@@ -1,0 +1,16 @@
+# Mount line for the dsh-ntr bundle.
+#
+# The pure package-name row is REQUIRED for the ClientModuleRegistry to match
+# the browser half (dsh.client in package.json); the host half is the same row
+# (one plugin module carries both Node and browser entries).
+#
+# Configure agents below (name -> command). Agent commands are ONLY ever read
+# from this configuration layer — the browser can never ask the host to spawn
+# an arbitrary program. Environment variables for a child are injected here
+# (YAML `!!js process.env.X` is allowed) so secrets stay out of the browser.
+- insert:
+    - id: dsh-ntr
+      name: dsh-ntr
+      config:
+        agents: []
+        # transcriptMaxEntries: 600
