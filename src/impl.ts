@@ -7,7 +7,8 @@
 
 import { randomUUID } from './ids.ts'
 import type {
-  AcpAgentDef, AcpEvent, AcpPluginConfig, AgentView, DetectedAgentInfo, PermissionMode, PermissionOutcome, RpcResult,
+  AcpAgentCatalog, AcpAgentDef, AcpEvent, AcpPluginConfig, AgentProbeModelsResult, AgentView, DetectedAgentInfo,
+  PermissionMode, PermissionOutcome, RpcResult,
 } from './protocol.ts'
 
 export { randomUUID }
@@ -57,6 +58,22 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
     throw new AcpError('bad_config', `acp: agent "${id}" allowedCwdRoots must be absolute paths`)
   }
   const title = typeof row.title === 'string' && row.title !== '' ? row.title : id
+  let exposedModels: string[] | undefined
+  if (row.exposedModels !== undefined) {
+    if (!Array.isArray(row.exposedModels) || row.exposedModels.length > 256) {
+      throw new AcpError('bad_config', `acp: agent "${id}" exposedModels must be a string array of at most 256 entries`)
+    }
+    const seen = new Set<string>()
+    exposedModels = []
+    for (const value of row.exposedModels) {
+      if (typeof value !== 'string' || value === '' || value.length > 128) {
+        throw new AcpError('bad_config', `acp: agent "${id}" exposedModels entries must be non-empty strings of at most 128 chars`)
+      }
+      if (seen.has(value)) continue
+      seen.add(value)
+      exposedModels.push(value)
+    }
+  }
   return {
     id,
     title,
@@ -66,6 +83,7 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
     permission: permission as AcpAgentDef['permission'],
     cwd: cwd as string | undefined,
     allowedCwdRoots: roots as string[],
+    ...(exposedModels !== undefined ? { exposedModels } : {}),
   }
 }
 
@@ -85,7 +103,30 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
   if (typeof max !== 'number' || !Number.isInteger(max) || max < 50 || max > 100_000) {
     throw new AcpError('bad_config', 'acp: transcriptMaxEntries must be an integer in [50, 100000]')
   }
-  return { agents, transcriptMaxEntries: max }
+  const probeModelsOnBoot = value.probeModelsOnBoot ?? true
+  if (typeof probeModelsOnBoot !== 'boolean') {
+    throw new AcpError('bad_config', 'acp: probeModelsOnBoot must be a boolean')
+  }
+  const startupTimeoutMs = value.startupTimeoutMs ?? 60_000
+  if (typeof startupTimeoutMs !== 'number' || !Number.isFinite(startupTimeoutMs) || startupTimeoutMs < 1_000 || startupTimeoutMs > 600_000) {
+    throw new AcpError('bad_config', 'acp: startupTimeoutMs must be a number in [1000, 600000]')
+  }
+  const permissionTimeoutMs = value.permissionTimeoutMs ?? 0
+  if (typeof permissionTimeoutMs !== 'number' || !Number.isInteger(permissionTimeoutMs) || permissionTimeoutMs < 0 || permissionTimeoutMs > 86_400_000) {
+    throw new AcpError('bad_config', 'acp: permissionTimeoutMs must be an integer in [0, 86400000] (0 = wait forever)')
+  }
+  const cancelFallbackMs = value.cancelFallbackMs ?? 15_000
+  if (typeof cancelFallbackMs !== 'number' || !Number.isInteger(cancelFallbackMs) || cancelFallbackMs < 0 || cancelFallbackMs > 600_000) {
+    throw new AcpError('bad_config', 'acp: cancelFallbackMs must be an integer in [0, 600000] (0 = disable the fallback)')
+  }
+  return {
+    agents,
+    transcriptMaxEntries: max,
+    probeModelsOnBoot,
+    startupTimeoutMs,
+    permissionTimeoutMs,
+    cancelFallbackMs,
+  }
 }
 
 // ---- Workspace guard ----
@@ -125,6 +166,58 @@ function safeRealpath(realpath: (p: string) => string, p: string): string {
   }
 }
 
+/** Pure path join with lexical `..`/`.` collapse (impl.ts cannot import node:path). */
+function joinWithin(base: string, rel: string): string {
+  const stack: string[] = []
+  for (const seg of `${base.replace(/\/+$/, '')}/${rel.replace(/^\/+/, '')}`.split('/')) {
+    if (seg === '') continue
+    if (seg === '.') continue
+    if (seg === '..') stack.pop()
+    else stack.push(seg)
+  }
+  return `/${stack.join('/')}`
+}
+
+/**
+ * Resolve a path requested by an ACP agent (fs/read_text_file, fs/write_text_file)
+ * against the session workspace and enforce the allow-list.
+ *
+ * Relative paths join under `sessionCwd`; the collapsed path is canonicalized
+ * by realpath up to the nearest existing ancestor (collapsing symlinks and any
+ * surviving `..`), with the missing tail re-attached lexically — so a fresh
+ * write target with not-yet-created parent directories still validates, and a
+ * symlink pointing outside the workspace resolves to its real location and is
+ * rejected by the root check. Escaping the workspace throws; the caller
+ * answers the agent's request with that error instead of touching the disk.
+ */
+export function resolveFsPath(sessionCwd: string, roots: readonly string[], requested: string, realpath: (p: string) => string): string {
+  if (typeof requested !== 'string' || requested === '') {
+    throw new AcpError('bad_path', 'acp: fs path must be a non-empty string')
+  }
+  const collapsed = requested.startsWith('/') ? joinWithin('/', requested) : joinWithin(sessionCwd, requested)
+  const segments = collapsed.split('/').filter(s => s !== '')
+  let canonical: string | undefined
+  let consumed = 0
+  for (let i = segments.length; i >= 0; i--) {
+    try {
+      canonical = realpath(i === 0 ? '/' : `/${segments.slice(0, i).join('/')}`)
+      consumed = i
+      break
+    } catch { /* walk up to the nearest existing ancestor */ }
+  }
+  if (canonical === undefined) {
+    throw new AcpError('bad_path', `acp: fs path does not exist: ${requested}`)
+  }
+  const tail = segments.slice(consumed)
+  const full = tail.length === 0 ? canonical : `${canonical.replace(/\/+$/, '')}/${tail.join('/')}`
+  const inside = roots.some(root => {
+    const canonicalRoot = safeRealpath(realpath, root)
+    return full === canonicalRoot || full.startsWith(`${canonicalRoot.replace(/\/+$/, '')}/`)
+  })
+  if (!inside) throw new AcpError('cwd_denied', `acp: fs path ${full} is outside the session workspace`)
+  return full
+}
+
 // ---- Child environment ----
 
 /**
@@ -142,6 +235,90 @@ export function childEnv(parent: NodeJS.ProcessEnv, extra: Record<string, string
   }
   for (const [k, v] of Object.entries(extra)) out[k] = v
   return out
+}
+
+// ---- Model catalog (pure parsing of ACP `configOptions`) ----
+
+/**
+ * Extract the `model` and `thought_level` select options from a raw ACP
+ * `configOptions` payload. Tolerant by design: unknown categories, boolean
+ * options, grouped choices, missing `name`, and the legacy `id` field (pre-
+ * spec agents) are all handled; anything unusable is skipped silently.
+ */
+export function parseCatalogOptions(configOptions: unknown): AcpAgentCatalog {
+  const out: AcpAgentCatalog = {}
+  if (!Array.isArray(configOptions)) return out
+  for (const raw of configOptions) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const row = raw as Record<string, unknown>
+    const category = typeof row.category === 'string' ? row.category : undefined
+    const slot = category === 'model' ? 'model' : category === 'thought_level' ? 'thought' : undefined
+    if (slot === undefined) continue
+    const configIdRaw = row.configId ?? row.id
+    if (typeof configIdRaw !== 'string' && typeof configIdRaw !== 'number') continue
+    const configId = String(configIdRaw)
+    if (configId === '') continue
+    const choices: NonNullable<AcpAgentCatalog['model']>['choices'] = []
+    collectCatalogChoices(row.options, choices)
+    out[slot] = {
+      configId,
+      name: typeof row.name === 'string' && row.name !== '' ? row.name : configId,
+      currentValue: typeof row.currentValue === 'string' && row.currentValue !== '' ? row.currentValue : null,
+      choices,
+    }
+  }
+  return out
+}
+
+/** Flatten select `options` (plain values or `SessionConfigSelectGroup`s) into choices, deduped by value. */
+function collectCatalogChoices(options: unknown, out: NonNullable<AcpAgentCatalog['model']>['choices']): void {
+  if (!Array.isArray(options)) return
+  for (const raw of options) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const row = raw as Record<string, unknown>
+    if (Array.isArray(row.options)) {
+      // Grouped form: flatten the inner values, borrowing the group label as fallback description.
+      for (const inner of row.options) {
+        if (typeof inner !== 'object' || inner === null) continue
+        pushCatalogChoice(inner as Record<string, unknown>, out, typeof row.name === 'string' ? row.name : undefined)
+      }
+      continue
+    }
+    pushCatalogChoice(row, out)
+  }
+}
+
+function pushCatalogChoice(row: Record<string, unknown>, out: NonNullable<AcpAgentCatalog['model']>['choices'], groupLabel?: string): void {
+  const value = row.value
+  if (typeof value !== 'string' || value === '') return
+  if (out.some(c => c.value === value)) return
+  const description = typeof row.description === 'string' && row.description !== '' ? row.description : groupLabel
+  out.push({
+    value,
+    name: typeof row.name === 'string' && row.name !== '' ? row.name : value,
+    ...(description !== undefined ? { description } : {}),
+    // The group label is kept on its own field (commonly the vendor) so the
+    // settings panel can filter by it even when the choice has its own text.
+    // Only real ACP `SessionConfigSelectGroup` labels land here — no guessing:
+    // any vendor may serve another vendor's models, so synthesizing buckets
+    // from name prefixes or value paths would misclassify.
+    ...(groupLabel !== undefined ? { group: groupLabel } : {}),
+  })
+}
+
+/**
+ * Split an adapter model id into its agent id and optional model choice.
+ * `@` is the separator because agent ids are restricted to `[a-z0-9._-]`.
+ */
+export function splitAdapterModelId(model: string): { agentId: string; choice?: string } {
+  const at = model.indexOf('@')
+  if (at <= 0) return { agentId: model }
+  return { agentId: model.slice(0, at), choice: model.slice(at + 1) }
+}
+
+/** Inverse of {@link splitAdapterModelId} for variant entries. */
+export function buildAdapterModelId(agentId: string, choice: string): string {
+  return `${agentId}@${choice}`
 }
 
 // ---- Transcript ----
@@ -215,6 +392,10 @@ export class PermissionLedger {
     return true
   }
 
+  has(requestId: string): boolean {
+    return this.pending.has(requestId)
+  }
+
   settleFor(predicate: (p: { requestId: string; sessionId: string }) => boolean): string[] {
     const settled: string[] = []
     for (const [id, entry] of [...this.pending]) {
@@ -252,6 +433,9 @@ export interface AcpManager {
   detectAgents?(): Promise<DetectedAgentInfo[]>
   saveAgent?(def: AcpAgentDef): Promise<void>
   deleteAgent?(agentId: string): Promise<void>
+  /** Update which probed model choices surface in the native selector; `undefined` clears the filter. Must not restart the agent. */
+  setExposedModels?(agentId: string, exposedModels: readonly string[] | undefined): Promise<void>
+  probeAgentModels?(agentId: string): Promise<AgentProbeModelsResult>
 }
 
 function ok<T>(value: T): RpcResult<T> {
@@ -341,6 +525,27 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         }
         await manager.setPermission?.(agentId, permission as PermissionMode)
         return ok({ done: true })
+      }
+      case 'agent/set-exposed-models': {
+        const agentId = str(body, 'agentId', 64)
+        const raw = body.exposedModels
+        if (raw === undefined) {
+          await manager.setExposedModels?.(agentId, undefined)
+          return ok({ done: true })
+        }
+        if (!Array.isArray(raw) || raw.length > 256 || raw.some(v => typeof v !== 'string' || v === '' || v.length > 128)) {
+          throw new AcpError('bad_payload', 'acp: exposedModels must be non-empty strings of at most 128 chars (max 256 entries)')
+        }
+        await manager.setExposedModels?.(agentId, raw as string[])
+        return ok({ done: true })
+      }
+      case 'agent/probe-models': {
+        if (manager.probeAgentModels === undefined) {
+          return fail('unsupported', 'acp: agent/probe-models is not available')
+        }
+        // Must invoke as a method: extracting the function would drop the
+        // manager receiver (`this`) and crash the real BridgeManager.
+        return ok(await manager.probeAgentModels(str(body, 'agentId', 64)))
       }
       default:
         return fail('unknown_endpoint', `acp: unknown endpoint ${endpoint}`)

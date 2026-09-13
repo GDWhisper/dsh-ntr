@@ -9,14 +9,15 @@
 
 import { spawn, type ChildProcess } from 'node:child_process'
 import { homedir } from 'node:os'
-import { delimiter, join, resolve } from 'node:path'
+import { delimiter, dirname, join, resolve } from 'node:path'
 import { Writable, Readable } from 'node:stream'
-import { accessSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import {
   client,
   methods,
   ndJsonStream,
   PROTOCOL_VERSION,
+  RequestError,
   type ClientConnection,
   type InitializeResponse,
   type PermissionOption,
@@ -29,17 +30,26 @@ import {
   EventHub,
   PermissionLedger,
   Transcript,
+  buildAdapterModelId,
   childEnv,
+  parseCatalogOptions,
   randomUUID,
+  resolveFsPath,
   resolveSessionCwd,
+  splitAdapterModelId,
   validateAgentDef,
 } from './impl.ts'
 import type {
-  AcpAgentDef, AgentView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike, LlmModelInfo, LlmProviderInfo,
-  LlmResolvedModelInfo, PermissionMode, PermissionOutcome, PermissionOptionView, PreparedAdapterCall, SessionView, StreamChunk,
+  AcpAgentCatalog, AcpAgentDef, AgentProbeModelsResult, AgentView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
+  LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo, PermissionMode,
+  PermissionOutcome, PermissionOptionView, PreparedAdapterCall, SessionView, StreamChunk,
 } from './protocol.ts'
 
 const STDERR_TAIL_LINES = 40
+/** Single fs/read_text_file answer cap — agents reading huge files must page via `line`/`limit`. */
+const FS_MAX_READ_BYTES = 2 * 1024 * 1024
+/** Single fs/write_text_file payload cap. */
+const FS_MAX_WRITE_BYTES = 2 * 1024 * 1024
 
 interface LiveSession {
   /** Host-minted id (stable across an agent restart; the ACP id is per-connection). */
@@ -55,7 +65,22 @@ interface LiveSession {
   usage?: SessionView['usage']
   running: boolean
   closed: boolean
+  /** The agent process died; the session awaits a `session/load` resume. */
+  released: boolean
   transcript: Transcript
+}
+
+/** Reliability tuning, threaded from `AcpPluginConfig` through the manager. */
+export interface BridgeTuning {
+  startupTimeoutMs?: number
+  permissionTimeoutMs?: number
+  cancelFallbackMs?: number
+}
+
+const DEFAULT_TUNING: Required<BridgeTuning> = {
+  startupTimeoutMs: 60_000,
+  permissionTimeoutMs: 0,
+  cancelFallbackMs: 15_000,
 }
 
 type BridgeState = 'stopped' | 'starting' | 'ready' | 'error'
@@ -71,7 +96,14 @@ export class AgentBridge {
   private starting?: Promise<void>
   private readonly sessions = new Map<string, LiveSession>()
   private readonly acpIndex = new Map<string, LiveSession>()
+  /** Sessions whose process died but whose ACP id can be resumed via `session/load`. */
+  private readonly released = new Map<string, LiveSession>()
+  /** Inflight `session/load` resumes, shared so concurrent prompts don't double-resume. */
+  private readonly resuming = new Map<string, Promise<LiveSession>>()
   readonly permissions = new PermissionLedger()
+  private readonly startupTimeoutMs: number
+  private readonly permissionTimeoutMs: number
+  private readonly cancelFallbackMs: number
 
   constructor(
     readonly def: AcpAgentDef,
@@ -79,7 +111,15 @@ export class AgentBridge {
     private readonly transcriptMax: number,
     /** Called when the connection dies so the manager can settle outstanding prompts. */
     private readonly onConnectionLost: (bridge: AgentBridge, reason: string) => void,
-  ) {}
+    /** Observes `configOptions` from any real session so the manager's model catalog stays warm. */
+    private readonly onCatalog?: (agentId: string, configOptions: unknown) => void,
+    tuning?: BridgeTuning,
+  ) {
+    const merged = { ...DEFAULT_TUNING, ...tuning }
+    this.startupTimeoutMs = merged.startupTimeoutMs
+    this.permissionTimeoutMs = merged.permissionTimeoutMs
+    this.cancelFallbackMs = merged.cancelFallbackMs
+  }
 
   view(): AgentView {
     return {
@@ -143,10 +183,15 @@ export class AgentBridge {
     })
     this.child = child
     child.on('error', (error) => {
+      // Identity guard: a stale event from a PREVIOUS child must not tear down
+      // a connection that replaced it (an `exit` can land after the respawn
+      // already started and would otherwise kill the fresh process).
+      if (this.child !== child) return
       this.noteStderr(`spawn error: ${error.message}`)
       if (this.state !== 'stopped') this.onConnectionLost(this, `spawn error: ${error.message}`)
     })
     child.on('exit', (code, signal) => {
+      if (this.child !== child) return // stale event from a replaced child
       this.noteStderr(`[process exited code=${String(code)} signal=${String(signal)}]`)
       if (this.state === 'ready' || this.state === 'starting') {
         this.onConnectionLost(this, `agent process exited (code=${String(code)}, signal=${String(signal)})`)
@@ -170,6 +215,8 @@ export class AgentBridge {
       .onRequest(methods.client.session.requestPermission, async ctx => {
         return this.handlePermissionRequest(ctx.params.sessionId, ctx.params.toolCall, ctx.params.options)
       })
+      .onRequest(methods.client.fs.readTextFile, async ctx => this.handleFsRead(ctx.params))
+      .onRequest(methods.client.fs.writeTextFile, async ctx => this.handleFsWrite(ctx.params))
     const conn = app.connect(stream)
     this.conn = conn
     void conn.closed.then(() => {
@@ -177,12 +224,40 @@ export class AgentBridge {
         this.onConnectionLost(this, 'ACP connection closed')
       }
     })
-    const init = await conn.agent.request(methods.agent.initialize, {
-      protocolVersion: PROTOCOL_VERSION,
-      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-      clientInfo: { name: 'dsh-ntr', title: 'DSH NTR', version: '0.1.0' },
-    })
+    const init = await this.withStartupTimeout(
+      conn.agent.request(methods.agent.initialize, {
+        protocolVersion: PROTOCOL_VERSION,
+        // The fs handlers are implemented below behind the same workspace
+        // sandbox that gates session cwds; terminal is not implemented.
+        clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: false },
+        clientInfo: { name: 'dsh-ntr', title: 'DSH NTR', version: '0.1.0' },
+      }),
+      'initialize',
+    )
     this.initResult = init
+  }
+
+  /**
+   * Bound one agent-startup request (`initialize`, `session/new`,
+   * `session/load`). The SDK's `cancellationSignal` is cooperative — a wedged
+   * agent never answers `$/cancel_request` either — so the only real timeout
+   * is a race, and the losing call tears the child down: a process that stops
+   * answering protocol requests is dead for every session it owns.
+   */
+  private withStartupTimeout<T>(request: Promise<T>, what: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        this.killChild()
+        reject(new AcpError('agent_timeout', `acp: agent "${this.def.id}" did not answer ${what} within ${String(this.startupTimeoutMs)}ms${this.stderrTail.length > 0 ? `; stderr: ${this.stderrTail.slice(-5).join(' | ')}` : ''}`))
+      }, this.startupTimeoutMs)
+      timer.unref?.()
+    })
+    return Promise.race([request, timeout]).finally(() => {
+      clearTimeout(timer)
+      // The losing request may still reject when the child is torn down below.
+      void request.catch(() => { /* already surfaced through the timeout path */ })
+    })
   }
 
   private noteStderr(line: string): void {
@@ -200,7 +275,13 @@ export class AgentBridge {
     const conn = this.conn
     if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
     const resolved = resolveSessionCwd(this.def, cwd, p => realpathSync(p))
-    const result = await conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: [] })
+    const result = await this.withStartupTimeout(
+      conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: [] }),
+      'session/new',
+    )
+    if (this.onCatalog !== undefined && result.configOptions !== undefined && result.configOptions !== null) {
+      this.onCatalog(this.def.id, result.configOptions)
+    }
     const session: LiveSession = {
       sessionId: randomUUID(),
       agentId: this.def.id,
@@ -208,6 +289,7 @@ export class AgentBridge {
       cwd: resolved,
       running: false,
       closed: false,
+      released: false,
       transcript: new Transcript(this.transcriptMax),
       ...(result.modes !== undefined && result.modes !== null
         ? {
@@ -230,13 +312,31 @@ export class AgentBridge {
   }
 
   /**
+   * Spawn a throwaway ACP session purely to read its `configOptions` (the
+   * model catalog probe). Deliberately bypasses the live-session bookkeeping
+   * so probe sessions never surface in the browser session list.
+   */
+  async probeConfigOptions(): Promise<unknown[]> {
+    await this.ensureReady()
+    const conn = this.conn
+    if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
+    const resolved = resolveSessionCwd(this.def, undefined, p => realpathSync(p))
+    const result = await this.withStartupTimeout(
+      conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: [] }),
+      'session/new',
+    )
+    await conn.agent.request(methods.agent.session.close, { sessionId: result.sessionId }).catch(() => { /* optional capability */ })
+    return Array.isArray(result.configOptions) ? result.configOptions : []
+  }
+
+  /**
    * Fire one prompt turn. Returns after the agent settles the turn; the caller
    * (manager) keeps the UI informed through broadcast events, so the RPC that
    * started the turn can answer `accepted` immediately.
    */
   async runPrompt(session: LiveSession, text: string, turnId: string): Promise<string> {
     const conn = this.conn
-    if (conn === undefined || session.closed) throw new AcpError('session_closed', 'acp: session is closed')
+    if (conn === undefined || session.closed || session.released) throw new AcpError('session_closed', 'acp: session is closed')
     const result = await conn.agent.request(methods.agent.session.prompt, {
       sessionId: session.acpSessionId,
       prompt: [{ type: 'text', text }],
@@ -247,6 +347,152 @@ export class AgentBridge {
   async cancel(session: LiveSession): Promise<void> {
     if (this.conn === undefined) return
     await this.conn.agent.notify(methods.agent.session.cancel, { sessionId: session.acpSessionId }).catch(() => { /* best effort */ })
+    this.armCancelFallback(session)
+  }
+
+  /**
+   * An agent that ignores the `session/cancel` notification must not wedge the
+   * session in `running` forever (every later prompt would fail with
+   * `turn_in_flight`). Force-finalize the turn after the grace period; the
+   * real `session/prompt` response may still arrive later and is folded in by
+   * the manager as usual.
+   */
+  private armCancelFallback(session: LiveSession): void {
+    if (this.cancelFallbackMs <= 0) return
+    const timer = setTimeout(() => {
+      if (session.closed || !session.running) return
+      session.running = false
+      this.hub.broadcast({
+        type: 'turn/end',
+        sessionId: session.sessionId,
+        turnId: '',
+        error: `agent "${this.def.id}" did not respond to the cancel request within ${String(Math.round(this.cancelFallbackMs / 1000))}s; the turn was force-finalized`,
+      })
+    }, this.cancelFallbackMs)
+    timer.unref?.()
+  }
+
+  /**
+   * Bring a released session back on a fresh agent process via
+   * `session/load` ("send to recover"). Concurrent callers share one inflight
+   * resume. The agent replays its history as fresh `session/update`s while
+   * the load request is still in flight, so the session re-registers with the
+   * update router and broadcasts `session/reset` BEFORE the request goes out;
+   * on failure the record is parked back into the released map so a later
+   * prompt can retry.
+   */
+  resumeSession(session: LiveSession): Promise<LiveSession> {
+    const inflight = this.resuming.get(session.sessionId)
+    if (inflight !== undefined) return inflight
+    const promise = this.doResumeSession(session).finally(() => {
+      this.resuming.delete(session.sessionId)
+    })
+    this.resuming.set(session.sessionId, promise)
+    return promise
+  }
+
+  private async doResumeSession(session: LiveSession): Promise<LiveSession> {
+    try {
+      await this.ensureReady()
+      // The capability comes from the FRESH initialize: after a crash the
+      // bridge restarts the process, so check the (new) initResult here.
+      if (this.initResult?.agentCapabilities?.loadSession !== true) {
+        throw new AcpError('resume_unsupported', `acp: agent "${this.def.id}" does not advertise the loadSession capability; start a new session`)
+      }
+      const conn = this.conn
+      if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
+      // The cwd was validated when the session was created, but allowed roots
+      // may have narrowed since; re-check before handing the path back.
+      const resolved = resolveSessionCwd(this.def, session.cwd, p => realpathSync(p))
+      // Replay arrives as brand-new updates, so the transcript restarts too;
+      // seq keeps meaning "position in the current epoch".
+      session.transcript = new Transcript(this.transcriptMax)
+      session.cwd = resolved
+      session.running = false
+      session.closed = false
+      session.released = false
+      // Route replay updates into the fresh transcript while the load request
+      // is in flight, and let the browser drop its blocks/watermark first.
+      this.acpIndex.set(session.acpSessionId, session)
+      this.hub.broadcast({ type: 'session/reset', sessionId: session.sessionId, session: snapshot(session) })
+      const result = await this.withStartupTimeout(
+        conn.agent.request(methods.agent.session.load, { sessionId: session.acpSessionId, cwd: resolved, mcpServers: [] }),
+        'session/load',
+      )
+      if (this.onCatalog !== undefined && result.configOptions !== undefined && result.configOptions !== null) {
+        this.onCatalog(this.def.id, result.configOptions)
+      }
+      session.modes = result.modes !== undefined && result.modes !== null
+        ? {
+          currentModeId: result.modes.currentModeId,
+          availableModes: result.modes.availableModes.map(m => ({
+            id: m.id,
+            name: m.name,
+            ...(m.description !== null ? { description: m.description } : {}),
+          })),
+        }
+        : session.modes
+      if (Array.isArray(result.configOptions)) session.configOptions = result.configOptions
+      this.sessions.set(session.sessionId, session)
+      this.released.delete(session.sessionId)
+      // Republish so configOptions/modes observed on load reach the browser.
+      this.hub.broadcast({ type: 'session/meta', sessionId: session.sessionId, session: snapshot(session) })
+      return session
+    } catch (error) {
+      this.acpIndex.delete(session.acpSessionId)
+      this.sessions.delete(session.sessionId)
+      session.released = true
+      this.released.set(session.sessionId, session)
+      this.hub.broadcast({ type: 'session/released', sessionId: session.sessionId, session: snapshot(session), reason: 'resume failed' })
+      throw error
+    }
+  }
+
+  /** Release all live sessions (agent process died): keep them resumable, settle permissions, drop the connection. */
+  releaseAll(reason: string): void {
+    for (const session of [...this.sessions.values()]) {
+      if (session.running) {
+        session.running = false
+        this.hub.broadcast({ type: 'turn/end', sessionId: session.sessionId, turnId: '', error: reason })
+      }
+      session.released = true
+      this.settlePermissions(session)
+      this.released.set(session.sessionId, session)
+      this.hub.broadcast({ type: 'session/released', sessionId: session.sessionId, session: snapshot(session), reason })
+    }
+    this.sessions.clear()
+    this.acpIndex.clear()
+    this.conn?.close()
+    this.conn = undefined
+    this.killChild()
+    this.state = 'stopped'
+    this.initResult = undefined
+    this.publishStatus()
+  }
+
+  /** Detach one released session record for a resume attempt. */
+  takeReleased(sessionId: string): LiveSession | undefined {
+    const session = this.released.get(sessionId)
+    if (session === undefined) return undefined
+    this.released.delete(sessionId)
+    return session
+  }
+
+  /** Drop a released session record for good (user closed it or the agent was stopped). */
+  dropReleased(sessionId: string): boolean {
+    return this.released.delete(sessionId)
+  }
+
+  get releasedList(): LiveSession[] {
+    return [...this.released.values()]
+  }
+
+  hasReleased(sessionId: string): LiveSession | undefined {
+    return this.released.get(sessionId)
+  }
+
+  inflightResume(sessionId: string): Promise<LiveSession> | undefined {
+    return this.resuming.get(sessionId)
   }
 
   async setMode(session: LiveSession, modeId: string): Promise<void> {
@@ -300,6 +546,8 @@ export class AgentBridge {
     for (const session of [...this.sessions.values()]) {
       await this.closeSession(session, reason)
     }
+    // A deliberate stop is not a crash: nothing stays resumable.
+    this.released.clear()
     this.conn?.close()
     this.conn = undefined
     this.killChild()
@@ -351,7 +599,9 @@ export class AgentBridge {
     }
     if (session === undefined || session.closed) return { outcome: { outcome: 'cancelled' } }
     return new Promise<RequestPermissionResponse>(resolve => {
+      let timer: ReturnType<typeof setTimeout> | undefined
       const requestId = this.permissions.create(session.sessionId, (outcome: PermissionOutcome) => {
+        clearTimeout(timer)
         this.hub.broadcast({
           type: 'permission/resolved',
           requestId,
@@ -362,6 +612,22 @@ export class AgentBridge {
           ? { outcome: { outcome: 'selected', optionId: outcome.optionId } }
           : { outcome: { outcome: 'cancelled' } })
       })
+      // Optional deadline (`permissionTimeoutMs`): an approval left unanswered
+      // is answered `cancelled` on the human's behalf instead of hanging the
+      // turn forever. Off by default — approvals belong to a person.
+      if (this.permissionTimeoutMs > 0) {
+        timer = setTimeout(() => {
+          if (!this.permissions.has(requestId)) return
+          this.hub.broadcast({
+            type: 'agent/notice',
+            agentId: this.def.id,
+            level: 'info',
+            text: `acp: permission request timed out after ${String(Math.round(this.permissionTimeoutMs / 1000))}s; answered "cancelled"`,
+          })
+          this.permissions.respond(requestId, { outcome: 'cancelled' })
+        }, this.permissionTimeoutMs)
+        timer.unref?.()
+      }
       this.hub.broadcast({
         type: 'permission/request',
         requestId,
@@ -374,6 +640,53 @@ export class AgentBridge {
 
   private settlePermissions(session: LiveSession): void {
     this.permissions.settleFor(p => p.sessionId === session.sessionId)
+  }
+
+  /** `fs/read_text_file` for agents that fetch workspace content through the
+   * client. Every path passes the same workspace guard as session cwds
+   * (resolveFsPath); violations answer as JSON-RPC internal errors so the
+   * agent sees a refusal instead of file contents.
+   */
+  private handleFsRead(params: { sessionId: string; path: string; line?: number | null; limit?: number | null }): { content: string } {
+    const session = this.acpIndex.get(params.sessionId)
+    if (session === undefined) {
+      throw fsRequestError(`acp: fs request for unknown session ${params.sessionId}`)
+    }
+    const path = this.guardFsPath(session, params.path)
+    if (statSync(path).size > FS_MAX_READ_BYTES) {
+      throw fsRequestError(`acp: fs read refused: ${path} exceeds ${String(FS_MAX_READ_BYTES)} bytes; page with line/limit or read smaller files`)
+    }
+    let content = readFileSync(path, 'utf8')
+    if (params.line != null || params.limit != null) {
+      const lines = content.split('\n')
+      const start = Math.max(0, (params.line ?? 1) - 1)
+      const end = params.limit != null ? start + params.limit : lines.length
+      content = lines.slice(start, end).join('\n')
+    }
+    return { content }
+  }
+
+  /** `fs/write_text_file`; parent directories are created inside the sandbox. */
+  private handleFsWrite(params: { sessionId: string; path: string; content: string }): { } {
+    const session = this.acpIndex.get(params.sessionId)
+    if (session === undefined) {
+      throw fsRequestError(`acp: fs request for unknown session ${params.sessionId}`)
+    }
+    if (params.content.length > FS_MAX_WRITE_BYTES) {
+      throw fsRequestError(`acp: fs write refused: payload exceeds ${String(FS_MAX_WRITE_BYTES)} bytes`)
+    }
+    const path = this.guardFsPath(session, params.path)
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, params.content, 'utf8')
+    return { }
+  }
+
+  private guardFsPath(session: LiveSession, requested: string): string {
+    try {
+      return resolveFsPath(session.cwd, [...(this.def.allowedCwdRoots ?? []), session.cwd], requested, p => realpathSync(p))
+    } catch (error) {
+      throw fsRequestError(`acp: fs access denied: ${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 
   private handleSessionUpdate(params: SessionNotification): void {
@@ -391,6 +704,7 @@ export class AgentBridge {
         break
       case 'config_option_update':
         session.configOptions = update.configOptions ?? []
+        this.onCatalog?.(this.def.id, session.configOptions)
         break
       case 'available_commands_update':
         session.availableCommands = update.availableCommands.map(c => ({
@@ -433,6 +747,7 @@ function snapshot(session: LiveSession): SessionView {
     ...(session.usage !== undefined ? { usage: session.usage } : {}),
     running: session.running,
     closed: session.closed,
+    ...(session.released ? { released: true } : {}),
     seq: session.transcript.head,
   }
 }
@@ -464,6 +779,14 @@ export const AGENT_PRESETS: AgentPreset[] = [
     defaultCommand: 'pi-acp',
     defaultArgs: [],
   },
+  {
+    id: 'omp',
+    name: 'Oh My Pi',
+    description: 'Oh My Pi (pi-based coding agent) — run as `omp acp` over stdio',
+    executables: ['omp'],
+    defaultCommand: 'omp',
+    defaultArgs: ['acp'],
+  },
 ]
 
 export function findExecutable(command: string): string | undefined {
@@ -483,6 +806,7 @@ export function findExecutable(command: string): string | undefined {
   const dirs = envPath.split(delimiter).filter(Boolean)
   const extraDirs = [
     join(homedir(), '.pi', 'agent', 'bin'),
+    join(homedir(), '.bun', 'bin'),
     join(homedir(), '.local', 'bin'),
   ]
   const allDirs = [...new Set([...dirs, ...extraDirs])]
@@ -541,11 +865,20 @@ export class BridgeManager {
     readonly hub: EventHub,
     private readonly transcriptMax: number,
     private readonly configStoragePath?: string,
+    private readonly catalogStoragePath?: string,
+    /** Auto-probe agents for model catalogs (boot + lazy); manual probes always run. */
+    private readonly probeModelsOnBoot = true,
+    private readonly tuning?: BridgeTuning,
   ) {
     for (const def of defs) {
       this.defsMap.set(def.id, def)
     }
     this.loadPersistedAgents()
+    this.loadPersistedCatalogs()
+  }
+
+  private makeBridge(def: AcpAgentDef, onConnectionLost: (bridge: AgentBridge, reason: string) => void, onCatalog?: (agentId: string, configOptions: unknown) => void): AgentBridge {
+    return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, this.tuning)
   }
 
   private getStoragePath(): string | undefined {
@@ -598,13 +931,256 @@ export class BridgeManager {
     }
   }
 
+  // ---- Model catalog ----
+
+  private readonly catalogs = new Map<string, { catalog: AcpAgentCatalog; updatedAt: number }>()
+  /** Auto-spawning probes are suppressed under test runners so suites stay deterministic. */
+  private readonly autoProbeEnabled = process.env.VITEST === undefined && process.env.NODE_ENV !== 'test'
+
+  private getCatalogStoragePath(): string | undefined {
+    if (this.catalogStoragePath !== undefined) return this.catalogStoragePath
+    if (process.env.DSH_ACP_CATALOG_FILE) return process.env.DSH_ACP_CATALOG_FILE
+    if (process.env.VITEST !== undefined || process.env.NODE_ENV === 'test') {
+      return undefined
+    }
+    try {
+      const dshDir = join(homedir(), '.dsh')
+      if (!existsSync(dshDir)) {
+        mkdirSync(dshDir, { recursive: true })
+      }
+      return join(dshDir, 'acp-model-catalog.json')
+    } catch {
+      return undefined
+    }
+  }
+
+  private loadPersistedCatalogs(): void {
+    const filePath = this.getCatalogStoragePath()
+    if (!filePath || !existsSync(filePath)) return
+    try {
+      const parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>
+      const agents = parsed.agents
+      if (typeof agents !== 'object' || agents === null) return
+      for (const [agentId, raw] of Object.entries(agents)) {
+        if (typeof raw !== 'object' || raw === null) continue
+        const row = raw as { catalog?: unknown; updatedAt?: unknown }
+        if (typeof row.catalog !== 'object' || row.catalog === null) continue
+        this.catalogs.set(agentId, {
+          catalog: row.catalog as AcpAgentCatalog,
+          updatedAt: typeof row.updatedAt === 'number' ? row.updatedAt : 0,
+        })
+      }
+    } catch {
+      // Storage load failure is non-fatal
+    }
+  }
+
+  private persistCatalogs(): void {
+    const filePath = this.getCatalogStoragePath()
+    if (!filePath) return
+    try {
+      const agents: Record<string, { catalog: AcpAgentCatalog; updatedAt: number }> = {}
+      for (const [agentId, entry] of this.catalogs) agents[agentId] = entry
+      writeFileSync(filePath, JSON.stringify({ version: 1, agents }, null, 2), 'utf-8')
+    } catch {
+      // Storage persist failure is non-fatal
+    }
+  }
+
+  /** Merge `configOptions` observed on any real session into the agent's catalog. */
+  private absorbCatalog(agentId: string, configOptions: unknown): { catalog: AcpAgentCatalog; updatedAt: number } {
+    const catalog = parseCatalogOptions(configOptions)
+    const existing = this.catalogs.get(agentId)
+    if (existing !== undefined && JSON.stringify(existing.catalog) === JSON.stringify(catalog)) return existing
+    const entry = { catalog, updatedAt: Date.now() }
+    this.catalogs.set(agentId, entry)
+    this.persistCatalogs()
+    return entry
+  }
+
+  catalogFor(agentId: string): AcpAgentCatalog | undefined {
+    return this.catalogs.get(agentId)?.catalog
+  }
+
+  /**
+   * Probe one agent right now: spawn (if needed), open a throwaway session,
+   * read its `configOptions`, close it. Errors propagate to the caller (the
+   * RPC result or a notice broadcast).
+   */
+  async probeAgentModels(agentId: string): Promise<AgentProbeModelsResult> {
+    const bridge = this.bridge(agentId)
+    const configOptions = await bridge.probeConfigOptions()
+    const entry = this.absorbCatalog(agentId, configOptions)
+    return { agentId, catalog: entry.catalog, updatedAt: entry.updatedAt }
+  }
+
+  /**
+   * Fire-and-forget background probe for an agent without a cached catalog.
+   * Failures stay silent: the catalog is advisory and the selector simply
+   * shows the base entry until a probe succeeds.
+   */
+  private ensureCatalog(agentId: string): void {
+    if (this.catalogs.has(agentId)) return
+    if (!this.autoProbeEnabled || !this.probeModelsOnBoot) return
+    void this.probeAgentModels(agentId).catch(() => { /* background best-effort */ })
+  }
+
+  /** Boot-time probe for agents that have no persisted catalog yet. */
+  bootstrapCatalogs(): void {
+    if (!this.autoProbeEnabled || !this.probeModelsOnBoot) return
+    for (const def of this.defsMap.values()) this.ensureCatalog(def.id)
+  }
+
+  /**
+   * Flat per-provider model list for the DSH selector: one base entry per
+   * agent (the agent's own default model) plus one `agent@choice` variant per
+   * cataloged model choice, narrowed by the agent's `exposedModels` filter
+   * (unset → all choices; the base entry is never filtered out). Pure memory —
+   * NEVER spawns; agents without a catalog merely get a lazy background probe
+   * so the next refresh is full.
+   */
+  listAdapterModels(provider: string): LlmModelInfo[] {
+    const out: LlmModelInfo[] = []
+    for (const def of this.defsMap.values()) {
+      const title = def.title ?? def.id
+      out.push({
+        provider,
+        id: def.id,
+        name: title,
+        description: `ACP Agent: ${def.command} ${(def.args ?? []).join(' ')}`.trim(),
+      })
+      const entry = this.catalogs.get(def.id)
+      if (entry === undefined) {
+        this.ensureCatalog(def.id)
+        continue
+      }
+      const exposed = def.exposedModels
+      for (const choice of entry.catalog.model?.choices ?? []) {
+        if (exposed !== undefined && !exposed.includes(choice.value)) continue
+        out.push({
+          provider,
+          id: buildAdapterModelId(def.id, choice.value),
+          name: `${title} · ${choice.name}`,
+          ...(choice.description !== undefined ? { description: choice.description } : {}),
+        })
+      }
+    }
+    return out
+  }
+
+  /**
+   * Resolve one catalog id for the DSH selector/validation. Unknown agents
+   * throw (that is what turns `selectModel` into `model-unavailable`); known
+   * agents NEVER throw — stale variants degrade to a bare-id entry so one
+   * dead choice cannot sink the whole `acp` provider group in
+   * `buildModelCatalog`.
+   */
+  resolveAdapterModel(provider: string, model: string): LlmResolvedModelInfo {
+    const { agentId, choice } = splitAdapterModelId(model)
+    const def = this.defsMap.get(agentId)
+    if (def === undefined) {
+      throw new AcpError('unknown_model', `acp: model "${model}" is unavailable: agent "${agentId}" is not configured`)
+    }
+    const title = def.title ?? def.id
+    if (choice === undefined || choice === '') {
+      const reasoning = this.reasoningMeta(agentId)
+      return {
+        provider,
+        id: model,
+        name: title,
+        description: `ACP Agent: ${def.command} ${(def.args ?? []).join(' ')}`.trim(),
+        ...(reasoning !== undefined ? { reasoning } : {}),
+      }
+    }
+    const modelChoice = this.catalogs.get(agentId)?.catalog.model?.choices.find(c => c.value === choice)
+    if (modelChoice === undefined) {
+      // Stale variant (agent dropped the model): degrade instead of throwing.
+      return { provider, id: model, name: model }
+    }
+    const reasoning = this.reasoningMeta(agentId)
+    return {
+      provider,
+      id: model,
+      name: `${title} · ${modelChoice.name}`,
+      ...(modelChoice.description !== undefined ? { description: modelChoice.description } : {}),
+      ...(reasoning !== undefined ? { reasoning } : {}),
+    }
+  }
+
+  /**
+   * DSH reasoning metadata built from the agent's `thought_level` option:
+   * efforts come from its choices and `defaultEffort` from the current value
+   * (only when it is one of the choices — DSH rejects unknown defaults).
+   */
+  private reasoningMeta(agentId: string): LlmModelReasoningInfo | undefined {
+    const thought = this.catalogs.get(agentId)?.catalog.thought
+    if (thought === undefined) return undefined
+    const efforts: LlmReasoningEffortInfo[] = []
+    for (const choice of thought.choices) {
+      if (efforts.some(e => e.id === choice.value)) continue
+      efforts.push({
+        id: choice.value,
+        name: choice.name,
+        ...(choice.description !== undefined ? { description: choice.description } : {}),
+      })
+    }
+    if (efforts.length === 0) return undefined
+    const defaultEffort = thought.currentValue
+    return {
+      efforts,
+      ...(defaultEffort !== null && efforts.some(e => e.id === defaultEffort) ? { defaultEffort } : {}),
+    }
+  }
+
+  /**
+   * Bring the live ACP session's model / thought level in line with what the
+   * chat UI selected: diff the session's current `configOptions` and call
+   * `session/set_config_option` only for drifting entries. Best effort by
+   * design — failures broadcast a notice and the turn proceeds with the
+   * agent's current configuration.
+   */
+  private async alignSessionConfig(session: LiveSession, modelChoice: string | undefined, effort: string | undefined): Promise<void> {
+    const wantedModel = modelChoice !== undefined && modelChoice !== '' ? modelChoice : undefined
+    const wantedEffort = effort !== undefined && effort !== '' ? effort : undefined
+    if (wantedModel === undefined && wantedEffort === undefined) return
+    const catalog = parseCatalogOptions(session.configOptions)
+    const bridge = this.bridge(session.agentId)
+    const notice = (level: 'info' | 'error', text: string): void => {
+      this.hub.broadcast({ type: 'agent/notice', agentId: session.agentId, level, text })
+    }
+    if (wantedModel !== undefined) {
+      const model = catalog.model
+      if (model === undefined) {
+        notice('error', `acp: agent "${session.agentId}" exposes no model selector; ignoring model "${wantedModel}"`)
+      } else if (model.currentValue !== wantedModel && (model.choices.length === 0 || model.choices.some(c => c.value === wantedModel))) {
+        try {
+          await bridge.setConfigOption(session, model.configId, wantedModel)
+        } catch (error) {
+          notice('error', `acp: failed to switch model to "${wantedModel}": ${describeError(error)}`)
+        }
+      }
+    }
+    if (wantedEffort !== undefined) {
+      const thought = catalog.thought
+      if (thought !== undefined && thought.currentValue !== wantedEffort && (thought.choices.length === 0 || thought.choices.some(c => c.value === wantedEffort))) {
+        try {
+          await bridge.setConfigOption(session, thought.configId, wantedEffort)
+        } catch (error) {
+          notice('error', `acp: failed to set thought level "${wantedEffort}": ${describeError(error)}`)
+        }
+      }
+    }
+  }
+
   private bridge(agentId: string): AgentBridge {
     const def = this.defsMap.get(agentId)
     if (def === undefined) throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
     let bridge = this.bridges.get(agentId)
     if (bridge === undefined) {
-      bridge = new AgentBridge(def, this.hub, this.transcriptMax, (b, reason) => {
+      bridge = this.makeBridge(def, (b, reason) => {
         this.connectionLost(b, reason)
+      }, (observedAgentId, configOptions) => {
+        this.absorbCatalog(observedAgentId, configOptions)
       })
       this.bridges.set(agentId, bridge)
     }
@@ -619,18 +1195,46 @@ export class BridgeManager {
     throw new AcpError('unknown_session', `acp: no live session ${sessionId}`)
   }
 
-  private connectionLost(bridge: AgentBridge, reason: string): void {
-    for (const session of bridge.sessionList) {
-      if (session.running) {
-        this.hub.broadcast({ type: 'turn/end', sessionId: session.sessionId, turnId: '', error: reason })
-        session.running = false
+  private tryLocate(sessionId: string): { bridge: AgentBridge; session: LiveSession } | undefined {
+    try {
+      return this.find(sessionId)
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Locate a session for an interaction, resuming it first when it was
+   * released by an agent crash ("send to recover"). Resuming spawns a fresh
+   * process and runs `session/load`, so the first prompt after a crash pays
+   * the restart cost once and the conversation continues.
+   */
+  private async locateOrResume(sessionId: string): Promise<{ bridge: AgentBridge; session: LiveSession }> {
+    for (const bridge of this.bridges.values()) {
+      const session = bridge.hasSession(sessionId)
+      if (session !== undefined) return { bridge, session }
+    }
+    for (const bridge of this.bridges.values()) {
+      const released = bridge.hasReleased(sessionId)
+      if (released !== undefined) {
+        bridge.takeReleased(sessionId)
+        const session = await bridge.resumeSession(released)
+        return { bridge, session }
+      }
+      const inflight = bridge.inflightResume(sessionId)
+      if (inflight !== undefined) {
+        return { bridge, session: await inflight }
       }
     }
-    void bridge.stop('agent-died')
+    throw new AcpError('unknown_session', `acp: no live session ${sessionId}`)
+  }
+
+  private connectionLost(bridge: AgentBridge, reason: string): void {
+    bridge.releaseAll(reason)
   }
 
   agentViews(): AgentView[] {
-    return [...this.defsMap.values()].map(def => (this.bridges.get(def.id) ?? new AgentBridge(def, this.hub, this.transcriptMax, () => { /* pre-spawn */ })).view())
+    return [...this.defsMap.values()].map(def => (this.bridges.get(def.id) ?? this.makeBridge(def, () => { /* pre-spawn */ })).view())
   }
 
   async detectAgents(): Promise<DetectedAgentInfo[]> {
@@ -663,6 +1267,36 @@ export class BridgeManager {
       state: 'stopped',
       agent: new AgentBridge(resolvedDef, this.hub, this.transcriptMax, () => {}).view(),
     })
+    // A save is user-initiated: probe the model catalog immediately so the
+    // chat selector fills in; a failing startup surfaces as a notice.
+    void this.probeAgentModels(resolvedDef.id).catch((error: unknown) => {
+      this.hub.broadcast({
+        type: 'agent/notice',
+        agentId: resolvedDef.id,
+        level: 'error',
+        text: `acp: model probe failed: ${describeError(error)}`,
+      })
+    })
+  }
+
+  /**
+   * Lightweight model-visibility update: mutates the def in place (the live
+   * bridge shares the same object, so nothing needs restarting), persists, and
+   * republishes status. `undefined` clears the filter (expose every choice).
+   */
+  async setExposedModels(agentId: string, exposedModels: readonly string[] | undefined): Promise<void> {
+    const def = this.defsMap.get(agentId)
+    if (def === undefined) throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
+    if (exposedModels === undefined) delete def.exposedModels
+    else def.exposedModels = [...exposedModels]
+    this.persistAgents()
+    const bridge = this.bridges.get(agentId)
+    this.hub.broadcast({
+      type: 'agent/status',
+      agentId,
+      state: bridge?.state ?? 'stopped',
+      ...(bridge === undefined ? {} : { agent: bridge.view() }),
+    })
   }
 
   async deleteAgent(agentId: string): Promise<void> {
@@ -671,6 +1305,7 @@ export class BridgeManager {
       this.bridges.delete(agentId)
     }
     this.defsMap.delete(agentId)
+    if (this.catalogs.delete(agentId)) this.persistCatalogs()
     this.persistAgents()
     this.hub.broadcast({
       type: 'agent/status',
@@ -685,7 +1320,7 @@ export class BridgeManager {
   }
 
   async prompt(sessionId: string, text: string): Promise<{ turnId: string }> {
-    const { bridge, session } = this.find(sessionId)
+    const { bridge, session } = await this.locateOrResume(sessionId)
     if (session.running) throw new AcpError('turn_in_flight', 'acp: this session already has a prompt in flight')
     session.running = true
     const turnId = randomUUID()
@@ -708,22 +1343,34 @@ export class BridgeManager {
   }
 
   async cancel(sessionId: string): Promise<void> {
-    const { bridge, session } = this.find(sessionId)
-    await bridge.cancel(session)
+    const live = this.tryLocate(sessionId)
+    if (live === undefined) return // released/stale session: nothing to cancel
+    await live.bridge.cancel(live.session)
   }
 
   async closeSession(sessionId: string): Promise<void> {
-    const { bridge, session } = this.find(sessionId)
-    await bridge.closeSession(session, 'closed')
+    const live = this.tryLocate(sessionId)
+    if (live !== undefined) {
+      await live.bridge.closeSession(live.session, 'closed')
+      return
+    }
+    // A released session has no process left to close; just drop the record.
+    for (const bridge of this.bridges.values()) {
+      if (bridge.dropReleased(sessionId)) {
+        this.hub.broadcast({ type: 'session/closed', sessionId, reason: 'closed' })
+        return
+      }
+    }
+    throw new AcpError('unknown_session', `acp: no live session ${sessionId}`)
   }
 
   async setMode(sessionId: string, modeId: string): Promise<void> {
-    const { bridge, session } = this.find(sessionId)
+    const { bridge, session } = await this.locateOrResume(sessionId)
     await bridge.setMode(session, modeId)
   }
 
   async setConfigOption(sessionId: string, configId: string, value: string | boolean): Promise<void> {
-    const { bridge, session } = this.find(sessionId)
+    const { bridge, session } = await this.locateOrResume(sessionId)
     await bridge.setConfigOption(session, configId, value)
   }
 
@@ -738,12 +1385,22 @@ export class BridgeManager {
   }
 
   transcript(sessionId: string, afterSeq: number | undefined): { session: unknown; entries: Array<{ seq: number; update: unknown }> } {
-    const { session } = this.find(sessionId)
-    return { session: snapshot(session), entries: session.transcript.since(afterSeq ?? 0) }
+    const live = this.tryLocate(sessionId)
+    if (live !== undefined) {
+      return { session: snapshot(live.session), entries: live.session.transcript.since(afterSeq ?? 0) }
+    }
+    // A released session still serves its pre-crash transcript for viewing.
+    for (const bridge of this.bridges.values()) {
+      const released = bridge.hasReleased(sessionId)
+      if (released !== undefined) {
+        return { session: snapshot(released), entries: released.transcript.since(afterSeq ?? 0) }
+      }
+    }
+    throw new AcpError('unknown_session', `acp: no live session ${sessionId}`)
   }
 
   sessions(): unknown[] {
-    return [...this.bridges.values()].flatMap(b => b.sessionList.map(snapshot))
+    return [...this.bridges.values()].flatMap(b => [...b.sessionList, ...b.releasedList].map(snapshot))
   }
 
   async stopAgent(agentId: string): Promise<void> {
@@ -795,8 +1452,13 @@ export class BridgeManager {
   async getOrCreateDshSession(dshSessionId: string | undefined, agentId: string, cwd?: string): Promise<LiveSession> {
     const key = `${dshSessionId ?? 'ephemeral'}:${agentId}`
     const existing = this.dshSessionMap.get(key)
-    if (existing !== undefined && !existing.closed) {
+    if (existing !== undefined && !existing.closed && !existing.released) {
       return existing
+    }
+    // The session's agent died earlier: resume in place so the conversation
+    // context survives via `session/load`.
+    if (existing !== undefined && existing.released) {
+      return this.bridge(agentId).resumeSession(existing)
     }
     const session = await this.bridge(agentId).createSession(cwd)
     this.dshSessionMap.set(key, session)
@@ -804,7 +1466,7 @@ export class BridgeManager {
   }
 
   async *streamPrompt(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    const agentId = options.model
+    const { agentId, choice } = splitAdapterModelId(options.model)
     const def = this.defsMap.get(agentId)
     if (def === undefined) {
       yield {
@@ -832,6 +1494,11 @@ export class BridgeManager {
       }
       return
     }
+
+    // Same-agent model/effort switches ride the SAME ACP session (context
+    // stays continuous); switching to another agent lands in a separate one
+    // via the `${dshSessionId}:${agentId}` key in getOrCreateDshSession.
+    await this.alignSessionConfig(session, choice, options.reasoningEffort)
 
     const userMessages = (options.messages ?? []).filter(m => m.role === 'user')
     const lastUserMsg = userMessages[userMessages.length - 1]
@@ -985,22 +1652,11 @@ export class AcpLlmAdapter implements LlmAdapterLike {
   }
 
   async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    return this.manager.agentViews().map(a => ({
-      provider,
-      id: a.id,
-      name: a.title || a.id,
-      description: `ACP Agent: ${a.command} ${(a.args ?? []).join(' ')}`.trim(),
-    }))
+    return this.manager.listAdapterModels(provider)
   }
 
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
-    const agent = this.manager.agentViews().find(a => a.id === model)
-    return {
-      provider,
-      id: model,
-      name: agent?.title ?? model,
-      description: agent ? `ACP Agent: ${agent.command} ${(agent.args ?? []).join(' ')}`.trim() : undefined,
-    }
+    return this.manager.resolveAdapterModel(provider, model)
   }
 
   async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<PreparedAdapterCall> {
@@ -1054,6 +1710,11 @@ export class AsyncQueue<T> {
       }
     }
   }
+}
+
+/** A JSON-RPC internal error for fs requests: actionable text in `message`, mirrored into `data` (see AGENTS.md rule 5). */
+function fsRequestError(message: string): RequestError {
+  return new RequestError(-32603, message, { message })
 }
 
 function updateContentToLines(content: unknown): string[] {

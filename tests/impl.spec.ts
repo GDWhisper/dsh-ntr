@@ -4,14 +4,18 @@ import {
   EventHub,
   PermissionLedger,
   Transcript,
+  buildAdapterModelId,
   childEnv,
   dispatchRpc,
+  parseCatalogOptions,
+  resolveFsPath,
   resolveSessionCwd,
+  splitAdapterModelId,
   validateAgentDef,
   validateConfig,
 } from '../src/impl.ts'
 import type { AcpManager } from '../src/impl.ts'
-import type { AcpAgentDef } from '../src/protocol.ts'
+import type { AcpAgentDef, AgentProbeModelsResult } from '../src/protocol.ts'
 
 function agentDef(overrides: Partial<AcpAgentDef> = {}): AcpAgentDef {
   return {
@@ -45,6 +49,86 @@ describe('validateConfig', () => {
     expect(() => validateConfig({ agents: 'nope' })).toThrow(/array/)
     expect(() => validateConfig({ agents: [], transcriptMaxEntries: 1 })).toThrow(/transcriptMaxEntries/)
   })
+  it('defaults probeModelsOnBoot to true and rejects non-boolean values', () => {
+    expect(validateConfig({ agents: [] }).probeModelsOnBoot).toBe(true)
+    expect(validateConfig({ agents: [], probeModelsOnBoot: false }).probeModelsOnBoot).toBe(false)
+    expect(() => validateConfig({ agents: [], probeModelsOnBoot: 'yes' })).toThrow(/probeModelsOnBoot/)
+  })
+  it('defaults and bounds the reliability timeouts', () => {
+    const config = validateConfig({ agents: [] })
+    expect(config.startupTimeoutMs).toBe(60_000)
+    expect(config.permissionTimeoutMs).toBe(0)
+    expect(config.cancelFallbackMs).toBe(15_000)
+    expect(() => validateConfig({ agents: [], startupTimeoutMs: 500 })).toThrow(/startupTimeoutMs/)
+    expect(() => validateConfig({ agents: [], permissionTimeoutMs: -1 })).toThrow(/permissionTimeoutMs/)
+    expect(() => validateConfig({ agents: [], cancelFallbackMs: 601_000 })).toThrow(/cancelFallbackMs/)
+    expect(validateConfig({ agents: [], permissionTimeoutMs: 60_000, cancelFallbackMs: 0 }).cancelFallbackMs).toBe(0)
+  })
+})
+
+describe('parseCatalogOptions', () => {
+  it('extracts model and thought_level categories from spec-shaped options', () => {
+    const catalog = parseCatalogOptions([
+      { configId: 'model', name: 'Model', type: 'select', category: 'model', currentValue: 'a', options: [
+        { value: 'a', name: 'Model A' },
+        { value: 'b', name: 'Model B', description: 'The B model' },
+      ] },
+      { configId: 'think', name: 'Think', type: 'select', category: 'thought_level', currentValue: 'high', options: [
+        { value: 'off', name: 'Off' },
+        { value: 'high', name: 'High' },
+      ] },
+      { configId: 'temp', name: 'Temp', type: 'select', currentValue: 'mid', options: [{ value: 'mid', name: 'mid' }] },
+      { configId: 'flag', name: 'Flag', type: 'boolean', currentValue: true },
+    ])
+    expect(catalog.model).toEqual({
+      configId: 'model',
+      name: 'Model',
+      currentValue: 'a',
+      choices: [{ value: 'a', name: 'Model A' }, { value: 'b', name: 'Model B', description: 'The B model' }],
+    })
+    expect(catalog.thought?.configId).toBe('think')
+    expect(catalog.thought?.currentValue).toBe('high')
+  })
+
+  it('falls back to the legacy id field, flattens grouped options, dedupes, and skips unknown categories', () => {
+    const catalog = parseCatalogOptions([
+      { id: 'model', category: 'model', currentValue: 'x', options: [
+        { groupId: 'g', name: 'Group G', options: [{ value: 'x', name: 'X' }, { value: 'z', name: 'Z', description: 'own text' }] },
+        { value: 'x', name: 'X duplicate' },
+        { value: 'y', name: '' },
+      ] },
+      { configId: 'weird', category: 'future_thing', currentValue: 'z', options: [{ value: 'z', name: 'Z' }] },
+      { category: 'thought_level', currentValue: 'on' },
+    ])
+    expect(catalog.model?.configId).toBe('model')
+    // Dedupe keeps the first occurrence; grouped choices carry the group label
+    // both as fallback description and as a dedicated `group` field (vendor).
+    expect(catalog.model?.choices).toEqual([
+      { value: 'x', name: 'X', description: 'Group G', group: 'Group G' },
+      { value: 'z', name: 'Z', description: 'own text', group: 'Group G' },
+      { value: 'y', name: 'y' },
+    ])
+    expect(catalog.thought).toBeUndefined()
+  })
+
+  it('returns an empty catalog for non-arrays and choice-less options', () => {
+    expect(parseCatalogOptions('nope')).toEqual({})
+    expect(parseCatalogOptions(undefined)).toEqual({})
+    expect(parseCatalogOptions([{ configId: 'model', category: 'model', currentValue: 'a' }])).toEqual({
+      model: { configId: 'model', name: 'model', currentValue: 'a', choices: [] },
+    })
+  })
+})
+
+describe('adapter model id split/build', () => {
+  it('splits base and variant ids at the @ separator', () => {
+    expect(splitAdapterModelId('pi')).toEqual({ agentId: 'pi' })
+    expect(splitAdapterModelId('pi@deepseek-chat')).toEqual({ agentId: 'pi', choice: 'deepseek-chat' })
+    expect(splitAdapterModelId('a.b-c@v1')).toEqual({ agentId: 'a.b-c', choice: 'v1' })
+  })
+  it('builds the inverse variant id', () => {
+    expect(buildAdapterModelId('pi', 'deepseek-chat')).toBe('pi@deepseek-chat')
+  })
 })
 
 describe('validateAgentDef', () => {
@@ -60,6 +144,15 @@ describe('validateAgentDef', () => {
       cwd: undefined,
       allowedCwdRoots: [],
     })
+    expect('exposedModels' in def).toBe(false)
+  })
+
+  it('normalizes exposedModels (dedupe) and rejects malformed filters', () => {
+    expect(validateAgentDef({ id: 'pi', command: 'x', exposedModels: ['b', 'a', 'b'] }).exposedModels).toEqual(['b', 'a'])
+    expect(validateAgentDef({ id: 'pi', command: 'x', exposedModels: [] }).exposedModels).toEqual([])
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', exposedModels: 'model-a' })).toThrow(/exposedModels/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', exposedModels: ['a', ''] })).toThrow(/exposedModels/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', exposedModels: [42] })).toThrow(/exposedModels/)
   })
 
   it('rejects empty command and invalid id', () => {
@@ -86,6 +179,35 @@ describe('resolveSessionCwd', () => {
   })
   it('guards prefix confusion (/work2 must not pass under /work)', () => {
     expect(() => resolveSessionCwd(agentDef(), '/work2', realpath)).toThrow(/outside/)
+  })
+})
+
+describe('resolveFsPath', () => {
+  /** realpath that mimics the filesystem: /ws exists (with a symlink to /etc), deeper paths must already exist. */
+  const realpath = (p: string): string => {
+    if (p === '/' || p === '/ws' || p === '/ws/existing' || p === '/ws/link') {
+      return p === '/ws/link' ? '/etc' : p
+    }
+    throw new Error(`realpath: ENOENT ${p}`)
+  }
+
+  it('accepts absolute and relative paths inside the workspace', () => {
+    expect(resolveFsPath('/ws', ['/ws'], '/ws/existing', realpath)).toBe('/ws/existing')
+    expect(resolveFsPath('/ws', ['/ws'], 'existing', realpath)).toBe('/ws/existing')
+  })
+  it('canonicalizes a fresh write target through its nearest existing ancestor', () => {
+    expect(resolveFsPath('/ws', ['/ws'], '/ws/a/b/c/new.txt', realpath)).toBe('/ws/a/b/c/new.txt')
+    expect(resolveFsPath('/ws', ['/ws'], 'sub/./x/../new.txt', realpath)).toBe('/ws/sub/new.txt')
+  })
+  it('rejects escapes via .., symlinks, and out-of-root absolutes', () => {
+    expect(() => resolveFsPath('/ws', ['/ws'], '/ws/../../etc/passwd', realpath)).toThrow(/outside/)
+    expect(() => resolveFsPath('/ws', ['/ws'], '/ws/link/passwd', realpath)).toThrow(/outside/)
+    expect(() => resolveFsPath('/ws', ['/ws'], '/etc/passwd', realpath)).toThrow(/outside/)
+    expect(() => resolveFsPath('/ws', ['/other'], 'file.txt', realpath)).toThrow(/outside/)
+  })
+  it('guards prefix confusion and empty paths', () => {
+    expect(() => resolveFsPath('/ws', ['/ws'], '/ws2/file.txt', realpath)).toThrow(/outside/)
+    expect(() => resolveFsPath('/ws', ['/ws'], '', realpath)).toThrow(/non-empty/)
   })
 })
 
@@ -148,6 +270,11 @@ function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } {
     detectAgents: async () => { calls.push(['detect', undefined]); return [] },
     saveAgent: async def => { calls.push(['save', def]) },
     deleteAgent: async id => { calls.push(['delete', id]) },
+    setExposedModels: async (id, exposed) => { calls.push(['setExposedModels', { id, exposed }]) },
+    probeAgentModels: async agentId => {
+      calls.push(['probe', agentId])
+      return { agentId, catalog: { model: { configId: 'model', name: 'Model', currentValue: 'a', choices: [{ value: 'a', name: 'A' }] } }, updatedAt: 1 }
+    },
   }
 }
 
@@ -175,6 +302,38 @@ describe('dispatchRpc', () => {
     await expect(dispatchRpc(manager, 'agent/set-permission', { agentId: 'custom', permission: 'allow' })).resolves.toEqual({ ok: true, value: { done: true } })
     expect(manager.calls).toContainEqual(['setPermission', { id: 'custom', p: 'allow' }])
     await expect(dispatchRpc(manager, 'agent/set-permission', { agentId: 'custom', permission: 'invalid' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc(manager, 'agent/probe-models', { agentId: 'pi' })).resolves.toMatchObject({
+      ok: true,
+      value: { agentId: 'pi', catalog: { model: { configId: 'model' } } },
+    })
+    expect(manager.calls).toContainEqual(['probe', 'pi'])
+    await expect(dispatchRpc(manager, 'agent/probe-models', {})).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    const bare = { ...manager, probeAgentModels: undefined }
+    await expect(dispatchRpc(bare, 'agent/probe-models', { agentId: 'pi' })).resolves.toMatchObject({ ok: false, error: { code: 'unsupported' } })
+    await expect(dispatchRpc(manager, 'agent/set-exposed-models', { agentId: 'pi', exposedModels: ['a', 'b'] })).resolves.toEqual({ ok: true, value: { done: true } })
+    expect(manager.calls).toContainEqual(['setExposedModels', { id: 'pi', exposed: ['a', 'b'] }])
+    await expect(dispatchRpc(manager, 'agent/set-exposed-models', { agentId: 'pi' })).resolves.toEqual({ ok: true, value: { done: true } })
+    expect(manager.calls).toContainEqual(['setExposedModels', { id: 'pi', exposed: undefined }])
+    await expect(dispatchRpc(manager, 'agent/set-exposed-models', { agentId: 'pi', exposedModels: ['ok', ''] })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc(manager, 'agent/set-exposed-models', { agentId: 'pi', exposedModels: 'a' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc(manager, 'agent/set-exposed-models', {})).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+  })
+
+  it('invokes agent/probe-models as a manager method so the receiver (`this`) survives', async () => {
+    const receiver = fakeManager() as AcpManager & { marker: string }
+    receiver.marker = 'host'
+    Object.assign(receiver, {
+      // A `this`-reading method like the real BridgeManager.probeAgentModels
+      // (which dereferences this.bridge); an arrow fake would hide the bug.
+      probeAgentModels(this: { marker: string }, agentId: string): Promise<AgentProbeModelsResult> {
+        if (this?.marker !== 'host') throw new AcpError('internal', 'probe lost its manager receiver')
+        return Promise.resolve({ agentId, catalog: {}, updatedAt: 1 })
+      },
+    })
+    await expect(dispatchRpc(receiver, 'agent/probe-models', { agentId: 'pi' })).resolves.toEqual({
+      ok: true,
+      value: { agentId: 'pi', catalog: {}, updatedAt: 1 },
+    })
   })
 
   it('rejects oversized text payloads with a protocol error, not a crash', async () => {

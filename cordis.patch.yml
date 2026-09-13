@@ -14,3 +14,13 @@
       config:
         agents: []
         # transcriptMaxEntries: 600
+        # probeModelsOnBoot: true   # set false to disable automatic model-catalog probes (manual button still works)
+        # Reliability tuning (defaults shown):
+        # startupTimeoutMs: 60000    # budget for initialize / session/new / session/load
+        # permissionTimeoutMs: 0     # auto-cancel a pending approval after N ms (0 = wait for the human forever)
+        # cancelFallbackMs: 15000    # force-finalize a turn the agent ignores after session/cancel (0 = off)
+        # Per-agent native-selector model filter (panel checkboxes persist here):
+        # agents:
+        #   - id: pi
+        #     command: pi-acp
+        #     exposedModels: [model-a, model-b]   # unset = expose every probed choice; [] = base entry only

@@ -23,8 +23,23 @@ function formatSse(event: AcpEvent): string {
 export function apply(ctx: Context, config?: unknown): void {
   const resolved = validateConfig(config)
   const hub = new EventHub()
-  const manager = new BridgeManager(resolved.agents, hub, resolved.transcriptMaxEntries ?? 600)
+  const manager = new BridgeManager(
+    resolved.agents,
+    hub,
+    resolved.transcriptMaxEntries ?? 600,
+    undefined,
+    undefined,
+    resolved.probeModelsOnBoot ?? true,
+    {
+      startupTimeoutMs: resolved.startupTimeoutMs,
+      permissionTimeoutMs: resolved.permissionTimeoutMs,
+      cancelFallbackMs: resolved.cancelFallbackMs,
+    },
+  )
   const adapter = new AcpLlmAdapter(manager)
+  // Warm the model catalog at boot (no-op under test runners or when
+  // probeModelsOnBoot is disabled): background spawn per uncached agent only.
+  manager.bootstrapCatalogs()
 
   const defaultModelService = (typeof ctx.get === 'function' ? ctx.get('agentDefaultModel') : undefined) as {
     currentSelection?(): { provider: string; model: string; reasoningEffort?: string }

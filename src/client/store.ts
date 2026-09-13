@@ -6,7 +6,7 @@
  * Deliberately framework-free: React binds through `useSyncExternalStore`.
  */
 
-import type { AcpEvent, AgentSavePayload, AgentView, DetectedAgentInfo, SessionView } from '../protocol.ts'
+import type { AcpEvent, AgentProbeModelsResult, AgentSavePayload, AgentView, DetectedAgentInfo, SessionView } from '../protocol.ts'
 
 /** The unary RPC face (narrowed `ctx.connection.rpc.call`). */
 export type RpcCall = (channel: string, endpoint: string, payload: unknown) => Promise<
@@ -42,6 +42,9 @@ export interface UiState {
   defaultModel?: string
   detectedAgents: DetectedAgentInfo[]
   detecting: boolean
+  /** Probed model catalogs per agent id (from `agent/probe-models`). */
+  modelCatalogs: Record<string, AgentProbeModelsResult>
+  probingModels: Record<string, boolean>
 }
 
 interface Listener { (): void }
@@ -75,6 +78,14 @@ export const DEFAULT_KNOWN_PRESETS: DetectedAgentInfo[] = [
     defaultCommand: 'pi-acp',
     defaultArgs: [],
   },
+  {
+    id: 'omp',
+    name: 'Oh My Pi',
+    description: 'Oh My Pi (pi-based coding agent) — run as `omp acp` over stdio',
+    detected: false,
+    defaultCommand: 'omp',
+    defaultArgs: ['acp'],
+  },
 ]
 
 export class AcpStore {
@@ -88,11 +99,15 @@ export class AcpStore {
     busy: false,
     detectedAgents: [...DEFAULT_KNOWN_PRESETS],
     detecting: false,
+    modelCatalogs: {},
+    probingModels: {},
   }
 
   private readonly listeners = new Set<Listener>()
   private source?: EventSource
   private readonly lastSeq = new Map<string, number>()
+  /** Sessions with a finalized turn (dedups the cancel-fallback + late real turn/end pair). */
+  private readonly openTurns = new Set<string>()
 
   constructor(private readonly rpc: RpcCall, private readonly locale: (zh: string, en: string) => string) {}
 
@@ -197,8 +212,54 @@ export class AcpStore {
     try {
       await this.call('agent/save', payload)
       await this.resync()
+      // The host probes the catalog right after a save; pull the fresh result
+      // so the agent card fills in without a second click.
+      void this.probeModels(payload.id)
     } catch (error) {
       this.flashError(error)
+      throw error
+    }
+  }
+
+  /** Ask the host to probe one agent's model catalog (spawn + throwaway session). */
+  async probeModels(agentId: string): Promise<void> {
+    this.mutate({ probingModels: { ...this.state.probingModels, [agentId]: true } })
+    try {
+      const result = await this.call<AgentProbeModelsResult>('agent/probe-models', { agentId })
+      this.mutate({
+        modelCatalogs: { ...this.state.modelCatalogs, [agentId]: result },
+        probingModels: { ...this.state.probingModels, [agentId]: false },
+      })
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      const notice = msg.includes('unknown endpoint agent/probe-models')
+        ? this.locale('宿主服务运行着旧版本代码，请在终端重启 dsh web 服务以激活模型检测功能。', 'Host running older version. Please restart dsh web to enable model detection.')
+        : msg
+      this.mutate({
+        notice,
+        probingModels: { ...this.state.probingModels, [agentId]: false },
+      })
+    }
+  }
+
+  /**
+   * Persist the native-selector model filter for one agent. `undefined` clears
+   * the filter (expose everything). Uses the dedicated lightweight RPC so the
+   * agent process and its live sessions are never restarted.
+   */
+  async setExposedModels(agentId: string, exposedModels: string[] | undefined): Promise<void> {
+    try {
+      await this.call('agent/set-exposed-models', {
+        agentId,
+        ...(exposedModels === undefined ? {} : { exposedModels }),
+      })
+      await this.resync()
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      const notice = msg.includes('unknown endpoint agent/set-exposed-models')
+        ? this.locale('宿主服务运行着旧版本代码，请在终端重启 dsh web 服务以启用模型筛选功能。', 'Host running older version. Please restart dsh web to enable model filtering.')
+        : msg
+      this.mutate({ notice })
       throw error
     }
   }
@@ -371,6 +432,10 @@ export class AcpStore {
 
   private applyEvent(event: AcpEvent): Promise<void> {
     switch (event.type) {
+      case 'agent/notice': {
+        this.mutate({ notice: event.text })
+        return Promise.resolve()
+      }
       case 'agent/status': {
         if (event.agent !== undefined) {
           const agents = this.state.agents.some(a => a.id === event.agent?.id)
@@ -400,12 +465,43 @@ export class AcpStore {
       case 'session/closed': {
         const sessions = this.state.sessions.filter(s => s.sessionId !== event.sessionId)
         const active = this.state.activeSessionId === event.sessionId ? sessions[0]?.sessionId : this.state.activeSessionId
+        this.openTurns.delete(event.sessionId)
         this.mutate({
           sessions,
           activeSessionId: active,
           permissions: this.state.permissions.filter(p => p.sessionId !== event.sessionId),
           ...(event.reason === 'agent-died' ? { notice: this.locale('会话因 agent 进程退出而终止', 'session ended: agent process died') } : {}),
         })
+        return Promise.resolve()
+      }
+      case 'session/released': {
+        // The agent process died: keep the session visible (marked released)
+        // instead of dropping it — the next prompt resumes it via session/load.
+        const sessions = this.state.sessions.some(s => s.sessionId === event.sessionId)
+          ? this.state.sessions.map(s => (s.sessionId === event.sessionId ? event.session : s))
+          : [...this.state.sessions, event.session]
+        this.openTurns.delete(event.sessionId)
+        this.mutate({
+          sessions,
+          permissions: this.state.permissions.filter(p => p.sessionId !== event.sessionId),
+          notice: this.locale(
+            'agent 进程已退出，会话已挂起；再次发送消息将自动恢复。',
+            'agent process died; the session is paused and will resume on your next message.',
+          ),
+        })
+        return Promise.resolve()
+      }
+      case 'session/reset': {
+        // The session was resumed on a fresh process and the agent is about to
+        // replay its history as fresh updates: drop local blocks and the seq
+        // watermark so the replay folds in from a clean slate.
+        this.lastSeq.set(event.sessionId, 0)
+        this.openTurns.delete(event.sessionId)
+        const isActive = event.sessionId === this.state.activeSessionId
+        const sessions = this.state.sessions.some(s => s.sessionId === event.sessionId)
+          ? this.state.sessions.map(s => (s.sessionId === event.sessionId ? event.session : s))
+          : [...this.state.sessions, event.session]
+        this.mutate({ sessions, ...(isActive ? { blocks: [] } : {}) })
         return Promise.resolve()
       }
       case 'session/update': {
@@ -443,6 +539,7 @@ export class AcpStore {
         return Promise.resolve()
       }
       case 'turn/start': {
+        this.openTurns.add(event.sessionId)
         if (event.sessionId === this.state.activeSessionId) {
           this.state.blocks.push({ kind: 'user', text: event.text })
           trimBlocks(this.state.blocks)
@@ -451,6 +548,11 @@ export class AcpStore {
         return Promise.resolve()
       }
       case 'turn/end': {
+        // One turn may end twice (force-finalized after an ignored cancel, or
+        // settled by the host after a crash, then the real response arrives);
+        // only the first turn/end per open turn is applied.
+        if (!this.openTurns.has(event.sessionId)) return Promise.resolve()
+        this.openTurns.delete(event.sessionId)
         if (event.sessionId === this.state.activeSessionId) {
           if (event.error !== undefined) {
             this.state.blocks.push({ kind: 'notice', tone: 'error', text: event.error })

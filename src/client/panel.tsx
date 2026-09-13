@@ -1,10 +1,11 @@
 /**
  * React surface for ACP: the settings configuration section.
- * Supports host agent detection, tested defaults display, and startup command customization.
+ * Supports host agent detection, tested defaults display, startup command
+ * customization, and per-agent model catalog probing.
  * All business state lives in the injected AcpStore.
  */
 
-import { useState, useSyncExternalStore } from 'react'
+import { useEffect, useState, useSyncExternalStore } from 'react'
 import type { AcpStore } from './store.ts'
 import type { AgentView, DetectedAgentInfo, PermissionMode } from '../protocol.ts'
 
@@ -201,6 +202,11 @@ export function AcpSettingsSection(props: WithStore) {
   )
 }
 
+/** Canonical comparable form of an exposure filter: `'all'` (unset) vs `'set:…'`. */
+function exposureKey(exposed: string[] | undefined): string {
+  return exposed === undefined ? 'all' : `set:${exposed.join('\u0000')}`
+}
+
 function DetectedAgentCard({
   detected,
   activeAgent,
@@ -224,8 +230,19 @@ function DetectedAgentCard({
   const [cwd, setCwd] = useState(
     activeAgent?.cwd ?? detected.currentConfig?.cwd ?? '',
   )
+  const [exposed, setExposed] = useState<string[] | undefined>(
+    detected.currentConfig?.exposedModels === undefined ? undefined : [...detected.currentConfig.exposedModels],
+  )
   const [saving, setSaving] = useState(false)
   const [savedSuccess, setSavedSuccess] = useState(false)
+
+  const serverExposureKey = exposureKey(detected.currentConfig?.exposedModels)
+  useEffect(() => {
+    const server = detected.currentConfig?.exposedModels
+    setExposed(server === undefined ? undefined : [...server])
+    // Re-sync the editor only when the persisted filter actually changes, so
+    // background resyncs never clobber in-progress checkbox edits.
+  }, [serverExposureKey])
 
   const isConfigured = activeAgent !== undefined || detected.currentConfig !== undefined
 
@@ -246,6 +263,7 @@ function DetectedAgentCard({
         args: parsedArgs,
         permission,
         cwd: cwd.trim() === '' ? undefined : cwd.trim(),
+        ...(exposed === undefined ? {} : { exposedModels: exposed }),
       })
       setSavedSuccess(true)
       setTimeout(() => setSavedSuccess(false), 2000)
@@ -404,6 +422,230 @@ function DetectedAgentCard({
           </button>
         )}
       </div>
+
+      {isConfigured && (
+        <ModelCatalogBlock agentId={detected.id} detected={detected} acp={acp} exposed={exposed} onExposedChange={setExposed} />
+      )}
+    </div>
+  )
+}
+
+/** Sentinel vendor bucket for choices that arrived without a select group. */
+const UNGROUPED_VENDOR = '\u0000'
+
+/** Probed model / thought-level catalog display plus the native-selector exposure filter. */
+function ModelCatalogBlock({
+  agentId,
+  detected,
+  acp,
+  exposed,
+  onExposedChange,
+}: {
+  agentId: string
+  detected: DetectedAgentInfo
+  acp: AcpStore
+  exposed: string[] | undefined
+  onExposedChange: (next: string[] | undefined) => void
+}) {
+  const ui = useUi(acp)
+  const [applying, setApplying] = useState(false)
+  const [search, setSearch] = useState('')
+  const [vendor, setVendor] = useState('')
+  const probing = ui.probingModels[agentId] === true
+  const result = ui.modelCatalogs[agentId]
+  const modelChoices = result?.catalog.model?.choices ?? []
+  const serverExposureKey = exposureKey(detected.currentConfig?.exposedModels)
+  const dirty = exposureKey(exposed) !== serverExposureKey
+
+  const vendorOptions = (() => {
+    const stats = new Map<string, number>()
+    for (const choice of modelChoices) {
+      const key = choice.group ?? UNGROUPED_VENDOR
+      stats.set(key, (stats.get(key) ?? 0) + 1)
+    }
+    return [...stats].map(([key, count]) => ({ key, count }))
+  })()
+
+  const query = search.trim().toLowerCase()
+  const viewFilterActive = query !== '' || vendor !== ''
+  const visibleChoices = modelChoices.filter(choice =>
+    (query === '' || choice.name.toLowerCase().includes(query) || choice.value.toLowerCase().includes(query))
+    && (vendor === '' || (choice.group ?? UNGROUPED_VENDOR) === vendor),
+  )
+  const visibleValues = visibleChoices.map(c => c.value)
+
+  const toggleChoice = (value: string) => {
+    const basis = exposed ?? modelChoices.map(c => c.value)
+    onExposedChange(basis.includes(value) ? basis.filter(v => v !== value) : [...basis, value])
+  }
+
+  /**
+   * 全选 toggle: no view filter → expose everything ↔ none ([]); with one →
+   * check the visible set, or uncheck exactly those when all are checked.
+   * The button label mirrors the toggle state.
+   */
+  const basis = exposed ?? modelChoices.map(c => c.value)
+  const scopeValues = viewFilterActive ? visibleValues : modelChoices.map(c => c.value)
+  const allChecked = scopeValues.length > 0 && scopeValues.every(v => basis.includes(v))
+  const selectVisible = () => {
+    if (!viewFilterActive) {
+      onExposedChange(allChecked ? [] : undefined)
+      return
+    }
+    onExposedChange(
+      allChecked
+        ? basis.filter(v => !visibleValues.includes(v))
+        : [...new Set([...basis, ...visibleValues])],
+    )
+  }
+
+  /** 仅保留可见: narrow the exposure to exactly the currently visible choices. */
+  const keepVisible = () => onExposedChange(visibleValues)
+
+  const applyFilter = async (next: string[] | undefined) => {
+    setApplying(true)
+    try {
+      await acp.setExposedModels(agentId, next)
+      onExposedChange(next)
+    } catch {
+      // Notice handled in store; keep the local edits so the user can retry.
+    } finally {
+      setApplying(false)
+    }
+  }
+
+  return (
+    <div style={{ marginTop: 12, borderTop: '1px dashed var(--dsw-alias-border-l2, #e5e7eb)', paddingTop: 10 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <button className="dwa-btn dwa-btn-secondary" disabled={probing} onClick={() => void acp.probeModels(agentId)}>
+          {probing
+            ? acp.label('模型检测中...', 'Probing models...')
+            : acp.label('🧠 检测可用模型', 'Detect Available Models')}
+        </button>
+        {result !== undefined && result.catalog.model === undefined && (
+          <span style={{ fontSize: 12, color: '#6b7280' }}>
+            {acp.label('该 Agent 未暴露模型选择器（category: model）', 'Agent exposes no model selector (category: model)')}
+          </span>
+        )}
+      </div>
+      {result !== undefined && (
+        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8, fontSize: 12 }}>
+          {modelChoices.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <span style={{ color: 'var(--dsw-alias-text-secondary, #555)', fontWeight: 600 }}>
+                  {acp.label('原生选择器可见模型', 'Models in Native Selector')}
+                </span>
+                {exposed !== undefined && (
+                  <span className="dwa-badge dwa-badge-info">
+                    {acp.label(
+                      `已筛选 ${exposed.filter(v => modelChoices.some(c => c.value === v)).length}/${modelChoices.length}`,
+                      `Filtered ${exposed.filter(v => modelChoices.some(c => c.value === v)).length}/${modelChoices.length}`,
+                    )}
+                  </span>
+                )}
+                <span style={{ fontSize: 11, color: '#6b7280' }}>
+                  {acp.label(
+                    '勾选要出现在聊天模型选择器中的模型（原生选择器没有搜索，避免刷屏）；Agent 默认模型始终可见。',
+                    'Check the models to show in the chat model selector (it has no search); the agent default is always visible.',
+                  )}
+                </span>
+              </div>
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                <input
+                  className="dwa-input"
+                  style={{ width: 170 }}
+                  value={search}
+                  onChange={e => setSearch(e.target.value)}
+                  placeholder={acp.label('搜索模型…', 'Search models…')}
+                />
+                <select className="dwa-select" value={vendor} onChange={e => setVendor(e.target.value)}>
+                  <option value="">{acp.label(`全部供应商 (${modelChoices.length})`, `All vendors (${modelChoices.length})`)}</option>
+                  {vendorOptions.map(({ key, count }) => (
+                    <option key={key} value={key}>
+                      {key === UNGROUPED_VENDOR ? acp.label('未分组', 'Ungrouped') : key} ({count})
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className="dwa-btn dwa-btn-secondary"
+                  disabled={visibleChoices.length === 0}
+                  onClick={selectVisible}
+                  title={acp.label('在全部勾选与全部取消之间切换；筛选中则只切换可见模型的勾选', 'Toggles between checking everything and none; with a filter active it toggles only the visible models')}
+                >
+                  {allChecked ? acp.label('取消全选', 'Deselect All') : acp.label('全选', 'Select All')}
+                </button>
+                {viewFilterActive && (
+                  <button
+                    className="dwa-btn dwa-btn-secondary"
+                    disabled={visibleChoices.length === 0}
+                    onClick={keepVisible}
+                    title={acp.label('把暴露范围收窄为当前可见的模型', 'Narrow exposure to exactly the currently visible models')}
+                  >
+                    {acp.label('仅保留可见', 'Keep Visible Only')}
+                  </button>
+                )}
+                {exposed !== undefined && (
+                  <button className="dwa-btn" disabled={applying} onClick={() => void applyFilter(undefined)}>
+                    {acp.label('全部显示', 'Show All')}
+                  </button>
+                )}
+                <button
+                  className="dwa-btn dwa-btn-primary"
+                  disabled={!dirty || applying}
+                  onClick={() => void applyFilter(exposed)}
+                >
+                  {applying ? acp.label('应用中...', 'Applying...') : acp.label('应用筛选', 'Apply Filter')}
+                </button>
+                {viewFilterActive && (
+                  <span style={{ fontSize: 11, color: '#6b7280' }}>
+                    {acp.label(`显示 ${visibleChoices.length}/${modelChoices.length}`, `Showing ${visibleChoices.length}/${modelChoices.length}`)}
+                  </span>
+                )}
+              </div>
+              <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center', maxHeight: 180, overflow: 'auto' }}>
+                {visibleChoices.map(choice => {
+                  const checked = exposed === undefined || exposed.includes(choice.value)
+                  return (
+                    <label
+                      key={choice.value}
+                      className="dwa-badge"
+                      title={choice.description}
+                      style={{
+                        cursor: 'pointer',
+                        ...(checked ? { background: '#3b82f622', color: '#2563eb' } : { opacity: 0.55 }),
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => toggleChoice(choice.value)}
+                        style={{ margin: 0, accentColor: '#2563eb' }}
+                      />
+                      {choice.name}
+                    </label>
+                  )
+                })}
+                {visibleChoices.length === 0 && (
+                  <span style={{ color: '#6b7280' }}>{acp.label('无匹配模型', 'No matching models')}</span>
+                )}
+              </div>
+            </div>
+          )}
+          {result.catalog.thought !== undefined && (
+            <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' }}>
+              <span style={{ color: 'var(--dsw-alias-text-secondary, #555)', fontWeight: 600 }}>
+                {acp.label('思考等级', 'Thought Levels')}
+              </span>
+              {result.catalog.thought.choices.map(choice => (
+                <span key={choice.value} className="dwa-badge" title={choice.description}>
+                  {choice.name}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }

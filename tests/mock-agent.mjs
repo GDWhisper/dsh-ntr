@@ -5,8 +5,16 @@
  * Scenario markers read from the prompt text:
  *  - "PERM"  → mid-turn session/request_permission (allow_once / reject_once)
  *  - "SLOW"  → a 5s pause that session/cancel interrupts (cancelled stopReason)
+ *  - "DIE"   → emits one update then exits the process (crash → release → resume)
+ *  - "IGNORE_CANCEL" → ignores session/cancel for ~1.2s, then finishes normally
+ *  - "READFILE <path>"   → reads the file through the client fs capability
+ *  - "WRITEFILE <path>"  → writes 'written-by-mock-agent' through the client fs capability
  * Every turn streams: thought, plan, available_commands, tool_call lifecycle,
  * two same-messageId chunks, usage_update.
+ * `session/new` advertises spec-shaped configOptions: a `model` selector, a
+ * `thought_level` selector, and a plain legacy `temp` select.
+ * `session/load` (loadSession capability) recreates the session record and
+ * replays a marker update before answering, simulating agent-side persistence.
  */
 import { Writable, Readable } from 'node:stream'
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from '@agentclientprotocol/sdk'
@@ -16,18 +24,42 @@ const cancelled = new Set()
 const cancelWaiters = new Map()
 let counter = 0
 
-function mockConfigOptions(temp = 'mid') {
-  return {
-    id: 'temp',
-    name: 'Temperature',
-    type: 'select',
-    currentValue: temp,
-    options: [
-      { value: 'low', name: 'low' },
-      { value: 'mid', name: 'mid' },
-      { value: 'high', name: 'high' },
-    ],
-  }
+function mockConfigOptions(state = { temp: 'mid', model: 'mock-model-a', effort: 'high' }) {
+  return [
+    {
+      configId: 'model',
+      name: 'Model',
+      type: 'select',
+      category: 'model',
+      currentValue: state.model,
+      options: [
+        { value: 'mock-model-a', name: 'Mock Model A' },
+        { value: 'mock-model-b', name: 'Mock Model B', description: 'The stronger mock model' },
+      ],
+    },
+    {
+      configId: 'thought',
+      name: 'Thought Level',
+      type: 'select',
+      category: 'thought_level',
+      currentValue: state.effort,
+      options: [
+        { value: 'off', name: 'Off' },
+        { value: 'high', name: 'High' },
+      ],
+    },
+    {
+      configId: 'temp',
+      name: 'Temperature',
+      type: 'select',
+      currentValue: state.temp,
+      options: [
+        { value: 'low', name: 'low' },
+        { value: 'mid', name: 'mid' },
+        { value: 'high', name: 'high' },
+      ],
+    },
+  ]
 }
 
 function sleep(ms) {
@@ -51,7 +83,7 @@ const app = agent({ name: 'mock-acp-agent' })
   .onRequest(methods.agent.initialize, () => ({
     protocolVersion: PROTOCOL_VERSION,
     agentCapabilities: {
-      loadSession: false,
+      loadSession: true,
       sessionCapabilities: { close: {} },
       promptCapabilities: { image: false, audio: false, embeddedContext: false },
     },
@@ -60,7 +92,7 @@ const app = agent({ name: 'mock-acp-agent' })
   }))
   .onRequest(methods.agent.session.new, ctx => {
     const sessionId = `mock-sess-${String(++counter)}`
-    sessions.set(sessionId, { cwd: ctx.params.cwd, modeId: 'default', temp: 'mid' })
+    sessions.set(sessionId, { cwd: ctx.params.cwd, modeId: 'default', temp: 'mid', model: 'mock-model-a', effort: 'high' })
     return {
       sessionId,
       modes: {
@@ -70,7 +102,7 @@ const app = agent({ name: 'mock-acp-agent' })
           { id: 'strict', name: 'Strict' },
         ],
       },
-      configOptions: [mockConfigOptions()],
+      configOptions: mockConfigOptions(sessions.get(sessionId)),
     }
   })
   .onNotification(methods.agent.session.cancel, ctx => {
@@ -81,11 +113,32 @@ const app = agent({ name: 'mock-acp-agent' })
     sessions.delete(ctx.params.sessionId)
     return {}
   })
+  .onRequest(methods.agent.session.load, async ctx => {
+    const { sessionId, cwd } = ctx.params
+    // Stand-in for agent-side persistence: recreate the record, replay a
+    // marker update, then answer with the session state.
+    sessions.set(sessionId, { cwd, modeId: 'default', temp: 'mid', model: 'mock-model-a', effort: 'high' })
+    const send = update => ctx.client.notify(methods.client.session.update, { sessionId, update })
+    await send({ sessionUpdate: 'tool_call', toolCallId: 'replay_tool', title: 'replayed tool', kind: 'other', status: 'completed' })
+    await send({ sessionUpdate: 'agent_message_chunk', messageId: 'replay-1', content: { type: 'text', text: 'REPLAYED: earlier conversation' } })
+    return {
+      modes: {
+        currentModeId: 'default',
+        availableModes: [
+          { id: 'default', name: 'Default' },
+          { id: 'strict', name: 'Strict' },
+        ],
+      },
+      configOptions: mockConfigOptions(sessions.get(sessionId)),
+    }
+  })
   .onRequest(methods.agent.session.setConfigOption, ctx => {
     const session = sessions.get(ctx.params.sessionId)
     if (session === undefined) throw new Error('no such session')
-    session.temp = String(ctx.params.value)
-    return { configOptions: [mockConfigOptions(session.temp)] }
+    if (ctx.params.configId === 'temp') session.temp = String(ctx.params.value)
+    else if (ctx.params.configId === 'model') session.model = String(ctx.params.value)
+    else if (ctx.params.configId === 'thought') session.effort = String(ctx.params.value)
+    return { configOptions: mockConfigOptions(session) }
   })
   .onRequest(methods.agent.session.setMode, async ctx => {
     const session = sessions.get(ctx.params.sessionId)
@@ -105,6 +158,31 @@ const app = agent({ name: 'mock-acp-agent' })
       .join(' ')
     const send = update => ctx.client.notify(methods.client.session.update, { sessionId, update })
     let permissionAnswer = 'none'
+
+    if (text.includes('DIE')) {
+      await send({ sessionUpdate: 'agent_message_chunk', messageId: 'dying', content: { type: 'text', text: 'about to die' } })
+      process.exit(1)
+    }
+
+    if (text.includes('READFILE')) {
+      const path = text.split('READFILE')[1]?.trim().split(/\s+/)[0] ?? ''
+      try {
+        const file = await ctx.client.request(methods.client.fs.readTextFile, { sessionId, path })
+        await send({ sessionUpdate: 'agent_message_chunk', messageId: 'fs', content: { type: 'text', text: `READ_OK:${file.content}` } })
+      } catch (error) {
+        await send({ sessionUpdate: 'agent_message_chunk', messageId: 'fs', content: { type: 'text', text: `READ_FAIL:${String(error?.message ?? error)}` } })
+      }
+    }
+
+    if (text.includes('WRITEFILE')) {
+      const path = text.split('WRITEFILE')[1]?.trim().split(/\s+/)[0] ?? ''
+      try {
+        await ctx.client.request(methods.client.fs.writeTextFile, { sessionId, path, content: 'written-by-mock-agent' })
+        await send({ sessionUpdate: 'agent_message_chunk', messageId: 'fs', content: { type: 'text', text: 'WRITE_OK' } })
+      } catch (error) {
+        await send({ sessionUpdate: 'agent_message_chunk', messageId: 'fs', content: { type: 'text', text: `WRITE_FAIL:${String(error?.message ?? error)}` } })
+      }
+    }
 
     await send({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thinking…' } })
     await send({
@@ -142,6 +220,12 @@ const app = agent({ name: 'mock-acp-agent' })
         cancelled.delete(sessionId)
         return { stopReason: 'cancelled' }
       }
+    }
+    if (text.includes('IGNORE_CANCEL')) {
+      // Deliberately ignore the cancel notification to exercise the host's
+      // cancel fallback timer; the turn eventually finishes normally.
+      await sleep(1200)
+      fireCancel(sessionId)
     }
     await send({
       sessionUpdate: 'tool_call_update',
