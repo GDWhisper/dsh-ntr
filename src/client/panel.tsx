@@ -600,11 +600,17 @@ function ModelCatalogBlock({
               <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center', maxHeight: 180, overflow: 'auto' }}>
                 {visibleChoices.map(choice => {
                   const checked = exposed === undefined || exposed.includes(choice.value)
+                  // group 前缀仅来自 agent 返回的 SessionConfigSelectGroup（见 impl.ts
+                  // pushCatalogChoice）；供应商可见性兜底靠原样展示 value，严禁从
+                  // value 路径截取供应商段做标签（约束 8）。
+                  const title = choice.description === undefined
+                    ? choice.value
+                    : `${choice.value}\n${choice.description}`
                   return (
                     <label
                       key={choice.value}
                       className="dwa-badge"
-                      title={choice.description}
+                      title={title}
                       style={{
                         cursor: 'pointer',
                         ...(checked ? { background: '#3b82f622', color: '#2563eb' } : { opacity: 0.55 }),
@@ -616,7 +622,13 @@ function ModelCatalogBlock({
                         onChange={() => toggleChoice(choice.value)}
                         style={{ margin: 0, accentColor: '#2563eb' }}
                       />
+                      {choice.group !== undefined && (
+                        <span style={{ opacity: 0.7, marginRight: 4 }}>{choice.group} ·</span>
+                      )}
                       {choice.name}
+                      {choice.value !== choice.name && (
+                        <span style={{ opacity: 0.55, marginLeft: 4, fontSize: 10 }}>{choice.value}</span>
+                      )}
                     </label>
                   )
                 })}
