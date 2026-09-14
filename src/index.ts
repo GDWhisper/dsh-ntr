@@ -53,13 +53,29 @@ export function apply(ctx: Context, config?: unknown): void {
     )
   }
 
+  /** Registration handle: callable disposer, plus `replace` to re-announce routes. */
+  interface LlmAdapterHandle {
+    (): void
+    replace(providers: string[]): void
+  }
+
   interface LlmService {
-    registerAdapter(providers: string[], adapter: unknown): () => void
+    registerAdapter(providers: string[], adapter: unknown): LlmAdapterHandle
   }
 
   const registerLlm = (llmHandle: LlmService): void => {
     ctx.effect(
-      () => llmHandle.registerAdapter(['acp'], adapter),
+      () => {
+        const handle = llmHandle.registerAdapter(['acp'], adapter)
+        // Re-committing the unchanged routes republishes `llm/adapters-updated`
+        // (forwarded to browsers, where chat model selectors rebuild their
+        // directory) — the live-refresh path for panel-side catalog mutations.
+        manager.setModelsChangedHook(() => handle.replace(['acp']))
+        return () => {
+          manager.setModelsChangedHook(undefined)
+          handle()
+        }
+      },
       'dsh-ntr: acp llm adapter',
     )
   }

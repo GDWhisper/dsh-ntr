@@ -995,6 +995,7 @@ export class BridgeManager {
     const entry = { catalog, updatedAt: Date.now() }
     this.catalogs.set(agentId, entry)
     this.persistCatalogs()
+    this.notifyModelsChanged()
     return entry
   }
 
@@ -1277,6 +1278,7 @@ export class BridgeManager {
         text: `acp: model probe failed: ${describeError(error)}`,
       })
     })
+    this.notifyModelsChanged()
   }
 
   /**
@@ -1297,6 +1299,7 @@ export class BridgeManager {
       state: bridge?.state ?? 'stopped',
       ...(bridge === undefined ? {} : { agent: bridge.view() }),
     })
+    this.notifyModelsChanged()
   }
 
   async deleteAgent(agentId: string): Promise<void> {
@@ -1312,6 +1315,7 @@ export class BridgeManager {
       agentId,
       state: 'stopped',
     })
+    this.notifyModelsChanged()
   }
 
   async startSession(agentId: string, cwd: string | undefined): Promise<{ sessionId: string }> {
@@ -1422,6 +1426,8 @@ export class BridgeManager {
   private defaultModelSelection?: { provider: string; model: string }
   private defaultModelGetter?: () => { provider: string; model: string; reasoningEffort?: string } | undefined
   private defaultModelSetter?: (next: { provider: string; model: string }) => Promise<void>
+  /** Announcement used after in-memory catalog mutations (see setModelsChangedHook). */
+  private modelsChangedHook?: () => void
 
   setDefaultModelHooks(
     getter?: () => { provider: string; model: string; reasoningEffort?: string } | undefined,
@@ -1429,6 +1435,25 @@ export class BridgeManager {
   ): void {
     this.defaultModelGetter = getter
     this.defaultModelSetter = setter
+  }
+
+  /**
+   * Register the announcement fired after in-memory catalog mutations. The
+   * host entry re-commits the adapter's unchanged routes so the republished
+   * `llm/adapters-updated` reaches open browsers, where chat model selectors
+   * rebuild their directory — panel-side edits land without a page reload.
+   */
+  setModelsChangedHook(hook?: () => void): void {
+    this.modelsChangedHook = hook
+  }
+
+  /** Advisory: a failed announcement must not fail the mutation itself. */
+  private notifyModelsChanged(): void {
+    try {
+      this.modelsChangedHook?.()
+    } catch {
+      // The next full page load rebuilds the catalog anyway.
+    }
   }
 
   async getDefaultModel(): Promise<{ provider?: string; model?: string }> {

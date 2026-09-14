@@ -1,7 +1,9 @@
 /**
  * React surface for ACP: the settings configuration section.
- * Supports host agent detection, tested defaults display, startup command
- * customization, and per-agent model catalog probing.
+ * Focuses on what users need day to day: per-agent connection state and
+ * the model catalog. Startup command / permission editing lives behind a
+ * collapsed "配置" disclosure; unconfigured presets collapse into an
+ * "添加 Agent" section at the bottom.
  * All business state lives in the injected AcpStore.
  */
 
@@ -12,10 +14,9 @@ import type { AgentView, DetectedAgentInfo, PermissionMode } from '../protocol.t
 interface WithStore { acp: AcpStore }
 
 const STYLE = `
-.dwa-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-.dwa-table th, .dwa-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--dsw-alias-border-l2, #e2e2e2); vertical-align: middle; }
 .dwa-btn { font: inherit; border-radius: 6px; border: 1px solid var(--dsw-alias-border-l2, #bbb); background: var(--dsw-alias-button-tool-bar-fill, transparent); padding: 5px 12px; cursor: pointer; color: inherit; font-size: 12px; display: inline-flex; align-items: center; gap: 5px; transition: background 0.15s ease; }
 .dwa-btn:hover { background: var(--dsw-alias-interactive-bg-active, #0000000d); }
+.dwa-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .dwa-btn-primary { background: var(--dsw-alias-button-primary-fill, #2563eb); color: var(--dsw-alias-button-primary-invert, #fff); border-color: transparent; font-weight: 500; }
 .dwa-btn-primary:hover { opacity: 0.9; }
 .dwa-btn-danger { color: #dc2626; border-color: #fca5a5; }
@@ -27,7 +28,6 @@ const STYLE = `
 .dwa-badge-warn { background: #f59e0b22; color: #d97706; font-weight: 600; }
 .dwa-badge-info { background: #3b82f622; color: #2563eb; font-weight: 500; }
 .dwa-card { border: 1px solid var(--dsw-alias-border-l2, #e0e0e0); border-radius: 8px; padding: 12px 14px; background: var(--dsw-alias-bg-layer-1, #fafafa); font-size: 13px; line-height: 1.5; }
-.dwa-card-info { border-left: 4px solid var(--dsw-alias-button-primary-fill, #2563eb); }
 .dwa-card-warn { border-left: 4px solid var(--dsw-alias-state-warn-primary, #d97706); background: var(--dsw-alias-state-warn-secondary, #fffbeb); }
 .dwa-select { font: inherit; font-size: 12px; padding: 5px 8px; border: 1px solid var(--dsw-alias-border-l2, #ccc); border-radius: 6px; background: var(--dsw-alias-bg-layer-1, #fff); color: inherit; }
 .dwa-input { font: inherit; font-size: 12px; padding: 5px 8px; border: 1px solid var(--dsw-alias-border-l2, #ccc); border-radius: 6px; background: var(--dsw-alias-bg-layer-1, #fff); color: inherit; width: 100%; box-sizing: border-box; }
@@ -57,11 +57,61 @@ function useUi(acp: AcpStore) {
   return useSyncExternalStore(cb => acp.subscribe(cb), () => acp.getSnapshot())
 }
 
+function stateVisual(state: AgentView['state'], acp: AcpStore): { color: string; text: string } {
+  switch (state) {
+    case 'ready': return { color: '#22c55e', text: acp.label('已连接', 'Connected') }
+    case 'starting': return { color: '#eab308', text: acp.label('启动中', 'Starting') }
+    case 'error': return { color: '#ef4444', text: acp.label('错误', 'Error') }
+    default: return { color: '#9ca3af', text: acp.label('已停止', 'Stopped') }
+  }
+}
+
+/** Canonical comparable form of an exposure filter: `'all'` (unset) vs `'set:…'`. */
+function exposureKey(exposed: string[] | undefined): string {
+  return exposed === undefined ? 'all' : `set:${exposed.join('\u0000')}`
+}
+
+/**
+ * Detected presets split by configured-ness, plus configured agents missing
+ * from detection (custom / legacy persisted defs) synthesized into card
+ * entries so they stay manageable.
+ */
+function partitionAgents(
+  detectedAgents: readonly DetectedAgentInfo[],
+  agents: readonly AgentView[],
+): { configured: Array<{ info: DetectedAgentInfo; synthesized: boolean }>; available: DetectedAgentInfo[] } {
+  const configured: Array<{ info: DetectedAgentInfo; synthesized: boolean }> = []
+  const available: DetectedAgentInfo[] = []
+  const agentIds = new Set(agents.map(a => a.id))
+  const detectedIds = new Set(detectedAgents.map(d => d.id))
+  for (const info of detectedAgents) {
+    if (agentIds.has(info.id) || info.currentConfig !== undefined) configured.push({ info, synthesized: false })
+    else available.push(info)
+  }
+  for (const agent of agents) {
+    if (!detectedIds.has(agent.id)) {
+      configured.push({
+        info: {
+          id: agent.id,
+          name: agent.title,
+          detected: false,
+          defaultCommand: agent.command,
+          defaultArgs: [...agent.args],
+        },
+        synthesized: true,
+      })
+    }
+  }
+  return { configured, available }
+}
+
 /** Settings configuration section for ACP agents. */
 export function AcpSettingsSection(props: WithStore) {
   const acp = props.acp
   ensureStyle()
   const ui = useUi(acp)
+  const [showAdd, setShowAdd] = useState(false)
+  const { configured, available } = partitionAgents(ui.detectedAgents, ui.agents)
 
   return (
     <div style={{ padding: 16, overflow: 'auto' }}>
@@ -82,18 +132,6 @@ export function AcpSettingsSection(props: WithStore) {
         >
           {ui.detecting ? acp.label('检测中...', 'Detecting...') : acp.label('重新检测与刷新', 'Re-detect & Refresh')}
         </button>
-      </div>
-
-      <div className="dwa-card dwa-card-info" style={{ marginBottom: 16 }}>
-        <div style={{ fontWeight: 600, marginBottom: 4 }}>
-          {acp.label('💡 原生聊天已深度接入', '💡 Native Chat Deeply Integrated')}
-        </div>
-        <div style={{ color: 'var(--dsw-alias-text-secondary, #555)' }}>
-          {acp.label(
-            '系统会自动检测主机安装的 Agent，并提供测试验证过的 ACP 启动命令。你也可以自由定制命令与启动参数。配置完成后，可在下方将其设为默认模型，或在聊天中直接使用。',
-            'The host automatically detects installed agents and provides tested default startup commands. You can also customize commands and arguments. Once saved, set it as the default model or select it directly in chat.',
-          )}
-        </div>
       </div>
 
       {ui.permissions.length > 0 && (
@@ -128,95 +166,75 @@ export function AcpSettingsSection(props: WithStore) {
         </div>
       )}
 
-      {/* Detected Host Agents */}
+      {/* Connected ACP agents: connection state + model catalog per card */}
       <div style={{ marginBottom: 24 }}>
         <div className="dwa-section-title">
-          <span>🔍 {acp.label('检测主机当前智能体', 'Detected Host Agents')}</span>
-          <span style={{ fontSize: 12, fontWeight: 400, color: '#6b7280' }}>
-            {acp.label('检测系统 PATH 中支持 ACP 的 Agent', 'Scanned from system PATH')}
-          </span>
+          <span>🤖 {acp.label('已接入的 ACP 智能体', 'Connected ACP Agents')}</span>
+          <span className="dwa-badge">{configured.length}</span>
         </div>
 
-        {ui.detectedAgents.length === 0 && (
+        {configured.length === 0 && (
           <div className="dwa-card" style={{ textAlign: 'center', color: '#6b7280', padding: 20 }}>
-            {ui.detecting
-              ? acp.label('正在扫描主机 Agent...', 'Scanning host for agents...')
-              : acp.label('暂无可检测的智能体预设，点击右上角按钮重新扫描。', 'No presets available. Click Re-detect above.')}
+            {acp.label(
+              '尚未启用任何 Agent。展开下方「添加 Agent」，用检测到的预设一键启用。',
+              'No agents configured yet. Expand "Add Agent" below to enable a detected preset.',
+            )}
           </div>
         )}
 
-        {ui.detectedAgents.map(detected => {
-          const activeAgent = ui.agents.find(a => a.id === detected.id)
+        {configured.map(({ info, synthesized }) => {
+          const activeAgent = ui.agents.find(a => a.id === info.id)
           return (
-            <DetectedAgentCard
-              key={detected.id}
-              detected={detected}
+            <AgentCard
+              key={info.id}
+              detected={info}
               activeAgent={activeAgent}
               acp={acp}
-              isDefault={ui.defaultModel === detected.id}
+              isDefault={ui.defaultModel === info.id}
+              synthesized={synthesized}
             />
           )
         })}
       </div>
 
-      {/* Configured / Active ACP Agents Table */}
-      <div>
-        <div className="dwa-section-title">
-          <span>📋 {acp.label('当前已启用的 ACP 代理', 'Configured & Active ACP Agents')}</span>
-          <span className="dwa-badge">{ui.agents.length}</span>
+      {/* Unconfigured detected presets, collapsed until the user wants to add one */}
+      {available.length > 0 && (
+        <div>
+          <button type="button" className="dwa-btn dwa-btn-secondary" onClick={() => setShowAdd(open => !open)}>
+            {showAdd ? '▾' : '▸'} {acp.label(`添加 Agent (${available.length})`, `Add Agent (${available.length})`)}
+          </button>
+          {showAdd && (
+            <div style={{ marginTop: 12 }}>
+              {available.map(info => (
+                <AgentCard
+                  key={info.id}
+                  detected={info}
+                  acp={acp}
+                  isDefault={ui.defaultModel === info.id}
+                  synthesized={false}
+                />
+              ))}
+            </div>
+          )}
         </div>
-
-        <table className="dwa-table">
-          <thead>
-            <tr>
-              <th>ID / {acp.label('名称', 'Title')}</th>
-              <th>{acp.label('命令与参数', 'Command & Args')}</th>
-              <th>{acp.label('运行状态', 'State')}</th>
-              <th>{acp.label('权限策略', 'Permission')}</th>
-              <th>{acp.label('快捷操作', 'Actions')}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {ui.agents.map(agent => (
-              <AgentRow
-                key={agent.id}
-                agent={agent}
-                acp={acp}
-                isDefault={ui.defaultModel === agent.id}
-              />
-            ))}
-            {ui.agents.length === 0 && (
-              <tr>
-                <td colSpan={5} style={{ padding: 18, textAlign: 'center', color: '#6b7280' }}>
-                  {acp.label(
-                    '尚未启用任何 Agent：请在上方检测列表中配置并启用智能体（例如 Pi Agent）。',
-                    'No active agents — enable one from the detected list above (e.g. Pi Agent).',
-                  )}
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-      </div>
+      )}
     </div>
   )
 }
 
-/** Canonical comparable form of an exposure filter: `'all'` (unset) vs `'set:…'`. */
-function exposureKey(exposed: string[] | undefined): string {
-  return exposed === undefined ? 'all' : `set:${exposed.join('\u0000')}`
-}
-
-function DetectedAgentCard({
+/** One card per agent: connection state, model catalog, and a collapsible config form. */
+function AgentCard({
   detected,
   activeAgent,
   acp,
   isDefault,
+  synthesized,
 }: {
   detected: DetectedAgentInfo
   activeAgent?: AgentView
   acp: AcpStore
   isDefault: boolean
+  synthesized: boolean
 }) {
   const [command, setCommand] = useState(
     activeAgent?.command ?? detected.currentConfig?.command ?? detected.defaultCommand,
@@ -236,6 +254,14 @@ function DetectedAgentCard({
   const [saving, setSaving] = useState(false)
   const [savedSuccess, setSavedSuccess] = useState(false)
 
+  const isConfigured = activeAgent !== undefined || detected.currentConfig !== undefined
+
+  const [configOpen, setConfigOpen] = useState(!isConfigured)
+  useEffect(() => {
+    setConfigOpen(!isConfigured)
+    // Follow configured-ness transitions: collapse after save, reopen after remove.
+  }, [isConfigured])
+
   const serverExposureKey = exposureKey(detected.currentConfig?.exposedModels)
   useEffect(() => {
     const server = detected.currentConfig?.exposedModels
@@ -243,8 +269,6 @@ function DetectedAgentCard({
     // Re-sync the editor only when the persisted filter actually changes, so
     // background resyncs never clobber in-progress checkbox edits.
   }, [serverExposureKey])
-
-  const isConfigured = activeAgent !== undefined || detected.currentConfig !== undefined
 
   const handleUseDefault = () => {
     setCommand(detected.defaultCommand)
@@ -283,13 +307,16 @@ function DetectedAgentCard({
     }
   }
 
+  const state = activeAgent !== undefined ? stateVisual(activeAgent.state, acp) : undefined
+
   return (
     <div className="dwa-detected-card">
       <div className="dwa-detected-header">
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <strong style={{ fontSize: 14 }}>{detected.name}</strong>
-          <span style={{ color: '#6b7280', fontSize: 12 }}>({detected.id})</span>
-          {detected.detected ? (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          {state && <span className="dwa-dot" style={{ background: state.color }} title={activeAgent?.state} />}
+          <strong style={{ fontSize: 14 }} title={detected.description}>{detected.name}</strong>
+          {state && <span style={{ fontSize: 12, color: '#6b7280' }}>{state.text}</span>}
+          {!synthesized && (detected.detected ? (
             <span className="dwa-badge dwa-badge-success" title={detected.executablePath}>
               ✓ {acp.label('已检测到主机安装', 'Detected on Host')}
             </span>
@@ -297,141 +324,135 @@ function DetectedAgentCard({
             <span className="dwa-badge dwa-badge-warn">
               ⚠ {acp.label('未在 PATH 中检测到', 'Not in PATH')}
             </span>
-          )}
-          {isConfigured && (
-            <span className="dwa-badge dwa-badge-info">
-              {acp.label('已启用', 'Configured')}
-            </span>
-          )}
+          ))}
           {isDefault && (
             <span className="dwa-badge dwa-badge-success">
               ★ {acp.label('当前默认模型', 'Default Model')}
             </span>
           )}
         </div>
-
-        {detected.executablePath && (
-          <span style={{ fontSize: 11, color: '#6b7280', fontFamily: 'monospace' }}>
-            {detected.executablePath}
-          </span>
-        )}
       </div>
 
-      {detected.description && (
-        <div style={{ fontSize: 12, color: 'var(--dsw-alias-text-secondary, #666)', marginBottom: 10 }}>
-          {detected.description}
-        </div>
+      {activeAgent?.state === 'error' && activeAgent.stderrTail !== undefined && activeAgent.stderrTail.length > 0 && (
+        <pre className="dwa-stderr">{activeAgent.stderrTail.join('\n')}</pre>
       )}
-
-      {/* Tested default command bar */}
-      <div className="dwa-default-hint">
-        <div>
-          <span style={{ fontWeight: 600, marginRight: 6 }}>
-            {acp.label('官方测试默认命令:', 'Tested Default Command:')}
-          </span>
-          <code className="dwa-input-mono" style={{ background: '#0000000a', padding: '2px 6px', borderRadius: 4 }}>
-            {detected.defaultCommand} {detected.defaultArgs.join(' ')}
-          </code>
-        </div>
-        <button
-          type="button"
-          className="dwa-btn dwa-btn-secondary"
-          onClick={handleUseDefault}
-          title={acp.label('将下方输入框重置为官方验证命令', 'Reset command inputs to tested default')}
-        >
-          ↺ {acp.label('填入测试默认值', 'Use Tested Default')}
-        </button>
-      </div>
-
-      {/* Editable Form */}
-      <div className="dwa-form-row">
-        <div className="dwa-form-col" style={{ flex: 2 }}>
-          <label className="dwa-form-label">{acp.label('ACP 启动命令 (Command)', 'ACP Startup Command')}</label>
-          <input
-            className="dwa-input dwa-input-mono"
-            value={command}
-            onChange={e => setCommand(e.target.value)}
-            placeholder="e.g. pi-acp"
-          />
-        </div>
-        <div className="dwa-form-col" style={{ flex: 3 }}>
-          <label className="dwa-form-label">{acp.label('启动参数 (Args, 空格分隔)', 'Arguments (space-separated)')}</label>
-          <input
-            className="dwa-input dwa-input-mono"
-            value={argsStr}
-            onChange={e => setArgsStr(e.target.value)}
-            placeholder="e.g. --thinking high"
-          />
-        </div>
-      </div>
-
-      <div className="dwa-form-row">
-        <div className="dwa-form-col" style={{ flex: 2 }}>
-          <label className="dwa-form-label">{acp.label('权限模式 (Permission Policy)', 'Permission Policy')}</label>
-          <select
-            className="dwa-select"
-            value={permission}
-            onChange={e => setPermission(e.target.value as PermissionMode)}
-          >
-            <option value="ask">{acp.label('询问人类 (ask)', 'Ask human (ask)')}</option>
-            <option value="allow">{acp.label('始终允许 (allow)', 'Always allow (allow)')}</option>
-            <option value="reject">{acp.label('自动拒绝 (reject)', 'Reject all (reject)')}</option>
-          </select>
-        </div>
-        <div className="dwa-form-col" style={{ flex: 3 }}>
-          <label className="dwa-form-label">{acp.label('工作空间根目录 (Workspace Cwd, 可选)', 'Workspace Directory (Optional)')}</label>
-          <input
-            className="dwa-input"
-            value={cwd}
-            onChange={e => setCwd(e.target.value)}
-            placeholder={acp.label('默认项目 acp-workspaces 目录', 'Default: project acp-workspaces directory')}
-          />
-        </div>
-      </div>
-
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
-        <button
-          className="dwa-btn dwa-btn-primary"
-          onClick={() => void handleSave()}
-          disabled={saving || command.trim() === ''}
-        >
-          {saving
-            ? acp.label('保存中...', 'Saving...')
-            : savedSuccess
-              ? acp.label('✓ 已保存并更新', '✓ Saved & Updated')
-              : isConfigured
-                ? acp.label('保存配置更改', 'Save Changes')
-                : acp.label('保存并启用该 Agent', 'Save & Enable Agent')}
-        </button>
-
-        {isConfigured && !isDefault && (
-          <button className="dwa-btn" onClick={() => void acp.setDefaultModel(detected.id)}>
-            {acp.label('设为默认模型', 'Set as Default Model')}
-          </button>
-        )}
-
-        {activeAgent && activeAgent.state !== 'stopped' && (
-          <button className="dwa-btn" onClick={() => void acp.stopAgent(detected.id)}>
-            {acp.label('停止当前运行实例', 'Stop Running Process')}
-          </button>
-        )}
-
-        {isConfigured && (
-          <button className="dwa-btn dwa-btn-danger" onClick={() => void handleDelete()}>
-            {acp.label('移除配置', 'Remove')}
-          </button>
-        )}
-      </div>
 
       {isConfigured && (
-        <ModelCatalogBlock agentId={detected.id} detected={detected} acp={acp} exposed={exposed} onExposedChange={setExposed} />
+        <ModelCatalogBlock
+          agentId={detected.id}
+          detected={detected}
+          acp={acp}
+          exposed={exposed}
+          onExposedChange={setExposed}
+          isDefault={isDefault}
+        />
       )}
+
+      <div style={{ marginTop: 12, paddingTop: 8, borderTop: '1px dashed var(--dsw-alias-border-l2, #e5e7eb)' }}>
+        <button type="button" className="dwa-btn dwa-btn-secondary" onClick={() => setConfigOpen(open => !open)}>
+          {configOpen ? '▾' : '▸'} ⚙ {acp.label('配置（命令 / 权限 / 工作目录）', 'Configuration (command / permission / workspace)')}
+        </button>
+
+        {configOpen && (
+          <>
+            {/* Tested default command bar */}
+            <div className="dwa-default-hint" style={{ marginTop: 10 }}>
+              <div>
+                <span style={{ fontWeight: 600, marginRight: 6 }}>
+                  {acp.label('官方测试默认命令:', 'Tested Default Command:')}
+                </span>
+                <code className="dwa-input-mono" style={{ background: '#0000000a', padding: '2px 6px', borderRadius: 4 }}>
+                  {detected.defaultCommand} {detected.defaultArgs.join(' ')}
+                </code>
+              </div>
+              <button
+                type="button"
+                className="dwa-btn dwa-btn-secondary"
+                onClick={handleUseDefault}
+                title={acp.label('将下方输入框重置为官方验证命令', 'Reset command inputs to tested default')}
+              >
+                ↺ {acp.label('填入测试默认值', 'Use Tested Default')}
+              </button>
+            </div>
+
+            <div className="dwa-form-row">
+              <div className="dwa-form-col" style={{ flex: 2 }}>
+                <label className="dwa-form-label">{acp.label('ACP 启动命令 (Command)', 'ACP Startup Command')}</label>
+                <input
+                  className="dwa-input dwa-input-mono"
+                  value={command}
+                  onChange={e => setCommand(e.target.value)}
+                  placeholder="e.g. pi-acp"
+                />
+              </div>
+              <div className="dwa-form-col" style={{ flex: 3 }}>
+                <label className="dwa-form-label">{acp.label('启动参数 (Args, 空格分隔)', 'Arguments (space-separated)')}</label>
+                <input
+                  className="dwa-input dwa-input-mono"
+                  value={argsStr}
+                  onChange={e => setArgsStr(e.target.value)}
+                  placeholder="e.g. --thinking high"
+                />
+              </div>
+            </div>
+
+            <div className="dwa-form-row">
+              <div className="dwa-form-col" style={{ flex: 2 }}>
+                <label className="dwa-form-label">{acp.label('权限模式 (Permission Policy)', 'Permission Policy')}</label>
+                <select
+                  className="dwa-select"
+                  value={permission}
+                  onChange={e => setPermission(e.target.value as PermissionMode)}
+                >
+                  <option value="ask">{acp.label('询问人类 (ask)', 'Ask human (ask)')}</option>
+                  <option value="allow">{acp.label('始终允许 (allow)', 'Always allow (allow)')}</option>
+                  <option value="reject">{acp.label('自动拒绝 (reject)', 'Reject all (reject)')}</option>
+                </select>
+              </div>
+              <div className="dwa-form-col" style={{ flex: 3 }}>
+                <label className="dwa-form-label">{acp.label('工作空间根目录 (Workspace Cwd, 可选)', 'Workspace Directory (Optional)')}</label>
+                <input
+                  className="dwa-input"
+                  value={cwd}
+                  onChange={e => setCwd(e.target.value)}
+                  placeholder={acp.label('默认项目 acp-workspaces 目录', 'Default: project acp-workspaces directory')}
+                />
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
+              <button
+                className="dwa-btn dwa-btn-primary"
+                onClick={() => void handleSave()}
+                disabled={saving || command.trim() === ''}
+              >
+                {saving
+                  ? acp.label('保存中...', 'Saving...')
+                  : savedSuccess
+                    ? acp.label('✓ 已保存并更新', '✓ Saved & Updated')
+                    : isConfigured
+                      ? acp.label('保存配置更改', 'Save Changes')
+                      : acp.label('保存并启用该 Agent', 'Save & Enable Agent')}
+              </button>
+
+              {activeAgent && activeAgent.state !== 'stopped' && (
+                <button className="dwa-btn" onClick={() => void acp.stopAgent(detected.id)}>
+                  {acp.label('停止当前运行实例', 'Stop Running Process')}
+                </button>
+              )}
+
+              {isConfigured && (
+                <button className="dwa-btn dwa-btn-danger" onClick={() => void handleDelete()}>
+                  {acp.label('移除配置', 'Remove')}
+                </button>
+              )}
+            </div>
+          </>
+        )}
+      </div>
     </div>
   )
 }
-
-/** Sentinel vendor bucket for choices that arrived without a select group. */
-const UNGROUPED_VENDOR = '\u0000'
 
 /** Probed model / thought-level catalog display plus the native-selector exposure filter. */
 function ModelCatalogBlock({
@@ -440,55 +461,46 @@ function ModelCatalogBlock({
   acp,
   exposed,
   onExposedChange,
+  isDefault,
 }: {
   agentId: string
   detected: DetectedAgentInfo
   acp: AcpStore
   exposed: string[] | undefined
   onExposedChange: (next: string[] | undefined) => void
+  isDefault: boolean
 }) {
   const ui = useUi(acp)
   const [applying, setApplying] = useState(false)
+  const [appliedOk, setAppliedOk] = useState(false)
   const [search, setSearch] = useState('')
-  const [vendor, setVendor] = useState('')
   const probing = ui.probingModels[agentId] === true
   const result = ui.modelCatalogs[agentId]
   const modelChoices = result?.catalog.model?.choices ?? []
   const serverExposureKey = exposureKey(detected.currentConfig?.exposedModels)
   const dirty = exposureKey(exposed) !== serverExposureKey
 
-  const vendorOptions = (() => {
-    const stats = new Map<string, number>()
-    for (const choice of modelChoices) {
-      const key = choice.group ?? UNGROUPED_VENDOR
-      stats.set(key, (stats.get(key) ?? 0) + 1)
-    }
-    return [...stats].map(([key, count]) => ({ key, count }))
-  })()
-
   const query = search.trim().toLowerCase()
-  const viewFilterActive = query !== '' || vendor !== ''
-  const visibleChoices = modelChoices.filter(choice =>
-    (query === '' || choice.name.toLowerCase().includes(query) || choice.value.toLowerCase().includes(query))
-    && (vendor === '' || (choice.group ?? UNGROUPED_VENDOR) === vendor),
-  )
+  const visibleChoices = query === ''
+    ? modelChoices
+    : modelChoices.filter(choice =>
+      choice.name.toLowerCase().includes(query) || choice.value.toLowerCase().includes(query))
+
+  const basis = exposed ?? modelChoices.map(c => c.value)
   const visibleValues = visibleChoices.map(c => c.value)
+  const allChecked = visibleValues.length > 0 && visibleValues.every(v => basis.includes(v))
 
   const toggleChoice = (value: string) => {
-    const basis = exposed ?? modelChoices.map(c => c.value)
     onExposedChange(basis.includes(value) ? basis.filter(v => v !== value) : [...basis, value])
   }
 
   /**
-   * 全选 toggle: no view filter → expose everything ↔ none ([]); with one →
-   * check the visible set, or uncheck exactly those when all are checked.
-   * The button label mirrors the toggle state.
+   * 全选 toggle: no search → expose everything ↔ none ([]); with a search
+   * active → check the matching models, or uncheck exactly those when all
+   * of them are checked. The button label mirrors the toggle state.
    */
-  const basis = exposed ?? modelChoices.map(c => c.value)
-  const scopeValues = viewFilterActive ? visibleValues : modelChoices.map(c => c.value)
-  const allChecked = scopeValues.length > 0 && scopeValues.every(v => basis.includes(v))
-  const selectVisible = () => {
-    if (!viewFilterActive) {
+  const toggleVisible = () => {
+    if (query === '') {
       onExposedChange(allChecked ? [] : undefined)
       return
     }
@@ -499,14 +511,13 @@ function ModelCatalogBlock({
     )
   }
 
-  /** 仅保留可见: narrow the exposure to exactly the currently visible choices. */
-  const keepVisible = () => onExposedChange(visibleValues)
-
   const applyFilter = async (next: string[] | undefined) => {
     setApplying(true)
     try {
       await acp.setExposedModels(agentId, next)
       onExposedChange(next)
+      setAppliedOk(true)
+      setTimeout(() => setAppliedOk(false), 2000)
     } catch {
       // Notice handled in store; keep the local edits so the user can retry.
     } finally {
@@ -522,6 +533,11 @@ function ModelCatalogBlock({
             ? acp.label('模型检测中...', 'Probing models...')
             : acp.label('🧠 检测可用模型', 'Detect Available Models')}
         </button>
+        {!isDefault && (
+          <button className="dwa-btn" onClick={() => void acp.setDefaultModel(agentId)}>
+            ★ {acp.label('设为默认模型', 'Set as Default Model')}
+          </button>
+        )}
         {result !== undefined && result.catalog.model === undefined && (
           <span style={{ fontSize: 12, color: '#6b7280' }}>
             {acp.label('该 Agent 未暴露模型选择器（category: model）', 'Agent exposes no model selector (category: model)')}
@@ -545,46 +561,25 @@ function ModelCatalogBlock({
                   </span>
                 )}
                 <span style={{ fontSize: 11, color: '#6b7280' }}>
-                  {acp.label(
-                    '勾选要出现在聊天模型选择器中的模型（原生选择器没有搜索，避免刷屏）；Agent 默认模型始终可见。',
-                    'Check the models to show in the chat model selector (it has no search); the agent default is always visible.',
-                  )}
+                  {acp.label('勾选后点「应用筛选」生效；默认模型始终可见。', 'Check models then "Apply Filter"; the agent default is always visible.')}
                 </span>
               </div>
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
                 <input
                   className="dwa-input"
-                  style={{ width: 170 }}
+                  style={{ width: 220 }}
                   value={search}
                   onChange={e => setSearch(e.target.value)}
                   placeholder={acp.label('搜索模型…', 'Search models…')}
                 />
-                <select className="dwa-select" value={vendor} onChange={e => setVendor(e.target.value)}>
-                  <option value="">{acp.label(`全部供应商 (${modelChoices.length})`, `All vendors (${modelChoices.length})`)}</option>
-                  {vendorOptions.map(({ key, count }) => (
-                    <option key={key} value={key}>
-                      {key === UNGROUPED_VENDOR ? acp.label('未分组', 'Ungrouped') : key} ({count})
-                    </option>
-                  ))}
-                </select>
                 <button
                   className="dwa-btn dwa-btn-secondary"
                   disabled={visibleChoices.length === 0}
-                  onClick={selectVisible}
-                  title={acp.label('在全部勾选与全部取消之间切换；筛选中则只切换可见模型的勾选', 'Toggles between checking everything and none; with a filter active it toggles only the visible models')}
+                  onClick={toggleVisible}
+                  title={acp.label('在全部勾选与全部取消之间切换；搜索中则只切换匹配的模型', 'Toggles between checking everything and none; while searching it toggles only the matching models')}
                 >
                   {allChecked ? acp.label('取消全选', 'Deselect All') : acp.label('全选', 'Select All')}
                 </button>
-                {viewFilterActive && (
-                  <button
-                    className="dwa-btn dwa-btn-secondary"
-                    disabled={visibleChoices.length === 0}
-                    onClick={keepVisible}
-                    title={acp.label('把暴露范围收窄为当前可见的模型', 'Narrow exposure to exactly the currently visible models')}
-                  >
-                    {acp.label('仅保留可见', 'Keep Visible Only')}
-                  </button>
-                )}
                 {exposed !== undefined && (
                   <button className="dwa-btn" disabled={applying} onClick={() => void applyFilter(undefined)}>
                     {acp.label('全部显示', 'Show All')}
@@ -595,13 +590,12 @@ function ModelCatalogBlock({
                   disabled={!dirty || applying}
                   onClick={() => void applyFilter(exposed)}
                 >
-                  {applying ? acp.label('应用中...', 'Applying...') : acp.label('应用筛选', 'Apply Filter')}
+                  {applying
+                    ? acp.label('应用中...', 'Applying...')
+                    : appliedOk
+                      ? acp.label('✓ 已应用', '✓ Applied')
+                      : acp.label('应用筛选', 'Apply Filter')}
                 </button>
-                {viewFilterActive && (
-                  <span style={{ fontSize: 11, color: '#6b7280' }}>
-                    {acp.label(`显示 ${visibleChoices.length}/${modelChoices.length}`, `Showing ${visibleChoices.length}/${modelChoices.length}`)}
-                  </span>
-                )}
               </div>
               <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center', maxHeight: 180, overflow: 'auto' }}>
                 {visibleChoices.map(choice => {
@@ -649,67 +643,3 @@ function ModelCatalogBlock({
     </div>
   )
 }
-
-function AgentRow({ agent, acp, isDefault }: { agent: AgentView; acp: AcpStore; isDefault: boolean }) {
-  const dotColor = agent.state === 'ready'
-    ? '#22c55e'
-    : agent.state === 'starting'
-      ? '#eab308'
-      : agent.state === 'error'
-        ? '#ef4444'
-        : '#9ca3af'
-
-  return (
-    <tr>
-      <td>
-        <strong>{agent.title}</strong>
-        <br />
-        <small style={{ color: '#6b7280' }}>{agent.id}</small>
-      </td>
-      <td>
-        <code style={{ fontSize: 12, background: 'var(--dsw-alias-bg-layer-1, #f4f4f4)', padding: '2px 4px', borderRadius: 4 }}>
-          {agent.command} {agent.args.join(' ')}
-        </code>
-      </td>
-      <td>
-        <div style={{ display: 'flex', alignItems: 'center' }}>
-          <span className="dwa-dot" style={{ background: dotColor }} />
-          <span>{agent.state}</span>
-        </div>
-        {agent.state === 'error' && agent.stderrTail !== undefined && agent.stderrTail.length > 0 && (
-          <pre className="dwa-stderr">{agent.stderrTail.join('\n')}</pre>
-        )}
-      </td>
-      <td>
-        <select
-          className="dwa-select"
-          value={agent.permission}
-          onChange={e => void acp.setPermission(agent.id, e.target.value as PermissionMode)}
-        >
-          <option value="ask">{acp.label('询问 (ask)', 'Ask')}</option>
-          <option value="allow">{acp.label('允许 (allow)', 'Allow')}</option>
-          <option value="reject">{acp.label('拒绝 (reject)', 'Reject')}</option>
-        </select>
-      </td>
-      <td>
-        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-          {isDefault ? (
-            <span className="dwa-badge dwa-badge-success">
-              ✓ {acp.label('默认模型', 'Default')}
-            </span>
-          ) : (
-            <button className="dwa-btn dwa-btn-primary" onClick={() => void acp.setDefaultModel(agent.id)}>
-              {acp.label('设为默认', 'Set Default')}
-            </button>
-          )}
-          {agent.state !== 'stopped' && (
-            <button className="dwa-btn" onClick={() => void acp.stopAgent(agent.id)}>
-              {acp.label('停止', 'Stop')}
-            </button>
-          )}
-        </div>
-      </td>
-    </tr>
-  )
-}
-
