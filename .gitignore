@@ -1,5 +1,7 @@
 node_modules/
 lib/
 *.tgz
+# Local agent planning scratch (never shipped)
+.zcode/
 acp-workspaces/*
 !acp-workspaces/.gitkeep

@@ -5,16 +5,27 @@ import {
   PermissionLedger,
   Transcript,
   buildAdapterModelId,
+  canonicalizeFsPath,
   childEnv,
+  decidePermission,
   dispatchRpc,
+  dshApprovalPolicyOf,
+  dshSessionPolicyOf,
+  isUnderPath,
   parseCatalogOptions,
+  permissionToolKind,
+  permissionToolPaths,
   resolveFsPath,
   resolveSessionCwd,
+  sandboxDenialMarker,
+  selectForwardPrompt,
+  sessionAgentPreset,
+  sessionAgentPresetFromLog,
   splitAdapterModelId,
   validateAgentDef,
   validateConfig,
 } from '../src/impl.ts'
-import type { AcpManager } from '../src/impl.ts'
+import type { AcpManager, DshSessionPolicy } from '../src/impl.ts'
 import type { AcpAgentDef, AgentProbeModelsResult } from '../src/protocol.ts'
 
 function agentDef(overrides: Partial<AcpAgentDef> = {}): AcpAgentDef {
@@ -54,6 +65,11 @@ describe('validateConfig', () => {
     expect(validateConfig({ agents: [], probeModelsOnBoot: false }).probeModelsOnBoot).toBe(false)
     expect(() => validateConfig({ agents: [], probeModelsOnBoot: 'yes' })).toThrow(/probeModelsOnBoot/)
   })
+  it('defaults installAcpPreset to true and rejects non-boolean values', () => {
+    expect(validateConfig({ agents: [] }).installAcpPreset).toBe(true)
+    expect(validateConfig({ agents: [], installAcpPreset: false }).installAcpPreset).toBe(false)
+    expect(() => validateConfig({ agents: [], installAcpPreset: 'no' })).toThrow(/installAcpPreset/)
+  })
   it('defaults and bounds the reliability timeouts', () => {
     const config = validateConfig({ agents: [] })
     expect(config.startupTimeoutMs).toBe(60_000)
@@ -63,6 +79,19 @@ describe('validateConfig', () => {
     expect(() => validateConfig({ agents: [], permissionTimeoutMs: -1 })).toThrow(/permissionTimeoutMs/)
     expect(() => validateConfig({ agents: [], cancelFallbackMs: 601_000 })).toThrow(/cancelFallbackMs/)
     expect(validateConfig({ agents: [], permissionTimeoutMs: 60_000, cancelFallbackMs: 0 }).cancelFallbackMs).toBe(0)
+  })
+  it('keeps idleTimeoutMs optional per agent and bounds it when present', () => {
+    // Absent means "host default": a config stored before this field existed
+    // must keep validating, or `loadPersistedAgents` would drop the agent.
+    const bare = validateConfig({ agents: [{ id: 'a', command: 'x' }] })
+    expect(bare.agents[0]?.idleTimeoutMs).toBeUndefined()
+    expect(validateConfig({ agents: [{ id: 'a', command: 'x', idleTimeoutMs: 0 }] }).agents[0]?.idleTimeoutMs).toBe(0)
+    expect(validateConfig({ agents: [{ id: 'a', command: 'x', idleTimeoutMs: 600_000 }] }).agents[0]?.idleTimeoutMs).toBe(600_000)
+    // A sub-second window would thrash spawn/release; 0 is the documented "off".
+    expect(() => validateConfig({ agents: [{ id: 'a', command: 'x', idleTimeoutMs: 999 }] })).toThrow(/idleTimeoutMs/)
+    expect(() => validateConfig({ agents: [{ id: 'a', command: 'x', idleTimeoutMs: -1 }] })).toThrow(/idleTimeoutMs/)
+    expect(() => validateConfig({ agents: [{ id: 'a', command: 'x', idleTimeoutMs: 1.5 }] })).toThrow(/idleTimeoutMs/)
+    expect(() => validateConfig({ agents: [{ id: 'a', command: 'x', idleTimeoutMs: 86_400_001 }] })).toThrow(/idleTimeoutMs/)
   })
 })
 
@@ -131,6 +160,40 @@ describe('adapter model id split/build', () => {
   })
 })
 
+describe('selectForwardPrompt (host request → forwarded ACP prompt)', () => {
+  const user = (text: string, id = 'u1') => ({ role: 'user', id, source: { kind: 'user' }, content: [{ type: 'text', text }] })
+  const injected = (kind: string, text: string) => ({ role: 'user', source: { kind }, content: [{ type: 'text', text }] })
+
+  it('takes the user message even when the host folds context sections after it', () => {
+    const picked = selectForwardPrompt([
+      user('你好'),
+      injected('agent-instructions', '<system-reminder>The following workspace instructions…'),
+      injected('plugin', 'Current runtime context.\n\nCurrent DSH file policy: workspace-write.'),
+      injected('skill-catalog', '<available_skills>…'),
+    ])
+    expect(picked).toEqual({ kind: 'prompt', text: '你好', id: 'u1' })
+  })
+
+  it('ignores tool results and reports an injected-only wake separately', () => {
+    expect(selectForwardPrompt([
+      user('run the tests'),
+      { role: 'user', source: { kind: 'tool' }, content: [{ type: 'text', text: 'exit code 0' }] },
+    ])).toEqual({ kind: 'prompt', text: 'run the tests', id: 'u1' })
+    expect(selectForwardPrompt([injected('skill-catalog', '<available_skills>…')])).toEqual({ kind: 'no-user-input' })
+    expect(selectForwardPrompt([{ role: 'assistant', content: [{ type: 'text', text: 'hi' }] }])).toEqual({ kind: 'empty' })
+  })
+
+  it('treats a source-less message as user input and joins text blocks', () => {
+    expect(selectForwardPrompt([
+      { role: 'user', content: [{ type: 'text', text: 'hand-built' }] },
+    ])).toEqual({ kind: 'prompt', text: 'hand-built' })
+    expect(selectForwardPrompt([
+      { role: 'user', content: [{ type: 'text', text: '  first  ' }, { type: 'image', url: 'x' }, { type: 'text', text: 'second' }] },
+    ])).toEqual({ kind: 'prompt', text: 'first  \nsecond' })
+    expect(selectForwardPrompt([{ role: 'user', content: [{ type: 'text', text: '   ' }] }])).toEqual({ kind: 'no-user-input' })
+  })
+})
+
 describe('validateAgentDef', () => {
   it('validates a valid agent definition and applies defaults', () => {
     const def = validateAgentDef({ id: 'pi', command: 'pi-acp' })
@@ -153,6 +216,30 @@ describe('validateAgentDef', () => {
     expect(() => validateAgentDef({ id: 'pi', command: 'x', exposedModels: 'model-a' })).toThrow(/exposedModels/)
     expect(() => validateAgentDef({ id: 'pi', command: 'x', exposedModels: ['a', ''] })).toThrow(/exposedModels/)
     expect(() => validateAgentDef({ id: 'pi', command: 'x', exposedModels: [42] })).toThrow(/exposedModels/)
+  })
+
+  // The cap used to be 256 entries, which is below what real agents publish
+  // (pi: 500 choices, omp: 581) — the panel's "only my selected models" switch
+  // sends every choice at once and got `bad_payload` for a legitimate filter.
+  it('accepts an exposedModels filter as large as a real catalog, and bounds it by size', () => {
+    const catalog = Array.from({ length: 600 }, (_, i) => `provider/model-${String(i)}`)
+    expect(validateAgentDef({ id: 'pi', command: 'x', exposedModels: catalog }).exposedModels).toEqual(catalog)
+    // Config reload re-validates the stored filter: exceeding the bound would
+    // silently drop the whole agent definition, so the guard is on total size.
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', exposedModels: Array.from({ length: 3000 }, (_, i) => `${'x'.repeat(400)}-${String(i)}`) })).toThrow(/too large/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', exposedModels: ['y'.repeat(513)] })).toThrow(/exposedModels/)
+  })
+
+  it('accepts, trims, and drops npmPackage; rejects invalid package names', () => {
+    expect(validateAgentDef({ id: 'pi', command: 'x', npmPackage: ' @mariozechner/pi-acp ' }).npmPackage).toBe('@mariozechner/pi-acp')
+    expect(validateAgentDef({ id: 'pi', command: 'x', npmPackage: 'omp@latest' }).npmPackage).toBe('omp@latest')
+    expect('npmPackage' in validateAgentDef({ id: 'pi', command: 'x', npmPackage: '  ' })).toBe(false)
+    expect('npmPackage' in validateAgentDef({ id: 'pi', command: 'x' })).toBe(false)
+    // Shell metacharacters must never reach the installer spawn argv.
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', npmPackage: 'pkg; rm -rf /' })).toThrow(/npmPackage/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', npmPackage: 'pkg$(whoami)' })).toThrow(/npmPackage/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', npmPackage: 'pkg && other' })).toThrow(/npmPackage/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', npmPackage: 42 })).toThrow(/npmPackage/)
   })
 
   it('rejects empty command and invalid id', () => {
@@ -270,10 +357,29 @@ function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } {
     detectAgents: async () => { calls.push(['detect', undefined]); return [] },
     saveAgent: async def => { calls.push(['save', def]) },
     deleteAgent: async id => { calls.push(['delete', id]) },
+    testAgent: async def => {
+      calls.push(['test', def])
+      return { ok: true, durationMs: 5, stderr: [] }
+    },
     setExposedModels: async (id, exposed) => { calls.push(['setExposedModels', { id, exposed }]) },
     probeAgentModels: async agentId => {
       calls.push(['probe', agentId])
       return { agentId, catalog: { model: { configId: 'model', name: 'Model', currentValue: 'a', choices: [{ value: 'a', name: 'A' }] } }, updatedAt: 1 }
+    },
+    agentCatalog: agentId => {
+      calls.push(['catalog', agentId])
+      return {
+        agentId,
+        title: 'Agent',
+        base: { id: agentId, name: 'Agent' },
+        variants: [{ id: `${agentId}@a`, name: 'Agent · A' }],
+        probed: true,
+        updatedAt: 1,
+      }
+    },
+    chatTranscripts: (dshSessionId, afterSeq) => {
+      calls.push(['chatTranscripts', { dshSessionId, afterSeq }])
+      return []
     },
   }
 }
@@ -281,11 +387,67 @@ function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } {
 describe('dispatchRpc', () => {
   it('routes endpoints and normalizes errors into the Connection result shape', async () => {
     const manager = fakeManager()
-    await expect(dispatchRpc(manager, 'agents/list', {})).resolves.toEqual({ ok: true, value: { agents: [] } })
+    // `approvalRouted` / `accessModeRouted` are reported for every host build; a
+    // manager without the probes (older/partial implementation) reports the
+    // degraded `false` for each.
+    await expect(dispatchRpc(manager, 'agents/list', {})).resolves.toEqual({
+      ok: true,
+      value: { agents: [], approvalRouted: false, accessModeRouted: false },
+    })
+    expect(manager.calls).toContainEqual(['agents', undefined])
+    const routed = { ...manager, approvalRouting: () => true }
+    await expect(dispatchRpc(routed, 'agents/list', {})).resolves.toEqual({
+      ok: true,
+      value: { agents: [], approvalRouted: true, accessModeRouted: false },
+    })
+    const modeRouted = { ...manager, accessModeRouting: () => true }
+    await expect(dispatchRpc(modeRouted, 'agents/list', {})).resolves.toEqual({
+      ok: true,
+      value: { agents: [], approvalRouted: false, accessModeRouted: true },
+    })
+    // Optional chat-session mode surface: a manager without it reports none.
+    await expect(dispatchRpc(manager, 'session/chat-list', { dshSessionId: 'chat-1' })).resolves.toEqual({ ok: true, value: { sessions: [], acpMode: false } })
+    // The seat gate's fallback fact source: read-only, memory-only, and false
+    // when the manager lacks the method (an older host half) or the resolver.
+    const acpModeOn = { ...manager, chatSessionAcpMode: (dshSessionId: string) => dshSessionId === 'chat-1' }
+    await expect(dispatchRpc(acpModeOn, 'session/chat-list', { dshSessionId: 'chat-1' })).resolves.toEqual({ ok: true, value: { sessions: [], acpMode: true } })
+    await expect(dispatchRpc(acpModeOn, 'session/chat-list', { dshSessionId: 'chat-2' })).resolves.toEqual({ ok: true, value: { sessions: [], acpMode: false } })
+    await expect(dispatchRpc(manager, 'session/chat-mode-set', { dshSessionId: 'chat-1', modeId: 'strict' })).resolves.toEqual({ ok: true, value: { done: true } })
+    await expect(dispatchRpc(manager, 'session/chat-list', {})).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    // The ACP view's data source: addressed by the CHAT session id, because
+    // the browser has no ACP session id before the first turn.
+    await expect(dispatchRpc(manager, 'session/chat-transcript', { dshSessionId: 'chat-1' })).resolves.toEqual({ ok: true, value: { views: [] } })
+    expect(manager.calls).toContainEqual(['chatTranscripts', { dshSessionId: 'chat-1', afterSeq: undefined }])
+    await expect(dispatchRpc(manager, 'session/chat-transcript', { dshSessionId: 'chat-1', afterSeq: 7 })).resolves.toEqual({ ok: true, value: { views: [] } })
+    expect(manager.calls).toContainEqual(['chatTranscripts', { dshSessionId: 'chat-1', afterSeq: 7 }])
+    await expect(dispatchRpc(manager, 'session/chat-transcript', {})).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc(manager, 'session/chat-transcript', { dshSessionId: 'chat-1', afterSeq: 'x' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    // A host half without the method answers an empty list rather than failing.
+    await expect(dispatchRpc({ ...manager, chatTranscripts: undefined }, 'session/chat-transcript', { dshSessionId: 'chat-1' })).resolves.toEqual({ ok: true, value: { views: [] } })
+    // Preset surface: absent methods report `null` instead of failing, so an
+    // older host half still answers the panel's status poll.
+    await expect(dispatchRpc(manager, 'preset/status', {})).resolves.toEqual({ ok: true, value: { preset: null } })
+    await expect(dispatchRpc(manager, 'preset/install', {})).resolves.toEqual({ ok: true, value: { preset: null } })
+    const withPreset = {
+      ...manager,
+      presetStatus: () => ({ id: 'acp', dir: '/home/x/.dsh/.agent-presets/acp', installed: false, missing: [] }),
+      presetInstall: () => ({ id: 'acp', dir: '/home/x/.dsh/.agent-presets/acp', installed: true, missing: [] }),
+    }
+    await expect(dispatchRpc(withPreset, 'preset/status', {})).resolves.toEqual({
+      ok: true,
+      value: { preset: { id: 'acp', dir: '/home/x/.dsh/.agent-presets/acp', installed: false, missing: [] } },
+    })
+    await expect(dispatchRpc(withPreset, 'preset/install', {})).resolves.toMatchObject({ ok: true, value: { preset: { installed: true } } })
     await expect(dispatchRpc(manager, 'agents/detect', {})).resolves.toEqual({ ok: true, value: { agents: [] } })
     expect(manager.calls).toContainEqual(['detect', undefined])
     await expect(dispatchRpc(manager, 'agent/save', { id: 'pi', command: 'pi-acp' })).resolves.toEqual({ ok: true, value: { done: true } })
     expect(manager.calls).toContainEqual(['save', expect.objectContaining({ id: 'pi', command: 'pi-acp' })])
+    await expect(dispatchRpc(manager, 'agent/test', { id: 'pi', command: 'pi-acp', npmPackage: 'pi-acp' })).resolves.toEqual({ ok: true, value: { ok: true, durationMs: 5, stderr: [] } })
+    expect(manager.calls).toContainEqual(['test', expect.objectContaining({ id: 'pi', command: 'pi-acp', npmPackage: 'pi-acp' })])
+    await expect(dispatchRpc(manager, 'agent/test', { id: 'pi', command: 'pi-acp', npmPackage: 'bad name' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_config' } })
+    await expect(dispatchRpc(manager, 'agent/test', { id: 'pi' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_config' } })
+    const bareTest = { ...manager, testAgent: undefined }
+    await expect(dispatchRpc(bareTest, 'agent/test', { id: 'pi', command: 'pi-acp' })).resolves.toMatchObject({ ok: false, error: { code: 'unsupported' } })
     await expect(dispatchRpc(manager, 'agent/delete', { agentId: 'pi' })).resolves.toEqual({ ok: true, value: { done: true } })
     expect(manager.calls).toContainEqual(['delete', 'pi'])
     await expect(dispatchRpc(manager, 'session/start', { agentId: 'a' })).resolves.toEqual({ ok: true, value: { sessionId: 'S' } })
@@ -310,6 +472,14 @@ describe('dispatchRpc', () => {
     await expect(dispatchRpc(manager, 'agent/probe-models', {})).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     const bare = { ...manager, probeAgentModels: undefined }
     await expect(dispatchRpc(bare, 'agent/probe-models', { agentId: 'pi' })).resolves.toMatchObject({ ok: false, error: { code: 'unsupported' } })
+    // `agent/catalog` is the seats' model list — the ONLY place ACP models are
+    // offered, since the `acp` route advertises nothing in DSH's own catalog.
+    await expect(dispatchRpc(manager, 'agent/catalog', { agentId: 'pi' })).resolves.toMatchObject({
+      ok: true,
+      value: { agentId: 'pi', base: { id: 'pi' }, variants: [{ id: 'pi@a' }], probed: true },
+    })
+    expect(manager.calls).toContainEqual(['catalog', 'pi'])
+    await expect(dispatchRpc(manager, 'agent/catalog', {})).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     await expect(dispatchRpc(manager, 'agent/set-exposed-models', { agentId: 'pi', exposedModels: ['a', 'b'] })).resolves.toEqual({ ok: true, value: { done: true } })
     expect(manager.calls).toContainEqual(['setExposedModels', { id: 'pi', exposed: ['a', 'b'] }])
     await expect(dispatchRpc(manager, 'agent/set-exposed-models', { agentId: 'pi' })).resolves.toEqual({ ok: true, value: { done: true } })
@@ -317,6 +487,10 @@ describe('dispatchRpc', () => {
     await expect(dispatchRpc(manager, 'agent/set-exposed-models', { agentId: 'pi', exposedModels: ['ok', ''] })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     await expect(dispatchRpc(manager, 'agent/set-exposed-models', { agentId: 'pi', exposedModels: 'a' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     await expect(dispatchRpc(manager, 'agent/set-exposed-models', {})).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    // A whole real catalog must go through in one call (see the config-side case).
+    const catalog = Array.from({ length: 581 }, (_, i) => `provider/model-${String(i)}`)
+    await expect(dispatchRpc(manager, 'agent/set-exposed-models', { agentId: 'omp', exposedModels: catalog })).resolves.toEqual({ ok: true, value: { done: true } })
+    expect(manager.calls).toContainEqual(['setExposedModels', { id: 'omp', exposed: catalog }])
   })
 
   it('invokes agent/probe-models as a manager method so the receiver (`this`) survives', async () => {
@@ -352,5 +526,177 @@ describe('EventHub', () => {
     hub.subscribe(e => { seen.push(e) })
     hub.broadcast({ type: 'session/closed', sessionId: 'x', reason: 'closed' })
     expect(seen).toHaveLength(1)
+  })
+})
+
+describe('DSH access mode → ACP permission decision', () => {
+  const policy = (overrides: Partial<DshSessionPolicy> = {}): DshSessionPolicy => ({
+    mode: 'workspace-write',
+    approval: 'ask',
+    ...overrides,
+  })
+
+  it('lets full access answer locally — the inversion this mapping replaces', () => {
+    // 完全权限 = danger-full-access + approval `never`; the host resolves every
+    // `never` ask to 'rejected', so routing there denied exactly what the mode allows.
+    expect(decidePermission(policy({ mode: 'danger-full-access', approval: 'never' }), 'execute')).toBe('allow')
+    expect(decidePermission(policy({ mode: 'danger-full-access', approval: 'never' }), undefined)).toBe('allow')
+    expect(decidePermission(policy({ mode: 'danger-full-access', approval: 'never' }), 'edit', ['/etc/passwd'])).toBe('allow')
+  })
+
+  it('allows reads in every mode and for every approval policy', () => {
+    for (const mode of ['read-only', 'workspace-write', 'danger-full-access'] as const) {
+      for (const approval of ['ask', 'never'] as const) {
+        expect(decidePermission(policy({ mode, approval }), 'read')).toBe('allow')
+        expect(decidePermission(policy({ mode, approval }), 'search')).toBe('allow')
+      }
+    }
+  })
+
+  it('denies writes under read-only + never and escalates them under read-only + ask', () => {
+    expect(decidePermission(policy({ mode: 'read-only', approval: 'never' }), 'edit', ['/tmp/x'])).toBe('reject')
+    expect(decidePermission(policy({ mode: 'read-only', approval: 'never' }), 'delete')).toBe('reject')
+    expect(decidePermission(policy({ mode: 'read-only', approval: 'never' }), 'execute')).toBe('reject')
+    expect(decidePermission(policy({ mode: 'read-only', approval: 'ask' }), 'edit', ['/tmp/x'])).toBe('ask')
+    expect(decidePermission(policy({ mode: 'read-only', approval: 'ask' }), 'execute')).toBe('ask')
+  })
+
+  it('permits a proven in-workspace write under workspace-write and escalates anything else', () => {
+    const p = policy({ workspaceRoot: '/srv/ws' })
+    expect(decidePermission(p, 'edit', ['/srv/ws/src/a.ts'])).toBe('allow')
+    expect(decidePermission(p, 'edit', ['/srv/ws'])).toBe('allow')
+    expect(decidePermission(p, 'edit', ['/etc/passwd'])).toBe('ask')
+    // Mixed locations: one outside the boundary is enough to need a human.
+    expect(decidePermission(p, 'edit', ['/srv/ws/a.ts', '/tmp/b.ts'])).toBe('ask')
+    // An undeclared target cannot be proven inside the boundary.
+    expect(decidePermission(p, 'edit')).toBe('ask')
+    expect(decidePermission(policy({ workspaceRoot: '/srv/ws', approval: 'never' }), 'edit', ['/etc/passwd'])).toBe('reject')
+    expect(decidePermission(policy({ workspaceRoot: undefined }), 'edit', ['/srv/ws/a.ts'])).toBe('ask')
+  })
+
+  it('treats an unknown effect as confined only under read-only', () => {
+    expect(decidePermission(policy({ mode: 'read-only', approval: 'never' }), undefined)).toBe('reject')
+    expect(decidePermission(policy({ mode: 'read-only', approval: 'ask' }), 'other')).toBe('ask')
+    expect(decidePermission(policy({ approval: 'never' }), 'execute')).toBe('allow')
+    expect(decidePermission(policy({ approval: 'never' }), undefined)).toBe('allow')
+  })
+
+  it('narrates only in ACP mode: every ask the agent raises reaches the human', () => {
+    // The agent's own permission mode decides what it asks about, so the
+    // boundary arithmetic must not answer for it — except where the host cannot
+    // ask anybody at all (`never` resolves every ask to 'rejected' before an
+    // answerer runs, so a quiet local reject is the honest answer).
+    const narrate = { narrateOnly: true }
+    const ws = policy({ workspaceRoot: '/srv/ws' })
+    expect(decidePermission(ws, 'edit', ['/srv/ws/a.ts'], narrate)).toBe('ask')
+    expect(decidePermission(ws, 'execute', [], narrate)).toBe('ask')
+    expect(decidePermission(policy({ mode: 'read-only' }), 'edit', [], narrate)).toBe('ask')
+    // Reads and full access are never worth a prompt.
+    expect(decidePermission(ws, 'read', [], narrate)).toBe('allow')
+    expect(decidePermission(policy({ mode: 'danger-full-access', approval: 'never' }), 'edit', ['/etc/passwd'], narrate)).toBe('allow')
+    expect(decidePermission(policy({ mode: 'read-only', approval: 'never' }), 'edit', [], narrate)).toBe('reject')
+  })
+
+  it('folds a session\'s agent preset, newest selection winning over the header', () => {
+    expect(sessionAgentPreset(undefined)).toBeUndefined()
+    expect(sessionAgentPreset({ header: { agentPreset: 'standard' } })).toBe('standard')
+    expect(sessionAgentPreset({ header: {} })).toBeUndefined()
+    expect(sessionAgentPreset({
+      header: { agentPreset: 'standard' },
+      events: [{ type: 'turn/start' }, { type: 'agent-preset/selected', data: { agentPreset: 'acp' } }],
+    })).toBe('acp')
+    // A malformed event must not shadow the header with garbage.
+    expect(sessionAgentPreset({
+      header: { agentPreset: 'standard' },
+      events: [{ type: 'agent-preset/selected', data: {} }],
+    })).toBeUndefined()
+  })
+
+  it('folds a preset from a RAW stored log (the cold-read path)', () => {
+    // `sessionPersistence` hands back the header verbatim and a read handle
+    // returns raw event objects — neither is a host `Session`, so the fold is
+    // spelled on its own inputs.
+    expect(sessionAgentPresetFromLog('standard', [])).toBe('standard')
+    expect(sessionAgentPresetFromLog(undefined, [
+      { type: 'sandbox/mode', data: { mode: 'ask' } },
+      { type: 'agent-preset/selected', data: { agentPreset: 'acp' } },
+    ])).toBe('acp')
+    // Newest selection wins over an older one and over the header.
+    expect(sessionAgentPresetFromLog('standard', [
+      { type: 'agent-preset/selected', data: { agentPreset: 'acp' } },
+      { type: 'agent-preset/selected', data: { agentPreset: 'minimal' } },
+    ])).toBe('minimal')
+    expect(sessionAgentPresetFromLog(7, [{ type: 'turn/start' }])).toBeUndefined()
+  })
+
+  it('reads the ACP tool-call shape defensively', () => {
+    expect(permissionToolKind({ kind: 'edit' })).toBe('edit')
+    expect(permissionToolKind({ kind: '' })).toBeUndefined()
+    expect(permissionToolKind({})).toBeUndefined()
+    expect(permissionToolKind(null)).toBeUndefined()
+    expect(permissionToolPaths({ locations: [{ path: '/a' }, { path: '' }, {}, 'x'] })).toEqual(['/a'])
+    expect(permissionToolPaths({})).toEqual([])
+  })
+
+  it('compares containment lexically and conservatively', () => {
+    expect(isUnderPath('/srv/ws/a.ts', '/srv/ws/')).toBe(true)
+    expect(isUnderPath('/srv/ws', '/srv/ws')).toBe(true)
+    expect(isUnderPath('/srv/wsx/a.ts', '/srv/ws')).toBe(false)
+    expect(isUnderPath('/anything', '/')).toBe(true)
+    expect(isUnderPath('/srv', 'relative/path')).toBe(false)
+  })
+
+  it('folds the session approval policy over the configured default', () => {
+    expect(dshApprovalPolicyOf({ events: [{ type: 'approval/policy', data: { policy: 'never' } }] }, 'ask')).toBe('never')
+    expect(dshApprovalPolicyOf({ events: [{ type: 'approval/policy', data: { policy: 'ask' } }] }, 'never')).toBe('ask')
+    // The LAST switch wins, exactly like the host's own fold.
+    expect(dshApprovalPolicyOf({
+      events: [
+        { type: 'approval/policy', data: { policy: 'never' } },
+        { type: 'sandbox/mode', data: { mode: 'read-only' } },
+        { type: 'approval/policy', data: { policy: 'ask' } },
+      ],
+    }, 'never')).toBe('ask')
+    expect(dshApprovalPolicyOf({ events: [] }, 'never')).toBe('never')
+    expect(dshApprovalPolicyOf(undefined, undefined)).toBe('ask')
+    expect(dshApprovalPolicyOf({ events: [{ type: 'approval/policy', data: {} }] }, 'never')).toBe('ask')
+    expect(dshApprovalPolicyOf({}, 'unexpected')).toBe('ask')
+  })
+
+  it('refuses a mode outside the vocabulary instead of guessing a boundary', () => {
+    expect(dshSessionPolicyOf({ mode: 'sandboxed', workspaceRoot: '/x' }, undefined, 'ask')).toBeUndefined()
+    expect(dshSessionPolicyOf({}, undefined, 'ask')).toBeUndefined()
+    expect(dshSessionPolicyOf({ mode: null }, undefined, 'ask')).toBeUndefined()
+  })
+
+  it('assembles the snapshot and drops an unusable workspace root', () => {
+    expect(dshSessionPolicyOf({ mode: 'read-only', workspaceRoot: '/srv/ws' }, { events: [] }, 'ask')).toEqual({
+      mode: 'read-only',
+      approval: 'ask',
+      workspaceRoot: '/srv/ws',
+    })
+    expect(dshSessionPolicyOf({ mode: 'danger-full-access' }, { events: [] }, 'never')).toEqual({
+      mode: 'danger-full-access',
+      approval: 'never',
+    })
+    expect(dshSessionPolicyOf({ mode: 'workspace-write', workspaceRoot: '' }, undefined, 'ask')).toEqual({
+      mode: 'workspace-write',
+      approval: 'ask',
+    })
+  })
+
+  it('carries the host denial dialect', () => {
+    expect(sandboxDenialMarker('read-only')).toBe('[sandbox: file access denied under read-only mode]')
+    expect(sandboxDenialMarker('workspace-write')).toBe('[sandbox: file access denied under workspace-write mode]')
+  })
+
+  it('canonicalizes without containment for the unrestricted mode', () => {
+    const realpath = (p: string): string => p
+    expect(canonicalizeFsPath('/srv/ws', '/etc/hosts', realpath)).toBe('/etc/hosts')
+    expect(canonicalizeFsPath('/srv/ws', 'sub/../a.txt', realpath)).toBe('/srv/ws/a.txt')
+    expect(() => canonicalizeFsPath('/srv/ws', '', realpath)).toThrow(AcpError)
+    // The containment variant still refuses what it always refused.
+    expect(() => resolveFsPath('/srv/ws', ['/srv/ws'], '/etc/hosts', realpath)).toThrow(AcpError)
+    expect(resolveFsPath('/srv/ws', ['/srv/ws'], 'a.txt', realpath)).toBe('/srv/ws/a.txt')
   })
 })

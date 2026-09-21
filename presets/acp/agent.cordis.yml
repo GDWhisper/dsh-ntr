@@ -1,0 +1,57 @@
+# The `acp` agent preset — "ACP 模式": a session whose conversation is served by
+# an external ACP agent (dsh-ntr's `acp` LLM provider) instead of a
+# harness-driven model.
+#
+# Why this file exists: an ACP agent is ANOTHER agent reached over the wire, and
+# the harness is only its shell. Everything the harness normally contributes to a
+# session's model view — its identity, the deployment persona, tool schemas, the
+# AGENTS.md digest, the skill catalog, the runtime-context snapshot, plan mode,
+# compaction — describes work the DSH loop would have done itself. None of it
+# reaches the ACP agent (dsh-ntr forwards only the person's own message — see
+# AGENTS.md rule 16) and all of it perturbs the conversation, so this composition
+# contributes none of it. The model-visible surface is the ACP agent's own.
+#
+# This is an AGENT-PLANE composition, mounted once per process under a standing
+# scope; every session joined to it shares these two rows. It publishes no
+# service, so it needs no `isolate` realm.
+#
+# Deliberately absent — do not add these back without a reason:
+#   - `tool-*` rows: the agent's tools live in its own process. Advertising DSH
+#     tools would be dead weight (the bridge never emits a DSH tool call), and
+#     the agent's own tool calls are not DSH tool calls.
+#   - `agent-instructions`: AGENTS.md/CLAUDE.md digests are harness context.
+#   - `tool-skill` / `skill-filesystem`: same, plus the `<available_skills>` dump.
+#   - `plan-mode` / `tool-todo` / `tool-goal`: harness state machines this
+#     session never enters — the agent brings its own modes (the composer
+#     control in dsh-ntr drives those).
+#   - `compaction-basic` / `command-compact`: a compaction would dispatch an
+#     auxiliary harness call on the ACP route; the agent owns its own context.
+#   - the delegation/workflow rows: delegation is a harness capability.
+
+# `complete: true` makes this the whole system prompt — it suppresses the static
+# harness identity and the deployment persona. `includeRuntimeContext: false`
+# suppresses the dynamic runtime-context snapshot, which the driver would
+# otherwise append as a sourced user message right behind the person's own
+# message (the bridge filters those by source as well; this row is why they are
+# not even assembled).
+#
+# The key is `prefix` (the persona prefix section), not `text`: the row's config
+# schema is `prefix: string` (required) + `suffix?: string` + the two flags, and
+# a wrong key makes the whole preset unloadable at session creation
+# (`$.prefix missing required value`). Omitting `suffix` is deliberate — an
+# absent suffix shadows the deployment suffix away.
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    prefix: >-
+      This session's conversation is served by an external ACP agent over the
+      Agent Client Protocol. The harness provides no tools and no context of its
+      own: the agent's own instructions, tools, and modes are authoritative.
+    complete: true
+    includeRuntimeContext: false
+
+# Belt and braces for the contract above: strip harness context injections from
+# every proposed step, so a row added here later (or a host-plane plugin
+# injecting one) cannot quietly re-enter the session's model view either.
+- id: acp-guard
+  name: ./acp-guard.mjs

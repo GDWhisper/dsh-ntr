@@ -1,5 +1,15 @@
 # DSH 插件开发文档
 
+- [ACP 模式：把会话交给另一个 agent](./acp-mode.md)
+  - 原生上下文确实被转发的证据（`agent/pre-step` 折入顺序 + 真实会话日志）与宿主侧修复（`selectForwardPrompt`、`purpose` 拒绝）
+  - ACP 模式 = agent preset（`presets/acp`）：清空宿主对模型可见的一切；loop 不可替换的硬约束
+  - 不替 agent 裁决（`narrateOnly`）、转发内容严格等于用户文本、保留的 fs 写栅栏；做不到的边界（宿主侧无 per-session 目录过滤缝、Access mode 控件）
+  - 对话内的 ACP 面：三块芯片（agent / 模型 / 思考等级）怎么写进 per-session 模型目录、模型面为什么另走 `agent/catalog`、边界档为什么放在芯片菜单里，以及 ACP 视图 tab 如何用 `session/chat-transcript` 渲染真工具卡与 unified diff
+  - 双向模型隔离：宿主侧"什么都不广告"（ACP 模型不进 DSH 目录，`/model` 弹窗也不例外）+ 浏览器侧 `priority: -1` 遮蔽原生座位（按当前会话 preset 动态注册，失败一律回到原生座位）
+- [ACP 会话的权限对齐调研（DSH Access mode ↔ ACP 权限）](./acp-permission-and-sandbox.md)
+  - 两个权限旋钮的实体与证据（preset / projection / sandbox / approval）
+  - 现状接线错误（`never` → ACP 请求被全拒、只读档可被审批放行、沙箱对 ACP 无作用力）
+  - 方案裁定：原生下拉不可替换、`conversation.input.left` 可加控件、`ctx.sandbox.confine` 硬约束的代价
 - [DSH 插件开发通用指南（从零起手）](./dsh-plugin-development-guide.md)
   - 核心架构认知（Cordis 内核、Plugin / Bundle / Profile 三要素）
   - 空项目起手骨架（目录结构、package.json、tsconfig.json、cordis.patch.yml）

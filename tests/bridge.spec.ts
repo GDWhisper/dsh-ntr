@@ -4,12 +4,18 @@
  */
 
 import { fileURLToPath } from 'node:url'
-import { tmpdir } from 'node:os'
-import { mkdirSync, readFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { afterAll, describe, expect, it } from 'vitest'
-import { AcpLlmAdapter, BridgeManager, detectHostAgents, findExecutable } from '../src/bridge.ts'
+import {
+  AcpLlmAdapter, BridgeManager, acpPresetDir, acpPresetStatus, bundledAcpPresetDir, defaultAgentWorkspace,
+  detectHostAgents, ensureAgentExecutable, findExecutable, installAcpPreset,
+  type ApprovalOutcome, type ApprovalRequestContext,
+} from '../src/bridge.ts'
 import { EventHub, dispatchRpc } from '../src/impl.ts'
-import type { AcpAgentDef, AcpEvent, StreamChunk } from '../src/protocol.ts'
+import type { DshSessionPolicy } from '../src/impl.ts'
+import type { AcpAgentDef, AcpEvent, AgentCatalogResult, ChatSessionView, StreamChunk } from '../src/protocol.ts'
 
 const MOCK = fileURLToPath(new URL('./mock-agent.mjs', import.meta.url))
 
@@ -181,11 +187,27 @@ describe('ACP bridge over stdio (mock agent)', () => {
     const adapter = new AcpLlmAdapter(manager)
     expect(adapter.providerInfo('acp')).toEqual({ id: 'acp', name: 'ACP' })
 
-    // Earlier tests opened real sessions, so the catalog was absorbed
-    // opportunistically: base entry + one variant per mock model choice.
-    const models = await adapter.listModels('acp')
-    expect(models.map(m => m.id)).toEqual(['mock', 'mock@mock-model-a', 'mock@mock-model-b'])
-    expect(models[0]).toEqual(expect.objectContaining({ provider: 'acp', id: 'mock', name: 'Mock' }))
+    // The route advertises NO models. That is the isolation guarantee: DSH
+    // builds one global provider catalog with no per-session seam, so anything
+    // listed here would be offered in every conversation — including the ones
+    // where no ACP agent is behind the route at all.
+    expect(await adapter.listModels('acp')).toEqual([])
+
+    // The agent's own surface is the plugin's `agent/catalog`. Exposing choices
+    // is the only way `agent@choice` variants appear there (via the lightweight
+    // RPC — no restart), and clearing is the same as never setting.
+    expect(await dispatchRpc(manager, 'agent/set-exposed-models', { agentId: 'mock', exposedModels: ['mock-model-a', 'mock-model-b'] }))
+      .toEqual({ ok: true, value: { done: true } })
+    const exposed = await dispatchRpc(manager, 'agent/catalog', { agentId: 'mock' })
+    if (!exposed.ok) throw new Error('agent/catalog failed')
+    const seat = exposed.value as AgentCatalogResult
+    expect(seat).toMatchObject({ agentId: 'mock', title: 'Mock', probed: true })
+    expect(seat.base).toMatchObject({ id: 'mock', name: 'Mock' })
+    expect(seat.variants.map(variant => variant.id)).toEqual(['mock@mock-model-a', 'mock@mock-model-b'])
+    expect(await dispatchRpc(manager, 'agent/set-exposed-models', { agentId: 'mock' })).toEqual({ ok: true, value: { done: true } })
+    const cleared = await dispatchRpc(manager, 'agent/catalog', { agentId: 'mock' })
+    if (!cleared.ok) throw new Error('agent/catalog failed')
+    expect((cleared.value as AgentCatalogResult).variants).toEqual([])
 
     const resolved = await adapter.resolveModel('acp', 'mock')
     expect(resolved).toEqual(expect.objectContaining({ provider: 'acp', id: 'mock', name: 'Mock' }))
@@ -227,6 +249,107 @@ describe('ACP bridge over stdio (mock agent)', () => {
 
     const finish = chunks.find((c): c is Extract<StreamChunk, { type: 'finish' }> => c.type === 'finish')
     expect(finish?.reason).toEqual({ kind: 'stop' })
+  }, 30_000)
+
+  it('installs the ACP-mode preset into a user preset root without ever overwriting it', () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-ntr-preset-home-'))
+    try {
+      expect(acpPresetStatus(home)).toMatchObject({ id: 'acp', installed: false })
+      expect(acpPresetDir(home)).toBe(join(home, '.dsh', '.agent-presets', 'acp'))
+
+      const installed = installAcpPreset(home)
+      expect(installed).toMatchObject({ id: 'acp', installed: true, missing: [] })
+      expect(existsSync(join(installed.dir, 'agent.cordis.yml'))).toBe(true)
+      expect(existsSync(join(installed.dir, 'acp-guard.mjs'))).toBe(true)
+
+      // A preset the user has edited is theirs: neither the boot path nor the
+      // repair path may overwrite it, and only absent files are filled in.
+      writeFileSync(join(installed.dir, 'agent.cordis.yml'), '# user edit\n')
+      expect(installAcpPreset(home, { onlyIfAbsent: true })).toMatchObject({ installed: true })
+      expect(installAcpPreset(home)).toMatchObject({ installed: true, missing: [] })
+      expect(readFileSync(join(installed.dir, 'agent.cordis.yml'), 'utf-8')).toBe('# user edit\n')
+
+      rmSync(join(installed.dir, 'acp-guard.mjs'))
+      expect(acpPresetStatus(home).missing).toEqual(['acp-guard.mjs'])
+      expect(installAcpPreset(home).missing).toEqual([])
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('ships a persona row the persona row schema accepts', () => {
+    // The row's schema is `prefix: string` (required) + `suffix?: string` + the
+    // two flags. A stale key (`text` used to be the persona prose key) makes the
+    // preset unloadable at session creation — `invalid config: $.prefix missing
+    // required value` — and the error only surfaces when a session actually
+    // switches to this preset, so pin the field names here.
+    const composition = readFileSync(join(bundledAcpPresetDir(), 'agent.cordis.yml'), 'utf-8')
+    const personaRow = /- id: persona\n[\s\S]*?(?=\n- id: |\s*$)/.exec(composition)?.[0]
+    expect(personaRow, 'the preset must carry a persona row').toBeTruthy()
+    expect(personaRow).toMatch(/^[ \t]+prefix:/m)
+    expect(personaRow).toMatch(/^[ \t]+complete: true$/m)
+    expect(personaRow).toMatch(/^[ \t]+includeRuntimeContext: false$/m)
+    expect(personaRow).not.toMatch(/^[ \t]+text:/m)
+  })
+
+  it('forwards only the user message past harness-injected context, and refuses auxiliary calls', async () => {
+    const adapter = new AcpLlmAdapter(manager)
+    const sessionId = 'dsh-injected-context-test'
+
+    // The host appends its context sections AFTER the claimed user batch
+    // (dsh-agent-instructions folds its digest there, the driver appends the
+    // runtime snapshot last), so "the last user-role message" is an injection.
+    const chunks: StreamChunk[] = []
+    for await (const chunk of adapter.stream({
+      provider: 'acp',
+      model: 'mock',
+      sessionId,
+      messages: [
+        { role: 'user', id: 'u1', source: { kind: 'user' }, content: [{ type: 'text', text: 'hello from the person' }] },
+        { role: 'user', id: 'i1', source: { kind: 'agent-instructions' }, content: [{ type: 'text', text: '<system-reminder>The following workspace instructions…' }] },
+        { role: 'user', id: 'i2', source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt', form: 'snapshot' }, content: [{ type: 'text', text: 'Current runtime context.\n\nCurrent DSH file policy: workspace-write.' }] },
+        { role: 'user', id: 'i3', source: { kind: 'skill-catalog' }, content: [{ type: 'text', text: '<available_skills>…' }] },
+      ],
+    })) {
+      chunks.push(chunk)
+    }
+    const answer = chunks
+      .filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
+      .map(c => c.text).join('')
+    expect(answer).toBe('MOCK: echo hello from the person perm=none')
+
+    // A session-title call rides the same logged route; it must not become an
+    // ACP turn (it would spend a remote turn on a title, or fold a harness
+    // prompt into the agent's own context).
+    const titleChunks: StreamChunk[] = []
+    for await (const chunk of adapter.stream({
+      provider: 'acp',
+      model: 'mock',
+      sessionId,
+      purpose: 'session-title',
+      messages: [{
+        role: 'user',
+        source: { kind: 'plugin', plugin: 'dsh-session-title-llm' },
+        content: [{ type: 'text', text: 'Generate the session title from this JSON array of human messages: […]' }],
+      }],
+    })) {
+      titleChunks.push(chunk)
+    }
+    const titleFinish = titleChunks.find((c): c is Extract<StreamChunk, { type: 'finish' }> => c.type === 'finish')
+    expect(titleFinish?.reason).toMatchObject({ kind: 'error', failure: { code: 'unsupported_purpose' } })
+    expect(titleChunks.some(c => c.type === 'text-delta' || c.type === 'block-start')).toBe(false)
+
+    // An injected-context wake carries nothing the user said: no ACP turn at all.
+    const wakeChunks: StreamChunk[] = []
+    for await (const chunk of adapter.stream({
+      provider: 'acp',
+      model: 'mock',
+      sessionId,
+      messages: [{ role: 'user', source: { kind: 'skill-catalog' }, content: [{ type: 'text', text: '<available_skills>…' }] }],
+    })) {
+      wakeChunks.push(chunk)
+    }
+    expect(wakeChunks).toEqual([{ type: 'finish', reason: { kind: 'stop' } }])
   }, 30_000)
 
   it('handles cancellation in adapter.stream via AbortSignal', async () => {
@@ -287,6 +410,84 @@ describe('ACP bridge over stdio (mock agent)', () => {
     expect(piPreset?.defaultArgs).toEqual([])
   })
 
+  it('surfaces configured custom agents as detect entries carrying their full def', () => {
+    const custom: AcpAgentDef = {
+      id: 'my-agent',
+      title: 'My Agent',
+      command: process.execPath,
+      args: [MOCK],
+      npmPackage: '@scope/my-agent',
+      env: { MY_KEY: 'v' },
+      permission: 'allow',
+    }
+    const detected = detectHostAgents([custom])
+    const entry = detected.find(d => d.id === 'my-agent')
+    expect(entry).toBeDefined()
+    expect(entry?.detected).toBe(true) // process.execPath resolves on PATH
+    expect(entry?.currentConfig).toMatchObject({ id: 'my-agent', npmPackage: '@scope/my-agent', env: { MY_KEY: 'v' } })
+    expect(entry?.defaultCommand).toBe(process.execPath)
+    // Preset ids are not duplicated as custom entries.
+    expect(detected.filter(d => d.id === 'pi')).toHaveLength(1)
+  })
+
+  it('ensureAgentExecutable resolves PATH first, installs on miss, and never rewrites a bare miss', async () => {
+    // Resolvable command: no install, absolute path pinned.
+    const installs: string[] = []
+    const noInstall = async (pkg: string) => { installs.push(pkg) }
+    const direct = await ensureAgentExecutable({ command: 'node' }, noInstall)
+    expect(direct.installed).toBe(false)
+    expect(installs).toEqual([])
+    expect(direct.command).toBe(findExecutable('node'))
+
+    // Missing command with no npmPackage: the original comes back untouched.
+    const bare = await ensureAgentExecutable({ command: 'definitely-missing-dsh-ntr-cmd' }, noInstall)
+    expect(bare).toEqual({ command: 'definitely-missing-dsh-ntr-cmd', installed: false })
+    expect(installs).toEqual([])
+
+    // Missing command with npmPackage: install runs, command falls back when
+    // still unresolvable (the spawn then fails with the familiar ENOENT).
+    const installed = await ensureAgentExecutable(
+      { command: 'definitely-missing-dsh-ntr-cmd', npmPackage: 'some-pkg' },
+      noInstall,
+    )
+    expect(installs).toEqual(['some-pkg'])
+    expect(installed.installed).toBe(true)
+    expect(installed.command).toBe('definitely-missing-dsh-ntr-cmd')
+
+    // An installer failure propagates so the caller can surface it.
+    await expect(ensureAgentExecutable(
+      { command: 'definitely-missing-dsh-ntr-cmd', npmPackage: 'some-pkg' },
+      async () => { throw new Error('npm down') },
+    )).rejects.toThrow(/npm down/)
+  })
+
+  it('testAgent handshakes a throwaway process without touching the manager', async () => {
+    const before = manager.agentViews().map(a => a.id)
+    const result = await manager.testAgent({
+      id: 'test-only',
+      command: process.execPath,
+      args: [MOCK],
+      cwd: tmpdir(),
+      allowedCwdRoots: [tmpdir()],
+    })
+    expect(result.ok).toBe(true)
+    expect(result.agentInfo).toBeDefined()
+    expect(result.durationMs).toBeGreaterThanOrEqual(0)
+    expect(Array.isArray(result.stderr)).toBe(true)
+    // The test def was never registered.
+    expect(manager.agentViews().map(a => a.id)).toEqual(before)
+
+    // A broken form value yields an ok:false verdict, not a throw.
+    const failed = await manager.testAgent({
+      id: 'test-only',
+      command: 'definitely-missing-dsh-ntr-cmd',
+      cwd: tmpdir(),
+      allowedCwdRoots: [tmpdir()],
+    })
+    expect(failed.ok).toBe(false)
+    expect(failed.error).toBeDefined()
+  }, 30_000)
+
   it('supports saving and deleting agents dynamically with persistence', async () => {
     const testStorage = `${tmpdir()}/acp-test-storage-${Date.now()}.json`
     const dynamicManager = new BridgeManager([], hub, 100, testStorage)
@@ -322,6 +523,44 @@ describe('ACP bridge over stdio (mock agent)', () => {
     const reloadedAfterDelete = new BridgeManager([], hub, 100, testStorage)
     expect(reloadedAfterDelete.agentViews()).toHaveLength(0)
   })
+
+  it('anchors the default workspace to the plugin state dir, not the launch cwd', () => {
+    expect(defaultAgentWorkspace('/tmp/fake-home')).toBe('/tmp/fake-home/.dsh/acp-workspaces')
+    expect(defaultAgentWorkspace()).toBe(join(homedir(), '.dsh', 'acp-workspaces'))
+    expect(defaultAgentWorkspace()).not.toBe(join(process.cwd(), 'acp-workspaces'))
+  })
+
+  it('defaults a cwd-less agent into the plugin workspace and deduplicates roots', async () => {
+    const testStorage = `${tmpdir()}/acp-workspace-defaults-${Date.now()}.json`
+    const wsManager = new BridgeManager([], hub, 100, testStorage)
+
+    // No cwd, no roots (the panel always pre-fills both, but YAML/RPC callers
+    // may not): the host must pick the plugin workspace, never `process.cwd()`.
+    await wsManager.saveAgent({
+      id: 'defaults',
+      command: process.execPath,
+      args: [MOCK],
+      permission: 'ask',
+    })
+    const saved = (wsManager as unknown as { defsMap: Map<string, AcpAgentDef> }).defsMap.get('defaults')
+    expect(saved?.cwd).toBe(defaultAgentWorkspace())
+    expect(saved?.allowedCwdRoots).toEqual([defaultAgentWorkspace()])
+    expect(saved?.allowedCwdRoots).not.toContain(process.cwd())
+
+    // Duplicated panel input collapses to a single root (was `[cwd, cwd, $HOME]`).
+    await wsManager.saveAgent({
+      id: 'defaults',
+      command: process.execPath,
+      args: [MOCK],
+      permission: 'ask',
+      cwd: defaultAgentWorkspace(),
+      allowedCwdRoots: [defaultAgentWorkspace(), defaultAgentWorkspace()],
+    })
+    expect((wsManager as unknown as { defsMap: Map<string, AcpAgentDef> }).defsMap.get('defaults')?.allowedCwdRoots)
+      .toEqual([defaultAgentWorkspace()])
+
+    await wsManager.shutdownAll()
+  })
 })
 
 describe('model catalog (isolated manager)', () => {
@@ -333,9 +572,19 @@ describe('model catalog (isolated manager)', () => {
     await catalogManager.shutdownAll()
   })
 
-  it('listModels stays memory-only: base entry only before any probe (no spawn)', async () => {
-    const models = await catalogAdapter.listModels('acp')
-    expect(models.map(m => m.id)).toEqual(['mock'])
+  it('advertises nothing: the ACP route is absent from DSH\'s model catalog', async () => {
+    expect(await catalogAdapter.listModels('acp')).toEqual([])
+  })
+
+  it('serves the agent surface through agent/catalog, memory-only before any probe', async () => {
+    // The seats' read is pure memory: no probe has run yet, so the answer is
+    // the base entry and a `probed: false` flag (the host probes in the
+    // background behind it).
+    const before = catalogManager.agentCatalog('mock')
+    expect(before).toMatchObject({ agentId: 'mock', title: 'Mock', probed: false, variants: [] })
+    expect(before.base).toMatchObject({ id: 'mock', name: 'Mock' })
+    expect(before.reasoning).toBeUndefined()
+    expect(() => catalogManager.agentCatalog('ghost')).toThrow(/not configured/)
   })
 
   it('probes configOptions, expands variants with reasoning metadata, degrades stale ids', async () => {
@@ -346,9 +595,19 @@ describe('model catalog (isolated manager)', () => {
     expect(probe.catalog.thought?.choices.map(c => c.value)).toEqual(['off', 'high'])
     expect(probe.catalog.thought?.currentValue).toBe('high')
 
-    const models = await catalogAdapter.listModels('acp')
-    expect(models.map(m => m.id)).toEqual(['mock', 'mock@mock-model-a', 'mock@mock-model-b'])
-    expect(models[2]).toMatchObject({ provider: 'acp', name: 'Mock · Mock Model B', description: 'The stronger mock model' })
+    // Variants are opt-in (an unexposed catalog would flood the seats' menus —
+    // pi publishes 500 choices): a probe alone offers the base entry.
+    const probed = catalogManager.agentCatalog('mock')
+    expect(probed.probed).toBe(true)
+    expect(probed.variants).toEqual([])
+    // The agent's own reasoning metadata rides the same read.
+    expect(probed.reasoning?.efforts.map(e => e.id)).toEqual(['off', 'high'])
+    expect(probed.reasoning?.defaultEffort).toBe('high')
+    await catalogManager.setExposedModels('mock', ['mock-model-a', 'mock-model-b'])
+
+    const seat = catalogManager.agentCatalog('mock')
+    expect(seat.variants.map(variant => variant.id)).toEqual(['mock@mock-model-a', 'mock@mock-model-b'])
+    expect(seat.variants[1]).toMatchObject({ name: 'Mock · Mock Model B', description: 'The stronger mock model' })
 
     const resolved = await catalogAdapter.resolveModel('acp', 'mock@mock-model-b')
     expect(resolved).toMatchObject({ provider: 'acp', id: 'mock@mock-model-b', name: 'Mock · Mock Model B' })
@@ -388,29 +647,36 @@ describe('model catalog (isolated manager)', () => {
     expect(view?.configOptions?.find(o => o.configId === 'thought')?.currentValue).toBe('off')
   }, 30_000)
 
-  it('narrows the native selector via setExposedModels; hidden variants still resolve', async () => {
-    await catalogManager.setExposedModels('mock', ['mock-model-b'])
-    expect((await catalogAdapter.listModels('acp')).map(m => m.id)).toEqual(['mock', 'mock@mock-model-b'])
+  it('narrows the ACP seats via setExposedModels; hidden variants still resolve', async () => {
+    // Unset and empty are the same state: no variants, only the base entry
+    // (the agent's own default model), which is never filtered out.
+    await catalogManager.setExposedModels('mock', undefined)
+    expect(catalogManager.agentCatalog('mock').variants).toEqual([])
 
-    // An empty filter leaves just the base entry (the agent default model).
+    await catalogManager.setExposedModels('mock', ['mock-model-b'])
+    expect(catalogManager.agentCatalog('mock').variants.map(v => v.id)).toEqual(['mock@mock-model-b'])
+
+    // An empty filter leaves just the base entry too.
     await catalogManager.setExposedModels('mock', [])
-    expect((await catalogAdapter.listModels('acp')).map(m => m.id)).toEqual(['mock'])
+    expect(catalogManager.agentCatalog('mock').variants).toEqual([])
 
     // Filtering only affects listing: a hidden variant still resolves fully.
     const hidden = await catalogAdapter.resolveModel('acp', 'mock@mock-model-a')
     expect(hidden).toMatchObject({ id: 'mock@mock-model-a', name: 'Mock · Mock Model A' })
-
-    // Clearing the filter (undefined) restores every choice.
-    await catalogManager.setExposedModels('mock', undefined)
-    expect((await catalogAdapter.listModels('acp')).map(m => m.id)).toEqual(['mock', 'mock@mock-model-a', 'mock@mock-model-b'])
 
     await expect(catalogManager.setExposedModels('ghost', ['x'])).rejects.toThrow(/not configured/)
   }, 30_000)
 
   it('reloads a persisted catalog into a fresh manager without probing', async () => {
     const reloaded = new BridgeManager([def], hub, 500, undefined, catalogPath)
-    const models = await new AcpLlmAdapter(reloaded).listModels('acp')
-    expect(models.map(m => m.id)).toEqual(['mock', 'mock@mock-model-a', 'mock@mock-model-b'])
+    // Nothing exposed yet, so the base entry is the whole surface…
+    expect(reloaded.agentCatalog('mock')).toMatchObject({ probed: true, variants: [] })
+    // …but the catalog really did come off disk: exposing a choice is enough to
+    // offer it, and that path never spawns an agent.
+    await reloaded.setExposedModels('mock', ['mock-model-a', 'mock-model-b'])
+    expect(reloaded.agentCatalog('mock').variants.map(v => v.id)).toEqual(['mock@mock-model-a', 'mock@mock-model-b'])
+    // `def` is shared with the suite, so leave it the way it was found.
+    await reloaded.setExposedModels('mock', undefined)
   })
 })
 
@@ -594,5 +860,579 @@ describe('reliability (isolated manager, short timeouts)', () => {
     await relWaitFor('agent/notice', event => event.text.includes('timed out'))
     const end = await relWaitFor('turn/end', event => event.sessionId === id && event.stopReason === 'end_turn')
     void end
+  }, 30_000)
+})
+
+describe('native approval routing (isolated manager)', () => {
+  const approvalHub = new EventHub()
+  const approvalEvents: AcpEvent[] = []
+  approvalHub.subscribe(event => { approvalEvents.push(event) })
+  const approvalManager = new BridgeManager([{ ...def, id: 'appr' }], approvalHub, 500)
+  const approvalAdapter = new AcpLlmAdapter(approvalManager)
+  const calls: ApprovalRequestContext[] = []
+  let scripted: ApprovalOutcome | 'throw' = 'unavailable'
+
+  approvalManager.setApprovalRequester(request => {
+    calls.push(request)
+    if (scripted === 'throw') throw new Error('approval service exploded')
+    return Promise.resolve(scripted)
+  })
+
+  afterAll(async () => {
+    await approvalManager.shutdownAll()
+  })
+
+  /**
+   * Wait for a fresh event. `since` is mandatory: the hub keeps every event
+   * from earlier cases, so an unscoped predicate would match a stale one.
+   */
+  function apprWaitFor<T extends AcpEvent['type']>(type: T, since: number, predicate: (event: Extract<AcpEvent, { type: T }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: T }>> {
+    const matches = (event: AcpEvent): event is Extract<AcpEvent, { type: T }> =>
+      event.type === type && predicate(event as Extract<AcpEvent, { type: T }>)
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${type}`)), timeoutMs)
+      const unsub = approvalHub.subscribe(event => {
+        if (approvalEvents.indexOf(event) >= since && matches(event)) {
+          clearTimeout(timer)
+          unsub()
+          resolve(event)
+        }
+      })
+      const existing = approvalEvents.find((event, index) => index >= since && matches(event))
+      if (existing !== undefined) {
+        clearTimeout(timer)
+        unsub()
+        resolve(existing)
+      }
+    })
+  }
+
+  /** Drain one adapter turn (the only path that binds a DSH chat session id). */
+  async function adapterTurn(sessionId: string, text: string): Promise<void> {
+    for await (const _chunk of approvalAdapter.stream({
+      provider: 'acp',
+      model: 'appr',
+      sessionId,
+      messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+    })) {
+      // Drain to completion: the mock answers the permission mid-turn.
+      void _chunk
+    }
+  }
+
+  async function echoOf(sessionId: string, text: string): Promise<string> {
+    const transcript = await dispatchRpc(approvalManager, 'transcript/get', { sessionId })
+    if (!transcript.ok) throw new Error('transcript failed')
+    return (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
+      .filter(e => e.update.sessionUpdate === 'agent_message_chunk')
+      .map(e => String((e.update.content as { text?: string }).text ?? ''))
+      .join('')
+  }
+
+  function hostSessionIdOf(sessionKey: string): string | undefined {
+    const turn = approvalEvents.find(e => e.type === 'turn/start' && e.text === sessionKey)
+    return turn?.sessionId
+  }
+
+  it('reports approvalRouting and answers an ask with the native outcome', async () => {
+    expect(approvalManager.approvalRouting()).toBe(true)
+    const before = approvalEvents.length
+
+    scripted = 'allowed-once'
+    await adapterTurn('dsh-approval-allow', 'PERM allow me')
+    const sessionId = hostSessionIdOf('PERM allow me')
+    expect(sessionId).toBeDefined()
+    expect(await echoOf(sessionId!, 'PERM allow me')).toContain('perm=allow1')
+
+    scripted = 'rejected'
+    await adapterTurn('dsh-approval-reject', 'PERM deny me')
+    const rejectSession = hostSessionIdOf('PERM deny me')
+    expect(rejectSession).toBeDefined()
+    expect(await echoOf(rejectSession!, 'PERM deny me')).toContain('perm=reject1')
+
+    // The question travelled with the chat session identity and the tool name.
+    expect(calls.at(-1)).toMatchObject({ dshSessionId: 'dsh-approval-reject', agentId: 'appr', toolName: 'mock dangerous operation' })
+
+    // Routed asks never surface a settings-panel card: no `permission/request`
+    // for this epoch, but the resolution frame still rides the stream.
+    const fresh = approvalEvents.slice(before)
+    expect(fresh.filter(e => e.type === 'permission/request')).toHaveLength(0)
+    expect(fresh.filter(e => e.type === 'permission/resolved' && e.sessionId === rejectSession)).toHaveLength(1)
+  }, 30_000)
+
+  it('degrades to the panel ledger when the native answerer is unavailable', async () => {
+    scripted = 'unavailable'
+    // Drive through the adapter so the session IS chat-bound (a ledger fallback
+    // must still work for a session the router could have handled).
+    const since = approvalEvents.length
+    const drained = adapterTurn('dsh-approval-degrade', 'PERM degrade please')
+    const request = await apprWaitFor('permission/request', since, () => true)
+    await dispatchRpc(approvalManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
+    await drained
+    expect(await echoOf(request.sessionId, 'PERM degrade please')).toContain('perm=allow1')
+  }, 30_000)
+
+  it('never calls the requester for a session without a DSH chat id', async () => {
+    const start = await dispatchRpc(approvalManager, 'session/start', { agentId: 'appr' })
+    if (!start.ok) throw new Error('start failed')
+    const id = (start.value as { sessionId: string }).sessionId
+    const callsBefore = calls.length
+    const since = approvalEvents.length
+
+    await dispatchRpc(approvalManager, 'session/prompt', { sessionId: id, text: 'PERM rpc path' })
+    const request = await apprWaitFor('permission/request', since, event => event.sessionId === id)
+    expect(calls).toHaveLength(callsBefore)
+    await dispatchRpc(approvalManager, 'permission/respond', { requestId: request.requestId, optionId: 'reject1' })
+    await apprWaitFor('permission/resolved', since, event => event.requestId === request.requestId)
+    await apprWaitFor('turn/end', since, event => event.sessionId === id && event.stopReason === 'end_turn')
+    expect(await echoOf(id, 'PERM rpc path')).toContain('perm=reject1')
+  }, 30_000)
+
+  it('treats a throwing requester as unavailable instead of failing the turn', async () => {
+    scripted = 'throw'
+    const since = approvalEvents.length
+    const drained = adapterTurn('dsh-approval-throw', 'PERM throw please')
+    const request = await apprWaitFor('permission/request', since, () => true)
+    await dispatchRpc(approvalManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
+    await drained
+    expect(await echoOf(request.sessionId, 'PERM throw please')).toContain('perm=allow1')
+  }, 30_000)
+})
+
+/**
+ * A chat-backed session follows the DSH access mode: the mode supplies the
+ * boundary, `approval` decides whether a human is asked at it. The resolver
+ * below is the exact seam `src/index.ts` wires (DSH session id → folded policy),
+ * so these cases exercise the production path without a live DSH host.
+ */
+describe('DSH access mode mapping (isolated manager)', () => {
+  const modeHub = new EventHub()
+  const modeEvents: AcpEvent[] = []
+  modeHub.subscribe(event => { modeEvents.push(event) })
+  const modeManager = new BridgeManager([{ ...def, id: 'moded' }], modeHub, 500)
+  const modeAdapter = new AcpLlmAdapter(modeManager)
+  const asks: ApprovalRequestContext[] = []
+  let answer: ApprovalOutcome = 'allowed-once'
+  let policy: DshSessionPolicy | undefined
+
+  modeManager.setApprovalRequester(request => {
+    asks.push(request)
+    return Promise.resolve(answer)
+  })
+  modeManager.setSessionPolicyResolver(() => policy)
+
+  afterAll(async () => {
+    await modeManager.shutdownAll()
+  })
+
+  /** Wait for a fresh event (the hub keeps older cases' frames, so `since` is mandatory). */
+  function modeWaitFor<T extends AcpEvent['type']>(type: T, since: number, predicate: (event: Extract<AcpEvent, { type: T }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: T }>> {
+    const matches = (event: AcpEvent): event is Extract<AcpEvent, { type: T }> =>
+      event.type === type && predicate(event as Extract<AcpEvent, { type: T }>)
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${type}`)), timeoutMs)
+      const unsub = modeHub.subscribe(event => {
+        if (modeEvents.indexOf(event) >= since && matches(event)) {
+          clearTimeout(timer)
+          unsub()
+          resolve(event)
+        }
+      })
+      const existing = modeEvents.find((event, index) => index >= since && matches(event))
+      if (existing !== undefined) {
+        clearTimeout(timer)
+        unsub()
+        resolve(existing)
+      }
+    })
+  }
+
+  /** Drain one adapter turn and return the mock agent's own echo of what it saw. */
+  async function modeTurn(sessionId: string, text: string): Promise<string> {
+    const since = modeEvents.length
+    for await (const chunk of modeAdapter.stream({
+      provider: 'acp',
+      model: 'moded',
+      sessionId,
+      messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+    })) {
+      void chunk
+    }
+    const started = modeEvents.slice(since).find(event => event.type === 'turn/start' && event.text === text)
+    if (started === undefined) throw new Error('the turn never started')
+    const transcript = await dispatchRpc(modeManager, 'transcript/get', { sessionId: started.sessionId })
+    if (!transcript.ok) throw new Error('transcript failed')
+    return (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
+      .filter(e => e.update.sessionUpdate === 'agent_message_chunk')
+      .map(e => String((e.update.content as { text?: string }).text ?? ''))
+      .join('')
+  }
+
+  it('answers "full access" locally instead of routing it into a guaranteed rejection', async () => {
+    // 完全权限 = danger-full-access + approval `never`. The host resolves every
+    // `never` ask to 'rejected' before an answerer runs, so feeding it the ask
+    // would deny exactly the writes this mode exists to allow.
+    policy = { mode: 'danger-full-access', approval: 'never' }
+    expect(modeManager.accessModeRouting()).toBe(true)
+    const before = asks.length
+    expect(await modeTurn('dsh-mode-full', 'PERM full access')).toContain('perm=allow1')
+    expect(asks).toHaveLength(before)
+  }, 30_000)
+
+  it('denies a write under read-only without asking anyone', async () => {
+    policy = { mode: 'read-only', approval: 'never' }
+    const before = asks.length
+    expect(await modeTurn('dsh-mode-ro', 'PERMEDIT read only write')).toContain('perm=reject1')
+    expect(asks).toHaveLength(before)
+  }, 30_000)
+
+  it('escalates a read-only write to the human when the approval policy asks', async () => {
+    policy = { mode: 'read-only', approval: 'ask' }
+    answer = 'allowed-once'
+    const before = asks.length
+    expect(await modeTurn('dsh-mode-ro-ask', 'PERMEDIT read only ask')).toContain('perm=allow1')
+    expect(asks).toHaveLength(before + 1)
+    expect(asks.at(-1)?.toolName).toBe('mock dangerous operation')
+  }, 30_000)
+
+  it('allows a declared in-workspace write without asking, and escalates one outside it', async () => {
+    const root = join(tmpdir(), 'dsh-mode-ws')
+    mkdirSync(root, { recursive: true })
+    policy = { mode: 'workspace-write', approval: 'ask', workspaceRoot: root }
+    const before = asks.length
+    expect(await modeTurn('dsh-mode-ws-in', `PERMEDIT PERMLOC:${join(root, 'a.txt')} write inside`)).toContain('perm=allow1')
+    expect(asks).toHaveLength(before)
+
+    answer = 'rejected'
+    expect(await modeTurn('dsh-mode-ws-out', `PERMEDIT PERMLOC:${join(homedir(), 'outside.txt')} write outside`)).toContain('perm=reject1')
+    expect(asks).toHaveLength(before + 1)
+  }, 30_000)
+
+  it('narrates only in ACP mode: the agent\'s own ask reaches the user instead of being auto-allowed', async () => {
+    const root = join(tmpdir(), 'dsh-mode-acp')
+    mkdirSync(root, { recursive: true })
+    policy = { mode: 'workspace-write', approval: 'ask', workspaceRoot: root }
+    modeManager.setAcpModeResolver(() => true)
+    answer = 'allowed-once'
+    try {
+      const before = asks.length
+      // An in-boundary write: the access-mode mapping allows this silently. In
+      // ACP mode the agent's own permission mode is what decides, so its ask is
+      // what reaches the human.
+      const echoed = await modeTurn('dsh-mode-acp-in', `PERMEDIT PERMLOC:${join(root, 'a.txt')} acp write inside`)
+      expect(echoed).toContain('perm=allow1')
+      expect(asks).toHaveLength(before + 1)
+      // A resolved access mode must not smuggle anything into the prompt: the
+      // mock echoes its whole input, so byte equality is the whole guard. The
+      // mode arbitrates answers; it is never narrated.
+      expect(echoed).toBe(`MOCK: echo PERMEDIT PERMLOC:${join(root, 'a.txt')} acp write inside perm=allow1`)
+
+      // `approval: never` still answers locally: the host resolves every ask to
+      // 'rejected' before an answerer runs, so routing one would be a lie.
+      policy = { mode: 'read-only', approval: 'never' }
+      const after = asks.length
+      expect(await modeTurn('dsh-mode-acp-ro', 'PERMEDIT read only write')).toContain('perm=reject1')
+      expect(asks).toHaveLength(after)
+    } finally {
+      modeManager.setAcpModeResolver(undefined)
+      policy = { mode: 'workspace-write', approval: 'ask', workspaceRoot: tmpdir() }
+    }
+  }, 30_000)
+
+  it('keeps the pre-mapping behavior when no access mode is available', async () => {
+    modeManager.setSessionPolicyResolver(undefined)
+    answer = 'allowed-once'
+    try {
+      expect(modeManager.accessModeRouting()).toBe(false)
+      const since = modeEvents.length
+      const before = asks.length
+      // Resolver gone → the agent's own `permission: ask` governs again, which
+      // for a chat-bound session still means the native composer path.
+      expect(await modeTurn('dsh-mode-none', 'PERM no mode')).toContain('perm=allow1')
+      expect(asks).toHaveLength(before + 1)
+      // Routed asks never surface a settings-panel card.
+      expect(modeEvents.slice(since).filter(e => e.type === 'permission/request')).toHaveLength(0)
+    } finally {
+      modeManager.setSessionPolicyResolver(() => policy)
+    }
+  }, 30_000)
+
+  it('exposes and switches the agent\'s own mode for a chat session', async () => {
+    policy = { mode: 'workspace-write', approval: 'ask', workspaceRoot: tmpdir() }
+    await modeTurn('dsh-mode-list', 'PERM mode list')
+
+    const listed = await dispatchRpc(modeManager, 'session/chat-list', { dshSessionId: 'dsh-mode-list' })
+    if (!listed.ok) throw new Error('listing failed')
+    const sessions = (listed.value as { sessions: ChatSessionView[] }).sessions
+    expect(sessions).toHaveLength(1)
+    expect(sessions[0]?.agentId).toBe('moded')
+    expect(sessions[0]?.modes?.availableModes?.map(m => m.id)).toEqual(['default', 'strict'])
+    // A chat session the agent has not run in yet has nothing to show.
+    await expect(dispatchRpc(modeManager, 'session/chat-list', { dshSessionId: 'never-ran' }))
+      .resolves.toEqual({ ok: true, value: { sessions: [], acpMode: false } })
+
+    const since = modeEvents.length
+    await expect(dispatchRpc(modeManager, 'session/chat-mode-set', { dshSessionId: 'dsh-mode-list', modeId: 'strict' }))
+      .resolves.toEqual({ ok: true, value: { done: true } })
+    await modeWaitFor('session/meta', since, event => event.session.modes?.currentModeId === 'strict')
+
+    // Unknown chat session → a normalized error, never a thrown exception.
+    await expect(dispatchRpc(modeManager, 'session/chat-mode-set', { dshSessionId: 'never-ran', modeId: 'strict' }))
+      .resolves.toMatchObject({ ok: false, error: { code: 'unknown_session' } })
+  }, 30_000)
+
+  it('reports the per-chat-session ACP-mode verdict for the seat gate', async () => {
+    // Without the ACP-mode resolver (an older entry that never wired it) the
+    // verdict is false for everything: the gate keeps the native seat, which
+    // is the allowed failure mode.
+    expect(modeManager.chatSessionAcpMode('never-ran')).toBe(false)
+    modeManager.setAcpModeResolver(dshSessionId => dshSessionId === 'dsh-mode-list' ? true : undefined)
+    try {
+      // The resolver reads the session log; only its verdict is echoed.
+      expect(modeManager.chatSessionAcpMode('dsh-mode-list')).toBe(true)
+      // `undefined` (unknown session) reads as "not ACP", never a guess.
+      expect(modeManager.chatSessionAcpMode('never-ran')).toBe(false)
+      // A settled verdict is CACHED: a resolver that later throws (a flaky
+      // persistence read) must not flip a fact the log already answered — the
+      // gate keeps the seat instead of flickering on every ask.
+      modeManager.setAcpModeResolver(() => { throw new Error('log unreadable') })
+      expect(modeManager.chatSessionAcpMode('dsh-mode-list')).toBe(true)
+      // An explicit invalidation (the log moved) is what retires the verdict.
+      modeManager.invalidateAcpMode('dsh-mode-list')
+      expect(modeManager.chatSessionAcpMode('dsh-mode-list')).toBe(false)
+      // And the wire answer carries it, so the browser half can consume it.
+      await expect(dispatchRpc(modeManager, 'session/chat-list', { dshSessionId: 'dsh-mode-list' }))
+        .resolves.toMatchObject({ ok: true, value: { acpMode: false } })
+      // An ASYNC resolver settles into the cache on the next ask (the cold
+      // persistence read), and the wire answers with it.
+      modeManager.invalidateAcpMode('dsh-mode-list')
+      modeManager.setAcpModeResolver(dshSessionId => dshSessionId === 'dsh-mode-list'
+        ? Promise.resolve(true)
+        : undefined)
+      expect(modeManager.chatSessionAcpMode('dsh-mode-list')).toBe(false)
+      await new Promise(resolve => setTimeout(resolve, 10))
+      expect(modeManager.chatSessionAcpMode('dsh-mode-list')).toBe(true)
+      await expect(dispatchRpc(modeManager, 'session/chat-list', { dshSessionId: 'dsh-mode-list' }))
+        .resolves.toMatchObject({ ok: true, value: { acpMode: true } })
+    } finally {
+      modeManager.setAcpModeResolver(undefined)
+      modeManager.invalidateAcpMode()
+    }
+  })
+
+  it('gates fs/write_text_file by the access mode, escalation included', async () => {
+    const dir = join(tmpdir(), 'dsh-mode-fs')
+    mkdirSync(dir, { recursive: true })
+    const target = join(dir, 'probe.txt')
+    const root = join(tmpdir(), 'dsh-mode-fs-ws')
+    mkdirSync(root, { recursive: true })
+
+    policy = { mode: 'read-only', approval: 'never', workspaceRoot: root }
+    const denied = await modeTurn('dsh-mode-fs-ro', `WRITEFILE ${target}`)
+    expect(denied).toContain('WRITE_FAIL')
+    expect(denied).toContain('[sandbox: file access denied under read-only mode]')
+
+    policy = { mode: 'read-only', approval: 'ask', workspaceRoot: root }
+    answer = 'allowed-once'
+    expect(await modeTurn('dsh-mode-fs-ask', `WRITEFILE ${target}`)).toContain('WRITE_OK')
+    expect(readFileSync(target, 'utf8')).toBe('written-by-mock-agent')
+
+    policy = { mode: 'workspace-write', approval: 'ask', workspaceRoot: join(tmpdir(), 'dsh-mode-fs') }
+    answer = 'rejected'
+    expect(await modeTurn('dsh-mode-fs-ws', `WRITEFILE ${target}`)).toContain('WRITE_OK')
+  }, 30_000)
+})
+
+describe('idle release (isolated manager)', () => {
+  async function waitUntil(predicate: () => boolean, timeoutMs = 8_000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      if (predicate()) return true
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+    return predicate()
+  }
+
+  function idleManager(id: string, tuning: { idleTimeoutMs: number }, overrides: Partial<AcpAgentDef> = {}): { hub: EventHub; events: AcpEvent[]; manager: BridgeManager } {
+    const hub = new EventHub()
+    const events: AcpEvent[] = []
+    hub.subscribe(event => { events.push(event) })
+    const manager = new BridgeManager([{ ...def, id, ...overrides }], hub, 500, undefined, undefined, false, tuning)
+    return { hub, events, manager }
+  }
+
+  it('releases an agent whose model probe left no live session behind', async () => {
+    const { events, manager } = idleManager('idle-probe', { idleTimeoutMs: 150 })
+    try {
+      await manager.probeAgentModels('idle-probe')
+      // The probe's throwaway session is deliberately never registered, so the
+      // only thing holding the process was the probe itself.
+      expect(manager.agentViews()[0]).toMatchObject({ state: 'ready', liveSessions: [] })
+      expect(await waitUntil(() => manager.agentViews()[0]?.state === 'stopped')).toBe(true)
+      const view = manager.agentViews()[0]
+      expect(view?.liveSessions).toEqual([])
+      // The release is announced: a process disappearing must not be silent.
+      const notice = events.find(event => event.type === 'agent/notice')
+      expect(notice).toMatchObject({ type: 'agent/notice', agentId: 'idle-probe', level: 'info' })
+      if (notice?.type === 'agent/notice') expect(notice.text).toContain('released after')
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
+  it('never releases an agent that set idleTimeoutMs to 0', async () => {
+    const { manager } = idleManager('idle-off', { idleTimeoutMs: 150 }, { idleTimeoutMs: 0 })
+    try {
+      await manager.probeAgentModels('idle-off')
+      await new Promise(resolve => setTimeout(resolve, 600))
+      expect(manager.agentViews()[0]?.state).toBe('ready')
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
+  it('holds a live session\u2019 process and releases it once the session closes', async () => {
+    const { manager } = idleManager('idle-live', { idleTimeoutMs: 200 })
+    try {
+      const { sessionId } = await manager.startSession('idle-live', undefined)
+      await new Promise(resolve => setTimeout(resolve, 700))
+      // Two full windows elapsed: a session the user may still type into keeps
+      // its process (the whole point of scoping the release to session-less
+      // bridges).
+      expect(manager.agentViews()[0]).toMatchObject({ state: 'ready', liveSessions: [sessionId] })
+      await manager.closeSession(sessionId)
+      expect(await waitUntil(() => manager.agentViews()[0]?.state === 'stopped')).toBe(true)
+      // Releasing is not closing: the record stays resumable.
+      expect(manager.sessions()).toEqual([])
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+})
+
+describe('prompt slot (isolated manager)', () => {
+  const slotHub = new EventHub()
+  const slotManager = new BridgeManager([{ ...def, id: 'slot' }], slotHub, 500, undefined, undefined, false, {
+    turnSettleMs: 200,
+    // Keep the cancel fallback out of the way: this suite is about the wait
+    // for the AGENT's own settlement, not about the host giving up on it.
+    cancelFallbackMs: 5_000,
+  })
+  const slotAdapter = new AcpLlmAdapter(slotManager)
+
+  afterAll(async () => {
+    await slotManager.shutdownAll()
+  })
+
+  /** Drain one adapter stream for the shared session id. */
+  async function drain(text: string, signal?: AbortSignal): Promise<StreamChunk[]> {
+    const chunks: StreamChunk[] = []
+    for await (const chunk of slotAdapter.stream({
+      provider: 'acp',
+      model: 'slot',
+      sessionId: 'dsh-slot',
+      ...(signal === undefined ? {} : { signal }),
+      messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+    })) {
+      chunks.push(chunk)
+    }
+    return chunks
+  }
+
+  it('refuses a second prompt while the agent still owns the cancelled turn, then accepts it once settled', async () => {
+    // IGNORE_CANCEL: the mock keeps working ~1.2s after receiving the cancel,
+    // so the aborted stream and the agent's settlement are far apart — exactly
+    // the window in which a naive implementation sends a concurrent prompt.
+    const controller = new AbortController()
+    const first = drain('IGNORE_CANCEL please', controller.signal)
+    await new Promise(resolve => setTimeout(resolve, 400))
+    controller.abort()
+    const firstChunks = await first
+    expect(firstChunks.at(-1)).toMatchObject({ type: 'finish', reason: { kind: 'aborted' } })
+
+    // Immediately afterwards: the slot is still the agent's, so the honest
+    // answer is a refusal — never a second `session/prompt` on a busy session.
+    const second = await drain('hello after cancel')
+    expect(second.find((chunk): chunk is Extract<StreamChunk, { type: 'finish' }> => chunk.type === 'finish'))
+      .toMatchObject({ reason: { kind: 'error', failure: { code: 'turn_in_flight' } } })
+
+    // Once the agent has settled, the session is usable again: nothing wedged.
+    await new Promise(resolve => setTimeout(resolve, 1_600))
+    const third = await drain('hello again')
+    const text = third
+      .filter((chunk): chunk is Extract<StreamChunk, { type: 'text-delta' }> => chunk.type === 'text-delta')
+      .map(chunk => chunk.text)
+      .join('')
+    expect(text).toContain('MOCK: echo hello again')
+  }, 30_000)
+})
+
+describe('observed chat transcripts (isolated manager)', () => {
+  const txHub = new EventHub()
+  const txManager = new BridgeManager([{ ...def, id: 'tx' }], txHub, 500)
+  const txAdapter = new AcpLlmAdapter(txManager)
+
+  afterAll(async () => {
+    await txManager.shutdownAll()
+  })
+
+  /** Run one adapter turn for a chat session and drain it. */
+  async function txTurn(sessionId: string, text: string): Promise<void> {
+    for await (const chunk of txAdapter.stream({
+      provider: 'acp',
+      model: 'tx',
+      sessionId,
+      messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+    })) {
+      void chunk
+    }
+  }
+
+  it('addresses a chat session\'s ACP transcript by the chat id and serves it over RPC', async () => {
+    await txTurn('dsh-tx-1', 'hello transcript')
+
+    const views = txManager.chatTranscripts('dsh-tx-1')
+    expect(views).toHaveLength(1)
+    expect(views[0]?.session.agentId).toBe('tx')
+    const kinds = views[0]?.entries.map(entry => String((entry.update as Record<string, unknown>).sessionUpdate)) ?? []
+    expect(kinds).toContain('agent_message_chunk')
+    // The tool calls the native chat cannot render are exactly what this view
+    // exists for, so their presence is part of the contract.
+    expect(kinds).toContain('tool_call')
+    const echoed = views[0]?.entries
+      .filter(entry => (entry.update as Record<string, unknown>).sessionUpdate === 'agent_message_chunk')
+      .map(entry => String(((entry.update as Record<string, unknown>).content as { text?: string }).text ?? ''))
+      .join('')
+    expect(echoed).toContain('MOCK: echo hello transcript')
+
+    // `afterSeq` pages the same buffer the transcript RPC serves: past the head
+    // the session snapshot still answers, with nothing left to replay.
+    expect(txManager.chatTranscripts('dsh-tx-1', 10_000)[0]?.entries).toEqual([])
+    // A chat session no ACP agent has run in has nothing to show.
+    expect(txManager.chatTranscripts('dsh-tx-never')).toEqual([])
+
+    const viaRpc = await dispatchRpc(txManager, 'session/chat-transcript', { dshSessionId: 'dsh-tx-1' })
+    expect(viaRpc.ok).toBe(true)
+    if (!viaRpc.ok) return
+    const views2 = (viaRpc.value as { views: Array<{ entries: unknown[] }> }).views
+    expect(views2).toHaveLength(1)
+    expect(views2[0]?.entries.length).toBe(views[0]?.entries.length)
+
+    // The composer's agent chip reads the roster title for the chat binding.
+    const listed = await dispatchRpc(txManager, 'session/chat-list', { dshSessionId: 'dsh-tx-1' })
+    if (!listed.ok) throw new Error('listing failed')
+    expect((listed.value as { sessions: ChatSessionView[] }).sessions[0]?.agentTitle).toBe('Mock')
+  }, 30_000)
+
+  it('drops a closed session instead of serving a ghost transcript', async () => {
+    await txTurn('dsh-tx-2', 'hello close')
+    const views = txManager.chatTranscripts('dsh-tx-2')
+    const sessionId = views[0]?.session.sessionId ?? ''
+    expect(sessionId).not.toBe('')
+
+    await expect(dispatchRpc(txManager, 'session/close', { sessionId })).resolves.toEqual({ ok: true, value: { done: true } })
+    expect(txManager.chatTranscripts('dsh-tx-2')).toEqual([])
+    expect((await dispatchRpc(txManager, 'session/chat-list', { dshSessionId: 'dsh-tx-2' })))
+      .toEqual({ ok: true, value: { sessions: [], acpMode: false } })
   }, 30_000)
 })

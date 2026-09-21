@@ -7,8 +7,8 @@
 
 import { randomUUID } from './ids.ts'
 import type {
-  AcpAgentCatalog, AcpAgentDef, AcpEvent, AcpPluginConfig, AgentProbeModelsResult, AgentView, DetectedAgentInfo,
-  PermissionMode, PermissionOutcome, RpcResult,
+  AcpAgentCatalog, AcpAgentDef, AcpEvent, AcpPluginConfig, AcpPresetStatus, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult,
+  AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionMode, PermissionOutcome, RpcResult,
 } from './protocol.ts'
 
 export { randomUUID }
@@ -23,6 +23,64 @@ export class AcpError extends Error {
 // ---- Config validation ----
 
 const AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/
+/**
+ * npm package name (optionally `@scope/name`, optionally `@version`/`@tag`).
+ * Deliberately charset-only (letters, digits, `.`, `_`, `-`, `/`, `@`): this
+ * string is handed to `npm install -g` as a spawn argument, and on Windows the
+ * installer runs with a shell — a charset this narrow leaves no injection
+ * surface. Length 214 is npm's own hard limit.
+ */
+const NPM_PACKAGE_PATTERN = /^(@[a-zA-Z0-9][a-zA-Z0-9._-]*\/)?[a-zA-Z0-9][a-zA-Z0-9._-]*(@[a-zA-Z0-9][a-zA-Z0-9._-]*)?$/
+
+/**
+ * Per-value sanity bound for one `exposedModels` entry. Well above any real
+ * model choice value (the longest observed in the wild is 61 chars) but still
+ * small enough to refuse a hostile blob.
+ */
+const EXPOSED_MODEL_VALUE_MAX = 512
+
+/**
+ * Total size guard for one `exposedModels` filter.
+ *
+ * Deliberately a *size* bound and not an entry cap: the number of legitimate
+ * values is the agent's own `category: model` choice count, which is unbounded
+ * (pi publishes 500 choices, omp 581), so any fixed entry cap is a cap the
+ * settings panel can exceed — it would then offer a selection the host refuses
+ * with `bad_payload` (the "只显示我选的模型" / "全选" paths send every choice at
+ * once). A 1 MiB list is already far beyond any catalog and is the shape a
+ * caller would need to abuse the endpoint.
+ */
+const EXPOSED_MODELS_TOTAL_MAX = 1 << 20
+
+/**
+ * Validate and normalize one `exposedModels` filter (order preserved,
+ * duplicates dropped).
+ *
+ * Shared by the persisted-config validator and the `agent/set-exposed-models`
+ * RPC route so the two can never drift apart: a filter the panel can build must
+ * be accepted by every layer that sees it — including `loadPersistedAgents`,
+ * which re-validates the stored config on every boot (a mismatch there silently
+ * drops the whole agent definition).
+ */
+export function normalizeExposedModels(raw: unknown, label: string, code: 'bad_config' | 'bad_payload'): string[] {
+  if (!Array.isArray(raw)) throw new AcpError(code, `acp: ${label} must be an array of model choice values`)
+  const seen = new Set<string>()
+  const out: string[] = []
+  let total = 0
+  for (const value of raw) {
+    if (typeof value !== 'string' || value === '' || value.length > EXPOSED_MODEL_VALUE_MAX) {
+      throw new AcpError(code, `acp: ${label} entries must be non-empty strings of at most ${String(EXPOSED_MODEL_VALUE_MAX)} chars`)
+    }
+    total += value.length
+    if (total > EXPOSED_MODELS_TOTAL_MAX) {
+      throw new AcpError(code, `acp: ${label} is too large (over ${String(EXPOSED_MODELS_TOTAL_MAX)} chars in total)`)
+    }
+    if (seen.has(value)) continue
+    seen.add(value)
+    out.push(value)
+  }
+  return out
+}
 
 /** Validate a single agent definition object. */
 export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
@@ -58,32 +116,38 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
     throw new AcpError('bad_config', `acp: agent "${id}" allowedCwdRoots must be absolute paths`)
   }
   const title = typeof row.title === 'string' && row.title !== '' ? row.title : id
-  let exposedModels: string[] | undefined
-  if (row.exposedModels !== undefined) {
-    if (!Array.isArray(row.exposedModels) || row.exposedModels.length > 256) {
-      throw new AcpError('bad_config', `acp: agent "${id}" exposedModels must be a string array of at most 256 entries`)
-    }
-    const seen = new Set<string>()
-    exposedModels = []
-    for (const value of row.exposedModels) {
-      if (typeof value !== 'string' || value === '' || value.length > 128) {
-        throw new AcpError('bad_config', `acp: agent "${id}" exposedModels entries must be non-empty strings of at most 128 chars`)
-      }
-      if (seen.has(value)) continue
-      seen.add(value)
-      exposedModels.push(value)
-    }
+  const npmPackageRaw = row.npmPackage
+  if (npmPackageRaw !== undefined && (typeof npmPackageRaw !== 'string' || npmPackageRaw.length > 214)) {
+    throw new AcpError('bad_config', `acp: agent "${id}" npmPackage must be a string of at most 214 chars`)
+  }
+  const npmPackage = npmPackageRaw === undefined || (npmPackageRaw as string).trim() === ''
+    ? undefined
+    : (npmPackageRaw as string).trim()
+  if (npmPackage !== undefined && !NPM_PACKAGE_PATTERN.test(npmPackage)) {
+    throw new AcpError('bad_config', `acp: agent "${id}" npmPackage "${npmPackage}" is not a valid npm package name`)
+  }
+  const exposedModels = row.exposedModels === undefined
+    ? undefined
+    : normalizeExposedModels(row.exposedModels, `agent "${id}" exposedModels`, 'bad_config')
+  // Per-agent idle-release window. Kept optional so a stored config from before
+  // this field existed still validates (it falls back to the host default).
+  const idleTimeoutMs = row.idleTimeoutMs
+  if (idleTimeoutMs !== undefined && (typeof idleTimeoutMs !== 'number' || !Number.isInteger(idleTimeoutMs)
+    || idleTimeoutMs > 86_400_000 || (idleTimeoutMs !== 0 && idleTimeoutMs < 1_000))) {
+    throw new AcpError('bad_config', `acp: agent "${id}" idleTimeoutMs must be 0 (never release) or an integer in [1000, 86400000]`)
   }
   return {
     id,
     title,
     command: row.command as string,
     args: args as string[],
+    ...(npmPackage !== undefined ? { npmPackage } : {}),
     env,
     permission: permission as AcpAgentDef['permission'],
     cwd: cwd as string | undefined,
     allowedCwdRoots: roots as string[],
     ...(exposedModels !== undefined ? { exposedModels } : {}),
+    ...(idleTimeoutMs === undefined ? {} : { idleTimeoutMs: idleTimeoutMs as number }),
   }
 }
 
@@ -119,6 +183,10 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
   if (typeof cancelFallbackMs !== 'number' || !Number.isInteger(cancelFallbackMs) || cancelFallbackMs < 0 || cancelFallbackMs > 600_000) {
     throw new AcpError('bad_config', 'acp: cancelFallbackMs must be an integer in [0, 600000] (0 = disable the fallback)')
   }
+  const installAcpPreset = value.installAcpPreset ?? true
+  if (typeof installAcpPreset !== 'boolean') {
+    throw new AcpError('bad_config', 'acp: installAcpPreset must be a boolean')
+  }
   return {
     agents,
     transcriptMaxEntries: max,
@@ -126,6 +194,7 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
     startupTimeoutMs,
     permissionTimeoutMs,
     cancelFallbackMs,
+    installAcpPreset,
   }
 }
 
@@ -179,18 +248,17 @@ function joinWithin(base: string, rel: string): string {
 }
 
 /**
- * Resolve a path requested by an ACP agent (fs/read_text_file, fs/write_text_file)
- * against the session workspace and enforce the allow-list.
+ * Canonicalize a path requested by an ACP agent (fs/read_text_file,
+ * fs/write_text_file) against the session workspace — no containment check.
  *
  * Relative paths join under `sessionCwd`; the collapsed path is canonicalized
  * by realpath up to the nearest existing ancestor (collapsing symlinks and any
  * surviving `..`), with the missing tail re-attached lexically — so a fresh
  * write target with not-yet-created parent directories still validates, and a
- * symlink pointing outside the workspace resolves to its real location and is
- * rejected by the root check. Escaping the workspace throws; the caller
- * answers the agent's request with that error instead of touching the disk.
+ * symlink pointing outside the workspace resolves to its real location (where
+ * the containment check then judges it).
  */
-export function resolveFsPath(sessionCwd: string, roots: readonly string[], requested: string, realpath: (p: string) => string): string {
+export function canonicalizeFsPath(sessionCwd: string, requested: string, realpath: (p: string) => string): string {
   if (typeof requested !== 'string' || requested === '') {
     throw new AcpError('bad_path', 'acp: fs path must be a non-empty string')
   }
@@ -209,7 +277,21 @@ export function resolveFsPath(sessionCwd: string, roots: readonly string[], requ
     throw new AcpError('bad_path', `acp: fs path does not exist: ${requested}`)
   }
   const tail = segments.slice(consumed)
-  const full = tail.length === 0 ? canonical : `${canonical.replace(/\/+$/, '')}/${tail.join('/')}`
+  return tail.length === 0 ? canonical : `${canonical.replace(/\/+$/, '')}/${tail.join('/')}`
+}
+
+/**
+ * {@link canonicalizeFsPath} plus the allowed-root containment check: escaping
+ * the roots throws (`cwd_denied`) and the caller answers the agent's request
+ * with that error instead of touching the disk.
+ *
+ * The split from canonicalization exists because containment is conditional on
+ * the resolved access mode — under DSH's `danger-full-access` the canonical path
+ * is used as-is (that mode's whole promise is "no restriction"), while every
+ * other mode keeps the agent's own `allowedCwdRoots` as a hard cap.
+ */
+export function resolveFsPath(sessionCwd: string, roots: readonly string[], requested: string, realpath: (p: string) => string): string {
+  const full = canonicalizeFsPath(sessionCwd, requested, realpath)
   const inside = roots.some(root => {
     const canonicalRoot = safeRealpath(realpath, root)
     return full === canonicalRoot || full.startsWith(`${canonicalRoot.replace(/\/+$/, '')}/`)
@@ -320,6 +402,293 @@ export function splitAdapterModelId(model: string): { agentId: string; choice?: 
 export function buildAdapterModelId(agentId: string, choice: string): string {
   return `${agentId}@${choice}`
 }
+
+// ---- host request → forwarded ACP prompt ----
+
+/**
+ * Outcome of picking the one message an ACP turn forwards.
+ *
+ * `no-user-input` is its own case, not an error: the host wakes a driver for
+ * injected context too (goal/subagent/skill material), and that turn carries no
+ * user intent to send anywhere.
+ */
+export type ForwardPromptSelection =
+  | { kind: 'prompt'; text: string; id?: string }
+  | { kind: 'no-user-input' }
+  | { kind: 'empty' }
+
+/**
+ * Select the user's own words out of a host-built request.
+ *
+ * Why this exists (AGENTS.md rule 16): the host appends its context sections
+ * *after* the claimed user batch — `agent-instructions` folds its digest right
+ * behind the prompt, and the driver appends the runtime-context snapshot after
+ * that — so "the last user-role message" is routinely an injected section, not
+ * the prompt. Only the message's `source` distinguishes them: `kind: 'user'` is
+ * the person, anything else (`plugin`, `skill-catalog`, `agent-instructions`,
+ * `tool`, …) is harness context. An absent source means a hand-built request
+ * (tests, headless callers) and counts as user input.
+ *
+ * @param messages - the request's ordered messages, exactly as the host built them.
+ * @returns the last real user message's text, or why there is none to forward.
+ */
+export function selectForwardPrompt(messages: readonly {
+  role: string
+  content?: Array<{ type?: string; text?: string }>
+  source?: { kind?: string }
+  id?: string
+}[]): ForwardPromptSelection {
+  let sawUserRole = false
+  let last: { text: string; id?: string } | undefined
+  for (const message of messages) {
+    if (message.role !== 'user') continue
+    sawUserRole = true
+    const kind = message.source?.kind
+    if (kind !== undefined && kind !== 'user') continue
+    const text = (message.content ?? [])
+      .filter(block => block.type === 'text' && typeof block.text === 'string')
+      .map(block => block.text as string)
+      .join('\n')
+      .trim()
+    if (text === '') continue
+    last = { text, ...(message.id === undefined ? {} : { id: message.id }) }
+  }
+  if (last !== undefined) return { kind: 'prompt', ...last }
+  return sawUserRole ? { kind: 'no-user-input' } : { kind: 'empty' }
+}
+
+// ---- DSH access mode → ACP permission decision ----
+
+/**
+ * DSH's file-effect mode vocabulary, mirrored from `@deepseek-ai/dsh-sandbox`
+ * (`SandboxMode`). Host-only: the browser never sees a mode, only whether the
+ * routing is active (`AcpManager.accessModeRouting`).
+ */
+export type DshSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
+
+/**
+ * DSH's approval-policy vocabulary (`@deepseek-ai/dsh-user-approval`). `never`
+ * is the important one: the host's `ApprovalService` resolves every ask to
+ * `'rejected'` deterministically and never reaches an answerer, so routing an
+ * ACP ask through `ctx.approval` under `never` would silently deny it.
+ */
+export type DshApprovalPolicy = 'ask' | 'never'
+
+/**
+ * The access mode one DSH chat session runs under, resolved per turn by the
+ * host entry: the session's `sandbox/mode` + `approval/policy` folds over the
+ * composition defaults, plus the workspace root `workspace-write` confines
+ * writes to.
+ */
+export interface DshSessionPolicy {
+  mode: DshSandboxMode
+  approval: DshApprovalPolicy
+  /** Absolute root `workspace-write` may write under; absent when the host did not report one. */
+  workspaceRoot?: string
+}
+
+/** What one ACP permission ask resolves to before the routing layer runs. */
+export type PermissionDecision = 'ask' | 'allow' | 'reject'
+
+/** ACP `ToolCall.kind` values that are known to take a file effect. */
+const WRITE_TOOL_KINDS = new Set(['edit', 'delete', 'move'])
+
+/** ACP `ToolCall.kind` values that provably take no file effect. */
+const READ_TOOL_KINDS = new Set(['read', 'search', 'think', 'fetch', 'switch_mode'])
+
+/** Structural read of ACP `ToolCall.kind`; anything unexpected stays `undefined` (= effect unknown). */
+export function permissionToolKind(toolCall: unknown): string | undefined {
+  const kind = (toolCall as { kind?: unknown } | null | undefined)?.kind
+  return typeof kind === 'string' && kind !== '' ? kind : undefined
+}
+
+/** Structural read of ACP `ToolCall.locations[].path` — where an edit claims it will write. */
+export function permissionToolPaths(toolCall: unknown): string[] {
+  const locations = (toolCall as { locations?: unknown } | null | undefined)?.locations
+  if (!Array.isArray(locations)) return []
+  const out: string[] = []
+  for (const entry of locations) {
+    const path = (entry as { path?: unknown } | null | undefined)?.path
+    if (typeof path === 'string' && path !== '') out.push(path)
+  }
+  return out
+}
+
+/** Lexical containment test for the mode's workspace boundary (the enforced paths are already canonical). */
+export function isUnderPath(path: string, root: string): boolean {
+  if (!root.startsWith('/')) return false
+  const trimmed = root.replace(/\/+$/, '')
+  if (trimmed === '') return path.startsWith('/')
+  return path === trimmed || path.startsWith(`${trimmed}/`)
+}
+
+/** The slice of a host session log the access-mode fold reads. */
+export interface AccessModeSessionLike {
+  events?: readonly unknown[]
+  /** Creation header; carries the agent preset the session started under. */
+  header?: { agentPreset?: unknown }
+}
+
+/**
+ * The agent preset a session actually runs.
+ *
+ * Mirrors `resolveSessionPreset` from `@deepseek-ai/dsh-agent-presets`
+ * structurally (no dependency): the newest `agent-preset/selected` log event
+ * wins over the creation-time header, because a blank session may be recomposed
+ * and the header is by design a frozen creation fact.
+ *
+ * This is how the host half knows a chat session is in ACP mode: the mode IS an
+ * agent preset, so reading it back from the session log is the only honest
+ * source — a marker we set ourselves could drift from what the roster mounted.
+ */
+export function sessionAgentPreset(session: AccessModeSessionLike | undefined): string | undefined {
+  const events = session?.events
+  if (Array.isArray(events)) {
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index] as { type?: unknown; data?: { agentPreset?: unknown } } | undefined
+      if (event?.type !== 'agent-preset/selected') continue
+      const selected = event.data?.agentPreset
+      return typeof selected === 'string' ? selected : undefined
+    }
+  }
+  return sessionAgentPresetFromLog(session?.header?.agentPreset, [])
+}
+
+/**
+ * Fold a preset from a RAW stored header plus already-decoded log events —
+ * the cold-read path: `sessionPersistence` hands back the header verbatim and
+ * `SessionHandle.read` returns raw event objects, neither of which is a host
+ * `Session`, so {@link sessionAgentPreset} does not apply.
+ */
+export function sessionAgentPresetFromLog(headerPreset: unknown, events: readonly unknown[]): string | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index] as { type?: unknown; data?: { agentPreset?: unknown } } | undefined
+    if (event?.type !== 'agent-preset/selected') continue
+    const selected = event.data?.agentPreset
+    return typeof selected === 'string' ? selected : undefined
+  }
+  return typeof headerPreset === 'string' ? headerPreset : undefined
+}
+
+/**
+ * The session's effective approval policy: its own last `approval/policy` event
+ * wins, else the service's configured default — the fold
+ * `ApprovalService.effectivePolicy` performs (`overrideOf ?? config.policy`),
+ * done structurally so this plugin needs no dependency on the package.
+ *
+ * The distinction matters because `never` is not a preference: the host resolves
+ * every ask under it to `'rejected'` before any answerer runs.
+ */
+export function dshApprovalPolicyOf(session: AccessModeSessionLike | undefined, configuredDefault: string | undefined): DshApprovalPolicy {
+  const events = session?.events
+  if (Array.isArray(events)) {
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index] as { type?: unknown; data?: { policy?: unknown } } | undefined
+      if (event?.type !== 'approval/policy') continue
+      return event.data?.policy === 'never' ? 'never' : 'ask'
+    }
+  }
+  return configuredDefault === 'never' ? 'never' : 'ask'
+}
+
+/**
+ * Assemble one chat session's access-mode snapshot from what the host's policy
+ * service resolved plus the session's own log.
+ *
+ * @param resolved - the host's `sandboxPolicy.resolve({session})` payload.
+ * @param session - the host session (for the approval-policy override).
+ * @param configuredDefault - the approval service's deployment default.
+ * @returns the snapshot, or `undefined` when the host reported a mode outside
+ *   the vocabulary (unexpected or newer host) — the caller then leaves the
+ *   agent's own `permission` field in charge instead of guessing a boundary.
+ */
+export function dshSessionPolicyOf(
+  resolved: { mode?: unknown; workspaceRoot?: unknown },
+  session: AccessModeSessionLike | undefined,
+  configuredDefault: string | undefined,
+): DshSessionPolicy | undefined {
+  const mode = resolved.mode
+  if (mode !== 'read-only' && mode !== 'workspace-write' && mode !== 'danger-full-access') return undefined
+  const root = resolved.workspaceRoot
+  return {
+    mode,
+    approval: dshApprovalPolicyOf(session, configuredDefault),
+    ...(typeof root === 'string' && root !== '' ? { workspaceRoot: root } : {}),
+  }
+}
+
+/**
+ * Mirror of `@deepseek-ai/dsh-sandbox`'s `sandboxDenialMarker`: the dialect DSH
+ * uses to tell a model "the sandbox blocked this, it is a policy denial, not a
+ * bug". Reusing the exact spelling keeps one vocabulary for both halves.
+ */
+export function sandboxDenialMarker(mode: DshSandboxMode): string {
+  return `[sandbox: file access denied under ${mode} mode]`
+}
+
+/**
+ * Map DSH's access mode onto one ACP permission ask.
+ *
+ * A chat session's mode is the source of truth whenever one is available (that
+ * is the entire point of the mapping — see
+ * `docs/acp-permission-and-sandbox.md`), because the alternative is what this
+ * replaced: a per-agent policy that made "full access" deny everything (the
+ * host answers `never` asks with `'rejected'`) and "read-only" grant writes.
+ *
+ * The mode supplies the boundary, `approval` supplies whether a human is
+ * asked at it:
+ *
+ * - `danger-full-access` — everything is allowed, no prompt.
+ * - known read-only kinds (`read` / `search` / `think` / `fetch` /
+ *   `switch_mode`) — allowed in every mode: no mode restricts reading.
+ * - known write kinds — allowed outright only when the mode is
+ *   `workspace-write` AND every declared location is inside the workspace root
+ *   (what that mode exists to permit); otherwise a human decides (`ask`) or it
+ *   is denied (`never`).
+ * - effect unknown (`execute`, `other`, a missing kind) — `workspace-write`
+ *   allows it (DSH lets bash run there and confines it at the kernel instead,
+ *   which we cannot do to an agent's own tools), `read-only` asks or denies.
+ *
+ * @param policy - the session's resolved DSH access mode.
+ * @param kind - ACP tool-call kind, when the agent declared one.
+ * @param paths - declared write locations (see {@link permissionToolPaths}).
+ * @param options - `narrateOnly` is the ACP-mode rule: the mode stays out of
+ *   the arbitration entirely, so every ask the agent raises reaches the human
+ *   (`ask`) instead of being auto-allowed or auto-denied by our boundary
+ *   arithmetic. (The flag's name is older than this — nothing is narrated into
+ *   the prompt any more; it is enforcement-only.) Under `approval: 'never'` the
+ *   host cannot ask anybody —
+ *   `ApprovalService.decide` resolves every ask to `'rejected'` before an
+ *   answerer runs — so a quiet local `reject` stays the honest answer there.
+ * @returns the decision the bridge enacts.
+ */
+export function decidePermission(
+  policy: DshSessionPolicy,
+  kind: string | undefined,
+  paths: readonly string[] = [],
+  options: { narrateOnly?: boolean } = {},
+): PermissionDecision {
+  if (policy.mode === 'danger-full-access') return 'allow'
+  if (kind !== undefined && READ_TOOL_KINDS.has(kind)) return 'allow'
+  if (options.narrateOnly === true) return policy.approval === 'ask' ? 'ask' : 'reject'
+  if (kind !== undefined && WRITE_TOOL_KINDS.has(kind)) {
+    const root = policy.workspaceRoot
+    if (policy.mode === 'workspace-write' && root !== undefined && paths.length > 0 && paths.every(p => isUnderPath(p, root))) {
+      return 'allow'
+    }
+    return policy.approval === 'ask' ? 'ask' : 'reject'
+  }
+  // Effect unknown: only the read-only mode has a boundary strict enough that
+  // running it unexamined would break the mode's promise.
+  if (policy.mode === 'read-only') return policy.approval === 'ask' ? 'ask' : 'reject'
+  return 'allow'
+}
+
+// The session's access mode is deliberately **not** narrated into the prompt we
+// forward: the agent sees the user's own words and nothing else. The mode is
+// enforced (see {@link decidePermission} and the bridge's `authorizeWrite`), and
+// it is enforced as a fence rather than announced as a boundary — an agent that
+// never reaches the fence never needed the sentence.
 
 // ---- Transcript ----
 
@@ -433,9 +802,78 @@ export interface AcpManager {
   detectAgents?(): Promise<DetectedAgentInfo[]>
   saveAgent?(def: AcpAgentDef): Promise<void>
   deleteAgent?(agentId: string): Promise<void>
-  /** Update which probed model choices surface in the native selector; `undefined` clears the filter. Must not restart the agent. */
+  /**
+   * Spawn a throwaway process from raw form values (never persisted, never
+   * registered), run the ACP handshake, tear it down, and report the outcome.
+   * May trigger the def's npm auto-install.
+   */
+  testAgent?(def: AcpAgentDef): Promise<AgentTestResult>
+  /** Update which probed model choices the ACP seats offer; `undefined` clears the filter. Must not restart the agent. */
   setExposedModels?(agentId: string, exposedModels: readonly string[] | undefined): Promise<void>
   probeAgentModels?(agentId: string): Promise<AgentProbeModelsResult>
+  /**
+   * The ACP model surface for one agent (the seats' data source): base entry,
+   * the `exposedModels` variants, and the agent's own reasoning efforts.
+   * Memory-only — never spawns; an agent without a cached catalog gets a
+   * background probe so the next read is complete.
+   */
+  agentCatalog(agentId: string): AgentCatalogResult
+  /**
+   * True when ACP permission asks are routed to the host's native approval
+   * service (answered in the chat composer) instead of the settings-panel
+   * ledger. Read-only capability report for `agents/list`.
+   */
+  approvalRouting?(): boolean
+  /**
+   * True when permission asks and filesystem writes for chat-backed sessions
+   * follow the host's DSH access mode (`sandbox/mode` + `approval/policy`)
+   * instead of the agent's own `permission` field. Read-only capability report
+   * for `agents/list`; the panel tells the user which knob actually governs a
+   * given session with it.
+   */
+  accessModeRouting?(): boolean
+  /**
+   * ACP agent sessions backing one DSH chat session (looked up by chat session
+   * id), so the composer can offer the agent's OWN mode list. Empty when no
+   * agent has run in that chat yet.
+   */
+  chatSessions?(dshSessionId: string): ChatSessionView[]
+  /**
+   * Whether ONE DSH chat session runs the ACP agent preset (asked by chat
+   * session id). Read-only report for `session/chat-list`; the browser's
+   * model-seat gate falls back to it when the client session list does not
+   * carry `agentPreset` on its rows.
+   */
+  chatSessionAcpMode?(dshSessionId: string): boolean
+  /**
+   * Awaitable verdict for `session/chat-list`: waits out the cold read behind
+   * the synchronous probe, so the browser's one-shot fallback sees the settled
+   * answer on the FIRST response instead of a premature `false`.
+   */
+  chatSessionAcpModeAnswer?(dshSessionId: string): Promise<boolean>
+  /**
+   * Every ACP session transcript belonging to one DSH chat session, so the
+   * conversation can render the agent's real stream (tool calls, plans,
+   * diffs) in its own view tab. Read-only: never spawns, never resumes.
+   */
+  chatTranscripts?(dshSessionId: string, afterSeq?: number): ChatTranscriptView[]
+  /**
+   * Switch one chat-bound ACP session's mode (`session/set_mode`). `agentId`
+   * disambiguates when more than one agent has run in the same chat session;
+   * without it the live (non-released) session is picked.
+   */
+  setChatSessionMode?(dshSessionId: string, modeId: string, agentId?: string): Promise<void>
+  /**
+   * Read-only install state of the ACP-mode agent preset. Its own RPC rather
+   * than an `agents/list` field: it is host filesystem state, not agent runtime
+   * state, and the panel refreshes it independently.
+   */
+  presetStatus?(): AcpPresetStatus
+  /**
+   * (Re)install the ACP-mode preset from the bundled copy into the user preset
+   * root. Non-destructive: existing files are never overwritten.
+   */
+  presetInstall?(): AcpPresetStatus
 }
 
 function ok<T>(value: T): RpcResult<T> {
@@ -468,7 +906,13 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
   try {
     switch (endpoint) {
       case 'agents/list':
-        return ok({ agents: manager.agentViews() })
+        // `approvalRouted` is a capability report, not a command: the browser
+        // uses it to decide whether the settings panel still owns approvals.
+        return ok({
+          agents: manager.agentViews(),
+          approvalRouted: manager.approvalRouting?.() ?? false,
+          accessModeRouted: manager.accessModeRouting?.() ?? false,
+        })
       case 'agents/detect':
         return ok({ agents: await (manager.detectAgents?.() ?? Promise.resolve([])) })
       case 'agent/save': {
@@ -480,6 +924,13 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         const agentId = str(body, 'agentId', 64)
         await manager.deleteAgent?.(agentId)
         return ok({ done: true })
+      }
+      case 'agent/test': {
+        if (manager.testAgent === undefined) {
+          return fail('unsupported', 'acp: agent/test is not available')
+        }
+        // Invoked as a method to keep the manager receiver (see probe-models).
+        return ok(await manager.testAgent(validateAgentDef(body)))
       }
       case 'session/start':
         return ok(await manager.startSession(str(body, 'agentId', 64), optionalStr(body, 'cwd', 4096)))
@@ -508,6 +959,38 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
       }
       case 'sessions/list':
         return ok({ sessions: manager.sessions() })
+      case 'session/chat-list': {
+        // Validate before the optional call: `manager.chatSessions?.(str(...))`
+        // would short-circuit the arguments away on a manager without the
+        // method, silently skipping the payload check.
+        const dshSessionId = str(body, 'dshSessionId', 128)
+        return ok({
+          sessions: manager.chatSessions?.(dshSessionId) ?? [],
+          // Read-only memory answer, same authority as `setAcpModeResolver`'s
+          // session-log read: the seat gate's fallback fact source on hosts
+          // whose session rows carry no `agentPreset`. Awaited: a cold read
+          // must not be answered with a premature `false`.
+          acpMode: manager.chatSessionAcpModeAnswer !== undefined
+            ? await manager.chatSessionAcpModeAnswer(dshSessionId)
+            : manager.chatSessionAcpMode?.(dshSessionId) === true,
+        })
+      }
+      case 'session/chat-transcript': {
+        const dshSessionId = str(body, 'dshSessionId', 128)
+        const after = body.afterSeq
+        if (after !== undefined && typeof after !== 'number') throw new AcpError('bad_payload', 'acp: afterSeq must be a number')
+        return ok({ views: manager.chatTranscripts?.(dshSessionId, after as number | undefined) ?? [] })
+      }
+      case 'session/chat-mode-set': {
+        const dshSessionId = str(body, 'dshSessionId', 128)
+        const modeId = str(body, 'modeId', 128)
+        await manager.setChatSessionMode?.(dshSessionId, modeId, optionalStr(body, 'agentId', 64))
+        return ok({ done: true })
+      }
+      case 'preset/status':
+        return ok({ preset: manager.presetStatus?.() ?? null })
+      case 'preset/install':
+        return ok({ preset: manager.presetInstall?.() ?? null })
       case 'agent/stop':
         await manager.stopAgent(str(body, 'agentId', 64)); return ok({ done: true })
       case 'model/get-default':
@@ -533,10 +1016,11 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
           await manager.setExposedModels?.(agentId, undefined)
           return ok({ done: true })
         }
-        if (!Array.isArray(raw) || raw.length > 256 || raw.some(v => typeof v !== 'string' || v === '' || v.length > 128)) {
-          throw new AcpError('bad_payload', 'acp: exposedModels must be non-empty strings of at most 128 chars (max 256 entries)')
-        }
-        await manager.setExposedModels?.(agentId, raw as string[])
+        // Same normalizer as the config validator: the panel's "only my selected
+        // models" mode sends every probed choice in one call, so the route must
+        // accept exactly what the catalog can produce (constraint 8's sibling —
+        // saving a filter must never be the thing that breaks).
+        await manager.setExposedModels?.(agentId, normalizeExposedModels(raw, 'exposedModels', 'bad_payload'))
         return ok({ done: true })
       }
       case 'agent/probe-models': {
@@ -547,6 +1031,11 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         // manager receiver (`this`) and crash the real BridgeManager.
         return ok(await manager.probeAgentModels(str(body, 'agentId', 64)))
       }
+      case 'agent/catalog':
+        // The seats' model list. Read-only and memory-only on purpose: the
+        // conversation asks for it on every mount, so it must never spawn (a
+        // probe only ever runs in the background behind it).
+        return ok(manager.agentCatalog(str(body, 'agentId', 64)))
       default:
         return fail('unknown_endpoint', `acp: unknown endpoint ${endpoint}`)
     }

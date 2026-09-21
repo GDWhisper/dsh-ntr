@@ -19,8 +19,20 @@
         # startupTimeoutMs: 60000    # budget for initialize / session/new / session/load
         # permissionTimeoutMs: 0     # auto-cancel a pending approval after N ms (0 = wait for the human forever)
         # cancelFallbackMs: 15000    # force-finalize a turn the agent ignores after session/cancel (0 = off)
-        # Per-agent native-selector model filter (panel checkboxes persist here):
+        # ACP 模式 agent preset (presets/acp) is installed into the roster's user
+        # root (~/.dsh/.agent-presets/acp) on first boot; an existing preset is
+        # never overwritten. Set false to keep the host out of that directory.
+        # installAcpPreset: true
+        # Per-agent ACP-model filter — which of the agent's models its own
+        # conversation seats offer (panel checkboxes persist here). ACP models
+        # are never advertised in DSH's model catalog, so they cannot leak into
+        # a non-ACP conversation:
         # agents:
         #   - id: pi
         #     command: pi-acp
-        #     exposedModels: [model-a, model-b]   # unset = expose every probed choice; [] = base entry only
+        #     npmPackage: pi-acp        # auto `npm install -g` when command is missing from PATH
+        #     exposedModels: [model-a, model-b]   # opt-in `agent@choice` variants; unset/[] = base entry only
+        #     idleTimeoutMs: 1800000     # release the process once it has been idle this long (ms)
+        #                                #   with NO live session (0 = never; unset = 30 min).
+        #                                #   Only session-less processes are released — model probes
+        #                                #   and post-save probes are what leak them.

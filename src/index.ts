@@ -8,12 +8,64 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-client-connection'
-import { AcpLlmAdapter, BridgeManager } from './bridge.ts'
-import { EventHub, dispatchRpc, validateConfig } from './impl.ts'
+import { ACP_PRESET_ID, AcpLlmAdapter, BridgeManager, installAcpPreset } from './bridge.ts'
+import { EventHub, dispatchRpc, dshSessionPolicyOf, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
 import type { AcpEvent } from './protocol.ts'
+import type { ApprovalOutcome } from './bridge.ts'
+import type { AccessModeSessionLike } from './impl.ts'
 
 export const name = 'dsh-ntr'
+// `approval` / `agents` are deliberately NOT listed here: they are optional
+// collaborators probed structurally below. A hard dependency would make the
+// whole plugin fail to load on a deployment without them (see the LLM service
+// probe, which follows the same shape).
 export const inject = ['webServer', 'connection']
+
+/** Structural view of the host approval service (`@deepseek-ai/dsh-user-approval`). */
+interface ApprovalServiceLike {
+  request(req: { agent: unknown; toolName: string; reason?: string; signal?: AbortSignal }): Promise<ApprovalOutcome>
+  /** Deployment-wide default policy, read only when the session log carries no override. */
+  config?: { policy?: string }
+}
+
+/** Structural view of the host agent registry (`ctx.agents`), keyed by chat session id. */
+interface AgentsServiceLike {
+  get(sessionId: string): unknown | undefined
+}
+
+/** Structural view of the host sandbox policy service (`@deepseek-ai/dsh-sandbox-policy`). */
+interface SandboxPolicyLike {
+  resolve(request: { session?: unknown }): { mode?: unknown; workspaceRoot?: unknown }
+}
+
+/** Structural view of the host session store (`@deepseek-ai/dsh-session`'s `ctx.sessions`). */
+interface SessionsLike {
+  get(sessionId: string): AccessModeSessionLike | undefined
+}
+
+/**
+ * Structural view of the host session persistence service
+ * (`@deepseek-ai/dsh-session-persistence`'s `ctx.sessionPersistence`). A COLD
+ * session — one whose last turn predates this process — is not in
+ * `ctx.sessions` (that store is live sessions only), so the only honest fact
+ * source for its preset is the stored log. Read-only: a `read` handle never
+ * takes ownership and races nothing.
+ */
+interface PersistenceLike {
+  open(id: string, access: 'read' | 'write', options?: { signal?: AbortSignal }): Promise<SessionHandleLike>
+}
+
+/** Structural view of an open `SessionHandle`. */
+interface SessionHandleLike {
+  readonly header: { agentPreset?: unknown }
+  read(offset?: number, length?: number, options?: { signal?: AbortSignal }): Promise<{ events: readonly unknown[] }>
+  close(): Promise<void> | void
+}
+
+/** How many stored events the cold-read folds before giving up on scanning. */
+const COLD_READ_MAX_EVENTS = 4096
+
+
 
 /** Browser-safe encoder of `AcpEvent` frames; one SSE `data:` line per event. */
 function formatSse(event: AcpEvent): string {
@@ -41,6 +93,165 @@ export function apply(ctx: Context, config?: unknown): void {
   // probeModelsOnBoot is disabled): background spawn per uncached agent only.
   manager.bootstrapCatalogs()
 
+  // ACP 模式: make the agent preset available to the roster's user root on
+  // first boot. Non-destructive (an existing preset is the user's to edit) and
+  // skipped under test runners, which must never write into a real home.
+  if (resolved.installAcpPreset !== false
+    && process.env.VITEST === undefined
+    && process.env.NODE_ENV !== 'test') {
+    try {
+      installAcpPreset(undefined, { onlyIfAbsent: true })
+    } catch { /* best effort: an unwritable preset root must not break loading */ }
+  }
+
+  /**
+   * Native approval routing: answer ACP `session/request_permission` through
+   * the host approval chain so the question takes over the chat composer
+   * (`ApprovalPanel`) instead of the settings panel.
+   *
+   * `approval.request` needs the live agent object (its session carries the
+   * audit pair, and the ask must land inside an open turn) and the chat
+   * session id our adapter already knows. Any missing piece — service absent,
+   * unknown session, a rejecting service — degrades to `'unavailable'`, which
+   * sends the ask back to the ledger/panel path rather than losing it.
+   */
+  const wireApproval = (): void => {
+    const approval = (typeof ctx.get === 'function' ? ctx.get('approval') : (ctx as unknown as { approval?: ApprovalServiceLike }).approval) as ApprovalServiceLike | undefined
+    const agents = (typeof ctx.get === 'function' ? ctx.get('agents') : (ctx as unknown as { agents?: AgentsServiceLike }).agents) as AgentsServiceLike | undefined
+    if (approval === undefined || agents === undefined) return
+    manager.setApprovalRequester(async ({ dshSessionId, toolName, signal }) => {
+      if (dshSessionId === undefined) return 'unavailable'
+      const agent = agents.get(dshSessionId)
+      if (agent === undefined) return 'unavailable'
+      try {
+        return await approval.request({ agent, toolName, ...(signal === undefined ? {} : { signal }) })
+      } catch {
+        // Never propagate: a failed ask must fall back, not break the turn.
+        return 'unavailable'
+      }
+    })
+  }
+
+  /**
+   * Access-mode routing: a chat-backed session's DSH access mode
+   * (`sandbox/mode` + `approval/policy` — the knobs the composer's Access mode
+   * control writes) governs its permission asks and its fs writes. It is
+   * enforced, never narrated into the prompt.
+   *
+   * Why this exists: an ACP agent's tools run in its own process, where DSH's
+   * file sandbox has no reach, and the one knob that did reach the agent —
+   * `approval/policy` — reached it INVERTED (`never`, the "full access" preset,
+   * resolves every ask to `'rejected'` inside the approval service before any
+   * answerer runs, so full access denied every write). See
+   * docs/acp-permission-and-sandbox.md.
+   */
+  const wireAccessMode = (): void => {
+    const sandboxPolicy = (typeof ctx.get === 'function' ? ctx.get('sandboxPolicy') : undefined) as SandboxPolicyLike | undefined
+    const sessions = (typeof ctx.get === 'function' ? ctx.get('sessions') : undefined) as SessionsLike | undefined
+    const approval = (typeof ctx.get === 'function' ? ctx.get('approval') : undefined) as ApprovalServiceLike | undefined
+    if (sandboxPolicy === undefined || sessions === undefined || approval === undefined) return
+    manager.setSessionPolicyResolver(dshSessionId => {
+      try {
+        const session = sessions.get(dshSessionId)
+        if (session === undefined) return undefined
+        return dshSessionPolicyOf(sandboxPolicy.resolve({ session }), session, approval.config?.policy)
+      } catch {
+        // A lookup failure must never break a turn: no mode means the agent's
+        // own `permission` field governs this session, exactly as before.
+        return undefined
+      }
+    })
+  }
+
+  /**
+   * ACP-mode resolver wiring: a session running the ACP agent preset stops
+   * letting the access mode arbitrate its asks (the agent's own permission
+   * mode does, answered by the human in the conversation); the mode keeps
+   * narrating the boundary and the fs fence stays enforced, and the browser's
+   * model-seat gate reads the same verdict over `session/chat-list`. Read from
+   * the session log rather than from a marker we set ourselves, so it cannot
+   * drift from the roster.
+   *
+   * THREE fact sources, newest-wins: the live session store (`ctx.sessions`,
+   * in-memory log, always fresh) — then the persistence store, because a
+   * session whose last turn predates this process is not live anywhere and
+   * the model-seat gate asks exactly such cold sessions — then nothing
+   * (`undefined`, which every consumer reads as "not ACP", the allowed
+   * failure mode).
+   */
+  const wireAcpMode = (): void => {
+    const sessions = (typeof ctx.get === 'function' ? ctx.get('sessions') : undefined) as SessionsLike | undefined
+    if (sessions === undefined) return
+    manager.setAcpModeResolver(dshSessionId => {
+      try {
+        const session = sessions.get(dshSessionId)
+        // An event-less session object proves nothing: `sessions.get` hands
+        // back placeholders for ids it has not hydrated (a restarted process
+        // serves empty stubs for cold sessions), and folding an empty log
+        // reads as the default preset — a guess, not a fact. Only a log with
+        // rows may answer synchronously; anything else falls through to the
+        // persisted log, which is the authoritative fold.
+        if (session !== undefined && (session.events?.length ?? 0) > 0) {
+          return sessionAgentPreset(session) === ACP_PRESET_ID
+        }
+      } catch {
+        // Fall through to the cold read.
+      }
+      return coldAcpMode(dshSessionId)
+    })
+  }
+
+  /**
+   * The ACP-preset verdict for a COLD session, read from the persistence
+   * store. The read handle observes the log without taking ownership (another
+   * writer, live or in another process, is untouched); the header plus the
+   * last `agent-preset/selected` event are the whole fold — the same
+   * newest-selection-wins rule the host's own `resolveSessionPreset` applies.
+   * Returns `undefined` when the service is absent, the session is unknown, or
+   * anything throws: a failed lookup must never read as "definitely not ACP".
+   */
+  const coldAcpMode = async (dshSessionId: string): Promise<boolean | undefined> => {
+    const persistence = (typeof ctx.get === 'function' ? ctx.get('sessionPersistence') : undefined) as PersistenceLike | undefined
+    if (persistence === undefined || typeof persistence.open !== 'function') return undefined
+    try {
+      const handle = await persistence.open(dshSessionId, 'read')
+      try {
+        const tail = await handle.read(0, COLD_READ_MAX_EVENTS)
+        return sessionAgentPresetFromLog(handle.header?.agentPreset, tail?.events ?? []) === ACP_PRESET_ID
+      } finally {
+        await handle.close()
+      }
+    } catch {
+      return undefined
+    }
+  }
+
+  wireApproval()
+  wireAccessMode()
+  if (typeof ctx.inject === 'function') {
+    // Late arrival for the access-mode collaborators; kept separate from the
+    // approval probe so a deployment missing one service still wires the other.
+    ctx.inject(['sandboxPolicy', 'sessions'], () => {
+      wireAccessMode()
+    })
+  }
+  // The seat gate's verdict only needs the session store (live) and the
+  // persistence store (cold); the access-mode knobs are NOT its dependencies.
+  // A deployment without `approval` must still take the model seat over.
+  wireAcpMode()
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['sessions'], () => {
+      wireAcpMode()
+    })
+  }
+  if (typeof ctx.inject === 'function') {
+    // Late arrival: both services may still be loading when this plugin
+    // applies (profile order is not ours to control).
+    ctx.inject(['approval', 'agents'], () => {
+      wireApproval()
+    })
+  }
+
   const defaultModelService = (typeof ctx.get === 'function' ? ctx.get('agentDefaultModel') : undefined) as {
     currentSelection?(): { provider: string; model: string; reasoningEffort?: string }
     saveSelection?(next: { provider: string; model: string }): Promise<void>
@@ -56,7 +267,6 @@ export function apply(ctx: Context, config?: unknown): void {
   /** Registration handle: callable disposer, plus `replace` to re-announce routes. */
   interface LlmAdapterHandle {
     (): void
-    replace(providers: string[]): void
   }
 
   interface LlmService {
@@ -66,15 +276,13 @@ export function apply(ctx: Context, config?: unknown): void {
   const registerLlm = (llmHandle: LlmService): void => {
     ctx.effect(
       () => {
+        // The route is registered so sessions can select and stream
+        // `acp@<agentId>`; it deliberately advertises no models (see
+        // `AcpLlmAdapter.listModels`), so there is nothing for a browser-side
+        // model directory to refresh when the catalog changes — the ACP seats
+        // read `agent/catalog` themselves.
         const handle = llmHandle.registerAdapter(['acp'], adapter)
-        // Re-committing the unchanged routes republishes `llm/adapters-updated`
-        // (forwarded to browsers, where chat model selectors rebuild their
-        // directory) — the live-refresh path for panel-side catalog mutations.
-        manager.setModelsChangedHook(() => handle.replace(['acp']))
-        return () => {
-          manager.setModelsChangedHook(undefined)
-          handle()
-        }
+        return () => { handle() }
       },
       'dsh-ntr: acp llm adapter',
     )

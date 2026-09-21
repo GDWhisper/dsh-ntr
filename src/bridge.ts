@@ -9,9 +9,10 @@
 
 import { spawn, type ChildProcess } from 'node:child_process'
 import { homedir } from 'node:os'
-import { delimiter, dirname, join, resolve } from 'node:path'
+import { delimiter, dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Writable, Readable } from 'node:stream'
-import { accessSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
+import { accessSync, constants, copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import {
   client,
   methods,
@@ -31,16 +32,24 @@ import {
   PermissionLedger,
   Transcript,
   buildAdapterModelId,
+  canonicalizeFsPath,
   childEnv,
+  decidePermission,
+  isUnderPath,
   parseCatalogOptions,
+  permissionToolKind,
+  permissionToolPaths,
   randomUUID,
   resolveFsPath,
   resolveSessionCwd,
+  sandboxDenialMarker,
+  selectForwardPrompt,
   splitAdapterModelId,
   validateAgentDef,
 } from './impl.ts'
+import type { DshSandboxMode, DshSessionPolicy, PermissionDecision } from './impl.ts'
 import type {
-  AcpAgentCatalog, AcpAgentDef, AgentProbeModelsResult, AgentView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
+  AcpAgentCatalog, AcpAgentDef, AcpPresetStatus, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
   LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo, PermissionMode,
   PermissionOutcome, PermissionOptionView, PreparedAdapterCall, SessionView, StreamChunk,
 } from './protocol.ts'
@@ -67,6 +76,36 @@ interface LiveSession {
   closed: boolean
   /** The agent process died; the session awaits a `session/load` resume. */
   released: boolean
+  /**
+   * Owning DSH chat session id, when the session was opened through the LLM
+   * adapter (`AcpLlmAdapter`). `ctx.agents.get()` needs it to name the agent
+   * whose open turn carries the native approval question; sessions started
+   * over the `/acp` RPC have no chat session and stay on the ledger path.
+   */
+  dshSessionId?: string
+  /**
+   * The DSH access mode this chat session runs under, resolved at the start of
+   * the current turn (the host folds `sandbox/mode` + `approval/policy` for us).
+   * Re-resolved per turn so a mid-conversation switch lands on the next prompt;
+   * absent → the agent's own `permission` field governs.
+   */
+  dshPolicy?: DshSessionPolicy
+  /**
+   * True when this chat session runs on the ACP-mode agent preset, re-resolved
+   * with the access mode every turn. It switches the mapping's stance from
+   * "the mode arbitrates" to "the mode stays out of it" (see
+   * `decidePermission`'s `narrateOnly`): the agent's own permission mode
+   * decides its approvals.
+   */
+  acpMode?: boolean
+  /**
+   * Resolves when the AGENT has settled the turn it is currently running (its
+   * `session/prompt` response, or its acknowledgement of a cancel). This is
+   * deliberately not `running`: an aborted turn ends our stream at once,
+   * while the agent keeps working until it observes the cancel — and the ACP
+   * protocol forbids a second `session/prompt` on a busy session.
+   */
+  settled?: Promise<void>
   transcript: Transcript
 }
 
@@ -75,12 +114,65 @@ export interface BridgeTuning {
   startupTimeoutMs?: number
   permissionTimeoutMs?: number
   cancelFallbackMs?: number
+  /**
+   * How long a new turn waits for the agent to settle a predecessor that is
+   * still running on its side (an aborted turn we already stopped streaming).
+   * Zero disables the wait: the next prompt then fails immediately rather than
+   * racing a concurrent `session/prompt` into the agent.
+   */
+  turnSettleMs?: number
+  /**
+   * Default idle-release window for agents without their own
+   * `AcpAgentDef.idleTimeoutMs`: a READY process that holds no live session
+   * and has no work in flight is killed after this long. `0` disables it.
+   */
+  idleTimeoutMs?: number
 }
+
+/** One native approval question, as the host approval service defines it. */
+export interface ApprovalRequestContext {
+  /** DSH chat session that owns the open turn the question is asked in. */
+  dshSessionId?: string
+  agentId: string
+  /** Human-facing identity of the operation awaiting a decision. */
+  toolName: string
+  reason?: string
+  signal?: AbortSignal
+}
+
+/** Outcome vocabulary of the host approval chain (`'unavailable'` = no answerer). */
+export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
+
+/**
+ * Asks the host approval service (`ctx.approval`) for one decision. Never
+ * throws: any failure is reported as `'unavailable'` so the caller can fall
+ * back to the settings-panel ledger.
+ */
+export type ApprovalRequester = (request: ApprovalRequestContext) => Promise<ApprovalOutcome>
+
+/**
+ * Resolves the DSH access mode of one chat session (`sessionId` = DSH session
+ * id). Never throws; `undefined` means "no mode available" — the host has no
+ * sandbox/approval services, or the session is unknown to it — and the agent's
+ * own `permission` field stays in charge.
+ */
+export type SessionPolicyResolver = (dshSessionId: string) => DshSessionPolicy | undefined
+
+/** Reports whether one DSH chat session runs the ACP-mode agent preset. */
+/**
+ * Whether ONE DSH chat session runs the ACP agent preset. May be async: a cold
+ * session (the process restarted since its last turn) has to be read from the
+ * persistence store, and only the answer is worth the wait — the asker is the
+ * browser's seat gate, which polls.
+ */
+export type AcpModeResolver = (dshSessionId: string) => boolean | undefined | Promise<boolean | undefined>
 
 const DEFAULT_TUNING: Required<BridgeTuning> = {
   startupTimeoutMs: 60_000,
   permissionTimeoutMs: 0,
   cancelFallbackMs: 15_000,
+  turnSettleMs: 5_000,
+  idleTimeoutMs: 1_800_000,
 }
 
 type BridgeState = 'stopped' | 'starting' | 'ready' | 'error'
@@ -104,6 +196,14 @@ export class AgentBridge {
   private readonly startupTimeoutMs: number
   private readonly permissionTimeoutMs: number
   private readonly cancelFallbackMs: number
+  private readonly turnSettleMs: number
+  private readonly defaultIdleTimeoutMs: number
+  /** Armed while READY; fires the idle-release check (never per-event). */
+  private idleTimer?: ReturnType<typeof setTimeout>
+  /** Last observable activity; the idle window is measured from here. */
+  private lastActivityAt = 0
+  /** Throwaway catalog probes in flight — they hold no live session of their own. */
+  private pendingProbes = 0
 
   constructor(
     readonly def: AcpAgentDef,
@@ -114,11 +214,143 @@ export class AgentBridge {
     /** Observes `configOptions` from any real session so the manager's model catalog stays warm. */
     private readonly onCatalog?: (agentId: string, configOptions: unknown) => void,
     tuning?: BridgeTuning,
+    /**
+     * Resolved per ask (not captured) so a requester wired after this bridge
+     * was built still applies. Absent → every ask rides the ledger.
+     */
+    private readonly approvalRequester?: () => ApprovalRequester | undefined,
+    /**
+     * Resolved per turn, like {@link approvalRequester}: the host entry may
+     * wire the access-mode mapping after this bridge was built.
+     */
+    private readonly sessionPolicy?: () => SessionPolicyResolver | undefined,
   ) {
     const merged = { ...DEFAULT_TUNING, ...tuning }
     this.startupTimeoutMs = merged.startupTimeoutMs
     this.permissionTimeoutMs = merged.permissionTimeoutMs
     this.cancelFallbackMs = merged.cancelFallbackMs
+    this.turnSettleMs = merged.turnSettleMs
+    this.defaultIdleTimeoutMs = merged.idleTimeoutMs
+  }
+
+  /** The idle-release window this agent honors: its own field, else the host default. */
+  private get idleTimeoutMs(): number {
+    return this.def.idleTimeoutMs ?? this.defaultIdleTimeoutMs
+  }
+
+  /**
+   * Restart the idle-release clock. Every observable activity calls this, so a
+   * bridge is only ever released after a FULL quiet window — never while it is
+   * being used.
+   */
+  private touch(): void {
+    this.lastActivityAt = Date.now()
+    this.armIdleRelease()
+  }
+
+  /**
+   * Arm the single idle timer. The delay is what is left of the window measured
+   * from the last activity, so a timer that fires early (one timer is armed and
+   * not rescheduled per event) self-corrects rather than releasing a busy agent.
+   */
+  private armIdleRelease(): void {
+    if (this.idleTimeoutMs <= 0 || this.state !== 'ready' || this.idleTimer !== undefined) return
+    const timer = setTimeout(() => {
+      this.idleTimer = undefined
+      this.releaseIfIdle()
+    }, Math.max(0, this.lastActivityAt + this.idleTimeoutMs - Date.now()))
+    timer.unref?.()
+    this.idleTimer = timer
+  }
+
+  private clearIdleTimer(): void {
+    if (this.idleTimer === undefined) return
+    clearTimeout(this.idleTimer)
+    this.idleTimer = undefined
+  }
+
+  /**
+   * Release a READY agent that has been quiet for a full window, i.e. one that
+   * leaked in by probing the model catalog or by a post-save probe: those spawns
+   * hold no session at all (see {@link probeConfigOptions}).
+   *
+   * Deliberately scoped to bridges with NO live session: killing a process the
+   * user is chatting with would trade a resident process for a cold start on the
+   * next message. Parked `released` records do not block a release and survive
+   * it — they are resumable on a fresh child by design (`session/load`).
+   *
+   * `releaseAll` (not `stop`) is the right teardown: `stop` drops resumable
+   * records, which would destroy the context of sessions parked by an earlier
+   * crash just because this bridge went quiet.
+   */
+  private releaseIfIdle(): void {
+    if (this.state !== 'ready') return
+    if (this.sessions.size > 0 || this.pendingProbes > 0 || this.resuming.size > 0 || this.permissions.sessionIds().length > 0) {
+      // Busy after all: the quiet window starts now, not at the last event.
+      this.touch()
+      return
+    }
+    const seconds = Math.round(this.idleTimeoutMs / 1000)
+    const reason = `agent "${this.def.id}" was released after ${String(seconds)}s idle`
+    this.hub.broadcast({ type: 'agent/notice', agentId: this.def.id, level: 'info', text: `acp: ${reason}` })
+    this.releaseAll(reason)
+  }
+
+  /**
+   * Claim this bridge's single prompt slot for one turn, waiting (bounded) for
+   * a predecessor the agent has not finished yet.
+   *
+   * WHY the wait: `onAbort` finishes OUR stream the moment the user hits stop,
+   * but the cancel is a notification the agent may not have processed yet. A
+   * prompt sent into that window is a second concurrent `session/prompt` on the
+   * same session — forbidden by the protocol and rejected (or worse, mishandled)
+   * by the agent. Waiting turns a protocol error into a short delay.
+   *
+   * @param session - the session asking for the slot.
+   * @returns whether the slot was claimed, and why not when it was not.
+   */
+  async claimTurn(session: LiveSession): Promise<{ ok: true } | { ok: false; reason: 'busy' | 'unsettled' }> {
+    if (session.running) return { ok: false, reason: 'busy' }
+    const pending = session.settled
+    if (pending === undefined) return { ok: true }
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        pending,
+        new Promise<void>(resolve => {
+          timer = setTimeout(resolve, this.turnSettleMs)
+          timer.unref?.()
+        }),
+      ])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+    // The agent never acknowledged: sending now would start a concurrent turn,
+    // so report it honestly instead of handing the agent two prompts at once.
+    if (session.settled !== undefined) return { ok: false, reason: 'unsettled' }
+    if (session.running) return { ok: false, reason: 'busy' }
+    return { ok: true }
+  }
+
+  /**
+   * Mark the agent-side turn as in flight and hand back the settler its stream
+   * owner must call once the agent is actually done with it.
+   *
+   * @param session - the session whose turn is starting.
+   * @returns the settler (idempotent; also used by connection loss).
+   */
+  beginTurn(session: LiveSession): () => void {
+    let settle: () => void = () => { /* replaced below */ }
+    const settled = new Promise<void>(resolve => { settle = resolve })
+    session.settled = settled
+    this.touch()
+    return () => {
+      if (session.settled === settled) session.settled = undefined
+      settle()
+      // The turn is over: a fresh window starts here rather than at the prompt
+      // that may have started a long turn ago.
+      this.touch()
+    }
   }
 
   view(): AgentView {
@@ -141,6 +373,7 @@ export class AgentBridge {
         : undefined,
       agentCapabilities: this.initResult?.agentCapabilities,
       liveSessions: [...this.sessions.keys()],
+      idleTimeoutMs: this.idleTimeoutMs,
     }
   }
 
@@ -160,10 +393,14 @@ export class AgentBridge {
         this.state = 'ready'
         this.lastError = undefined
         this.publishStatus()
+        // Start the idle clock only from a READY process: `starting` may take
+        // the whole startup budget and must not race the release.
+        this.touch()
       })
       .catch((error: unknown) => {
         this.state = 'error'
         this.lastError = error instanceof Error ? error.message : String(error)
+        this.clearIdleTimer()
         this.killChild()
         this.publishStatus()
         throw new AcpError('agent_unreachable', `acp: agent "${this.def.id}" failed to start: ${this.lastError}`)
@@ -174,7 +411,11 @@ export class AgentBridge {
 
   private async spawnAndConnect(): Promise<void> {
     this.stderrTail = []
-    const child = spawn(this.def.command, [...(this.def.args ?? [])], {
+    // Resolve (and, with npmPackage, auto-install) the executable before the
+    // spawn; the resolved absolute path also pins the lookup to the host PATH
+    // plus the well-known extra dirs, not the scrubbed child env.
+    const { command } = await ensureAgentExecutable(this.def, undefined, line => this.noteStderr(line))
+    const child = spawn(command, [...(this.def.args ?? [])], {
       cwd: safeSpawnCwd(this.def),
       env: childEnv(process.env, this.def.env ?? {}),
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -213,7 +454,7 @@ export class AgentBridge {
         this.handleSessionUpdate(ctx.params)
       })
       .onRequest(methods.client.session.requestPermission, async ctx => {
-        return this.handlePermissionRequest(ctx.params.sessionId, ctx.params.toolCall, ctx.params.options)
+        return this.handlePermissionRequest(ctx.params.sessionId, ctx.params.toolCall, ctx.params.options, ctx.signal)
       })
       .onRequest(methods.client.fs.readTextFile, async ctx => this.handleFsRead(ctx.params))
       .onRequest(methods.client.fs.writeTextFile, async ctx => this.handleFsWrite(ctx.params))
@@ -308,6 +549,7 @@ export class AgentBridge {
     this.sessions.set(session.sessionId, session)
     this.acpIndex.set(session.acpSessionId, session)
     this.hub.broadcast({ type: 'session/created', sessionId: session.sessionId, session: snapshot(session) })
+    this.touch()
     return session
   }
 
@@ -317,16 +559,25 @@ export class AgentBridge {
    * so probe sessions never surface in the browser session list.
    */
   async probeConfigOptions(): Promise<unknown[]> {
-    await this.ensureReady()
-    const conn = this.conn
-    if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
-    const resolved = resolveSessionCwd(this.def, undefined, p => realpathSync(p))
-    const result = await this.withStartupTimeout(
-      conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: [] }),
-      'session/new',
-    )
-    await conn.agent.request(methods.agent.session.close, { sessionId: result.sessionId }).catch(() => { /* optional capability */ })
-    return Array.isArray(result.configOptions) ? result.configOptions : []
+    // A probe is the reason an agent process can be resident with NOTHING else
+    // going on: it opens a session it deliberately never registers, so the
+    // probe itself is the only thing keeping it from being idle-released.
+    this.pendingProbes += 1
+    try {
+      await this.ensureReady()
+      const conn = this.conn
+      if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
+      const resolved = resolveSessionCwd(this.def, undefined, p => realpathSync(p))
+      const result = await this.withStartupTimeout(
+        conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: [] }),
+        'session/new',
+      )
+      await conn.agent.request(methods.agent.session.close, { sessionId: result.sessionId }).catch(() => { /* optional capability */ })
+      return Array.isArray(result.configOptions) ? result.configOptions : []
+    } finally {
+      this.pendingProbes -= 1
+      this.touch()
+    }
   }
 
   /**
@@ -337,6 +588,7 @@ export class AgentBridge {
   async runPrompt(session: LiveSession, text: string, turnId: string): Promise<string> {
     const conn = this.conn
     if (conn === undefined || session.closed || session.released) throw new AcpError('session_closed', 'acp: session is closed')
+    this.touch()
     const result = await conn.agent.request(methods.agent.session.prompt, {
       sessionId: session.acpSessionId,
       prompt: [{ type: 'text', text }],
@@ -346,6 +598,7 @@ export class AgentBridge {
 
   async cancel(session: LiveSession): Promise<void> {
     if (this.conn === undefined) return
+    this.touch()
     await this.conn.agent.notify(methods.agent.session.cancel, { sessionId: session.acpSessionId }).catch(() => { /* best effort */ })
     this.armCancelFallback(session)
   }
@@ -384,6 +637,8 @@ export class AgentBridge {
   resumeSession(session: LiveSession): Promise<LiveSession> {
     const inflight = this.resuming.get(session.sessionId)
     if (inflight !== undefined) return inflight
+    // An inflight resume also counts as work (see `releaseIfIdle`).
+    this.touch()
     const promise = this.doResumeSession(session).finally(() => {
       this.resuming.delete(session.sessionId)
     })
@@ -450,6 +705,7 @@ export class AgentBridge {
 
   /** Release all live sessions (agent process died): keep them resumable, settle permissions, drop the connection. */
   releaseAll(reason: string): void {
+    this.clearIdleTimer()
     for (const session of [...this.sessions.values()]) {
       if (session.running) {
         session.running = false
@@ -498,6 +754,7 @@ export class AgentBridge {
   async setMode(session: LiveSession, modeId: string): Promise<void> {
     const conn = this.conn
     if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
+    this.touch()
     await conn.agent.request(methods.agent.session.setMode, { sessionId: session.acpSessionId, modeId })
     // Well-behaved agents push `current_mode_update`, but the spec does not
     // require it — apply locally so the browser selector never goes stale.
@@ -508,6 +765,7 @@ export class AgentBridge {
   async setConfigOption(session: LiveSession, configId: string, value: string | boolean): Promise<void> {
     const conn = this.conn
     if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
+    this.touch()
     const result = await conn.agent.request(methods.agent.session.setConfigOption, { sessionId: session.acpSessionId, configId, value }) as { configOptions?: unknown }
     // The response carries the full authoritative option set; some agents
     // (pi-acp observed) never re-notify after a client-driven set.
@@ -522,6 +780,9 @@ export class AgentBridge {
   async closeSession(session: LiveSession, reason: 'closed' | 'agent-stopped' | 'agent-died'): Promise<void> {
     if (session.closed) return
     session.closed = true
+    // Closing the last session is what makes a chat agent idle: start the
+    // window here rather than at the prompt that opened it.
+    this.touch()
     const conn = this.conn
     if (conn !== undefined && this.state === 'ready') {
       // `session/close` is an optional capability; the local teardown stands regardless.
@@ -543,6 +804,7 @@ export class AgentBridge {
 
   /** Kill the child and drop every local session bound to this connection. */
   async stop(reason: 'closed' | 'agent-stopped' | 'agent-died' = 'agent-stopped'): Promise<void> {
+    this.clearIdleTimer()
     for (const session of [...this.sessions.values()]) {
       await this.closeSession(session, reason)
     }
@@ -583,25 +845,32 @@ export class AgentBridge {
     }, 3000).unref()
   }
 
-  /** Permission requests are answered per the agent's policy; `ask` parks them on the ledger. */
-  private async handlePermissionRequest(acpSessionId: string, toolCall: unknown, options: PermissionOption[]): Promise<RequestPermissionResponse> {
+  /**
+   * Answer one ACP permission ask. The governing policy is the session's DSH
+   * access mode when it has one (chat-backed sessions — see
+   * `docs/acp-permission-and-sandbox.md`); otherwise the agent's own
+   * `permission` field, exactly as before the mapping existed. `ask` always
+   * means "a human decides": the native approval chain first, the ledger
+   * otherwise.
+   */
+  private async handlePermissionRequest(acpSessionId: string, toolCall: unknown, options: PermissionOption[], signal?: AbortSignal): Promise<RequestPermissionResponse> {
     const session = this.acpIndex.get(acpSessionId)
-    const policy = this.def.permission ?? 'ask'
-    if (policy === 'allow') {
-      const allow = options.find(o => o.kind === 'allow_once') ?? options.find(o => o.kind === 'allow_always')
-      if (allow !== undefined) return { outcome: { outcome: 'selected', optionId: allow.optionId } }
-      return { outcome: { outcome: 'cancelled' } }
-    }
-    if (policy === 'reject') {
-      const reject = options.find(o => o.kind === 'reject_once') ?? options.find(o => o.kind === 'reject_always')
-      if (reject !== undefined) return { outcome: { outcome: 'selected', optionId: reject.optionId } }
-      return { outcome: { outcome: 'cancelled' } }
-    }
+    const decision = this.permissionDecision(session, toolCall)
+    if (decision === 'allow') return selectOption(options, 'allow')
+    if (decision === 'reject') return selectOption(options, 'reject')
     if (session === undefined || session.closed) return { outcome: { outcome: 'cancelled' } }
+    // Native approval first (answered in the chat composer); `undefined` means
+    // no route is available and the settings-panel ledger takes over.
+    const routed = await this.askNativeApproval(session, toolCall, options, signal)
+    if (routed !== undefined) {
+      this.touch()
+      return routed
+    }
     return new Promise<RequestPermissionResponse>(resolve => {
       let timer: ReturnType<typeof setTimeout> | undefined
       const requestId = this.permissions.create(session.sessionId, (outcome: PermissionOutcome) => {
         clearTimeout(timer)
+        this.touch()
         this.hub.broadcast({
           type: 'permission/resolved',
           requestId,
@@ -638,6 +907,76 @@ export class AgentBridge {
     })
   }
 
+  /**
+   * Ask the host approval service for this permission (`ctx.approval` → the
+   * browser's composer takeover). Only sessions bound to a DSH chat session
+   * qualify: the service appends its audit pair to that session inside an
+   * open turn, so a session started over `/acp` (no chat turn) cannot be
+   * routed and must stay on the ledger path.
+   *
+   * No `permissionTimeoutMs` timer is armed here on purpose: the human answers
+   * inside the conversation, and a host-side deadline would answer for them.
+   *
+   * @returns the agent-facing response, or `undefined` to fall back to the ledger.
+   */
+  private async askNativeApproval(
+    session: LiveSession,
+    toolCall: unknown,
+    options: PermissionOption[],
+    signal?: AbortSignal,
+  ): Promise<RequestPermissionResponse | undefined> {
+    const requester = this.approvalRequester?.()
+    if (requester === undefined || session.dshSessionId === undefined) return undefined
+    let outcome: ApprovalOutcome
+    try {
+      outcome = await requester({
+        dshSessionId: session.dshSessionId,
+        agentId: this.def.id,
+        toolName: permissionToolName(toolCall),
+        ...(signal === undefined ? {} : { signal }),
+      })
+    } catch {
+      // Synchronous throw or rejection, either way: the ask falls back to the
+      // ledger. An approval failure must never break the agent's turn.
+      outcome = 'unavailable'
+    }
+    if (outcome === 'unavailable') return undefined
+    const response = nativeOutcomeResponse(outcome, options)
+    // Keep the event stream symmetric with the ledger path: a routed decision
+    // is still a resolution, and the browser uses it to drop any card it may
+    // hold for this session. No `permission/request` is broadcast — the
+    // settings panel must never show a card for a composer-routed ask.
+    this.hub.broadcast({
+      type: 'permission/resolved',
+      requestId: randomUUID(),
+      sessionId: session.sessionId,
+      outcome: response.outcome.outcome === 'selected'
+        ? { outcome: 'selected', optionId: response.outcome.optionId }
+        : { outcome: 'cancelled' },
+    })
+    return response
+  }
+
+  /**
+   * The effective decision for one ask. A resolved DSH access mode outranks the
+   * agent's own `permission` field on purpose: the mode is the user's live
+   * choice for this conversation, and `permission: 'allow'` + "full access"
+   * would otherwise mean two knobs disagreeing about whether to ask at all.
+   */
+  private permissionDecision(session: LiveSession | undefined, toolCall: unknown): PermissionDecision {
+    const policy = session?.dshPolicy
+    if (policy !== undefined) {
+      return decidePermission(policy, permissionToolKind(toolCall), permissionToolPaths(toolCall), {
+        ...session?.acpMode === true ? { narrateOnly: true } : {},
+      })
+    }
+    switch (this.def.permission ?? 'ask') {
+      case 'allow': return 'allow'
+      case 'reject': return 'reject'
+      default: return 'ask'
+    }
+  }
+
   private settlePermissions(session: LiveSession): void {
     this.permissions.settleFor(p => p.sessionId === session.sessionId)
   }
@@ -666,8 +1005,13 @@ export class AgentBridge {
     return { content }
   }
 
-  /** `fs/write_text_file`; parent directories are created inside the sandbox. */
-  private handleFsWrite(params: { sessionId: string; path: string; content: string }): { } {
+  /**
+   * `fs/write_text_file`; parent directories are created inside the boundary.
+   * The write is authorized by {@link authorizeWrite} before anything touches
+   * the disk, so an agent that uses client fs is subject to the same access mode
+   * as its own tools.
+   */
+  private async handleFsWrite(params: { sessionId: string; path: string; content: string }): Promise<{ }> {
     const session = this.acpIndex.get(params.sessionId)
     if (session === undefined) {
       throw fsRequestError(`acp: fs request for unknown session ${params.sessionId}`)
@@ -675,14 +1019,50 @@ export class AgentBridge {
     if (params.content.length > FS_MAX_WRITE_BYTES) {
       throw fsRequestError(`acp: fs write refused: payload exceeds ${String(FS_MAX_WRITE_BYTES)} bytes`)
     }
-    const path = this.guardFsPath(session, params.path)
+    const path = this.guardFsPath(session, params.path, session.dshPolicy?.mode === 'danger-full-access')
+    if (!(await this.authorizeWrite(session, path))) {
+      throw fsRequestError(sandboxWriteDenial(path, session.dshPolicy?.mode ?? 'read-only'))
+    }
     mkdirSync(dirname(path), { recursive: true })
     writeFileSync(path, params.content, 'utf8')
     return { }
   }
 
-  private guardFsPath(session: LiveSession, requested: string): string {
+  /**
+   * Apply the session's access mode to an already-resolved write target.
+   * `workspace-write` permits the workspace root and the agent's own roots (that
+   * is what the mode promises); everything else is DSH's escalation case — with
+   * `approval: 'ask'` the human decides and a grant is one-off, and under
+   * `'never'` it is a plain denial. No mode available (non-chat session) keeps
+   * the historical behavior: the def's roots are the boundary and the guard has
+   * already enforced them.
+   */
+  private async authorizeWrite(session: LiveSession, path: string): Promise<boolean> {
+    const policy = session.dshPolicy
+    if (policy === undefined || policy.mode === 'danger-full-access') return true
+    if (policy.mode === 'workspace-write') {
+      const roots = [...(this.def.allowedCwdRoots ?? []), session.cwd, ...(policy.workspaceRoot === undefined ? [] : [policy.workspaceRoot])]
+      if (roots.some(root => isUnderPath(path, canonical(root)))) return true
+    }
+    if (policy.approval === 'never') return false
+    const requester = this.approvalRequester?.()
+    if (requester === undefined || session.dshSessionId === undefined) return false
     try {
+      const outcome = await requester({
+        dshSessionId: session.dshSessionId,
+        agentId: this.def.id,
+        toolName: `write ${path}`,
+      })
+      return outcome === 'allowed-once'
+    } catch {
+      // A failed ask must deny the write, never escape into the turn.
+      return false
+    }
+  }
+
+  private guardFsPath(session: LiveSession, requested: string, unrestricted = false): string {
+    try {
+      if (unrestricted) return canonicalizeFsPath(session.cwd, requested, p => realpathSync(p))
       return resolveFsPath(session.cwd, [...(this.def.allowedCwdRoots ?? []), session.cwd], requested, p => realpathSync(p))
     } catch (error) {
       throw fsRequestError(`acp: fs access denied: ${error instanceof Error ? error.message : String(error)}`)
@@ -733,6 +1113,51 @@ export class AgentBridge {
   }
 }
 
+/** Human-facing identity of an ACP tool call (the approval headline). */
+function permissionToolName(toolCall: unknown): string {
+  const row = (typeof toolCall === 'object' && toolCall !== null ? toolCall : {}) as Record<string, unknown>
+  return typeof row.title === 'string' && row.title !== '' ? row.title : 'tool call'
+}
+
+/**
+ * Choose the agent's own option for a decided ask. The specific variants are
+ * preferred over the `always` ones because neither DSH's approval chain nor our
+ * mode mapping ever grants a standing permission.
+ */
+function selectOption(options: PermissionOption[], direction: 'allow' | 'reject'): RequestPermissionResponse {
+  const wanted: readonly string[] = direction === 'allow' ? ['allow_once', 'allow_always'] : ['reject_once', 'reject_always']
+  for (const kind of wanted) {
+    const option = options.find(o => o.kind === kind)
+    if (option !== undefined) return { outcome: { outcome: 'selected', optionId: option.optionId } }
+  }
+  return { outcome: { outcome: 'cancelled' } }
+}
+
+/**
+ * Refusal text for a write the access mode blocked. It carries the host's own
+ * denial marker vocabulary (`sandboxDenialMarker`) plus the actionable way out,
+ * because this message is what the agent's model reads.
+ */
+function sandboxWriteDenial(path: string, mode: DshSandboxMode): string {
+  return `acp: fs write refused: ${sandboxDenialMarker(mode)} ${path} is outside this session's writable boundary; widen the access mode or ask the user to approve the path`
+}
+
+/**
+ * Translate a native approval outcome into the ACP option the agent must see.
+ * `'allowed-once'` is the chain's only grant; a rejection prefers the once-variant.
+ */
+function nativeOutcomeResponse(outcome: ApprovalOutcome, options: PermissionOption[]): RequestPermissionResponse {
+  if (outcome === 'allowed-once') {
+    const allow = options.find(o => o.kind === 'allow_once') ?? options.find(o => o.kind === 'allow_always')
+    return allow === undefined ? { outcome: { outcome: 'cancelled' } } : { outcome: { outcome: 'selected', optionId: allow.optionId } }
+  }
+  if (outcome === 'rejected') {
+    const reject = options.find(o => o.kind === 'reject_once') ?? options.find(o => o.kind === 'reject_always')
+    return reject === undefined ? { outcome: { outcome: 'cancelled' } } : { outcome: { outcome: 'selected', optionId: reject.optionId } }
+  }
+  return { outcome: { outcome: 'cancelled' } }
+}
+
 function snapshot(session: LiveSession): SessionView {
   return {
     sessionId: session.sessionId,
@@ -752,13 +1177,108 @@ function snapshot(session: LiveSession): SessionView {
   }
 }
 
-function safeSpawnCwd(def: AcpAgentDef): string {
-  if (def.cwd !== undefined) {
-    try {
-      return realpathSync(def.cwd)
-    } catch { /* fall through to home */ }
+/** Canonical spelling of a configured root, or the spelling as-is when it does not exist yet. */
+function canonical(path: string): string {
+  try {
+    return realpathSync(path)
+  } catch {
+    return path
   }
+}
+
+function safeSpawnCwd(def: AcpAgentDef): string {
+  const candidate = def.cwd ?? ensureDefaultWorkspace()
+  try {
+    return realpathSync(candidate)
+  } catch { /* fall through to home */ }
   return homedir()
+}
+
+/**
+ * Plugin-owned default execution workspace, anchored to the plugin state dir
+ * (`~/.dsh/acp-workspaces`).
+ *
+ * It deliberately does NOT derive from `process.cwd()`: that is wherever the
+ * DSH host happened to be launched from, so the "default workspace" used to
+ * move around per launch — and, via the `allowedCwdRoots` fallback, it could
+ * widen an agent's sandbox to the entire launch directory (in practice `$HOME`
+ * when `dsh web` is started from the home dir).
+ */
+export function defaultAgentWorkspace(home: string = homedir()): string {
+  return join(home, '.dsh', 'acp-workspaces')
+}
+
+// ---- ACP-mode agent preset (the roster's user root) ----
+
+/** Preset id (also its directory name) of the ACP-mode composition. */
+export const ACP_PRESET_ID = 'acp'
+
+/** The three files a preset directory must carry. */
+const ACP_PRESET_FILES = ['preset.yml', 'agent.cordis.yml', 'acp-guard.mjs'] as const
+
+/**
+ * Target directory for the ACP-mode preset: the roster's own user root.
+ *
+ * `~/.dsh/.agent-presets/<id>` is where `dsh-agent-presets` discovers
+ * user-authored presets without any deployment configuration (`includeUserRoot`
+ * defaults to true), which is why the plugin does not need to patch the roster's
+ * `roots` — and why an id colliding with a shipped preset would lose, hence the
+ * distinct `acp` id.
+ */
+export function acpPresetDir(home: string = homedir()): string {
+  return join(home, '.dsh', '.agent-presets', ACP_PRESET_ID)
+}
+
+/** Absolute path of the preset files shipped inside this package. */
+export function bundledAcpPresetDir(): string {
+  return fileURLToPath(new URL(`../presets/${ACP_PRESET_ID}/`, import.meta.url))
+}
+
+/**
+ * Report whether the ACP-mode preset is installed and complete.
+ *
+ * `installed` only says the directory exists — a user may have edited it, and
+ * this plugin never treats an existing directory as its own. `missing` is the
+ * repair list: the bundled files absent from the installed copy.
+ */
+export function acpPresetStatus(home: string = homedir()): AcpPresetStatus {
+  const dir = acpPresetDir(home)
+  const installed = existsSync(dir)
+  const missing = ACP_PRESET_FILES.filter(file => !existsSync(join(dir, file)))
+  return { id: ACP_PRESET_ID, dir, installed, missing: [...missing] }
+}
+
+/**
+ * Install the ACP-mode preset for the user's roster.
+ *
+ * Idempotent and non-destructive: an existing file is never overwritten (the
+ * composition is meant to be edited in place — copying is the roster's own
+ * authoring model), so this only ever creates the directory and fills in files
+ * that are absent. The boot path calls it with `onlyIfAbsent`, which leaves a
+ * preset the user has taken over completely untouched.
+ */
+export function installAcpPreset(home: string = homedir(), options: { onlyIfAbsent?: boolean } = {}): AcpPresetStatus {
+  const dir = acpPresetDir(home)
+  if (options.onlyIfAbsent === true && existsSync(dir)) return acpPresetStatus(home)
+  const source = bundledAcpPresetDir()
+  try {
+    mkdirSync(dir, { recursive: true })
+    for (const file of ACP_PRESET_FILES) {
+      const target = join(dir, file)
+      if (existsSync(target)) continue
+      copyFileSync(join(source, file), target)
+    }
+  } catch { /* best effort: an unwritable home must not break plugin load */ }
+  return acpPresetStatus(home)
+}
+
+/** Same as {@link defaultAgentWorkspace}, best-effort creating it on disk. */
+export function ensureDefaultWorkspace(home: string = homedir()): string {
+  const dir = defaultAgentWorkspace(home)
+  try {
+    mkdirSync(dir, { recursive: true })
+  } catch { /* best effort: a missing dir is reported when a session starts */ }
+  return dir
 }
 
 export interface AgentPreset {
@@ -831,8 +1351,93 @@ export function findExecutable(command: string): string | undefined {
   return undefined
 }
 
+/** Budget for one `npm install -g` triggered by `npmPackage` (cold installs are slow). */
+const NPM_INSTALL_TIMEOUT_MS = 180_000
+
+/**
+ * Globally install an agent's npm package. The package name reaches the
+ * installer as a spawn argv item; on Windows the installer needs a shell,
+ * which is exactly why `validateAgentDef` restricts `npmPackage` to a
+ * charset with no shell metacharacters.
+ */
+export function npmInstallGlobal(pkg: string, onLog: (line: string) => void = () => {}): Promise<void> {
+  return new Promise((resolveInstall, rejectInstall) => {
+    let settled = false
+    onLog(`[dsh-ntr] "${pkg}" not found on PATH — running: npm install -g ${pkg}`)
+    const child = spawn('npm', ['install', '-g', '--no-fund', '--no-audit', pkg], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: process.platform === 'win32',
+    })
+    const output: string[] = []
+    const collect = (chunk: unknown) => {
+      for (const line of String(chunk).split('\n')) {
+        if (line.trim() === '') continue
+        output.push(line.slice(0, 500))
+        if (output.length > 40) output.splice(0, output.length - 40)
+      }
+    }
+    child.stdout?.setEncoding('utf8')
+    child.stdout?.on('data', collect)
+    child.stderr?.setEncoding('utf8')
+    child.stderr?.on('data', collect)
+    const timer = setTimeout(() => {
+      child.kill()
+      settle(new AcpError('agent_unreachable', `acp: npm install -g ${pkg} timed out after ${NPM_INSTALL_TIMEOUT_MS}ms; output: ${output.slice(-5).join(' | ')}`))
+    }, NPM_INSTALL_TIMEOUT_MS)
+    timer.unref?.()
+    child.on('error', error => {
+      settle(new AcpError('agent_unreachable', `acp: npm install -g ${pkg} failed to run: ${error.message}`))
+    })
+    child.on('exit', (code, signal) => {
+      if (code === 0) {
+        onLog(`[dsh-ntr] npm install -g ${pkg} finished`)
+        settle(undefined)
+        return
+      }
+      for (const line of output.slice(-5)) onLog(line)
+      settle(new AcpError('agent_unreachable', `acp: npm install -g ${pkg} exited code=${String(code)} signal=${String(signal)}; output: ${output.slice(-5).join(' | ')}`))
+    })
+
+    function settle(error: AcpError | undefined): void {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (error === undefined) resolveInstall()
+      else rejectInstall(error)
+    }
+  })
+}
+
+export interface ExecutableResolution {
+  command: string
+  /** True when the npm auto-install ran during this resolution. */
+  installed: boolean
+}
+
+/**
+ * Resolve the spawn command for an agent def: PATH lookup first, then — when
+ * the command is missing and the def carries `npmPackage` — a global install
+ * and a second lookup. When nothing resolves the original command comes back
+ * untouched so the spawn itself fails with the familiar ENOENT.
+ */
+export async function ensureAgentExecutable(
+  def: Pick<AcpAgentDef, 'command' | 'npmPackage'>,
+  install: (pkg: string, onLog: (line: string) => void) => Promise<void> = (pkg, onLog) => npmInstallGlobal(pkg, onLog),
+  onLog: (line: string) => void = () => {},
+): Promise<ExecutableResolution> {
+  const found = findExecutable(def.command)
+  if (found !== undefined) return { command: found, installed: false }
+  if (def.npmPackage === undefined || def.npmPackage === '') return { command: def.command, installed: false }
+  await install(def.npmPackage, onLog)
+  const retry = findExecutable(def.command)
+  if (retry === undefined) {
+    onLog(`[dsh-ntr] ${def.npmPackage} installed but "${def.command}" is still not resolvable on PATH`)
+  }
+  return { command: retry ?? def.command, installed: true }
+}
+
 export function detectHostAgents(configuredDefs: readonly AcpAgentDef[]): DetectedAgentInfo[] {
-  return AGENT_PRESETS.map(preset => {
+  const presetEntries = AGENT_PRESETS.map(preset => {
     let detectedPath: string | undefined
     for (const exe of preset.executables) {
       const found = findExecutable(exe)
@@ -853,6 +1458,27 @@ export function detectHostAgents(configuredDefs: readonly AcpAgentDef[]): Detect
       currentConfig: current,
     }
   })
+  // Configured agents outside the preset table (custom ids created in the
+  // panel) surface as their own detect entries so the browser can edit their
+  // full connection form — env / npmPackage / title exist only on
+  // `currentConfig`, which the synthesized client-side fallback lacks.
+  const presetIds = new Set(presetEntries.map(entry => entry.id))
+  const customEntries = configuredDefs
+    .filter(def => !presetIds.has(def.id))
+    .map(def => {
+      const executablePath = findExecutable(def.command)
+      return {
+        id: def.id,
+        name: def.title ?? def.id,
+        description: `Custom ACP agent (command: ${def.command})`,
+        detected: executablePath !== undefined,
+        executablePath,
+        defaultCommand: def.command,
+        defaultArgs: [...(def.args ?? [])],
+        currentConfig: def,
+      }
+    })
+  return [...presetEntries, ...customEntries]
 }
 
 /** Routes host session ids to their owning bridge. */
@@ -878,7 +1504,204 @@ export class BridgeManager {
   }
 
   private makeBridge(def: AcpAgentDef, onConnectionLost: (bridge: AgentBridge, reason: string) => void, onCatalog?: (agentId: string, configOptions: unknown) => void): AgentBridge {
-    return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, this.tuning)
+    return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, this.tuning, () => this.approvalRequester, () => this.sessionPolicyResolver)
+  }
+
+  /**
+   * Route ACP permission asks through the host approval service (answered in
+   * the chat composer). Absent → every ask stays on the settings-panel ledger.
+   * Setting it also flips {@link approvalRouting}, which the browser reads to
+   * stop rendering the settings-panel permission card.
+   */
+  setApprovalRequester(requester?: ApprovalRequester): void {
+    this.approvalRequester = requester
+  }
+
+  /** True when permission asks go to native approval instead of the settings panel. */
+  approvalRouting(): boolean {
+    return this.approvalRequester !== undefined
+  }
+
+  /**
+   * Let the host's DSH access mode govern permission asks (and fs writes) for
+   * chat-backed sessions instead of the agent's own `permission` field. Absent
+   * resolver → the pre-mapping behavior, which is what `/acp`-RPC sessions and
+   * headless deployments want anyway.
+   */
+  setSessionPolicyResolver(resolver?: SessionPolicyResolver): void {
+    this.sessionPolicyResolver = resolver
+  }
+
+  /**
+   * Wire the ACP-mode probe: given a DSH session id, report whether that
+   * session runs the ACP agent preset. The host half reads it back from the
+   * session log (`sessionAgentPreset`); absent resolver (or an unknown session)
+   * leaves the access-mode mapping in charge, exactly as before.
+   */
+  setAcpModeResolver(resolver?: AcpModeResolver): void {
+    this.acpModeResolver = resolver
+  }
+
+  /** True when a chat session's DSH access mode governs its asks (read-only capability report). */
+  accessModeRouting(): boolean {
+    return this.sessionPolicyResolver !== undefined
+  }
+
+  /**
+   * Whether ONE DSH chat session runs the ACP agent preset, asked by chat
+   * session id. The browser's model-seat gate consumes this: on hosts whose
+   * client runtime does not carry `agentPreset` on the session-list row (the
+   * gate's preferred fact source), this is the only way the seat takeover can
+   * happen at all — see `docs/acp-mode.md` on the shadowing gate.
+   *
+   * The resolver may await a persistence read (a cold session has to be read
+   * from disk), so answers are CACHED per session id and served synchronously:
+   * the first ask returns `false` while the read is in flight and the gate
+   * re-asks on the next store tick — a one-turn delay, never a wrong seat.
+   * A cached verdict is dropped when the session's log moves (preset switch,
+   * new turn), so a stale answer cannot outlive the fact it was folded from.
+   */
+  chatSessionAcpMode(dshSessionId: string): boolean {
+    const cached = this.acpModeCache.get(dshSessionId)
+    if (cached !== undefined) return cached
+    const resolver = this.acpModeResolver
+    if (resolver === undefined) return false
+    try {
+      const answered = resolver(dshSessionId)
+      if (answered instanceof Promise) {
+        // Prime the cache from the settled read; the synchronous asker still
+        // got `false` this round (see `chatSessionAcpModeAnswer` for the
+        // awaitable form the RPC serves instead).
+        void answered.then(verdict => {
+          if (verdict !== undefined) this.acpModeCache.set(dshSessionId, verdict === true)
+        }).catch(() => { /* retry on the next ask */ })
+        return false
+      }
+      if (answered !== undefined) this.acpModeCache.set(dshSessionId, answered === true)
+      return answered === true
+    } catch {
+      // Never guess from a failed lookup: the browser's fallback then reads
+      // "not ACP", which keeps the native seat — the allowed failure mode.
+      return false
+    }
+  }
+
+  /**
+   * The awaitable form of `chatSessionAcpMode`, served by the `session/chat-list`
+   * RPC: the first ask WAITS for the cold read instead of answering early, so
+   * the browser's one-shot fallback sees the settled verdict immediately —
+   * a synchronous first answer of `false` would be remembered by the gate and
+   * the seat would never take over. Concurrent asks for the same session share
+   * one read (in-flight dedup); a failed lookup returns `false` for that ask
+   * but is NOT cached, so the next ask retries.
+   */
+  async chatSessionAcpModeAnswer(dshSessionId: string): Promise<boolean> {
+    const cached = this.acpModeCache.get(dshSessionId)
+    if (cached !== undefined) return cached
+    const resolver = this.acpModeResolver
+    if (resolver === undefined) return false
+    let inflight = this.acpModeInflight.get(dshSessionId)
+    if (inflight === undefined) {
+      inflight = (async () => {
+        try {
+          return await resolver(dshSessionId)
+        } catch {
+          return undefined
+        } finally {
+          this.acpModeInflight.delete(dshSessionId)
+        }
+      })()
+      this.acpModeInflight.set(dshSessionId, inflight)
+    }
+    const verdict = await inflight
+    if (verdict !== undefined) {
+      this.acpModeCache.set(dshSessionId, verdict === true)
+      return verdict === true
+    }
+    return false
+  }
+
+  /** Drop cached ACP-mode verdicts: one session's, or all of them. */
+  invalidateAcpMode(dshSessionId?: string): void {
+    if (dshSessionId === undefined) {
+      this.acpModeCache.clear()
+      return
+    }
+    this.acpModeCache.delete(dshSessionId)
+  }
+
+  /**
+   * The ACP agent sessions backing one DSH chat session. The composer uses this
+   * to offer the agent's OWN modes next to the host's Access mode control —
+   * "how the agent works" beside "what it may touch", which is the split that
+   * keeps the two controls from reading as duplicates.
+   */
+  chatSessions(dshSessionId: string): ChatSessionView[] {
+    const out: ChatSessionView[] = []
+    for (const session of this.dshSessionMap.values()) {
+      if (session.dshSessionId !== dshSessionId) continue
+      const title = this.defsMap.get(session.agentId)?.title
+      out.push({
+        agentId: session.agentId,
+        ...(title === undefined ? {} : { agentTitle: title }),
+        sessionId: session.sessionId,
+        ...(session.title === undefined ? {} : { title: session.title }),
+        ...(session.modes === undefined ? {} : { modes: session.modes }),
+        ...(session.released ? { released: true } : {}),
+      })
+    }
+    return out
+  }
+
+  /**
+   * Every ACP session's transcript that belongs to one DSH chat session, so the
+   * conversation can render the REAL agent stream (tool calls, plans, diffs) as
+   * its own view tab. Released sessions keep serving their pre-crash buffer —
+   * a dead agent must not blank the history the user is reading.
+   *
+   * Read-only and synchronous: like `transcript`, it never spawns and never
+   * resumes (a `session/load` resume is triggered by *sending*, not looking).
+   */
+  chatTranscripts(dshSessionId: string, afterSeq?: number): ChatTranscriptView[] {
+    const views: ChatTranscriptView[] = []
+    for (const session of this.dshSessionMap.values()) {
+      // A closed session is destroyed, not merely unreachable: its buffered
+      // transcript would be a ghost the user cannot act on.
+      if (session.dshSessionId !== dshSessionId || session.closed) continue
+      views.push({ session: snapshot(session), entries: session.transcript.since(afterSeq ?? 0) })
+    }
+    return views
+  }
+
+  /**
+   * Switch one chat-bound session's ACP mode. A released session is resumed
+   * first (`session/load`), matching the "send to recover" promise — the mode
+   * switch is itself a reason to bring the agent back.
+   */
+  async setChatSessionMode(dshSessionId: string, modeId: string, agentId?: string): Promise<void> {
+    const candidates = [...this.dshSessionMap.values()].filter(session => session.dshSessionId === dshSessionId)
+    const target = agentId === undefined
+      ? (candidates.find(session => !session.released) ?? candidates[0])
+      : candidates.find(session => session.agentId === agentId)
+    if (target === undefined || target.closed) {
+      throw new AcpError('unknown_session', `acp: no live ACP session is bound to chat session ${dshSessionId}`)
+    }
+    const bridge = this.bridge(target.agentId)
+    const session = target.released ? await bridge.resumeSession(target) : target
+    await bridge.setMode(session, modeId)
+  }
+
+  /**
+   * Read-only install state of the ACP-mode preset for the settings panel.
+   * Filesystem state, not agent runtime state, so it is reported on its own.
+   */
+  presetStatus(): AcpPresetStatus {
+    return acpPresetStatus()
+  }
+
+  /** Install or repair the ACP-mode preset from the bundled copy (never overwrites). */
+  presetInstall(): AcpPresetStatus {
+    return installAcpPreset()
   }
 
   private getStoragePath(): string | undefined {
@@ -995,7 +1818,6 @@ export class BridgeManager {
     const entry = { catalog, updatedAt: Date.now() }
     this.catalogs.set(agentId, entry)
     this.persistCatalogs()
-    this.notifyModelsChanged()
     return entry
   }
 
@@ -1017,8 +1839,8 @@ export class BridgeManager {
 
   /**
    * Fire-and-forget background probe for an agent without a cached catalog.
-   * Failures stay silent: the catalog is advisory and the selector simply
-   * shows the base entry until a probe succeeds.
+   * Failures stay silent: the catalog is advisory and an ACP seat simply shows
+   * the agent's default model until a probe succeeds.
    */
   private ensureCatalog(agentId: string): void {
     if (this.catalogs.has(agentId)) return
@@ -1033,48 +1855,60 @@ export class BridgeManager {
   }
 
   /**
-   * Flat per-provider model list for the DSH selector: one base entry per
-   * agent (the agent's own default model) plus one `agent@choice` variant per
-   * cataloged model choice, narrowed by the agent's `exposedModels` filter
-   * (unset → all choices; the base entry is never filtered out). Pure memory —
-   * NEVER spawns; agents without a catalog merely get a lazy background probe
-   * so the next refresh is full.
+   * The ACP model surface for ONE agent — the seats' own list (see
+   * `AgentCatalogResult`). This is what the chat composer's ACP cluster and the
+   * ACP-mode model seat render; DSH's native selector has no ACP entries at all
+   * (`AcpLlmAdapter.listModels` advertises nothing), because the host builds one
+   * global provider catalog with no per-session seam and every session would
+   * then be offered ACP agents as if they were just another model.
+   *
+   * Variants are opt-in: an agent with no `exposedModels` (or an empty list)
+   * offers only its base entry. Offering the whole catalog by default is not a
+   * feature — these menus have no search, and a real agent publishes hundreds
+   * of choices (pi: 500, omp: 581), so "everything by default" is a list storm
+   * the user cannot navigate. The base entry is never filtered out.
+   *
+   * Pure memory — NEVER spawns; an agent without a cached catalog merely gets a
+   * background probe so the next read is complete.
    */
-  listAdapterModels(provider: string): LlmModelInfo[] {
-    const out: LlmModelInfo[] = []
-    for (const def of this.defsMap.values()) {
-      const title = def.title ?? def.id
-      out.push({
-        provider,
+  agentCatalog(agentId: string): AgentCatalogResult {
+    const def = this.defsMap.get(agentId)
+    if (def === undefined) throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
+    const title = def.title ?? def.id
+    const entry = this.catalogs.get(agentId)
+    if (entry === undefined) this.ensureCatalog(agentId)
+    const exposed = def.exposedModels
+    const variants: AgentCatalogResult['variants'] = []
+    for (const choice of entry?.catalog.model?.choices ?? []) {
+      if (exposed === undefined || !exposed.includes(choice.value)) continue
+      variants.push({
+        id: buildAdapterModelId(def.id, choice.value),
+        name: `${title} · ${choice.name}`,
+        ...(choice.description !== undefined ? { description: choice.description } : {}),
+      })
+    }
+    const reasoning = this.reasoningMeta(agentId)
+    return {
+      agentId: def.id,
+      title,
+      base: {
         id: def.id,
         name: title,
         description: `ACP Agent: ${def.command} ${(def.args ?? []).join(' ')}`.trim(),
-      })
-      const entry = this.catalogs.get(def.id)
-      if (entry === undefined) {
-        this.ensureCatalog(def.id)
-        continue
-      }
-      const exposed = def.exposedModels
-      for (const choice of entry.catalog.model?.choices ?? []) {
-        if (exposed !== undefined && !exposed.includes(choice.value)) continue
-        out.push({
-          provider,
-          id: buildAdapterModelId(def.id, choice.value),
-          name: `${title} · ${choice.name}`,
-          ...(choice.description !== undefined ? { description: choice.description } : {}),
-        })
-      }
+      },
+      variants,
+      probed: entry !== undefined,
+      ...(reasoning !== undefined ? { reasoning } : {}),
+      ...(entry === undefined ? {} : { updatedAt: entry.updatedAt }),
     }
-    return out
   }
 
   /**
-   * Resolve one catalog id for the DSH selector/validation. Unknown agents
+   * Resolve one exact ACP route id for validation/streaming. Unknown agents
    * throw (that is what turns `selectModel` into `model-unavailable`); known
-   * agents NEVER throw — stale variants degrade to a bare-id entry so one
-   * dead choice cannot sink the whole `acp` provider group in
-   * `buildModelCatalog`.
+   * agents NEVER throw — a stale variant degrades to a bare-id entry, because
+   * the agent may have dropped a model it used to publish and an
+   * already-selected session must keep working.
    */
   resolveAdapterModel(provider: string, model: string): LlmResolvedModelInfo {
     const { agentId, choice } = splitAdapterModelId(model)
@@ -1243,11 +2077,14 @@ export class BridgeManager {
   }
 
   async saveAgent(def: AcpAgentDef): Promise<void> {
-    const defaultWorkspace = resolve(process.cwd(), 'acp-workspaces')
+    const defaultWorkspace = ensureDefaultWorkspace()
     const resolvedCwd = def.cwd ?? defaultWorkspace
+    // Deduplicated on purpose: the panel pre-fills the same path in several
+    // fields, and the old fallback also appended `process.cwd()`, which handed
+    // the agent the whole launch directory as an allowed root.
     const resolvedRoots = (def.allowedCwdRoots && def.allowedCwdRoots.length > 0)
-      ? def.allowedCwdRoots
-      : [resolvedCwd, defaultWorkspace, process.cwd()]
+      ? [...new Set(def.allowedCwdRoots)]
+      : [...new Set([resolvedCwd, defaultWorkspace])]
 
     const resolvedDef: AcpAgentDef = {
       ...def,
@@ -1268,8 +2105,8 @@ export class BridgeManager {
       state: 'stopped',
       agent: new AgentBridge(resolvedDef, this.hub, this.transcriptMax, () => {}).view(),
     })
-    // A save is user-initiated: probe the model catalog immediately so the
-    // chat selector fills in; a failing startup surfaces as a notice.
+    // A save is user-initiated: probe the model catalog immediately so the ACP
+    // seats fill in; a failing startup surfaces as a notice.
     void this.probeAgentModels(resolvedDef.id).catch((error: unknown) => {
       this.hub.broadcast({
         type: 'agent/notice',
@@ -1278,13 +2115,13 @@ export class BridgeManager {
         text: `acp: model probe failed: ${describeError(error)}`,
       })
     })
-    this.notifyModelsChanged()
   }
 
   /**
    * Lightweight model-visibility update: mutates the def in place (the live
    * bridge shares the same object, so nothing needs restarting), persists, and
-   * republishes status. `undefined` clears the filter (expose every choice).
+   * republishes status. `undefined` clears the filter, which — being the same
+   * as `[]` — leaves only the agent's base entry in the ACP seats.
    */
   async setExposedModels(agentId: string, exposedModels: readonly string[] | undefined): Promise<void> {
     const def = this.defsMap.get(agentId)
@@ -1299,7 +2136,6 @@ export class BridgeManager {
       state: bridge?.state ?? 'stopped',
       ...(bridge === undefined ? {} : { agent: bridge.view() }),
     })
-    this.notifyModelsChanged()
   }
 
   async deleteAgent(agentId: string): Promise<void> {
@@ -1315,7 +2151,39 @@ export class BridgeManager {
       agentId,
       state: 'stopped',
     })
-    this.notifyModelsChanged()
+  }
+
+  /**
+   * Spawn a throwaway agent process from raw form values and run the ACP
+   * handshake against it. The bridge is never registered in `defsMap` /
+   * `bridges` and broadcasts on a private hub with no sinks, so a test cannot
+   * touch persisted config, real sessions, or the browser event stream. The
+   * process is torn down in every outcome.
+   */
+  async testAgent(def: AcpAgentDef): Promise<AgentTestResult> {
+    const bridge = new AgentBridge(def, new EventHub(), 50, () => {})
+    const startedAt = Date.now()
+    try {
+      await bridge.ensureReady()
+      const info = bridge.initResult?.agentInfo
+      return {
+        ok: true,
+        ...(info
+          ? { agentInfo: { name: info.name, title: info.title ?? undefined, version: info.version } }
+          : {}),
+        durationMs: Date.now() - startedAt,
+        stderr: [...bridge.stderrTail],
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+        durationMs: Date.now() - startedAt,
+        stderr: [...bridge.stderrTail],
+      }
+    } finally {
+      await bridge.stop().catch(() => { /* already torn down by the failure path */ })
+    }
   }
 
   async startSession(agentId: string, cwd: string | undefined): Promise<{ sessionId: string }> {
@@ -1356,6 +2224,7 @@ export class BridgeManager {
     const live = this.tryLocate(sessionId)
     if (live !== undefined) {
       await live.bridge.closeSession(live.session, 'closed')
+      this.forgetDshSession(sessionId)
       return
     }
     // A released session has no process left to close; just drop the record.
@@ -1426,8 +2295,6 @@ export class BridgeManager {
   private defaultModelSelection?: { provider: string; model: string }
   private defaultModelGetter?: () => { provider: string; model: string; reasoningEffort?: string } | undefined
   private defaultModelSetter?: (next: { provider: string; model: string }) => Promise<void>
-  /** Announcement used after in-memory catalog mutations (see setModelsChangedHook). */
-  private modelsChangedHook?: () => void
 
   setDefaultModelHooks(
     getter?: () => { provider: string; model: string; reasoningEffort?: string } | undefined,
@@ -1435,25 +2302,6 @@ export class BridgeManager {
   ): void {
     this.defaultModelGetter = getter
     this.defaultModelSetter = setter
-  }
-
-  /**
-   * Register the announcement fired after in-memory catalog mutations. The
-   * host entry re-commits the adapter's unchanged routes so the republished
-   * `llm/adapters-updated` reaches open browsers, where chat model selectors
-   * rebuild their directory — panel-side edits land without a page reload.
-   */
-  setModelsChangedHook(hook?: () => void): void {
-    this.modelsChangedHook = hook
-  }
-
-  /** Advisory: a failed announcement must not fail the mutation itself. */
-  private notifyModelsChanged(): void {
-    try {
-      this.modelsChangedHook?.()
-    } catch {
-      // The next full page load rebuilds the catalog anyway.
-    }
   }
 
   async getDefaultModel(): Promise<{ provider?: string; model?: string }> {
@@ -1474,6 +2322,24 @@ export class BridgeManager {
 
   private readonly dshSessionMap = new Map<string, LiveSession>()
 
+  /** Drop every chat-keyed record pointing at one host session (close/stop paths). */
+  private forgetDshSession(sessionId: string): void {
+    for (const [key, session] of this.dshSessionMap) {
+      if (session.sessionId === sessionId) this.dshSessionMap.delete(key)
+    }
+  }
+  /**
+   * Latest native-approval requester. Held as a field (read through a thunk by
+   * each bridge) so a requester wired after bridges were built still applies.
+   */
+  private approvalRequester?: ApprovalRequester
+  private sessionPolicyResolver?: SessionPolicyResolver
+  private acpModeResolver?: AcpModeResolver
+  /** Cached `chatSessionAcpMode` answers, keyed by DSH chat session id. */
+  private readonly acpModeCache = new Map<string, boolean>()
+  /** In-flight cold reads behind `chatSessionAcpModeAnswer`, keyed by session id. */
+  private readonly acpModeInflight = new Map<string, Promise<boolean | undefined>>()
+
   async getOrCreateDshSession(dshSessionId: string | undefined, agentId: string, cwd?: string): Promise<LiveSession> {
     const key = `${dshSessionId ?? 'ephemeral'}:${agentId}`
     const existing = this.dshSessionMap.get(key)
@@ -1483,9 +2349,16 @@ export class BridgeManager {
     // The session's agent died earlier: resume in place so the conversation
     // context survives via `session/load`.
     if (existing !== undefined && existing.released) {
-      return this.bridge(agentId).resumeSession(existing)
+      const resumed = await this.bridge(agentId).resumeSession(existing)
+      // Rebind explicitly: a resume keeps the record's identity, but the chat
+      // session id is what native approval routing keys off.
+      resumed.dshSessionId = dshSessionId
+      return resumed
     }
     const session = await this.bridge(agentId).createSession(cwd)
+    // Absent for `/acp`-RPC sessions and for adapter calls without a chat
+    // session; those deliberately keep the ledger path (see askNativeApproval).
+    session.dshSessionId = dshSessionId
     this.dshSessionMap.set(key, session)
     return session
   }
@@ -1501,6 +2374,47 @@ export class BridgeManager {
       return
     }
 
+    // Auxiliary host calls (`session-title`, `compaction`) ride the session's
+    // logged route, so they reach this adapter looking like a turn. They are not
+    // conversation: forwarding one would spend a remote agent turn on a title
+    // prompt, or worse, fold it into the ACP agent's own context. Refuse before
+    // touching (or spawning) anything — the title service degrades to its text
+    // fallback and compaction is best-effort.
+    if (options.purpose !== undefined) {
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            message: `acp: "${options.purpose}" is an auxiliary harness call, not a conversation turn — an ACP agent cannot serve it`,
+            code: 'unsupported_purpose',
+          },
+        },
+      }
+      return
+    }
+
+    // Forward the person's own words: the host folds its context sections
+    // (AGENTS.md digest, skill catalog, runtime snapshot) after the claimed user
+    // batch precisely so a consumer can tell them apart by `source` — see
+    // `selectForwardPrompt` and AGENTS.md rule 16.
+    const selection = selectForwardPrompt(options.messages ?? [])
+    if (selection.kind === 'no-user-input') {
+      // An injected-context wake: nothing the user said, nothing to send.
+      yield { type: 'finish', reason: { kind: 'stop' } }
+      return
+    }
+    if (selection.kind === 'empty') {
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: { message: 'acp: this request carries no user message to forward', code: 'empty_prompt' },
+        },
+      }
+      return
+    }
+
     let session: LiveSession
     try {
       session = await this.getOrCreateDshSession(options.sessionId, agentId)
@@ -1512,10 +2426,23 @@ export class BridgeManager {
       return
     }
 
-    if (session.running) {
+    const bridge = this.bridge(agentId)
+
+    // One prompt slot per session, and a turn the user aborted still occupies
+    // the AGENT's slot until it acknowledges the cancel (see `claimTurn`).
+    const claim = await bridge.claimTurn(session)
+    if (!claim.ok) {
       yield {
         type: 'finish',
-        reason: { kind: 'error', failure: { message: 'acp: this session already has a prompt in flight', code: 'turn_in_flight' } },
+        reason: {
+          kind: 'error',
+          failure: {
+            message: claim.reason === 'busy'
+              ? 'acp: this session already has a prompt in flight'
+              : 'acp: the agent is still finishing the previous (cancelled) turn; send again in a moment',
+            code: 'turn_in_flight',
+          },
+        },
       }
       return
     }
@@ -1525,14 +2452,30 @@ export class BridgeManager {
     // via the `${dshSessionId}:${agentId}` key in getOrCreateDshSession.
     await this.alignSessionConfig(session, choice, options.reasoningEffort)
 
-    const userMessages = (options.messages ?? []).filter(m => m.role === 'user')
-    const lastUserMsg = userMessages[userMessages.length - 1]
-    const textBlocks = lastUserMsg?.content?.filter(b => b.type === 'text' && typeof b.text === 'string') ?? []
-    const rawText = textBlocks.map(b => b.text).join('\n')
-    const promptText = rawText.trim() !== '' ? rawText : 'Hello'
+    const promptText = selection.text
+
+    // The session's access mode is the single source of truth for this turn:
+    // re-resolve it every prompt (a control flipped mid-conversation lands on
+    // the next turn). It arbitrates the permission answers and the fs write
+    // fence below, and it is deliberately NOT narrated into the prompt: what the
+    // agent receives is the user's own words and nothing else, so it learns a
+    // boundary only where it actually hits one (a refusal or an approval ask).
+    session.dshPolicy = session.dshSessionId === undefined ? undefined : this.sessionPolicyResolver?.(session.dshSessionId)
+    // The resolver may await a persistence read (a cold session); the turn
+    // needs a synchronous verdict, so resolve the promise when there is one.
+    // A live session answers synchronously and this is a no-op await.
+    if (session.dshSessionId !== undefined) {
+      const resolved = await this.acpModeResolver?.(session.dshSessionId)
+      session.acpMode = resolved === true
+      // This turn may log an `agent-preset/selected` (a blank-session
+      // recompose) and any persistence read observed the log BEFORE it: drop
+      // the cached verdict so the gate re-asks against the moved log.
+      this.invalidateAcpMode(session.dshSessionId)
+    } else {
+      session.acpMode = false
+    }
 
     const queue = new AsyncQueue<StreamChunk>()
-    const bridge = this.bridge(agentId)
     session.running = true
     const turnId = randomUUID()
     this.hub.broadcast({ type: 'turn/start', sessionId: session.sessionId, turnId, text: promptText })
@@ -1641,6 +2584,10 @@ export class BridgeManager {
       onAbort()
     } else {
       options.signal?.addEventListener('abort', onAbort, { once: true })
+      // The agent-side turn is in flight from here until its response lands
+      // (or the connection dies): that window, not our own stream, is what the
+      // next turn has to respect.
+      const endTurn = bridge.beginTurn(session)
       bridge.runPrompt(session, promptText, turnId)
         .then(stopReason => {
           this.hub.broadcast({ type: 'turn/end', sessionId: session.sessionId, turnId, stopReason })
@@ -1655,6 +2602,7 @@ export class BridgeManager {
           this.hub.broadcast({ type: 'turn/end', sessionId: session.sessionId, turnId, error: desc })
           finishStream({ kind: 'error', failure: { message: desc, code: 'INTERNAL' } })
         })
+        .finally(endTurn)
     }
 
     yield* queue
@@ -1676,8 +2624,24 @@ export class AcpLlmAdapter implements LlmAdapterLike {
     return undefined
   }
 
-  async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    return this.manager.listAdapterModels(provider)
+  /**
+   * Advertise NOTHING, on purpose (see `AgentCatalogResult` and
+   * `BridgeManager.agentCatalog`).
+   *
+   * DSH's model catalog is per request, not per session (`buildModelCatalog(ctx)`
+   * takes no session id), so an `acp` that listed models would list them in
+   * every conversation — including the ones with no ACP agent behind them. The
+   * catalog is advisory (its own contract: "an adapter may accept unlisted model
+   * ids, and consumers must not turn absence into request rejection"), and route
+   * liveness is judged by registration, not by this list, so `acp@agent` and
+   * `acp@agent@choice` still resolve and stream while being advertised nowhere.
+   * An empty list also keeps this hot path (every `session.models` / `llm.models`
+   * request) allocation-free: there is no per-session seam to filter with, so
+   * nothing may be listed until there is. The ACP seats read the per-agent view
+   * through `agent/catalog` instead.
+   */
+  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    return []
   }
 
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {

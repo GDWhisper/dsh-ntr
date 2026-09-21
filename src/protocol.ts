@@ -16,7 +16,15 @@ import type { SessionUpdate } from '@agentclientprotocol/sdk'
 
 // ---- Configuration (host side, from the profile layer) ----
 
-/** How the human answers the agent's `session/request_permission`. */
+/**
+ * Per-agent *policy* for `session/request_permission` — it decides whether a
+ * human is asked at all, NOT where the question is rendered.
+ *
+ * - `ask`: surface every request to a human. The surface is picked by host
+ *   capability: the chat composer when the native approval chain is wired
+ *   (see `AgentsListResult.approvalRouted`), otherwise the settings panel.
+ * - `allow` / `reject`: answer automatically, nothing is ever surfaced.
+ */
 export type PermissionMode = 'ask' | 'allow' | 'reject'
 
 /** One pre-configured ACP agent executable. */
@@ -29,6 +37,13 @@ export interface AcpAgentDef {
   command: string
   /** Argument vector (no shell interpretation). */
   args?: string[]
+  /**
+   * npm package installed globally (`npm install -g`) when `command` cannot be
+   * resolved on the host PATH, right before the spawn is attempted. Unset → a
+   * missing command just fails with ENOENT. Name-only charset is enforced by
+   * `validateAgentDef` (no shell metacharacters can ever reach the installer).
+   */
+  npmPackage?: string
   /** Child environment layered over a credential-scrubbed copy of the host env. */
   env?: Record<string, string>
   /** Default absolute workspace directory for new sessions. */
@@ -38,14 +53,30 @@ export interface AcpAgentDef {
   /** Permission policy: `ask` (default, surfaces the human), `allow`, `reject`. */
   permission?: PermissionMode
   /**
-   * Which probed `category: model` choices are exposed as `agentId@choice`
-   * variants in the native chat model selector (the selector has no search,
-   * so an unfiltered pi agent floods it). Unset → every choice is exposed;
-   * set → only the listed choice values. The bare `agentId` entry (the
-   * agent's own default model) is always exposed regardless. Filtering only
-   * affects listing — hidden variants still resolve and stream.
+   * Which probed `category: model` choices this agent offers as `agentId@choice`
+   * variants in the plugin's own ACP seats (the chips/picker in the chat
+   * composer and the ACP-mode model seat). Those menus have no search, so the
+   * full catalog is a list storm nobody can navigate: a real pi agent publishes
+   * 500 choices, omp 581. Variants are **opt-in** — unset or empty offers none
+   * of them, and only the listed choice values are added. The bare `agentId`
+   * entry (the agent's own default model) is always offered regardless, so an
+   * agent is never unreachable. Filtering only affects listing — hidden
+   * variants still resolve and stream (see `agent/catalog`).
+   *
+   * ACP models are deliberately absent from DSH's native model selector — see
+   * {@link AgentCatalogResult} for why that is structural, not cosmetic.
    */
   exposedModels?: string[]
+  /**
+   * How long this agent's process may sit READY with no live session and
+   * nothing in flight before the host releases it (kills the child). Unset →
+   * the host default (30 minutes). `0` = never release, and only agents with
+   * no live session are ever candidates (see `AgentBridge.releaseIfIdle`):
+   * probing / post-save spawns are what leak processes, since they hold no
+   * session at all. Nothing is lost either way — a released session is
+   * resumed with `session/load` on the next send.
+   */
+  idleTimeoutMs?: number
 }
 
 export interface AcpPluginConfig {
@@ -55,7 +86,7 @@ export interface AcpPluginConfig {
   /**
    * Probe each configured agent's model catalog by spawning a throwaway ACP
    * session. Defaults to `true` (boot probe for agents without a persisted
-   * catalog, plus a lazy probe when the model selector first needs one).
+   * catalog, plus a lazy probe when an ACP seat first asks for a list).
    * `false` disables every automatic spawn; the catalog then only fills from
    * real sessions or the manual probe button.
    */
@@ -81,6 +112,12 @@ export interface AcpPluginConfig {
    * Default 15000 ms; `0` disables the fallback.
    */
   cancelFallbackMs?: number
+  /**
+   * Install the bundled ACP-mode agent preset into the roster's user root
+   * (`~/.dsh/.agent-presets/acp`) at boot when it is absent. Default `true`;
+   * an existing preset is never touched.
+   */
+  installAcpPreset?: boolean
 }
 
 // ---- Host → browser events (`/api/acp/stream`, SSE) ----
@@ -88,6 +125,22 @@ export interface AcpPluginConfig {
 export type AgentProcessState = 'stopped' | 'starting' | 'ready' | 'error'
 
 /** Agent facts the browser may render (never includes env/argv secrets beyond argv itself, which is config-visible). */
+/**
+ * Install state of the ACP-mode agent preset (`presets/acp` → the roster's user
+ * root). Read-only report: the panel shows it, and the browser can only ask the
+ * host to (re)install from the bundled copy.
+ */
+export interface AcpPresetStatus {
+  /** Preset id, which is also its directory name. */
+  id: string
+  /** Absolute target directory under the user preset root. */
+  dir: string
+  /** Whether the directory exists — an existing preset is never overwritten. */
+  installed: boolean
+  /** Bundled files absent from the installed copy (the repair list). */
+  missing: string[]
+}
+
 export interface AgentView {
   id: string
   title: string
@@ -103,6 +156,13 @@ export interface AgentView {
   agentInfo?: { name?: string; title?: string; version?: string }
   agentCapabilities?: unknown
   liveSessions: string[]
+  /**
+   * The window the host actually honors for this agent (its own
+   * `idleTimeoutMs`, else the host default). Resolved, not raw, so the panel
+   * can show a concrete number instead of guessing at a default; `0` = never
+   * released. Absent on an older host half.
+   */
+  idleTimeoutMs?: number
 }
 
 export type AcpEvent =
@@ -177,11 +237,79 @@ export type RpcResult<T> = {
   error: { code: string; message: string; details: object }
 }
 
-export type AgentsListResult = { agents: AgentView[] }
+export interface AgentsListResult {
+  agents: AgentView[]
+  /**
+   * True when permission asks are routed to the host approval chain and the
+   * browser must stop rendering the settings-panel permission card. False (or
+   * absent on an older host) keeps the degraded ledger path visible.
+   */
+  approvalRouted?: boolean
+  /**
+   * True when a chat-backed session's *DSH access mode* (the composer's Access
+   * mode control) governs its permission asks and fs writes, so the agent-level
+   * `permission` field below only applies to sessions without a chat binding
+   * (`/acp` RPC). False (or absent on an older host) means the agent field
+   * governs everything, as it did before the mapping existed.
+   */
+  accessModeRouted?: boolean
+}
 export type SessionStartResult = { sessionId: string; session: SessionView }
 export type SessionPromptResult = { accepted: true; turnId: string }
 export type TranscriptResult = { session: SessionView; entries: Array<{ seq: number; update: SessionUpdate }> }
 export type SessionsListResult = { sessions: SessionView[] }
+
+/**
+ * One ACP agent session currently backing a DSH chat session, looked up by the
+ * chat session id the composer already knows. This is what lets the browser
+ * expose an agent's OWN mode list in the conversation (the ACP-native control),
+ * independently of the host's Access mode preset.
+ */
+export interface ChatSessionView {
+  agentId: string
+  /** Display name of the agent definition, when it differs from the id. */
+  agentTitle?: string
+  /** Host-minted session id (stable across an agent restart). */
+  sessionId: string
+  title?: string
+  /** The agent's declared modes, when it has any (`session/new` / `session/load`). */
+  modes?: SessionView['modes']
+  /** The agent process died; the session awaits a `session/load` resume. */
+  released?: boolean
+}
+export type ChatSessionsListResult = { sessions: ChatSessionView[] }
+
+/**
+ * The `session/chat-list` answer: the backing ACP sessions, plus whether that
+ * DSH chat session runs the ACP agent preset (host-read from the session log).
+ * The composer's model-seat gate falls back to the latter when the client
+ * runtime's session rows carry no `agentPreset` — on such hosts it is the only
+ * fact source the seat takeover has.
+ */
+export interface ChatSessionListResult extends ChatSessionsListResult {
+  acpMode?: boolean
+}
+
+/**
+ * One ACP session's folded transcript, addressed by its DSH chat session.
+ *
+ * This is the data behind the conversation's ACP view tab: the native chat
+ * plane can only ever show text/reasoning (that is the LLM adapter's whole
+ * chunk vocabulary), so tool calls, plans and diffs have no home there — they
+ * only exist in the ACP transcript, and this is how the browser reaches it
+ * without knowing an ACP session id up front.
+ */
+export interface ChatTranscriptView {
+  session: SessionView
+  /**
+   * Raw ACP `session/update` payloads in seq order (the fold happens
+   * client-side). `unknown` is deliberate, matching `TranscriptResult`: the
+   * host's buffer is transport-agnostic and must not import the SDK.
+   */
+  entries: Array<{ seq: number; update: unknown }>
+}
+export type ChatTranscriptResult = { views: ChatTranscriptView[] }
+export interface ChatTranscriptPayload { dshSessionId: string; afterSeq?: number }
 
 export interface SessionStartPayload { agentId: string; cwd?: string }
 export interface SessionPromptPayload { sessionId: string; text: string }
@@ -214,16 +342,32 @@ export interface AgentSavePayload {
   title?: string
   command: string
   args?: string[]
+  npmPackage?: string
   cwd?: string
   allowedCwdRoots?: string[]
   permission?: PermissionMode
   env?: Record<string, string>
   exposedModels?: string[]
+  /** Absent → keep the host default (30 minutes); `0` = never release. */
+  idleTimeoutMs?: number
+}
+
+/** Result of `agent/test`: spawn + initialize a throwaway process from form values, then tear it down. */
+export interface AgentTestResult {
+  ok: boolean
+  /** Failure reason when `ok` is false (spawn ENOENT, install failure, initialize timeout, …). */
+  error?: string
+  /** The agent's `initialize` identity, when the handshake completed. */
+  agentInfo?: { name?: string; title?: string; version?: string }
+  /** Wall-clock cost of the whole test, including a triggered npm install. */
+  durationMs: number
+  /** Tail of the child's stderr (and installer output), newest last. */
+  stderr: string[]
 }
 
 export interface AgentExposedModelsPayload {
   agentId: string
-  /** Absent → clear the filter (expose everything); array (even empty) → expose exactly these. */
+  /** Absent → clear the filter (expose no variants); array (even empty) → expose exactly these. */
   exposedModels?: string[]
 }
 
@@ -263,6 +407,44 @@ export interface AgentProbeModelsResult {
   agentId: string
   catalog: AcpAgentCatalog
   updatedAt: number
+}
+
+/**
+ * Result of `agent/catalog`: the ACP model surface for ONE agent.
+ *
+ * THIS IS THE ONLY PLACE ACP MODELS EXIST. DSH builds its provider/model
+ * catalog per *request*, not per session — `buildModelCatalog(ctx)` takes no
+ * session id, so every session's model directory is that same global list. A
+ * provider that advertises models therefore advertises them to every
+ * conversation, including the ones where the external agent has no tool
+ * registration, no runtime context and is not the model talking at all. The
+ * `acp` route consequently advertises nothing (`LlmAdapter.listModels` is
+ * advisory — exact ids still resolve and stream), and the plugin's own seats
+ * read this per-agent view instead. There is no per-session seam on the host
+ * to filter the global catalog with, so "advertise nothing" is the only
+ * structurally honest isolation.
+ *
+ * Read-only and memory-only: it never spawns. An agent without a cached
+ * catalog merely gets a background probe, exactly like the old selector path.
+ */
+export interface AgentCatalogResult {
+  agentId: string
+  /** Agent display name (`title` ?? id). */
+  title: string
+  /** The bare-`agentId` entry: the agent's own default model, always offered. */
+  base: { id: string; name: string; description?: string }
+  /** The `agentId@choice` variants this agent exposes (`exposedModels` applied). */
+  variants: Array<{ id: string; name: string; description?: string }>
+  /**
+   * Reasoning efforts from the agent's own `thought_level` option, when it
+   * advertises one. Agent-wide by construction (a thought level is not a
+   * property of one model), which is why it rides here and not on `variants`.
+   */
+  reasoning?: LlmModelReasoningInfo
+  /** A probe has produced a catalog for this agent (`false` → base entry only). */
+  probed: boolean
+  /** When the cached catalog was last refreshed. */
+  updatedAt?: number
 }
 
 // ---- LLM Streaming & Adapter types (shared with DSH core LLM service) ----
@@ -314,18 +496,44 @@ export type StreamChunk =
       | { kind: 'error'; failure?: { message: string; code: string } }
   }
 
+/**
+ * Provenance of one message in a host-built request. The host tags every
+ * message, and the tag is the only way to tell the user's own words apart from
+ * the context sections the harness injects around them (`agent-instructions`,
+ * `skill-catalog`, the `@deepseek-ai/dsh-system-prompt` runtime snapshot, tool
+ * results) — see AGENTS.md rule 16.
+ */
+export interface GenerateMessageSource {
+  kind?: string
+  plugin?: string
+  form?: string
+  [k: string]: unknown
+}
+
+export interface GenerateMessage {
+  role: 'system' | 'user' | 'assistant'
+  content: Array<{ type: string; text?: string; [k: string]: unknown }>
+  /** Host provenance; absent sources are treated as real user input (hand-built callers). */
+  source?: GenerateMessageSource
+  /** Stable identity of the durable message, when the host built the request from a session log. */
+  id?: string
+}
+
 export interface GenerateOptions {
   provider: string
   model: string
   /** Adapter-owned reasoning effort selected for this exact model. */
   reasoningEffort?: string
-  messages: Array<{
-    role: 'system' | 'user' | 'assistant'
-    content: Array<{ type: string; text?: string; [k: string]: unknown }>
-  }>
+  messages: GenerateMessage[]
   system?: string
   signal?: AbortSignal
   sessionId?: string
+  /**
+   * Auxiliary (non-conversation) call classification, e.g. `session-title` or
+   * `compaction`. Ordinary turns leave it unset; an ACP bridge must never turn
+   * one of these into a remote agent turn.
+   */
+  purpose?: string
 }
 
 export interface PreparedAdapterCall {

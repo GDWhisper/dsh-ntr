@@ -199,9 +199,20 @@ const app = agent({ name: 'mock-acp-agent' })
     await send({ sessionUpdate: 'tool_call', toolCallId: 'call_1', title: 'mock tool', kind: 'other', status: 'pending' })
 
     if (text.includes('PERM')) {
+      // `PERMEDIT` / `PERMEXEC` declare the ACP tool-call kind and
+      // `PERMLOC:<path>` the write locations, so host tests can exercise the
+      // DSH access-mode mapping (kind classification + workspace containment).
+      const kind = text.includes('PERMEDIT') ? 'edit' : text.includes('PERMEXEC') ? 'execute' : undefined
+      const location = /PERMLOC:(\S+)/.exec(text)
+      const toolCall = {
+        toolCallId: 'call_1',
+        title: 'mock dangerous operation',
+        ...(kind === undefined ? {} : { kind }),
+        ...(location === null ? {} : { locations: [{ path: location[1] }] }),
+      }
       const response = await ctx.client.request(methods.client.session.requestPermission, {
         sessionId,
-        toolCall: { toolCallId: 'call_1', title: 'mock dangerous operation' },
+        toolCall,
         options: [
           { optionId: 'allow1', name: 'Allow once', kind: 'allow_once' },
           { optionId: 'reject1', name: 'Reject once', kind: 'reject_once' },
