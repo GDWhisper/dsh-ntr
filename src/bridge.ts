@@ -204,6 +204,18 @@ export class AgentBridge {
   private lastActivityAt = 0
   /** Throwaway catalog probes in flight — they hold no live session of their own. */
   private pendingProbes = 0
+  /** cwd the CURRENT child was spawned with (undefined while there is no child). */
+  private spawnCwd?: string
+  /**
+   * Workspace a chat session wants the agent PROCESS to run in (see
+   * `ensureReady`). Some agents fix their whole workspace at process start —
+   * cwd-derived project state, the environment block they show the model, the
+   * files their tools may touch — so `session/new`'s cwd arrives too late for
+   * them (observed on codebuddy: it logs `Workspace Path: <process cwd>` before
+   * any ACP request is read). For those agents the spawn cwd is the only lever
+   * there is.
+   */
+  private wantedSpawnCwd?: string
 
   constructor(
     readonly def: AcpAgentDef,
@@ -285,7 +297,7 @@ export class AgentBridge {
    */
   private releaseIfIdle(): void {
     if (this.state !== 'ready') return
-    if (this.sessions.size > 0 || this.pendingProbes > 0 || this.resuming.size > 0 || this.permissions.sessionIds().length > 0) {
+    if (!this.isQuiet()) {
       // Busy after all: the quiet window starts now, not at the last event.
       this.touch()
       return
@@ -382,8 +394,42 @@ export class AgentBridge {
     this.publishStatus()
   }
 
-  /** Memoized spawn + `initialize`; failures reset so the next call can retry. */
-  ensureReady(): Promise<void> {
+  /**
+   * Nothing depends on this child's identity right now: no live session, no
+   * probe, no resume, no open permission ask, nothing starting. The one shared
+   * predicate behind both the idle release and the workspace move below — two
+   * copies of it would drift, and "is it safe to drop this child" is exactly
+   * the question that must never be answered twice, differently.
+   */
+  private isQuiet(): boolean {
+    return this.sessions.size === 0
+      && this.pendingProbes === 0
+      && this.resuming.size === 0
+      && this.permissions.sessionIds().length === 0
+      && this.starting === undefined
+  }
+
+  /**
+   * Memoized spawn + `initialize`; failures reset so the next call can retry.
+   *
+   * @param spawnCwd - the workspace the caller needs the PROCESS to run in; a
+   *   chat session passes its DSH session workspace. A ready child cannot be
+   *   moved (its cwd is fixed at spawn), so a quiet bridge — nothing above to
+   *   lose — is restarted in the wanted workspace instead of inheriting the
+   *   directory some probe happened to spawn it in. A busy bridge keeps the
+   *   child it has: `session/new` still tells the agent where that session
+   *   lives, and killing a live conversation to move a process never is worth
+   *   it.
+   */
+  ensureReady(spawnCwd?: string): Promise<void> {
+    if (spawnCwd !== undefined) {
+      this.wantedSpawnCwd = spawnCwd
+      if (this.state === 'ready' && this.conn !== undefined && this.spawnCwd !== spawnCwd && this.isQuiet()) {
+        const reason = `agent "${this.def.id}" restarts in ${spawnCwd} (the workspace of the session using it)`
+        this.hub.broadcast({ type: 'agent/notice', agentId: this.def.id, level: 'info', text: `acp: ${reason}` })
+        this.releaseAll(reason)
+      }
+    }
     if (this.state === 'ready' && this.conn !== undefined) return Promise.resolve()
     if (this.starting !== undefined) return this.starting
     this.state = 'starting'
@@ -415,8 +461,10 @@ export class AgentBridge {
     // spawn; the resolved absolute path also pins the lookup to the host PATH
     // plus the well-known extra dirs, not the scrubbed child env.
     const { command } = await ensureAgentExecutable(this.def, undefined, line => this.noteStderr(line))
+    const cwd = safeSpawnCwd(this.def, this.wantedSpawnCwd)
+    this.spawnCwd = cwd
     const child = spawn(command, [...(this.def.args ?? [])], {
-      cwd: safeSpawnCwd(this.def),
+      cwd,
       env: childEnv(process.env, this.def.env ?? {}),
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: process.platform !== 'win32',
@@ -511,8 +559,14 @@ export class AgentBridge {
     this.hub.broadcast({ type: 'agent/status', agentId: this.def.id, state: this.state, ...(this.lastError === undefined ? {} : { error: this.lastError }), agent: this.view() })
   }
 
-  async createSession(cwd: string | undefined, extraRoots: readonly string[] = []): Promise<LiveSession> {
-    await this.ensureReady()
+  /**
+   * @param cwd - the ACP session's cwd (validated against the agent's roots).
+   * @param extraRoots - roots trusted for THIS session only (a chat session's
+   *   DSH workspace; see `resolveSessionCwd`).
+   * @param spawnCwd - where the agent PROCESS should run; see `ensureReady`.
+   */
+  async createSession(cwd: string | undefined, extraRoots: readonly string[] = [], spawnCwd?: string): Promise<LiveSession> {
+    await this.ensureReady(spawnCwd)
     const conn = this.conn
     if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
     const resolved = resolveSessionCwd(this.def, cwd, p => realpathSync(p), extraRoots)
@@ -648,7 +702,15 @@ export class AgentBridge {
 
   private async doResumeSession(session: LiveSession): Promise<LiveSession> {
     try {
-      await this.ensureReady()
+      // The cwd was validated when the session was created, but allowed roots
+      // may have narrowed since; re-check before handing the path back. A chat
+      // session's cwd is its DSH workspace (never in the agent's own roots), so
+      // that root has to be re-trusted here too — otherwise a crash would park
+      // the session in `released` forever with `cwd_denied`. The same workspace
+      // is what the resumed process must RUN in, or an agent that reads its
+      // workspace from its own cwd would come back in the plugin's sandbox.
+      const workspaceRoot = chatWorkspaceRoot(this.sessionPolicy?.(), session.dshSessionId)
+      await this.ensureReady(workspaceRoot)
       // The capability comes from the FRESH initialize: after a crash the
       // bridge restarts the process, so check the (new) initResult here.
       if (this.initResult?.agentCapabilities?.loadSession !== true) {
@@ -656,12 +718,6 @@ export class AgentBridge {
       }
       const conn = this.conn
       if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
-      // The cwd was validated when the session was created, but allowed roots
-      // may have narrowed since; re-check before handing the path back. A chat
-      // session's cwd is its DSH workspace (never in the agent's own roots), so
-      // that root has to be re-trusted here too — otherwise a crash would park
-      // the session in `released` forever with `cwd_denied`.
-      const workspaceRoot = chatWorkspaceRoot(this.sessionPolicy?.(), session.dshSessionId)
       const resolved = resolveSessionCwd(this.def, session.cwd, p => realpathSync(p), workspaceRoot === undefined ? [] : [workspaceRoot])
       // Replay arrives as brand-new updates, so the transcript restarts too;
       // seq keeps meaning "position in the current epoch".
@@ -825,6 +881,10 @@ export class AgentBridge {
   private killChild(): void {
     const child = this.child
     this.child = undefined
+    // No child, no recorded spawn cwd: the next spawn decides its own (see
+    // `spawnAndConnect`). Leaving it behind would make `ensureReady` believe a
+    // process is still running in that directory.
+    this.spawnCwd = undefined
     if (child === undefined || child.pid === undefined) return
     try {
       child.stdin?.end()
@@ -1212,11 +1272,25 @@ function canonical(path: string): string {
   }
 }
 
-function safeSpawnCwd(def: AcpAgentDef): string {
-  const candidate = def.cwd ?? ensureDefaultWorkspace()
-  try {
-    return realpathSync(candidate)
-  } catch { /* fall through to home */ }
+/**
+ * Where the agent process itself starts.
+ *
+ * `wanted` (a chat session's DSH workspace, see `ensureReady`) wins over the
+ * agent's configured `cwd`: some agents derive their ENTIRE notion of "the
+ * project" from the directory they were started in — their file fences, the
+ * environment block they show the model, their per-project state — so a process
+ * started in the plugin's sandbox answers "my workspace is
+ * ~/.dsh/acp-workspaces" no matter what `session/new` said (observed on
+ * codebuddy). `def.cwd` remains the answer for everything that has no DSH
+ * session behind it (probes, `/acp`-RPC sessions, the settings-page test).
+ */
+function safeSpawnCwd(def: AcpAgentDef, wanted?: string): string {
+  const configured = def.cwd ?? ensureDefaultWorkspace()
+  for (const candidate of wanted === undefined ? [configured] : [wanted, configured]) {
+    try {
+      if (statSync(candidate).isDirectory()) return realpathSync(candidate)
+    } catch { /* not usable — try the next candidate */ }
+  }
   return homedir()
 }
 
@@ -2392,6 +2466,9 @@ export class BridgeManager {
     const session = await this.bridge(agentId).createSession(
       workspaceRoot ?? cwd,
       workspaceRoot === undefined ? [] : [workspaceRoot],
+      // ...and the agent PROCESS runs there too, not just the session: see
+      // `ensureReady` for why `session/new`'s cwd alone is not enough.
+      workspaceRoot,
     )
     // Absent for `/acp`-RPC sessions and for adapter calls without a chat
     // session; those deliberately keep the ledger path (see askNativeApproval).

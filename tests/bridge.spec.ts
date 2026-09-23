@@ -1283,7 +1283,13 @@ describe('chat session workspace (isolated manager)', () => {
   // the host trusts the DSH session's own root for that session.
   const narrow = mkdtempSync(join(tmpdir(), 'dsh-ntr-narrow-'))
   const workspace = mkdtempSync(join(tmpdir(), 'dsh-ntr-ws-'))
-  const wsManager = new BridgeManager([{ ...def, id: 'wsmock', cwd: narrow, allowedCwdRoots: [narrow] }], wsHub, 500)
+  // A second agent, so the process-workspace cases start from a state the
+  // earlier cases did not leave behind: their live sessions are exactly what
+  // pins a process to the directory it was spawned in.
+  const wsManager = new BridgeManager([
+    { ...def, id: 'wsmock', cwd: narrow, allowedCwdRoots: [narrow] },
+    { ...def, id: 'wsprobe', cwd: narrow, allowedCwdRoots: [narrow] },
+  ], wsHub, 500)
   const wsAdapter = new AcpLlmAdapter(wsManager)
   let wsPolicy: DshSessionPolicy | undefined
   wsManager.setSessionPolicyResolver(() => wsPolicy)
@@ -1325,11 +1331,11 @@ describe('chat session workspace (isolated manager)', () => {
   }
 
   /** Drain one adapter turn; returns the agent's echo, its host session id and that session's cwd. */
-  async function wsTurn(dshSessionId: string, text: string): Promise<{ echoed: string; hostSessionId: string; cwd: string }> {
+  async function wsTurn(dshSessionId: string, text: string, model = 'wsmock'): Promise<{ echoed: string; hostSessionId: string; cwd: string }> {
     const since = wsEvents.length
     for await (const chunk of wsAdapter.stream({
       provider: 'acp',
-      model: 'wsmock',
+      model,
       sessionId: dshSessionId,
       messages: [{ role: 'user', content: [{ type: 'text', text }] }],
     })) {
@@ -1382,6 +1388,45 @@ describe('chat session workspace (isolated manager)', () => {
     expect(resumed.cwd).toBe(realpathSync(workspace))
     expect(resumed.echoed).toContain('REPLAYED: earlier conversation')
     expect(resumed.echoed).toContain('MOCK: echo back again')
+  }, 30_000)
+
+  it('moves an idle process into the chat session workspace instead of leaving it in the agent default', async () => {
+    // The regression guard for agents that derive their workspace from their
+    // OWN cwd (codebuddy logs `Workspace Path: <process cwd>` before it reads a
+    // single ACP request): `session/new`'s cwd arrives too late for them, so the
+    // process has to be started in the right directory.
+    //
+    // In the field the process is usually already up by then — the model probe
+    // spawns it first, in the agent's configured cwd — so this case reproduces
+    // exactly that order.
+    wsPolicy = { mode: 'workspace-write', approval: 'ask', workspaceRoot: workspace }
+    await wsManager.probeAgentModels('wsprobe')
+    const restarts = wsWaitFor('agent/notice', event => event.agentId === 'wsprobe' && event.text.includes('restarts in'))
+    const moved = await wsTurn('dsh-ws-proc', 'PWD please', 'wsprobe')
+    expect((await restarts).text).toContain(realpathSync(workspace))
+    expect(moved.echoed).toContain(`PWD:${realpathSync(workspace)}`)
+    expect(moved.echoed).not.toContain(`PWD:${realpathSync(narrow)}`)
+
+    // A live session pins the process: a second conversation in another
+    // workspace must not restart it (that would kill the first one). Its own
+    // ACP cwd still follows its DSH workspace, and the session that owns the
+    // process keeps working — the limit is reported, not papered over.
+    const other = mkdtempSync(join(tmpdir(), 'dsh-ntr-ws2-'))
+    wsManager.setSessionPolicyResolver(id => ({
+      mode: 'workspace-write',
+      approval: 'ask',
+      workspaceRoot: id === 'dsh-ws-proc' ? workspace : other,
+    }))
+    try {
+      const since = wsEvents.length
+      const second = await wsTurn('dsh-ws-other', 'PWD again', 'wsprobe')
+      expect(second.cwd).toBe(realpathSync(other))
+      expect(second.echoed).toContain(`PWD:${realpathSync(workspace)}`)
+      expect(wsEvents.slice(since).filter(event => event.type === 'agent/notice' && event.text.includes('restarts in'))).toHaveLength(0)
+      expect((await wsTurn('dsh-ws-proc', 'PWD once more', 'wsprobe')).echoed).toContain(`PWD:${realpathSync(workspace)}`)
+    } finally {
+      wsManager.setSessionPolicyResolver(() => wsPolicy)
+    }
   }, 30_000)
 })
 

@@ -1110,8 +1110,8 @@ function WorkspaceBlock({
         )}
         <span className="dwa-hint">
           {acp.label(
-            '对话里的 ACP 会话以该 DSH 会话选中的工作区为工作目录；此项只在 /acp 直连会话与宿主未上报工作区时生效。',
-            'An ACP session inside a conversation runs in that DSH session\u2019s own workspace; this value applies to /acp-direct sessions and when the host reports no workspace.',
+            '对话里的 ACP 会话以该 DSH 会话选中的工作区为工作目录（agent 进程也从那里启动）；此项只在 /acp 直连会话与宿主未上报工作区时生效。',
+            'An ACP session inside a conversation runs \u2014 and starts its agent process \u2014 in that DSH session\u2019s own workspace; this value applies to /acp-direct sessions and when the host reports no workspace.',
           )}
         </span>
         {/* The effective allow-list stays visible in single-root mode too:

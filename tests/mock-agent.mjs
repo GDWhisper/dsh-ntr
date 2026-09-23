@@ -9,6 +9,8 @@
  *  - "IGNORE_CANCEL" → ignores session/cancel for ~1.2s, then finishes normally
  *  - "READFILE <path>"   → reads the file through the client fs capability
  *  - "WRITEFILE <path>"  → writes 'written-by-mock-agent' through the client fs capability
+ *  - "PWD"   → reports this PROCESS's own cwd (what an agent that derives its
+ *              workspace from `process.cwd()` would answer)
  * Every turn streams: thought, plan, available_commands, tool_call lifecycle,
  * two same-messageId chunks, usage_update.
  * `session/new` advertises spec-shaped configOptions: a `model` selector, a
@@ -182,6 +184,13 @@ const app = agent({ name: 'mock-acp-agent' })
       } catch (error) {
         await send({ sessionUpdate: 'agent_message_chunk', messageId: 'fs', content: { type: 'text', text: `WRITE_FAIL:${String(error?.message ?? error)}` } })
       }
+    }
+
+    if (text.includes('PWD')) {
+      // The stand-in for agents (codebuddy) that fix their workspace at process
+      // start: this answer depends on where the child was SPAWNED, never on
+      // `session/new`'s cwd.
+      await send({ sessionUpdate: 'agent_message_chunk', messageId: 'cwd', content: { type: 'text', text: `PWD:${process.cwd()}` } })
     }
 
     await send({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thinking…' } })

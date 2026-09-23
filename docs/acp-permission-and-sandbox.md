@@ -75,6 +75,10 @@
 同一个 `workspaceRoot` 也是聊天会话的 **ACP 工作目录**（`session/new` / `session/load` 的 cwd，见 `BridgeManager.getOrCreateDshSession` 的 `chatWorkspaceRoot`）：
 用户选的是「会话在哪个目录里」，对端 agent 的 Read/Glob/Bash 必须看到同一个目录，否则它会如实回答当前工作区是插件沙箱目录（`~/.dsh/acp-workspaces`）。
 该目录以 `extraRoots` 形式加进该会话的 roots 校验（`resolveSessionCwd` 第 4 参），create 与 resume 两条路径都传；`/acp` RPC 会话没有 DSH 会话，仍用 agent 自己的 `cwd`。
+同一个工作区还必须作为 `spawnCwd` 传进 `AgentBridge.ensureReady`，让 **agent 子进程自己的 cwd** 也落在那里（`safeSpawnCwd`）：
+有的 agent（实测 codebuddy）在进程启动那一刻就打印 `Workspace Path: <process cwd>` 并据此定死自己的 workspace（项目态、file policy、给模型看的 env 块），
+`session/new` 的 cwd 对它们太晚，只改 session cwd 时它会照旧回答 `~/.dsh/acp-workspaces`。搬迁只发生在 bridge **空闲**（无 live session / 探测 / resume / 待答审批）时就地重启，
+且先广播 `agent/notice`；有会话的进程不杀（`session/new` 仍如实带上各会话自己的工作区）。
 - ~~叙述兜底：把 policy 句子拼进转发给 ACP 的 prompt 前缀~~ —— **已放弃**（用户裁定：没必要）。
   转发内容严格等于用户文本；access mode 只以裁决（`decidePermission`）与 fs 栅栏（`authorizeWrite`）的形式生效，
   不再有任何句子去影响"agent 自己怎么干"。见 [acp-mode.md](./acp-mode.md) §3。
