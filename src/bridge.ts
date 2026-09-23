@@ -511,11 +511,11 @@ export class AgentBridge {
     this.hub.broadcast({ type: 'agent/status', agentId: this.def.id, state: this.state, ...(this.lastError === undefined ? {} : { error: this.lastError }), agent: this.view() })
   }
 
-  async createSession(cwd: string | undefined): Promise<LiveSession> {
+  async createSession(cwd: string | undefined, extraRoots: readonly string[] = []): Promise<LiveSession> {
     await this.ensureReady()
     const conn = this.conn
     if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
-    const resolved = resolveSessionCwd(this.def, cwd, p => realpathSync(p))
+    const resolved = resolveSessionCwd(this.def, cwd, p => realpathSync(p), extraRoots)
     const result = await this.withStartupTimeout(
       conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: [] }),
       'session/new',
@@ -657,8 +657,12 @@ export class AgentBridge {
       const conn = this.conn
       if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
       // The cwd was validated when the session was created, but allowed roots
-      // may have narrowed since; re-check before handing the path back.
-      const resolved = resolveSessionCwd(this.def, session.cwd, p => realpathSync(p))
+      // may have narrowed since; re-check before handing the path back. A chat
+      // session's cwd is its DSH workspace (never in the agent's own roots), so
+      // that root has to be re-trusted here too — otherwise a crash would park
+      // the session in `released` forever with `cwd_denied`.
+      const workspaceRoot = chatWorkspaceRoot(this.sessionPolicy?.(), session.dshSessionId)
+      const resolved = resolveSessionCwd(this.def, session.cwd, p => realpathSync(p), workspaceRoot === undefined ? [] : [workspaceRoot])
       // Replay arrives as brand-new updates, so the transcript restarts too;
       // seq keeps meaning "position in the current epoch".
       session.transcript = new Transcript(this.transcriptMax)
@@ -1174,6 +1178,28 @@ function snapshot(session: LiveSession): SessionView {
     closed: session.closed,
     ...(session.released ? { released: true } : {}),
     seq: session.transcript.head,
+  }
+}
+
+/**
+ * The DSH chat session's OWN workspace, when one is resolvable: the directory
+ * the user selected in the DSH sidebar, which the host reports back as the
+ * session policy's `workspaceRoot` (it is the session header cwd). This is what
+ * a chat session's ACP cwd must be, so it deliberately outranks the agent's
+ * configured `cwd` — that field is the plugin's own sandbox directory, not the
+ * place the conversation lives.
+ *
+ * Never throws: a broken/absent resolver, an unknown session (an `/acp`-RPC or
+ * pre-policy- wiring session) or a host that reports no root all read as
+ * `undefined`, and the caller falls back to the agent's configured cwd.
+ */
+function chatWorkspaceRoot(resolver: SessionPolicyResolver | undefined, dshSessionId: string | undefined): string | undefined {
+  if (resolver === undefined || dshSessionId === undefined) return undefined
+  try {
+    const root = resolver(dshSessionId)?.workspaceRoot
+    return root === undefined || root === '' ? undefined : root
+  } catch {
+    return undefined
   }
 }
 
@@ -2355,7 +2381,18 @@ export class BridgeManager {
       resumed.dshSessionId = dshSessionId
       return resumed
     }
-    const session = await this.bridge(agentId).createSession(cwd)
+    // A chat session runs where its DSH session lives, not in the plugin's
+    // sandbox directory: the sidebar's workspace selection IS the session's
+    // workspace (`sandboxPolicy.resolve` reports it as `workspaceRoot`), and an
+    // agent whose cwd is `~/.dsh/acp-workspaces` answers "current workspace"
+    // with that path while its Read/Glob/Bash cannot see the user's project.
+    // That root is trusted on top of the agent's own roots for this session
+    // only (see `chatWorkspaceRoot`); the fallback is the configured cwd.
+    const workspaceRoot = chatWorkspaceRoot(this.sessionPolicyResolver, dshSessionId)
+    const session = await this.bridge(agentId).createSession(
+      workspaceRoot ?? cwd,
+      workspaceRoot === undefined ? [] : [workspaceRoot],
+    )
     // Absent for `/acp`-RPC sessions and for adapter calls without a chat
     // session; those deliberately keep the ledger path (see askNativeApproval).
     session.dshSessionId = dshSessionId

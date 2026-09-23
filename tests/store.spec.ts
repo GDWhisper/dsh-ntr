@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { AcpStore, foldUpdate, type Block } from '../src/client/store.ts'
+import { acpModeFromPresetEvent, shouldShadowModelSeat } from '../src/client/acp-ui.tsx'
 
 function fold(...updates: Array<Record<string, unknown>>): Block[] {
   const blocks: Block[] = []
@@ -269,6 +270,108 @@ describe('AcpStore agent management', () => {
     // Absent field = no fact either way: the seat gate reads this as "ask
     // unanswered" and keeps the native seat, never a false ACP claim.
     expect(store.getSnapshot().acpMode).toEqual({})
+  })
+
+  it('folds a committed preset frame into the verdict instead of re-reading the log', async () => {
+    // The host log read is one switch behind the frame that announces the
+    // switch, so the seat used to move only after a page reload.
+    const reads: string[] = []
+    const store = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint === 'session/chat-list') {
+        reads.push('session/chat-list')
+        return { ok: true, value: { sessions: [], acpMode: false } }
+      }
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+    const gate = (): boolean => shouldShadowModelSeat({ current: 'chat-1' }, id => store.getSnapshot().acpMode[id])
+
+    // Cold seed: the session still runs the standard preset.
+    await store.loadChatSessions('chat-1')
+    expect(gate()).toBe(false)
+
+    // The user switches into ACP mode. The frame carries the committed preset, so
+    // the verdict comes from the frame — not from the log, which the host can
+    // only fold to the preset BEFORE this switch.
+    store.noteAcpMode('chat-1', acpModeFromPresetEvent('acp'))
+    expect(gate()).toBe(true)
+    // ...and out again, same way.
+    store.noteAcpMode('chat-1', acpModeFromPresetEvent('standard'))
+    expect(gate()).toBe(false)
+    // Neither switch needed a round-trip.
+    expect(reads).toHaveLength(1)
+
+    // A frame restating the held verdict changes nothing (no listener churn).
+    store.noteAcpMode('chat-1', acpModeFromPresetEvent('standard'))
+    expect(store.getSnapshot().acpMode).toEqual({ 'chat-1': false })
+  })
+
+  it('lets a committed preset frame override a chat-list answer still in flight', async () => {
+    let release: (() => void) | undefined
+    const store = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint === 'session/chat-list') {
+        await new Promise<void>(resolve => { release = resolve })
+        // The log as it read BEFORE the switch: still ACP.
+        return { ok: true, value: { sessions: [], acpMode: true } }
+      }
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+
+    const pending = store.loadChatSessions('chat-1')
+    // The switch commits while that read is outstanding.
+    store.abandonChatSessionRead('chat-1')
+    store.noteAcpMode('chat-1', acpModeFromPresetEvent('standard'))
+    release?.()
+    await pending
+    // The stale answer must not land over the frame's verdict.
+    expect(store.getSnapshot().acpMode).toEqual({ 'chat-1': false })
+
+    // A later read for the same session is no longer blocked by the dropped one.
+    const other = new AcpStore(async () => ({ ok: true, value: { sessions: [], acpMode: true } }), (zh) => zh)
+    await other.abandonChatSessionRead('chat-1')
+    await other.loadChatSessions('chat-1')
+    expect(other.getSnapshot().acpMode['chat-1']).toBe(true)
+  })
+
+  it('keeps a frame-settled verdict immune to a later host read that lags the switch', async () => {
+    // Taking the model seat re-mounts the composer's readers, and the host's log
+    // read can still fold the preset BEFORE the switch — so the frame's verdict
+    // must outrank any read, whenever it lands. This is what made the seat move
+    // only after a page reload.
+    const reads: string[] = []
+    const store = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint === 'session/chat-list') {
+        reads.push('read')
+        return { ok: true, value: { sessions: [], acpMode: false } }
+      }
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+    const gate = (): boolean => shouldShadowModelSeat({ current: 'chat-1' }, id => store.getSnapshot().acpMode[id])
+
+    // Cold seed (the session still runs another preset).
+    await store.loadChatSessions('chat-1')
+    // The switch commits: the frame carries 'acp'.
+    store.noteAcpMode('chat-1', acpModeFromPresetEvent('acp'))
+    expect(gate()).toBe(true)
+
+    // A reader mounts (the seat owns the model cell now) and reads again; the
+    // host answers with the pre-switch fold. The verdict must hold.
+    await store.loadChatSessions('chat-1')
+    expect(store.getSnapshot().acpMode['chat-1']).toBe(true)
+    expect(gate()).toBe(true)
+    // ...and again, for good measure.
+    await store.loadChatSessions('chat-1')
+    expect(gate()).toBe(true)
+
+    // Only a newer frame may move it.
+    store.noteAcpMode('chat-1', acpModeFromPresetEvent('standard'))
+    expect(gate()).toBe(false)
+
+    // Invalidating re-opens the session to host reads (the older-runtime path
+    // whose frames carry no preset has to be able to re-ask).
+    store.invalidateAcpMode('chat-1')
+    await store.loadChatSessions('chat-1')
+    expect(store.getSnapshot().acpMode['chat-1']).toBe(false)
+    expect(reads).toHaveLength(4)
   })
 
   it('setExposedModels uses the lightweight endpoint and resyncs afterwards', async () => {

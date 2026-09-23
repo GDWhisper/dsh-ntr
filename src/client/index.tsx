@@ -17,7 +17,7 @@ import { AcpSettingsSection } from './panel.tsx'
 import { AcpComposerMode } from './composer-mode.tsx'
 import { AcpModelSeat, AcpSessionControls, AcpSessionMenu } from './session-controls.tsx'
 import { AcpConversationView } from './acp-view.tsx'
-import { setAcpSeatActive, shouldShadowModelSeat } from './acp-ui.tsx'
+import { acpModeFromPresetEvent, setAcpSeatActive, shouldShadowModelSeat } from './acp-ui.tsx'
 import type { AcpChatInjected, AcpDirectory, AcpSessionFace, AcpSessionsSnapshot, SessionListSource } from './acp-ui.tsx'
 
 export const name = 'dsh-ntr-client'
@@ -252,7 +252,7 @@ export function apply(ctx: Context): void {
       seatRegistered = true
       setAcpSeatActive(true)
       ensureSeatWins()
-    } catch (e) {
+    } catch {
       // A refused registration (slot undeclared in this build, or the rank is
       // taken) leaves the native seat in place, which is the safe outcome.
       seatRegistered = false
@@ -320,18 +320,36 @@ export function apply(ctx: Context): void {
     // verdict arriving is what re-runs this gate — the list subscription alone
     // cannot see it (the runtime rows are silent on these hosts).
     const stopStore = store.subscribe(syncModelSeat)
-    // A committed preset switch rewrites the session the gate judged: drop the
-    // held verdict and re-ask, instead of trusting what the log moved past.
-    // Structural `remote` (not injected): an older runtime without it simply
-    // never gets this refresh path, and the one-shot ask still applies.
+    // A committed preset switch rewrites the session the gate judged. The
+    // runtime's frame carries the new preset, so fold it straight into the
+    // verdict map — see the handler for why re-reading the log there would be a
+    // step behind. Structural `remote` (not injected): an older runtime without
+    // it simply never gets this refresh path, and the one-shot ask still applies.
     const remote = (ctx as unknown as { get(key: string): unknown }).get('remote') as
       | { $on?(event: string, listener: (...args: unknown[]) => void): () => void }
       | undefined
     const stopPreset = typeof remote?.$on === 'function'
       ? remote.$on('agent-preset/selected', (...args: unknown[]) => {
+        // `[sessionId, agentPreset]`: the frame carries the committed preset, so
+        // fold IT rather than re-asking the host. The runtime broadcasts this
+        // the moment the switch commits, while the appended session-log row is
+        // not yet visible to a fresh `session/chat-list` cold read — reading
+        // there folds the PREVIOUS preset, which kept the seat one switch behind
+        // until a page reload (the reported "switching into or out of ACP mode
+        // only moves the model seat after a refresh" symptom). The host read
+        // stays the cold path for a session this tab has no frame for.
         const sessionId = args[0]
-        if (typeof sessionId === 'string') {
-          acpModeAsked.delete(sessionId)
+        if (typeof sessionId !== 'string') return
+        // A frame supersedes both a held verdict and a pending one-shot ask.
+        acpModeAsked.delete(sessionId)
+        if (args.length >= 2) {
+          // The late answer to an ask that predates the frame must not win: it
+          // describes the log from before the switch.
+          store.abandonChatSessionRead(sessionId)
+          store.noteAcpMode(sessionId, acpModeFromPresetEvent(args[1]))
+        } else {
+          // A frame carrying no preset can only be honoured by a fresh host
+          // read — the behaviour the fold replaced.
           store.invalidateAcpMode(sessionId)
         }
         syncModelSeat()

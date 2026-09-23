@@ -267,6 +267,24 @@ describe('resolveSessionCwd', () => {
   it('guards prefix confusion (/work2 must not pass under /work)', () => {
     expect(() => resolveSessionCwd(agentDef(), '/work2', realpath)).toThrow(/outside/)
   })
+  it('trusts explicitly passed extra roots for this session only', () => {
+    // A chat session's cwd is the workspace the user picked in the DSH
+    // sidebar; it is never in the agent's own allow-list, which is why the
+    // caller has to hand it over as an extra root explicitly.
+    expect(() => resolveSessionCwd(agentDef(), '/elsewhere', realpath)).toThrow(/outside/)
+    expect(resolveSessionCwd(agentDef(), '/elsewhere', realpath, ['/elsewhere'])).toBe('/elsewhere')
+    // Trusting one directory must not widen anything else.
+    expect(() => resolveSessionCwd(agentDef(), '/etc', realpath, ['/elsewhere'])).toThrow(/outside/)
+    // A junk extra root (relative, non-string) is dropped, never treated as a root.
+    expect(() => resolveSessionCwd(agentDef(), '/etc', realpath, ['relative', 42 as unknown as string])).toThrow(/outside/)
+    // The configured roots stay in effect alongside it.
+    expect(resolveSessionCwd(agentDef(), '/work/sub', realpath, ['/elsewhere'])).toBe('/work/sub')
+  })
+  it('lets an extra root serve as the cwd of a cwd-less agent', () => {
+    const def = agentDef({ cwd: undefined, allowedCwdRoots: [] })
+    expect(() => resolveSessionCwd(def, undefined, realpath)).toThrow(/no default cwd/)
+    expect(resolveSessionCwd(def, '/elsewhere', realpath, ['/elsewhere'])).toBe('/elsewhere')
+  })
 })
 
 describe('resolveFsPath', () => {

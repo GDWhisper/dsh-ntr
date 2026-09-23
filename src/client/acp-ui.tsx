@@ -317,6 +317,19 @@ export function shouldShadowModelSeat(
   return acpMode?.(current) === true
 }
 
+/**
+ * The ACP-mode verdict a committed `agent-preset/selected` frame carries. The
+ * frame is `[sessionId, agentPreset]` and the runtime broadcasts it the moment
+ * a switch commits — before the appended session-log row is visible to a fresh
+ * `session/chat-list` cold read, so re-reading the log from that frame folds the
+ * PREVIOUS preset and the seat would lag one switch behind until a reload.
+ * The frame's own preset is therefore the live path's fact source; the host read
+ * only seeds a session this tab has never seen a frame for.
+ */
+export function acpModeFromPresetEvent(agentPreset: unknown): boolean {
+  return agentPreset === ACP_PRESET_ID
+}
+
 /** The session list store as this bundle reads it (structural, see {@link AcpSessionsSnapshot}). */
 export interface SessionListSource {
   getSnapshot(): AcpSessionsSnapshot | undefined

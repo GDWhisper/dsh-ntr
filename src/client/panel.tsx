@@ -106,12 +106,25 @@ function useUi(acp: AcpStore) {
   return useSyncExternalStore(cb => acp.subscribe(cb), () => acp.getSnapshot())
 }
 
-function stateVisual(state: AgentView['state'], acp: AcpStore): { color: string; text: string } {
+function stateVisual(state: AgentView['state'], acp: AcpStore): { color: string; text: string; title?: string } {
   switch (state) {
     case 'ready': return { color: '#22c55e', text: acp.label('已连接', 'Connected') }
     case 'starting': return { color: '#eab308', text: acp.label('启动中', 'Starting') }
     case 'error': return { color: '#ef4444', text: acp.label('错误', 'Error') }
-    default: return { color: '#9ca3af', text: acp.label('已停止', 'Stopped') }
+    // A configured-but-resting agent is the normal state, not a fault: the
+    // process is not kept resident and connects on demand the first time a DSH
+    // chat turn uses it. Surfacing a runtime lifecycle here ("stopped"/"idle")
+    // read as broken; the user's real question at a glance is "is it set up?",
+    // which the config-time 测试连接 (agent/test) already answers. So the
+    // resting state just says 已配置.
+    default: return {
+      color: '#9ca3af',
+      text: acp.label('已配置', 'Configured'),
+      title: acp.label(
+        '已配置，进程不常驻。在 DSH 聊天中首次使用时自动连接；展开区可用「测试连接」验证命令能否正常起来。',
+        'Configured; the process is not kept resident. It connects automatically the first time a DSH chat turn uses it — use “Test connection” in the expanded panel to verify the command starts.',
+      ),
+    }
   }
 }
 
@@ -546,7 +559,7 @@ function AgentRow({
         >
           {open ? '▾' : '▸'}
         </button>
-        {state !== undefined && <span className="dwa-dot" style={{ background: state.color }} title={activeAgent?.state} />}
+        {state !== undefined && <span className="dwa-dot" style={{ background: state.color }} title={state.title ?? activeAgent?.state} />}
         <span className="dwa-agent-name" title={detected.executablePath ?? detected.description}>{displayName}</span>
         {state !== undefined && <span className="dwa-hint">{state.text}</span>}
         {configured && (
@@ -1095,6 +1108,12 @@ function WorkspaceBlock({
         {cwdInvalid && (
           <span className="dwa-error">{acp.label('必须是绝对路径（以 / 开头）', 'Must be an absolute path (starting with /)')}</span>
         )}
+        <span className="dwa-hint">
+          {acp.label(
+            '对话里的 ACP 会话以该 DSH 会话选中的工作区为工作目录；此项只在 /acp 直连会话与宿主未上报工作区时生效。',
+            'An ACP session inside a conversation runs in that DSH session\u2019s own workspace; this value applies to /acp-direct sessions and when the host reports no workspace.',
+          )}
+        </span>
         {/* The effective allow-list stays visible in single-root mode too:
             saving there deliberately narrows it to this one directory. */}
         {!form.rootsOpen && (
@@ -1147,7 +1166,10 @@ function WorkspaceBlock({
       )}
 
       <span className="dwa-hint">
-        {acp.label('白名单之外的路径会被宿主拒绝（cwd_denied）。', 'Paths outside the allow-list are refused by the host (cwd_denied).')}
+        {acp.label(
+          '白名单之外的路径会被宿主拒绝（cwd_denied）；当前 DSH 会话自己的工作区始终被信任。',
+          'Paths outside the allow-list are refused by the host (cwd_denied); the current DSH session\u2019s own workspace is always trusted.',
+        )}
       </span>
     </div>
   )

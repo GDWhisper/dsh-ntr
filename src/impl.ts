@@ -205,9 +205,16 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
  * @param def - validated agent definition.
  * @param requested - browser-supplied cwd (optional; `''`/undefined → default).
  * @param realpath - platform realpath (injected; throws if the path is unusable).
+ * @param extraRoots - roots trusted on top of the agent's own ones, for THIS
+ *   session only. The one caller that matters is a chat session, whose cwd is
+ *   the workspace the user picked in the DSH sidebar: that directory is never in
+ *   the agent's configured allow-list (the plugin's own sandbox dir is), yet it
+ *   is the session's declared boundary — the same root `authorizeWrite` and
+ *   `decidePermission` already treat as writable. `/acp`-RPC sessions pass none
+ *   and keep `allowedCwdRoots` as a hard cap.
  * @returns the canonical absolute directory to hand to `session/new`.
  */
-export function resolveSessionCwd(def: AcpAgentDef, requested: string | undefined, realpath: (p: string) => string): string {
+export function resolveSessionCwd(def: AcpAgentDef, requested: string | undefined, realpath: (p: string) => string, extraRoots: readonly string[] = []): string {
   const candidate = requested === undefined || requested === '' ? def.cwd : requested
   if (candidate === undefined) throw new AcpError('no_cwd', `acp: agent "${def.id}" has no default cwd; pass one`)
   if (!candidate.startsWith('/')) throw new AcpError('bad_cwd', 'acp: session cwd must be absolute')
@@ -217,7 +224,8 @@ export function resolveSessionCwd(def: AcpAgentDef, requested: string | undefine
   } catch {
     throw new AcpError('bad_cwd', `acp: cwd does not exist: ${candidate}`)
   }
-  const roots = (def.allowedCwdRoots ?? []).length > 0 ? (def.allowedCwdRoots ?? []) : (def.cwd !== undefined ? [def.cwd] : [])
+  const configured = (def.allowedCwdRoots ?? []).length > 0 ? (def.allowedCwdRoots ?? []) : (def.cwd !== undefined ? [def.cwd] : [])
+  const roots = [...configured, ...extraRoots.filter(root => typeof root === 'string' && root.startsWith('/'))]
   if (roots.length === 0) throw new AcpError('no_roots', `acp: agent "${def.id}" has no allowedCwdRoots configured`)
   const inside = roots.some(root => {
     const canonicalRoot = safeRealpath(realpath, root)
@@ -852,6 +860,12 @@ export interface AcpManager {
    */
   chatSessionAcpModeAnswer?(dshSessionId: string): Promise<boolean>
   /**
+   * Drop the cached ACP-mode verdict for one session (or all). The gate's
+   * `session/chat-list` path calls this before answering so a preset switch is
+   * never masked by a stale cached negative (see the chat-list handler).
+   */
+  invalidateAcpMode?(dshSessionId?: string): void
+  /**
    * Every ACP session transcript belonging to one DSH chat session, so the
    * conversation can render the agent's real stream (tool calls, plans,
    * diffs) in its own view tab. Read-only: never spawns, never resumes.
@@ -964,6 +978,15 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         // would short-circuit the arguments away on a manager without the
         // method, silently skipping the payload check.
         const dshSessionId = str(body, 'dshSessionId', 128)
+        // The gate re-asks this on every `agent-preset/selected`; it passes
+        // `refresh` to mean "the session log moved, re-resolve". A verdict
+        // cached from BEFORE the switch must not be echoed, or the ACP model
+        // seat never activates and the ACP model stays unselectable until a
+        // prompt turn retires the cache — a chicken-and-egg (you can't run that
+        // turn without the model the seat is supposed to offer). Callers that
+        // DON'T pass `refresh` keep the per-session cache (repeat reads stay
+        // cheap); the browser half always sets it (see AcpStore.loadChatSessions).
+        if (body.refresh === true) manager.invalidateAcpMode?.(dshSessionId)
         return ok({
           sessions: manager.chatSessions?.(dshSessionId) ?? [],
           // Read-only memory answer, same authority as `setAcpModeResolver`'s

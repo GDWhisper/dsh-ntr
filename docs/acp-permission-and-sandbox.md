@@ -59,7 +59,7 @@
 
 | 来源 | 读法 |
 | --- | --- |
-| sandbox 模式 + workspaceRoot | `ctx.sandboxPolicy.resolve({ session })`（`packages/sandbox/sandbox-policy/src/index.ts`） |
+| sandbox 模式 + workspaceRoot | `ctx.sandboxPolicy.resolve({ session })`（`packages/sandbox/sandbox-policy/src/index.ts`，其实现是 `session?.header.cwd ?? config.workspaceRoot`——即**会话自己在 sidebar 选中的工作区**） |
 | approval policy | 会话事件里最后一条 `approval/policy` → `data.policy`；无则 `ctx.approval.config.policy` |
 | 会话本身 | `ctx.sessions` 按 id 取（`session.events`） |
 
@@ -71,6 +71,10 @@
   对齐 DSH 的 "cannot modify files in the standing mode"；fs handler 的写同样拒。
 - `sandbox: workspace-write` → 路径落在 workspaceRoot / 我们的 roots 内放行，域外走审批（ask）/ 拒绝（never）（即 DSH 的 escalation 语义）。
 - `sandbox: danger-full-access` → 放行 + roots 检查放宽。
+
+同一个 `workspaceRoot` 也是聊天会话的 **ACP 工作目录**（`session/new` / `session/load` 的 cwd，见 `BridgeManager.getOrCreateDshSession` 的 `chatWorkspaceRoot`）：
+用户选的是「会话在哪个目录里」，对端 agent 的 Read/Glob/Bash 必须看到同一个目录，否则它会如实回答当前工作区是插件沙箱目录（`~/.dsh/acp-workspaces`）。
+该目录以 `extraRoots` 形式加进该会话的 roots 校验（`resolveSessionCwd` 第 4 参），create 与 resume 两条路径都传；`/acp` RPC 会话没有 DSH 会话，仍用 agent 自己的 `cwd`。
 - ~~叙述兜底：把 policy 句子拼进转发给 ACP 的 prompt 前缀~~ —— **已放弃**（用户裁定：没必要）。
   转发内容严格等于用户文本；access mode 只以裁决（`decidePermission`）与 fs 栅栏（`authorizeWrite`）的形式生效，
   不再有任何句子去影响"agent 自己怎么干"。见 [acp-mode.md](./acp-mode.md) §3。

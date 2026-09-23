@@ -6,7 +6,7 @@
 import { fileURLToPath } from 'node:url'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { afterAll, describe, expect, it } from 'vitest'
 import {
   AcpLlmAdapter, BridgeManager, acpPresetDir, acpPresetStatus, bundledAcpPresetDir, defaultAgentWorkspace,
@@ -1220,6 +1220,28 @@ describe('DSH access mode mapping (isolated manager)', () => {
     }
   })
 
+  it('session/chat-list drops a stale cached acpMode verdict across a preset switch', async () => {
+    // The gate re-asks session/chat-list on every `agent-preset/selected`; a
+    // verdict cached BEFORE the switch must not be echoed, or the ACP model
+    // seat never activates and the ACP model stays unselectable until the next
+    // prompt turn retires the cache (a chicken-and-egg: you can't run the turn
+    // without the model the seat is supposed to offer). So the chat-list
+    // handler invalidates the cached verdict and always folds the log fresh.
+    let acp = false
+    modeManager.setAcpModeResolver(() => acp)
+    try {
+      await expect(dispatchRpc(modeManager, 'session/chat-list', { dshSessionId: 'dsh-stale-seat', refresh: true }))
+        .resolves.toMatchObject({ ok: true, value: { acpMode: false } })
+      // User switches the session to the ACP preset with no turn in between.
+      acp = true
+      await expect(dispatchRpc(modeManager, 'session/chat-list', { dshSessionId: 'dsh-stale-seat', refresh: true }))
+        .resolves.toMatchObject({ ok: true, value: { acpMode: true } })
+    } finally {
+      modeManager.setAcpModeResolver(undefined)
+      modeManager.invalidateAcpMode()
+    }
+  })
+
   it('gates fs/write_text_file by the access mode, escalation included', async () => {
     const dir = join(tmpdir(), 'dsh-mode-fs')
     mkdirSync(dir, { recursive: true })
@@ -1240,6 +1262,126 @@ describe('DSH access mode mapping (isolated manager)', () => {
     policy = { mode: 'workspace-write', approval: 'ask', workspaceRoot: join(tmpdir(), 'dsh-mode-fs') }
     answer = 'rejected'
     expect(await modeTurn('dsh-mode-fs-ws', `WRITEFILE ${target}`)).toContain('WRITE_OK')
+  }, 30_000)
+})
+
+/**
+ * A chat session must run where its DSH session lives: the workspace the user
+ * selected in the sidebar, which the host reports back as the policy's
+ * `workspaceRoot` (it IS the session header cwd). The agent's configured `cwd`
+ * is the plugin's own sandbox directory and only serves `/acp`-RPC sessions and
+ * hosts that report no workspace — an agent started in it answers "current
+ * workspace" with `~/.dsh/acp-workspaces` while its Read/Glob/Bash cannot see
+ * the user's project.
+ */
+describe('chat session workspace (isolated manager)', () => {
+  const wsHub = new EventHub()
+  const wsEvents: AcpEvent[] = []
+  wsHub.subscribe(event => { wsEvents.push(event) })
+  // Deliberately a SIBLING of the workspace: the agent's allow-list does not
+  // contain the workspace, so the session can only be anchored there because
+  // the host trusts the DSH session's own root for that session.
+  const narrow = mkdtempSync(join(tmpdir(), 'dsh-ntr-narrow-'))
+  const workspace = mkdtempSync(join(tmpdir(), 'dsh-ntr-ws-'))
+  const wsManager = new BridgeManager([{ ...def, id: 'wsmock', cwd: narrow, allowedCwdRoots: [narrow] }], wsHub, 500)
+  const wsAdapter = new AcpLlmAdapter(wsManager)
+  let wsPolicy: DshSessionPolicy | undefined
+  wsManager.setSessionPolicyResolver(() => wsPolicy)
+
+  afterAll(async () => {
+    await wsManager.shutdownAll()
+  })
+
+  /** Wait for a fresh event on THIS suite's hub (the shared `waitFor` watches the top-level one). */
+  function wsWaitFor<T extends AcpEvent['type']>(type: T, predicate: (event: Extract<AcpEvent, { type: T }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: T }>> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${type}`)), timeoutMs)
+      const unsub = wsHub.subscribe(event => {
+        if (event.type === type && predicate(event as Extract<AcpEvent, { type: T }>)) {
+          clearTimeout(timer)
+          unsub()
+          resolve(event as Extract<AcpEvent, { type: T }>)
+        }
+      })
+      const existing = wsEvents.find(event => event.type === type && predicate(event as Extract<AcpEvent, { type: T }>))
+      if (existing !== undefined) {
+        clearTimeout(timer)
+        unsub()
+        resolve(existing as Extract<AcpEvent, { type: T }>)
+      }
+    })
+  }
+
+  /** The session's LATEST snapshot cwd (created, then reset/meta across a resume). */
+  function lastCwdOf(sessionId: string): string {
+    for (let i = wsEvents.length - 1; i >= 0; i--) {
+      const event = wsEvents[i]
+      if ((event.type === 'session/created' || event.type === 'session/meta' || event.type === 'session/reset')
+        && event.sessionId === sessionId) {
+        return event.session.cwd
+      }
+    }
+    return ''
+  }
+
+  /** Drain one adapter turn; returns the agent's echo, its host session id and that session's cwd. */
+  async function wsTurn(dshSessionId: string, text: string): Promise<{ echoed: string; hostSessionId: string; cwd: string }> {
+    const since = wsEvents.length
+    for await (const chunk of wsAdapter.stream({
+      provider: 'acp',
+      model: 'wsmock',
+      sessionId: dshSessionId,
+      messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+    })) {
+      void chunk
+    }
+    const started = wsEvents.slice(since).find(event => event.type === 'turn/start' && event.text === text)
+    if (started === undefined) throw new Error('the turn never started')
+    const transcript = await dispatchRpc(wsManager, 'transcript/get', { sessionId: started.sessionId })
+    if (!transcript.ok) throw new Error('transcript failed')
+    const echoed = (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
+      .filter(e => e.update.sessionUpdate === 'agent_message_chunk')
+      .map(e => String((e.update.content as { text?: string }).text ?? ''))
+      .join('')
+    return { echoed, hostSessionId: started.sessionId, cwd: lastCwdOf(started.sessionId) }
+  }
+
+  it('anchors a chat session at the DSH session workspace, not the agent default', async () => {
+    writeFileSync(join(workspace, 'in-workspace.txt'), 'seen-by-the-agent')
+    wsPolicy = { mode: 'workspace-write', approval: 'ask', workspaceRoot: workspace }
+    const turn = await wsTurn('dsh-ws-chat', 'hello there')
+    expect(turn.cwd).toBe(realpathSync(workspace))
+    // The fs guard reads the session cwd, so the workspace is readable too (the
+    // agent's own allow-list does not contain it).
+    const read = await wsTurn('dsh-ws-chat', `READFILE ${join(workspace, 'in-workspace.txt')}`)
+    expect(read.cwd).toBe(realpathSync(workspace))
+    expect(read.echoed).toContain('READ_OK:seen-by-the-agent')
+  }, 30_000)
+
+  it('keeps the configured cwd when the host reports no workspace', async () => {
+    // No `workspaceRoot` (a deployment without the sandbox policy service, or
+    // an /acp-direct session): the agent's own cwd stays in charge.
+    wsPolicy = { mode: 'workspace-write', approval: 'ask' }
+    const turn = await wsTurn('dsh-ws-fallback', 'hello fallback')
+    expect(turn.cwd).toBe(realpathSync(narrow))
+  }, 30_000)
+
+  it('resumes a crashed chat session whose cwd is the DSH workspace', async () => {
+    // The regression guard: `session/load` re-validates the cwd against the
+    // allowed roots, so a workspace the agent's own allow-list never contained
+    // must be re-trusted there too — otherwise the session parks back into
+    // `released` forever with `cwd_denied`.
+    wsPolicy = { mode: 'workspace-write', approval: 'ask', workspaceRoot: workspace }
+    const first = await wsTurn('dsh-ws-resume', 'DIE now')
+    expect(first.cwd).toBe(realpathSync(workspace))
+    const released = await wsWaitFor('session/released', event => event.sessionId === first.hostSessionId)
+    expect(released.session.released).toBe(true)
+
+    const resumed = await wsTurn('dsh-ws-resume', 'back again')
+    expect(resumed.hostSessionId).toBe(first.hostSessionId)
+    expect(resumed.cwd).toBe(realpathSync(workspace))
+    expect(resumed.echoed).toContain('REPLAYED: earlier conversation')
+    expect(resumed.echoed).toContain('MOCK: echo back again')
   }, 30_000)
 })
 

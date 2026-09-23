@@ -211,7 +211,16 @@ export class AcpStore {
   /** Sessions with a finalized turn (dedups the cancel-fallback + late real turn/end pair). */
   private readonly openTurns = new Set<string>()
   /** In-flight `session/chat-list` reads, keyed by chat session id. */
-  private readonly chatSessionReads = new Set<string>()
+  private readonly chatSessionReads = new Map<string, { dropped: boolean }>()
+  /**
+   * Sessions whose ACP-mode verdict a committed `agent-preset/selected` frame
+   * settled. A frame settles the verdict; the host's log read can lag a switch
+   * by one (the appended row is not yet visible to a fresh read, and the seat
+   * taking the model cell re-mounts readers), so a read may only settle a
+   * session no frame has spoken for — otherwise a stale answer would regress a
+   * verdict the runtime already told us the truth about.
+   */
+  private readonly acpModeLive = new Set<string>()
   /** In-flight `agent/catalog` reads, keyed by agent id. */
   private readonly seatCatalogReads = new Set<string>()
 
@@ -581,23 +590,66 @@ export class AcpStore {
     // cluster) and both re-read when a turn settles; one round-trip answers
     // for both instead of two racing ones.
     if (this.chatSessionReads.has(dshSessionId)) return
-    this.chatSessionReads.add(dshSessionId)
+    const read = { dropped: false }
+    this.chatSessionReads.set(dshSessionId, read)
     try {
-      const { sessions, acpMode } = await this.call<{ sessions: ChatSessionView[]; acpMode?: boolean }>('session/chat-list', { dshSessionId })
+      const { sessions, acpMode } = await this.call<{ sessions: ChatSessionView[]; acpMode?: boolean }>('session/chat-list', { dshSessionId, refresh: true })
+      // A committed `agent-preset/selected` frame may have settled this
+      // session's verdict while the read was in flight; the host answer then
+      // describes the log as of BEFORE that switch and must not overwrite it.
+      if (read.dropped) return
       this.mutate({
         chatSessions: sessions,
         chatSessionsFor: dshSessionId,
         // The seat gate's fallback fact source: absent on an older host half,
         // which then simply never takes the seat over (the allowed failure).
-        ...(acpMode === undefined ? {} : { acpMode: { ...this.state.acpMode, [dshSessionId]: acpMode === true } }),
+        // A frame-settled verdict outranks any read, whenever it lands: the
+        // host's log read can lag a switch by one, and taking the model seat
+        // re-mounts readers, so a stale answer would otherwise regress it.
+        ...(acpMode === undefined || this.acpModeLive.has(dshSessionId)
+          ? {}
+          : { acpMode: { ...this.state.acpMode, [dshSessionId]: acpMode === true } }),
       })
     } catch {
       // A host without this surface (older build) has nothing to show; the
       // control simply renders nothing rather than an error nobody can act on.
+      if (read.dropped) return
       this.mutate({ chatSessions: [], chatSessionsFor: dshSessionId })
     } finally {
-      this.chatSessionReads.delete(dshSessionId)
+      if (this.chatSessionReads.get(dshSessionId) === read) this.chatSessionReads.delete(dshSessionId)
     }
+  }
+
+  /**
+   * Abandon the in-flight `session/chat-list` read for one session (or all of
+   * them): a committed `agent-preset/selected` frame carries the authoritative
+   * verdict, and the late answer to an ask that predates the frame describes
+   * the log from before the switch — it must not land in the store.
+   */
+  abandonChatSessionRead(dshSessionId?: string): void {
+    if (dshSessionId === undefined) {
+      for (const read of this.chatSessionReads.values()) read.dropped = true
+      this.chatSessionReads.clear()
+      return
+    }
+    const read = this.chatSessionReads.get(dshSessionId)
+    if (read === undefined) return
+    read.dropped = true
+    this.chatSessionReads.delete(dshSessionId)
+  }
+
+  /**
+   * Record the verdict a committed `agent-preset/selected` frame carries, folded
+   * from the frame's own preset field ({@link acpModeFromPresetEvent}). The
+   * frame is authoritative: it marks the session live-settled, so no later host
+   * read may regress it (see {@link acpModeLive}). Same no-op-when-unchanged
+   * discipline as the other accessors, so a frame restating the held verdict
+   * costs no listener churn.
+   */
+  noteAcpMode(dshSessionId: string, acpMode: boolean): void {
+    this.acpModeLive.add(dshSessionId)
+    if (this.state.acpMode[dshSessionId] === acpMode) return
+    this.mutate({ acpMode: { ...this.state.acpMode, [dshSessionId]: acpMode } })
   }
 
   /**
@@ -608,10 +660,13 @@ export class AcpStore {
    */
   invalidateAcpMode(dshSessionId?: string): void {
     if (dshSessionId === undefined) {
+      // Dropping the whole map also re-opens every session to host reads.
+      this.acpModeLive.clear()
       if (Object.keys(this.state.acpMode).length === 0) return
       this.mutate({ acpMode: {} })
       return
     }
+    this.acpModeLive.delete(dshSessionId)
     if (this.state.acpMode[dshSessionId] === undefined) return
     const acpMode = { ...this.state.acpMode }
     delete acpMode[dshSessionId]

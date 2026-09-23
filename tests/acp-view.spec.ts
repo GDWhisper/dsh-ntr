@@ -8,7 +8,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { ACP_PRESET_ID, shouldShadowModelSeat, splitAcpModelId } from '../src/client/acp-ui.tsx'
+import { ACP_PRESET_ID, acpModeFromPresetEvent, shouldShadowModelSeat, splitAcpModelId } from '../src/client/acp-ui.tsx'
 import type { AcpDirectoryState, AcpPermissionSelect } from '../src/client/acp-ui.tsx'
 import { diffRows } from '../src/client/acp-view.tsx'
 import { describeRoute, menuFor } from '../src/client/session-controls.tsx'
@@ -37,6 +37,26 @@ describe('splitAcpModelId', () => {
   it('splits on the first @ so a choice may contain one', () => {
     expect(splitAcpModelId('pi@a@b')).toEqual({ agentId: 'pi', choice: 'a@b' })
     expect(splitAcpModelId('pi')).toEqual({ agentId: 'pi' })
+  })
+})
+
+describe('acpModeFromPresetEvent (the live preset frame)', () => {
+  // The `agent-preset/selected` frame is `[sessionId, agentPreset]` and is the
+  // ONLY race-free signal: the host's session-log cold read triggered from that
+  // same frame still folds the PREVIOUS preset, which is what made the model
+  // seat lag one switch behind until a page reload.
+  it('takes the verdict off the frame’s own preset field', () => {
+    expect(acpModeFromPresetEvent(ACP_PRESET_ID)).toBe(true)
+    expect(acpModeFromPresetEvent('standard')).toBe(false)
+    expect(acpModeFromPresetEvent('ptc')).toBe(false)
+  })
+
+  it('reads a missing or malformed field as "not ACP", never "definitely ACP"', () => {
+    expect(acpModeFromPresetEvent(undefined)).toBe(false)
+    expect(acpModeFromPresetEvent(null)).toBe(false)
+    expect(acpModeFromPresetEvent('')).toBe(false)
+    expect(acpModeFromPresetEvent(42)).toBe(false)
+    expect(acpModeFromPresetEvent({ agentPreset: ACP_PRESET_ID })).toBe(false)
   })
 })
 

@@ -5,3 +5,5 @@ lib/
 .zcode/
 acp-workspaces/*
 !acp-workspaces/.gitkeep
+# Runtime marker written to cwd by a co-installed plugin (@hytime/dsh-thinking-effort) on DSH start
+thinking-effort-loaded.json
