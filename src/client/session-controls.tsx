@@ -35,8 +35,8 @@ import { useEffect, useState } from 'react'
 // Type-only: pulls the ui-conversation SlotMap merge into this program.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import {
-  ACP_PROVIDER, AcpChip, AcpMenu, closeAcpMenu, ensureAcpStyle, openAcpMenu, setAcpMenuError,
-  splitAcpModelId, useAcpMenu, useAcpSeatActive, useDirectory, usePermissionSelect, useUi,
+  ACP_PROVIDER, AcpChip, AcpMenu, closeAcpMenu, ensureAcpStyle, openAcpMenu, selectAcpRoute,
+  setAcpMenuError, splitAcpModelId, useAcpMenu, useAcpSeatActive, useDirectory, usePermissionSelect, useUi,
 } from './acp-ui.tsx'
 import type {
   AcpChatInjected, AcpDirectoryState, AcpMenuKind, AcpMenuItem, AcpMenuSection, AcpSessionFace,
@@ -504,7 +504,9 @@ export function AcpSessionMenu(props: AcpClusterProps) {
       return
     }
     try {
-      await directory.select(selection)
+      // Never `directory.select` directly: an ACP pick must not become the
+      // deployment default model (see `selectAcpRoute`).
+      await selectAcpRoute(acp, directory, selection)
       closeAcpMenu()
     } catch (error) {
       setAcpMenuError(text(error))

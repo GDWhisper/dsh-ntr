@@ -30,19 +30,21 @@ DSH 组装一次请求时，消息顺序**不是**"历史 + 最后一条用户�
 
 ## 2. ACP 模式 = 一个 agent preset（不是新控件）
 
-DSH 的"模式"就是 **agent preset**：文件系统 roster（随部署的 `standard` / `code` / `minimal` / `cordis`，加上自动发现的 `~/.dsh/.agent-presets/`），每个目录一份 `agent.cordis.yml`；UI 上是新会话页的模式 chip（`conversation.hero.agentPreset`）。它只能在**空白会话**上选/切（已产出内容的会话由网关返回 `agent-preset-locked`）。
+DSH 的"模式"就是 **agent preset**：一条 `@deepseek-ai/dsh-agent-preset` 声明（`- id: preset-<id>` + `config.{id,name,description,order,plugins}`；随部署的 `standard` / `ptc` / `minimal` / `cordis` 是 `@deepseek-ai/dsh-web-app` 的 `presets/*.patch.yml`）；UI 上是新会话页的模式 chip（`conversation.hero.agentPreset`）。它只能在**空白会话**上选/切（已产出内容的会话由网关返回 `agent-preset-locked`）。
+
+**声明只能由 bundle patch 携带，且旧的目录 roster 已死**：DSH 早先按 `$DSH_HOME/.agent-presets/<id>/{preset.yml,agent.cordis.yml}` 自动发现用户 preset，现在**任何代码都不再读那个目录**（0.1.7-rc.1 实测：整个安装树里除了 `dsh-agent-preset` 的迁移文档外没有任何读取方）。所以 dsh-ntr 自己就是 profile bundle（`dsh.bundle.patch`），ACP 模式的声明就写在它的 `presets/acp/acp.patch.yml` 里——模式 chip 因此随插件包本身出现，没有任何复制/安装步骤。旧目录里残留的副本无害（没人读），可以删。
 
 分工是硬边界：preset 拥有 **agent 平面**（工具注册、prompt 段、plan mode、compaction、`agent-instructions` / skill 目录这类注入行），而 **host 平面**（loop 本身、各 registry、sandbox/approval、persistence、model route）preset 拿不到。**loop 不可替换**：创建 agent 只有一个 factory（`ctx.agents.setFactory`，由 `dsh-agent-loop` 注册），所以"ACP 模式"不能把 DSH 从驱动位置上摘掉。
 
-它**能**做的是把宿主对模型可见的贡献清零，`presets/acp/agent.cordis.yml` 就干这个：
+它**能**做的是把宿主对模型可见的贡献清零，`presets/acp/acp.patch.yml` 的声明就干这个：
 
 - `@deepseek-ai/dsh-persona` 行：`prefix`（persona 前缀段的文本，**旧名 `text` 已失效**——schema 是 `prefix: string` 必填 + `suffix?` + 两个开关，写错键会让整个 preset 在会话创建时报 `invalid config: $.prefix missing required value`；省略 `suffix` 是故意的，缺席即遮蔽部署 suffix）+ `complete: true`（压制 harness 身份段与部署 persona）+ `includeRuntimeContext: false`（不再组装运行上下文快照）；
 - 不挂任何 `tool-*` 行 → 工具目录为空（对端 agent 的工具在它自己进程里）；
 - 不挂 `agent-instructions` / `tool-skill` / `skill-filesystem` → 没有 AGENTS.md 摘要，也没有 `<available_skills>` 大块；
 - 不挂 `plan-mode` / `tool-todo` / `tool-goal` / `compaction-basic` / `command-compact` / 委派行 → 这些原生状态机与辅助调用不再作用于该会话；
-- `acp-guard.mjs` 行：`agent/pre-step` 兜底过滤（`agent-instructions` / `skill-catalog` / 一切 `plugin` 来源），保证后来新增的行或 host 平面的注入也不会悄悄回到模型视野。
+- `acp-guard.mjs` 行：`agent/pre-step` 兜底过滤（`agent-instructions` / `skill-catalog` / 一切 `plugin` 来源），保证后来新增的行或 host 平面的注入也不会悄悄回到模型视野。该行以**包名**引用（`dsh-ntr/acp-guard`，由 package.json 的 `exports` 映射到 `presets/acp/acp-guard.mjs`）：声明里的插件名是按**声明者 Loader 的解析基准**（profile 目录）解析的，`./acp-guard.mjs` 这种相对路径会落到 profile 目录里一个不存在的文件上。
 
-安装：宿主在启动时把 `presets/acp/{preset.yml,agent.cordis.yml,acp-guard.mjs}` 复制到 `~/.dsh/.agent-presets/acp`（`installAcpPreset`，只补缺失文件，**永不覆盖**已存在的 preset——preset 是用户可编辑的）。设置页显示安装状态并可一键修复；配置项 `installAcpPreset: false` 可让宿主完全不碰该目录。
+安装：**没有安装步骤**——声明是插件包自己的 bundle patch，模式 chip 随包出现。只有「声明到了 roster 但激活失败」才需要人看：设置页那张卡读宿主 roster（`ctx.agentPresets` 的 `list()`，缺席即隐藏）并原样显示宿主的诊断。`preset/status` 只读，没有 `preset/install`：往那个没人读的旧目录里复制文件曾经让 UI 显示"已安装"而模式 chip 依然不见。
 
 ## 3. 权限：ACP 模式下 Access mode 不替 agent 裁决，agent 自己的模式说了算
 
@@ -86,6 +88,8 @@ DSH 的"模式"就是 **agent preset**：文件系统 roster（随部署的 `sta
 
 流式更新不需要轮询：store 把 SSE 的 `session/update` 直接折进被观察的 transcript（`chatTranscripts`，上限 `MAX_WATCHED` 条，最旧的淘汰），`session/reset`（resume 重放）会同时清空块与 seq 水位，`session/closed` 直接丢弃——**已关闭的会话不提供幽灵历史**。视图本身只读，没有任何 prompt/cancel/spawn 能力；它唯一的动词是空态里的「由 X 接管」，那是一次与芯片等价的 `directory.select` 写入。
 
+**默认 Agent（★）与三次路由写入**：ACP 模式会话需要一个初始路由，而这个路由**不能**是 DSH 的全局默认模型（见 §5 的第一条），所以插件自己存一个默认 agent（`~/.dsh/acp-agents.json` 的 `defaultAgentId`，RPC `model/get-default` / `model/set-default`，设置页 agent 卡的 ★ 按钮；删除该 agent 时指针一并清空，读作“没有默认 agent”）。三处写入 ACP 路由的地方（芯片菜单、ACP tab 的「由 X 接管」、座位 gate 对新会话的自动路由）全部经 `selectAcpRoute`：**先读**该会话写入前的路由，写入，再把它交给宿主的守卫（`model/reconcile-default`）——守卫需要“之前是什么”才能精确回滚，而不是靠猜。gate 只对**还没有自己的路由选择**的会话自动路由（读 `modelSelection` 投影的 `lastUsed`/`next`；投影读不到就不动，用户自己选过的路由也不动），且每条会话只尝试一次（`routeSettled`），写失败就交给座位菜单。
+
 ## 5. 已知边界（做不到的事）
 
 - **宿主侧仍然不能按会话过滤目录**：目录构建（`buildModelCatalog(ctx)`）是全量遍历 `ctx.llm.listProviders()`，且**不接 session id**（只用来找 agent 的是它的调用方），没有 per-session 过滤 seam。所以“在宿主目录里少列几个 provider”做不到——但“不必过滤”却可以：**ACP 模型压根不进那份目录**，详见下条。
@@ -100,4 +104,6 @@ DSH 的"模式"就是 **agent preset**：文件系统 roster（随部署的 `sta
 - **原生聊天里永远只有文字**：这不再是缺口而是分工——ACP tab 承载工具卡/计划/diff，原生聊天承载对话本身。想让工具卡长在对话流里，需要 LLM adapter 的 chunk 词表扩到 `tool-call`（那是 DSH 侧改动）。
 - **模式只能在空白会话选**：想中途切换到 ACP 模式（preset）需要新建会话；但**路由**可以随时切：在任意会话选 `acp@<agent>`（芯片或原生选择器），从下一条消息开始由 ACP agent 服务。历史上下文不会追送（只转发人说的话），所以中途接管是“从这里开始由它接手”。
 - **芯片不出现于普通会话**：从没路由到 ACP 的会话不渲染任何 ACP 芯片（工具行保持干净）；入口是 ACP tab 空态里的「由 X 接管」。
+- **部署默认模型绝不落在 ACP 路由上**：DSH 的 `session.selectModel` 对每一次选择写两份——会话自己的持久路由**和**全局默认模型（`agentDefaultModel.saveSelection`），后者不分会话、不分模式。所以任何一次 ACP 选择都会让**所有模式的新会话**从对端 agent 起步（对端 agent 收到的是宿主的工具 schema，正是本设计要挡住的事）。守卫 `AcpDefaultModelGuard` 记住最后一个**原生**默认并在默认变成 `acp` 时改回它：候选顺序是「该会话写入前的原生路由（浏览器 `selectAcpRoute` 递过来的 `previous`）→ 已知原生默认 → 本部署 live 会话里最近的原生路由（`lastNativeRoute`，即这个部署实际在跑的东西）」，一个都没有时**保持原值**并入实报 `stranded: true`（错的值比陈旧的值更坏），下一次原生选择会同时治好它并教会守卫。守卫在每轮 prompt 前与宿主启动时各复查一次，服务缺失（没有 `agentDefaultModel`）就是纯惰性——没有服务也就不存在这份全局写入。守卫自己的单测在 `tests/impl.spec.ts` 的 `AcpDefaultModelGuard` / `lastNativeRoute` 套件，接线在 `tests/bridge.spec.ts` 的 `deployment default model guard` 套件。
+- **一个 ACP 轮次的“结束”由对端 agent 决定，宿主不替它收尾**：`turn/end` 只在 `session/prompt` 的**响应**返回时发出，不在最后一个 chunk 到达时——所以“已经不再吐字了但仍显示正在输出”这段时间属于 agent 自己的内部节奏。实测（codebuddy，首轮）：它要先完成自己的标题生成才回应 prompt，期间一个通知都不发（它自己的日志：`Timed out waiting for pending title generation … timeoutMs=5000`），于是首轮的可视收尾被推迟约 5s。这是**记录在案的边界，不是待修 bug**：宿主无法区分“agent 正在想”与“agent 在磨蹭”，任何强制定稿（提前发 `turn/end`）都会把真实答案切在流中间；能提前给出响应的只有 agent 自己。唯一已有的强制定稿兜底是 `session/cancel` 之后的 `cancelFallbackMs`（见 `armCancelFallback`）——那是用户已经叫停的场合，与这里的语义完全不同，不得复用。
 - **codec 是手拷贝**：`splitAcpModelId`（浏览器）与 `splitAdapterModelId`（宿主）必须同步，由 `tests/acp-view.spec.ts` 的等价断言看住。

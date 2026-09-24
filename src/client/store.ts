@@ -69,7 +69,12 @@ export interface UiState {
   permissions: PendingPermission[]
   busy: boolean
   notice?: string
-  defaultModel?: string
+  /**
+   * The plugin's OWN default ACP agent (the panel's ★ gesture) — which agent a
+   * new ACP-mode conversation starts on. NOT the deployment default model:
+   * that one is global to every mode and must stay native (`AcpDefaultModelGuard`).
+   */
+  defaultAgent?: string
   detectedAgents: DetectedAgentInfo[]
   detecting: boolean
   /** Probed model catalogs per agent id (from `agent/probe-models`). */
@@ -130,13 +135,11 @@ export interface UiState {
    */
   chatTranscripts: Record<string, ChatTranscript>
   /**
-   * Install state of the host's ACP-mode agent preset (the roster entry the
-   * new-session chip shows). `undefined` on an older host half that serves no
-   * `preset/status`, in which case the panel hides the block entirely.
+   * State of the host's ACP-mode agent preset IN THE HARNESS ROSTER (the entry
+   * the new-session picker shows). `undefined` when the host serves no roster
+   * (`preset/status` answering `null`), in which case the panel hides the block.
    */
   preset?: AcpPresetStatus
-  /** True while a preset install/repair round-trip is in flight. */
-  presetInstalling: boolean
 }
 
 interface Listener { (): void }
@@ -202,7 +205,6 @@ export class AcpStore {
     chatSessions: [],
     chatTranscripts: {},
     acpMode: {},
-    presetInstalling: false,
   }
 
   private readonly listeners = new Set<Listener>()
@@ -284,15 +286,15 @@ export class AcpStore {
   /** Snapshot refresh used on panel open and after a stream outage. */
   async resync(): Promise<void> {
     try {
-      const [{ agents, approvalRouted, accessModeRouted }, { sessions }, defaultModelInfo, detectResult, presetResult] = await Promise.all([
+      const [{ agents, approvalRouted, accessModeRouted }, { sessions }, defaultAgentInfo, detectResult, presetResult] = await Promise.all([
         this.call<{ agents: AgentView[]; approvalRouted?: boolean; accessModeRouted?: boolean }>('agents/list'),
         this.call<{ sessions: SessionView[] }>('sessions/list'),
         this.call<{ provider?: string; model?: string }>('model/get-default').catch(() => ({} as { provider?: string; model?: string })),
         this.call<{ agents: DetectedAgentInfo[] }>('agents/detect').catch(() => null),
-        // Absent on an older host half: `null` hides the panel block.
+        // `null` (host without a preset roster) hides the panel block.
         this.call<{ preset: AcpPresetStatus | null }>('preset/status').catch(() => null),
       ])
-      const defaultModel = defaultModelInfo?.provider === 'acp' ? defaultModelInfo.model : undefined
+      const defaultAgent = defaultAgentInfo?.provider === 'acp' ? defaultAgentInfo.model : undefined
       const detectedAgents = (detectResult && detectResult.agents.length > 0)
         ? detectResult.agents
         : (this.state.detectedAgents.length > 0 ? this.state.detectedAgents : [...DEFAULT_KNOWN_PRESETS])
@@ -300,7 +302,7 @@ export class AcpStore {
       this.mutate({
         agents,
         sessions,
-        defaultModel,
+        defaultAgent,
         detectedAgents,
         approvalRouted: approvalRouted === true,
         accessModeRouted: accessModeRouted === true,
@@ -806,12 +808,36 @@ export class AcpStore {
     }
   }
 
-  async setDefaultModel(agentId: string): Promise<void> {
+  /**
+   * Set the plugin's OWN default ACP agent (the panel's ★ gesture): which agent
+   * an ACP-mode conversation starts on. Host-side state — NOT the deployment
+   * default model, which must stay native for every other mode.
+   */
+  async setDefaultAgent(agentId: string): Promise<void> {
     try {
+      // Wire names stay `model/*` (the endpoint the host half mounts); the value
+      // is the plugin's own default AGENT, not the deployment default model.
       await this.call('model/set-default', { agentId })
-      this.mutate({ defaultModel: agentId })
+      this.mutate({ defaultAgent: agentId })
     } catch (error) {
       this.flashError(error)
+    }
+  }
+
+  /**
+   * Ask the host to keep the deployment default model off the ACP route, after
+   * this browser wrote one (see `selectAcpRoute`); `previous` is the route the
+   * session was on before the write, when that route was native.
+   *
+   * Failures are swallowed: the host re-runs the same check at the start of
+   * every turn, so a lost round trip costs one turn of cleanliness — it must
+   * never turn a successful model switch into an error card.
+   */
+  async reconcileDefaultModel(previous?: { provider: string; model: string; reasoningEffort?: string }): Promise<void> {
+    try {
+      await this.call('model/reconcile-default', previous === undefined ? {} : { previous })
+    } catch {
+      // See the doc comment.
     }
   }
 
@@ -821,23 +847,6 @@ export class AcpStore {
       await this.resync()
     } catch (error) {
       this.flashError(error)
-    }
-  }
-
-  /**
-   * Install or repair the ACP-mode agent preset in the roster's user root.
-   * Idempotent and non-destructive on the host side (existing files win), so
-   * the button is safe to press when the preset already looks healthy.
-   */
-  async installPreset(): Promise<void> {
-    this.mutate({ presetInstalling: true })
-    try {
-      const result = await this.call<{ preset: AcpPresetStatus | null }>('preset/install')
-      this.mutate({ preset: result.preset ?? undefined })
-    } catch (error) {
-      this.flashError(error)
-    } finally {
-      this.mutate({ presetInstalling: false })
     }
   }
 

@@ -17,7 +17,9 @@ import { AcpSettingsSection } from './panel.tsx'
 import { AcpComposerMode } from './composer-mode.tsx'
 import { AcpModelSeat, AcpSessionControls, AcpSessionMenu } from './session-controls.tsx'
 import { AcpConversationView } from './acp-view.tsx'
-import { acpModeFromPresetEvent, setAcpSeatActive, shouldShadowModelSeat } from './acp-ui.tsx'
+import {
+  ACP_PROVIDER, acpModeFromPresetEvent, selectAcpRoute, sessionHasOwnSelection, setAcpSeatActive, shouldShadowModelSeat,
+} from './acp-ui.tsx'
 import type { AcpChatInjected, AcpDirectory, AcpSessionFace, AcpSessionsSnapshot, SessionListSource } from './acp-ui.tsx'
 
 export const name = 'dsh-ntr-client'
@@ -210,6 +212,51 @@ export function apply(ctx: Context): void {
   /** The host-side verdict for the seat gate, when we hold one (`AcpStore.acpMode`). */
   const acpModeVerdict = (sessionId: string): boolean | undefined => store.getSnapshot().acpMode[sessionId]
 
+  /** Sessions this gate already routed (or deliberately left alone); one answer per page life. */
+  const routeSettled = new Set<string>()
+
+  /**
+   * Route a brand-new ACP-mode conversation to the plugin's default agent.
+   *
+   * WHY: the deployment default model may never be an ACP route (see
+   * `AcpDefaultModelGuard`), so an ACP-mode conversation that has not selected
+   * anything yet starts on a *native* route — which the seat would report as
+   * "runs the ACP preset, but its model is not an ACP agent", asking for a click
+   * on every new conversation. The default agent (the panel's ★ gesture) is the
+   * plugin's own answer to which agent that should be.
+   *
+   * Deliberately narrow: only sessions with NO selection of their own are
+   * routed (a route the user picked stays theirs — the seat's warning is the
+   * documented surface for it), only when the default agent still exists, and a
+   * session is settled either way after the first attempt so a refused write
+   * cannot turn the gate into a retry loop.
+   */
+  const ensureAcpRoute = (sessionId: string): void => {
+    if (routeSettled.has(sessionId)) return
+    const defaultAgent = store.getSnapshot().defaultAgent
+    if (defaultAgent === undefined || !store.getSnapshot().agents.some(agent => agent.id === defaultAgent)) return
+    const own = sessionHasOwnSelection(faceFor, sessionId)
+    if (own === undefined) return // the runtime has not answered yet: ask again on the next tick
+    if (own) {
+      routeSettled.add(sessionId)
+      return
+    }
+    const directory = directoryFor(sessionId)
+    if (directory === undefined) return
+    routeSettled.add(sessionId)
+    void (async () => {
+      try {
+        await directory.load()
+        // The directory is the fact source for "where this session is": if the
+        // route already is an ACP one (someone picked while we loaded), leave it.
+        if (directory.store.getSnapshot().current?.provider === ACP_PROVIDER) return
+        await selectAcpRoute(store, directory, { provider: ACP_PROVIDER, model: defaultAgent })
+      } catch {
+        // The seat's own menu stays the way to pick an agent.
+      }
+    })()
+  }
+
   /** Register or drop the seat for the current session's preset state (idempotent). */
   const syncModelSeat = (): void => {
     if (seatBroken) return
@@ -232,6 +279,11 @@ export function apply(ctx: Context): void {
     const want = list !== undefined
       && service<StructuralServices['modelDirectories']>('modelDirectories') !== undefined
       && shouldShadowModelSeat(snapshot, acpModeVerdict)
+    // Same verdict as the seat takeover: this session runs the ACP preset, so it
+    // must be on an ACP route (see `ensureAcpRoute`). Runs even when the seat
+    // itself could not be registered — the route is the conversation's, not the
+    // seat's.
+    if (want && current !== undefined) ensureAcpRoute(current)
     if (want === seatRegistered) return
     if (!want) {
       dropSeat()

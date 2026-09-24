@@ -15,7 +15,8 @@
       "default": "./lib/client.js"
     },
     "./cordis.patch.yml": "./cordis.patch.yml",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./acp-guard": "./presets/acp/acp-guard.mjs"
   },
   "files": [
     "lib",
@@ -52,7 +53,10 @@
   },
   "dsh": {
     "bundle": {
-      "patch": "./cordis.patch.yml"
+      "patch": [
+        "./cordis.patch.yml",
+        "./presets/acp/acp.patch.yml"
+      ]
     },
     "client": {
       "platform": "web",

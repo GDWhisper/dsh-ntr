@@ -148,6 +148,72 @@ export function splitAcpModelId(model: string): { agentId: string; choice?: stri
 /** The ACP provider route id every ACP model selection carries. */
 export const ACP_PROVIDER = 'acp'
 
+/** One model route selection (the subset of DSH's `ModelSelection`) these surfaces write. */
+export interface AcpRouteSelection {
+  provider: string
+  model: string
+  reasoningEffort?: string
+}
+
+/** The `modelSelection` session projection, narrowed to its wire view. */
+export interface AcpModelSelectionProjection {
+  lastUsed: AcpRouteSelection | null
+  next: AcpRouteSelection | null
+}
+
+/**
+ * Whether a session carries a model selection of its OWN, as opposed to running
+ * on the deployment default model.
+ *
+ * WHY it matters: the gate routes a brand-new ACP-mode conversation to the
+ * default agent, and a session that has never selected anything is the only one
+ * where that is not overriding somebody's choice — a route the user picked (or
+ * the `/model` popup wrote) is the documented "detached" state the seat warns
+ * about instead of silently undoing.
+ *
+ * @returns `true`/`false` when the projection answered, `undefined` when it
+ *   cannot be read at all (an older runtime, an addressed subagent route) — the
+ *   caller must then leave the session alone.
+ */
+export function sessionHasOwnSelection(faceFor: AcpChatInjected['faceFor'], sessionId: string): boolean | undefined {
+  try {
+    const projection = faceFor(sessionId)?.projections.faceOf('modelSelection')?.getSnapshot() as AcpModelSelectionProjection | undefined | null
+    if (projection === undefined || projection === null || typeof projection !== 'object') return undefined
+    return projection.lastUsed != null || projection.next != null
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Write one ACP route into a session's shared model directory — and keep the
+ * DEPLOYMENT default model off it.
+ *
+ * WHY the second half: DSH's `session.selectModel` records a selection as the
+ * session's own durable route AND as the deployment default, and that second
+ * write is global — every NEW session in EVERY mode starts on it. So an ACP
+ * pick made here would leak the agent into ordinary conversations, which is
+ * exactly what this plugin's two-way isolation forbids. The host half's guard
+ * (`AcpDefaultModelGuard`) puts the previous native value back, and it needs the
+ * route this session was on *before* the write to do that exactly rather than
+ * by guessing — hence the read below.
+ *
+ * Every ACP route write in this bundle goes through here (the chips' picker, the
+ * ACP view's takeover, the gate's auto-route), so no surface can reintroduce the
+ * leak on its own.
+ */
+export async function selectAcpRoute(
+  acp: AcpStore,
+  directory: AcpDirectory,
+  selection: AcpRouteSelection,
+): Promise<void> {
+  const before = directory.store.getSnapshot().current
+  await directory.select(selection)
+  // A closed loop on purpose: an ACP route is never the value to restore, and a
+  // failed repair is housekeeping noise, not a failed pick.
+  await acp.reconcileDefaultModel(before === null || before.provider === ACP_PROVIDER ? undefined : before)
+}
+
 // ---- React bindings ----
 
 /** Subscribe to the ACP store (the panel and every chat surface share this). */
@@ -267,12 +333,13 @@ export function usePermissionSelect(faceFor: AcpChatInjected['faceFor'], session
 // ---- The ACP-mode model seat (shadowing the native one) ----
 
 /**
- * The ACP agent preset's id. A preset's id IS its directory name, and the host
- * installs this bundle's preset at `~/.dsh/.agent-presets/acp`
- * (`installAcpPreset`) — so `acp` is the value the session list reports for an
- * ACP-mode session. Hand copy of that path segment (the browser cannot read the
- * host plane), and the same string the host's own `sessionAgentPreset` resolver
- * reads back from the session log.
+ * The ACP agent preset's id. THREE places must agree on it (no type system
+ * spans them): the declaration's `config.id` in `presets/acp/acp.patch.yml`
+ * (this bundle's own patch, carried by package.json `dsh.bundle.patch` — no
+ * install step), the host half's `ACP_PRESET_ID` (`src/bridge.ts`), and this
+ * constant (the browser cannot read the host plane). `acp` is the value the
+ * session list reports for an ACP-mode session and the same string the host's
+ * own `sessionAgentPreset` resolver reads back from the session log.
  */
 export const ACP_PRESET_ID = 'acp'
 

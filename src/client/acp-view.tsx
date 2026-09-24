@@ -21,7 +21,7 @@ import { useEffect, useRef, useState } from 'react'
 // Type-only: pulls the ui-conversation SlotMap merge into this program.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import {
-  ACP_PROVIDER, ensureAcpStyle, useDirectory, useUi,
+  ACP_PROVIDER, ensureAcpStyle, selectAcpRoute, useDirectory, useUi,
 } from './acp-ui.tsx'
 import type { AcpChatInjected } from './acp-ui.tsx'
 import type { Block, ChatTranscript } from './store.ts'
@@ -308,7 +308,10 @@ export function AcpConversationView(props: AcpViewProps) {
 
   const agents = ui.agents
   const routeToAcp = (agentId: string): void => {
-    void directory?.select({ provider: ACP_PROVIDER, model: agentId })
+    if (directory === undefined) return
+    // `selectAcpRoute`, not a bare `select`: the write also keeps the deployment
+    // default model off the ACP route (see its doc comment).
+    void selectAcpRoute(acp, directory, { provider: ACP_PROVIDER, model: agentId })
       .catch(() => { /* the cluster's picker owns the failure surface */ })
   }
 

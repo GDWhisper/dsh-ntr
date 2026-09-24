@@ -112,12 +112,6 @@ export interface AcpPluginConfig {
    * Default 15000 ms; `0` disables the fallback.
    */
   cancelFallbackMs?: number
-  /**
-   * Install the bundled ACP-mode agent preset into the roster's user root
-   * (`~/.dsh/.agent-presets/acp`) at boot when it is absent. Default `true`;
-   * an existing preset is never touched.
-   */
-  installAcpPreset?: boolean
 }
 
 // ---- Host → browser events (`/api/acp/stream`, SSE) ----
@@ -126,19 +120,23 @@ export type AgentProcessState = 'stopped' | 'starting' | 'ready' | 'error'
 
 /** Agent facts the browser may render (never includes env/argv secrets beyond argv itself, which is config-visible). */
 /**
- * Install state of the ACP-mode agent preset (`presets/acp` → the roster's user
- * root). Read-only report: the panel shows it, and the browser can only ask the
- * host to (re)install from the bundled copy.
+ * State of the ACP-mode agent preset in the HARNESS's own preset roster.
+ *
+ * Nothing is installed any more: the preset ships as this package's bundle
+ * patch (`presets/acp/acp.patch.yml`), which the harness composes when it
+ * builds the profile, so the only question left is whether the roster carries
+ * the declaration and can compose a session from it — which is exactly what a
+ * `preset-<id>` row that failed to activate reports as `problem`.
  */
 export interface AcpPresetStatus {
-  /** Preset id, which is also its directory name. */
+  /** Preset id (a session's `agentPreset` value; matched by the browser half). */
   id: string
-  /** Absolute target directory under the user preset root. */
-  dir: string
-  /** Whether the directory exists — an existing preset is never overwritten. */
+  /** The declaration inside this package, for copy and debugging. */
+  source: string
+  /** Whether the roster carries the preset and it can compose a session. */
   installed: boolean
-  /** Bundled files absent from the installed copy (the repair list). */
-  missing: string[]
+  /** The harness's own diagnostic when the declaration exists but is unusable. */
+  problem?: string
 }
 
 export interface AgentView {
@@ -320,8 +318,36 @@ export interface SessionConfigSetPayload { sessionId: string; configId: string; 
 export interface TranscriptGetPayload { sessionId: string; afterSeq?: number }
 export interface AgentIdPayload { agentId: string }
 export interface AgentPermissionSetPayload { agentId: string; permission: PermissionMode }
-export interface ModelDefaultSetPayload { agentId: string }
-export type ModelDefaultResult = { provider?: string; model?: string }
+/**
+ * The plugin's OWN default ACP agent (the panel's ★ gesture): which agent an
+ * ACP-mode conversation starts on. Host-side state, NOT the deployment default
+ * model — that one is global to every mode, so an ACP route must never land in
+ * it (`AcpDefaultModelGuard` repairs it when it does).
+ */
+export interface DefaultAgentSetPayload { agentId: string }
+/** `model/get-default`: `{provider: 'acp', model: agentId}`, or `{}` when unset. */
+export type DefaultAgentResult = { provider?: string; model?: string }
+
+/**
+ * `model/reconcile-default`: DSH's `session.selectModel` saves every selection
+ * as the deployment default as well, so an ACP pick made in one conversation
+ * would otherwise become what every NEW session in EVERY mode starts on. The
+ * browser calls this right after an ACP write, carrying the route the session
+ * was on before it (`previous`, when that route was native) so the host can
+ * put that value back.
+ */
+export interface ModelDefaultReconcilePayload {
+  previous?: { provider: string; model: string; reasoningEffort?: string }
+}
+
+export interface ModelDefaultReconcileResult {
+  /** The deployment default after the round trip; absent when it was unreadable. */
+  selection?: { provider: string; model: string; reasoningEffort?: string }
+  /** A native route replaced an ACP one. */
+  restored: boolean
+  /** The default is still an ACP route and the host held no native candidate. */
+  stranded: boolean
+}
 
 /** Host-detected agent presence and tested defaults. */
 export interface DetectedAgentInfo {

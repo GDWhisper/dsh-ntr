@@ -19,10 +19,16 @@
         # startupTimeoutMs: 60000    # budget for initialize / session/new / session/load
         # permissionTimeoutMs: 0     # auto-cancel a pending approval after N ms (0 = wait for the human forever)
         # cancelFallbackMs: 15000    # force-finalize a turn the agent ignores after session/cancel (0 = off)
-        # ACP 模式 agent preset (presets/acp) is installed into the roster's user
-        # root (~/.dsh/.agent-presets/acp) on first boot; an existing preset is
-        # never overwritten. Set false to keep the host out of that directory.
-        # installAcpPreset: true
+        # ACP 模式 (agent preset) is declared by this package's own bundle
+        # patch list (package.json `dsh.bundle.patch` → presets/acp/acp.patch.yml),
+        # so it needs no install step and has no config knob. The settings card
+        # only reports the harness roster's verdict for the `preset-acp` row.
+        # The plugin's OWN default ACP agent (panel's ★ button) lives in the
+        # agent registry file (~/.dsh/acp-agents.json, key `defaultAgentId`),
+        # NOT in DSH's deployment default model: that value is global to every
+        # mode, so writing an ACP route there would start new sessions of ANY
+        # mode on the external agent. The host-side guard puts a native route
+        # back whenever the default becomes `acp`.
         # Per-agent ACP-model filter — which of the agent's models its own
         # conversation seats offer (panel checkboxes persist here). ACP models
         # are never advertised in DSH's model catalog, so they cannot leak into

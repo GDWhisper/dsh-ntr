@@ -177,7 +177,7 @@ describe('host plugin contract', () => {
     expect(bare.acpMode).toBe(false)
   })
 
-  it('wires agentDefaultModel hooks when service is available', async () => {
+  it('keeps the deployment default model native while owning its own default agent', async () => {
     const ctx = fakeCtx()
     let rpcHandler: ((endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>) | undefined
     ctx.connection.rpc.handle = vi.fn((_channel: string, handler: unknown) => {
@@ -185,7 +185,8 @@ describe('host plugin contract', () => {
       return () => Promise.resolve()
     })
     const saveSelection = vi.fn(async () => {})
-    const currentSelection = vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-v4' }))
+    let selection: { provider: string; model: string } | undefined = { provider: 'deepseek', model: 'deepseek-v4' }
+    const currentSelection = vi.fn(() => selection)
     const get = vi.fn((key: string) => {
       if (key === 'agentDefaultModel') return { currentSelection, saveSelection }
       return undefined
@@ -196,11 +197,21 @@ describe('host plugin contract', () => {
     expect(rpcHandler).toBeDefined()
     const dummySignal = new AbortController().signal
 
-    const getRes = await rpcHandler!('model/get-default', {}, dummySignal)
-    expect(getRes).toEqual({ ok: true, value: { provider: 'deepseek', model: 'deepseek-v4' } })
-
-    const setRes = await rpcHandler!('model/set-default', { agentId: 'agent-1' }, dummySignal)
-    expect(setRes).toEqual({ ok: true, value: { done: true } })
-    expect(saveSelection).toHaveBeenCalledWith({ provider: 'acp', model: 'agent-1' })
+    // `model/get-default` is the plugin's OWN default agent (the panel's ★
+    // gesture), not the deployment default model: unset here → `{}`.
+    expect(await rpcHandler!('model/get-default', {}, dummySignal)).toEqual({ ok: true, value: {} })
+    expect(await rpcHandler!('model/set-default', { agentId: 'agent-1' }, dummySignal)).toEqual({ ok: true, value: { done: true } })
+    expect(await rpcHandler!('model/get-default', {}, dummySignal)).toEqual({ ok: true, value: { provider: 'acp', model: 'agent-1' } })
+    // The gesture must never touch the deployment default model (that is the
+    // cross-mode leak the guard exists to prevent).
+    expect(saveSelection).not.toHaveBeenCalled()
+    // …while an ACP route arriving there (DSH's own `selectModel` saves every
+    // selection) IS repaired, back to the native default the guard learned.
+    selection = { provider: 'acp', model: 'codebuddy@hy3' }
+    expect(await rpcHandler!('model/reconcile-default', {}, dummySignal)).toEqual({
+      ok: true,
+      value: { selection: { provider: 'deepseek', model: 'deepseek-v4' }, restored: true, stranded: false },
+    })
+    expect(saveSelection).toHaveBeenCalledWith({ provider: 'deepseek', model: 'deepseek-v4' })
   })
 })

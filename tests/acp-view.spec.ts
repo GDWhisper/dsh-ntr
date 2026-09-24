@@ -8,7 +8,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { ACP_PRESET_ID, acpModeFromPresetEvent, shouldShadowModelSeat, splitAcpModelId } from '../src/client/acp-ui.tsx'
+import { ACP_PRESET_ID, acpModeFromPresetEvent, sessionHasOwnSelection, shouldShadowModelSeat, splitAcpModelId } from '../src/client/acp-ui.tsx'
 import type { AcpDirectoryState, AcpPermissionSelect } from '../src/client/acp-ui.tsx'
 import { diffRows } from '../src/client/acp-view.tsx'
 import { describeRoute, menuFor } from '../src/client/session-controls.tsx'
@@ -223,6 +223,33 @@ describe('ACP model seat picker', () => {
     const elsewhere = describeRoute({ ...state, current: { provider: 'deepseek', model: 'chat' } }, [], undefined, catalog)
     expect(elsewhere).toMatchObject({ routed: false })
     expect(menuFor('seat', { ...base, route: elsewhere }).sections.map(s => s.id)).toEqual(['agent'])
+  })
+})
+
+describe('sessionHasOwnSelection (the gate\u2019s auto-route predicate)', () => {
+  /** A `faceFor` stub whose `modelSelection` projection answers with one value. */
+  function faceForReturning(value: unknown) {
+    return (() => ({
+      projections: { faceOf: () => ({ getSnapshot: () => value, subscribe: () => () => {} }) },
+    })) as never
+  }
+
+  it('reports a session that already carries a route of its own', () => {
+    expect(sessionHasOwnSelection(faceForReturning({ lastUsed: { provider: 'acp', model: 'pi' }, next: null }), 's1')).toBe(true)
+    expect(sessionHasOwnSelection(faceForReturning({ lastUsed: null, next: { provider: 'deepseek', model: 'x' } }), 's1')).toBe(true)
+  })
+
+  it('reports a never-selected session as free to route', () => {
+    expect(sessionHasOwnSelection(faceForReturning({ lastUsed: null, next: null }), 's1')).toBe(false)
+  })
+
+  it('returns undefined when the projection cannot be read at all', () => {
+    // An older runtime without the projection, or an addressed subagent route:
+    // the gate must leave the session alone (re-asking on the next tick) rather
+    // than decide "never selected" from a missing answer.
+    expect(sessionHasOwnSelection(faceForReturning(undefined), 's1')).toBeUndefined()
+    expect(sessionHasOwnSelection(faceForReturning('nonsense'), 's1')).toBeUndefined()
+    expect(sessionHasOwnSelection((() => { throw new Error('no face') }) as never, 's1')).toBeUndefined()
   })
 })
 

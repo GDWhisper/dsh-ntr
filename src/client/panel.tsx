@@ -320,8 +320,12 @@ export function AcpSettingsSection(props: WithStore) {
         </div>
       )}
 
-      {/* ACP 模式: the agent preset the new-session chip offers. Host filesystem
-          state, so it is reported and repaired here rather than under an agent. */}
+      {/* ACP 模式: the agent preset the new-session picker offers.
+
+          Nothing is installed from here — the preset is a declaration this
+          package ships in its OWN bundle patch (`presets/acp/acp.patch.yml`),
+          so the card is a read-only window onto the harness roster: it exists
+          to say why the mode is missing when its activation failed. */}
       {ui.preset !== undefined && (
         <div className="dwa-card" style={{ marginBottom: 16 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
@@ -329,32 +333,21 @@ export function AcpSettingsSection(props: WithStore) {
               {acp.label('ACP 模式（智能体预设）', 'ACP mode (agent preset)')}
             </span>
             <span className="dwa-badge">{ui.preset.id}</span>
-            <button
-              className="dwa-btn"
-              onClick={() => void acp.installPreset()}
-              disabled={ui.presetInstalling}
-            >
-              {ui.presetInstalling
-                ? acp.label('处理中...', 'Working...')
-                : ui.preset.installed
-                  ? acp.label('修复缺失文件', 'Repair missing files')
-                  : acp.label('安装', 'Install')}
-            </button>
           </div>
           <div className="dwa-hint" style={{ marginTop: 6 }}>
             {ui.preset.installed
               ? acp.label(
-                `已安装：${ui.preset.dir}。在新建会话页的模式选择里选「ACP 模式」。`,
-                `Installed at ${ui.preset.dir}. Pick “ACP mode” in the new-session mode picker.`,
+                `已进入宿主模式列表（声明：${ui.preset.source}）。在新建会话页的模式选择里选「ACP 模式」。`,
+                `In the harness roster (declared at ${ui.preset.source}). Pick “ACP mode” in the new-session mode picker.`,
               )
               : acp.label(
-                `尚未安装到 ${ui.preset.dir}（宿主下次启动会自动安装）。`,
-                `Not installed at ${ui.preset.dir} yet (the host installs it on next boot).`,
+                `宿主模式列表里没有可用的「ACP 模式」（声明：${ui.preset.source}）。`,
+                `The harness roster carries no usable “ACP mode” (declared at ${ui.preset.source}).`,
               )}
           </div>
-          {ui.preset.missing.length > 0 && (
+          {ui.preset.problem !== undefined && (
             <div className="dwa-hint" style={{ marginTop: 4, color: '#f59e0b' }}>
-              {acp.label(`缺失：${ui.preset.missing.join('、')}`, `Missing: ${ui.preset.missing.join(', ')}`)}
+              {acp.label(`宿主报告：${ui.preset.problem}`, `Harness reported: ${ui.preset.problem}`)}
             </div>
           )}
         </div>
@@ -384,7 +377,7 @@ export function AcpSettingsSection(props: WithStore) {
               detected={info}
               activeAgent={activeAgent}
               acp={acp}
-              isDefault={ui.defaultModel === info.id}
+              isDefault={ui.defaultAgent === info.id}
               synthesized={synthesized}
             />
           )
@@ -1403,9 +1396,22 @@ function ModelCatalogBlock({
           {probing ? acp.label('模型检测中...', 'Probing models...') : acp.label('检测可用模型', 'Detect Available Models')}
         </button>
         {!isDefault && (
-          <button className="dwa-btn" onClick={() => void acp.setDefaultModel(agentId)}>
-            ★ {acp.label('设为默认模型', 'Set as Default Model')}
+          <button className="dwa-btn" onClick={() => void acp.setDefaultAgent(agentId)}>
+            ★ {acp.label('设为默认 Agent', 'Set as Default Agent')}
           </button>
+        )}
+        {isDefault && (
+          // Says out loud what this gesture is — and what it is NOT. It is the
+          // plugin's own default ACP agent (which agent a new ACP-mode
+          // conversation starts on); it deliberately does NOT write the
+          // deployment default model, which stays native so ordinary
+          // conversations in every other mode are untouched.
+          <span className="dwa-hint">
+            {acp.label(
+              '默认 Agent：新的 ACP 模式会话直接由它服务（其他模式的默认模型不受影响）',
+              "Default agent: a new ACP-mode conversation starts on it (other modes' default model is untouched)",
+            )}
+          </span>
         )}
         {result !== undefined && result.catalog.model === undefined && (
           <span className="dwa-hint">

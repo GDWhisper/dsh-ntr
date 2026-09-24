@@ -183,10 +183,6 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
   if (typeof cancelFallbackMs !== 'number' || !Number.isInteger(cancelFallbackMs) || cancelFallbackMs < 0 || cancelFallbackMs > 600_000) {
     throw new AcpError('bad_config', 'acp: cancelFallbackMs must be an integer in [0, 600000] (0 = disable the fallback)')
   }
-  const installAcpPreset = value.installAcpPreset ?? true
-  if (typeof installAcpPreset !== 'boolean') {
-    throw new AcpError('bad_config', 'acp: installAcpPreset must be a boolean')
-  }
   return {
     agents,
     transcriptMaxEntries: max,
@@ -194,7 +190,6 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
     startupTimeoutMs,
     permissionTimeoutMs,
     cancelFallbackMs,
-    installAcpPreset,
   }
 }
 
@@ -306,6 +301,195 @@ export function resolveFsPath(sessionCwd: string, roots: readonly string[], requ
   })
   if (!inside) throw new AcpError('cwd_denied', `acp: fs path ${full} is outside the session workspace`)
   return full
+}
+
+// ---- Deployment default model (the ACP route must never become it) ----
+
+/** The provider route this plugin's LLM adapter serves (mirrors `ACP_PRESET_ID`'s spelling). */
+export const ACP_PROVIDER_ID = 'acp'
+
+/**
+ * One model route selection — the subset of DSH's `ModelSelection` this layer
+ * reads and writes. Kept structural on purpose: `agentDefaultModel` and the
+ * session projector belong to the host, not to this plugin.
+ */
+export interface ModelRouteSelection {
+  provider: string
+  model: string
+  reasoningEffort?: string
+}
+
+/** The host ports the guard needs (`ctx.agentDefaultModel` + the session store). */
+export interface DefaultModelPorts {
+  /** Current deployment default; `undefined` when the service cannot answer. */
+  read(): ModelRouteSelection | undefined
+  /** Persist a complete selection as the deployment default. */
+  write(next: ModelRouteSelection): Promise<void>
+  /**
+   * Last-resort candidate: a route this deployment already uses natively (the
+   * most recently used non-ACP route among live sessions). Only consulted when
+   * the guard holds no memory of a native default — see `reconcile`.
+   */
+  fallback?(): ModelRouteSelection | undefined
+}
+
+/** What one `reconcile` round trip did (also the `model/reconcile-default` reply). */
+export interface DefaultModelReconcileOutcome {
+  /** The deployment default after the round trip; `undefined` when unreadable. */
+  selection?: ModelRouteSelection
+  /** A native route replaced an ACP one. */
+  restored: boolean
+  /**
+   * The default points at `acp` and the guard had no native candidate: it left
+   * the value alone (a wrong model is worse than a stale one). The next native
+   * pick heals it.
+   */
+  stranded: boolean
+}
+
+/**
+ * Keep the deployment default model off the ACP route.
+ *
+ * WHY: DSH's `session.selectModel` records a selection twice — as the session's
+ * own durable selection AND as the deployment default (`agentDefaultModel
+ * .saveSelection`), and that second write is not scoped to the session or to
+ * the mode. So picking an ACP agent in one conversation changes what every NEW
+ * session starts on, in EVERY mode: a fresh standard-mode session then sends
+ * its first request to the external agent (with DSH's own tool schemas
+ * advertised to it), which is precisely the isolation the ACP design forbids
+ * (see `AcpLlmAdapter.listModels` and the model-seat gate).
+ *
+ * WHAT IT DOES: remembers the last NATIVE default it has seen and puts it back
+ * when the default points at `acp` again. The value is never invented; the
+ * sources, in order, are the route the caller saw before its own ACP write
+ * (a session's pre-write route), the remembered native default, and the
+ * deployment's own last native route among live sessions (`ports.fallback`).
+ * With no candidate in hand it does nothing and says so (`stranded`) — a wrong
+ * model would be worse than a stale one, and the user's next native pick both
+ * heals the default and teaches the guard.
+ */
+export class AcpDefaultModelGuard {
+  private native?: ModelRouteSelection
+
+  constructor(private readonly ports: DefaultModelPorts) {}
+
+  /** Learn one native route the caller knows about (a session's pre-write route). */
+  noteNative(candidate?: ModelRouteSelection | undefined): void {
+    const clean = sanitizeSelection(candidate)
+    if (clean !== undefined && clean.provider !== ACP_PROVIDER_ID) this.native = clean
+  }
+
+  /** The native default the guard would put back, when it holds one. */
+  get remembered(): ModelRouteSelection | undefined {
+    return this.native
+  }
+
+  /**
+   * Read the deployment default, learn from it, and repair it when it is an ACP
+   * route. Never throws — a service that cannot answer leaves the guard inert,
+   * which is the same behavior a deployment without `agentDefaultModel` gets.
+   *
+   * @param known - the route the caller saw before its own ACP write, if any.
+   * @returns the default after the round trip plus what happened to it.
+   */
+  async reconcile(known?: ModelRouteSelection | undefined): Promise<DefaultModelReconcileOutcome> {
+    this.noteNative(known)
+    let current: ModelRouteSelection | undefined
+    try {
+      current = sanitizeSelection(this.ports.read())
+    } catch {
+      return { restored: false, stranded: false }
+    }
+    if (current === undefined) return { restored: false, stranded: false }
+    if (current.provider !== ACP_PROVIDER_ID) {
+      // The healthy path: the default is a native route, so it is exactly what
+      // an ACP selection must be reverted to next time.
+      this.native = current
+      return { selection: current, restored: false, stranded: false }
+    }
+    const target = this.native ?? this.fallbackCandidate()
+    if (target === undefined) return { selection: current, restored: false, stranded: true }
+    try {
+      await this.ports.write(target)
+    } catch {
+      // An unwritable default (a deployment pinned by a home patch, a read-only
+      // profile) must not break the turn that triggered the check.
+      return { selection: current, restored: false, stranded: true }
+    }
+    this.native = target
+    return { selection: target, restored: true, stranded: false }
+  }
+
+  private fallbackCandidate(): ModelRouteSelection | undefined {
+    try {
+      const candidate = sanitizeSelection(this.ports.fallback?.())
+      return candidate !== undefined && candidate.provider !== ACP_PROVIDER_ID ? candidate : undefined
+    } catch {
+      return undefined
+    }
+  }
+}
+
+/** The slice of a live host session the default-model fallback reads. */
+export interface RouteBearingSessionLike extends AccessModeSessionLike {
+  /** The route of this session's most recent request (absent before its first turn). */
+  requestHeader?(): { config?: { provider?: unknown; model?: unknown; reasoningEffort?: unknown } } | undefined
+}
+
+/**
+ * The most recently used NON-ACP route among live sessions — the guard's last
+ * candidate when the deployment default is ALREADY on an ACP route (an install
+ * from before the guard existed) and no native default has been observed yet.
+ *
+ * This is the user's own data, not an invention: every session keeps the route
+ * of its last request, so the freshest native one is what this deployment was
+ * actually running before the ACP pick overwrote the default. Sessions whose
+ * last request was ACP are skipped, and an unreadable session is ignored — one
+ * bad row must not hide the others.
+ */
+export function lastNativeRoute(sessions: readonly RouteBearingSessionLike[] | undefined): ModelRouteSelection | undefined {
+  let best: { selection: ModelRouteSelection; at: number } | undefined
+  for (const session of sessions ?? []) {
+    try {
+      const config = session.requestHeader?.()?.config
+      if (config === undefined) continue
+      const provider = typeof config.provider === 'string' ? config.provider.trim() : ''
+      const model = typeof config.model === 'string' ? config.model.trim() : ''
+      if (provider === '' || model === '' || provider === ACP_PROVIDER_ID) continue
+      const at = lastEventTime(session.events)
+      if (best !== undefined && at < best.at) continue
+      const reasoningEffort = typeof config.reasoningEffort === 'string' && config.reasoningEffort.trim() !== ''
+        ? config.reasoningEffort.trim()
+        : undefined
+      best = { selection: { provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) }, at }
+    } catch {
+      // Ignored on purpose: see the doc comment.
+    }
+  }
+  return best?.selection
+}
+
+/** Freshest activity stamp of a session's log; `0` when it carries none. */
+function lastEventTime(events: readonly unknown[] | undefined): number {
+  if (!Array.isArray(events)) return 0
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index] as { time?: unknown } | undefined
+    if (typeof event?.time === 'number') return event.time
+  }
+  return 0
+}
+
+/**
+ * Drop a malformed selection: a service answering garbage (or an older host's
+ * partial object) must never be written back as somebody's default model.
+ */
+function sanitizeSelection(value: ModelRouteSelection | undefined): ModelRouteSelection | undefined {
+  if (value === undefined || typeof value.provider !== 'string' || typeof value.model !== 'string') return undefined
+  const provider = value.provider.trim()
+  const model = value.model.trim()
+  if (provider === '' || model === '') return undefined
+  const reasoningEffort = typeof value.reasoningEffort === 'string' && value.reasoningEffort.trim() !== '' ? value.reasoningEffort.trim() : undefined
+  return { provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) }
 }
 
 // ---- Child environment ----
@@ -578,6 +762,47 @@ export function sessionAgentPresetFromLog(headerPreset: unknown, events: readonl
   return typeof headerPreset === 'string' ? headerPreset : undefined
 }
 
+/** Where the ACP-mode preset is declared inside this package. */
+export const ACP_PRESET_SOURCE = 'dsh-ntr/presets/acp/acp.patch.yml'
+
+/** One harness preset-roster row (structurally `AgentPresetRow`; no dependency). */
+export interface RosterPresetRow {
+  id: string
+  /** Why this preset cannot compose a session; absent when it can. */
+  broken?: unknown
+}
+
+/**
+ * Fold the harness's preset roster into the panel's preset status.
+ *
+ * WHY the roster is the only honest source: the ACP mode IS an agent preset, and
+ * this package only *declares* it (a `preset-<id>` row in its own bundle patch).
+ * Whether that declaration reached the roster, and whether it can compose a
+ * session, is the harness's state — a file we ship cannot answer it, and a
+ * failed activation stays on the roster with a diagnostic rather than
+ * disappearing, which is exactly the case the panel must show.
+ *
+ * @param rows - the roster as read from the harness, or `undefined` when the
+ *   roster could not be read at all (a host without the registry service) —
+ *   the caller then hides the block instead of reporting a false negative.
+ * @param id - the preset id to look for (`ACP_PRESET_ID`).
+ * @returns the status, or `undefined` when the roster is unreadable.
+ */
+export function acpPresetStatusFromRoster(rows: readonly RosterPresetRow[] | undefined, id: string): AcpPresetStatus | undefined {
+  if (rows === undefined) return undefined
+  const row = rows.find(candidate => candidate?.id === id)
+  if (row === undefined) {
+    // The roster is readable and simply has no such row: the declaration was
+    // not composed (an unapplied bundle patch, or a harness generation whose
+    // roster is fed from somewhere else).
+    return { id, source: ACP_PRESET_SOURCE, installed: false, problem: 'the harness preset roster does not carry this declaration' }
+  }
+  const broken = typeof row.broken === 'string' && row.broken !== '' ? row.broken : undefined
+  return broken === undefined
+    ? { id, source: ACP_PRESET_SOURCE, installed: true }
+    : { id, source: ACP_PRESET_SOURCE, installed: false, problem: broken }
+}
+
 /**
  * The session's effective approval policy: its own last `approval/policy` event
  * wins, else the service's configured default — the fold
@@ -804,8 +1029,20 @@ export interface AcpManager {
   transcript(sessionId: string, afterSeq: number | undefined): { session: unknown; entries: Array<{ seq: number; update: unknown }> }
   sessions(): unknown[]
   stopAgent(agentId: string): Promise<void>
-  getDefaultModel?(): Promise<{ provider?: string; model?: string }>
-  setDefaultModel?(agentId: string): Promise<void>
+  /**
+   * The plugin's OWN default ACP agent (the panel's ★ gesture): which agent an
+   * ACP-mode conversation should start on. Deliberately NOT the deployment
+   * default model — writing that is exactly the cross-mode leak
+   * {@link AcpDefaultModelGuard} repairs.
+   */
+  defaultAgent?(): string | undefined
+  /** Set (or clear, with `undefined`) the default ACP agent. */
+  setDefaultAgent?(agentId: string | undefined): Promise<void>
+  /**
+   * Put the deployment default model back on a native route after an ACP pick
+   * (see {@link AcpDefaultModelGuard}).
+   */
+  reconcileDefaultModel?(previous?: ModelRouteSelection): Promise<DefaultModelReconcileOutcome>
   setPermission?(agentId: string, permission: PermissionMode): Promise<void>
   detectAgents?(): Promise<DetectedAgentInfo[]>
   saveAgent?(def: AcpAgentDef): Promise<void>
@@ -878,16 +1115,16 @@ export interface AcpManager {
    */
   setChatSessionMode?(dshSessionId: string, modeId: string, agentId?: string): Promise<void>
   /**
-   * Read-only install state of the ACP-mode agent preset. Its own RPC rather
-   * than an `agents/list` field: it is host filesystem state, not agent runtime
-   * state, and the panel refreshes it independently.
+   * State of the ACP-mode agent preset in the harness's OWN roster. Read-only
+   * report for the settings panel: the preset is a declaration this package
+   * ships (a bundle patch), so there is nothing to install — but a declaration
+   * whose activation failed stays on the roster with its diagnostic, and that
+   * has to be visible somewhere the user can act on it.
+   *
+   * Answers `undefined` when the roster cannot be read at all (a host without
+   * the registry service), which hides the panel block instead of guessing.
    */
-  presetStatus?(): AcpPresetStatus
-  /**
-   * (Re)install the ACP-mode preset from the bundled copy into the user preset
-   * root. Non-destructive: existing files are never overwritten.
-   */
-  presetInstall?(): AcpPresetStatus
+  presetStatus?(): Promise<AcpPresetStatus | undefined>
 }
 
 function ok<T>(value: T): RpcResult<T> {
@@ -912,6 +1149,19 @@ function optionalStr(payload: Record<string, unknown>, key: string, maxLen: numb
   if (typeof value !== 'string') throw new AcpError('bad_payload', `acp: ${key} must be a string`)
   if (value.length > maxLen) throw new AcpError('bad_payload', `acp: ${key} exceeds ${String(maxLen)} chars`)
   return value
+}
+
+/** Optional `{provider, model, reasoningEffort?}` payload field (absent/garbage → `undefined`). */
+function optionalSelection(payload: Record<string, unknown>, key: string): ModelRouteSelection | undefined {
+  const value = payload[key]
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'object') throw new AcpError('bad_payload', `acp: ${key} must be an object`)
+  const row = value as Record<string, unknown>
+  const provider = optionalStr(row, 'provider', 64)
+  const model = optionalStr(row, 'model', 128)
+  if (provider === undefined || model === undefined) return undefined
+  const reasoningEffort = optionalStr(row, 'reasoningEffort', 64)
+  return { provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) }
 }
 
 /** Dispatch one decoded `/acp` channel call. Never rejects; protocol errors come back as `ok:false`. */
@@ -1011,17 +1261,24 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         return ok({ done: true })
       }
       case 'preset/status':
-        return ok({ preset: manager.presetStatus?.() ?? null })
-      case 'preset/install':
-        return ok({ preset: manager.presetInstall?.() ?? null })
+        return ok({ preset: await manager.presetStatus?.() ?? null })
       case 'agent/stop':
         await manager.stopAgent(str(body, 'agentId', 64)); return ok({ done: true })
-      case 'model/get-default':
-        return ok(await (manager.getDefaultModel?.() ?? Promise.resolve({})))
+      case 'model/get-default': {
+        // The plugin's own default ACP agent, reported in the shape the panel
+        // already reads (`{provider: 'acp', model: agentId}`). Absent → `{}`,
+        // which the panel reads as "no default agent chosen yet".
+        const agentId = manager.defaultAgent?.()
+        return ok(agentId === undefined ? {} : { provider: ACP_PROVIDER_ID, model: agentId })
+      }
       case 'model/set-default': {
         const agentId = str(body, 'agentId', 64)
-        await manager.setDefaultModel?.(agentId)
+        await manager.setDefaultAgent?.(agentId)
         return ok({ done: true })
+      }
+      case 'model/reconcile-default': {
+        const previous = optionalSelection(body, 'previous')
+        return ok(await (manager.reconcileDefaultModel?.(previous) ?? Promise.resolve({ restored: false, stranded: false })))
       }
       case 'agent/set-permission': {
         const agentId = str(body, 'agentId', 64)

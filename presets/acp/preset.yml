@@ -1,3 +1,0 @@
-name: ACP 模式
-description: 会话由外接 ACP agent 驱动：宿主不提供工具、提示词、项目指令与运行上下文，原生聊天只作外壳。
-order: 6

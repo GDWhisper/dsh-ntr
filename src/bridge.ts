@@ -27,6 +27,8 @@ import {
   type SessionUpdate,
 } from '@agentclientprotocol/sdk'
 import {
+  ACP_PROVIDER_ID,
+  AcpDefaultModelGuard,
   AcpError,
   EventHub,
   PermissionLedger,
@@ -44,10 +46,11 @@ import {
   resolveSessionCwd,
   sandboxDenialMarker,
   selectForwardPrompt,
+  acpPresetStatusFromRoster,
   splitAdapterModelId,
   validateAgentDef,
 } from './impl.ts'
-import type { DshSandboxMode, DshSessionPolicy, PermissionDecision } from './impl.ts'
+import type { DefaultModelPorts, DefaultModelReconcileOutcome, DshSandboxMode, DshSessionPolicy, ModelRouteSelection, PermissionDecision, RosterPresetRow } from './impl.ts'
 import type {
   AcpAgentCatalog, AcpAgentDef, AcpPresetStatus, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
   LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo, PermissionMode,
@@ -1308,69 +1311,17 @@ export function defaultAgentWorkspace(home: string = homedir()): string {
   return join(home, '.dsh', 'acp-workspaces')
 }
 
-// ---- ACP-mode agent preset (the roster's user root) ----
+// ---- ACP-mode agent preset ----
 
-/** Preset id (also its directory name) of the ACP-mode composition. */
+/**
+ * Preset id of the ACP-mode composition.
+ *
+ * THREE places must agree on it (no type system spans them): the declaration's
+ * `config.id` in `presets/acp/acp.patch.yml` (the bundle patch the roster row
+ * comes from), the browser half's `ACP_PRESET_ID` (`src/client/acp-ui.tsx`), and
+ * this constant, which the host's session-log readers compare against.
+ */
 export const ACP_PRESET_ID = 'acp'
-
-/** The three files a preset directory must carry. */
-const ACP_PRESET_FILES = ['preset.yml', 'agent.cordis.yml', 'acp-guard.mjs'] as const
-
-/**
- * Target directory for the ACP-mode preset: the roster's own user root.
- *
- * `~/.dsh/.agent-presets/<id>` is where `dsh-agent-presets` discovers
- * user-authored presets without any deployment configuration (`includeUserRoot`
- * defaults to true), which is why the plugin does not need to patch the roster's
- * `roots` — and why an id colliding with a shipped preset would lose, hence the
- * distinct `acp` id.
- */
-export function acpPresetDir(home: string = homedir()): string {
-  return join(home, '.dsh', '.agent-presets', ACP_PRESET_ID)
-}
-
-/** Absolute path of the preset files shipped inside this package. */
-export function bundledAcpPresetDir(): string {
-  return fileURLToPath(new URL(`../presets/${ACP_PRESET_ID}/`, import.meta.url))
-}
-
-/**
- * Report whether the ACP-mode preset is installed and complete.
- *
- * `installed` only says the directory exists — a user may have edited it, and
- * this plugin never treats an existing directory as its own. `missing` is the
- * repair list: the bundled files absent from the installed copy.
- */
-export function acpPresetStatus(home: string = homedir()): AcpPresetStatus {
-  const dir = acpPresetDir(home)
-  const installed = existsSync(dir)
-  const missing = ACP_PRESET_FILES.filter(file => !existsSync(join(dir, file)))
-  return { id: ACP_PRESET_ID, dir, installed, missing: [...missing] }
-}
-
-/**
- * Install the ACP-mode preset for the user's roster.
- *
- * Idempotent and non-destructive: an existing file is never overwritten (the
- * composition is meant to be edited in place — copying is the roster's own
- * authoring model), so this only ever creates the directory and fills in files
- * that are absent. The boot path calls it with `onlyIfAbsent`, which leaves a
- * preset the user has taken over completely untouched.
- */
-export function installAcpPreset(home: string = homedir(), options: { onlyIfAbsent?: boolean } = {}): AcpPresetStatus {
-  const dir = acpPresetDir(home)
-  if (options.onlyIfAbsent === true && existsSync(dir)) return acpPresetStatus(home)
-  const source = bundledAcpPresetDir()
-  try {
-    mkdirSync(dir, { recursive: true })
-    for (const file of ACP_PRESET_FILES) {
-      const target = join(dir, file)
-      if (existsSync(target)) continue
-      copyFileSync(join(source, file), target)
-    }
-  } catch { /* best effort: an unwritable home must not break plugin load */ }
-  return acpPresetStatus(home)
-}
 
 /** Same as {@link defaultAgentWorkspace}, best-effort creating it on disk. */
 export function ensureDefaultWorkspace(home: string = homedir()): string {
@@ -1585,6 +1536,8 @@ export function detectHostAgents(configuredDefs: readonly AcpAgentDef[]): Detect
 export class BridgeManager {
   private readonly bridges = new Map<string, AgentBridge>()
   private readonly defsMap = new Map<string, AcpAgentDef>()
+  /** The plugin's own default ACP agent id (persisted; see `persistAgents`). */
+  private defaultAgentId?: string
 
   constructor(
     defs: readonly AcpAgentDef[],
@@ -1792,16 +1745,36 @@ export class BridgeManager {
   }
 
   /**
-   * Read-only install state of the ACP-mode preset for the settings panel.
-   * Filesystem state, not agent runtime state, so it is reported on its own.
+   * Wire the harness's preset roster (`ctx.agentPresets`) into `presetStatus`.
+   *
+   * Optional on purpose: a deployment without the registry service has no
+   * roster to report and the panel card hides itself, which is strictly better
+   * than inventing a second truth about where presets come from.
    */
-  presetStatus(): AcpPresetStatus {
-    return acpPresetStatus()
+  setPresetRosterReader(reader?: () => Promise<readonly RosterPresetRow[] | undefined>): void {
+    this.presetRosterReader = reader
   }
 
-  /** Install or repair the ACP-mode preset from the bundled copy (never overwrites). */
-  presetInstall(): AcpPresetStatus {
-    return installAcpPreset()
+  /**
+   * Read-only state of the ACP-mode preset in the harness's own roster.
+   *
+   * The preset is a declaration this package SHIPS (its own bundle patch), so
+   * there is nothing to install — what the panel needs to know is whether the
+   * roster carries the row and can compose a session from it. `undefined` when
+   * the roster cannot be read (no registry service wired): the panel then hides
+   * the block rather than claiming the preset is gone.
+   */
+  async presetStatus(): Promise<AcpPresetStatus | undefined> {
+    const reader = this.presetRosterReader
+    if (reader === undefined) return undefined
+    let rows: readonly RosterPresetRow[] | undefined
+    try {
+      rows = await reader()
+    } catch {
+      // An unreadable roster is not a verdict about the preset.
+      return undefined
+    }
+    return acpPresetStatusFromRoster(rows, ACP_PRESET_ID)
   }
 
   private getStoragePath(): string | undefined {
@@ -1822,14 +1795,26 @@ export class BridgeManager {
     }
   }
 
+  /**
+   * Read the agent registry file.
+   *
+   * TWO shapes on purpose: version 1 was a bare array of agent definitions,
+   * while `defaultAgentId` (the panel's ★ gesture — the agent an ACP-mode
+   * conversation should start on) needs a home that is not the deployment
+   * default model. A legacy bare array still loads; it is rewritten in the
+   * current shape on the next persist.
+   */
   private loadPersistedAgents(): void {
     const filePath = this.getStoragePath()
     if (!filePath || !existsSync(filePath)) return
     try {
       const content = readFileSync(filePath, 'utf-8')
-      const parsed = JSON.parse(content)
-      if (Array.isArray(parsed)) {
-        for (const item of parsed) {
+      const parsed = JSON.parse(content) as unknown
+      const rows = Array.isArray(parsed)
+        ? parsed
+        : (parsed !== null && typeof parsed === 'object' ? (parsed as { agents?: unknown }).agents : undefined)
+      if (Array.isArray(rows)) {
+        for (const item of rows) {
           try {
             const def = validateAgentDef(item)
             this.defsMap.set(def.id, def)
@@ -1837,6 +1822,13 @@ export class BridgeManager {
             // Ignore invalid entry
           }
         }
+      }
+      if (!Array.isArray(parsed) && parsed !== null && typeof parsed === 'object') {
+        const stored = (parsed as { defaultAgentId?: unknown }).defaultAgentId
+        // Kept as-is (even when it names an agent this boot did not load):
+        // `defaultAgent()` is the accessor that filters a stale id out, so a
+        // temporarily unreadable agent list cannot silently erase the choice.
+        if (typeof stored === 'string' && stored !== '') this.defaultAgentId = stored
       }
     } catch {
       // Storage load failure is non-fatal
@@ -1847,8 +1839,12 @@ export class BridgeManager {
     const filePath = this.getStoragePath()
     if (!filePath) return
     try {
-      const agents = [...this.defsMap.values()]
-      writeFileSync(filePath, JSON.stringify(agents, null, 2), 'utf-8')
+      const payload = {
+        version: 2,
+        ...(this.defaultAgentId === undefined ? {} : { defaultAgentId: this.defaultAgentId }),
+        agents: [...this.defsMap.values()],
+      }
+      writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf-8')
     } catch {
       // Storage persist failure is non-fatal
     }
@@ -2244,6 +2240,9 @@ export class BridgeManager {
       this.bridges.delete(agentId)
     }
     this.defsMap.delete(agentId)
+    // The default agent is a pointer INTO this registry: deleting its target
+    // must drop the pointer too, or the file would keep naming a ghost.
+    if (this.defaultAgentId === agentId) this.defaultAgentId = undefined
     if (this.catalogs.delete(agentId)) this.persistCatalogs()
     this.persistAgents()
     this.hub.broadcast({
@@ -2392,32 +2391,63 @@ export class BridgeManager {
     this.bridge(agentId).setPermission(permission)
   }
 
-  private defaultModelSelection?: { provider: string; model: string }
-  private defaultModelGetter?: () => { provider: string; model: string; reasoningEffort?: string } | undefined
-  private defaultModelSetter?: (next: { provider: string; model: string }) => Promise<void>
+  /** Host-side reader of the harness preset roster (`ctx.agentPresets`), for `presetStatus`. */
+  private presetRosterReader?: () => Promise<readonly RosterPresetRow[] | undefined>
+  /** The guard that keeps the DEPLOYMENT default model off the ACP route (see `impl.ts`). */
+  private defaultModelGuard?: AcpDefaultModelGuard
+  /**
+   * One in-flight reconcile at a time: the browser fires it after every ACP
+   * pick and each turn starts with one, and all of them would do the same
+   * read/write round trip.
+   */
+  private pendingDefaultReconcile?: Promise<DefaultModelReconcileOutcome>
 
-  setDefaultModelHooks(
-    getter?: () => { provider: string; model: string; reasoningEffort?: string } | undefined,
-    setter?: (next: { provider: string; model: string }) => Promise<void>,
-  ): void {
-    this.defaultModelGetter = getter
-    this.defaultModelSetter = setter
+  /**
+   * Wire the deployment-default-model guard (`ctx.agentDefaultModel` plus the
+   * live session store). Absent → the guard is inert, which is the whole
+   * behavior a deployment without that service can have anyway.
+   */
+  setDefaultModelGuard(ports?: DefaultModelPorts): void {
+    this.defaultModelGuard = ports === undefined ? undefined : new AcpDefaultModelGuard(ports)
   }
 
-  async getDefaultModel(): Promise<{ provider?: string; model?: string }> {
-    if (this.defaultModelGetter) {
-      const current = this.defaultModelGetter()
-      if (current) return { provider: current.provider, model: current.model }
-    }
-    return this.defaultModelSelection ?? {}
+  /**
+   * Put the deployment default model back on a native route after an ACP pick,
+   * and learn from a native one. Called by the turn path (a cheap read) and by
+   * the browser right after it writes an ACP route (`previous` = the route the
+   * session was on before that write).
+   */
+  reconcileDefaultModel(previous?: ModelRouteSelection): Promise<DefaultModelReconcileOutcome> {
+    const guard = this.defaultModelGuard
+    if (guard === undefined) return Promise.resolve({ restored: false, stranded: false })
+    if (previous !== undefined) guard.noteNative(previous)
+    const inflight = this.pendingDefaultReconcile
+    if (inflight !== undefined) return inflight
+    const run = guard.reconcile(previous).finally(() => {
+      if (this.pendingDefaultReconcile === run) this.pendingDefaultReconcile = undefined
+    })
+    this.pendingDefaultReconcile = run
+    return run
   }
 
-  async setDefaultModel(agentId: string): Promise<void> {
-    const selection = { provider: 'acp', model: agentId }
-    this.defaultModelSelection = selection
-    if (this.defaultModelSetter) {
-      await this.defaultModelSetter(selection)
+  /**
+   * The plugin's own default ACP agent (the panel's ★ gesture): which agent an
+   * ACP-mode conversation starts on. Host-side state in the agent registry
+   * file — deliberately NOT the deployment default model, which is global to
+   * every mode and must stay native (`AcpDefaultModelGuard`).
+   */
+  defaultAgent(): string | undefined {
+    // A default pointing at a deleted agent answers as "none": the browser
+    // then offers the agent menu instead of auto-routing nowhere.
+    return this.defaultAgentId !== undefined && this.defsMap.has(this.defaultAgentId) ? this.defaultAgentId : undefined
+  }
+
+  async setDefaultAgent(agentId: string | undefined): Promise<void> {
+    if (agentId !== undefined && !this.defsMap.has(agentId)) {
+      throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
     }
+    this.defaultAgentId = agentId
+    this.persistAgents()
   }
 
   private readonly dshSessionMap = new Map<string, LiveSession>()
@@ -2528,6 +2558,13 @@ export class BridgeManager {
       }
       return
     }
+
+    // Housekeeping before a real turn: the DEPLOYMENT default model must not
+    // stay on an ACP route (see `AcpDefaultModelGuard`), because a fresh session
+    // in any other mode would then start on this agent. Never awaited: an
+    // unwritable config (a pinned profile) must not delay the turn, and once
+    // the default is native this is a single in-memory read.
+    void this.reconcileDefaultModel().catch(() => { /* best effort, see the guard */ })
 
     let session: LiveSession
     try {

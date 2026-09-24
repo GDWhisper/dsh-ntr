@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  AcpDefaultModelGuard,
   AcpError,
   EventHub,
   PermissionLedger,
@@ -11,10 +12,13 @@ import {
   dispatchRpc,
   dshApprovalPolicyOf,
   dshSessionPolicyOf,
+  ACP_PRESET_SOURCE,
+  acpPresetStatusFromRoster,
   isUnderPath,
   parseCatalogOptions,
   permissionToolKind,
   permissionToolPaths,
+  lastNativeRoute,
   resolveFsPath,
   resolveSessionCwd,
   sandboxDenialMarker,
@@ -25,7 +29,7 @@ import {
   validateAgentDef,
   validateConfig,
 } from '../src/impl.ts'
-import type { AcpManager, DshSessionPolicy } from '../src/impl.ts'
+import type { AcpManager, DefaultModelPorts, DshSessionPolicy, ModelRouteSelection } from '../src/impl.ts'
 import type { AcpAgentDef, AgentProbeModelsResult } from '../src/protocol.ts'
 
 function agentDef(overrides: Partial<AcpAgentDef> = {}): AcpAgentDef {
@@ -64,11 +68,6 @@ describe('validateConfig', () => {
     expect(validateConfig({ agents: [] }).probeModelsOnBoot).toBe(true)
     expect(validateConfig({ agents: [], probeModelsOnBoot: false }).probeModelsOnBoot).toBe(false)
     expect(() => validateConfig({ agents: [], probeModelsOnBoot: 'yes' })).toThrow(/probeModelsOnBoot/)
-  })
-  it('defaults installAcpPreset to true and rejects non-boolean values', () => {
-    expect(validateConfig({ agents: [] }).installAcpPreset).toBe(true)
-    expect(validateConfig({ agents: [], installAcpPreset: false }).installAcpPreset).toBe(false)
-    expect(() => validateConfig({ agents: [], installAcpPreset: 'no' })).toThrow(/installAcpPreset/)
   })
   it('defaults and bounds the reliability timeouts', () => {
     const config = validateConfig({ agents: [] })
@@ -369,8 +368,12 @@ function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } {
     transcript: (id) => ({ session: { id }, entries: [] }),
     sessions: () => [],
     stopAgent: async id => { calls.push(['stop', id]) },
-    getDefaultModel: async () => ({ provider: 'acp', model: 'mock' }),
-    setDefaultModel: async id => { calls.push(['setDefaultModel', id]) },
+    defaultAgent: () => 'mock',
+    setDefaultAgent: async id => { calls.push(['setDefaultAgent', id]) },
+    reconcileDefaultModel: async previous => {
+      calls.push(['reconcileDefaultModel', previous])
+      return { selection: previous, restored: previous !== undefined, stranded: previous === undefined }
+    },
     setPermission: async (id, p) => { calls.push(['setPermission', { id, p }]) },
     detectAgents: async () => { calls.push(['detect', undefined]); return [] },
     saveAgent: async def => { calls.push(['save', def]) },
@@ -442,20 +445,29 @@ describe('dispatchRpc', () => {
     await expect(dispatchRpc(manager, 'session/chat-transcript', { dshSessionId: 'chat-1', afterSeq: 'x' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     // A host half without the method answers an empty list rather than failing.
     await expect(dispatchRpc({ ...manager, chatTranscripts: undefined }, 'session/chat-transcript', { dshSessionId: 'chat-1' })).resolves.toEqual({ ok: true, value: { views: [] } })
-    // Preset surface: absent methods report `null` instead of failing, so an
-    // older host half still answers the panel's status poll.
+    // Preset surface: a host half with no roster reader reports `null` instead
+    // of failing, so the panel's status poll still answers (and hides the block).
     await expect(dispatchRpc(manager, 'preset/status', {})).resolves.toEqual({ ok: true, value: { preset: null } })
-    await expect(dispatchRpc(manager, 'preset/install', {})).resolves.toEqual({ ok: true, value: { preset: null } })
     const withPreset = {
       ...manager,
-      presetStatus: () => ({ id: 'acp', dir: '/home/x/.dsh/.agent-presets/acp', installed: false, missing: [] }),
-      presetInstall: () => ({ id: 'acp', dir: '/home/x/.dsh/.agent-presets/acp', installed: true, missing: [] }),
+      presetStatus: async () => ({
+        id: 'acp',
+        source: 'dsh-ntr/presets/acp/acp.patch.yml',
+        installed: false,
+        problem: 'the harness preset roster does not carry this declaration',
+      }),
     }
     await expect(dispatchRpc(withPreset, 'preset/status', {})).resolves.toEqual({
       ok: true,
-      value: { preset: { id: 'acp', dir: '/home/x/.dsh/.agent-presets/acp', installed: false, missing: [] } },
+      value: {
+        preset: {
+          id: 'acp',
+          source: 'dsh-ntr/presets/acp/acp.patch.yml',
+          installed: false,
+          problem: 'the harness preset roster does not carry this declaration',
+        },
+      },
     })
-    await expect(dispatchRpc(withPreset, 'preset/install', {})).resolves.toMatchObject({ ok: true, value: { preset: { installed: true } } })
     await expect(dispatchRpc(manager, 'agents/detect', {})).resolves.toEqual({ ok: true, value: { agents: [] } })
     expect(manager.calls).toContainEqual(['detect', undefined])
     await expect(dispatchRpc(manager, 'agent/save', { id: 'pi', command: 'pi-acp' })).resolves.toEqual({ ok: true, value: { done: true } })
@@ -476,9 +488,34 @@ describe('dispatchRpc', () => {
     })
     await expect(dispatchRpc(manager, 'session/prompt', { sessionId: 'S', text: 3 })).resolves.toMatchObject({ ok: false })
     await expect(dispatchRpc(manager, 'session/config-set', { sessionId: 'S', configId: 'm', value: 42 })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    // The plugin's OWN default ACP agent (the panel's ★ gesture) — never the
+    // deployment default model, which must stay a native route.
     await expect(dispatchRpc(manager, 'model/get-default', {})).resolves.toEqual({ ok: true, value: { provider: 'acp', model: 'mock' } })
     await expect(dispatchRpc(manager, 'model/set-default', { agentId: 'custom' })).resolves.toEqual({ ok: true, value: { done: true } })
-    expect(manager.calls).toContainEqual(['setDefaultModel', 'custom'])
+    expect(manager.calls).toContainEqual(['setDefaultAgent', 'custom'])
+    // A host half with no default agent answers `{}` → the panel shows no ★.
+    await expect(dispatchRpc({ ...manager, defaultAgent: undefined }, 'model/get-default', {})).resolves.toEqual({ ok: true, value: {} })
+    // The guard's RPC: the pre-write route rides along, and the host's outcome
+    // is passed through untouched.
+    await expect(dispatchRpc(manager, 'model/reconcile-default', {})).resolves.toEqual({
+      ok: true,
+      value: { restored: false, stranded: true },
+    })
+    await expect(dispatchRpc(manager, 'model/reconcile-default', {
+      previous: { provider: 'deepseek', model: 'deepseek-v4', reasoningEffort: 'high' },
+    })).resolves.toEqual({
+      ok: true,
+      value: { selection: { provider: 'deepseek', model: 'deepseek-v4', reasoningEffort: 'high' }, restored: true, stranded: false },
+    })
+    expect(manager.calls).toContainEqual(['reconcileDefaultModel', { provider: 'deepseek', model: 'deepseek-v4', reasoningEffort: 'high' }])
+    // A malformed `previous` is not a payload error (it is optional metadata);
+    // a non-object one is.
+    await expect(dispatchRpc(manager, 'model/reconcile-default', { previous: { provider: 'x' } })).resolves.toMatchObject({ ok: true })
+    await expect(dispatchRpc(manager, 'model/reconcile-default', { previous: 'x' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc({ ...manager, reconcileDefaultModel: undefined }, 'model/reconcile-default', {})).resolves.toEqual({
+      ok: true,
+      value: { restored: false, stranded: false },
+    })
     await expect(dispatchRpc(manager, 'agent/set-permission', { agentId: 'custom', permission: 'allow' })).resolves.toEqual({ ok: true, value: { done: true } })
     expect(manager.calls).toContainEqual(['setPermission', { id: 'custom', p: 'allow' }])
     await expect(dispatchRpc(manager, 'agent/set-permission', { agentId: 'custom', permission: 'invalid' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
@@ -630,6 +667,36 @@ describe('DSH access mode → ACP permission decision', () => {
     })).toBeUndefined()
   })
 
+  it('reads the ACP-mode preset status out of the harness roster', () => {
+    // Unreadable roster (no `agentPresets` service): no verdict at all, which
+    // hides the panel block instead of claiming the preset is gone.
+    expect(acpPresetStatusFromRoster(undefined, 'acp')).toBeUndefined()
+
+    // A readable roster WITHOUT the row: the declaration was not composed.
+    expect(acpPresetStatusFromRoster([{ id: 'standard' }], 'acp')).toMatchObject({
+      id: 'acp',
+      source: ACP_PRESET_SOURCE,
+      installed: false,
+    })
+    expect(acpPresetStatusFromRoster([{ id: 'standard' }], 'acp')?.problem).toMatch(/roster/)
+
+    // A row that cannot compose a session carries the harness's own diagnostic.
+    expect(acpPresetStatusFromRoster([{ id: 'acp', broken: 'acp-guard: cannot find module' }], 'acp')).toEqual({
+      id: 'acp',
+      source: ACP_PRESET_SOURCE,
+      installed: false,
+      problem: 'acp-guard: cannot find module',
+    })
+    // An empty/garbage `broken` is the harness's way of saying "finite": the
+    // registry omits the field on a healthy row, so neither may read as broken.
+    expect(acpPresetStatusFromRoster([{ id: 'acp', broken: '' }], 'acp')).toEqual({
+      id: 'acp',
+      source: ACP_PRESET_SOURCE,
+      installed: true,
+    })
+    expect(acpPresetStatusFromRoster([{ id: 'acp' }], 'acp')?.installed).toBe(true)
+  })
+
   it('folds a preset from a RAW stored log (the cold-read path)', () => {
     // `sessionPersistence` hands back the header verbatim and a read handle
     // returns raw event objects — neither is a host `Session`, so the fold is
@@ -716,5 +783,110 @@ describe('DSH access mode → ACP permission decision', () => {
     // The containment variant still refuses what it always refused.
     expect(() => resolveFsPath('/srv/ws', ['/srv/ws'], '/etc/hosts', realpath)).toThrow(AcpError)
     expect(resolveFsPath('/srv/ws', ['/srv/ws'], 'a.txt', realpath)).toBe('/srv/ws/a.txt')
+  })
+})
+
+/**
+ * The deployment default model is global to every mode, so an ACP route landing
+ * in it leaks the agent into ordinary conversations. These cases pin the guard's
+ * candidate order and its refusal to invent a value.
+ */
+describe('AcpDefaultModelGuard', () => {
+  const native: ModelRouteSelection = { provider: 'tokitoken', model: 'deepseek-v4.1-flash' }
+  const acpRoute: ModelRouteSelection = { provider: 'acp', model: 'codebuddy@hy3', reasoningEffort: 'enabled' }
+
+  function guard(initial: ModelRouteSelection | undefined, extra: Partial<DefaultModelPorts> = {}): {
+    guard: AcpDefaultModelGuard
+    writes: ModelRouteSelection[]
+    set: (next: ModelRouteSelection | undefined) => void
+  } {
+    let current = initial
+    const writes: ModelRouteSelection[] = []
+    return {
+      writes,
+      set: next => { current = next },
+      guard: new AcpDefaultModelGuard({
+        read: () => current,
+        write: async next => { writes.push(next); current = next },
+        ...extra,
+      }),
+    }
+  }
+
+  it('learns a native default and puts it back when the default becomes an ACP route', async () => {
+    const { guard: g, writes, set } = guard(native)
+    expect(await g.reconcile()).toEqual({ selection: native, restored: false, stranded: false })
+    expect(g.remembered).toEqual(native)
+    // The ACP pick (DSH's `selectModel` wrote it) is repaired.…
+    set(acpRoute)
+    expect(await g.reconcile()).toEqual({ selection: native, restored: true, stranded: false })
+    expect(writes).toEqual([native])
+  })
+
+  it('learns a route the caller saw BEFORE its own ACP write (the exact pre-write value)', async () => {
+    // A default already poisoned by an older build: the only native value in
+    // sight is the session's own pre-write route, which outranks the fallback.
+    const { guard: g, writes } = guard(acpRoute, { fallback: () => ({ provider: 'mimo', model: 'mimo-v2.6-pro' }) })
+    expect(await g.reconcile(native)).toEqual({ selection: native, restored: true, stranded: false })
+    expect(writes).toEqual([native])
+  })
+
+  it('falls back to the deployment\'s own last native route, and never to another ACP one', async () => {
+    const poisoned = guard(acpRoute, { fallback: () => ({ provider: 'mimo', model: 'mimo-v2.6-pro' }) })
+    expect(await poisoned.guard.reconcile()).toMatchObject({ restored: true, selection: { provider: 'mimo' } })
+    // A fallback that is itself an ACP route is not a candidate.
+    const acpFallback = guard(acpRoute, { fallback: () => acpRoute })
+    expect(await acpFallback.guard.reconcile()).toEqual({ selection: acpRoute, restored: false, stranded: true })
+  })
+
+  it('stays stranded — and silent — when no native candidate exists', async () => {
+    const { guard: g, writes } = guard(acpRoute)
+    expect(await g.reconcile()).toEqual({ selection: acpRoute, restored: false, stranded: true })
+    expect(writes).toEqual([])
+  })
+
+  it('never lets a malformed or non-native value become the remembered default', async () => {
+    const { guard: g } = guard(native)
+    await g.reconcile()
+    g.noteNative({ provider: 'acp', model: 'pi' })
+    g.noteNative({ provider: '', model: 'x' })
+    g.noteNative(undefined)
+    expect(g.remembered).toEqual(native)
+  })
+
+  it('is inert when the service cannot answer, and reports why a repair failed', async () => {
+    const throwing = new AcpDefaultModelGuard({ read: () => { throw new Error('no service') }, write: async () => {} })
+    expect(await throwing.reconcile(native)).toEqual({ restored: false, stranded: false })
+    const unwritable = new AcpDefaultModelGuard({
+      read: () => acpRoute,
+      write: async () => { throw new Error('read-only profile') },
+    })
+    unwritable.noteNative(native)
+    expect(await unwritable.reconcile()).toEqual({ selection: acpRoute, restored: false, stranded: true })
+    // An empty answer is not a selection either.
+    const empty = new AcpDefaultModelGuard({ read: () => ({ provider: '  ', model: '' }), write: async () => {} })
+    expect(await empty.reconcile()).toEqual({ restored: false, stranded: false })
+  })
+})
+
+describe('lastNativeRoute', () => {
+  it('picks the freshest non-ACP route among live sessions', () => {
+    expect(lastNativeRoute([
+      { requestHeader: () => ({ config: { provider: 'mimo', model: 'mimo-v2.6-pro' } }), events: [{ type: 'turn/end', time: 100 }] },
+      { requestHeader: () => ({ config: { provider: 'acp', model: 'codebuddy@hy3' } }), events: [{ type: 'turn/end', time: 500 }] },
+      { requestHeader: () => ({ config: { provider: 'tokitoken', model: 'step-5-preview', reasoningEffort: 'high' } }), events: [{ type: 'turn/end', time: 300 }] },
+    ])).toEqual({ provider: 'tokitoken', model: 'step-5-preview', reasoningEffort: 'high' })
+  })
+
+  it('skips sessions with no request, an ACP route, or an unreadable header', () => {
+    expect(lastNativeRoute([
+      {},
+      { events: [{ type: 'turn/end', time: 900 }] },
+      { requestHeader: () => ({ config: { provider: 'acp', model: 'pi' } }), events: [{ type: 'turn/end', time: 800 }] },
+      { requestHeader: () => { throw new Error('cold session') } },
+      { requestHeader: () => ({ config: { provider: 'tokitoken', model: '' } }) },
+    ])).toBeUndefined()
+    expect(lastNativeRoute(undefined)).toBeUndefined()
+    expect(lastNativeRoute([])).toBeUndefined()
   })
 })

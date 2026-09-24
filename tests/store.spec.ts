@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { AcpStore, foldUpdate, type Block } from '../src/client/store.ts'
-import { acpModeFromPresetEvent, shouldShadowModelSeat } from '../src/client/acp-ui.tsx'
+import { acpModeFromPresetEvent, selectAcpRoute, shouldShadowModelSeat } from '../src/client/acp-ui.tsx'
 
 function fold(...updates: Array<Record<string, unknown>>): Block[] {
   const blocks: Block[] = []
@@ -108,7 +108,7 @@ describe('AcpStore agent management', () => {
     expect(endpoints).toContain('agent/delete')
   })
 
-  it('resyncs and repairs the ACP-mode preset through its own endpoints', async () => {
+  it('reads the ACP-mode preset state from the harness roster on resync', async () => {
     const endpoints: string[] = []
     const store = new (await import('../src/client/store.ts')).AcpStore(
       async (_channel, endpoint) => {
@@ -116,24 +116,48 @@ describe('AcpStore agent management', () => {
         if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
         if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
         if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
-        if (endpoint === 'preset/status') return { ok: true, value: { preset: { id: 'acp', dir: '/home/x/.dsh/.agent-presets/acp', installed: false, missing: [] } } }
-        if (endpoint === 'preset/install') return { ok: true, value: { preset: { id: 'acp', dir: '/home/x/.dsh/.agent-presets/acp', installed: true, missing: [] } } }
+        if (endpoint === 'preset/status') {
+          return {
+            ok: true,
+            value: {
+              preset: {
+                id: 'acp',
+                source: 'dsh-ntr/presets/acp/acp.patch.yml',
+                installed: false,
+                problem: 'acp-guard: cannot find module',
+              },
+            },
+          }
+        }
         return { ok: true, value: {} }
       },
       (zh) => zh,
     )
 
     await store.resync()
-    expect(store.getSnapshot().preset).toMatchObject({ installed: false })
-
-    await store.installPreset()
-    expect(endpoints).toContain('preset/install')
-    expect(store.getSnapshot().preset).toMatchObject({ installed: true })
-    expect(store.getSnapshot().presetInstalling).toBe(false)
+    expect(endpoints).toContain('preset/status')
+    // The failure mode this card exists for: the declaration is in place but
+    // the harness could not activate it, and the diagnostic travels to the UI.
+    expect(store.getSnapshot().preset).toMatchObject({ installed: false, problem: 'acp-guard: cannot find module' })
   })
 
-  it('hides the preset block on a host half that serves no preset RPC', async () => {
+  it('hides the preset block when the host serves no roster', async () => {
     const store = new (await import('../src/client/store.ts')).AcpStore(
+      async (_channel, endpoint) => {
+        if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
+        if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
+        // Either shape means "this host cannot report a roster": an endpoint it
+        // does not serve, or one that answers `null` (no `agentPresets` service).
+        if (endpoint === 'preset/status') return { ok: true, value: { preset: null } }
+        return { ok: true, value: {} }
+      },
+      (zh) => zh,
+    )
+    await store.resync()
+    expect(store.getSnapshot().preset).toBeUndefined()
+
+    const older = new (await import('../src/client/store.ts')).AcpStore(
       async (_channel, endpoint) => {
         if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
         if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
@@ -143,8 +167,8 @@ describe('AcpStore agent management', () => {
       },
       (zh) => zh,
     )
-    await store.resync()
-    expect(store.getSnapshot().preset).toBeUndefined()
+    await older.resync()
+    expect(older.getSnapshot().preset).toBeUndefined()
   })
 
   it('testAgent posts the form payload as-is and returns the host verdict', async () => {
@@ -682,5 +706,93 @@ describe('AcpStore observed ACP transcripts (the ACP view tab)', () => {
     // The newest window survives; the oldest is the one evicted.
     expect(ids).toContain('acp-8')
     expect(ids).not.toContain('acp-0')
+  })
+})
+
+describe('ACP route writes keep the deployment default native', () => {
+  /** A store whose only interesting endpoint is the reconcile call. */
+  function makeStore() {
+    const calls: Array<{ endpoint: string; payload: unknown }> = []
+    const store = new AcpStore(async (_channel, endpoint, payload) => {
+      calls.push({ endpoint, payload })
+      if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
+      if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
+      if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+    return { store, calls }
+  }
+
+  /** A model directory stub: records the write, answers the pre-write read. */
+  function makeDirectory(current: { provider: string; model: string } | null) {
+    const writes: Array<{ provider: string; model: string }> = []
+    return {
+      writes,
+      directory: {
+        store: { getSnapshot: () => ({ current, routable: true, groups: [], status: 'ready', error: null }), subscribe: () => () => {} },
+        load: async () => undefined,
+        select: async (selection: { provider: string; model: string }) => { writes.push(selection) },
+      },
+    }
+  }
+
+  it('hands the host the route the session was on BEFORE the ACP write', async () => {
+    const { store, calls } = makeStore()
+    const { directory, writes } = makeDirectory({ provider: 'deepseek', model: 'deepseek-v4', reasoningEffort: 'high' })
+
+    await selectAcpRoute(store, directory, { provider: 'acp', model: 'codebuddy' })
+
+    expect(writes).toEqual([{ provider: 'acp', model: 'codebuddy' }])
+    expect(calls.map(c => c.endpoint)).toEqual(['model/reconcile-default'])
+    expect(calls[0].payload).toEqual({ previous: { provider: 'deepseek', model: 'deepseek-v4', reasoningEffort: 'high' } })
+  })
+
+  it('never offers an ACP route (or an empty one) as the value to restore', async () => {
+    // A session already on an ACP route switching agents: the previous route is
+    // not a candidate, so the host must fall back to what it remembers.
+    const { store, calls } = makeStore()
+    const { directory } = makeDirectory({ provider: 'acp', model: 'codebuddy' })
+    await selectAcpRoute(store, directory, { provider: 'acp', model: 'pi' })
+    expect(calls[0].payload).toEqual({})
+
+    // A brand-new session with no selection at all: same.
+    const fresh = makeStore()
+    await selectAcpRoute(fresh.store, makeDirectory(null).directory, { provider: 'acp', model: 'pi' })
+    expect(fresh.calls[0].payload).toEqual({})
+  })
+
+  it('treats a failed repair as housekeeping, not as a failed pick', async () => {
+    const store = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint === 'model/reconcile-default') return { ok: false, error: { code: 'internal', message: 'nope' } }
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+    const { directory, writes } = makeDirectory({ provider: 'deepseek', model: 'deepseek-v4' })
+    await expect(selectAcpRoute(store, directory, { provider: 'acp', model: 'pi' })).resolves.toBeUndefined()
+    expect(writes).toEqual([{ provider: 'acp', model: 'pi' }])
+  })
+
+  it('reads the plugin default agent from model/get-default and sets it back', async () => {
+    const calls: Array<{ endpoint: string; payload: unknown }> = []
+    let answer: { provider?: string; model?: string } = { provider: 'acp', model: 'codebuddy' }
+    const store = new AcpStore(async (_channel, endpoint, payload) => {
+      calls.push({ endpoint, payload })
+      if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
+      if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
+      if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
+      if (endpoint === 'model/get-default') return { ok: true, value: answer }
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+
+    await store.resync()
+    expect(store.getSnapshot().defaultAgent).toBe('codebuddy')
+
+    // A native deployment default (no ACP default agent chosen) is not a default agent.
+    answer = { provider: 'deepseek', model: 'deepseek-v4' }
+    await store.resync()
+    expect(store.getSnapshot().defaultAgent).toBeUndefined()
+
+    await store.setDefaultAgent('pi')
+    expect(calls.at(-1)).toEqual({ endpoint: 'model/set-default', payload: { agentId: 'pi' } })
+    expect(store.getSnapshot().defaultAgent).toBe('pi')
   })
 })

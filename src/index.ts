@@ -8,11 +8,11 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-client-connection'
-import { ACP_PRESET_ID, AcpLlmAdapter, BridgeManager, installAcpPreset } from './bridge.ts'
-import { EventHub, dispatchRpc, dshSessionPolicyOf, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
+import { ACP_PRESET_ID, AcpLlmAdapter, BridgeManager } from './bridge.ts'
+import { EventHub, dispatchRpc, dshSessionPolicyOf, lastNativeRoute, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
 import type { AcpEvent } from './protocol.ts'
 import type { ApprovalOutcome } from './bridge.ts'
-import type { AccessModeSessionLike } from './impl.ts'
+import type { AccessModeSessionLike, ModelRouteSelection, RosterPresetRow, RouteBearingSessionLike } from './impl.ts'
 
 export const name = 'dsh-ntr'
 // `approval` / `agents` are deliberately NOT listed here: they are optional
@@ -41,6 +41,8 @@ interface SandboxPolicyLike {
 /** Structural view of the host session store (`@deepseek-ai/dsh-session`'s `ctx.sessions`). */
 interface SessionsLike {
   get(sessionId: string): AccessModeSessionLike | undefined
+  /** Live sessions, for the default-model guard's fallback route (optional: an older store may lack it). */
+  list?(): readonly RouteBearingSessionLike[]
 }
 
 /**
@@ -93,15 +95,35 @@ export function apply(ctx: Context, config?: unknown): void {
   // probeModelsOnBoot is disabled): background spawn per uncached agent only.
   manager.bootstrapCatalogs()
 
-  // ACP 模式: make the agent preset available to the roster's user root on
-  // first boot. Non-destructive (an existing preset is the user's to edit) and
-  // skipped under test runners, which must never write into a real home.
-  if (resolved.installAcpPreset !== false
-    && process.env.VITEST === undefined
-    && process.env.NODE_ENV !== 'test') {
-    try {
-      installAcpPreset(undefined, { onlyIfAbsent: true })
-    } catch { /* best effort: an unwritable preset root must not break loading */ }
+  /**
+   * ACP 模式 preset status.
+   *
+   * The preset is a DECLARATION this package ships — `presets/acp/acp.patch.yml`
+   * is one of our own `dsh.bundle.patch` files, so the harness composes the
+   * `preset-acp` roster row with no install step. Nothing here copies files:
+   * the legacy `~/.dsh/.agent-presets/<id>` directory is no longer read by the
+   * harness at all, which is exactly why a copy there proves nothing.
+   *
+   * What the panel can still need is the roster's own verdict — the declaration
+   * stays visible with a diagnostic when its activation fails — so the registry
+   * service is probed (never injected: a missing service must not fail loading)
+   * and read lazily. `list()` is never called during this activation: the
+   * registry settles the Host tree while auditing a definition, so reading the
+   * roster inside our own row would wait on ourselves.
+   */
+  const wirePresetRoster = (): void => {
+    const roster = (typeof ctx.get === 'function' ? ctx.get('agentPresets') : undefined) as {
+      list?(): Promise<readonly RosterPresetRow[]>
+    } | undefined
+    const list = roster?.list
+    if (roster === undefined || typeof list !== 'function') return
+    manager.setPresetRosterReader(() => list.call(roster))
+  }
+
+  wirePresetRoster()
+  if (typeof ctx.inject === 'function') {
+    // Late arrival: the registry may still be loading when this plugin applies.
+    ctx.inject(['agentPresets'], () => { wirePresetRoster() })
   }
 
   /**
@@ -252,16 +274,45 @@ export function apply(ctx: Context, config?: unknown): void {
     })
   }
 
-  const defaultModelService = (typeof ctx.get === 'function' ? ctx.get('agentDefaultModel') : undefined) as {
-    currentSelection?(): { provider: string; model: string; reasoningEffort?: string }
-    saveSelection?(next: { provider: string; model: string }): Promise<void>
-  } | undefined
+  /**
+   * Deployment-default-model guard: DSH's `session.selectModel` records a
+   * selection as the session's own durable route AND as the deployment default
+   * (`agentDefaultModel.saveSelection`), and that second write is global to
+   * every mode. Picking an ACP agent in one conversation would therefore make
+   * every NEW session — in every other mode — start on the external agent.
+   * The guard puts the previous NATIVE default back; see `AcpDefaultModelGuard`
+   * for the candidate order (the config editor is never asked to guess).
+   *
+   * `fallback` is the only candidate a default that is *already* poisoned has:
+   * the freshest non-ACP route among live sessions, i.e. what this deployment
+   * was actually running. An install that predates the guard is repaired on the
+   * boot check below or on its next native turn/pick.
+   */
+  const wireDefaultModelGuard = (): void => {
+    const defaultModel = (typeof ctx.get === 'function' ? ctx.get('agentDefaultModel') : undefined) as {
+      currentSelection?(): ModelRouteSelection | undefined
+      saveSelection?(next: ModelRouteSelection): Promise<void>
+    } | undefined
+    if (defaultModel === undefined || typeof defaultModel.saveSelection !== 'function') return
+    const sessions = (typeof ctx.get === 'function' ? ctx.get('sessions') : undefined) as SessionsLike | undefined
+    manager.setDefaultModelGuard({
+      read: () => defaultModel.currentSelection?.(),
+      write: next => defaultModel.saveSelection?.(next) ?? Promise.resolve(),
+      ...(sessions === undefined
+        ? {}
+        : { fallback: () => lastNativeRoute(sessions.list?.() ?? []) }),
+    })
+    // A boot already carrying an ACP default is repaired here when any live
+    // session supplies a native route; otherwise the first native turn/pick is
+    // what heals it (every one of them re-runs this check).
+    void manager.reconcileDefaultModel().catch(() => { /* inert without a guard */ })
+  }
 
-  if (defaultModelService) {
-    manager.setDefaultModelHooks(
-      () => defaultModelService.currentSelection?.(),
-      next => defaultModelService.saveSelection ? defaultModelService.saveSelection(next) : Promise.resolve(),
-    )
+  wireDefaultModelGuard()
+  if (typeof ctx.inject === 'function') {
+    // Late arrival for the guard's collaborators: both services may still be
+    // loading when this plugin applies (profile order is not ours to control).
+    ctx.inject(['sessions'], () => { wireDefaultModelGuard() })
   }
 
   /** Registration handle: callable disposer, plus `replace` to re-announce routes. */

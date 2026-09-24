@@ -9,8 +9,8 @@ import { join } from 'node:path'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { afterAll, describe, expect, it } from 'vitest'
 import {
-  AcpLlmAdapter, BridgeManager, acpPresetDir, acpPresetStatus, bundledAcpPresetDir, defaultAgentWorkspace,
-  detectHostAgents, ensureAgentExecutable, findExecutable, installAcpPreset,
+  AcpLlmAdapter, BridgeManager, defaultAgentWorkspace,
+  detectHostAgents, ensureAgentExecutable, findExecutable,
   type ApprovalOutcome, type ApprovalRequestContext,
 } from '../src/bridge.ts'
 import { EventHub, dispatchRpc } from '../src/impl.ts'
@@ -251,30 +251,57 @@ describe('ACP bridge over stdio (mock agent)', () => {
     expect(finish?.reason).toEqual({ kind: 'stop' })
   }, 30_000)
 
-  it('installs the ACP-mode preset into a user preset root without ever overwriting it', () => {
-    const home = mkdtempSync(join(tmpdir(), 'dsh-ntr-preset-home-'))
-    try {
-      expect(acpPresetStatus(home)).toMatchObject({ id: 'acp', installed: false })
-      expect(acpPresetDir(home)).toBe(join(home, '.dsh', '.agent-presets', 'acp'))
+  it('reports the ACP-mode preset from the harness roster it is wired to', async () => {
+    // No roster reader wired (a host without `agentPresets`): no verdict, which
+    // the panel renders as "no block" rather than "the preset is gone".
+    expect(await manager.presetStatus()).toBeUndefined()
 
-      const installed = installAcpPreset(home)
-      expect(installed).toMatchObject({ id: 'acp', installed: true, missing: [] })
-      expect(existsSync(join(installed.dir, 'agent.cordis.yml'))).toBe(true)
-      expect(existsSync(join(installed.dir, 'acp-guard.mjs'))).toBe(true)
+    manager.setPresetRosterReader(async () => [{ id: 'standard' }])
+    expect(await manager.presetStatus()).toMatchObject({ id: 'acp', installed: false })
 
-      // A preset the user has edited is theirs: neither the boot path nor the
-      // repair path may overwrite it, and only absent files are filled in.
-      writeFileSync(join(installed.dir, 'agent.cordis.yml'), '# user edit\n')
-      expect(installAcpPreset(home, { onlyIfAbsent: true })).toMatchObject({ installed: true })
-      expect(installAcpPreset(home)).toMatchObject({ installed: true, missing: [] })
-      expect(readFileSync(join(installed.dir, 'agent.cordis.yml'), 'utf-8')).toBe('# user edit\n')
+    manager.setPresetRosterReader(async () => [{ id: 'acp' }, { id: 'standard' }])
+    expect(await manager.presetStatus()).toEqual({
+      id: 'acp',
+      source: 'dsh-ntr/presets/acp/acp.patch.yml',
+      installed: true,
+    })
 
-      rmSync(join(installed.dir, 'acp-guard.mjs'))
-      expect(acpPresetStatus(home).missing).toEqual(['acp-guard.mjs'])
-      expect(installAcpPreset(home).missing).toEqual([])
-    } finally {
-      rmSync(home, { recursive: true, force: true })
+    manager.setPresetRosterReader(async () => [{ id: 'acp', broken: 'persona: invalid config' }])
+    expect(await manager.presetStatus()).toMatchObject({ installed: false, problem: 'persona: invalid config' })
+
+    // A roster read that throws is not a verdict about the preset either.
+    manager.setPresetRosterReader(async () => { throw new Error('registry down') })
+    expect(await manager.presetStatus()).toBeUndefined()
+    manager.setPresetRosterReader(undefined)
+  })
+
+  it('ships the ACP-mode preset as its own bundle patch, resolvable from the profile', () => {
+    // The preset is a DECLARATION this package carries: the harness composes the
+    // `preset-<id>` roster row from `dsh.bundle.patch`, so the plugin must ship
+    // both the patch and every file the declaration names. A declaration whose
+    // plugin row cannot be resolved fails activation and the mode silently
+    // disappears from the picker — which is exactly what this pins.
+    const root = fileURLToPath(new URL('..', import.meta.url))
+    const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf-8')) as {
+      exports: Record<string, string>
+      dsh: { bundle: { patch: string | string[] }, client: unknown }
+      files: string[]
     }
+    const patches = Array.isArray(manifest.dsh.bundle.patch) ? manifest.dsh.bundle.patch : [manifest.dsh.bundle.patch]
+    expect(patches).toContain('./presets/acp/acp.patch.yml')
+    expect(manifest.files).toContain('presets')
+
+    const declaration = readFileSync(join(root, 'presets/acp/acp.patch.yml'), 'utf-8')
+    expect(declaration).toMatch(/^[ \t]+id: acp$/m)
+    // The guard is named through the package's exports map: a preset
+    // declaration resolves its plugin names against the PROFILE's resolution
+    // base, never against the patch file that inserted the row, so a relative
+    // `./acp-guard.mjs` would resolve to a file that is not there.
+    const guardSpecifier = /name: (dsh-ntr\/acp-guard)/.exec(declaration)?.[1]
+    expect(guardSpecifier).toBe('dsh-ntr/acp-guard')
+    const guardTarget = manifest.exports['./acp-guard']
+    expect(guardTarget).toBe('./presets/acp/acp-guard.mjs')
+    expect(existsSync(join(root, guardTarget.replace(/^\.\//, '')))).toBe(true)
   })
 
   it('ships a persona row the persona row schema accepts', () => {
@@ -283,8 +310,8 @@ describe('ACP bridge over stdio (mock agent)', () => {
     // preset unloadable at session creation — `invalid config: $.prefix missing
     // required value` — and the error only surfaces when a session actually
     // switches to this preset, so pin the field names here.
-    const composition = readFileSync(join(bundledAcpPresetDir(), 'agent.cordis.yml'), 'utf-8')
-    const personaRow = /- id: persona\n[\s\S]*?(?=\n- id: |\s*$)/.exec(composition)?.[0]
+    const composition = readFileSync(fileURLToPath(new URL('../presets/acp/acp.patch.yml', import.meta.url)), 'utf-8')
+    const personaRow = /- id: persona\n[\s\S]*?(?=\n\s*- id: |\s*$)/.exec(composition)?.[0]
     expect(personaRow, 'the preset must carry a persona row').toBeTruthy()
     expect(personaRow).toMatch(/^[ \t]+prefix:/m)
     expect(personaRow).toMatch(/^[ \t]+complete: true$/m)
@@ -1621,5 +1648,105 @@ describe('observed chat transcripts (isolated manager)', () => {
     expect(txManager.chatTranscripts('dsh-tx-2')).toEqual([])
     expect((await dispatchRpc(txManager, 'session/chat-list', { dshSessionId: 'dsh-tx-2' })))
       .toEqual({ ok: true, value: { sessions: [], acpMode: false } })
+  }, 30_000)
+})
+
+describe('deployment default model guard (isolated manager)', () => {
+  const guardHub = new EventHub()
+  /** Poll a condition a background repair satisfies without being awaited by its caller. */
+  async function until(condition: () => boolean, timeoutMs = 5_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs
+    while (!condition()) {
+      if (Date.now() > deadline) throw new Error('condition never became true')
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
+  }
+
+  it('keeps the plugin default agent in its own registry, never in the deployment default', async () => {
+    const storage = `${tmpdir()}/acp-default-agent-${Date.now()}.json`
+    const gm = new BridgeManager([{ ...def, id: 'guarded' }], guardHub, 500, storage)
+
+    // Unset reads as `{}` — the panel's "no default agent chosen yet".
+    expect(await dispatchRpc(gm, 'model/get-default', {})).toEqual({ ok: true, value: {} })
+    await dispatchRpc(gm, 'model/set-default', { agentId: 'guarded' })
+    expect(await dispatchRpc(gm, 'model/get-default', {})).toEqual({ ok: true, value: { provider: 'acp', model: 'guarded' } })
+
+    // It lives in the agent registry file beside the agents, under its own key.
+    const raw = JSON.parse(readFileSync(storage, 'utf-8')) as { version: number; defaultAgentId?: string; agents: unknown[] }
+    expect(raw.defaultAgentId).toBe('guarded')
+    expect(raw.agents).toHaveLength(1)
+    expect(new BridgeManager([], guardHub, 100, storage).defaultAgent()).toBe('guarded')
+
+    // Deleting the agent clears the pointer (a default naming a missing agent
+    // is reported as "none", so the browser offers the menu instead of
+    // auto-routing an ACP session at nothing).
+    await gm.deleteAgent('guarded')
+    expect(gm.defaultAgent()).toBeUndefined()
+    expect(JSON.parse(readFileSync(storage, 'utf-8')).defaultAgentId).toBeUndefined()
+    await expect(gm.setDefaultAgent('ghost')).rejects.toMatchObject({ code: 'unknown_agent' })
+    await gm.shutdownAll()
+  })
+
+  it('puts an ACP deployment default back on the native route the guard learned', async () => {
+    const gm = new BridgeManager([{ ...def, id: 'guarded' }], guardHub, 500, `${tmpdir()}/acp-guard-${Date.now()}.json`)
+    let current: { provider: string; model: string } | undefined = { provider: 'deepseek', model: 'deepseek-v4' }
+    const writes: Array<{ provider: string; model: string }> = []
+    gm.setDefaultModelGuard({
+      read: () => current,
+      write: async next => { writes.push(next); current = next },
+      fallback: () => ({ provider: 'anthropic', model: 'claude' }),
+    })
+
+    // The healthy path learns the native default and rewrites nothing.
+    expect(await gm.reconcileDefaultModel()).toEqual({
+      selection: { provider: 'deepseek', model: 'deepseek-v4' }, restored: false, stranded: false,
+    })
+    expect(writes).toEqual([])
+
+    // DSH's `selectModel` recorded the ACP pick as the deployment default: the
+    // learned native route goes back, so a NEW session in ANY mode never starts
+    // on the external agent.
+    current = { provider: 'acp', model: 'guarded' }
+    expect(await gm.reconcileDefaultModel()).toEqual({
+      selection: { provider: 'deepseek', model: 'deepseek-v4' }, restored: true, stranded: false,
+    })
+    expect(writes).toEqual([{ provider: 'deepseek', model: 'deepseek-v4' }])
+
+    // After the repair the default is native again, so the next check is a read.
+    expect(await gm.reconcileDefaultModel()).toMatchObject({ restored: false })
+
+    // No guard service (a deployment without `agentDefaultModel`) → inert.
+    const bare = new BridgeManager([def], guardHub, 500)
+    expect(await bare.reconcileDefaultModel()).toEqual({ restored: false, stranded: false })
+
+    await bare.shutdownAll()
+    await gm.shutdownAll()
+  })
+
+  it('repairs the deployment default on the turn path, not only from the browser', async () => {
+    const gm = new BridgeManager([{ ...def, id: 'turnguard' }], guardHub, 500, `${tmpdir()}/acp-turn-guard-${Date.now()}.json`)
+    // An install from before the guard existed: the default is ALREADY an ACP
+    // route and no native default was ever observed, so the repair leans on the
+    // deployment's own last native route (`ports.fallback`).
+    let current: { provider: string; model: string } | undefined = { provider: 'acp', model: 'turnguard' }
+    gm.setDefaultModelGuard({
+      read: () => current,
+      write: async next => { current = next },
+      fallback: () => ({ provider: 'deepseek', model: 'deepseek-v4' }),
+    })
+
+    const adapter = new AcpLlmAdapter(gm)
+    for await (const chunk of adapter.stream({
+      provider: 'acp',
+      model: 'turnguard',
+      sessionId: 'dsh-guard-turn',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello guard' }] }],
+    })) {
+      void chunk
+    }
+
+    await until(() => current?.provider !== 'acp')
+    expect(current).toEqual({ provider: 'deepseek', model: 'deepseek-v4' })
+    await gm.shutdownAll()
   }, 30_000)
 })

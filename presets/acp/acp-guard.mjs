@@ -23,10 +23,12 @@
  *                                 disables the filter, e.g. to debug what the
  *                                 harness is injecting).
  *
- * Deliberately dependency-free: a preset lives under `~/.dsh/.agent-presets/`,
- * where Node can never resolve `@deepseek-ai/*` imports — only the `ctx` it is
- * handed and node builtins are available. A filter bug must never eat context,
- * so every step into this listener is guarded and degrades to "keep everything".
+ * Deliberately dependency-free: this file is loaded by the harness's Loader as
+ * the preset declaration's `dsh-ntr/acp-guard` row (see acp.patch.yml), and it
+ * needs nothing but the `ctx` it is handed and node builtins. Keeping it that
+ * way means a preset row can never fail for a reason the plugin's own dependency
+ * graph would have to explain. A filter bug must never eat context, so every
+ * step into this listener is guarded and degrades to "keep everything".
  */
 
 /** Cordis plugin name used by loader diagnostics. */
