@@ -1489,10 +1489,9 @@ describe('idle release (isolated manager)', () => {
       // The view keeps meaning "the chat residency the user configured" — the
       // panel prefills its form from it, so it must not leak probe semantics.
       expect(view?.idleTimeoutMs).toBe(60_000)
-      // The release is announced: a process disappearing must not be silent.
-      const notice = events.find(event => event.type === 'agent/notice')
-      expect(notice).toMatchObject({ type: 'agent/notice', agentId: 'idle-probe', level: 'info' })
-      if (notice?.type === 'agent/notice') expect(notice.text).toContain('released after')
+      // The release is silent: an idle teardown is the expected lifecycle of a
+      // resting process, not a fault — no notice, the status just falls back.
+      expect(events.some(event => event.type === 'agent/notice')).toBe(false)
     } finally {
       await manager.shutdownAll()
     }

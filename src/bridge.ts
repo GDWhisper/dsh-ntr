@@ -337,6 +337,12 @@ export class AgentBridge {
    * `releaseAll` (not `stop`) is the right teardown: `stop` drops resumable
    * records, which would destroy the context of sessions parked by an earlier
    * crash just because this bridge went quiet.
+   *
+   * The teardown is SILENT by design: an idle release is the expected lifecycle
+   * of a resting process, not a fault — the panel's status simply falls back to
+   * "configured", and a notice would only train the user to ignore notices.
+   * Abnormal disappearances (crashes) surface through `session/released`
+   * events instead.
    */
   private releaseIfIdle(): void {
     if (this.state !== 'ready') return
@@ -345,10 +351,7 @@ export class AgentBridge {
       this.touch()
       return
     }
-    const seconds = Math.round(this.currentIdleTimeoutMs / 1000)
-    const reason = `agent "${this.def.id}" was released after ${String(seconds)}s idle`
-    this.hub.broadcast({ type: 'agent/notice', agentId: this.def.id, level: 'info', text: `acp: ${reason}` })
-    this.releaseAll(reason)
+    this.releaseAll(`agent "${this.def.id}" was released after ${String(Math.round(this.currentIdleTimeoutMs / 1000))}s idle`)
   }
 
   /**
