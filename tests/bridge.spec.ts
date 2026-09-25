@@ -11,7 +11,7 @@ import { afterAll, describe, expect, it } from 'vitest'
 import {
   AcpLlmAdapter, BridgeManager, defaultAgentWorkspace,
   detectHostAgents, ensureAgentExecutable, findExecutable,
-  type ApprovalOutcome, type ApprovalRequestContext,
+  type ApprovalOutcome, type ApprovalRequestContext, type BridgeTuning,
 } from '../src/bridge.ts'
 import { EventHub, dispatchRpc } from '../src/impl.ts'
 import type { DshSessionPolicy } from '../src/impl.ts'
@@ -1467,7 +1467,7 @@ describe('idle release (isolated manager)', () => {
     return predicate()
   }
 
-  function idleManager(id: string, tuning: { idleTimeoutMs: number }, overrides: Partial<AcpAgentDef> = {}): { hub: EventHub; events: AcpEvent[]; manager: BridgeManager } {
+  function idleManager(id: string, tuning: BridgeTuning, overrides: Partial<AcpAgentDef> = {}): { hub: EventHub; events: AcpEvent[]; manager: BridgeManager } {
     const hub = new EventHub()
     const events: AcpEvent[] = []
     hub.subscribe(event => { events.push(event) })
@@ -1475,16 +1475,20 @@ describe('idle release (isolated manager)', () => {
     return { hub, events, manager }
   }
 
-  it('releases an agent whose model probe left no live session behind', async () => {
-    const { events, manager } = idleManager('idle-probe', { idleTimeoutMs: 150 })
+  it('releases a probe-spawned process on the probe window, not the chat window', async () => {
+    const { events, manager } = idleManager('idle-probe', { idleTimeoutMs: 60_000, probeIdleTimeoutMs: 150 })
     try {
       await manager.probeAgentModels('idle-probe')
       // The probe's throwaway session is deliberately never registered, so the
-      // only thing holding the process was the probe itself.
+      // bridge still counts as never-hosted: the short probe window governs
+      // even though the chat window is a full minute.
       expect(manager.agentViews()[0]).toMatchObject({ state: 'ready', liveSessions: [] })
       expect(await waitUntil(() => manager.agentViews()[0]?.state === 'stopped')).toBe(true)
       const view = manager.agentViews()[0]
       expect(view?.liveSessions).toEqual([])
+      // The view keeps meaning "the chat residency the user configured" — the
+      // panel prefills its form from it, so it must not leak probe semantics.
+      expect(view?.idleTimeoutMs).toBe(60_000)
       // The release is announced: a process disappearing must not be silent.
       const notice = events.find(event => event.type === 'agent/notice')
       expect(notice).toMatchObject({ type: 'agent/notice', agentId: 'idle-probe', level: 'info' })
@@ -1494,12 +1498,27 @@ describe('idle release (isolated manager)', () => {
     }
   }, 30_000)
 
-  it('never releases an agent that set idleTimeoutMs to 0', async () => {
-    const { manager } = idleManager('idle-off', { idleTimeoutMs: 150 }, { idleTimeoutMs: 0 })
+  it('releases a probe-spawned process even when the agent asked for permanent chat residency', async () => {
+    const { manager } = idleManager('idle-probe-forever', { probeIdleTimeoutMs: 150 }, { idleTimeoutMs: 0 })
     try {
-      await manager.probeAgentModels('idle-off')
+      await manager.probeAgentModels('idle-probe-forever')
+      // def.idleTimeoutMs = 0 is a promise about the CHAT process; a probe
+      // bridge never hosted one and still honors the short probe window.
+      expect(await waitUntil(() => manager.agentViews()[0]?.state === 'stopped')).toBe(true)
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
+  it('never releases a chat process whose agent set idleTimeoutMs to 0', async () => {
+    const { manager } = idleManager('idle-off', { idleTimeoutMs: 0 })
+    try {
+      const { sessionId } = await manager.startSession('idle-off', undefined)
+      // Once a real session has landed, the process lives by the agent's own
+      // residency rules, and 0 means never — even though the bridge was born
+      // from a spawn that (before the session arrived) sat on the probe window.
       await new Promise(resolve => setTimeout(resolve, 600))
-      expect(manager.agentViews()[0]?.state).toBe('ready')
+      expect(manager.agentViews()[0]).toMatchObject({ state: 'ready', liveSessions: [sessionId] })
     } finally {
       await manager.shutdownAll()
     }

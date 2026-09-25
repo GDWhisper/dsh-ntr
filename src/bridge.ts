@@ -130,6 +130,14 @@ export interface BridgeTuning {
    * and has no work in flight is killed after this long. `0` disables it.
    */
   idleTimeoutMs?: number
+  /**
+   * Idle-release window for a bridge that has NEVER hosted a real session —
+   * i.e. a process a model-catalog probe spawned (probes bypass session
+   * bookkeeping). Applies before and instead of `idleTimeoutMs`/`def.idleTimeoutMs`:
+   * those express how long a CHAT process waits for its next message, which a
+   * probe-only process has no stake in. `0` disables it.
+   */
+  probeIdleTimeoutMs?: number
 }
 
 /** One native approval question, as the host approval service defines it. */
@@ -176,6 +184,7 @@ const DEFAULT_TUNING: Required<BridgeTuning> = {
   cancelFallbackMs: 15_000,
   turnSettleMs: 5_000,
   idleTimeoutMs: 1_800_000,
+  probeIdleTimeoutMs: 300_000,
 }
 
 type BridgeState = 'stopped' | 'starting' | 'ready' | 'error'
@@ -201,12 +210,20 @@ export class AgentBridge {
   private readonly cancelFallbackMs: number
   private readonly turnSettleMs: number
   private readonly defaultIdleTimeoutMs: number
+  private readonly probeIdleTimeoutMs: number
   /** Armed while READY; fires the idle-release check (never per-event). */
   private idleTimer?: ReturnType<typeof setTimeout>
   /** Last observable activity; the idle window is measured from here. */
   private lastActivityAt = 0
   /** Throwaway catalog probes in flight — they hold no live session of their own. */
   private pendingProbes = 0
+  /**
+   * Whether a REAL session has ever been registered on this bridge. Probes
+   * bypass session bookkeeping, so a bridge that has never hosted anything was
+   * spawned by a probe and honors {@link probeIdleTimeoutMs}; the first
+   * registered session flips it to the agent's own residency semantics.
+   */
+  private everHostedSession = false
   /** cwd the CURRENT child was spawned with (undefined while there is no child). */
   private spawnCwd?: string
   /**
@@ -246,11 +263,32 @@ export class AgentBridge {
     this.cancelFallbackMs = merged.cancelFallbackMs
     this.turnSettleMs = merged.turnSettleMs
     this.defaultIdleTimeoutMs = merged.idleTimeoutMs
+    this.probeIdleTimeoutMs = merged.probeIdleTimeoutMs
   }
 
-  /** The idle-release window this agent honors: its own field, else the host default. */
+  /**
+   * The idle-release window this agent honors for its CHAT process: its own
+   * field, else the host default. This is the number the panel prefills and
+   * displays (`AgentView.idleTimeoutMs`), so it must keep meaning "the chat
+   * residency the user configured" even while the current child is a probe
+   * spawn that will actually die much sooner.
+   */
   private get idleTimeoutMs(): number {
     return this.def.idleTimeoutMs ?? this.defaultIdleTimeoutMs
+  }
+
+  /**
+   * The window that governs THIS child right now. A bridge that has never
+   * hosted a real session exists only because a probe spawned it, and a probe
+   * process has no stake in how long a CHAT process may wait for its next
+   * message — it gets the short probe window unconditionally (even when
+   * `def.idleTimeoutMs` asks for permanent residency, which is a promise about
+   * the chat process). The first registered session flips the bridge to the
+   * agent's own semantics.
+   */
+  private get currentIdleTimeoutMs(): number {
+    if (!this.everHostedSession) return this.probeIdleTimeoutMs
+    return this.idleTimeoutMs
   }
 
   /**
@@ -269,11 +307,11 @@ export class AgentBridge {
    * not rescheduled per event) self-corrects rather than releasing a busy agent.
    */
   private armIdleRelease(): void {
-    if (this.idleTimeoutMs <= 0 || this.state !== 'ready' || this.idleTimer !== undefined) return
+    if (this.currentIdleTimeoutMs <= 0 || this.state !== 'ready' || this.idleTimer !== undefined) return
     const timer = setTimeout(() => {
       this.idleTimer = undefined
       this.releaseIfIdle()
-    }, Math.max(0, this.lastActivityAt + this.idleTimeoutMs - Date.now()))
+    }, Math.max(0, this.lastActivityAt + this.currentIdleTimeoutMs - Date.now()))
     timer.unref?.()
     this.idleTimer = timer
   }
@@ -285,9 +323,11 @@ export class AgentBridge {
   }
 
   /**
-   * Release a READY agent that has been quiet for a full window, i.e. one that
-   * leaked in by probing the model catalog or by a post-save probe: those spawns
-   * hold no session at all (see {@link probeConfigOptions}).
+   * Release a READY agent that has been quiet for a full window. The window is
+   * {@link currentIdleTimeoutMs}: the short probe window for a child that has
+   * never hosted a session (model-catalog probes and post-save probes spawn
+   * exactly such children, see {@link probeConfigOptions}), the agent's own
+   * residency window once a real session has landed.
    *
    * Deliberately scoped to bridges with NO live session: killing a process the
    * user is chatting with would trade a resident process for a cold start on the
@@ -305,7 +345,7 @@ export class AgentBridge {
       this.touch()
       return
     }
-    const seconds = Math.round(this.idleTimeoutMs / 1000)
+    const seconds = Math.round(this.currentIdleTimeoutMs / 1000)
     const reason = `agent "${this.def.id}" was released after ${String(seconds)}s idle`
     this.hub.broadcast({ type: 'agent/notice', agentId: this.def.id, level: 'info', text: `acp: ${reason}` })
     this.releaseAll(reason)
@@ -605,6 +645,12 @@ export class AgentBridge {
     }
     this.sessions.set(session.sessionId, session)
     this.acpIndex.set(session.acpSessionId, session)
+    // First real session on this bridge: from here the process lives by the
+    // agent's own residency rules, not the probe window it was born under.
+    // Any armed timer computed its delay from the old window — drop it so the
+    // touch below re-arms with the effective one.
+    this.clearIdleTimer()
+    this.everHostedSession = true
     this.hub.broadcast({ type: 'session/created', sessionId: session.sessionId, session: snapshot(session) })
     this.touch()
     return session
@@ -753,6 +799,11 @@ export class AgentBridge {
       if (Array.isArray(result.configOptions)) session.configOptions = result.configOptions
       this.sessions.set(session.sessionId, session)
       this.released.delete(session.sessionId)
+      // Same flip as `createSession`: a registered session makes this a chat
+      // process; re-arm the idle clock on the agent's own window.
+      this.clearIdleTimer()
+      this.everHostedSession = true
+      this.touch()
       // Republish so configOptions/modes observed on load reach the browser.
       this.hub.broadcast({ type: 'session/meta', sessionId: session.sessionId, session: snapshot(session) })
       return session
