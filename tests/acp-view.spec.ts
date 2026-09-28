@@ -8,12 +8,12 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { ACP_PRESET_ID, acpModeFromPresetEvent, sessionHasOwnSelection, shouldShadowModelSeat, splitAcpModelId } from '../src/client/acp-ui.tsx'
+import { ACP_PRESET_ID, acpModeFromPresetEvent, isAbsolutePathLike, joinPermissionSelect, placeMenu, rowAgentPreset, sessionHasOwnSelection, shouldShadowModelSeat, stagedSessionOf, splitAcpModelId } from '../src/client/acp-ui.tsx'
 import type { AcpDirectoryState, AcpPermissionSelect } from '../src/client/acp-ui.tsx'
 import { diffRows } from '../src/client/acp-view.tsx'
 import { describeRoute, menuFor } from '../src/client/session-controls.tsx'
 import { AcpStore } from '../src/client/store.ts'
-import { splitAdapterModelId } from '../src/impl.ts'
+import { isAbsolutePath, splitAdapterModelId } from '../src/impl.ts'
 import type { AgentCatalogResult, AgentView, ChatSessionView } from '../src/protocol.ts'
 
 describe('splitAcpModelId', () => {
@@ -37,6 +37,44 @@ describe('splitAcpModelId', () => {
   it('splits on the first @ so a choice may contain one', () => {
     expect(splitAcpModelId('pi@a@b')).toEqual({ agentId: 'pi', choice: 'a@b' })
     expect(splitAcpModelId('pi')).toEqual({ agentId: 'pi' })
+  })
+})
+
+describe('isAbsolutePathLike', () => {
+  const samples = [
+    '/work',
+    '/work/sub',
+    'C:\\work',
+    'C:/work',
+    'c:/work/sub',
+    '\\\\srv\\share',
+    '//srv/share',
+    '\\\\?\\C:\\x',
+    'C:relative',
+    'relative',
+    'foo\\bar',
+    '',
+    'C:',
+    '/',
+    '.',
+  ]
+
+  it('agrees with the host isAbsolutePath it mirrors on every sample', () => {
+    for (const sample of samples) {
+      expect(isAbsolutePathLike(sample)).toBe(isAbsolutePath(sample))
+    }
+  })
+
+  it('accepts POSIX, drive, and UNC forms and rejects drive-relative or plain-relative ones', () => {
+    expect(isAbsolutePathLike('/work')).toBe(true)
+    expect(isAbsolutePathLike('C:\\work')).toBe(true)
+    expect(isAbsolutePathLike('//srv/share')).toBe(true)
+    expect(isAbsolutePathLike('C:work')).toBe(false)
+    expect(isAbsolutePathLike('relative')).toBe(false)
+    // Extended-length/verbatim: the host's workspace guard cannot interpret it,
+    // so the form must not bless a cwd that could never resolve.
+    expect(isAbsolutePathLike('\\\\?\\C:\\x')).toBe(false)
+    expect(isAbsolutePathLike('//?/C:/x')).toBe(false)
   })
 })
 
@@ -103,6 +141,63 @@ describe('shouldShadowModelSeat (the ACP-mode model seat gate)', () => {
     const verdicts = (): boolean | undefined => true
     expect(shouldShadowModelSeat({ current: 'b', byId: { b: row('standard') } }, verdicts)).toBe(false)
     expect(shouldShadowModelSeat({ current: 'b', byId: { b: row(ACP_PRESET_ID) } }, verdicts)).toBe(true)
+  })
+
+  it('derives the staged session from the rc.2 list shape (no `current` field)', () => {
+    // DSH 0.1.7-rc.2's session controller ships `{ ids, byId, phase }` rows of
+    // `{ id, retainedBy, projectionValues, origin }` — the staged session is
+    // the row whose main-view retain count is positive, and the preset rides
+    // `projectionValues.agentPreset` (verified against the shipped
+    // dsh-api-session-controller; the old top-level fields do not exist).
+    const rc2Row = (agentPreset?: string, extra: Record<string, unknown> = {}) => ({
+      id: 'r1',
+      retainedBy: { mainView: 1 },
+      ...(agentPreset === undefined ? {} : { projectionValues: { agentPreset } }),
+      ...extra,
+    })
+    expect(shouldShadowModelSeat({ byId: { r1: rc2Row(ACP_PRESET_ID) } })).toBe(true)
+    expect(shouldShadowModelSeat({ byId: { r1: rc2Row('standard') } })).toBe(false)
+    // Row silent (projections not folded yet): the host-side fallback answers.
+    const ask = (id: string): boolean | undefined => (id === 'r1' ? true : undefined)
+    expect(shouldShadowModelSeat({ byId: { r1: rc2Row() } }, ask)).toBe(true)
+    expect(shouldShadowModelSeat({ byId: { r1: rc2Row() } })).toBe(false)
+    // No row holds the main view (boot, or the list has not loaded): stand down.
+    expect(shouldShadowModelSeat({ byId: { r1: rc2Row(ACP_PRESET_ID, { retainedBy: {} }) } })).toBe(false)
+    expect(shouldShadowModelSeat({ byId: {} })).toBe(false)
+    // An addressed subagent session is on stage: no ACP seat (its model RPCs
+    // are refused), even though the row names the ACP preset.
+    expect(shouldShadowModelSeat({ byId: { r1: rc2Row(ACP_PRESET_ID, { origin: 'subagent' }) } })).toBe(false)
+    // Only the main-view row decides; a background ACP session does not leak
+    // the takeover onto a staged non-ACP session.
+    expect(shouldShadowModelSeat({
+      byId: {
+        r1: { id: 'r1', retainedBy: { mainView: 1 }, projectionValues: { agentPreset: 'standard' } },
+        r2: { id: 'r2', retainedBy: {}, projectionValues: { agentPreset: ACP_PRESET_ID } },
+      },
+    })).toBe(false)
+  })
+
+  it('reads the staged session and its preset the same way the gate does', () => {
+    // stagedSessionOf is the shared derivation (the ask gate in index.tsx uses
+    // it too); rowAgentPreset is the preset accessor both spellings fold into.
+    expect(stagedSessionOf({ current: 'old', byId: { old: { agentPreset: 'standard' } } }))
+      .toEqual({ sessionId: 'old', row: { agentPreset: 'standard' }, subagent: false })
+    expect(stagedSessionOf({ current: 'old' })?.sessionId).toBe('old')
+    expect(stagedSessionOf({ current: 'old', currentAddress: { parent: 'p' } })?.subagent).toBe(true)
+    const rc2 = stagedSessionOf({ byId: { r1: { id: 'r1', retainedBy: { mainView: 2 } } } })
+    expect(rc2?.sessionId).toBe('r1')
+    // With several qualifying rows the list's own `ids` order decides (display
+    // order, not key insertion order), and a row that omits `id` still resolves
+    // through its key.
+    expect(stagedSessionOf({
+      ids: ['b', 'a'],
+      byId: { a: { id: 'a', retainedBy: { mainView: 1 } }, b: { id: 'b', retainedBy: { mainView: 1 } } },
+    })?.sessionId).toBe('b')
+    expect(stagedSessionOf({ byId: { r9: { retainedBy: { mainView: 1 } } } })?.sessionId).toBe('r9')
+    expect(rowAgentPreset({ projectionValues: { agentPreset: ACP_PRESET_ID } })).toBe(ACP_PRESET_ID)
+    expect(rowAgentPreset({ agentPreset: 'standard' })).toBe('standard')
+    expect(rowAgentPreset(undefined)).toBeUndefined()
+    expect(rowAgentPreset({})).toBeUndefined()
   })
 })
 
@@ -226,6 +321,64 @@ describe('ACP model seat picker', () => {
   })
 })
 
+describe('the permissions projection shape (the picker must survive the real one)', () => {
+  const acp = new AcpStore(async () => ({ ok: true, value: {} }), zh => zh)
+  const agent: AgentView = {
+    id: 'pi', title: 'Pi', command: 'pi-acp', args: [], permission: 'ask',
+    allowedCwdRoots: [], state: 'ready', liveSessions: [],
+  }
+  const state: AcpDirectoryState = {
+    current: { provider: 'acp', model: 'pi' },
+    routable: true,
+    groups: [],
+    status: 'ready',
+    error: null,
+  }
+  const base = { acp, agents: [agent], state }
+  const routed = describeRoute(state, [agent], undefined)
+
+  it('menuFor survives the runtime projection (selection only, no options)', () => {
+    // What `projections.faceOf('permissions').getSnapshot()` ACTUALLY answers on
+    // 0.1.7-rc.2: the projection's `viewSchema` is `{ currentValue }` — the rows
+    // to switch to live in the process-level `permissionPresets.catalog`, a
+    // different surface. Reading `options.length` off this value used to throw
+    // inside the overlay entry's render, and a slot-entry crash ABIDATES the
+    // picker for the rest of the session — the reported "ACP seat clicks do
+    // nothing" symptom.
+    const selection = { currentValue: 'workspace-write' } as unknown as AcpPermissionSelect
+    expect(() => menuFor('seat', { ...base, route: routed, permissions: selection })).not.toThrow()
+    const menu = menuFor('seat', { ...base, route: routed, permissions: selection })
+    expect(menu.sections.map(s => s.id)).not.toContain('boundary')
+  })
+
+  it('joins the projection selection with the catalog rows', () => {
+    // Absent selection = this host projects no boundary at all.
+    expect(joinPermissionSelect(undefined, { options: [] })).toBeUndefined()
+    expect(joinPermissionSelect('nonsense' as never, undefined)).toBeUndefined()
+    // Absent catalog = no rows to offer, but the selection still reads true.
+    expect(joinPermissionSelect({ currentValue: 'workspace-write' }, undefined))
+      .toEqual({ options: [], currentValue: 'workspace-write' })
+    // Garbage rows are dropped rather than rendered.
+    expect(joinPermissionSelect({ currentValue: 'read-only' }, {
+      options: [{ value: 'read-only', name: 'ReadOnly', description: 'r' }, { name: 'no value' }, null as never],
+    })).toEqual({ options: [{ value: 'read-only', name: 'ReadOnly', description: 'r' }], currentValue: 'read-only' })
+  })
+
+  it('renders the boundary rows from the join, filtered and marked', () => {
+    const joined = joinPermissionSelect({ currentValue: 'workspace-write' }, {
+      options: [
+        { value: 'workspace-write', name: 'Workspace' },
+        { value: 'custom', name: 'Custom' },
+        { value: 'danger-full-access', name: 'Full' },
+      ],
+    })!
+    const menu = menuFor('seat', { ...base, route: routed, permissions: joined })
+    const boundary = menu.sections.find(s => s.id === 'boundary')
+    expect(boundary?.items.map(i => i.id)).toEqual(['workspace-write', 'danger-full-access'])
+    expect(boundary?.items[0]?.active).toBe(true)
+  })
+})
+
 describe('sessionHasOwnSelection (the gate\u2019s auto-route predicate)', () => {
   /** A `faceFor` stub whose `modelSelection` projection answers with one value. */
   function faceForReturning(value: unknown) {
@@ -299,5 +452,35 @@ describe('diffRows (ACP view)', () => {
     // Removals precede the additions: the fallback is a replacement block.
     expect(rows[399]?.sign).toBe('-')
     expect(rows[400]?.sign).toBe('+')
+  })
+})
+
+describe('placeMenu (the picker docks to the control that opened it)', () => {
+  const menu = { width: 360, height: 200 }
+  const viewport = { width: 1200, height: 800 }
+
+  it('docks right-aligned above the trigger', () => {
+    // The ACP seat sits in the composer's trailing row: the menu's right edge
+    // lands on the seat's, floating just above it — NOT at the card's top-left
+    // (where the overlay anchor parks it by default).
+    expect(placeMenu({ left: 800, right: 900, top: 500, bottom: 530 }, menu, viewport))
+      .toEqual({ x: 540, y: 292 })
+  })
+
+  it('flips below the trigger when the top has no room', () => {
+    expect(placeMenu({ left: 800, right: 900, top: 40, bottom: 70 }, menu, viewport))
+      .toEqual({ x: 540, y: 78 })
+  })
+
+  it('slides left at the right edge and stops at the left edge', () => {
+    expect(placeMenu({ left: 1100, right: 1195, top: 500, bottom: 530 }, menu, viewport).x).toBe(832)
+    expect(placeMenu({ left: 5, right: 100, top: 500, bottom: 530 }, menu, viewport).x).toBe(8)
+  })
+
+  it('clamps to the viewport when even the flip cannot fit', () => {
+    // Short viewport: below the trigger would overflow the bottom, so the menu
+    // settles against the bottom edge instead of hanging out of the window.
+    expect(placeMenu({ left: 800, right: 900, top: 10, bottom: 40 }, menu, { width: 1200, height: 250 }))
+      .toEqual({ x: 540, y: 42 })
   })
 })

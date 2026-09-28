@@ -14,6 +14,7 @@
  */
 
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { isAbsolutePathLike } from './acp-ui.tsx'
 import { DEFAULT_KNOWN_PRESETS } from './store.ts'
 import type { AcpStore } from './store.ts'
 import type { AcpAgentDef, AgentSavePayload, AgentView, DetectedAgentInfo, PermissionMode } from '../protocol.ts'
@@ -249,9 +250,14 @@ export function AcpSettingsSection(props: WithStore) {
   const acp = props.acp
   ensureStyle()
   const ui = useUi(acp)
+  // The agent list section opens by default. `addTarget === undefined` means
+  // "follow the first available preset"; an explicit chip click pins the
+  // selection until the next create resets it.
+  const [addOpen, setAddOpen] = useState(true)
   const [addTarget, setAddTarget] = useState<DetectedAgentInfo | undefined>(undefined)
+  const [createNonce, setCreateNonce] = useState(0)
   const { configured, available } = partitionAgents(ui.detectedAgents, ui.agents)
-  const addOpen = addTarget !== undefined
+  const selected = addTarget ?? available[0] ?? NEW_AGENT_SEED
 
   return (
     <div className="dwa-root">
@@ -262,6 +268,7 @@ export function AcpSettingsSection(props: WithStore) {
           title={ui.stream}
         />
         <span className="dwa-hint" style={{ flex: 1 }}>{streamText(ui.stream, acp)}</span>
+        {ui.detectSummary !== undefined && <span className="dwa-hint">{ui.detectSummary}</span>}
         <button
           className="dwa-btn"
           onClick={() => {
@@ -363,8 +370,8 @@ export function AcpSettingsSection(props: WithStore) {
         {configured.length === 0 && (
           <div className="dwa-card" style={{ textAlign: 'center', color: 'var(--ntr-muted)', padding: 20 }}>
             {acp.label(
-              '尚未启用任何 Agent。展开下方「添加 Agent」用检测到的预设一键启用，或从零新建自定义 Agent。',
-              'No agents configured yet. Expand "Add Agent" to enable a detected preset, or create a custom one from scratch.',
+              '尚未启用任何 Agent。从下方「Agent 列表」选择检测到的预设一键启用，或新建自定义 Agent。',
+              'No agents configured yet. Pick a detected preset from the "Agent List" below to enable it, or create a custom one from scratch.',
             )}
           </div>
         )}
@@ -384,19 +391,21 @@ export function AcpSettingsSection(props: WithStore) {
         })}
       </div>
 
-      {/* Agent intake: one collapsible area, preset chips inside it. */}
+      {/* Agent list: available presets plus the from-scratch creation form,
+          open by default so the page answers "what can I enable" without a
+          click. Selection follows the first available preset until pinned. */}
       <div>
-        <button type="button" className="dwa-btn dwa-btn-secondary" onClick={() => setAddTarget(current => (current === undefined ? available[0] ?? NEW_AGENT_SEED : undefined))}>
-          {addOpen ? '▾' : '▸'} {acp.label('添加 Agent', 'Add Agent')}
+        <button type="button" className="dwa-btn dwa-btn-secondary" onClick={() => setAddOpen(open => !open)}>
+          {addOpen ? '▾' : '▸'} {acp.label('Agent 列表', 'Agent List')}
         </button>
-        {addOpen && addTarget !== undefined && (
+        {addOpen && (
           <div style={{ marginTop: 12 }}>
             <div className="dwa-chip-list" style={{ marginTop: 0, marginBottom: 4 }}>
               {available.map(info => (
                 <button
                   key={info.id}
                   type="button"
-                  className={`dwa-chip${addTarget.id === info.id ? ' dwa-chip-active' : ''}`}
+                  className={`dwa-chip${selected.id === info.id ? ' dwa-chip-active' : ''}`}
                   onClick={() => setAddTarget(info)}
                   title={info.description}
                 >
@@ -405,25 +414,32 @@ export function AcpSettingsSection(props: WithStore) {
               ))}
               <button
                 type="button"
-                className={`dwa-chip${addTarget.id === '' ? ' dwa-chip-active' : ''}`}
+                className={`dwa-chip${selected.id === '' ? ' dwa-chip-active' : ''}`}
                 onClick={() => setAddTarget(NEW_AGENT_SEED)}
               >
                 {acp.label('自定义', 'Custom')}
               </button>
             </div>
-            {available.length === 0 && addTarget.id === '' && (
+            {available.length === 0 && selected.id === '' && (
               <div className="dwa-hint" style={{ marginBottom: 8 }}>
                 {acp.label('没有更多可启用的预设 Agent。', 'No more detected presets to enable.')}
               </div>
             )}
             <AgentRow
-              key={addTarget.id}
-              detected={addTarget}
+              key={selected.id === '' ? `custom-${createNonce}` : selected.id}
+              detected={selected}
               acp={acp}
               isDefault={false}
               synthesized={false}
-              newCustom={addTarget.id === ''}
-              onCreated={() => setAddTarget(undefined)}
+              newCustom={selected.id === ''}
+              onCreated={() => {
+                // Creation done: drop the pin so the selection re-derives to
+                // the next available preset (or a fresh custom card), and bump
+                // the nonce so an all-custom reset still remounts empty
+                // instead of keeping the just-saved values in the form.
+                setAddTarget(undefined)
+                setCreateNonce(nonce => nonce + 1)
+              }}
             />
           </div>
         )}
@@ -449,7 +465,7 @@ function AgentRow({
   synthesized: boolean
   /** From-scratch creation: the id is editable and no preset defaults exist. */
   newCustom?: boolean
-  /** Fired after a from-scratch save succeeds (closes the creation card). */
+  /** Fired after a creation-card save succeeds (the list re-derives its selection). */
   onCreated?: () => void
 }) {
   const ui = useUi(acp)
@@ -475,9 +491,9 @@ function AgentRow({
   const trimmedId = form.agentId.trim()
   const idValid = !newCustom || AGENT_ID_PATTERN.test(trimmedId)
   const idTaken = newCustom && trimmedId !== '' && ui.agents.some(a => a.id === trimmedId)
-  const cwdInvalid = form.cwd.trim() !== '' && !form.cwd.trim().startsWith('/')
+  const cwdInvalid = form.cwd.trim() !== '' && !isAbsolutePathLike(form.cwd.trim())
   const rootValues = form.roots.map(root => root.trim()).filter(root => root !== '')
-  const rootsInvalid = form.rootsOpen && (rootValues.length === 0 || rootValues.some(root => !root.startsWith('/')))
+  const rootsInvalid = form.rootsOpen && (rootValues.length === 0 || rootValues.some(root => !isAbsolutePathLike(root)))
   const idleInvalid = !idleValid(form.idleStr)
   const formIncomplete = form.command.trim() === '' || !idValid || idTaken || cwdInvalid || rootsInvalid || idleInvalid
 
@@ -494,9 +510,10 @@ function AgentRow({
     setSavedSuccess(false)
     try {
       await acp.saveAgent(payload)
-      // A save from the intake card closes it: the agent now lives in the
-      // configured list, and leaving the card open would render it twice.
-      // Configured rows pass no `onCreated`, so this is a no-op for them.
+      // A save from the creation card resets the list's selection: the agent
+      // now lives in the configured list, and keeping the same card mounted
+      // would render it twice. Configured rows pass no `onCreated`, so this is
+      // a no-op for them.
       onCreated?.()
       if (newCustom) return
       setSavedSuccess(true)
@@ -1099,7 +1116,7 @@ function WorkspaceBlock({
           placeholder={acp.label('默认 ~/.dsh/acp-workspaces', 'Default: ~/.dsh/acp-workspaces')}
         />
         {cwdInvalid && (
-          <span className="dwa-error">{acp.label('必须是绝对路径（以 / 开头）', 'Must be an absolute path (starting with /)')}</span>
+          <span className="dwa-error">{acp.label('必须是绝对路径（如 /work 或 C:\\work）', 'Must be an absolute path (e.g. /work or C:\\work)')}</span>
         )}
         <span className="dwa-hint">
           {acp.label(

@@ -20,7 +20,7 @@
  */
 
 import type { CSSProperties, ReactNode } from 'react'
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import type { AcpStore, UiState } from './store.ts'
 
 // ---- Host-facing structural types ----
@@ -74,11 +74,41 @@ export interface AcpDirectory {
   select(selection: { provider: string; model: string; reasoningEffort?: string }): Promise<void>
 }
 
-/** The `permissions` session projection value (DSH `PermissionSelect`, narrowed). */
-export interface AcpPermissionSelect {
-  options: readonly { value: string; name: string; description?: string }[]
+/** One row of the DSH permission-preset select (`permissionPresets.catalog`). */
+export interface AcpPermissionOption {
+  value: string
+  name: string
+  description?: string
+}
+
+/**
+ * The `permissions` session projection value (DSH `PermissionSelect`),
+ * narrowed: the projection carries the SELECTION ONLY — its `viewSchema` is
+ * `{ currentValue }` (0.1.7-rc.2, `dsh-permission-presets`). The rows to switch
+ * to are NOT in it (see `AcpPermissionCatalog`).
+ */
+export interface AcpPermissionSelection {
   currentValue: string
 }
+
+/**
+ * The process-level permission catalog (`permissionPresets.catalog`), narrowed
+ * to its rows. Deliberately NOT read off the session projection: it does not
+ * live there, and declaring it there once already cost a picker entry its life
+ * (a render crash abdicates the slot entry — the "seat clicks do nothing" bug).
+ */
+export interface AcpPermissionCatalog {
+  options: readonly AcpPermissionOption[]
+}
+
+/** The joined view the picker needs: where this session is + what it can switch to. */
+export interface AcpPermissionSelect {
+  options: readonly AcpPermissionOption[]
+  currentValue: string
+}
+
+/** Resolves the process-level permission catalog; `undefined` when the host has no such service. */
+export type AcpPermissionCatalogResolver = () => Promise<AcpPermissionCatalog | undefined> | undefined
 
 /**
  * The session's command + projection face (`SessionFace`), narrowed to what the
@@ -104,6 +134,8 @@ export interface AcpChatInjected {
   directoryFor(sessionId: string): AcpDirectory | undefined
   /** Resolve the session's command/projection face; `undefined` before the session materializes. */
   faceFor(sessionId: string): AcpSessionFace | undefined
+  /** Resolve the process-level permission catalog (the boundary picker's rows). */
+  permissionCatalogFor?: AcpPermissionCatalogResolver
 }
 
 // ---- The session standard kit (framework-provided, declared structurally) ----
@@ -143,6 +175,23 @@ export function splitAcpModelId(model: string): { agentId: string; choice?: stri
   const at = model.indexOf('@')
   if (at <= 0) return { agentId: model }
   return { agentId: model.slice(0, at), choice: model.slice(at + 1) }
+}
+
+/**
+ * Whether a form value looks like an absolute path on some platform the plugin
+ * runs on: POSIX (`/…`), a Windows drive path (`C:\…`, `C:/…`), or a UNC path
+ * (`\\host\share…`, `//host/share…`). Mirrors the host's `isAbsolutePath`
+ * (src/impl.ts) — the browser must pre-reject exactly what `validateAgentDef`
+ * would reject, or a save the form enables dies on the host
+ * (tests/acp-view.spec.ts asserts equivalence on a shared sample set).
+ *
+ * The extended-length `\\?\…` / `//?/…` family is rejected here too: the host's
+ * workspace guard cannot interpret it, so a config written that way could never
+ * resolve a cwd.
+ */
+export function isAbsolutePathLike(p: string): boolean {
+  if (p.startsWith('\\\\?\\') || p.startsWith('//?/')) return false
+  return p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\')
 }
 
 /** The ACP provider route id every ACP model selection carries. */
@@ -304,8 +353,63 @@ function noopSubscribe(): () => void {
   return () => {}
 }
 
-/** Read one session's `permissions` projection (the DSH Access mode select). */
-export function usePermissionSelect(faceFor: AcpChatInjected['faceFor'], sessionId: string): AcpPermissionSelect | undefined {
+/**
+ * Join the session's `permissions` projection (the selection) with the
+ * permission-preset catalog (the rows). Every partial is legal and must not
+ * throw: an absent selection means this host projects no boundary; an absent
+ * catalog means there are no rows to offer. Nothing here may throw — the caller
+ * renders inside a slot entry whose crash ABIDATES the whole picker.
+ */
+export function joinPermissionSelect(
+  selection: unknown,
+  catalog: AcpPermissionCatalog | undefined,
+): AcpPermissionSelect | undefined {
+  const currentValue = (selection as AcpPermissionSelection | null | undefined)?.currentValue
+  if (typeof currentValue !== 'string') return undefined
+  const raw = Array.isArray(catalog?.options) ? catalog.options : []
+  const options = raw.filter((option): option is AcpPermissionOption =>
+    typeof option?.value === 'string' && typeof option?.name === 'string')
+  return { options, currentValue }
+}
+
+// The permission catalog is PROCESS-level (one table for every session) and its
+// read is a remote round-trip: one fetch per page, fanned out to every picker.
+let permissionCatalogCache: AcpPermissionCatalog | undefined
+let permissionCatalogPending = false
+const permissionCatalogListeners = new Set<() => void>()
+
+function ensurePermissionCatalog(permissionCatalogFor: AcpPermissionCatalogResolver | undefined): void {
+  if (permissionCatalogFor === undefined || permissionCatalogCache !== undefined || permissionCatalogPending) return
+  let pending: Promise<AcpPermissionCatalog | undefined> | undefined
+  try {
+    pending = permissionCatalogFor()
+  } catch {
+    return
+  }
+  if (pending === undefined) return
+  permissionCatalogPending = true
+  void Promise.resolve(pending)
+    .then((catalog) => {
+      if (Array.isArray(catalog?.options)) permissionCatalogCache = catalog
+    })
+    .catch(() => { /* no catalog: the picker simply offers no rows to switch to */ })
+    .finally(() => {
+      permissionCatalogPending = false
+      for (const listener of [...permissionCatalogListeners]) listener()
+    })
+}
+
+/**
+ * Read one session's DSH Access mode for the pickers: the `permissions`
+ * projection carries the selection (`{ currentValue }`), and the rows come from
+ * the process-level `permissionPresets.catalog` — joined by
+ * `joinPermissionSelect` because the projection alone cannot list them.
+ */
+export function usePermissionSelect(
+  faceFor: AcpChatInjected['faceFor'],
+  sessionId: string,
+  permissionCatalogFor?: AcpPermissionCatalogResolver,
+): AcpPermissionSelect | undefined {
   const face = useMemo(() => {
     try {
       return faceFor(sessionId)
@@ -320,14 +424,23 @@ export function usePermissionSelect(faceFor: AcpChatInjected['faceFor'], session
       return noopSubscribe
     }
   }, [face])
-  const getState = useMemo(() => (): AcpPermissionSelect | undefined => {
+  const getState = useMemo((): (() => AcpPermissionSelection | undefined) => () => {
     try {
-      return face?.projections.faceOf('permissions').getSnapshot() as AcpPermissionSelect | undefined
+      return face?.projections.faceOf('permissions').getSnapshot() as AcpPermissionSelection | undefined
     } catch {
       return undefined
     }
   }, [face])
-  return useSyncExternalStore(subscribe, getState)
+  const selection = useSyncExternalStore(subscribe, getState)
+  const [catalog, setCatalog] = useState<AcpPermissionCatalog | undefined>(permissionCatalogCache)
+  useEffect(() => {
+    ensurePermissionCatalog(permissionCatalogFor)
+    const listener = (): void => { setCatalog(permissionCatalogCache) }
+    permissionCatalogListeners.add(listener)
+    listener()
+    return () => { permissionCatalogListeners.delete(listener) }
+  }, [permissionCatalogFor])
+  return useMemo(() => joinPermissionSelect(selection, catalog), [selection, catalog])
 }
 
 // ---- The ACP-mode model seat (shadowing the native one) ----
@@ -350,14 +463,90 @@ export const ACP_PRESET_ID = 'acp'
  * this bundle, so the list is resolved as a plain observable at call time and
  * an unexpected shape simply reads as "no ACP session" — which leaves the
  * native seat exactly where it was.
+ *
+ * TWO SHAPES ship in the wild. DSH 0.1.7-rc.2's session controller
+ * (`dsh-api-session-controller`) builds `{ ids, byId, phase,
+ * projectionsBySession }` with NO `current` field at all — the staged session
+ * is the row whose `retainedBy.mainView` count is positive (the same rule
+ * `dsh-client-ui-session` uses to pick its main view), and the session's
+ * preset rides `projectionValues.agentPreset` (folded from the
+ * `agent-preset/selected` log event; the value is the preset's `id`).
+ * Older runtimes carried a literal `current` plus a top-level `agentPreset`
+ * on the row and a `currentAddress` marker for addressed subagent routes.
  */
 export interface AcpSessionsSnapshot {
-  /** Currently selected session id (the one whose composer is rendered). */
+  /** Old runtimes only: the currently selected session id. */
   current?: string
-  /** List rows by session id; the row carries the preset the session runs. */
-  byId?: Record<string, { agentPreset?: string } | undefined>
-  /** Set when the current route is an addressed subagent session. */
+  /** Old runtimes only: set when the current route is an addressed subagent session. */
   currentAddress?: unknown
+  /** List rows by session id (both runtime shapes). */
+  byId?: Record<string, AcpSessionsRow | undefined>
+  /**
+   * rc.2 shape: row ids in display order. Preferred over the `byId` key order
+   * when picking the staged row, so a multi-view list cannot hand the seat to
+   * whichever session happened to be inserted first.
+   */
+  ids?: readonly string[]
+  phase?: string
+}
+
+/** One session-list row, narrowed to what the gate reads (both shapes). */
+export interface AcpSessionsRow {
+  id?: string
+  /** Old runtimes: the preset at the top level. */
+  agentPreset?: string
+  /** rc.2: session projections, `agentPreset` among them. */
+  projectionValues?: { agentPreset?: string } | undefined
+  /** rc.2: per-surface retain counts; `mainView > 0` marks the staged session. */
+  retainedBy?: { mainView?: number } | undefined
+  /** rc.2: `"subagent"` marks addressed subagent rows. */
+  origin?: string
+}
+
+/**
+ * The preset the row records, under either runtime spelling. `undefined` means
+ * the row is silent (projections not loaded yet, or a runtime without presets)
+ * — never "definitely not ACP".
+ */
+export function rowAgentPreset(row: AcpSessionsRow | undefined): string | undefined {
+  return row?.agentPreset ?? row?.projectionValues?.agentPreset
+}
+
+/** The session the composer is staged on, derived per runtime shape. */
+export interface AcpStagedSession {
+  sessionId: string
+  row?: AcpSessionsRow
+  /** Addressed subagent route: its model RPCs are refused, so the seat stands down. */
+  subagent: boolean
+}
+
+/**
+ * Which session the composer is currently staged on.
+ *
+ * Old runtimes answer from `snapshot.current` (with `currentAddress` as the
+ * subagent marker). rc.2 has no `current`: the staged session is the row the
+ * main view retains (`retainedBy.mainView > 0`) — the exact rule
+ * `dsh-client-ui-session` applies, walked in the list's own `ids` order — and a
+ * row with `origin === "subagent"` is an addressed subagent route. `undefined`
+ * when nothing is staged yet (the list has not loaded, or no row holds the main
+ * view): callers must stand down rather than guess.
+ */
+export function stagedSessionOf(snapshot: AcpSessionsSnapshot | undefined): AcpStagedSession | undefined {
+  if (snapshot === undefined) return undefined
+  if (snapshot.current !== undefined) {
+    return {
+      sessionId: snapshot.current,
+      row: snapshot.byId?.[snapshot.current],
+      subagent: snapshot.currentAddress !== undefined,
+    }
+  }
+  const byId = snapshot.byId ?? {}
+  const sessionId = (snapshot.ids ?? Object.keys(byId)).find(
+    id => (byId[id]?.retainedBy?.mainView ?? 0) > 0,
+  )
+  if (sessionId === undefined) return undefined
+  const row = byId[sessionId]
+  return { sessionId, row, subagent: row?.origin === 'subagent' }
 }
 
 /**
@@ -365,23 +554,23 @@ export interface AcpSessionsSnapshot {
  * current session runs the ACP agent preset, and it is an ordinary session (an
  * addressed subagent route gets no ACP seat — its model RPCs are refused).
  *
- * FACT SOURCES, in order: the client runtime's session row (`agentPreset`,
- * folded from the host's `agent-preset/selected` frames) — and, when the row
- * carries no preset (older client runtimes ship rows without it), the plugin's
- * own host-side report (`AcpStore.acpMode`, read from the same session log the
- * host's `sessionAgentPreset` resolver reads). Neither source alone covers
- * every deployment, and a false from an ABSENT field must not read as
- * "definitely not ACP", which is why the fallback exists.
+ * FACT SOURCES, in order: the client runtime's session row (`agentPreset`
+ * top-level on older runtimes, `projectionValues.agentPreset` on rc.2, folded
+ * from the host's `agent-preset/selected` frames) — and, when the row carries
+ * no preset, the plugin's own host-side report (`AcpStore.acpMode`, read from
+ * the same session log the host's `sessionAgentPreset` resolver reads). Neither
+ * source alone covers every deployment, and a false from an ABSENT field must
+ * not read as "definitely not ACP", which is why the fallback exists.
  */
 export function shouldShadowModelSeat(
   snapshot: AcpSessionsSnapshot | undefined,
   acpMode?: (sessionId: string) => boolean | undefined,
 ): boolean {
-  const current = snapshot?.current
-  if (current === undefined || snapshot?.currentAddress !== undefined) return false
-  const listed = snapshot?.byId?.[current]?.agentPreset
+  const staged = stagedSessionOf(snapshot)
+  if (staged === undefined || staged.subagent) return false
+  const listed = rowAgentPreset(staged.row)
   if (listed !== undefined) return listed === ACP_PRESET_ID
-  return acpMode?.(current) === true
+  return acpMode?.(staged.sessionId) === true
 }
 
 /**
@@ -437,6 +626,8 @@ export type AcpMenuKind = 'agent' | 'model' | 'thought' | 'boundary' | 'seat'
 interface MenuState {
   sessionId: string
   kind: AcpMenuKind
+  /** The control that opened the picker; the popup docks to it. */
+  trigger?: HTMLElement
   /** Last pick failure, rendered inside the open picker (its own retry surface). */
   error?: string
 }
@@ -449,10 +640,10 @@ function emitMenu(): void {
 }
 
 /** Toggle-style open: pressing the same chip twice closes its menu. */
-export function openAcpMenu(sessionId: string, kind: AcpMenuKind): void {
+export function openAcpMenu(sessionId: string, kind: AcpMenuKind, trigger?: HTMLElement): void {
   menuState = menuState !== null && menuState.sessionId === sessionId && menuState.kind === kind
     ? null
-    : { sessionId, kind }
+    : { sessionId, kind, ...trigger === undefined ? {} : { trigger } }
   emitMenu()
 }
 
@@ -517,18 +708,73 @@ export interface AcpMenuProps {
     error?: string
     loading?: boolean
   }
+  /** The control that opened the menu; the popup docks above it (see `placeMenu`). */
+  anchor?: HTMLElement | null
   onPick(itemId: string, sectionId: string): void
   onClose(): void
 }
 
 /**
- * The picker shell. It rides the composer's overlay anchor (the card's top
- * edge), which is the seat the platform reserves for menus — so the popup
- * floats above the composer exactly like the `/`-command menu does, and is not
- * clipped by the card's own scrollport.
+ * Pure popup placement, viewport coordinates: the menu docks with its right
+ * edge under the trigger's, `gap`px above it — and only then clamps to the
+ * viewport (flip below when the top has no room, slide left at the right edge).
+ * Separated from the DOM measurement so the geometry stays testable.
  */
-export function AcpMenu({ model, onPick, onClose }: AcpMenuProps) {
+export function placeMenu(
+  trigger: { left: number; right: number; top: number; bottom: number },
+  menu: { width: number; height: number },
+  viewport: { width: number; height: number },
+  gap = 8,
+): { x: number; y: number } {
+  const x = Math.min(
+    Math.max(gap, trigger.right - menu.width),
+    Math.max(gap, viewport.width - menu.width - gap),
+  )
+  const above = trigger.top - menu.height - gap
+  let y = above >= gap ? above : trigger.bottom + gap
+  if (y + menu.height > viewport.height - gap) {
+    y = Math.max(gap, viewport.height - menu.height - gap)
+  }
+  return { x, y }
+}
+
+/**
+ * The picker shell. It rides the composer's overlay anchor (the card's top
+ * edge) — the seat the platform reserves for menus, so the popup is never
+ * clipped by the card's own scrollport — and then docks itself to the control
+ * that opened it (`anchor`): the seat or a chip is a dropdown trigger, and a
+ * menu that materializes elsewhere on the card reads as "nothing happened".
+ */
+export function AcpMenu({ model, anchor, onPick, onClose }: AcpMenuProps) {
   const rootRef = useRef<HTMLDivElement>(null)
+  useLayoutEffect(() => {
+    const node = rootRef.current
+    if (node === null || model === undefined) return
+    const place = (): void => {
+      try {
+        if (anchor === undefined || anchor === null || !anchor.isConnected) {
+          node.style.transform = ''
+          return
+        }
+        const menuRect = node.getBoundingClientRect()
+        const triggerRect = anchor.getBoundingClientRect()
+        const { x, y } = placeMenu(
+          triggerRect,
+          menuRect,
+          { width: window.innerWidth, height: window.innerHeight },
+        )
+        // Translate from wherever CSS parked the popup: the offset parent is
+        // the platform's zero-height overlay anchor, so plain left/top would
+        // need its exact geometry — measuring the delta needs none.
+        node.style.transform = 'none'
+        const base = node.getBoundingClientRect()
+        node.style.transform = `translate(${x - base.left}px, ${y - base.top}px)`
+      } catch { /* placement must never break the menu */ }
+    }
+    place()
+    window.addEventListener('resize', place)
+    return () => { window.removeEventListener('resize', place) }
+  }, [model, anchor])
   useEffect(() => {
     if (model === undefined) return
     const onKey = (event: KeyboardEvent): void => {
@@ -600,7 +846,7 @@ export function AcpChip(props: {
   label: string
   title?: string
   active?: boolean
-  onClick: () => void
+  onClick: (trigger: HTMLElement) => void
   children?: ReactNode
   style?: CSSProperties
 }) {
@@ -610,7 +856,7 @@ export function AcpChip(props: {
       className={`ntr-acp-chip${props.active === true ? ' is-active' : ''}`}
       title={props.title}
       aria-haspopup="menu"
-      onClick={props.onClick}
+      onClick={(event) => { props.onClick(event.currentTarget) }}
       style={props.style}
     >
       {props.children}

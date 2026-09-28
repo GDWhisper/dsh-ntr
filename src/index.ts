@@ -7,7 +7,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
-import type {} from '@deepseek-ai/dsh-client-connection'
+import type { ConnectionRpcHandler, HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
 import { ACP_PRESET_ID, AcpLlmAdapter, BridgeManager } from './bridge.ts'
 import { EventHub, dispatchRpc, dshSessionPolicyOf, lastNativeRoute, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
 import type { AcpEvent } from './protocol.ts'
@@ -36,6 +36,17 @@ interface AgentsServiceLike {
 /** Structural view of the host sandbox policy service (`@deepseek-ai/dsh-sandbox-policy`). */
 interface SandboxPolicyLike {
   resolve(request: { session?: unknown }): { mode?: unknown; workspaceRoot?: unknown }
+}
+
+/**
+ * The Connection service's private, owner-explicit channel registration. It is
+ * not on the public `HostConnectionHandle` surface (only `rpc.handle` is), but
+ * `rpc.handle` is unusable from an external plugin on the 0.1.7-rc.x runtime —
+ * see the registration comment in `apply`. Absent on hypothetical runtimes
+ * without it: fall back to `rpc.handle` there.
+ */
+interface ChannelRegisteringConnection extends HostConnectionHandle {
+  register?(owner: Context, channel: string, handler: ConnectionRpcHandler): () => Promise<void>
 }
 
 /** Structural view of the host session store (`@deepseek-ai/dsh-session`'s `ctx.sessions`). */
@@ -352,10 +363,34 @@ export function apply(ctx: Context, config?: unknown): void {
   }
 
   ctx.effect(
-    () => ctx.connection.rpc.handle('/acp', (endpoint, payload, signal) => {
-      if (signal.aborted) return Promise.resolve({ ok: false, error: { code: 'aborted', message: 'acp: request aborted', details: {} } })
-      return dispatchRpc(manager, endpoint, payload)
-    }),
+    () => {
+      const handler: ConnectionRpcHandler = (endpoint, payload, signal) => {
+        if (signal.aborted) return Promise.resolve({ ok: false, error: { code: 'aborted', message: 'acp: request aborted', details: {} } })
+        return dispatchRpc(manager, endpoint, payload)
+      }
+      const connection = ctx.connection as ChannelRegisteringConnection
+      // `rpc.handle` binds the route owner through Connection's traceable shadow,
+      // which re-roots service lookups at the Connection service's own scope — a
+      // scope that does not inject `webServer`. On the desktop 0.1.7-rc.2
+      // composition that read dies with `cannot get property "webServer" without
+      // inject`, the entry fails to activate, and every /acp POST falls through
+      // to the static 405 fallback. `register` takes the owning context
+      // explicitly, so pass ours — it declares webServer.
+      //
+      // The probe is presence-only (the method is private, so there is no type to
+      // check against), so treat surprises conservatively: a `register` that
+      // throws counts as absent (nothing was registered → use the documented
+      // path), while one that returns something other than the disposer this
+      // effect needs is kept anyway (the channel works; re-registering it through
+      // the fallback would register twice) with a no-op disposer.
+      if (typeof connection.register === 'function') {
+        try {
+          const disposer = connection.register(ctx, '/acp', handler)
+          return typeof disposer === 'function' ? disposer : () => Promise.resolve()
+        } catch { /* an unusable `register` is no better than none */ }
+      }
+      return connection.rpc.handle('/acp', handler)
+    },
     'dsh-ntr: /acp rpc channel',
   )
 

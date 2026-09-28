@@ -19,6 +19,11 @@ import type { AcpAgentDef, AcpEvent, AgentCatalogResult, ChatSessionView, Stream
 
 const MOCK = fileURLToPath(new URL('./mock-agent.mjs', import.meta.url))
 
+/** Separator-blind comparison: realpath answers `\` on Windows, the session cwd is folded to `/`. */
+function normPath(p: string): string {
+  return p.replaceAll('\\', '/')
+}
+
 const def: AcpAgentDef = {
   id: 'mock',
   title: 'Mock',
@@ -133,7 +138,9 @@ describe('ACP bridge over stdio (mock agent)', () => {
   }, 30_000)
 
   it('enforces the cwd allow-list before touching the agent', async () => {
-    const escape = await dispatchRpc(manager, 'session/start', { agentId: 'mock', cwd: '/etc' })
+    // An existing directory outside the allow-list: /etc on POSIX, C:\Windows on Windows.
+    const escapeCwd = process.platform === 'win32' ? 'C:\\Windows' : '/etc'
+    const escape = await dispatchRpc(manager, 'session/start', { agentId: 'mock', cwd: escapeCwd })
     expect(escape).toMatchObject({ ok: false, error: { code: 'cwd_denied' } })
     const missing = await dispatchRpc(manager, 'session/start', { agentId: 'mock', cwd: '/definitely/not/here' })
     expect(missing).toMatchObject({ ok: false, error: { code: 'bad_cwd' } })
@@ -310,7 +317,8 @@ describe('ACP bridge over stdio (mock agent)', () => {
     // preset unloadable at session creation — `invalid config: $.prefix missing
     // required value` — and the error only surfaces when a session actually
     // switches to this preset, so pin the field names here.
-    const composition = readFileSync(fileURLToPath(new URL('../presets/acp/acp.patch.yml', import.meta.url)), 'utf-8')
+    // Git checks the patch file out with CRLF on Windows; the row regex anchors on \n.
+    const composition = readFileSync(fileURLToPath(new URL('../presets/acp/acp.patch.yml', import.meta.url)), 'utf-8').replaceAll('\r\n', '\n')
     const personaRow = /- id: persona\n[\s\S]*?(?=\n\s*- id: |\s*$)/.exec(composition)?.[0]
     expect(personaRow, 'the preset must carry a persona row').toBeTruthy()
     expect(personaRow).toMatch(/^[ \t]+prefix:/m)
@@ -552,7 +560,7 @@ describe('ACP bridge over stdio (mock agent)', () => {
   })
 
   it('anchors the default workspace to the plugin state dir, not the launch cwd', () => {
-    expect(defaultAgentWorkspace('/tmp/fake-home')).toBe('/tmp/fake-home/.dsh/acp-workspaces')
+    expect(defaultAgentWorkspace('/tmp/fake-home')).toBe(join('/tmp/fake-home', '.dsh', 'acp-workspaces'))
     expect(defaultAgentWorkspace()).toBe(join(homedir(), '.dsh', 'acp-workspaces'))
     expect(defaultAgentWorkspace()).not.toBe(join(process.cwd(), 'acp-workspaces'))
   })
@@ -1383,11 +1391,11 @@ describe('chat session workspace (isolated manager)', () => {
     writeFileSync(join(workspace, 'in-workspace.txt'), 'seen-by-the-agent')
     wsPolicy = { mode: 'workspace-write', approval: 'ask', workspaceRoot: workspace }
     const turn = await wsTurn('dsh-ws-chat', 'hello there')
-    expect(turn.cwd).toBe(realpathSync(workspace))
+    expect(normPath(turn.cwd)).toBe(normPath(realpathSync(workspace)))
     // The fs guard reads the session cwd, so the workspace is readable too (the
     // agent's own allow-list does not contain it).
     const read = await wsTurn('dsh-ws-chat', `READFILE ${join(workspace, 'in-workspace.txt')}`)
-    expect(read.cwd).toBe(realpathSync(workspace))
+    expect(normPath(read.cwd)).toBe(normPath(realpathSync(workspace)))
     expect(read.echoed).toContain('READ_OK:seen-by-the-agent')
   }, 30_000)
 
@@ -1396,7 +1404,7 @@ describe('chat session workspace (isolated manager)', () => {
     // an /acp-direct session): the agent's own cwd stays in charge.
     wsPolicy = { mode: 'workspace-write', approval: 'ask' }
     const turn = await wsTurn('dsh-ws-fallback', 'hello fallback')
-    expect(turn.cwd).toBe(realpathSync(narrow))
+    expect(normPath(turn.cwd)).toBe(normPath(realpathSync(narrow)))
   }, 30_000)
 
   it('resumes a crashed chat session whose cwd is the DSH workspace', async () => {
@@ -1406,13 +1414,13 @@ describe('chat session workspace (isolated manager)', () => {
     // `released` forever with `cwd_denied`.
     wsPolicy = { mode: 'workspace-write', approval: 'ask', workspaceRoot: workspace }
     const first = await wsTurn('dsh-ws-resume', 'DIE now')
-    expect(first.cwd).toBe(realpathSync(workspace))
+    expect(normPath(first.cwd)).toBe(normPath(realpathSync(workspace)))
     const released = await wsWaitFor('session/released', event => event.sessionId === first.hostSessionId)
     expect(released.session.released).toBe(true)
 
     const resumed = await wsTurn('dsh-ws-resume', 'back again')
     expect(resumed.hostSessionId).toBe(first.hostSessionId)
-    expect(resumed.cwd).toBe(realpathSync(workspace))
+    expect(normPath(resumed.cwd)).toBe(normPath(realpathSync(workspace)))
     expect(resumed.echoed).toContain('REPLAYED: earlier conversation')
     expect(resumed.echoed).toContain('MOCK: echo back again')
   }, 30_000)
@@ -1447,7 +1455,7 @@ describe('chat session workspace (isolated manager)', () => {
     try {
       const since = wsEvents.length
       const second = await wsTurn('dsh-ws-other', 'PWD again', 'wsprobe')
-      expect(second.cwd).toBe(realpathSync(other))
+      expect(normPath(second.cwd)).toBe(normPath(realpathSync(other)))
       expect(second.echoed).toContain(`PWD:${realpathSync(workspace)}`)
       expect(wsEvents.slice(since).filter(event => event.type === 'agent/notice' && event.text.includes('restarts in'))).toHaveLength(0)
       expect((await wsTurn('dsh-ws-proc', 'PWD once more', 'wsprobe')).echoed).toContain(`PWD:${realpathSync(workspace)}`)

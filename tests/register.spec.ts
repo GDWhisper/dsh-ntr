@@ -37,6 +37,50 @@ describe('host plugin contract', () => {
     expect(ctx.effect).toHaveBeenCalled()
   })
 
+  it('prefers the owner-explicit channel register when the runtime Connection service exposes it', () => {
+    // rc.2 runtimes: `rpc.handle` re-roots service lookups at the Connection
+    // service's own scope (no `webServer` injected there) and the registration
+    // dies with `cannot get property "webServer" without inject`. The private
+    // `register(owner, channel, handler)` takes the owner explicitly instead.
+    const ctx = fakeCtx() as unknown as {
+      connection: { register: ReturnType<typeof vi.fn>; rpc: { handle: ReturnType<typeof vi.fn> } }
+    }
+    ctx.connection.register = vi.fn(() => () => Promise.resolve())
+    apply(ctx as never, { agents: [{ id: 'a', command: 'x' }] })
+    expect(ctx.connection.register).toHaveBeenCalledWith(ctx, '/acp', expect.any(Function))
+    expect(ctx.connection.rpc.handle).not.toHaveBeenCalled()
+  })
+
+  it('falls back to rpc.handle when the private register throws', () => {
+    // Presence-only probe: a `register` that cannot take (owner, channel, handler)
+    // must leave the plugin on the documented path instead of failing the boot.
+    const ctx = fakeCtx() as unknown as {
+      connection: { register: ReturnType<typeof vi.fn>; rpc: { handle: ReturnType<typeof vi.fn> } }
+    }
+    ctx.connection.register = vi.fn(() => { throw new Error('cannot get property "webServer" without inject') })
+    apply(ctx as never, { agents: [{ id: 'a', command: 'x' }] })
+    expect(ctx.connection.rpc.handle).toHaveBeenCalledWith('/acp', expect.any(Function))
+  })
+
+  it('keeps the channel registered when register returns no disposer, without registering twice', () => {
+    // An unexpected return shape means "this runtime's register is not the one we
+    // know": keep the working channel and hand the effect a no-op disposer rather
+    // than re-registering the same prefix through rpc.handle.
+    const ctx = fakeCtx() as unknown as {
+      connection: { register: ReturnType<typeof vi.fn>; rpc: { handle: ReturnType<typeof vi.fn> } }
+      effect: { mock: { calls: unknown[][] } }
+    }
+    ctx.connection.register = vi.fn(() => ({ dispose: () => Promise.resolve() }))
+    apply(ctx as never, { agents: [{ id: 'a', command: 'x' }] })
+    expect(ctx.connection.register).toHaveBeenCalledWith(ctx, '/acp', expect.any(Function))
+    expect(ctx.connection.rpc.handle).not.toHaveBeenCalled()
+    const channel = ctx.effect.mock.calls.find(call => call[1] === 'dsh-ntr: /acp rpc channel') as [() => unknown] | undefined
+    // The effect contract wants a disposer back: an unexpected shape must still
+    // hand one over instead of letting activation/disposal fail.
+    expect(channel).toBeDefined()
+    expect(typeof channel![0]()).toBe('function')
+  })
+
   it('fails the boot loudly on invalid agent config', () => {
     const ctx = fakeCtx()
     expect(() => apply(ctx as never, { agents: [{ id: 'BAD ID', command: 'x' }] })).toThrow(/acp/)

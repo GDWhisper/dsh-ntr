@@ -174,7 +174,7 @@ export function AcpSessionControls(props: AcpClusterProps) {
   // No ACP route and no ACP history: this conversation has no ACP story to
   // tell, and chrome for it would be noise. The ACP view tab owns that entry.
   if (seatOwns || state === undefined || (!route.routed && bound === undefined)) return null
-  const open = (kind: AcpMenuKind): void => { openAcpMenu(sessionId, kind) }
+  const open = (kind: AcpMenuKind, trigger: HTMLElement): void => { openAcpMenu(sessionId, kind, trigger) }
 
   return (
     <span className="ntr-acp-cluster">
@@ -187,14 +187,14 @@ export function AcpSessionControls(props: AcpClusterProps) {
           'This conversation is served by an external ACP agent — open to switch the agent and the boundary',
         )}
         active={route.routed}
-        onClick={() => { open('agent') }}
+        onClick={(trigger) => { open('agent', trigger) }}
       />
       {route.routed && route.modelLabel !== undefined && (
         <AcpChip
           label={route.modelLabel}
           title={acp.label('agent 自己的模型目录', "the agent's own model directory")}
           active={menu?.sessionId === sessionId && menu.kind === 'model'}
-          onClick={() => { open('model') }}
+          onClick={(trigger) => { open('model', trigger) }}
         />
       )}
       {route.routed && route.efforts.length > 0 && (
@@ -202,7 +202,7 @@ export function AcpSessionControls(props: AcpClusterProps) {
           label={`${acp.label('思考', 'think')} · ${route.effortLabel ?? acp.label('默认', 'default')}`}
           title={acp.label('思考等级（agent 的 thought_level）', "Thought level (the agent's thought_level)")}
           active={menu?.sessionId === sessionId && menu.kind === 'thought'}
-          onClick={() => { open('thought') }}
+          onClick={(trigger) => { open('thought', trigger) }}
         />
       )}
     </span>
@@ -344,8 +344,13 @@ function thoughtSection(context: MenuContext): AcpMenuSection {
 /** The session's DSH Access mode, when the host projects one for it. */
 function boundarySection(context: MenuContext): AcpMenuSection | undefined {
   const { acp } = context
-  if (context.permissions === undefined || context.permissions.options.length === 0) return undefined
-  const options = context.permissions
+  const permissions = context.permissions
+  // Both fields are runtime values from a projection + a remote catalog, not
+  // types: never trust either shape (a `.length` off an absent `options` used
+  // to throw here, and a throw inside a slot entry retires the whole picker).
+  if (permissions === undefined
+    || !Array.isArray(permissions.options)
+    || permissions.options.length === 0) return undefined
   return {
     id: 'boundary',
     title: acp.label('会话边界（DSH Access mode）', 'Conversation boundary (DSH access mode)'),
@@ -353,13 +358,13 @@ function boundarySection(context: MenuContext): AcpMenuSection | undefined {
       'agent 的工具跑在它自己的进程里，DSH 的沙箱管不到它；这一档规定的是宿主给我们这道闸门的边界（写盘与询问）。',
       "The agent's tools run in its own process, beyond the DSH sandbox; this preset is what binds our gate — its writes and its asks.",
     ),
-    items: options.options
-      .filter(option => option.value !== 'custom')
+    items: permissions.options
+      .filter(option => typeof option?.value === 'string' && option.value !== 'custom')
       .map(option => ({
         id: option.value,
         label: option.name,
         ...option.description === undefined ? {} : { detail: option.description },
-        active: option.value === options.currentValue,
+        active: option.value === permissions.currentValue,
       })),
   }
 }
@@ -427,10 +432,10 @@ export function menuFor(kind: AcpMenuKind, context: MenuContext): {
  */
 export function AcpSessionMenu(props: AcpClusterProps) {
   ensureAcpStyle()
-  const { acp, sessionId, directoryFor, faceFor } = props
+  const { acp, sessionId, directoryFor, faceFor, permissionCatalogFor } = props
   const ui = useUi(acp)
   const { directory, state } = useDirectory(directoryFor, sessionId)
-  const permissions = usePermissionSelect(faceFor, sessionId)
+  const permissions = usePermissionSelect(faceFor, sessionId, permissionCatalogFor)
   const menu = useAcpMenu()
   const [busy, setBusy] = useState(false)
   const bound = boundSession(ui, sessionId)
@@ -442,15 +447,30 @@ export function AcpSessionMenu(props: AcpClusterProps) {
 
   if (menu === null || menu.sessionId !== sessionId) return null
   const route = describeRoute(state, ui.agents, bound, catalog)
-  const model = menuFor(menu.kind, {
-    acp,
-    agents: ui.agents,
-    route,
-    ...catalog === undefined ? {} : { catalog },
-    ...state === undefined ? {} : { state },
-    ...permissions === undefined ? {} : { permissions },
-    ...menu.error === undefined ? {} : { error: menu.error },
-  })
+  // A menu-model bug must never retire the whole picker: a render throw inside
+  // this slot entry makes the error boundary ABIDATE it for the rest of the
+  // session (every later click silently opens nothing — that was the reported
+  // "ACP seat clicks do nothing" bug, caused by `boundarySection` reading
+  // `options.length` off the projection, which has no `options`). Show the
+  // failure inside the menu instead of dying.
+  let model: ReturnType<typeof menuFor>
+  try {
+    model = menuFor(menu.kind, {
+      acp,
+      agents: ui.agents,
+      route,
+      ...catalog === undefined ? {} : { catalog },
+      ...state === undefined ? {} : { state },
+      ...permissions === undefined ? {} : { permissions },
+      ...menu.error === undefined ? {} : { error: menu.error },
+    })
+  } catch (error) {
+    model = {
+      title: acp.label('ACP', 'ACP'),
+      sections: [],
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
 
   const pick = async (sectionId: string, itemId: string): Promise<void> => {
     if (sectionId === 'boundary') {
@@ -516,6 +536,7 @@ export function AcpSessionMenu(props: AcpClusterProps) {
   return (
     <AcpMenu
       model={model}
+      anchor={menu.trigger}
       onPick={(itemId, sectionId) => {
         if (busy) return
         setAcpMenuError(undefined)
@@ -594,7 +615,9 @@ export function AcpModelSeat(props: AcpSeatProps) {
           'ACP 模式：模型只能是对端 agent。点开可切换 agent、它的模型与思考等级',
           'ACP mode: the model can only be the external agent. Open to switch the agent, its model and the thought level',
         )}
-      onClick={() => { openAcpMenu(sessionId, 'seat') }}
+      onClick={(event) => {
+        openAcpMenu(sessionId, 'seat', event.currentTarget)
+      }}
     >
       <span className="ntr-acp-seat-main">{route.agentTitle === undefined ? 'ACP' : `ACP · ${route.agentTitle}`}</span>
       {sub !== '' && <span className="ntr-acp-seat-sub">{sub}</span>}

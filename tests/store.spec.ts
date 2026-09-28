@@ -85,6 +85,44 @@ describe('AcpStore agent management', () => {
     expect(state.detectedAgents).toHaveLength(1)
     expect(state.detectedAgents[0].id).toBe('pi')
     expect(state.detecting).toBe(false)
+    expect(state.detectSummary).toBe('已检测 1 个预设：1 个已安装，其余可从「Agent 列表」启用。')
+  })
+
+  it('detectAgents reports the fallback preset list as the summary when the host detects nothing', async () => {
+    const store = new (await import('../src/client/store.ts')).AcpStore(
+      async (_channel, endpoint) => {
+        if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
+        return { ok: true, value: {} }
+      },
+      (zh) => zh,
+    )
+    await store.detectAgents()
+    const state = store.getSnapshot()
+    expect(state.detectedAgents.length).toBeGreaterThan(0)
+    expect(state.detectSummary).toContain('个预设')
+  })
+
+  it('clears the previous detect summary when a re-detect fails', async () => {
+    let failing = false
+    const store = new (await import('../src/client/store.ts')).AcpStore(
+      async (_channel, endpoint) => {
+        if (endpoint === 'agents/detect') {
+          if (failing) return { ok: false, error: { code: 'internal', message: 'host offline' } }
+          return { ok: true, value: { agents: [{ id: 'pi', name: 'Pi Agent', detected: true, defaultCommand: 'pi-acp', defaultArgs: [] }] } }
+        }
+        return { ok: true, value: {} }
+      },
+      (zh) => zh,
+    )
+    await store.detectAgents()
+    expect(store.getSnapshot().detectSummary).toContain('个预设')
+    failing = true
+    await store.detectAgents()
+    const state = store.getSnapshot()
+    // The stale success line must not sit next to the failure notice.
+    expect(state.detectSummary).toBeUndefined()
+    expect(state.detecting).toBe(false)
+    expect(state.notice).toBe('host offline')
   })
 
   it('saveAgent and deleteAgent trigger RPC calls and resync', async () => {

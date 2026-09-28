@@ -77,6 +77,14 @@ export interface UiState {
   defaultAgent?: string
   detectedAgents: DetectedAgentInfo[]
   detecting: boolean
+  /**
+   * Outcome of the last explicit re-detect (`重新检测与刷新`). Detection
+   * usually finds exactly what the panel already renders — without this line
+   * the button reads as dead. Set only by an explicit click, not the ambient
+   * resync, and cleared again when that click's detection fails (a stale success
+   * line next to the failure notice reads as if nothing happened).
+   */
+  detectSummary?: string
   /** Probed model catalogs per agent id (from `agent/probe-models`). */
   modelCatalogs: Record<string, AgentProbeModelsResult>
   /**
@@ -319,9 +327,15 @@ export class AcpStore {
     this.mutate({ detecting: true })
     try {
       const result = await this.call<{ agents: DetectedAgentInfo[] }>('agents/detect')
+      const agents = result.agents.length > 0 ? result.agents : [...DEFAULT_KNOWN_PRESETS]
+      const installed = agents.filter(agent => agent.detected).length
       this.mutate({
-        detectedAgents: result.agents.length > 0 ? result.agents : [...DEFAULT_KNOWN_PRESETS],
+        detectedAgents: agents,
         detecting: false,
+        detectSummary: this.locale(
+          `已检测 ${String(agents.length)} 个预设：${String(installed)} 个已安装，其余可从「Agent 列表」启用。`,
+          `Detected ${String(agents.length)} presets: ${String(installed)} installed, enable the rest via the "Agent List".`,
+        ),
       })
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error)
@@ -332,6 +346,8 @@ export class AcpStore {
         detecting: false,
         notice,
         detectedAgents: this.state.detectedAgents.length > 0 ? this.state.detectedAgents : [...DEFAULT_KNOWN_PRESETS],
+        // A failed re-detect must not keep showing the previous run's success line.
+        detectSummary: undefined,
       })
     }
   }

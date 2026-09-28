@@ -18,9 +18,9 @@ import { AcpComposerMode } from './composer-mode.tsx'
 import { AcpModelSeat, AcpSessionControls, AcpSessionMenu } from './session-controls.tsx'
 import { AcpConversationView } from './acp-view.tsx'
 import {
-  ACP_PROVIDER, acpModeFromPresetEvent, selectAcpRoute, sessionHasOwnSelection, setAcpSeatActive, shouldShadowModelSeat,
+  ACP_PROVIDER, acpModeFromPresetEvent, rowAgentPreset, selectAcpRoute, sessionHasOwnSelection, setAcpSeatActive, shouldShadowModelSeat, stagedSessionOf,
 } from './acp-ui.tsx'
-import type { AcpChatInjected, AcpDirectory, AcpSessionFace, AcpSessionsSnapshot, SessionListSource } from './acp-ui.tsx'
+import type { AcpChatInjected, AcpDirectory, AcpPermissionCatalog, AcpSessionFace, AcpSessionsSnapshot, SessionListSource } from './acp-ui.tsx'
 
 export const name = 'dsh-ntr-client'
 export const inject = ['slots', 'connection']
@@ -99,12 +99,33 @@ export function apply(ctx: Context): void {
     }
   }
 
+  /**
+   * The process-level permission-preset catalog (`permissionPresets.catalog`
+   * over the remote channel) — the rows the boundary picker switches between.
+   * The session `permissions` projection only carries the current selection,
+   * never the options. Resolved at call time like every optional service here,
+   * and every failure just means "no rows to offer", never a throw.
+   */
+  const permissionCatalogFor = async (): Promise<AcpPermissionCatalog | undefined> => {
+    type CatalogResult = { ok: boolean; value?: AcpPermissionCatalog }
+    type PresetsRemote = { catalog(): Promise<CatalogResult> }
+    try {
+      const direct = service<PresetsRemote>('remote.permissionPresets')
+      const viaNamespace = service<{ permissionPresets?: PresetsRemote }>('remote')?.permissionPresets
+      const result = await (direct ?? viaNamespace)?.catalog()
+      return result?.ok === true ? result.value : undefined
+    } catch {
+      return undefined
+    }
+  }
+
   /** The injected face every ACP conversation entry receives. */
   const chatFace = (sessionId: unknown): AcpChatInjected & { sessionId: string } => ({
     acp: store,
     sessionId: String(sessionId),
     directoryFor,
     faceFor,
+    permissionCatalogFor,
   })
 
   ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
@@ -262,19 +283,18 @@ export function apply(ctx: Context): void {
     if (seatBroken) return
     const list = sessionsList()
     const snapshot = list?.getSnapshot() as AcpSessionsSnapshot | undefined
-    const current = snapshot?.current
     // The gate prefers the runtime's own session row; on hosts whose rows
     // carry no `agentPreset` the row is silent and only our host-side report
     // can answer. Ask once per id, exactly while the row is silent AND no
     // verdict is held — the store subscriber below re-runs this gate when the
     // answer lands (`loadChatSessions` dedups racing asks in flight too).
-    if (list !== undefined && current !== undefined
-      && snapshot?.currentAddress === undefined
-      && snapshot?.byId?.[current]?.agentPreset === undefined
-      && acpModeVerdict(current) === undefined
-      && !acpModeAsked.has(current)) {
-      acpModeAsked.add(current)
-      void store.loadChatSessions(current)
+    const staged = stagedSessionOf(snapshot)
+    if (list !== undefined && staged !== undefined && !staged.subagent
+      && rowAgentPreset(staged.row) === undefined
+      && acpModeVerdict(staged.sessionId) === undefined
+      && !acpModeAsked.has(staged.sessionId)) {
+      acpModeAsked.add(staged.sessionId)
+      void store.loadChatSessions(staged.sessionId)
     }
     const want = list !== undefined
       && service<StructuralServices['modelDirectories']>('modelDirectories') !== undefined
@@ -283,7 +303,7 @@ export function apply(ctx: Context): void {
     // must be on an ACP route (see `ensureAcpRoute`). Runs even when the seat
     // itself could not be registered — the route is the conversation's, not the
     // seat's.
-    if (want && current !== undefined) ensureAcpRoute(current)
+    if (want && staged !== undefined) ensureAcpRoute(staged.sessionId)
     if (want === seatRegistered) return
     if (!want) {
       dropSeat()
@@ -416,7 +436,11 @@ export function apply(ctx: Context): void {
     // cluster would stay stood-down and the ACP controls would vanish with it.
     // Only a cell's WINNER renders, and while we hold rank -1 that is us, so an
     // abdication here is ours: hand both surfaces back and stop retrying.
-    const stopErrors = ctx.slots.onEntryError((key, _entry, _error, info) => {
+    const stopErrors = ctx.slots.onEntryError((key, _entry, error, info) => {
+      // An abdication is silent by construction — which is exactly how a dead
+      // picker once hid a crash for a whole session. One line on the console
+      // keeps that failure mode observable.
+      console.warn(`dsh-ntr: slot entry "${key}" failed${info?.abdicated === true ? ' (abdicated)' : ''}`, error)
       if (seatBroken || !seatRegistered || !info.abdicated || key !== 'conversation.input.model') return
       seatBroken = true
       dropSeat()
