@@ -9,10 +9,10 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { ConnectionRpcHandler, HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
 import { ACP_PRESET_ID, AcpLlmAdapter, BridgeManager } from './bridge.ts'
-import { EventHub, dispatchRpc, dshSessionPolicyOf, lastNativeRoute, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
+import { EventHub, dispatchRpc, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
 import type { AcpEvent } from './protocol.ts'
 import type { ApprovalOutcome } from './bridge.ts'
-import type { AccessModeSessionLike, ModelRouteSelection, RosterPresetRow, RouteBearingSessionLike } from './impl.ts'
+import type { RosterPresetRow, SessionLogLike } from './impl.ts'
 
 export const name = 'dsh-ntr'
 // `approval` / `agents` are deliberately NOT listed here: they are optional
@@ -37,7 +37,6 @@ interface AgentsServiceLike {
 interface SandboxPolicyLike {
   resolve(request: { session?: unknown }): { mode?: unknown; workspaceRoot?: unknown }
 }
-
 /**
  * The Connection service's private, owner-explicit channel registration. It is
  * not on the public `HostConnectionHandle` surface (only `rpc.handle` is), but
@@ -51,9 +50,7 @@ interface ChannelRegisteringConnection extends HostConnectionHandle {
 
 /** Structural view of the host session store (`@deepseek-ai/dsh-session`'s `ctx.sessions`). */
 interface SessionsLike {
-  get(sessionId: string): AccessModeSessionLike | undefined
-  /** Live sessions, for the default-model guard's fallback route (optional: an older store may lack it). */
-  list?(): readonly RouteBearingSessionLike[]
+  get(sessionId: string): SessionLogLike | undefined
 }
 
 /**
@@ -166,49 +163,43 @@ export function apply(ctx: Context, config?: unknown): void {
   }
 
   /**
-   * Access-mode routing: a chat-backed session's DSH access mode
-   * (`sandbox/mode` + `approval/policy` — the knobs the composer's Access mode
-   * control writes) governs its permission asks and its fs writes. It is
-   * enforced, never narrated into the prompt.
+   * Workspace routing: the sidebar's selected workspace IS the chat session's
+   * workspace, so the agent's session and its process both run there (see
+   * `chatWorkspaceRoot` and `getOrCreateDshSession`).
    *
-   * Why this exists: an ACP agent's tools run in its own process, where DSH's
-   * file sandbox has no reach, and the one knob that did reach the agent —
-   * `approval/policy` — reached it INVERTED (`never`, the "full access" preset,
-   * resolves every ask to `'rejected'` inside the approval service before any
-   * answerer runs, so full access denied every write). See
-   * docs/acp-permission-and-sandbox.md.
+   * This is the ONLY host state the turn path still needs. It used to also
+   * resolve the session's access mode so the host could arbitrate the agent's
+   * permission asks — that mapping is retired: an ACP agent is fully
+   * autonomous, its `session/request_permission` is mapped to the user
+   * unchanged, and DSH's sandbox has no reach into the agent's own process
+   * anyway. See docs/acp-convergence.md §2.3.
    */
-  const wireAccessMode = (): void => {
+  const wireWorkspace = (): void => {
     const sandboxPolicy = (typeof ctx.get === 'function' ? ctx.get('sandboxPolicy') : undefined) as SandboxPolicyLike | undefined
     const sessions = (typeof ctx.get === 'function' ? ctx.get('sessions') : undefined) as SessionsLike | undefined
-    const approval = (typeof ctx.get === 'function' ? ctx.get('approval') : undefined) as ApprovalServiceLike | undefined
-    if (sandboxPolicy === undefined || sessions === undefined || approval === undefined) return
-    manager.setSessionPolicyResolver(dshSessionId => {
+    if (sandboxPolicy === undefined || sessions === undefined) return
+    manager.setSessionWorkspaceResolver(dshSessionId => {
       try {
         const session = sessions.get(dshSessionId)
         if (session === undefined) return undefined
-        return dshSessionPolicyOf(sandboxPolicy.resolve({ session }), session, approval.config?.policy)
+        const root = sandboxPolicy.resolve({ session })?.workspaceRoot
+        return typeof root === 'string' && root !== '' ? { workspaceRoot: root } : undefined
       } catch {
-        // A lookup failure must never break a turn: no mode means the agent's
-        // own `permission` field governs this session, exactly as before.
+        // A lookup failure must never break a turn.
         return undefined
       }
     })
   }
 
   /**
-   * ACP-mode resolver wiring: a session running the ACP agent preset stops
-   * letting the access mode arbitrate its asks (the agent's own permission
-   * mode does, answered by the human in the conversation); the mode keeps
-   * narrating the boundary and the fs fence stays enforced, and the browser's
-   * model-seat gate reads the same verdict over `session/chat-list`. Read from
-   * the session log rather than from a marker we set ourselves, so it cannot
-   * drift from the roster.
+   * ACP-mode resolver wiring: whether a chat session runs the ACP agent preset.
+   * Read from the session log rather than from a marker we set ourselves, so it
+   * cannot drift from the roster.
    *
    * THREE fact sources, newest-wins: the live session store (`ctx.sessions`,
    * in-memory log, always fresh) — then the persistence store, because a
-   * session whose last turn predates this process is not live anywhere and
-   * the model-seat gate asks exactly such cold sessions — then nothing
+   * session whose last turn predates this process is not live anywhere and the
+   * browser's surfaces ask exactly such cold sessions — then nothing
    * (`undefined`, which every consumer reads as "not ACP", the allowed
    * failure mode).
    */
@@ -260,17 +251,16 @@ export function apply(ctx: Context, config?: unknown): void {
   }
 
   wireApproval()
-  wireAccessMode()
+  wireWorkspace()
   if (typeof ctx.inject === 'function') {
-    // Late arrival for the access-mode collaborators; kept separate from the
+    // Late arrival for the workspace collaborators; kept separate from the
     // approval probe so a deployment missing one service still wires the other.
     ctx.inject(['sandboxPolicy', 'sessions'], () => {
-      wireAccessMode()
+      wireWorkspace()
     })
   }
-  // The seat gate's verdict only needs the session store (live) and the
-  // persistence store (cold); the access-mode knobs are NOT its dependencies.
-  // A deployment without `approval` must still take the model seat over.
+  // The ACP-preset verdict only needs the session store (live) and the
+  // persistence store (cold); the sandbox knobs are NOT its dependencies.
   wireAcpMode()
   if (typeof ctx.inject === 'function') {
     ctx.inject(['sessions'], () => {
@@ -285,47 +275,6 @@ export function apply(ctx: Context, config?: unknown): void {
     })
   }
 
-  /**
-   * Deployment-default-model guard: DSH's `session.selectModel` records a
-   * selection as the session's own durable route AND as the deployment default
-   * (`agentDefaultModel.saveSelection`), and that second write is global to
-   * every mode. Picking an ACP agent in one conversation would therefore make
-   * every NEW session — in every other mode — start on the external agent.
-   * The guard puts the previous NATIVE default back; see `AcpDefaultModelGuard`
-   * for the candidate order (the config editor is never asked to guess).
-   *
-   * `fallback` is the only candidate a default that is *already* poisoned has:
-   * the freshest non-ACP route among live sessions, i.e. what this deployment
-   * was actually running. An install that predates the guard is repaired on the
-   * boot check below or on its next native turn/pick.
-   */
-  const wireDefaultModelGuard = (): void => {
-    const defaultModel = (typeof ctx.get === 'function' ? ctx.get('agentDefaultModel') : undefined) as {
-      currentSelection?(): ModelRouteSelection | undefined
-      saveSelection?(next: ModelRouteSelection): Promise<void>
-    } | undefined
-    if (defaultModel === undefined || typeof defaultModel.saveSelection !== 'function') return
-    const sessions = (typeof ctx.get === 'function' ? ctx.get('sessions') : undefined) as SessionsLike | undefined
-    manager.setDefaultModelGuard({
-      read: () => defaultModel.currentSelection?.(),
-      write: next => defaultModel.saveSelection?.(next) ?? Promise.resolve(),
-      ...(sessions === undefined
-        ? {}
-        : { fallback: () => lastNativeRoute(sessions.list?.() ?? []) }),
-    })
-    // A boot already carrying an ACP default is repaired here when any live
-    // session supplies a native route; otherwise the first native turn/pick is
-    // what heals it (every one of them re-runs this check).
-    void manager.reconcileDefaultModel().catch(() => { /* inert without a guard */ })
-  }
-
-  wireDefaultModelGuard()
-  if (typeof ctx.inject === 'function') {
-    // Late arrival for the guard's collaborators: both services may still be
-    // loading when this plugin applies (profile order is not ours to control).
-    ctx.inject(['sessions'], () => { wireDefaultModelGuard() })
-  }
-
   /** Registration handle: callable disposer, plus `replace` to re-announce routes. */
   interface LlmAdapterHandle {
     (): void
@@ -338,11 +287,12 @@ export function apply(ctx: Context, config?: unknown): void {
   const registerLlm = (llmHandle: LlmService): void => {
     ctx.effect(
       () => {
-        // The route is registered so sessions can select and stream
-        // `acp@<agentId>`; it deliberately advertises no models (see
-        // `AcpLlmAdapter.listModels`), so there is nothing for a browser-side
-        // model directory to refresh when the catalog changes — the ACP seats
-        // read `agent/catalog` themselves.
+        // The route exists so the host's driver can reach this adapter at all:
+        // `adapter.stream()` is the ONLY path by which anything lands in DSH's
+        // session log, and the log is what the native chat plane renders from
+        // (see docs/acp-convergence.md §1.2-1.3). It deliberately advertises no
+        // models — nothing here is selectable in DSH's model catalog, and no
+        // surface in this bundle writes a `model/selection` for it.
         const handle = llmHandle.registerAdapter(['acp'], adapter)
         return () => { handle() }
       },

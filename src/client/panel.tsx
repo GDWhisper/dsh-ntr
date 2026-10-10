@@ -14,7 +14,7 @@
  */
 
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
-import { isAbsolutePathLike } from './acp-ui.tsx'
+import { formatCommandLine, isAbsolutePathLike, splitCommandLine } from './acp-ui.tsx'
 import { DEFAULT_KNOWN_PRESETS } from './store.ts'
 import type { AcpStore } from './store.ts'
 import type { AcpAgentDef, AgentSavePayload, AgentView, DetectedAgentInfo, PermissionMode } from '../protocol.ts'
@@ -495,7 +495,7 @@ function AgentRow({
   const rootValues = form.roots.map(root => root.trim()).filter(root => root !== '')
   const rootsInvalid = form.rootsOpen && (rootValues.length === 0 || rootValues.some(root => !isAbsolutePathLike(root)))
   const idleInvalid = !idleValid(form.idleStr)
-  const formIncomplete = form.command.trim() === '' || !idValid || idTaken || cwdInvalid || rootsInvalid || idleInvalid
+  const formIncomplete = splitCommandLine(form.commandLine).command === '' || !idValid || idTaken || cwdInvalid || rootsInvalid || idleInvalid
 
   const payload = buildPayload(form, detected, newCustom)
   const current = persistedDef(detected, activeAgent)
@@ -503,7 +503,7 @@ function AgentRow({
   // A save stops the child and kills every live session (see BridgeManager.saveAgent).
   const showSaveWarning = dirty && activeAgent !== undefined && activeAgent.state !== 'stopped'
 
-  const handleUseDefault = (): void => patch({ command: detected.defaultCommand, argsStr: detected.defaultArgs.join(' ') })
+  const handleUseDefault = (): void => patch({ commandLine: formatCommandLine(detected.defaultCommand, detected.defaultArgs) })
 
   const handleSave = async (): Promise<void> => {
     setSaving(true)
@@ -653,8 +653,14 @@ function AgentRow({
 interface AgentForm {
   agentId: string
   title: string
-  command: string
-  argsStr: string
+  /**
+   * ONE command line — program first, arguments after, quoting to keep a path
+   * with spaces in one piece (`splitCommandLine`). The old split into
+   * `command` + `argsStr` invited the single most common misconfiguration
+   * there is: pasting `codebuddy --acp` into the program box, which the host
+   * then looked for as a file literally named `codebuddy --acp`.
+   */
+  commandLine: string
   npmPackage: string
   permission: PermissionMode
   cwd: string
@@ -681,8 +687,10 @@ function initialForm(detected: DetectedAgentInfo, activeAgent: AgentView | undef
   return {
     agentId: detected.id,
     title: activeAgent?.title ?? config?.title ?? detected.name,
-    command: activeAgent?.command ?? config?.command ?? detected.defaultCommand,
-    argsStr: (activeAgent?.args ?? config?.args ?? detected.defaultArgs).join(' '),
+    commandLine: formatCommandLine(
+      activeAgent?.command ?? config?.command ?? detected.defaultCommand,
+      activeAgent?.args ?? config?.args ?? detected.defaultArgs,
+    ),
     npmPackage: config?.npmPackage ?? '',
     permission: activeAgent?.permission ?? config?.permission ?? 'ask',
     cwd: activeAgent?.cwd ?? config?.cwd ?? '',
@@ -729,11 +737,14 @@ function buildPayload(form: AgentForm, detected: DetectedAgentInfo, newCustom: b
   }
   const cwd = form.cwd.trim()
   const idleRaw = form.idleStr.trim()
+  // The field is a command line; the host validates it the same way, so what
+  // the preview under the input shows is what will actually be spawned.
+  const parsed = splitCommandLine(form.commandLine)
   const payload: AgentSavePayload = {
     id: newCustom ? form.agentId.trim() : detected.id,
     ...(form.title.trim() === '' ? {} : { title: form.title.trim() }),
-    command: form.command.trim(),
-    args: form.argsStr.trim() === '' ? [] : form.argsStr.trim().split(/\s+/),
+    command: parsed.command,
+    args: parsed.args,
     ...(form.npmPackage.trim() === '' ? {} : { npmPackage: form.npmPackage.trim() }),
     permission: form.permission,
     env,
@@ -800,6 +811,14 @@ function AgentDetails({
 }) {
   const ui = useUi(acp)
   const [advancedOpen, setAdvancedOpen] = useState(false)
+  // The same parse the host will run (`validateAgentDef` → `splitCommandLine`).
+  // Showing it is what turns "the first box swallowed my arguments" into a
+  // visible, fixable state instead of a spawn error.
+  const parsedCommand = splitCommandLine(form.commandLine)
+  const commandPreview = parsedCommand.command === ''
+    ? acp.label('填整条命令，例如：codebuddy --acp', 'Type the whole command, e.g. codebuddy --acp')
+    : `${acp.label('程序', 'Program')}: ${parsedCommand.command}`
+      + (parsedCommand.args.length === 0 ? '' : `　${acp.label('参数', 'Arguments')}: ${parsedCommand.args.join(' ')}`)
   return (
     <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px dashed var(--dsw-alias-border-l2, #e5e7eb)' }}>
       {/* 基础参数: id / display name / command / args — the preset chip already
@@ -838,24 +857,30 @@ function AgentDetails({
         </div>
       </div>
 
+      {/* ONE field on purpose: the program and its arguments are one command
+          line, exactly as a user would type them. Splitting them into two boxes
+          made "paste the whole command into the first box" the default mistake
+          (the host then looked for a file named `codebuddy --acp`); here the
+          same paste is correct, and the parse preview below shows what will
+          actually run (same parser the host's `validateAgentDef` uses). */}
       <div className="dwa-form-row">
-        <div className="dwa-form-col" style={{ flex: 2 }}>
-          <label className="dwa-form-label">{acp.label('命令', 'Command')}</label>
+        <div className="dwa-form-col">
+          <label className="dwa-form-label">{acp.label('启动命令（程序 + 参数）', 'Launch Command (program + arguments)')}</label>
           <input
             className="dwa-input dwa-input-mono"
-            value={form.command}
-            onChange={e => patch({ command: e.target.value })}
-            placeholder="e.g. pi-acp"
+            value={form.commandLine}
+            onChange={e => patch({ commandLine: e.target.value })}
+            placeholder={detected.defaultCommand === ''
+              ? 'e.g. codebuddy --acp'
+              : formatCommandLine(detected.defaultCommand, detected.defaultArgs)}
           />
-        </div>
-        <div className="dwa-form-col" style={{ flex: 3 }}>
-          <label className="dwa-form-label">{acp.label('参数（空格分隔）', 'Arguments (space-separated)')}</label>
-          <input
-            className="dwa-input dwa-input-mono"
-            value={form.argsStr}
-            onChange={e => patch({ argsStr: e.target.value })}
-            placeholder="e.g. acp --thinking high"
-          />
+          <span className="dwa-hint">{commandPreview}</span>
+          <span className="dwa-hint">
+            {acp.label(
+              '参数直接跟在程序后面即可；路径里含空格时用引号包住整条路径，例如 "C:\\Program Files\\nodejs\\node.exe" --acp。',
+              'Arguments go right after the program; quote a whole path that contains spaces, e.g. "C:\\Program Files\\nodejs\\node.exe" --acp.',
+            )}
+          </span>
         </div>
       </div>
 
@@ -913,14 +938,15 @@ function AgentDetails({
         </div>
       </div>
 
-      {/* This is the *policy* (whether a human is asked at all), NOT the
-          approval channel. With `ask` the question surfaces in the chat
-          composer when the host approval chain exists (see `approvalRouted`),
-          otherwise at the top of this page. `allow`/`reject` never surface
-          anything — see `AgentBridge.handlePermissionRequest`. */}
+      {/* The agent's OWN permission field (see `AgentBridge.handlePermissionRequest`):
+          whether the agent asks a human at all. It is the only knob — the host
+          arbitrates nothing in front of the agent. With `ask` the question is
+          mapped through unchanged and surfaces in the chat composer when the
+          host approval chain exists (see `approvalRouted`), otherwise at the top
+          of this page. `allow`/`reject` never surface anything. */}
       <div className="dwa-form-row">
         <div className="dwa-form-col" style={{ flex: 2 }}>
-          <label className="dwa-form-label">{acp.label('权限策略（要不要问人）', 'Permission Policy (whether to ask)')}</label>
+          <label className="dwa-form-label">{acp.label('agent 自己的权限策略（要不要问人）', "The agent's own permission policy (whether to ask)")}</label>
           <select
             className="dwa-select"
             value={form.permission}
@@ -931,14 +957,9 @@ function AgentDetails({
             <option value="reject">{acp.label('自动拒绝，不询问 (reject)', 'Reject all, never ask (reject)')}</option>
           </select>
           <span className="dwa-hint">
-            {ui.accessModeRouted
-              ? acp.label(
-                '聊天会话由 DSH 的 Access mode 决定，本页策略只对非聊天会话生效；选「询问」时审批出现在对话里，不在本页。',
-                'Chat sessions follow the DSH access mode — this policy only covers non-chat sessions. With “ask”, approvals appear in the conversation, not here.',
-              )
-              : ui.approvalRouted
-                ? acp.label('选「询问」时审批出现在对话里（不在本页）。', 'With “ask”, approvals appear in the conversation (not here).')
-                : acp.label('选「询问」时审批出现在本页顶部。', 'With “ask”, approvals appear at the top of this page.')}
+            {ui.approvalRouted
+              ? acp.label('选「询问」时审批出现在对话里（不在本页）。', 'With “ask”, approvals appear in the conversation (not here).')
+              : acp.label('选「询问」时审批出现在本页顶部。', 'With “ask”, approvals appear at the top of this page.')}
           </span>
         </div>
       </div>

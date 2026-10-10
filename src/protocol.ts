@@ -243,14 +243,6 @@ export interface AgentsListResult {
    * absent on an older host) keeps the degraded ledger path visible.
    */
   approvalRouted?: boolean
-  /**
-   * True when a chat-backed session's *DSH access mode* (the composer's Access
-   * mode control) governs its permission asks and fs writes, so the agent-level
-   * `permission` field below only applies to sessions without a chat binding
-   * (`/acp` RPC). False (or absent on an older host) means the agent field
-   * governs everything, as it did before the mapping existed.
-   */
-  accessModeRouted?: boolean
 }
 export type SessionStartResult = { sessionId: string; session: SessionView }
 export type SessionPromptResult = { accepted: true; turnId: string }
@@ -260,8 +252,8 @@ export type SessionsListResult = { sessions: SessionView[] }
 /**
  * One ACP agent session currently backing a DSH chat session, looked up by the
  * chat session id the composer already knows. This is what lets the browser
- * expose an agent's OWN mode list in the conversation (the ACP-native control),
- * independently of the host's Access mode preset.
+ * expose an agent's OWN mode list, model and thought level in the conversation
+ * (the ACP-native controls), independently of DSH's model selection.
  */
 export interface ChatSessionView {
   agentId: string
@@ -270,6 +262,14 @@ export interface ChatSessionView {
   /** Host-minted session id (stable across an agent restart). */
   sessionId: string
   title?: string
+  /**
+   * The adapter model id this session was last aligned to
+   * (`agentId` / `agentId@choice`), as recorded by the host half. Absent until
+   * the first turn or an explicit switch.
+   */
+  modelId?: string
+  /** The reasoning effort in force, when the agent reports one. */
+  reasoningEffort?: string
   /** The agent's declared modes, when it has any (`session/new` / `session/load`). */
   modes?: SessionView['modes']
   /** The agent process died; the session awaits a `session/load` resume. */
@@ -280,9 +280,9 @@ export type ChatSessionsListResult = { sessions: ChatSessionView[] }
 /**
  * The `session/chat-list` answer: the backing ACP sessions, plus whether that
  * DSH chat session runs the ACP agent preset (host-read from the session log).
- * The composer's model-seat gate falls back to the latter when the client
- * runtime's session rows carry no `agentPreset` — on such hosts it is the only
- * fact source the seat takeover has.
+ * The composer surfaces fall back to the latter when the client runtime's
+ * session rows carry no `agentPreset` — on such hosts it is the only fact
+ * source they have.
  */
 export interface ChatSessionListResult extends ChatSessionsListResult {
   acpMode?: boolean
@@ -291,11 +291,12 @@ export interface ChatSessionListResult extends ChatSessionsListResult {
 /**
  * One ACP session's folded transcript, addressed by its DSH chat session.
  *
- * This is the data behind the conversation's ACP view tab: the native chat
- * plane can only ever show text/reasoning (that is the LLM adapter's whole
- * chunk vocabulary), so tool calls, plans and diffs have no home there — they
- * only exist in the ACP transcript, and this is how the browser reaches it
- * without knowing an ACP session id up front.
+ * This is the data behind the conversation's ACP view tab. The native chat
+ * plane renders what the LLM adapter emits, so the agent's prose and thinking
+ * ride there — but a fuller card (a tool call with its arguments, a plan, a
+ * unified diff) has no chunk vocabulary in the adapter's output, so it is
+ * rendered here instead. This is how the browser reaches it without knowing an
+ * ACP session id up front. See docs/acp-convergence.md §1.2.
  */
 export interface ChatTranscriptView {
   session: SessionView
@@ -320,34 +321,25 @@ export interface AgentIdPayload { agentId: string }
 export interface AgentPermissionSetPayload { agentId: string; permission: PermissionMode }
 /**
  * The plugin's OWN default ACP agent (the panel's ★ gesture): which agent an
- * ACP-mode conversation starts on. Host-side state, NOT the deployment default
- * model — that one is global to every mode, so an ACP route must never land in
- * it (`AcpDefaultModelGuard` repairs it when it does).
+ * ACP-mode conversation starts on. Plugin-private state — the host never sees a
+ * model route here, and nothing in this plugin writes DSH's model selection
+ * (see docs/acp-convergence.md §2.2).
  */
-export interface DefaultAgentSetPayload { agentId: string }
-/** `model/get-default`: `{provider: 'acp', model: agentId}`, or `{}` when unset. */
-export type DefaultAgentResult = { provider?: string; model?: string }
+export interface DefaultAgentSetPayload { agentId?: string }
+/** `default/agent`: the plugin's own default agent id, or `undefined` when unset. */
+export type DefaultAgentResult = { agentId?: string }
 
 /**
- * `model/reconcile-default`: DSH's `session.selectModel` saves every selection
- * as the deployment default as well, so an ACP pick made in one conversation
- * would otherwise become what every NEW session in EVERY mode starts on. The
- * browser calls this right after an ACP write, carrying the route the session
- * was on before it (`previous`, when that route was native) so the host can
- * put that value back.
+ * `session/chat-bind`: point one DSH chat conversation at an ACP agent. The
+ * plugin's own conversation↔agent mapping — deliberately NOT a DSH model
+ * selection, which is what polluting the deployment default and getting
+ * refused by the GUI's catalog gate both came from.
  */
-export interface ModelDefaultReconcilePayload {
-  previous?: { provider: string; model: string; reasoningEffort?: string }
-}
-
-export interface ModelDefaultReconcileResult {
-  /** The deployment default after the round trip; absent when it was unreadable. */
-  selection?: { provider: string; model: string; reasoningEffort?: string }
-  /** A native route replaced an ACP one. */
-  restored: boolean
-  /** The default is still an ACP route and the host held no native candidate. */
-  stranded: boolean
-}
+export interface ChatBindPayload { dshSessionId: string; agentId: string }
+/** `session/chat-model-set`: switch the bound agent's model (`agentId@choice`). */
+export interface ChatModelSetPayload { dshSessionId: string; modelId: string }
+/** `session/chat-effort-set`: switch (or clear, by omitting) the bound agent's effort. */
+export interface ChatEffortSetPayload { dshSessionId: string; effort?: string }
 
 /** Host-detected agent presence and tested defaults. */
 export interface DetectedAgentInfo {

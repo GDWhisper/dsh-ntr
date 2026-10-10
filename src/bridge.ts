@@ -27,30 +27,30 @@ import {
   type SessionUpdate,
 } from '@agentclientprotocol/sdk'
 import {
-  ACP_PROVIDER_ID,
-  AcpDefaultModelGuard,
   AcpError,
   EventHub,
   PermissionLedger,
   Transcript,
+  acpToolCallDelta,
+  acpToolCallFromUpdate,
   buildAdapterModelId,
-  canonicalizeFsPath,
   childEnv,
-  decidePermission,
   isUnderPath,
   parseCatalogOptions,
   permissionToolKind,
   permissionToolPaths,
+  quoteCommandToken,
   randomUUID,
   resolveFsPath,
   resolveSessionCwd,
-  sandboxDenialMarker,
   selectForwardPrompt,
   acpPresetStatusFromRoster,
   splitAdapterModelId,
   validateAgentDef,
 } from './impl.ts'
-import type { DefaultModelPorts, DefaultModelReconcileOutcome, DshSandboxMode, DshSessionPolicy, ModelRouteSelection, PermissionDecision, RosterPresetRow } from './impl.ts'
+import type {
+  AcpToolCallSnapshot, PermissionDecision, RosterPresetRow,
+} from './impl.ts'
 import type {
   AcpAgentCatalog, AcpAgentDef, AcpPresetStatus, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
   LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo, PermissionMode,
@@ -70,6 +70,17 @@ interface LiveSession {
   acpSessionId: string
   cwd: string
   title?: string
+  /**
+   * The adapter model id this session was last aligned to (`agentId` /
+   * `agentId@choice`). Recorded here so the browser can show "which model is
+   * this conversation on" from `session/chat-list` alone — the plugin's own
+   * binding, not a DSH model route.
+   */
+  modelId?: string
+  /** The model choice portion of {@link modelId}, when it carries one. */
+  choice?: string
+  /** The reasoning effort in force for this session, when one applies. */
+  reasoningEffort?: string
   modes?: SessionView['modes']
   configOptions?: unknown[]
   availableCommands?: SessionView['availableCommands']
@@ -87,18 +98,10 @@ interface LiveSession {
    */
   dshSessionId?: string
   /**
-   * The DSH access mode this chat session runs under, resolved at the start of
-   * the current turn (the host folds `sandbox/mode` + `approval/policy` for us).
-   * Re-resolved per turn so a mid-conversation switch lands on the next prompt;
-   * absent → the agent's own `permission` field governs.
-   */
-  dshPolicy?: DshSessionPolicy
-  /**
    * True when this chat session runs on the ACP-mode agent preset, re-resolved
-   * with the access mode every turn. It switches the mapping's stance from
-   * "the mode arbitrates" to "the mode stays out of it" (see
-   * `decidePermission`'s `narrateOnly`): the agent's own permission mode
-   * decides its approvals.
+   * every turn. It is a report for the browser surfaces (which conversation are
+   * we in), not a policy switch: an ACP agent decides its own permissions, so
+   * the host arbitrates nothing (see docs/acp-convergence.md §2.3).
    */
   acpMode?: boolean
   /**
@@ -162,12 +165,13 @@ export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unava
 export type ApprovalRequester = (request: ApprovalRequestContext) => Promise<ApprovalOutcome>
 
 /**
- * Resolves the DSH access mode of one chat session (`sessionId` = DSH session
- * id). Never throws; `undefined` means "no mode available" — the host has no
- * sandbox/approval services, or the session is unknown to it — and the agent's
- * own `permission` field stays in charge.
+ * Resolves the workspace root of one chat session (`dshSessionId` = DSH session
+ * id) — the sidebar's selected workspace, which the host's sandbox policy keeps
+ * for the session. Never throws; `undefined` means "no workspace available" (an
+ * `/acp`-RPC session, an unknown session, or a host without the service), and
+ * the caller falls back to the agent's configured cwd.
  */
-export type SessionPolicyResolver = (dshSessionId: string) => DshSessionPolicy | undefined
+export type SessionWorkspaceResolver = (dshSessionId: string) => { workspaceRoot?: string } | undefined
 
 /** Reports whether one DSH chat session runs the ACP-mode agent preset. */
 /**
@@ -255,7 +259,7 @@ export class AgentBridge {
      * Resolved per turn, like {@link approvalRequester}: the host entry may
      * wire the access-mode mapping after this bridge was built.
      */
-    private readonly sessionPolicy?: () => SessionPolicyResolver | undefined,
+    private readonly sessionWorkspace?: () => SessionWorkspaceResolver | undefined,
   ) {
     const merged = { ...DEFAULT_TUNING, ...tuning }
     this.startupTimeoutMs = merged.startupTimeoutMs
@@ -509,12 +513,17 @@ export class AgentBridge {
     const { command } = await ensureAgentExecutable(this.def, undefined, line => this.noteStderr(line))
     const cwd = safeSpawnCwd(this.def, this.wantedSpawnCwd)
     this.spawnCwd = cwd
-    const child = spawn(command, [...(this.def.args ?? [])], {
+    const launch = windowsShimLaunch(command, this.def.args ?? [])
+    const child = spawn(launch.command, launch.args, {
       cwd,
       env: childEnv(process.env, this.def.env ?? {}),
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: process.platform !== 'win32',
       shell: false,
+      // A console child of a GUI host (the desktop app) would otherwise pop a
+      // console window on every spawn.
+      windowsHide: true,
+      ...(launch.verbatim ? { windowsVerbatimArguments: true } : {}),
     })
     this.child = child
     child.on('error', (error) => {
@@ -761,7 +770,7 @@ export class AgentBridge {
       // the session in `released` forever with `cwd_denied`. The same workspace
       // is what the resumed process must RUN in, or an agent that reads its
       // workspace from its own cwd would come back in the plugin's sandbox.
-      const workspaceRoot = chatWorkspaceRoot(this.sessionPolicy?.(), session.dshSessionId)
+      const workspaceRoot = chatWorkspaceRoot(this.sessionWorkspace?.(), session.dshSessionId)
       await this.ensureReady(workspaceRoot)
       // The capability comes from the FRESH initialize: after a crash the
       // bridge restarts the process, so check the (new) initResult here.
@@ -946,22 +955,25 @@ export class AgentBridge {
     try {
       child.stdin?.end()
     } catch { /* already gone */ }
-    const victim = process.platform === 'win32' ? () => { child.kill('SIGTERM') } : () => {
-      const pid = child.pid
-      if (pid === undefined) return
-      try {
-        process.kill(-pid, 'SIGTERM')
-      } catch {
-        child.kill('SIGTERM')
-      }
+    const pid = child.pid
+    if (process.platform === 'win32') {
+      // Parity with the POSIX branch below, which kills the whole process
+      // GROUP: on Windows "the group" is the process tree, and it has to be
+      // killed while the tree is intact — killing the direct child first (a
+      // `cmd.exe` shim wrapper, see `windowsShimLaunch`) re-parents the agent
+      // out of `taskkill /T`'s reach. `stdin.end()` above is the graceful half.
+      killProcessTree(pid)
+      return
     }
-    victim()
+    try {
+      process.kill(-pid, 'SIGTERM')
+    } catch {
+      child.kill('SIGTERM')
+    }
     setTimeout(() => {
       if (child.exitCode !== null || child.signalCode !== null) return
-      const pid = child.pid
       try {
-        if (process.platform === 'win32') child.kill('SIGKILL')
-        else if (pid !== undefined) process.kill(-pid, 'SIGKILL')
+        process.kill(-pid, 'SIGKILL')
       } catch { /* already gone */ }
     }, 3000).unref()
   }
@@ -1079,18 +1091,16 @@ export class AgentBridge {
   }
 
   /**
-   * The effective decision for one ask. A resolved DSH access mode outranks the
-   * agent's own `permission` field on purpose: the mode is the user's live
-   * choice for this conversation, and `permission: 'allow'` + "full access"
-   * would otherwise mean two knobs disagreeing about whether to ask at all.
+   * The effective decision for one ask.
+   *
+   * The agent's own `permission` field is the only knob, because the host no
+   * longer sits in the middle: an ACP agent is fully autonomous, and what it
+   * asks is mapped to the user unchanged (`askNativeApproval`). The retired
+   * axis resolved a DSH access mode and pre-judged every ask with it — which
+   * both inverted `never` into "deny everything" and let `allow` skip the
+   * human entirely. See docs/acp-convergence.md §2.3.
    */
-  private permissionDecision(session: LiveSession | undefined, toolCall: unknown): PermissionDecision {
-    const policy = session?.dshPolicy
-    if (policy !== undefined) {
-      return decidePermission(policy, permissionToolKind(toolCall), permissionToolPaths(toolCall), {
-        ...session?.acpMode === true ? { narrateOnly: true } : {},
-      })
-    }
+  private permissionDecision(_session: LiveSession | undefined, _toolCall: unknown): PermissionDecision {
     switch (this.def.permission ?? 'ask') {
       case 'allow': return 'allow'
       case 'reject': return 'reject'
@@ -1128,9 +1138,14 @@ export class AgentBridge {
 
   /**
    * `fs/write_text_file`; parent directories are created inside the boundary.
-   * The write is authorized by {@link authorizeWrite} before anything touches
-   * the disk, so an agent that uses client fs is subject to the same access mode
-   * as its own tools.
+   *
+   * The workspace guard (`guardFsPath`) is the only fence, and it is the one
+   * that has always applied: a write outside the session's resolved roots is
+   * refused. There is deliberately NO extra access-mode layer — DSH's sandbox
+   * cannot reach into the agent's own process, so a second gate here would only
+   * be a fiction in front of a tool that can write without asking us at all.
+   * What the agent chooses to ask about goes to the human unchanged
+   * (`askNativeApproval`). See docs/acp-convergence.md §2.3.
    */
   private async handleFsWrite(params: { sessionId: string; path: string; content: string }): Promise<{ }> {
     const session = this.acpIndex.get(params.sessionId)
@@ -1140,50 +1155,14 @@ export class AgentBridge {
     if (params.content.length > FS_MAX_WRITE_BYTES) {
       throw fsRequestError(`acp: fs write refused: payload exceeds ${String(FS_MAX_WRITE_BYTES)} bytes`)
     }
-    const path = this.guardFsPath(session, params.path, session.dshPolicy?.mode === 'danger-full-access')
-    if (!(await this.authorizeWrite(session, path))) {
-      throw fsRequestError(sandboxWriteDenial(path, session.dshPolicy?.mode ?? 'read-only'))
-    }
+    const path = this.guardFsPath(session, params.path)
     mkdirSync(dirname(path), { recursive: true })
     writeFileSync(path, params.content, 'utf8')
     return { }
   }
 
-  /**
-   * Apply the session's access mode to an already-resolved write target.
-   * `workspace-write` permits the workspace root and the agent's own roots (that
-   * is what the mode promises); everything else is DSH's escalation case — with
-   * `approval: 'ask'` the human decides and a grant is one-off, and under
-   * `'never'` it is a plain denial. No mode available (non-chat session) keeps
-   * the historical behavior: the def's roots are the boundary and the guard has
-   * already enforced them.
-   */
-  private async authorizeWrite(session: LiveSession, path: string): Promise<boolean> {
-    const policy = session.dshPolicy
-    if (policy === undefined || policy.mode === 'danger-full-access') return true
-    if (policy.mode === 'workspace-write') {
-      const roots = [...(this.def.allowedCwdRoots ?? []), session.cwd, ...(policy.workspaceRoot === undefined ? [] : [policy.workspaceRoot])]
-      if (roots.some(root => isUnderPath(path, canonical(root)))) return true
-    }
-    if (policy.approval === 'never') return false
-    const requester = this.approvalRequester?.()
-    if (requester === undefined || session.dshSessionId === undefined) return false
+  private guardFsPath(session: LiveSession, requested: string): string {
     try {
-      const outcome = await requester({
-        dshSessionId: session.dshSessionId,
-        agentId: this.def.id,
-        toolName: `write ${path}`,
-      })
-      return outcome === 'allowed-once'
-    } catch {
-      // A failed ask must deny the write, never escape into the turn.
-      return false
-    }
-  }
-
-  private guardFsPath(session: LiveSession, requested: string, unrestricted = false): string {
-    try {
-      if (unrestricted) return canonicalizeFsPath(session.cwd, requested, p => realpathSync(p))
       return resolveFsPath(session.cwd, [...(this.def.allowedCwdRoots ?? []), session.cwd], requested, p => realpathSync(p))
     } catch (error) {
       throw fsRequestError(`acp: fs access denied: ${error instanceof Error ? error.message : String(error)}`)
@@ -1255,15 +1234,6 @@ function selectOption(options: PermissionOption[], direction: 'allow' | 'reject'
 }
 
 /**
- * Refusal text for a write the access mode blocked. It carries the host's own
- * denial marker vocabulary (`sandboxDenialMarker`) plus the actionable way out,
- * because this message is what the agent's model reads.
- */
-function sandboxWriteDenial(path: string, mode: DshSandboxMode): string {
-  return `acp: fs write refused: ${sandboxDenialMarker(mode)} ${path} is outside this session's writable boundary; widen the access mode or ask the user to approve the path`
-}
-
-/**
  * Translate a native approval outcome into the ACP option the agent must see.
  * `'allowed-once'` is the chain's only grant; a rejection prefers the once-variant.
  */
@@ -1306,11 +1276,11 @@ function snapshot(session: LiveSession): SessionView {
  * configured `cwd` — that field is the plugin's own sandbox directory, not the
  * place the conversation lives.
  *
- * Never throws: a broken/absent resolver, an unknown session (an `/acp`-RPC or
- * pre-policy- wiring session) or a host that reports no root all read as
- * `undefined`, and the caller falls back to the agent's configured cwd.
+ * Never throws: a broken/absent resolver, an unknown session (an `/acp`-RPC
+ * session) or a host that reports no root all read as `undefined`, and the
+ * caller falls back to the agent's configured cwd.
  */
-function chatWorkspaceRoot(resolver: SessionPolicyResolver | undefined, dshSessionId: string | undefined): string | undefined {
+function chatWorkspaceRoot(resolver: SessionWorkspaceResolver | undefined, dshSessionId: string | undefined): string | undefined {
   if (resolver === undefined || dshSessionId === undefined) return undefined
   try {
     const root = resolver(dshSessionId)?.workspaceRoot
@@ -1412,6 +1382,14 @@ export const AGENT_PRESETS: AgentPreset[] = [
     defaultCommand: 'omp',
     defaultArgs: ['acp'],
   },
+  {
+    id: 'codebuddy',
+    name: 'CodeBuddy Code',
+    description: 'Tencent CodeBuddy Code — run as `codebuddy --acp` over stdio',
+    executables: ['codebuddy', 'cbc'],
+    defaultCommand: 'codebuddy',
+    defaultArgs: ['--acp'],
+  },
 ]
 
 export function findExecutable(command: string): string | undefined {
@@ -1458,6 +1436,74 @@ export function findExecutable(command: string): string | undefined {
 
 /** Budget for one `npm install -g` triggered by `npmPackage` (cold installs are slow). */
 const NPM_INSTALL_TIMEOUT_MS = 180_000
+
+/** A generated Windows shim: what every npm-installed agent resolves to (`codebuddy.CMD`). */
+const WINDOWS_SHIM_PATTERN = /\.(?:cmd|bat)$/i
+
+/** cmd.exe metacharacters that force quoting; inside a quoted run they are literal. */
+const CMD_QUOTE_TRIGGER = /[\s"&|<>^()]/
+
+/** Quote one command-line token for `cmd.exe`. */
+function quoteForCmd(token: string): string {
+  if (token !== '' && !CMD_QUOTE_TRIGGER.test(token)) return token
+  return `"${token.replaceAll('"', '\\"')}"`
+}
+
+export interface ShimLaunch {
+  command: string
+  args: string[]
+  /** The caller must pass `windowsVerbatimArguments: true` (see below). */
+  verbatim: boolean
+}
+
+/**
+ * Turn a resolved executable + argv into a spawnable launch.
+ *
+ * WHY: on Windows every npm-installed ACP agent is a generated `.cmd` shim
+ * (`codebuddy`, `pi-acp`, `omp`, `npx` — `findExecutable` finds them through
+ * PATHEXT), and Node ≥ 20.12 refuses to spawn a `.cmd`/`.bat` with `shell:false`
+ * (the BatBadBut fix): it throws `EINVAL` before the process exists. The shim is
+ * therefore handed to `cmd.exe`, which is what CreateProcess used to do for us.
+ *
+ * The two non-obvious details, both measured on Windows:
+ *  - `windowsVerbatimArguments` — otherwise libuv re-quotes our argument with
+ *    MSVCRT rules, turning the embedded quotes into `\"`, which cmd.exe does not
+ *    treat as an escape; the whole line then fails as "not recognized".
+ *  - the outer quote pair — `/s` strips the first and last quote of the `/c`
+ *    string, so the line must be wrapped for the quoted program path to survive.
+ *
+ * `cmd` expands `%VAR%` even inside quotes; that is the one thing this cannot
+ * neutralize (a literal `%` in a shim path or argument is not a real case).
+ */
+export function windowsShimLaunch(
+  command: string,
+  args: readonly string[],
+  platform: NodeJS.Platform = process.platform,
+  comspec: string = process.env.ComSpec ?? process.env.COMSPEC ?? 'cmd.exe',
+): ShimLaunch {
+  if (platform !== 'win32' || !WINDOWS_SHIM_PATTERN.test(command)) {
+    return { command, args: [...args], verbatim: false }
+  }
+  const line = [command, ...args].map(quoteForCmd).join(' ')
+  return { command: comspec, args: ['/d', '/s', '/c', `"${line}"`], verbatim: true }
+}
+
+/**
+ * Kill a Windows process tree — the counterpart of the POSIX process-GROUP kill
+ * the bridge does elsewhere (see `AgentBridge.killChild`).
+ *
+ * It must run while the tree is intact: a `.cmd` shim is launched through
+ * `cmd.exe`, so killing the direct child first re-parents the agent and
+ * `taskkill /T` can no longer reach it (measured: the agent survived `stop()`).
+ * Best effort — `taskkill` is absent from no Windows this runs on, and a
+ * failure here only means the OS reclaims the process later.
+ */
+export function killProcessTree(pid: number): void {
+  try {
+    const killer = spawn('taskkill', ['/pid', String(pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true })
+    killer.on('error', () => { /* nothing else to try; the OS reaps it eventually */ })
+  } catch { /* spawn itself refused */ }
+}
 
 /**
  * Globally install an agent's npm package. The package name reaches the
@@ -1586,6 +1632,25 @@ export function detectHostAgents(configuredDefs: readonly AcpAgentDef[]): Detect
   return [...presetEntries, ...customEntries]
 }
 
+/**
+ * Rescue a def persisted before `command` became a command LINE (AGENTS.md
+ * constraint 26): `command` used to be the whole program string, and an
+ * absolute Windows path may legitimately contain spaces
+ * (`C:\Program Files\nodejs\node.exe`). Re-validating would now split that on
+ * the first space and silently point the agent at `C:\Program`, so the row is
+ * quoted first — but ONLY when the untouched string really is a file on disk,
+ * which is the one case where the split would be wrong.
+ */
+function quoteLegacyCommand(item: unknown): unknown {
+  if (typeof item !== 'object' || item === null) return item
+  const row = item as Record<string, unknown>
+  const command = row.command
+  if (typeof command !== 'string') return item
+  const trimmed = command.trim()
+  if (!/\s/.test(trimmed) || !existsSync(trimmed)) return item
+  return { ...row, command: quoteCommandToken(trimmed) }
+}
+
 /** Routes host session ids to their owning bridge. */
 export class BridgeManager {
   private readonly bridges = new Map<string, AgentBridge>()
@@ -1611,7 +1676,7 @@ export class BridgeManager {
   }
 
   private makeBridge(def: AcpAgentDef, onConnectionLost: (bridge: AgentBridge, reason: string) => void, onCatalog?: (agentId: string, configOptions: unknown) => void): AgentBridge {
-    return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, this.tuning, () => this.approvalRequester, () => this.sessionPolicyResolver)
+    return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, this.tuning, () => this.approvalRequester, () => this.sessionWorkspaceResolver)
   }
 
   /**
@@ -1630,41 +1695,37 @@ export class BridgeManager {
   }
 
   /**
-   * Let the host's DSH access mode govern permission asks (and fs writes) for
-   * chat-backed sessions instead of the agent's own `permission` field. Absent
-   * resolver → the pre-mapping behavior, which is what `/acp`-RPC sessions and
-   * headless deployments want anyway.
+   * Let the host resolve a chat session's workspace root — the sidebar's
+   * selected workspace, which the agent's session and its process both run in.
+   * Absent resolver → every chat session falls back to the agent's configured
+   * cwd (`~/.dsh/acp-workspaces`), which is the right answer for `/acp`-RPC
+   * sessions and headless deployments.
    */
-  setSessionPolicyResolver(resolver?: SessionPolicyResolver): void {
-    this.sessionPolicyResolver = resolver
+  setSessionWorkspaceResolver(resolver?: SessionWorkspaceResolver): void {
+    this.sessionWorkspaceResolver = resolver
   }
 
   /**
    * Wire the ACP-mode probe: given a DSH session id, report whether that
    * session runs the ACP agent preset. The host half reads it back from the
-   * session log (`sessionAgentPreset`); absent resolver (or an unknown session)
-   * leaves the access-mode mapping in charge, exactly as before.
+   * session log (`sessionAgentPreset`); an absent resolver means the browser
+   * falls back to its own session-list rows.
    */
   setAcpModeResolver(resolver?: AcpModeResolver): void {
     this.acpModeResolver = resolver
   }
 
-  /** True when a chat session's DSH access mode governs its asks (read-only capability report). */
-  accessModeRouting(): boolean {
-    return this.sessionPolicyResolver !== undefined
-  }
-
   /**
    * Whether ONE DSH chat session runs the ACP agent preset, asked by chat
-   * session id. The browser's model-seat gate consumes this: on hosts whose
-   * client runtime does not carry `agentPreset` on the session-list row (the
-   * gate's preferred fact source), this is the only way the seat takeover can
-   * happen at all — see `docs/acp-mode.md` on the shadowing gate.
+   * session id. The browser's composer surfaces consume this: on hosts whose
+   * client runtime does not carry `agentPreset` on the session-list row (their
+   * preferred fact source), this is the only way to know which conversation is
+   * an ACP one.
    *
    * The resolver may await a persistence read (a cold session has to be read
    * from disk), so answers are CACHED per session id and served synchronously:
-   * the first ask returns `false` while the read is in flight and the gate
-   * re-asks on the next store tick — a one-turn delay, never a wrong seat.
+   * the first ask returns `false` while the read is in flight and the caller
+   * re-asks on the next tick — a one-turn delay, never a wrong verdict.
    * A cached verdict is dropped when the session's log moves (preset switch,
    * new turn), so a stale answer cannot outlive the fact it was folded from.
    */
@@ -1753,11 +1814,72 @@ export class BridgeManager {
         ...(title === undefined ? {} : { agentTitle: title }),
         sessionId: session.sessionId,
         ...(session.title === undefined ? {} : { title: session.title }),
+        ...(session.modelId === undefined ? {} : { modelId: session.modelId }),
+        ...(session.reasoningEffort === undefined ? {} : { reasoningEffort: session.reasoningEffort }),
         ...(session.modes === undefined ? {} : { modes: session.modes }),
         ...(session.released ? { released: true } : {}),
       })
     }
     return out
+  }
+
+  /**
+   * Bind one DSH chat session to an ACP agent.
+   *
+   * This is the plugin's OWN conversation↔agent mapping. It deliberately does
+   * NOT write a DSH model selection: the retired "express the agent as a
+   * `provider: 'acp'` route" axis forced `session.selectModel`, which both
+   * polluted the deployment default model and got refused by the GUI's catalog
+   * gate (`session/model-unavailable`) — even though the prompt admission path
+   * never checked catalog membership in the first place. See
+   * docs/acp-convergence.md §1.1 and §2.2.
+   *
+   * The host half records the intent; the actual ACP session is created on the
+   * next turn (which is also what resumes a released one).
+   */
+  bindChatAgent(dshSessionId: string, agentId: string): void {
+    if (!this.defsMap.has(agentId)) {
+      throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
+    }
+    this.chatAgentIntent.set(dshSessionId, agentId)
+  }
+
+  /** The ACP agent a chat session was last pointed at, when one is known. */
+  chatAgentFor(dshSessionId: string): string | undefined {
+    const recorded = this.chatAgentIntent.get(dshSessionId)
+    if (recorded !== undefined && this.defsMap.has(recorded)) return recorded
+    // Fall back to the binding itself: a session that already ran an agent is
+    // pointed at that agent even if the intent map was never seeded.
+    for (const session of this.dshSessionMap.values()) {
+      if (session.dshSessionId === dshSessionId && !session.closed) return session.agentId
+    }
+    return undefined
+  }
+
+  /** Switch the bound agent's model for one chat session (`agentId@choice`). */
+  async setChatSessionModel(dshSessionId: string, modelId: string): Promise<void> {
+    const { agentId, choice } = splitAdapterModelId(modelId)
+    const def = this.defsMap.get(agentId)
+    if (def === undefined) {
+      throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
+    }
+    this.chatAgentIntent.set(dshSessionId, agentId)
+    for (const session of this.dshSessionMap.values()) {
+      if (session.dshSessionId !== dshSessionId || session.agentId !== agentId) continue
+      if (session.released) continue
+      session.choice = choice
+      await this.alignSessionConfig(session, choice, session.reasoningEffort)
+      session.modelId = modelId
+    }
+  }
+
+  /** Switch the bound agent's reasoning effort for one chat session. */
+  async setChatSessionEffort(dshSessionId: string, effort: string | undefined): Promise<void> {
+    for (const session of this.dshSessionMap.values()) {
+      if (session.dshSessionId !== dshSessionId || session.released) continue
+      session.reasoningEffort = effort
+      await this.alignSessionConfig(session, session.choice, effort)
+    }
   }
 
   /**
@@ -1870,7 +1992,7 @@ export class BridgeManager {
       if (Array.isArray(rows)) {
         for (const item of rows) {
           try {
-            const def = validateAgentDef(item)
+            const def = validateAgentDef(quoteLegacyCommand(item))
             this.defsMap.set(def.id, def)
           } catch {
             // Ignore invalid entry
@@ -2447,48 +2569,12 @@ export class BridgeManager {
 
   /** Host-side reader of the harness preset roster (`ctx.agentPresets`), for `presetStatus`. */
   private presetRosterReader?: () => Promise<readonly RosterPresetRow[] | undefined>
-  /** The guard that keeps the DEPLOYMENT default model off the ACP route (see `impl.ts`). */
-  private defaultModelGuard?: AcpDefaultModelGuard
-  /**
-   * One in-flight reconcile at a time: the browser fires it after every ACP
-   * pick and each turn starts with one, and all of them would do the same
-   * read/write round trip.
-   */
-  private pendingDefaultReconcile?: Promise<DefaultModelReconcileOutcome>
-
-  /**
-   * Wire the deployment-default-model guard (`ctx.agentDefaultModel` plus the
-   * live session store). Absent → the guard is inert, which is the whole
-   * behavior a deployment without that service can have anyway.
-   */
-  setDefaultModelGuard(ports?: DefaultModelPorts): void {
-    this.defaultModelGuard = ports === undefined ? undefined : new AcpDefaultModelGuard(ports)
-  }
-
-  /**
-   * Put the deployment default model back on a native route after an ACP pick,
-   * and learn from a native one. Called by the turn path (a cheap read) and by
-   * the browser right after it writes an ACP route (`previous` = the route the
-   * session was on before that write).
-   */
-  reconcileDefaultModel(previous?: ModelRouteSelection): Promise<DefaultModelReconcileOutcome> {
-    const guard = this.defaultModelGuard
-    if (guard === undefined) return Promise.resolve({ restored: false, stranded: false })
-    if (previous !== undefined) guard.noteNative(previous)
-    const inflight = this.pendingDefaultReconcile
-    if (inflight !== undefined) return inflight
-    const run = guard.reconcile(previous).finally(() => {
-      if (this.pendingDefaultReconcile === run) this.pendingDefaultReconcile = undefined
-    })
-    this.pendingDefaultReconcile = run
-    return run
-  }
 
   /**
    * The plugin's own default ACP agent (the panel's ★ gesture): which agent an
    * ACP-mode conversation starts on. Host-side state in the agent registry
-   * file — deliberately NOT the deployment default model, which is global to
-   * every mode and must stay native (`AcpDefaultModelGuard`).
+   * file — deliberately NOT a DSH model route: nothing here ever writes to the
+   * host's model selection (see docs/acp-convergence.md §2.2).
    */
   defaultAgent(): string | undefined {
     // A default pointing at a deleted agent answers as "none": the browser
@@ -2505,6 +2591,12 @@ export class BridgeManager {
   }
 
   private readonly dshSessionMap = new Map<string, LiveSession>()
+  /**
+   * Which ACP agent each DSH chat session is pointed at, as chosen in the
+   * conversation. Persisted with the agent registry; this is the plugin's own
+   * conversation↔agent mapping, never a DSH model route (see `bindChatAgent`).
+   */
+  private readonly chatAgentIntent = new Map<string, string>()
 
   /** Drop every chat-keyed record pointing at one host session (close/stop paths). */
   private forgetDshSession(sessionId: string): void {
@@ -2517,7 +2609,7 @@ export class BridgeManager {
    * each bridge) so a requester wired after bridges were built still applies.
    */
   private approvalRequester?: ApprovalRequester
-  private sessionPolicyResolver?: SessionPolicyResolver
+  private sessionWorkspaceResolver?: SessionWorkspaceResolver
   private acpModeResolver?: AcpModeResolver
   /** Cached `chatSessionAcpMode` answers, keyed by DSH chat session id. */
   private readonly acpModeCache = new Map<string, boolean>()
@@ -2546,7 +2638,7 @@ export class BridgeManager {
     // with that path while its Read/Glob/Bash cannot see the user's project.
     // That root is trusted on top of the agent's own roots for this session
     // only (see `chatWorkspaceRoot`); the fallback is the configured cwd.
-    const workspaceRoot = chatWorkspaceRoot(this.sessionPolicyResolver, dshSessionId)
+    const workspaceRoot = chatWorkspaceRoot(this.sessionWorkspaceResolver, dshSessionId)
     const session = await this.bridge(agentId).createSession(
       workspaceRoot ?? cwd,
       workspaceRoot === undefined ? [] : [workspaceRoot],
@@ -2613,13 +2705,6 @@ export class BridgeManager {
       return
     }
 
-    // Housekeeping before a real turn: the DEPLOYMENT default model must not
-    // stay on an ACP route (see `AcpDefaultModelGuard`), because a fresh session
-    // in any other mode would then start on this agent. Never awaited: an
-    // unwritable config (a pinned profile) must not delay the turn, and once
-    // the default is native this is a single in-memory read.
-    void this.reconcileDefaultModel().catch(() => { /* best effort, see the guard */ })
-
     let session: LiveSession
     try {
       session = await this.getOrCreateDshSession(options.sessionId, agentId)
@@ -2656,25 +2741,24 @@ export class BridgeManager {
     // stays continuous); switching to another agent lands in a separate one
     // via the `${dshSessionId}:${agentId}` key in getOrCreateDshSession.
     await this.alignSessionConfig(session, choice, options.reasoningEffort)
+    // Record what this conversation is now on, so `session/chat-list` can show
+    // it without the browser having to derive it from anything else.
+    session.modelId = options.model
+    session.choice = choice
+    session.reasoningEffort = options.reasoningEffort
 
     const promptText = selection.text
 
-    // The session's access mode is the single source of truth for this turn:
-    // re-resolve it every prompt (a control flipped mid-conversation lands on
-    // the next turn). It arbitrates the permission answers and the fs write
-    // fence below, and it is deliberately NOT narrated into the prompt: what the
-    // agent receives is the user's own words and nothing else, so it learns a
-    // boundary only where it actually hits one (a refusal or an approval ask).
-    session.dshPolicy = session.dshSessionId === undefined ? undefined : this.sessionPolicyResolver?.(session.dshSessionId)
-    // The resolver may await a persistence read (a cold session); the turn
-    // needs a synchronous verdict, so resolve the promise when there is one.
-    // A live session answers synchronously and this is a no-op await.
+    // Re-resolve the ACP-preset verdict every turn (a switch made mid-
+    // conversation must land on the next prompt). It is a report for the browser
+    // surfaces, not a policy switch: the host arbitrates nothing about the
+    // agent's own permissions (see docs/acp-convergence.md §2.3).
     if (session.dshSessionId !== undefined) {
       const resolved = await this.acpModeResolver?.(session.dshSessionId)
       session.acpMode = resolved === true
       // This turn may log an `agent-preset/selected` (a blank-session
       // recompose) and any persistence read observed the log BEFORE it: drop
-      // the cached verdict so the gate re-asks against the moved log.
+      // the cached verdict so a later ask re-reads against the moved log.
       this.invalidateAcpMode(session.dshSessionId)
     } else {
       session.acpMode = false
@@ -2686,22 +2770,33 @@ export class BridgeManager {
     this.hub.broadcast({ type: 'turn/start', sessionId: session.sessionId, turnId, text: promptText })
 
     let currentBlockIndex = -1
-    let activeBlockType: 'reasoning' | 'text' | null = null
+    let activeBlockType: 'reasoning' | 'text' | 'tool-call' | null = null
     let activeBlockText = ''
+    /**
+     * The open tool-call block's accumulated snapshot, or `undefined` while the
+     * active block is prose. ACP has no fixed shape for tool-call content, so
+     * this is where `callId` / `name` / `argsRaw` live until the block closes —
+     * `block-end` carries a COMPLETE snapshot because the host's accumulator
+     * replaces the block on `block-end` rather than merging into it.
+     */
+    let activeToolCall: AcpToolCallSnapshot | undefined
     let latestUsage: { inputTokens: number; outputTokens: number } | null = null
 
-    const switchToBlock = (targetType: 'reasoning' | 'text') => {
+    const switchToBlock = (targetType: 'reasoning' | 'text' | 'tool-call') => {
       if (activeBlockType === targetType) return
       if (activeBlockType !== null) {
         queue.push({
           type: 'block-end',
           index: currentBlockIndex,
-          block: { type: activeBlockType, text: activeBlockText },
+          block: activeBlockType === 'tool-call' && activeToolCall !== undefined
+            ? { type: 'tool-call', id: activeToolCall.callId, name: activeToolCall.name, arguments: activeToolCall.argsRaw }
+            : { type: activeBlockType, text: activeBlockText },
         })
       }
       currentBlockIndex++
       activeBlockType = targetType
       activeBlockText = ''
+      activeToolCall = undefined
       queue.push({
         type: 'block-start',
         index: currentBlockIndex,
@@ -2722,18 +2817,46 @@ export class BridgeManager {
             queue.push({ type: 'reasoning-delta', index: currentBlockIndex, text: content.text })
           }
         } else if (kind === 'tool_call') {
-          switchToBlock('reasoning')
-          const title = String(update.title ?? update.toolCallId ?? 'tool')
-          const line = `\n> 🛠️ [Tool: ${title}]\n`
-          activeBlockText += line
-          queue.push({ type: 'reasoning-delta', index: currentBlockIndex, text: line })
+          // A real tool call, not prose: the host's accumulator turns these
+          // deltas into `{ kind: 'tool-call', callId, name, argsRaw }` and the
+          // Chat plane renders the card the ACP view used to own. A call whose
+          // the same callId as the open block is an update-in-place, not a new
+          // card — agents announce a call once and then update it.
+          const snapshot = acpToolCallFromUpdate(update)
+          if (snapshot !== undefined) {
+            if (activeBlockType !== 'tool-call' || activeToolCall?.callId !== snapshot.callId) {
+              switchToBlock('tool-call')
+              activeToolCall = snapshot
+              queue.push({
+                type: 'tool-call-delta',
+                index: currentBlockIndex,
+                id: snapshot.callId,
+                name: snapshot.name,
+                argumentsDelta: snapshot.argsRaw,
+              })
+            }
+          }
         } else if (kind === 'tool_call_update') {
-          const lines = updateContentToLines(update.content)
-          if (lines.length > 0) {
-            switchToBlock('reasoning')
-            const text = lines.map(l => `> ${l}`).join('\n') + '\n'
-            activeBlockText += text
-            queue.push({ type: 'reasoning-delta', index: currentBlockIndex, text })
+          // Fold the update into the open card. An update for a call that is not
+          // open (the agent skipped its `tool_call` announcement) opens one:
+          // dropping it would lose the result entirely.
+          const callId = typeof update.toolCallId === 'string' ? update.toolCallId.trim() : ''
+          if (callId !== '') {
+            if (activeBlockType !== 'tool-call' || activeToolCall?.callId !== callId) {
+              const reopened = acpToolCallFromUpdate({ ...update, toolCallId: callId })
+              switchToBlock('tool-call')
+              activeToolCall = reopened
+              queue.push({ type: 'tool-call-delta', index: currentBlockIndex, id: callId, argumentsDelta: '' })
+            }
+            if (activeToolCall !== undefined) {
+              for (const delta of acpToolCallDelta(activeToolCall, update)) {
+                if (delta.kind === 'name') {
+                  queue.push({ type: 'tool-call-delta', index: currentBlockIndex, id: activeToolCall.callId, name: delta.name, argumentsDelta: '' })
+                } else {
+                  queue.push({ type: 'tool-call-delta', index: currentBlockIndex, id: activeToolCall.callId, argumentsDelta: delta.text })
+                }
+              }
+            }
           }
         } else if (kind === 'agent_message_chunk') {
           const content = update.content as Record<string, unknown> | undefined
@@ -2774,9 +2897,12 @@ export class BridgeManager {
         queue.push({
           type: 'block-end',
           index: currentBlockIndex,
-          block: { type: activeBlockType, text: activeBlockText },
+          block: activeBlockType === 'tool-call' && activeToolCall !== undefined
+            ? { type: 'tool-call', id: activeToolCall.callId, name: activeToolCall.name, arguments: activeToolCall.argsRaw }
+            : { type: activeBlockType, text: activeBlockText },
         })
         activeBlockType = null
+        activeToolCall = undefined
       }
       if (latestUsage !== null) {
         queue.push({ type: 'usage', usage: latestUsage })
@@ -2911,27 +3037,8 @@ function fsRequestError(message: string): RequestError {
   return new RequestError(-32603, message, { message })
 }
 
-function updateContentToLines(content: unknown): string[] {
-  if (!Array.isArray(content)) return []
-  const out: string[] = []
-  for (const item of content) {
-    if (typeof item !== 'object' || item === null) continue
-    const row = item as Record<string, unknown>
-    if (row.type === 'content') {
-      const inner = row.content as Record<string, unknown> | undefined
-      if (inner?.type === 'text' && typeof inner.text === 'string') out.push(inner.text)
-      else if (inner?.type === 'diff') out.push(`diff ${String(inner.path ?? '')}`)
-      else out.push(`[${String(inner?.type ?? 'content')}]`)
-    } else if (row.type === 'terminal') {
-      out.push(`[terminal ${String(row.terminalId ?? '')}]`)
-    }
-  }
-  return out
-}
-
 /**
- * JSON-RPC errors often carry the actionable detail in `data` (e.g. pi-acp
- * reports { errorKind: 'billing_error', message: '…' } while `message` is the
+ * JSON-RPC errors often carry the actionable detail in `data` (e.g. pi-acp * reports { errorKind: 'billing_error', message: '…' } while `message` is the
  * generic "Internal error"). Surface both.
  */
 function describeError(error: unknown): string {

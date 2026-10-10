@@ -2,27 +2,21 @@
  * The conversation's ACP view tab: the agent's REAL stream, as the agent
  * produced it.
  *
- * WHY A TAB AND NOT THE CHAT ITSELF: the native chat plane renders what the LLM
- * adapter emits, and that vocabulary is text + reasoning only — an ACP tool
- * call reaching the chat can be nothing but a `> 🛠️ [Tool: …]` line of prose,
- * and a diff nothing but its filename. The transcript this view reads is the
- * same durable buffer the RPC/SSE surfaces serve, so here calls, plans and
- * diffs are rendered as themselves: a tool card per call, a checklist per plan,
- * a unified diff per edit.
+ * WHY A TAB AS WELL AS THE CHAT: the native chat plane renders what the LLM
+ * adapter emits, and the adapter's chunk vocabulary is text + reasoning — so
+ * the agent's prose and thinking ride the native plane, while a fuller card (a
+ * tool call with its arguments, a plan, a unified diff) has no chunk to ride
+ * there. This view renders those as themselves.
  *
  * It is a VIEW, not a second client: it never prompts, never cancels, never
- * spawns. Everything it shows is host state, and the only verb it offers is
- * "let an ACP agent take over this conversation" — the same model-directory
- * write the composer cluster performs.
+ * spawns. Everything it shows is host state.
  */
 
 import type { ReactNode } from 'react'
 import { useEffect, useRef, useState } from 'react'
 // Type-only: pulls the ui-conversation SlotMap merge into this program.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
-import {
-  ACP_PROVIDER, ensureAcpStyle, selectAcpRoute, useDirectory, useUi,
-} from './acp-ui.tsx'
+import { ensureAcpStyle, useUi } from './acp-ui.tsx'
 import type { AcpChatInjected } from './acp-ui.tsx'
 import type { Block, ChatTranscript } from './store.ts'
 import type { ChatSessionView } from '../protocol.ts'
@@ -285,7 +279,6 @@ export function AcpConversationView(props: AcpViewProps) {
   const { acp, sessionId } = props
   const t: Translate = (zh, en) => acp.label(zh, en)
   const ui = useUi(acp)
-  const { directory, state } = useDirectory(props.directoryFor, sessionId)
   const bound = ui.chatSessionsFor === sessionId ? boundSession(ui.chatSessions) : undefined
   const transcript: ChatTranscript | undefined = acp.chatTranscriptOf(sessionId)
   const streamRef = useRef<HTMLDivElement>(null)
@@ -306,15 +299,6 @@ export function AcpConversationView(props: AcpViewProps) {
     node.scrollTop = node.scrollHeight
   }, [blockCount, tail])
 
-  const agents = ui.agents
-  const routeToAcp = (agentId: string): void => {
-    if (directory === undefined) return
-    // `selectAcpRoute`, not a bare `select`: the write also keeps the deployment
-    // default model off the ACP route (see its doc comment).
-    void selectAcpRoute(acp, directory, { provider: ACP_PROVIDER, model: agentId })
-      .catch(() => { /* the cluster's picker owns the failure surface */ })
-  }
-
   if (transcript === undefined) {
     return (
       <div className="ntr-acp-view">
@@ -322,27 +306,28 @@ export function AcpConversationView(props: AcpViewProps) {
           <div className="ntr-acp-empty-title">{t('这个会话还没有 ACP agent 参与', 'No ACP agent has run in this conversation yet')}</div>
           <p className="ntr-acp-empty-body">
             {t(
-              '选中一个 ACP agent 后，本会话的对话就由它服务：原生聊天里只会出现它的文字回复，而它的工具调用、计划和 diff 会完整地出现在这个视图里。',
-              "Pick an ACP agent and it serves this conversation: the native chat shows its prose, while its tool calls, plans and diffs appear here in full.",
+              '选中一个 ACP agent 后，本会话的对话就由它服务：原生聊天里会出现它的文字回复与思考过程，而它的工具调用、计划和 diff 会完整地出现在这个视图里。',
+              "Pick an ACP agent and it serves this conversation: the native chat shows its prose and reasoning, while its tool calls, plans and diffs appear here in full.",
             )}
           </p>
-          {agents.length === 0
-            ? <div className="ntr-acp-empty-hint">{t('还没有配置 agent', 'No agent configured')} · {t('设置 → ACP 代理', 'Settings → ACP Agents')}</div>
-            : (
-              <div className="ntr-acp-empty-actions">
-                {agents.map(agent => (
-                  <button
-                    key={agent.id}
-                    type="button"
-                    className="ntr-acp-more is-primary"
-                    disabled={directory === undefined || state?.status === 'selecting'}
-                    onClick={() => { routeToAcp(agent.id) }}
-                  >
-                    {t(`由 ${agent.title ?? agent.id} 接管`, `Let ${agent.title ?? agent.id} take over`)}
-                  </button>
-                ))}
-              </div>
-            )}
+          {bound !== undefined
+            ? <div className="ntr-acp-empty-hint">{t('绑定的是', 'bound to')} · {bound.agentTitle ?? bound.agentId}</div>
+            : ui.agents.length === 0
+              ? <div className="ntr-acp-empty-hint">{t('还没有配置 agent', 'No agent configured')} · {t('设置 → ACP 代理', 'Settings → ACP Agents')}</div>
+              : <div className="ntr-acp-empty-hint">{t('用输入框右侧的 ACP 底座选择一个 agent', 'pick one from the ACP base in the composer')}</div>}
+          {/*
+            The model-seat gate's last verdict. When the ACP base does not take
+            over the composer's model seat — the native model selector is still
+            sitting there — the four possible reasons are otherwise
+            indistinguishable, because they all end with the same visible state.
+            Publishing the reason here turns "the base still is not replaced"
+            into something readable.
+          */}
+          {ui.seatDiag !== 'idle' && ui.seatDiag !== 'gate disposed' && (
+            <div className="ntr-acp-empty-hint ntr-acp-seat-diag">
+              {t('模型座位', 'model seat')} · {ui.seatDiag}
+            </div>
+          )}
         </div>
       </div>
     )

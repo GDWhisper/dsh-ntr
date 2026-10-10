@@ -1,48 +1,47 @@
 /**
- * The ACP cluster in the conversation composer (`conversation.input.left`) and
- * its picker (`conversation.input.overlay`).
+ * The ACP base in the conversation composer's model seat
+ * (`conversation.input.model`) and its picker (`conversation.input.overlay`).
  *
- * WHAT IT IS NOT: a second model selector. The composer already HAS one, and
- * its seat is single-occupancy — this cluster reads and writes the *same*
- * per-session model directory (`ctx.modelDirectories`) the native seat uses, so
- * a switch made in either surface is what the other shows next. That is also
- * what makes it the honest place to pick an ACP agent: an ACP agent IS a route
- * (`acp@<agentId>`), and the host is the single fact source for it.
+ * WHAT IT IS: the base of an ACP conversation. The first level is WHICH agent
+ * serves it; hanging off that are the three things the agent itself owns —
+ * its own permission preset, its own model, its own thought level. All three
+ * come from the agent (`agent/catalog`, the agent's own mode list), never from
+ * DSH's model catalog: an ACP agent is not a DSH provider, and DSH's catalog
+ * has no per-session seam to filter it with anyway. See
+ * docs/acp-convergence.md §2.1.
  *
- * WHAT IT ADDS over the native seat: the ACP side's own vocabulary. The native
- * selector flattens the ACP catalog into rows like "Pi · GLM-5.3", so the three
- * things a person actually thinks in — which agent, which of ITS models, how
- * hard it should think — arrive scrambled into one list. Here they are three
- * chips with the agent as the axis, plus the one setting the ACP side has no
- * other home for: the conversation's DSH Access mode, shown inside the ACP chip
- * as the boundary that actually binds this session's agent (see
- * docs/acp-permission-and-sandbox.md).
+ * WHERE IT SITS: the composer's model seat — the trailing group of the bar,
+ * immediately before the submit button. That is where the host's own base
+ * (the model selector) sits, and it is the cell an ACP conversation must not
+ * leave to that selector: it lists DSH's providers, none of which this
+ * conversation can use, and clicking one writes the process-wide default
+ * model. One cell, one occupant. The base is installed there by the ACP-mode
+ * gate in `index.tsx` (see `createModelSeatClaim`), which holds it only while
+ * the staged conversation runs the ACP preset — so an ordinary chat gets the
+ * native selector back and sees no ACP chrome at all.
  *
- * It is deliberately quiet: the cluster renders NOTHING for a conversation that
- * has never been routed to an ACP agent, so an ordinary chat's tool row is
- * untouched. The ACP view tab is the entry point for those (and for re-entry
+ * WHAT IT ADDS over a bare model selector: the three axes are separate. A
+ * native selector would flatten them into one list of "Agent · Model" rows;
+ * here "which agent", "which of ITS models" and "how hard it thinks" are three
+ * chips, because those are the three things a person actually thinks in.
+ *
+ * It is deliberately quiet: the base renders NOTHING for a conversation no ACP
+ * agent has served, so an ordinary chat is untouched even before the gate
+ * stands down. The ACP view tab is the entry point for those (and for re-entry
  * after a detour through another provider).
- *
- * IN ACP MODE IT STANDS DOWN. The native model seat is taken over by
- * {@link AcpModelSeat} there (`index.tsx`'s seat gate), and that seat owns the
- * same three axes plus the boundary section — leaving the chips up would put two
- * copies of one control in one tool row, which is what this file exists to
- * avoid. Ordinary conversations keep the chips (they are how a session gets
- * ROUTED to an ACP agent in the first place).
  */
 
 import { useEffect, useState } from 'react'
 // Type-only: pulls the ui-conversation SlotMap merge into this program.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import {
-  ACP_PROVIDER, AcpChip, AcpMenu, closeAcpMenu, ensureAcpStyle, openAcpMenu, selectAcpRoute,
-  setAcpMenuError, splitAcpModelId, useAcpMenu, useAcpSeatActive, useDirectory, usePermissionSelect, useUi,
+  AcpChip, AcpMenu, closeAcpMenu, ensureAcpStyle, openAcpMenu,
+  setAcpMenuError, splitAcpModelId, useAcpMenu, useUi,
 } from './acp-ui.tsx'
 import type {
-  AcpChatInjected, AcpDirectoryState, AcpMenuKind, AcpMenuItem, AcpMenuSection, AcpSessionFace,
-  AcpSessionHook,
+  AcpChatInjected, AcpMenuKind, AcpMenuItem, AcpMenuSection, AcpSessionHook,
 } from './acp-ui.tsx'
-import type { AgentCatalogResult, AgentView, ChatSessionView } from '../protocol.ts'
+import type { AgentCatalogResult, AgentView, ChatSessionView, SessionView } from '../protocol.ts'
 
 /**
  * Props every entry in this file receives: the injected face (built in
@@ -76,10 +75,9 @@ function agentStateText(acp: AcpChatInjected['acp'], state: AgentView['state']):
   }
 }
 
-/** Everything the chips need to describe the current route, computed once. */
+/** Everything the chips need to describe the current agent binding. */
 interface RouteInfo {
-  /** The session is routed to the ACP provider right now. */
-  routed: boolean
+  /** The agent serving this conversation. */
   agentId?: string
   agentTitle?: string
   modelId?: string
@@ -97,52 +95,55 @@ function boundSession(ui: { chatSessions: ChatSessionView[]; chatSessionsFor?: s
 }
 
 /**
- * The agent serving this conversation: the route's own agent when it is on
- * `acp`, else the last agent that ran here (`bound`), which is what lets a chip
- * offer "back to ACP: <agent>" instead of going blank the moment the user tries
- * another provider.
+ * The agent serving this conversation: the bound one when an ACP agent has run
+ * here, else the plugin's own default — which is what lets a chip offer
+ * "use ACP: <agent>" for a conversation that has never been routed, instead of
+ * going blank.
  */
-function routeAgentId(state: AcpDirectoryState | undefined, bound: ChatSessionView | undefined): string | undefined {
-  const current = state?.current ?? null
-  const routed = current !== null && current.provider === ACP_PROVIDER
-  return (routed && current !== null ? splitAcpModelId(current.model).agentId : undefined) ?? bound?.agentId
+function routeAgentId(
+  bound: ChatSessionView | undefined,
+  agents: readonly AgentView[],
+  defaultAgent: string | undefined,
+): string | undefined {
+  if (bound?.agentId !== undefined) return bound.agentId
+  if (defaultAgent !== undefined && agents.some(agent => agent.id === defaultAgent)) return defaultAgent
+  return agents[0]?.id
 }
 
 /**
- * Describe this session's ACP route from the host's directory + the agent
- * roster + the agent's own model surface (`agent/catalog`).
+ * Describe this conversation's ACP agent from the binding (the host's record of
+ * which agent actually serves it) + the agent roster + the agent's own model
+ * surface (`agent/catalog`).
  *
- * The model axis reads the ACP catalog, NOT the session's model directory: the
- * directory is DSH's global provider catalog, and the `acp` route advertises
- * nothing there, so an ACP agent's models never appear in a non-ACP
- * conversation (see `AgentCatalogResult`). The directory still owns `current` —
- * it is the single fact source for which route this session is on.
+ * The model axis reads the ACP catalog, NOT any DSH model directory: an ACP
+ * agent's models are the agent's own (see the module header), so there is
+ * nothing to look up in DSH's catalog — and reading `current` off a directory
+ * was the retired route axis.
  */
 export function describeRoute(
-  state: AcpDirectoryState | undefined,
   agents: readonly AgentView[],
   bound: ChatSessionView | undefined,
+  defaultAgent: string | undefined,
   catalog?: AgentCatalogResult,
 ): RouteInfo {
-  const current = state?.current ?? null
-  const agentId = routeAgentId(state, bound)
-  if (agentId === undefined) return { routed: false, efforts: [] }
-  const routed = current !== null && current.provider === ACP_PROVIDER
+  const agentId = routeAgentId(bound, agents, defaultAgent)
+  if (agentId === undefined) return { efforts: [] }
   const def = agents.find(agent => agent.id === agentId)
   const agentTitle = def?.title ?? bound?.agentTitle ?? catalog?.title ?? agentId
-  if (!routed || current === null) return { routed: false, agentId, agentTitle, efforts: [] }
-  const parsed = splitAcpModelId(current.model)
-  const variant = catalog?.variants.find(entry => entry.id === current.model)
+  if (bound === undefined) return { agentId, agentTitle, efforts: [] }
+  const parsed = splitAcpModelId(bound.modelId ?? '')
+  const variant = catalog?.variants.find(entry => entry.id === bound.modelId)
   const reasoning = catalog?.reasoning
-  const effectiveEffort = current.reasoningEffort ?? reasoning?.defaultEffort
+  const effectiveEffort = bound.reasoningEffort ?? reasoning?.defaultEffort
   return {
-    routed: true,
     agentId,
     agentTitle,
-    modelId: current.model,
-    modelLabel: parsed.choice === undefined
-      ? catalog?.base.name ?? agentTitle
-      : variant?.name ?? parsed.choice,
+    modelId: bound.modelId,
+    modelLabel: bound.modelId === undefined
+      ? undefined
+      : parsed.choice === undefined
+        ? catalog?.base.name ?? agentTitle
+        : variant?.name ?? parsed.choice,
     efforts: reasoning?.efforts ?? [],
     ...effectiveEffort === undefined ? {} : { effectiveEffort },
     ...effectiveEffort === undefined
@@ -154,42 +155,40 @@ export function describeRoute(
 /** The composer cluster: agent, model and thought level — or nothing at all. */
 export function AcpSessionControls(props: AcpClusterProps) {
   ensureAcpStyle()
-  const { acp, sessionId, directoryFor, useSession } = props
+  const { acp, sessionId, useSession } = props
   const ui = useUi(acp)
-  const { state } = useDirectory(directoryFor, sessionId)
-  const menu = useAcpMenu()
   const running = useSession(snapshot => snapshot.running)
+  const menu = useAcpMenu()
   useEffect(() => {
     void acp.loadChatSessions(sessionId)
   }, [acp, sessionId, running])
   const bound = boundSession(ui, sessionId)
-  const agentId = routeAgentId(state, bound)
+  const agents = ui.agents
+  const agentId = routeAgentId(bound, agents, ui.defaultAgent)
   const catalog = agentId === undefined ? undefined : ui.seatCatalogs[agentId]
   useEffect(() => {
     if (agentId !== undefined) void acp.loadAgentCatalog(agentId)
   }, [acp, agentId])
-  const route = describeRoute(state, ui.agents, bound, catalog)
-  // The seat owns the ACP controls in ACP mode (see the module header).
-  const seatOwns = useAcpSeatActive()
-  // No ACP route and no ACP history: this conversation has no ACP story to
-  // tell, and chrome for it would be noise. The ACP view tab owns that entry.
-  if (seatOwns || state === undefined || (!route.routed && bound === undefined)) return null
+  const route = describeRoute(agents, bound, ui.defaultAgent, catalog)
+  // A conversation with no ACP story to tell gets no chrome: the ACP view tab
+  // owns the entry point for starting one.
+  if (bound === undefined && agents.length === 0) return null
   const open = (kind: AcpMenuKind, trigger: HTMLElement): void => { openAcpMenu(sessionId, kind, trigger) }
 
   return (
     <span className="ntr-acp-cluster">
       <AcpChip
         label={route.agentTitle === undefined
-          ? (route.routed ? 'ACP' : acp.label('接入 ACP', 'Use ACP'))
+          ? (bound === undefined ? acp.label('接入 ACP', 'Use ACP') : 'ACP')
           : `ACP · ${route.agentTitle}`}
         title={acp.label(
-          '这个会话由外接 ACP agent 服务；点开可切换 agent 与会话边界',
-          'This conversation is served by an external ACP agent — open to switch the agent and the boundary',
+          '这个会话由外接 ACP agent 服务；点开可切换 agent、它的模型与思考等级',
+          'This conversation is served by an external ACP agent — open to switch the agent, its model and the thought level',
         )}
-        active={route.routed}
+        active={bound !== undefined}
         onClick={(trigger) => { open('agent', trigger) }}
       />
-      {route.routed && route.modelLabel !== undefined && (
+      {bound !== undefined && route.modelLabel !== undefined && (
         <AcpChip
           label={route.modelLabel}
           title={acp.label('agent 自己的模型目录', "the agent's own model directory")}
@@ -197,7 +196,7 @@ export function AcpSessionControls(props: AcpClusterProps) {
           onClick={(trigger) => { open('model', trigger) }}
         />
       )}
-      {route.routed && route.efforts.length > 0 && (
+      {bound !== undefined && route.efforts.length > 0 && (
         <AcpChip
           label={`${acp.label('思考', 'think')} · ${route.effortLabel ?? acp.label('默认', 'default')}`}
           title={acp.label('思考等级（agent 的 thought_level）', "Thought level (the agent's thought_level)")}
@@ -214,10 +213,10 @@ export interface MenuContext {
   acp: AcpChatInjected['acp']
   agents: readonly AgentView[]
   route: RouteInfo
-  /** The routed agent's own model surface (`agent/catalog`), if it has loaded. */
+  /** The bound agent's own model surface (`agent/catalog`), if it has loaded. */
   catalog?: AgentCatalogResult
-  state?: AcpDirectoryState
-  permissions?: { options: readonly { value: string; name: string; description?: string }[]; currentValue: string }
+  /** The agent's own mode list (`session/set_mode`), if it has loaded. */
+  agentModes?: SessionView['modes']
   error?: string
 }
 
@@ -229,7 +228,7 @@ function agentSection(context: MenuContext): AcpMenuSection {
     label: agent.title ?? agent.id,
     detail: agentStateText(acp, agent.state),
     dot: STATE_COLORS[agent.state],
-    active: route.routed && route.agentId === agent.id,
+    active: route.agentId === agent.id,
   }))
   if (items.length === 0) {
     items.push({
@@ -253,25 +252,24 @@ function agentSection(context: MenuContext): AcpMenuSection {
 /**
  * The selected agent's OWN models — `undefined` when no agent is known yet.
  *
- * The rows come from `agent/catalog`, not from the session's model directory:
- * ACP models are not advertised in DSH's catalog at all, and the exposure
- * filter (`exposedModels`) is applied host-side, so what arrives here is
- * exactly what this agent offers in this conversation. `catalog.base` is the
- * agent's default model (the bare `agentId` route) and is always offered.
+ * The rows come from `agent/catalog`, not from any DSH model directory: ACP
+ * models are not advertised in DSH's catalog at all, and the exposure filter
+ * (`exposedModels`) is applied host-side, so what arrives here is exactly what
+ * this agent offers in this conversation. `catalog.base` is the agent's default
+ * model and is always offered.
  */
 function modelSection(context: MenuContext): AcpMenuSection | undefined {
   const { acp, route, catalog } = context
   if (route.agentId === undefined) return undefined
   const items: AcpMenuItem[] = catalog === undefined
     // No catalog yet (a fresh conversation, or a host still probing): the
-    // current route is the only row we can honestly show.
+    // current model is the only row we can honestly show.
     ? (route.modelId === undefined ? [] : [{ id: route.modelId, label: route.modelLabel ?? route.modelId, active: true }])
     : [
-      // The session can sit on a model the list no longer offers: `exposedModels`
-      // is a filter over what is OFFERED, not over what works (an unexposed
-      // variant still resolves — see `resolveAdapterModel`), and an agent may
-      // simply have dropped a choice. Marking where we are keeps the picker from
-      // implying the session runs the default.
+      // The conversation can sit on a model the list no longer offers:
+      // `exposedModels` is a filter over what is OFFERED, not over what works,
+      // and an agent may simply have dropped a choice. Marking where we are
+      // keeps the picker from implying the conversation runs the default.
       ...(route.modelId === undefined
         || route.modelId === catalog.base.id
         || catalog.variants.some(variant => variant.id === route.modelId)
@@ -329,8 +327,7 @@ function thoughtSection(context: MenuContext): AcpMenuSection {
       ...level.description === undefined ? {} : { detail: level.description },
       active: level.id === route.effectiveEffort,
     })
-  }
-  return {
+  }  return {
     id: 'thought',
     title: acp.label('思考等级', 'Thought level'),
     note: acp.label(
@@ -341,31 +338,27 @@ function thoughtSection(context: MenuContext): AcpMenuSection {
   }
 }
 
-/** The session's DSH Access mode, when the host projects one for it. */
-function boundarySection(context: MenuContext): AcpMenuSection | undefined {
-  const { acp } = context
-  const permissions = context.permissions
-  // Both fields are runtime values from a projection + a remote catalog, not
-  // types: never trust either shape (a `.length` off an absent `options` used
-  // to throw here, and a throw inside a slot entry retires the whole picker).
-  if (permissions === undefined
-    || !Array.isArray(permissions.options)
-    || permissions.options.length === 0) return undefined
+/**
+ * The agent's OWN mode list (`session/set_mode`) — the agent's vocabulary for
+ * HOW it works (plan / acceptEdits / …), untouched by DSH. Absent for an agent
+ * that declares no modes, and absent before one has run here.
+ */
+function agentModeSection(context: MenuContext): AcpMenuSection | undefined {
+  const { acp, agentModes } = context
+  const modes = agentModes?.availableModes ?? []
+  if (modes.length === 0) return undefined
   return {
-    id: 'boundary',
-    title: acp.label('会话边界（DSH Access mode）', 'Conversation boundary (DSH access mode)'),
+    id: 'agent-mode',
+    title: acp.label('agent 自己的工作模式', "The agent's own mode"),
     note: acp.label(
-      'agent 的工具跑在它自己的进程里，DSH 的沙箱管不到它；这一档规定的是宿主给我们这道闸门的边界（写盘与询问）。',
-      "The agent's tools run in its own process, beyond the DSH sandbox; this preset is what binds our gate — its writes and its asks.",
+      '由 agent 自己定义，与 DSH 的 Access mode 互补。',
+      "Defined by the agent itself; complementary to DSH's access mode.",
     ),
-    items: permissions.options
-      .filter(option => typeof option?.value === 'string' && option.value !== 'custom')
-      .map(option => ({
-        id: option.value,
-        label: option.name,
-        ...option.description === undefined ? {} : { detail: option.description },
-        active: option.value === permissions.currentValue,
-      })),
+    items: modes.map(mode => ({
+      id: mode.id,
+      label: mode.name ?? mode.id,
+      active: mode.id === (agentModes?.currentModeId ?? modes[0]?.id),
+    })),
   }
 }
 
@@ -377,22 +370,16 @@ export function menuFor(kind: AcpMenuKind, context: MenuContext): {
   error?: string
   loading?: boolean
 } {
-  const { acp, route, state } = context
-  const loading = state?.status === 'loading' || state?.status === 'selecting'
-  const error = context.error ?? state?.error ?? undefined
-  const common = { ...loading ? { loading: true } : {}, ...error === null || error === undefined ? {} : { error } }
+  const { acp, route } = context
 
-  if (kind === 'seat') {
-    // The ACP-mode seat's own screen: all three axes in one list, because in ACP
-    // mode there is no other surface left to pick a model in.
+  if (kind === 'agent') {
     const sections: AcpMenuSection[] = [agentSection(context)]
     const model = modelSection(context)
     if (model !== undefined) sections.push(model)
     if (route.efforts.length > 0) sections.push(thoughtSection(context))
-    const boundary = boundarySection(context)
-    if (boundary !== undefined) sections.push(boundary)
+    const mode = agentModeSection(context)
+    if (mode !== undefined) sections.push(mode)
     return {
-      ...common,
       title: acp.label('ACP 模式', 'ACP mode'),
       note: acp.label(
         '这条会话跑的是 ACP 预设：模型只能是对端 agent。别的模型在这条会话里没有工具、也不是它在说话。',
@@ -402,27 +389,20 @@ export function menuFor(kind: AcpMenuKind, context: MenuContext): {
     }
   }
 
-  if (kind === 'agent') {
-    const sections: AcpMenuSection[] = [agentSection(context)]
-    const boundary = boundarySection(context)
-    if (boundary !== undefined) sections.push(boundary)
-    return { ...common, title: acp.label('ACP 模式', 'ACP mode'), sections }
-  }
-
   if (kind === 'model') {
     const section = modelSection(context)
-    if (section === undefined) return { ...common, title: acp.label('模型', 'Models'), sections: [] }
-    // The single-axis pickers keep the shape they had before the seat existed:
-    // one title + note on the menu header, rows under a header-less section.
-    return { ...common, title: section.title ?? acp.label('模型', 'Models'), note: section.note, sections: [{ ...section, title: undefined, note: undefined }] }
+    if (section === undefined) return { title: acp.label('模型', 'Models'), sections: [] }
+    // The single-axis picker keeps the shape it had before: one title + note on
+    // the menu header, rows under a header-less section.
+    return { title: section.title ?? acp.label('模型', 'Models'), note: section.note, sections: [{ ...section, title: undefined, note: undefined }] }
   }
 
   if (kind === 'thought') {
     const section = thoughtSection(context)
-    return { ...common, title: section.title ?? acp.label('思考等级', 'Thought level'), note: section.note, sections: [{ ...section, title: undefined, note: undefined }] }
+    return { title: section.title ?? acp.label('思考等级', 'Thought level'), note: section.note, sections: [{ ...section, title: undefined, note: undefined }] }
   }
 
-  return { ...common, title: acp.label('ACP', 'ACP'), sections: [] }
+  return { title: acp.label('ACP', 'ACP'), sections: [] }
 }
 
 /**
@@ -432,36 +412,32 @@ export function menuFor(kind: AcpMenuKind, context: MenuContext): {
  */
 export function AcpSessionMenu(props: AcpClusterProps) {
   ensureAcpStyle()
-  const { acp, sessionId, directoryFor, faceFor, permissionCatalogFor } = props
+  const { acp, sessionId } = props
   const ui = useUi(acp)
-  const { directory, state } = useDirectory(directoryFor, sessionId)
-  const permissions = usePermissionSelect(faceFor, sessionId, permissionCatalogFor)
   const menu = useAcpMenu()
   const [busy, setBusy] = useState(false)
   const bound = boundSession(ui, sessionId)
-  const agentId = routeAgentId(state, bound)
+  const agents = ui.agents
+  const agentId = routeAgentId(bound, agents, ui.defaultAgent)
   const catalog = agentId === undefined ? undefined : ui.seatCatalogs[agentId]
   useEffect(() => {
     if (agentId !== undefined) void acp.loadAgentCatalog(agentId)
   }, [acp, agentId])
 
   if (menu === null || menu.sessionId !== sessionId) return null
-  const route = describeRoute(state, ui.agents, bound, catalog)
+  const route = describeRoute(agents, bound, ui.defaultAgent, catalog)
   // A menu-model bug must never retire the whole picker: a render throw inside
-  // this slot entry makes the error boundary ABIDATE it for the rest of the
-  // session (every later click silently opens nothing — that was the reported
-  // "ACP seat clicks do nothing" bug, caused by `boundarySection` reading
-  // `options.length` off the projection, which has no `options`). Show the
-  // failure inside the menu instead of dying.
+  // this slot entry makes the error boundary ABDICATE it for the rest of the
+  // session (every later click silently opens nothing). Show the failure inside
+  // the menu instead of dying.
   let model: ReturnType<typeof menuFor>
   try {
     model = menuFor(menu.kind, {
       acp,
-      agents: ui.agents,
+      agents,
       route,
       ...catalog === undefined ? {} : { catalog },
-      ...state === undefined ? {} : { state },
-      ...permissions === undefined ? {} : { permissions },
+      ...bound?.modes === undefined ? {} : { agentModes: bound.modes },
       ...menu.error === undefined ? {} : { error: menu.error },
     })
   } catch (error) {
@@ -473,63 +449,24 @@ export function AcpSessionMenu(props: AcpClusterProps) {
   }
 
   const pick = async (sectionId: string, itemId: string): Promise<void> => {
-    if (sectionId === 'boundary') {
-      const face = safeFace(faceFor, sessionId)
-      if (face === undefined) {
-        setAcpMenuError(acp.label('这个会话还不能执行命令', 'this session cannot run commands yet'))
-        return
-      }
-      try {
-        const result = await face.command(`/permission ${itemId}`)
-        if (!result.ok) {
-          setAcpMenuError(`${result.error.code}: ${result.error.message}`)
-          return
-        }
-        if (!result.value.matched) {
-          setAcpMenuError(acp.label('这台宿主没有注册 /permission 命令', 'this host registers no /permission command'))
-          return
-        }
-      } catch (error) {
-        setAcpMenuError(text(error))
-        return
-      }
-      closeAcpMenu()
-      return
-    }
-    if (directory === undefined) {
-      setAcpMenuError(acp.label('这台宿主没有模型目录服务', 'this host exposes no model directory service'))
-      return
-    }
-    // The native seat's rule, mirrored: picking a model adopts that route's own
-    // default effort (composing a stale effort onto a fresh model is how a
-    // selector starts lying about what will actually run).
-    const selection = sectionId === 'agent'
-      ? { provider: ACP_PROVIDER, model: itemId }
-      : sectionId === 'model'
-        ? {
-          provider: ACP_PROVIDER,
-          model: itemId,
-          // The agent's own default effort for whatever model it is on now:
-          // composing a stale effort onto a fresh model is how a selector
-          // starts lying about what will actually run.
-          ...catalog?.reasoning?.defaultEffort === undefined ? {} : { reasoningEffort: catalog.reasoning.defaultEffort },
-        }
-        : {
-          provider: ACP_PROVIDER,
-          model: route.modelId ?? '',
-          ...itemId === 'provider-default' ? {} : { reasoningEffort: itemId },
-        }
-    if (selection.model === '') {
-      setAcpMenuError(acp.label('当前没有可切换的模型', 'there is no model to switch to right now'))
-      return
-    }
+    // Everything here writes into the PLUGIN's own binding for this chat
+    // session — never a DSH model route (see the module header).
     try {
-      // Never `directory.select` directly: an ACP pick must not become the
-      // deployment default model (see `selectAcpRoute`).
-      await selectAcpRoute(acp, directory, selection)
+      if (sectionId === 'agent') {
+        await acp.bindChatAgent(sessionId, itemId)
+      } else if (sectionId === 'model') {
+        await acp.setChatSessionModel(sessionId, itemId)
+      } else if (sectionId === 'thought') {
+        await acp.setChatSessionEffort(sessionId, itemId === 'provider-default' ? undefined : itemId)
+      } else if (sectionId === 'agent-mode') {
+        await acp.setChatSessionMode(sessionId, itemId, agentId)
+      } else {
+        return
+      }
+      await acp.loadChatSessions(sessionId)
       closeAcpMenu()
     } catch (error) {
-      setAcpMenuError(text(error))
+      setAcpMenuError(error instanceof Error ? error.message : String(error))
     }
   }
 
@@ -546,95 +483,4 @@ export function AcpSessionMenu(props: AcpClusterProps) {
       onClose={() => { closeAcpMenu() }}
     />
   )
-}
-
-/**
- * The ACP-mode model seat: what occupies the composer's `conversation.input.model`
- * seat while this session runs the ACP agent preset.
- *
- * WHY IT EXISTS: the native seat's catalog is built host-wide from every
- * registered provider — there is no per-session seam on the host side — so in an
- * ACP session it offers models that cannot work there at all: the ACP preset
- * strips the host's tools, and the session is the external agent's turn anyway.
- * The seat is registered at a lower shadowing rank by the gate in `index.tsx`,
- * and only ever while an ACP-mode session is current; every other session keeps
- * the untouched native seat. It reads and writes the SAME per-session model
- * directory (`ctx.modelDirectories`) as everything else here.
- *
- * The `/model` command popup is NOT ours to hide (a command contribution, not a
- * slot), so the seat also reports the case it cannot prevent: a route pointed
- * at another provider shows up as a warning-colored seat whose menu switches
- * back to an agent.
- */
-export interface AcpSeatProps extends AcpChatInjected {
-  sessionId: string
-  /** The seat's owner share (`InputControlOwnerProps`): the bar's chrome lock. */
-  locked?: boolean
-}
-
-/** The composer's model seat while the session runs the ACP preset. */
-export function AcpModelSeat(props: AcpSeatProps) {
-  ensureAcpStyle()
-  const { acp, sessionId, directoryFor } = props
-  const ui = useUi(acp)
-  const { state } = useDirectory(directoryFor, sessionId)
-  const menu = useAcpMenu()
-  useEffect(() => {
-    void acp.loadChatSessions(sessionId)
-  }, [acp, sessionId])
-  const bound = boundSession(ui, sessionId)
-  const agentId = routeAgentId(state, bound)
-  const catalog = agentId === undefined ? undefined : ui.seatCatalogs[agentId]
-  useEffect(() => {
-    if (agentId !== undefined) void acp.loadAgentCatalog(agentId)
-  }, [acp, agentId])
-  const route = describeRoute(state, ui.agents, bound, catalog)
-  const open = menu?.sessionId === sessionId && menu.kind === 'seat'
-  // A directory that has not answered yet is NOT a route that left ACP: only a
-  // loaded catalog may say the current model belongs to somebody else, or the
-  // warning would flash on every mount.
-  const pendingRoute = state === undefined || (state.current === null && (state.status === 'idle' || state.status === 'loading'))
-  // Not routed = the session's model was pointed elsewhere (the `/model` popup
-  // can still do that); the menu's agent section is the way back.
-  const detached = !route.routed && !pendingRoute
-  const sub = [route.modelLabel, route.effortLabel]
-    .filter((part): part is string => part !== undefined && part !== '')
-    .join(' · ')
-  return (
-    <button
-      type="button"
-      className={`ntr-acp-seat${open ? ' is-open' : ''}${detached ? ' is-detached' : ''}`}
-      aria-haspopup="menu"
-      disabled={props.locked === true}
-      title={detached
-        ? acp.label(
-          '这条会话跑的是 ACP 预设，但当前模型不是 ACP agent（那个模型在这里没有工具）——点开切回',
-          'This session runs the ACP preset, but its model is not an ACP agent (that model has no tools here) — open to switch back',
-        )
-        : acp.label(
-          'ACP 模式：模型只能是对端 agent。点开可切换 agent、它的模型与思考等级',
-          'ACP mode: the model can only be the external agent. Open to switch the agent, its model and the thought level',
-        )}
-      onClick={(event) => {
-        openAcpMenu(sessionId, 'seat', event.currentTarget)
-      }}
-    >
-      <span className="ntr-acp-seat-main">{route.agentTitle === undefined ? 'ACP' : `ACP · ${route.agentTitle}`}</span>
-      {sub !== '' && <span className="ntr-acp-seat-sub">{sub}</span>}
-      <span className="ntr-acp-caret" aria-hidden>▾</span>
-    </button>
-  )
-}
-
-/** Resolve the session face without letting a missing session throw through render. */
-function safeFace(faceFor: AcpChatInjected['faceFor'], sessionId: string): AcpSessionFace | undefined {
-  try {
-    return faceFor(sessionId)
-  } catch {
-    return undefined
-  }
-}
-
-function text(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
 }

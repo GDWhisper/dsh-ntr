@@ -1,16 +1,24 @@
 /**
  * Shared browser-side kit for the ACP *conversation* surfaces: the composer
- * cluster (agent / model / thought level) and the ACP view tab.
+ * base (agent / model / thought level), its picker and the ACP view tab.
  *
  * Everything here is deliberately structural. The ACP plugin's client half may
  * not import the host runtime or any client package at runtime — the seats it
- * takes (`conversation.input.left`, `conversation.input.overlay`,
+ * takes (`conversation.input.model`, `conversation.input.overlay`,
  * `conversation.view`) are declared by `dsh-client-ui-conversation`, and the
- * services it reads (`modelDirectories`, `sessions`) are resolved by the entry
- * in `index.tsx` and handed over as plain functions. That is what keeps this
- * bundle loadable in a deployment that composes only a subset of the official
- * client modules: an absent service yields `undefined` and the surface hides
- * itself instead of breaking the plugin.
+ * services it reads (`sessions`) are resolved by the entry in `index.tsx` and
+ * handed over as plain functions. That is what keeps this bundle loadable in a
+ * deployment that composes only a subset of the official client modules: an
+ * absent service yields `undefined` and the surface hides itself instead of
+ * breaking the plugin.
+ *
+ * NO MODEL DIRECTORY. This bundle used to read and write the host's per-session
+ * model directory (`ctx.modelDirectories`) so an ACP agent could be expressed as
+ * a route. That axis is retired: ACP is not a DSH provider, the route write
+ * polluted the deployment default, and the GUI's catalog gate then refused the
+ * plugin's own route with `session/model-unavailable`. The agent identity now
+ * lives in this plugin's own state (`session/chat-list`), reached by its own
+ * RPC — see docs/acp-convergence.md §2.2.
  *
  * THE ONE DUPLICATED CODEC: `splitAcpModelId` mirrors the host's
  * `splitAdapterModelId` (src/impl.ts). It cannot be imported from there — the
@@ -33,13 +41,10 @@ export interface AcpReasoningEffort {
 }
 
 /**
- * One model inside a provider group (the subset of DSH's `ModelCatalogModel`).
- *
- * The ACP surfaces no longer READ these: the directory is DSH's global provider
- * catalog, and the `acp` route advertises no models there, so an ACP agent's
- * models come from `agent/catalog` instead (see `AgentCatalogResult`). The
- * shape stays because the directory still carries `groups` and the shared
- * `AcpDirectoryState` has to describe it.
+ * One model inside a provider group of the agent's OWN catalog (from
+ * `agent/catalog`). Deliberately NOT DSH's model catalog: an ACP agent's models
+ * are the agent's business, and DSH's directory has no per-session seam to
+ * filter them with anyway (see the module header).
  */
 export interface AcpModelEntry {
   id: string
@@ -48,73 +53,14 @@ export interface AcpModelEntry {
   reasoning?: { efforts: readonly AcpReasoningEffort[]; defaultEffort?: string }
 }
 
-/** One provider group of the session's advisory model directory. */
+/** One provider group inside an agent's own model catalog. */
 export interface AcpModelGroup {
   id: string
   name: string
   models: readonly AcpModelEntry[]
 }
 
-/** The per-session model directory snapshot (`ModelDirectoryState`, narrowed). */
-export interface AcpDirectoryState {
-  current: { provider: string; model: string; reasoningEffort?: string } | null
-  routable: boolean | null
-  groups: readonly AcpModelGroup[]
-  status: string
-  error: string | null
-}
-
-/** The shared per-session model directory (`ctx.modelDirectories.directoryFor`). */
-export interface AcpDirectory {
-  store: {
-    getSnapshot(): AcpDirectoryState
-    subscribe(listener: () => void): () => void
-  }
-  load(): Promise<unknown>
-  select(selection: { provider: string; model: string; reasoningEffort?: string }): Promise<void>
-}
-
-/** One row of the DSH permission-preset select (`permissionPresets.catalog`). */
-export interface AcpPermissionOption {
-  value: string
-  name: string
-  description?: string
-}
-
-/**
- * The `permissions` session projection value (DSH `PermissionSelect`),
- * narrowed: the projection carries the SELECTION ONLY — its `viewSchema` is
- * `{ currentValue }` (0.1.7-rc.2, `dsh-permission-presets`). The rows to switch
- * to are NOT in it (see `AcpPermissionCatalog`).
- */
-export interface AcpPermissionSelection {
-  currentValue: string
-}
-
-/**
- * The process-level permission catalog (`permissionPresets.catalog`), narrowed
- * to its rows. Deliberately NOT read off the session projection: it does not
- * live there, and declaring it there once already cost a picker entry its life
- * (a render crash abdicates the slot entry — the "seat clicks do nothing" bug).
- */
-export interface AcpPermissionCatalog {
-  options: readonly AcpPermissionOption[]
-}
-
-/** The joined view the picker needs: where this session is + what it can switch to. */
-export interface AcpPermissionSelect {
-  options: readonly AcpPermissionOption[]
-  currentValue: string
-}
-
-/** Resolves the process-level permission catalog; `undefined` when the host has no such service. */
-export type AcpPermissionCatalogResolver = () => Promise<AcpPermissionCatalog | undefined> | undefined
-
-/**
- * The session's command + projection face (`SessionFace`), narrowed to what the
- * cluster uses: `/permission <preset>` writes the boundary through the host's
- * own command, so the plugin never reimplements the switch.
- */
+/** The session's command + projection face (`SessionFace`), narrowed to what the cluster reads. */
 export interface AcpSessionFace {
   command(line: string): Promise<
     { ok: true; value: { matched: boolean } } | { ok: false; error: { code: string; message: string } }
@@ -130,12 +76,8 @@ export interface AcpSessionFace {
 /** What `index.tsx` hands every ACP conversation entry. */
 export interface AcpChatInjected {
   acp: AcpStore
-  /** Resolve the session's shared model directory; `undefined` when the model-selection plugin is absent. */
-  directoryFor(sessionId: string): AcpDirectory | undefined
   /** Resolve the session's command/projection face; `undefined` before the session materializes. */
   faceFor(sessionId: string): AcpSessionFace | undefined
-  /** Resolve the process-level permission catalog (the boundary picker's rows). */
-  permissionCatalogFor?: AcpPermissionCatalogResolver
 }
 
 // ---- The session standard kit (framework-provided, declared structurally) ----
@@ -194,73 +136,71 @@ export function isAbsolutePathLike(p: string): boolean {
   return p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\')
 }
 
-/** The ACP provider route id every ACP model selection carries. */
-export const ACP_PROVIDER = 'acp'
-
-/** One model route selection (the subset of DSH's `ModelSelection`) these surfaces write. */
-export interface AcpRouteSelection {
-  provider: string
-  model: string
-  reasoningEffort?: string
-}
-
-/** The `modelSelection` session projection, narrowed to its wire view. */
-export interface AcpModelSelectionProjection {
-  lastUsed: AcpRouteSelection | null
-  next: AcpRouteSelection | null
-}
+// ---- The connection form's command line (hand copy of src/impl.ts) ----
 
 /**
- * Whether a session carries a model selection of its OWN, as opposed to running
- * on the deployment default model.
- *
- * WHY it matters: the gate routes a brand-new ACP-mode conversation to the
- * default agent, and a session that has never selected anything is the only one
- * where that is not overriding somebody's choice — a route the user picked (or
- * the `/model` popup wrote) is the documented "detached" state the seat warns
- * about instead of silently undoing.
- *
- * @returns `true`/`false` when the projection answered, `undefined` when it
- *   cannot be read at all (an older runtime, an addressed subagent route) — the
- *   caller must then leave the session alone.
+ * Hand copies of the host's `tokenizeCommandLine` / `splitCommandLine` /
+ * `quoteCommandToken` (src/impl.ts). The 命令 field is ONE command line — the
+ * whole thing a user would paste into a terminal — and the panel has to parse
+ * it exactly the way `validateAgentDef` will, or the "程序 / 参数" preview under
+ * the field would lie about what the host is about to run. Same discipline as
+ * `splitAcpModelId`: browser half cannot import the host plane, so
+ * tests/acp-view.spec.ts asserts equivalence on a shared sample set.
  */
-export function sessionHasOwnSelection(faceFor: AcpChatInjected['faceFor'], sessionId: string): boolean | undefined {
-  try {
-    const projection = faceFor(sessionId)?.projections.faceOf('modelSelection')?.getSnapshot() as AcpModelSelectionProjection | undefined | null
-    if (projection === undefined || projection === null || typeof projection !== 'object') return undefined
-    return projection.lastUsed != null || projection.next != null
-  } catch {
-    return undefined
+export function tokenizeCommandLine(raw: string): string[] {
+  const tokens: string[] = []
+  let current = ''
+  let quoted = false
+  let touched = false
+  let quote: '"' | "'" | undefined
+  for (let index = 0; index < raw.length; index += 1) {
+    const char = raw[index] as string
+    if (quote !== undefined) {
+      if (char === '\\' && quote === '"' && raw[index + 1] === '"') {
+        current += '"'
+        index += 1
+        continue
+      }
+      if (char === quote) {
+        quote = undefined
+        continue
+      }
+      current += char
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      touched = true
+      continue
+    }
+    if (char === ' ' || char === '\t' || char === '\n' || char === '\r') {
+      if (touched || current !== '') tokens.push(current)
+      current = ''
+      touched = false
+      continue
+    }
+    current += char
+    touched = true
   }
+  if (touched || current !== '') tokens.push(current)
+  return tokens
 }
 
-/**
- * Write one ACP route into a session's shared model directory — and keep the
- * DEPLOYMENT default model off it.
- *
- * WHY the second half: DSH's `session.selectModel` records a selection as the
- * session's own durable route AND as the deployment default, and that second
- * write is global — every NEW session in EVERY mode starts on it. So an ACP
- * pick made here would leak the agent into ordinary conversations, which is
- * exactly what this plugin's two-way isolation forbids. The host half's guard
- * (`AcpDefaultModelGuard`) puts the previous native value back, and it needs the
- * route this session was on *before* the write to do that exactly rather than
- * by guessing — hence the read below.
- *
- * Every ACP route write in this bundle goes through here (the chips' picker, the
- * ACP view's takeover, the gate's auto-route), so no surface can reintroduce the
- * leak on its own.
- */
-export async function selectAcpRoute(
-  acp: AcpStore,
-  directory: AcpDirectory,
-  selection: AcpRouteSelection,
-): Promise<void> {
-  const before = directory.store.getSnapshot().current
-  await directory.select(selection)
-  // A closed loop on purpose: an ACP route is never the value to restore, and a
-  // failed repair is housekeeping noise, not a failed pick.
-  await acp.reconcileDefaultModel(before === null || before.provider === ACP_PROVIDER ? undefined : before)
+/** First token = program, rest = arguments. Mirrors the host's `splitCommandLine`. */
+export function splitCommandLine(raw: string): { command: string; args: string[] } {
+  const tokens = tokenizeCommandLine(raw)
+  return { command: tokens[0] ?? '', args: tokens.slice(1) }
+}
+
+/** Quote one token for a command line — only when it needs it. */
+export function quoteCommandToken(token: string): string {
+  if (token !== '' && !/[\s"']/.test(token)) return token
+  return `"${token.replaceAll('"', '\\"')}"`
+}
+
+/** Join a parsed command back into the single editable field (round-trips through `splitCommandLine`). */
+export function formatCommandLine(command: string, args: readonly string[] = []): string {
+  return [command, ...args].map(quoteCommandToken).join(' ')
 }
 
 // ---- React bindings ----
@@ -270,178 +210,6 @@ export function useUi(acp: AcpStore): UiState {
   return useSyncExternalStore(cb => acp.subscribe(cb), () => acp.getSnapshot())
 }
 
-/** How long `useDirectory` keeps re-asking for a session's directory, and how long it waits between asks. */
-const DIRECTORY_RESOLVE_RETRY_MS = 120
-const DIRECTORY_RESOLVE_ATTEMPTS = 25
-
-/**
- * Resolve one session's model directory, or `undefined` when the host has none
- * for it *yet*.
- *
- * A THROW IS NOT A VERDICT. `ModelDirectoryResolver.directoryFor` materializes
- * the session's runtime scope on first use and throws while that scope does not
- * exist (observed live: `cannot get property "remote.session" without inject`,
- * boot-time, for the session on stage) — and the addressed-subagent case throws
- * by design. Caching the throw is what leaves the whole ACP surface blank for
- * the page's lifetime, so the caller retries instead (see {@link useDirectory}).
- */
-function resolveDirectory(
-  directoryFor: AcpChatInjected['directoryFor'],
-  sessionId: string,
-): AcpDirectory | undefined {
-  try {
-    return directoryFor(sessionId)
-  } catch {
-    return undefined
-  }
-}
-
-/**
- * Resolve and observe one session's model directory. The directory is loaded
- * once per session (the host is the fact source and pushes the current
- * selection back), and `undefined` covers both "service absent" and "this is
- * an addressed subagent session, which the Agent-bound RPCs refuse".
- *
- * The resolution is retried (bounded) rather than memoized: the first render of
- * a freshly staged session legitimately precedes its runtime scope, and a
- * one-shot memo would freeze that failure. Once a directory is in hand the
- * retry stops for good, so a steady-state surface does no extra work.
- */
-export function useDirectory(directoryFor: AcpChatInjected['directoryFor'], sessionId: string): {
-  directory?: AcpDirectory
-  state?: AcpDirectoryState
-} {
-  // Keyed on the RESOLVER, never on an object carrying it: a fresh options
-  // object every render would re-resolve (and so re-load) the directory on
-  // every render, which is an RPC loop.
-  const [directory, setDirectory] = useState<AcpDirectory | undefined>(() => resolveDirectory(directoryFor, sessionId))
-  useEffect(() => {
-    const first = resolveDirectory(directoryFor, sessionId)
-    if (first !== undefined) {
-      setDirectory(first)
-      return
-    }
-    setDirectory(undefined)
-    let attempts = 0
-    const timer = setInterval(() => {
-      const resolved = resolveDirectory(directoryFor, sessionId)
-      if (resolved !== undefined) {
-        setDirectory(resolved)
-        clearInterval(timer)
-        return
-      }
-      // Bounded: a session that never materializes a runtime scope (an
-      // addressed subagent route) simply keeps the surface hidden.
-      if (++attempts >= DIRECTORY_RESOLVE_ATTEMPTS) clearInterval(timer)
-    }, DIRECTORY_RESOLVE_RETRY_MS)
-    return () => { clearInterval(timer) }
-  }, [directoryFor, sessionId])
-  const subscribe = useMemo(
-    () => (cb: () => void): (() => void) => directory?.store.subscribe(cb) ?? noopSubscribe,
-    [directory],
-  )
-  const getState = useMemo(() => (): AcpDirectoryState | undefined => directory?.store.getSnapshot(), [directory])
-  const state = useSyncExternalStore(subscribe, getState)
-  useEffect(() => {
-    if (directory === undefined) return
-    void directory.load().catch(() => { /* the picker's own error row is the retry surface */ })
-  }, [directory])
-  return { ...directory === undefined ? {} : { directory }, ...state === undefined ? {} : { state } }
-}
-
-function noopSubscribe(): () => void {
-  return () => {}
-}
-
-/**
- * Join the session's `permissions` projection (the selection) with the
- * permission-preset catalog (the rows). Every partial is legal and must not
- * throw: an absent selection means this host projects no boundary; an absent
- * catalog means there are no rows to offer. Nothing here may throw — the caller
- * renders inside a slot entry whose crash ABIDATES the whole picker.
- */
-export function joinPermissionSelect(
-  selection: unknown,
-  catalog: AcpPermissionCatalog | undefined,
-): AcpPermissionSelect | undefined {
-  const currentValue = (selection as AcpPermissionSelection | null | undefined)?.currentValue
-  if (typeof currentValue !== 'string') return undefined
-  const raw = Array.isArray(catalog?.options) ? catalog.options : []
-  const options = raw.filter((option): option is AcpPermissionOption =>
-    typeof option?.value === 'string' && typeof option?.name === 'string')
-  return { options, currentValue }
-}
-
-// The permission catalog is PROCESS-level (one table for every session) and its
-// read is a remote round-trip: one fetch per page, fanned out to every picker.
-let permissionCatalogCache: AcpPermissionCatalog | undefined
-let permissionCatalogPending = false
-const permissionCatalogListeners = new Set<() => void>()
-
-function ensurePermissionCatalog(permissionCatalogFor: AcpPermissionCatalogResolver | undefined): void {
-  if (permissionCatalogFor === undefined || permissionCatalogCache !== undefined || permissionCatalogPending) return
-  let pending: Promise<AcpPermissionCatalog | undefined> | undefined
-  try {
-    pending = permissionCatalogFor()
-  } catch {
-    return
-  }
-  if (pending === undefined) return
-  permissionCatalogPending = true
-  void Promise.resolve(pending)
-    .then((catalog) => {
-      if (Array.isArray(catalog?.options)) permissionCatalogCache = catalog
-    })
-    .catch(() => { /* no catalog: the picker simply offers no rows to switch to */ })
-    .finally(() => {
-      permissionCatalogPending = false
-      for (const listener of [...permissionCatalogListeners]) listener()
-    })
-}
-
-/**
- * Read one session's DSH Access mode for the pickers: the `permissions`
- * projection carries the selection (`{ currentValue }`), and the rows come from
- * the process-level `permissionPresets.catalog` — joined by
- * `joinPermissionSelect` because the projection alone cannot list them.
- */
-export function usePermissionSelect(
-  faceFor: AcpChatInjected['faceFor'],
-  sessionId: string,
-  permissionCatalogFor?: AcpPermissionCatalogResolver,
-): AcpPermissionSelect | undefined {
-  const face = useMemo(() => {
-    try {
-      return faceFor(sessionId)
-    } catch {
-      return undefined
-    }
-  }, [faceFor, sessionId])
-  const subscribe = useMemo(() => (cb: () => void): (() => void) => {
-    try {
-      return face?.projections.faceOf('permissions').subscribe(cb) ?? noopSubscribe
-    } catch {
-      return noopSubscribe
-    }
-  }, [face])
-  const getState = useMemo((): (() => AcpPermissionSelection | undefined) => () => {
-    try {
-      return face?.projections.faceOf('permissions').getSnapshot() as AcpPermissionSelection | undefined
-    } catch {
-      return undefined
-    }
-  }, [face])
-  const selection = useSyncExternalStore(subscribe, getState)
-  const [catalog, setCatalog] = useState<AcpPermissionCatalog | undefined>(permissionCatalogCache)
-  useEffect(() => {
-    ensurePermissionCatalog(permissionCatalogFor)
-    const listener = (): void => { setCatalog(permissionCatalogCache) }
-    permissionCatalogListeners.add(listener)
-    listener()
-    return () => { permissionCatalogListeners.delete(listener) }
-  }, [permissionCatalogFor])
-  return useMemo(() => joinPermissionSelect(selection, catalog), [selection, catalog])
-}
 
 // ---- The ACP-mode model seat (shadowing the native one) ----
 
@@ -457,12 +225,12 @@ export function usePermissionSelect(
 export const ACP_PRESET_ID = 'acp'
 
 /**
- * The bits of the client session list the seat gate reads.
+ * The bits of the client session list this plugin reads.
  *
  * Structural on purpose: the client runtime package is not a dependency of
  * this bundle, so the list is resolved as a plain observable at call time and
- * an unexpected shape simply reads as "no ACP session" — which leaves the
- * native seat exactly where it was.
+ * an unexpected shape simply reads as "no ACP session" — which leaves every ACP
+ * surface hidden rather than broken.
  *
  * TWO SHAPES ship in the wild. DSH 0.1.7-rc.2's session controller
  * (`dsh-api-session-controller`) builds `{ ids, byId, phase,
@@ -482,9 +250,11 @@ export interface AcpSessionsSnapshot {
   /** List rows by session id (both runtime shapes). */
   byId?: Record<string, AcpSessionsRow | undefined>
   /**
-   * rc.2 shape: row ids in display order. Preferred over the `byId` key order
-   * when picking the staged row, so a multi-view list cannot hand the seat to
-   * whichever session happened to be inserted first.
+   * rc.2 shape: row ids in display order. A TIE-BREAK hint, never the
+   * candidate set: `byId` is a superset of `ids` (the session controller adds
+   * catalog-only and retained-scope rows to `byId` without giving them an
+   * `ids` entry), so walking `ids` alone can miss the row the main view
+   * actually retains. See {@link stagedSessionOf}.
    */
   ids?: readonly string[]
   phase?: string
@@ -516,7 +286,7 @@ export function rowAgentPreset(row: AcpSessionsRow | undefined): string | undefi
 export interface AcpStagedSession {
   sessionId: string
   row?: AcpSessionsRow
-  /** Addressed subagent route: its model RPCs are refused, so the seat stands down. */
+  /** Addressed subagent route: it is not a conversation this plugin may drive. */
   subagent: boolean
 }
 
@@ -541,28 +311,30 @@ export function stagedSessionOf(snapshot: AcpSessionsSnapshot | undefined): AcpS
     }
   }
   const byId = snapshot.byId ?? {}
-  const sessionId = (snapshot.ids ?? Object.keys(byId)).find(
-    id => (byId[id]?.retainedBy?.mainView ?? 0) > 0,
-  )
+  // Candidate set is `byId`, NOT `ids`. In rc.2 the controller projects
+  // `ids` from the host list only, then appends two fallback families to
+  // `byId` without an `ids` entry: subagent-catalog children of a projected
+  // parent, and live retained scopes carrying a subagent address. A retained
+  // scope of either family can be the row holding the main view, so an
+  // `ids`-only walk would report "nothing is staged" and every ACP surface
+  // (this gate included) would stand down on a real ACP conversation.
+  //
+  // `ids` still matters: it is the display order, so when several rows retain
+  // the main view (multi-view layouts) the one the list shows first wins —
+  // the same row `dsh-client-ui-session` puts on screen. Everything outside
+  // `ids` sorts last, in `byId` key order.
+  const order = new Map<string, number>()
+  for (const [index, id] of (snapshot.ids ?? []).entries()) order.set(id, index)
+  const rank = (id: string): number => order.get(id) ?? Number.MAX_SAFE_INTEGER
+  const candidates = Object.keys(byId).sort((a, b) => rank(a) - rank(b))
+  const sessionId = candidates.find(id => (byId[id]?.retainedBy?.mainView ?? 0) > 0)
   if (sessionId === undefined) return undefined
   const row = byId[sessionId]
   return { sessionId, row, subagent: row?.origin === 'subagent' }
 }
 
-/**
- * Whether the composer's model seat must be taken over by the ACP seat: the
- * current session runs the ACP agent preset, and it is an ordinary session (an
- * addressed subagent route gets no ACP seat — its model RPCs are refused).
- *
- * FACT SOURCES, in order: the client runtime's session row (`agentPreset`
- * top-level on older runtimes, `projectionValues.agentPreset` on rc.2, folded
- * from the host's `agent-preset/selected` frames) — and, when the row carries
- * no preset, the plugin's own host-side report (`AcpStore.acpMode`, read from
- * the same session log the host's `sessionAgentPreset` resolver reads). Neither
- * source alone covers every deployment, and a false from an ABSENT field must
- * not read as "definitely not ACP", which is why the fallback exists.
- */
-export function shouldShadowModelSeat(
+/** Whether the staged session runs the ACP agent preset. */
+export function stagedIsAcpMode(
   snapshot: AcpSessionsSnapshot | undefined,
   acpMode?: (sessionId: string) => boolean | undefined,
 ): boolean {
@@ -578,7 +350,7 @@ export function shouldShadowModelSeat(
  * frame is `[sessionId, agentPreset]` and the runtime broadcasts it the moment
  * a switch commits — before the appended session-log row is visible to a fresh
  * `session/chat-list` cold read, so re-reading the log from that frame folds the
- * PREVIOUS preset and the seat would lag one switch behind until a reload.
+ * PREVIOUS preset and the surface would lag one switch behind until a reload.
  * The frame's own preset is therefore the live path's fact source; the host read
  * only seeds a session this tab has never seen a frame for.
  */
@@ -592,36 +364,10 @@ export interface SessionListSource {
   subscribe(listener: () => void): () => void
 }
 
-let seatActive = false
-const seatListeners = new Set<() => void>()
-
-/**
- * Record whether this plugin currently occupies the composer's model seat. The
- * composer cluster reads it to stand down: with the seat live, its own
- * agent/model/effort chips would be a second copy of the same three controls in
- * one tool row.
- */
-export function setAcpSeatActive(active: boolean): void {
-  if (seatActive === active) return
-  seatActive = active
-  for (const listener of [...seatListeners]) listener()
-}
-
-/** Subscribe to the seat-occupancy flag. */
-export function useAcpSeatActive(): boolean {
-  return useSyncExternalStore(
-    cb => {
-      seatListeners.add(cb)
-      return () => { seatListeners.delete(cb) }
-    },
-    () => seatActive,
-  )
-}
-
 // ---- The one open menu (composer overlay slot) ----
 
-/** Which picker the composer overlay is showing (`seat` = the ACP-mode model seat). */
-export type AcpMenuKind = 'agent' | 'model' | 'thought' | 'boundary' | 'seat'
+/** Which picker the composer overlay is showing. */
+export type AcpMenuKind = 'agent' | 'model' | 'thought'
 
 interface MenuState {
   sessionId: string
@@ -958,6 +704,7 @@ const STYLE = `
 .ntr-acp-empty-title { font-size: 14px; font-weight: 600; }
 .ntr-acp-empty-body { margin: 0; color: var(--dsw-alias-text-secondary, #6b7280); font-size: 12.5px; line-height: 1.7; }
 .ntr-acp-empty-hint { color: var(--dsw-alias-text-secondary, #6b7280); font-size: 12px; }
+.ntr-acp-seat-diag { font-family: var(--dsw-alias-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); opacity: 0.72; word-break: break-word; }
 .ntr-acp-empty-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
 `
 

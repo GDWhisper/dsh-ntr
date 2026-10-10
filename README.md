@@ -2,18 +2,20 @@
 
 DeepSeek Harness (DSH) Web 插件：把浏览器变成一个 **ACP（Agent Client Protocol）客户端**。
 
-宿主侧按服务端配置拉起任意 ACP agent 子进程（stdio JSON-RPC v1），事件经 SSE 推送到网页；浏览器可开启多会话、流式交互消息/思考过程/工具调用/计划、人工审批权限请求、切换 mode 与配置选项（如模型切换）。
+**本质是借 DSH 的界面壳，与 ACP agent 对话。DSH 提供的只有显示层，它的模型调用逻辑我们不参与。** 一次对话的归属：推理、工具执行、文件读写、权限决策全部属于**对端 ACP agent**（独立进程，完全自治）；会话身份、消息列表、输入框、侧栏由 DSH 提供；模型选择、思考等级、权限档都是 **agent 自己的概念**，不是 DSH 的模型目录。
+
+宿主侧按服务端配置拉起任意 ACP agent 子进程（stdio JSON-RPC v1），事件经 SSE 推送到网页；浏览器可开启多会话、流式交互消息/思考过程/工具调用/计划、人工审批权限请求、切换 agent 自己的 mode 与配置选项。
 
 ## 功能特性
 
 - **多 Agent 进程管理**：支持按需启动、停用已配置的 ACP 代理子进程。
-- **透明连接表单（预设 + 自定义）**：设置面板每张 agent 卡片直接展示完整 ACP 连接命令（显示名 / 命令 / 参数 / npm 包名 / 环境变量 / 权限 / 工作目录），不对用户隐藏——预设 agent 提供一键填入的官方测试默认命令，任何 agent 都可改成自定义值；「测试」按钮用当前表单值在宿主侧拉起一次性进程完成 ACP 握手（不落盘、不注册），成功显示 agent 身份与耗时、失败显示可操作错误与 stderr 尾部。
+- **透明连接表单（预设 + 自定义）**：设置面板每张 agent 卡片直接展示完整 ACP 连接命令（显示名 / 启动命令 / npm 包名 / 环境变量 / 权限 / 工作目录），不对用户隐藏——预设 agent 提供一键填入的官方测试默认命令，任何 agent 都可改成自定义值；「测试」按钮用当前表单值在宿主侧拉起一次性进程完成 ACP 握手（不落盘、不注册），成功显示 agent 身份与耗时、失败显示可操作错误与 stderr 尾部。启动命令是**一整行**（程序 + 参数，例如 `codebuddy --acp`）：输入框下方实时显示宿主解析出的「程序 / 参数」，含空格的路径用引号包住。
+- **Windows 上的 npm agent 可直接用**：npm 全局安装的 agent 在 Windows 上是 `.cmd` 生成壳，Node 20.12+ 禁止在 `shell: false` 下启动它（抛 `EINVAL`）；插件改为经 `cmd.exe /d /s /c` 启动，并在停止/空闲释放时按进程树回收（对齐 POSIX 的进程组语义），不会残留后台 agent 进程。
 - **从零新建自定义 Agent**：「从零新建自定义 Agent」入口不依赖任何预设——填 Agent ID（客户端本地校验格式与查重，宿主端二次校验）+ 连接命令即可接入任意 stdio ACP agent；保存后自动进入「已接入」区并带「自定义」徽标，检测层会把自定义条目连同 env / npmPackage 一并回显到表单。
 - **npm 包自动安装**：agent 定义可携带 `npmPackage`；宿主在 PATH 中找不到 `command` 时自动执行 `npm install -g`（超时 3 分钟，包名经严格字符集校验、杜绝注入），装完再解析一次命令路径，装不上则回落为原生 spawn 报错。
 - **多会话与流式渲染**：支持多会话隔离，流式展示用户消息、Agent 回复、思考过程、工具执行与任务计划。
-- **审批就在对话里**：当 Agent 触发敏感工具调用时，宿主把 ACP `session/request_permission` 转发到 DSH 原生审批链（`ctx.approval`），审批卡直接在聊天 composer 里出现（拒绝 / 允许一次），不需要切到设置页。宿主没有审批服务、或会话不归属某个聊天会话时自动降级回设置页权限卡（并支持 `permissionTimeoutMs` 超时自动取消，默认永久等待）。
-- **权限策略 ≠ 审批通道**（两者容易混淆）：agent 定义里的 `permission` 是**策略**——`ask` 才把每一次请求交给人，`allow` / `reject` 由插件直接自动作答，**永远不会**弹出任何审批；至于 `ask` 的审批呈现在哪里（对话 composer 还是设置页）由宿主能力决定，不写死在配置里。
-- **聊天会话以 DSH 的 Access mode 为准**：只要宿主提供 `sandboxPolicy` / `sessions` / `approval` 服务，聊天里跑起来的 ACP 会话就按你当前选的那一档（仅可查看 / 工作区内修改 / 完全权限）执行——「完全权限」直接放行（不再被 `approval: never` 反判成拒绝），「仅可查看」写类请求一律拒（`approval: ask` 时问一次人，只给一次性许可），「工作区内修改」按工作区根判断、越界才问人；同时在 `fs/write_text_file` 上做同样的边界检查（越权拒绝文案带 `[sandbox: file access denied under <mode> mode]`）。`/acp` RPC 与 headless 会话没有聊天绑定，仍以 agent 定义里的 `permission` 为准，面板会如实说明当前是哪一种生效。
+- **审批就在对话里**：当 Agent 触发敏感工具调用时，宿主把 ACP `session/request_permission` 转发到 DSH 原生审批链（`ctx.approval`），审批卡直接在聊天 composer 里出现。宿主没有审批服务、或会话不归属某个聊天会话时自动降级回设置页权限卡（并支持 `permissionTimeoutMs` 超时自动取消，默认永久等待）。
+- **权限完全归 agent，界面只负责接住**：ACP agent 完全自治，**DSH 的 Access mode / `sandboxPolicy` 不参与 ACP 会话的权限裁决**。agent 侧 `session/request_permission` 原样映射到界面上——每个 agent 的权限形态不同（选项列表 / allow-deny / 带 tool call 详情），接住它的载荷、渲染给人、把人的选择按 ACP 协议回包即可。agent 定义里那个 `permission` 字段只是**策略**（要不要问人），不是审批通道；至于审批呈现在哪里（对话 composer 还是设置页）由宿主能力决定，不写死在配置里。（早年的版本曾让 DSH 的 Access mode 替 agent 裁决，并保留一道 `fs/write_text_file` 写栅栏，现已废弃——那个 knob 本身曾是反的：`never`（"完全权限"预设）会在 answerer 之前把所有询问判成拒绝，`read-only` + `ask` 又能被一次"允许一次"写穿。）
 - **无感断线重连（双向）**：浏览器↔宿主方向靠每会话环形事件缓存池（Transcript）按序补齐；宿主↔agent 方向靠 `session/load` 会话恢复——agent 进程崩溃后会话进入 released 状态（历史可读、上下文不丢），下次发消息自动 respawn 并回放会话历史（"发送即恢复"），无需人工重建会话。
 - **工作区沙箱内的客户端文件能力**：实现 ACP `fs/read_text_file` / `fs/write_text_file`（含 `line`/`limit` 分页、单次 2 MiB 上限、自动创建父目录），所有路径经与 session cwd 相同的 `allowedCwdRoots` 白名单校验，越权访问直接拒绝。
 - **空闲释放（只释放“没有会话”的进程，探测进程与聊天进程分档）**：设置面板的「探测模型」、保存后的后台探测、启动时的目录预热都会拉起 agent 进程，而它们**不留任何会话**——这类进程以前会一直常驻。现在空闲释放窗口分两档：**探测拉起的进程**（从未承载过真实会话，探测的 throwaway session 刻意不登记）空闲 5 分钟（`probeIdleTimeoutMs`）即释放，即使 agent 配了 `idleTimeoutMs: 0` 也不例外——那是聊天进程的常驻承诺；**承载过真实会话的进程**按每个 agent 可配的 `idleTimeoutMs`（默认 30 分钟，`0` = 永不释放）常驻。判定统一是：进程 READY 且**没有任何活动会话**（也没有进行中的探测 / 恢复 / 待答审批）时，空闲超过所属档位的时长就**静默释放**（杀掉子进程、状态回落 `stopped`，不发任何提示——这是预期生命周期，不是故障）。有活动会话的 agent **绝不**被释放，所以聊天不会因此多出冷启动；被释放的探测残留也不丢任何东西——已挂起的 released 会话记录原样保留，下次发送照旧走 `session/load` 恢复。
@@ -21,15 +23,15 @@ DeepSeek Harness (DSH) Web 插件：把浏览器变成一个 **ACP（Agent Clien
 - **聊天会话跑在你的工作区里**：对话里起的 ACP 会话，工作目录就是你在这个 DSH 会话里选中的工作区（sidebar 选的那个目录，即会话 header cwd）——对端 agent 的 Read / Glob / Bash 看到的就是它，`session/new` 报回的 cwd 也是它，**agent 进程本身也从那里启动**（有一类 agent 在进程启动时就定死自己的「工作区」，只改 `session/new` 的 cwd 它会照旧回答插件沙箱目录 `~/.dsh/acp-workspaces`；进程只在没有活动会话时才会被搬到该目录，有会话则保持原进程）。agent 卡片里的「工作空间目录」只对 `/acp` 直连会话与宿主未上报工作区的场合生效（面板上已注明）。agent 崩溃后的 `session/load` 恢复同样锚在该目录。
 - **工作区白名单可编辑**：设置面板把工作区拆成「单根模式」（一个工作空间目录，留空则用宿主默认 `~/.dsh/acp-workspaces`）与「白名单根目录（高级）」（多根逐条增删）；单根模式保存时会把白名单显式收窄为该目录，绝不静默放宽；非绝对路径就地校验。保存前有「会停止该 Agent 进程并中断进行中的会话」的副作用提示。
 - **对话内的 agent 原生模式控件**：agent 自己声明的 mode（`plan`、`acceptEdits` 之类，`session/set_mode` 枚举）会以小控件形式出现在聊天输入框工具行（`conversation.input.left`，就在 DSH 的 Access mode 旁边）——它管“agent 怎么干活”，Access mode 管“会话能碰什么”，两层各管一段；该聊天会话还没跑过 agent（或该 agent 未声明 mode）时控件自动不显示，切模式不重启进程。
-- **ACP 模式（agent preset）**：随包提供一份 `acp` agent preset（[presets/acp/acp.patch.yml](file:///home/pax/coding/dsh-ntr/presets/acp/acp.patch.yml)）——它就是这个包自己的 bundle patch（`dsh.bundle.patch`），所以宿主组装 profile 时就把模式声明进 roster，没有任何安装/复制步骤（旧的 `~/.dsh/.agent-presets/<id>` 目录已不再被宿主读取）。在新会话页的模式选择里选「ACP 模式」，该会话就不会再被宿主自己的东西污染：不注入身份/部署 persona、运行上下文快照、AGENTS.md 摘要与技能目录，工具目录为空，plan mode / todo / compaction / 委派全部不挂载——模型可见的表面完全属于对端 agent。该会话的 Access mode 不再替 agent 裁决（`fs/write_text_file` 栅栏仍然生效），实际裁决交给 agent 自己的权限模式，它的每次询问都原样出现在对话里的审批卡上；而转发给 agent 的 prompt **严格只有你说的话**，一句边界叙述都没有。
+- **ACP 模式（agent preset）**：随包提供一份 `acp` agent preset（[presets/acp/acp.patch.yml](file:///home/pax/coding/dsh-ntr/presets/acp/acp.patch.yml)）——它就是这个包自己的 bundle patch（`dsh.bundle.patch`），所以宿主组装 profile 时就把模式声明进 roster，没有任何安装/复制步骤（旧的 `~/.dsh/.agent-presets/<id>` 目录已不再被宿主读取）。在新会话页的模式选择里选「ACP 模式」，该会话就不会再被宿主自己的东西污染：不注入身份/部署 persona、运行上下文快照、AGENTS.md 摘要与技能目录，工具目录为空，plan mode / todo / compaction / 委派全部不挂载——模型可见的表面完全属于对端 agent。该会话的裁决完全交给 agent 自己（它的每次询问都原样出现在对话里的审批卡上），而转发给 agent 的 prompt **严格只有你说的话**，一句边界叙述都没有。
 - **转发的只有人说的话**：宿主把上下文段折在用户消息**之后**（运行时快照最后），所以“取最后一条 user 消息”拿到的是注入内容。插件改为按消息来源（`source.kind === 'user'`）挑人真正输入的那条，且**不转发辅助模型调用**（会话标题、compaction 这类带 `purpose` 的请求）——它们不再花掉一轮对端 agent 的 turn，也不再把自己的提示词折进 agent 的上下文。
-- **聊天窗内的 ACP 路由控件**：会话路由到 `acp`（或曾跑过 ACP agent）时，聊天输入框工具行会出现 `ACP · <agent>` / 模型 / 思考等级三块芯片，点开即选——agent 列表带进程状态、模型列表是 agent 自己上报的目录（并标明它的默认模型）、思考等级来自它的 `thought_level`。"在哪条路由上"读写的是宿主 **per-session 模型目录**（与原生选择器同一份状态），而"这个 agent 有哪些模型"读的是插件自己的 `agent/catalog`；切模型时新思考等级取该 agent 的默认值（与原生座位同样的规矩）。普通会话不渲染任何 ACP 芯片。
-- **会话边界就在 ACP 芯片里**：芯片菜单第二栏是「会话边界（DSH Access mode）」（仅可查看 / 工作区内修改 / 完全权限），数据取自宿主 `permissions` 投影，切换走宿主的 `/permission <preset>` 命令。它不重复摆一个下拉（原生 Access mode 就在同一条工具行上），而是在 ACP 的语境里告诉你在这一档下 agent 的写盘与询问会怎样被闸门挡住。
-- **ACP 模型不进非 ACP 会话（结构性隔离）**：DSH 的模型目录是**按请求**而非按会话构建的（`buildModelCatalog(ctx)` 不接 session id），所以一个 provider 只要广告模型，就等于对**每一条**会话广告——包括根本没有 ACP agent 在背后的那些。插件因此让 `acp` 路由**一个模型都不广告**（`LlmAdapter.listModels` 的契约本身写明目录是 advisory：未列出的 id 照样解析与流式，路由可用性由注册判定），ACP 模型只活在插件自己的对话座位里（`agent/catalog`：base + 按需暴露的变体 + agent 自己的思考等级）。非 ACP 会话的模型选择器里从此没有任何 ACP 条目，`/model` 弹窗也不例外。
-- **ACP 模式下模型选择器只剩 ACP**：原生模型座位虽是 single 槽，却**可按 priority 遮蔽**，插件就在更低的一档上注册自己的 ACP 座位——但只在**当前会话跑 ACP preset 时**挂上（判定取自客户端会话列表的 `agentPreset`，切走会话立即 dispose 让原生座位回来）。座位一个菜单里放下 agent、它的模型、思考等级与会话边界四个轴，同时左侧三块芯片在 ACP 模式会话里自动收起（两套同样的控件并排只会被读成重复控件）。宿主侧没有 per-session 目录过滤缝（目录是全 provider 全量构建），所以遮蔽只发生在浏览器半区；**任何一环读不到就保持原生座位**（不接管是唯一允许的失败模式），座位自身渲染崩溃也会自动交还。`/model` 命令弹窗不是槽位、遮蔽不到，所以座位会以告警色提示“跑的是 ACP 预设但不是 ACP agent”，菜单里的 agent 一节就是一键切回。
-- **默认 Agent 不进全局默认模型（跨模式隔离）**：agent 卡上的 ★「设为默认 Agent」是**插件自己的**默认 agent（存在 `~/.dsh/acp-agents.json`，与 agent 定义同处），新的 ACP 模式会话若还没有自己的路由选择就直接由它服务。之所以不写成 DSH 的默认模型：`session.selectModel` 会把每一次选择**同时**记到全局默认模型上（不分会话、不分模式），一次 ACP 选择就会让所有模式的**新会话**从对端 agent 起步。所以插件在宿主侧挂了守卫（`AcpDefaultModelGuard`）：默认模型一旦是 `acp` 路由就改回上一个原生路由（候选依次为：该会话写入前的原生路由 → 已知原生默认 → 本部署 live 会话里最近的原生路由；一个候选都没有时不动、并在 RPC 里如实报 `stranded`），每轮对话前与浏览器每次写入 ACP 路由后都会复查。于是切换模式时，agent / 模型 / 思考等级不会跟着跑到别的模式去。
-- **ACP 视图 tab（真工具卡）**：原生聊天的输出词表只有正文与思考（工具调用只能是一行散文），所以对话头部多了一个 **ACP** 视图 tab：按 agent 的原始流渲染真工具卡（按 kind 给图标、按 status 给色调、输出可展开）、计划清单、**unified diff**（行级 LCS 对齐 + `+N -M` 统计）与用量读数，并实时跟随 SSE（无需轮询）。已挂起（agent 崩过）的会话在这里标“下一条消息自动恢复”，关闭的会话不提供幽灵历史。该视图只读：它不发消息、不取消、不拉进程。
-- **无侵入 UI 挂载**：通过 Cordis UI Slots 机制挂载至系统设置页（`settings.section`）、聊天工具行（`conversation.input.left`）与其菜单浮层（`conversation.input.overlay`）、对话视图环（`conversation.view`），不接管对话界面本身。
+- **工具卡长在主聊天平面**：`BridgeManager.streamPrompt` 把 ACP 的 `tool_call` / `tool_call_update` 折成宿主 `StreamChunk` 里的 `block-start('tool-call')` + `tool-call-delta` + 带完整快照的 `block-end`。宿主 `AssistantStreamAccumulator` 自己会把它折成 `{ kind: 'tool-call', callId, name, argsRaw }`，官方 chat 包的 tool-call 渲染器画卡片——不需要注册新的 `ConversationNodeDefinition`，不需要写日志，不需要注册新 slot。工具调用不再降级成 `> 🛠️ [Tool: …]` 的思考散文。
+- **ACP 会话里接管原生模型底座**：宿主 composer 无条件渲染它的原生模型选择器（`conversation.input.model` 的 `ModelSelect`），那个控件读 DSH 模型目录、点了会写**全局默认模型**。ACP 会话的模型属于对端 agent，所以插件在这个 cell 里装上 ACP 底座本身（`src/client/model-seat.tsx` 的 `createModelSeatClaim`）——一个 cell 一个 occupant，且底座落在原生底座原来的位置（composer bar 行尾、提交键左边）。这个 cell 的归属由客户端 runner 的页面级计数器决定（声明优先级被改写，最后一个注册者赢），所以 claim 还要**核实自己真的赢下了这个 cell**，被别的座位插件（如 thinking-effort 的 slider）抢走时再注册一次夺回——这是纯粹的显示层动作，不写任何模型路由。
+- **对话内的 ACP 底座：第一级是选 agent**：聊天输入框**行尾**（`conversation.input.model`，即原生模型底座所在的那个座位）上的 ACP 底座，第一级选**哪个 agent** 服务这条会话；agent 自己的**模型、思考等级**由该底座的多级菜单承担。agent 列表带进程状态、模型列表是 agent 自己上报的目录（并标明它的默认模型）、思考等级来自它的 `thought_level`。**只出现在 ACP 模式的会话里**：注册由 ACP-mode 闸门驱动，非 ACP 会话里这条 entry 根本不存在，原生模型底座原样回来。
+
+  > **历史做法**：早年的设计把 ACP agent 接成一条模型路由 `acp@<agentId>`，"在哪条路由上"读写宿主 per-session 模型目录（与原生选择器共享同一份状态），并用 `priority: -1` 遮蔽原生模型座位。该方向已放弃：写路由会顺手写 DSH 的全局默认模型（一次 ACP 选择就让所有模式的新会话从对端 agent 起步），而宿主的 `session/select-model` 在写入前要过 `modelAvailable` 门禁（GUI 选择要求 provider/model 确切出现在可用目录里）——与"ACP 模型不广告"的隔离策略直接冲突，**实测报错 `session/model-unavailable: Select an available model before sending a message.`** 两边都不可能让步。（注：宿主的 prompt 准入路径并不校验目录成员资格，所以"发消息"从来不是问题，"写路由"才是。）详见 [docs/acp-mode.md](file:///home/pax/coding/dsh-ntr/docs/acp-mode.md) §4/§5 的「历史做法」。
+- **ACP 视图 tab**：对话头部的 **ACP** tab 按 agent 的原始流渲染计划清单、unified diff（行级 LCS 对齐 + `+N -M` 统计）与用量读数，并实时跟随 SSE（无需轮询）。已挂起（agent 崩过）的会话在这里标“下一条消息自动恢复”，关闭的会话不提供幽灵历史。该视图只读：它不发消息、不取消、不拉进程。工具卡则长在**主聊天平面**上——adapter 发真正的 tool-call chunk，宿主自己折成工具卡渲染（见下）。
+- **无侵入 UI 挂载**：通过 Cordis UI Slots 机制挂载至系统设置页（`settings.section`）、agent 自己的模式控件（`conversation.input.left`）、ACP 底座（`conversation.input.model`，仅 ACP 模式）与其菜单浮层（`conversation.input.overlay`）、对话视图环（`conversation.view`），不接管对话界面本身。
 - **ACP 模型目录（座位自己的面）**：把 ACP agent 的 `configOptions`（`category: model` / `thought_level`）折叠成 per-agent 的模型面（`agent/catalog`）——基础条目（agent 默认模型）加 `agent@模型` 变体，思考等级作为 `reasoning` 元数据；每轮请求前自动对齐会话配置，目录经探针获取并持久化到 `~/.dsh/acp-model-catalog.json`。
 - **可见模型（勾选式）**：ACP 座位菜单没有搜索功能，而真实 agent 动辄几百个模型（pi 500、omp 581），所以变体是**按需勾选**的——不勾就没有 `agent@模型` 变体条目，只留该 agent 自己的基础条目，永远不会出现列表风暴。勾选带搜索框、全选/取消全选与分批展开，改动立即（防抖）经轻量 RPC 生效，无需重启 agent、不影响进行中的会话，失败就地回滚并红字提示。模型 chip 上的供应商前缀只认 agent 自己返回的 ACP 分组（如 omp acp），不做猜测式推断——跨商供应模型太常见，猜必错。
 
@@ -39,8 +41,8 @@ DeepSeek Harness (DSH) Web 插件：把浏览器变成一个 **ACP（Agent Clien
 浏览器端 (Browser Half: lib/client.js)
   ├─ rpc.call('/acp', endpoint, payload)          一元操作（启动会话、发送 Prompt、读会话 transcript 等）
   ├─ EventSource /api/acp/stream                    事件推送流（状态、消息更新、权限请求）
-  ├─ ctx.modelDirectories.directoryFor(sessionId)   宿主 per-session 模型目录（路由读写，与原生选择器共享状态）
-  └─ rpc.call('/acp', 'agent/catalog')              per-agent 的 ACP 模型面（座位/芯片的模型与思考等级来源）
+  ├─ rpc.call('/acp', 'agent/catalog')              per-agent 的 ACP 模型面（底座的模型与思考等级来源）
+  └─ rpc.call('/acp', 'model/get-default')          插件自己的默认 agent（新会话默认选谁）
          │
 宿主端 (Host Half: lib/index.js → BridgeManager)
   ├─ ctx.connection.rpc.handle('/acp', dispatchRpc)
@@ -63,7 +65,10 @@ DeepSeek Harness (DSH) Web 插件：把浏览器变成一个 **ACP（Agent Clien
     agents:
       - id: pi
         title: pi coding agent (ACP)
+        # command 是「一整条启动命令行」：程序在前、参数在后，含空格的路径用引号包住。
+        # 也可以写成 command: "/path with space/bin/pi-acp" --flag，等价于下面两行分开写。
         command: /path/to/bin/pi-acp
+        # args: ["--acp"]
         # 省略 cwd / allowedCwdRoots 时默认使用插件自有工作区 ~/.dsh/acp-workspaces
         # （保存时自动创建；不再从 dsh 宿主进程的启动目录推导）
         cwd: /home/pax/.dsh/acp-workspaces
@@ -107,7 +112,8 @@ dsh plugin --profile web add ./
 
 ## 文档索引
 
-- [给 AI 编程 Agent 的操作规范与架构约束](./AGENTS.md)
+- [给 AI 编程 Agent 的操作规范与架构约束](./AGENTS.md) —— **先读它的「本插件是什么」一节**，那里说明哪些约束已废弃、哪些目标形态已落地
+- [ACP 收敛方向：只借显示层](./docs/acp-convergence.md) —— **代码收敛的唯一权威依据**：三条已证实的宿主事实、目标形态、分批退役清单
+- [ACP 模式：把会话交给另一个 agent](./docs/acp-mode.md) —— 设计、实测证据与硬边界（含错误方向的完整记录）
 - [DSH 插件开发通用指南（从零起手）](./docs/dsh-plugin-development-guide.md)
 - [DSH 官方源码参考与架构索引](./docs/README.md)
-- [ACP 模式：把会话交给另一个 agent](./docs/acp-mode.md)（预设组装、转发规则与证据、权限裁决、做不到的边界）

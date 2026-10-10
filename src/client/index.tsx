@@ -1,8 +1,9 @@
 /**
  * dsh-ntr browser entry: builds the store over the Connection RPC face and
- * contributes every public seat — the settings section, the composer's ACP
- * cluster and pickers, the ACP conversation view, and the agent-native mode
- * control beside them.
+ * contributes every public seat — the settings section, the ACP conversation
+ * view, the agent-native mode control, and the ACP base in the composer's
+ * model seat (installed by the ACP-mode gate, which is what keeps it out of
+ * every non-ACP conversation).
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -15,12 +16,14 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { AcpStore, type RpcCall } from './store.ts'
 import { AcpSettingsSection } from './panel.tsx'
 import { AcpComposerMode } from './composer-mode.tsx'
-import { AcpModelSeat, AcpSessionControls, AcpSessionMenu } from './session-controls.tsx'
+import { AcpSessionControls, AcpSessionMenu } from './session-controls.tsx'
 import { AcpConversationView } from './acp-view.tsx'
+import { createModelSeatClaim, MODEL_SEAT_KEY } from './model-seat.tsx'
+import type { ModelSeatClaim, SeatSlots } from './model-seat.tsx'
 import {
-  ACP_PROVIDER, acpModeFromPresetEvent, rowAgentPreset, selectAcpRoute, sessionHasOwnSelection, setAcpSeatActive, shouldShadowModelSeat, stagedSessionOf,
+  acpModeFromPresetEvent, rowAgentPreset, stagedIsAcpMode, stagedSessionOf,
 } from './acp-ui.tsx'
-import type { AcpChatInjected, AcpDirectory, AcpPermissionCatalog, AcpSessionFace, AcpSessionsSnapshot, SessionListSource } from './acp-ui.tsx'
+import type { AcpChatInjected, AcpSessionFace, AcpSessionsSnapshot, SessionListSource } from './acp-ui.tsx'
 
 export const name = 'dsh-ntr-client'
 export const inject = ['slots', 'connection']
@@ -37,13 +40,11 @@ interface BrowserConnection {
 
 /**
  * Optional services, resolved structurally rather than injected. Declaring
- * `modelDirectories` (the model-selection plugin's service) or `sessions` in
- * `inject` would make this plugin fail to load in a deployment that composes
- * only a subset of the official client modules — and both are read through
- * `ctx.get` at call time, so a late-arriving service still answers.
+ * `sessions` in `inject` would make this plugin fail to load in a deployment
+ * that composes only a subset of the official client modules — and it is read
+ * through `ctx.get` at call time, so a late-arriving service still answers.
  */
 interface StructuralServices {
-  modelDirectories: { directoryFor(sessionId: string): AcpDirectory }
   sessions: {
     binding(sessionId: string): { session?: unknown } | undefined
     /** The client runtime's session list store (see `AcpSessionsSnapshot`). */
@@ -71,25 +72,6 @@ export function apply(ctx: Context): void {
    */
   const service = <T,>(name: string): T | undefined => (ctx as unknown as { get(key: string): unknown }).get(name) as T | undefined
 
-  /**
-   * This session's shared model directory (`ctx.modelDirectories`); `undefined`
-   * when it cannot be resolved *yet*.
-   *
-   * Two legitimate throws land here: an addressed subagent session (refused on
-   * purpose) and a session whose runtime scope has not been materialized yet —
-   * observed live as `cannot get property "remote.session" without inject` for
-   * the session on stage, milliseconds after boot. They are NOT the same verdict,
-   * so the caller retries instead of treating `undefined` as final (see
-   * `useDirectory`).
-   */
-  const directoryFor = (sessionId: string): AcpDirectory | undefined => {
-    try {
-      return service<StructuralServices['modelDirectories']>('modelDirectories')?.directoryFor(sessionId)
-    } catch {
-      return undefined
-    }
-  }
-
   /** This session's command/projection face (`ctx.sessions`); `undefined` before it materializes. */
   const faceFor = (sessionId: string): AcpSessionFace | undefined => {
     try {
@@ -99,33 +81,11 @@ export function apply(ctx: Context): void {
     }
   }
 
-  /**
-   * The process-level permission-preset catalog (`permissionPresets.catalog`
-   * over the remote channel) — the rows the boundary picker switches between.
-   * The session `permissions` projection only carries the current selection,
-   * never the options. Resolved at call time like every optional service here,
-   * and every failure just means "no rows to offer", never a throw.
-   */
-  const permissionCatalogFor = async (): Promise<AcpPermissionCatalog | undefined> => {
-    type CatalogResult = { ok: boolean; value?: AcpPermissionCatalog }
-    type PresetsRemote = { catalog(): Promise<CatalogResult> }
-    try {
-      const direct = service<PresetsRemote>('remote.permissionPresets')
-      const viaNamespace = service<{ permissionPresets?: PresetsRemote }>('remote')?.permissionPresets
-      const result = await (direct ?? viaNamespace)?.catalog()
-      return result?.ok === true ? result.value : undefined
-    } catch {
-      return undefined
-    }
-  }
-
   /** The injected face every ACP conversation entry receives. */
   const chatFace = (sessionId: unknown): AcpChatInjected & { sessionId: string } => ({
     acp: store,
     sessionId: String(sessionId),
-    directoryFor,
     faceFor,
-    permissionCatalogFor,
   })
 
   ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
@@ -136,10 +96,10 @@ export function apply(ctx: Context): void {
     inject: () => ({ acp: store }),
   }, AcpSettingsSection)), 'dsh-ntr: settings section')
 
-  // The chat side of the permission story: DSH's Access mode governs the
-  // boundary (see `accessModeRouting`), and the agent's OWN modes sit beside it
-  // in the composer tool row — the seat the slot contract reserves for exactly
-  // this ("entries sit beside that chrome, never replace it").
+  // The agent's OWN modes sit in the composer tool row — the seat the slot
+  // contract reserves for exactly this ("entries sit beside that chrome, never
+  // replace it"). They are a different layer from everything the host controls:
+  // this is HOW the agent works, not what it may touch.
   ctx.effect(() => ctx.slots.inject('conversation.input.left', () => ctx.slots.register({
     name: 'conversation.input.left',
     id: 'acp-mode',
@@ -155,19 +115,6 @@ export function apply(ctx: Context): void {
     // (see the note there). Runtime passes the real shares either way.
   }, AcpComposerMode as unknown as SlotComponent<any>)), 'dsh-ntr: composer agent-mode control')
 
-  // The ACP cluster: which agent serves this conversation, which of ITS models,
-  // and how hard it should think — written through the SAME per-session model
-  // directory the native seat uses, so the two surfaces can never disagree.
-  ctx.effect(() => ctx.slots.inject('conversation.input.left', () => ctx.slots.register({
-    name: 'conversation.input.left',
-    id: 'acp-cluster',
-    order: 10,
-    inject: (sessionId: unknown) => chatFace(sessionId),
-    // Same cast as the mode control: the published slot map drops `owner`, so
-    // the composed-props constraint cannot be met by type (the props contract
-    // lives structurally in session-controls.tsx).
-  }, AcpSessionControls as unknown as SlotComponent<any>)), 'dsh-ntr: composer ACP cluster')
-
   // Its picker rides the composer's overlay seat — the platform's home for
   // menus, so the popup floats above the card instead of being clipped by it.
   ctx.effect(() => ctx.slots.inject('conversation.input.overlay', () => ctx.slots.register({
@@ -177,221 +124,164 @@ export function apply(ctx: Context): void {
     inject: (sessionId: unknown) => chatFace(sessionId),
   }, AcpSessionMenu as unknown as SlotComponent<any>)), 'dsh-ntr: composer ACP picker')
 
-  // The ACP-mode model seat: while the CURRENT session runs the ACP preset, the
-  // composer's single model seat is taken over by our ACP-only seat, so the
-  // native catalog (every provider the host registers, session-independent —
-  // there is no per-session seam to filter it with) cannot offer models that
-  // cannot work under that preset. The opposite direction needs no seat: ACP
-  // models are never advertised in that catalog in the first place (see
-  // `AcpLlmAdapter.listModels`), so a non-ACP conversation cannot see them.
-  // Registration here is dynamic and keyed on the client runtime's own session
-  // list, and every uncertain path (service missing, declarer missing,
-  // registration refused, addressed subagent route) leaves the native seat
-  // exactly where it was — the failure mode is "no takeover", never "no model
-  // selector".
+  /**
+   * The client runtime's session list store, read structurally. Used to find
+   * the session the composer is staged on and whether it runs the ACP preset —
+   * which is what every ACP conversation entry keys off.
+   */
   const sessionsList = (): SessionListSource | undefined => {
     const list = service<StructuralServices['sessions']>('sessions')?.list
     if (list === undefined || typeof list.getSnapshot !== 'function' || typeof list.subscribe !== 'function') return undefined
     return list
   }
 
-  let seatRegistered = false
-  let seatDispose: (() => void) | undefined
   /**
-   * Extra seat entries minted by the winner race below (a rival shadowing seat
-   * registered after us holds a lower auto rank; each extra entry undercuts it).
-   * All of them retire together with the seat (see `dropSeat`).
-   */
-  const extraSeatDisposals: (() => void)[] = []
-  /** Component identities minted for the winner race (see `seatIsOurs`). */
-  const extraWrappers = new Set<unknown>()
-  /** Retire every seat contribution (primary + any race mints). */
-  const dropSeat = (): void => {
-    const dispose = seatDispose
-    seatDispose = undefined
-    seatRegistered = false
-    while (extraSeatDisposals.length > 0) {
-      try { extraSeatDisposals.pop()?.() } catch { /* already gone */ }
-    }
-    extraWrappers.clear()
-    setAcpSeatActive(false)
-    dispose?.()
-  }
-  /** Set once the seat's own render crashed: never re-take the seat this session. */
-  let seatBroken = false
-
-  /**
-   * Chat session ids the seat gate has already asked the host about (the
-   * `session/chat-list` fallback). The ask must be one-shot per id: a host
-   * whose answer carries no `acpMode` would otherwise turn every store
-   * mutation into a fresh RPC — the classic resolve-loop this file already
-   * guards against elsewhere. `agent-preset/selected` clears an id so a
-   * committed preset switch re-asks.
+   * Chat session ids the ACP-mode tracker has already asked the host about (the
+   * `session/chat-list` fallback). The ask is once per id so a host whose
+   * answer carries no `acpMode` cannot turn every store mutation into a fresh
+   * RPC — the classic resolve-loop this file already guards against elsewhere.
+   * `agent-preset/selected` clears an id so a committed preset switch re-asks.
+   *
+   * An id is REMOVED again when its ask comes back without a verdict: a
+   * one-shot ask that cannot answer must not wedge the gate for the rest of
+   * the page's life. The next store mutation or list notification retries it,
+   * which is what makes the fallback recoverable rather than a single coin
+   * flip (a host half that transiently fails, or answers `{}` because the
+   * session's projection row is not resident yet, used to leave the native
+   * model seat visible forever with nothing in the console to say why).
    */
   const acpModeAsked = new Set<string>()
 
   /** The host-side verdict for the seat gate, when we hold one (`AcpStore.acpMode`). */
   const acpModeVerdict = (sessionId: string): boolean | undefined => store.getSnapshot().acpMode[sessionId]
 
-  /** Sessions this gate already routed (or deliberately left alone); one answer per page life. */
-  const routeSettled = new Set<string>()
-
-  /**
-   * Route a brand-new ACP-mode conversation to the plugin's default agent.
-   *
-   * WHY: the deployment default model may never be an ACP route (see
-   * `AcpDefaultModelGuard`), so an ACP-mode conversation that has not selected
-   * anything yet starts on a *native* route — which the seat would report as
-   * "runs the ACP preset, but its model is not an ACP agent", asking for a click
-   * on every new conversation. The default agent (the panel's ★ gesture) is the
-   * plugin's own answer to which agent that should be.
-   *
-   * Deliberately narrow: only sessions with NO selection of their own are
-   * routed (a route the user picked stays theirs — the seat's warning is the
-   * documented surface for it), only when the default agent still exists, and a
-   * session is settled either way after the first attempt so a refused write
-   * cannot turn the gate into a retry loop.
-   */
-  const ensureAcpRoute = (sessionId: string): void => {
-    if (routeSettled.has(sessionId)) return
-    const defaultAgent = store.getSnapshot().defaultAgent
-    if (defaultAgent === undefined || !store.getSnapshot().agents.some(agent => agent.id === defaultAgent)) return
-    const own = sessionHasOwnSelection(faceFor, sessionId)
-    if (own === undefined) return // the runtime has not answered yet: ask again on the next tick
-    if (own) {
-      routeSettled.add(sessionId)
-      return
-    }
-    const directory = directoryFor(sessionId)
-    if (directory === undefined) return
-    routeSettled.add(sessionId)
-    void (async () => {
-      try {
-        await directory.load()
-        // The directory is the fact source for "where this session is": if the
-        // route already is an ACP one (someone picked while we loaded), leave it.
-        if (directory.store.getSnapshot().current?.provider === ACP_PROVIDER) return
-        await selectAcpRoute(store, directory, { provider: ACP_PROVIDER, model: defaultAgent })
-      } catch {
-        // The seat's own menu stays the way to pick an agent.
-      }
-    })()
-  }
-
-  /** Register or drop the seat for the current session's preset state (idempotent). */
-  const syncModelSeat = (): void => {
-    if (seatBroken) return
-    const list = sessionsList()
-    const snapshot = list?.getSnapshot() as AcpSessionsSnapshot | undefined
-    // The gate prefers the runtime's own session row; on hosts whose rows
-    // carry no `agentPreset` the row is silent and only our host-side report
-    // can answer. Ask once per id, exactly while the row is silent AND no
-    // verdict is held — the store subscriber below re-runs this gate when the
-    // answer lands (`loadChatSessions` dedups racing asks in flight too).
-    const staged = stagedSessionOf(snapshot)
-    if (list !== undefined && staged !== undefined && !staged.subagent
-      && rowAgentPreset(staged.row) === undefined
-      && acpModeVerdict(staged.sessionId) === undefined
-      && !acpModeAsked.has(staged.sessionId)) {
-      acpModeAsked.add(staged.sessionId)
-      void store.loadChatSessions(staged.sessionId)
-    }
-    const want = list !== undefined
-      && service<StructuralServices['modelDirectories']>('modelDirectories') !== undefined
-      && shouldShadowModelSeat(snapshot, acpModeVerdict)
-    // Same verdict as the seat takeover: this session runs the ACP preset, so it
-    // must be on an ACP route (see `ensureAcpRoute`). Runs even when the seat
-    // itself could not be registered — the route is the conversation's, not the
-    // seat's.
-    if (want && staged !== undefined) ensureAcpRoute(staged.sessionId)
-    if (want === seatRegistered) return
-    if (!want) {
-      dropSeat()
-      return
-    }
-    try {
-      seatDispose = ctx.slots.inject('conversation.input.model', () => ctx.slots.register({
-        name: 'conversation.input.model',
-        // Shadowing rank: the native ui-model-selection seat sits at the
-        // default 0 and only the lowest live entry of a cell renders. NOTE:
-        // the dynamic-plugin runner gives this entry its own per-package rank,
-        // and a rival shadowing seat registered later can head the cell (see
-        // `ensureSeatWins` below) — this number is the declaration, the race
-        // below is the enforcement.
-        priority: -1,
-        inject: (sessionId: unknown) => chatFace(sessionId),
-      }, AcpModelSeat as unknown as SlotComponent<any>))
-      seatRegistered = true
-      setAcpSeatActive(true)
-      ensureSeatWins()
-    } catch {
-      // A refused registration (slot undeclared in this build, or the rank is
-      // taken) leaves the native seat in place, which is the safe outcome.
-      seatRegistered = false
-      seatDispose = undefined
-      setAcpSeatActive(false)
-    }
-  }
-
-  /**
-   * Settle cell ownership when another shadowing entry shares the seat.
-   *
-   * The renderer renders a cell's LOWEST live entry, but the dynamic-plugin
-   * runner gives every package one auto rank (observed: -1), so a rival
-   * shadowing seat (e.g. `dsh-thinking-effort`'s model slider) registered at
-   * the same tick lands at the SAME rank and — being registered later in the
-   * sorted order — our entry can end up headless: registered, but never
-   * rendered. Retire-and-re-register does NOT work here: the runner's load
-   * convergence drops the newer of two same-rank contributions, silently
-   * removing our entry entirely (observed live).
-   *
-   * The race is therefore settled by STACKING: register one extra entry at an
-   * EXPLICIT rank strictly below the incumbent head's (an exact duplicate of
-   * our own rank throws, so the undercut must move), with a distinct component
-   * identity so dedup cannot fold it into the standing entry. One undercut
-   * seat wins the cell; bounded by `attempt`; the stack unwinds via `dropSeat`
-   * when the gate stands down.
-   */
-  const seatIsOurs = (component: unknown): boolean =>
-    component === AcpModelSeat || extraWrappers.has(component)
-  const ensureSeatWins = (attempt = 0): void => {
-    if (seatBroken || !seatRegistered || attempt >= 4) return
-    const slots = ctx.slots as unknown as {
-      entriesOfSlot?(key: string): readonly { component?: unknown }[]
-    }
-    const heads = typeof slots?.entriesOfSlot === 'function' ? slots.entriesOfSlot('conversation.input.model') : undefined
-    if (heads === undefined || heads.length === 0) return
-    if (seatIsOurs(heads[0].component)) return
-    const headPrio = typeof (heads[0] as { options?: { priority?: number } }).options?.priority === 'number'
-      ? (heads[0] as { options: { priority: number } }).options.priority
-      : 0
-    const undercut = Math.min(headPrio - 1, -100)
-    const wrapper: SlotComponent<any> = props => AcpModelSeat(props)
-    extraWrappers.add(wrapper)
-    try {
-      extraSeatDisposals.push(ctx.slots.inject('conversation.input.model', () => ctx.slots.register({
-        name: 'conversation.input.model',
-        priority: undercut,
-        inject: (sessionId: unknown) => chatFace(sessionId),
-      }, wrapper)))
-    } catch {
-      return
-    }
-    setTimeout(() => ensureSeatWins(attempt + 1), 0)
-  }
-
   ctx.effect(() => {
     let stopWatch: (() => void) | undefined
+    /**
+     * The claim on the host's model seat, held while the staged conversation
+     * runs the ACP preset. That cell is where the host's own base sits (the
+     * trailing group, right before the submit button), so the claim installs
+     * the ACP base there rather than blanking it — one cell, one occupant, and
+     * the position the user expects. Ownership of the cell is NOT settled by
+     * the rank a registration declares — the client runner rewrites non-chain
+     * priorities with its own page-global counter, so the last registrant
+     * wins — which is why the claim verifies the cell's winner and retakes it
+     * when a rival (a shipped occupant, or a third-party seat plugin later in
+     * the load order) is holding it. See model-seat.tsx.
+     */
+    let claim: ModelSeatClaim | undefined
+    /**
+     * Last diagnostic line from {@link syncAcpMode}. Every way this gate can
+     * end with the native seat still on screen used to be silent — an inner
+     * `catch { return [] }` and an outer `catch { … }` between them swallowed
+     * both the registration failure and the inject failure, leaving "the ACP
+     * conversation still shows the native model picker" with nothing to read
+     * it from. This string is the gate's own account of what it last decided,
+     * verified or not, and why; the ACP view renders it.
+     */
+    let seatDiag = 'idle'
+    const syncAcpMode = (): void => {
+      const list = sessionsList()
+      const snapshot = list?.getSnapshot() as AcpSessionsSnapshot | undefined
+      if (list === undefined) {
+        seatDiag = 'no session list service'
+        return
+      }
+      const staged = stagedSessionOf(snapshot)
+      if (staged === undefined) {
+        seatDiag = 'no staged session (nothing retains the main view)'
+        return
+      }
+      if (staged.subagent) {
+        seatDiag = `staged ${staged.sessionId} is an addressed subagent route`
+        return
+      }
+      // The gate prefers the runtime's own session row; on hosts whose rows
+      // carry no `agentPreset` the row is silent and only our host-side report
+      // can answer. Ask while the row is silent AND no verdict is held — the
+      // store subscriber below re-runs this gate when the answer lands
+      // (`loadChatSessions` dedups racing asks in flight too). An ask that came
+      // back without an answer is reported unsettled and retracted here, so the
+      // next tick asks again rather than parking the session forever.
+      const verdictHeld = acpModeVerdict(staged.sessionId) !== undefined || store.hasAcpModeVerdict(staged.sessionId)
+      if (rowAgentPreset(staged.row) === undefined
+        && !verdictHeld
+        && !acpModeAsked.has(staged.sessionId)) {
+        acpModeAsked.add(staged.sessionId)
+        void store.loadChatSessions(staged.sessionId)
+      } else if (!verdictHeld && acpModeAsked.has(staged.sessionId)) {
+        // The previous ask for this session came back without a verdict (or is
+        // still in flight). Withdraw the one-shot mark so the round-trip can be
+        // repeated: without this, one silent failure pins the native seat in
+        // place for the rest of the page's life with nothing to show why.
+        acpModeAsked.delete(staged.sessionId)
+      }
+      // An ACP conversation's models belong to the external agent, so the
+      // host's native model seat must not be on screen here — it would list
+      // providers this conversation cannot use, and clicking one writes the
+      // process-wide default model. The seat is also exactly where the host's
+      // own base sat (the trailing group, before the submit button), which is
+      // where the ACP base belongs — so instead of blanking the cell we install
+      // the ACP base in it. See model-seat.tsx for why occupying it is not
+      // enough on its own.
+      if (!stagedIsAcpMode(snapshot, acpModeVerdict)) {
+        seatDiag = `staged ${staged.sessionId} is not in ACP mode`
+        if (claim !== undefined) { claim.release(); claim = undefined }
+        return
+      }
+      // Stays re-runnable on purpose: the seat is not declared before the
+      // composer bar mounts, a registration can be refused, and the cell can be
+      // taken from us later. The claim reports each of those through the
+      // diagnostic line instead of pretending the base is installed — the
+      // next evaluation (store mutation, list notification, preset frame, or a
+      // change to the cell itself) simply tries again.
+      seatDiag = `staged ${staged.sessionId} is ACP mode`
+      claim ??= createModelSeatClaim({
+        slots: ctx.slots as unknown as SeatSlots,
+        occupant: () => AcpSessionControls,
+        // The occupant's own face — REQUIRED by the claim, and the reason is a
+        // silent failure this gate could never see: `conversation.input.model`
+        // is session-scoped, so without it the entry renders with the standard
+        // kit alone (`acp === undefined`), the slot's error boundary abdicates
+        // our entry from the cell, and the native seat comes back while the
+        // diagnostic still says "held by the ACP base". See model-seat.tsx.
+        inject: (sessionId: unknown) => chatFace(sessionId),
+        onDiag: (line) => { seatDiag = `staged ${staged.sessionId} · ${line}` },
+      })
+      claim.sync()
+    }
     const attach = (): void => {
       const list = sessionsList()
-      if (list !== undefined && stopWatch === undefined) stopWatch = list.subscribe(syncModelSeat)
-      syncModelSeat()
+      if (list !== undefined && stopWatch === undefined) stopWatch = list.subscribe(runGate)
+      runGate()
+    }
+    /**
+     * Wrap {@link syncAcpMode} so every evaluation also publishes its verdict
+     * to the store. The gate runs on every store mutation, list notification,
+     * preset frame and change to the model-seat cell itself, so the published
+     * line is always the latest verdict — which is the whole point: the visible
+     * symptom ("the native seat is still there") looks identical whether the
+     * seat was never declared, refused us, or was taken by a rival, and only
+     * this line tells them apart.
+     */
+    const runGate = (): void => {
+      syncAcpMode()
+      store.noteSeatDiag(seatDiag)
     }
     attach()
     // The store mutates when `session/chat-list` answers, so the fallback
     // verdict arriving is what re-runs this gate — the list subscription alone
     // cannot see it (the runtime rows are silent on these hosts).
-    const stopStore = store.subscribe(syncModelSeat)
+    const stopStore = store.subscribe(runGate)
+    // The cell can be taken by someone else at any moment (the runner ranks the
+    // most recent registration lowest, so a seat plugin loading or re-mounting
+    // after us wins). `slots/changed` carries the key, and the claim's `sync`
+    // retakes the cell only when it is actually holding something that is not
+    // ours — so this is evidence-driven, not a poll.
+    const stopCell = ctx.on('slots/changed', (...args: unknown[]) => {
+      if (args[0] !== MODEL_SEAT_KEY) return
+      runGate()
+    })
     // A committed preset switch rewrites the session the gate judged. The
     // runtime's frame carries the new preset, so fold it straight into the
     // verdict map — see the handler for why re-reading the log there would be a
@@ -406,9 +296,9 @@ export function apply(ctx: Context): void {
         // fold IT rather than re-asking the host. The runtime broadcasts this
         // the moment the switch commits, while the appended session-log row is
         // not yet visible to a fresh `session/chat-list` cold read — reading
-        // there folds the PREVIOUS preset, which kept the seat one switch behind
-        // until a page reload (the reported "switching into or out of ACP mode
-        // only moves the model seat after a refresh" symptom). The host read
+        // there folds the PREVIOUS preset, which kept the surface one switch
+        // behind until a page reload (the reported "switching into or out of ACP
+        // mode only moves the model seat after a refresh" symptom). The host read
         // stays the cold path for a session this tab has no frame for.
         const sessionId = args[0]
         if (typeof sessionId !== 'string') return
@@ -424,41 +314,28 @@ export function apply(ctx: Context): void {
           // read — the behaviour the fold replaced.
           store.invalidateAcpMode(sessionId)
         }
-        syncModelSeat()
+        runGate()
       })
       : undefined
     // Late services: the runtime's session list normally exists before this
     // module applies, but a build that loads us first must not end up without
-    // the seat for the rest of the page's life.
+    // the gate for the rest of the page's life.
     const stopService = ctx.on('internal/service', attach)
-    // Supervision: a crash inside the seat's own render retires the entry
-    // (`abdicate`) and the native seat takes the cell back by itself — but the
-    // cluster would stay stood-down and the ACP controls would vanish with it.
-    // Only a cell's WINNER renders, and while we hold rank -1 that is us, so an
-    // abdication here is ours: hand both surfaces back and stop retrying.
-    const stopErrors = ctx.slots.onEntryError((key, _entry, error, info) => {
-      // An abdication is silent by construction — which is exactly how a dead
-      // picker once hid a crash for a whole session. One line on the console
-      // keeps that failure mode observable.
-      console.warn(`dsh-ntr: slot entry "${key}" failed${info?.abdicated === true ? ' (abdicated)' : ''}`, error)
-      if (seatBroken || !seatRegistered || !info.abdicated || key !== 'conversation.input.model') return
-      seatBroken = true
-      dropSeat()
-    })
     return () => {
-      stopErrors()
       stopService()
       stopStore()
+      stopCell()
       stopPreset?.()
       stopWatch?.()
-      dropSeat()
+      if (claim !== undefined) { claim.release(); claim = undefined }
+      store.noteSeatDiag('gate disposed')
     }
-  }, 'dsh-ntr: ACP model seat')
+  }, 'dsh-ntr: ACP mode tracking')
 
   // The ACP view tab: the agent's real stream (tool cards, plans, unified
-  // diffs) in a seat of its own, because the chat plane's chunk vocabulary is
-  // text + reasoning and nothing else. Session-scope list entry; the view ring
-  // renders it one tab at a time.
+  // diffs). Session-scope list entry; the view ring renders it one tab at a
+  // time. Meanwhile the agent's prose and thinking ride the NATIVE chat plane
+  // through the LLM adapter — see docs/acp-convergence.md §2.1.
   ctx.effect(() => ctx.slots.inject('conversation.view', () => ctx.slots.register({
     name: 'conversation.view',
     id: 'acp',

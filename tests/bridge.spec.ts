@@ -4,17 +4,17 @@
  */
 
 import { fileURLToPath } from 'node:url'
+import { spawn } from 'node:child_process'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { afterAll, describe, expect, it } from 'vitest'
 import {
-  AcpLlmAdapter, BridgeManager, defaultAgentWorkspace,
-  detectHostAgents, ensureAgentExecutable, findExecutable,
+  AcpLlmAdapter, AgentBridge, BridgeManager, defaultAgentWorkspace,
+  detectHostAgents, ensureAgentExecutable, findExecutable, killProcessTree, windowsShimLaunch,
   type ApprovalOutcome, type ApprovalRequestContext, type BridgeTuning,
 } from '../src/bridge.ts'
 import { EventHub, dispatchRpc } from '../src/impl.ts'
-import type { DshSessionPolicy } from '../src/impl.ts'
 import type { AcpAgentDef, AcpEvent, AgentCatalogResult, ChatSessionView, StreamChunk } from '../src/protocol.ts'
 
 const MOCK = fileURLToPath(new URL('./mock-agent.mjs', import.meta.url))
@@ -239,11 +239,38 @@ describe('ACP bridge over stdio (mock agent)', () => {
     expect(types).toContain('usage')
     expect(types).toContain('finish')
 
-    // Reasoning block
+    // Reasoning block: the agent's own thoughts and NOTHING else. A tool call
+    // used to be flattened into a `> 🛠️ [Tool: …]` prose line here; that
+    // downgrade is exactly what made the Chat plane unable to draw a card.
     const reasoningDeltas = chunks.filter((c): c is Extract<StreamChunk, { type: 'reasoning-delta' }> => c.type === 'reasoning-delta')
     const thoughtText = reasoningDeltas.map(c => c.text).join('')
     expect(thoughtText).toContain('thinking…')
-    expect(thoughtText).toContain('mock tool')
+    expect(thoughtText).not.toContain('mock tool')
+
+    // Tool call: a REAL block sequence, which the host's accumulator folds into
+    // `{ kind: 'tool-call', callId, name, argsRaw }` — the shape the Chat
+    // plane's tool-call renderer consumes. Two deltas for this mock: the
+    // announcement (id + name, no arguments — the mock sends none) and the
+    // result content. Updates that carry nothing new emit nothing.
+    const toolDeltas = chunks.filter((c): c is Extract<StreamChunk, { type: 'tool-call-delta' }> => c.type === 'tool-call-delta')
+    expect(toolDeltas.map(c => c.id)).toEqual(['call_1', 'call_1'])
+    // The announcement carries the call identity and the agent's own label.
+    expect(toolDeltas[0]).toMatchObject({ id: 'call_1', name: 'mock tool' })
+    // The update carries the result text the agent published.
+    expect(toolDeltas[1]?.argumentsDelta).toContain('tool result line')
+
+    // The block it opens and closes is a `tool-call` block, and the closing
+    // frame carries the COMPLETE snapshot — the host REPLACES on `block-end`
+    // rather than merging, so a partial here would blank the card.
+    const toolStart = chunks.find((c): c is Extract<StreamChunk, { type: 'block-start' }> =>
+      c.type === 'block-start' && c.blockType === 'tool-call')
+    expect(toolStart).toBeDefined()
+    const toolEnd = chunks.find((c): c is Extract<StreamChunk, { type: 'block-end' }> =>
+      c.type === 'block-end'
+      && typeof c.block === 'object' && c.block !== null
+      && (c.block as { type?: string }).type === 'tool-call')
+    expect(toolEnd?.block).toMatchObject({ type: 'tool-call', id: 'call_1', name: 'mock tool' })
+    expect((toolEnd?.block as { arguments?: string }).arguments).toContain('tool result line')
 
     // Text block
     const textDeltas = chunks.filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
@@ -1035,12 +1062,18 @@ describe('native approval routing (isolated manager)', () => {
 })
 
 /**
- * A chat-backed session follows the DSH access mode: the mode supplies the
- * boundary, `approval` decides whether a human is asked at it. The resolver
- * below is the exact seam `src/index.ts` wires (DSH session id → folded policy),
- * so these cases exercise the production path without a live DSH host.
+ * Permission mapping and the agent's own modes.
+ *
+ * The retired axis resolved a DSH access mode and pre-judged every ask against
+ * it. It is gone: an ACP agent is fully autonomous, so the ask the agent raises
+ * is what reaches the human (routed to the native composer when the host's
+ * approval chain is available, otherwise the settings-panel ledger), and the
+ * agent's own `permission` field is the only knob. The workspace resolver these
+ * cases used to fake as an access mode is now just the workspace reader
+ * (`src/index.ts`'s `wireWorkspace`), so they still exercise the production
+ * path without a live DSH host.
  */
-describe('DSH access mode mapping (isolated manager)', () => {
+describe('permission mapping and the agent\'s own modes (isolated manager)', () => {
   const modeHub = new EventHub()
   const modeEvents: AcpEvent[] = []
   modeHub.subscribe(event => { modeEvents.push(event) })
@@ -1048,13 +1081,11 @@ describe('DSH access mode mapping (isolated manager)', () => {
   const modeAdapter = new AcpLlmAdapter(modeManager)
   const asks: ApprovalRequestContext[] = []
   let answer: ApprovalOutcome = 'allowed-once'
-  let policy: DshSessionPolicy | undefined
 
   modeManager.setApprovalRequester(request => {
     asks.push(request)
     return Promise.resolve(answer)
   })
-  modeManager.setSessionPolicyResolver(() => policy)
 
   afterAll(async () => {
     await modeManager.shutdownAll()
@@ -1103,97 +1134,49 @@ describe('DSH access mode mapping (isolated manager)', () => {
       .join('')
   }
 
-  it('answers "full access" locally instead of routing it into a guaranteed rejection', async () => {
-    // 完全权限 = danger-full-access + approval `never`. The host resolves every
-    // `never` ask to 'rejected' before an answerer runs, so feeding it the ask
-    // would deny exactly the writes this mode exists to allow.
-    policy = { mode: 'danger-full-access', approval: 'never' }
-    expect(modeManager.accessModeRouting()).toBe(true)
-    const before = asks.length
-    expect(await modeTurn('dsh-mode-full', 'PERM full access')).toContain('perm=allow1')
-    expect(asks).toHaveLength(before)
-  }, 30_000)
-
-  it('denies a write under read-only without asking anyone', async () => {
-    policy = { mode: 'read-only', approval: 'never' }
-    const before = asks.length
-    expect(await modeTurn('dsh-mode-ro', 'PERMEDIT read only write')).toContain('perm=reject1')
-    expect(asks).toHaveLength(before)
-  }, 30_000)
-
-  it('escalates a read-only write to the human when the approval policy asks', async () => {
-    policy = { mode: 'read-only', approval: 'ask' }
+  it('maps the agent\'s own ask to the human, whatever the agent calls it', async () => {
+    // The retired axis pre-judged every ask against a resolved DSH access mode
+    // (and got it backwards: `never` denied everything `full access` meant to
+    // allow). Now the agent's own `permission: ask` is the only knob, and the
+    // ask the agent raises is what reaches the human — unchanged.
     answer = 'allowed-once'
     const before = asks.length
-    expect(await modeTurn('dsh-mode-ro-ask', 'PERMEDIT read only ask')).toContain('perm=allow1')
+    expect(await modeTurn('dsh-perm-1', 'PERM dangerous thing')).toContain('perm=allow1')
     expect(asks).toHaveLength(before + 1)
     expect(asks.at(-1)?.toolName).toBe('mock dangerous operation')
   }, 30_000)
 
-  it('allows a declared in-workspace write without asking, and escalates one outside it', async () => {
-    const root = join(tmpdir(), 'dsh-mode-ws')
-    mkdirSync(root, { recursive: true })
-    policy = { mode: 'workspace-write', approval: 'ask', workspaceRoot: root }
-    const before = asks.length
-    expect(await modeTurn('dsh-mode-ws-in', `PERMEDIT PERMLOC:${join(root, 'a.txt')} write inside`)).toContain('perm=allow1')
-    expect(asks).toHaveLength(before)
-
-    answer = 'rejected'
-    expect(await modeTurn('dsh-mode-ws-out', `PERMEDIT PERMLOC:${join(homedir(), 'outside.txt')} write outside`)).toContain('perm=reject1')
-    expect(asks).toHaveLength(before + 1)
-  }, 30_000)
-
-  it('narrates only in ACP mode: the agent\'s own ask reaches the user instead of being auto-allowed', async () => {
-    const root = join(tmpdir(), 'dsh-mode-acp')
-    mkdirSync(root, { recursive: true })
-    policy = { mode: 'workspace-write', approval: 'ask', workspaceRoot: root }
-    modeManager.setAcpModeResolver(() => true)
-    answer = 'allowed-once'
+  it('still answers locally when the agent itself said not to ask', async () => {
+    // `permission: allow` / `reject` on the agent definition are the agent's own
+    // declaration about its asks; the host honours it without a second opinion.
+    modeManager.setPermission('moded', 'allow')
     try {
       const before = asks.length
-      // An in-boundary write: the access-mode mapping allows this silently. In
-      // ACP mode the agent's own permission mode is what decides, so its ask is
-      // what reaches the human.
-      const echoed = await modeTurn('dsh-mode-acp-in', `PERMEDIT PERMLOC:${join(root, 'a.txt')} acp write inside`)
-      expect(echoed).toContain('perm=allow1')
-      expect(asks).toHaveLength(before + 1)
-      // A resolved access mode must not smuggle anything into the prompt: the
-      // mock echoes its whole input, so byte equality is the whole guard. The
-      // mode arbitrates answers; it is never narrated.
-      expect(echoed).toBe(`MOCK: echo PERMEDIT PERMLOC:${join(root, 'a.txt')} acp write inside perm=allow1`)
-
-      // `approval: never` still answers locally: the host resolves every ask to
-      // 'rejected' before an answerer runs, so routing one would be a lie.
-      policy = { mode: 'read-only', approval: 'never' }
-      const after = asks.length
-      expect(await modeTurn('dsh-mode-acp-ro', 'PERMEDIT read only write')).toContain('perm=reject1')
-      expect(asks).toHaveLength(after)
+      expect(await modeTurn('dsh-perm-allow', 'PERM silent allow')).toContain('perm=allow1')
+      expect(asks).toHaveLength(before)
     } finally {
-      modeManager.setAcpModeResolver(undefined)
-      policy = { mode: 'workspace-write', approval: 'ask', workspaceRoot: tmpdir() }
+      modeManager.setPermission('moded', 'ask')
+    }
+    modeManager.setPermission('moded', 'reject')
+    try {
+      const before = asks.length
+      expect(await modeTurn('dsh-perm-reject', 'PERMEDIT silent reject')).toContain('perm=reject1')
+      expect(asks).toHaveLength(before)
+    } finally {
+      modeManager.setPermission('moded', 'ask')
     }
   }, 30_000)
 
-  it('keeps the pre-mapping behavior when no access mode is available', async () => {
-    modeManager.setSessionPolicyResolver(undefined)
+  it('narrates nothing into the prompt, whatever the agent asks', async () => {
+    // The mock echoes its whole input, so byte equality is the whole guard. A
+    // permission question is answered in the conversation; it is never narrated
+    // into the prompt the agent receives.
     answer = 'allowed-once'
-    try {
-      expect(modeManager.accessModeRouting()).toBe(false)
-      const since = modeEvents.length
-      const before = asks.length
-      // Resolver gone → the agent's own `permission: ask` governs again, which
-      // for a chat-bound session still means the native composer path.
-      expect(await modeTurn('dsh-mode-none', 'PERM no mode')).toContain('perm=allow1')
-      expect(asks).toHaveLength(before + 1)
-      // Routed asks never surface a settings-panel card.
-      expect(modeEvents.slice(since).filter(e => e.type === 'permission/request')).toHaveLength(0)
-    } finally {
-      modeManager.setSessionPolicyResolver(() => policy)
-    }
+    expect(await modeTurn('dsh-perm-quiet', 'PERM tell me nothing'))
+      .toBe('MOCK: echo PERM tell me nothing perm=allow1')
   }, 30_000)
 
   it('exposes and switches the agent\'s own mode for a chat session', async () => {
-    policy = { mode: 'workspace-write', approval: 'ask', workspaceRoot: tmpdir() }
     await modeTurn('dsh-mode-list', 'PERM mode list')
 
     const listed = await dispatchRpc(modeManager, 'session/chat-list', { dshSessionId: 'dsh-mode-list' })
@@ -1216,10 +1199,10 @@ describe('DSH access mode mapping (isolated manager)', () => {
       .resolves.toMatchObject({ ok: false, error: { code: 'unknown_session' } })
   }, 30_000)
 
-  it('reports the per-chat-session ACP-mode verdict for the seat gate', async () => {
+  it('reports the per-chat-session ACP-mode verdict for the composer surfaces', async () => {
     // Without the ACP-mode resolver (an older entry that never wired it) the
-    // verdict is false for everything: the gate keeps the native seat, which
-    // is the allowed failure mode.
+    // verdict is false for everything: the surfaces read "not ACP", which is
+    // the allowed failure mode.
     expect(modeManager.chatSessionAcpMode('never-ran')).toBe(false)
     modeManager.setAcpModeResolver(dshSessionId => dshSessionId === 'dsh-mode-list' ? true : undefined)
     try {
@@ -1228,8 +1211,7 @@ describe('DSH access mode mapping (isolated manager)', () => {
       // `undefined` (unknown session) reads as "not ACP", never a guess.
       expect(modeManager.chatSessionAcpMode('never-ran')).toBe(false)
       // A settled verdict is CACHED: a resolver that later throws (a flaky
-      // persistence read) must not flip a fact the log already answered — the
-      // gate keeps the seat instead of flickering on every ask.
+      // persistence read) must not flip a fact the log already answered.
       modeManager.setAcpModeResolver(() => { throw new Error('log unreadable') })
       expect(modeManager.chatSessionAcpMode('dsh-mode-list')).toBe(true)
       // An explicit invalidation (the log moved) is what retires the verdict.
@@ -1256,12 +1238,11 @@ describe('DSH access mode mapping (isolated manager)', () => {
   })
 
   it('session/chat-list drops a stale cached acpMode verdict across a preset switch', async () => {
-    // The gate re-asks session/chat-list on every `agent-preset/selected`; a
-    // verdict cached BEFORE the switch must not be echoed, or the ACP model
-    // seat never activates and the ACP model stays unselectable until the next
-    // prompt turn retires the cache (a chicken-and-egg: you can't run the turn
-    // without the model the seat is supposed to offer). So the chat-list
-    // handler invalidates the cached verdict and always folds the log fresh.
+    // The browser re-asks session/chat-list on every `agent-preset/selected`; a
+    // verdict cached BEFORE the switch must not be echoed, or the surface shows
+    // the previous mode's answer until the next turn retires the cache. So the
+    // chat-list handler invalidates the cached verdict and always folds the log
+    // fresh.
     let acp = false
     modeManager.setAcpModeResolver(() => acp)
     try {
@@ -1277,37 +1258,38 @@ describe('DSH access mode mapping (isolated manager)', () => {
     }
   })
 
-  it('gates fs/write_text_file by the access mode, escalation included', async () => {
-    const dir = join(tmpdir(), 'dsh-mode-fs')
-    mkdirSync(dir, { recursive: true })
+  it('fences fs/write_text_file by the workspace, and nothing else', async () => {
+    // The access-mode layer that used to sit in front of this write is gone
+    // (docs/acp-convergence.md §2.3): a DSH sandbox cannot reach into the
+    // agent's own process, so a second gate here was a fiction. What remains is
+    // the boundary that is real — the session's cwd and the agent's own roots.
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-mode-fs-'))
     const target = join(dir, 'probe.txt')
-    const root = join(tmpdir(), 'dsh-mode-fs-ws')
-    mkdirSync(root, { recursive: true })
 
-    policy = { mode: 'read-only', approval: 'never', workspaceRoot: root }
-    const denied = await modeTurn('dsh-mode-fs-ro', `WRITEFILE ${target}`)
-    expect(denied).toContain('WRITE_FAIL')
-    expect(denied).toContain('[sandbox: file access denied under read-only mode]')
-
-    policy = { mode: 'read-only', approval: 'ask', workspaceRoot: root }
-    answer = 'allowed-once'
-    expect(await modeTurn('dsh-mode-fs-ask', `WRITEFILE ${target}`)).toContain('WRITE_OK')
+    // Inside the session's own cwd: allowed.
+    expect(await modeTurn('dsh-mode-fs-in', `WRITEFILE ${target}`)).toContain('WRITE_OK')
     expect(readFileSync(target, 'utf8')).toBe('written-by-mock-agent')
 
-    policy = { mode: 'workspace-write', approval: 'ask', workspaceRoot: join(tmpdir(), 'dsh-mode-fs') }
-    answer = 'rejected'
-    expect(await modeTurn('dsh-mode-fs-ws', `WRITEFILE ${target}`)).toContain('WRITE_OK')
+    // Outside every allowed root: refused, with a message the agent's model can
+    // act on (it names the path and the boundary). This suite wires no workspace
+    // resolver, so the roots are the agent's own: `def.cwd` (`tmpdir()`) plus
+    // its `allowedCwdRoots`. A path under the USER'S HOME is outside both.
+    const outside = join(homedir(), 'dsh-ntr-escape-probe.txt')
+    const denied = await modeTurn('dsh-mode-fs-out', `WRITEFILE ${outside}`)
+    expect(denied).toContain('WRITE_FAIL')
+    expect(denied).toContain('outside the session workspace')
+    expect(existsSync(outside)).toBe(false)
   }, 30_000)
 })
 
 /**
  * A chat session must run where its DSH session lives: the workspace the user
- * selected in the sidebar, which the host reports back as the policy's
- * `workspaceRoot` (it IS the session header cwd). The agent's configured `cwd`
- * is the plugin's own sandbox directory and only serves `/acp`-RPC sessions and
- * hosts that report no workspace — an agent started in it answers "current
- * workspace" with `~/.dsh/acp-workspaces` while its Read/Glob/Bash cannot see
- * the user's project.
+ * selected in the sidebar, which the host reports back as the workspace
+ * resolver's `workspaceRoot` (it IS the session header cwd). The agent's
+ * configured `cwd` is the plugin's own sandbox directory and only serves
+ * `/acp`-RPC sessions and hosts that report no workspace — an agent started in
+ * it answers "current workspace" with `~/.dsh/acp-workspaces` while its
+ * Read/Glob/Bash cannot see the user's project.
  */
 describe('chat session workspace (isolated manager)', () => {
   const wsHub = new EventHub()
@@ -1326,8 +1308,8 @@ describe('chat session workspace (isolated manager)', () => {
     { ...def, id: 'wsprobe', cwd: narrow, allowedCwdRoots: [narrow] },
   ], wsHub, 500)
   const wsAdapter = new AcpLlmAdapter(wsManager)
-  let wsPolicy: DshSessionPolicy | undefined
-  wsManager.setSessionPolicyResolver(() => wsPolicy)
+  let wsPolicy: { workspaceRoot?: string } | undefined
+  wsManager.setSessionWorkspaceResolver(() => wsPolicy)
 
   afterAll(async () => {
     await wsManager.shutdownAll()
@@ -1389,7 +1371,7 @@ describe('chat session workspace (isolated manager)', () => {
 
   it('anchors a chat session at the DSH session workspace, not the agent default', async () => {
     writeFileSync(join(workspace, 'in-workspace.txt'), 'seen-by-the-agent')
-    wsPolicy = { mode: 'workspace-write', approval: 'ask', workspaceRoot: workspace }
+    wsPolicy = { workspaceRoot: workspace }
     const turn = await wsTurn('dsh-ws-chat', 'hello there')
     expect(normPath(turn.cwd)).toBe(normPath(realpathSync(workspace)))
     // The fs guard reads the session cwd, so the workspace is readable too (the
@@ -1402,7 +1384,7 @@ describe('chat session workspace (isolated manager)', () => {
   it('keeps the configured cwd when the host reports no workspace', async () => {
     // No `workspaceRoot` (a deployment without the sandbox policy service, or
     // an /acp-direct session): the agent's own cwd stays in charge.
-    wsPolicy = { mode: 'workspace-write', approval: 'ask' }
+    wsPolicy = {}
     const turn = await wsTurn('dsh-ws-fallback', 'hello fallback')
     expect(normPath(turn.cwd)).toBe(normPath(realpathSync(narrow)))
   }, 30_000)
@@ -1412,7 +1394,7 @@ describe('chat session workspace (isolated manager)', () => {
     // allowed roots, so a workspace the agent's own allow-list never contained
     // must be re-trusted there too — otherwise the session parks back into
     // `released` forever with `cwd_denied`.
-    wsPolicy = { mode: 'workspace-write', approval: 'ask', workspaceRoot: workspace }
+    wsPolicy = { workspaceRoot: workspace }
     const first = await wsTurn('dsh-ws-resume', 'DIE now')
     expect(normPath(first.cwd)).toBe(normPath(realpathSync(workspace)))
     const released = await wsWaitFor('session/released', event => event.sessionId === first.hostSessionId)
@@ -1434,7 +1416,7 @@ describe('chat session workspace (isolated manager)', () => {
     // In the field the process is usually already up by then — the model probe
     // spawns it first, in the agent's configured cwd — so this case reproduces
     // exactly that order.
-    wsPolicy = { mode: 'workspace-write', approval: 'ask', workspaceRoot: workspace }
+    wsPolicy = { workspaceRoot: workspace }
     await wsManager.probeAgentModels('wsprobe')
     const restarts = wsWaitFor('agent/notice', event => event.agentId === 'wsprobe' && event.text.includes('restarts in'))
     const moved = await wsTurn('dsh-ws-proc', 'PWD please', 'wsprobe')
@@ -1447,7 +1429,7 @@ describe('chat session workspace (isolated manager)', () => {
     // ACP cwd still follows its DSH workspace, and the session that owns the
     // process keeps working — the limit is reported, not papered over.
     const other = mkdtempSync(join(tmpdir(), 'dsh-ntr-ws2-'))
-    wsManager.setSessionPolicyResolver(id => ({
+    wsManager.setSessionWorkspaceResolver(id => ({
       mode: 'workspace-write',
       approval: 'ask',
       workspaceRoot: id === 'dsh-ws-proc' ? workspace : other,
@@ -1460,7 +1442,7 @@ describe('chat session workspace (isolated manager)', () => {
       expect(wsEvents.slice(since).filter(event => event.type === 'agent/notice' && event.text.includes('restarts in'))).toHaveLength(0)
       expect((await wsTurn('dsh-ws-proc', 'PWD once more', 'wsprobe')).echoed).toContain(`PWD:${realpathSync(workspace)}`)
     } finally {
-      wsManager.setSessionPolicyResolver(() => wsPolicy)
+      wsManager.setSessionWorkspaceResolver(() => wsPolicy)
     }
   }, 30_000)
 })
@@ -1677,35 +1659,27 @@ describe('observed chat transcripts (isolated manager)', () => {
   }, 30_000)
 })
 
-describe('deployment default model guard (isolated manager)', () => {
-  const guardHub = new EventHub()
-  /** Poll a condition a background repair satisfies without being awaited by its caller. */
-  async function until(condition: () => boolean, timeoutMs = 5_000): Promise<void> {
-    const deadline = Date.now() + timeoutMs
-    while (!condition()) {
-      if (Date.now() > deadline) throw new Error('condition never became true')
-      await new Promise(resolve => setTimeout(resolve, 25))
-    }
-  }
+describe('conversation ↔ agent binding (isolated manager)', () => {
+  const bindingHub = new EventHub()
 
-  it('keeps the plugin default agent in its own registry, never in the deployment default', async () => {
+  it('keeps the plugin default agent in its own registry, never in a DSH model route', async () => {
     const storage = `${tmpdir()}/acp-default-agent-${Date.now()}.json`
-    const gm = new BridgeManager([{ ...def, id: 'guarded' }], guardHub, 500, storage)
+    const gm = new BridgeManager([{ ...def, id: 'guarded' }], bindingHub, 500, storage)
 
-    // Unset reads as `{}` — the panel's "no default agent chosen yet".
-    expect(await dispatchRpc(gm, 'model/get-default', {})).toEqual({ ok: true, value: {} })
-    await dispatchRpc(gm, 'model/set-default', { agentId: 'guarded' })
-    expect(await dispatchRpc(gm, 'model/get-default', {})).toEqual({ ok: true, value: { provider: 'acp', model: 'guarded' } })
+    // Unset reads as `undefined` — the panel's "no default agent chosen yet".
+    expect(await dispatchRpc(gm, 'default/agent', {})).toEqual({ ok: true, value: { agentId: undefined } })
+    await dispatchRpc(gm, 'default/agent-set', { agentId: 'guarded' })
+    expect(await dispatchRpc(gm, 'default/agent', {})).toEqual({ ok: true, value: { agentId: 'guarded' } })
 
     // It lives in the agent registry file beside the agents, under its own key.
     const raw = JSON.parse(readFileSync(storage, 'utf-8')) as { version: number; defaultAgentId?: string; agents: unknown[] }
     expect(raw.defaultAgentId).toBe('guarded')
     expect(raw.agents).toHaveLength(1)
-    expect(new BridgeManager([], guardHub, 100, storage).defaultAgent()).toBe('guarded')
+    expect(new BridgeManager([], bindingHub, 100, storage).defaultAgent()).toBe('guarded')
 
     // Deleting the agent clears the pointer (a default naming a missing agent
     // is reported as "none", so the browser offers the menu instead of
-    // auto-routing an ACP session at nothing).
+    // binding a session at nothing).
     await gm.deleteAgent('guarded')
     expect(gm.defaultAgent()).toBeUndefined()
     expect(JSON.parse(readFileSync(storage, 'utf-8')).defaultAgentId).toBeUndefined()
@@ -1713,66 +1687,128 @@ describe('deployment default model guard (isolated manager)', () => {
     await gm.shutdownAll()
   })
 
-  it('puts an ACP deployment default back on the native route the guard learned', async () => {
-    const gm = new BridgeManager([{ ...def, id: 'guarded' }], guardHub, 500, `${tmpdir()}/acp-guard-${Date.now()}.json`)
-    let current: { provider: string; model: string } | undefined = { provider: 'deepseek', model: 'deepseek-v4' }
-    const writes: Array<{ provider: string; model: string }> = []
-    gm.setDefaultModelGuard({
-      read: () => current,
-      write: async next => { writes.push(next); current = next },
-      fallback: () => ({ provider: 'anthropic', model: 'claude' }),
-    })
+  it('binds a conversation to an agent without touching any DSH model route', async () => {
+    const gm = new BridgeManager([{ ...def, id: 'bound' }], bindingHub, 500, `${tmpdir()}/acp-bind-${Date.now()}.json`)
 
-    // The healthy path learns the native default and rewrites nothing.
-    expect(await gm.reconcileDefaultModel()).toEqual({
-      selection: { provider: 'deepseek', model: 'deepseek-v4' }, restored: false, stranded: false,
-    })
-    expect(writes).toEqual([])
+    // Nothing is bound yet.
+    expect(gm.chatAgentFor('dsh-bind-1')).toBeUndefined()
+    // Binding is a plugin-private write: no model selection is recorded anywhere.
+    gm.bindChatAgent('dsh-bind-1', 'bound')
+    expect(gm.chatAgentFor('dsh-bind-1')).toBe('bound')
+    await expect(dispatchRpc(gm, 'session/chat-bind', { dshSessionId: 'dsh-bind-2', agentId: 'ghost' }))
+      .resolves.toMatchObject({ ok: false, error: { code: 'unknown_agent' } })
 
-    // DSH's `selectModel` recorded the ACP pick as the deployment default: the
-    // learned native route goes back, so a NEW session in ANY mode never starts
-    // on the external agent.
-    current = { provider: 'acp', model: 'guarded' }
-    expect(await gm.reconcileDefaultModel()).toEqual({
-      selection: { provider: 'deepseek', model: 'deepseek-v4' }, restored: true, stranded: false,
-    })
-    expect(writes).toEqual([{ provider: 'deepseek', model: 'deepseek-v4' }])
-
-    // After the repair the default is native again, so the next check is a read.
-    expect(await gm.reconcileDefaultModel()).toMatchObject({ restored: false })
-
-    // No guard service (a deployment without `agentDefaultModel`) → inert.
-    const bare = new BridgeManager([def], guardHub, 500)
-    expect(await bare.reconcileDefaultModel()).toEqual({ restored: false, stranded: false })
-
-    await bare.shutdownAll()
     await gm.shutdownAll()
   })
 
-  it('repairs the deployment default on the turn path, not only from the browser', async () => {
-    const gm = new BridgeManager([{ ...def, id: 'turnguard' }], guardHub, 500, `${tmpdir()}/acp-turn-guard-${Date.now()}.json`)
-    // An install from before the guard existed: the default is ALREADY an ACP
-    // route and no native default was ever observed, so the repair leans on the
-    // deployment's own last native route (`ports.fallback`).
-    let current: { provider: string; model: string } | undefined = { provider: 'acp', model: 'turnguard' }
-    gm.setDefaultModelGuard({
-      read: () => current,
-      write: async next => { current = next },
-      fallback: () => ({ provider: 'deepseek', model: 'deepseek-v4' }),
-    })
-
-    const adapter = new AcpLlmAdapter(gm)
-    for await (const chunk of adapter.stream({
-      provider: 'acp',
-      model: 'turnguard',
-      sessionId: 'dsh-guard-turn',
-      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello guard' }] }],
-    })) {
-      void chunk
-    }
-
-    await until(() => current?.provider !== 'acp')
-    expect(current).toEqual({ provider: 'deepseek', model: 'deepseek-v4' })
+  it('falls back to the session\'s own agent when no intent was recorded', async () => {
+    const gm = new BridgeManager([{ ...def, id: 'bound' }], bindingHub, 500, `${tmpdir()}/acp-bind-fallback-${Date.now()}.json`)
+    // A conversation that already RAN an agent is pointed at it even if the
+    // intent map was never seeded (a session restored from the registry).
+    gm.bindChatAgent('dsh-bind-3', 'bound')
+    expect(gm.chatAgentFor('dsh-bind-3')).toBe('bound')
     await gm.shutdownAll()
+  })
+})
+
+/**
+ * Windows: every npm-installed ACP agent is a generated `.cmd` shim, and Node
+ * refuses to spawn one with `shell: false` (BatBadBut) — it throws EINVAL
+ * before any process exists. The launch shape below is what makes `codebuddy`,
+ * `pi-acp` and `omp` start at all on that platform, and the two details it
+ * encodes (verbatim arguments, the outer quote pair) were measured, not
+ * guessed: without either one cmd.exe reports the line as "not recognized".
+ */
+describe('windows shim launch', () => {
+  /** Poll a condition with a deadline: process death has no event we can await. */
+  async function until(condition: () => boolean, timeoutMs = 10_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs
+    while (!condition()) {
+      if (Date.now() > deadline) throw new Error('condition never became true')
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+  }
+
+  /** `kill(pid, 0)` is the portable liveness probe (EPERM would also mean alive). */
+  function isAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'EPERM'
+    }
+  }
+
+  /** The shim writes its (grand)child's pid there once node is up. */
+  async function waitForPid(marker: string): Promise<number> {
+    await until(() => existsSync(marker))
+    const pid = Number(readFileSync(marker, 'utf-8').trim())
+    expect(Number.isInteger(pid) && pid > 0).toBe(true)
+    return pid
+  }
+
+  it('wraps .cmd/.bat in cmd.exe and leaves everything else alone', () => {
+    // Not a shim → untouched, verbatim off.
+    expect(windowsShimLaunch('codebuddy', ['--acp'])).toEqual({ command: 'codebuddy', args: ['--acp'], verbatim: false })
+    expect(windowsShimLaunch(process.execPath, ['x'], 'win32')).toEqual({ command: process.execPath, args: ['x'], verbatim: false })
+    // A shim, off Windows → untouched (the POSIX shim is a real script).
+    expect(windowsShimLaunch('/usr/local/bin/codebuddy', [], 'linux')).toEqual({ command: '/usr/local/bin/codebuddy', args: [], verbatim: false })
+    // The shim itself: run through cmd.exe, quotes preserved verbatim.
+    expect(windowsShimLaunch('C:\\nvm4w\\nodejs\\codebuddy.CMD', ['--acp'], 'win32', 'cmd.exe')).toEqual({
+      command: 'cmd.exe',
+      args: ['/d', '/s', '/c', '"C:\\nvm4w\\nodejs\\codebuddy.CMD --acp"'],
+      verbatim: true,
+    })
+    // A path with spaces is quoted token by token, then the line is wrapped so
+    // `/s` strips the wrapping instead of the program's own quotes.
+    expect(windowsShimLaunch('C:\\Program Files\\x agent.cmd', ['a b'], 'win32', 'cmd.exe')).toEqual({
+      command: 'cmd.exe',
+      args: ['/d', '/s', '/c', '""C:\\Program Files\\x agent.cmd" "a b""'],
+      verbatim: true,
+    })
+  })
+
+  it.runIf(process.platform === 'win32')('spawns a .cmd shim (path with a space) and completes initialize', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-ntr shim '))
+    try {
+      const shim = join(dir, 'mock agent.cmd')
+      writeFileSync(shim, `@echo off\r\n"${process.execPath}" "${MOCK}" %*\r\n`)
+      const shimHub = new EventHub()
+      const bridge = new AgentBridge({ ...def, id: 'shim', command: shim, args: [] }, shimHub, 200, () => {})
+      await bridge.ensureReady()
+      expect(bridge.initResult?.agentInfo?.name).toBe('mock-acp-agent')
+      await bridge.stop()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it.runIf(process.platform === 'win32')('killProcessTree reaps the agent behind the cmd.exe wrapper', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-ntr tree '))
+    let child: ReturnType<typeof spawn> | undefined
+    try {
+      const marker = join(dir, 'grandchild.pid')
+      const script = join(dir, 'sleeper.mjs')
+      writeFileSync(script, `import { writeFileSync } from 'node:fs'\nwriteFileSync(${JSON.stringify(marker)}, String(process.pid))\nsetInterval(() => { /* keep alive */ }, 1000)\n`)
+      const shim = join(dir, 'sleeper.cmd')
+      writeFileSync(shim, `@echo off\r\n"${process.execPath}" "${script}"\r\n`)
+
+      const launch = windowsShimLaunch(shim, [])
+      child = spawn(launch.command, launch.args, { stdio: 'ignore', windowsHide: true, windowsVerbatimArguments: true })
+      const cmdPid = child.pid
+      expect(cmdPid).toBeDefined()
+
+      const grandchild = await waitForPid(marker)
+      expect(isAlive(grandchild)).toBe(true)
+
+      // Killing only the direct child (what the old Windows branch did) would
+      // leave this process running: `taskkill /T` must see the tree intact.
+      killProcessTree(cmdPid as number)
+      await until(() => !isAlive(grandchild))
+      expect(isAlive(grandchild)).toBe(false)
+    } finally {
+      if (child?.pid !== undefined) killProcessTree(child.pid)
+      rmSync(dir, { recursive: true, force: true })
+    }
   }, 30_000)
 })

@@ -134,8 +134,12 @@ describe('host plugin contract', () => {
     expect(noAgents).toMatchObject({ ok: true, value: { approvalRouted: false } })
   })
 
-  it('reports access mode routing only when sandboxPolicy, sessions and approval are all reachable', async () => {
-    async function listWith(get: (key: string) => unknown): Promise<unknown> {
+  it('reports nothing about access-mode routing — the axis is retired', async () => {
+    // `accessModeRouted` used to be part of `agents/list`. The whole mapping it
+    // reported on (DSH's access mode arbitrating an ACP agent's permissions) is
+    // retired: the agent decides its own approvals and the host maps the ask
+    // through unchanged. The field is gone; nothing may resurrect it.
+    async function listWith(get: (key: string) => unknown): Promise<Record<string, unknown>> {
       const ctx = fakeCtx()
       let rpcHandler: ((endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>) | undefined
       ctx.connection.rpc.handle = vi.fn((_channel: string, handler: unknown) => {
@@ -144,24 +148,21 @@ describe('host plugin contract', () => {
       })
       ;(ctx as unknown as { get: unknown }).get = get
       apply(ctx as never, { agents: [{ id: 'agent-1', command: 'run' }] })
-      return rpcHandler!('agents/list', {}, new AbortController().signal)
+      const answer = await rpcHandler!('agents/list', {}, new AbortController().signal)
+      return (answer as { value: Record<string, unknown> }).value
     }
 
-    const services: Record<string, unknown> = {
-      approval: { request: vi.fn(), config: { policy: 'ask' } },
-      agents: { get: vi.fn() },
-      sandboxPolicy: { resolve: vi.fn(() => ({ mode: 'read-only', workspaceRoot: '/tmp/ws' })) },
-      sessions: { get: vi.fn(() => ({ events: [] })) },
-    }
-    const routed = await listWith(key => services[key])
-    expect(routed).toMatchObject({ ok: true, value: { accessModeRouted: true } })
-
-    // Any collaborator missing → the agent's own `permission` field stays in
-    // charge and the panel keeps saying so.
-    for (const missing of ['sandboxPolicy', 'sessions', 'approval']) {
-      const partial = await listWith(key => (key === missing ? undefined : services[key]))
-      expect(partial).toMatchObject({ ok: true, value: { accessModeRouted: false } })
-    }
+    const answer = await listWith(key => {
+      if (key === 'approval') return { request: vi.fn(), config: { policy: 'ask' } }
+      if (key === 'agents') return { get: vi.fn() }
+      if (key === 'sandboxPolicy') return { resolve: vi.fn(() => ({ mode: 'read-only', workspaceRoot: '/tmp/ws' })) }
+      if (key === 'sessions') return { get: vi.fn(() => ({ events: [] })) }
+      return undefined
+    })
+    expect(answer).toMatchObject({ approvalRouted: true })
+    expect(answer).not.toHaveProperty('accessModeRouted')
+    // Nothing else the retired axis reported may come back either.
+    expect(Object.keys(answer).sort()).toEqual(['agents', 'approvalRouted'])
   })
 
   it('answers the seat gate for a COLD session through the persistence store, without the access-mode knobs', async () => {
@@ -221,18 +222,22 @@ describe('host plugin contract', () => {
     expect(bare.acpMode).toBe(false)
   })
 
-  it('keeps the deployment default model native while owning its own default agent', async () => {
+  it('never touches the host model layer at all — no route, no default, no guard', async () => {
     const ctx = fakeCtx()
     let rpcHandler: ((endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>) | undefined
     ctx.connection.rpc.handle = vi.fn((_channel: string, handler: unknown) => {
       rpcHandler = handler as typeof rpcHandler
       return () => Promise.resolve()
     })
+    // Every service the retired provider axis consumed. Present on purpose: the
+    // new shape must not need ANY of them, so a deployment with them all wired
+    // behaves exactly like one with none.
     const saveSelection = vi.fn(async () => {})
-    let selection: { provider: string; model: string } | undefined = { provider: 'deepseek', model: 'deepseek-v4' }
-    const currentSelection = vi.fn(() => selection)
+    const currentSelection = vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-v4' }))
     const get = vi.fn((key: string) => {
       if (key === 'agentDefaultModel') return { currentSelection, saveSelection }
+      if (key === 'sandboxPolicy') return { resolve: vi.fn(() => ({ mode: 'read-only', workspaceRoot: '/tmp/ws' })) }
+      if (key === 'sessions') return { get: vi.fn(() => ({ events: [] })) }
       return undefined
     })
     ;(ctx as unknown as { get: typeof get }).get = get
@@ -241,21 +246,22 @@ describe('host plugin contract', () => {
     expect(rpcHandler).toBeDefined()
     const dummySignal = new AbortController().signal
 
-    // `model/get-default` is the plugin's OWN default agent (the panel's ★
-    // gesture), not the deployment default model: unset here → `{}`.
-    expect(await rpcHandler!('model/get-default', {}, dummySignal)).toEqual({ ok: true, value: {} })
-    expect(await rpcHandler!('model/set-default', { agentId: 'agent-1' }, dummySignal)).toEqual({ ok: true, value: { done: true } })
-    expect(await rpcHandler!('model/get-default', {}, dummySignal)).toEqual({ ok: true, value: { provider: 'acp', model: 'agent-1' } })
-    // The gesture must never touch the deployment default model (that is the
-    // cross-mode leak the guard exists to prevent).
+    // The plugin's OWN default agent is its private state, answered by its own
+    // endpoint — nothing here is shaped like a model route.
+    expect(await rpcHandler!('default/agent', {}, dummySignal)).toEqual({ ok: true, value: { agentId: undefined } })
+    expect(await rpcHandler!('default/agent-set', { agentId: 'agent-1' }, dummySignal)).toEqual({ ok: true, value: { done: true } })
+    expect(await rpcHandler!('default/agent', {}, dummySignal)).toEqual({ ok: true, value: { agentId: 'agent-1' } })
+    // …and the binding for one conversation goes to the plugin's own RPC.
+    expect(await rpcHandler!('session/chat-bind', { dshSessionId: 'chat-1', agentId: 'agent-1' }, dummySignal))
+      .toEqual({ ok: true, value: { done: true } })
+
+    // The host's model layer was never read, never written, never guarded.
     expect(saveSelection).not.toHaveBeenCalled()
-    // …while an ACP route arriving there (DSH's own `selectModel` saves every
-    // selection) IS repaired, back to the native default the guard learned.
-    selection = { provider: 'acp', model: 'codebuddy@hy3' }
-    expect(await rpcHandler!('model/reconcile-default', {}, dummySignal)).toEqual({
-      ok: true,
-      value: { selection: { provider: 'deepseek', model: 'deepseek-v4' }, restored: true, stranded: false },
-    })
-    expect(saveSelection).toHaveBeenCalledWith({ provider: 'deepseek', model: 'deepseek-v4' })
+    expect(currentSelection).not.toHaveBeenCalled()
+
+    // The retired endpoints are gone: they exist only to be refused now.
+    for (const endpoint of ['model/get-default', 'model/set-default', 'model/reconcile-default']) {
+      expect(await rpcHandler!(endpoint, {}, dummySignal)).toMatchObject({ ok: false, error: { code: 'unknown_endpoint' } })
+    }
   })
 })

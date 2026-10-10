@@ -82,7 +82,81 @@ export function normalizeExposedModels(raw: unknown, label: string, code: 'bad_c
   return out
 }
 
-/** Validate a single agent definition object. */
+// ---- Command lines (`AcpAgentDef.command` is a command LINE, not a bare program) ----
+
+/**
+ * Split a command line into tokens, the way a shell would: whitespace
+ * separates, single or double quotes group.
+ *
+ * Inside double quotes a backslash escapes a quote (`\"`) and is otherwise
+ * LITERAL — Windows paths are full of backslashes, so treating `\` as a general
+ * escape would mangle `"C:\Program Files\agent.exe"`. Best-effort only: an
+ * unbalanced quote swallows the rest of the line, which is the same thing a
+ * shell does and is reported by the caller as a missing executable.
+ */
+export function tokenizeCommandLine(raw: string): string[] {
+  const tokens: string[] = []
+  let current = ''
+  let quoted = false
+  let touched = false
+  let quote: '"' | "'" | undefined
+  for (let index = 0; index < raw.length; index += 1) {
+    const char = raw[index] as string
+    if (quote !== undefined) {
+      if (char === '\\' && quote === '"' && raw[index + 1] === '"') {
+        current += '"'
+        index += 1
+        continue
+      }
+      if (char === quote) {
+        quote = undefined
+        continue
+      }
+      current += char
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      touched = true
+      continue
+    }
+    if (char === ' ' || char === '\t' || char === '\n' || char === '\r') {
+      // `touched` keeps an explicitly empty quoted argument (`""`) alive.
+      if (touched || current !== '') tokens.push(current)
+      current = ''
+      touched = false
+      continue
+    }
+    current += char
+    touched = true
+  }
+  if (touched || current !== '') tokens.push(current)
+  return tokens
+}
+
+/** First token = program, rest = arguments (see {@link tokenizeCommandLine}). */
+export function splitCommandLine(raw: string): { command: string; args: string[] } {
+  const tokens = tokenizeCommandLine(raw)
+  return { command: tokens[0] ?? '', args: tokens.slice(1) }
+}
+
+/** Quote one token for a command line — only when it needs it. Inverse of the tokenizer. */
+export function quoteCommandToken(token: string): string {
+  if (token !== '' && !/[\s"']/.test(token)) return token
+  return `"${token.replaceAll('"', '\\"')}"`
+}
+
+/**
+ * Validate a single agent definition object.
+ *
+ * `command` is a COMMAND LINE: the whole thing a user would type in a terminal
+ * (`codebuddy --acp`) belongs in that one field, and its extra tokens are folded
+ * IN FRONT of `args`. Two reasons this is the host's job and not the panel's:
+ * `agent/save` / `agent/test` are callable without the panel, and
+ * `loadPersistedAgents` re-validates stored defs on every boot. A def in the
+ * canonical shape (bare command + args array — every preset, everything this
+ * function returns) parses back to exactly itself, so the fold is idempotent.
+ */
 export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
   if (typeof entry !== 'object' || entry === null) throw new AcpError('bad_config', `acp: ${label} is not an object`)
   const row = entry as Record<string, unknown>
@@ -93,8 +167,13 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
   if (typeof row.command !== 'string' || row.command.trim() === '') {
     throw new AcpError('bad_config', `acp: agent "${id}" needs a non-empty command`)
   }
-  const args = row.args ?? []
-  if (!Array.isArray(args) || args.some(a => typeof a !== 'string')) throw new AcpError('bad_config', `acp: agent "${id}" args must be string[]`)
+  const commandLine = splitCommandLine(row.command)
+  if (commandLine.command === '') {
+    throw new AcpError('bad_config', `acp: agent "${id}" needs a non-empty command`)
+  }
+  const extraArgs = row.args ?? []
+  if (!Array.isArray(extraArgs) || extraArgs.some(a => typeof a !== 'string')) throw new AcpError('bad_config', `acp: agent "${id}" args must be string[]`)
+  const args = [...commandLine.args, ...extraArgs]
   const env: Record<string, string> = {}
   if (row.env !== undefined) {
     if (typeof row.env !== 'object' || row.env === null || Array.isArray(row.env)) throw new AcpError('bad_config', `acp: agent "${id}" env must be an object`)
@@ -139,7 +218,7 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
   return {
     id,
     title,
-    command: row.command as string,
+    command: commandLine.command,
     args: args as string[],
     ...(npmPackage !== undefined ? { npmPackage } : {}),
     env,
@@ -343,9 +422,9 @@ function joinWithin(base: string, rel: string): string {
  *   session only. The one caller that matters is a chat session, whose cwd is
  *   the workspace the user picked in the DSH sidebar: that directory is never in
  *   the agent's configured allow-list (the plugin's own sandbox dir is), yet it
- *   is the session's declared boundary — the same root `authorizeWrite` and
- *   `decidePermission` already treat as writable. `/acp`-RPC sessions pass none
- *   and keep `allowedCwdRoots` as a hard cap.
+ *   is the session's declared workspace — the root the fs guard confines reads
+ *   and writes to. `/acp`-RPC sessions pass none and keep `allowedCwdRoots` as
+ *   a hard cap.
  * @returns the canonical absolute directory to hand to `session/new` (POSIX
  *   spelling on Windows too: `\` folded to `/`).
  */
@@ -443,195 +522,6 @@ export function resolveFsPath(sessionCwd: string, roots: readonly string[], requ
   const inside = roots.some(root => isUnderPath(full, safeRealpath(realpath, root)))
   if (!inside) throw new AcpError('cwd_denied', `acp: fs path ${full} is outside the session workspace`)
   return full
-}
-
-// ---- Deployment default model (the ACP route must never become it) ----
-
-/** The provider route this plugin's LLM adapter serves (mirrors `ACP_PRESET_ID`'s spelling). */
-export const ACP_PROVIDER_ID = 'acp'
-
-/**
- * One model route selection — the subset of DSH's `ModelSelection` this layer
- * reads and writes. Kept structural on purpose: `agentDefaultModel` and the
- * session projector belong to the host, not to this plugin.
- */
-export interface ModelRouteSelection {
-  provider: string
-  model: string
-  reasoningEffort?: string
-}
-
-/** The host ports the guard needs (`ctx.agentDefaultModel` + the session store). */
-export interface DefaultModelPorts {
-  /** Current deployment default; `undefined` when the service cannot answer. */
-  read(): ModelRouteSelection | undefined
-  /** Persist a complete selection as the deployment default. */
-  write(next: ModelRouteSelection): Promise<void>
-  /**
-   * Last-resort candidate: a route this deployment already uses natively (the
-   * most recently used non-ACP route among live sessions). Only consulted when
-   * the guard holds no memory of a native default — see `reconcile`.
-   */
-  fallback?(): ModelRouteSelection | undefined
-}
-
-/** What one `reconcile` round trip did (also the `model/reconcile-default` reply). */
-export interface DefaultModelReconcileOutcome {
-  /** The deployment default after the round trip; `undefined` when unreadable. */
-  selection?: ModelRouteSelection
-  /** A native route replaced an ACP one. */
-  restored: boolean
-  /**
-   * The default points at `acp` and the guard had no native candidate: it left
-   * the value alone (a wrong model is worse than a stale one). The next native
-   * pick heals it.
-   */
-  stranded: boolean
-}
-
-/**
- * Keep the deployment default model off the ACP route.
- *
- * WHY: DSH's `session.selectModel` records a selection twice — as the session's
- * own durable selection AND as the deployment default (`agentDefaultModel
- * .saveSelection`), and that second write is not scoped to the session or to
- * the mode. So picking an ACP agent in one conversation changes what every NEW
- * session starts on, in EVERY mode: a fresh standard-mode session then sends
- * its first request to the external agent (with DSH's own tool schemas
- * advertised to it), which is precisely the isolation the ACP design forbids
- * (see `AcpLlmAdapter.listModels` and the model-seat gate).
- *
- * WHAT IT DOES: remembers the last NATIVE default it has seen and puts it back
- * when the default points at `acp` again. The value is never invented; the
- * sources, in order, are the route the caller saw before its own ACP write
- * (a session's pre-write route), the remembered native default, and the
- * deployment's own last native route among live sessions (`ports.fallback`).
- * With no candidate in hand it does nothing and says so (`stranded`) — a wrong
- * model would be worse than a stale one, and the user's next native pick both
- * heals the default and teaches the guard.
- */
-export class AcpDefaultModelGuard {
-  private native?: ModelRouteSelection
-
-  constructor(private readonly ports: DefaultModelPorts) {}
-
-  /** Learn one native route the caller knows about (a session's pre-write route). */
-  noteNative(candidate?: ModelRouteSelection | undefined): void {
-    const clean = sanitizeSelection(candidate)
-    if (clean !== undefined && clean.provider !== ACP_PROVIDER_ID) this.native = clean
-  }
-
-  /** The native default the guard would put back, when it holds one. */
-  get remembered(): ModelRouteSelection | undefined {
-    return this.native
-  }
-
-  /**
-   * Read the deployment default, learn from it, and repair it when it is an ACP
-   * route. Never throws — a service that cannot answer leaves the guard inert,
-   * which is the same behavior a deployment without `agentDefaultModel` gets.
-   *
-   * @param known - the route the caller saw before its own ACP write, if any.
-   * @returns the default after the round trip plus what happened to it.
-   */
-  async reconcile(known?: ModelRouteSelection | undefined): Promise<DefaultModelReconcileOutcome> {
-    this.noteNative(known)
-    let current: ModelRouteSelection | undefined
-    try {
-      current = sanitizeSelection(this.ports.read())
-    } catch {
-      return { restored: false, stranded: false }
-    }
-    if (current === undefined) return { restored: false, stranded: false }
-    if (current.provider !== ACP_PROVIDER_ID) {
-      // The healthy path: the default is a native route, so it is exactly what
-      // an ACP selection must be reverted to next time.
-      this.native = current
-      return { selection: current, restored: false, stranded: false }
-    }
-    const target = this.native ?? this.fallbackCandidate()
-    if (target === undefined) return { selection: current, restored: false, stranded: true }
-    try {
-      await this.ports.write(target)
-    } catch {
-      // An unwritable default (a deployment pinned by a home patch, a read-only
-      // profile) must not break the turn that triggered the check.
-      return { selection: current, restored: false, stranded: true }
-    }
-    this.native = target
-    return { selection: target, restored: true, stranded: false }
-  }
-
-  private fallbackCandidate(): ModelRouteSelection | undefined {
-    try {
-      const candidate = sanitizeSelection(this.ports.fallback?.())
-      return candidate !== undefined && candidate.provider !== ACP_PROVIDER_ID ? candidate : undefined
-    } catch {
-      return undefined
-    }
-  }
-}
-
-/** The slice of a live host session the default-model fallback reads. */
-export interface RouteBearingSessionLike extends AccessModeSessionLike {
-  /** The route of this session's most recent request (absent before its first turn). */
-  requestHeader?(): { config?: { provider?: unknown; model?: unknown; reasoningEffort?: unknown } } | undefined
-}
-
-/**
- * The most recently used NON-ACP route among live sessions — the guard's last
- * candidate when the deployment default is ALREADY on an ACP route (an install
- * from before the guard existed) and no native default has been observed yet.
- *
- * This is the user's own data, not an invention: every session keeps the route
- * of its last request, so the freshest native one is what this deployment was
- * actually running before the ACP pick overwrote the default. Sessions whose
- * last request was ACP are skipped, and an unreadable session is ignored — one
- * bad row must not hide the others.
- */
-export function lastNativeRoute(sessions: readonly RouteBearingSessionLike[] | undefined): ModelRouteSelection | undefined {
-  let best: { selection: ModelRouteSelection; at: number } | undefined
-  for (const session of sessions ?? []) {
-    try {
-      const config = session.requestHeader?.()?.config
-      if (config === undefined) continue
-      const provider = typeof config.provider === 'string' ? config.provider.trim() : ''
-      const model = typeof config.model === 'string' ? config.model.trim() : ''
-      if (provider === '' || model === '' || provider === ACP_PROVIDER_ID) continue
-      const at = lastEventTime(session.events)
-      if (best !== undefined && at < best.at) continue
-      const reasoningEffort = typeof config.reasoningEffort === 'string' && config.reasoningEffort.trim() !== ''
-        ? config.reasoningEffort.trim()
-        : undefined
-      best = { selection: { provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) }, at }
-    } catch {
-      // Ignored on purpose: see the doc comment.
-    }
-  }
-  return best?.selection
-}
-
-/** Freshest activity stamp of a session's log; `0` when it carries none. */
-function lastEventTime(events: readonly unknown[] | undefined): number {
-  if (!Array.isArray(events)) return 0
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index] as { time?: unknown } | undefined
-    if (typeof event?.time === 'number') return event.time
-  }
-  return 0
-}
-
-/**
- * Drop a malformed selection: a service answering garbage (or an older host's
- * partial object) must never be written back as somebody's default model.
- */
-function sanitizeSelection(value: ModelRouteSelection | undefined): ModelRouteSelection | undefined {
-  if (value === undefined || typeof value.provider !== 'string' || typeof value.model !== 'string') return undefined
-  const provider = value.provider.trim()
-  const model = value.model.trim()
-  if (provider === '' || model === '') return undefined
-  const reasoningEffort = typeof value.reasoningEffort === 'string' && value.reasoningEffort.trim() !== '' ? value.reasoningEffort.trim() : undefined
-  return { provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) }
 }
 
 // ---- Child environment ----
@@ -737,6 +627,118 @@ export function buildAdapterModelId(agentId: string, choice: string): string {
   return `${agentId}@${choice}`
 }
 
+// ---- ACP tool-call notifications → DSH tool-call stream chunks ----
+
+/**
+ * One ACP tool call, narrowed to what the Chat plane's tool-call renderer shows.
+ *
+ * `callId` is the ACP `toolCallId` — it is the only identity the agent gives, and
+ * the Chat renderer uses it to group a call with its updates. `name` is the
+ * agent's own label (`title`, falling back to nothing at all: the renderer shows
+ * the call id when a name is missing). `argsRaw` accumulates whatever the agent
+ * chose to disclose — ACP has no mandatory arguments field, so an agent that
+ * sends none simply produces an empty block, which is honest.
+ */
+export interface AcpToolCallSnapshot {
+  callId: string
+  name: string
+  /** Accumulated argument text (ACP has no fixed vocabulary for it). */
+  argsRaw: string
+}
+
+/** A delta of tool-call content, folded into the open snapshot. */
+export type AcpToolCallDelta =
+  | { kind: 'name'; name: string }
+  | { kind: 'args'; text: string }
+
+/**
+ * Fold one ACP `tool_call` notification into a snapshot.
+ *
+ * `rawInput` / `arguments` are accepted when present: some agents send structured
+ * input, and a tool card that cannot show its arguments is half a card. Anything
+ * else is ignored — a tool call with only an id and a title is legal ACP.
+ */
+export function acpToolCallFromUpdate(update: Record<string, unknown>): AcpToolCallSnapshot | undefined {
+  const callId = typeof update.toolCallId === 'string' ? update.toolCallId.trim() : ''
+  if (callId === '') return undefined
+  const name = typeof update.title === 'string' ? update.title : ''
+  return { callId, name, argsRaw: acpToolCallArgsOf(update) }
+}
+
+/**
+ * Fold one ACP `tool_call_update` into an open snapshot, in place.
+ *
+ * A `content` array is read through the same tolerant walk the ACP view uses:
+ * ACP agents put text, diffs and terminal handles in there, and the Chat card
+ * only has room for text — so the rest becomes a bracketed placeholder rather
+ * than being dropped silently.
+ */
+export function acpToolCallDelta(
+  snapshot: AcpToolCallSnapshot,
+  update: Record<string, unknown>,
+): AcpToolCallDelta[] {
+  const deltas: AcpToolCallDelta[] = []
+  const title = update.title
+  if (typeof title === 'string' && title !== '' && title !== snapshot.name) {
+    deltas.push({ kind: 'name', name: title })
+    snapshot.name = title
+  }
+  const text = acpToolCallArgsOf(update)
+  if (text !== '') {
+    deltas.push({ kind: 'args', text })
+    snapshot.argsRaw += text
+  }
+  return deltas
+}
+
+/**
+ * The argument text an ACP tool-call notification carries, if any.
+ *
+ * Accepts the spellings seen in the wild (`rawInput` as a string, `arguments` as
+ * a string or an object, and a `content` array folded to text) and refuses to
+ * invent one: an agent that sends no arguments gets `''`, which renders as an
+ * empty card rather than a fabricated placeholder.
+ */
+export function acpToolCallArgsOf(update: Record<string, unknown>): string {
+  for (const key of ['rawInput', 'arguments'] as const) {
+    const value = update[key]
+    if (typeof value === 'string' && value !== '') return value
+    if (typeof value === 'object' && value !== null) {
+      try {
+        return JSON.stringify(value)
+      } catch {
+        // A circular or otherwise unserializable value is not worth failing a
+        // tool card over: show what we can.
+        return String(value)
+      }
+    }
+  }
+  return updateContentToText(update.content)
+}
+
+/**
+ * Fold ACP tool-call `content` into plain text, with a bracketed placeholder for
+ * the kinds the Chat card cannot render. Shares its shape with the ACP view's
+ * line fold so both halves read an agent's content the same way.
+ */
+function updateContentToText(content: unknown): string {
+  if (!Array.isArray(content)) return ''
+  const out: string[] = []
+  for (const item of content) {
+    if (typeof item !== 'object' || item === null) continue
+    const row = item as Record<string, unknown>
+    if (row.type === 'content') {
+      const inner = row.content as Record<string, unknown> | undefined
+      if (inner?.type === 'text' && typeof inner.text === 'string') out.push(inner.text)
+      else if (inner?.type === 'diff') out.push(`[diff ${String(inner.path ?? '')}]`)
+      else out.push(`[${String(inner?.type ?? 'content')}]`)
+    } else if (row.type === 'terminal') {
+      out.push(`[terminal ${String(row.terminalId ?? '')}]`)
+    }
+  }
+  return out.join('\n')
+}
+
 // ---- host request → forwarded ACP prompt ----
 
 /**
@@ -791,35 +793,17 @@ export function selectForwardPrompt(messages: readonly {
   return sawUserRole ? { kind: 'no-user-input' } : { kind: 'empty' }
 }
 
-// ---- DSH access mode → ACP permission decision ----
+// ---- The agent's own permission vocabulary ----
 
 /**
- * DSH's file-effect mode vocabulary, mirrored from `@deepseek-ai/dsh-sandbox`
- * (`SandboxMode`). Host-only: the browser never sees a mode, only whether the
- * routing is active (`AcpManager.accessModeRouting`).
+ * The ACP agent's OWN permission field (`ask` / `allow` / `reject`), declared
+ * per agent in the plugin's registry.
+ *
+ * This is now the ONLY knob. It used to be outranked by a DSH access mode
+ * resolved per turn; that mapping is retired because an ACP agent is fully
+ * autonomous and DSH's sandbox cannot reach into the agent's own process (see
+ * docs/acp-convergence.md §2.3).
  */
-export type DshSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
-
-/**
- * DSH's approval-policy vocabulary (`@deepseek-ai/dsh-user-approval`). `never`
- * is the important one: the host's `ApprovalService` resolves every ask to
- * `'rejected'` deterministically and never reaches an answerer, so routing an
- * ACP ask through `ctx.approval` under `never` would silently deny it.
- */
-export type DshApprovalPolicy = 'ask' | 'never'
-
-/**
- * The access mode one DSH chat session runs under, resolved per turn by the
- * host entry: the session's `sandbox/mode` + `approval/policy` folds over the
- * composition defaults, plus the workspace root `workspace-write` confines
- * writes to.
- */
-export interface DshSessionPolicy {
-  mode: DshSandboxMode
-  approval: DshApprovalPolicy
-  /** Absolute root `workspace-write` may write under; absent when the host did not report one. */
-  workspaceRoot?: string
-}
 
 /** What one ACP permission ask resolves to before the routing layer runs. */
 export type PermissionDecision = 'ask' | 'allow' | 'reject'
@@ -870,8 +854,12 @@ export function isUnderPath(path: string, root: string): boolean {
   return trimmedPath === trimmedRoot || trimmedPath.startsWith(`${trimmedRoot}/`)
 }
 
-/** The slice of a host session log the access-mode fold reads. */
-export interface AccessModeSessionLike {
+// ---- The agent preset a session runs ----
+
+/**
+ * The slice of a host session log the preset fold reads.
+ */
+export interface SessionLogLike {
   events?: readonly unknown[]
   /** Creation header; carries the agent preset the session started under. */
   header?: { agentPreset?: unknown }
@@ -889,7 +877,7 @@ export interface AccessModeSessionLike {
  * agent preset, so reading it back from the session log is the only honest
  * source — a marker we set ourselves could drift from what the roster mounted.
  */
-export function sessionAgentPreset(session: AccessModeSessionLike | undefined): string | undefined {
+export function sessionAgentPreset(session: SessionLogLike | undefined): string | undefined {
   const events = session?.events
   if (Array.isArray(events)) {
     for (let index = events.length - 1; index >= 0; index -= 1) {
@@ -959,125 +947,6 @@ export function acpPresetStatusFromRoster(rows: readonly RosterPresetRow[] | und
     : { id, source: ACP_PRESET_SOURCE, installed: false, problem: broken }
 }
 
-/**
- * The session's effective approval policy: its own last `approval/policy` event
- * wins, else the service's configured default — the fold
- * `ApprovalService.effectivePolicy` performs (`overrideOf ?? config.policy`),
- * done structurally so this plugin needs no dependency on the package.
- *
- * The distinction matters because `never` is not a preference: the host resolves
- * every ask under it to `'rejected'` before any answerer runs.
- */
-export function dshApprovalPolicyOf(session: AccessModeSessionLike | undefined, configuredDefault: string | undefined): DshApprovalPolicy {
-  const events = session?.events
-  if (Array.isArray(events)) {
-    for (let index = events.length - 1; index >= 0; index -= 1) {
-      const event = events[index] as { type?: unknown; data?: { policy?: unknown } } | undefined
-      if (event?.type !== 'approval/policy') continue
-      return event.data?.policy === 'never' ? 'never' : 'ask'
-    }
-  }
-  return configuredDefault === 'never' ? 'never' : 'ask'
-}
-
-/**
- * Assemble one chat session's access-mode snapshot from what the host's policy
- * service resolved plus the session's own log.
- *
- * @param resolved - the host's `sandboxPolicy.resolve({session})` payload.
- * @param session - the host session (for the approval-policy override).
- * @param configuredDefault - the approval service's deployment default.
- * @returns the snapshot, or `undefined` when the host reported a mode outside
- *   the vocabulary (unexpected or newer host) — the caller then leaves the
- *   agent's own `permission` field in charge instead of guessing a boundary.
- */
-export function dshSessionPolicyOf(
-  resolved: { mode?: unknown; workspaceRoot?: unknown },
-  session: AccessModeSessionLike | undefined,
-  configuredDefault: string | undefined,
-): DshSessionPolicy | undefined {
-  const mode = resolved.mode
-  if (mode !== 'read-only' && mode !== 'workspace-write' && mode !== 'danger-full-access') return undefined
-  const root = resolved.workspaceRoot
-  return {
-    mode,
-    approval: dshApprovalPolicyOf(session, configuredDefault),
-    ...(typeof root === 'string' && root !== '' ? { workspaceRoot: root } : {}),
-  }
-}
-
-/**
- * Mirror of `@deepseek-ai/dsh-sandbox`'s `sandboxDenialMarker`: the dialect DSH
- * uses to tell a model "the sandbox blocked this, it is a policy denial, not a
- * bug". Reusing the exact spelling keeps one vocabulary for both halves.
- */
-export function sandboxDenialMarker(mode: DshSandboxMode): string {
-  return `[sandbox: file access denied under ${mode} mode]`
-}
-
-/**
- * Map DSH's access mode onto one ACP permission ask.
- *
- * A chat session's mode is the source of truth whenever one is available (that
- * is the entire point of the mapping — see
- * `docs/acp-permission-and-sandbox.md`), because the alternative is what this
- * replaced: a per-agent policy that made "full access" deny everything (the
- * host answers `never` asks with `'rejected'`) and "read-only" grant writes.
- *
- * The mode supplies the boundary, `approval` supplies whether a human is
- * asked at it:
- *
- * - `danger-full-access` — everything is allowed, no prompt.
- * - known read-only kinds (`read` / `search` / `think` / `fetch` /
- *   `switch_mode`) — allowed in every mode: no mode restricts reading.
- * - known write kinds — allowed outright only when the mode is
- *   `workspace-write` AND every declared location is inside the workspace root
- *   (what that mode exists to permit); otherwise a human decides (`ask`) or it
- *   is denied (`never`).
- * - effect unknown (`execute`, `other`, a missing kind) — `workspace-write`
- *   allows it (DSH lets bash run there and confines it at the kernel instead,
- *   which we cannot do to an agent's own tools), `read-only` asks or denies.
- *
- * @param policy - the session's resolved DSH access mode.
- * @param kind - ACP tool-call kind, when the agent declared one.
- * @param paths - declared write locations (see {@link permissionToolPaths}).
- * @param options - `narrateOnly` is the ACP-mode rule: the mode stays out of
- *   the arbitration entirely, so every ask the agent raises reaches the human
- *   (`ask`) instead of being auto-allowed or auto-denied by our boundary
- *   arithmetic. (The flag's name is older than this — nothing is narrated into
- *   the prompt any more; it is enforcement-only.) Under `approval: 'never'` the
- *   host cannot ask anybody —
- *   `ApprovalService.decide` resolves every ask to `'rejected'` before an
- *   answerer runs — so a quiet local `reject` stays the honest answer there.
- * @returns the decision the bridge enacts.
- */
-export function decidePermission(
-  policy: DshSessionPolicy,
-  kind: string | undefined,
-  paths: readonly string[] = [],
-  options: { narrateOnly?: boolean } = {},
-): PermissionDecision {
-  if (policy.mode === 'danger-full-access') return 'allow'
-  if (kind !== undefined && READ_TOOL_KINDS.has(kind)) return 'allow'
-  if (options.narrateOnly === true) return policy.approval === 'ask' ? 'ask' : 'reject'
-  if (kind !== undefined && WRITE_TOOL_KINDS.has(kind)) {
-    const root = policy.workspaceRoot
-    if (policy.mode === 'workspace-write' && root !== undefined && paths.length > 0 && paths.every(p => isUnderPath(p, root))) {
-      return 'allow'
-    }
-    return policy.approval === 'ask' ? 'ask' : 'reject'
-  }
-  // Effect unknown: only the read-only mode has a boundary strict enough that
-  // running it unexamined would break the mode's promise.
-  if (policy.mode === 'read-only') return policy.approval === 'ask' ? 'ask' : 'reject'
-  return 'allow'
-}
-
-// The session's access mode is deliberately **not** narrated into the prompt we
-// forward: the agent sees the user's own words and nothing else. The mode is
-// enforced (see {@link decidePermission} and the bridge's `authorizeWrite`), and
-// it is enforced as a fence rather than announced as a boundary — an agent that
-// never reaches the fence never needed the sentence.
 
 // ---- Transcript ----
 
@@ -1187,18 +1056,13 @@ export interface AcpManager {
   stopAgent(agentId: string): Promise<void>
   /**
    * The plugin's OWN default ACP agent (the panel's ★ gesture): which agent an
-   * ACP-mode conversation should start on. Deliberately NOT the deployment
-   * default model — writing that is exactly the cross-mode leak
-   * {@link AcpDefaultModelGuard} repairs.
+   * ACP-mode conversation should start on. Deliberately NOT a DSH model route:
+   * nothing in this plugin writes the host's model selection (see
+   * docs/acp-convergence.md §2.2).
    */
   defaultAgent?(): string | undefined
   /** Set (or clear, with `undefined`) the default ACP agent. */
   setDefaultAgent?(agentId: string | undefined): Promise<void>
-  /**
-   * Put the deployment default model back on a native route after an ACP pick
-   * (see {@link AcpDefaultModelGuard}).
-   */
-  reconcileDefaultModel?(previous?: ModelRouteSelection): Promise<DefaultModelReconcileOutcome>
   setPermission?(agentId: string, permission: PermissionMode): Promise<void>
   detectAgents?(): Promise<DetectedAgentInfo[]>
   saveAgent?(def: AcpAgentDef): Promise<void>
@@ -1225,14 +1089,6 @@ export interface AcpManager {
    * ledger. Read-only capability report for `agents/list`.
    */
   approvalRouting?(): boolean
-  /**
-   * True when permission asks and filesystem writes for chat-backed sessions
-   * follow the host's DSH access mode (`sandbox/mode` + `approval/policy`)
-   * instead of the agent's own `permission` field. Read-only capability report
-   * for `agents/list`; the panel tells the user which knob actually governs a
-   * given session with it.
-   */
-  accessModeRouting?(): boolean
   /**
    * ACP agent sessions backing one DSH chat session (looked up by chat session
    * id), so the composer can offer the agent's OWN mode list. Empty when no
@@ -1271,6 +1127,16 @@ export interface AcpManager {
    */
   setChatSessionMode?(dshSessionId: string, modeId: string, agentId?: string): Promise<void>
   /**
+   * Point one DSH chat conversation at an ACP agent — the plugin's own
+   * conversation↔agent mapping, never a DSH model route (see
+   * `BridgeManager.bindChatAgent`).
+   */
+  bindChatAgent?(dshSessionId: string, agentId: string): void
+  /** Switch the bound agent's model (`agentId@choice`) for one chat session. */
+  setChatSessionModel?(dshSessionId: string, modelId: string): Promise<void>
+  /** Switch the bound agent's reasoning effort for one chat session. */
+  setChatSessionEffort?(dshSessionId: string, effort: string | undefined): Promise<void>
+  /**
    * State of the ACP-mode agent preset in the harness's OWN roster. Read-only
    * report for the settings panel: the preset is a declaration this package
    * ships (a bundle patch), so there is nothing to install — but a declaration
@@ -1307,19 +1173,6 @@ function optionalStr(payload: Record<string, unknown>, key: string, maxLen: numb
   return value
 }
 
-/** Optional `{provider, model, reasoningEffort?}` payload field (absent/garbage → `undefined`). */
-function optionalSelection(payload: Record<string, unknown>, key: string): ModelRouteSelection | undefined {
-  const value = payload[key]
-  if (value === undefined || value === null) return undefined
-  if (typeof value !== 'object') throw new AcpError('bad_payload', `acp: ${key} must be an object`)
-  const row = value as Record<string, unknown>
-  const provider = optionalStr(row, 'provider', 64)
-  const model = optionalStr(row, 'model', 128)
-  if (provider === undefined || model === undefined) return undefined
-  const reasoningEffort = optionalStr(row, 'reasoningEffort', 64)
-  return { provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) }
-}
-
 /** Dispatch one decoded `/acp` channel call. Never rejects; protocol errors come back as `ok:false`. */
 export async function dispatchRpc(manager: AcpManager, endpoint: string, payload: unknown): Promise<RpcResult<unknown>> {
   const body = (typeof payload === 'object' && payload !== null ? payload : {}) as Record<string, unknown>
@@ -1331,7 +1184,6 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         return ok({
           agents: manager.agentViews(),
           approvalRouted: manager.approvalRouting?.() ?? false,
-          accessModeRouted: manager.accessModeRouting?.() ?? false,
         })
       case 'agents/detect':
         return ok({ agents: await (manager.detectAgents?.() ?? Promise.resolve([])) })
@@ -1416,25 +1268,45 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         await manager.setChatSessionMode?.(dshSessionId, modeId, optionalStr(body, 'agentId', 64))
         return ok({ done: true })
       }
+      case 'session/chat-bind': {
+        // Point one chat conversation at an ACP agent. The plugin's own
+        // conversation↔agent mapping — NOT a DSH model route (see
+        // `BridgeManager.bindChatAgent`).
+        const dshSessionId = str(body, 'dshSessionId', 128)
+        const agentId = str(body, 'agentId', 64)
+        await manager.bindChatAgent?.(dshSessionId, agentId)
+        return ok({ done: true })
+      }
+      case 'session/chat-model-set': {
+        const dshSessionId = str(body, 'dshSessionId', 128)
+        const modelId = str(body, 'modelId', 128)
+        await manager.setChatSessionModel?.(dshSessionId, modelId)
+        return ok({ done: true })
+      }
+      case 'session/chat-effort-set': {
+        const dshSessionId = str(body, 'dshSessionId', 128)
+        await manager.setChatSessionEffort?.(dshSessionId, optionalStr(body, 'effort', 64))
+        return ok({ done: true })
+      }
       case 'preset/status':
         return ok({ preset: await manager.presetStatus?.() ?? null })
       case 'agent/stop':
         await manager.stopAgent(str(body, 'agentId', 64)); return ok({ done: true })
-      case 'model/get-default': {
-        // The plugin's own default ACP agent, reported in the shape the panel
-        // already reads (`{provider: 'acp', model: agentId}`). Absent → `{}`,
-        // which the panel reads as "no default agent chosen yet".
-        const agentId = manager.defaultAgent?.()
-        return ok(agentId === undefined ? {} : { provider: ACP_PROVIDER_ID, model: agentId })
-      }
-      case 'model/set-default': {
-        const agentId = str(body, 'agentId', 64)
+      case 'default/agent':
+        // The plugin's OWN default ACP agent (the panel's ★ gesture): which
+        // agent an ACP-mode conversation starts on. `undefined` when none is
+        // chosen yet, or the choice points at a deleted agent.
+        //
+        // NOT a DSH model route. It used to be reported as `{provider: 'acp',
+        // model: agentId}` under `model/get-default`, which invited readers to
+        // treat it as one — and the whole provider-route axis it fed has been
+        // retired (see docs/acp-convergence.md §3 batch 1). The endpoint is
+        // named for what it actually is.
+        return ok({ agentId: manager.defaultAgent?.() })
+      case 'default/agent-set': {
+        const agentId = optionalStr(body, 'agentId', 64)
         await manager.setDefaultAgent?.(agentId)
         return ok({ done: true })
-      }
-      case 'model/reconcile-default': {
-        const previous = optionalSelection(body, 'previous')
-        return ok(await (manager.reconcileDefaultModel?.(previous) ?? Promise.resolve({ restored: false, stranded: false })))
       }
       case 'agent/set-permission': {
         const agentId = str(body, 'agentId', 64)

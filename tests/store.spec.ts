@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { AcpStore, foldUpdate, type Block } from '../src/client/store.ts'
-import { acpModeFromPresetEvent, selectAcpRoute, shouldShadowModelSeat } from '../src/client/acp-ui.tsx'
+import { acpModeFromPresetEvent, stagedIsAcpMode } from '../src/client/acp-ui.tsx'
 
 function fold(...updates: Array<Record<string, unknown>>): Block[] {
   const blocks: Block[] = []
@@ -345,7 +345,7 @@ describe('AcpStore agent management', () => {
       }
       return { ok: true, value: {} }
     }, (zh) => zh)
-    const gate = (): boolean => shouldShadowModelSeat({ current: 'chat-1' }, id => store.getSnapshot().acpMode[id])
+    const gate = (): boolean => stagedIsAcpMode({ current: 'chat-1' }, id => store.getSnapshot().acpMode[id])
 
     // Cold seed: the session still runs the standard preset.
     await store.loadChatSessions('chat-1')
@@ -395,10 +395,10 @@ describe('AcpStore agent management', () => {
   })
 
   it('keeps a frame-settled verdict immune to a later host read that lags the switch', async () => {
-    // Taking the model seat re-mounts the composer's readers, and the host's log
-    // read can still fold the preset BEFORE the switch — so the frame's verdict
-    // must outrank any read, whenever it lands. This is what made the seat move
-    // only after a page reload.
+    // The composer's readers re-mount when the ACP surfaces re-activate, and
+    // the host's log read can still fold the preset BEFORE the switch — so the
+    // frame's verdict must outrank any read, whenever it lands. This is what
+    // made the surface move only after a page reload.
     const reads: string[] = []
     const store = new AcpStore(async (_channel, endpoint) => {
       if (endpoint === 'session/chat-list') {
@@ -407,7 +407,7 @@ describe('AcpStore agent management', () => {
       }
       return { ok: true, value: {} }
     }, (zh) => zh)
-    const gate = (): boolean => shouldShadowModelSeat({ current: 'chat-1' }, id => store.getSnapshot().acpMode[id])
+    const gate = (): boolean => stagedIsAcpMode({ current: 'chat-1' }, id => store.getSnapshot().acpMode[id])
 
     // Cold seed (the session still runs another preset).
     await store.loadChatSessions('chat-1')
@@ -415,8 +415,8 @@ describe('AcpStore agent management', () => {
     store.noteAcpMode('chat-1', acpModeFromPresetEvent('acp'))
     expect(gate()).toBe(true)
 
-    // A reader mounts (the seat owns the model cell now) and reads again; the
-    // host answers with the pre-switch fold. The verdict must hold.
+    // A reader mounts and reads again; the host answers with the pre-switch
+    // fold. The verdict must hold.
     await store.loadChatSessions('chat-1')
     expect(store.getSnapshot().acpMode['chat-1']).toBe(true)
     expect(gate()).toBe(true)
@@ -747,90 +747,68 @@ describe('AcpStore observed ACP transcripts (the ACP view tab)', () => {
   })
 })
 
-describe('ACP route writes keep the deployment default native', () => {
-  /** A store whose only interesting endpoint is the reconcile call. */
-  function makeStore() {
+describe('the conversation↔agent binding (no DSH model route)', () => {
+  /** A store that records every call and answers the panel's resync endpoints. */
+  function makeStore(defaultAgentId?: string) {
     const calls: Array<{ endpoint: string; payload: unknown }> = []
     const store = new AcpStore(async (_channel, endpoint, payload) => {
       calls.push({ endpoint, payload })
       if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
       if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
       if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
+      if (endpoint === 'default/agent') return { ok: true, value: { ...(defaultAgentId === undefined ? {} : { agentId: defaultAgentId }) } }
+      if (endpoint === 'session/chat-list') return { ok: true, value: { sessions: [], acpMode: false } }
       return { ok: true, value: {} }
     }, (zh) => zh)
     return { store, calls }
   }
 
-  /** A model directory stub: records the write, answers the pre-write read. */
-  function makeDirectory(current: { provider: string; model: string } | null) {
-    const writes: Array<{ provider: string; model: string }> = []
-    return {
-      writes,
-      directory: {
-        store: { getSnapshot: () => ({ current, routable: true, groups: [], status: 'ready', error: null }), subscribe: () => () => {} },
-        load: async () => undefined,
-        select: async (selection: { provider: string; model: string }) => { writes.push(selection) },
-      },
-    }
-  }
-
-  it('hands the host the route the session was on BEFORE the ACP write', async () => {
+  it('binds, re-models and re-efforts a conversation through its own RPCs', async () => {
     const { store, calls } = makeStore()
-    const { directory, writes } = makeDirectory({ provider: 'deepseek', model: 'deepseek-v4', reasoningEffort: 'high' })
 
-    await selectAcpRoute(store, directory, { provider: 'acp', model: 'codebuddy' })
+    await store.bindChatAgent('chat-1', 'codebuddy')
+    await store.setChatSessionModel('chat-1', 'codebuddy@hy3')
+    await store.setChatSessionEffort('chat-1', 'high')
+    await store.setChatSessionEffort('chat-1', undefined)
 
-    expect(writes).toEqual([{ provider: 'acp', model: 'codebuddy' }])
-    expect(calls.map(c => c.endpoint)).toEqual(['model/reconcile-default'])
-    expect(calls[0].payload).toEqual({ previous: { provider: 'deepseek', model: 'deepseek-v4', reasoningEffort: 'high' } })
+    expect(calls.map(c => c.endpoint)).toEqual([
+      'session/chat-bind', 'session/chat-model-set', 'session/chat-effort-set', 'session/chat-effort-set',
+    ])
+    expect(calls[0].payload).toEqual({ dshSessionId: 'chat-1', agentId: 'codebuddy' })
+    expect(calls[1].payload).toEqual({ dshSessionId: 'chat-1', modelId: 'codebuddy@hy3' })
+    expect(calls[2].payload).toEqual({ dshSessionId: 'chat-1', effort: 'high' })
+    // An absent effort is a clear, not an empty string.
+    expect(calls[3].payload).toEqual({ dshSessionId: 'chat-1' })
   })
 
-  it('never offers an ACP route (or an empty one) as the value to restore', async () => {
-    // A session already on an ACP route switching agents: the previous route is
-    // not a candidate, so the host must fall back to what it remembers.
-    const { store, calls } = makeStore()
-    const { directory } = makeDirectory({ provider: 'acp', model: 'codebuddy' })
-    await selectAcpRoute(store, directory, { provider: 'acp', model: 'pi' })
-    expect(calls[0].payload).toEqual({})
-
-    // A brand-new session with no selection at all: same.
-    const fresh = makeStore()
-    await selectAcpRoute(fresh.store, makeDirectory(null).directory, { provider: 'acp', model: 'pi' })
-    expect(fresh.calls[0].payload).toEqual({})
-  })
-
-  it('treats a failed repair as housekeeping, not as a failed pick', async () => {
+  it('surfaces a failed binding as a notice AND rethrows, so the menu shows the error', async () => {
     const store = new AcpStore(async (_channel, endpoint) => {
-      if (endpoint === 'model/reconcile-default') return { ok: false, error: { code: 'internal', message: 'nope' } }
+      if (endpoint === 'session/chat-bind') return { ok: false, error: { code: 'unknown_agent', message: 'no such agent' } }
       return { ok: true, value: {} }
     }, (zh) => zh)
-    const { directory, writes } = makeDirectory({ provider: 'deepseek', model: 'deepseek-v4' })
-    await expect(selectAcpRoute(store, directory, { provider: 'acp', model: 'pi' })).resolves.toBeUndefined()
-    expect(writes).toEqual([{ provider: 'acp', model: 'pi' }])
+
+    await expect(store.bindChatAgent('chat-1', 'ghost')).rejects.toThrow('no such agent')
+    expect(store.getSnapshot().notice).toBe('no such agent')
   })
 
-  it('reads the plugin default agent from model/get-default and sets it back', async () => {
-    const calls: Array<{ endpoint: string; payload: unknown }> = []
-    let answer: { provider?: string; model?: string } = { provider: 'acp', model: 'codebuddy' }
-    const store = new AcpStore(async (_channel, endpoint, payload) => {
-      calls.push({ endpoint, payload })
-      if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
-      if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
-      if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
-      if (endpoint === 'model/get-default') return { ok: true, value: answer }
-      return { ok: true, value: {} }
-    }, (zh) => zh)
+  it('reads the plugin default agent from default/agent and sets it back', async () => {
+    const { store, calls } = makeStore('codebuddy')
 
     await store.resync()
     expect(store.getSnapshot().defaultAgent).toBe('codebuddy')
 
-    // A native deployment default (no ACP default agent chosen) is not a default agent.
-    answer = { provider: 'deepseek', model: 'deepseek-v4' }
-    await store.resync()
-    expect(store.getSnapshot().defaultAgent).toBeUndefined()
+    // No default agent chosen: absent, not a fallback.
+    const bare = makeStore()
+    await bare.store.resync()
+    expect(bare.store.getSnapshot().defaultAgent).toBeUndefined()
 
     await store.setDefaultAgent('pi')
-    expect(calls.at(-1)).toEqual({ endpoint: 'model/set-default', payload: { agentId: 'pi' } })
+    expect(calls.at(-1)).toEqual({ endpoint: 'default/agent-set', payload: { agentId: 'pi' } })
     expect(store.getSnapshot().defaultAgent).toBe('pi')
+
+    // Clearing is legal (the only way to remove a star).
+    await store.setDefaultAgent(undefined)
+    expect(calls.at(-1)).toEqual({ endpoint: 'default/agent-set', payload: {} })
+    expect(store.getSnapshot().defaultAgent).toBeUndefined()
   })
 })

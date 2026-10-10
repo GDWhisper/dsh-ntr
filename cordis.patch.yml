@@ -24,11 +24,11 @@
         # so it needs no install step and has no config knob. The settings card
         # only reports the harness roster's verdict for the `preset-acp` row.
         # The plugin's OWN default ACP agent (panel's ★ button) lives in the
-        # agent registry file (~/.dsh/acp-agents.json, key `defaultAgentId`),
-        # NOT in DSH's deployment default model: that value is global to every
-        # mode, so writing an ACP route there would start new sessions of ANY
-        # mode on the external agent. The host-side guard puts a native route
-        # back whenever the default becomes `acp`.
+        # agent registry file (~/.dsh/acp-agents.json, key `defaultAgentId`).
+        # This plugin never reads or writes DSH's deployment default model: no
+        # ACP route is ever written there, so there is nothing to guard. (An
+        # older revision did write one and needed a host-side guard to put a
+        # native route back — both are gone; see AGENTS.md constraint 22.)
         # Per-agent ACP-model filter — which of the agent's models its own
         # conversation seats offer (panel checkboxes persist here). ACP models
         # are never advertised in DSH's model catalog, so they cannot leak into

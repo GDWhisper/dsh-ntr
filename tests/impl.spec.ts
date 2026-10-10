@@ -1,17 +1,15 @@
 import { describe, expect, it } from 'vitest'
 import {
-  AcpDefaultModelGuard,
   AcpError,
   EventHub,
   PermissionLedger,
   Transcript,
+  acpToolCallDelta,
+  acpToolCallFromUpdate,
   buildAdapterModelId,
   canonicalizeFsPath,
   childEnv,
-  decidePermission,
   dispatchRpc,
-  dshApprovalPolicyOf,
-  dshSessionPolicyOf,
   ACP_PRESET_SOURCE,
   acpPresetStatusFromRoster,
   isAbsolutePath,
@@ -19,18 +17,19 @@ import {
   parseCatalogOptions,
   permissionToolKind,
   permissionToolPaths,
-  lastNativeRoute,
   resolveFsPath,
   resolveSessionCwd,
-  sandboxDenialMarker,
   selectForwardPrompt,
   sessionAgentPreset,
   sessionAgentPresetFromLog,
   splitAdapterModelId,
+  splitCommandLine,
+  quoteCommandToken,
+  tokenizeCommandLine,
   validateAgentDef,
   validateConfig,
 } from '../src/impl.ts'
-import type { AcpManager, DefaultModelPorts, DshSessionPolicy, ModelRouteSelection } from '../src/impl.ts'
+import type { AcpManager } from '../src/impl.ts'
 import type { AcpAgentDef, AgentProbeModelsResult } from '../src/protocol.ts'
 
 function agentDef(overrides: Partial<AcpAgentDef> = {}): AcpAgentDef {
@@ -160,6 +159,64 @@ describe('adapter model id split/build', () => {
   })
 })
 
+describe('ACP tool-call notifications → Chat tool-call chunks', () => {
+  it('reads the identity and label an agent announces, and refuses to invent arguments', () => {
+    expect(acpToolCallFromUpdate({ toolCallId: 'call_1', title: 'mock tool', kind: 'read' }))
+      .toEqual({ callId: 'call_1', name: 'mock tool', argsRaw: '' })
+    // No arguments is legal ACP: the card is empty, not fabricated.
+    expect(acpToolCallFromUpdate({ toolCallId: 'call_2' }))
+      .toEqual({ callId: 'call_2', name: '', argsRaw: '' })
+  })
+
+  it('drops a notification with no call identity — the renderer groups by it', () => {
+    expect(acpToolCallFromUpdate({ title: 'no id' })).toBeUndefined()
+    expect(acpToolCallFromUpdate({ toolCallId: '   ' })).toBeUndefined()
+    expect(acpToolCallFromUpdate({})).toBeUndefined()
+  })
+
+  it('accepts the argument spellings agents use in the wild', () => {
+    expect(acpToolCallFromUpdate({ toolCallId: 'c', rawInput: '{"a":1}' })).toMatchObject({ argsRaw: '{"a":1}' })
+    expect(acpToolCallFromUpdate({ toolCallId: 'c', arguments: 'plain' })).toMatchObject({ argsRaw: 'plain' })
+    expect(acpToolCallFromUpdate({ toolCallId: 'c', arguments: { a: 1 } })).toMatchObject({ argsRaw: '{"a":1}' })
+    // An unserializable value degrades to text rather than failing the card.
+    const circular: Record<string, unknown> = {}
+    circular.self = circular
+    expect(acpToolCallFromUpdate({ toolCallId: 'c', arguments: circular }).argsRaw).toBe('[object Object]')
+  })
+
+  it('folds an update into the open snapshot, naming only real changes', () => {
+    const snapshot = { callId: 'call_1', name: 'mock tool', argsRaw: '' }
+    // No change at all: no deltas, so no chunk is emitted.
+    expect(acpToolCallDelta(snapshot, { toolCallId: 'call_1' })).toEqual([])
+    // Content becomes argument text.
+    expect(acpToolCallDelta(snapshot, {
+      toolCallId: 'call_1',
+      content: [{ type: 'content', content: { type: 'text', text: 'tool result line' } }],
+    })).toEqual([{ kind: 'args', text: 'tool result line' }])
+    expect(snapshot).toEqual({ callId: 'call_1', name: 'mock tool', argsRaw: 'tool result line' })
+    // A retitled agent gets a name delta and the snapshot follows.
+    expect(acpToolCallDelta(snapshot, { toolCallId: 'call_1', title: 'renamed tool' }))
+      .toEqual([{ kind: 'name', name: 'renamed tool' }])
+    expect(snapshot.name).toBe('renamed tool')
+    // A restatement of the same name is not a change.
+    expect(acpToolCallDelta(snapshot, { toolCallId: 'call_1', title: 'renamed tool' })).toEqual([])
+  })
+
+  it('keeps the content kinds the Chat card cannot render, as placeholders', () => {
+    const snapshot = { callId: 'c', name: '', argsRaw: '' }
+    acpToolCallDelta(snapshot, {
+      toolCallId: 'c',
+      content: [
+        { type: 'content', content: { type: 'text', text: 'first' } },
+        { type: 'content', content: { type: 'diff', path: '/w/a.ts' } },
+        { type: 'content', content: { type: 'image' } },
+        { type: 'terminal', terminalId: 't1' },
+      ],
+    })
+    expect(snapshot.argsRaw).toBe('first\n[diff /w/a.ts]\n[image]\n[terminal t1]')
+  })
+})
+
 describe('selectForwardPrompt (host request → forwarded ACP prompt)', () => {
   const user = (text: string, id = 'u1') => ({ role: 'user', id, source: { kind: 'user' }, content: [{ type: 'text', text }] })
   const injected = (kind: string, text: string) => ({ role: 'user', source: { kind }, content: [{ type: 'text', text }] })
@@ -245,6 +302,68 @@ describe('validateAgentDef', () => {
   it('rejects empty command and invalid id', () => {
     expect(() => validateAgentDef({ id: 'pi', command: '' })).toThrow(AcpError)
     expect(() => validateAgentDef({ id: 'PI AGENT', command: 'pi-acp' })).toThrow(AcpError)
+  })
+})
+
+/**
+ * The 命令 field is a command LINE. This is the semantics the panel's single
+ * input relies on, and the reason `codebuddy --acp` (the whole command pasted
+ * into one box) is a working configuration instead of an executable named
+ * `codebuddy --acp` — the failure that produced "ACP connection closed".
+ */
+describe('command lines', () => {
+  it('splits a pasted command line into program + arguments', () => {
+    expect(splitCommandLine('codebuddy --acp')).toEqual({ command: 'codebuddy', args: ['--acp'] })
+    expect(splitCommandLine('  omp   acp  ')).toEqual({ command: 'omp', args: ['acp'] })
+    expect(splitCommandLine('pi-acp')).toEqual({ command: 'pi-acp', args: [] })
+    expect(splitCommandLine('npx -y @tencent-ai/codebuddy-code --acp')).toEqual({
+      command: 'npx',
+      args: ['-y', '@tencent-ai/codebuddy-code', '--acp'],
+    })
+  })
+
+  it('keeps a quoted path in one piece, and a backslash is not an escape', () => {
+    expect(splitCommandLine('"C:\\Program Files\\nodejs\\node.exe" --acp'))
+      .toEqual({ command: 'C:\\Program Files\\nodejs\\node.exe', args: ['--acp'] })
+    expect(splitCommandLine("'my agent' --flag value")).toEqual({ command: 'my agent', args: ['--flag', 'value'] })
+    expect(splitCommandLine('cmd /c "a b"')).toEqual({ command: 'cmd', args: ['/c', 'a b'] })
+    // `\"` is the one escape the tokenizer honors (Windows paths are otherwise
+    // nothing but backslashes, so a general escape would mangle them).
+    expect(splitCommandLine('say "\\"hi\\""')).toEqual({ command: 'say', args: ['"hi"'] })
+  })
+
+  it('answers an empty command for blank and quote-only input', () => {
+    expect(splitCommandLine('')).toEqual({ command: '', args: [] })
+    expect(splitCommandLine('   ')).toEqual({ command: '', args: [] })
+    expect(splitCommandLine('""')).toEqual({ command: '', args: [] })
+    expect(tokenizeCommandLine('a "" b')).toEqual(['a', '', 'b'])
+  })
+
+  it('quotes tokens only when they need it, and round-trips', () => {
+    expect(quoteCommandToken('plain')).toBe('plain')
+    expect(quoteCommandToken('has space')).toBe('"has space"')
+    expect(quoteCommandToken('')).toBe('""')
+    for (const token of ['plain', 'has space', 'C:\\Program Files\\x.exe', 'say "hi"', "it's"]) {
+      expect(splitCommandLine(quoteCommandToken(token)).command).toBe(token)
+    }
+  })
+
+  it('folds the command line\'s trailing tokens in front of the explicit args', () => {
+    const def = validateAgentDef({ id: 'codebuddy', command: 'codebuddy --acp' })
+    expect(def.command).toBe('codebuddy')
+    expect(def.args).toEqual(['--acp'])
+    // Idempotent: re-validating what this function returned (every boot does)
+    // must not move anything around.
+    expect(validateAgentDef(def)).toMatchObject({ command: 'codebuddy', args: ['--acp'] })
+    // The canonical shape — bare command + args, what every preset stores — is
+    // untouched, and an explicit args list keeps its own order after the parsed
+    // ones.
+    expect(validateAgentDef({ id: 'omp', command: 'omp', args: ['acp'] })).toMatchObject({ command: 'omp', args: ['acp'] })
+    expect(validateAgentDef({ id: 'x', command: 'cmd /c foo', args: ['--tail'] }).args).toEqual(['/c', 'foo', '--tail'])
+    // Quoting survives: the stored command is the bare path, not the quotes.
+    expect(validateAgentDef({ id: 'x', command: '"C:\\Program Files\\x.exe" --acp' }))
+      .toMatchObject({ command: 'C:\\Program Files\\x.exe', args: ['--acp'] })
+    expect(() => validateAgentDef({ id: 'x', command: '"' })).toThrow(AcpError)
   })
 })
 
@@ -443,10 +562,14 @@ describe('cross-platform paths (Windows)', () => {
     expect(() => resolveFsPath('C:/ws', ['C:/ws'], '//?/C:/ws/x', winRealpath)).toThrow(/does not exist/)
   })
 
-  it('decidePermission folds a Windows workspace root against declared locations', () => {
-    const policy = { mode: 'workspace-write' as const, approval: 'ask' as const, workspaceRoot: 'C:/proj' }
-    expect(decidePermission(policy, 'edit', ['C:\\proj\\a.txt'])).toBe('allow')
-    expect(decidePermission(policy, 'edit', ['D:\\proj\\a.txt'])).toBe('ask')
+  it('folds a Windows workspace root against declared locations (the surviving containment)', () => {
+    // This used to prove `decidePermission`'s arithmetic. The decision layer is
+    // retired; what remains is the containment primitive the workspace fence is
+    // built on, and it must keep folding separators and case the same way.
+    expect(isUnderPath('C:\\proj\\a.txt', 'C:/proj')).toBe(true)
+    expect(isUnderPath('D:\\proj\\a.txt', 'C:/proj')).toBe(false)
+    // A path can be inside a root spelled with either separator on either side.
+    expect(isUnderPath('C:/proj/sub/b.ts', 'C:\\proj')).toBe(true)
   })
 })
 
@@ -505,10 +628,9 @@ function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } {
     stopAgent: async id => { calls.push(['stop', id]) },
     defaultAgent: () => 'mock',
     setDefaultAgent: async id => { calls.push(['setDefaultAgent', id]) },
-    reconcileDefaultModel: async previous => {
-      calls.push(['reconcileDefaultModel', previous])
-      return { selection: previous, restored: previous !== undefined, stranded: previous === undefined }
-    },
+    bindChatAgent: (dshSessionId, agentId) => { calls.push(['bindChatAgent', dshSessionId, agentId]) },
+    setChatSessionModel: async (dshSessionId, modelId) => { calls.push(['setChatSessionModel', dshSessionId, modelId]) },
+    setChatSessionEffort: async (dshSessionId, effort) => { calls.push(['setChatSessionEffort', dshSessionId, effort]) },
     setPermission: async (id, p) => { calls.push(['setPermission', { id, p }]) },
     detectAgents: async () => { calls.push(['detect', undefined]); return [] },
     saveAgent: async def => { calls.push(['save', def]) },
@@ -543,23 +665,17 @@ function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } {
 describe('dispatchRpc', () => {
   it('routes endpoints and normalizes errors into the Connection result shape', async () => {
     const manager = fakeManager()
-    // `approvalRouted` / `accessModeRouted` are reported for every host build; a
-    // manager without the probes (older/partial implementation) reports the
-    // degraded `false` for each.
+    // `approvalRouted` is reported for every host build; a manager without the
+    // probe (older/partial implementation) reports the degraded `false`.
     await expect(dispatchRpc(manager, 'agents/list', {})).resolves.toEqual({
       ok: true,
-      value: { agents: [], approvalRouted: false, accessModeRouted: false },
+      value: { agents: [], approvalRouted: false },
     })
     expect(manager.calls).toContainEqual(['agents', undefined])
     const routed = { ...manager, approvalRouting: () => true }
     await expect(dispatchRpc(routed, 'agents/list', {})).resolves.toEqual({
       ok: true,
-      value: { agents: [], approvalRouted: true, accessModeRouted: false },
-    })
-    const modeRouted = { ...manager, accessModeRouting: () => true }
-    await expect(dispatchRpc(modeRouted, 'agents/list', {})).resolves.toEqual({
-      ok: true,
-      value: { agents: [], approvalRouted: false, accessModeRouted: true },
+      value: { agents: [], approvalRouted: true },
     })
     // Optional chat-session mode surface: a manager without it reports none.
     await expect(dispatchRpc(manager, 'session/chat-list', { dshSessionId: 'chat-1' })).resolves.toEqual({ ok: true, value: { sessions: [], acpMode: false } })
@@ -623,34 +739,27 @@ describe('dispatchRpc', () => {
     })
     await expect(dispatchRpc(manager, 'session/prompt', { sessionId: 'S', text: 3 })).resolves.toMatchObject({ ok: false })
     await expect(dispatchRpc(manager, 'session/config-set', { sessionId: 'S', configId: 'm', value: 42 })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
-    // The plugin's OWN default ACP agent (the panel's ★ gesture) — never the
-    // deployment default model, which must stay a native route.
-    await expect(dispatchRpc(manager, 'model/get-default', {})).resolves.toEqual({ ok: true, value: { provider: 'acp', model: 'mock' } })
-    await expect(dispatchRpc(manager, 'model/set-default', { agentId: 'custom' })).resolves.toEqual({ ok: true, value: { done: true } })
+    // The plugin's OWN default ACP agent (the panel's ★ gesture) — a
+    // plugin-private id, never a DSH model route.
+    await expect(dispatchRpc(manager, 'default/agent', {})).resolves.toEqual({ ok: true, value: { agentId: 'mock' } })
+    await expect(dispatchRpc(manager, 'default/agent-set', { agentId: 'custom' })).resolves.toEqual({ ok: true, value: { done: true } })
     expect(manager.calls).toContainEqual(['setDefaultAgent', 'custom'])
-    // A host half with no default agent answers `{}` → the panel shows no ★.
-    await expect(dispatchRpc({ ...manager, defaultAgent: undefined }, 'model/get-default', {})).resolves.toEqual({ ok: true, value: {} })
-    // The guard's RPC: the pre-write route rides along, and the host's outcome
-    // is passed through untouched.
-    await expect(dispatchRpc(manager, 'model/reconcile-default', {})).resolves.toEqual({
-      ok: true,
-      value: { restored: false, stranded: true },
-    })
-    await expect(dispatchRpc(manager, 'model/reconcile-default', {
-      previous: { provider: 'deepseek', model: 'deepseek-v4', reasoningEffort: 'high' },
-    })).resolves.toEqual({
-      ok: true,
-      value: { selection: { provider: 'deepseek', model: 'deepseek-v4', reasoningEffort: 'high' }, restored: true, stranded: false },
-    })
-    expect(manager.calls).toContainEqual(['reconcileDefaultModel', { provider: 'deepseek', model: 'deepseek-v4', reasoningEffort: 'high' }])
-    // A malformed `previous` is not a payload error (it is optional metadata);
-    // a non-object one is.
-    await expect(dispatchRpc(manager, 'model/reconcile-default', { previous: { provider: 'x' } })).resolves.toMatchObject({ ok: true })
-    await expect(dispatchRpc(manager, 'model/reconcile-default', { previous: 'x' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
-    await expect(dispatchRpc({ ...manager, reconcileDefaultModel: undefined }, 'model/reconcile-default', {})).resolves.toEqual({
-      ok: true,
-      value: { restored: false, stranded: false },
-    })
+    // A host half with no default agent answers `undefined` → the panel shows no ★.
+    await expect(dispatchRpc({ ...manager, defaultAgent: undefined }, 'default/agent', {})).resolves.toEqual({ ok: true, value: { agentId: undefined } })
+    // Clearing the default is legal and is the only way to remove a star.
+    await expect(dispatchRpc(manager, 'default/agent-set', {})).resolves.toEqual({ ok: true, value: { done: true } })
+    expect(manager.calls).toContainEqual(['setDefaultAgent', undefined])
+    // The conversation↔agent mapping: the plugin's own binding, never a model route.
+    await expect(dispatchRpc(manager, 'session/chat-bind', { dshSessionId: 'chat-1', agentId: 'pi' })).resolves.toEqual({ ok: true, value: { done: true } })
+    expect(manager.calls).toContainEqual(['bindChatAgent', 'chat-1', 'pi'])
+    await expect(dispatchRpc(manager, 'session/chat-model-set', { dshSessionId: 'chat-1', modelId: 'pi@a' })).resolves.toEqual({ ok: true, value: { done: true } })
+    expect(manager.calls).toContainEqual(['setChatSessionModel', 'chat-1', 'pi@a'])
+    await expect(dispatchRpc(manager, 'session/chat-effort-set', { dshSessionId: 'chat-1', effort: 'high' })).resolves.toEqual({ ok: true, value: { done: true } })
+    expect(manager.calls).toContainEqual(['setChatSessionEffort', 'chat-1', 'high'])
+    // Absent effort clears it (follow the agent's own default).
+    await expect(dispatchRpc(manager, 'session/chat-effort-set', { dshSessionId: 'chat-1' })).resolves.toEqual({ ok: true, value: { done: true } })
+    expect(manager.calls).toContainEqual(['setChatSessionEffort', 'chat-1', undefined])
+    await expect(dispatchRpc(manager, 'session/chat-bind', { dshSessionId: 'chat-1' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     await expect(dispatchRpc(manager, 'agent/set-permission', { agentId: 'custom', permission: 'allow' })).resolves.toEqual({ ok: true, value: { done: true } })
     expect(manager.calls).toContainEqual(['setPermission', { id: 'custom', p: 'allow' }])
     await expect(dispatchRpc(manager, 'agent/set-permission', { agentId: 'custom', permission: 'invalid' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
@@ -719,309 +828,26 @@ describe('EventHub', () => {
   })
 })
 
-describe('DSH access mode → ACP permission decision', () => {
-  const policy = (overrides: Partial<DshSessionPolicy> = {}): DshSessionPolicy => ({
-    mode: 'workspace-write',
-    approval: 'ask',
-    ...overrides,
-  })
-
-  it('lets full access answer locally — the inversion this mapping replaces', () => {
-    // 完全权限 = danger-full-access + approval `never`; the host resolves every
-    // `never` ask to 'rejected', so routing there denied exactly what the mode allows.
-    expect(decidePermission(policy({ mode: 'danger-full-access', approval: 'never' }), 'execute')).toBe('allow')
-    expect(decidePermission(policy({ mode: 'danger-full-access', approval: 'never' }), undefined)).toBe('allow')
-    expect(decidePermission(policy({ mode: 'danger-full-access', approval: 'never' }), 'edit', ['/etc/passwd'])).toBe('allow')
-  })
-
-  it('allows reads in every mode and for every approval policy', () => {
-    for (const mode of ['read-only', 'workspace-write', 'danger-full-access'] as const) {
-      for (const approval of ['ask', 'never'] as const) {
-        expect(decidePermission(policy({ mode, approval }), 'read')).toBe('allow')
-        expect(decidePermission(policy({ mode, approval }), 'search')).toBe('allow')
-      }
+describe('the retired permission axis (nothing here may arbitrate an agent ask)', () => {
+  // The whole "DSH access mode maps onto ACP permission decisions" layer is gone
+  // (docs/acp-convergence.md §2.3): an ACP agent is fully autonomous, its
+  // `session/request_permission` is mapped to the user unchanged, and DSH's
+  // sandbox cannot reach into the agent's own process anyway. These cases pin
+  // the two facts that made the old axis actively harmful.
+  it('has no exported decision helper left to reach for', async () => {
+    const impl = await import('../src/impl.ts') as Record<string, unknown>
+    for (const gone of ['decidePermission', 'dshSessionPolicyOf', 'dshApprovalPolicyOf', 'sandboxDenialMarker']) {
+      expect(impl[gone]).toBeUndefined()
     }
   })
 
-  it('denies writes under read-only + never and escalates them under read-only + ask', () => {
-    expect(decidePermission(policy({ mode: 'read-only', approval: 'never' }), 'edit', ['/tmp/x'])).toBe('reject')
-    expect(decidePermission(policy({ mode: 'read-only', approval: 'never' }), 'delete')).toBe('reject')
-    expect(decidePermission(policy({ mode: 'read-only', approval: 'never' }), 'execute')).toBe('reject')
-    expect(decidePermission(policy({ mode: 'read-only', approval: 'ask' }), 'edit', ['/tmp/x'])).toBe('ask')
-    expect(decidePermission(policy({ mode: 'read-only', approval: 'ask' }), 'execute')).toBe('ask')
-  })
-
-  it('permits a proven in-workspace write under workspace-write and escalates anything else', () => {
-    const p = policy({ workspaceRoot: '/srv/ws' })
-    expect(decidePermission(p, 'edit', ['/srv/ws/src/a.ts'])).toBe('allow')
-    expect(decidePermission(p, 'edit', ['/srv/ws'])).toBe('allow')
-    expect(decidePermission(p, 'edit', ['/etc/passwd'])).toBe('ask')
-    // Mixed locations: one outside the boundary is enough to need a human.
-    expect(decidePermission(p, 'edit', ['/srv/ws/a.ts', '/tmp/b.ts'])).toBe('ask')
-    // An undeclared target cannot be proven inside the boundary.
-    expect(decidePermission(p, 'edit')).toBe('ask')
-    expect(decidePermission(policy({ workspaceRoot: '/srv/ws', approval: 'never' }), 'edit', ['/etc/passwd'])).toBe('reject')
-    expect(decidePermission(policy({ workspaceRoot: undefined }), 'edit', ['/srv/ws/a.ts'])).toBe('ask')
-  })
-
-  it('treats an unknown effect as confined only under read-only', () => {
-    expect(decidePermission(policy({ mode: 'read-only', approval: 'never' }), undefined)).toBe('reject')
-    expect(decidePermission(policy({ mode: 'read-only', approval: 'ask' }), 'other')).toBe('ask')
-    expect(decidePermission(policy({ approval: 'never' }), 'execute')).toBe('allow')
-    expect(decidePermission(policy({ approval: 'never' }), undefined)).toBe('allow')
-  })
-
-  it('narrates only in ACP mode: every ask the agent raises reaches the human', () => {
-    // The agent's own permission mode decides what it asks about, so the
-    // boundary arithmetic must not answer for it — except where the host cannot
-    // ask anybody at all (`never` resolves every ask to 'rejected' before an
-    // answerer runs, so a quiet local reject is the honest answer).
-    const narrate = { narrateOnly: true }
-    const ws = policy({ workspaceRoot: '/srv/ws' })
-    expect(decidePermission(ws, 'edit', ['/srv/ws/a.ts'], narrate)).toBe('ask')
-    expect(decidePermission(ws, 'execute', [], narrate)).toBe('ask')
-    expect(decidePermission(policy({ mode: 'read-only' }), 'edit', [], narrate)).toBe('ask')
-    // Reads and full access are never worth a prompt.
-    expect(decidePermission(ws, 'read', [], narrate)).toBe('allow')
-    expect(decidePermission(policy({ mode: 'danger-full-access', approval: 'never' }), 'edit', ['/etc/passwd'], narrate)).toBe('allow')
-    expect(decidePermission(policy({ mode: 'read-only', approval: 'never' }), 'edit', [], narrate)).toBe('reject')
-  })
-
-  it('folds a session\'s agent preset, newest selection winning over the header', () => {
-    expect(sessionAgentPreset(undefined)).toBeUndefined()
-    expect(sessionAgentPreset({ header: { agentPreset: 'standard' } })).toBe('standard')
-    expect(sessionAgentPreset({ header: {} })).toBeUndefined()
-    expect(sessionAgentPreset({
-      header: { agentPreset: 'standard' },
-      events: [{ type: 'turn/start' }, { type: 'agent-preset/selected', data: { agentPreset: 'acp' } }],
-    })).toBe('acp')
-    // A malformed event must not shadow the header with garbage.
-    expect(sessionAgentPreset({
-      header: { agentPreset: 'standard' },
-      events: [{ type: 'agent-preset/selected', data: {} }],
-    })).toBeUndefined()
-  })
-
-  it('reads the ACP-mode preset status out of the harness roster', () => {
-    // Unreadable roster (no `agentPresets` service): no verdict at all, which
-    // hides the panel block instead of claiming the preset is gone.
-    expect(acpPresetStatusFromRoster(undefined, 'acp')).toBeUndefined()
-
-    // A readable roster WITHOUT the row: the declaration was not composed.
-    expect(acpPresetStatusFromRoster([{ id: 'standard' }], 'acp')).toMatchObject({
-      id: 'acp',
-      source: ACP_PRESET_SOURCE,
-      installed: false,
-    })
-    expect(acpPresetStatusFromRoster([{ id: 'standard' }], 'acp')?.problem).toMatch(/roster/)
-
-    // A row that cannot compose a session carries the harness's own diagnostic.
-    expect(acpPresetStatusFromRoster([{ id: 'acp', broken: 'acp-guard: cannot find module' }], 'acp')).toEqual({
-      id: 'acp',
-      source: ACP_PRESET_SOURCE,
-      installed: false,
-      problem: 'acp-guard: cannot find module',
-    })
-    // An empty/garbage `broken` is the harness's way of saying "finite": the
-    // registry omits the field on a healthy row, so neither may read as broken.
-    expect(acpPresetStatusFromRoster([{ id: 'acp', broken: '' }], 'acp')).toEqual({
-      id: 'acp',
-      source: ACP_PRESET_SOURCE,
-      installed: true,
-    })
-    expect(acpPresetStatusFromRoster([{ id: 'acp' }], 'acp')?.installed).toBe(true)
-  })
-
-  it('folds a preset from a RAW stored log (the cold-read path)', () => {
-    // `sessionPersistence` hands back the header verbatim and a read handle
-    // returns raw event objects — neither is a host `Session`, so the fold is
-    // spelled on its own inputs.
-    expect(sessionAgentPresetFromLog('standard', [])).toBe('standard')
-    expect(sessionAgentPresetFromLog(undefined, [
-      { type: 'sandbox/mode', data: { mode: 'ask' } },
-      { type: 'agent-preset/selected', data: { agentPreset: 'acp' } },
-    ])).toBe('acp')
-    // Newest selection wins over an older one and over the header.
-    expect(sessionAgentPresetFromLog('standard', [
-      { type: 'agent-preset/selected', data: { agentPreset: 'acp' } },
-      { type: 'agent-preset/selected', data: { agentPreset: 'minimal' } },
-    ])).toBe('minimal')
-    expect(sessionAgentPresetFromLog(7, [{ type: 'turn/start' }])).toBeUndefined()
-  })
-
-  it('reads the ACP tool-call shape defensively', () => {
-    expect(permissionToolKind({ kind: 'edit' })).toBe('edit')
-    expect(permissionToolKind({ kind: '' })).toBeUndefined()
-    expect(permissionToolKind({})).toBeUndefined()
-    expect(permissionToolKind(null)).toBeUndefined()
-    expect(permissionToolPaths({ locations: [{ path: '/a' }, { path: '' }, {}, 'x'] })).toEqual(['/a'])
-    expect(permissionToolPaths({})).toEqual([])
-  })
-
-  it('compares containment lexically and conservatively', () => {
-    expect(isUnderPath('/srv/ws/a.ts', '/srv/ws/')).toBe(true)
-    expect(isUnderPath('/srv/ws', '/srv/ws')).toBe(true)
-    expect(isUnderPath('/srv/wsx/a.ts', '/srv/ws')).toBe(false)
-    expect(isUnderPath('/anything', '/')).toBe(true)
-    expect(isUnderPath('/srv', 'relative/path')).toBe(false)
-  })
-
-  it('folds the session approval policy over the configured default', () => {
-    expect(dshApprovalPolicyOf({ events: [{ type: 'approval/policy', data: { policy: 'never' } }] }, 'ask')).toBe('never')
-    expect(dshApprovalPolicyOf({ events: [{ type: 'approval/policy', data: { policy: 'ask' } }] }, 'never')).toBe('ask')
-    // The LAST switch wins, exactly like the host's own fold.
-    expect(dshApprovalPolicyOf({
-      events: [
-        { type: 'approval/policy', data: { policy: 'never' } },
-        { type: 'sandbox/mode', data: { mode: 'read-only' } },
-        { type: 'approval/policy', data: { policy: 'ask' } },
-      ],
-    }, 'never')).toBe('ask')
-    expect(dshApprovalPolicyOf({ events: [] }, 'never')).toBe('never')
-    expect(dshApprovalPolicyOf(undefined, undefined)).toBe('ask')
-    expect(dshApprovalPolicyOf({ events: [{ type: 'approval/policy', data: {} }] }, 'never')).toBe('ask')
-    expect(dshApprovalPolicyOf({}, 'unexpected')).toBe('ask')
-  })
-
-  it('refuses a mode outside the vocabulary instead of guessing a boundary', () => {
-    expect(dshSessionPolicyOf({ mode: 'sandboxed', workspaceRoot: '/x' }, undefined, 'ask')).toBeUndefined()
-    expect(dshSessionPolicyOf({}, undefined, 'ask')).toBeUndefined()
-    expect(dshSessionPolicyOf({ mode: null }, undefined, 'ask')).toBeUndefined()
-  })
-
-  it('assembles the snapshot and drops an unusable workspace root', () => {
-    expect(dshSessionPolicyOf({ mode: 'read-only', workspaceRoot: '/srv/ws' }, { events: [] }, 'ask')).toEqual({
-      mode: 'read-only',
-      approval: 'ask',
-      workspaceRoot: '/srv/ws',
-    })
-    expect(dshSessionPolicyOf({ mode: 'danger-full-access' }, { events: [] }, 'never')).toEqual({
-      mode: 'danger-full-access',
-      approval: 'never',
-    })
-    expect(dshSessionPolicyOf({ mode: 'workspace-write', workspaceRoot: '' }, undefined, 'ask')).toEqual({
-      mode: 'workspace-write',
-      approval: 'ask',
-    })
-  })
-
-  it('carries the host denial dialect', () => {
-    expect(sandboxDenialMarker('read-only')).toBe('[sandbox: file access denied under read-only mode]')
-    expect(sandboxDenialMarker('workspace-write')).toBe('[sandbox: file access denied under workspace-write mode]')
-  })
-
-  it('canonicalizes without containment for the unrestricted mode', () => {
+  it('still fences a workspace, because that boundary is real and always was', () => {
+    // What survives is only the workspace guard: a write or read outside the
+    // session's resolved roots is refused. That is not a policy layer — it is
+    // the same containment the ACP file protocol requires.
     const realpath = (p: string): string => p
-    expect(canonicalizeFsPath('/srv/ws', '/etc/hosts', realpath)).toBe('/etc/hosts')
-    expect(canonicalizeFsPath('/srv/ws', 'sub/../a.txt', realpath)).toBe('/srv/ws/a.txt')
-    expect(() => canonicalizeFsPath('/srv/ws', '', realpath)).toThrow(AcpError)
-    // The containment variant still refuses what it always refused.
-    expect(() => resolveFsPath('/srv/ws', ['/srv/ws'], '/etc/hosts', realpath)).toThrow(AcpError)
     expect(resolveFsPath('/srv/ws', ['/srv/ws'], 'a.txt', realpath)).toBe('/srv/ws/a.txt')
-  })
-})
-
-/**
- * The deployment default model is global to every mode, so an ACP route landing
- * in it leaks the agent into ordinary conversations. These cases pin the guard's
- * candidate order and its refusal to invent a value.
- */
-describe('AcpDefaultModelGuard', () => {
-  const native: ModelRouteSelection = { provider: 'tokitoken', model: 'deepseek-v4.1-flash' }
-  const acpRoute: ModelRouteSelection = { provider: 'acp', model: 'codebuddy@hy3', reasoningEffort: 'enabled' }
-
-  function guard(initial: ModelRouteSelection | undefined, extra: Partial<DefaultModelPorts> = {}): {
-    guard: AcpDefaultModelGuard
-    writes: ModelRouteSelection[]
-    set: (next: ModelRouteSelection | undefined) => void
-  } {
-    let current = initial
-    const writes: ModelRouteSelection[] = []
-    return {
-      writes,
-      set: next => { current = next },
-      guard: new AcpDefaultModelGuard({
-        read: () => current,
-        write: async next => { writes.push(next); current = next },
-        ...extra,
-      }),
-    }
-  }
-
-  it('learns a native default and puts it back when the default becomes an ACP route', async () => {
-    const { guard: g, writes, set } = guard(native)
-    expect(await g.reconcile()).toEqual({ selection: native, restored: false, stranded: false })
-    expect(g.remembered).toEqual(native)
-    // The ACP pick (DSH's `selectModel` wrote it) is repaired.…
-    set(acpRoute)
-    expect(await g.reconcile()).toEqual({ selection: native, restored: true, stranded: false })
-    expect(writes).toEqual([native])
-  })
-
-  it('learns a route the caller saw BEFORE its own ACP write (the exact pre-write value)', async () => {
-    // A default already poisoned by an older build: the only native value in
-    // sight is the session's own pre-write route, which outranks the fallback.
-    const { guard: g, writes } = guard(acpRoute, { fallback: () => ({ provider: 'mimo', model: 'mimo-v2.6-pro' }) })
-    expect(await g.reconcile(native)).toEqual({ selection: native, restored: true, stranded: false })
-    expect(writes).toEqual([native])
-  })
-
-  it('falls back to the deployment\'s own last native route, and never to another ACP one', async () => {
-    const poisoned = guard(acpRoute, { fallback: () => ({ provider: 'mimo', model: 'mimo-v2.6-pro' }) })
-    expect(await poisoned.guard.reconcile()).toMatchObject({ restored: true, selection: { provider: 'mimo' } })
-    // A fallback that is itself an ACP route is not a candidate.
-    const acpFallback = guard(acpRoute, { fallback: () => acpRoute })
-    expect(await acpFallback.guard.reconcile()).toEqual({ selection: acpRoute, restored: false, stranded: true })
-  })
-
-  it('stays stranded — and silent — when no native candidate exists', async () => {
-    const { guard: g, writes } = guard(acpRoute)
-    expect(await g.reconcile()).toEqual({ selection: acpRoute, restored: false, stranded: true })
-    expect(writes).toEqual([])
-  })
-
-  it('never lets a malformed or non-native value become the remembered default', async () => {
-    const { guard: g } = guard(native)
-    await g.reconcile()
-    g.noteNative({ provider: 'acp', model: 'pi' })
-    g.noteNative({ provider: '', model: 'x' })
-    g.noteNative(undefined)
-    expect(g.remembered).toEqual(native)
-  })
-
-  it('is inert when the service cannot answer, and reports why a repair failed', async () => {
-    const throwing = new AcpDefaultModelGuard({ read: () => { throw new Error('no service') }, write: async () => {} })
-    expect(await throwing.reconcile(native)).toEqual({ restored: false, stranded: false })
-    const unwritable = new AcpDefaultModelGuard({
-      read: () => acpRoute,
-      write: async () => { throw new Error('read-only profile') },
-    })
-    unwritable.noteNative(native)
-    expect(await unwritable.reconcile()).toEqual({ selection: acpRoute, restored: false, stranded: true })
-    // An empty answer is not a selection either.
-    const empty = new AcpDefaultModelGuard({ read: () => ({ provider: '  ', model: '' }), write: async () => {} })
-    expect(await empty.reconcile()).toEqual({ restored: false, stranded: false })
-  })
-})
-
-describe('lastNativeRoute', () => {
-  it('picks the freshest non-ACP route among live sessions', () => {
-    expect(lastNativeRoute([
-      { requestHeader: () => ({ config: { provider: 'mimo', model: 'mimo-v2.6-pro' } }), events: [{ type: 'turn/end', time: 100 }] },
-      { requestHeader: () => ({ config: { provider: 'acp', model: 'codebuddy@hy3' } }), events: [{ type: 'turn/end', time: 500 }] },
-      { requestHeader: () => ({ config: { provider: 'tokitoken', model: 'step-5-preview', reasoningEffort: 'high' } }), events: [{ type: 'turn/end', time: 300 }] },
-    ])).toEqual({ provider: 'tokitoken', model: 'step-5-preview', reasoningEffort: 'high' })
-  })
-
-  it('skips sessions with no request, an ACP route, or an unreadable header', () => {
-    expect(lastNativeRoute([
-      {},
-      { events: [{ type: 'turn/end', time: 900 }] },
-      { requestHeader: () => ({ config: { provider: 'acp', model: 'pi' } }), events: [{ type: 'turn/end', time: 800 }] },
-      { requestHeader: () => { throw new Error('cold session') } },
-      { requestHeader: () => ({ config: { provider: 'tokitoken', model: '' } }) },
-    ])).toBeUndefined()
-    expect(lastNativeRoute(undefined)).toBeUndefined()
-    expect(lastNativeRoute([])).toBeUndefined()
+    expect(() => resolveFsPath('/srv/ws', ['/srv/ws'], '/etc/hosts', realpath)).toThrow(AcpError)
+    expect(() => canonicalizeFsPath('/srv/ws', '', realpath)).toThrow(AcpError)
   })
 })

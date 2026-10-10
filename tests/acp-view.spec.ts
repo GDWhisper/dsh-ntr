@@ -8,12 +8,11 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { ACP_PRESET_ID, acpModeFromPresetEvent, isAbsolutePathLike, joinPermissionSelect, placeMenu, rowAgentPreset, sessionHasOwnSelection, shouldShadowModelSeat, stagedSessionOf, splitAcpModelId } from '../src/client/acp-ui.tsx'
-import type { AcpDirectoryState, AcpPermissionSelect } from '../src/client/acp-ui.tsx'
+import { ACP_PRESET_ID, acpModeFromPresetEvent, formatCommandLine, isAbsolutePathLike, placeMenu, rowAgentPreset, splitAcpModelId, splitCommandLine, stagedIsAcpMode, stagedSessionOf, tokenizeCommandLine } from '../src/client/acp-ui.tsx'
 import { diffRows } from '../src/client/acp-view.tsx'
 import { describeRoute, menuFor } from '../src/client/session-controls.tsx'
 import { AcpStore } from '../src/client/store.ts'
-import { isAbsolutePath, splitAdapterModelId } from '../src/impl.ts'
+import { isAbsolutePath, splitAdapterModelId, splitCommandLine as hostSplitCommandLine, tokenizeCommandLine as hostTokenizeCommandLine } from '../src/impl.ts'
 import type { AgentCatalogResult, AgentView, ChatSessionView } from '../src/protocol.ts'
 
 describe('splitAcpModelId', () => {
@@ -78,6 +77,48 @@ describe('isAbsolutePathLike', () => {
   })
 })
 
+/**
+ * The connection form's 命令 field is ONE command line, and the panel parses it
+ * to show "程序 / 参数" before saving. The host re-parses the same string in
+ * `validateAgentDef`, so a preview that disagrees with the host would be worse
+ * than no preview — the samples below are the shared truth.
+ */
+describe('command-line parsing (browser ⇄ host hand copy)', () => {
+  const samples = [
+    'codebuddy --acp',
+    'omp',
+    'pi-acp',
+    'npx -y @tencent-ai/codebuddy-code --acp',
+    '  omp   acp  ',
+    '"C:\\Program Files\\nodejs\\node.exe" --acp',
+    "'my agent' --flag value",
+    'cmd /c "a b"',
+    'say "\\"hi\\""',
+    'a "" b',
+    '""',
+    '"',
+    'has space',
+    '',
+    '   ',
+  ]
+
+  it('splits and tokenizes exactly like the host implementation it mirrors', () => {
+    for (const sample of samples) {
+      expect(splitCommandLine(sample)).toEqual(hostSplitCommandLine(sample))
+      expect(tokenizeCommandLine(sample)).toEqual(hostTokenizeCommandLine(sample))
+    }
+  })
+
+  it('round-trips a stored def through the field, quoting only what needs it', () => {
+    expect(formatCommandLine('codebuddy', ['--acp'])).toBe('codebuddy --acp')
+    expect(splitCommandLine(formatCommandLine('C:\\Program Files\\x.exe', ['a b']))).toEqual({
+      command: 'C:\\Program Files\\x.exe',
+      args: ['a b'],
+    })
+    expect(splitCommandLine(formatCommandLine('omp', ['acp']))).toEqual({ command: 'omp', args: ['acp'] })
+  })
+})
+
 describe('acpModeFromPresetEvent (the live preset frame)', () => {
   // The `agent-preset/selected` frame is `[sessionId, agentPreset]` and is the
   // ONLY race-free signal: the host's session-log cold read triggered from that
@@ -98,49 +139,47 @@ describe('acpModeFromPresetEvent (the live preset frame)', () => {
   })
 })
 
-describe('shouldShadowModelSeat (the ACP-mode model seat gate)', () => {
+describe('stagedIsAcpMode (does the staged conversation run the ACP preset)', () => {
   const row = (agentPreset?: string): { agentPreset?: string } => (agentPreset === undefined ? {} : { agentPreset })
 
-  it('takes the seat over only for an ACP-preset session', () => {
+  it('answers true only for an ACP-preset session', () => {
     const byId = { a: row(ACP_PRESET_ID), b: row('standard'), c: row() }
-    expect(shouldShadowModelSeat({ current: 'a', byId })).toBe(true)
-    expect(shouldShadowModelSeat({ current: 'b', byId })).toBe(false)
+    expect(stagedIsAcpMode({ current: 'a', byId })).toBe(true)
+    expect(stagedIsAcpMode({ current: 'b', byId })).toBe(false)
     // No preset recorded (a deployment without presets) is not ACP mode.
-    expect(shouldShadowModelSeat({ current: 'c', byId })).toBe(false)
+    expect(stagedIsAcpMode({ current: 'c', byId })).toBe(false)
   })
 
   it('fails open for everything it cannot read', () => {
-    expect(shouldShadowModelSeat(undefined)).toBe(false)
-    expect(shouldShadowModelSeat({})).toBe(false)
-    expect(shouldShadowModelSeat({ current: 'gone', byId: {} })).toBe(false)
-    expect(shouldShadowModelSeat({ current: 'a', byId: {} })).toBe(false)
-    // An addressed subagent route refuses the Agent-bound model RPCs, so the
-    // native seat's own behaviour is what that route gets.
-    expect(shouldShadowModelSeat({ current: 'a', byId: { a: row(ACP_PRESET_ID) }, currentAddress: { parent: 'p' } })).toBe(false)
+    expect(stagedIsAcpMode(undefined)).toBe(false)
+    expect(stagedIsAcpMode({})).toBe(false)
+    expect(stagedIsAcpMode({ current: 'gone', byId: {} })).toBe(false)
+    expect(stagedIsAcpMode({ current: 'a', byId: {} })).toBe(false)
+    // An addressed subagent route is not a conversation this plugin drives.
+    expect(stagedIsAcpMode({ current: 'a', byId: { a: row(ACP_PRESET_ID) }, currentAddress: { parent: 'p' } })).toBe(false)
   })
 
   it('falls back to the host-side report when the session row carries no preset', () => {
     // Older client runtimes ship session rows without `agentPreset` at all
     // (observed on DSH 0.1.5-rc.2: every row undefined) — there the plugin's
-    // own host report is the only fact source the takeover has.
+    // own host report is the only fact source.
     const silentRow = { a: row() }
     const verdicts: Record<string, boolean | undefined> = { a: true, b: false }
     const ask = (sessionId: string): boolean | undefined => verdicts[sessionId]
-    expect(shouldShadowModelSeat({ current: 'a', byId: silentRow }, ask)).toBe(true)
-    expect(shouldShadowModelSeat({ current: 'b', byId: silentRow }, ask)).toBe(false)
+    expect(stagedIsAcpMode({ current: 'a', byId: silentRow }, ask)).toBe(true)
+    expect(stagedIsAcpMode({ current: 'b', byId: silentRow }, ask)).toBe(false)
     // No verdict held yet (ask still in flight, or an older host half): the
-    // fallback reads as "not ACP", which keeps the native seat — the allowed
-    // failure mode.
-    expect(shouldShadowModelSeat({ current: 'x', byId: silentRow }, ask)).toBe(false)
-    expect(shouldShadowModelSeat({ current: 'a', byId: silentRow })).toBe(false)
+    // fallback reads as "not ACP" — the allowed failure mode.
+    expect(stagedIsAcpMode({ current: 'x', byId: silentRow }, ask)).toBe(false)
+    expect(stagedIsAcpMode({ current: 'a', byId: silentRow })).toBe(false)
   })
 
   it('lets an explicit non-ACP row win over the host-side report', () => {
     // The runtime row is the fresher fold (it tracks `agent-preset/selected`);
-    // a stale host verdict must not shadow a row that names another preset.
+    // a stale host verdict must not override a row that names another preset.
     const verdicts = (): boolean | undefined => true
-    expect(shouldShadowModelSeat({ current: 'b', byId: { b: row('standard') } }, verdicts)).toBe(false)
-    expect(shouldShadowModelSeat({ current: 'b', byId: { b: row(ACP_PRESET_ID) } }, verdicts)).toBe(true)
+    expect(stagedIsAcpMode({ current: 'b', byId: { b: row('standard') } }, verdicts)).toBe(false)
+    expect(stagedIsAcpMode({ current: 'b', byId: { b: row(ACP_PRESET_ID) } }, verdicts)).toBe(true)
   })
 
   it('derives the staged session from the rc.2 list shape (no `current` field)', () => {
@@ -155,21 +194,21 @@ describe('shouldShadowModelSeat (the ACP-mode model seat gate)', () => {
       ...(agentPreset === undefined ? {} : { projectionValues: { agentPreset } }),
       ...extra,
     })
-    expect(shouldShadowModelSeat({ byId: { r1: rc2Row(ACP_PRESET_ID) } })).toBe(true)
-    expect(shouldShadowModelSeat({ byId: { r1: rc2Row('standard') } })).toBe(false)
+    expect(stagedIsAcpMode({ byId: { r1: rc2Row(ACP_PRESET_ID) } })).toBe(true)
+    expect(stagedIsAcpMode({ byId: { r1: rc2Row('standard') } })).toBe(false)
     // Row silent (projections not folded yet): the host-side fallback answers.
     const ask = (id: string): boolean | undefined => (id === 'r1' ? true : undefined)
-    expect(shouldShadowModelSeat({ byId: { r1: rc2Row() } }, ask)).toBe(true)
-    expect(shouldShadowModelSeat({ byId: { r1: rc2Row() } })).toBe(false)
+    expect(stagedIsAcpMode({ byId: { r1: rc2Row() } }, ask)).toBe(true)
+    expect(stagedIsAcpMode({ byId: { r1: rc2Row() } })).toBe(false)
     // No row holds the main view (boot, or the list has not loaded): stand down.
-    expect(shouldShadowModelSeat({ byId: { r1: rc2Row(ACP_PRESET_ID, { retainedBy: {} }) } })).toBe(false)
-    expect(shouldShadowModelSeat({ byId: {} })).toBe(false)
-    // An addressed subagent session is on stage: no ACP seat (its model RPCs
-    // are refused), even though the row names the ACP preset.
-    expect(shouldShadowModelSeat({ byId: { r1: rc2Row(ACP_PRESET_ID, { origin: 'subagent' }) } })).toBe(false)
+    expect(stagedIsAcpMode({ byId: { r1: rc2Row(ACP_PRESET_ID, { retainedBy: {} }) } })).toBe(false)
+    expect(stagedIsAcpMode({ byId: {} })).toBe(false)
+    // An addressed subagent session is on stage, even though the row names the
+    // ACP preset.
+    expect(stagedIsAcpMode({ byId: { r1: rc2Row(ACP_PRESET_ID, { origin: 'subagent' }) } })).toBe(false)
     // Only the main-view row decides; a background ACP session does not leak
-    // the takeover onto a staged non-ACP session.
-    expect(shouldShadowModelSeat({
+    // the verdict onto a staged non-ACP session.
+    expect(stagedIsAcpMode({
       byId: {
         r1: { id: 'r1', retainedBy: { mainView: 1 }, projectionValues: { agentPreset: 'standard' } },
         r2: { id: 'r2', retainedBy: {}, projectionValues: { agentPreset: ACP_PRESET_ID } },
@@ -177,7 +216,7 @@ describe('shouldShadowModelSeat (the ACP-mode model seat gate)', () => {
     })).toBe(false)
   })
 
-  it('reads the staged session and its preset the same way the gate does', () => {
+  it('reads the staged session and its preset the same way the surfaces do', () => {
     // stagedSessionOf is the shared derivation (the ask gate in index.tsx uses
     // it too); rowAgentPreset is the preset accessor both spellings fold into.
     expect(stagedSessionOf({ current: 'old', byId: { old: { agentPreset: 'standard' } } }))
@@ -201,21 +240,11 @@ describe('shouldShadowModelSeat (the ACP-mode model seat gate)', () => {
   })
 })
 
-describe('ACP model seat picker', () => {
+describe('ACP composer picker (agent / its models / its thought level)', () => {
   const acp = new AcpStore(async () => ({ ok: true, value: {} }), zh => zh)
   const agent: AgentView = {
     id: 'pi', title: 'Pi', command: 'pi-acp', args: [], permission: 'ask',
     allowedCwdRoots: [], state: 'ready', liveSessions: [],
-  }
-  const state: AcpDirectoryState = {
-    current: { provider: 'acp', model: 'pi' },
-    routable: true,
-    // The directory still carries groups (it is DSH's global catalog), but the
-    // ACP surfaces never read the `acp` group out of it: the route advertises
-    // no models, so the agent's own surface is `agent/catalog` below.
-    groups: [],
-    status: 'ready',
-    error: null,
   }
   /** What `agent/catalog` answers for this agent (`exposedModels` already applied). */
   const catalog: AgentCatalogResult = {
@@ -227,20 +256,23 @@ describe('ACP model seat picker', () => {
     probed: true,
     updatedAt: 1,
   }
-  const base = { acp, agents: [agent], state, catalog }
-  const routed = describeRoute(state, [agent], undefined, catalog)
-  const permissions: AcpPermissionSelect = { options: [{ value: 'workspace-write', name: 'Workspace' }], currentValue: 'workspace-write' }
+  /** The conversation's own binding — the host's record of who serves it. */
+  const bound: ChatSessionView = { agentId: 'pi', agentTitle: 'Pi', sessionId: 's1', modelId: 'pi' }
+  const base = { acp, agents: [agent], catalog }
+  const routed = describeRoute([agent], bound, undefined, catalog)
+  const modes = { currentModeId: 'plan', availableModes: [{ id: 'plan', name: 'Plan' }, { id: 'acceptEdits', name: 'Accept edits' }] }
 
-  it('stacks all three axes plus the boundary in one screen', () => {
-    const menu = menuFor('seat', { ...base, route: routed, permissions })
-    expect(menu.sections.map(section => section.id)).toEqual(['agent', 'model', 'thought', 'boundary'])
+  it('stacks every axis the agent publishes in one screen', () => {
+    const menu = menuFor('agent', { ...base, route: routed, agentModes: modes })
+    expect(menu.sections.map(section => section.id)).toEqual(['agent', 'model', 'thought', 'agent-mode'])
     expect(menu.sections[0]?.items[0]).toMatchObject({ id: 'pi', active: true, dot: '#22c55e' })
     expect(menu.sections[2]?.items.map(item => item.id)).toEqual(['provider-default', 'high'])
-    expect(menu.sections[3]?.items[0]).toMatchObject({ id: 'workspace-write', active: true })
+    expect(menu.sections[3]?.items.map(item => item.id)).toEqual(['plan', 'acceptEdits'])
+    expect(menu.sections[3]?.items[0]).toMatchObject({ active: true })
   })
 
   it('offers the base entry plus the exposed variants, and nothing else', () => {
-    const menu = menuFor('seat', { ...base, route: routed })
+    const menu = menuFor('agent', { ...base, route: routed })
     const models = menu.sections.find(section => section.id === 'model')
     // The bare `agentId` row (the agent's default model) is never filtered out;
     // everything after it is what `exposedModels` let through.
@@ -248,32 +280,33 @@ describe('ACP model seat picker', () => {
     expect(models?.items[0]).toMatchObject({ label: 'Pi · 默认', active: true })
   })
 
-  it('labels a variant route from the agent catalog, not the directory', () => {
-    const onVariant = describeRoute({ ...state, current: { provider: 'acp', model: 'pi@claude-sonnet-4' } }, [agent], undefined, catalog)
+  it('labels a variant route from the agent catalog, not a DSH directory', () => {
+    const onVariant = describeRoute([agent], { ...bound, modelId: 'pi@claude-sonnet-4' }, undefined, catalog)
     expect(onVariant.modelLabel).toBe('Pi · Claude Sonnet 4')
     expect(onVariant.efforts.map(e => e.id)).toEqual(['high'])
+    // No effort of its own yet: the agent's own default applies.
     expect(onVariant.effectiveEffort).toBe('high')
     // A variant the agent dropped still labels itself instead of vanishing.
-    const stale = describeRoute({ ...state, current: { provider: 'acp', model: 'pi@gone' } }, [agent], undefined, catalog)
+    const stale = describeRoute([agent], { ...bound, modelId: 'pi@gone' }, undefined, catalog)
     expect(stale.modelLabel).toBe('gone')
   })
 
-  it('renders the bare route from the catalog without any directory group', () => {
-    // No ACP group anywhere in the directory: without the agent catalog the
-    // seat falls back to the roster title, which is still honest.
-    const withoutCatalog = describeRoute(state, [agent], undefined)
-    expect(withoutCatalog).toMatchObject({ routed: true, agentTitle: 'Pi', modelLabel: 'Pi', efforts: [] })
-    const unknownAgent = describeRoute({ ...state, current: { provider: 'acp', model: 'ghost' } }, [], undefined)
-    expect(unknownAgent.modelLabel).toBe('ghost')
+  it('renders the bare route from the catalog when nothing else is known', () => {
+    // Without the agent catalog the roster title is what we can honestly show.
+    const withoutCatalog = describeRoute([agent], bound, undefined)
+    expect(withoutCatalog).toMatchObject({ agentId: 'pi', agentTitle: 'Pi', modelLabel: 'Pi', efforts: [] })
+    // A binding naming an agent the roster no longer has still labels itself.
+    const unknownAgent = describeRoute([], { ...bound, agentId: 'ghost', modelId: 'ghost@x' }, undefined)
+    expect(unknownAgent.modelLabel).toBe('x')
   })
 
   it('drops the axes the agent does not publish', () => {
     const silent: AgentCatalogResult = { ...catalog, variants: [], reasoning: undefined }
-    const route = describeRoute(state, [agent], undefined, silent)
-    expect(menuFor('seat', { acp, agents: [agent], state, catalog: silent, route }).sections.map(s => s.id)).toEqual(['agent', 'model'])
+    const route = describeRoute([agent], bound, undefined, silent)
+    expect(menuFor('agent', { acp, agents: [agent], catalog: silent, route }).sections.map(s => s.id)).toEqual(['agent', 'model'])
     // …and when the catalog itself is missing, the route's own id is the row.
-    const noCatalog = describeRoute(state, [agent], undefined)
-    const fallback = menuFor('seat', { acp, agents: [agent], state, route: noCatalog })
+    const noCatalog = describeRoute([agent], bound, undefined)
+    const fallback = menuFor('agent', { acp, agents: [agent], route: noCatalog })
     expect(fallback.sections.find(section => section.id === 'model')?.items.map(item => item.id)).toEqual(['pi'])
   })
 
@@ -287,10 +320,10 @@ describe('ACP model seat picker', () => {
 
   it('marks a current route the exposure filter no longer lists', () => {
     // Unchecking a model in the settings must not make the picker look like the
-    // session runs something else: the route still resolves, so it stays as a
-    // marked row above the offered ones.
-    const hidden = describeRoute({ ...state, current: { provider: 'acp', model: 'pi@gone' } }, [agent], undefined, catalog)
-    const menu = menuFor('model', { acp, agents: [agent], state, catalog, route: hidden })
+    // conversation runs something else: the route still resolves, so it stays as
+    // a marked row above the offered ones.
+    const hidden = describeRoute([agent], { ...bound, modelId: 'pi@gone' }, undefined, catalog)
+    const menu = menuFor('model', { acp, agents: [agent], catalog, route: hidden })
     expect(menu.sections[0]?.items.map(item => item.id)).toEqual(['pi@gone', 'pi', 'pi@claude-sonnet-4'])
     expect(menu.sections[0]?.items[0]).toMatchObject({ active: true })
     // The default route is the base row itself — never duplicated.
@@ -300,109 +333,65 @@ describe('ACP model seat picker', () => {
 
   it('points an unfiltered agent at the exposure editor instead of looking broken', () => {
     const unfiltered: AgentCatalogResult = { ...catalog, variants: [] }
-    const model = menuFor('model', { acp, agents: [agent], state, catalog: unfiltered, route: describeRoute(state, [agent], undefined, unfiltered) })
+    const model = menuFor('model', { acp, agents: [agent], catalog: unfiltered, route: describeRoute([agent], bound, undefined, unfiltered) })
     expect(model.note).toMatch(/设置 → ACP 代理/)
   })
 
-  it('keeps the agent named after the route leaves ACP, so the seat can warn', () => {
-    const bound: ChatSessionView = { agentId: 'pi', agentTitle: 'Pi', sessionId: 's1' }
-    const elsewhere = describeRoute({ ...state, current: { provider: 'deepseek', model: 'chat' } }, [], bound, catalog)
-    expect(elsewhere).toMatchObject({ routed: false, agentId: 'pi', agentTitle: 'Pi' })
-    // The roster and the agent's models stay offered: they ARE the way back.
-    const menu = menuFor('seat', { ...base, route: elsewhere })
-    expect(menu.sections.map(s => s.id)).toEqual(['agent', 'model'])
-    expect(menu.sections[0]?.items[0]?.active).toBe(false)
+  it('keeps the agent named when the binding is released, so the picker can offer a way back', () => {
+    const released = describeRoute([agent], { ...bound, released: true }, undefined, catalog)
+    expect(released).toMatchObject({ agentId: 'pi', agentTitle: 'Pi' })
+    const menu = menuFor('agent', { ...base, route: released })
+    expect(menu.sections.map(s => s.id)).toEqual(['agent', 'model', 'thought'])
   })
 
-  it('offers only the roster when nothing has been bound yet', () => {
-    const elsewhere = describeRoute({ ...state, current: { provider: 'deepseek', model: 'chat' } }, [], undefined, catalog)
-    expect(elsewhere).toMatchObject({ routed: false })
-    expect(menuFor('seat', { ...base, route: elsewhere }).sections.map(s => s.id)).toEqual(['agent'])
+  it('offers only the roster when no agent is known yet', () => {
+    // The plugin's own default points nowhere (no agents configured, or the
+    // star names a deleted one): there is nothing to describe.
+    const nothing = describeRoute([], undefined, undefined)
+    expect(nothing.agentId).toBeUndefined()
+    expect(menuFor('agent', { acp, agents: [], route: nothing }).sections.map(s => s.id)).toEqual(['agent'])
+    // No agents at all: the menu says so instead of rendering an empty list.
+    expect(menuFor('agent', { acp, agents: [], route: nothing }).sections[0]?.items[0])
+      .toMatchObject({ id: 'none', disabled: true })
+  })
+
+  it('offers the roster for a conversation with no binding yet', () => {
+    // The plugin's own default names a real agent, so the agent axis is live —
+    // but no ACP session has run, so nothing describes "which model is current".
+    const fresh = describeRoute([agent], undefined, 'pi', catalog)
+    expect(fresh).toMatchObject({ agentId: 'pi', agentTitle: 'Pi' })
+    expect(fresh.modelId).toBeUndefined()
+    const menu = menuFor('agent', { ...base, route: fresh })
+    // The model section still renders: the catalog says what this agent offers,
+    // which is exactly what a person needs before the first turn.
+    expect(menu.sections.map(s => s.id)).toEqual(['agent', 'model'])
+    expect(menu.sections.find(s => s.id === 'model')?.items.map(i => i.id)).toEqual(['pi', 'pi@claude-sonnet-4'])
+    // No effort axis: nothing has run, so there is no current effort to mark.
+    expect(menu.sections.map(s => s.id)).not.toContain('thought')
   })
 })
 
-describe('the permissions projection shape (the picker must survive the real one)', () => {
+describe('the picker survives a host projection that is not what we assumed', () => {
   const acp = new AcpStore(async () => ({ ok: true, value: {} }), zh => zh)
   const agent: AgentView = {
     id: 'pi', title: 'Pi', command: 'pi-acp', args: [], permission: 'ask',
     allowedCwdRoots: [], state: 'ready', liveSessions: [],
   }
-  const state: AcpDirectoryState = {
-    current: { provider: 'acp', model: 'pi' },
-    routable: true,
-    groups: [],
-    status: 'ready',
-    error: null,
-  }
-  const base = { acp, agents: [agent], state }
-  const routed = describeRoute(state, [agent], undefined)
+  const routed = describeRoute([agent], { agentId: 'pi', sessionId: 's1' }, undefined)
 
-  it('menuFor survives the runtime projection (selection only, no options)', () => {
+  it('menuFor never throws when the session face answers a shape we did not expect', () => {
     // What `projections.faceOf('permissions').getSnapshot()` ACTUALLY answers on
-    // 0.1.7-rc.2: the projection's `viewSchema` is `{ currentValue }` — the rows
-    // to switch to live in the process-level `permissionPresets.catalog`, a
-    // different surface. Reading `options.length` off this value used to throw
-    // inside the overlay entry's render, and a slot-entry crash ABIDATES the
-    // picker for the rest of the session — the reported "ACP seat clicks do
-    // nothing" symptom.
-    const selection = { currentValue: 'workspace-write' } as unknown as AcpPermissionSelect
-    expect(() => menuFor('seat', { ...base, route: routed, permissions: selection })).not.toThrow()
-    const menu = menuFor('seat', { ...base, route: routed, permissions: selection })
-    expect(menu.sections.map(s => s.id)).not.toContain('boundary')
-  })
-
-  it('joins the projection selection with the catalog rows', () => {
-    // Absent selection = this host projects no boundary at all.
-    expect(joinPermissionSelect(undefined, { options: [] })).toBeUndefined()
-    expect(joinPermissionSelect('nonsense' as never, undefined)).toBeUndefined()
-    // Absent catalog = no rows to offer, but the selection still reads true.
-    expect(joinPermissionSelect({ currentValue: 'workspace-write' }, undefined))
-      .toEqual({ options: [], currentValue: 'workspace-write' })
-    // Garbage rows are dropped rather than rendered.
-    expect(joinPermissionSelect({ currentValue: 'read-only' }, {
-      options: [{ value: 'read-only', name: 'ReadOnly', description: 'r' }, { name: 'no value' }, null as never],
-    })).toEqual({ options: [{ value: 'read-only', name: 'ReadOnly', description: 'r' }], currentValue: 'read-only' })
-  })
-
-  it('renders the boundary rows from the join, filtered and marked', () => {
-    const joined = joinPermissionSelect({ currentValue: 'workspace-write' }, {
-      options: [
-        { value: 'workspace-write', name: 'Workspace' },
-        { value: 'custom', name: 'Custom' },
-        { value: 'danger-full-access', name: 'Full' },
-      ],
-    })!
-    const menu = menuFor('seat', { ...base, route: routed, permissions: joined })
-    const boundary = menu.sections.find(s => s.id === 'boundary')
-    expect(boundary?.items.map(i => i.id)).toEqual(['workspace-write', 'danger-full-access'])
-    expect(boundary?.items[0]?.active).toBe(true)
-  })
-})
-
-describe('sessionHasOwnSelection (the gate\u2019s auto-route predicate)', () => {
-  /** A `faceFor` stub whose `modelSelection` projection answers with one value. */
-  function faceForReturning(value: unknown) {
-    return (() => ({
-      projections: { faceOf: () => ({ getSnapshot: () => value, subscribe: () => () => {} }) },
-    })) as never
-  }
-
-  it('reports a session that already carries a route of its own', () => {
-    expect(sessionHasOwnSelection(faceForReturning({ lastUsed: { provider: 'acp', model: 'pi' }, next: null }), 's1')).toBe(true)
-    expect(sessionHasOwnSelection(faceForReturning({ lastUsed: null, next: { provider: 'deepseek', model: 'x' } }), 's1')).toBe(true)
-  })
-
-  it('reports a never-selected session as free to route', () => {
-    expect(sessionHasOwnSelection(faceForReturning({ lastUsed: null, next: null }), 's1')).toBe(false)
-  })
-
-  it('returns undefined when the projection cannot be read at all', () => {
-    // An older runtime without the projection, or an addressed subagent route:
-    // the gate must leave the session alone (re-asking on the next tick) rather
-    // than decide "never selected" from a missing answer.
-    expect(sessionHasOwnSelection(faceForReturning(undefined), 's1')).toBeUndefined()
-    expect(sessionHasOwnSelection(faceForReturning('nonsense'), 's1')).toBeUndefined()
-    expect(sessionHasOwnSelection((() => { throw new Error('no face') }) as never, 's1')).toBeUndefined()
+    // 0.1.7-rc.2: the projection's `viewSchema` is `{ currentValue }` — nothing
+    // else. Reading `options.length` off that value used to throw inside the
+    // overlay entry's render, and a slot-entry crash ABIDATES the picker for the
+    // rest of the session — the reported "ACP seat clicks do nothing" symptom.
+    // The boundary section is gone with the permission axis (the agent decides
+    // its own approvals), so the picker now carries no projection at all — but
+    // the discipline holds: every field it builds from is checked before use.
+    for (const face of [undefined, null, 'nonsense', 42, {}, { currentValue: 7 }]) {
+      expect(() => menuFor('agent', { acp, agents: [agent], route: routed, ...(face === undefined ? {} : { agentModes: face as never }) }))
+        .not.toThrow()
+    }
   })
 })
 

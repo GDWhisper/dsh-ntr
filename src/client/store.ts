@@ -71,8 +71,8 @@ export interface UiState {
   notice?: string
   /**
    * The plugin's OWN default ACP agent (the panel's ★ gesture) — which agent a
-   * new ACP-mode conversation starts on. NOT the deployment default model:
-   * that one is global to every mode and must stay native (`AcpDefaultModelGuard`).
+   * new ACP-mode conversation starts on. NOT the deployment default model: that
+   * one is global to every mode, and nothing in this bundle writes it.
    */
   defaultAgent?: string
   detectedAgents: DetectedAgentInfo[]
@@ -112,14 +112,6 @@ export interface UiState {
    */
   approvalRouted: boolean
   /**
-   * True when a chat-backed session's DSH access mode (the composer's Access
-   * mode control) governs its permission asks and fs writes. The agent-level
-   * `permission` field then only applies to sessions without a chat binding,
-   * which is what the panel says out loud instead of silently disagreeing with
-   * the control the user actually sees while chatting.
-   */
-  accessModeRouted: boolean
-  /**
    * ACP agent sessions backing the chat session the composer control sits in.
    * Only meaningful together with {@link chatSessionsFor}: the control reads it
    * by chat session id, so a stale list from another conversation never renders.
@@ -130,11 +122,20 @@ export interface UiState {
   /**
    * Per-chat-session "does this conversation run the ACP preset" verdicts, as
    * reported by `session/chat-list` (host-read from the session log). The
-   * model-seat gate falls back to this when the client runtime's session rows
+   * composer surfaces fall back to this when the client runtime's session rows
    * carry no `agentPreset` (older hosts); a session never asked about is simply
    * absent.
    */
   acpMode: Record<string, boolean>
+  /**
+   * The model-seat shadow gate's own account of what it last decided, and why
+   * (`src/client/index.tsx`'s `syncAcpMode`). Read-only, human-facing, and
+   * rendered by the ACP view: every branch of that gate ends with the native
+   * model seat either shadowed or not, and without this line the four ways it
+   * can end "not shadowed" are indistinguishable from the outside — which is
+   * exactly how "the ACP base still has not been replaced" became unreadable.
+   */
+  seatDiag: string
   /**
    * Observed ACP transcripts keyed by ACP session id. Only sessions the
    * conversation's ACP view asked for are watched (live `session/update`
@@ -191,6 +192,16 @@ export const DEFAULT_KNOWN_PRESETS: DetectedAgentInfo[] = [
     defaultCommand: 'omp',
     defaultArgs: ['acp'],
   },
+  // Hand copy of the host's `AGENT_PRESETS` entry (src/bridge.ts): the panel
+  // falls back to this list before the first `agents/detect` round-trip.
+  {
+    id: 'codebuddy',
+    name: 'CodeBuddy Code',
+    description: 'Tencent CodeBuddy Code — run as `codebuddy --acp` over stdio',
+    detected: false,
+    defaultCommand: 'codebuddy',
+    defaultArgs: ['--acp'],
+  },
 ]
 
 export class AcpStore {
@@ -209,10 +220,10 @@ export class AcpStore {
     probingModels: {},
     probeErrors: {},
     approvalRouted: false,
-    accessModeRouted: false,
     chatSessions: [],
     chatTranscripts: {},
     acpMode: {},
+    seatDiag: 'idle',
   }
 
   private readonly listeners = new Set<Listener>()
@@ -231,6 +242,13 @@ export class AcpStore {
    * verdict the runtime already told us the truth about.
    */
   private readonly acpModeLive = new Set<string>()
+  /**
+   * Chat sessions whose host read came back WITHOUT a verdict (no `acpMode`
+   * field, or the read failed). The seat gate consults this to retract its
+   * one-shot ask ledger entry, so a read that could not answer costs one retry
+   * instead of leaving the native model seat visible for the rest of the page.
+   */
+  private readonly acpModeUnsettled = new Set<string>()
   /** In-flight `agent/catalog` reads, keyed by agent id. */
   private readonly seatCatalogReads = new Set<string>()
 
@@ -294,15 +312,16 @@ export class AcpStore {
   /** Snapshot refresh used on panel open and after a stream outage. */
   async resync(): Promise<void> {
     try {
-      const [{ agents, approvalRouted, accessModeRouted }, { sessions }, defaultAgentInfo, detectResult, presetResult] = await Promise.all([
-        this.call<{ agents: AgentView[]; approvalRouted?: boolean; accessModeRouted?: boolean }>('agents/list'),
+      const [{ agents, approvalRouted }, { sessions }, defaultAgentInfo, detectResult, presetResult] = await Promise.all([
+        this.call<{ agents: AgentView[]; approvalRouted?: boolean }>('agents/list'),
         this.call<{ sessions: SessionView[] }>('sessions/list'),
-        this.call<{ provider?: string; model?: string }>('model/get-default').catch(() => ({} as { provider?: string; model?: string })),
+        // The plugin's OWN default ACP agent — a plugin-private id, not a DSH
+        // model route (see `defaultAgent` on the host half).
+        this.call<{ agentId?: string }>('default/agent').catch(() => ({} as { agentId?: string })),
         this.call<{ agents: DetectedAgentInfo[] }>('agents/detect').catch(() => null),
         // `null` (host without a preset roster) hides the panel block.
         this.call<{ preset: AcpPresetStatus | null }>('preset/status').catch(() => null),
       ])
-      const defaultAgent = defaultAgentInfo?.provider === 'acp' ? defaultAgentInfo.model : undefined
       const detectedAgents = (detectResult && detectResult.agents.length > 0)
         ? detectResult.agents
         : (this.state.detectedAgents.length > 0 ? this.state.detectedAgents : [...DEFAULT_KNOWN_PRESETS])
@@ -310,10 +329,9 @@ export class AcpStore {
       this.mutate({
         agents,
         sessions,
-        defaultAgent,
+        defaultAgent: defaultAgentInfo?.agentId,
         detectedAgents,
         approvalRouted: approvalRouted === true,
-        accessModeRouted: accessModeRouted === true,
         preset: presetResult?.preset ?? undefined,
       })
       const active = this.state.activeSessionId ?? sessions[0]?.sessionId
@@ -628,11 +646,24 @@ export class AcpStore {
           ? {}
           : { acpMode: { ...this.state.acpMode, [dshSessionId]: acpMode === true } }),
       })
+      // A read that answered but carried no verdict has NOT settled this
+      // session. The gate's ask ledger is one-shot per id, so unless the id is
+      // retracted here it stays marked "asked" forever and the gate never asks
+      // again — one silent round-trip and the native model seat is permanent
+      // for that session. The gate re-derives this from `hasAcpModeVerdict`
+      // on its next evaluation (every store mutation re-runs it), which is
+      // what makes the fallback recoverable instead of a single coin flip.
+      if (acpMode === undefined && !this.acpModeLive.has(dshSessionId)) {
+        this.acpModeUnsettled.add(dshSessionId)
+      }
     } catch {
       // A host without this surface (older build) has nothing to show; the
       // control simply renders nothing rather than an error nobody can act on.
       if (read.dropped) return
       this.mutate({ chatSessions: [], chatSessionsFor: dshSessionId })
+      if (!this.acpModeLive.has(dshSessionId)) {
+        this.acpModeUnsettled.add(dshSessionId)
+      }
     } finally {
       if (this.chatSessionReads.get(dshSessionId) === read) this.chatSessionReads.delete(dshSessionId)
     }
@@ -668,6 +699,36 @@ export class AcpStore {
     this.acpModeLive.add(dshSessionId)
     if (this.state.acpMode[dshSessionId] === acpMode) return
     this.mutate({ acpMode: { ...this.state.acpMode, [dshSessionId]: acpMode } })
+  }
+
+  /**
+   * Record the model-seat gate's last decision (see the `seatDiag` field). The
+   * gate owns the string; the store only carries it so the ACP view can render
+   * *why* the native seat is or is not shadowed. No-op when unchanged, so the
+   * gate can call this on every evaluation without churning listeners.
+   */
+  noteSeatDiag(text: string): void {
+    if (this.state.seatDiag === text) return
+    this.mutate({ seatDiag: text })
+  }
+
+  /**
+   * Whether a chat session's host read produced a verdict the seat gate can
+   * rely on. `false` means "asked but not answered" — the read returned no
+   * `acpMode` field or failed outright — and is the signal for the gate to
+   * retract its one-shot ask ledger entry for this id so it can ask again.
+   *
+   * A verdict handed down by a committed `agent-preset/selected` frame is
+   * authoritative and outranks everything (see {@link acpModeLive}); such a
+   * session always answers `true` here, settled or not.
+   */
+  hasAcpModeVerdict(dshSessionId: string): boolean {
+    if (this.acpModeLive.has(dshSessionId)) return true
+    if (this.acpModeUnsettled.has(dshSessionId)) {
+      this.acpModeUnsettled.delete(dshSessionId)
+      return false
+    }
+    return this.state.acpMode[dshSessionId] !== undefined
   }
 
   /**
@@ -826,14 +887,13 @@ export class AcpStore {
 
   /**
    * Set the plugin's OWN default ACP agent (the panel's ★ gesture): which agent
-   * an ACP-mode conversation starts on. Host-side state — NOT the deployment
-   * default model, which must stay native for every other mode.
+   * an ACP-mode conversation starts on. Plugin-private state — the host keeps it
+   * in its own agent registry file, and nothing here touches DSH's model
+   * selection (see docs/acp-convergence.md §2.2).
    */
-  async setDefaultAgent(agentId: string): Promise<void> {
+  async setDefaultAgent(agentId: string | undefined): Promise<void> {
     try {
-      // Wire names stay `model/*` (the endpoint the host half mounts); the value
-      // is the plugin's own default AGENT, not the deployment default model.
-      await this.call('model/set-default', { agentId })
+      await this.call('default/agent-set', { ...(agentId === undefined ? {} : { agentId }) })
       this.mutate({ defaultAgent: agentId })
     } catch (error) {
       this.flashError(error)
@@ -841,19 +901,40 @@ export class AcpStore {
   }
 
   /**
-   * Ask the host to keep the deployment default model off the ACP route, after
-   * this browser wrote one (see `selectAcpRoute`); `previous` is the route the
-   * session was on before the write, when that route was native.
+   * Bind one DSH chat session to an ACP agent. This is the plugin's own
+   * conversation↔agent mapping: it does NOT write a DSH model route, so it
+   * cannot pollute the deployment default model and cannot be refused by the
+   * GUI's catalog gate (the retired `session/model-unavailable` failure).
    *
-   * Failures are swallowed: the host re-runs the same check at the start of
-   * every turn, so a lost round trip costs one turn of cleanliness — it must
-   * never turn a successful model switch into an error card.
+   * The mapping is host-side and keyed by chat session id; the browser learns
+   * the binding back through `session/chat-list`.
    */
-  async reconcileDefaultModel(previous?: { provider: string; model: string; reasoningEffort?: string }): Promise<void> {
+  async bindChatAgent(dshSessionId: string, agentId: string): Promise<void> {
     try {
-      await this.call('model/reconcile-default', previous === undefined ? {} : { previous })
-    } catch {
-      // See the doc comment.
+      await this.call('session/chat-bind', { dshSessionId, agentId })
+    } catch (error) {
+      this.flashError(error)
+      throw error
+    }
+  }
+
+  /** Switch the bound agent's model (`agentId@choice`) for one chat session. */
+  async setChatSessionModel(dshSessionId: string, modelId: string): Promise<void> {
+    try {
+      await this.call('session/chat-model-set', { dshSessionId, modelId })
+    } catch (error) {
+      this.flashError(error)
+      throw error
+    }
+  }
+
+  /** Switch the bound agent's reasoning effort for one chat session. */
+  async setChatSessionEffort(dshSessionId: string, effort: string | undefined): Promise<void> {
+    try {
+      await this.call('session/chat-effort-set', { dshSessionId, ...(effort === undefined ? {} : { effort }) })
+    } catch (error) {
+      this.flashError(error)
+      throw error
     }
   }
 
