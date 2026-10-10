@@ -95,16 +95,22 @@ function boundSession(ui: { chatSessions: ChatSessionView[]; chatSessionsFor?: s
 }
 
 /**
- * The agent serving this conversation: the bound one when an ACP agent has run
- * here, else the plugin's own default — which is what lets a chip offer
- * "use ACP: <agent>" for a conversation that has never been routed, instead of
- * going blank.
+ * The agent serving this conversation: the plugin's own binding first (who
+ * serves the NEXT message — the host reports it per chat session), then the
+ * agent an ACP session for this conversation is already served by, then the
+ * plugin's default — which is what lets a chip offer "use ACP: <agent>" for a
+ * conversation that has never been routed, instead of going blank. The binding
+ * outranks the live session because a switch applies from the next message:
+ * until that turn materializes a session for the new agent, the live list still
+ * names the previous one, and the chip must not read as "the click did nothing".
  */
 function routeAgentId(
+  boundAgentId: string | undefined,
   bound: ChatSessionView | undefined,
   agents: readonly AgentView[],
   defaultAgent: string | undefined,
 ): string | undefined {
+  if (boundAgentId !== undefined && agents.some(agent => agent.id === boundAgentId)) return boundAgentId
   if (bound?.agentId !== undefined) return bound.agentId
   if (defaultAgent !== undefined && agents.some(agent => agent.id === defaultAgent)) return defaultAgent
   return agents[0]?.id
@@ -125,8 +131,9 @@ export function describeRoute(
   bound: ChatSessionView | undefined,
   defaultAgent: string | undefined,
   catalog?: AgentCatalogResult,
+  boundAgentId?: string,
 ): RouteInfo {
-  const agentId = routeAgentId(bound, agents, defaultAgent)
+  const agentId = routeAgentId(boundAgentId, bound, agents, defaultAgent)
   if (agentId === undefined) return { efforts: [] }
   const def = agents.find(agent => agent.id === agentId)
   const agentTitle = def?.title ?? bound?.agentTitle ?? catalog?.title ?? agentId
@@ -164,12 +171,12 @@ export function AcpSessionControls(props: AcpClusterProps) {
   }, [acp, sessionId, running])
   const bound = boundSession(ui, sessionId)
   const agents = ui.agents
-  const agentId = routeAgentId(bound, agents, ui.defaultAgent)
+  const agentId = routeAgentId(ui.chatBoundAgent[sessionId], bound, agents, ui.defaultAgent)
   const catalog = agentId === undefined ? undefined : ui.seatCatalogs[agentId]
   useEffect(() => {
     if (agentId !== undefined) void acp.loadAgentCatalog(agentId)
   }, [acp, agentId])
-  const route = describeRoute(agents, bound, ui.defaultAgent, catalog)
+  const route = describeRoute(agents, bound, ui.defaultAgent, catalog, ui.chatBoundAgent[sessionId])
   // A conversation with no ACP story to tell gets no chrome: the ACP view tab
   // owns the entry point for starting one.
   if (bound === undefined && agents.length === 0) return null
@@ -418,14 +425,14 @@ export function AcpSessionMenu(props: AcpClusterProps) {
   const [busy, setBusy] = useState(false)
   const bound = boundSession(ui, sessionId)
   const agents = ui.agents
-  const agentId = routeAgentId(bound, agents, ui.defaultAgent)
+  const agentId = routeAgentId(ui.chatBoundAgent[sessionId], bound, agents, ui.defaultAgent)
   const catalog = agentId === undefined ? undefined : ui.seatCatalogs[agentId]
   useEffect(() => {
     if (agentId !== undefined) void acp.loadAgentCatalog(agentId)
   }, [acp, agentId])
 
   if (menu === null || menu.sessionId !== sessionId) return null
-  const route = describeRoute(agents, bound, ui.defaultAgent, catalog)
+  const route = describeRoute(agents, bound, ui.defaultAgent, catalog, ui.chatBoundAgent[sessionId])
   // A menu-model bug must never retire the whole picker: a render throw inside
   // this slot entry makes the error boundary ABDICATE it for the rest of the
   // session (every later click silently opens nothing). Show the failure inside

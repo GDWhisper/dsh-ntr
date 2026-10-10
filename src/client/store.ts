@@ -128,6 +128,15 @@ export interface UiState {
    */
   acpMode: Record<string, boolean>
   /**
+   * Per-chat-session ACP agent binding, as reported by `session/chat-list`'s
+   * `boundAgentId` (the host's intent map plus its live-session fallback): who
+   * serves this conversation's NEXT message. `session/chat-bind` writes the
+   * optimistic entry here the moment the click succeeds — the live session
+   * list cannot reflect a switch until a turn materializes a session for the
+   * new agent, and the chip would otherwise keep naming the previous agent.
+   */
+  chatBoundAgent: Record<string, string>
+  /**
    * The model-seat shadow gate's own account of what it last decided, and why
    * (`src/client/index.tsx`'s `syncAcpMode`). Read-only, human-facing, and
    * rendered by the ACP view: every branch of that gate ends with the native
@@ -223,6 +232,7 @@ export class AcpStore {
     chatSessions: [],
     chatTranscripts: {},
     acpMode: {},
+    chatBoundAgent: {},
     seatDiag: 'idle',
   }
 
@@ -629,7 +639,7 @@ export class AcpStore {
     const read = { dropped: false }
     this.chatSessionReads.set(dshSessionId, read)
     try {
-      const { sessions, acpMode } = await this.call<{ sessions: ChatSessionView[]; acpMode?: boolean }>('session/chat-list', { dshSessionId, refresh: true })
+      const { sessions, acpMode, boundAgentId } = await this.call<{ sessions: ChatSessionView[]; acpMode?: boolean; boundAgentId?: string }>('session/chat-list', { dshSessionId, refresh: true })
       // A committed `agent-preset/selected` frame may have settled this
       // session's verdict while the read was in flight; the host answer then
       // describes the log as of BEFORE that switch and must not overwrite it.
@@ -637,6 +647,12 @@ export class AcpStore {
       this.mutate({
         chatSessions: sessions,
         chatSessionsFor: dshSessionId,
+        // The host's binding (intent + live-session fallback) outranks the
+        // optimistic entry this store wrote on the click; a host without the
+        // field (older half) simply leaves the optimistic value standing.
+        ...(boundAgentId === undefined
+          ? {}
+          : { chatBoundAgent: { ...this.state.chatBoundAgent, [dshSessionId]: boundAgentId } }),
         // The seat gate's fallback fact source: absent on an older host half,
         // which then simply never takes the seat over (the allowed failure).
         // A frame-settled verdict outranks any read, whenever it lands: the
@@ -912,6 +928,11 @@ export class AcpStore {
   async bindChatAgent(dshSessionId: string, agentId: string): Promise<void> {
     try {
       await this.call('session/chat-bind', { dshSessionId, agentId })
+      // Optimistic: the host recorded the intent, so the NEXT message runs the
+      // picked agent — but the live-session list (`chatSessions`) cannot show
+      // that until the turn materializes its session. Recording here is what
+      // makes the chip and the picker's checkmark move on the click itself.
+      this.mutate({ chatBoundAgent: { ...this.state.chatBoundAgent, [dshSessionId]: agentId } })
     } catch (error) {
       this.flashError(error)
       throw error

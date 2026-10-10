@@ -1651,6 +1651,51 @@ function quoteLegacyCommand(item: unknown): unknown {
   return { ...row, command: quoteCommandToken(trimmed) }
 }
 
+/**
+ * The conversation→agent binding the REQUEST path honors.
+ *
+ * `session/chat-bind` records which ACP agent serves one DSH chat session — the
+ * plugin's own mapping, deliberately not a DSH model route (see
+ * `bindChatAgent`). But a route is exactly what the host driver reads per turn
+ * (`selectionFor(agent).current`: pending selection → last request header →
+ * deployment default), and a session that has never run an ACP turn resolves to
+ * the DEPLOYMENT DEFAULT — so without a rewrite the driver never reaches this
+ * adapter at all, and a session already on `acp/<old>` replays `<old>` forever.
+ *
+ * The rewrite lives in `presets/acp/acp-guard.mjs` (an `agent/request` waterfall
+ * listener, registered with `prepend` so it lands OUTSIDE the harness's own
+ * `installModelSelection` rewrite and wins). The guard is loaded by the
+ * harness's Loader as its own module instance, so the two halves share state
+ * through this registry on `globalThis` rather than through a module import —
+ * same-package, cross-instance, like a service. The guard reads it defensively
+ * and degrades to "no rewrite" (the harness default plays out) when it is
+ * absent; `ACP_ROUTE_BINDING_KEY` is therefore a hand-copy discipline with the
+ * guard's `BINDING_KEY` (see tests/register.spec.ts for the equivalence).
+ */
+export const ACP_ROUTE_BINDING_KEY = Symbol.for('dsh-ntr.acp-binding')
+
+/** The registry shape the guard reads. Values are adapter model strings. */
+export interface AcpRouteBindingRegistry {
+  /** DSH chat session id → the adapter model (`agentId` | `agentId@choice`) its next turn runs on. */
+  readonly conversations: Map<string, string>
+  /** Bare agent id served when a conversation carries no explicit binding (`undefined`: no rewrite). */
+  defaultModel?: string
+}
+
+/**
+ * Install (or reuse) the process-wide registry. Idempotent: the guard and the
+ * plugin load in either order, and a hot reload must not orphan bindings the
+ * previous instance recorded.
+ */
+export function routeBindingRegistry(): AcpRouteBindingRegistry {
+  const host = globalThis as unknown as { [ACP_ROUTE_BINDING_KEY]?: AcpRouteBindingRegistry }
+  const existing = host[ACP_ROUTE_BINDING_KEY]
+  if (existing !== undefined) return existing
+  const registry: AcpRouteBindingRegistry = { conversations: new Map() }
+  host[ACP_ROUTE_BINDING_KEY] = registry
+  return registry
+}
+
 /** Routes host session ids to their owning bridge. */
 export class BridgeManager {
   private readonly bridges = new Map<string, AgentBridge>()
@@ -1673,6 +1718,9 @@ export class BridgeManager {
     }
     this.loadPersistedAgents()
     this.loadPersistedCatalogs()
+    // The request-path rewrite falls back to this default for a conversation
+    // the user never bound explicitly — the same agent the composer chip shows.
+    routeBindingRegistry().defaultModel = this.defaultAgent()
   }
 
   private makeBridge(def: AcpAgentDef, onConnectionLost: (bridge: AgentBridge, reason: string) => void, onCatalog?: (agentId: string, configOptions: unknown) => void): AgentBridge {
@@ -1842,6 +1890,9 @@ export class BridgeManager {
       throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
     }
     this.chatAgentIntent.set(dshSessionId, agentId)
+    // The request path reads this (the guard's `agent/request` rewrite and this
+    // class's own turn admission): the switch takes effect on the next message.
+    routeBindingRegistry().conversations.set(dshSessionId, agentId)
   }
 
   /** The ACP agent a chat session was last pointed at, when one is known. */
@@ -1856,6 +1907,29 @@ export class BridgeManager {
     return undefined
   }
 
+  /**
+   * The adapter model string one chat conversation's next turn runs on — the
+   * request-path binding, when it names a CONFIGURED agent. `undefined` leaves
+   * the turn on whatever route the driver resolved (the allowed failure: the
+   * harness default plays out).
+   */
+  private conversationRouteModel(dshSessionId: string): string | undefined {
+    const model = routeBindingRegistry().conversations.get(dshSessionId)
+    if (model === undefined || model === '') return undefined
+    return this.defsMap.has(splitAdapterModelId(model).agentId) ? model : undefined
+  }
+
+  /**
+   * The agent's own default thought level — the effort the driver MATERIALIZES
+   * into a request that did not ask for one (`resolveCallWithInfo` fills
+   * `reasoning.defaultEffort` in and marks it adapter-defaulted). Re-applying
+   * that as a per-turn choice would revert a pick the user just made through
+   * the seat, so the turn path treats it as "no effort requested".
+   */
+  private modelDefaultEffort(agentId: string): string | undefined {
+    return this.reasoningMeta(agentId)?.defaultEffort
+  }
+
   /** Switch the bound agent's model for one chat session (`agentId@choice`). */
   async setChatSessionModel(dshSessionId: string, modelId: string): Promise<void> {
     const { agentId, choice } = splitAdapterModelId(modelId)
@@ -1864,6 +1938,7 @@ export class BridgeManager {
       throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
     }
     this.chatAgentIntent.set(dshSessionId, agentId)
+    routeBindingRegistry().conversations.set(dshSessionId, modelId)
     for (const session of this.dshSessionMap.values()) {
       if (session.dshSessionId !== dshSessionId || session.agentId !== agentId) continue
       if (session.released) continue
@@ -2419,6 +2494,13 @@ export class BridgeManager {
     // The default agent is a pointer INTO this registry: deleting its target
     // must drop the pointer too, or the file would keep naming a ghost.
     if (this.defaultAgentId === agentId) this.defaultAgentId = undefined
+    // Same for the request-path binding: a conversation pointed at the deleted
+    // agent must fall back (to the default, or to no rewrite) rather than send
+    // the next turn after a ghost.
+    for (const [dshSessionId, model] of routeBindingRegistry().conversations) {
+      if (splitAdapterModelId(model).agentId === agentId) routeBindingRegistry().conversations.delete(dshSessionId)
+    }
+    if (routeBindingRegistry().defaultModel === agentId) routeBindingRegistry().defaultModel = undefined
     if (this.catalogs.delete(agentId)) this.persistCatalogs()
     this.persistAgents()
     this.hub.broadcast({
@@ -2588,6 +2670,8 @@ export class BridgeManager {
     }
     this.defaultAgentId = agentId
     this.persistAgents()
+    // The request-path rewrite falls back to it for never-bound conversations.
+    routeBindingRegistry().defaultModel = agentId
   }
 
   private readonly dshSessionMap = new Map<string, LiveSession>()
@@ -2629,6 +2713,11 @@ export class BridgeManager {
       // Rebind explicitly: a resume keeps the record's identity, but the chat
       // session id is what native approval routing keys off.
       resumed.dshSessionId = dshSessionId
+      // A resume without an explicit pick must keep serving the agent the
+      // conversation was ON (its own model string when one was recorded).
+      if (dshSessionId !== undefined) {
+        routeBindingRegistry().conversations.set(dshSessionId, resumed.modelId ?? agentId)
+      }
       return resumed
     }
     // A chat session runs where its DSH session lives, not in the plugin's
@@ -2650,11 +2739,21 @@ export class BridgeManager {
     // session; those deliberately keep the ledger path (see askNativeApproval).
     session.dshSessionId = dshSessionId
     this.dshSessionMap.set(key, session)
+    // Pin what this conversation now runs on, so a route that does not name it
+    // (a fresh session replays the deployment default) is rewritten to reality.
+    if (dshSessionId !== undefined) routeBindingRegistry().conversations.set(dshSessionId, agentId)
     return session
   }
 
   async *streamPrompt(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    const { agentId, choice } = splitAdapterModelId(options.model)
+    // The plugin's own conversation↔agent mapping decides who serves the turn
+    // (see `bindChatAgent`): the driver may arrive here with the previous
+    // agent's id (the logged request header replays) or a session that has
+    // never run an ACP turn at all. An explicit binding outranks it.
+    const model = options.sessionId === undefined
+      ? options.model
+      : this.conversationRouteModel(options.sessionId) ?? options.model
+    const { agentId, choice } = splitAdapterModelId(model)
     const def = this.defsMap.get(agentId)
     if (def === undefined) {
       yield {
@@ -2740,12 +2839,21 @@ export class BridgeManager {
     // Same-agent model/effort switches ride the SAME ACP session (context
     // stays continuous); switching to another agent lands in a separate one
     // via the `${dshSessionId}:${agentId}` key in getOrCreateDshSession.
-    await this.alignSessionConfig(session, choice, options.reasoningEffort)
+    // An adapter-DEFAULTED effort is not a choice (see `modelDefaultEffort`):
+    // recording or re-applying one would revert the seat's own pick.
+    const requestedEffort = options.reasoningEffort
+    const turnEffort = requestedEffort !== undefined && requestedEffort === this.modelDefaultEffort(agentId)
+      ? undefined
+      : requestedEffort
+    await this.alignSessionConfig(session, choice, turnEffort)
     // Record what this conversation is now on, so `session/chat-list` can show
-    // it without the browser having to derive it from anything else.
-    session.modelId = options.model
+    // it without the browser having to derive it from anything else. A
+    // materialized-default effort leaves the recorded pick standing: the agent
+    // still runs it (the align above was skipped), and erasing it would make
+    // the chip claim "default" for a conversation the user explicitly tuned.
+    session.modelId = model
     session.choice = choice
-    session.reasoningEffort = options.reasoningEffort
+    if (turnEffort !== undefined) session.reasoningEffort = turnEffort
 
     const promptText = selection.text
 

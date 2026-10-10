@@ -11,7 +11,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { afterAll, describe, expect, it } from 'vitest'
 import {
   AcpLlmAdapter, AgentBridge, BridgeManager, defaultAgentWorkspace,
-  detectHostAgents, ensureAgentExecutable, findExecutable, killProcessTree, windowsShimLaunch,
+  detectHostAgents, ensureAgentExecutable, findExecutable, killProcessTree, routeBindingRegistry, windowsShimLaunch,
   type ApprovalOutcome, type ApprovalRequestContext, type BridgeTuning,
 } from '../src/bridge.ts'
 import { EventHub, dispatchRpc } from '../src/impl.ts'
@@ -1708,6 +1708,129 @@ describe('conversation ↔ agent binding (isolated manager)', () => {
     gm.bindChatAgent('dsh-bind-3', 'bound')
     expect(gm.chatAgentFor('dsh-bind-3')).toBe('bound')
     await gm.shutdownAll()
+  })
+})
+
+/**
+ * The turn path must honor the conversation↔agent binding. The driver resolves
+ * each turn's route as "pending selection → last request header → deployment
+ * default" (dsh-api-session-controller's `selectionFor`), so a session that has
+ * never run an ACP turn arrives at SOME OTHER adapter entirely, and one that
+ * has replays its previous `acp/<agent>` header forever — the click would
+ * change nothing. Two layers fix that: the guard's `agent/request` rewrite
+ * makes the driver reach this adapter with the bound agent (register.spec.ts
+ * covers it), and `streamPrompt` re-checks the binding in case the driver still
+ * arrived with a stale agent id.
+ */
+describe('request-path binding (isolated manager)', () => {
+  const bindingHub = new EventHub()
+  /** Iterate a turn to completion (the queue closes when the turn settles). */
+  async function drain(stream: AsyncIterable<StreamChunk>): Promise<StreamChunk[]> {
+    const chunks: StreamChunk[] = []
+    for await (const chunk of stream) chunks.push(chunk)
+    return chunks
+  }
+
+  function userTurn(text: string): { role: 'user'; content: { type: 'text'; text: string }[] } {
+    return { role: 'user', content: [{ type: 'text', text }] }
+  }
+
+  it('serves the bound agent even when the turn still names the previous one', async () => {
+    const gm = new BridgeManager(
+      [{ ...def, id: 'alpha' }, { ...def, id: 'beta' }],
+      bindingHub,
+      500,
+      `${tmpdir()}/acp-redirect-${Date.now()}.json`,
+    )
+    const adapter = new AcpLlmAdapter(gm)
+    try {
+      // Turn 1 has no binding: the requested agent serves, and materializing
+      // the session pins what the conversation runs on.
+      await drain(adapter.stream({ provider: 'acp', model: 'alpha', sessionId: 'dsh-redir-1', messages: [userTurn('first')] }))
+      expect(gm.chatSessions('dsh-redir-1').map(session => session.agentId)).toEqual(['alpha'])
+      expect(routeBindingRegistry().conversations.get('dsh-redir-1')).toBe('alpha')
+
+      // The picker click: point the conversation at beta.
+      gm.bindChatAgent('dsh-redir-1', 'beta')
+      expect(routeBindingRegistry().conversations.get('dsh-redir-1')).toBe('beta')
+
+      // Turn 2 arrives with the STALE route (the logged request header still
+      // names alpha — nothing outside the guard ever rewrites it). The binding
+      // wins: beta serves, in its OWN session (context separation per agent).
+      await drain(adapter.stream({ provider: 'acp', model: 'alpha', sessionId: 'dsh-redir-1', messages: [userTurn('second')] }))
+      const sessions = gm.chatSessions('dsh-redir-1')
+      expect(sessions.map(session => session.agentId)).toContain('beta')
+      // The turn's record names what actually served it (the bound agent), not
+      // the stale id the driver arrived with.
+      expect(sessions.find(session => session.agentId === 'beta')?.modelId).toBe('beta')
+      // …and the record of what the conversation is on follows the binding.
+      expect(routeBindingRegistry().conversations.get('dsh-redir-1')).toBe('beta')
+    } finally {
+      routeBindingRegistry().conversations.delete('dsh-redir-1')
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
+  it('switches the model variant through the same binding the turn path reads', async () => {
+    const gm = new BridgeManager([{ ...def, id: 'alpha' }], bindingHub, 500, `${tmpdir()}/acp-variant-${Date.now()}.json`)
+    try {
+      await gm.setChatSessionModel('dsh-variant-1', 'alpha@mock-model-b')
+      expect(routeBindingRegistry().conversations.get('dsh-variant-1')).toBe('alpha@mock-model-b')
+      // A stale or ghost entry must not fail the turn: it is ignored instead.
+      routeBindingRegistry().conversations.set('dsh-variant-2', 'ghost@x')
+      const adapter = new AcpLlmAdapter(gm)
+      await drain(adapter.stream({ provider: 'acp', model: 'alpha', sessionId: 'dsh-variant-2', messages: [userTurn('hi')] }))
+      expect(gm.chatSessions('dsh-variant-2').map(session => session.agentId)).toEqual(['alpha'])
+    } finally {
+      routeBindingRegistry().conversations.delete('dsh-variant-1')
+      routeBindingRegistry().conversations.delete('dsh-variant-2')
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
+  it('does not re-apply an adapter-defaulted effort over the seat\'s own pick', async () => {
+    // The driver materializes `reasoning.defaultEffort` into every request that
+    // did not ask for one. That default comes from the agent-level catalog
+    // cache, which a per-session thought-level switch does not refresh — so
+    // re-applying it per turn would silently revert the user's pick.
+    const gm = new BridgeManager([{ ...def, id: 'alpha' }], bindingHub, 500, `${tmpdir()}/acp-effort-${Date.now()}.json`)
+    try {
+      // Warm the catalog: the mock advertises thought_level choices with
+      // currentValue 'high', which is the effort the driver will materialize.
+      // (The background probe is disabled under the test runner, so probe
+      // directly — the same await the panel's manual probe uses.)
+      const probe = await gm.probeAgentModels('alpha')
+      expect(probe.catalog.thought?.currentValue).toBe('high')
+
+      const adapter = new AcpLlmAdapter(gm)
+      // Turn 1: a REAL pick ('off' ≠ the default) applies and is recorded.
+      await drain(adapter.stream({ provider: 'acp', model: 'alpha', sessionId: 'dsh-effort-1', reasoningEffort: 'off', messages: [userTurn('one')] }))
+      expect(gm.chatSessions('dsh-effort-1')[0]?.reasoningEffort).toBe('off')
+      // Turn 2: the driver arrives with the materialized default ('high').
+      // Re-applying it would revert the pick to the catalog's stale value.
+      await drain(adapter.stream({ provider: 'acp', model: 'alpha', sessionId: 'dsh-effort-1', reasoningEffort: 'high', messages: [userTurn('two')] }))
+      expect(gm.chatSessions('dsh-effort-1')[0]?.reasoningEffort).toBe('off')
+    } finally {
+      routeBindingRegistry().conversations.delete('dsh-effort-1')
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
+  it('mirrors the default agent into the request path and purges deleted agents', async () => {
+    const gm = new BridgeManager([{ ...def, id: 'alpha' }], bindingHub, 500, `${tmpdir()}/acp-purge-${Date.now()}.json`)
+    try {
+      await dispatchRpc(gm, 'default/agent-set', { agentId: 'alpha' })
+      expect(routeBindingRegistry().defaultModel).toBe('alpha')
+      // A conversation bound to the agent, with a model variant recorded.
+      routeBindingRegistry().conversations.set('dsh-purge-1', 'alpha@mock-model-a')
+      await gm.deleteAgent('alpha')
+      expect(routeBindingRegistry().conversations.has('dsh-purge-1')).toBe(false)
+      expect(routeBindingRegistry().defaultModel).toBeUndefined()
+    } finally {
+      await gm.setDefaultAgent(undefined).catch(() => {})
+      routeBindingRegistry().conversations.delete('dsh-purge-1')
+      await gm.shutdownAll()
+    }
   })
 })
 

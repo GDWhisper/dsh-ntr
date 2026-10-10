@@ -334,6 +334,36 @@ describe('AcpStore agent management', () => {
     expect(store.getSnapshot().acpMode).toEqual({})
   })
 
+  it('records the agent binding optimistically on the click and folds the host answer over it', async () => {
+    // The click is the whole user-visible contract of the agent picker: the
+    // chip must name the picked agent immediately. The live-session list cannot
+    // do that (a switch materializes its session only on the next message), so
+    // the store carries the binding itself and lets the host read confirm it.
+    const store = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint === 'session/chat-list') return { ok: true, value: { sessions: [], boundAgentId: 'omp' } }
+      return { ok: true, value: { done: true } }
+    }, (zh) => zh)
+
+    await store.bindChatAgent('chat-1', 'omp')
+    expect(store.getSnapshot().chatBoundAgent['chat-1']).toBe('omp')
+
+    // The host read (the click path re-reads) confirms the same binding.
+    await store.loadChatSessions('chat-1')
+    expect(store.getSnapshot().chatBoundAgent['chat-1']).toBe('omp')
+    // A different conversation keeps its own binding.
+    await store.loadChatSessions('chat-2')
+    expect(store.getSnapshot().chatBoundAgent['chat-2']).toBe('omp')
+
+    // An older host half without the field: the optimistic value stands.
+    const legacy = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint === 'session/chat-list') return { ok: true, value: { sessions: [] } }
+      return { ok: true, value: { done: true } }
+    }, (zh) => zh)
+    await legacy.bindChatAgent('chat-1', 'pi')
+    await legacy.loadChatSessions('chat-1')
+    expect(legacy.getSnapshot().chatBoundAgent['chat-1']).toBe('pi')
+  })
+
   it('folds a committed preset frame into the verdict instead of re-reading the log', async () => {
     // The host log read is one switch behind the frame that announces the
     // switch, so the seat used to move only after a page reload.

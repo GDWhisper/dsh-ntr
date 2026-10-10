@@ -1132,6 +1132,13 @@ export interface AcpManager {
    * `BridgeManager.bindChatAgent`).
    */
   bindChatAgent?(dshSessionId: string, agentId: string): void
+  /**
+   * The ACP agent one DSH chat conversation is pointed at — the recorded intent
+   * when there is one, else the agent an existing ACP session for that
+   * conversation is already served by. The composer's chip and picker read this
+   * so a switch shows BEFORE the next turn materializes it.
+   */
+  chatAgentFor?(dshSessionId: string): string | undefined
   /** Switch the bound agent's model (`agentId@choice`) for one chat session. */
   setChatSessionModel?(dshSessionId: string, modelId: string): Promise<void>
   /** Switch the bound agent's reasoning effort for one chat session. */
@@ -1247,6 +1254,11 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         if (body.refresh === true) manager.invalidateAcpMode?.(dshSessionId)
         return ok({
           sessions: manager.chatSessions?.(dshSessionId) ?? [],
+          // The plugin's own binding for this conversation — who serves its
+          // NEXT message. The composer's chip and picker read it so a switch
+          // is visible before the next turn materializes a session for the
+          // new agent (the live-session list below lags one message by design).
+          boundAgentId: manager.chatAgentFor?.(dshSessionId),
           // Read-only memory answer, same authority as `setAcpModeResolver`'s
           // session-log read: the seat gate's fallback fact source on hosts
           // whose session rows carry no `agentPreset`. Awaited: a cold read

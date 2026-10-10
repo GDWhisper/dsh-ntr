@@ -300,6 +300,21 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
     expect(unknownAgent.modelLabel).toBe('x')
   })
 
+  it('shows the recorded binding before the live session has caught up', () => {
+    // The click recorded 'omp' for this conversation, but the live session list
+    // still names 'pi' — a switch applies from the NEXT message, and until that
+    // turn materializes a session for the new agent the chip must read 'omp',
+    // not the previous agent (that lag is exactly what read as "clicking does
+    // nothing"). An unknown binding id falls through to the live session.
+    const switched = describeRoute([agent, { ...agent, id: 'omp', title: 'Omp' }], bound, undefined, catalog, 'omp')
+    expect(switched.agentId).toBe('omp')
+    expect(switched.agentTitle).toBe('Omp')
+    const ghost = describeRoute([agent], bound, undefined, catalog, 'ghost')
+    expect(ghost.agentId).toBe('pi')
+    // No binding: the live session decides (the pre-binding behavior).
+    expect(describeRoute([agent], bound, undefined, catalog).agentId).toBe('pi')
+  })
+
   it('drops the axes the agent does not publish', () => {
     const silent: AgentCatalogResult = { ...catalog, variants: [], reasoning: undefined }
     const route = describeRoute([agent], bound, undefined, silent)

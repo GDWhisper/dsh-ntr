@@ -265,3 +265,99 @@ describe('host plugin contract', () => {
     }
   })
 })
+
+describe('acp-guard preset row', () => {
+  /**
+   * The guard registers its listeners on whatever ctx the Loader hands the
+   * preset row. This fake records the registrations so the tests can fire the
+   * listeners directly — the real dispatch (`dispatch.waterfall`) is a runtime
+   * concern these tests stand in for.
+   */
+  function guardCtx() {
+    const listeners = new Map<string, { listener: (payload: unknown, next: () => Promise<unknown>) => Promise<unknown>; options?: unknown }>()
+    return {
+      listeners,
+      on: vi.fn((name: string, listener: (payload: unknown, next: () => Promise<unknown>) => Promise<unknown>, options?: unknown) => {
+        listeners.set(name, { listener, options })
+        return () => {}
+      }),
+    }
+  }
+
+  it('registers the route rewrite outermost so the binding outranks the harness selection', async () => {
+    const ctx = guardCtx()
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    // `installModelSelection`'s own agent/request rewrite registers BEFORE the
+    // preset rows mount; waterfall listeners run outermost-first, so only the
+    // outermost slot lets the binding's rewrite land last (and win).
+    expect(ctx.on).toHaveBeenCalledWith('agent/request', expect.any(Function), { prepend: true })
+    expect(ctx.on).toHaveBeenCalledWith('agent/pre-step', expect.any(Function))
+  })
+
+  it('rewrites the resolved request to the conversation binding, dropping the inherited effort', async () => {
+    const ctx = guardCtx()
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    const request = ctx.listeners.get('agent/request')
+    if (request === undefined) throw new Error('guard registered no agent/request listener')
+
+    // The plugin records the binding on `session/chat-bind`; the registry is
+    // the SAME object bridge.ts installs on globalThis (cross-instance share).
+    const { ACP_ROUTE_BINDING_KEY, routeBindingRegistry } = await import('../src/bridge.ts')
+    expect((globalThis as Record<symbol, unknown>)[ACP_ROUTE_BINDING_KEY as symbol]).toBe(routeBindingRegistry())
+    routeBindingRegistry().conversations.set('dsh-guard-1', 'beta@mock-model-b')
+    try {
+      // What the harness's own chain resolves for a never-ACP session: the
+      // deployment default, with its materialized effort.
+      const resolved = await request.listener(
+        { agent: { session: { id: 'dsh-guard-1' } } },
+        async () => ({ provider: 'deepseek', model: 'deepseek-v4', reasoningEffort: 'high' }),
+      )
+      expect(resolved).toEqual({ provider: 'acp', model: 'beta@mock-model-b' })
+    } finally {
+      routeBindingRegistry().conversations.delete('dsh-guard-1')
+    }
+  })
+
+  it('falls back to the plugin default agent for a conversation nobody bound', async () => {
+    const ctx = guardCtx()
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    const request = ctx.listeners.get('agent/request')
+    if (request === undefined) throw new Error('guard registered no agent/request listener')
+
+    const { routeBindingRegistry } = await import('../src/bridge.ts')
+    const registry = routeBindingRegistry()
+    const previousDefault = registry.defaultModel
+    registry.defaultModel = 'fallback-agent'
+    try {
+      const resolved = await request.listener(
+        { agent: { session: { id: 'dsh-guard-unbound' } } },
+        async () => ({ provider: 'deepseek', model: 'deepseek-v4' }),
+      )
+      expect(resolved).toEqual({ provider: 'acp', model: 'fallback-agent' })
+    } finally {
+      registry.defaultModel = previousDefault
+    }
+  })
+
+  it('leaves the resolved route untouched when nothing is bound (and never throws)', async () => {
+    const ctx = guardCtx()
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    const request = ctx.listeners.get('agent/request')
+    if (request === undefined) throw new Error('guard registered no agent/request listener')
+
+    const { routeBindingRegistry } = await import('../src/bridge.ts')
+    const registry = routeBindingRegistry()
+    const previousDefault = registry.defaultModel
+    registry.defaultModel = undefined
+    try {
+      const seed = { provider: 'deepseek', model: 'deepseek-v4', reasoningEffort: 'high' }
+      const untouched = await request.listener({ agent: { session: { id: 'dsh-guard-none' } } }, async () => seed)
+      expect(untouched).toBe(seed)
+      // A payload without a session id must not rewrite either.
+      const anonymous = await request.listener({ agent: {} }, async () => seed)
+      expect(anonymous).toBe(seed)
+    } finally {
+      registry.defaultModel = previousDefault
+    }
+  })
+})

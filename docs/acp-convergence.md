@@ -142,16 +142,30 @@ conversation.input.model   ← ACP 底座（ACP 模式下由闸门动态安装�
 
 ### 2.2 prompt 触发：插件自己的会话映射
 
-ACP 会话的 prompt **不经过 DSH selection**。composer 发送时：
+ACP 会话的 prompt **不经过 DSH selection**。**但进日志的唯一路径仍是 LLM adapter（§1.3）——
+即 prompt 仍由宿主 driver 调 `adapter.stream()`，本节说的"不经过 selection"指的是：插件不写
+selection，而 driver 每轮解析的路由（`selectionFor(agent).current`：pending selection →
+上一条请求 header → 部署默认）必须被插件接到绑定上。** 2026-10-14 的实机缺陷是这一环缺失：
+`session/chat-bind` 只写了 `chatAgentIntent` 而无人消费，于是从未跑过 ACP 轮次的会话发到部署
+默认 provider（adapter 根本不被调用）、已跑过的永远回放旧 agent——用户看到的就是「agent 选择器
+点击无效」。现行机制（两层）：
 
-1. 浏览器半区认出「这条 DSH 会话绑定了哪个 agentId」（读 `session/chat-list` 的 `chatSessions`）
-2. 经插件自己的 RPC 调 `BridgeManager` 的 ACP 轮次
-3. 结果经 adapter 折进 DSH 会话日志 → 主聊天平面原生渲染
+1. **guard 的 `agent/request` waterfall 改写**（`presets/acp/acp-guard.mjs`，`{ prepend: true }`）：
+   driver 解析出请求配置后，guard 把它改写成绑定指向的 `acp/<agent>`（无绑定的会话回落插件默认
+   agent；改写丢掉继承 effort）。注册必须 prepend——`installModelSelection` 的改写（fresh 会话
+   回放部署默认）先注册，waterfall 外层后执行且其返回值才生效，只有最外层能让绑定赢。binding 经
+   `globalThis[Symbol.for('dsh-ntr.acp-binding')]` 跨模块实例共享（guard 是 Loader 加载的独立
+   实例）；`dsh-ntr` 在 bind / model-set / 会话物化 / 默认 agent / 删除 agent 五处写入。
+2. **adapter 自己的复查**（`BridgeManager.streamPrompt`）：driver 仍带来旧 agent id 时（旧
+   header 回放、guard 未挂载的降级态），绑定 model 串优先。材料化的默认 effort 不算用户选择，
+   不回写（否则座位刚选的思考等级被 catalog 缓存的陈旧默认静默改回）。
 
-**不写任何 `provider: 'acp'` 路由。** 于是：
+**不写任何 `provider: 'acp'` 路由**（无 `selectModel`、无 `saveSelection`、无全局默认污染）；
+路由的"写"只发生在 driver 每轮的请求配置上，由 guard 改写、随请求 header 留痕。于是：
 - 没有 `selectModel` → 没有 `model-unavailable`
 - 没有 `saveSelection` → 全局默认模型不被污染 → `AcpDefaultModelGuard` 无事可做
-- 没有路由 → 不需要遮蔽原生座位
+- agent 之间切换 = 改绑定 → 下一条消息生效（`getOrCreateDshSession` 按 `dsh:agentId` 分会话，
+  上下文各自保留）
 
 ### 2.3 permission 原样映射
 
@@ -286,7 +300,7 @@ outlet 读的就是它）核对这个 cell 的 head 是不是我们自己的组�
 
 | 端点 | 宿主符号 | 作用 |
 |---|---|---|
-| `session/chat-bind` | `BridgeManager.bindChatAgent` | 把一条 DSH 聊天会话指向某个 agent（写入 `chatAgentIntent`，**不碰模型路由**） |
+| `session/chat-bind` | `BridgeManager.bindChatAgent` | 把一条 DSH 聊天会话指向某个 agent（写入 `chatAgentIntent` + 请求路径绑定注册表，**不碰模型路由**） |
 | `session/chat-model-set` | `BridgeManager.setChatSessionModel` | 切绑定 agent 的模型（`agentId@choice`） |
 | `session/chat-effort-set` | `BridgeManager.setChatSessionEffort` | 切绑定 agent 的思考等级 |
 
