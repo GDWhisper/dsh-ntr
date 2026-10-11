@@ -668,10 +668,17 @@ export function acpToolCallFromUpdate(update: Record<string, unknown>): AcpToolC
 /**
  * Fold one ACP `tool_call_update` into an open snapshot, in place.
  *
- * A `content` array is read through the same tolerant walk the ACP view uses:
- * ACP agents put text, diffs and terminal handles in there, and the Chat card
- * only has room for text — so the rest becomes a bracketed placeholder rather
- * than being dropped silently.
+ * ACP updates carry FULL replacement snapshots (`rawInput` restated in whole on
+ * every change), while the host's accumulator CONCATENATES `argumentsDelta` —
+ * so the deltas produced here are the extension suffix only, and the snapshot
+ * itself always moves to the latest known text (the closing `block-end` frame
+ * replaces the block wholesale, which is what makes a non-extension update
+ * land correctly in the settled card).
+ *
+ * Input (`rawInput` / `arguments`) outranks `content`: the card's argument text
+ * is what the agent asked the tool to do, not what the tool printed back. Once
+ * input has been seen, content updates stop contributing — a `content` fold
+ * only fills a call whose agent never sent input at all.
  */
 export function acpToolCallDelta(
   snapshot: AcpToolCallSnapshot,
@@ -683,12 +690,54 @@ export function acpToolCallDelta(
     deltas.push({ kind: 'name', name: title })
     snapshot.name = title
   }
-  const text = acpToolCallArgsOf(update)
-  if (text !== '') {
-    deltas.push({ kind: 'args', text })
-    snapshot.argsRaw += text
+  const input = acpToolCallInputOf(update)
+  if (input !== undefined) {
+    const suffix = extensionSuffixOf(snapshot.argsRaw, input)
+    if (suffix !== '') deltas.push({ kind: 'args', text: suffix })
+    snapshot.argsRaw = input
+  } else if (snapshot.argsRaw === '') {
+    const text = updateContentToText(update.content)
+    if (text !== '') {
+      deltas.push({ kind: 'args', text })
+      snapshot.argsRaw = text
+    }
   }
   return deltas
+}
+
+/**
+ * The part of `next` that extends `previous` — the only thing a concatenating
+ * delta consumer can express. A replacement (the agent rewrote its input) has
+ * no honest delta; the caller updates the snapshot regardless and lets the
+ * closing snapshot tell the truth.
+ */
+function extensionSuffixOf(previous: string, next: string): string {
+  if (previous === '') return next
+  return next.startsWith(previous) ? next.slice(previous.length) : ''
+}
+
+/**
+ * The argument INPUT an ACP tool-call notification carries, if any.
+ *
+ * Accepts the spellings seen in the wild (`rawInput` as a string, `arguments`
+ * as a string or an object). A stringified object is accepted as-is: the card
+ * shows raw text, and re-serializing would reorder nothing but risk throwing.
+ */
+function acpToolCallInputOf(update: Record<string, unknown>): string | undefined {
+  for (const key of ['rawInput', 'arguments'] as const) {
+    const value = update[key]
+    if (typeof value === 'string' && value !== '') return value
+    if (typeof value === 'object' && value !== null) {
+      try {
+        return JSON.stringify(value)
+      } catch {
+        // A circular or otherwise unserializable value is not worth failing a
+        // tool card over: show what we can.
+        return String(value)
+      }
+    }
+  }
+  return undefined
 }
 
 /**

@@ -18,6 +18,20 @@
  * construction. `user` and `tool` sources are kept: the first is the person,
  * the second is loop-internal continuity this session still needs.
  *
+ * NO-USER-INPUT STEPS ARE REJECTED (third duty): a batch that carries no
+ * user-sourced message is the fuel of a host-side CONTINUATION step — the
+ * agent loop re-runs whenever the settled assistant message contains
+ * `tool-call` blocks, which is exactly what the ACP agent's tool cards are.
+ * The host "executes" them (the preset registers no tools, so each records an
+ * `unknown tool` error result) and proposes the next step fed with those
+ * results. Forwarding it would re-send the person's last words to the ACP
+ * agent — the agent runs its OWN loop and must hear a prompt once. The ACP
+ * agent's tools are display-only on this side, so a step with nothing the
+ * person said is refused (`reject` ends the turn). Batches that DO carry user
+ * input keep flowing (stripped as configured), and a source-less message
+ * counts as user input — the same convention the bridge's forward picker uses,
+ * so a hand-assembled batch is never eaten.
+ *
  * Config:
  *   strippedSources?: string[]  — source kinds to strip (default below; `[]`
  *                                 disables the filter, e.g. to debug what the
@@ -96,30 +110,45 @@ function boundModelFor(dshSessionId) {
 }
 
 /**
- * Register the strip filter and the route rewrite for this preset's agent scope.
+ * Register the step gate and the route rewrite for this preset's agent scope.
  * @param ctx - the preset-scoped context the row is mounted under.
  * @param config - optional `strippedSources` override.
  */
 export function apply(ctx, config) {
   const stripped = strippedSourcesOf(config)
-  if (stripped.size > 0) {
-    ctx.on('agent/pre-step', async (_payload, next) => {
-      // Downstream failures propagate untouched; only this filter's own logic is guarded.
-      const decision = await next()
-      if (decision.kind === 'reject') return decision
-      try {
-        if (!Array.isArray(decision.messages)) return decision
-        const kept = decision.messages.filter(message => {
+  ctx.on('agent/pre-step', async (_payload, next) => {
+    // Downstream failures propagate untouched; only this gate's own logic is guarded.
+    const decision = await next()
+    if (decision.kind === 'reject') return decision
+    try {
+      if (!Array.isArray(decision.messages)) return decision
+      let kept = decision.messages
+      if (stripped.size > 0) {
+        const filtered = kept.filter(message => {
           const kind = message?.source?.kind
           return typeof kind !== 'string' || !stripped.has(kind)
         })
-        return kept.length === decision.messages.length ? decision : { ...decision, messages: kept }
-      } catch {
-        // A filter bug must never eat context: degrade to keeping every message.
-        return decision
+        if (filtered.length !== kept.length) kept = filtered
       }
-    })
-  }
+      // A stripped batch that still has content but nothing the person said is
+      // a host-side continuation step: tool results staged after the loop
+      // "executed" the ACP agent's display-only tool cards (the preset
+      // registers no tools, so each records an `unknown tool` error result).
+      // Forwarding it would re-send the person's last words — the ACP agent
+      // runs its own loop and must hear a prompt once. `reject` ends the turn.
+      // An EMPTY batch keeps the plain enter: the loop ends a first step with
+      // no messages as a completed no-op (the injected-wake path).
+      const hasUserInput = kept.some(message => {
+        const kind = message?.source?.kind
+        return kind === undefined || kind === 'user'
+      })
+      if (kept.length > 0 && !hasUserInput) return { kind: 'reject' }
+      return kept === decision.messages ? decision : { ...decision, messages: kept }
+    } catch {
+      // A gate bug must never eat context: degrade to keeping every message.
+      return decision
+    }
+  })
 
   // The route rewrite: outermost on purpose — see the module header for why
   // `prepend` is load-bearing (the harness's own selection rewrite registers

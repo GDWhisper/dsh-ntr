@@ -360,4 +360,70 @@ describe('acp-guard preset row', () => {
       registry.defaultModel = previousDefault
     }
   })
+
+  it('rejects a continuation step fed with nothing the person said', async () => {
+    // The oml session bug: the host loop re-runs whenever the settled
+    // assistant message carries tool-call blocks — which is what the ACP
+    // agent's display-only tool cards are. The next step's batch is the
+    // staged tool results, and forwarding it re-sent the person's last words
+    // to the agent on every step. `reject` ends the turn instead.
+    const ctx = guardCtx()
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    const preStep = ctx.listeners.get('agent/pre-step')
+    if (preStep === undefined) throw new Error('guard registered no agent/pre-step listener')
+
+    const toolResult = { role: 'user', source: { kind: 'tool', callId: 'c1' }, content: [{ type: 'text', text: 'Error: unknown tool "Bash"' }] }
+    const context = { role: 'user', source: { kind: 'runtime-context', form: 'snapshot' }, content: [{ type: 'text', text: 'Current runtime context.' }] }
+    const decision = await preStep.listener({ messages: [toolResult, context], turn: 2, step: 2 }, async () => ({
+      kind: 'enter',
+      messages: [toolResult, context],
+    }))
+    expect(decision).toEqual({ kind: 'reject' })
+  })
+
+  it('keeps a batch that carries the person\'s words and still strips the injections', async () => {
+    const ctx = guardCtx()
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    const preStep = ctx.listeners.get('agent/pre-step')
+    if (preStep === undefined) throw new Error('guard registered no agent/pre-step listener')
+
+    const user = { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '你好' }] }
+    const injected = { role: 'user', source: { kind: 'skill-catalog' }, content: [{ type: 'text', text: '<available_skills>…' }] }
+    const decision = await preStep.listener({ messages: [user, injected], turn: 1, step: 1 }, async () => ({
+      kind: 'enter',
+      messages: [user, injected],
+    }))
+    expect(decision).toEqual({ kind: 'enter', messages: [user] })
+  })
+
+  it('ends an injected-only wake as the plain no-op it always was', async () => {
+    // A batch the strip empties completely carries no continuation fuel: the
+    // loop itself ends a first step with zero messages as `completed`, so the
+    // gate must not dress it up as a rejection.
+    const ctx = guardCtx()
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    const preStep = ctx.listeners.get('agent/pre-step')
+    if (preStep === undefined) throw new Error('guard registered no agent/pre-step listener')
+
+    const injected = { role: 'user', source: { kind: 'plugin' }, content: [{ type: 'text', text: 'goal material' }] }
+    const decision = await preStep.listener({ messages: [injected], turn: 3, step: 1 }, async () => ({
+      kind: 'enter',
+      messages: [injected],
+    }))
+    expect(decision).toEqual({ kind: 'enter', messages: [] })
+  })
+
+  it('never eats a source-less batch: hand-assembled messages count as the person', async () => {
+    const ctx = guardCtx()
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    const preStep = ctx.listeners.get('agent/pre-step')
+    if (preStep === undefined) throw new Error('guard registered no agent/pre-step listener')
+
+    const handBuilt = { role: 'user', content: [{ type: 'text', text: 'headless prompt' }] }
+    const decision = await preStep.listener({ messages: [handBuilt] }, async () => ({
+      kind: 'enter',
+      messages: [handBuilt],
+    }))
+    expect(decision).toEqual({ kind: 'enter', messages: [handBuilt] })
+  })
 })

@@ -111,6 +111,43 @@ ACP 的 `tool_call` 被 `switchToBlock('reasoning')` 降级成
 **注意**：`block-end` 的 `block` 会经 `toAssistantBlock` **替换**整个 block，
 所以最后一个 `block-end` 必须带完整内容（accumulator 的 `block-end` 分支是覆盖不是合并）。
 
+### 1.5 展示卡的隐性代价：宿主 loop 会续跑，原话会被重发（oml「你好」会话事故，2026-10-11）
+
+§1.4 的方案落地后，oml 项目的「你好」会话暴露了它没算到的代价。用户报告
+「ACP agent 侧不断地反复接收到我发出去的话」。会话日志（`session-afd36498`，
+turn 2 跑了 4 个 step）给出完整链条：
+
+1. agent（codebuddy）在回答里发 `tool_call` / `tool_call_update`，adapter 按本节
+   方案折成真正的 `tool-call` block；
+2. 宿主 agent-loop 的续跑判定**只看** settled assistant message 里有没有
+   `tool-call` block（`dsh-agent-loop` `step()`：`content.filter(block => block.type
+   === "tool-call")`，空则 `completed`，非空则 `executeToolCalls` → 返回 null →
+   下一步）。没有任何 finish-reason 闸门，BlockAssembler 的词表也只有
+   `text` / `reasoning` / `tool-call` 三种，**没有「只展示」的块形态**；
+3. preset 没挂工具 → 每张卡执行即 `unknown tool`（`ToolNotFoundError`），
+   错误 result 记入日志 → loop 续跑；
+4. 下一步的批次只有 staged tool results（`source.kind: 'tool'`），而
+   `selectForwardPrompt` 扫的是**整个请求消息列表**里最后一条 user-kind 消息——
+   历史里的原话永远在 → **原话重发给 agent** → agent 再发工具卡 → 循环，直到
+   用户中止。
+
+宿主仍会执行卡片并记录 `unknown tool` 错误 result（卡片渲染依赖宿主的
+`tool/call` 执行记录，插件没有 append 通道，§1.3），这个噪音掐不掉；但续跑必须掐断。
+修复是 guard 的第三职责（`agent/pre-step`）：**strip 之后仍有内容、却没有任何
+用户来源的批次一律 `reject`**（turn 以 blocked 收尾；strip 后为空的注入轮保持
+原 completed 空转；无 source 的消息算用户输入，与 bridge 取词约定一致）。
+
+同一次事故还暴露了 delta 语义错位：ACP 的 `tool_call_update` **整包重述**
+`rawInput`，而宿主 accumulator 对 `argumentsDelta` 是**拼接**
+（`previous.args.push(...)`，组装时 `args.join("")`）——把快照当增量，
+卡片参数长成 `{"cmd":""}{"cmd":"cd /m/Coding/oml && git"}…` 碎片，Read 卡甚至把
+整个文件内容吞进参数。修复（`acpToolCallDelta`）：只对**真字符串前缀扩展**发
+后缀 delta；替换类更新只移动快照，由 `block-end` 整块替换纠正；
+输入（`rawInput`/`arguments`）优先于 `content`（content 是工具输出）。
+另外相邻两个工具调用必须各开一个 block——`switchToBlock` 的类型相等早退会把
+第二张卡折进第一张（日志里三张卡的参数互相串味即此），`openToolCallBlock` 按
+callId 显式断块；同 callId 重发的 `tool_call` 按更新折叠。
+
 ---
 
 ## 2. 目标形态

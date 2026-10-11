@@ -410,7 +410,7 @@ export class AgentBridge {
       if (session.settled === settled) session.settled = undefined
       settle()
       // The turn is over: a fresh window starts here rather than at the prompt
-      // that may have started a long turn ago.
+      // that may have started a long time ago.
       this.touch()
     }
   }
@@ -2890,26 +2890,70 @@ export class BridgeManager {
     let activeToolCall: AcpToolCallSnapshot | undefined
     let latestUsage: { inputTokens: number; outputTokens: number } | null = null
 
+    const blockEndChunk = () => ({
+      type: 'block-end' as const,
+      index: currentBlockIndex,
+      block: activeBlockType === 'tool-call' && activeToolCall !== undefined
+        ? { type: 'tool-call' as const, id: activeToolCall.callId, name: activeToolCall.name, arguments: activeToolCall.argsRaw }
+        : { type: activeBlockType as 'reasoning' | 'text', text: activeBlockText },
+    })
+
+    const closeOpenBlock = () => {
+      if (activeBlockType === null) return
+      queue.push(blockEndChunk())
+      activeBlockType = null
+      activeToolCall = undefined
+    }
+
     const switchToBlock = (targetType: 'reasoning' | 'text' | 'tool-call') => {
       if (activeBlockType === targetType) return
-      if (activeBlockType !== null) {
-        queue.push({
-          type: 'block-end',
-          index: currentBlockIndex,
-          block: activeBlockType === 'tool-call' && activeToolCall !== undefined
-            ? { type: 'tool-call', id: activeToolCall.callId, name: activeToolCall.name, arguments: activeToolCall.argsRaw }
-            : { type: activeBlockType, text: activeBlockText },
-        })
-      }
+      closeOpenBlock()
       currentBlockIndex++
       activeBlockType = targetType
       activeBlockText = ''
-      activeToolCall = undefined
       queue.push({
         type: 'block-start',
         index: currentBlockIndex,
         blockType: targetType,
       })
+    }
+
+    /**
+     * Open a tool-call block for one call. This is `switchToBlock` with a
+     * callId twist the prose helper cannot express: two adjacent tool calls
+     * have the SAME block type, and a type-equality early-return would fold
+     * the second call into the first card — every call needs its own block.
+     */
+    const openToolCallBlock = (snapshot: AcpToolCallSnapshot) => {
+      closeOpenBlock()
+      currentBlockIndex++
+      activeBlockType = 'tool-call'
+      activeBlockText = ''
+      activeToolCall = snapshot
+      queue.push({
+        type: 'block-start',
+        index: currentBlockIndex,
+        blockType: 'tool-call',
+      })
+      queue.push({
+        type: 'tool-call-delta',
+        index: currentBlockIndex,
+        id: snapshot.callId,
+        ...(snapshot.name === '' ? {} : { name: snapshot.name }),
+        argumentsDelta: snapshot.argsRaw,
+      })
+    }
+
+    /** Fold an in-place update of the open call into name/argument deltas. */
+    const foldToolCallUpdate = (update: Record<string, unknown>) => {
+      if (activeToolCall === undefined) return
+      for (const delta of acpToolCallDelta(activeToolCall, update)) {
+        if (delta.kind === 'name') {
+          queue.push({ type: 'tool-call-delta', index: currentBlockIndex, id: activeToolCall.callId, name: delta.name, argumentsDelta: '' })
+        } else {
+          queue.push({ type: 'tool-call-delta', index: currentBlockIndex, id: activeToolCall.callId, argumentsDelta: delta.text })
+        }
+      }
     }
 
     const unsubscribe = this.hub.subscribe(event => {
@@ -2927,21 +2971,15 @@ export class BridgeManager {
         } else if (kind === 'tool_call') {
           // A real tool call, not prose: the host's accumulator turns these
           // deltas into `{ kind: 'tool-call', callId, name, argsRaw }` and the
-          // Chat plane renders the card the ACP view used to own. A call whose
-          // the same callId as the open block is an update-in-place, not a new
+          // Chat plane renders the card the ACP view used to own. A restated
+          // `tool_call` for the call already on air is an update, not a new
           // card — agents announce a call once and then update it.
           const snapshot = acpToolCallFromUpdate(update)
           if (snapshot !== undefined) {
-            if (activeBlockType !== 'tool-call' || activeToolCall?.callId !== snapshot.callId) {
-              switchToBlock('tool-call')
-              activeToolCall = snapshot
-              queue.push({
-                type: 'tool-call-delta',
-                index: currentBlockIndex,
-                id: snapshot.callId,
-                name: snapshot.name,
-                argumentsDelta: snapshot.argsRaw,
-              })
+            if (activeBlockType === 'tool-call' && activeToolCall?.callId === snapshot.callId) {
+              foldToolCallUpdate(update)
+            } else {
+              openToolCallBlock(snapshot)
             }
           }
         } else if (kind === 'tool_call_update') {
@@ -2952,18 +2990,9 @@ export class BridgeManager {
           if (callId !== '') {
             if (activeBlockType !== 'tool-call' || activeToolCall?.callId !== callId) {
               const reopened = acpToolCallFromUpdate({ ...update, toolCallId: callId })
-              switchToBlock('tool-call')
-              activeToolCall = reopened
-              queue.push({ type: 'tool-call-delta', index: currentBlockIndex, id: callId, argumentsDelta: '' })
-            }
-            if (activeToolCall !== undefined) {
-              for (const delta of acpToolCallDelta(activeToolCall, update)) {
-                if (delta.kind === 'name') {
-                  queue.push({ type: 'tool-call-delta', index: currentBlockIndex, id: activeToolCall.callId, name: delta.name, argumentsDelta: '' })
-                } else {
-                  queue.push({ type: 'tool-call-delta', index: currentBlockIndex, id: activeToolCall.callId, argumentsDelta: delta.text })
-                }
-              }
+              if (reopened !== undefined) openToolCallBlock(reopened)
+            } else {
+              foldToolCallUpdate(update)
             }
           }
         } else if (kind === 'agent_message_chunk') {

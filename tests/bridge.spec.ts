@@ -285,6 +285,54 @@ describe('ACP bridge over stdio (mock agent)', () => {
     expect(finish?.reason).toEqual({ kind: 'stop' })
   }, 30_000)
 
+  it('gives every tool call its own block and treats restated input as a snapshot', async () => {
+    // The oml session bug, at both layers. ACP agents announce a call with a
+    // `rawInput` snapshot and then RESTATE the whole input on every update;
+    // folding those as append-deltas grew `{"cmd":""}{"cmd":"ls -la"}` garbage
+    // in the card arguments. And a second call announced while the first card
+    // was still open used to fold into the SAME block (the type-equality
+    // early-return), merging two cards into one.
+    const adapter = new AcpLlmAdapter(manager)
+    const chunks: StreamChunk[] = []
+    for await (const chunk of adapter.stream({
+      provider: 'acp',
+      model: 'mock',
+      sessionId: 'dsh-native-test-2',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'TWOTOOLS please' }] },
+      ],
+    })) {
+      chunks.push(chunk)
+    }
+
+    // Three announced calls — t1, t2, call_1 — three separate tool-call blocks,
+    // even though every one of them switches from a tool-call block to a
+    // tool-call block.
+    const starts = chunks.filter((c): c is Extract<StreamChunk, { type: 'block-start' }> =>
+      c.type === 'block-start' && c.blockType === 'tool-call')
+    expect(starts).toHaveLength(3)
+
+    // The restated `tool_call` for t1 folds as an update (no new block, no
+    // delta), and the replacement `rawInput` update pushes nothing — a
+    // replacement is not expressible as an append. call_1 keeps its standard
+    // two deltas (announcement + result content).
+    const toolDeltas = chunks.filter((c): c is Extract<StreamChunk, { type: 'tool-call-delta' }> => c.type === 'tool-call-delta')
+    expect(toolDeltas.map(c => c.id)).toEqual(['t1', 't2', 'call_1', 'call_1'])
+    expect(toolDeltas[0]).toMatchObject({ id: 't1', name: 'first tool', argumentsDelta: '{"cmd":""}' })
+    expect(toolDeltas[1]).toMatchObject({ id: 't2', argumentsDelta: '{"path":"a.md"}' })
+
+    // The settled cards carry the LATEST snapshot each — block-end replaces
+    // the block wholesale, so the replacement update lands verbatim instead
+    // of concatenating behind the announcement.
+    const settled = chunks.filter((c): c is Extract<StreamChunk, { type: 'block-end' }> =>
+      c.type === 'block-end'
+      && typeof c.block === 'object' && c.block !== null
+      && (c.block as { type?: string }).type === 'tool-call')
+    expect(settled.map(c => (c.block as { id?: string }).id)).toEqual(['t1', 't2', 'call_1'])
+    expect((settled[0]?.block as { arguments?: string }).arguments).toBe('{"cmd":"ls -la"}')
+    expect((settled[1]?.block as { arguments?: string }).arguments).toBe('{"path":"a.md"}')
+  }, 30_000)
+
   it('reports the ACP-mode preset from the harness roster it is wired to', async () => {
     // No roster reader wired (a host without `agentPresets`): no verdict, which
     // the panel renders as "no block" rather than "the preset is gone".

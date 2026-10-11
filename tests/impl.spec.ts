@@ -215,6 +215,45 @@ describe('ACP tool-call notifications → Chat tool-call chunks', () => {
     })
     expect(snapshot.argsRaw).toBe('first\n[diff /w/a.ts]\n[image]\n[terminal t1]')
   })
+
+  it('treats a restated rawInput as a snapshot, not an append', () => {
+    // ACP updates restate the whole input on every change; the host's
+    // accumulator CONCATENATES deltas, so folding a full snapshot as one would
+    // grow `{"cmd":""}{"cmd":"ls -la"}…` garbage (the oml session bug). Only
+    // a genuine string extension becomes a delta (plain-text args grow like
+    // that); a replacement pushes nothing and moves the snapshot, which the
+    // closing `block-end` frame states in full.
+    const snapshot = { callId: 'c', name: 't', argsRaw: 'Running the build' }
+    expect(acpToolCallDelta(snapshot, { toolCallId: 'c', arguments: 'Running the build for the oml workspace' }))
+      .toEqual([{ kind: 'args', text: ' for the oml workspace' }])
+    expect(snapshot.argsRaw).toBe('Running the build for the oml workspace')
+    // JSON growth is a REWRITE, not an extension — the closing brace moves.
+    expect(acpToolCallDelta(snapshot, { toolCallId: 'c', rawInput: '{"file":"a.md"}' }))
+      .toEqual([])
+    expect(snapshot.argsRaw).toBe('{"file":"a.md"}')
+    // A verbatim restatement changes nothing.
+    expect(acpToolCallDelta(snapshot, { toolCallId: 'c', rawInput: '{"file":"a.md"}' }))
+      .toEqual([])
+    expect(snapshot.argsRaw).toBe('{"file":"a.md"}')
+  })
+
+  it('lets input outrank content: the card shows what the tool was asked, not what it printed', () => {
+    const snapshot = { callId: 'c', name: 't', argsRaw: '{"file":"a.md"}' }
+    // The result text arrives as `content` AFTER input was seen: it is output,
+    // not arguments — ignored, or a Read card would swallow the whole file.
+    expect(acpToolCallDelta(snapshot, {
+      toolCallId: 'c',
+      content: [{ type: 'content', content: { type: 'text', text: '   1→ entire file body' } }],
+    })).toEqual([])
+    expect(snapshot.argsRaw).toBe('{"file":"a.md"}')
+    // Content only fills a call whose agent never sent input at all.
+    const silent = { callId: 'd', name: 't', argsRaw: '' }
+    expect(acpToolCallDelta(silent, {
+      toolCallId: 'd',
+      content: [{ type: 'content', content: { type: 'text', text: 'tool result line' } }],
+    })).toEqual([{ kind: 'args', text: 'tool result line' }])
+    expect(silent.argsRaw).toBe('tool result line')
+  })
 })
 
 describe('selectForwardPrompt (host request → forwarded ACP prompt)', () => {
