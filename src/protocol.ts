@@ -112,6 +112,20 @@ export interface AcpPluginConfig {
    * Default 15000 ms; `0` disables the fallback.
    */
   cancelFallbackMs?: number
+  /**
+   * How long to wait before resending a prompt the agent answered with
+   * `cancelled` although no cancel was requested for that turn. Some agents
+   * (observed on codebuddy 2.161.4) clean up cancel state asynchronously, and
+   * a prompt landing inside that cleanup window is answered with `cancelled`
+   * without generating a turn — the user's message is silently swallowed.
+   * The delay must outlast the agent's cleanup window. Default 600 ms.
+   */
+  staleCancelRetryDelayMs?: number
+  /**
+   * How many times a stale-cancelled prompt is resent before the host gives
+   * up and reports the `cancelled` stop as-is. Default 2.
+   */
+  staleCancelMaxRetries?: number
 }
 
 // ---- Host → browser events (`/api/acp/stream`, SSE) ----

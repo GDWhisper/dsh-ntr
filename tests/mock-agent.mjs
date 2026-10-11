@@ -6,7 +6,16 @@
  *  - "PERM"  → mid-turn session/request_permission (allow_once / reject_once)
  *  - "SLOW"  → a 5s pause that session/cancel interrupts (cancelled stopReason)
  *  - "DIE"   → emits one update then exits the process (crash → release → resume)
+ *  - "EMPTY" → only a usage_update, then a legal end_turn: the silent-failure
+ *              shape wild agents produce (pi-acp folds a provider 403 into a
+ *              normal stop), zero visible output
  *  - "IGNORE_CANCEL" → ignores session/cancel for ~1.2s, then finishes normally
+ *
+ * Stale-cancel window: for 300ms after a `session/cancel` the NEXT prompt is
+ * answered `cancelled` without generating a turn (the codebuddy 2.161.4
+ * cleanup race — cancel state is cleared asynchronously and the prompt that
+ * lands inside the window is swallowed). A prompt arriving after the window
+ * runs normally.
  *  - "READFILE <path>"   → reads the file through the client fs capability
  *  - "WRITEFILE <path>"  → writes 'written-by-mock-agent' through the client fs capability
  *  - "PWD"   → reports this PROCESS's own cwd (what an agent that derives its
@@ -24,6 +33,8 @@ import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from '@agentclientprot
 const sessions = new Map()
 const cancelled = new Set()
 const cancelWaiters = new Map()
+/** sessionId → epoch ms until which the next prompt is swallowed (stale cancel). */
+const cancelCleanupUntil = new Map()
 let counter = 0
 
 function mockConfigOptions(state = { temp: 'mid', model: 'mock-model-a', effort: 'high' }) {
@@ -109,6 +120,7 @@ const app = agent({ name: 'mock-acp-agent' })
   })
   .onNotification(methods.agent.session.cancel, ctx => {
     cancelled.add(ctx.params.sessionId)
+    cancelCleanupUntil.set(ctx.params.sessionId, Date.now() + 300)
     fireCancel(ctx.params.sessionId)
   })
   .onRequest(methods.agent.session.close, ctx => {
@@ -160,6 +172,19 @@ const app = agent({ name: 'mock-acp-agent' })
       .join(' ')
     const send = update => ctx.client.notify(methods.client.session.update, { sessionId, update })
     let permissionAnswer = 'none'
+
+    // Stale-cancel swallow: a prompt landing inside the cleanup window of the
+    // PREVIOUS cancel is answered from that cancel — no updates, no turn.
+    const cleanupUntil = cancelCleanupUntil.get(sessionId)
+    if (cleanupUntil !== undefined && Date.now() < cleanupUntil) {
+      return { stopReason: 'cancelled' }
+    }
+
+    if (text.includes('EMPTY')) {
+      // Bookkeeping frames only: opens no visible block in the host's fold.
+      await send({ sessionUpdate: 'usage_update', used: 5, size: 1000 })
+      return { stopReason: 'end_turn' }
+    }
 
     if (text.includes('DIE')) {
       await send({ sessionUpdate: 'agent_message_chunk', messageId: 'dying', content: { type: 'text', text: 'about to die' } })

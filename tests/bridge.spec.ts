@@ -973,6 +973,136 @@ describe('reliability (isolated manager, short timeouts)', () => {
   }, 30_000)
 })
 
+describe('stale cancel and silent stops (isolated manager)', () => {
+  const scWorkspace = `${tmpdir()}/dsh-ntr-sc-workspace`
+  mkdirSync(scWorkspace, { recursive: true })
+  const scHub = new EventHub()
+  const scEvents: AcpEvent[] = []
+  scHub.subscribe(event => { scEvents.push(event) })
+  const scManager = new BridgeManager(
+    [{
+      ...def,
+      id: 'sc',
+      cwd: scWorkspace,
+      allowedCwdRoots: [scWorkspace],
+    }],
+    scHub,
+    500,
+    undefined,
+    undefined,
+    true,
+    // cancelFallbackMs 800ms: longer than the mock's 300ms stale-cancel window,
+    // so the generation-guard case can start a successor turn before it fires.
+    { startupTimeoutMs: 2_500, cancelFallbackMs: 800, staleCancelRetryDelayMs: 500, staleCancelMaxRetries: 2 },
+  )
+
+  afterAll(async () => {
+    await scManager.shutdownAll()
+  })
+
+  function scWaitFor<T extends AcpEvent['type']>(type: T, predicate: (event: Extract<AcpEvent, { type: T }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: T }>> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${type}`)), timeoutMs)
+      const unsub = scHub.subscribe(event => {
+        if (event.type === type && predicate(event as Extract<AcpEvent, { type: T }>)) {
+          clearTimeout(timer)
+          unsub()
+          resolve(event as Extract<AcpEvent, { type: T }>)
+        }
+      })
+      const existing = scEvents.find(event => event.type === type && predicate(event as Extract<AcpEvent, { type: T }>))
+      if (existing !== undefined) {
+        clearTimeout(timer)
+        unsub()
+        resolve(existing as Extract<AcpEvent, { type: T }>)
+      }
+    })
+  }
+
+  it('does not force-finalize a LATER turn when an old cancel fallback fires', async () => {
+    const start = await dispatchRpc(scManager, 'session/start', { agentId: 'sc' })
+    if (!start.ok) throw new Error('start failed')
+    const id = (start.value as { sessionId: string }).sessionId
+
+    // Turn 1 settles promptly, so the fallback armed below outlives it.
+    const p1 = await dispatchRpc(scManager, 'session/prompt', { sessionId: id, text: 'hello' })
+    if (!p1.ok) throw new Error('prompt failed')
+    await scWaitFor('turn/end', event => event.sessionId === id && event.turnId === (p1.value as { turnId: string }).turnId && event.stopReason === 'end_turn')
+
+    // Cancel while IDLE: arms the 800ms fallback for the (already finished)
+    // current generation — exactly the timer that used to murder whatever
+    // turn happened to be running when it fired.
+    await dispatchRpc(scManager, 'session/cancel', { sessionId: id })
+    // Out-wait the mock's 300ms stale-cancel window so turn 2 is not swallowed.
+    await new Promise(resolve => setTimeout(resolve, 350))
+
+    // Turn 2 runs far longer than the remaining fallback window (the mock
+    // sleeps ~1.2s on IGNORE_CANCEL). Without the generation guard the timer
+    // would force-finalize THIS turn mid-flight and broadcast a bogus error.
+    const p2 = await dispatchRpc(scManager, 'session/prompt', { sessionId: id, text: 'IGNORE_CANCEL please' })
+    if (!p2.ok) throw new Error('prompt failed')
+    const end2 = await scWaitFor('turn/end', event => event.sessionId === id && event.turnId === (p2.value as { turnId: string }).turnId, 10_000)
+    expect(end2.stopReason).toBe('end_turn')
+    expect(end2.error).toBeUndefined()
+    expect(scEvents.some(event =>
+      event.type === 'turn/end'
+      && event.sessionId === id
+      && typeof event.error === 'string'
+      && event.error.includes('force-finalized'),
+    )).toBe(false)
+  }, 30_000)
+
+  it('resends a prompt the agent swallowed with a stale cancelled stop', async () => {
+    const start = await dispatchRpc(scManager, 'session/start', { agentId: 'sc' })
+    if (!start.ok) throw new Error('start failed')
+    const id = (start.value as { sessionId: string }).sessionId
+
+    // Turn 1 is cancelled properly (the mock answers it from the cancel).
+    const p1 = await dispatchRpc(scManager, 'session/prompt', { sessionId: id, text: 'SLOW please' })
+    if (!p1.ok) throw new Error('prompt failed')
+    await new Promise(resolve => setTimeout(resolve, 150))
+    await dispatchRpc(scManager, 'session/cancel', { sessionId: id })
+    await scWaitFor('turn/end', event => event.sessionId === id && event.turnId === (p1.value as { turnId: string }).turnId && event.stopReason === 'cancelled')
+
+    // Turn 2 lands inside the mock's 300ms cleanup window and is answered
+    // `cancelled` without a turn — the user's message, silently swallowed.
+    // The bridge must detect the stale stop (no cancel was requested for THIS
+    // generation) and resend after the retry delay, out-waiting the window.
+    const p2 = await dispatchRpc(scManager, 'session/prompt', { sessionId: id, text: 'fresh turn' })
+    if (!p2.ok) throw new Error('prompt failed')
+    const end2 = await scWaitFor('turn/end', event => event.sessionId === id && event.turnId === (p2.value as { turnId: string }).turnId, 10_000)
+    // Only the resent prompt can end normally: the first attempt was swallowed.
+    expect(end2.stopReason).toBe('end_turn')
+  }, 30_000)
+
+  it('reports a normal stop that produced no visible output', async () => {
+    // The pi-acp shape: an upstream failure folded into a legal end_turn,
+    // bookkeeping frames only — the user would see an empty bubble. The turn
+    // must carry a visible hint instead.
+    const adapter = new AcpLlmAdapter(scManager)
+    const chunks: StreamChunk[] = []
+    for await (const chunk of adapter.stream({
+      provider: 'acp',
+      model: 'sc',
+      sessionId: 'dsh-sc-empty-turn',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'EMPTY please' }] },
+      ],
+    })) {
+      chunks.push(chunk)
+    }
+
+    const text = chunks
+      .filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
+      .map(c => c.text)
+      .join('')
+    expect(text).toContain('no visible output')
+    expect(text).toContain('end_turn')
+    const finish = chunks.find((c): c is Extract<StreamChunk, { type: 'finish' }> => c.type === 'finish')
+    expect(finish?.reason.kind).toBe('stop')
+  }, 30_000)
+})
+
 describe('native approval routing (isolated manager)', () => {
   const approvalHub = new EventHub()
   const approvalEvents: AcpEvent[] = []

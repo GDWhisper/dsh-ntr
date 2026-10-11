@@ -19,6 +19,8 @@
         # startupTimeoutMs: 60000    # budget for initialize / session/new / session/load
         # permissionTimeoutMs: 0     # auto-cancel a pending approval after N ms (0 = wait for the human forever)
         # cancelFallbackMs: 15000    # force-finalize a turn the agent ignores after session/cancel (0 = off)
+        # staleCancelRetryDelayMs: 600  # resend a prompt answered cancelled with no cancel requested (0 = at once)
+        # staleCancelMaxRetries: 2      # cap on those resends before the cancelled stop is reported as-is
         # ACP 模式 (agent preset) is declared by this package's own bundle
         # patch list (package.json `dsh.bundle.patch` → presets/acp/acp.patch.yml),
         # so it needs no install step and has no config knob. The settings card

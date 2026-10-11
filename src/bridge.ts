@@ -112,6 +112,28 @@ interface LiveSession {
    * protocol forbids a second `session/prompt` on a busy session.
    */
   settled?: Promise<void>
+  /**
+   * The resolver of {@link settled}, kept alongside so turn-scoped force
+   * finalization (the cancel fallback) can open the gate without owning the
+   * stream. Cleared by the same settler that clears {@link settled}.
+   */
+  settledResolve?: () => void
+  /**
+   * Monotonic per-session counter, bumped at every turn start (both the
+   * `/acp` RPC path and the adapter's `streamPrompt`). Turn-scoped timers —
+   * the cancel fallback — capture it when armed and compare when they fire:
+   * a timer whose generation has moved on belongs to a turn that already
+   * ended, and must not force-finalize the LATER turn now on air.
+   */
+  turnSeq: number
+  /**
+   * The {@link turnSeq} of the turn `session/cancel` was last called for.
+   * A `cancelled` stopReason on a turn whose generation does not match is
+   * not the user's cancel: some agents answer the NEXT prompt with the
+   * PREVIOUS cancel while still cleaning up (the stale-cancel swallow), and
+   * that answer means the message was silently dropped.
+   */
+  cancelRequestedAtTurn?: number
   transcript: Transcript
 }
 
@@ -120,6 +142,16 @@ export interface BridgeTuning {
   startupTimeoutMs?: number
   permissionTimeoutMs?: number
   cancelFallbackMs?: number
+  /**
+   * How long to wait before resending a prompt the agent answered `cancelled`
+   * although no cancel was requested for that turn — the stale-cancel swallow
+   * (codebuddy answers the NEXT prompt with the PREVIOUS cancel while it is
+   * still cleaning up). The delay must outlast the agent's cleanup window;
+   * measured at 250ms on codebuddy 2.161.4, so the default is 600ms.
+   */
+  staleCancelRetryDelayMs?: number
+  /** How many times a stale-cancelled prompt is resent before giving up. */
+  staleCancelMaxRetries?: number
   /**
    * How long a new turn waits for the agent to settle a predecessor that is
    * still running on its side (an aborted turn we already stopped streaming).
@@ -186,6 +218,8 @@ const DEFAULT_TUNING: Required<BridgeTuning> = {
   startupTimeoutMs: 60_000,
   permissionTimeoutMs: 0,
   cancelFallbackMs: 15_000,
+  staleCancelRetryDelayMs: 600,
+  staleCancelMaxRetries: 2,
   turnSettleMs: 5_000,
   idleTimeoutMs: 1_800_000,
   probeIdleTimeoutMs: 300_000,
@@ -212,6 +246,8 @@ export class AgentBridge {
   private readonly startupTimeoutMs: number
   private readonly permissionTimeoutMs: number
   private readonly cancelFallbackMs: number
+  private readonly staleCancelRetryDelayMs: number
+  private readonly staleCancelMaxRetries: number
   private readonly turnSettleMs: number
   private readonly defaultIdleTimeoutMs: number
   private readonly probeIdleTimeoutMs: number
@@ -265,6 +301,8 @@ export class AgentBridge {
     this.startupTimeoutMs = merged.startupTimeoutMs
     this.permissionTimeoutMs = merged.permissionTimeoutMs
     this.cancelFallbackMs = merged.cancelFallbackMs
+    this.staleCancelRetryDelayMs = merged.staleCancelRetryDelayMs
+    this.staleCancelMaxRetries = merged.staleCancelMaxRetries
     this.turnSettleMs = merged.turnSettleMs
     this.defaultIdleTimeoutMs = merged.idleTimeoutMs
     this.probeIdleTimeoutMs = merged.probeIdleTimeoutMs
@@ -405,9 +443,13 @@ export class AgentBridge {
     let settle: () => void = () => { /* replaced below */ }
     const settled = new Promise<void>(resolve => { settle = resolve })
     session.settled = settled
+    session.settledResolve = settle
     this.touch()
     return () => {
-      if (session.settled === settled) session.settled = undefined
+      if (session.settled === settled) {
+        session.settled = undefined
+        session.settledResolve = undefined
+      }
       settle()
       // The turn is over: a fresh window starts here rather than at the prompt
       // that may have started a long time ago.
@@ -638,6 +680,7 @@ export class AgentBridge {
       acpSessionId: result.sessionId,
       cwd: resolved,
       running: false,
+      turnSeq: 0,
       closed: false,
       released: false,
       transcript: new Transcript(this.transcriptMax),
@@ -699,21 +742,42 @@ export class AgentBridge {
    * Fire one prompt turn. Returns after the agent settles the turn; the caller
    * (manager) keeps the UI informed through broadcast events, so the RPC that
    * started the turn can answer `accepted` immediately.
+   *
+   * A `cancelled` stop on a turn the user never cancelled is the stale-cancel
+   * swallow (the agent is still cleaning up the PREVIOUS cancel and answers
+   * the new prompt from it — observed on codebuddy, which drops the message
+   * without generating a turn). The same prompt is resent after
+   * {@link BridgeTuning.staleCancelRetryDelayMs}, out-waiting the cleanup
+   * window, bounded by {@link BridgeTuning.staleCancelMaxRetries}; a genuinely
+   * requested cancel (`cancelRequestedAtTurn` still names this generation)
+   * returns as-is.
    */
   async runPrompt(session: LiveSession, text: string, turnId: string): Promise<string> {
     const conn = this.conn
     if (conn === undefined || session.closed || session.released) throw new AcpError('session_closed', 'acp: session is closed')
     this.touch()
-    const result = await conn.agent.request(methods.agent.session.prompt, {
-      sessionId: session.acpSessionId,
-      prompt: [{ type: 'text', text }],
-    })
-    return result.stopReason
+    for (let attempt = 0; ; attempt += 1) {
+      const result = await conn.agent.request(methods.agent.session.prompt, {
+        sessionId: session.acpSessionId,
+        prompt: [{ type: 'text', text }],
+      })
+      if (result.stopReason !== 'cancelled' || session.cancelRequestedAtTurn === session.turnSeq) {
+        return result.stopReason
+      }
+      if (attempt >= this.staleCancelMaxRetries) return result.stopReason
+      await new Promise(resolve => setTimeout(resolve, this.staleCancelRetryDelayMs))
+      if (session.closed || this.conn !== conn) throw new AcpError('session_closed', 'acp: session is closed')
+      this.touch()
+    }
   }
 
   async cancel(session: LiveSession): Promise<void> {
     if (this.conn === undefined) return
     this.touch()
+    // Name the generation this cancel belongs to, so `runPrompt` can tell a
+    // real cancel apart from a stale one and the fallback timer can tell its
+    // own turn apart from a later one.
+    session.cancelRequestedAtTurn = session.turnSeq
     await this.conn.agent.notify(methods.agent.session.cancel, { sessionId: session.acpSessionId }).catch(() => { /* best effort */ })
     this.armCancelFallback(session)
   }
@@ -721,15 +785,30 @@ export class AgentBridge {
   /**
    * An agent that ignores the `session/cancel` notification must not wedge the
    * session in `running` forever (every later prompt would fail with
-   * `turn_in_flight`). Force-finalize the turn after the grace period; the
-   * real `session/prompt` response may still arrive later and is folded in by
-   * the manager as usual.
+   * `turn_in_flight`), nor leave the adapter turn's settle gate hanging (every
+   * later prompt would fail with `unsettled`). Force-finalize the turn after
+   * the grace period; the real `session/prompt` response may still arrive
+   * later and is folded in by the manager as usual.
+   *
+   * The timer is generation-guarded: it belongs to the turn `cancel` was
+   * called for. If that turn already ended and a LATER turn is on air (the
+   * agent settled late, the user moved on), firing would murder the innocent
+   * successor — so a moved-on {@link LiveSession.turnSeq} disarms it.
    */
   private armCancelFallback(session: LiveSession): void {
     if (this.cancelFallbackMs <= 0) return
+    const turnGen = session.turnSeq
     const timer = setTimeout(() => {
-      if (session.closed || !session.running) return
+      if (session.closed || session.turnSeq !== turnGen) return
+      // Nothing is in flight anymore (the turn settled on its own): nothing to
+      // finalize. A still-pending settle gate counts as in flight even though
+      // the stream is gone — that gate is what the next prompt waits on.
+      if (!session.running && session.settled === undefined) return
       session.running = false
+      const settle = session.settledResolve
+      session.settled = undefined
+      session.settledResolve = undefined
+      settle?.()
       this.hub.broadcast({
         type: 'turn/end',
         sessionId: session.sessionId,
@@ -2552,6 +2631,7 @@ export class BridgeManager {
     const { bridge, session } = await this.locateOrResume(sessionId)
     if (session.running) throw new AcpError('turn_in_flight', 'acp: this session already has a prompt in flight')
     session.running = true
+    session.turnSeq += 1
     const turnId = randomUUID()
     this.hub.broadcast({ type: 'turn/start', sessionId, turnId, text })
     void bridge.runPrompt(session, text, turnId)
@@ -2874,6 +2954,7 @@ export class BridgeManager {
 
     const queue = new AsyncQueue<StreamChunk>()
     session.running = true
+    session.turnSeq += 1
     const turnId = randomUUID()
     this.hub.broadcast({ type: 'turn/start', sessionId: session.sessionId, turnId, text: promptText })
 
@@ -2889,6 +2970,15 @@ export class BridgeManager {
      */
     let activeToolCall: AcpToolCallSnapshot | undefined
     let latestUsage: { inputTokens: number; outputTokens: number } | null = null
+    /**
+     * Whether the fold loop pushed at least one block the chat plane renders
+     * (text / reasoning / tool-call). Usage and other bookkeeping updates do
+     * NOT count: some agents fold an upstream failure (provider 403, auth,
+     * billing) into a legal `end_turn` while emitting only bookkeeping frames
+     * (observed on pi-acp), and the user is left with an empty bubble and no
+     * hint. A normal stop with zero visible output is reported below.
+     */
+    let sawVisibleBlock = false
 
     const blockEndChunk = () => ({
       type: 'block-end' as const,
@@ -2911,6 +3001,7 @@ export class BridgeManager {
       currentBlockIndex++
       activeBlockType = targetType
       activeBlockText = ''
+      sawVisibleBlock = true
       queue.push({
         type: 'block-start',
         index: currentBlockIndex,
@@ -2930,6 +3021,7 @@ export class BridgeManager {
       activeBlockType = 'tool-call'
       activeBlockText = ''
       activeToolCall = snapshot
+      sawVisibleBlock = true
       queue.push({
         type: 'block-start',
         index: currentBlockIndex,
@@ -3062,6 +3154,16 @@ export class BridgeManager {
           if (stopReason === 'cancelled') {
             finishStream({ kind: 'aborted', failure: { message: 'Turn was cancelled', code: 'CANCELLED' } })
           } else {
+            if (!sawVisibleBlock) {
+              // The silent-failure report: a normal stop with nothing the chat
+              // plane renders. An aborted or already-failing turn needs no
+              // extra hint; this is specifically the "protocol says success,
+              // the bubble is empty" case.
+              switchToBlock('text')
+              const line = `\n[dsh-ntr] agent "${session.agentId}" ended the turn with no visible output (stop reason: ${stopReason}). Some agents fold upstream failures — auth, billing, rate limits — into a normal stop; try resending, and check the agent process logs if it repeats.\n`
+              activeBlockText += line
+              queue.push({ type: 'text-delta', index: currentBlockIndex, text: line })
+            }
             finishStream({ kind: 'stop' })
           }
         })

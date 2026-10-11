@@ -19,7 +19,7 @@ DeepSeek Harness (DSH) Web 插件：把浏览器变成一个 **ACP（Agent Clien
 - **无感断线重连（双向）**：浏览器↔宿主方向靠每会话环形事件缓存池（Transcript）按序补齐；宿主↔agent 方向靠 `session/load` 会话恢复——agent 进程崩溃后会话进入 released 状态（历史可读、上下文不丢），下次发消息自动 respawn 并回放会话历史（"发送即恢复"），无需人工重建会话。
 - **工作区沙箱内的客户端文件能力**：实现 ACP `fs/read_text_file` / `fs/write_text_file`（含 `line`/`limit` 分页、单次 2 MiB 上限、自动创建父目录），所有路径经与 session cwd 相同的 `allowedCwdRoots` 白名单校验，越权访问直接拒绝。
 - **空闲释放（只释放“没有会话”的进程，探测进程与聊天进程分档）**：设置面板的「探测模型」、保存后的后台探测、启动时的目录预热都会拉起 agent 进程，而它们**不留任何会话**——这类进程以前会一直常驻。现在空闲释放窗口分两档：**探测拉起的进程**（从未承载过真实会话，探测的 throwaway session 刻意不登记）空闲 5 分钟（`probeIdleTimeoutMs`）即释放，即使 agent 配了 `idleTimeoutMs: 0` 也不例外——那是聊天进程的常驻承诺；**承载过真实会话的进程**按每个 agent 可配的 `idleTimeoutMs`（默认 30 分钟，`0` = 永不释放）常驻。判定统一是：进程 READY 且**没有任何活动会话**（也没有进行中的探测 / 恢复 / 待答审批）时，空闲超过所属档位的时长就**静默释放**（杀掉子进程、状态回落 `stopped`，不发任何提示——这是预期生命周期，不是故障）。有活动会话的 agent **绝不**被释放，所以聊天不会因此多出冷启动；被释放的探测残留也不丢任何东西——已挂起的 released 会话记录原样保留，下次发送照旧走 `session/load` 恢复。
-- **可靠性兜底**：agent 启动期请求（`initialize` / `session/new` / `session/load`）受 `startupTimeoutMs` 约束（默认 60s），挂死的 agent 会被杀掉并报可操作错误（含 stderr 尾部）；agent 无视 `session/cancel` 时经 `cancelFallbackMs`（默认 15s）强制定稿 turn，会话永不卡死。
+- **可靠性兜底**：agent 启动期请求（`initialize` / `session/new` / `session/load`）受 `startupTimeoutMs` 约束（默认 60s），挂死的 agent 会被杀掉并报可操作错误（含 stderr 尾部）；agent 无视 `session/cancel` 时经 `cancelFallbackMs`（默认 15s）强制定稿 turn——兜底带 **turn 世代守卫**，迟到结算的旧 turn 不会让定时器误杀用户新发的 turn，且强制定稿会同时解开适配器路径的 settle 闸门，会话永不卡死；一部分 agent（实测 codebuddy）异步清理取消状态，会把上一轮的取消错答给紧跟着的下一条消息（秒回 `cancelled`、消息无痕丢失）——`runPrompt` 按「本世代是否发起过取消」识别这种**粘滞取消**并自动重发（`staleCancelRetryDelayMs` / `staleCancelMaxRetries`，默认 600ms / 2 次）；agent 把上游失败折叠成合法 `end_turn` 时（实测 pi-acp），聊天平面不再只剩空气泡——零可见产出的正常结束会带一条显式告警。
 - **聊天会话跑在你的工作区里**：对话里起的 ACP 会话，工作目录就是你在这个 DSH 会话里选中的工作区（sidebar 选的那个目录，即会话 header cwd）——对端 agent 的 Read / Glob / Bash 看到的就是它，`session/new` 报回的 cwd 也是它，**agent 进程本身也从那里启动**（有一类 agent 在进程启动时就定死自己的「工作区」，只改 `session/new` 的 cwd 它会照旧回答插件沙箱目录 `~/.dsh/acp-workspaces`；进程只在没有活动会话时才会被搬到该目录，有会话则保持原进程）。agent 卡片里的「工作空间目录」只对 `/acp` 直连会话与宿主未上报工作区的场合生效（面板上已注明）。agent 崩溃后的 `session/load` 恢复同样锚在该目录。
 - **工作区白名单可编辑**：设置面板把工作区拆成「单根模式」（一个工作空间目录，留空则用宿主默认 `~/.dsh/acp-workspaces`）与「白名单根目录（高级）」（多根逐条增删）；单根模式保存时会把白名单显式收窄为该目录，绝不静默放宽；非绝对路径就地校验。保存前有「会停止该 Agent 进程并中断进行中的会话」的副作用提示。
 - **对话内的 agent 原生模式控件**：agent 自己声明的 mode（`plan`、`acceptEdits` 之类，`session/set_mode` 枚举）会以小控件形式出现在聊天输入框工具行（`conversation.input.left`，就在 DSH 的 Access mode 旁边）——它管“agent 怎么干活”，Access mode 管“会话能碰什么”，两层各管一段；该聊天会话还没跑过 agent（或该 agent 未声明 mode）时控件自动不显示，切模式不重启进程。
@@ -92,6 +92,8 @@ DeepSeek Harness (DSH) Web 插件：把浏览器变成一个 **ACP（Agent Clien
     # startupTimeoutMs: 60000      # initialize / session/new / session/load 的超时
     # permissionTimeoutMs: 0       # 审批挂起超时自动取消（0 = 永久等待人工决策）
     # cancelFallbackMs: 15000      # session/cancel 后 agent 无响应的强制定稿时限（0 = 关闭）
+    # staleCancelRetryDelayMs: 600 # agent 把上一轮的取消错答给下一轮消息时的重发等待
+    # staleCancelMaxRetries: 2     # 上述重发的次数上限
 ```
 
 ## 构建与安装

@@ -74,10 +74,15 @@ describe('validateConfig', () => {
     expect(config.startupTimeoutMs).toBe(60_000)
     expect(config.permissionTimeoutMs).toBe(0)
     expect(config.cancelFallbackMs).toBe(15_000)
+    expect(config.staleCancelRetryDelayMs).toBe(600)
+    expect(config.staleCancelMaxRetries).toBe(2)
     expect(() => validateConfig({ agents: [], startupTimeoutMs: 500 })).toThrow(/startupTimeoutMs/)
     expect(() => validateConfig({ agents: [], permissionTimeoutMs: -1 })).toThrow(/permissionTimeoutMs/)
     expect(() => validateConfig({ agents: [], cancelFallbackMs: 601_000 })).toThrow(/cancelFallbackMs/)
+    expect(() => validateConfig({ agents: [], staleCancelRetryDelayMs: 60_001 })).toThrow(/staleCancelRetryDelayMs/)
+    expect(() => validateConfig({ agents: [], staleCancelMaxRetries: 6 })).toThrow(/staleCancelMaxRetries/)
     expect(validateConfig({ agents: [], permissionTimeoutMs: 60_000, cancelFallbackMs: 0 }).cancelFallbackMs).toBe(0)
+    expect(validateConfig({ agents: [], staleCancelRetryDelayMs: 0, staleCancelMaxRetries: 0 }).staleCancelMaxRetries).toBe(0)
   })
   it('keeps idleTimeoutMs optional per agent and bounds it when present', () => {
     // Absent means "host default": a config stored before this field existed

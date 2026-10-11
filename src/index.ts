@@ -96,6 +96,8 @@ export function apply(ctx: Context, config?: unknown): void {
       startupTimeoutMs: resolved.startupTimeoutMs,
       permissionTimeoutMs: resolved.permissionTimeoutMs,
       cancelFallbackMs: resolved.cancelFallbackMs,
+      staleCancelRetryDelayMs: resolved.staleCancelRetryDelayMs,
+      staleCancelMaxRetries: resolved.staleCancelMaxRetries,
     },
   )
   const adapter = new AcpLlmAdapter(manager)

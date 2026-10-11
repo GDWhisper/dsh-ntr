@@ -262,6 +262,14 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
   if (typeof cancelFallbackMs !== 'number' || !Number.isInteger(cancelFallbackMs) || cancelFallbackMs < 0 || cancelFallbackMs > 600_000) {
     throw new AcpError('bad_config', 'acp: cancelFallbackMs must be an integer in [0, 600000] (0 = disable the fallback)')
   }
+  const staleCancelRetryDelayMs = value.staleCancelRetryDelayMs ?? 600
+  if (typeof staleCancelRetryDelayMs !== 'number' || !Number.isInteger(staleCancelRetryDelayMs) || staleCancelRetryDelayMs < 0 || staleCancelRetryDelayMs > 60_000) {
+    throw new AcpError('bad_config', 'acp: staleCancelRetryDelayMs must be an integer in [0, 60000] (0 = resend immediately)')
+  }
+  const staleCancelMaxRetries = value.staleCancelMaxRetries ?? 2
+  if (typeof staleCancelMaxRetries !== 'number' || !Number.isInteger(staleCancelMaxRetries) || staleCancelMaxRetries < 0 || staleCancelMaxRetries > 5) {
+    throw new AcpError('bad_config', 'acp: staleCancelMaxRetries must be an integer in [0, 5]')
+  }
   return {
     agents,
     transcriptMaxEntries: max,
@@ -269,6 +277,8 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
     startupTimeoutMs,
     permissionTimeoutMs,
     cancelFallbackMs,
+    staleCancelRetryDelayMs,
+    staleCancelMaxRetries,
   }
 }
 
