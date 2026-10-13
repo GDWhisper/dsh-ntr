@@ -273,7 +273,7 @@ describe('acp-guard preset row', () => {
    * listeners directly — the real dispatch (`dispatch.waterfall`) is a runtime
    * concern these tests stand in for.
    */
-  function guardCtx() {
+  function guardCtx(services: Record<string, unknown> = {}) {
     const listeners = new Map<string, { listener: (payload: unknown, next: () => Promise<unknown>) => Promise<unknown>; options?: unknown }>()
     return {
       listeners,
@@ -281,6 +281,7 @@ describe('acp-guard preset row', () => {
         listeners.set(name, { listener, options })
         return () => {}
       }),
+      get: vi.fn((service: string) => services[service]),
     }
   }
 
@@ -359,6 +360,144 @@ describe('acp-guard preset row', () => {
     } finally {
       registry.defaultModel = previousDefault
     }
+  })
+
+  it('registers a scoped virtual tool for a name nothing resolves', async () => {
+    // The host loop executes every tool-call block in a settled ACP message —
+    // that execution record IS the card the Chat plane draws. With no tool
+    // registered each call recorded `Error: unknown tool "Bash"`. The guard
+    // answers the `tools/execute` waterfall by registering a scoped virtual
+    // tool whose body replays the call's real output.
+    const ctx = guardCtx()
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    const execute = ctx.listeners.get('tools/execute')
+    if (execute === undefined) throw new Error('guard registered no tools/execute listener')
+
+    const registered: Array<{ name: string; execute: (args: unknown, exec: unknown) => unknown; output: { render: (args: unknown, value: unknown) => unknown } }> = []
+    const tools = {
+      get: vi.fn(() => undefined),
+      register: vi.fn((definition: { name: string; execute: (args: unknown, exec: unknown) => unknown; output: { render: (args: unknown, value: unknown) => unknown } }) => {
+        registered.push(definition)
+        return () => {}
+      }),
+    }
+    ctx.get.mockImplementation((service: string) => (service === 'tools' ? tools : undefined))
+
+    const concludeTurn = vi.fn()
+    const next = vi.fn(async () => 'dispatched')
+    const outcome = await execute.listener(
+      { name: 'Bash', agent: { id: 'acp-agent' }, callId: 'c1', concludeTurn },
+      next,
+    )
+    expect(outcome).toBe('dispatched')
+    expect(next).toHaveBeenCalledTimes(1)
+    expect(registered).toHaveLength(1)
+    expect(registered[0]?.name).toBe('Bash')
+
+    // The body answers from the shared tool-output record and deliberately
+    // does NOT conclude the turn: the Chat plane's answer detection refuses
+    // any message containing a tool-call block, so the loop must propose the
+    // continuation step for the buffered answer to replay as the second,
+    // tool-free message (the pre-step gate lets exactly that batch through).
+    const { routeBindingRegistry } = await import('../src/bridge.ts')
+    routeBindingRegistry().toolResults.set('c1', 'REAL TOOL OUTPUT')
+    try {
+      const body = registered[0]?.execute({}, { callId: 'c1', concludeTurn })
+      expect(body).toEqual({ text: 'REAL TOOL OUTPUT' })
+      expect(concludeTurn).not.toHaveBeenCalled()
+      // Content blocks the registry can snapshot straight into the result.
+      expect(registered[0]?.output.render({}, { text: 'REAL TOOL OUTPUT' })).toEqual([
+        { type: 'text', text: 'REAL TOOL OUTPUT' },
+      ])
+    } finally {
+      routeBindingRegistry().toolResults.delete('c1')
+    }
+  })
+
+  it('answers a call with no recorded output with the fallback note', async () => {
+    const ctx = guardCtx()
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    const execute = ctx.listeners.get('tools/execute')
+    if (execute === undefined) throw new Error('guard registered no tools/execute listener')
+    const registered: Array<{ name: string; execute: (args: unknown, exec: unknown) => unknown; output: { render: (args: unknown, value: unknown) => unknown } }> = []
+    ctx.get.mockImplementation((service: string) => (service === 'tools' ? {
+      get: () => undefined,
+      register: vi.fn((definition: { name: string; execute: (args: unknown, exec: unknown) => unknown; output: { render: (args: unknown, value: unknown) => unknown } }) => {
+        registered.push(definition)
+        return () => {}
+      }),
+    } : undefined))
+
+    const concludeTurn = vi.fn()
+    await execute.listener({ name: 'Read', agent: {}, callId: 'no-output', concludeTurn }, async () => 'ok')
+    expect(registered[0]?.execute({}, { callId: 'no-output', concludeTurn })).toEqual({
+      text: 'This tool call ran inside the ACP agent process; its output lives in the ACP transcript view.',
+    })
+    expect(concludeTurn).not.toHaveBeenCalled()
+  })
+
+  it('lets the continuation batch of its own display cards through the pre-step gate', async () => {
+    // The second half of the two-step turn shape: after the loop executed the
+    // ACP cards, the staged tool results propose the continuation step. Every
+    // call id was folded into the shared registry by the bridge, so the gate
+    // passes the batch and the adapter replays the buffered answer on it.
+    const ctx = guardCtx()
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    const step = ctx.listeners.get('agent/pre-step')
+    if (step === undefined) throw new Error('guard registered no pre-step listener')
+
+    const { routeBindingRegistry } = await import('../src/bridge.ts')
+    routeBindingRegistry().toolResults.set('own-1', 'output')
+    try {
+      const decision = {
+        messages: [
+          { role: 'tool', source: { kind: 'tool', callId: 'own-1' }, content: [{ type: 'text', text: 'output' }] },
+        ],
+      }
+      const outcome = await step.listener(decision, async () => decision)
+      expect(outcome).toBe(decision)
+    } finally {
+      routeBindingRegistry().toolResults.delete('own-1')
+    }
+  })
+
+  it('still rejects a no-user batch whose tool calls the bridge never saw', async () => {
+    // A foreign continuation (tool results this row did not produce) would
+    // re-send the person's last words to the ACP agent on forward.
+    const ctx = guardCtx()
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    const step = ctx.listeners.get('agent/pre-step')
+    if (step === undefined) throw new Error('guard registered no pre-step listener')
+
+    const decision = {
+      messages: [
+        { role: 'tool', source: { kind: 'tool', callId: 'foreign-1' }, content: [] },
+      ],
+    }
+    const outcome = await step.listener(decision, async () => decision)
+    expect(outcome).toEqual({ kind: 'reject' })
+  })
+
+  it('never shadows a real tool and degrades silently without the tools service', async () => {
+    const ctx = guardCtx()
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    const execute = ctx.listeners.get('tools/execute')
+    if (execute === undefined) throw new Error('guard registered no tools/execute listener')
+
+    // A name that resolves to a REAL definition passes untouched.
+    const realTool = { name: 'Bash' }
+    const register = vi.fn()
+    ctx.get.mockImplementation((service: string) => (service === 'tools' ? { get: () => realTool, register } : undefined))
+    const next = vi.fn(async () => 'real')
+    expect(await execute.listener({ name: 'Bash', agent: {}, callId: 'c2' }, next)).toBe('real')
+    expect(register).not.toHaveBeenCalled()
+
+    // A host without the `tools` service reachable from this scope degrades to
+    // the plain dispatch (the old error result; the pre-step gate still bounds
+    // the re-prompt damage).
+    ctx.get.mockImplementation(() => undefined)
+    const fallback = vi.fn(async () => 'plain')
+    expect(await execute.listener({ name: 'Bash', agent: {}, callId: 'c3' }, fallback)).toBe('plain')
   })
 
   it('rejects a continuation step fed with nothing the person said', async () => {

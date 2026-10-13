@@ -20,6 +20,7 @@ import {
   resolveFsPath,
   resolveSessionCwd,
   selectForwardPrompt,
+  isAcpToolContinuation,
   sessionAgentPreset,
   sessionAgentPresetFromLog,
   splitAdapterModelId,
@@ -292,6 +293,28 @@ describe('selectForwardPrompt (host request → forwarded ACP prompt)', () => {
       { role: 'user', content: [{ type: 'text', text: '  first  ' }, { type: 'image', url: 'x' }, { type: 'text', text: 'second' }] },
     ])).toEqual({ kind: 'prompt', text: 'first  \nsecond' })
     expect(selectForwardPrompt([{ role: 'user', content: [{ type: 'text', text: '   ' }] }])).toEqual({ kind: 'no-user-input' })
+  })
+})
+
+describe('isAcpToolContinuation (staged tool results after the person said something)', () => {
+  const user = (text: string) => ({ source: { kind: 'user' }, content: [{ type: 'text', text }] })
+  const tool = (callId: string) => ({ role: 'tool', source: { kind: 'tool', callId }, content: [] })
+
+  it('is true exactly when tool results trail the last user message', () => {
+    expect(isAcpToolContinuation([])).toBe(false)
+    expect(isAcpToolContinuation([user('fresh words')])).toBe(false)
+    expect(isAcpToolContinuation([user('run the tests'), tool('c1')])).toBe(true)
+    expect(isAcpToolContinuation([tool('c1')])).toBe(true)
+    expect(isAcpToolContinuation([user('older'), tool('c1'), tool('c2')])).toBe(true)
+  })
+
+  it('is false when a user message follows the tools (a fresh prompt, not a replay)', () => {
+    expect(isAcpToolContinuation([tool('c1'), user('next question')])).toBe(false)
+    expect(isAcpToolContinuation([user('run the tests'), tool('c1'), user('now commit')])).toBe(false)
+    // A source-less message counts as user input — the same convention
+    // `selectForwardPrompt` uses for hand-built requests.
+    expect(isAcpToolContinuation([user('run the tests'), tool('c1'), { role: 'user', content: [{ type: 'text', text: 'again' }] }])).toBe(false)
+    expect(isAcpToolContinuation([{ role: 'tool', source: { kind: 'tool', callId: 'c1' } }, { role: 'user', content: [] }])).toBe(false)
   })
 })
 

@@ -778,9 +778,11 @@ export function acpToolCallArgsOf(update: Record<string, unknown>): string {
 /**
  * Fold ACP tool-call `content` into plain text, with a bracketed placeholder for
  * the kinds the Chat card cannot render. Shares its shape with the ACP view's
- * line fold so both halves read an agent's content the same way.
+ * line fold so both halves read an agent's content the same way. Exported for
+ * the bridge's tool-output record (the shared registry the guard's virtual
+ * tools answer from), so both halves fold an agent's result identically.
  */
-function updateContentToText(content: unknown): string {
+export function updateContentToText(content: unknown): string {
   if (!Array.isArray(content)) return ''
   const out: string[] = []
   for (const item of content) {
@@ -850,6 +852,37 @@ export function selectForwardPrompt(messages: readonly {
   }
   if (last !== undefined) return { kind: 'prompt', ...last }
   return sawUserRole ? { kind: 'no-user-input' } : { kind: 'empty' }
+}
+
+/**
+ * Whether this request is the CONTINUATION step of a turn whose first step
+ * settled with tool-call blocks — which is exactly what the ACP agent's display
+ * cards are. The host agent-loop starts a next step whenever the settled
+ * assistant message contains `tool-call` blocks, feeding it the staged tool
+ * results: the request's message list then has `tool`-sourced messages AFTER
+ * the last user-sourced one. A fresh prompt never does (the person's new words
+ * are the last message); history from earlier turns sits before the new user
+ * text, so it cannot trip this.
+ *
+ * The adapter replays the buffered answer on such a step instead of touching
+ * the ACP agent — its turn already ran to completion in step 1 (see
+ * `BridgeManager.streamPrompt` and docs/acp-convergence.md §1.6).
+ */
+export function isAcpToolContinuation(messages: readonly {
+  source?: { kind?: string }
+}[]): boolean {
+  let lastTool = -1
+  for (let i = 0; i < messages.length; i += 1) {
+    if (messages[i]?.source?.kind === 'tool') lastTool = i
+  }
+  if (lastTool < 0) return false
+  for (let i = lastTool + 1; i < messages.length; i += 1) {
+    const kind = messages[i]?.source?.kind
+    // A source-less message counts as user input — the same convention
+    // `selectForwardPrompt` uses for hand-built requests.
+    if (kind === undefined || kind === 'user') return false
+  }
+  return true
 }
 
 // ---- The agent's own permission vocabulary ----

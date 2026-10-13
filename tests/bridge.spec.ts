@@ -235,7 +235,6 @@ describe('ACP bridge over stdio (mock agent)', () => {
     expect(types).toContain('block-start')
     expect(types).toContain('reasoning-delta')
     expect(types).toContain('block-end')
-    expect(types).toContain('text-delta')
     expect(types).toContain('usage')
     expect(types).toContain('finish')
 
@@ -272,10 +271,12 @@ describe('ACP bridge over stdio (mock agent)', () => {
     expect(toolEnd?.block).toMatchObject({ type: 'tool-call', id: 'call_1', name: 'mock tool' })
     expect((toolEnd?.block as { arguments?: string }).arguments).toContain('tool result line')
 
-    // Text block
+    // The answer text does NOT stream here: the mock's message chunks arrive
+    // after the tool card, and the Chat plane's answer detection refuses any
+    // message containing a tool-call block — so they buffered for the
+    // continuation step (`pendingToolAnswers`).
     const textDeltas = chunks.filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
-    const answer = textDeltas.map(c => c.text).join('')
-    expect(answer).toBe('MOCK: echo hello from native chat perm=none')
+    expect(textDeltas).toHaveLength(0)
 
     // Usage and finish
     const usage = chunks.find((c): c is Extract<StreamChunk, { type: 'usage' }> => c.type === 'usage')
@@ -283,6 +284,31 @@ describe('ACP bridge over stdio (mock agent)', () => {
 
     const finish = chunks.find((c): c is Extract<StreamChunk, { type: 'finish' }> => c.type === 'finish')
     expect(finish?.reason).toEqual({ kind: 'stop' })
+
+    // The continuation step — staged tool results after the person's words —
+    // replays the buffer as a SECOND, tool-free message: the shape the Chat
+    // plane's answer detection accepts as the answer.
+    const continued: StreamChunk[] = []
+    for await (const chunk of adapter.stream({
+      provider: 'acp',
+      model: 'mock',
+      sessionId: 'dsh-native-test-1',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'hello from native chat' }] },
+        { role: 'tool', source: { kind: 'tool', callId: 'call_1' }, content: [{ type: 'text', text: 'tool result line' }] },
+      ],
+    })) {
+      continued.push(chunk)
+    }
+    const answer = continued
+      .filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
+      .map(c => c.text).join('')
+    expect(answer).toBe('MOCK: echo hello from native chat perm=none')
+    const answerEnd = continued.find((c): c is Extract<StreamChunk, { type: 'block-end' }> => c.type === 'block-end')
+    expect(answerEnd?.block).toEqual({ type: 'text', text: answer })
+    expect(continued.find((c): c is Extract<StreamChunk, { type: 'finish' }> => c.type === 'finish')?.reason).toEqual({ kind: 'stop' })
+    // Usage rode step 1; the replay step adds none (no double counting).
+    expect(continued.some(c => c.type === 'usage')).toBe(false)
   }, 30_000)
 
   it('gives every tool call its own block and treats restated input as a snapshot', async () => {
@@ -331,7 +357,57 @@ describe('ACP bridge over stdio (mock agent)', () => {
     expect(settled.map(c => (c.block as { id?: string }).id)).toEqual(['t1', 't2', 'call_1'])
     expect((settled[0]?.block as { arguments?: string }).arguments).toBe('{"cmd":"ls -la"}')
     expect((settled[1]?.block as { arguments?: string }).arguments).toBe('{"path":"a.md"}')
+
+    // The codebuddy interleave: t1's titled restatement arrives while t2's card
+    // is the open block. It must NOT open a duplicate t1 card — three calls,
+    // three cards (indices 1..3; the mock's leading thought chunk owns 0) — and
+    // t1's final content-only update lands in the shared tool-output record the
+    // guard's virtual tools answer from.
+    expect(starts.map(c => (c as { index: number }).index)).toEqual([1, 2, 3])
+    expect(routeBindingRegistry().toolResults.get('t1')).toBe('T1 OUTPUT LINE')
+    routeBindingRegistry().toolResults.delete('t1')
+
+    // The answer replay: the mock's message chunks arrived after the first
+    // card, so they buffered; the continuation step delivers them as the
+    // tool-free answer message.
+    const continued: StreamChunk[] = []
+    for await (const chunk of adapter.stream({
+      provider: 'acp',
+      model: 'mock',
+      sessionId: 'dsh-native-test-2',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'TWOTOOLS please' }] },
+        { role: 'tool', source: { kind: 'tool', callId: 't1' }, content: [{ type: 'text', text: 'T1 OUTPUT LINE' }] },
+      ],
+    })) {
+      continued.push(chunk)
+    }
+    expect(continued
+      .filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
+      .map(c => c.text).join('')).toBe('MOCK: echo TWOTOOLS please perm=none')
   }, 30_000)
+
+  it('answers a tool-only turn with a pointer note on the continuation step', async () => {
+    // Cards executed but the agent sent no text: the stash is empty, so the
+    // continuation delivers the note instead of a silent bubble.
+    const adapter = new AcpLlmAdapter(manager)
+    const chunks: StreamChunk[] = []
+    for await (const chunk of adapter.stream({
+      provider: 'acp',
+      model: 'mock',
+      sessionId: 'dsh-native-toolonly',
+      messages: [
+        { role: 'tool', source: { kind: 'tool', callId: 'call_x' }, content: [{ type: 'text', text: 'x' }] },
+      ],
+    })) {
+      chunks.push(chunk)
+    }
+    const text = chunks
+      .filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
+      .map(c => c.text).join('')
+    expect(text).toContain('sent no text reply')
+    expect(chunks.find((c): c is Extract<StreamChunk, { type: 'finish' }> => c.type === 'finish')?.reason).toEqual({ kind: 'stop' })
+  })
 
   it('reports the ACP-mode preset from the harness roster it is wired to', async () => {
     // No roster reader wired (a host without `agentPresets`): no verdict, which
@@ -423,10 +499,27 @@ describe('ACP bridge over stdio (mock agent)', () => {
     })) {
       chunks.push(chunk)
     }
+    // The echo does not stream in step 1: the mock's message chunks arrive
+    // after its tool call, so they buffered for the continuation step.
     const answer = chunks
       .filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
       .map(c => c.text).join('')
-    expect(answer).toBe('MOCK: echo hello from the person perm=none')
+    expect(answer).toBe('')
+    const continued: StreamChunk[] = []
+    for await (const chunk of adapter.stream({
+      provider: 'acp',
+      model: 'mock',
+      sessionId,
+      messages: [
+        { role: 'user', id: 'u1', source: { kind: 'user' }, content: [{ type: 'text', text: 'hello from the person' }] },
+        { role: 'tool', source: { kind: 'tool', callId: 'call_1' }, content: [{ type: 'text', text: 'tool result line' }] },
+      ],
+    })) {
+      continued.push(chunk)
+    }
+    expect(continued
+      .filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
+      .map(c => c.text).join('')).toBe('MOCK: echo hello from the person perm=none')
 
     // A session-title call rides the same logged route; it must not become an
     // ACP turn (it would spend a remote turn on a title, or fold a harness
@@ -501,8 +594,22 @@ describe('ACP bridge over stdio (mock agent)', () => {
       chunks.push(chunk)
     }
 
-    const textDeltas = chunks.filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
-    const answer = textDeltas.map(c => c.text).join('')
+    // The echo rides the continuation step (the two-step turn shape).
+    const continued: StreamChunk[] = []
+    for await (const chunk of adapter.stream({
+      provider: 'acp',
+      model: 'mock',
+      sessionId: 'dsh-native-perm-test',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'hello PERM allowed' }] },
+        { role: 'tool', source: { kind: 'tool', callId: 'call_1' }, content: [{ type: 'text', text: 'tool result line' }] },
+      ],
+    })) {
+      continued.push(chunk)
+    }
+    const answer = continued
+      .filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
+      .map(c => c.text).join('')
     expect(answer).toBe('MOCK: echo hello PERM allowed perm=allow1')
 
     await manager.setPermission('mock', 'ask')
@@ -1759,7 +1866,21 @@ describe('prompt slot (isolated manager)', () => {
     // Once the agent has settled, the session is usable again: nothing wedged.
     await new Promise(resolve => setTimeout(resolve, 1_600))
     const third = await drain('hello again')
-    const text = third
+    // The echo rides the continuation step (the two-step turn shape), so the
+    // settled turn is followed by the staged-results replay.
+    const thirdAnswer: StreamChunk[] = []
+    for await (const chunk of slotAdapter.stream({
+      provider: 'acp',
+      model: 'slot',
+      sessionId: 'dsh-slot',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'hello again' }] },
+        { role: 'tool', source: { kind: 'tool', callId: 'call_1' }, content: [{ type: 'text', text: 'tool result line' }] },
+      ],
+    })) {
+      thirdAnswer.push(chunk)
+    }
+    const text = thirdAnswer
       .filter((chunk): chunk is Extract<StreamChunk, { type: 'text-delta' }> => chunk.type === 'text-delta')
       .map(chunk => chunk.text)
       .join('')

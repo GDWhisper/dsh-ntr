@@ -44,8 +44,10 @@ import {
   resolveFsPath,
   resolveSessionCwd,
   selectForwardPrompt,
+  isAcpToolContinuation,
   acpPresetStatusFromRoster,
   splitAdapterModelId,
+  updateContentToText,
   validateAgentDef,
 } from './impl.ts'
 import type {
@@ -1757,6 +1759,13 @@ export const ACP_ROUTE_BINDING_KEY = Symbol.for('dsh-ntr.acp-binding')
 export interface AcpRouteBindingRegistry {
   /** DSH chat session id → the adapter model (`agentId` | `agentId@choice`) its next turn runs on. */
   readonly conversations: Map<string, string>
+  /**
+   * ACP tool call id → the tool's output folded to plain text. The guard's
+   * `tools/execute` listener answers the host loop's execution of an ACP
+   * display card from here, so the card records the tool's REAL output
+   * instead of an `unknown tool` error (see `recordAcpToolOutput`).
+   */
+  readonly toolResults: Map<string, string>
   /** Bare agent id served when a conversation carries no explicit binding (`undefined`: no rewrite). */
   defaultModel?: string
 }
@@ -1770,9 +1779,39 @@ export function routeBindingRegistry(): AcpRouteBindingRegistry {
   const host = globalThis as unknown as { [ACP_ROUTE_BINDING_KEY]?: AcpRouteBindingRegistry }
   const existing = host[ACP_ROUTE_BINDING_KEY]
   if (existing !== undefined) return existing
-  const registry: AcpRouteBindingRegistry = { conversations: new Map() }
+  const registry: AcpRouteBindingRegistry = { conversations: new Map(), toolResults: new Map() }
   host[ACP_ROUTE_BINDING_KEY] = registry
   return registry
+}
+
+/** Bounds for the shared tool-output record (see {@link recordAcpToolOutput}). */
+const TOOL_OUTPUT_MAX_ENTRIES = 200
+const TOOL_OUTPUT_MAX_CHARS = 16_000
+
+/** Bounds for {@link BridgeManager.pendingToolAnswers} (one per conversation, transient). */
+const PENDING_TOOL_ANSWERS_MAX = 32
+
+/**
+ * Record one ACP tool call for the guard's virtual tools. The host loop
+ * "executes" every tool-call block in a settled ACP message (that execution
+ * record is what draws the card); the preset registers no tools, so each call
+ * used to record `Error: unknown tool "<name>"`. The guard's `tools/execute`
+ * listener instead registers a scoped virtual tool per name, and its body
+ * answers with THIS record — the tool's real output, folded by the same helper
+ * the ACP view uses. Every seen call id is recorded, even with empty output:
+ * the guard's pre-step gate identifies its own continuation batches by exactly
+ * this membership. Bounded: entries are transient, but an agent that inlines
+ * whole files must not grow the process-wide map without limit.
+ */
+export function recordAcpToolOutput(callId: string, text: string): void {
+  if (callId === '') return
+  const registry = routeBindingRegistry()
+  registry.toolResults.set(callId, text.length > TOOL_OUTPUT_MAX_CHARS ? `${text.slice(0, TOOL_OUTPUT_MAX_CHARS)}…` : text)
+  while (registry.toolResults.size > TOOL_OUTPUT_MAX_ENTRIES) {
+    const oldest = registry.toolResults.keys().next().value
+    if (oldest === undefined) break
+    registry.toolResults.delete(oldest)
+  }
 }
 
 /** Routes host session ids to their owning bridge. */
@@ -1781,6 +1820,18 @@ export class BridgeManager {
   private readonly defsMap = new Map<string, AcpAgentDef>()
   /** The plugin's own default ACP agent id (persisted; see `persistAgents`). */
   private defaultAgentId?: string
+  /**
+   * Answer text buffered for the continuation step of a tool-bearing turn
+   * (`dshSessionId` → text). The Chat plane's answer detection refuses any
+   * message containing a tool-call block (`dsh-client-ui-chat`'s
+   * `latestAnswer`), so the ACP agent's answer — which arrives interleaved
+   * with its tool cards — must reach it as a SECOND, tool-free message: step 1
+   * streams reasoning + the cards and buffers the text from the first card on;
+   * the loop's continuation step (staged tool results,
+   * `isAcpToolContinuation`) replays it. Consumed by the very next
+   * continuation step; dropped at the next real prompt.
+   */
+  private readonly pendingToolAnswers = new Map<string, string>()
 
   constructor(
     defs: readonly AcpAgentDef[],
@@ -2843,6 +2894,35 @@ export class BridgeManager {
       return
     }
 
+    // A tool-bearing ACP turn arrives as TWO driver steps. The host loop
+    // starts a next step whenever the settled assistant message contains
+    // `tool-call` blocks — which is exactly what the ACP agent's cards are —
+    // feeding it the staged tool results. The Chat plane's answer detection
+    // (`latestAnswer`) refuses any message that contains a tool-call block,
+    // so the answer text must land in a SECOND, tool-free message: step 1
+    // streamed reasoning + the cards and buffered the text since the first
+    // card opened; this step replays that buffer. Nothing is sent to the ACP
+    // agent — its turn already ran to completion in step 1 (see
+    // `isAcpToolContinuation` and docs/acp-convergence.md §1.6).
+    if (isAcpToolContinuation(options.messages ?? [])) {
+      const buffered = options.sessionId === undefined
+        ? undefined
+        : this.pendingToolAnswers.get(options.sessionId)
+      if (options.sessionId !== undefined) this.pendingToolAnswers.delete(options.sessionId)
+      if (options.signal?.aborted) {
+        yield { type: 'finish', reason: { kind: 'aborted', failure: { message: 'aborted', code: 'ABORTED' } } }
+        return
+      }
+      const text = buffered === undefined || buffered === ''
+        ? `\n[dsh-ntr] agent "${agentId}" executed its tool call(s) but sent no text reply this turn — the tool details are in the ACP transcript view.\n`
+        : buffered
+      yield { type: 'block-start', index: 0, blockType: 'text' }
+      yield { type: 'text-delta', index: 0, text }
+      yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+      return
+    }
+
     // Auxiliary host calls (`session-title`, `compaction`) ride the session's
     // logged route, so they reach this adapter looking like a turn. They are not
     // conversation: forwarding one would spend a remote agent turn on a title
@@ -2862,6 +2942,10 @@ export class BridgeManager {
       }
       return
     }
+
+    // A real prompt: any stash left over from an interrupted turn is dead —
+    // the continuation step that would have consumed it never ran.
+    if (options.sessionId !== undefined) this.pendingToolAnswers.delete(options.sessionId)
 
     // Forward the person's own words: the host folds its context sections
     // (AGENTS.md digest, skill catalog, runtime snapshot) after the claimed user
@@ -2962,6 +3046,14 @@ export class BridgeManager {
     let activeBlockType: 'reasoning' | 'text' | 'tool-call' | null = null
     let activeBlockText = ''
     /**
+     * Answer text held back from this stream. Text that arrives AFTER the
+     * first tool-call card belongs to the answer, and the Chat plane's answer
+     * detection refuses any message containing a tool-call block — so it must
+     * reach the plane as a second, tool-free message. It is stashed at turn
+     * end (see `pendingToolAnswers`) and replayed by the continuation step.
+     */
+    let answerBuffer = ''
+    /**
      * The open tool-call block's accumulated snapshot, or `undefined` while the
      * active block is prose. ACP has no fixed shape for tool-call content, so
      * this is where `callId` / `name` / `argsRaw` live until the block closes —
@@ -2979,6 +3071,17 @@ export class BridgeManager {
      * hint. A normal stop with zero visible output is reported below.
      */
     let sawVisibleBlock = false
+    /**
+     * Tool calls already given a card this turn. ACP agents (codebuddy) restate
+     * the WHOLE `tool_call` on every progress tick — announcement, a
+     * command-titled rewrite, then a final restatement carrying the result as
+     * `content` — and with parallel calls the restatements interleave
+     * (A, B, A, B, …). A restatement for a call whose card already CLOSED used
+     * to open a duplicate card: 2 real calls became 6 cards, each executed by
+     * the host loop. A call gets exactly one card; later restatements only
+     * refresh the output record (see `recordAcpToolOutput`).
+     */
+    const seenCalls = new Set<string>()
 
     const blockEndChunk = () => ({
       type: 'block-end' as const,
@@ -3064,35 +3167,51 @@ export class BridgeManager {
           // A real tool call, not prose: the host's accumulator turns these
           // deltas into `{ kind: 'tool-call', callId, name, argsRaw }` and the
           // Chat plane renders the card the ACP view used to own. A restated
-          // `tool_call` for the call already on air is an update, not a new
-          // card — agents announce a call once and then update it.
+          // `tool_call` for a call that already has a card is never a second
+          // card — agents announce a call once and then restate it (open card:
+          // an update; closed card: only the output record can still change).
           const snapshot = acpToolCallFromUpdate(update)
           if (snapshot !== undefined) {
+            recordAcpToolOutput(snapshot.callId, updateContentToText(update.content))
             if (activeBlockType === 'tool-call' && activeToolCall?.callId === snapshot.callId) {
               foldToolCallUpdate(update)
-            } else {
+            } else if (!seenCalls.has(snapshot.callId)) {
+              seenCalls.add(snapshot.callId)
               openToolCallBlock(snapshot)
             }
           }
         } else if (kind === 'tool_call_update') {
-          // Fold the update into the open card. An update for a call that is not
-          // open (the agent skipped its `tool_call` announcement) opens one:
-          // dropping it would lose the result entirely.
+          // Fold the update into the open card. An update for a call that is
+          // not open (the agent skipped its `tool_call` announcement) opens one:
+          // dropping it would lose the result entirely. A call that already has
+          // a closed card only refreshes the output record.
           const callId = typeof update.toolCallId === 'string' ? update.toolCallId.trim() : ''
           if (callId !== '') {
-            if (activeBlockType !== 'tool-call' || activeToolCall?.callId !== callId) {
-              const reopened = acpToolCallFromUpdate({ ...update, toolCallId: callId })
-              if (reopened !== undefined) openToolCallBlock(reopened)
-            } else {
+            recordAcpToolOutput(callId, updateContentToText(update.content))
+            if (activeBlockType === 'tool-call' && activeToolCall?.callId === callId) {
               foldToolCallUpdate(update)
+            } else if (!seenCalls.has(callId)) {
+              const reopened = acpToolCallFromUpdate({ ...update, toolCallId: callId })
+              if (reopened !== undefined) {
+                seenCalls.add(callId)
+                openToolCallBlock(reopened)
+              }
             }
           }
         } else if (kind === 'agent_message_chunk') {
           const content = update.content as Record<string, unknown> | undefined
           if (content?.type === 'text' && typeof content.text === 'string') {
-            switchToBlock('text')
-            activeBlockText += content.text
-            queue.push({ type: 'text-delta', index: currentBlockIndex, text: content.text })
+            if (seenCalls.size > 0) {
+              // After the first card this is the ANSWER: the Chat plane
+              // refuses any message containing a tool-call block, so it must
+              // not join this stream's message. Buffer it for the continuation
+              // step (replayed via `pendingToolAnswers`).
+              answerBuffer += content.text
+            } else {
+              switchToBlock('text')
+              activeBlockText += content.text
+              queue.push({ type: 'text-delta', index: currentBlockIndex, text: content.text })
+            }
           }
         } else if (kind === 'usage_update') {
           const used = typeof update.used === 'number' ? update.used : 0
@@ -3154,6 +3273,27 @@ export class BridgeManager {
           if (stopReason === 'cancelled') {
             finishStream({ kind: 'aborted', failure: { message: 'Turn was cancelled', code: 'CANCELLED' } })
           } else {
+            if (seenCalls.size > 0) {
+              // Cards streamed: the loop will execute them (the guard's virtual
+              // tools answer with the real outputs) and propose the continuation
+              // step, which replays this buffer as the answer message. An EMPTY
+              // buffer is a legal stash — the continuation then reports the
+              // tool-only turn instead of silence.
+              if (session.dshSessionId !== undefined) {
+                this.pendingToolAnswers.set(session.dshSessionId, answerBuffer)
+                while (this.pendingToolAnswers.size > PENDING_TOOL_ANSWERS_MAX) {
+                  const oldest = this.pendingToolAnswers.keys().next().value
+                  if (oldest === undefined) break
+                  this.pendingToolAnswers.delete(oldest)
+                }
+              } else if (answerBuffer !== '') {
+                // No conversation id to hand the buffer to: flush it into this
+                // stream rather than dropping the answer.
+                switchToBlock('text')
+                activeBlockText += answerBuffer
+                queue.push({ type: 'text-delta', index: currentBlockIndex, text: answerBuffer })
+              }
+            }
             if (!sawVisibleBlock) {
               // The silent-failure report: a normal stop with nothing the chat
               // plane renders. An aborted or already-failing turn needs no

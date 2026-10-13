@@ -234,13 +234,18 @@ const app = agent({ name: 'mock-acp-agent' })
       // The shapes the wild agents (codebuddy) actually send: a call announced
       // with a `rawInput` snapshot that later updates RESTATE IN WHOLE (the
       // update is a replacement, not an append), and a second call announced
-      // while the first card is still the open block.
+      // while the first card is still the open block. The restatements also
+      // INTERLEAVE across parallel calls — the t1 restatement below lands
+      // while t2's card is the open block, and the final t1 update carries
+      // the tool's real output as `content`.
       await send({ sessionUpdate: 'tool_call', toolCallId: 't1', title: 'first tool', rawInput: '{"cmd":""}' })
       await send({ sessionUpdate: 'tool_call_update', toolCallId: 't1', rawInput: '{"cmd":"ls -la"}' })
       // Some agents restate the announcement instead of updating; the same
       // callId on an open card is an update, never a second card.
       await send({ sessionUpdate: 'tool_call', toolCallId: 't1', title: 'first tool', rawInput: '{"cmd":"ls -la"}' })
       await send({ sessionUpdate: 'tool_call', toolCallId: 't2', title: 'second tool', rawInput: { path: 'a.md' } })
+      await send({ sessionUpdate: 'tool_call', toolCallId: 't1', title: '`ls -la`', rawInput: '{"cmd":"ls -la"}' })
+      await send({ sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'completed', content: [{ type: 'content', content: { type: 'text', text: 'T1 OUTPUT LINE' } }] })
     }
 
     await send({ sessionUpdate: 'tool_call', toolCallId: 'call_1', title: 'mock tool', kind: 'other', status: 'pending' })

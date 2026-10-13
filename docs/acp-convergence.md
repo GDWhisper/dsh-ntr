@@ -148,6 +148,76 @@ turn 2 跑了 4 个 step）给出完整链条：
 第二张卡折进第一张（日志里三张卡的参数互相串味即此），`openToolCallBlock` 按
 callId 显式断块；同 callId 重发的 `tool_call` 按更新折叠。
 
+**第二轮事故（2026-10-11，同日）——重复卡片与 `unknown tool` 错误堆**。上述修复
+后实测（会话 `session-34788953`，turn 2 第一条消息 24 个块里 18 个 tool-call）
+暴露了两个残留：
+
+1. **重发会交错，已闭的卡挡不住重复**。codebuddy 把整条 `tool_call` 重发
+   **三遍**当进度用：announce（title=`Bash`）→ 命令串 title 的重写 → 最后一次
+   带**结果 content** 的重发；并行调用的重发**交错**（A,B,A,B,A,B）。「同
+   callId 折为更新」只在卡片还开着时生效，B 开着时 A 的重发就开出重复卡——
+   2 个真实调用变成 6 张卡，且第三遍重发的空 title/空 args 让卡片退化成
+   `unknown tool ""`。修复：每 turn 一个 `seenCalls` 注册表，**每个 callId 只开
+   一张卡**；已见 callId 的重述只刷新输出记录（`recordAcpToolOutput`），不再
+   开卡。accumulator 对已闭合 index 的迟到 `block-end` 是**忽略**的（malformed
+   stream），所以「回头替换已闭块」这条路不通，去重必须在发射侧做。
+2. **`unknown tool` 错误堆有 seam 可掐**。执行记录就是卡片，执行掐不得；但
+   `dsh-tools` 的 `tools/execute` waterfall 是公开扩展点（listener 不调
+   `next()` 即短路，非 error 返回值仍要过 `resolveExecution`，error 形状免检
+   通过）。guard 的第四职责走得更进一步：对解析不到的工具名**即时注册一个
+   agent 作用域的虚拟工具**（`tools.register` 按 calling ctx 的层落位；工具体
+   从共享注册表 `toolResults` 取该 callId 的真实输出——桥在折叠循环里把每条
+   `tool_call`/`tool_call_update` 的 content 折成文本写入）。卡片从红色
+   `Error: unknown tool "Bash"` 变成带真实输出的正常卡。`tools` 服务缺席/
+   注册失败时静默放行，退回旧行为。（工具体最初调 `exec.concludeTurn()` 让
+   turn 在卡片后直接完成；§1.6 的答案折叠修复把它拿掉了——loop 必须提出
+   续跑步，缓冲的答案才有地方落。）
+
+### 1.6 宿主聊天包的两条渲染规则：答案判定与消息内卡片（acp-test-2，2026-10-11）
+
+现象：ACP 回合结束后，整个回合（思考、**答案、工具卡**）折叠进「已完成，
+用时 N 秒」的过程行，看起来「agent 的话全成了思考」；工具卡片永远钉在回合
+底部。日志证明桥的发射无罪——settled `assistant/message` 的块数组交错正确
+（reasoning / tool-call / text），正式答案就在 `text` 块里；英文思考与
+「过渡句在两个通道各发一遍」是 codebuddy 自己的行为。两条规则都在 DSH 侧
+（asar 内 `@deepseek-ai/dsh-client-ui-chat`）：
+
+1. **答案判定**（`latestAnswer(turn)`）：只要最后一步消息的 blocks 含任何
+   `tool-call` 块就返回 `null`——原生回合在工具调用后会有「干净的第二条答案
+   消息」，ACP 回合是单条消息，必不合格。`answerAnchorSeq === null` 使全回合
+   节点都成为「过程成员」，compact / standard / detailed 三档全部
+   `foldCompletedTurns: true`（仅 verbose 不折叠；默认 `detailed`），回合一
+   结束就整体折叠。`StreamChunk` 没有 step/消息边界 chunk，adapter 拆不出
+   「干净的第二条答案消息」，所以在插件侧无解。
+2. **消息内卡片不渲染**（`AssistantMarkdown`）：消息体对 `tool-call` 块显式
+   跳过（`case "tool-call": break`）；卡片只由宿主 loop 在消息落定**之后**
+   执行的 `tool/call` 审计事件创建（执行对象是 guard 注册的虚拟工具，输出
+   回放自共享注册表 `toolResults`——链路实测有效，Read 卡的结果就是真实文件
+   内容），节点顺序恒为答案在前、卡片在后 → 置底，流式期间同样最后才出现。
+
+插件侧的修复（2026-10-11 当日落地，acp-test-3 复测后用户确认）：**两步形状**。
+`latestAnswer` 只看最后一步的 assistant 消息，那就让答案自己成为第二步：
+step 1 流式发 reasoning + 工具卡，第一张卡之后的文本**缓冲不发**
+（`answerBuffer`），turn 收尾 stash 进 `pendingToolAnswers`（src/bridge.ts，
+按 dshSessionId 有界）；loop 执行完卡片后提出的续跑步由
+`isAcpToolContinuation`（src/impl.ts：最后一条用户来源消息之后跟着 tool
+来源消息——新鲜 prompt 的用户消息永远在最后，不会误判）认出，adapter
+**原样回放缓冲文本成第二条无工具消息**，不碰 ACP agent（它的 turn 在
+step 1 已跑完）。配套改动：guard 虚拟工具**不再调 `exec.concludeTurn()`**
+（loop 必须提出续跑步）；pre-step 闸门为「callId 都在共享注册表里」的 tool
+批次开唯一例外（其余无用户批次照旧 reject）；`recordAcpToolOutput` 空
+content 也记录（闸门成员判定靠它）；缓冲空时续步发「只调了工具没输出」的
+指引文案。DSH 侧仍值得提的两条——`latestAnswer` 放宽、消息体按原位渲染
+tool-call——在插件侧修好可见性之后只剩锦上添花。
+
+同日操作记录：`session-34788953` 的历史日志因旧构建的重复 tool-call 块被宿主
+`@deepseek-ai/dsh-session-persistence-jsonl` 拒载（`SessionFormatError:
+assistant/message repeats advertised tool call`，校验在 `verifyCurrentGeneration`
+一族）。修复：每 id 保留**首个**块（首个带真实 name/args，末个多为空名空参
+的退化重述），删 32 行重复的 `tool/call` + `tool/result` 审计行（结果全是
+`unknown tool` 错误），重排 seq，用宿主自己的校验器验证 `ok:true`；原文件
+备份为同目录 `session.v4.jsonl.zstd.bak-1791707886`。
+
 ---
 
 ## 2. 目标形态
