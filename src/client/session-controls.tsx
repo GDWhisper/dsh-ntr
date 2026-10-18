@@ -222,8 +222,6 @@ export interface MenuContext {
   route: RouteInfo
   /** The bound agent's own model surface (`agent/catalog`), if it has loaded. */
   catalog?: AgentCatalogResult
-  /** The agent's own mode list (`session/set_mode`), if it has loaded. */
-  agentModes?: SessionView['modes']
   error?: string
 }
 
@@ -247,11 +245,6 @@ function agentSection(context: MenuContext): AcpMenuSection {
   }
   return {
     id: 'agent',
-    title: acp.label('智能体（这个会话由谁服务）', 'Agent (who serves this conversation)'),
-    note: acp.label(
-      '切换从下一条消息开始生效；同一个 agent 内换模型/思考等级不会丢上下文。',
-      'A switch applies from your next message; model/effort changes inside one agent keep its context.',
-    ),
     items,
   }
 }
@@ -346,28 +339,14 @@ function thoughtSection(context: MenuContext): AcpMenuSection {
 }
 
 /**
- * The agent's OWN mode list (`session/set_mode`) — the agent's vocabulary for
- * HOW it works (plan / acceptEdits / …), untouched by DSH. Absent for an agent
- * that declares no modes, and absent before one has run here.
+ * REMOVED on purpose (2026-10-17): the agent's own `session/set_mode` list used
+ * to ride inside the agent base's menu. It has its own control
+ * (`AcpComposerMode`, the native-mode select in `conversation.input.left`), so
+ * duplicating it in the base made two entries for one setting and put four
+ * unrelated axes behind a control whose only job is "who serves this
+ * conversation". Do not reintroduce it here — the editor belongs to
+ * composer-mode.tsx.
  */
-function agentModeSection(context: MenuContext): AcpMenuSection | undefined {
-  const { acp, agentModes } = context
-  const modes = agentModes?.availableModes ?? []
-  if (modes.length === 0) return undefined
-  return {
-    id: 'agent-mode',
-    title: acp.label('agent 自己的工作模式', "The agent's own mode"),
-    note: acp.label(
-      '由 agent 自己定义，与 DSH 的 Access mode 互补。',
-      "Defined by the agent itself; complementary to DSH's access mode.",
-    ),
-    items: modes.map(mode => ({
-      id: mode.id,
-      label: mode.name ?? mode.id,
-      active: mode.id === (agentModes?.currentModeId ?? modes[0]?.id),
-    })),
-  }
-}
 
 /** Build the picker model for one kind. */
 export function menuFor(kind: AcpMenuKind, context: MenuContext): {
@@ -380,19 +359,21 @@ export function menuFor(kind: AcpMenuKind, context: MenuContext): {
   const { acp, route } = context
 
   if (kind === 'agent') {
-    const sections: AcpMenuSection[] = [agentSection(context)]
-    const model = modelSection(context)
-    if (model !== undefined) sections.push(model)
-    if (route.efforts.length > 0) sections.push(thoughtSection(context))
-    const mode = agentModeSection(context)
-    if (mode !== undefined) sections.push(mode)
+    // The agent base is ONLY the entry point for starting/replacing the agent
+    // (user decision, 2026-10-17). Everything else the agent publishes — its
+    // models, its thought levels, its own modes — has a seat of its own and is
+    // reached from there, so stacking them in here turned one gesture ("who
+    // serves this conversation") into a four-section dump and made the agent
+    // list harder to scan. One control, one job.
+    //
+    // ONE heading, no note (user decision, 2026-10-18): the menu header says it
+    // and the section adds no second title. The previous caption spelled out
+    // where the other axes live and how switching applies — true, but it read
+    // as a manual for a list that is self-explanatory, and it pushed the rows
+    // down for no information the user needed at the moment of picking.
     return {
-      title: acp.label('ACP 模式', 'ACP mode'),
-      note: acp.label(
-        '这条会话跑的是 ACP 预设：模型只能是对端 agent。别的模型在这条会话里没有工具、也不是它在说话。',
-        'This session runs the ACP preset: the model can only be the external agent. Any other model would have no tools here — and it would not be the agent talking.',
-      ),
-      sections,
+      title: acp.label('选择你的 Agent', 'Choose your agent'),
+      sections: [{ ...agentSection(context), title: undefined, note: undefined }],
     }
   }
 
@@ -444,7 +425,6 @@ export function AcpSessionMenu(props: AcpClusterProps) {
       agents,
       route,
       ...catalog === undefined ? {} : { catalog },
-      ...bound?.modes === undefined ? {} : { agentModes: bound.modes },
       ...menu.error === undefined ? {} : { error: menu.error },
     })
   } catch (error) {
@@ -465,9 +445,9 @@ export function AcpSessionMenu(props: AcpClusterProps) {
         await acp.setChatSessionModel(sessionId, itemId)
       } else if (sectionId === 'thought') {
         await acp.setChatSessionEffort(sessionId, itemId === 'provider-default' ? undefined : itemId)
-      } else if (sectionId === 'agent-mode') {
-        await acp.setChatSessionMode(sessionId, itemId, agentId)
       } else {
+        // `agent-mode` used to be handled here; the agent's mode list now lives
+        // only in the composer-mode control (see the removed-section note).
         return
       }
       await acp.loadChatSessions(sessionId)

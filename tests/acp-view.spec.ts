@@ -262,22 +262,34 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
   const routed = describeRoute([agent], bound, undefined, catalog)
   const modes = { currentModeId: 'plan', availableModes: [{ id: 'plan', name: 'Plan' }, { id: 'acceptEdits', name: 'Accept edits' }] }
 
-  it('stacks every axis the agent publishes in one screen', () => {
+  it('offers ONLY the agent roster in the agent base', () => {
+    // The base is the entry point for "who serves this conversation" and
+    // nothing else (user decision, 2026-10-17). Every other axis the agent
+    // publishes has its own control, so seeing it stacked in here too meant
+    // two entries for one setting and a four-section dump behind one gesture.
     const menu = menuFor('agent', { ...base, route: routed, agentModes: modes })
-    expect(menu.sections.map(section => section.id)).toEqual(['agent', 'model', 'thought', 'agent-mode'])
+    expect(menu.sections.map(section => section.id)).toEqual(['agent'])
     expect(menu.sections[0]?.items[0]).toMatchObject({ id: 'pi', active: true, dot: '#22c55e' })
-    expect(menu.sections[2]?.items.map(item => item.id)).toEqual(['provider-default', 'high'])
-    expect(menu.sections[3]?.items.map(item => item.id)).toEqual(['plan', 'acceptEdits'])
-    expect(menu.sections[3]?.items[0]).toMatchObject({ active: true })
+    // The agent's own modes are adjacent to the roster but NOT in this menu:
+    // they belong to the composer-mode select alone.
+    expect(menu.sections.some(section => section.id === 'agent-mode')).toBe(false)
   })
 
-  it('offers the base entry plus the exposed variants, and nothing else', () => {
-    const menu = menuFor('agent', { ...base, route: routed })
-    const models = menu.sections.find(section => section.id === 'model')
+  it('shows the base entry plus the exposed variants in the MODEL picker', () => {
+    // The model axis did not disappear — it moved to its own chip, which is
+    // where the model control reads it from.
+    const menu = menuFor('model', { ...base, route: routed })
+    const models = menu.sections[0]
     // The bare `agentId` row (the agent's default model) is never filtered out;
     // everything after it is what `exposedModels` let through.
     expect(models?.items.map(item => item.id)).toEqual(['pi', 'pi@claude-sonnet-4'])
     expect(models?.items[0]).toMatchObject({ label: 'Pi · 默认', active: true })
+  })
+
+  it('offers the thought levels in the THOUGHT picker, and only there', () => {
+    const thought = menuFor('thought', { ...base, route: routed })
+    expect(thought.sections[0]?.items.map(item => item.id)).toEqual(['provider-default', 'high'])
+    expect(menuFor('agent', { ...base, route: routed }).sections.map(s => s.id)).toEqual(['agent'])
   })
 
   it('labels a variant route from the agent catalog, not a DSH directory', () => {
@@ -318,11 +330,15 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
   it('drops the axes the agent does not publish', () => {
     const silent: AgentCatalogResult = { ...catalog, variants: [], reasoning: undefined }
     const route = describeRoute([agent], bound, undefined, silent)
-    expect(menuFor('agent', { acp, agents: [agent], catalog: silent, route }).sections.map(s => s.id)).toEqual(['agent', 'model'])
-    // …and when the catalog itself is missing, the route's own id is the row.
+    // The base never carries these axes any more — it is the roster, full stop.
+    expect(menuFor('agent', { acp, agents: [agent], catalog: silent, route }).sections.map(s => s.id)).toEqual(['agent'])
+    // The MODEL picker still degrades honestly: `variants: []` means the base
+    // row is all this agent offers, which is exactly one row — not an error.
+    expect(menuFor('model', { acp, agents: [agent], catalog: silent, route }).sections[0]?.items.map(item => item.id))
+      .toEqual(['pi'])
     const noCatalog = describeRoute([agent], bound, undefined)
-    const fallback = menuFor('agent', { acp, agents: [agent], route: noCatalog })
-    expect(fallback.sections.find(section => section.id === 'model')?.items.map(item => item.id)).toEqual(['pi'])
+    const fallback = menuFor('model', { acp, agents: [agent], route: noCatalog })
+    expect(fallback.sections[0]?.items.map(item => item.id)).toEqual(['pi'])
   })
 
   it('keeps the single-axis pickers header-shaped as before', () => {
@@ -355,8 +371,9 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
   it('keeps the agent named when the binding is released, so the picker can offer a way back', () => {
     const released = describeRoute([agent], { ...bound, released: true }, undefined, catalog)
     expect(released).toMatchObject({ agentId: 'pi', agentTitle: 'Pi' })
-    const menu = menuFor('agent', { ...base, route: released })
-    expect(menu.sections.map(s => s.id)).toEqual(['agent', 'model', 'thought'])
+    // The base still answers "who serves this" even for a released session;
+    // the rest of the axes live in their own pickers.
+    expect(menuFor('agent', { ...base, route: released }).sections.map(s => s.id)).toEqual(['agent'])
   })
 
   it('offers only the roster when no agent is known yet', () => {
@@ -376,13 +393,13 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
     const fresh = describeRoute([agent], undefined, 'pi', catalog)
     expect(fresh).toMatchObject({ agentId: 'pi', agentTitle: 'Pi' })
     expect(fresh.modelId).toBeUndefined()
-    const menu = menuFor('agent', { ...base, route: fresh })
-    // The model section still renders: the catalog says what this agent offers,
-    // which is exactly what a person needs before the first turn.
-    expect(menu.sections.map(s => s.id)).toEqual(['agent', 'model'])
-    expect(menu.sections.find(s => s.id === 'model')?.items.map(i => i.id)).toEqual(['pi', 'pi@claude-sonnet-4'])
+    // The base lists the roster only; the models this agent OFFERS are readable
+    // before the first turn — through the model chip's own picker.
+    expect(menuFor('agent', { ...base, route: fresh }).sections.map(s => s.id)).toEqual(['agent'])
+    expect(menuFor('model', { ...base, route: fresh }).sections[0]?.items.map(i => i.id))
+      .toEqual(['pi', 'pi@claude-sonnet-4'])
     // No effort axis: nothing has run, so there is no current effort to mark.
-    expect(menu.sections.map(s => s.id)).not.toContain('thought')
+    expect(menuFor('agent', { ...base, route: fresh }).sections.map(s => s.id)).not.toContain('thought')
   })
 })
 
