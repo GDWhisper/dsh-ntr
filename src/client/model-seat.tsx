@@ -1,5 +1,11 @@
 /**
- * The ACP conversation's claim on the host's native model seat.
+ * The ACP conversation's claim on two cells of the host's composer bar.
+ *
+ * Both cells are `single`, session-scoped slots the composer bar renders
+ * unconditionally, and both are held by claims this module defines — one that
+ * REPLACES what is there (`conversation.input.model`, see
+ * {@link createModelSeatClaim}) and one that EMPTIES it
+ * (`conversation.input.permission`, see {@link createPermissionSeatClaim}).
  *
  * WHAT IT IS: `conversation.input.model` is a `single` slot the host's composer
  * bar renders unconditionally, in the TRAILING group (`margin-left: auto`),
@@ -80,6 +86,19 @@ import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 export const MODEL_SEAT_KEY = 'conversation.input.model'
 
 /**
+ * Exact key of the composer's permission seat (a `single`, session-scoped
+ * slot): the cell the host's Access mode control occupies. It selects the
+ * file-write policy the HOST applies to its own tools, read from the
+ * `permissions` projection `dsh-permission-presets` owns. An ACP conversation's
+ * writes belong to the external agent's process, which never consults that
+ * policy, so there is nothing to put in this cell in ACP mode — which is why
+ * {@link createPermissionSeatClaim} installs a `null`-rendering occupant rather
+ * than a replacement control, and why its lifetime must be exactly the ACP-mode
+ * verdict's lifetime (see the claim's own note in `index.tsx`).
+ */
+export const PERMISSION_SEAT_KEY = 'conversation.input.permission'
+
+/**
  * Declared rank of the first occupant we install.
  *
  * Honoured only by a registry that keeps what we declare (a statically composed
@@ -89,6 +108,13 @@ export const MODEL_SEAT_KEY = 'conversation.input.model'
  * header — which is why the claim verifies ownership instead of trusting this.
  */
 export const MODEL_SEAT_PRIORITY = -1
+
+/**
+ * Rank of the first occupant the permission claim installs. Same meaning (and
+ * same caveat) as {@link MODEL_SEAT_PRIORITY}; see {@link createSeatClaim} for
+ * why a declared rank is never trusted as proof of ownership.
+ */
+export const PERMISSION_SEAT_PRIORITY = -1
 
 /**
  * How many times ONE claim may retake the cell before it stops and says so.
@@ -174,6 +200,41 @@ export interface ModelSeatClaimOptions {
   maxClaims?: number
 }
 
+/**
+ * Options for the permission claim. Unlike {@link ModelSeatClaimOptions}, both
+ * the occupant and the inject face are OPTIONAL: this claim exists to hold an
+ * EMPTY cell, so the defaults express what it is — nothing rendered, nothing
+ * injected — and a caller only passes them to customize (the tests do).
+ *
+ * The default inject still matters: the cell is session-scoped, and an entry
+ * without any inject receives only the framework's standard kit. A `null`
+ * occupant reads none of it, so an omitted inject is harmless here — whereas
+ * omitting one on the model seat is a silent abdication. The asymmetry is
+ * deliberate: required where silence hides a failure, defaulted where silence
+ * is the correct answer.
+ */
+export interface PermissionSeatClaimOptions {
+  slots: SeatSlots
+  /** Optional custom occupant; defaults to a component rendering null. */
+  occupant?(): unknown
+  /** Optional inject factory; defaults to providing an empty object `{}`. */
+  inject?(sessionId: unknown, actions?: unknown): unknown
+  /** Every evaluation reports its verdict here (the gate forwards it to the ACP view's diagnostic line). */
+  onDiag?(line: string): void
+  maxClaims?: number
+}
+
+export interface SeatClaimOptions {
+  slots: SeatSlots
+  slotKey: string
+  basePriority: number
+  occupant(): unknown
+  inject?(sessionId: unknown, actions?: unknown): unknown
+  label?: string
+  onDiag?(line: string): void
+  maxClaims?: number
+}
+
 export interface ModelSeatClaim {
   /** Hold or retake the cell; idempotent, so it can run on every gate evaluation. */
   sync(): void
@@ -198,34 +259,24 @@ interface CellView {
 }
 
 /**
- * Take and hold the composer's model seat for one ACP-mode spell.
+ * Core generic slot claim engine.
  *
- * Lifecycle: the gate creates a claim when the staged conversation enters ACP
- * mode, calls `sync()` on every evaluation (store mutation, session-list
- * notification, preset frame, and any change to the cell itself), and calls
- * `release()` when the conversation leaves ACP mode or the gate tears down.
+ * Installs and holds an occupant into a single-occupant slot, verifying via
+ * `entriesOfSlot` and performing bounded retakes if displaced by later registrations.
  */
-export function createModelSeatClaim(options: ModelSeatClaimOptions): ModelSeatClaim {
-  const { slots, occupant, inject } = options
+export function createSeatClaim(options: SeatClaimOptions): ModelSeatClaim {
+  const { slots, slotKey, basePriority, occupant, inject } = options
+  const label = options.label ?? slotKey
   const onDiag = options.onDiag
   const maxClaims = options.maxClaims ?? MAX_SEAT_CLAIMS
-  /**
-   * The component identity of every entry we installed. Fresh per install: the
-   * runner attributes a crashed entry by component identity, and two seats with
-   * one identity could be folded into a single entry.
-   */
   const ours = new Set<unknown>()
-  /** Declared ranks we have used — a registry that keeps them throws on a duplicate. */
   const declared = new Set<number>()
-  /** Disposers of every entry we installed, oldest first (released as a stack). */
   const installed: Array<() => void> = []
-  /** Retakes spent on this claim. */
   let retakes = 0
   let holding = false
 
   const say = (line: string): void => onDiag?.(line)
 
-  /** The rival's own words about itself, for the diagnostic line. */
   const describe = (entry: SeatEntry | undefined): string => {
     if (entry === undefined) return 'no occupant'
     const who = entry.options?.registrant
@@ -234,65 +285,41 @@ export function createModelSeatClaim(options: ModelSeatClaimOptions): ModelSeatC
     return `${who ?? 'an unnamed entry'} (rank ${rank ?? 0})`
   }
 
-  /** Read the cell's declaration and winner, distinguishing the three states that matter. */
   const cell = (): CellView => {
-    let declared = true
+    let isDeclared = true
     if (typeof slots.spec === 'function') {
-      try { declared = slots.spec(MODEL_SEAT_KEY) !== undefined } catch { declared = false }
+      try { isDeclared = slots.spec(slotKey) !== undefined } catch { isDeclared = false }
     }
-    if (typeof slots.entriesOfSlot !== 'function') return { declared, verified: false }
+    if (typeof slots.entriesOfSlot !== 'function') return { declared: isDeclared, verified: false }
     try {
-      const heads = slots.entriesOfSlot(MODEL_SEAT_KEY) ?? []
-      return { declared, verified: true, ...heads[0] === undefined ? {} : { entry: heads[0] } }
+      const heads = slots.entriesOfSlot(slotKey) ?? []
+      return { declared: isDeclared, verified: true, ...heads[0] === undefined ? {} : { entry: heads[0] } }
     } catch {
-      // A registry that throws here tells us nothing about ownership; refusing
-      // to loop on it is the only safe reading.
-      return { declared, verified: false }
+      return { declared: isDeclared, verified: false }
     }
   }
 
-  /**
-   * Install one more entry occupying the cell.
-   *
-   * A declared rank strictly below the incumbent's (and below anything we have
-   * used, since a duplicate rank is a hard error in a registry that keeps it).
-   * Returns `false` — with the reason reported — when the registry refuses,
-   * which is recoverable: the gate re-evaluates and tries again.
-   */
   const install = (head: SeatEntry | undefined): boolean => {
-    // The first occupant declares exactly the documented rank; a retake goes
-    // strictly below it (and below whatever holds the cell now) so a registry
-    // that KEEPS declared ranks has no duplicate and no incumbent above us.
-    const base = installed.length === 0 ? MODEL_SEAT_PRIORITY : MODEL_SEAT_PRIORITY - 1 - retakes
+    const base = installed.length === 0 ? basePriority : basePriority - 1 - retakes
     let rank = Math.min((head?.options?.priority ?? 0) - 1, base)
     while (declared.has(rank)) rank -= 1
-    // A fresh identity per install: the registry dedups by component identity,
-    // and one occupant object shared across entries could be folded into one.
-    // The wrapper is what the seat frame calls, so it forwards the frame's
-    // props (the injected face plus the standard kit) to the occupant — without
-    // them the base could not name the session it is describing.
     const component = (props: unknown): unknown => {
-      const installed = occupant() as (p: unknown) => unknown
-      return installed(props)
+      const target = occupant() as (p: unknown) => unknown
+      return target(props)
     }
     ours.add(component)
     declared.add(rank)
     try {
-      installed.push(slots.inject(MODEL_SEAT_KEY, () => slots.register({
-        name: MODEL_SEAT_KEY,
+      installed.push(slots.inject(slotKey, () => slots.register({
+        name: slotKey,
         priority: rank,
-        // The occupant's own face. This cell is session-scoped, so the
-        // renderer hands an entry only the standard kit unless the entry
-        // declares an `inject` — and everything the ACP base reads beyond the
-        // kit (`acp`, `faceFor`) arrives ONLY through it. See
-        // {@link ModelSeatClaimOptions.inject} for the failure this closes.
-        inject,
+        ...(inject ? { inject } : {}),
       }, component)))
       return true
     } catch (error) {
       ours.delete(component)
       declared.delete(rank)
-      say(`model seat: registration failed (${error instanceof Error ? error.message : String(error)})`)
+      say(`${label}: registration failed (${error instanceof Error ? error.message : String(error)})`)
       return false
     }
   }
@@ -300,53 +327,43 @@ export function createModelSeatClaim(options: ModelSeatClaimOptions): ModelSeatC
   return {
     get holding(): boolean { return holding },
     sync(): void {
-      // The occupant has to exist before there is anything to verify.
       if (installed.length === 0 && !install(undefined)) return
       const view = cell()
       if (!view.declared) {
-        // Nothing to win yet: the composer bar has not mounted the seat, and
-        // our registration is parked on that declaration.
         holding = false
-        say(`${MODEL_SEAT_KEY}: waiting for the host to declare the seat`)
+        say(`${slotKey}: waiting for the host to declare the seat`)
         return
       }
       if (!view.verified) {
         holding = true
-        say(`${MODEL_SEAT_KEY}: occupied (ownership is not verifiable on this runtime)`)
+        say(`${slotKey}: occupied (ownership is not verifiable on this runtime)`)
         return
       }
       if (ours.has(view.entry?.component)) {
         holding = true
-        say(`${MODEL_SEAT_KEY}: held by the ACP base${retakes === 0 ? '' : ` (retook it ${retakes}×)`}`)
+        say(`${slotKey}: held by the ACP base${retakes === 0 ? '' : ` (retook it ${retakes}×)`}`)
         return
       }
-      // A rival holds the cell — including the case where our own first
-      // registration lost it outright.
       const incumbent = view
       if (retakes >= maxClaims) {
-        // Bounded and loud: a rival that re-registers in a loop must not turn
-        // this into an endless registration war, and the user must be able to
-        // read why the native control is back.
         holding = false
-        say(`${MODEL_SEAT_KEY}: taken by ${describe(incumbent.entry)} — gave up after ${maxClaims} retakes`)
+        say(`${slotKey}: taken by ${describe(incumbent.entry)} — gave up after ${maxClaims} retakes`)
         return
       }
       retakes += 1
       if (!install(incumbent.entry)) return
-      // Verify — a fresh registration is expected to be the lowest live rank on
-      // the page, but being wrong about that must be visible, not assumed.
       const settled = cell()
       if (settled.verified && ours.has(settled.entry?.component)) {
         holding = true
-        say(`${MODEL_SEAT_KEY}: retook it from ${describe(incumbent.entry)} (retake ${retakes})`)
+        say(`${slotKey}: retook it from ${describe(incumbent.entry)} (retake ${retakes})`)
         return
       }
       holding = false
-      say(`${MODEL_SEAT_KEY}: still held by ${describe(settled.entry ?? incumbent.entry)} after retake ${retakes}`)
+      say(`${slotKey}: still held by ${describe(settled.entry ?? incumbent.entry)} after retake ${retakes}`)
     },
     release(): void {
       while (installed.length > 0) {
-        try { installed.pop()?.() } catch { /* a refused disposer must not strand the rest */ }
+        try { installed.pop()?.() } catch {}
       }
       ours.clear()
       declared.clear()
@@ -354,4 +371,57 @@ export function createModelSeatClaim(options: ModelSeatClaimOptions): ModelSeatC
       holding = false
     },
   }
+}
+
+/**
+ * Take and hold the composer's model seat for one ACP-mode spell.
+ *
+ * Lifecycle: the gate creates a claim when the staged conversation enters ACP
+ * mode, calls `sync()` on every evaluation (store mutation, session-list
+ * notification, preset frame, and any change to the cell itself), and calls
+ * `release()` when the conversation leaves ACP mode or the gate tears down.
+ */
+export function createModelSeatClaim(options: ModelSeatClaimOptions): ModelSeatClaim {
+  return createSeatClaim({
+    slots: options.slots,
+    slotKey: MODEL_SEAT_KEY,
+    basePriority: MODEL_SEAT_PRIORITY,
+    occupant: options.occupant,
+    inject: options.inject,
+    label: 'model seat',
+    onDiag: options.onDiag,
+    maxClaims: options.maxClaims,
+  })
+}
+
+/** Null placeholder component for blanking a slot. */
+const BlankSlotOccupant = (): null => null
+
+/** Empty inject face provider for slots that require an inject definition. */
+const emptyInject = (): Record<string, never> => ({})
+
+/**
+ * Take and hold the composer's permission seat for one ACP-mode spell.
+ *
+ * Same lifecycle as {@link createModelSeatClaim} — created when the staged
+ * conversation enters ACP mode, `sync()`ed on every gate evaluation,
+ * `release()`d the instant it leaves — with one difference worth saying out
+ * loud: this claim has NO occupant to show for itself. Its entire product is
+ * the ABSENCE of the host's Access mode control, and absence is exactly what
+ * cannot be inspected after the fact. A permission claim that outlives its
+ * reason does not render an obvious wrong thing on an ACP conversation; it
+ * silently removes a control from ordinary ones, and every path through the
+ * gate that cannot confirm the verdict releases it.
+ */
+export function createPermissionSeatClaim(options: PermissionSeatClaimOptions): ModelSeatClaim {
+  return createSeatClaim({
+    slots: options.slots,
+    slotKey: PERMISSION_SEAT_KEY,
+    basePriority: PERMISSION_SEAT_PRIORITY,
+    occupant: options.occupant ?? (() => BlankSlotOccupant),
+    inject: options.inject ?? emptyInject,
+    label: 'permission seat',
+    onDiag: options.onDiag,
+    maxClaims: options.maxClaims,
+  })
 }

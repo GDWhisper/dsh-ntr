@@ -328,6 +328,11 @@ export function AcpConversationView(props: AcpViewProps) {
               {t('模型座位', 'model seat')} · {ui.seatDiag}
             </div>
           )}
+          {ui.permissionSeatDiag !== 'idle' && ui.permissionSeatDiag !== 'gate disposed' && (
+            <div className="ntr-acp-empty-hint ntr-acp-seat-diag">
+              {t('权限底座', 'permission seat')} · {ui.permissionSeatDiag}
+            </div>
+          )}
         </div>
       </div>
     )

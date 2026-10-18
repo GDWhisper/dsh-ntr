@@ -23,12 +23,19 @@
  * behaviour instead of about a number.
  */
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, beforeAll, vi } from 'vitest'
 import {
-  createModelSeatClaim, MAX_SEAT_CLAIMS, MODEL_SEAT_KEY, MODEL_SEAT_PRIORITY,
+  createModelSeatClaim,
+  createPermissionSeatClaim,
+  MAX_SEAT_CLAIMS,
+  MODEL_SEAT_KEY,
+  MODEL_SEAT_PRIORITY,
+  PERMISSION_SEAT_KEY,
+  PERMISSION_SEAT_PRIORITY,
 } from '../src/client/model-seat.tsx'
 import type { SeatEntry, SeatSlots } from '../src/client/model-seat.tsx'
 import { ACP_PRESET_ID, stagedIsAcpMode, stagedSessionOf } from '../src/client/acp-ui.tsx'
+import { apply } from '../src/client/index.tsx'
 
 describe('the native model seat is occupied by the ACP base on an ACP conversation', () => {
   const acpRow = (retainedBy = { mainView: 1 }) => ({
@@ -518,5 +525,590 @@ describe('the model seat claim', () => {
     // The base reads `props.acp` and crashes — which the runtime's error
     // boundary converts into the abdication that hands the cell back.
     expect(() => (head?.component as (p: unknown) => unknown)(composed)).toThrow()
+  })
+})
+
+describe('the native permission seat is blanked on an ACP conversation', () => {
+  function makePermissionSlots(declared = true) {
+    interface FakeEntry {
+      component: unknown
+      options: { priority: number; registrant?: string }
+      inject?: (sessionId: unknown, actions?: unknown) => unknown
+    }
+    const entries: FakeEntry[] = []
+    const ranks: number[] = []
+    const attempted: Array<{ name: string; declaredPriority?: number; inject?: unknown }> = []
+    let counter = 0
+    let declaredNow = declared
+    let epoch = declaredNow ? 1 : 0
+    const watchers = new Set<() => void>()
+    const slots: SeatSlots = {
+      register(options: { name: string; priority?: number; inject?: (sessionId: unknown, actions?: unknown) => unknown }, component: unknown): () => void {
+        attempted.push({
+          name: options.name,
+          ...options.priority === undefined ? {} : { declaredPriority: options.priority },
+          ...options.inject === undefined ? {} : { inject: options.inject },
+        })
+        if (!declaredNow) throw new Error(`slot "${options.name}" is not declared`)
+        const rank = --counter
+        ranks.push(rank)
+        const entry: FakeEntry = {
+          component,
+          options: { priority: rank },
+          ...options.inject === undefined ? {} : { inject: options.inject },
+        }
+        entries.push(entry)
+        let live = true
+        return () => {
+          if (!live) return
+          live = false
+          entries.splice(entries.indexOf(entry), 1)
+        }
+      },
+      inject(_key: string, callback: () => (() => void) | Iterable<() => void>): () => void {
+        let active: (() => void) | undefined
+        let activeEpoch: number | undefined
+        let stopped = false
+        const stop = (): void => {
+          if (stopped) return
+          stopped = true
+          watchers.delete(reconcile)
+          active?.()
+          active = undefined
+        }
+        const reconcile = (): void => {
+          if (stopped) return
+          if (active !== undefined && activeEpoch === epoch) return
+          active?.()
+          active = undefined
+          activeEpoch = undefined
+          if (!declaredNow) return
+          const effect = callback()
+          activeEpoch = epoch
+          active = typeof effect === 'function' ? effect : () => { for (const d of [...effect].reverse()) d() }
+        }
+        watchers.add(reconcile)
+        reconcile()
+        return stop
+      },
+      entriesOfSlot(_key: string): readonly SeatEntry[] {
+        return [...entries].sort((a, b) => a.options.priority - b.options.priority)
+      },
+      spec(_key: string): { kind?: string } | undefined {
+        return declaredNow ? { kind: 'single' } : undefined
+      },
+    }
+    return {
+      slots,
+      entries,
+      attempted,
+      head(): SeatEntry | undefined {
+        return slots.entriesOfSlot(PERMISSION_SEAT_KEY)[0]
+      },
+      get ourRegistrations(): number {
+        return entries.filter(entry => entry.options.registrant === undefined).length
+      },
+      rival(registrant: string, priority?: number): void {
+        attempted.push({ name: PERMISSION_SEAT_KEY, ...priority === undefined ? {} : { declaredPriority: priority } })
+        const rank = --counter
+        ranks.push(rank)
+        entries.push({ component: { rival: registrant }, options: { priority: rank, registrant } })
+      },
+      declare(): void { declaredNow = true; epoch += 1; for (const watch of [...watchers]) watch() },
+    }
+  }
+
+  it('displaces native permission select with priority below default 0', () => {
+    expect(PERMISSION_SEAT_PRIORITY).toBeLessThan(0)
+    expect(PERMISSION_SEAT_KEY).toBe('conversation.input.permission')
+  })
+
+  it('installs a null occupant and reports holding the cell', () => {
+    const fake = makePermissionSlots()
+    const diag: string[] = []
+    const claim = createPermissionSeatClaim({
+      slots: fake.slots,
+      onDiag: (line) => diag.push(line),
+    })
+    claim.sync()
+    expect(claim.holding).toBe(true)
+    expect(fake.entries).toHaveLength(1)
+    const occupantComponent = fake.head()?.component as (() => unknown) | undefined
+    expect(typeof occupantComponent).toBe('function')
+    expect(occupantComponent?.()).toBeNull()
+    expect(diag.at(-1)).toContain('held by the ACP base')
+    expect(fake.attempted[0]?.declaredPriority).toBe(PERMISSION_SEAT_PRIORITY)
+    expect(fake.attempted[0]?.name).toBe(PERMISSION_SEAT_KEY)
+  })
+
+  it('provides safe empty inject face so session-scoped slot does not throw or abdicate', () => {
+    const fake = makePermissionSlots()
+    const claim = createPermissionSeatClaim({ slots: fake.slots })
+    claim.sync()
+    const head = fake.head()
+    const inject = (head as { inject?: (sessionId: unknown) => unknown }).inject
+    expect(typeof inject).toBe('function')
+    expect(inject?.('test-session')).toEqual({})
+  })
+
+  it('retakes the cell when a native or rival control registers after us', () => {
+    const fake = makePermissionSlots()
+    const diag: string[] = []
+    const claim = createPermissionSeatClaim({
+      slots: fake.slots,
+      onDiag: (line) => diag.push(line),
+    })
+    claim.sync()
+    fake.rival('client-ui-permission-presets PermissionSelect', 0)
+    expect(fake.head()?.options?.registrant).toBe('client-ui-permission-presets PermissionSelect')
+
+    claim.sync()
+    expect(claim.holding).toBe(true)
+    expect(fake.head()?.options?.registrant).toBeUndefined()
+    expect(diag.at(-1)).toContain('retook it from client-ui-permission-presets PermissionSelect')
+  })
+
+  it('releases all entries when leaving ACP mode to restore the native selector', () => {
+    const fake = makePermissionSlots()
+    const claim = createPermissionSeatClaim({ slots: fake.slots })
+    claim.sync()
+    fake.rival('client-ui-permission-presets PermissionSelect')
+    claim.sync()
+    expect(fake.entries).toHaveLength(3)
+
+    claim.release()
+    expect(fake.ourRegistrations).toBe(0)
+    expect(fake.entries).toHaveLength(1)
+    expect(fake.head()?.options?.registrant).toBe('client-ui-permission-presets PermissionSelect')
+    expect(claim.holding).toBe(false)
+  })
+
+  it('waits for the permission slot to be declared on startup', () => {
+    const fake = makePermissionSlots(false)
+    const diag: string[] = []
+    const claim = createPermissionSeatClaim({
+      slots: fake.slots,
+      onDiag: (line) => diag.push(line),
+    })
+    expect(() => claim.sync()).not.toThrow()
+    expect(claim.holding).toBe(false)
+    expect(diag.at(-1)).toContain('waiting for the host to declare')
+    expect(fake.entries).toHaveLength(0)
+
+    fake.declare()
+    claim.sync()
+    expect(claim.holding).toBe(true)
+    expect(fake.entries).toHaveLength(1)
+  })
+
+  it('renders nothing even when the renderer hands it no face at all', () => {
+    // The mirror of the model seat's abdication trap, and the reason the two
+    // claims differ on `inject`. The permission occupant reads NO props — it
+    // exists to be absent — so an entry composed from the standard kit alone
+    // still renders cleanly, where the ACP base would crash and abdicate.
+    // The cell therefore stays ours for as long as the claim is held, and the
+    // only thing that can give it back is `release()`.
+    const fake = makePermissionSlots()
+    const claim = createPermissionSeatClaim({ slots: fake.slots })
+    claim.sync()
+    const head = fake.head()
+    const inject = (head as { inject?: (sessionId: unknown) => unknown }).inject
+    const render = head?.component as (p: unknown) => unknown
+    // Every composition the renderer can produce: no props, the kit alone, and
+    // the kit merged with our own (empty) face.
+    expect(render(undefined)).toBeNull()
+    expect(render({ sessionId: 's1', useSession: () => ({ running: false }) })).toBeNull()
+    expect(render({ sessionId: 's1', ...inject?.('s1') })).toBeNull()
+  })
+
+  it('gives up retaking rather than stacking blanking entries forever', () => {
+    // A rival that registers on every evaluation would otherwise produce an
+    // unbounded pile of null occupants — each displacing the last, none of them
+    // visible. The bound exists so the cost of a losing fight stays fixed.
+    const fake = makePermissionSlots()
+    const diag: string[] = []
+    const claim = createPermissionSeatClaim({
+      slots: fake.slots,
+      onDiag: (line) => diag.push(line),
+    })
+    claim.sync()
+    for (let round = 0; round < MAX_SEAT_CLAIMS + 2; round += 1) {
+      fake.rival('a rival registering every evaluation')
+      claim.sync()
+    }
+    expect(claim.holding).toBe(false)
+    expect(diag.at(-1)).toContain('gave up after')
+    // One first install plus MAX_SEAT_CLAIMS retakes — never more.
+    expect(fake.ourRegistrations).toBe(MAX_SEAT_CLAIMS + 1)
+  })
+
+  it('releases cleanly before any entry was ever installed', () => {
+    // The gate can tear down, or stand down, before the composer bar mounts
+    // (its very first `attach()` runs ahead of the declaration). `release()` on
+    // a claim that never got a cell must be a no-op, not a crash that takes the
+    // plugin's teardown down with it.
+    const fake = makePermissionSlots(false)
+    const claim = createPermissionSeatClaim({ slots: fake.slots })
+    claim.sync()
+    expect(() => claim.release()).not.toThrow()
+    expect(() => claim.release()).not.toThrow()
+    expect(claim.holding).toBe(false)
+  })
+
+  it('re-installs after a stand-down, because standing down is not a verdict', () => {
+    // The load-bearing property: releasing says nothing about the conversation,
+    // only that the current evidence stopped answering. Switch back into ACP
+    // mode and the cell must be taken again — a claim that learned "never
+    // again" from one silent tick would leave native chrome on an ACP
+    // conversation permanently.
+    const fake = makePermissionSlots()
+    const claim = createPermissionSeatClaim({ slots: fake.slots })
+    claim.sync()
+    expect(claim.holding).toBe(true)
+    claim.release()
+    expect(claim.holding).toBe(false)
+    claim.sync()
+    expect(claim.holding).toBe(true)
+    expect(fake.ourRegistrations).toBe(1)
+  })
+})
+
+/**
+ * The ACP-mode GATE (`src/client/index.tsx`'s `syncAcpMode`), which is what
+ * decides either cell is taken at all. The claim suites above exercise the
+ * mechanism; this one exercises the judgement, through the REAL `apply()` of
+ * the browser half against a fake host that reproduces the two runtime
+ * behaviours the gate depends on — both verified against the installed DSH
+ * 0.1.7-rc.1 runtime while fixing the reported defect:
+ *
+ *  1. `slots/changed` fires SYNCHRONOUSLY from inside `slots.register` and from
+ *     inside an entry's disposer (`SlotCore.markDirty` -> the registry's
+ *     `onMutate` bridge -> `ctx.emit`; cordis `emit` dispatches synchronously).
+ *     A gate that re-enters itself from its own install therefore registers a
+ *     second entry, whose own `slots/changed` re-enters again — an unbounded
+ *     pile. The second test below pins the bound.
+ *  2. The session list is an observable store, and the verdict map is fed by
+ *     `agent-preset/selected` frames over `remote.$on` and by the
+ *     `session/chat-list` host read.
+ *
+ * What is NOT covered here: the renderer's outlet (which entry React actually
+ * paints) and the host half. The cell's winner view (`entriesOfSlot`) is the
+ * same call the renderer's outlet makes, so "the head is ours" is as close to
+ * the screen as a unit test can honestly get.
+ */
+describe('the ACP-mode gate hands the permission seat back when the conversation leaves ACP mode', () => {
+  /** The store opens an EventSource on start(); the gate never reads it here. */
+  class FakeEventSource {
+    onopen: (() => void) | null = null
+    onerror: (() => void) | null = null
+    onmessage: ((raw: { data: string }) => void) | null = null
+    close(): void {}
+  }
+
+  /**
+   * A fake host for the browser half's `apply()`.
+   *
+   * `silentRow` models the host shape the gate's host-read fallback exists for:
+   * session-list rows that carry no `agentPreset`, so the row cannot answer and
+   * only the verdict map can.
+   */
+  function makeHost(options: { silentRow?: boolean; withList?: boolean } = {}) {
+    interface Entry { component: unknown; options: { priority: number; registrant?: string }; inject?: unknown }
+    const cells = new Map<string, Entry[]>()
+    const declared = new Set<string>([MODEL_SEAT_KEY, PERMISSION_SEAT_KEY])
+    let counter = 0
+    let registrations = 0
+    const cellHandlers: Array<(...args: unknown[]) => void> = []
+    const nativeModel = { native: 'ModelSelect' }
+    const nativePermission = { native: 'PermissionSelect' }
+    cells.set(MODEL_SEAT_KEY, [{ component: nativeModel, options: { priority: 0, registrant: 'client-ui-model-selection' } }])
+    cells.set(PERMISSION_SEAT_KEY, [{ component: nativePermission, options: { priority: 0, registrant: 'client-ui-permission-presets' } }])
+    // The proven synchronous emission: our own registration and our own
+    // unregistration both notify the gate from inside their own call stack.
+    const emitChanged = (key: string): void => { for (const handler of [...cellHandlers]) handler(key) }
+
+    const slots = {
+      spec: (key: string) => (declared.has(key) ? { kind: 'single' } : undefined),
+      entriesOfSlot: (key: string) => [...(cells.get(key) ?? [])].sort((a, b) => a.options.priority - b.options.priority),
+      register(options: { name: string; priority?: number; inject?: unknown }, component: unknown) {
+        if (!declared.has(options.name)) throw new Error(`slot "${options.name}" is not declared`)
+        // A bound the real registry does not have: one gate evaluation must
+        // install one entry, so a registration past this line is the gate
+        // re-entering itself through its own `slots/changed`. Without it the
+        // failure mode is an unbounded loop (the test hangs) instead of a
+        // readable one.
+        registrations += 1
+        if (registrations > 8) throw new Error('runaway registration: the gate re-entered itself')
+        const rank = --counter
+        const entry: Entry = {
+          component,
+          options: { priority: rank },
+          ...(options.inject === undefined ? {} : { inject: options.inject }),
+        }
+        const list = cells.get(options.name) ?? []
+        list.push(entry)
+        cells.set(options.name, list)
+        emitChanged(options.name)
+        let live = true
+        return () => {
+          if (!live) return
+          live = false
+          const current = cells.get(options.name) ?? []
+          current.splice(current.indexOf(entry), 1)
+          emitChanged(options.name)
+        }
+      },
+      inject(key: string, callback: () => (() => void) | Iterable<() => void>) {
+        let active: (() => void) | undefined
+        const stop = (): void => { active?.(); active = undefined }
+        if (declared.has(key)) {
+          const effect = callback()
+          active = typeof effect === 'function' ? effect : () => { for (const d of [...effect].reverse()) d() }
+        }
+        return stop
+      },
+    }
+
+    let snapshot: Record<string, unknown> = { byId: {}, ids: [] }
+    const listListeners = new Set<() => void>()
+    const list = {
+      getSnapshot: () => snapshot,
+      subscribe(fn: () => void) { listListeners.add(fn); return () => { listListeners.delete(fn) } },
+    }
+    const notifyList = (): void => { for (const fn of [...listListeners]) fn() }
+
+    let hostAcpMode: boolean | undefined
+    const rpcCalls: Array<{ endpoint: string; payload: unknown }> = []
+    const rpc = {
+      call: async (channel: string, endpoint: string, payload: unknown) => {
+        rpcCalls.push({ endpoint, payload })
+        if (endpoint === 'session/chat-list') {
+          return { ok: true, value: { sessions: [], ...(hostAcpMode === undefined ? {} : { acpMode: hostAcpMode }) } }
+        }
+        return { ok: true, value: {} }
+      },
+    }
+
+    const remoteHandlers = new Map<string, Array<(...args: unknown[]) => void>>()
+    const ctx = {
+      slots,
+      get(key: string): unknown {
+        if (key === 'connection') return { rpc }
+        if (key === 'sessions') {
+          if (options.withList === false) return undefined
+          return { binding: () => undefined, list }
+        }
+        if (key === 'remote') return { $on: (event: string, cb: (...args: unknown[]) => void) => {
+          const handlers = remoteHandlers.get(event) ?? []
+          handlers.push(cb)
+          remoteHandlers.set(event, handlers)
+          return () => { const l = remoteHandlers.get(event) ?? []; l.splice(l.indexOf(cb), 1) }
+        } }
+        return undefined
+      },
+      effect(fn: () => unknown) { if (typeof fn === 'function') fn(); return fn },
+      on(event: string, handler: (...args: unknown[]) => void) {
+        if (event === 'slots/changed') cellHandlers.push(handler)
+        return () => {
+          if (event !== 'slots/changed') return
+          const at = cellHandlers.indexOf(handler)
+          if (at >= 0) cellHandlers.splice(at, 1)
+        }
+      },
+    }
+
+    return {
+      ctx,
+      /** The cell's current head — the same winner view the renderer's outlet reads. */
+      head(key: string) { return slots.entriesOfSlot(key)[0] },
+      count(key: string) { return (cells.get(key) ?? []).length },
+      isNative(key: string, native: unknown) { return slots.entriesOfSlot(key)[0]?.component === native },
+      nativeModel,
+      nativePermission,
+      stage(sessionId: string, row: { agentPreset?: string; subagent?: boolean } | undefined) {
+        snapshot = row === undefined
+          ? { byId: {}, ids: [] }
+          : {
+            ids: [sessionId],
+            byId: {
+              [sessionId]: {
+                id: sessionId,
+                retainedBy: { mainView: 1 },
+                ...(options.silentRow || row.agentPreset === undefined ? {} : { projectionValues: { agentPreset: row.agentPreset } }),
+                ...(row.subagent === true ? { origin: 'subagent' } : {}),
+              },
+            },
+          }
+        notifyList()
+      },
+      presetFrame(sessionId: string, agentPreset: string) {
+        for (const handler of remoteHandlers.get('agent-preset/selected') ?? []) handler(sessionId, agentPreset)
+      },
+      setHostAcpMode(value: boolean | undefined) { hostAcpMode = value },
+      rpcCalls,
+    }
+  }
+
+  const flush = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 0))
+
+  beforeAll(() => {
+    (globalThis as unknown as { EventSource: unknown }).EventSource = FakeEventSource
+  })
+
+  it('takes both cells on a confirmed ACP verdict', () => {
+    const host = makeHost()
+    apply(host.ctx as never)
+    host.stage('s1', { agentPreset: ACP_PRESET_ID })
+    // The model cell holds the ACP base; the permission cell holds the
+    // null-rendering blanking entry. Neither is the shipped occupant.
+    expect(host.isNative(MODEL_SEAT_KEY, host.nativeModel)).toBe(false)
+    expect(host.isNative(PERMISSION_SEAT_KEY, host.nativePermission)).toBe(false)
+  })
+
+  it('installs ONE entry per cell — the gate cannot re-enter itself through its own registration', () => {
+    // The reported defect's mechanism, pinned at its bound. `slots/changed`
+    // fires synchronously from inside `register`, so an evaluation that
+    // installs an entry re-runs the gate from inside its own call stack; the
+    // nested run reads the same evidence and, seeing `installed.length === 0`
+    // (the outer install has not pushed yet), registers again — whose own
+    // `slots/changed` re-enters again. One entry per cell is the whole proof
+    // that the nested run is dropped rather than repeated.
+    const host = makeHost()
+    apply(host.ctx as never)
+    host.stage('s1', { agentPreset: ACP_PRESET_ID })
+    expect(host.count(MODEL_SEAT_KEY)).toBe(2) // the shipped one + ours
+    expect(host.count(PERMISSION_SEAT_KEY)).toBe(2)
+  })
+
+  it('restores the native permission control when the staged session leaves ACP mode', () => {
+    // THE reported symptom: the Access mode dropdown was hidden in ACP mode and
+    // stayed hidden after the conversation switched back, silently removing a
+    // control from every ordinary conversation. The row is this gate's fact
+    // source, so the switch must hand BOTH cells back.
+    const host = makeHost()
+    apply(host.ctx as never)
+    host.stage('s1', { agentPreset: ACP_PRESET_ID })
+    expect(host.isNative(PERMISSION_SEAT_KEY, host.nativePermission)).toBe(false)
+
+    host.stage('s1', { agentPreset: 'standard' })
+    expect(host.isNative(MODEL_SEAT_KEY, host.nativeModel)).toBe(true)
+    expect(host.isNative(PERMISSION_SEAT_KEY, host.nativePermission)).toBe(true)
+    expect(host.count(MODEL_SEAT_KEY)).toBe(1)
+    expect(host.count(PERMISSION_SEAT_KEY)).toBe(1)
+  })
+
+  it('restores both cells when a preset frame says the conversation left', () => {
+    // The same switch on a host whose rows are silent: the frame is the only
+    // live fact source, and it must be able to take the claim back out.
+    const host = makeHost({ silentRow: true })
+    apply(host.ctx as never)
+    host.stage('s1', {})
+    host.presetFrame('s1', ACP_PRESET_ID)
+    expect(host.isNative(PERMISSION_SEAT_KEY, host.nativePermission)).toBe(false)
+
+    host.presetFrame('s1', 'standard')
+    expect(host.isNative(MODEL_SEAT_KEY, host.nativeModel)).toBe(true)
+    expect(host.isNative(PERMISSION_SEAT_KEY, host.nativePermission)).toBe(true)
+  })
+
+  it('re-asks a stale verdict while the row is silent, and restores both cells', async () => {
+    // The root cause of the reported symptom on a host whose rows never speak
+    // and whose frames never arrive: the host verdict was asked ONCE and then
+    // held forever, so a switch the runtime never announced left the gate
+    // judging a conversation that had already left ACP mode. The re-ask is
+    // bounded (one round-trip per TTL per staged session) because a read on
+    // every store mutation is the resolve-loop the one-shot ask was bought to
+    // prevent.
+    vi.useFakeTimers()
+    try {
+      const host = makeHost({ silentRow: true })
+      apply(host.ctx as never)
+      host.setHostAcpMode(true)
+      host.stage('s1', {})
+      await vi.advanceTimersByTimeAsync(0)
+      expect(host.isNative(PERMISSION_SEAT_KEY, host.nativePermission)).toBe(false)
+
+      // The conversation switches back; nothing tells the gate — not the row,
+      // not a frame. The held verdict is now the only evidence, and it is
+      // wrong.
+      host.setHostAcpMode(false)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(host.isNative(PERMISSION_SEAT_KEY, host.nativePermission)).toBe(false)
+
+      // The re-ask deadline fires, the host read lands with the current log,
+      // and the stale verdict is corrected.
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(host.isNative(MODEL_SEAT_KEY, host.nativeModel)).toBe(true)
+      expect(host.isNative(PERMISSION_SEAT_KEY, host.nativePermission)).toBe(true)
+      expect(host.count(PERMISSION_SEAT_KEY)).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('stands down on every path that cannot confirm ACP mode', () => {
+    // The permission seat's product is an ABSENCE, so an entry that outlives
+    // its reason is indistinguishable from a permanent one on screen. No
+    // session list, nothing staged, and an addressed subagent route must all
+    // hand the cell back rather than guess.
+    const noList = makeHost({ withList: false })
+    apply(noList.ctx as never)
+    noList.stage('s1', { agentPreset: ACP_PRESET_ID })
+    expect(noList.isNative(MODEL_SEAT_KEY, noList.nativeModel)).toBe(true)
+    expect(noList.isNative(PERMISSION_SEAT_KEY, noList.nativePermission)).toBe(true)
+
+    const host = makeHost()
+    apply(host.ctx as never)
+    host.stage('s1', { agentPreset: ACP_PRESET_ID })
+    expect(host.isNative(PERMISSION_SEAT_KEY, host.nativePermission)).toBe(false)
+    host.stage('s1', undefined) // nothing retains the main view
+    expect(host.isNative(MODEL_SEAT_KEY, host.nativeModel)).toBe(true)
+    expect(host.isNative(PERMISSION_SEAT_KEY, host.nativePermission)).toBe(true)
+
+    host.stage('s2', { agentPreset: ACP_PRESET_ID, subagent: true })
+    expect(host.isNative(MODEL_SEAT_KEY, host.nativeModel)).toBe(true)
+    expect(host.isNative(PERMISSION_SEAT_KEY, host.nativePermission)).toBe(true)
+  })
+
+  it('takes the cells again when the conversation returns to ACP mode', () => {
+    // Standing down is not a verdict: the claim must be re-installable, or one
+    // silent tick would cost the ACP conversation its base for good.
+    const host = makeHost()
+    apply(host.ctx as never)
+    host.stage('s1', { agentPreset: ACP_PRESET_ID })
+    host.stage('s1', { agentPreset: 'standard' })
+    host.stage('s1', { agentPreset: ACP_PRESET_ID })
+    expect(host.isNative(MODEL_SEAT_KEY, host.nativeModel)).toBe(false)
+    expect(host.isNative(PERMISSION_SEAT_KEY, host.nativePermission)).toBe(false)
+    expect(host.count(MODEL_SEAT_KEY)).toBe(2)
+    expect(host.count(PERMISSION_SEAT_KEY)).toBe(2)
+  })
+
+  it('keeps the ask bounded while the row stays silent', async () => {
+    // The re-ask exists to correct a stale verdict, not to poll: on a host whose
+    // rows never speak, a genuine ACP conversation must cost one round-trip per
+    // TTL, not one per store mutation.
+    vi.useFakeTimers()
+    try {
+      const host = makeHost({ silentRow: true })
+      apply(host.ctx as never)
+      host.setHostAcpMode(true)
+      host.stage('s1', {})
+      await vi.advanceTimersByTimeAsync(0)
+      const before = host.rpcCalls.filter(call => call.endpoint === 'session/chat-list').length
+      expect(before).toBe(1)
+      // Ambient store traffic must not produce a fresh read each time.
+      await vi.advanceTimersByTimeAsync(1000)
+      host.stage('s1', {})
+      await vi.advanceTimersByTimeAsync(0)
+      const mid = host.rpcCalls.filter(call => call.endpoint === 'session/chat-list').length
+      expect(mid).toBe(1)
+      // Past the deadline it re-asks — once per window, not once per tick.
+      await vi.advanceTimersByTimeAsync(1500)
+      const after = host.rpcCalls.filter(call => call.endpoint === 'session/chat-list').length
+      expect(after).toBe(2)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

@@ -466,6 +466,46 @@ describe('AcpStore agent management', () => {
     expect(reads).toHaveLength(4)
   })
 
+  it('lets the seat gate own re-ask settle a verdict a frame had settled', async () => {
+    // The frame's authority has ONE authorized exception, and this is it. A
+    // session whose rows are silent AND whose frames have stopped arriving has
+    // the held verdict as its only fact source; a host read is the one place a
+    // switch the runtime never framed can still be learned from. Without it the
+    // gate pinned the conversation in ACP mode for the rest of the page — and
+    // the permission seat's product is an absence, so an ordinary
+    // conversation silently lost its Access mode control.
+    const reads: string[] = []
+    const host = { acpMode: true }
+    const store = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint === 'session/chat-list') {
+        reads.push('read')
+        return { ok: true, value: { sessions: [], acpMode: host.acpMode } }
+      }
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+    const gate = (): boolean => stagedIsAcpMode({ current: 'chat-1' }, id => store.getSnapshot().acpMode[id])
+
+    // The switch into ACP mode arrives as a frame; the verdict is frame-settled.
+    store.noteAcpMode('chat-1', acpModeFromPresetEvent('acp'))
+    expect(gate()).toBe(true)
+    // A composer reader's answer still defers to the frame (the host's log
+    // read can lag a switch by one).
+    host.acpMode = false
+    await store.loadChatSessions('chat-1')
+    expect(gate()).toBe(true)
+
+    // The gate's own re-ask is allowed to settle it: the conversation switched
+    // back, the frame path is quiet, and the host now says so.
+    await store.loadChatSessions('chat-1', { settleVerdict: true })
+    expect(gate()).toBe(false)
+    expect(store.getSnapshot().acpMode['chat-1']).toBe(false)
+
+    // And the frame is still the authority afterwards: a newer one wins again.
+    store.noteAcpMode('chat-1', acpModeFromPresetEvent('acp'))
+    expect(gate()).toBe(true)
+    expect(reads).toHaveLength(2)
+  })
+
   it('setExposedModels uses the lightweight endpoint and resyncs afterwards', async () => {
     const endpoints: string[] = []
     const payloads: Array<Record<string, unknown>> = []

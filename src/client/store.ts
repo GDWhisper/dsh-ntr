@@ -146,6 +146,10 @@ export interface UiState {
    */
   seatDiag: string
   /**
+   * Diagnostic summary from the permission-seat blanking gate (`conversation.input.permission`).
+   */
+  permissionSeatDiag: string
+  /**
    * Observed ACP transcripts keyed by ACP session id. Only sessions the
    * conversation's ACP view asked for are watched (live `session/update`
    * frames fold straight into them), and the map is capped so a long browsing
@@ -234,6 +238,7 @@ export class AcpStore {
     acpMode: {},
     chatBoundAgent: {},
     seatDiag: 'idle',
+    permissionSeatDiag: 'idle',
   }
 
   private readonly listeners = new Set<Listener>()
@@ -250,6 +255,12 @@ export class AcpStore {
    * taking the model cell re-mounts readers), so a read may only settle a
    * session no frame has spoken for — otherwise a stale answer would regress a
    * verdict the runtime already told us the truth about.
+   *
+   * The ONE exception is the gate's own re-ask ({@link loadChatSessions} with
+   * `settleVerdict`): a verdict the gate has held as its only fact source for
+   * longer than its TTL is exactly the case where the frame path has gone
+   * quiet, and without an authorized re-read a switch the runtime never framed
+   * could never be corrected.
    */
   private readonly acpModeLive = new Set<string>()
   /**
@@ -631,13 +642,26 @@ export class AcpStore {
    * control calls this per chat session (and again whenever a turn settles, so
    * the binding a fresh conversation just created shows up).
    */
-  async loadChatSessions(dshSessionId: string): Promise<void> {
+  /**
+   * Load the ACP agent sessions backing one DSH chat session. The composer
+   * control calls this per chat session (and again whenever a turn settles, so
+   * the binding a fresh conversation just created shows up).
+   *
+   * `settleVerdict` is the seat gate's own re-ask and the ONLY read allowed to
+   * settle a verdict a frame had already settled (see {@link acpModeLive}): the
+   * gate holds such a verdict as its only fact source while the session row
+   * stays silent, and a host read is the one place a switch the runtime never
+   * framed can still be learned from. Composer readers pass nothing and keep
+   * the frame's authority.
+   */
+  async loadChatSessions(dshSessionId: string, options?: { settleVerdict?: boolean }): Promise<void> {
     // Two composer entries read this (the agent-mode control and the ACP
     // cluster) and both re-read when a turn settles; one round-trip answers
     // for both instead of two racing ones.
     if (this.chatSessionReads.has(dshSessionId)) return
     const read = { dropped: false }
     this.chatSessionReads.set(dshSessionId, read)
+    const settle = options?.settleVerdict === true || !this.acpModeLive.has(dshSessionId)
     try {
       const { sessions, acpMode, boundAgentId } = await this.call<{ sessions: ChatSessionView[]; acpMode?: boolean; boundAgentId?: string }>('session/chat-list', { dshSessionId, refresh: true })
       // A committed `agent-preset/selected` frame may have settled this
@@ -658,7 +682,7 @@ export class AcpStore {
         // A frame-settled verdict outranks any read, whenever it lands: the
         // host's log read can lag a switch by one, and taking the model seat
         // re-mounts readers, so a stale answer would otherwise regress it.
-        ...(acpMode === undefined || this.acpModeLive.has(dshSessionId)
+        ...(acpMode === undefined || !settle
           ? {}
           : { acpMode: { ...this.state.acpMode, [dshSessionId]: acpMode === true } }),
       })
@@ -669,7 +693,7 @@ export class AcpStore {
       // for that session. The gate re-derives this from `hasAcpModeVerdict`
       // on its next evaluation (every store mutation re-runs it), which is
       // what makes the fallback recoverable instead of a single coin flip.
-      if (acpMode === undefined && !this.acpModeLive.has(dshSessionId)) {
+      if (acpMode === undefined && settle) {
         this.acpModeUnsettled.add(dshSessionId)
       }
     } catch {
@@ -677,7 +701,7 @@ export class AcpStore {
       // control simply renders nothing rather than an error nobody can act on.
       if (read.dropped) return
       this.mutate({ chatSessions: [], chatSessionsFor: dshSessionId })
-      if (!this.acpModeLive.has(dshSessionId)) {
+      if (settle) {
         this.acpModeUnsettled.add(dshSessionId)
       }
     } finally {
@@ -707,9 +731,10 @@ export class AcpStore {
    * Record the verdict a committed `agent-preset/selected` frame carries, folded
    * from the frame's own preset field ({@link acpModeFromPresetEvent}). The
    * frame is authoritative: it marks the session live-settled, so no later host
-   * read may regress it (see {@link acpModeLive}). Same no-op-when-unchanged
-   * discipline as the other accessors, so a frame restating the held verdict
-   * costs no listener churn.
+   * read may regress it (see {@link acpModeLive}) — the gate's own TTL re-ask
+   * being the one authorized exception. Same no-op-when-unchanged discipline as
+   * the other accessors, so a frame restating the held verdict costs no
+   * listener churn.
    */
   noteAcpMode(dshSessionId: string, acpMode: boolean): void {
     this.acpModeLive.add(dshSessionId)
@@ -726,6 +751,14 @@ export class AcpStore {
   noteSeatDiag(text: string): void {
     if (this.state.seatDiag === text) return
     this.mutate({ seatDiag: text })
+  }
+
+  /**
+   * Record the permission-seat gate's last decision (`conversation.input.permission`).
+   */
+  notePermissionSeatDiag(text: string): void {
+    if (this.state.permissionSeatDiag === text) return
+    this.mutate({ permissionSeatDiag: text })
   }
 
   /**
