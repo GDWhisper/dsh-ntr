@@ -6,6 +6,10 @@ DeepSeek Harness (DSH) Web 插件：把浏览器变成一个 **ACP（Agent Clien
 
 宿主侧按服务端配置拉起任意 ACP agent 子进程（stdio JSON-RPC v1），事件经 SSE 推送到网页；浏览器可开启多会话、流式交互消息/思考过程/工具调用/计划、人工审批权限请求、切换 agent 自己的 mode 与配置选项。
 
+> **NTR = Negotiated Target Routing（协商式目标路由）**
+>
+> NTR 是本项目对 ACP 的一种用法模式的简称：宿主 Agent 作为 ACP 客户端，经过能力/权限协商，把一轮任务路由给目标 Agent 执行。
+
 ## 功能特性
 
 - **多 Agent 进程管理**：支持按需启动、停用已配置的 ACP 代理子进程。
