@@ -32,9 +32,27 @@ export type Block =
      * an edit reviewable.
      */
     diffs?: Array<{ path: string; oldText: string | null; newText: string }>
+    /** Text items the card cannot render (diff output, an unknown content kind's JSON). */
+    extras?: string[]
+    /**
+     * The call's arguments, as the agent sent them (`rawInput` / `arguments`).
+     * Rendered read-only under the header: the real model's view of "it ran
+     * `ls -la`" is that line, and the old fold dropped it entirely.
+     */
+    input?: string
+    /** The call's other named fields (`kind`, `status`, `locations`, `terminalId`, `meta`), one `key: value` per line. */
+    details?: string[]
+    /** The whole notification this block was last written from, pretty-printed. */
     raw?: string
   }
   | { kind: 'plan'; entries: Array<{ content: string; status: string; priority?: string }> }
+  /**
+   * Any other ACP notification, kept whole: an available-commands list, a mode
+   * change, or a kind newer than this build. `text` is the readable fold and
+   * `raw` the untouched payload — an agent's word the ACP view cannot format is
+   * still an agent's word.
+   */
+  | { kind: 'event'; event: string; text: string; raw?: string; status?: string }
   | { kind: 'notice'; tone: 'info' | 'error'; text: string }
 
 export interface PendingPermission {
@@ -181,22 +199,170 @@ const MAX_BLOCKS = 400
 /** How many observed ACP transcripts stay live at once (insertion-ordered eviction). */
 const MAX_WATCHED = 6
 
-function updateContentToLines(content: unknown): string[] {
-  if (!Array.isArray(content)) return []
-  const out: string[] = []
+/** Raw JSON budget for one event block; the cut is marked. */
+const RAW_MAX = 256_000
+
+/** Pretty-printed JSON of an agent message (never throws, cuts only at {@link RAW_MAX} with a marker). */
+export function jsonText(value: unknown): string {
+  let text: string
+  try {
+    text = JSON.stringify(value, null, 2) ?? String(value)
+  } catch {
+    text = String(value)
+  }
+  return text.length > RAW_MAX
+    ? `${text.slice(0, RAW_MAX)}\n… [truncated ${String(text.length - RAW_MAX)} chars]`
+    : text
+}
+
+/**
+ * The call's arguments as the agent sent them. Accepts every spelling seen in
+ * the wild (`rawInput` / `arguments`, string / object / array) and never
+ * invents one: a call with no input gets `undefined`.
+ */
+export function toolInputOf(update: Record<string, unknown>): string | undefined {
+  for (const key of ['rawInput', 'arguments'] as const) {
+    const value = update[key]
+    if (typeof value === 'string') {
+      if (value !== '') return value
+      continue
+    }
+    if (Array.isArray(value)) {
+      if (value.length > 0) return JSON.stringify(value, null, 2)
+      continue
+    }
+    if (typeof value === 'object' && value !== null) return JSON.stringify(value, null, 2)
+  }
+  return undefined
+}
+
+/** The call's other named fields, one `key: value` per line. */
+export function toolDetailsOf(update: Record<string, unknown>): string[] {
+  const lines: string[] = []
+  for (const key of ['kind', 'status', 'locations', 'terminalId', 'meta'] as const) {
+    const value = update[key]
+    if (value === undefined || value === null || value === '') continue
+    if (key === 'locations' && Array.isArray(value) && value.length === 0) continue
+    lines.push(`${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`)
+  }
+  return lines
+}
+
+/** Text a `text` / `thinking` chunk's `content` carries (string, object, or array of blocks). */
+function chunkText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content.map(item => {
+      if (typeof item === 'string') return item
+      if (typeof item === 'object' && item !== null) {
+        const row = item as Record<string, unknown>
+        return typeof row.text === 'string' ? row.text : JSON.stringify(item)
+      }
+      return ''
+    }).join('')
+  }
+  if (typeof content === 'object' && content !== null) {
+    const row = content as Record<string, unknown>
+    if (typeof row.text === 'string') return row.text
+    return JSON.stringify(content)
+  }
+  return ''
+}
+
+/**
+ * One tool call's `content`, split into what the card renders as text
+ * ({@link lines}), the structured edits it renders as diffs, and everything
+ * else as its own readable text ({@link extras}). Nothing is dropped: a diff is
+ * ALSO shown as text (header plus `-`/`+` lines) because the model's view of a
+ * tool result is text, and a kind this build cannot render becomes its full
+ * JSON.
+ */
+function splitToolContent(content: unknown): { lines: string[]; diffs?: Array<{ path: string; oldText: string | null; newText: string }>; extras: string[] } {
+  const lines: string[] = []
+  const extras: string[] = []
+  const diffs: Array<{ path: string; oldText: string | null; newText: string }> = []
+  if (!Array.isArray(content)) {
+    if (typeof content === 'string' && content !== '') lines.push(content)
+    return { lines, extras }
+  }
   for (const item of content) {
+    if (typeof item === 'string') {
+      if (item !== '') lines.push(item)
+      continue
+    }
     if (typeof item !== 'object' || item === null) continue
     const row = item as Record<string, unknown>
     if (row.type === 'content') {
       const inner = row.content as Record<string, unknown> | undefined
-      if (inner?.type === 'text' && typeof inner.text === 'string') out.push(inner.text)
-      else if (inner?.type === 'diff') out.push(`diff ${String(inner.path ?? '')}`)
-      else out.push(`[${String(inner?.type ?? 'content')}]`)
-    } else if (row.type === 'terminal') {
-      out.push(`[terminal ${String(row.terminalId ?? '')}]`)
+      if (typeof inner === 'string') {
+        lines.push(inner)
+      } else if (inner?.type === 'text') {
+        lines.push(typeof inner.text === 'string' ? inner.text : JSON.stringify(item))
+      } else if (inner?.type === 'diff' && typeof inner.path === 'string') {
+        const diff = { path: inner.path, oldText: typeof inner.oldText === 'string' ? inner.oldText : null, newText: typeof inner.newText === 'string' ? inner.newText : '' }
+        diffs.push(diff)
+        lines.push(diffText(diff))
+      } else {
+        extras.push(`${String(inner?.type ?? 'content')} ${JSON.stringify(item)}`)
+      }
+      continue
     }
+    if (row.type === 'diff' && typeof row.path === 'string' && typeof row.newText === 'string') {
+      const diff = { path: row.path, oldText: typeof row.oldText === 'string' ? row.oldText : null, newText: row.newText }
+      diffs.push(diff)
+      lines.push(diffText(diff))
+      continue
+    }
+    if (row.type === 'text' && typeof row.text === 'string') {
+      lines.push(row.text)
+      continue
+    }
+    extras.push(`${String(row.type ?? 'content')} ${JSON.stringify(item)}`)
   }
-  return out
+  return { lines, extras, ...(diffs.length === 0 ? {} : { diffs }) }
+}
+
+/** A structured edit as plain text: its path, then `-`/`+` lines with three lines of context. */
+function diffText(diff: { path: string; oldText: string | null; newText: string }): string {
+  const split = (text: string | null): string[] => text === null || text === '' ? [] : (text.endsWith('\n') ? text.slice(0, -1) : text).split('\n')
+  const oldLines = split(diff.oldText)
+  const newLines = split(diff.newText)
+  let head = 0
+  while (head < oldLines.length && head < newLines.length && oldLines[head] === newLines[head]) head++
+  let tail = 0
+  while (
+    tail < oldLines.length - head
+    && tail < newLines.length - head
+    && oldLines[oldLines.length - 1 - tail] === newLines[newLines.length - 1 - tail]
+  ) tail++
+  const out: string[] = [diff.path]
+  for (let i = Math.max(0, head - 3); i < head; i++) out.push(`  ${oldLines[i] ?? ''}`)
+  for (let i = head; i < oldLines.length - tail; i++) out.push(`- ${oldLines[i] ?? ''}`)
+  for (let i = head; i < newLines.length - tail; i++) out.push(`+ ${newLines[i] ?? ''}`)
+  for (let i = oldLines.length - tail; i < oldLines.length; i++) out.push(`  ${oldLines[i] ?? ''}`)
+  return out.join('\n')
+}
+
+/** The readable fold of a notification the view has no card of its own for. */
+export function describeEvent(kind: string, update: Record<string, unknown>): string {
+  if (kind === 'available_commands_update') {
+    const commands = Array.isArray(update.availableCommands) ? update.availableCommands : []
+    return commands.map(command => {
+      const row = (typeof command === 'object' && command !== null ? command : {}) as Record<string, unknown>
+      const name = typeof row.name === 'string' ? row.name : ''
+      const description = typeof row.description === 'string' && row.description !== '' ? ` — ${row.description}` : ''
+      return `${name}${description}`
+    }).join('\n')
+  }
+  if (kind === 'plan') {
+    const entries = Array.isArray(update.entries) ? update.entries : []
+    return entries.map(entry => {
+      const row = (typeof entry === 'object' && entry !== null ? entry : {}) as Record<string, unknown>
+      return `[${String(row.status ?? 'pending')}] ${String(row.content ?? '')}`
+    }).join('\n')
+  }
+  if (kind === 'current_mode_update' && typeof update.currentModeId === 'string') return update.currentModeId
+  return ''
 }
 
 export const DEFAULT_KNOWN_PRESETS: DetectedAgentInfo[] = [
@@ -1231,9 +1397,7 @@ export function foldUpdate(blocks: Block[], update: Record<string, unknown>): vo
     case 'agent_message_chunk':
     case 'agent_thought_chunk': {
       const targetKind = kind === 'user_message_chunk' ? 'user' : kind === 'agent_message_chunk' ? 'agent' : 'thought'
-      const text = content?.type === 'text' && typeof content.text === 'string'
-        ? content.text
-        : content !== undefined ? `[${String(content.type)}]` : ''
+      const text = chunkText(content)
       if (text === '') return
       const messageId = typeof update.messageId === 'string' ? update.messageId : undefined
       const last = blocks[blocks.length - 1]
@@ -1249,15 +1413,21 @@ export function foldUpdate(blocks: Block[], update: Record<string, unknown>): vo
       return
     }
     case 'tool_call': {
-      const diffs = extractDiffs(update.content)
+      const parsed = splitToolContent(update.content)
+      const input = toolInputOf(update)
+      const details = toolDetailsOf(update)
       blocks.push({
         kind: 'tool',
         toolCallId: String(update.toolCallId ?? ''),
         title: String(update.title ?? ''),
         status: String(update.status ?? 'pending'),
         ...(typeof update.kind === 'string' ? { toolKind: update.kind } : {}),
-        lines: updateContentToLines(update.content),
-        ...(diffs === undefined ? {} : { diffs }),
+        lines: parsed.lines,
+        ...(parsed.diffs === undefined ? {} : { diffs: parsed.diffs }),
+        ...(parsed.extras.length === 0 ? {} : { extras: parsed.extras }),
+        ...(input === undefined ? {} : { input }),
+        ...(details.length === 0 ? {} : { details }),
+        raw: jsonText(update),
       })
       return
     }
@@ -1268,21 +1438,33 @@ export function foldUpdate(blocks: Block[], update: Record<string, unknown>): vo
         if (block?.kind !== 'tool' || block.toolCallId !== id) continue
         if (typeof update.title === 'string' && update.title !== '') block.title = update.title
         if (typeof update.status === 'string') block.status = update.status
-        const lines = updateContentToLines(update.content)
-        if (lines.length > 0) block.lines = lines
-        const diffs = extractDiffs(update.content)
-        if (diffs !== undefined) block.diffs = diffs
+        if (typeof update.kind === 'string') block.toolKind = update.kind
+        const parsed = splitToolContent(update.content)
+        if (parsed.lines.length > 0) block.lines = parsed.lines
+        if (parsed.diffs !== undefined) block.diffs = parsed.diffs
+        if (parsed.extras.length > 0) block.extras = parsed.extras
+        const input = toolInputOf(update)
+        if (input !== undefined) block.input = input
+        const details = toolDetailsOf(update)
+        if (details.length > 0) block.details = details
+        block.raw = jsonText(update)
         return
       }
       // Update for a tool call that rolled out of the transcript window.
-      const diffs = extractDiffs(update.content)
+      const parsed = splitToolContent(update.content)
+      const input = toolInputOf(update)
+      const details = toolDetailsOf(update)
       blocks.push({
         kind: 'tool',
         toolCallId: id,
         title: id,
         status: String(update.status ?? 'completed'),
-        lines: updateContentToLines(update.content),
-        ...(diffs === undefined ? {} : { diffs }),
+        lines: parsed.lines,
+        ...(parsed.diffs === undefined ? {} : { diffs: parsed.diffs }),
+        ...(parsed.extras.length === 0 ? {} : { extras: parsed.extras }),
+        ...(input === undefined ? {} : { input }),
+        ...(details.length === 0 ? {} : { details }),
+        raw: jsonText(update),
       })
       return
     }
@@ -1302,25 +1484,25 @@ export function foldUpdate(blocks: Block[], update: Record<string, unknown>): vo
       }
       return
     }
-    default:
-      // available_commands / modes / config / usage / session_info ride on the
-      // SessionView snapshot, not the block stream.
+    default: {
+      // Every remaining notification kind is kept, not dropped: a command list,
+      // a mode change, or a kind newer than this build. Bookkeeping frames that
+      // say nothing new (`config_option_update` / `usage_update` /
+      // `session_info_update`) ride the SessionView snapshot — they are state,
+      // not stream content, and a row per tick would be noise.
+      if (kind === '' || STATE_ONLY_UPDATES.has(kind)) return
+      blocks.push({ kind: 'event', event: kind, text: describeEvent(kind, update), raw: jsonText(update) })
       return
+    }
   }
 }
 
-/** Pull structured diff payloads out of one tool call's content array. */
-function extractDiffs(content: unknown): Array<{ path: string; oldText: string | null; newText: string }> | undefined {
-  if (!Array.isArray(content)) return undefined
-  const out: Array<{ path: string; oldText: string | null; newText: string }> = []
-  for (const item of content) {
-    if (typeof item !== 'object' || item === null) continue
-    const row = item as Record<string, unknown>
-    if (row.type !== 'diff' || typeof row.path !== 'string' || typeof row.newText !== 'string') continue
-    out.push({ path: row.path, oldText: typeof row.oldText === 'string' ? row.oldText : null, newText: row.newText })
-  }
-  return out.length > 0 ? out : undefined
-}
+/** Notifications that update the SessionView snapshot instead of the block stream. */
+export const STATE_ONLY_UPDATES: ReadonlySet<string> = new Set([
+  'config_option_update',
+  'usage_update',
+  'session_info_update',
+])
 
 function trimBlocks(blocks: Block[]): void {
   if (blocks.length > MAX_BLOCKS) blocks.splice(0, blocks.length - MAX_BLOCKS)

@@ -31,19 +31,55 @@ describe('foldUpdate', () => {
     expect(blocks[0]).toMatchObject({ text: 'ab' })
   })
 
-  it('renders non-text content as a placeholder', () => {
+  it('keeps a non-text chunk as its payload instead of a placeholder', () => {
     const blocks = fold({ sessionUpdate: 'agent_message_chunk', content: { type: 'image', data: 'x', mimeType: 'image/png' } })
-    expect(blocks[0]).toMatchObject({ kind: 'agent', text: '[image]' })
+    expect(blocks[0]).toMatchObject({ kind: 'agent' })
+    expect((blocks[0] as { text: string }).text).toContain('image/png')
   })
 
-  it('creates and merges tool cards by toolCallId, including content lines', () => {
+  it('reads a chunk whose content is an object or an array of blocks', () => {
     const blocks = fold(
-      { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'run', kind: 'execute', status: 'pending' },
+      { sessionUpdate: 'agent_thought_chunk', content: { text: 'nested' } },
+      { sessionUpdate: 'agent_message_chunk', content: 'plain string' },
+      { sessionUpdate: 'agent_message_chunk', messageId: 'm', content: [{ text: 'a' }, { text: 'b' }] },
+    )
+    expect(blocks.map(block => (block as { text: string }).text)).toEqual(['nested', 'plain string', 'ab'])
+  })
+
+  it('creates and merges tool cards by toolCallId, including content lines and arguments', () => {
+    const blocks = fold(
+      { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'run', kind: 'execute', status: 'pending', rawInput: '{"cmd":"ls"}' },
       { sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'in_progress' },
       { sessionUpdate: 'tool_call_update', toolCallId: 't1', title: 'run ls', status: 'completed', content: [{ type: 'content', content: { type: 'text', text: 'file1\nfile2' } }] },
     )
     expect(blocks).toHaveLength(1)
-    expect(blocks[0]).toEqual({ kind: 'tool', toolCallId: 't1', title: 'run ls', status: 'completed', toolKind: 'execute', lines: ['file1\nfile2'] })
+    expect(blocks[0]).toMatchObject({
+      kind: 'tool',
+      toolCallId: 't1',
+      title: 'run ls',
+      status: 'completed',
+      toolKind: 'execute',
+      lines: ['file1\nfile2'],
+      input: '{"cmd":"ls"}',
+    })
+  })
+
+  it('keeps diffs as text AND as a diff, and an unknown content kind as its JSON', () => {
+    const blocks = fold({
+      sessionUpdate: 'tool_call',
+      toolCallId: 't2',
+      title: 'edit',
+      content: [
+        { type: 'diff', path: '/w/a.ts', oldText: 'one\ntwo\n', newText: 'one\nTWO\n' },
+        { type: 'terminal', terminalId: 'term-7' },
+      ],
+    })
+    const card = blocks[0] as Extract<Block, { kind: 'tool' }>
+    expect(card.diffs).toEqual([{ path: '/w/a.ts', oldText: 'one\ntwo\n', newText: 'one\nTWO\n' }])
+    expect(card.lines.join('\n')).toContain('- two')
+    expect(card.lines.join('\n')).toContain('+ TWO')
+    expect((card.extras ?? []).join('\n')).toContain('term-7')
+    expect(card.raw).toContain('term-7')
   })
 
   it('materializes an update-only tool card when the original rolled out of the window', () => {
@@ -60,9 +96,15 @@ describe('foldUpdate', () => {
     expect(blocks[0]).toMatchObject({ kind: 'plan', entries: [{ content: 'a', status: 'completed' }] })
   })
 
-  it('ignores meta updates that ride on the session snapshot', () => {
+  it('records a notification it has no card for as an event, and skips state-only frames', () => {
     expect(fold({ sessionUpdate: 'usage_update', used: 1, size: 2 })).toEqual([])
-    expect(fold({ sessionUpdate: 'current_mode_update', currentModeId: 'x' })).toEqual([])
+    expect(fold({ sessionUpdate: 'config_option_update', configOptions: [] })).toEqual([])
+    const events = fold(
+      { sessionUpdate: 'current_mode_update', currentModeId: 'plan' },
+      { sessionUpdate: 'something_new', payload: { deep: true } },
+    )
+    expect(events[0]).toMatchObject({ kind: 'event', event: 'current_mode_update', text: 'plan' })
+    expect((events[1] as { raw: string }).raw).toContain('"deep"')
   })
 })
 

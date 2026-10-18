@@ -234,6 +234,15 @@ describe('ACP bridge over stdio (mock agent)', () => {
       chunks.push(chunk)
     }
 
+    // The notification that has no card of its own — the agent's plan — is
+    // still announced on the stream as an `acp_plan` card rather than dropped.
+    // (The command list is session state and stays off the stream.)
+    const cardNames = chunks
+      .filter((c): c is Extract<StreamChunk, { type: 'tool-call-delta' }> => c.type === 'tool-call-delta')
+      .map(c => c.name)
+      .filter((name): name is string => name !== undefined)
+    expect(cardNames).toEqual(expect.arrayContaining(['acp_plan', 'mock tool']))
+
     const types = chunks.map(c => c.type)
     expect(types).toContain('block-start')
     expect(types).toContain('reasoning-delta')
@@ -254,12 +263,14 @@ describe('ACP bridge over stdio (mock agent)', () => {
     // plane's tool-call renderer consumes. Two deltas for this mock: the
     // announcement (id + name, no arguments — the mock sends none) and the
     // result content. Updates that carry nothing new emit nothing.
-    const toolDeltas = chunks.filter((c): c is Extract<StreamChunk, { type: 'tool-call-delta' }> => c.type === 'tool-call-delta')
-    expect(toolDeltas.map(c => c.id)).toEqual(['call_1', 'call_1'])
+    const toolDeltas = chunks.filter((c): c is Extract<StreamChunk, { type: 'tool-call-delta' }> => c.type === 'tool-call-delta' && c.id === 'call_1')
+    expect(toolDeltas.length).toBeGreaterThanOrEqual(2)
+    expect(new Set(toolDeltas.map(c => c.id))).toEqual(new Set(['call_1']))
     // The announcement carries the call identity and the agent's own label.
     expect(toolDeltas[0]).toMatchObject({ id: 'call_1', name: 'mock tool' })
-    // The update carries the result text the agent published.
-    expect(toolDeltas[1]?.argumentsDelta).toContain('tool result line')
+    // The update carries the result text the agent published (after the
+    // per-update `raw` refresh delta, which carries no arguments).
+    expect(toolDeltas.some(c => c.argumentsDelta.includes('tool result line'))).toBe(true)
 
     // The block it opens and closes is a `tool-call` block, and the closing
     // frame carries the COMPLETE snapshot — the host REPLACES on `block-end`
@@ -270,7 +281,8 @@ describe('ACP bridge over stdio (mock agent)', () => {
     const toolEnd = chunks.find((c): c is Extract<StreamChunk, { type: 'block-end' }> =>
       c.type === 'block-end'
       && typeof c.block === 'object' && c.block !== null
-      && (c.block as { type?: string }).type === 'tool-call')
+      && (c.block as { type?: string }).type === 'tool-call'
+      && (c.block as { id?: string }).id === 'call_1')
     expect(toolEnd?.block).toMatchObject({ type: 'tool-call', id: 'call_1', name: 'mock tool' })
     expect((toolEnd?.block as { arguments?: string }).arguments).toContain('tool result line')
 
@@ -278,6 +290,8 @@ describe('ACP bridge over stdio (mock agent)', () => {
     // after the tool card, and the Chat plane's answer detection refuses any
     // message containing a tool-call block — so they buffered for the
     // continuation step (`pendingToolAnswers`).
+    // (The plan card opened before any real call — see the `acp_plan` card
+    // above — so this turn's message text still counts as an answer buffer.)
     const textDeltas = chunks.filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
     expect(textDeltas).toHaveLength(0)
 
@@ -339,16 +353,22 @@ describe('ACP bridge over stdio (mock agent)', () => {
     // tool-call block.
     const starts = chunks.filter((c): c is Extract<StreamChunk, { type: 'block-start' }> =>
       c.type === 'block-start' && c.blockType === 'tool-call')
-    expect(starts).toHaveLength(3)
+    // One announcement card (the plan) plus three calls.
+    expect(starts).toHaveLength(4)
 
     // The restated `tool_call` for t1 folds as an update (no new block, no
     // delta), and the replacement `rawInput` update pushes nothing — a
     // replacement is not expressible as an append. call_1 keeps its standard
     // two deltas (announcement + result content).
-    const toolDeltas = chunks.filter((c): c is Extract<StreamChunk, { type: 'tool-call-delta' }> => c.type === 'tool-call-delta')
-    expect(toolDeltas.map(c => c.id)).toEqual(['t1', 't2', 'call_1', 'call_1'])
+    // One delta per distinct change: t1's announcement and its two
+    // restatements, t2's announcement, then call_1's announcement, its
+    // three progress ticks and its result. A delta is also the carrier for
+    // `details` / `raw` changes, so a restatement is never silent.
+    const toolDeltas = chunks.filter((c): c is Extract<StreamChunk, { type: 'tool-call-delta' }> => c.type === 'tool-call-delta' && !c.id.startsWith('unhandled'))
+    expect(toolDeltas.map(c => c.id)).toEqual(['t1', 't1', 't1', 't2', 'call_1', 'call_1', 'call_1', 'call_1', 'call_1', 'call_1'])
     expect(toolDeltas[0]).toMatchObject({ id: 't1', name: 'first tool', argumentsDelta: '{"cmd":""}' })
-    expect(toolDeltas[1]).toMatchObject({ id: 't2', argumentsDelta: '{"path":"a.md"}' })
+    const t2Deltas = toolDeltas.filter(c => c.id === 't2')
+    expect(t2Deltas[0]).toMatchObject({ id: 't2', name: 'second tool', argumentsDelta: '{"path":"a.md"}' })
 
     // The settled cards carry the LATEST snapshot each — block-end replaces
     // the block wholesale, so the replacement update lands verbatim instead
@@ -357,16 +377,18 @@ describe('ACP bridge over stdio (mock agent)', () => {
       c.type === 'block-end'
       && typeof c.block === 'object' && c.block !== null
       && (c.block as { type?: string }).type === 'tool-call')
-    expect(settled.map(c => (c.block as { id?: string }).id)).toEqual(['t1', 't2', 'call_1'])
-    expect((settled[0]?.block as { arguments?: string }).arguments).toBe('{"cmd":"ls -la"}')
-    expect((settled[1]?.block as { arguments?: string }).arguments).toBe('{"path":"a.md"}')
+    expect(settled.filter(c => !(c.block as { id?: string }).id?.startsWith('unhandled')).map(c => (c.block as { id?: string }).id)).toEqual(['t1', 't2', 'call_1'])
+    const calls = settled.filter(c => !(c.block as { id?: string }).id?.startsWith('unhandled'))
+    expect((calls[0]?.block as { arguments?: string }).arguments).toBe('{"cmd":"ls -la"}')
+    expect((calls[1]?.block as { arguments?: string }).arguments).toBe('{"path":"a.md"}')
 
     // The codebuddy interleave: t1's titled restatement arrives while t2's card
     // is the open block. It must NOT open a duplicate t1 card — three calls,
     // three cards (indices 1..3; the mock's leading thought chunk owns 0) — and
     // t1's final content-only update lands in the shared tool-output record the
     // guard's virtual tools answer from.
-    expect(starts.map(c => (c as { index: number }).index)).toEqual([1, 2, 3])
+    // The plan card sits at 1; the three call cards follow it.
+    expect(starts.map(c => (c as { index: number }).index)).toEqual([1, 2, 3, 4])
     expect(routeBindingRegistry().toolResults.get('t1')).toBe('T1 OUTPUT LINE')
     routeBindingRegistry().toolResults.delete('t1')
 

@@ -134,12 +134,18 @@ function boundModelFor(dshSessionId) {
 /**
  * The ACP tool call's real output, as the bridge folded it. `undefined` when
  * the call carried no content (the card then shows a plain note).
+ *
+ * Two records are probed: `toolResults` (real agent tool calls) and
+ * `cardOutputs` (display cards for notifications that are not tool calls — a
+ * plan, a mode change, an unknown kind). They are separate maps because the
+ * pre-step gate reads `toolResults` as "these staged results are my own
+ * continuation step", and a plan is not a tool result.
  */
 function toolOutputFor(callId) {
   try {
     if (typeof callId !== 'string' || callId === '') return undefined
     const registry = globalThis[BINDING_KEY]
-    const text = registry?.toolResults?.get?.(callId)
+    const text = registry?.toolResults?.get?.(callId) ?? registry?.cardOutputs?.get?.(callId)
     return typeof text === 'string' && text !== '' ? text : undefined
   } catch {
     return undefined

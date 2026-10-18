@@ -196,9 +196,10 @@ function DiffView({ diff, t }: { diff: { path: string; oldText: string | null; n
   )
 }
 
-/** One tool call: header, text output, and any structured edits it carried. */
+/** One tool call: header, arguments, text output, unknown payloads, and any structured edits it carried. */
 function ToolCard({ block, t }: { block: Extract<Block, { kind: 'tool' }>; t: Translate }) {
   const [expanded, setExpanded] = useState(false)
+  const [rawOpen, setRawOpen] = useState(false)
   const glyph = TOOL_GLYPH[block.toolKind ?? 'other'] ?? TOOL_GLYPH.other
   const tone = STATUS_TONE[block.status] ?? 'idle'
   const clipped = !expanded && block.lines.length > TOOL_LINES_CLIP
@@ -210,8 +211,22 @@ function ToolCard({ block, t }: { block: Extract<Block, { kind: 'tool' }>; t: Tr
         <span className="ntr-acp-tool-title">{block.title === '' ? block.toolCallId : block.title}</span>
         <span className={`ntr-acp-badge is-${tone}`}>{block.status}</span>
       </div>
+      {/*
+        The arguments the agent sent. Rendered as-is: `rawInput` may be a JSON
+        object the agent serialized, a plain command line, or nothing at all —
+        reformatting it would be this view guessing at another agent's schema.
+      */}
+      {block.input !== undefined && block.input !== '' && (
+        <pre className="ntr-acp-tool-body ntr-acp-tool-input">{block.input}</pre>
+      )}
+      {block.details !== undefined && block.details.length > 0 && (
+        <pre className="ntr-acp-tool-body ntr-acp-tool-meta">{block.details.join('\n')}</pre>
+      )}
       {shown.length > 0 && (
         <pre className="ntr-acp-tool-body">{`${shown.join('\n')}${clipped ? '\n…' : ''}`}</pre>
+      )}
+      {block.extras !== undefined && block.extras.length > 0 && (
+        <pre className="ntr-acp-tool-body">{block.extras.join('\n')}</pre>
       )}
       {block.diffs?.map((diff, index) => <DiffView key={`${diff.path}#${String(index)}`} diff={diff} t={t} />)}
       {block.lines.length > TOOL_LINES_CLIP && (
@@ -221,6 +236,32 @@ function ToolCard({ block, t }: { block: Extract<Block, { kind: 'tool' }>; t: Tr
             : t(`显示全部 ${block.lines.length} 行`, `show all ${block.lines.length} lines`)}
         </button>
       )}
+      {block.raw !== undefined && (
+        <button type="button" className="ntr-acp-more" onClick={() => { setRawOpen(!rawOpen) }}>
+          {rawOpen ? t('收起原始数据', 'hide raw payload') : t('原始数据', 'raw payload')}
+        </button>
+      )}
+      {rawOpen && block.raw !== undefined && <pre className="ntr-acp-tool-body">{block.raw}</pre>}
+    </div>
+  )
+}
+
+/** One notification the view has no card of its own for: its readable fold, plus the untouched payload. */
+function EventCard({ block, t }: { block: Extract<Block, { kind: 'event' }>; t: Translate }) {
+  const [rawOpen, setRawOpen] = useState(false)
+  return (
+    <div className="ntr-acp-tool is-done">
+      <div className="ntr-acp-tool-head">
+        <span aria-hidden>ℹ️</span>
+        <span className="ntr-acp-tool-title">{block.event}</span>
+      </div>
+      {block.text !== '' && <pre className="ntr-acp-tool-body">{block.text}</pre>}
+      {block.raw !== undefined && (
+        <button type="button" className="ntr-acp-more" onClick={() => { setRawOpen(!rawOpen) }}>
+          {rawOpen ? t('收起原始数据', 'hide raw payload') : t('原始数据', 'raw payload')}
+        </button>
+      )}
+      {rawOpen && block.raw !== undefined && <pre className="ntr-acp-tool-body">{block.raw}</pre>}
     </div>
   )
 }
@@ -260,6 +301,8 @@ function BlockView({ block, t }: { block: Block; t: Translate }) {
       return <ToolCard block={block} t={t} />
     case 'plan':
       return <PlanCard entries={block.entries} t={t} />
+    case 'event':
+      return <EventCard block={block} t={t} />
     default:
       return <div className={`ntr-acp-notice is-${block.tone}`}>{block.text}</div>
   }
@@ -303,18 +346,18 @@ export function AcpConversationView(props: AcpViewProps) {
     return (
       <div className="ntr-acp-view">
         <div className="ntr-acp-empty">
-          <div className="ntr-acp-empty-title">{t('这个会话还没有 ACP agent 参与', 'No ACP agent has run in this conversation yet')}</div>
+          <div className="ntr-acp-empty-title">{t('这个会话还没有 NTR agent 参与', 'No NTR agent has run in this conversation yet')}</div>
           <p className="ntr-acp-empty-body">
             {t(
-              '选中一个 ACP agent 后，本会话的对话就由它服务：原生聊天里会出现它的文字回复与思考过程，而它的工具调用、计划和 diff 会完整地出现在这个视图里。',
-              "Pick an ACP agent and it serves this conversation: the native chat shows its prose and reasoning, while its tool calls, plans and diffs appear here in full.",
+              '选中一个 NTR agent 后，本会话的对话就由它服务：原生聊天里会出现它的文字回复与思考过程，而它的工具调用、计划和 diff 会完整地出现在这个视图里。',
+              "Pick a NTR agent and it serves this conversation: the native chat shows its prose and reasoning, while its tool calls, plans and diffs appear here in full.",
             )}
           </p>
           {bound !== undefined
             ? <div className="ntr-acp-empty-hint">{t('绑定的是', 'bound to')} · {bound.agentTitle ?? bound.agentId}</div>
             : ui.agents.length === 0
-              ? <div className="ntr-acp-empty-hint">{t('还没有配置 agent', 'No agent configured')} · {t('设置 → ACP 代理', 'Settings → ACP Agents')}</div>
-              : <div className="ntr-acp-empty-hint">{t('用输入框右侧的 ACP 底座选择一个 agent', 'pick one from the ACP base in the composer')}</div>}
+              ? <div className="ntr-acp-empty-hint">{t('还没有配置 agent', 'No agent configured')} · {t('设置 → NTR', 'Settings → NTR')}</div>
+              : <div className="ntr-acp-empty-hint">{t('用输入框右侧的 NTR 底座选择一个 agent', 'pick one from the NTR base in the composer')}</div>}
           {/*
             The model-seat gate's last verdict. When the ACP base does not take
             over the composer's model seat — the native model selector is still

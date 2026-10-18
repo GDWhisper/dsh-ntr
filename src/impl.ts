@@ -660,26 +660,54 @@ export interface AcpToolCallSnapshot {
   name: string
   /** Accumulated argument text (ACP has no fixed vocabulary for it). */
   argsRaw: string
+  /** The call's other named fields (`kind`, `status`, `locations`, `terminalId`, `meta`) as `key: value` lines. */
+  details?: string
+  /** Pretty-printed JSON of the latest full notification, truncated only at {@link ACP_TOOL_RAW_MAX}. */
+  raw?: string
 }
 
 /** A delta of tool-call content, folded into the open snapshot. */
 export type AcpToolCallDelta =
   | { kind: 'name'; name: string }
   | { kind: 'args'; text: string }
+  /** Replacement text of the call's other named fields (kind/status/locations/…). */
+  | { kind: 'details'; text: string }
+  /** Replacement JSON of the whole notification (see {@link AcpToolCallSnapshot.raw}). */
+  | { kind: 'raw'; text: string }
 
 /**
  * Fold one ACP `tool_call` notification into a snapshot.
  *
- * `rawInput` / `arguments` are accepted when present: some agents send structured
- * input, and a tool card that cannot show its arguments is half a card. Anything
- * else is ignored — a tool call with only an id and a title is legal ACP.
+ * The snapshot keeps the fields the card itself renders (`title`, input text),
+ * the call's other named fields (`kind`, `status`, `locations`, `terminalId`,
+ * `meta`) in {@link AcpToolCallSnapshot.details}, and the whole raw notification
+ * in {@link AcpToolCallSnapshot.raw} — an agent's call may carry a shape this
+ * plugin has never seen, and the settled card can still show it verbatim.
+ * Returns `undefined` only when the notification has no id: without one there is
+ * nothing to group the card with, and inventing an id would be a lie.
  */
 export function acpToolCallFromUpdate(update: Record<string, unknown>): AcpToolCallSnapshot | undefined {
   const callId = typeof update.toolCallId === 'string' ? update.toolCallId.trim() : ''
   if (callId === '') return undefined
   const name = typeof update.title === 'string' ? update.title : ''
-  return { callId, name, argsRaw: acpToolCallArgsOf(update) }
+  const details = acpToolCallDetailsOf(update)
+  return { callId, name, argsRaw: acpToolCallArgsOf(update), ...(details === '' ? {} : { details }), raw: dumpJson(update) }
 }
+
+/** The ordered `key: value` rendering of a tool call's non-text fields (see {@link AcpToolCallSnapshot.details}). */
+export function acpToolCallDetailsOf(update: Record<string, unknown>): string {
+  const lines: string[] = []
+  for (const key of ['kind', 'status', 'locations', 'terminalId', 'meta'] as const) {
+    const value = update[key]
+    if (value === undefined || value === null || value === '') continue
+    if (key === 'locations' && Array.isArray(value) && value.length === 0) continue
+    lines.push(`${key}: ${typeof value === 'string' ? value : jsonOf(value)}`)
+  }
+  return lines.join('\n')
+}
+
+/** Keys {@link acpToolCallDetailsOf} already accounts for (everything else is announced as an extra key). */
+const ACP_TOOL_CALL_KNOWN_KEYS = new Set(['sessionUpdate', 'toolCallId', 'title', 'rawInput', 'arguments', 'content', 'kind', 'status', 'locations', 'terminalId', 'meta'])
 
 /**
  * Fold one ACP `tool_call_update` into an open snapshot, in place.
@@ -718,6 +746,21 @@ export function acpToolCallDelta(
       snapshot.argsRaw = text
     }
   }
+  const details = acpToolCallDetailsOf(update)
+  if (details !== '') {
+    deltas.push({ kind: 'details', text: details })
+    snapshot.details = details
+  }
+  // `kind` / `status` name themselves; an unknown key is the one thing a shape
+  // we have never seen would carry, so it is announced here rather than only
+  // sitting in the raw JSON.
+  const extra = Object.keys(update).filter(key => !ACP_TOOL_CALL_KNOWN_KEYS.has(key))
+  if (extra.length > 0) {
+    deltas.push({ kind: 'details', text: `other keys: ${extra.join(', ')}` })
+  }
+  const raw = dumpJson(update)
+  deltas.push({ kind: 'raw', text: raw })
+  snapshot.raw = raw
   return deltas
 }
 
@@ -735,23 +778,24 @@ function extensionSuffixOf(previous: string, next: string): string {
 /**
  * The argument INPUT an ACP tool-call notification carries, if any.
  *
- * Accepts the spellings seen in the wild (`rawInput` as a string, `arguments`
- * as a string or an object). A stringified object is accepted as-is: the card
- * shows raw text, and re-serializing would reorder nothing but risk throwing.
+ * Accepts the spellings seen in the wild: `rawInput` / `arguments` as a string,
+ * an object, or an ARRAY (some agents batch several calls as one input). Every
+ * non-empty value is serialized as-is — a stringified object is accepted as-is,
+ * because the card shows raw text and re-serializing would only risk throwing.
+ * Only an absent / empty / null value counts as "no input".
  */
 function acpToolCallInputOf(update: Record<string, unknown>): string | undefined {
   for (const key of ['rawInput', 'arguments'] as const) {
     const value = update[key]
-    if (typeof value === 'string' && value !== '') return value
-    if (typeof value === 'object' && value !== null) {
-      try {
-        return JSON.stringify(value)
-      } catch {
-        // A circular or otherwise unserializable value is not worth failing a
-        // tool card over: show what we can.
-        return String(value)
-      }
+    if (typeof value === 'string') {
+      if (value !== '') return value
+      continue
     }
+    if (Array.isArray(value)) {
+      if (value.length > 0) return jsonOf(value)
+      continue
+    }
+    if (typeof value === 'object' && value !== null) return jsonOf(value)
   }
   return undefined
 }
@@ -759,54 +803,183 @@ function acpToolCallInputOf(update: Record<string, unknown>): string | undefined
 /**
  * The argument text an ACP tool-call notification carries, if any.
  *
- * Accepts the spellings seen in the wild (`rawInput` as a string, `arguments` as
- * a string or an object, and a `content` array folded to text) and refuses to
- * invent one: an agent that sends no arguments gets `''`, which renders as an
- * empty card rather than a fabricated placeholder.
+ * Same spellings as {@link acpToolCallInputOf}, plus a `content` array folded to
+ * text, and refuses to invent one: an agent that sends no arguments gets `''`,
+ * which renders as an empty card rather than a fabricated placeholder.
  */
 export function acpToolCallArgsOf(update: Record<string, unknown>): string {
-  for (const key of ['rawInput', 'arguments'] as const) {
-    const value = update[key]
-    if (typeof value === 'string' && value !== '') return value
-    if (typeof value === 'object' && value !== null) {
-      try {
-        return JSON.stringify(value)
-      } catch {
-        // A circular or otherwise unserializable value is not worth failing a
-        // tool card over: show what we can.
-        return String(value)
-      }
+  return acpToolCallInputOf(update) ?? updateContentToText(update.content)
+}
+
+/** The fields of one ACP content block that a diff row carries. */
+export interface AcpDiffPayload {
+  path: string
+  oldText: string | null
+  newText: string
+}
+
+/** One folded piece of a tool call's `content`. */
+export type AcpContentRow =
+  | { kind: 'text'; text: string }
+  /** Structured edits are kept apart: flattening them to `diff <path>` throws away the review. */
+  | { kind: 'diff'; diff: AcpDiffPayload }
+  /** A kind we cannot render. `json` carries the whole item, so nothing the agent sent is lost. */
+  | { kind: 'other'; label: string; json: string }
+
+/**
+ * Fold one ACP tool-call content item, preserving everything.
+ *
+ * The caller decides how to render a `text` / `diff` / `other` row; the one rule
+ * here is that no shape may vanish. ACP agents in the wild send kinds beyond the
+ * spec's `content` / `diff` / `terminal` (observations, images, links, custom
+ * rows), and an item we do not understand is still something the agent said —
+ * it rides along as `other` with its full JSON rather than disappearing.
+ */
+export function acpContentRows(content: unknown): AcpContentRow[] {
+  if (!Array.isArray(content)) return []
+  const out: AcpContentRow[] = []
+  for (const item of content) {
+    if (typeof item !== 'object' || item === null) {
+      if (typeof item === 'string' && item !== '') out.push({ kind: 'text', text: item })
+      continue
     }
+    const row = item as Record<string, unknown>
+    const type = typeof row.type === 'string' ? row.type : ''
+    if (type === 'content') {
+      const inner = row.content as Record<string, unknown> | undefined
+      if (typeof inner === 'string') {
+        out.push({ kind: 'text', text: inner })
+      } else if (inner?.type === 'text' && typeof inner.text === 'string') {
+        out.push({ kind: 'text', text: inner.text })
+      } else if (inner?.type === 'diff') {
+        const path = typeof inner.path === 'string' ? inner.path : ''
+        out.push({
+          kind: 'diff',
+          diff: { path, oldText: typeof inner.oldText === 'string' ? inner.oldText : null, newText: typeof inner.newText === 'string' ? inner.newText : '' },
+        })
+      } else {
+        out.push({ kind: 'other', label: String(inner?.type ?? 'content'), json: jsonOf(item) })
+      }
+      continue
+    }
+    if (type === 'diff' && typeof row.path === 'string' && typeof row.newText === 'string') {
+      out.push({ kind: 'diff', diff: { path: row.path, oldText: typeof row.oldText === 'string' ? row.oldText : null, newText: row.newText } })
+      continue
+    }
+    out.push({ kind: 'other', label: type === '' ? 'content' : type, json: jsonOf(item) })
   }
-  return updateContentToText(update.content)
+  return out
 }
 
 /**
- * Fold ACP tool-call `content` into plain text, with a bracketed placeholder for
- * the kinds the Chat card cannot render. Shares its shape with the ACP view's
- * line fold so both halves read an agent's content the same way. Exported for
- * the bridge's tool-output record (the shared registry the guard's virtual
- * tools answer from), so both halves fold an agent's result identically.
+ * The plain text of one tool payload: text as-is, diffs as a per-file header
+ * plus its removed/added lines (`-`/`+`), other kinds as their full JSON. This
+ * replaces the old `[diff path]` / `[terminal id]` placeholders — those names
+ * the block and drop everything else the agent said.
+ *
+ * It doubles as what the guard's virtual tools answer the host loop with, so
+ * both the card and the executed result read the same thing.
  */
 export function updateContentToText(content: unknown): string {
-  if (!Array.isArray(content)) return ''
-  const out: string[] = []
-  for (const item of content) {
-    if (typeof item !== 'object' || item === null) continue
-    const row = item as Record<string, unknown>
-    if (row.type === 'content') {
-      const inner = row.content as Record<string, unknown> | undefined
-      if (inner?.type === 'text' && typeof inner.text === 'string') out.push(inner.text)
-      else if (inner?.type === 'diff') out.push(`[diff ${String(inner.path ?? '')}]`)
-      else out.push(`[${String(inner?.type ?? 'content')}]`)
-    } else if (row.type === 'terminal') {
-      out.push(`[terminal ${String(row.terminalId ?? '')}]`)
-    }
+  return acpContentRows(content).map(row => {
+    if (row.kind === 'text') return row.text
+    if (row.kind === 'diff') return formatAcpDiff(row.diff)
+    return `${row.label} ${row.json}`
+  }).join('\n')
+}
+
+/** One structured edit as readable text: `path`, then `-`/`+` lines plus unchanged context. */
+export function formatAcpDiff(diff: AcpDiffPayload): string {
+  const oldLines = splitLines(diff.oldText)
+  const newLines = splitLines(diff.newText)
+  let head = 0
+  while (head < oldLines.length && head < newLines.length && oldLines[head] === newLines[head]) head++
+  let tail = 0
+  while (
+    tail < oldLines.length - head
+    && tail < newLines.length - head
+    && oldLines[oldLines.length - 1 - tail] === newLines[newLines.length - 1 - tail]
+  ) tail++
+  const lines: string[] = [diff.path]
+  for (let i = Math.max(0, head - 3); i < head; i++) lines.push(`  ${oldLines[i] ?? ''}`)
+  for (let i = head; i < oldLines.length - tail; i++) lines.push(`- ${oldLines[i] ?? ''}`)
+  for (let i = head; i < newLines.length - tail; i++) lines.push(`+ ${newLines[i] ?? ''}`)
+  for (let i = oldLines.length - tail; i < oldLines.length; i++) lines.push(`  ${oldLines[i] ?? ''}`)
+  return lines.join('\n')
+}
+
+function splitLines(text: string | null): string[] {
+  if (text === null || text === '') return []
+  return text.endsWith('\n') ? text.slice(0, -1).split('\n') : text.split('\n')
+}
+
+/** JSON text of a value; a non-serializable value falls back to its string form rather than throwing. */
+function jsonOf(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? String(value)
+  } catch {
+    return String(value)
   }
-  return out.join('\n')
+}
+
+/** Cap on one tool call's raw notification. Large enough for big `content` arrays; the cut is marked. */
+export const ACP_TOOL_RAW_MAX = 256_000
+
+/** Pretty-printed JSON of an agent message, truncated only at {@link ACP_TOOL_RAW_MAX}. */
+export function dumpJson(value: unknown): string {
+  let text: string
+  try {
+    text = JSON.stringify(value, null, 2) ?? String(value)
+  } catch {
+    text = String(value)
+  }
+  return text.length > ACP_TOOL_RAW_MAX
+    ? `${text.slice(0, ACP_TOOL_RAW_MAX)}\n… [truncated ${String(text.length - ACP_TOOL_RAW_MAX)} chars]`
+    : text
 }
 
 // ---- host request → forwarded ACP prompt ----
+
+/** Notification kinds that are routine state, not content: they update the session view and nothing else. */
+export const BOOKKEEPING_UPDATES: ReadonlySet<string> = new Set([
+  'current_mode_update',
+  'config_option_update',
+  'available_commands_update',
+  'session_info_update',
+  'usage_update',
+])
+
+/**
+ * Human-readable text of an ACP notification this build has no card of its own
+ * for. The text is what the native chat stream shows and what the guard answers
+ * the host loop's execution of that card with, so it must carry the payload —
+ * a plan's entries, a mode change, an unknown kind's whole JSON — rather than
+ * only a name.
+ */
+export function describeUnhandledUpdate(kind: string, update: Record<string, unknown>): string {
+  const label = kind === '' ? 'session update' : kind
+  if (kind === 'plan') {
+    const entries = Array.isArray(update.entries) ? update.entries : []
+    if (entries.length === 0) return `${label}: (empty plan)`
+    return entries.map(entry => {
+      const row = (typeof entry === 'object' && entry !== null ? entry : {}) as Record<string, unknown>
+      const status = typeof row.status === 'string' ? row.status : 'pending'
+      const priority = typeof row.priority === 'string' ? ` [${row.priority}]` : ''
+      return `[${status}]${priority} ${String(row.content ?? '')}`
+    }).join('\n')
+  }
+  if (kind === 'current_mode_update' && typeof update.currentModeId === 'string') return `${label}: ${update.currentModeId}`
+  if (kind === 'available_commands_update') {
+    const commands = Array.isArray(update.availableCommands) ? update.availableCommands : []
+    return commands.map(command => {
+      const row = (typeof command === 'object' && command !== null ? command : {}) as Record<string, unknown>
+      const name = typeof row.name === 'string' ? row.name : ''
+      const description = typeof row.description === 'string' && row.description !== '' ? ` — ${row.description}` : ''
+      return `${name}${description}`
+    }).join('\n')
+  }
+  return `${label}\n${dumpJson(update)}`
+}
 
 /**
  * Outcome of picking the one message an ACP turn forwards.

@@ -7,6 +7,8 @@ import {
   acpToolCallDelta,
   acpToolCallFromUpdate,
   buildAdapterModelId,
+  describeUnhandledUpdate,
+  updateContentToText,
   canonicalizeFsPath,
   childEnv,
   dispatchRpc,
@@ -192,11 +194,12 @@ describe('adapter model id split/build', () => {
 
 describe('ACP tool-call notifications → Chat tool-call chunks', () => {
   it('reads the identity and label an agent announces, and refuses to invent arguments', () => {
-    expect(acpToolCallFromUpdate({ toolCallId: 'call_1', title: 'mock tool', kind: 'read' }))
-      .toEqual({ callId: 'call_1', name: 'mock tool', argsRaw: '' })
+    expect(acpToolCallFromUpdate({ toolCallId: 'call_1', title: 'mock tool', kind: 'read' })).toMatchObject({ callId: 'call_1', name: 'mock tool', argsRaw: '' })
     // No arguments is legal ACP: the card is empty, not fabricated.
-    expect(acpToolCallFromUpdate({ toolCallId: 'call_2' }))
-      .toEqual({ callId: 'call_2', name: '', argsRaw: '' })
+    expect(acpToolCallFromUpdate({ toolCallId: 'call_2' })).toMatchObject({ callId: 'call_2', name: '', argsRaw: '' })
+    // Fields the card does not render as text are kept, not dropped.
+    expect(acpToolCallFromUpdate({ toolCallId: 'call_1', title: 'mock tool', kind: 'read' }).details).toBe('kind: read')
+    expect(acpToolCallFromUpdate({ toolCallId: 'call_1', title: 'mock tool' }).raw).toContain('"title": "mock tool"')
   })
 
   it('drops a notification with no call identity — the renderer groups by it', () => {
@@ -209,6 +212,8 @@ describe('ACP tool-call notifications → Chat tool-call chunks', () => {
     expect(acpToolCallFromUpdate({ toolCallId: 'c', rawInput: '{"a":1}' })).toMatchObject({ argsRaw: '{"a":1}' })
     expect(acpToolCallFromUpdate({ toolCallId: 'c', arguments: 'plain' })).toMatchObject({ argsRaw: 'plain' })
     expect(acpToolCallFromUpdate({ toolCallId: 'c', arguments: { a: 1 } })).toMatchObject({ argsRaw: '{"a":1}' })
+    // An array (batched input) is an argument spelling too, not an empty one.
+    expect(acpToolCallFromUpdate({ toolCallId: 'c', arguments: [{ a: 1 }] })).toMatchObject({ argsRaw: '[{"a":1}]' })
     // An unserializable value degrades to text rather than failing the card.
     const circular: Record<string, unknown> = {}
     circular.self = circular
@@ -217,34 +222,39 @@ describe('ACP tool-call notifications → Chat tool-call chunks', () => {
 
   it('folds an update into the open snapshot, naming only real changes', () => {
     const snapshot = { callId: 'call_1', name: 'mock tool', argsRaw: '' }
-    // No change at all: no deltas, so no chunk is emitted.
-    expect(acpToolCallDelta(snapshot, { toolCallId: 'call_1' })).toEqual([])
+    // A restatement with nothing new still refreshes the raw snapshot.
+    expect(acpToolCallDelta(snapshot, { toolCallId: 'call_1' })).toEqual([{ kind: 'raw', text: expect.any(String) }])
     // Content becomes argument text.
     expect(acpToolCallDelta(snapshot, {
       toolCallId: 'call_1',
       content: [{ type: 'content', content: { type: 'text', text: 'tool result line' } }],
-    })).toEqual([{ kind: 'args', text: 'tool result line' }])
-    expect(snapshot).toEqual({ callId: 'call_1', name: 'mock tool', argsRaw: 'tool result line' })
+    })).toEqual([{ kind: 'args', text: 'tool result line' }, { kind: 'raw', text: expect.any(String) }])
+    expect(snapshot).toMatchObject({ callId: 'call_1', name: 'mock tool', argsRaw: 'tool result line' })
     // A retitled agent gets a name delta and the snapshot follows.
     expect(acpToolCallDelta(snapshot, { toolCallId: 'call_1', title: 'renamed tool' }))
-      .toEqual([{ kind: 'name', name: 'renamed tool' }])
+      .toEqual([{ kind: 'name', name: 'renamed tool' }, { kind: 'raw', text: expect.any(String) }])
     expect(snapshot.name).toBe('renamed tool')
-    // A restatement of the same name is not a change.
-    expect(acpToolCallDelta(snapshot, { toolCallId: 'call_1', title: 'renamed tool' })).toEqual([])
+    // `status` is not a parameter: it rides `details`, never `argumentsDelta`.
+    expect(acpToolCallDelta(snapshot, { toolCallId: 'call_1', title: 'renamed tool', status: 'in_progress' }))
+      .toEqual([{ kind: 'details', text: 'status: in_progress' }, { kind: 'raw', text: expect.any(String) }])
+    expect(snapshot.details).toBe('status: in_progress')
   })
 
-  it('keeps the content kinds the Chat card cannot render, as placeholders', () => {
-    const snapshot = { callId: 'c', name: '', argsRaw: '' }
-    acpToolCallDelta(snapshot, {
-      toolCallId: 'c',
-      content: [
-        { type: 'content', content: { type: 'text', text: 'first' } },
-        { type: 'content', content: { type: 'diff', path: '/w/a.ts' } },
-        { type: 'content', content: { type: 'image' } },
-        { type: 'terminal', terminalId: 't1' },
-      ],
-    })
-    expect(snapshot.argsRaw).toBe('first\n[diff /w/a.ts]\n[image]\n[terminal t1]')
+  it('keeps the content kinds the Chat card cannot render, instead of placeholders', () => {
+    const text = updateContentToText([
+      { type: 'content', content: { type: 'text', text: 'first' } },
+      { type: 'diff', path: '/w/a.ts', oldText: 'one\ntwo\n', newText: 'one\nTWO\n' },
+      { type: 'content', content: { type: 'image', data: 'abc' } },
+      { type: 'terminal', terminalId: 't1' },
+    ])
+    expect(text).toContain('first')
+    // A diff becomes its path plus -/+ lines, not a `[diff path]` stub.
+    expect(text).toContain('/w/a.ts')
+    expect(text).toContain('- two')
+    expect(text).toContain('+ TWO')
+    // Unknown kinds keep their whole payload.
+    expect(text).toContain('"data":"abc"')
+    expect(text).toContain('"terminalId":"t1"')
   })
 
   it('treats a restated rawInput as a snapshot, not an append', () => {
@@ -256,15 +266,15 @@ describe('ACP tool-call notifications → Chat tool-call chunks', () => {
     // closing `block-end` frame states in full.
     const snapshot = { callId: 'c', name: 't', argsRaw: 'Running the build' }
     expect(acpToolCallDelta(snapshot, { toolCallId: 'c', arguments: 'Running the build for the oml workspace' }))
-      .toEqual([{ kind: 'args', text: ' for the oml workspace' }])
+      .toEqual([{ kind: 'args', text: ' for the oml workspace' }, { kind: 'raw', text: expect.any(String) }])
     expect(snapshot.argsRaw).toBe('Running the build for the oml workspace')
     // JSON growth is a REWRITE, not an extension — the closing brace moves.
-    expect(acpToolCallDelta(snapshot, { toolCallId: 'c', rawInput: '{"file":"a.md"}' }))
-      .toEqual([])
+    expect(acpToolCallDelta(snapshot, { toolCallId: 'call_1', rawInput: '{"file":"a.md"}' }))
+      .toEqual([{ kind: 'raw', text: expect.any(String) }])
     expect(snapshot.argsRaw).toBe('{"file":"a.md"}')
-    // A verbatim restatement changes nothing.
-    expect(acpToolCallDelta(snapshot, { toolCallId: 'c', rawInput: '{"file":"a.md"}' }))
-      .toEqual([])
+    // A verbatim restatement moves nothing but the raw snapshot.
+    expect(acpToolCallDelta(snapshot, { toolCallId: 'call_1', rawInput: '{"file":"a.md"}' }))
+      .toEqual([{ kind: 'raw', text: expect.any(String) }])
     expect(snapshot.argsRaw).toBe('{"file":"a.md"}')
   })
 
@@ -275,15 +285,24 @@ describe('ACP tool-call notifications → Chat tool-call chunks', () => {
     expect(acpToolCallDelta(snapshot, {
       toolCallId: 'c',
       content: [{ type: 'content', content: { type: 'text', text: '   1→ entire file body' } }],
-    })).toEqual([])
+    })).toEqual([{ kind: 'raw', text: expect.any(String) }])
     expect(snapshot.argsRaw).toBe('{"file":"a.md"}')
     // Content only fills a call whose agent never sent input at all.
     const silent = { callId: 'd', name: 't', argsRaw: '' }
     expect(acpToolCallDelta(silent, {
       toolCallId: 'd',
       content: [{ type: 'content', content: { type: 'text', text: 'tool result line' } }],
-    })).toEqual([{ kind: 'args', text: 'tool result line' }])
+    })).toEqual([{ kind: 'args', text: 'tool result line' }, { kind: 'raw', text: expect.any(String) }])
     expect(silent.argsRaw).toBe('tool result line')
+  })
+
+  it('describes a notification it has no card for without dropping its payload', () => {
+    expect(describeUnhandledUpdate('plan', {
+      entries: [{ content: 'fix the bug', status: 'in_progress', priority: 'high' }],
+    })).toBe('[in_progress] [high] fix the bug')
+    expect(describeUnhandledUpdate('current_mode_update', { currentModeId: 'plan' })).toBe('current_mode_update: plan')
+    expect(describeUnhandledUpdate('brand_new_kind', { sessionUpdate: 'brand_new_kind', extra: [1, 2] }))
+      .toContain('"extra": [')
   })
 })
 

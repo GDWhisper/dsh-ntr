@@ -33,6 +33,7 @@ import {
   Transcript,
   acpToolCallDelta,
   acpToolCallFromUpdate,
+  acpToolCallDetailsOf,
   buildAdapterModelId,
   childEnv,
   isUnderPath,
@@ -48,6 +49,9 @@ import {
   acpPresetStatusFromRoster,
   splitAdapterModelId,
   updateContentToText,
+  dumpJson,
+  describeUnhandledUpdate,
+  BOOKKEEPING_UPDATES,
   validateAgentDef,
 } from './impl.ts'
 import type {
@@ -650,7 +654,9 @@ export class AgentBridge {
 
   private noteStderr(line: string): void {
     if (line === '') return
-    this.stderrTail.push(line.slice(0, 2000))
+    // Stderr is what a misbehaving agent says about itself: keep the whole line
+    // (a stack trace or an activation error is exactly the line that gets cut).
+    this.stderrTail.push(line)
     if (this.stderrTail.length > STDERR_TAIL_LINES) this.stderrTail.splice(0, this.stderrTail.length - STDERR_TAIL_LINES)
   }
 
@@ -1268,10 +1274,13 @@ export class AgentBridge {
         this.onCatalog?.(this.def.id, session.configOptions)
         break
       case 'available_commands_update':
+        // Spread the whole command, not just name+description: the protocol
+        // grows fields (and agents already send `input` hints), and a room the
+        // picker has no widget for is still something the agent declared.
         session.availableCommands = update.availableCommands.map(c => ({
-          name: c.name,
-          ...(c.description !== null ? { description: c.description } : {}),
-        }))
+          ...(c as unknown as Record<string, unknown>),
+          ...(c.description !== null && c.description !== undefined ? { description: c.description } : {}),
+        })) as typeof session.availableCommands
         break
       case 'plan':
         session.plan = update.entries
@@ -1738,7 +1747,7 @@ export function npmInstallGlobal(pkg: string, onLog: (line: string) => void = ()
     const collect = (chunk: unknown) => {
       for (const line of String(chunk).split('\n')) {
         if (line.trim() === '') continue
-        output.push(line.slice(0, 500))
+        output.push(line)
         if (output.length > 40) output.splice(0, output.length - 40)
       }
     }
@@ -1900,6 +1909,15 @@ export interface AcpRouteBindingRegistry {
    * instead of an `unknown tool` error (see `recordAcpToolOutput`).
    */
   readonly toolResults: Map<string, string>
+  /**
+   * Display-card call id → its folded text, for cards that are NOT agent tool
+   * calls (the one-per-kind cards of {@link noteUnhandledUpdate}: a plan, a
+   * mode or command-list update, a notification kind newer than this plugin).
+   * Kept apart from {@link toolResults} because the guard's pre-step gate reads
+   * that map as "these staged results are my own continuation step" — a plan is
+   * neither a call id the agent issued nor a tool result.
+   */
+  cardOutputs?: Map<string, string>
   /** Bare agent id served when a conversation carries no explicit binding (`undefined`: no rewrite). */
   defaultModel?: string
 }
@@ -1920,7 +1938,13 @@ export function routeBindingRegistry(): AcpRouteBindingRegistry {
 
 /** Bounds for the shared tool-output record (see {@link recordAcpToolOutput}). */
 const TOOL_OUTPUT_MAX_ENTRIES = 200
-const TOOL_OUTPUT_MAX_CHARS = 16_000
+/**
+ * Cap on one tool result's text in the shared registry (the guard's virtual
+ * tools answer the host loop from it). Sized for real output — a build log or a
+ * file read — not for a preview: cutting here is the one place a truncation
+ * would change what the model sees, not just what the card shows.
+ */
+const TOOL_OUTPUT_MAX_CHARS = 1_000_000
 
 /** Bounds for {@link BridgeManager.pendingToolAnswers} (one per conversation, transient). */
 const PENDING_TOOL_ANSWERS_MAX = 32
@@ -1940,7 +1964,12 @@ const PENDING_TOOL_ANSWERS_MAX = 32
 export function recordAcpToolOutput(callId: string, text: string): void {
   if (callId === '') return
   const registry = routeBindingRegistry()
-  registry.toolResults.set(callId, text.length > TOOL_OUTPUT_MAX_CHARS ? `${text.slice(0, TOOL_OUTPUT_MAX_CHARS)}…` : text)
+  const kept = text.length > TOOL_OUTPUT_MAX_CHARS ? `${text.slice(0, TOOL_OUTPUT_MAX_CHARS)}\n… [truncated ${String(text.length - TOOL_OUTPUT_MAX_CHARS)} chars]` : text
+  // Empty output is recorded too (the guard's gate keys on membership). An
+  // EMPTY record must not overwrite a non-empty one: some agents send their
+  // result in one notification and an empty `content` restatement after it.
+  if (kept === '' && (registry.toolResults.get(callId) ?? '') !== '') return
+  registry.toolResults.set(callId, kept)
   while (registry.toolResults.size > TOOL_OUTPUT_MAX_ENTRIES) {
     const oldest = registry.toolResults.keys().next().value
     if (oldest === undefined) break
@@ -3537,7 +3566,14 @@ export class BridgeManager {
       type: 'block-end' as const,
       index: currentBlockIndex,
       block: activeBlockType === 'tool-call' && activeToolCall !== undefined
-        ? { type: 'tool-call' as const, id: activeToolCall.callId, name: activeToolCall.name, arguments: activeToolCall.argsRaw }
+        ? {
+          type: 'tool-call' as const,
+          id: activeToolCall.callId,
+          name: activeToolCall.name,
+          arguments: activeToolCall.argsRaw,
+          ...(activeToolCall.details === undefined ? {} : { details: activeToolCall.details }),
+          ...(activeToolCall.raw === undefined ? {} : { raw: activeToolCall.raw }),
+        }
         : { type: activeBlockType as 'reasoning' | 'text', text: activeBlockText },
     })
 
@@ -3593,11 +3629,107 @@ export class BridgeManager {
     const foldToolCallUpdate = (update: Record<string, unknown>) => {
       if (activeToolCall === undefined) return
       for (const delta of acpToolCallDelta(activeToolCall, update)) {
-        if (delta.kind === 'name') {
-          queue.push({ type: 'tool-call-delta', index: currentBlockIndex, id: activeToolCall.callId, name: delta.name, argumentsDelta: '' })
-        } else {
-          queue.push({ type: 'tool-call-delta', index: currentBlockIndex, id: activeToolCall.callId, argumentsDelta: delta.text })
+        // `name` + `args` extend the card's parameter text. `details` / `raw`
+        // are not parameters: appending them to `argumentsDelta` would splice
+        // `kind: execute` into the JSON the host shows as the call's args.
+        // They ride the closing snapshot instead.
+        queue.push({
+          type: 'tool-call-delta',
+          index: currentBlockIndex,
+          id: activeToolCall.callId,
+          ...(delta.kind === 'name' ? { name: delta.name } : {}),
+          argumentsDelta: delta.kind === 'args' ? delta.text : '',
+        })
+      }
+    }
+
+    /**
+     * Text of a `text` / `thinking` chunk's `content`. Some agents send the
+     * block's innards as an OBJECT (`{ type: 'text', text }` one level down) or
+     * as an ARRAY of blocks; both are read rather than dropped, and a shape
+     * nobody predicts still contributes its JSON.
+     */
+    const chunkTextOf = (content: unknown): string => {
+      if (typeof content === 'string') return content
+      if (Array.isArray(content)) {
+        const parts: string[] = []
+        for (const item of content) {
+          if (typeof item === 'string') parts.push(item)
+          else if (typeof item === 'object' && item !== null) {
+            const row = item as Record<string, unknown>
+            if (typeof row.text === 'string') parts.push(row.text)
+            else parts.push(JSON.stringify(item))
+          }
         }
+        return parts.join('')
+      }
+      if (typeof content === 'object' && content !== null) {
+        const row = content as Record<string, unknown>
+        if (typeof row.text === 'string') return row.text
+        if (row.type === 'text' || row.type === undefined) return JSON.stringify(content)
+      }
+      return ''
+    }
+
+    /**
+     * Cards already streamed for this turn, by callId: real ACP tool calls and
+     * the one-per-kind cards of {@link noteUnhandledUpdate} both live here.
+     */
+    /** The open one-per-kind card of {@link noteUnhandledUpdate}, by notification kind (`''` = unnamed). */
+    const unhandledCards = new Map<string, AcpToolCallSnapshot>()
+    /**
+     * Announce an ACP update this build does not render as a card of its own.
+     *
+     * The card is a `tool-call` block because that is the only card the Chat
+     * plane draws — its chunk vocabulary is text/reasoning/tool-call. The name
+     * satisfies the host's `^[A-Za-z0-9_-]{1,64}$` tool-name rule. ONE card per
+     * notification KIND per turn, updated in place: agents restate a plan in
+     * full on every step, and a card per restatement would bury the
+     * conversation. Restatements therefore reuse the SAME callId — a second id
+     * would also look like a second call to the host loop, which executes every
+     * card it sees. The newest payload is what the settled snapshot carries.
+     */
+    const noteUnhandledUpdate = (kind: string, update: Record<string, unknown>) => {
+      const text = describeUnhandledUpdate(kind, update)
+      const open = unhandledCards.get(kind)
+      const card = open ?? {
+        callId: `unhandled:${kind === '' ? 'update' : kind}`,
+        name: kind === '' ? 'unhandled_update' : `acp_${kind.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 56)}`,
+        argsRaw: '',
+      }
+      card.raw = dumpJson(update)
+      noteExtraCard(card.callId, text)
+      if (open === undefined) {
+        unhandledCards.set(kind, card)
+        openToolCallBlock(card)
+      } else if (activeBlockType === 'tool-call' && activeToolCall?.callId === card.callId) {
+        // The card is still open: nothing to restart, the closing snapshot
+        // carries the new payload.
+      } else {
+        // Already closed (a real call followed it): reopen it in place so the
+        // latest payload is visible where it happened instead of vanishing.
+        openToolCallBlock(card)
+      }
+    }
+
+    /**
+     * Register a display card that is NOT an agent tool call (see
+     * {@link noteUnhandledUpdate}) so the guard can both answer the host loop's
+     * execution of the card and recognise its own continuation step.
+     *
+     * A plan has no call id and its text is not a tool result, so it must stay
+     * out of `toolResults` (the pre-step gate reads that map as "these are
+     * staged tool results, this is my own continuation"). It lives in
+     * `cardOutputs`, which the guard probes read-only.
+     */
+    const noteExtraCard = (callId: string, text: string) => {
+      const registry = routeBindingRegistry()
+      const cards = registry.cardOutputs ?? (registry.cardOutputs = new Map<string, string>())
+      cards.set(callId, text)
+      while (cards.size > TOOL_OUTPUT_MAX_ENTRIES) {
+        const oldest = cards.keys().next().value
+        if (oldest === undefined) break
+        cards.delete(oldest)
       }
     }
 
@@ -3607,11 +3739,11 @@ export class BridgeManager {
         const update = event.update as Record<string, unknown>
         const kind = String(update.sessionUpdate ?? '')
         if (kind === 'agent_thought_chunk') {
-          const content = update.content as Record<string, unknown> | undefined
-          if (content?.type === 'text' && typeof content.text === 'string') {
+          const text = chunkTextOf(update.content)
+          if (text !== '') {
             switchToBlock('reasoning')
-            activeBlockText += content.text
-            queue.push({ type: 'reasoning-delta', index: currentBlockIndex, text: content.text })
+            activeBlockText += text
+            queue.push({ type: 'reasoning-delta', index: currentBlockIndex, text })
           }
         } else if (kind === 'tool_call') {
           // A real tool call, not prose: the host's accumulator turns these
@@ -3623,8 +3755,15 @@ export class BridgeManager {
           const snapshot = acpToolCallFromUpdate(update)
           if (snapshot !== undefined) {
             recordAcpToolOutput(snapshot.callId, updateContentToText(update.content))
+            // The most recent RESTATEMENT is what the card's settled shape
+            // should be, even when the card itself is already open: agents
+            // restate a call in full on every progress tick (codebuddy) and
+            // the closing snapshot must carry the newest fields.
             if (activeBlockType === 'tool-call' && activeToolCall?.callId === snapshot.callId) {
               foldToolCallUpdate(update)
+              if (snapshot.details !== undefined) activeToolCall.details = snapshot.details
+              if (snapshot.raw !== undefined) activeToolCall.raw = snapshot.raw
+              if (snapshot.name !== '') activeToolCall.name = snapshot.name
             } else if (!seenCalls.has(snapshot.callId)) {
               seenCalls.add(snapshot.callId)
               openToolCallBlock(snapshot)
@@ -3639,6 +3778,11 @@ export class BridgeManager {
           if (callId !== '') {
             recordAcpToolOutput(callId, updateContentToText(update.content))
             if (activeBlockType === 'tool-call' && activeToolCall?.callId === callId) {
+              activeToolCall.raw = dumpJson(update)
+              if (activeToolCall.details === undefined) {
+                const details = acpToolCallDetailsOf(update)
+                if (details !== '') activeToolCall.details = details
+              }
               foldToolCallUpdate(update)
             } else if (!seenCalls.has(callId)) {
               const reopened = acpToolCallFromUpdate({ ...update, toolCallId: callId })
@@ -3649,24 +3793,32 @@ export class BridgeManager {
             }
           }
         } else if (kind === 'agent_message_chunk') {
-          const content = update.content as Record<string, unknown> | undefined
-          if (content?.type === 'text' && typeof content.text === 'string') {
+          const text = chunkTextOf(update.content)
+          if (text !== '') {
             if (seenCalls.size > 0) {
               // After the first card this is the ANSWER: the Chat plane
               // refuses any message containing a tool-call block, so it must
               // not join this stream's message. Buffer it for the continuation
               // step (replayed via `pendingToolAnswers`).
-              answerBuffer += content.text
+              answerBuffer += text
             } else {
               switchToBlock('text')
-              activeBlockText += content.text
-              queue.push({ type: 'text-delta', index: currentBlockIndex, text: content.text })
+              activeBlockText += text
+              queue.push({ type: 'text-delta', index: currentBlockIndex, text })
             }
           }
         } else if (kind === 'usage_update') {
           const used = typeof update.used === 'number' ? update.used : 0
           const size = typeof update.size === 'number' ? update.size : 0
           latestUsage = { inputTokens: size, outputTokens: used }
+        } else {
+          // A notification kind this build does not render (available commands,
+          // a plan, a mode change, or something newer than this plugin). It
+          // already reaches the ACP view through the transcript; open a card for
+          // it so the native chat stream carries it too. Bookkeeping kinds
+          // (`current_mode_update`, `config_option_update`, `available_commands_update`,
+          // `session_info_update`) stay silent — they are routine, not content.
+          if (!BOOKKEEPING_UPDATES.has(kind)) noteUnhandledUpdate(kind, update)
         }
       } else if (event.type === 'permission/request') {
         switchToBlock('reasoning')
@@ -3692,13 +3844,7 @@ export class BridgeManager {
       unsubscribe()
       session.running = false
       if (activeBlockType !== null) {
-        queue.push({
-          type: 'block-end',
-          index: currentBlockIndex,
-          block: activeBlockType === 'tool-call' && activeToolCall !== undefined
-            ? { type: 'tool-call', id: activeToolCall.callId, name: activeToolCall.name, arguments: activeToolCall.argsRaw }
-            : { type: activeBlockType, text: activeBlockText },
-        })
+        queue.push(blockEndChunk())
         activeBlockType = null
         activeToolCall = undefined
       }

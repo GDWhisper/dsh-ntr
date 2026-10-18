@@ -223,7 +223,8 @@ export interface SessionView {
   title?: string
   modes?: { currentModeId?: string; availableModes?: Array<{ id: string; name?: string; description?: string }> }
   configOptions?: unknown[]
-  availableCommands?: Array<{ name: string; description?: string }>
+  /** The agent's slash commands, every field it declared — not just the two the picker draws. */
+  availableCommands?: Array<{ name: string; description?: string; [key: string]: unknown }>
   plan?: unknown[]
   usage?: { used: number; size: number; cost?: { amount: number; currency: string } }
   running: boolean
