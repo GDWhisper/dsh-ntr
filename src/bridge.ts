@@ -12,7 +12,7 @@ import { homedir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Writable, Readable } from 'node:stream'
-import { accessSync, constants, copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
+import { accessSync, constants, copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import {
   client,
   methods,
@@ -1388,7 +1388,7 @@ function canonical(path: string): string {
  * project" from the directory they were started in — their file fences, the
  * environment block they show the model, their per-project state — so a process
  * started in the plugin's sandbox answers "my workspace is
- * ~/.dsh/acp-workspaces" no matter what `session/new` said (observed on
+ * ~/.dsh/dsh-ntr/workspaces" no matter what `session/new` said (observed on
  * codebuddy). `def.cwd` remains the answer for everything that has no DSH
  * session behind it (probes, `/acp`-RPC sessions, the settings-page test).
  */
@@ -1403,8 +1403,142 @@ function safeSpawnCwd(def: AcpAgentDef, wanted?: string): string {
 }
 
 /**
+ * This plugin's OWN state directory, `~/.dsh/dsh-ntr`.
+ *
+ * Everything this plugin persists belongs in here — the agent registry, the
+ * probed model catalog, and the default ACP execution workspaces. `~/.dsh` is
+ * the HOST's shared root: it holds the host's own `sessions/`, `storages/`,
+ * `skills/`, `profiles/`, credentials and so on. Dropping a plugin's files
+ * loose in there makes them indistinguishable from the host's state, and two
+ * unrelated `acp-*.json` names at that level read as host config to anyone
+ * (user or agent) looking at the directory. One owner, one subdirectory —
+ * same convention `~/.dsh/skills/<owner>` and `~/.dsh/dsh-runtimes/<owner>`
+ * already follow.
+ *
+ * `DSH_NTR_STATE_DIR` overrides the location (tests, and power users with a
+ * relocated state root).
+ */
+export function pluginStateDir(home: string = homedir()): string {
+  const override = process.env.DSH_NTR_STATE_DIR
+  if (override !== undefined && override !== '') return override
+  return join(home, '.dsh', 'dsh-ntr')
+}
+
+/**
+ * The host's own shared `~/.dsh` root — the parent of this plugin's directory.
+ *
+ * Derived from {@link pluginStateDir} instead of recomputing `~/.dsh` from
+ * `home`, on purpose: when a caller redirects the plugin's directory (tests,
+ * a relocated state root), the legacy lookup must stay INSIDE that redirect.
+ * Recomputing `~/.dsh` would make an overridden run read — and MIGRATE — the
+ * real home directory.
+ */
+function hostStateDir(home: string = homedir()): string {
+  return dirname(pluginStateDir(home))
+}
+
+/** True when the plugin's state dir was redirected (tests, relocated state). */
+function stateDirExplicit(): boolean {
+  const override = process.env.DSH_NTR_STATE_DIR
+  return override !== undefined && override !== ''
+}
+
+/**
+ * Pre-`~/.dsh/dsh-ntr` locations, kept only to MIGRATE them.
+ *
+ * These files used to live loose in the host's `~/.dsh` root. They are moved
+ * into the plugin's own directory on first boot (see {@link migrateLegacyState})
+ * and never written again — the constants stay so the migration keeps working
+ * for an installation that has not started the new build yet.
+ */
+function legacyStatePaths(home: string = homedir()): {
+  readonly dir: string
+  readonly agentsFile: string
+  readonly catalogFile: string
+  readonly workspaces: string
+} {
+  const dir = hostStateDir(home)
+  return {
+    dir,
+    agentsFile: join(dir, 'acp-agents.json'),
+    catalogFile: join(dir, 'acp-model-catalog.json'),
+    workspaces: join(dir, 'acp-workspaces'),
+  }
+}
+
+/**
+ * Move the state this plugin used to scatter across the host's `~/.dsh` root
+ * into {@link pluginStateDir}.
+ *
+ * Idempotent and one-way: a target that already exists is left alone, so a
+ * user who edits the new location never has it overwritten by a stale legacy
+ * file. Only files this plugin itself created are touched — nothing else in
+ * `~/.dsh` is read, moved or deleted.
+ *
+ * The workspace DIRECTORY is renamed rather than copied, and an agent's own
+ * `cwd` / `allowedCwdRoots` are rewritten afterwards by
+ * {@link rewriteLegacyWorkspaceRoots}, because those recorded absolute paths
+ * would otherwise point at a directory that no longer exists (the session cwd
+ * resolver rejects a missing cwd outright).
+ */
+function migrateLegacyState(home: string = homedir()): void {
+  const legacy = legacyStatePaths(home)
+  const target = pluginStateDir(home)
+  try {
+    const moves: Array<[string, string]> = [
+      [legacy.agentsFile, join(target, 'agents.json')],
+      [legacy.catalogFile, join(target, 'model-catalog.json')],
+      [legacy.workspaces, join(target, 'workspaces')],
+    ]
+    for (const [from, to] of moves) {
+      if (!existsSync(from) || existsSync(to)) continue
+      mkdirSync(target, { recursive: true })
+      renameSync(from, to)
+    }
+  } catch {
+    // Best effort: a failed move leaves the legacy location readable, and the
+    // readers below fall back to it, so no state is lost either way.
+  }
+}
+
+/**
+ * Legacy location of one plugin state file, consulted only when the new
+ * location has nothing. Keeps a half-migrated installation (or a move that
+ * failed because a file was momentarily locked) fully functional.
+ */
+function legacyFallback(name: 'agents' | 'catalog', home: string = homedir()): string {
+  const legacy = legacyStatePaths(home)
+  return name === 'agents' ? legacy.agentsFile : legacy.catalogFile
+}
+
+/**
+ * Rewrite an agent definition's recorded workspace paths onto
+ * {@link pluginStateDir} after the migration.
+ *
+ * `cwd` and `allowedCwdRoots` are absolute, user-visible paths stored verbatim,
+ * and `resolveSessionCwd` REJECTS a cwd that does not exist — so moving the
+ * directory without rewriting the agents that point into it breaks every saved
+ * agent. Returns the definition unchanged when it never named the old root.
+ */
+export function rewriteLegacyWorkspaceRoots(def: AcpAgentDef, home: string = homedir()): AcpAgentDef {
+  const from = legacyStatePaths(home).workspaces
+  const to = defaultAgentWorkspace(home)
+  const swap = (path: string | undefined): string | undefined => {
+    if (path === undefined) return undefined
+    if (!isUnderPath(path, from)) return path
+    return to + path.slice(from.length)
+  }
+  const cwd = swap(def.cwd)
+  const roots = def.allowedCwdRoots?.map(root => swap(root) ?? root)
+  const cwdChanged = cwd !== def.cwd
+  const rootsChanged = roots !== undefined && roots.some((root, index) => root !== def.allowedCwdRoots?.[index])
+  if (!cwdChanged && !rootsChanged) return def
+  return { ...def, ...(cwd === undefined ? {} : { cwd }), ...(roots === undefined ? {} : { allowedCwdRoots: roots }) }
+}
+
+/**
  * Plugin-owned default execution workspace, anchored to the plugin state dir
- * (`~/.dsh/acp-workspaces`).
+ * (`~/.dsh/dsh-ntr/workspaces`).
  *
  * It deliberately does NOT derive from `process.cwd()`: that is wherever the
  * DSH host happened to be launched from, so the "default workspace" used to
@@ -1413,7 +1547,7 @@ function safeSpawnCwd(def: AcpAgentDef, wanted?: string): string {
  * when `dsh web` is started from the home dir).
  */
 export function defaultAgentWorkspace(home: string = homedir()): string {
-  return join(home, '.dsh', 'acp-workspaces')
+  return join(pluginStateDir(home), 'workspaces')
 }
 
 // ---- ACP-mode agent preset ----
@@ -1846,6 +1980,13 @@ export class BridgeManager {
     for (const def of defs) {
       this.defsMap.set(def.id, def)
     }
+    // Move any state left loose in the host's `~/.dsh` root into this plugin's
+    // own directory BEFORE reading it (see `migrateLegacyState`). Storage paths
+    // injected by a caller are that caller's business; the migration only runs
+    // for the default, plugin-owned locations.
+    if (this.configStoragePath === undefined && this.catalogStoragePath === undefined) {
+      migrateLegacyState()
+    }
     this.loadPersistedAgents()
     this.loadPersistedCatalogs()
     // The request-path rewrite falls back to this default for a conversation
@@ -1876,7 +2017,7 @@ export class BridgeManager {
    * Let the host resolve a chat session's workspace root — the sidebar's
    * selected workspace, which the agent's session and its process both run in.
    * Absent resolver → every chat session falls back to the agent's configured
-   * cwd (`~/.dsh/acp-workspaces`), which is the right answer for `/acp`-RPC
+   * cwd (`~/.dsh/dsh-ntr/workspaces`), which is the right answer for `/acp`-RPC
    * sessions and headless deployments.
    */
   setSessionWorkspaceResolver(resolver?: SessionWorkspaceResolver): void {
@@ -2161,16 +2302,23 @@ export class BridgeManager {
   private getStoragePath(): string | undefined {
     if (this.configStoragePath !== undefined) return this.configStoragePath
     if (process.env.DSH_ACP_CONFIG_FILE) return process.env.DSH_ACP_CONFIG_FILE
-    if (process.env.VITEST !== undefined || process.env.NODE_ENV === 'test') {
+    // The test-runner guard exists so a suite never reads or writes the real
+    // home directory. An explicitly redirected state dir (tests that exercise
+    // the migration, or a relocated deployment) is already hermetic, so it is
+    // allowed through instead of silently disabling persistence.
+    if (!stateDirExplicit() && (process.env.VITEST !== undefined || process.env.NODE_ENV === 'test')) {
       return undefined
     }
     try {
-      const home = homedir()
-      const dshDir = join(home, '.dsh')
-      if (!existsSync(dshDir)) {
-        mkdirSync(dshDir, { recursive: true })
+      // A legacy registry that has not been migrated yet stays readable; the
+      // next persist writes to the plugin's own state dir and retires it.
+      const migrated = join(pluginStateDir(), 'agents.json')
+      if (!existsSync(migrated)) {
+        const legacy = legacyFallback('agents')
+        if (existsSync(legacy)) return legacy
       }
-      return join(dshDir, 'acp-agents.json')
+      mkdirSync(pluginStateDir(), { recursive: true })
+      return migrated
     } catch {
       return undefined
     }
@@ -2195,14 +2343,27 @@ export class BridgeManager {
         ? parsed
         : (parsed !== null && typeof parsed === 'object' ? (parsed as { agents?: unknown }).agents : undefined)
       if (Array.isArray(rows)) {
+        let rewritten = false
         for (const item of rows) {
           try {
-            const def = validateAgentDef(quoteLegacyCommand(item))
+            // `rewriteLegacyWorkspaceRoots` folds a definition that still names
+            // the pre-migration workspace into the plugin's own state dir: the
+            // recorded absolute cwd is fed straight to `session/new`, and the
+            // cwd resolver rejects one that does not exist.
+            const validated = validateAgentDef(quoteLegacyCommand(item))
+            const def = rewriteLegacyWorkspaceRoots(validated)
+            if (def !== validated) rewritten = true
             this.defsMap.set(def.id, def)
           } catch {
             // Ignore invalid entry
           }
         }
+        // Write the corrected paths back. Without this the correction lives
+        // only in memory: the directory was already renamed, so the file on
+        // disk keeps naming a cwd that no longer exists, and every boot has to
+        // repair it again (and anything reading the file directly sees the
+        // stale path).
+        if (rewritten) this.persistAgents()
       }
       if (!Array.isArray(parsed) && parsed !== null && typeof parsed === 'object') {
         const stored = (parsed as { defaultAgentId?: unknown }).defaultAgentId
@@ -2240,15 +2401,17 @@ export class BridgeManager {
   private getCatalogStoragePath(): string | undefined {
     if (this.catalogStoragePath !== undefined) return this.catalogStoragePath
     if (process.env.DSH_ACP_CATALOG_FILE) return process.env.DSH_ACP_CATALOG_FILE
-    if (process.env.VITEST !== undefined || process.env.NODE_ENV === 'test') {
+    if (!stateDirExplicit() && (process.env.VITEST !== undefined || process.env.NODE_ENV === 'test')) {
       return undefined
     }
     try {
-      const dshDir = join(homedir(), '.dsh')
-      if (!existsSync(dshDir)) {
-        mkdirSync(dshDir, { recursive: true })
+      const migrated = join(pluginStateDir(), 'model-catalog.json')
+      if (!existsSync(migrated)) {
+        const legacy = legacyFallback('catalog')
+        if (existsSync(legacy)) return legacy
       }
-      return join(dshDir, 'acp-model-catalog.json')
+      mkdirSync(pluginStateDir(), { recursive: true })
+      return migrated
     } catch {
       return undefined
     }
@@ -2854,7 +3017,7 @@ export class BridgeManager {
     // A chat session runs where its DSH session lives, not in the plugin's
     // sandbox directory: the sidebar's workspace selection IS the session's
     // workspace (`sandboxPolicy.resolve` reports it as `workspaceRoot`), and an
-    // agent whose cwd is `~/.dsh/acp-workspaces` answers "current workspace"
+    // agent whose cwd is `~/.dsh/dsh-ntr/workspaces` answers "current workspace"
     // with that path while its Read/Glob/Bash cannot see the user's project.
     // That root is trusted on top of the agent's own roots for this session
     // only (see `chatWorkspaceRoot`); the fallback is the configured cwd.

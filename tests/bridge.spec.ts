@@ -11,7 +11,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { afterAll, describe, expect, it } from 'vitest'
 import {
   AcpLlmAdapter, AgentBridge, BridgeManager, defaultAgentWorkspace,
-  detectHostAgents, ensureAgentExecutable, findExecutable, killProcessTree, routeBindingRegistry, windowsShimLaunch,
+  detectHostAgents, ensureAgentExecutable, findExecutable, killProcessTree, pluginStateDir, routeBindingRegistry, windowsShimLaunch,
   type ApprovalOutcome, type ApprovalRequestContext, type BridgeTuning,
 } from '../src/bridge.ts'
 import { EventHub, dispatchRpc } from '../src/impl.ts'
@@ -742,13 +742,119 @@ describe('ACP bridge over stdio (mock agent)', () => {
   })
 
   it('anchors the default workspace to the plugin state dir, not the launch cwd', () => {
-    expect(defaultAgentWorkspace('/tmp/fake-home')).toBe(join('/tmp/fake-home', '.dsh', 'acp-workspaces'))
-    expect(defaultAgentWorkspace()).toBe(join(homedir(), '.dsh', 'acp-workspaces'))
+    // This plugin's own directory under the host's `~/.dsh` root — never that
+    // root itself. Loose `acp-*.json` files and an `acp-workspaces/` directory
+    // beside the host's `sessions/`, `storages/` and credentials made plugin
+    // state indistinguishable from host state.
+    expect(defaultAgentWorkspace('/tmp/fake-home')).toBe(join('/tmp/fake-home', '.dsh', 'dsh-ntr', 'workspaces'))
+    expect(defaultAgentWorkspace()).toBe(join(homedir(), '.dsh', 'dsh-ntr', 'workspaces'))
     expect(defaultAgentWorkspace()).not.toBe(join(process.cwd(), 'acp-workspaces'))
+    // The state dir is the common root every persisted file hangs off.
+    expect(pluginStateDir('/tmp/fake-home')).toBe(join('/tmp/fake-home', '.dsh', 'dsh-ntr'))
+    expect(defaultAgentWorkspace('/tmp/fake-home').startsWith(pluginStateDir('/tmp/fake-home'))).toBe(true)
   })
 
-  it('defaults a cwd-less agent into the plugin workspace and deduplicates roots', async () => {
-    const testStorage = `${tmpdir()}/acp-workspace-defaults-${Date.now()}.json`
+  /**
+   * The move off the host's shared `~/.dsh` root must not cost anyone their
+   * setup, and must not break the agents it moves.
+   *
+   * The hard part is the recorded workspace: an agent's `cwd` and
+   * `allowedCwdRoots` are absolute paths stored verbatim, and the session cwd
+   * resolver REJECTS a cwd that does not exist. Renaming the directory without
+   * rewriting those fields turns every saved agent into a `bad_cwd` failure.
+   */
+  it('migrates plugin state out of the host root and rewrites the workspace paths', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-ntr-migrate-'))
+    // The old layout: files loose in the host's root, workspaces beside them.
+    mkdirSync(join(home, '.dsh', 'acp-workspaces'), { recursive: true })
+    mkdirSync(join(home, '.dsh', 'sessions'), { recursive: true })
+    writeFileSync(join(home, '.dsh', 'sessions', 'host-state.txt'), 'the host owns this', 'utf-8')
+    const legacyCwd = join(home, '.dsh', 'acp-workspaces')
+    writeFileSync(join(home, '.dsh', 'acp-agents.json'), JSON.stringify({
+      version: 2,
+      defaultAgentId: 'legacy',
+      agents: [{
+        id: 'legacy',
+        command: process.execPath,
+        args: [MOCK],
+        permission: 'ask',
+        cwd: legacyCwd,
+        allowedCwdRoots: [legacyCwd],
+      }],
+    }), 'utf-8')
+    writeFileSync(join(home, '.dsh', 'acp-model-catalog.json'), JSON.stringify({ version: 1, agents: {} }), 'utf-8')
+
+    const previous = process.env.DSH_NTR_STATE_DIR
+    process.env.DSH_NTR_STATE_DIR = join(home, '.dsh', 'dsh-ntr')
+    try {
+      const manager = new BridgeManager([], hub, 100)
+      const defs = (manager as unknown as { defsMap: Map<string, AcpAgentDef> }).defsMap
+      const migrated = defs.get('legacy')
+      // The agent survived, and its workspace now points at the new home.
+      expect(migrated).toBeDefined()
+      expect(migrated?.cwd).toBe(defaultAgentWorkspace())
+      expect(migrated?.allowedCwdRoots).toEqual([defaultAgentWorkspace()])
+      expect(migrated?.cwd).not.toBe(legacyCwd)
+      // The migration is one-way: the old spots are empty, the host's own
+      // state is untouched, and the registry now lives under the plugin dir.
+      expect(existsSync(join(home, '.dsh', 'acp-agents.json'))).toBe(false)
+      expect(existsSync(join(home, '.dsh', 'acp-model-catalog.json'))).toBe(false)
+      expect(existsSync(legacyCwd)).toBe(false)
+      expect(existsSync(join(home, '.dsh', 'sessions', 'host-state.txt'))).toBe(true)
+      expect(existsSync(join(home, '.dsh', 'dsh-ntr', 'agents.json'))).toBe(true)
+      // The correction must reach DISK, not just memory: the recorded cwd it
+      // replaced no longer exists, so a file still naming it is a booby trap for
+      // anything that reads it directly (and for the next boot).
+      const onDisk = JSON.parse(readFileSync(join(home, '.dsh', 'dsh-ntr', 'agents.json'), 'utf-8')) as {
+        agents: Array<{ id: string; cwd?: string; allowedCwdRoots?: string[] }>
+      }
+      const onDiskAgent = onDisk.agents.find(agent => agent.id === 'legacy')
+      expect(onDiskAgent?.cwd).toBe(defaultAgentWorkspace())
+      expect(onDiskAgent?.allowedCwdRoots).toEqual([defaultAgentWorkspace()])
+
+      // Idempotent: a second boot over the migrated layout changes nothing.
+      const again = new BridgeManager([], hub, 100)
+      const againDefs = (again as unknown as { defsMap: Map<string, AcpAgentDef> }).defsMap
+      expect(againDefs.get('legacy')?.cwd).toBe(defaultAgentWorkspace())
+      await again.shutdownAll()
+      await manager.shutdownAll()
+    } finally {
+      if (previous === undefined) delete process.env.DSH_NTR_STATE_DIR
+      else process.env.DSH_NTR_STATE_DIR = previous
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('never overwrites state that already exists in the plugin directory', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-ntr-noclobber-'))
+    mkdirSync(join(home, '.dsh', 'dsh-ntr'), { recursive: true })
+    // Both locations populated: the new one is the truth, the stale legacy file
+    // must not clobber the setup the user has been editing.
+    writeFileSync(join(home, '.dsh', 'dsh-ntr', 'agents.json'), JSON.stringify({
+      version: 2,
+      agents: [{ id: 'current', command: process.execPath, args: [MOCK], permission: 'ask' }],
+    }), 'utf-8')
+    writeFileSync(join(home, '.dsh', 'acp-agents.json'), JSON.stringify({
+      version: 2,
+      agents: [{ id: 'stale', command: process.execPath, args: [MOCK], permission: 'ask' }],
+    }), 'utf-8')
+
+    const previous = process.env.DSH_NTR_STATE_DIR
+    process.env.DSH_NTR_STATE_DIR = join(home, '.dsh', 'dsh-ntr')
+    try {
+      const manager = new BridgeManager([], hub, 100)
+      const defs = (manager as unknown as { defsMap: Map<string, AcpAgentDef> }).defsMap
+      expect(defs.has('current')).toBe(true)
+      expect(defs.has('stale')).toBe(false)
+      await manager.shutdownAll()
+    } finally {
+      if (previous === undefined) delete process.env.DSH_NTR_STATE_DIR
+      else process.env.DSH_NTR_STATE_DIR = previous
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('defaults a cwd-less agent into the plugin workspace and deduplicates roots', async () => {    const testStorage = `${tmpdir()}/acp-workspace-defaults-${Date.now()}.json`
     const wsManager = new BridgeManager([], hub, 100, testStorage)
 
     // No cwd, no roots (the panel always pre-fills both, but YAML/RPC callers
