@@ -54,7 +54,7 @@ import type {
   AcpToolCallSnapshot, PermissionDecision, RosterPresetRow,
 } from './impl.ts'
 import type {
-  AcpAgentCatalog, AcpAgentDef, AcpPresetStatus, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
+  AcpAgentCatalog, AcpAgentDef, AcpConversationChoice, AcpPresetStatus, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
   LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo, PermissionMode,
   PermissionOutcome, PermissionOptionView, PreparedAdapterCall, SessionView, StreamChunk,
 } from './protocol.ts'
@@ -2160,15 +2160,18 @@ export class BridgeManager {
     if (!this.defsMap.has(agentId)) {
       throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
     }
-    this.chatAgentIntent.set(dshSessionId, agentId)
-    // The request path reads this (the guard's `agent/request` rewrite and this
-    // class's own turn admission): the switch takes effect on the next message.
-    routeBindingRegistry().conversations.set(dshSessionId, agentId)
+    // A switch to a DIFFERENT agent drops its model/effort/mode: those values
+    // are the PREVIOUS agent's vocabulary (a `choice` from its catalog, a value
+    // of ITS `thought_level`, one of ITS `session/set_mode` ids) and would be
+    // rejected or silently remapped by the new one. Re-picking the SAME agent
+    // is not a switch, so its picks stand. `patchChatChoice` owns that rule —
+    // both entry points go through it so the two cannot drift.
+    this.patchChatChoice(dshSessionId, { agentId })
   }
 
   /** The ACP agent a chat session was last pointed at, when one is known. */
   chatAgentFor(dshSessionId: string): string | undefined {
-    const recorded = this.chatAgentIntent.get(dshSessionId)
+    const recorded = this.chatAgentIntent.get(dshSessionId)?.agentId
     if (recorded !== undefined && this.defsMap.has(recorded)) return recorded
     // Fall back to the binding itself: a session that already ran an agent is
     // pointed at that agent even if the intent map was never seeded.
@@ -2176,6 +2179,38 @@ export class BridgeManager {
       if (session.dshSessionId === dshSessionId && !session.closed) return session.agentId
     }
     return undefined
+  }
+
+  /**
+   * The conversation's persisted pick (agent + model + thought level). This is
+   * the record that survives a host restart and is readable BEFORE the
+   * conversation has ever run a turn — the composer shows it, and the turn path
+   * applies it to a freshly created or resumed session.
+   */
+  chatChoice(dshSessionId: string): AcpConversationChoice | undefined {
+    const recorded = this.chatAgentIntent.get(dshSessionId)
+    if (recorded === undefined) return undefined
+    if (!this.defsMap.has(recorded.agentId)) return undefined
+    return { ...recorded }
+  }
+
+  /**
+   * Publish one conversation's pick onto the request-path binding.
+   *
+   * The guard's `agent/request` rewrite and this class's own turn admission read
+   * `routeBindingRegistry().conversations`, whose values are adapter model ids.
+   * The MODEL half of the pick therefore rides there, so a turn that starts
+   * with `agentId` alone does not silently drop a variant chosen up front; with
+   * no model picked the binding is the bare agent id (the agent's default).
+   *
+   * Only ever WRITES: a conversation with no recorded pick keeps whatever the
+   * turn path pinned to it (the agent that actually served its last turn), which
+   * is the honest answer for a session whose intent map was never seeded.
+   */
+  private syncConversationRoute(dshSessionId: string): void {
+    const choice = this.chatAgentIntent.get(dshSessionId)
+    if (choice === undefined || !this.defsMap.has(choice.agentId)) return
+    routeBindingRegistry().conversations.set(dshSessionId, choice.modelId ?? choice.agentId)
   }
 
   /**
@@ -2201,6 +2236,36 @@ export class BridgeManager {
     return this.reasoningMeta(agentId)?.defaultEffort
   }
 
+  /**
+   * Record one field of a conversation's pick and persist it.
+   *
+   * Every bottom-bar control (agent, model, thought level, the agent's own mode)
+   * is one field of the SAME record, and the setters used to spell the record
+   * out by hand each time — which is exactly how `mode` ended up as the one
+   * control that reset on every restart: no setter wrote it. Patch through here
+   * so a new axis cannot be half-wired.
+   *
+   * `undefined` CLEARS the field (the "follow the agent's default" choice).
+   */
+  private patchChatChoice(
+    dshSessionId: string,
+    patch: Partial<AcpConversationChoice>,
+  ): void {
+    const current = this.chatAgentIntent.get(dshSessionId)
+    const agentId = patch.agentId ?? current?.agentId ?? this.chatAgentFor(dshSessionId)
+    if (agentId === undefined) return
+    // A patch that names a DIFFERENT agent starts from a clean record: the
+    // other fields are the previous agent's vocabulary and must not survive.
+    const base = patch.agentId !== undefined && patch.agentId !== current?.agentId ? {} : current
+    const next: AcpConversationChoice = { ...base, ...patch, agentId }
+    if (next.modelId === undefined) delete next.modelId
+    if (next.effort === undefined) delete next.effort
+    if (next.mode === undefined) delete next.mode
+    this.chatAgentIntent.set(dshSessionId, next)
+    this.persistAgents()
+    this.syncConversationRoute(dshSessionId)
+  }
+
   /** Switch the bound agent's model for one chat session (`agentId@choice`). */
   async setChatSessionModel(dshSessionId: string, modelId: string): Promise<void> {
     const { agentId, choice } = splitAdapterModelId(modelId)
@@ -2208,8 +2273,10 @@ export class BridgeManager {
     if (def === undefined) {
       throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
     }
-    this.chatAgentIntent.set(dshSessionId, agentId)
-    routeBindingRegistry().conversations.set(dshSessionId, modelId)
+    // The pick is recorded even when NO live session exists yet — that is the
+    // "choose the model before the first message" case. A session that
+    // materializes later reads it back (`applyChatChoice`).
+    this.patchChatChoice(dshSessionId, { agentId, modelId: choice === undefined ? undefined : modelId })
     for (const session of this.dshSessionMap.values()) {
       if (session.dshSessionId !== dshSessionId || session.agentId !== agentId) continue
       if (session.released) continue
@@ -2221,10 +2288,66 @@ export class BridgeManager {
 
   /** Switch the bound agent's reasoning effort for one chat session. */
   async setChatSessionEffort(dshSessionId: string, effort: string | undefined): Promise<void> {
+    // Recorded before any session exists (see `setChatSessionModel`); a released
+    // session is skipped here and re-aligned by `applyChatChoice` on resume.
+    this.patchChatChoice(dshSessionId, { effort })
     for (const session of this.dshSessionMap.values()) {
       if (session.dshSessionId !== dshSessionId || session.released) continue
       session.reasoningEffort = effort
       await this.alignSessionConfig(session, session.choice, effort)
+    }
+  }
+
+  /**
+   * Apply a conversation's persisted pick to a session that just materialized —
+   * created by the first turn, or resumed through `session/load` after a crash.
+   *
+   * This is what makes an up-front choice real rather than decorative: the
+   * session/new and session/load answers come back with the AGENT's defaults,
+   * which would otherwise run the first message on a model the user already
+   * replaced. Best effort, exactly like the turn path's alignment: a stale pick
+   * (a choice the agent dropped, a thought level it no longer offers) is warned
+   * about and skipped, never turned into a failed turn.
+   */
+  private async applyChatChoice(session: LiveSession): Promise<void> {
+    const dshSessionId = session.dshSessionId
+    if (dshSessionId === undefined) return
+    const choice = this.chatAgentIntent.get(dshSessionId)
+    if (choice === undefined || choice.agentId !== session.agentId) return
+    const { choice: modelChoice } = splitAdapterModelId(choice.modelId ?? '')
+    await this.alignSessionConfig(session, modelChoice, choice.effort)
+    // Mirror the pick onto the session so `session/chat-list` reports what is
+    // actually in force, not just what was requested.
+    if (choice.modelId !== undefined) {
+      session.modelId = choice.modelId
+      session.choice = modelChoice
+    }
+    if (choice.effort !== undefined) session.reasoningEffort = choice.effort
+    // The agent's own mode is the third control in the same composer bar, so it
+    // follows the same contract: a mode the agent no longer declares is skipped
+    // (warning, not a failed turn) — `session/new` and `session/load` both come
+    // back on whatever the agent starts with.
+    if (choice.mode !== undefined) {
+      const offered = session.modes?.availableModes ?? []
+      if (offered.length === 0 || offered.some(mode => mode.id === choice.mode)) {
+        try {
+          await this.bridge(session.agentId).setMode(session, choice.mode)
+        } catch (error) {
+          this.hub.broadcast({
+            type: 'agent/notice',
+            agentId: session.agentId,
+            level: 'error',
+            text: `acp: failed to restore mode "${choice.mode}": ${describeError(error)}`,
+          })
+        }
+      } else {
+        this.hub.broadcast({
+          type: 'agent/notice',
+          agentId: session.agentId,
+          level: 'error',
+          text: `acp: agent "${session.agentId}" no longer offers mode "${choice.mode}"; keeping its own`,
+        })
+      }
     }
   }
 
@@ -2258,12 +2381,31 @@ export class BridgeManager {
     const target = agentId === undefined
       ? (candidates.find(session => !session.released) ?? candidates[0])
       : candidates.find(session => session.agentId === agentId)
-    if (target === undefined || target.closed) {
-      throw new AcpError('unknown_session', `acp: no live ACP session is bound to chat session ${dshSessionId}`)
+    // No live session yet: this is the "choose the mode before the first
+    // message" case, and the pick is recorded WITHOUT spawning anything — the
+    // session that materializes later reads it back (`applyChatChoice`). This
+    // matches `setChatSessionModel`, which has always recorded ahead of a
+    // session; refusing here was what made the mode control unusable on a
+    // conversation still being set up.
+    if (target === undefined) {
+      const bound = agentId ?? this.chatAgentFor(dshSessionId)
+      if (bound === undefined || !this.defsMap.has(bound)) {
+        throw new AcpError('unknown_session', `acp: no live ACP session is bound to chat session ${dshSessionId}`)
+      }
+      this.patchChatChoice(dshSessionId, { agentId: bound, mode: modeId })
+      return
+    }
+    if (target.closed) {
+      throw new AcpError('unknown_session', `acp: the ACP session bound to chat session ${dshSessionId} is closed`)
     }
     const bridge = this.bridge(target.agentId)
     const session = target.released ? await bridge.resumeSession(target) : target
     await bridge.setMode(session, modeId)
+    // Persisted only AFTER the agent accepted it: a mode the agent rejected must
+    // not come back on the next restore. This is the same contract the model and
+    // thought level follow (user decision, 2026-10-18 — every control in the
+    // bottom bar remembers its last choice, not just the thought level).
+    this.patchChatChoice(dshSessionId, { agentId: target.agentId, mode: modeId })
   }
 
   /**
@@ -2371,9 +2513,32 @@ export class BridgeManager {
         // `defaultAgent()` is the accessor that filters a stale id out, so a
         // temporarily unreadable agent list cannot silently erase the choice.
         if (typeof stored === 'string' && stored !== '') this.defaultAgentId = stored
+        this.loadPersistedChoices((parsed as { conversations?: unknown }).conversations)
       }
     } catch {
       // Storage load failure is non-fatal
+    }
+  }
+
+  /**
+   * Read the per-conversation picks back. Tolerant on purpose, one row at a
+   * time: a single corrupt entry must not cost the user every other
+   * conversation's set-up. Entries are kept even when the named agent is not
+   * configured on this boot — `chatChoice` filters those out, so a temporarily
+   * missing agent does not erase the choice it was made for.
+   */
+  private loadPersistedChoices(raw: unknown): void {
+    if (raw === null || typeof raw !== 'object') return
+    for (const [dshSessionId, row] of Object.entries(raw as Record<string, unknown>)) {
+      if (dshSessionId === '' || row === null || typeof row !== 'object') continue
+      const { agentId, modelId, effort, mode } = row as { agentId?: unknown; modelId?: unknown; effort?: unknown; mode?: unknown }
+      if (typeof agentId !== 'string' || agentId === '') continue
+      this.chatAgentIntent.set(dshSessionId, {
+        agentId,
+        ...(typeof modelId === 'string' && modelId !== '' ? { modelId } : {}),
+        ...(typeof effort === 'string' && effort !== '' ? { effort } : {}),
+        ...(typeof mode === 'string' && mode !== '' ? { mode } : {}),
+      })
     }
   }
 
@@ -2385,6 +2550,11 @@ export class BridgeManager {
         version: 2,
         ...(this.defaultAgentId === undefined ? {} : { defaultAgentId: this.defaultAgentId }),
         agents: [...this.defsMap.values()],
+        // The per-conversation picks: agent + model + thought level chosen in
+        // the composer, including for conversations with no live session yet.
+        ...(this.chatAgentIntent.size === 0
+          ? {}
+          : { conversations: Object.fromEntries(this.chatAgentIntent) }),
       }
       writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf-8')
     } catch {
@@ -2523,22 +2693,70 @@ export class BridgeManager {
       if (exposed === undefined || !exposed.includes(choice.value)) continue
       variants.push({
         id: buildAdapterModelId(def.id, choice.value),
-        name: `${title} · ${choice.name}`,
+        // The MODEL name alone, not `<agent> · <model>`: the picker already
+        // groups these under "<agent>'s models", and the composer chip sits next
+        // to the agent chip, so repeating the agent name in every row was noise
+        // on top of noise (user report, 2026-10-18).
+        name: choice.name,
         ...(choice.description !== undefined ? { description: choice.description } : {}),
       })
     }
     const reasoning = this.reasoningMeta(agentId)
+    const modelOption = entry?.catalog.model
+    // The model the agent reports it is ON (its `model.currentValue`, refreshed
+    // every time a session publishes `configOptions`). This is what the base
+    // entry NAMES: `base` is the bare `agentId` route ("let the agent choose"),
+    // and the honest way to describe that route is by the model it actually
+    // resolves to — "CodeBuddy Code · Hy3", not just "CodeBuddy Code". Without
+    // the model name the checked row in the picker said nothing about which
+    // model it was (user report, 2026-10-18).
+    //
+    // An agent can also sit on a model it no longer offers (or report a value it
+    // forgot to list): report it with the raw value as its name rather than
+    // dropping it — dropping it is what removes the model chip entirely.
+    const currentModelValue = modelOption?.currentValue ?? null
+    const currentModelChoice = currentModelValue === null
+      ? undefined
+      : modelOption?.choices.find(choice => choice.value === currentModelValue)
+        ?? { value: currentModelValue, name: currentModelValue }
+    const baseName = currentModelChoice === undefined
+      ? title
+      : `${title} · ${currentModelChoice.name}`
+    const modeOption = entry?.catalog.mode
     return {
       agentId: def.id,
       title,
       base: {
         id: def.id,
-        name: title,
+        name: baseName,
         description: `ACP Agent: ${def.command} ${(def.args ?? []).join(' ')}`.trim(),
       },
       variants,
       probed: entry !== undefined,
       ...(reasoning !== undefined ? { reasoning } : {}),
+      // The agent's OWN current model, so the model chip has something to show
+      // before this conversation has picked one. Absent when the agent publishes
+      // no model selector at all — then there really is no model axis.
+      ...(currentModelChoice === undefined ? {} : {
+        currentModel: {
+          value: currentModelChoice.value,
+          name: currentModelChoice.name,
+          ...(currentModelChoice.description === undefined ? {} : { description: currentModelChoice.description }),
+        },
+      }),
+      // Same reason, for the mode select: before `session/new` there is no live
+      // session to read `modes` from, and the control would silently vanish on a
+      // conversation the user is still setting up.
+      ...(modeOption === undefined ? {} : {
+        mode: {
+          ...(modeOption.currentValue === null ? {} : { currentValue: modeOption.currentValue }),
+          choices: modeOption.choices.map(choice => ({
+            id: choice.value,
+            name: choice.name,
+            ...(choice.description === undefined ? {} : { description: choice.description }),
+          })),
+        },
+      }),
       ...(entry === undefined ? {} : { updatedAt: entry.updatedAt }),
     }
   }
@@ -2970,11 +3188,13 @@ export class BridgeManager {
 
   private readonly dshSessionMap = new Map<string, LiveSession>()
   /**
-   * Which ACP agent each DSH chat session is pointed at, as chosen in the
-   * conversation. Persisted with the agent registry; this is the plugin's own
+   * What each DSH chat session has chosen for its ACP agent — the agent itself
+   * plus the agent's model and thought level. Persisted with the agent registry
+   * (`conversations`), so the pick survives a host restart and is readable
+   * before the conversation has ever run a turn. This is the plugin's own
    * conversation↔agent mapping, never a DSH model route (see `bindChatAgent`).
    */
-  private readonly chatAgentIntent = new Map<string, string>()
+  private readonly chatAgentIntent = new Map<string, AcpConversationChoice>()
 
   /** Drop every chat-keyed record pointing at one host session (close/stop paths). */
   private forgetDshSession(sessionId: string): void {
@@ -3008,10 +3228,15 @@ export class BridgeManager {
       // session id is what native approval routing keys off.
       resumed.dshSessionId = dshSessionId
       // A resume without an explicit pick must keep serving the agent the
-      // conversation was ON (its own model string when one was recorded).
+      // conversation was ON (its own model string when one was recorded). The
+      // recorded pick wins when there is one (it carries the model half).
       if (dshSessionId !== undefined) {
-        routeBindingRegistry().conversations.set(dshSessionId, resumed.modelId ?? agentId)
+        if (this.chatAgentIntent.has(dshSessionId)) this.syncConversationRoute(dshSessionId)
+        else routeBindingRegistry().conversations.set(dshSessionId, resumed.modelId ?? agentId)
       }
+      // ...and the persisted pick (model / thought level) is re-applied to the
+      // freshly loaded session, whose config comes back at the agent's defaults.
+      await this.applyChatChoice(resumed)
       return resumed
     }
     // A chat session runs where its DSH session lives, not in the plugin's
@@ -3035,7 +3260,17 @@ export class BridgeManager {
     this.dshSessionMap.set(key, session)
     // Pin what this conversation now runs on, so a route that does not name it
     // (a fresh session replays the deployment default) is rewritten to reality.
-    if (dshSessionId !== undefined) routeBindingRegistry().conversations.set(dshSessionId, agentId)
+    // The recorded pick wins when there is one (it carries the model half);
+    // otherwise the agent that just served this turn is pinned bare.
+    if (dshSessionId !== undefined) {
+      if (this.chatAgentIntent.has(dshSessionId)) this.syncConversationRoute(dshSessionId)
+      else routeBindingRegistry().conversations.set(dshSessionId, agentId)
+    }
+    // Apply whatever the conversation picked BEFORE this session existed — the
+    // model and thought level chosen in the composer ahead of the first message.
+    // `session/new` answered with the agent's defaults; without this the first
+    // turn would run on them and the pick would only take effect afterwards.
+    await this.applyChatChoice(session)
     return session
   }
 

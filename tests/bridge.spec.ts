@@ -209,7 +209,10 @@ describe('ACP bridge over stdio (mock agent)', () => {
     if (!exposed.ok) throw new Error('agent/catalog failed')
     const seat = exposed.value as AgentCatalogResult
     expect(seat).toMatchObject({ agentId: 'mock', title: 'Mock', probed: true })
-    expect(seat.base).toMatchObject({ id: 'mock', name: 'Mock' })
+    // `base` names the bare route AND the model it currently resolves to, so the
+    // checked row in the picker says which model is running (user report,
+    // 2026-10-18). Mock is on `mock-model-a`.
+    expect(seat.base).toMatchObject({ id: 'mock', name: 'Mock · Mock Model A' })
     expect(seat.variants.map(variant => variant.id)).toEqual(['mock@mock-model-a', 'mock@mock-model-b'])
     expect(await dispatchRpc(manager, 'agent/set-exposed-models', { agentId: 'mock' })).toEqual({ ok: true, value: { done: true } })
     const cleared = await dispatchRpc(manager, 'agent/catalog', { agentId: 'mock' })
@@ -905,7 +908,9 @@ describe('model catalog (isolated manager)', () => {
     // background behind it).
     const before = catalogManager.agentCatalog('mock')
     expect(before).toMatchObject({ agentId: 'mock', title: 'Mock', probed: false, variants: [] })
+    // No probe yet → no known current model, so `base` names the agent alone.
     expect(before.base).toMatchObject({ id: 'mock', name: 'Mock' })
+    expect(before.currentModel).toBeUndefined()
     expect(before.reasoning).toBeUndefined()
     expect(() => catalogManager.agentCatalog('ghost')).toThrow(/not configured/)
   })
@@ -930,7 +935,9 @@ describe('model catalog (isolated manager)', () => {
 
     const seat = catalogManager.agentCatalog('mock')
     expect(seat.variants.map(variant => variant.id)).toEqual(['mock@mock-model-a', 'mock@mock-model-b'])
-    expect(seat.variants[1]).toMatchObject({ name: 'Mock · Mock Model B', description: 'The stronger mock model' })
+    // Rows name the MODEL alone — the picker already says whose models these are,
+    // and the composer chip sits beside the agent chip.
+    expect(seat.variants[1]).toMatchObject({ name: 'Mock Model B', description: 'The stronger mock model' })
 
     const resolved = await catalogAdapter.resolveModel('acp', 'mock@mock-model-b')
     expect(resolved).toMatchObject({ provider: 'acp', id: 'mock@mock-model-b', name: 'Mock · Mock Model B' })
@@ -2112,6 +2119,241 @@ describe('conversation ↔ agent binding (isolated manager)', () => {
     // intent map was never seeded (a session restored from the registry).
     gm.bindChatAgent('dsh-bind-3', 'bound')
     expect(gm.chatAgentFor('dsh-bind-3')).toBe('bound')
+    await gm.shutdownAll()
+  })
+})
+
+/**
+ * A conversation must be set up BEFORE its first message.
+ *
+ * The composer's model / thought-level pickers used to write only into a live
+ * ACP session, of which there is none until a turn has already gone out — so
+ * the choice could not be made up front, and the first message always ran on
+ * whatever the agent's defaults happened to be. The pick is now the plugin's
+ * own persisted per-conversation record and is applied when the session
+ * materializes (§ "apply on create/resume"), which is the OmniTerm behavior
+ * this mirrors (its `config_prefs` agent-level + session-level restore).
+ */
+describe('pre-chat pick persistence (isolated manager)', () => {
+  const pickHub = new EventHub()
+
+  it('records a model/effort pick before any ACP session exists, and reports it back', async () => {
+    const storage = `${tmpdir()}/acp-pick-${Date.now()}.json`
+    const gm = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
+
+    // Nothing bound and nothing picked: the composer has nothing to show.
+    expect(gm.chatChoice('dsh-pick-1')).toBeUndefined()
+
+    gm.bindChatAgent('dsh-pick-1', 'picked')
+    // No live session exists at this point — that is the whole point.
+    expect(gm.chatSessions('dsh-pick-1')).toEqual([])
+
+    await gm.setChatSessionModel('dsh-pick-1', 'picked@opus')
+    await gm.setChatSessionEffort('dsh-pick-1', 'high')
+    expect(gm.chatChoice('dsh-pick-1')).toEqual({ agentId: 'picked', modelId: 'picked@opus', effort: 'high' })
+    // Still no session: the pick was recorded without creating one.
+    expect(gm.chatSessions('dsh-pick-1')).toEqual([])
+
+    await gm.shutdownAll()
+  })
+
+  it('survives a host restart, because the pick belongs to the conversation, not the process', async () => {
+    const storage = `${tmpdir()}/acp-pick-restart-${Date.now()}.json`
+    const first = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
+    first.bindChatAgent('dsh-pick-2', 'picked')
+    await first.setChatSessionModel('dsh-pick-2', 'picked@sonnet')
+    await first.setChatSessionEffort('dsh-pick-2', 'low')
+    await first.shutdownAll()
+
+    // A fresh manager over the same storage answers with the same pick — this
+    // is what a browser reloading after a host restart reads back.
+    const second = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
+    expect(second.chatChoice('dsh-pick-2')).toEqual({ agentId: 'picked', modelId: 'picked@sonnet', effort: 'low' })
+    await second.shutdownAll()
+  })
+
+  it('drops the previous agent\'s model and effort when the conversation switches agent', async () => {
+    const gm = new BridgeManager(
+      [{ ...def, id: 'alpha' }, { ...def, id: 'beta' }],
+      pickHub,
+      500,
+      `${tmpdir()}/acp-pick-switch-${Date.now()}.json`,
+    )
+    gm.bindChatAgent('dsh-pick-3', 'alpha')
+    await gm.setChatSessionModel('dsh-pick-3', 'alpha@opus')
+    await gm.setChatSessionEffort('dsh-pick-3', 'high')
+
+    // Those values are alpha's vocabulary: `opus` is a choice from ITS catalog
+    // and `high` a value of ITS thought_level. Carrying them to beta would ask
+    // the new agent for things it never offered.
+    gm.bindChatAgent('dsh-pick-3', 'beta')
+    expect(gm.chatChoice('dsh-pick-3')).toEqual({ agentId: 'beta' })
+
+    // Re-picking the SAME agent is not a switch: the model and effort stand.
+    await gm.setChatSessionModel('dsh-pick-3', 'beta@sonnet')
+    gm.bindChatAgent('dsh-pick-3', 'beta')
+    expect(gm.chatChoice('dsh-pick-3')).toEqual({ agentId: 'beta', modelId: 'beta@sonnet' })
+    await gm.shutdownAll()
+  })
+
+  /**
+   * The agent's own mode is the third control in the same bar, so it follows the
+   * same "remember the last choice" contract. It used to be the one that did
+   * not: `setChatSessionMode` wrote only into the live session, so a restart
+   * silently put the conversation back on the agent's starting mode.
+   */
+  it('persists the agent\'s own mode alongside the model and thought level', async () => {
+    const storage = `${tmpdir()}/acp-pick-mode-${Date.now()}.json`
+    const gm = new BridgeManager([def], pickHub, 500, storage)
+    gm.bindChatAgent('dsh-pick-mode-1', 'mock')
+    // The mode can only be SET once a session exists (the agent declares its
+    // mode list in `session/new`), so send one turn to materialize it.
+    for await (const _ of gm.streamPrompt({
+      model: 'mock',
+      sessionId: 'dsh-pick-mode-1',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    } as never)) { /* drain */ }
+    const [session] = gm.chatSessions('dsh-pick-mode-1')
+    const available = session?.modes?.availableModes ?? []
+    expect(available.length).toBeGreaterThan(1)
+    const target = available.find(mode => mode.id !== session?.modes?.currentModeId)
+    expect(target).toBeDefined()
+
+    await gm.setChatSessionMode('dsh-pick-mode-1', target!.id, 'mock')
+    // The pick now carries the mode next to the other two axes.
+    expect(gm.chatChoice('dsh-pick-mode-1')).toMatchObject({ agentId: 'mock', mode: target!.id })
+
+    // And it survives a host restart, which is the whole point.
+    await gm.shutdownAll()
+    const again = new BridgeManager([def], pickHub, 500, storage)
+    expect(again.chatChoice('dsh-pick-mode-1')).toMatchObject({ agentId: 'mock', mode: target!.id })
+    await again.shutdownAll()
+  })
+
+  it('records a mode pick before any ACP session exists', async () => {
+    // The composer's mode select reads its OPTIONS from the agent catalog, so it
+    // is now reachable on a conversation that has never sent a message — and the
+    // click must land. It used to throw `unknown_session` here, which on screen
+    // is indistinguishable from a dead control (user report, 2026-10-18).
+    const gm = new BridgeManager([def], pickHub, 500, `${tmpdir()}/acp-pick-mode-early-${Date.now()}.json`)
+    gm.bindChatAgent('dsh-pick-mode-3', 'mock')
+    expect(gm.chatSessions('dsh-pick-mode-3')).toEqual([])
+    await gm.setChatSessionMode('dsh-pick-mode-3', 'strict', 'mock')
+    expect(gm.chatChoice('dsh-pick-mode-3')).toMatchObject({ agentId: 'mock', mode: 'strict' })
+    // Still nothing spawned: choosing ahead of the first message costs no process.
+    expect(gm.chatSessions('dsh-pick-mode-3')).toEqual([])
+    // ...and it is applied to the session the first turn materializes.
+    for await (const _ of gm.streamPrompt({
+      model: 'mock',
+      sessionId: 'dsh-pick-mode-3',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    } as never)) { /* drain */ }
+    expect(gm.chatSessions('dsh-pick-mode-3')[0]?.modes?.currentModeId).toBe('strict')
+    await gm.shutdownAll()
+
+    // A conversation pointed at NO agent still fails honestly — that is a caller
+    // bug, not a conversation being set up.
+    const nowhere = new BridgeManager([def], pickHub, 500, `${tmpdir()}/acp-pick-mode-none-${Date.now()}.json`)
+    await expect(nowhere.setChatSessionMode('never-bound', 'strict'))
+      .rejects.toThrow(/no live ACP session is bound/)
+    await nowhere.shutdownAll()
+  }, 30_000)
+
+  it('drops the previous agent\'s mode when the conversation switches agent', async () => {
+    const gm = new BridgeManager(
+      [{ ...def, id: 'alpha2' }, { ...def, id: 'beta2' }],
+      pickHub,
+      500,
+      `${tmpdir()}/acp-pick-mode-switch-${Date.now()}.json`,
+    )
+    // Seed a mode directly through the receipt path used by the RPC layer.
+    gm.bindChatAgent('dsh-pick-mode-2', 'alpha2')
+    const internal = gm as unknown as {
+      patchChatChoice(id: string, patch: Record<string, unknown>): void
+    }
+    internal.patchChatChoice('dsh-pick-mode-2', { agentId: 'alpha2', mode: 'plan' })
+    expect(gm.chatChoice('dsh-pick-mode-2')).toMatchObject({ mode: 'plan' })
+    // A mode id belongs to the agent that declared it; beta2 never offered it.
+    gm.bindChatAgent('dsh-pick-mode-2', 'beta2')
+    expect(gm.chatChoice('dsh-pick-mode-2')).toEqual({ agentId: 'beta2' })
+    await gm.shutdownAll()
+  })
+
+  it('serves the pick over session/chat-list so the composer can show it before the first turn', async () => {
+    const gm = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, `${tmpdir()}/acp-pick-rpc-${Date.now()}.json`)
+    await dispatchRpc(gm, 'session/chat-bind', { dshSessionId: 'dsh-pick-4', agentId: 'picked' })
+    await dispatchRpc(gm, 'session/chat-model-set', { dshSessionId: 'dsh-pick-4', modelId: 'picked@opus' })
+    await dispatchRpc(gm, 'session/chat-effort-set', { dshSessionId: 'dsh-pick-4', effort: 'high' })
+
+    const listed = await dispatchRpc(gm, 'session/chat-list', { dshSessionId: 'dsh-pick-4' })
+    expect(listed).toMatchObject({
+      ok: true,
+      value: {
+        sessions: [],
+        boundAgentId: 'picked',
+        choice: { agentId: 'picked', modelId: 'picked@opus', effort: 'high' },
+      },
+    })
+    // Clearing the effort reports the absence honestly instead of keeping a
+    // stale value the agent is not running.
+    await dispatchRpc(gm, 'session/chat-effort-set', { dshSessionId: 'dsh-pick-4' })
+    expect(gm.chatChoice('dsh-pick-4')).toEqual({ agentId: 'picked', modelId: 'picked@opus' })
+    await gm.shutdownAll()
+  })
+
+  it('carries the picked model onto the request path, not just the bare agent', async () => {
+    const gm = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, `${tmpdir()}/acp-pick-route-${Date.now()}.json`)
+    gm.bindChatAgent('dsh-pick-5', 'picked')
+    // The guard's `agent/request` rewrite reads this registry; a bare agent id
+    // here would silently drop the variant the user chose up front.
+    expect(routeBindingRegistry().conversations.get('dsh-pick-5')).toBe('picked')
+    await gm.setChatSessionModel('dsh-pick-5', 'picked@opus')
+    expect(routeBindingRegistry().conversations.get('dsh-pick-5')).toBe('picked@opus')
+    await gm.shutdownAll()
+  })
+
+  /**
+   * The pick must be REAL: a model chosen before the first message has to be on
+   * the agent before that message runs, not applied afterwards.
+   *
+   * `session/new` answers with the agent's own defaults (`mock-model-a`, `high`),
+   * so without `applyChatChoice` the first turn would run on them — the pick
+   * would take effect only from the second message on, which is exactly the
+   * "chose a model, got another one" bug this whole record exists to prevent.
+   */
+  it('applies a pick made before the first turn when the session is created', async () => {
+    const applyHub = new EventHub()
+    const meta: Array<{ configId: string; currentValue: string }[]> = []
+    applyHub.subscribe(event => {
+      if (event.type !== 'session/meta') return
+      const options = (event.session as unknown as { configOptions?: Array<{ configId: string; currentValue: string }> }).configOptions
+      if (options !== undefined) meta.push(options)
+    })
+    const gm = new BridgeManager([{ ...def, id: 'mock' }], applyHub, 500, `${tmpdir()}/acp-pick-apply-${Date.now()}.json`)
+    // Choose `mock-model-b` / `off` with NO session in existence — the pre-chat
+    // case, before a single message has been sent.
+    gm.bindChatAgent('dsh-pick-6', 'mock')
+    await gm.setChatSessionModel('dsh-pick-6', 'mock@mock-model-b')
+    await gm.setChatSessionEffort('dsh-pick-6', 'off')
+    expect(gm.chatSessions('dsh-pick-6')).toEqual([])
+
+    const chunks: StreamChunk[] = []
+    for await (const chunk of gm.streamPrompt({
+      model: 'mock',
+      sessionId: 'dsh-pick-6',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+    } as never)) chunks.push(chunk)
+    expect(chunks.at(-1)).toMatchObject({ type: 'finish' })
+
+    // The AGENT is now on the picked values, not its defaults: `session/meta`
+    // carries the option set `session/set_config_option` answered with.
+    const last = meta.at(-1) ?? []
+    expect(last.find(option => option.configId === 'model')?.currentValue).toBe('mock-model-b')
+    expect(last.find(option => option.configId === 'thought')?.currentValue).toBe('off')
+    // ...and the conversation reports what is actually in force.
+    const [session] = gm.chatSessions('dsh-pick-6')
+    expect(session?.modelId).toBe('mock@mock-model-b')
+    expect(session?.reasoningEffort).toBe('off')
     await gm.shutdownAll()
   })
 })

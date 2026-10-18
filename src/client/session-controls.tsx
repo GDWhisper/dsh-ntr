@@ -35,13 +35,13 @@ import { useEffect, useState } from 'react'
 // Type-only: pulls the ui-conversation SlotMap merge into this program.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import {
-  AcpChip, AcpMenu, closeAcpMenu, ensureAcpStyle, openAcpMenu,
+  AcpChip, AcpMenu, buildAcpModelId, closeAcpMenu, ensureAcpStyle, openAcpMenu,
   setAcpMenuError, splitAcpModelId, useAcpMenu, useUi,
 } from './acp-ui.tsx'
 import type {
   AcpChatInjected, AcpMenuKind, AcpMenuItem, AcpMenuSection, AcpSessionHook,
 } from './acp-ui.tsx'
-import type { AgentCatalogResult, AgentView, ChatSessionView, SessionView } from '../protocol.ts'
+import type { AcpConversationChoice, AgentCatalogResult, AgentView, ChatSessionView } from '../protocol.ts'
 
 /**
  * Props every entry in this file receives: the injected face (built in
@@ -132,25 +132,52 @@ export function describeRoute(
   defaultAgent: string | undefined,
   catalog?: AgentCatalogResult,
   boundAgentId?: string,
+  choice?: AcpConversationChoice,
 ): RouteInfo {
   const agentId = routeAgentId(boundAgentId, bound, agents, defaultAgent)
   if (agentId === undefined) return { efforts: [] }
   const def = agents.find(agent => agent.id === agentId)
   const agentTitle = def?.title ?? bound?.agentTitle ?? catalog?.title ?? agentId
-  if (bound === undefined) return { agentId, agentTitle, efforts: [] }
-  const parsed = splitAcpModelId(bound.modelId ?? '')
-  const variant = catalog?.variants.find(entry => entry.id === bound.modelId)
+  // The conversation's persisted pick covers the window in which there is no
+  // live ACP session yet (nothing has been sent). The live session outranks it
+  // — that is what the agent is actually running right now — but without the
+  // pick a conversation set up ahead of its first message could not show the
+  // model and thought level it is about to use, which is the whole point of
+  // choosing them early.
+  const pick = choice !== undefined && choice.agentId === agentId ? choice : undefined
+  const modelId = bound?.modelId ?? pick?.modelId
+  const effort = bound?.reasoningEffort ?? pick?.effort
   const reasoning = catalog?.reasoning
-  const effectiveEffort = bound.reasoningEffort ?? reasoning?.defaultEffort
+  // The model the AGENT says it is on, for a conversation nobody has picked a
+  // model for yet. Without it the chip has no label and does not render at all,
+  // so an agent with a perfectly good model axis looked like it had none (user
+  // report, 2026-10-18). An agent publishing no `category: 'model'` select
+  // genuinely has no model axis — there `currentModel` is absent and nothing is
+  // faked. Display-only: `modelId` stays in the adapter-id space, so the picker
+  // keeps marking rows by what this conversation actually chose.
+  const agentModel = catalog?.currentModel
+  if (bound === undefined && pick === undefined && agentModel === undefined) {
+    return { agentId, agentTitle, efforts: [] }
+  }
+  const parsed = splitAcpModelId(modelId ?? '')
+  const variant = catalog?.variants.find(entry => entry.id === modelId)
+  const effectiveEffort = effort ?? reasoning?.defaultEffort
+  // The chip names the MODEL, not the agent (user report, 2026-10-18): the agent
+  // is already the chip to its right, so "CodeBuddy Code" beside "ACP · CodeBuddy
+  // Code" said nothing about which model was running. A bare `agentId` route
+  // means "the agent's own choice", which the catalog resolves to `currentModel`.
+  const modelLabel = modelId === undefined
+    ? agentModel?.name
+    : parsed.choice === undefined
+      // Bare route: name the model it resolves to. `base.name` already spells out
+      // `<agent> · <model>`, so prefer the model half when we have it.
+      ? agentModel?.name ?? catalog?.base.name ?? agentTitle
+      : variant?.name ?? parsed.choice
   return {
     agentId,
     agentTitle,
-    modelId: bound.modelId,
-    modelLabel: bound.modelId === undefined
-      ? undefined
-      : parsed.choice === undefined
-        ? catalog?.base.name ?? agentTitle
-        : variant?.name ?? parsed.choice,
+    ...(modelId === undefined ? {} : { modelId }),
+    ...(modelLabel === undefined ? {} : { modelLabel }),
     efforts: reasoning?.efforts ?? [],
     ...effectiveEffort === undefined ? {} : { effectiveEffort },
     ...effectiveEffort === undefined
@@ -171,31 +198,39 @@ export function AcpSessionControls(props: AcpClusterProps) {
   }, [acp, sessionId, running])
   const bound = boundSession(ui, sessionId)
   const agents = ui.agents
+  const choice = ui.chatChoice[sessionId]
   const agentId = routeAgentId(ui.chatBoundAgent[sessionId], bound, agents, ui.defaultAgent)
   const catalog = agentId === undefined ? undefined : ui.seatCatalogs[agentId]
+  // Read the catalog ONLY for a conversation that actually points at an agent.
+  // `routeAgentId` falls back to the plugin's global default so the picker can
+  // offer a way in — but that fallback must not cause a READ of an unrelated
+  // agent's surface: reading is what can spawn a probe process (user report,
+  // 2026-10-18: a conversation served by one agent had another one start up).
+  const served = bound !== undefined || choice !== undefined || ui.chatBoundAgent[sessionId] !== undefined
   useEffect(() => {
-    if (agentId !== undefined) void acp.loadAgentCatalog(agentId)
-  }, [acp, agentId])
-  const route = describeRoute(agents, bound, ui.defaultAgent, catalog, ui.chatBoundAgent[sessionId])
+    if (served && agentId !== undefined) void acp.loadAgentCatalog(agentId)
+  }, [acp, served, agentId])
+  const route = describeRoute(agents, bound, ui.defaultAgent, catalog, ui.chatBoundAgent[sessionId], choice)
   // A conversation with no ACP story to tell gets no chrome: the ACP view tab
   // owns the entry point for starting one.
   if (bound === undefined && agents.length === 0) return null
+  // Set up = an ACP session exists OR the conversation carries a persisted pick.
+  // The second half is what makes the cluster usable BEFORE the first message:
+  // the model and thought level can be chosen up front, and they must show as
+  // chosen rather than as nothing at all.
+  const routed = bound !== undefined || choice !== undefined || ui.chatBoundAgent[sessionId] !== undefined
   const open = (kind: AcpMenuKind, trigger: HTMLElement): void => { openAcpMenu(sessionId, kind, trigger) }
 
+  // The AGENT base is pinned to the RIGHT edge (user decision, 2026-10-17).
+  // Ordering, not luck: it is the last child, and the cluster is the rightmost
+  // cell of the composer bar, so whatever the agent publishes can only push
+  // into the space to its left. Before this the base was the FIRST child, so
+  // each extra chip (model, thought level) shoved it further left — the base
+  // visibly moved depending on what the agent happened to advertise, which
+  // reads as the whole bar reflowing when you switch agents.
   return (
     <span className="ntr-acp-cluster">
-      <AcpChip
-        label={route.agentTitle === undefined
-          ? (bound === undefined ? acp.label('接入 ACP', 'Use ACP') : 'ACP')
-          : `ACP · ${route.agentTitle}`}
-        title={acp.label(
-          '这个会话由外接 ACP agent 服务；点开可切换 agent、它的模型与思考等级',
-          'This conversation is served by an external ACP agent — open to switch the agent, its model and the thought level',
-        )}
-        active={bound !== undefined}
-        onClick={(trigger) => { open('agent', trigger) }}
-      />
-      {bound !== undefined && route.modelLabel !== undefined && (
+      {routed && route.modelLabel !== undefined && (
         <AcpChip
           label={route.modelLabel}
           title={acp.label('agent 自己的模型目录', "the agent's own model directory")}
@@ -203,7 +238,7 @@ export function AcpSessionControls(props: AcpClusterProps) {
           onClick={(trigger) => { open('model', trigger) }}
         />
       )}
-      {bound !== undefined && route.efforts.length > 0 && (
+      {routed && route.efforts.length > 0 && (
         <AcpChip
           label={`${acp.label('思考', 'think')} · ${route.effortLabel ?? acp.label('默认', 'default')}`}
           title={acp.label('思考等级（agent 的 thought_level）', "Thought level (the agent's thought_level)")}
@@ -211,6 +246,18 @@ export function AcpSessionControls(props: AcpClusterProps) {
           onClick={(trigger) => { open('thought', trigger) }}
         />
       )}
+      {/* Last on purpose: this is the fixed right-hand anchor of the cluster. */}
+      <AcpChip
+        label={route.agentTitle === undefined
+          ? (routed ? 'ACP' : acp.label('接入 ACP', 'Use ACP'))
+          : `ACP · ${route.agentTitle}`}
+        title={acp.label(
+          '这个会话由外接 ACP agent 服务；点开可切换 agent、它的模型与思考等级',
+          'This conversation is served by an external ACP agent — open to switch the agent, its model and the thought level',
+        )}
+        active={routed}
+        onClick={(trigger) => { open('agent', trigger) }}
+      />
     </span>
   )
 }
@@ -255,60 +302,97 @@ function agentSection(context: MenuContext): AcpMenuSection {
  * The rows come from `agent/catalog`, not from any DSH model directory: ACP
  * models are not advertised in DSH's catalog at all, and the exposure filter
  * (`exposedModels`) is applied host-side, so what arrives here is exactly what
- * this agent offers in this conversation. `catalog.base` is the agent's default
- * model and is always offered.
+ * this agent offers in this conversation.
+ *
+ * ONE ROW PER MODEL, and the checked row names its model (user report,
+ * 2026-10-18). The bare `agentId` route ("let the agent choose") is NOT a model,
+ * so it is folded onto the row of the model it currently resolves to: the
+ * previous shape listed `<agent> · 默认` AND `<agent> · Hy3` as two entries for
+ * one model, and the checked one was the row that did not say "Hy3".
  */
 function modelSection(context: MenuContext): AcpMenuSection | undefined {
   const { acp, route, catalog } = context
   if (route.agentId === undefined) return undefined
-  const items: AcpMenuItem[] = catalog === undefined
+  if (catalog === undefined) {
     // No catalog yet (a fresh conversation, or a host still probing): the
     // current model is the only row we can honestly show.
-    ? (route.modelId === undefined ? [] : [{ id: route.modelId, label: route.modelLabel ?? route.modelId, active: true }])
-    : [
-      // The conversation can sit on a model the list no longer offers:
-      // `exposedModels` is a filter over what is OFFERED, not over what works,
-      // and an agent may simply have dropped a choice. Marking where we are
-      // keeps the picker from implying the conversation runs the default.
-      ...(route.modelId === undefined
-        || route.modelId === catalog.base.id
-        || catalog.variants.some(variant => variant.id === route.modelId)
-        ? []
-        : [{
-          id: route.modelId,
-          label: `${route.modelLabel ?? route.modelId} · ${acp.label('当前', 'current')}`,
-          detail: acp.label(
-            '未在「设置 → ACP 代理」里勾选可见；仍然可用。',
-            'Not checked as visible in Settings → ACP Agents; still usable.',
-          ),
-          active: true,
-        }]),
-      {
-        id: catalog.base.id,
-        label: `${catalog.base.name} · ${acp.label('默认', 'default')}`,
-        ...(catalog.base.description === undefined ? {} : { detail: catalog.base.description }),
-        active: catalog.base.id === route.modelId,
-      },
-      ...catalog.variants.map(variant => ({
-        id: variant.id,
-        label: variant.name,
-        ...(variant.description === undefined ? {} : { detail: variant.description }),
-        active: variant.id === route.modelId,
-      })),
-    ]
+    return route.modelId === undefined ? undefined : {
+      id: 'model',
+      title: acp.label(`${route.agentTitle ?? 'agent'} 的模型`, `Models of ${route.agentTitle ?? 'the agent'}`),
+      items: [{ id: route.modelId, label: route.modelLabel ?? route.modelId, active: true }],
+    }
+  }
+  // Which model is IN FORCE, as a model VALUE (not a route). `route.modelId` is
+  // an adapter id: the bare `agentId` means "the agent's own choice", which the
+  // catalog resolves to `currentModel.value`. A variant is a specific value.
+  const parsed = splitAcpModelId(route.modelId ?? '')
+  const pickedChoice = parsed.choice
+  const current = catalog.currentModel
+  const inForce = pickedChoice ?? current?.value
+  // What the agent offers, as model VALUES. `exposedModels` is a filter over what
+  // is OFFERED, not over what works, so a model in force outside this set still
+  // gets a row — otherwise the picker would imply the conversation runs another.
+  const offered = new Map<string, AcpMenuItem>()
+  for (const variant of catalog.variants) {
+    const value = splitAcpModelId(variant.id).choice
+    if (value === undefined) continue
+    offered.set(value, {
+      id: variant.id,
+      label: variant.name,
+      ...(variant.description === undefined ? {} : { detail: variant.description }),
+      active: value === inForce,
+    })
+  }
+  // THE BUG IN THE SCREENSHOT (user report, 2026-10-18): the agent is on `hy3`,
+  // `hy3` is also exposed, and the list showed `<agent> · 默认 ✓` above
+  // `<agent> · Hy3` — two rows for one model, the checkmark on the one that named
+  // no model. So: ONE row per model, and the model in force is marked wherever it
+  // appears.
+  const rows: AcpMenuItem[] = []
+  if (inForce !== undefined && !offered.has(inForce)) {
+    // Either the agent is on a model its own exposure filter hides, or the
+    // conversation picked one that has dropped out of the catalog. Named either
+    // way — `route.modelLabel` already resolves the stale-variant case.
+    rows.push({
+      id: buildAcpModelId(route.agentId, inForce),
+      label: `${inForce === current?.value ? current?.name ?? inForce : route.modelLabel ?? inForce} · ${acp.label('当前', 'current')}`,
+      detail: acp.label(
+        '未在「设置 → ACP 代理」里勾选可见；仍然可用。',
+        'Not checked as visible in Settings → ACP Agents; still usable.',
+      ),
+      active: true,
+    })
+  }
+  if (current === undefined) {
+    // The bare `agentId` route could not be resolved to a model — the agent has
+    // never been probed (or publishes no model selector). The bare row is then
+    // the only honest description of what this conversation runs, and leaving the
+    // picker empty would read as broken rather than as unknown.
+    //
+    // When the route DOES resolve to a model this row is deliberately absent: it
+    // would be a second row for that same model, which is precisely the defect
+    // being fixed.
+    rows.push({
+      id: catalog.base.id,
+      label: `${catalog.base.name} · ${acp.label('默认', 'default')}`,
+      ...(catalog.base.description === undefined ? {} : { detail: catalog.base.description }),
+      active: inForce === undefined,
+    })
+  }
+  rows.push(...offered.values())
   return {
     id: 'model',
     title: acp.label(`${route.agentTitle ?? 'agent'} 的模型`, `Models of ${route.agentTitle ?? 'the agent'}`),
-    note: catalog !== undefined && catalog.variants.length === 0
+    note: catalog.variants.length === 0
       ? acp.label(
-        'agent 自己上报的模型目录；这里只列出默认模型，其余可在「设置 → ACP 代理」里勾选可见。',
-        "The agent's own model directory; only its default is offered here — enable more in Settings → ACP Agents.",
+        'agent 自己上报的模型目录；这里只列出它当前用的模型，其余可在「设置 → ACP 代理」里勾选可见。',
+        "The agent's own model directory; only the model it is on is offered here — enable more in Settings → ACP Agents.",
       )
       : acp.label(
-        'agent 自己上报的模型目录；带「默认」的一条是它的默认模型。',
-        "The agent's own model directory; the row marked default is its default model.",
+        'agent 自己上报的模型目录；勾选的那条就是这条会话正在用的模型。',
+        "The agent's own model directory; the checked row is the model this conversation is running.",
       ),
-    items,
+    items: rows,
   }
 }
 
@@ -406,14 +490,18 @@ export function AcpSessionMenu(props: AcpClusterProps) {
   const [busy, setBusy] = useState(false)
   const bound = boundSession(ui, sessionId)
   const agents = ui.agents
+  const choice = ui.chatChoice[sessionId]
   const agentId = routeAgentId(ui.chatBoundAgent[sessionId], bound, agents, ui.defaultAgent)
   const catalog = agentId === undefined ? undefined : ui.seatCatalogs[agentId]
+  // Same rule as the cluster: a menu that is not open, or a conversation that
+  // points at no agent, must not read (and so must not probe) anybody's catalog.
+  const served = bound !== undefined || choice !== undefined || ui.chatBoundAgent[sessionId] !== undefined
   useEffect(() => {
     if (agentId !== undefined) void acp.loadAgentCatalog(agentId)
   }, [acp, agentId])
 
   if (menu === null || menu.sessionId !== sessionId) return null
-  const route = describeRoute(agents, bound, ui.defaultAgent, catalog, ui.chatBoundAgent[sessionId])
+  const route = describeRoute(agents, bound, ui.defaultAgent, catalog, ui.chatBoundAgent[sessionId], choice)
   // A menu-model bug must never retire the whole picker: a render throw inside
   // this slot entry makes the error boundary ABDICATE it for the rest of the
   // session (every later click silently opens nothing). Show the failure inside

@@ -312,6 +312,128 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
     expect(unknownAgent.modelLabel).toBe('x')
   })
 
+  it('shows a pick made before the conversation ever ran a turn', () => {
+    // THE case this exists for: no live ACP session yet, but the user already
+    // chose an agent, its model and a thought level in the composer. Reading
+    // only the live session would show nothing and make the pick look lost.
+    const picked = describeRoute([agent], undefined, undefined, catalog, 'pi', {
+      agentId: 'pi',
+      modelId: 'pi@claude-sonnet-4',
+      effort: 'high',
+    })
+    expect(picked).toMatchObject({
+      agentId: 'pi',
+      modelId: 'pi@claude-sonnet-4',
+      modelLabel: 'Pi · Claude Sonnet 4',
+      effectiveEffort: 'high',
+    })
+    // The agent's own catalog still supplies the axes, not the pick.
+    expect(picked.efforts.map(level => level.id)).toEqual(['high'])
+
+    // A pick naming an agent this route is NOT on is ignored: the record
+    // belongs to whichever agent the conversation is bound to.
+    const otherAgent = describeRoute([agent], undefined, undefined, catalog, 'pi', {
+      agentId: 'someone-else',
+      modelId: 'someone-else@x',
+    })
+    expect(otherAgent).toMatchObject({ agentId: 'pi', efforts: [] })
+    expect(otherAgent.modelId).toBeUndefined()
+  })
+
+  it('shows the model chip for a conversation that has picked nothing yet', () => {
+    // THE regression this exists for (user report, 2026-10-18): a conversation
+    // with a persisted pick of `{ agent, effort }` and NO model — the shape you
+    // get by only touching the thought-level chip — had `modelId === undefined`
+    // and therefore rendered no model chip at all. An agent with a perfectly
+    // good model axis looked like it had none.
+    const withAgentModel: AgentCatalogResult = {
+      ...catalog,
+      currentModel: { value: 'claude-sonnet-4', name: 'Claude Sonnet 4' },
+    }
+    const pickedEffortOnly = describeRoute([agent], undefined, undefined, withAgentModel, 'pi', {
+      agentId: 'pi',
+      effort: 'high',
+    })
+    // The label comes from the agent's own reported current model, and the
+    // adapter id stays unset: this conversation has not chosen a model, so
+    // nothing pretends it did (the picker marks rows by `modelId`).
+    expect(pickedEffortOnly.modelLabel).toBe('Claude Sonnet 4')
+    expect(pickedEffortOnly.modelId).toBeUndefined()
+
+    // An agent that publishes no `category: 'model'` select has no model axis,
+    // and the chip stays away rather than inventing a label.
+    expect(describeRoute([agent], undefined, undefined, catalog, 'pi', { agentId: 'pi' }).modelLabel)
+      .toBeUndefined()
+  })
+
+  it('lists one row per model, and the checked row names its model', () => {
+    // THE bug in the screenshot (user report, 2026-10-18): codebuddy is on `hy3`,
+    // `hy3` is ALSO in `exposedModels`, and the picker rendered
+    //   <agent> · 默认  ✓        ← the checked row, naming no model at all
+    //   <agent> · Hy3
+    // i.e. two rows for one model, with the checkmark on the one that did not
+    // say "Hy3". One row per model; the checked row names the model.
+    const onExposed: AgentCatalogResult = {
+      ...catalog,
+      base: { id: 'pi', name: 'Pi · Claude Sonnet 4' },
+      // Not a variant row — it is the agent's `currentValue`, and the exposure
+      // list below happens to contain the same value.
+      currentModel: { value: 'claude-sonnet-4', name: 'Claude Sonnet 4' },
+    }
+    const route = describeRoute([agent], undefined, undefined, onExposed, 'pi')
+    const menu = menuFor('model', { acp, agents: [agent], catalog: onExposed, route })
+    // ONE row for the model the agent is on — not a "默认" row plus a variant row.
+    // The row is the VARIANT row (it is in `exposedModels`), so it carries that
+    // row's label; what matters is that it is marked and that it names a model.
+    expect(menu.sections[0]?.items.map(item => item.id)).toEqual(['pi@claude-sonnet-4'])
+    expect(menu.sections[0]?.items[0]).toMatchObject({ active: true })
+    expect(menu.sections[0]?.items[0]?.label).toContain('Claude Sonnet 4')
+    // The chip names the model too, not the agent (the agent chip already does).
+    expect(route.modelLabel).toBe('Claude Sonnet 4')
+
+    // An agent sitting on a model the exposure filter does not list: still one
+    // row, still named, still checked — the picker must never imply the
+    // conversation runs one of the offered models instead.
+    const offList: AgentCatalogResult = {
+      ...catalog,
+      variants: [{ id: 'pi@other-model', name: 'Other Model' }],
+      currentModel: { value: 'hy3', name: 'Hy3' },
+    }
+    const offMenu = menuFor('model', { acp, agents: [agent], catalog: offList, route: describeRoute([agent], undefined, undefined, offList, 'pi') })
+    expect(offMenu.sections[0]?.items.map(item => item.id)).toEqual(['pi@hy3', 'pi@other-model'])
+    expect(offMenu.sections[0]?.items[0]).toMatchObject({ active: true, label: 'Hy3 · 当前' })
+    expect(offMenu.sections[0]?.items[1]).toMatchObject({ active: false })
+  })
+
+  it('offers the agent\'s modes before any live session exists', () => {
+    // The mode select used to require a live session, because that is where its
+    // list came from — so on a conversation still being set up it silently
+    // vanished (user report, 2026-10-18). The probed catalog carries the same
+    // list the agent publishes on `session/new`.
+    const withMode: AgentCatalogResult = {
+      ...catalog,
+      mode: {
+        currentValue: 'default',
+        choices: [{ id: 'default', name: 'Always Ask' }, { id: 'plan', name: 'Plan' }],
+      },
+    }
+    expect(withMode.mode?.choices.map(choice => choice.id)).toEqual(['default', 'plan'])
+    // Nothing to show for an agent that declares no modes.
+    expect(catalog.mode).toBeUndefined()
+  })
+
+  it('lets the live session outrank the pick once one exists', () => {
+    // The session is what the agent is ACTUALLY running (it may have switched
+    // its own model); the pick only covers the window before one exists.
+    const live = describeRoute([agent], { ...bound, modelId: 'pi', reasoningEffort: 'low' }, undefined, catalog, 'pi', {
+      agentId: 'pi',
+      modelId: 'pi@claude-sonnet-4',
+      effort: 'high',
+    })
+    expect(live.modelId).toBe('pi')
+    expect(live.effectiveEffort).toBe('low')
+  })
+
   it('shows the recorded binding before the live session has caught up', () => {
     // The click recorded 'omp' for this conversation, but the live session list
     // still names 'pi' — a switch applies from the NEXT message, and until that

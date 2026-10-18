@@ -300,6 +300,13 @@ export type ChatSessionsListResult = { sessions: ChatSessionView[] }
  */
 export interface ChatSessionListResult extends ChatSessionsListResult {
   acpMode?: boolean
+  /**
+   * The conversation's persisted pick (agent + model + thought level), when one
+   * exists. This is what the composer reads BEFORE the conversation has an ACP
+   * session, so a model chosen up front shows up as the current one instead of
+   * appearing to have been forgotten.
+   */
+  choice?: AcpConversationChoice
 }
 
 /**
@@ -428,10 +435,54 @@ export interface AcpCatalogOption {
   choices: AcpCatalogChoice[]
 }
 
-/** The model/thought-level catalog derived from one agent's `configOptions`. */
+/**
+ * The per-category catalog derived from one agent's `configOptions`.
+ *
+ * `mode` is the agent's own permission/working mode published as a
+ * `category: 'mode'` select. It duplicates the `modes` field of `session/new`
+ * on the agents observed so far (omp, codebuddy), but it is the only copy a
+ * conversation can read BEFORE it has a live session — which is exactly the
+ * window in which the composer must still show the control (user report,
+ * 2026-10-18: the mode select vanished on a conversation set up ahead of its
+ * first message).
+ */
 export interface AcpAgentCatalog {
   model?: AcpCatalogOption
   thought?: AcpCatalogOption
+  mode?: AcpCatalogOption
+}
+
+/**
+ * Everything one DSH chat conversation has chosen for its ACP agent — the
+ * plugin's own per-conversation record, persisted with the agent registry.
+ *
+ * Every field is a PICK, not a live-session fact: a conversation can be set up
+ * before it has ever run a turn (that is the whole point — choosing the agent,
+ * model and thought level BEFORE the first message rather than discovering you
+ * cannot). Nothing here is a DSH model route (see the module header): these
+ * values are applied to the agent's `session/new` / `session/set_config_option`
+ * on the next turn, and re-applied when a session is recreated or resumed.
+ */
+export interface AcpConversationChoice {
+  /** The ACP agent serving this conversation. */
+  agentId: string
+  /**
+   * The agent's model as an adapter model id (`agentId` = the agent's default,
+   * `agentId@choice` = an explicit variant). Absent means "the agent's default".
+   */
+  modelId?: string
+  /** The agent's own `thought_level` value. Absent means "the agent's default". */
+  effort?: string
+  /**
+   * The agent's own working mode (`session/set_mode`: `plan` / `acceptEdits` /
+   * …). Absent means "whatever the agent starts on".
+   *
+   * This is the agent's vocabulary for HOW it works, distinct from the model and
+   * the thought level, but it sits in the same composer bar — so it belongs to
+   * the same "remember what the user last chose here" contract rather than being
+   * the one control that resets every time the process restarts.
+   */
+  mode?: string
 }
 
 /** Result of `agent/probe-models`: the freshly probed (or cached) catalog. */
@@ -463,7 +514,13 @@ export interface AgentCatalogResult {
   agentId: string
   /** Agent display name (`title` ?? id). */
   title: string
-  /** The bare-`agentId` entry: the agent's own default model, always offered. */
+  /**
+   * The bare-`agentId` entry: the route that means "let the agent choose its own
+   * model". Its `name` spells out the model that route CURRENTLY resolves to
+   * (`<agent> · <model>`) — the bare route is not a model, so naming it after the
+   * agent alone left the checked row in the picker saying nothing about which
+   * model was in force.
+   */
   base: { id: string; name: string; description?: string }
   /** The `agentId@choice` variants this agent exposes (`exposedModels` applied). */
   variants: Array<{ id: string; name: string; description?: string }>
@@ -473,6 +530,35 @@ export interface AgentCatalogResult {
    * property of one model), which is why it rides here and not on `variants`.
    */
   reasoning?: LlmModelReasoningInfo
+  /**
+   * The model the agent itself reports as selected (`model.currentValue`).
+   *
+   * This is what the model chip shows for a conversation that has not picked
+   * anything yet: without it the chip has no label and therefore does not
+   * render at all, so an agent the user simply has not tuned yet looks like an
+   * agent with no model axis (user report, 2026-10-18). Its absence is
+   * meaningful — an agent that publishes no `category: 'model'` select has no
+   * model axis, and the chip stays away.
+   *
+   * NOTE the difference from `base`: `base` is a ROUTE (bare `agentId`), this is
+   * a MODEL VALUE (a choice id). The picker needs both — one to name the route,
+   * one to mark the row the conversation is actually on.
+   */
+  currentModel?: { value: string; name: string; description?: string }
+  /**
+   * The agent's own MODE options (`category: 'mode'`, e.g. codebuddy's
+   * `Always Ask` … `Bypass Permissions`).
+   *
+   * The live composer select reads the `modes` field of `session/new` /
+   * `session/load`; this copy exists for the window before one exists. It is
+   * the same list on every agent observed so far (omp, codebuddy), and it is
+   * the only source a conversation set up ahead of its first message has.
+   */
+  mode?: {
+    /** The agent's current mode id, when it reports one. */
+    currentValue?: string
+    choices: Array<{ id: string; name: string; description?: string }>
+  }
   /** A probe has produced a catalog for this agent (`false` → base entry only). */
   probed: boolean
   /** When the cached catalog was last refreshed. */

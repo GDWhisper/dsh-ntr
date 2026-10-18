@@ -7,7 +7,7 @@
 
 import { randomUUID } from './ids.ts'
 import type {
-  AcpAgentCatalog, AcpAgentDef, AcpEvent, AcpPluginConfig, AcpPresetStatus, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult,
+  AcpAgentCatalog, AcpAgentDef, AcpConversationChoice, AcpEvent, AcpPluginConfig, AcpPresetStatus, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult,
   AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionMode, PermissionOutcome, RpcResult,
 } from './protocol.ts'
 
@@ -568,7 +568,13 @@ export function parseCatalogOptions(configOptions: unknown): AcpAgentCatalog {
     if (typeof raw !== 'object' || raw === null) continue
     const row = raw as Record<string, unknown>
     const category = typeof row.category === 'string' ? row.category : undefined
-    const slot = category === 'model' ? 'model' : category === 'thought_level' ? 'thought' : undefined
+    const slot = category === 'model'
+      ? 'model'
+      : category === 'thought_level'
+        ? 'thought'
+        : category === 'mode'
+          ? 'mode'
+          : undefined
     if (slot === undefined) continue
     const configIdRaw = row.configId ?? row.id
     if (typeof configIdRaw !== 'string' && typeof configIdRaw !== 'number') continue
@@ -1231,6 +1237,13 @@ export interface AcpManager {
    * so a switch shows BEFORE the next turn materializes it.
    */
   chatAgentFor?(dshSessionId: string): string | undefined
+  /**
+   * The conversation's whole persisted pick — agent, model, thought level —
+   * readable BEFORE the conversation has an ACP session. This is what makes a
+   * conversation set up ahead of its first message report that set-up instead
+   * of the agent's defaults.
+   */
+  chatChoice?(dshSessionId: string): AcpConversationChoice | undefined
   /** Switch the bound agent's model (`agentId@choice`) for one chat session. */
   setChatSessionModel?(dshSessionId: string, modelId: string): Promise<void>
   /** Switch the bound agent's reasoning effort for one chat session. */
@@ -1351,6 +1364,10 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
           // is visible before the next turn materializes a session for the
           // new agent (the live-session list below lags one message by design).
           boundAgentId: manager.chatAgentFor?.(dshSessionId),
+          // The rest of the persisted pick (model + thought level). Read
+          // BEFORE any ACP session exists, which is what lets the composer show
+          // a conversation set up ahead of its first message as it really is.
+          choice: manager.chatChoice?.(dshSessionId),
           // Read-only memory answer, same authority as `setAcpModeResolver`'s
           // session-log read: the seat gate's fallback fact source on hosts
           // whose session rows carry no `agentPreset`. Awaited: a cold read

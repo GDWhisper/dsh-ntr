@@ -120,6 +120,18 @@ export function splitAcpModelId(model: string): { agentId: string; choice?: stri
 }
 
 /**
+ * Build `agentId` / `agentId@choice`; mirrors the host's `buildAdapterModelId`.
+ *
+ * The inverse of {@link splitAcpModelId}, and a hand copy for the same reason:
+ * the browser half cannot import the host plane. Needed where the browser has a
+ * bare choice value (the agent's own current model, as `agent/catalog` reports
+ * it) and must compare it against adapter model ids.
+ */
+export function buildAcpModelId(agentId: string, choice?: string): string {
+  return choice === undefined || choice === '' ? agentId : `${agentId}@${choice}`
+}
+
+/**
  * Whether a form value looks like an absolute path on some platform the plugin
  * runs on: POSIX (`/…`), a Windows drive path (`C:\…`, `C:/…`), or a UNC path
  * (`\\host\share…`, `//host/share…`). Mirrors the host's `isAbsolutePath`
@@ -615,7 +627,12 @@ export function AcpChip(props: {
 // ---- Styles ----
 
 const STYLE = `
-.ntr-acp-cluster { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.ntr-acp-cluster { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; flex-wrap: nowrap; }
+/* The agent base is the cluster's fixed right-hand anchor: it never shrinks
+   below its own label, while the agent-published chips to its left absorb the
+   squeeze. Without this a long model name could compress the base instead,
+   which is the same "it moved" symptom as reordering it was meant to fix. */
+.ntr-acp-cluster > .ntr-acp-chip:last-child { flex: none; }
 .ntr-acp-chip { display: inline-flex; align-items: center; gap: 5px; max-width: 220px; font: inherit; font-size: 12px; line-height: 1.4; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: inherit; cursor: pointer; }
 .ntr-acp-chip:hover { background: var(--dsw-alias-interactive-bg-active, #0000000d); }
 .ntr-acp-chip.is-active { border-color: var(--dsw-alias-state-business-primary, #2563eb); color: var(--dsw-alias-state-business-primary, #2563eb); background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 10%, transparent); }

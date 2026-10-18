@@ -6,7 +6,7 @@
  * Deliberately framework-free: React binds through `useSyncExternalStore`.
  */
 
-import type { AcpEvent, AcpPresetStatus, AgentCatalogResult, AgentProbeModelsResult, AgentSavePayload, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, SessionView } from '../protocol.ts'
+import type { AcpConversationChoice, AcpEvent, AcpPresetStatus, AgentCatalogResult, AgentProbeModelsResult, AgentSavePayload, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, SessionView } from '../protocol.ts'
 
 /** The unary RPC face (narrowed `ctx.connection.rpc.call`). */
 export type RpcCall = (channel: string, endpoint: string, payload: unknown) => Promise<
@@ -137,6 +137,17 @@ export interface UiState {
    */
   chatBoundAgent: Record<string, string>
   /**
+   * The conversation's persisted pick — model and thought level — as reported by
+   * `session/chat-list`'s `choice`, and written optimistically the moment a
+   * picker commits one.
+   *
+   * This is the record that makes a conversation usable BEFORE it has ever run
+   * a turn: without it the model / thought-level chips can only reflect a live
+   * ACP session, which does not exist until the first message has already gone
+   * out on whatever the agent's defaults were.
+   */
+  chatChoice: Record<string, AcpConversationChoice>
+  /**
    * The model-seat shadow gate's own account of what it last decided, and why
    * (`src/client/index.tsx`'s `syncAcpMode`). Read-only, human-facing, and
    * rendered by the ACP view: every branch of that gate ends with the native
@@ -237,6 +248,7 @@ export class AcpStore {
     chatTranscripts: {},
     acpMode: {},
     chatBoundAgent: {},
+    chatChoice: {},
     seatDiag: 'idle',
     permissionSeatDiag: 'idle',
   }
@@ -663,7 +675,7 @@ export class AcpStore {
     this.chatSessionReads.set(dshSessionId, read)
     const settle = options?.settleVerdict === true || !this.acpModeLive.has(dshSessionId)
     try {
-      const { sessions, acpMode, boundAgentId } = await this.call<{ sessions: ChatSessionView[]; acpMode?: boolean; boundAgentId?: string }>('session/chat-list', { dshSessionId, refresh: true })
+      const { sessions, acpMode, boundAgentId, choice } = await this.call<{ sessions: ChatSessionView[]; acpMode?: boolean; boundAgentId?: string; choice?: AcpConversationChoice }>('session/chat-list', { dshSessionId, refresh: true })
       // A committed `agent-preset/selected` frame may have settled this
       // session's verdict while the read was in flight; the host answer then
       // describes the log as of BEFORE that switch and must not overwrite it.
@@ -677,6 +689,13 @@ export class AcpStore {
         ...(boundAgentId === undefined
           ? {}
           : { chatBoundAgent: { ...this.state.chatBoundAgent, [dshSessionId]: boundAgentId } }),
+        // The persisted pick (model + thought level) — the host's record,
+        // present before any ACP session exists. Merged over the optimistic
+        // entry so a value a click just wrote is not erased by a read that
+        // started before the click landed.
+        ...(choice === undefined
+          ? {}
+          : { chatChoice: { ...this.state.chatChoice, [dshSessionId]: choice } }),
         // The seat gate's fallback fact source: absent on an older host half,
         // which then simply never takes the seat over (the allowed failure).
         // A frame-settled verdict outranks any read, whenever it lands: the
@@ -976,6 +995,10 @@ export class AcpStore {
   async setChatSessionModel(dshSessionId: string, modelId: string): Promise<void> {
     try {
       await this.call('session/chat-model-set', { dshSessionId, modelId })
+      // Optimistic for the same reason the binding is: the host recorded the
+      // pick, and a conversation with no ACP session yet would otherwise show
+      // the agent's default until its first turn created one.
+      this.writeChoice(dshSessionId, choice => ({ ...choice, modelId }))
     } catch (error) {
       this.flashError(error)
       throw error
@@ -986,10 +1009,27 @@ export class AcpStore {
   async setChatSessionEffort(dshSessionId: string, effort: string | undefined): Promise<void> {
     try {
       await this.call('session/chat-effort-set', { dshSessionId, ...(effort === undefined ? {} : { effort }) })
+      this.writeChoice(dshSessionId, choice => {
+        const { effort: _dropped, ...rest } = choice
+        return effort === undefined ? rest : { ...rest, effort }
+      })
     } catch (error) {
       this.flashError(error)
       throw error
     }
+  }
+
+  /**
+   * Patch one conversation's optimistic pick. The agent half is required by the
+   * record (a model or thought level belongs to an agent), so a conversation
+   * whose binding is not known yet is left alone: the host answer will carry it.
+   */
+  private writeChoice(dshSessionId: string, update: (choice: AcpConversationChoice) => AcpConversationChoice): void {
+    const current = this.state.chatChoice[dshSessionId]
+    const agentId = current?.agentId ?? this.state.chatBoundAgent[dshSessionId]
+    if (agentId === undefined) return
+    const next = update({ ...current, agentId })
+    this.mutate({ chatChoice: { ...this.state.chatChoice, [dshSessionId]: { ...next, agentId } } })
   }
 
   async setPermission(agentId: string, permission: 'ask' | 'allow' | 'reject'): Promise<void> {

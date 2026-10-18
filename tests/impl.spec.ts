@@ -152,6 +152,31 @@ describe('parseCatalogOptions', () => {
       model: { configId: 'model', name: 'model', currentValue: 'a', choices: [] },
     })
   })
+
+  it('reads the agent\'s own mode select, which is not a DSH concept', () => {
+    // Both real agents publish their permission/working mode as a
+    // `category: 'mode'` select on `session/new` (omp: Mode, codebuddy:
+    // Permission Mode). It used to be dropped here — every category that was
+    // not model/thought_level was skipped — which left the composer with no
+    // mode list until a live session existed.
+    const catalog = parseCatalogOptions([
+      { configId: 'mode', name: 'Permission Mode', type: 'select', category: 'mode', currentValue: 'default', options: [
+        { value: 'default', name: 'Always Ask' },
+        { value: 'plan', name: 'Plan' },
+      ] },
+    ])
+    expect(catalog.mode).toEqual({
+      configId: 'mode',
+      name: 'Permission Mode',
+      currentValue: 'default',
+      choices: [{ value: 'default', name: 'Always Ask' }, { value: 'plan', name: 'Plan' }],
+    })
+    // `sandbox` and vendor extensions stay unparsed: they have no control, and
+    // half-reading them would be worse than not reading them at all.
+    expect(parseCatalogOptions([
+      { configId: 'sandbox', category: 'sandbox', currentValue: 'false', options: [{ value: 'false', name: 'Local' }] },
+    ])).toEqual({})
+  })
 })
 
 describe('adapter model id split/build', () => {
