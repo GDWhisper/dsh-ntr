@@ -497,8 +497,8 @@ export function AcpSessionMenu(props: AcpClusterProps) {
   // points at no agent, must not read (and so must not probe) anybody's catalog.
   const served = bound !== undefined || choice !== undefined || ui.chatBoundAgent[sessionId] !== undefined
   useEffect(() => {
-    if (agentId !== undefined) void acp.loadAgentCatalog(agentId)
-  }, [acp, agentId])
+    if (menu !== null && served && agentId !== undefined) void acp.loadAgentCatalog(agentId)
+  }, [acp, menu, served, agentId])
 
   if (menu === null || menu.sessionId !== sessionId) return null
   const route = describeRoute(agents, bound, ui.defaultAgent, catalog, ui.chatBoundAgent[sessionId], choice)

@@ -2565,6 +2565,23 @@ export class BridgeManager {
   // ---- Model catalog ----
 
   private readonly catalogs = new Map<string, { catalog: AcpAgentCatalog; updatedAt: number }>()
+  /**
+   * Catalog schema the persisted file was written with. Bumped when a parser
+   * gains a category, so a cache written by an older build is KNOWN to be
+   * incomplete — a persisted `{model, thought}` catalog from v1 would otherwise
+   * keep an agent looking like it has no `mode` axis forever.
+   *
+   * A stale entry is still SERVED (dropping it would blank the seats across an
+   * upgrade) and is repaired for free the next time that agent's own session
+   * publishes `configOptions` (`absorbCatalog`). It is NOT re-probed at boot:
+   * a probe spawns a process, and starting agents nobody is talking to is the
+   * defect this marker used to cause (user report, 2026-10-18).
+   *
+   * v2 = `mode` (`category: 'mode'`) joined `model` / `thought_level`.
+   */
+  private static readonly CATALOG_SCHEMA = 2
+  /** Agents whose persisted catalog predates {@link CATALOG_SCHEMA}. */
+  private readonly catalogStale = new Set<string>()
   /** Auto-spawning probes are suppressed under test runners so suites stay deterministic. */
   private readonly autoProbeEnabled = process.env.VITEST === undefined && process.env.NODE_ENV !== 'test'
 
@@ -2594,6 +2611,12 @@ export class BridgeManager {
       const parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>
       const agents = parsed.agents
       if (typeof agents !== 'object' || agents === null) return
+      // A cache written by an older build answers with a PARTIAL surface: it may
+      // predate a category entirely. It is still served (dropping it would blank
+      // the seats across the upgrade) and marked stale; `absorbCatalog` repairs
+      // it for free the next time that agent's own session publishes its
+      // options. No probe is spawned here on purpose — see `CATALOG_SCHEMA`.
+      const stale = parsed.version !== BridgeManager.CATALOG_SCHEMA
       for (const [agentId, raw] of Object.entries(agents)) {
         if (typeof raw !== 'object' || raw === null) continue
         const row = raw as { catalog?: unknown; updatedAt?: unknown }
@@ -2602,6 +2625,7 @@ export class BridgeManager {
           catalog: row.catalog as AcpAgentCatalog,
           updatedAt: typeof row.updatedAt === 'number' ? row.updatedAt : 0,
         })
+        if (stale) this.catalogStale.add(agentId)
       }
     } catch {
       // Storage load failure is non-fatal
@@ -2614,15 +2638,24 @@ export class BridgeManager {
     try {
       const agents: Record<string, { catalog: AcpAgentCatalog; updatedAt: number }> = {}
       for (const [agentId, entry] of this.catalogs) agents[agentId] = entry
-      writeFileSync(filePath, JSON.stringify({ version: 1, agents }, null, 2), 'utf-8')
+      writeFileSync(filePath, JSON.stringify({ version: BridgeManager.CATALOG_SCHEMA, agents }, null, 2), 'utf-8')
     } catch {
       // Storage persist failure is non-fatal
     }
   }
 
-  /** Merge `configOptions` observed on any real session into the agent's catalog. */
+  /**
+   * Merge `configOptions` observed on any real session into the agent's catalog.
+   *
+   * This is the SECOND way a catalog gets refreshed (the first being an explicit
+   * `probeAgentModels`), and the only one that happens for free: it rides a
+   * session the user is already running. It therefore also discharges the
+   * {@link CATALOG_SCHEMA} staleness mark — whatever an older parser missed, the
+   * current `parseCatalogOptions` has now seen this agent's real answer.
+   */
   private absorbCatalog(agentId: string, configOptions: unknown): { catalog: AcpAgentCatalog; updatedAt: number } {
     const catalog = parseCatalogOptions(configOptions)
+    this.catalogStale.delete(agentId)
     const existing = this.catalogs.get(agentId)
     if (existing !== undefined && JSON.stringify(existing.catalog) === JSON.stringify(catalog)) return existing
     const entry = { catalog, updatedAt: Date.now() }
@@ -2644,24 +2677,36 @@ export class BridgeManager {
     const bridge = this.bridge(agentId)
     const configOptions = await bridge.probeConfigOptions()
     const entry = this.absorbCatalog(agentId, configOptions)
+    // A fresh probe answers in the CURRENT schema by construction.
+    this.catalogStale.delete(agentId)
     return { agentId, catalog: entry.catalog, updatedAt: entry.updatedAt }
   }
 
   /**
-   * Fire-and-forget background probe for an agent without a cached catalog.
-   * Failures stay silent: the catalog is advisory and an ACP seat simply shows
-   * the agent's default model until a probe succeeds.
+   * Boot-time catalog warm-up.
+   *
+   * DELIBERATELY DOES NOTHING (user report, 2026-10-18: an unbound conversation
+   * showed "Oh My Pi 已连接" in the agent picker, i.e. a second agent process was
+   * running for a conversation served by another one).
+   *
+   * A probe SPAWNS A PROCESS. That is only defensible for an agent the user is
+   * actually engaging with, so every probe now has a gesture behind it:
+   *
+   *  - a conversation bound to that agent → its first `session/new` fills the
+   *    catalog in via `absorbCatalog` (that is the agent the user is talking to,
+   *    already running);
+   *  - the settings card's own button → `agent/probe-models`, one explicit click
+   *    on one agent;
+   *  - a STALE on-disk entry → repaired by `absorbCatalog` the next time that
+   *    agent's own session publishes its options, not at boot.
+   *
+   * Probing every configured agent at startup — which is what this did — turns
+   * "open the app" into "start N agent processes", and the picker then honestly
+   * reports them as connected, which is exactly the confusion reported.
    */
-  private ensureCatalog(agentId: string): void {
-    if (this.catalogs.has(agentId)) return
-    if (!this.autoProbeEnabled || !this.probeModelsOnBoot) return
-    void this.probeAgentModels(agentId).catch(() => { /* background best-effort */ })
-  }
-
-  /** Boot-time probe for agents that have no persisted catalog yet. */
   bootstrapCatalogs(): void {
-    if (!this.autoProbeEnabled || !this.probeModelsOnBoot) return
-    for (const def of this.defsMap.values()) this.ensureCatalog(def.id)
+    // Intentionally empty; kept as the boot hook's name so the host entry does
+    // not have to change, and so the rule lives where the call is.
   }
 
   /**
@@ -2678,15 +2723,22 @@ export class BridgeManager {
    * of choices (pi: 500, omp: 581), so "everything by default" is a list storm
    * the user cannot navigate. The base entry is never filtered out.
    *
-   * Pure memory — NEVER spawns; an agent without a cached catalog merely gets a
-   * background probe so the next read is complete.
+   * Pure memory — NEVER spawns and NEVER starts a probe. This is a RENDER path:
+   * the composer entries call it on every store change, so anything that spawns
+   * here turns "open a conversation" into "start every agent" (user report,
+   * 2026-10-18: a conversation served by `codebuddy` had `omp` running). A
+   * missing or stale catalog is reported honestly (`probed: false`, or the stale
+   * entry's contents), and the probe is started by an explicit gesture:
+   * `agent/probe-models` (the settings card's button) or a session's own
+   * `session/new`, both of which are about ONE agent the user is actually using.
    */
   agentCatalog(agentId: string): AgentCatalogResult {
     const def = this.defsMap.get(agentId)
     if (def === undefined) throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
     const title = def.title ?? def.id
     const entry = this.catalogs.get(agentId)
-    if (entry === undefined) this.ensureCatalog(agentId)
+    // NO `ensureCatalog` HERE — see the note above. Reading must stay pure
+    // memory, even for a stale or absent entry.
     const exposed = def.exposedModels
     const variants: AgentCatalogResult['variants'] = []
     for (const choice of entry?.catalog.model?.choices ?? []) {

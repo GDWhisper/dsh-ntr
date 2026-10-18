@@ -1008,6 +1008,83 @@ describe('model catalog (isolated manager)', () => {
     // `def` is shared with the suite, so leave it the way it was found.
     await reloaded.setExposedModels('mock', undefined)
   })
+
+  it('serves a catalog persisted by an older schema, and marks it for repair', async () => {
+    // A `{model, thought}`-only catalog written before the `mode` category was
+    // parsed would otherwise keep an agent looking like it has no mode axis
+    // FOREVER. It is still SERVED (dropping it would blank the seats across an
+    // upgrade), marked stale, and repaired for free by `absorbCatalog` the next
+    // time that agent's own session publishes its options.
+    const stalePath = `${tmpdir()}/acp-catalog-stale-${Date.now()}.json`
+    writeFileSync(stalePath, JSON.stringify({
+      version: 1,
+      agents: { mock: { catalog: { model: { configId: 'model', name: 'Model', currentValue: 'mock-model-a', choices: [] } }, updatedAt: 1 } },
+    }), 'utf-8')
+    const stale = new BridgeManager([def], hub, 500, undefined, stalePath)
+    // Served, so the seats keep working across the upgrade…
+    expect(stale.agentCatalog('mock')).toMatchObject({ probed: true, currentModel: { value: 'mock-model-a' } })
+    // …and marked, so the next real session on this agent knows to rewrite it.
+    expect((stale as unknown as { catalogStale: Set<string> }).catalogStale.has('mock')).toBe(true)
+    // A REAL session publishing its options discharges the mark — this is the
+    // repair path, and it costs no process because the session already exists.
+    for await (const _ of stale.streamPrompt({
+      model: 'mock',
+      sessionId: 'dsh-stale-repair',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    } as never)) { /* drain */ }
+    expect((stale as unknown as { catalogStale: Set<string> }).catalogStale.has('mock')).toBe(false)
+    await stale.shutdownAll()
+  }, 30_000)
+
+  it('NEVER spawns an agent just because a catalog was read', async () => {
+    // THE reported defect (user report, 2026-10-18): a conversation served by
+    // `codebuddy` showed "Oh My Pi 已连接" in the agent picker — a second agent
+    // process was running because opening the app probed EVERY configured
+    // agent's catalog. `agentCatalog` is a RENDER path (the composer entries
+    // call it on every store change), so a probe here means "open a page, start
+    // N agents".
+    //
+    // The rule: reading is pure memory. A probe needs a gesture —
+    // `agent/probe-models`, or a session the user is actually running.
+    const spawnPath = `${tmpdir()}/acp-catalog-nospawn-${Date.now()}.json`
+    // Two agents, neither with a cached catalog.
+    const twoDefs = [{ ...def, id: 'nospawn-a' }, { ...def, id: 'nospawn-b' }]
+    const gm = new BridgeManager(twoDefs, hub, 500, undefined, spawnPath)
+    const stateOf = (id: string): string =>
+      (gm.agentViews() as Array<{ id: string; state: string }>).find(agent => agent.id === id)?.state ?? 'missing'
+    gm.bootstrapCatalogs()
+    expect(stateOf('nospawn-a')).toBe('stopped')
+    expect(stateOf('nospawn-b')).toBe('stopped')
+    // Reading every agent's catalog — which the composer does on each render,
+    // including for agents this conversation is not bound to — must not change
+    // that.
+    expect(gm.agentCatalog('nospawn-a').probed).toBe(false)
+    expect(gm.agentCatalog('nospawn-b').probed).toBe(false)
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(stateOf('nospawn-a')).toBe('stopped')
+    expect(stateOf('nospawn-b')).toBe('stopped')
+    // The explicit gesture still works — that is the settings card's button.
+    await gm.probeAgentModels('nospawn-b')
+    expect(gm.agentCatalog('nospawn-b').probed).toBe(true)
+    await gm.shutdownAll()
+  }, 30_000)
+
+  it('serves the agent\'s own current model and modes before any session exists', async () => {
+    // What the composer reads for a conversation nobody has sent a message in
+    // yet. Without these two the model chip has no label and the mode select
+    // has no options, so both controls vanish on exactly the conversation the
+    // user is setting up (user report, 2026-10-18).
+    await catalogManager.probeAgentModels('mock')
+    const seat = catalogManager.agentCatalog('mock')
+    expect(seat.currentModel).toEqual({ value: 'mock-model-a', name: 'Mock Model A' })
+    // `base` spells out the model that the bare route currently resolves to, so
+    // the picker's checked row names a model rather than just the agent.
+    expect(seat.base.name).toBe('Mock · Mock Model A')
+    // The mock publishes no `category: 'mode'` select (it mirrors an agent that
+    // only has the `session/new` modes field), so the field is absent rather
+    // than empty — the browser must be able to tell the difference.
+    expect(seat.mode).toBeUndefined()
+  })
 })
 
 describe('reliability (isolated manager, short timeouts)', () => {
