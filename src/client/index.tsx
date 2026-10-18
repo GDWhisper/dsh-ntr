@@ -117,7 +117,7 @@ export function apply(ctx: Context): void {
     name: 'settings.section',
     id: 'acp-agents',
     order: 120,
-    label: () => (zh ? 'ACP 代理' : 'ACP Agents'),
+    label: () => 'NTR',
     inject: () => ({ acp: store }),
   }, AcpSettingsSection)), 'dsh-ntr: settings section')
 
@@ -511,7 +511,7 @@ export function apply(ctx: Context): void {
     name: 'conversation.view',
     id: 'acp',
     order: 20,
-    label: () => 'ACP',
+    label: () => 'NTR',
     inject: (sessionId: unknown) => chatFace(sessionId),
   }, AcpConversationView as unknown as SlotComponent<any>)), 'dsh-ntr: ACP view tab')
 }

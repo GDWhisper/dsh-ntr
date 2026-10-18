@@ -228,14 +228,14 @@ assistant/message repeats advertised tool call`，校验在 `verifyCurrentGenera
 conversation.input.left
 └── acp-mode        (order 20)  agent 自己的 mode（session/set_mode）
 
-conversation.input.model   ← ACP 底座（ACP 模式下由闸门动态安装）
+conversation.input.model   ← NTR 底座（NTR 模式下由闸门动态安装）
                             第一级：选 agent；其下多级菜单接 模型 / 思考等级
 ```
 
 底座占的是**原生模型底座那个座位**——composer bar 行尾（`.trailing`，`margin-left: auto`）、
 提交键左边那一个 cell。理由有两条，且指向同一个位置：
 
-1. **位置**：用户报告「ACP 底座应该在原来底座的位置」。原生底座就在行尾，不在工具行左侧。
+1. **位置**：用户报告「NTR 底座应该在原来底座的位置」。原生底座就在行尾，不在工具行左侧。
 2. **隔离**：那个 cell 的 occupant 是宿主的 `ModelSelect`，它列 DSH 全量 provider，
    点一下写全局默认模型（§2.4）。ACP 会话里它必须在的正是这里。
 
@@ -315,7 +315,7 @@ replaceRisk:  "shadows-shipped-ui"
 **做法（2026-10-07 修正，2026-10-14 再修正）**：`src/client/model-seat.tsx` 的 claim 依然按
 `stagedIsAcpMode` 条件注册，但**「渲染空白」不是全部机制——它还得赢下这个 cell**，
 而第一版对「怎么赢」的假设是错的。第二次修正把它从「遮蔽」改成「接管」：
-闸门往这个 cell 里装的不是渲染 `null` 的 shadow，而是 **ACP 底座本身**
+闸门往这个 cell 里装的不是渲染 `null` 的 shadow，而是 **NTR 底座本身**
 （`createModelSeatClaim({ slots, occupant: () => AcpSessionControls })`）。
 
 **实测事实（桌面 0.1.7-rc.x）**：非 chain 槽位的注册优先级由**客户端 runner 改写**，我们声明多少都不算数。
@@ -334,10 +334,10 @@ if (spec === undefined || spec.kind !== "chain") {
 于是 `priority: -1` 既不保护我们，也不保护对手——第三方座位插件
 `@hytime/dsh-thinking-effort` 0.3.7 正把它的模型/思考强度 slider 注册进**同一个 cell**
 （它声明 `priority: -10`，同样被改写），又因为它在 bundle 顺序里排在我们之后，
-**它赢**。用户看到的就是「ACP 模式下底座没有换掉」。
+**它赢**。用户看到的就是「NTR 模式下底座没有换掉」。
 
 **改了什么**：`createModelSeatClaim`（`src/client/model-seat.tsx`）把 cell 当成**要核实的占位**：
-① 注册一个 occupant（ACP 底座）；② 用渲染器自己的 winner 视图 `entriesOfSlot`（renderer 的
+① 注册一个 occupant（NTR 底座）；② 用渲染器自己的 winner 视图 `entriesOfSlot`（renderer 的
 outlet 读的就是它）核对这个 cell 的 head 是不是我们自己的组件身份；③ 不是就**再注册一次**
 （新的注册 = 新的最低 rank = 赢），最多 `MAX_SEAT_CLAIMS` 次，到顶就如实报「被谁占着、放弃」。
 触发来自两条：gate 的每次评估，以及 `ctx.on('slots/changed', …)`（只认
@@ -391,7 +391,7 @@ outlet 读的就是它）核对这个 cell 的 head 是不是我们自己的组�
 **⚠️ 本批删过头了，后已补回**（见 §2.4）。遮蔽的**存在理由**随路由轴一起消失，这一点没错；
 但遮蔽同时是这个 cell 上**唯一**能挡住「原生 `ModelSelect` 点一下就写全局默认模型」的手段，
 删掉它并没有消掉那个伤害，只是消掉了防护。承接实现是 `src/client/model-seat.tsx`
-的 `createModelSeatClaim`——只保留「`stagedIsAcpMode` 条件 + `entriesOfSlot` 核实 + 有界重取」，而 occupant 是 ACP 底座本体（见 §2.1 的第二次修正），
+的 `createModelSeatClaim`——只保留「`stagedIsAcpMode` 条件 + `entriesOfSlot` 核实 + 有界重取」，而 occupant 是 NTR 底座本体（见 §2.1 的第二次修正），
 旧机制那套 winner 竞争 / abdicate 恢复全部不带回来。教训：
 **退役一条链时要区分「这根轴的要求」和「这根轴顺带提供的防护」。**
 
@@ -456,7 +456,7 @@ preset fold，不再有 access-mode 语义）。
 | 3 RPC 清理 | ✅ 完成 | `default/agent` 等新端点在 bundle 中；`tests/store.spec.ts` 的 "the conversation↔agent binding" |
 | 批次 4 权限裁决链 | ✅ 完成 | `tests/impl.spec.ts` 的 "the retired permission axis" 断言 helper 已不存在 |
 | 5 主平面工具卡 | ✅ 完成 | `streamPrompt` 改发 `tool-call` block 序列；`tests/bridge.spec.ts` 的 "implements LlmAdapter" 断言 reasoning 里**不再有** `mock tool` |
-| 6 原生模型座位接管 | ✅ 完成，**2026-10-07 / 2026-10-14 两次修正**（见 §2.4） | `createModelSeatClaim` 把 ACP 底座装进该 cell 并核实夺回；`tests/model-seat.spec.ts` 16 例（含"后来注册的对手抢走 cell 后夺回"、有界放弃、释放栈）|
+| 6 原生模型座位接管 | ✅ 完成，**2026-10-07 / 2026-10-14 两次修正**（见 §2.4） | `createModelSeatClaim` 把 NTR 底座装进该 cell 并核实夺回；`tests/model-seat.spec.ts` 16 例（含"后来注册的对手抢走 cell 后夺回"、有界放弃、释放栈）|
 
 **测试基线**：224 passed（2026-10-14）。模型座位套件 16 例，其中 claim 部分对着一个**按 runner 真实规则**
 实现替身注册表（声明优先级被丢弃、页面级递减 rank、最后注册者赢）跑，而不是对着我们自己写的数字跑。
@@ -465,16 +465,16 @@ preset fold，不再有 access-mode 语义）。
 
 **桌面临场验收（2026-10-07）**：临时 `DSH_HOME` + 桌面 asar 内 CLI 起一个只装
 `dsh-ntr` + `@hytime/dsh-thinking-effort` 的 web profile（`--port 0`，独立 junction 的 profile node_modules），
-一个会话切到 ACP 模式：
+一个会话切到 NTR 模式：
 
 | 观察 | 结果 |
 |---|---|
 | Standard 模式：`[data-slot="conversation.input.model"]` | 被对手占着（`[data-seat-root]`，"DeepSeek-V41-Flash ・ High"）——对照证明对手真的在这个 cell 里 |
-| 切到 ACP 模式 | 同一 cell 里是 ACP 底座"ACP · Oh My Pi"（2026-10-07 时为**空**，见 §2.1 的第二次修正）|
-| ACP 模式下整页 reload（两侧同时冷启动注册） | 仍然是底座——这正是用户报的那个顺序（对手后注册）|
+| 切到 NTR 模式 | 同一 cell 里是 NTR 底座"NTR · Oh My Pi"（2026-10-07 时为**空**，见 §2.1 的第二次修正）|
+| NTR 模式下整页 reload（两侧同时冷启动注册） | 仍然是底座——这正是用户报的那个顺序（对手后注册）|
 | 切回 Standard | 对手的 slider 立刻回来（claim 已释放，没有残留条目）|
 
-**2026-10-14 用户报的两个缺陷**（同一根因）：①「ACP 底座位置不对」——底座注册在
+**2026-10-14 用户报的两个缺陷**（同一根因）：①「NTR 底座位置不对」——底座注册在
 `conversation.input.left`（工具行最左的 list 槽位），而原生底座在行尾的
 `conversation.input.model`；②「底座没有隔离，任何模式下都显示」——`AcpSessionControls`
 只在「无绑定且无 agent」时返回 null，只要配过任意 agent，芯片在任何模式下都渲染。

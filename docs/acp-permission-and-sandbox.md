@@ -111,7 +111,7 @@
 
 ## 6. 落地顺序（本仓）
 
-> 状态更新：第 1、2 项已落地（方案 1 语义 + `conversation.input.left` 模式控件），并新增 **ACP 模式 agent preset** 与其附带的裁决降级（`decidePermission(..., { narrateOnly: true })`）——完整设计、证据与边界见 [acp-mode.md](./acp-mode.md)。第 3、4 项仍未做。
+> 状态更新：第 1、2 项已落地（方案 1 语义 + `conversation.input.left` 模式控件），并新增 **NTR 模式 agent preset** 与其附带的裁决降级（`decidePermission(..., { narrateOnly: true })`）——完整设计、证据与边界见 [acp-mode.md](./acp-mode.md)。第 3、4 项仍未做。
 
 1. **方案 1 语义**（宿主侧，正确性修复）：per-session 快照 → 判定替换 `def.permission`；`never` 不再递 `ctx.approval`；fs 写栅栏按 mode 生效。（原文还包括 policy 叙述注入 prompt 前缀，已放弃。）
 2. **方案 2b 控件**：`conversation.input.left` 注册 ACP mode 选择器 + `session/set_mode` RPC（按 DSH 会话 id 定位）。

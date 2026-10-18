@@ -487,7 +487,7 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
   it('points an unfiltered agent at the exposure editor instead of looking broken', () => {
     const unfiltered: AgentCatalogResult = { ...catalog, variants: [] }
     const model = menuFor('model', { acp, agents: [agent], catalog: unfiltered, route: describeRoute([agent], bound, undefined, unfiltered) })
-    expect(model.note).toMatch(/设置 → ACP 代理/)
+    expect(model.note).toMatch(/设置 → NTR/)
   })
 
   it('keeps the agent named when the binding is released, so the picker can offer a way back', () => {

@@ -337,19 +337,19 @@ export function AcpSettingsSection(props: WithStore) {
         <div className="dwa-card" style={{ marginBottom: 16 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <span style={{ fontWeight: 600, flex: 1 }}>
-              {acp.label('ACP 模式（智能体预设）', 'ACP mode (agent preset)')}
+              {acp.label('NTR 模式（智能体预设）', 'NTR mode (agent preset)')}
             </span>
             <span className="dwa-badge">{ui.preset.id}</span>
           </div>
           <div className="dwa-hint" style={{ marginTop: 6 }}>
             {ui.preset.installed
               ? acp.label(
-                `已进入宿主模式列表（声明：${ui.preset.source}）。在新建会话页的模式选择里选「ACP 模式」。`,
-                `In the harness roster (declared at ${ui.preset.source}). Pick “ACP mode” in the new-session mode picker.`,
+                `已进入宿主模式列表（声明：${ui.preset.source}）。在新建会话页的模式选择里选「NTR 模式」。`,
+                `In the harness roster (declared at ${ui.preset.source}). Pick “NTR mode” in the new-session mode picker.`,
               )
               : acp.label(
-                `宿主模式列表里没有可用的「ACP 模式」（声明：${ui.preset.source}）。`,
-                `The harness roster carries no usable “ACP mode” (declared at ${ui.preset.source}).`,
+                `宿主模式列表里没有可用的「NTR 模式」（声明：${ui.preset.source}）。`,
+                `The harness roster carries no usable “NTR mode” (declared at ${ui.preset.source}).`,
               )}
           </div>
           {ui.preset.problem !== undefined && (
@@ -363,7 +363,7 @@ export function AcpSettingsSection(props: WithStore) {
       {/* Connected ACP agents: one compact row per agent, details on demand */}
       <div style={{ marginBottom: 24 }}>
         <div className="dwa-section-title">
-          <span>{acp.label('已接入的 ACP 智能体', 'Connected ACP Agents')}</span>
+          <span>{acp.label('已接入的 NTR 智能体', 'Connected NTR Agents')}</span>
           <span className="dwa-badge">{configured.length}</span>
         </div>
 
@@ -1141,8 +1141,8 @@ function WorkspaceBlock({
         )}
         <span className="dwa-hint">
           {acp.label(
-            '对话里的 ACP 会话以该 DSH 会话选中的工作区为工作目录（agent 进程也从那里启动）；此项只在 /acp 直连会话与宿主未上报工作区时生效。',
-            'An ACP session inside a conversation runs \u2014 and starts its agent process \u2014 in that DSH session\u2019s own workspace; this value applies to /acp-direct sessions and when the host reports no workspace.',
+            '对话里的 NTR 会话以该 DSH 会话选中的工作区为工作目录（agent 进程也从那里启动）；此项只在 /acp 直连会话与宿主未上报工作区时生效。',
+            'An NTR session inside a conversation runs \u2014 and starts its agent process \u2014 in that DSH session\u2019s own workspace; this value applies to /acp-direct sessions and when the host reports no workspace.',
           )}
         </span>
         {/* The effective allow-list stays visible in single-root mode too:
@@ -1446,8 +1446,8 @@ function ModelCatalogBlock({
           // conversations in every other mode are untouched.
           <span className="dwa-hint">
             {acp.label(
-              '默认 Agent：新的 ACP 模式会话直接由它服务（其他模式的默认模型不受影响）',
-              "Default agent: a new ACP-mode conversation starts on it (other modes' default model is untouched)",
+              '默认 Agent：新的 NTR 模式会话直接由它服务（其他模式的默认模型不受影响）',
+              "Default agent: a new NTR-mode conversation starts on it (other modes' default model is untouched)",
             )}
           </span>
         )}
@@ -1472,11 +1472,11 @@ function ModelCatalogBlock({
                 className="dwa-hint"
                 style={{ marginLeft: 6, fontWeight: 400 }}
                 title={acp.label(
-                  'ACP 模式下的对话只会列出这里勾选的模型；未勾选的仍可用（比如会话里已选中的那个），只是不在这里列出来。',
-                  'The ACP surfaces only list what is checked here; unchecked models still work (e.g. the one a session already selected) — they are just not offered.',
+                  'NTR 模式下的对话只会列出这里勾选的模型；未勾选的仍可用（比如会话里已选中的那个），只是不在这里列出来。',
+                  'The NTR surfaces only list what is checked here; unchecked models still work (e.g. the one a session already selected) — they are just not offered.',
                 )}
               >
-                {acp.label('（ACP 座位 / 芯片的下拉列表）', '(the ACP seat and chip pickers)')}
+                {acp.label('（NTR 座位 / 芯片的下拉列表）', '(the NTR seat and chip pickers)')}
               </span>
             </span>
             <span className="dwa-badge dwa-badge-info">

@@ -1,4 +1,4 @@
-# The `acp` agent preset — "ACP 模式": a session whose conversation is served by
+# The `acp` agent preset — "NTR 模式": a session whose conversation is served by
 # an external ACP agent (dsh-ntr's `acp` LLM provider) instead of a
 # harness-driven model.
 #
@@ -8,7 +8,7 @@
 # `$DSH_HOME/.agent-presets/<id>/` directory — `preset.yml` + `agent.cordis.yml`
 # — is dead: nothing reads it any more, so a preset that only exists there never
 # reaches the roster. dsh-ntr is itself a profile bundle (`dsh.bundle.patch` in
-# package.json), so declaring the preset here is what makes "ACP 模式" appear in
+# package.json), so declaring the preset here is what makes "NTR 模式" appear in
 # the mode chooser with no copying step at all.
 #
 # WHY THE PRESET EXISTS: an ACP agent is ANOTHER agent reached over the wire, and
@@ -43,8 +43,8 @@
         # `id` is what a session stores and what the browser half matches
         # (`ACP_PRESET_ID` in src/client/acp-ui.tsx — keep the two in sync).
         id: acp
-        name: ACP 模式
-        description: 会话由外接 ACP agent 驱动：宿主不提供工具、提示词、项目指令与运行上下文，原生聊天只作外壳。
+        name: NTR 模式
+        description: 会话由外接 Agent 驱动（Agent Client Protocol）：宿主不提供工具、提示词、项目指令与运行上下文，原生聊天只作外壳。
         order: 6
         plugins:
           # `complete: true` makes this the whole system prompt — it suppresses

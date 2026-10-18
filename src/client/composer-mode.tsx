@@ -120,12 +120,12 @@ export function AcpComposerMode({ acp, sessionId, useSession }: ComposerModeProp
       // only adds a second line of chrome to a control whose value already says
       // it. The explanation stays in the tooltip for whoever goes looking.
       title={acp.label(
-        `ACP agent 模式（${agentId ?? 'agent'}）：由 agent 自己定义，与 DSH 的 Access mode 互补`,
-        `ACP agent mode (${agentId ?? 'agent'}): defined by the agent, complementary to the DSH access mode`,
+        `agent 模式（${agentId ?? 'agent'}）：由 agent 自己定义，与 DSH 的 Access mode 互补`,
+        `agent mode (${agentId ?? 'agent'}): defined by the agent, complementary to the DSH access mode`,
       )}
     >
       <select
-        aria-label={acp.label('ACP agent 模式', 'ACP agent mode')}
+        aria-label={acp.label('agent 模式', 'agent mode')}
         value={current}
         disabled={switching}
         onChange={event => {

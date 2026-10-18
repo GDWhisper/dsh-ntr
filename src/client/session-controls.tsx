@@ -249,11 +249,11 @@ export function AcpSessionControls(props: AcpClusterProps) {
       {/* Last on purpose: this is the fixed right-hand anchor of the cluster. */}
       <AcpChip
         label={route.agentTitle === undefined
-          ? (routed ? 'ACP' : acp.label('接入 ACP', 'Use ACP'))
-          : `ACP · ${route.agentTitle}`}
+          ? (routed ? 'NTR' : acp.label('接入 NTR', 'Use NTR'))
+          : `NTR · ${route.agentTitle}`}
         title={acp.label(
-          '这个会话由外接 ACP agent 服务；点开可切换 agent、它的模型与思考等级',
-          'This conversation is served by an external ACP agent — open to switch the agent, its model and the thought level',
+          '这个会话由外接 NTR agent 服务；点开可切换 agent、它的模型与思考等级',
+          'This conversation is served by an external NTR agent — open to switch the agent, its model and the thought level',
         )}
         active={routed}
         onClick={(trigger) => { open('agent', trigger) }}
@@ -285,8 +285,8 @@ function agentSection(context: MenuContext): AcpMenuSection {
   if (items.length === 0) {
     items.push({
       id: 'none',
-      label: acp.label('还没有配置 ACP agent', 'No ACP agent configured yet'),
-      detail: acp.label('设置 → ACP 代理', 'Settings → ACP Agents'),
+      label: acp.label('还没有配置 NTR agent', 'No NTR agent configured yet'),
+      detail: acp.label('设置 → NTR', 'Settings → NTR'),
       disabled: true,
     })
   }
@@ -357,8 +357,8 @@ function modelSection(context: MenuContext): AcpMenuSection | undefined {
       id: buildAcpModelId(route.agentId, inForce),
       label: `${inForce === current?.value ? current?.name ?? inForce : route.modelLabel ?? inForce} · ${acp.label('当前', 'current')}`,
       detail: acp.label(
-        '未在「设置 → ACP 代理」里勾选可见；仍然可用。',
-        'Not checked as visible in Settings → ACP Agents; still usable.',
+        '未在「设置 → NTR」里勾选可见；仍然可用。',
+        'Not checked as visible in Settings → NTR; still usable.',
       ),
       active: true,
     })
@@ -385,8 +385,8 @@ function modelSection(context: MenuContext): AcpMenuSection | undefined {
     title: acp.label(`${route.agentTitle ?? 'agent'} 的模型`, `Models of ${route.agentTitle ?? 'the agent'}`),
     note: catalog.variants.length === 0
       ? acp.label(
-        'agent 自己上报的模型目录；这里只列出它当前用的模型，其余可在「设置 → ACP 代理」里勾选可见。',
-        "The agent's own model directory; only the model it is on is offered here — enable more in Settings → ACP Agents.",
+        'agent 自己上报的模型目录；这里只列出它当前用的模型，其余可在「设置 → NTR」里勾选可见。',
+        "The agent's own model directory; only the model it is on is offered here — enable more in Settings → NTR.",
       )
       : acp.label(
         'agent 自己上报的模型目录；勾选的那条就是这条会话正在用的模型。',
@@ -474,7 +474,7 @@ export function menuFor(kind: AcpMenuKind, context: MenuContext): {
     return { title: section.title ?? acp.label('思考等级', 'Thought level'), note: section.note, sections: [{ ...section, title: undefined, note: undefined }] }
   }
 
-  return { title: acp.label('ACP', 'ACP'), sections: [] }
+  return { title: acp.label('NTR', 'NTR'), sections: [] }
 }
 
 /**
@@ -517,7 +517,7 @@ export function AcpSessionMenu(props: AcpClusterProps) {
     })
   } catch (error) {
     model = {
-      title: acp.label('ACP', 'ACP'),
+      title: acp.label('NTR', 'NTR'),
       sections: [],
       error: error instanceof Error ? error.message : String(error),
     }
