@@ -717,6 +717,100 @@ describe('AcpStore agent management', () => {
     expect(endpoints.filter(endpoint => endpoint === 'agent/catalog')).toHaveLength(1)
   })
 
+  it('drops the cached seat catalog when the host announces a new one', async () => {
+    let reads = 0
+    const store = new AcpStore(
+      async (_channel, endpoint) => {
+        if (endpoint !== 'agent/catalog') return { ok: true, value: {} }
+        reads += 1
+        return {
+          ok: true,
+          value: {
+            agentId: 'pi',
+            title: 'Pi',
+            base: { id: 'pi', name: 'Pi' },
+            variants: [],
+            probed: true,
+            currentModel: { value: `m${String(reads)}`, name: `M${String(reads)}` },
+          },
+        }
+      },
+      (zh) => zh,
+    )
+
+    await store.loadAgentCatalog('pi')
+    expect(reads).toBe(1)
+    expect(store.getSnapshot().seatCatalogs.pi?.currentModel?.value).toBe('m1')
+
+    // A real session on the host learned a new catalog: the cached projection
+    // must be dropped and re-read, or the open conversation renders yesterday's
+    // list until the user presses "detect models".
+    await (store as unknown as { applyEvent(event: unknown): Promise<void> }).applyEvent({
+      type: 'catalog/updated',
+      agentId: 'pi',
+      updatedAt: 2,
+    })
+    expect(reads).toBe(2)
+    expect(store.getSnapshot().seatCatalogs.pi?.currentModel?.value).toBe('m2')
+
+    // And the freshly read surface is cached again (no frame-storm re-reads).
+    await store.loadAgentCatalog('pi')
+    expect(reads).toBe(2)
+  })
+
+  it('takes a host-side exposure change without a save, and re-reads the seat surface', async () => {
+    // Auto-discovery appends models on the HOST while a session runs. The
+    // settings card must hear about it (its right pane is the selection) and
+    // the composer must drop its cached seat list (the variants are a
+    // projection of the same filter) — without an `agent/save`.
+    let reads = 0
+    const store = new AcpStore(
+      async (_channel, endpoint) => {
+        if (endpoint === 'agent/catalog') {
+          reads += 1
+          return {
+            ok: true,
+            value: { agentId: 'pi', title: 'Pi', base: { id: 'pi', name: 'Pi' }, variants: [], probed: true },
+          }
+        }
+        if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
+        if (endpoint === 'agents/detect') {
+          return {
+            ok: true,
+            value: {
+              agents: [{
+                id: 'pi',
+                name: 'Pi',
+                detected: true,
+                defaultCommand: 'pi-acp',
+                defaultArgs: [],
+                currentConfig: { id: 'pi', command: 'pi-acp', exposedModels: ['a'], autoDiscoverModels: true },
+              }],
+            },
+          }
+        }
+        return { ok: true, value: {} }
+      },
+      (zh) => zh,
+    )
+    await store.resync()
+    expect(store.getSnapshot().detectedAgents.find(info => info.id === 'pi')?.currentConfig?.exposedModels).toEqual(['a'])
+
+    await (store as unknown as { applyEvent(event: unknown): Promise<void> }).applyEvent({
+      type: 'agent/exposure',
+      agentId: 'pi',
+      exposedModels: ['a', 'b'],
+      autoDiscoverModels: true,
+    })
+
+    expect(store.getSnapshot().detectedAgents.find(info => info.id === 'pi')?.currentConfig).toMatchObject({
+      exposedModels: ['a', 'b'],
+      autoDiscoverModels: true,
+    })
+    expect(reads).toBe(1)
+  })
+
   it('loadAgentCatalog stays quiet when the host has no catalog surface', async () => {
     const store = new AcpStore(
       async () => ({ ok: false, error: { code: 'unknown_endpoint', message: 'nope' } }),

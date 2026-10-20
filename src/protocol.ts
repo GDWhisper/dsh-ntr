@@ -55,7 +55,7 @@ export interface AcpAgentDef {
    * `validateAgentDef` (no shell metacharacters can ever reach the installer).
    */
   npmPackage?: string
-  /** Child environment layered over a credential-scrubbed copy of the host env. */
+  /** Child environment: the inherited host env, with these keys layered on top. */
   env?: Record<string, string>
   /** Default absolute workspace directory for new sessions. */
   cwd?: string
@@ -78,6 +78,16 @@ export interface AcpAgentDef {
    * {@link AgentCatalogResult} for why that is structural, not cosmetic.
    */
   exposedModels?: string[]
+  /**
+   * Auto-discovery for {@link exposedModels}: when true, every model the agent
+   * NEWLY publishes (present in an observed catalog but absent from the one
+   * known before it) is appended to `exposedModels` automatically. It never
+   * touches models the user already had selected, and the very first catalog
+   * observation is a baseline (nothing is "new" yet). Set from the settings
+   * card's lightweight `agent/set-auto-discover-models` RPC — never by
+   * `agent/save`, which restarts the process for connection changes.
+   */
+  autoDiscoverModels?: boolean
   /**
    * How long this agent's process may sit READY with no live session and
    * nothing in flight before the host releases it (kills the child). Unset →
@@ -216,6 +226,24 @@ export type AcpEvent =
     session: SessionView
   }
   | { type: 'session/update'; sessionId: string; seq: number; update: SessionUpdate }
+  /**
+   * One agent's model catalog changed on the host because a real session
+   * published new `configOptions` (its `session/new` / `session/load`, or a
+   * `config_option_update`). The browser must drop its cached seat catalog for
+   * that agent and re-read `agent/catalog`; without this, a conversation opened
+   * before the agent's first real session keeps rendering yesterday's model
+   * list until someone presses "detect models" (user report, 2026-10-19).
+   */
+  | { type: 'catalog/updated'; agentId: string; updatedAt: number }
+  /**
+   * One agent's model visibility changed outside `agent/save`: the settings
+   * panel edited `exposedModels`, the auto-discovery switch was flipped, or an
+   * observed catalog contributed newly published models. The browser patches
+   * its copy of the agent definition (the settings card) and re-reads
+   * `agent/catalog` (the composer's seat list). `exposedModels: []` means the
+   * same as unset — no `agentId@choice` variants.
+   */
+  | { type: 'agent/exposure'; agentId: string; exposedModels: string[]; autoDiscoverModels: boolean }
   | { type: 'permission/request'; requestId: string; sessionId: string; toolCall: unknown; options: PermissionOptionView[] }
   | { type: 'permission/resolved'; requestId: string; sessionId: string; outcome: PermissionOutcome }
   | { type: 'turn/start'; sessionId: string; turnId: string; text: string }
@@ -426,6 +454,8 @@ export interface AgentSavePayload {
   permission?: PermissionMode
   env?: Record<string, string>
   exposedModels?: string[]
+  /** Keep newer models the agent publishes in the selection (see {@link AcpAgentDef.autoDiscoverModels}). */
+  autoDiscoverModels?: boolean
   /** Absent → keep the host default (30 minutes); `0` = never release. */
   idleTimeoutMs?: number
 }

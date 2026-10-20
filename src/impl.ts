@@ -1,8 +1,8 @@
 /**
  * Pure host-side logic for dsh-ntr: config validation, workspace guard,
- * credential-scrubbed child env, capped transcript, event hub, and the RPC
- * dispatcher. No Node imports, no SDK imports — everything here is testable
- * with plain fakes.
+ * child env assembly, capped transcript, event hub, and the RPC dispatcher.
+ * No Node imports, no SDK imports — everything here is testable with plain
+ * fakes.
  */
 
 import { randomUUID } from './ids.ts'
@@ -216,6 +216,12 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
   const exposedModels = row.exposedModels === undefined
     ? undefined
     : normalizeExposedModels(row.exposedModels, `agent "${id}" exposedModels`, 'bad_config')
+  // Optional boolean; stored only when true (absent and false are the same
+  // "off" state, so the persisted file does not carry noise).
+  const autoDiscoverModels = row.autoDiscoverModels
+  if (autoDiscoverModels !== undefined && typeof autoDiscoverModels !== 'boolean') {
+    throw new AcpError('bad_config', `acp: agent "${id}" autoDiscoverModels must be a boolean`)
+  }
   // Per-agent idle-release window. Kept optional so a stored config from before
   // this field existed still validates (it falls back to the host default).
   const idleTimeoutMs = row.idleTimeoutMs
@@ -234,6 +240,7 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
     cwd: cwd as string | undefined,
     allowedCwdRoots: roots as string[],
     ...(exposedModels !== undefined ? { exposedModels } : {}),
+    ...(autoDiscoverModels === true ? { autoDiscoverModels: true } : {}),
     ...(idleTimeoutMs === undefined ? {} : { idleTimeoutMs: idleTimeoutMs as number }),
   }
 }
@@ -550,16 +557,14 @@ export function resolveFsPath(sessionCwd: string, roots: readonly string[], requ
 // ---- Child environment ----
 
 /**
- * Credential-scrubbed copy of the parent env, matching the harness subprocess
- * boundary: anything shaped like a secret and every ambient `DSH_*` deployment
- * fact is dropped; the agent's configured env merges back on top.
+ * The agent is a peer process, not a DSH sub-agent: it inherits the host
+ * environment exactly as a native tool would, and the agent's configured env
+ * wins per key on top.
  */
 export function childEnv(parent: NodeJS.ProcessEnv, extra: Record<string, string>): Record<string, string> {
-  const SENSITIVE = /KEY|PASSWORD|SECRET|TOKEN/i
   const out: Record<string, string> = {}
   for (const [k, v] of Object.entries(parent)) {
     if (v === undefined) continue
-    if (SENSITIVE.test(k) || k.toUpperCase().startsWith('DSH_')) continue
     out[k] = v
   }
   for (const [k, v] of Object.entries(extra)) out[k] = v
@@ -1243,6 +1248,8 @@ export interface AcpManager {
   testAgent?(def: AcpAgentDef): Promise<AgentTestResult>
   /** Update which probed model choices the ACP seats offer; `undefined` clears the filter. Must not restart the agent. */
   setExposedModels?(agentId: string, exposedModels: readonly string[] | undefined): Promise<void>
+  /** Toggle auto-discovery of newly published models. Must not restart the agent. */
+  setAutoDiscoverModels?(agentId: string, autoDiscoverModels: boolean): Promise<void>
   probeAgentModels?(agentId: string): Promise<AgentProbeModelsResult>
   /**
    * The ACP model surface for one agent (the seats' data source): base entry,
@@ -1538,6 +1545,15 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         // accept exactly what the catalog can produce (constraint 8's sibling —
         // saving a filter must never be the thing that breaks).
         await manager.setExposedModels?.(agentId, normalizeExposedModels(raw, 'exposedModels', 'bad_payload'))
+        return ok({ done: true })
+      }
+      case 'agent/set-auto-discover-models': {
+        const agentId = str(body, 'agentId', 64)
+        const autoDiscoverModels = body.autoDiscoverModels
+        if (typeof autoDiscoverModels !== 'boolean') {
+          return fail('bad_payload', 'acp: autoDiscoverModels must be a boolean')
+        }
+        await manager.setAutoDiscoverModels?.(agentId, autoDiscoverModels)
         return ok({ done: true })
       }
       case 'agent/probe-models': {

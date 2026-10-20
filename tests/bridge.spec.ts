@@ -965,6 +965,93 @@ describe('model catalog (isolated manager)', () => {
     await stale.shutdownAll()
   }, 30_000)
 
+  it('announces a catalog learned from a real session, so open conversations can re-read it', async () => {
+    // The composer caches the seat surface per agent. Before this announcement
+    // path existed, the first real session could learn a NEWER catalog on the
+    // host while the open conversation kept rendering yesterday's list until
+    // someone pressed "detect models" (user report, 2026-10-19).
+    const announcePath = `${tmpdir()}/acp-catalog-announce-${Date.now()}.json`
+    const announceHub = new EventHub()
+    const announced: AcpEvent[] = []
+    announceHub.subscribe(event => { announced.push(event) })
+    const gm = new BridgeManager([def], announceHub, 500, undefined, announcePath)
+
+    const start = await dispatchRpc(gm, 'session/start', { agentId: 'mock' })
+    expect(start.ok).toBe(true)
+    if (!start.ok) return
+    const sessionId = (start.value as { sessionId: string }).sessionId
+
+    // `session/new` itself is a catalog observation: it announces the change
+    // (absent → present) without any explicit probe.
+    const fromSession = announced.filter(event => event.type === 'catalog/updated')
+    expect(fromSession).toHaveLength(1)
+    expect(fromSession[0]).toMatchObject({ agentId: 'mock' })
+    expect(gm.agentCatalog('mock')).toMatchObject({ probed: true, currentModel: { value: 'mock-model-a' } })
+
+    // A second session that publishes the SAME options is not news: the
+    // catalog is unchanged, so no redundant frame (and no browser re-read).
+    const second = await dispatchRpc(gm, 'session/start', { agentId: 'mock' })
+    expect(second.ok).toBe(true)
+    expect(announced.filter(event => event.type === 'catalog/updated')).toHaveLength(1)
+
+    await gm.shutdownAll()
+  }, 30_000)
+
+  it('auto-discovers models the agent newly publishes, without touching the existing selection', async () => {
+    // Baseline: the host knew only model A, and the user had selected exactly
+    // it. The agent then adds model B; the switch must append B and nothing
+    // else — no settings-panel visit, no resurrection of unchecked models.
+    const autoCatalogPath = `${tmpdir()}/acp-catalog-auto-${Date.now()}.json`
+    const autoAgentsPath = `${tmpdir()}/acp-agents-auto-${Date.now()}.json`
+    writeFileSync(autoCatalogPath, JSON.stringify({
+      version: 2,
+      agents: {
+        mock: {
+          catalog: {
+            model: {
+              configId: 'model',
+              name: 'Model',
+              currentValue: 'mock-model-a',
+              choices: [{ value: 'mock-model-a', name: 'Mock Model A' }],
+            },
+          },
+          updatedAt: 1,
+        },
+      },
+    }), 'utf-8')
+    const autoHub = new EventHub()
+    const announced: AcpEvent[] = []
+    autoHub.subscribe(event => { announced.push(event) })
+    const autoDef: AcpAgentDef = {
+      ...def,
+      exposedModels: ['mock-model-a'],
+      autoDiscoverModels: true,
+    }
+    const auto = new BridgeManager([autoDef], autoHub, 500, autoAgentsPath, autoCatalogPath)
+
+    // A real session publishes {A, B}: B is NEW relative to the baseline.
+    const start = await dispatchRpc(auto, 'session/start', { agentId: 'mock' })
+    expect(start.ok).toBe(true)
+    expect(auto.agentCatalog('mock').variants.map(variant => variant.id))
+      .toEqual(['mock@mock-model-a', 'mock@mock-model-b'])
+    expect(announced.filter((event): event is Extract<AcpEvent, { type: 'agent/exposure' }> => event.type === 'agent/exposure'))
+      .toMatchObject([{ agentId: 'mock', exposedModels: ['mock-model-a', 'mock-model-b'], autoDiscoverModels: true }])
+    // A persisted policy change, not a live-only tweak.
+    const stored = JSON.parse(readFileSync(autoAgentsPath, 'utf-8')) as {
+      agents: Array<{ exposedModels?: string[]; autoDiscoverModels?: boolean }>
+    }
+    expect(stored.agents[0]).toMatchObject({
+      exposedModels: ['mock-model-a', 'mock-model-b'],
+      autoDiscoverModels: true,
+    })
+
+    // Switching it off keeps what was already discovered.
+    await auto.setAutoDiscoverModels('mock', false)
+    expect(auto.agentCatalog('mock').variants.map(variant => variant.id))
+      .toEqual(['mock@mock-model-a', 'mock@mock-model-b'])
+    await auto.shutdownAll()
+  }, 30_000)
+
   it('NEVER spawns an agent just because a catalog was read', async () => {
     // THE reported defect (user report, 2026-10-18): a conversation served by
     // `codebuddy` showed "Oh My Pi 已连接" in the agent picker — a second agent

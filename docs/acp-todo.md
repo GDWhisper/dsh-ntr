@@ -1,6 +1,6 @@
 # NTR 待办清单
 
-本文件记录**用户已报告、尚未落地**的 NTR 面改动。每条都写清四件事：用户报告了什么、现状代码在哪里、已知的障碍（避免下次从零查）、以及验收时看什么。
+本文件记录**用户已报告、尚未落地**的 NTR 面改动。每条都写清四件事：用户报告了什么、现状代码在哪里、已知的障碍（避免下次从零查）、以及验收时看什么。文末「已落地」只保留一行去向，详细结论在 [AGENTS.md](../AGENTS.md) 的对应约束里。
 
 > 引用代码位置一律用「文件 + 符号名」，不用行号。
 
@@ -15,35 +15,30 @@
 
 | # | 待办 | 现状 | 建议 |
 |---|---|---|---|
-| 1 | agent 底座选定后隐藏，当前 agent 由输入框上边缘的挂牌显示 | 已落地（首轮开始时隐藏并锁定；首轮无可见输出则回滚，挂牌只读） | 去向见「已落地」 |
-| 2 | 模型列表获取不完全 | 先要样本，不能直接改 | 定位到某一层后再动 |
-| 3 | NTR 模式下原生输入框应透传 agent 自己的命令 | 部分被宿主命令层拦死 | 先做可见面与非冲突转发；同名透传需上游接缝或换 composer |
+| 1 | 模型列表获取不完全 | 样本已拿到；第 5 层已修；pi 的 env 缺口已由全量环境继承修复 | codebuddy 属设计 |
+| 2 | NTR 模式下原生输入框应透传 agent 自己的命令 | 部分被宿主命令层拦死 | 先做可见面与非冲突转发；同名透传需上游接缝或换 composer |
 
 剩下的待办互不依赖。新会话开工时只读对应的一条，不要顺手改另一条的红线。
 
 ---
 
-## 1. agent 选择底座在选定后隐藏，当前 agent 由输入框上边缘的挂牌显示
+## 1. 模型列表获取不完全
 
-**状态**：已落地（2026-10-20）。结论并进了 [AGENTS.md](../AGENTS.md) 的「本插件是什么」第 1 点与约束 18 的「规则（agent 底座的退场时机）」：
+**状态**：进行中（2026-10-20 拿到样本；第 5 层已修，其余为配置/设计判定）。**用户报告**：2026-10-19（原文只有这一句，缺"哪个 agent、少了什么"）。
 
-- **隐藏时机**：首轮**开始**时（ACP 会话 materialize、prompt 发出前）即锁定 agent 并广播 `chat/agent-locked`，动画同时开始。首轮之前底座保留，用户可以先选好再改。
-- **失败回滚**：锁是临时的，直到首轮产生第一个可见块。若本轮没有任何可见输出就结束（报错、静默失败、取消），`rollbackFirstTurn` 删除 `locked`、关闭失败的 ACP 会话并广播 `chat/agent-unlocked`；底座回来，可以重新选 agent。一旦有可见输出，锁永久。
-- **锁定判据**：`lockedAgentOf` 的链是宿主 `lockedAgentId` → 活/挂起会话的 agent，**不拿插件默认 agent 兜底，也不查 roster**（agent 被删除时底座也不回来，否则会给出一个 turn 路径必然拒绝的切换入口）。
-- **挂牌补偿**：`conversation.input.overlay` 的 `AcpComposerAgentTag` 显示 `NTR · <agent>`，样式 `.ntr-acp-tag` 骑在 composer 卡片上边缘（一半在卡片外、一半压在上边框）。挂牌**只读**：没有点击、没有 caret，tooltip 说明锁定与「换 agent 请新建会话」。它自带 ACP 闸门，显式 `acpMode === false` 压过残留的 ACP 会话记录。会话头部**不放**这个芯片（用户 2026-10-20 决定：挂牌是唯一显示面）。
-- **退场动效**：锁定帧到达（首轮开始）时，底座先粉碎（460ms，`.ntr-acp-shatter` + `out` 沙粒），挂牌随后从碎片凝聚（540ms，`.ntr-acp-tag.is-forming` + `in` 沙粒）；回滚时底座直接回来，不播反向动效。两个 slot 共读 `agent-lock-anim.ts` 的相位钟；只有本页亲眼看到的锁定才播（`agentLockReveal` + `chatUnlocked` 防复活），刷新已锁定的会话不重演，`prefers-reduced-motion` 下整段跳过。
-- **服务端锁定**：`chatChoice.locked` 随会话持久化；`bindChatAgent` / `setChatSessionModel` / `setChatSessionMode` 指向别的 agent 以及 `getOrCreateDshSession` 的 turn 路径都以 `agent_locked` 拒绝；`session/chat-list` 回 `lockedAgentId`。确认后的锁定在 ACP 会话关闭、进程停止、宿主重启后仍然保留。
-- **代码 / 测试**：`src/client/session-controls.tsx` 的 `lockedAgentOf` / `agentBaseHidden` / `agentTagVisible` / `AcpComposerAgentTag`，`src/client/index.tsx` 的 overlay 注册，`src/bridge.ts` 的 `lockedAgentFor` / `lockChatAgent` / `rollbackFirstTurn`，`src/client/agent-lock-anim.ts`，`tests/session-controls.spec.ts` 的 "the agent base retires after the first turn, locks the agent, and the edge tag takes over" 套件，`tests/bridge.spec.ts` 的 "agent lock at the start of the first turn" 套件（含 EMPTY / FAIL 回滚用例）。
+它有五种完全不同的可能原因，对应五个不同的层，修错层会把"设计"当成 bug 改掉。第一步是拿到一份对照——**agent 实际报的 `configOptions`**、**设置页"检测可用模型"列出的行**、**composer 模型菜单列出的行**——然后定位缺口在哪一层。**对照已于 2026-10-20 拿到（见下表）。**
 
-落地前的分析（头部两条优先级链、view tab 标签为何不可响应式、产品裁决选项）已由上述结论取代，不再保留。
+### 样本（2026-10-20，本机实测）
 
----
+用真实 ACP 会话（`initialize` + `session/new`，等 8s 收后续 `config_option_update`）对照磁盘缓存：
 
-## 2. 模型列表获取不完全
+| agent | 真实 `session/new` | 磁盘缓存 | 结论 |
+|---|---|---|---|
+| omp | 780 | 774（10-18） | 缓存陈旧：6 个新模型（opencode/openrouter/stepfun），无解析丢失 → 第 4+5 层 |
+| codebuddy | 20 | 20 | 版本无缺口；composer 只列 3 个是因为 `exposedModels` 只勾了 3 个 → 第 1 层（设计） |
+| pi | 119（旧：脱敏 env）/ 145（完整 env） | 119 | 缺的 26 个全部来自 `TOKITOKEN` / `STEPFUN` / `AMD` / `SENSENOVA` 四家 provider；旧版插件按名字剥离 `*_KEY*` 环境变量，pi 因此不报这些 provider。2026-10-20 起 `childEnv` 改为**全量继承宿主环境**（agent 自己的 `env` 按键覆盖），该缺口消失 |
 
-**状态**：待办。**用户报告**：2026-10-19（原文只有这一句，缺"哪个 agent、少了什么"）。
-
-这条**还不能直接动手**：它有五种完全不同的可能原因，对应五个不同的层，修错层会把"设计"当成 bug 改掉。第一步永远是拿到一份对照——**agent 实际报的 `configOptions`**、**设置页"检测可用模型"列出的行**、**composer 模型菜单列出的行**——然后定位缺口在哪一层。
+结论：**omp 的用户症状正是第 5 层**——宿主缓存停在旧目录、浏览器端 `seatCatalogs` 又永不失效。pi 的 26 个模型是环境继承问题（2026-10-20 已改为全量继承宿主环境，见 [AGENTS.md](../AGENTS.md)「边界与禁区」）；codebuddy 的 3 个是 `exposedModels` 的可见性语义，不是缺数据。
 
 ### 五个可能的层（从外到内）
 
@@ -58,7 +53,7 @@
 
 4. **磁盘缓存陈旧**。`CATALOG_SCHEMA` 与 `catalogStale`（`src/bridge.ts`）：旧 schema 的磁盘缓存会被当成有效目录，直到一次真实会话的 `absorbCatalog` 把它修好；启动时不重探。
 
-5. **浏览器端 `seatCatalogs` 缓存不失效（待办原先漏掉的第五层）**。`src/client/store.ts` 的 `loadAgentCatalog` 以 agentId 为键**永久缓存**并 early-return；`invalidateSeatCatalog` 只在 `setExposedModels` / `deleteAgent` / `probeModels` 调用。宿主侧 `absorbCatalog` 更新目录后**不广播**，`session/meta` 也不清缓存。于是：会话首轮前读到空/旧目录 → 首轮中 agent 的 `session/new` 把完整目录吸收进宿主 → **composer 永远停在旧目录**，直到用户去设置页点"检测可用模型"或改一次可见性。这完全符合"列表获取不完全"的症状，而且修复不违反"不启动探测"的红线——`agent/catalog` 本身是纯内存，重新读一次即可。
+5. **浏览器端 `seatCatalogs` 缓存不失效（待办原先漏掉的第五层）**。`src/client/store.ts` 的 `loadAgentCatalog` 以 agentId 为键**永久缓存**并 early-return；`invalidateSeatCatalog` 只在 `setExposedModels` / `deleteAgent` / `probeModels` 调用。宿主侧 `absorbCatalog` 更新目录后**不广播**，`session/meta` 也不清缓存。于是：会话首轮前读到空/旧目录 → 首轮中 agent 的 `session/new` 把完整目录吸收进宿主 → **composer 永远停在旧目录**，直到用户去设置页点"检测可用模型"或改一次可见性。这完全符合"列表获取不完全"的症状，而且修复不违反"不启动探测"的红线——`agent/catalog` 本身是纯内存，重新读一次即可。**已修（2026-10-20）**：`absorbCatalog` 内容变化时广播 `catalog/updated`（`agentId` + `updatedAt`），`AcpStore` 收到后 `invalidateSeatCatalog` + `loadAgentCatalog`（去重保留）。`setConfigOption` 的响应**不**进目录（会话级 `currentValue` 会污染 `defaultEffort`），只进会话快照。
 
 ### 附带核对（已确认）
 
@@ -66,7 +61,7 @@
 
 另一处文档纠错：待办红线说"禁止让 `agent/catalog` 在渲染路径上 spawn"——现行代码已经是纯内存、绝不 spawn（`BridgeManager.agentCatalog`）；`session-controls` 里"reading can spawn a probe"的注释是旧说法，不是当前行为。
 
-### 第一步：先拿样本
+### 第一步：先拿样本（已完成 2026-10-20）
 
 - 哪个 agent（本机有 `omp` / `codebuddy` / `pi`）。
 - 设置页"检测可用模型"列出的模型数，与 `~/.dsh/dsh-ntr/model-catalog.json` 里该 agent 的 `catalog.model.choices` 数是否一致。
@@ -76,7 +71,7 @@
 
 ### 修法（按层，拿到样本后再选）
 
-- **第 5 层**：在 `session/meta` / 目录变化时失效该 agent 的 `seatCatalogs`，或在会话物化后重读一次 `agent/catalog`。注意别把它做成每帧重读（`loadAgentCatalog` 的 dedupe 要保留）。
+- **第 5 层（已落地 2026-10-20）**：`BridgeManager.absorbCatalog` 在目录内容真正变化时广播 `catalog/updated`（`agentId` + `updatedAt`）；`AcpStore.applyEvent` 收到后失效该 agent 的 `seatCatalogs` 并重读 `agent/catalog`。只在真实会话观察到变化时发（`session/new` / `session/load` / `config_option_update`），同内容重复发布不广播；`loadAgentCatalog` 的 dedupe 保留。测试：`tests/bridge.spec.ts` 的 "announces a catalog learned from a real session"、`tests/store.spec.ts` 的 "drops the cached seat catalog when the host announces a new one"。
 - **第 3 层**：按样本决定是否支持 `model_config` / 多 select；**严禁**猜测供应商分组或按名称前缀推断。多 select 的取舍（哪个是模型轴）需要一次明确裁决。
 - **第 2 层**：探测可在 `session/new` 后有界等待一次 `config_option_update` 再关闭；探测会话必须能被 bridge 接住更新（当前刻意不登记，需要设计）。这是显式探测，不违反"启动不探"的红线。
 - **第 1 层**：不改。`exposedModels` 语义保持"只影响可见性，不影响可用性"。
@@ -90,14 +85,15 @@
 
 ### 验收
 
-- 拿到对照样本，缺口定位到某一层并说明依据。
+- 拿到对照样本，缺口定位到某一层并说明依据。**已完成（见上方样本表）。**
 - 修完后同一 agent 的 `configOptions` 与 UI 行一一对应（未勾的仍不列，`exposedModels` 语义不变）。
-- 首次真实会话之后，composer 的模型列表能自动补齐，不需要用户点"检测"。
+- 首次真实会话之后，composer 的模型列表能自动补齐，不需要用户点"检测"。**代码路径已通；桌面端待用户用 omp 复核。**
 - 不新增任何启动期探测。
+- pi 的 26 个 env-gated 模型不在本条的代码修复范围内：旧版需要显式配置密钥，2026-10-20 起 env 全量继承后自动恢复。
 
 ---
 
-## 3. NTR 模式下原生输入框应透传 agent 自己的命令
+## 2. NTR 模式下原生输入框应透传 agent 自己的命令
 
 **状态**：待办。**用户报告**：2026-10-19。
 
@@ -148,6 +144,6 @@
 
 ## 已落地
 
-- **2026-10-20 · #1 agent 底座选定后隐藏**：首轮**开始时**隐藏并锁定 agent，底座粉碎、挂牌凝聚（首轮前保留以便改选）；首轮没有任何可见输出则回滚锁定、底座回来。当前 agent 由骑在输入框卡片上边缘的只读挂牌显示；确认锁定后换 agent 只能新建会话。去向：[AGENTS.md](../AGENTS.md)「本插件是什么」第 1 点 + 约束 18「规则（agent 底座的退场与锁定）」；测试见 `tests/session-controls.spec.ts` 的 "the agent base retires after the first turn, locks the agent, and the edge tag takes over"、`tests/bridge.spec.ts` 的 "agent lock at the start of the first turn" 与 `tests/acp-view.spec.ts` 的 "the agent-lock hand-off clock"。
+- **2026-10-20 · agent 底座选定后隐藏**：首轮开始时隐藏并锁定 agent（首轮无可见输出则回滚），当前 agent 由输入框上边缘的只读挂牌显示。结论见 [AGENTS.md](../AGENTS.md)「本插件是什么」第 1 点 + 约束 18「规则（agent 底座的退场与锁定）」；测试见 `tests/bridge.spec.ts` 的 "agent lock at the start of the first turn" 与 `tests/acp-view.spec.ts` 的 "the agent-lock hand-off clock"。
 
 （一条待办完成时，把它的结论写进 AGENTS.md 的对应约束或 [docs/acp-convergence.md](./acp-convergence.md) 的批次表，然后在这里留一行去向。）

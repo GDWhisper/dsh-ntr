@@ -763,6 +763,25 @@ export class AcpStore {
     }
   }
 
+  /**
+   * Persist the auto-discovery switch for one agent. Lightweight like
+   * {@link setExposedModels}: no process restart, and the current selection is
+   * left exactly as it is.
+   */
+  async setAutoDiscoverModels(agentId: string, autoDiscoverModels: boolean): Promise<void> {
+    try {
+      await this.call('agent/set-auto-discover-models', { agentId, autoDiscoverModels })
+      await this.resync()
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      const notice = msg.includes('unknown endpoint agent/set-auto-discover-models')
+        ? this.locale('宿主服务运行着旧版本代码，请在终端重启 dsh web 服务以启用自动发现功能。', 'Host running older version. Please restart dsh web to enable auto-discovery.')
+        : msg
+      this.mutate({ notice })
+      throw error
+    }
+  }
+
   // ---- Panel lifecycle ----
 
   toggle(): void {
@@ -1406,6 +1425,37 @@ export class AcpStore {
         foldUpdate(this.state.blocks, event.update as unknown as Record<string, unknown>)
         this.mutate({ blocks: [...this.state.blocks], ...(folded === undefined ? {} : { chatTranscripts: folded }) })
         return Promise.resolve()
+      }
+      case 'catalog/updated': {
+        // The host learned a new catalog from a real session (its session/new,
+        // session/load, or a config_option_update). The seat list is a cached
+        // projection of it, so drop and re-read it — deduped by
+        // `loadAgentCatalog`, and memory-only on the host, so this never starts
+        // a probe.
+        this.invalidateSeatCatalog(event.agentId)
+        return this.loadAgentCatalog(event.agentId)
+      }
+      case 'agent/exposure': {
+        // The host changed an agent's model visibility outside `agent/save`:
+        // the settings card edited it, the auto-discovery switch was flipped,
+        // or newly published models were appended automatically. Patch the
+        // settings card's copy of the definition AND drop the seat cache — the
+        // variants `agent/catalog` answers are a projection of this filter.
+        const exposedModels = event.exposedModels.length === 0 ? undefined : [...event.exposedModels]
+        const detectedAgents = this.state.detectedAgents.map(info =>
+          info.id === event.agentId && info.currentConfig !== undefined
+            ? {
+                ...info,
+                currentConfig: {
+                  ...info.currentConfig,
+                  exposedModels: exposedModels === undefined ? undefined : exposedModels,
+                  autoDiscoverModels: event.autoDiscoverModels,
+                },
+              }
+            : info)
+        this.invalidateSeatCatalog(event.agentId)
+        this.mutate({ detectedAgents })
+        return this.loadAgentCatalog(event.agentId)
       }
       case 'permission/request': {
         const title = typeof (event.toolCall as { title?: unknown } | undefined)?.title === 'string'

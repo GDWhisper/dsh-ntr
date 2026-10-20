@@ -331,6 +331,14 @@ describe('validateAgentDef', () => {
     expect(() => validateAgentDef({ id: 'pi', command: 'x', exposedModels: ['y'.repeat(513)] })).toThrow(/exposedModels/)
   })
 
+  it('keeps autoDiscoverModels as an optional boolean (false and absent are "off")', () => {
+    expect(validateAgentDef({ id: 'pi', command: 'x', autoDiscoverModels: true }).autoDiscoverModels).toBe(true)
+    // Stored only when true: false and absent are the same host-side state.
+    expect('autoDiscoverModels' in validateAgentDef({ id: 'pi', command: 'x', autoDiscoverModels: false })).toBe(false)
+    expect('autoDiscoverModels' in validateAgentDef({ id: 'pi', command: 'x' })).toBe(false)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', autoDiscoverModels: 'yes' })).toThrow(/autoDiscoverModels/)
+  })
+
   it('accepts, trims, and drops npmPackage; rejects invalid package names', () => {
     expect(validateAgentDef({ id: 'pi', command: 'x', npmPackage: ' @mariozechner/pi-acp ' }).npmPackage).toBe('@mariozechner/pi-acp')
     expect(validateAgentDef({ id: 'pi', command: 'x', npmPackage: 'omp@latest' }).npmPackage).toBe('omp@latest')
@@ -648,12 +656,19 @@ describe('cross-platform paths (Windows)', () => {
 })
 
 describe('childEnv', () => {
-  it('scrubs secret-shaped and DSH_* ambient names, then merges explicit env', () => {
+  it('inherits the whole host env and lets the agent env win per key', () => {
     const out = childEnv(
-      { HOME: '/h', ANTHROPIC_API_KEY: 'sk', GITHUB_TOKEN: 'gh', DSH_PERMISSION_MODE: 'x', PLAIN: 'p' },
+      { HOME: '/h', ANTHROPIC_API_KEY: 'sk', GITHUB_TOKEN: 'gh', DSH_PERMISSION_MODE: 'x', PLAIN: 'p', EMPTY: undefined },
       { DEEPSEEK_API_KEY: 'explicit', HOME: '/other' },
     )
-    expect(out).toEqual({ HOME: '/other', PLAIN: 'p', DEEPSEEK_API_KEY: 'explicit' })
+    expect(out).toEqual({
+      HOME: '/other',
+      ANTHROPIC_API_KEY: 'sk',
+      GITHUB_TOKEN: 'gh',
+      DSH_PERMISSION_MODE: 'x',
+      PLAIN: 'p',
+      DEEPSEEK_API_KEY: 'explicit',
+    })
   })
 })
 
@@ -714,6 +729,7 @@ function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } {
       return { ok: true, durationMs: 5, stderr: [] }
     },
     setExposedModels: async (id, exposed) => { calls.push(['setExposedModels', { id, exposed }]) },
+    setAutoDiscoverModels: async (id, autoDiscoverModels) => { calls.push(['setAutoDiscoverModels', { id, autoDiscoverModels }]) },
     probeAgentModels: async agentId => {
       calls.push(['probe', agentId])
       return { agentId, catalog: { model: { configId: 'model', name: 'Model', currentValue: 'a', choices: [{ value: 'a', name: 'A' }] } }, updatedAt: 1 }
@@ -871,6 +887,13 @@ describe('dispatchRpc', () => {
     const catalog = Array.from({ length: 581 }, (_, i) => `provider/model-${String(i)}`)
     await expect(dispatchRpc(manager, 'agent/set-exposed-models', { agentId: 'omp', exposedModels: catalog })).resolves.toEqual({ ok: true, value: { done: true } })
     expect(manager.calls).toContainEqual(['setExposedModels', { id: 'omp', exposed: catalog }])
+    // Auto-discovery is a per-agent switch on the same lightweight surface —
+    // never `agent/save`, which would restart the process.
+    await expect(dispatchRpc(manager, 'agent/set-auto-discover-models', { agentId: 'pi', autoDiscoverModels: true })).resolves.toEqual({ ok: true, value: { done: true } })
+    expect(manager.calls).toContainEqual(['setAutoDiscoverModels', { id: 'pi', autoDiscoverModels: true }])
+    await expect(dispatchRpc(manager, 'agent/set-auto-discover-models', { agentId: 'pi', autoDiscoverModels: 'yes' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc(manager, 'agent/set-auto-discover-models', { agentId: 'pi' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc(manager, 'agent/set-auto-discover-models', { autoDiscoverModels: true })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
   })
 
   it('invokes agent/probe-models as a manager method so the receiver (`this`) survives', async () => {

@@ -55,7 +55,7 @@
 
 - [`src/index.ts`](file:///home/pax/coding/dsh-ntr/src/index.ts): Cordis 插件宿主入口，负责挂载 `/acp` RPC 通道与 `/api/acp/stream` SSE 路由。
 - [`src/protocol.ts`](file:///home/pax/coding/dsh-ntr/src/protocol.ts): 前后端共享契约定义（纯类型），**严禁引入任何 Node 专属库或运行时代码**（必须 browser-safe）。
-- [`src/impl.ts`](file:///home/pax/coding/dsh-ntr/src/impl.ts): 纯宿主端逻辑（配置校验、环境变量脱敏、工作区防越权、Transcript 缓冲、EventHub），**严禁直接引入 Node 内置模块或 SDK**，逻辑必须由 tests/impl.spec.ts 覆盖。
+- [`src/impl.ts`](file:///home/pax/coding/dsh-ntr/src/impl.ts): 纯宿主端逻辑（配置校验、子进程环境组装、工作区防越权、Transcript 缓冲、EventHub），**严禁直接引入 Node 内置模块或 SDK**，逻辑必须由 tests/impl.spec.ts 覆盖。
 - [`src/bridge.ts`](file:///home/pax/coding/dsh-ntr/src/bridge.ts): 宿主与 ACP 子进程 stdio 通信桥，依赖 `@agentclientprotocol/sdk`。
 - [`src/client/`](file:///home/pax/coding/dsh-ntr/src/client): Web 浏览器端 React 扩展。**严禁引入 Node.js 内置模块（`node:*`、`child_process`、`fs`）或 `@agentclientprotocol/sdk`**，通信必须经由 RPC / SSE。其中 [`acp-ui.tsx`](file:///home/pax/coding/dsh-ntr/src/client/acp-ui.tsx) 是对话侧三块座位（composer 底座 / picker 浮层 / NTR 视图 tab）共用的结构类型 + 样式 + 菜单壳，[`session-controls.tsx`](file:///home/pax/coding/dsh-ntr/src/client/session-controls.tsx) 与 [`acp-view.tsx`](file:///home/pax/coding/dsh-ntr/src/client/acp-view.tsx) 分别实现这两类界面。
 - [`acp-workspaces/`](file:///home/pax/coding/dsh-ntr/acp-workspaces): 插件本仓的本地 ACP agent 执行工作目录（仅开发/测试用）。**运行时默认工作区是 `~/.dsh/dsh-ntr/workspaces`**（`defaultAgentWorkspace`/`ensureDefaultWorkspace`），由插件在保存 agent 时按需创建；受工作区路径前缀防越权校验保护。
@@ -114,13 +114,15 @@
    - 规则（隔离）：`AcpLlmAdapter.listModels('acp')` 必须返回空数组——`acp` 路由不得出现在任何会话的模型目录里。DSH 的目录构建是 per-request 而非 per-session（`buildModelCatalog(ctx)` 不接 session id），所以一旦广告模型，就等于对**每一条**会话广告（包括没有 ACP agent 在背后的那些）；`LlmAdapter.listModels` 的契约本身写明目录是 advisory（“an adapter may accept unlisted model ids, and consumers must not turn absence into request rejection”），路由可用性由注册判定（`routeServed` 读 `listProviders()`），因此空列表不影响 `agent@choice` 的解析、选择与流式。
    - 规则（座位面）：ACP 座位/芯片的模型面只能读 `BridgeManager.agentCatalog`（RPC `agent/catalog`）——`base`（裸 `agentId` = agent 默认模型）+ `exposedModels` 过滤后的 `variants` + agent 自己的 `thought_level` 作为 `reasoning`。该 RPC **只读内存，绝不 spawn、也绝不顺手起探测**（2026-10-18 修「一个会话拉起了另一个 agent」）：`agentCatalog` 是**渲染路径**，composer 每次 store 变更都调它，所以这里只要有一点点自发起探测的余地，「打开页面」就等于「启动 N 个 agent」，而 picker 会如实把那些进程报成「已连接」——用户看到的就是「我用 codebuddy 的会话，为什么 Oh My Pi 也起来了」。同理 `bootstrapCatalogs()` **现在是空实现**（保留只为不改宿主入口的调用点），启动时不再为每个已配置 agent 各探一次。探测只允许三种**有手势**的来源：① `agent/probe-models`（设置页那张卡的按钮，一次点击一个 agent）；② 某 agent **自己的** `session/new` / `session/load`（用户正在跟它说话，进程本来就在）；③ 旧 schema 的磁盘缓存——**不重探**，而是被 ② 顺带修好（`absorbCatalog` 清 `catalogStale`）。客户端侧配套：三个 `loadAgentCatalog` 调用点都必须先判定「这条会话真的指向某个 agent」（`bound` / `choice` / `chatBoundAgent`），**严禁**因为 `routeAgentId` 回落到全局 `defaultAgent` 就去读别人的目录——读就会触发探测。守这条的是 `tests/bridge.spec.ts` 的 "NEVER spawns an agent just because a catalog was read"（已用「把 bug 放回去」验证过它真的会红）。`resolveAdapterModel` 对已知 agent 的任何输入都不得 throw（过期变体降级为裸 id 条目），仅对未配置 agent throw；`exposedModels` 过滤只允许作用于 `agentCatalog` 的变体展开（`base` 永不过滤），严禁影响 `resolveAdapterModel`。
    - 规则（变体按需）：未设置/空 = 不提供任何变体，只留 `base`——真实 agent 动辄数百个 choice，默认全暴露在无搜索的菜单里就是列表风暴。供应商 `group` 只能来自 agent 自己返回的 ACP `SessionConfigSelectGroup` 标签，严禁从名称前缀/value 路径/家族词做猜测式推断（任何供应商都可能供应别家模型）。
+   - 规则（目录热更新）：真实会话观察到新目录时（`session/new` / `session/load` 响应、`config_option_update`），`BridgeManager.absorbCatalog` 只要内容变化就必须广播 `catalog/updated`（`agentId` + `updatedAt`）；浏览器 `AcpStore.applyEvent` 收到后失效该 agent 的 `seatCatalogs` 并重读 `agent/catalog`（`loadAgentCatalog` 的 dedupe 保留）。不广播，首轮前打开的会话会永远停在旧列表，直到用户点「检测可用模型」——这正是「模型列表获取不完全」的真实症状（omp 实测：`session/new` 报 780，磁盘/浏览器停在 774）。`session/set_config_option` 的响应**只**反哺 `session.configOptions`，**严禁**喂进 `absorbCatalog`：那里的 `currentValue` 是这条会话的选择，升格成 agent 级 `reasoning.defaultEffort` 会让下一轮把座位刚选的思考等级静默改回去。
    - 原因：宿主平面没有 per-session 目录过滤 seam，"少列几个 provider"在宿主做不到；唯一结构性诚实的隔离就是"什么都不广告"，把 ACP 模型整体搬进插件自己的座位数据面（`agent/catalog`）。`buildModelCatalog` 是 await 的且对逐模型 `resolveModel` 异常整组连坐，所以这条路径还必须纯内存。
-   - 证据：[src/bridge.ts](file:///home/pax/coding/dsh-ntr/src/bridge.ts) 的 `AcpLlmAdapter.listModels`/`agentCatalog`/`resolveAdapterModel`/`absorbCatalog`/`bootstrapCatalogs`、[src/impl.ts](file:///home/pax/coding/dsh-ntr/src/impl.ts) 的 `dispatchRpc('agent/catalog')` 与 [tests/bridge.spec.ts](file:///home/pax/coding/dsh-ntr/tests/bridge.spec.ts) 的 "model catalog (isolated manager)" 套件。
+   - 证据：[src/bridge.ts](file:///home/pax/coding/dsh-ntr/src/bridge.ts) 的 `AcpLlmAdapter.listModels`/`agentCatalog`/`resolveAdapterModel`/`absorbCatalog`/`bootstrapCatalogs`、[src/impl.ts](file:///home/pax/coding/dsh-ntr/src/impl.ts) 的 `dispatchRpc('agent/catalog')`、[tests/bridge.spec.ts](file:///home/pax/coding/dsh-ntr/tests/bridge.spec.ts) 的 "model catalog (isolated manager)" 套件（含 "announces a catalog learned from a real session" 与 "does not re-apply an adapter-defaulted effort over the seat's own pick"）与 [tests/store.spec.ts](file:///home/pax/coding/dsh-ntr/tests/store.spec.ts) 的 "drops the cached seat catalog when the host announces a new one"。
 
 9. **模型可见性筛选必须走轻量 RPC，严禁复用 `agent/save` 全量保存**
-   - 规则：面板勾选 `exposedModels` 后经 `agent/set-exposed-models` 原地修改 def 并持久化（`setExposedModels`），不重启 agent 进程；`agent/save` 会停掉子进程、杀死全部活动会话，只能用于命令/参数等真正需要重建的变更。浏览器半区必须在保存后失效并重读该 agent 的座位目录缓存（`loadAgentCatalog`），否则已打开的对话仍列旧集合。
-   - 原因：座位菜单没有搜索功能，筛选是高频微调操作；每次勾选都杀会话的代价不可接受。
-   - 证据：[src/bridge.ts](file:///home/pax/coding/dsh-ntr/src/bridge.ts) 的 `setExposedModels`（对比 `saveAgent`）、[src/client/store.ts](file:///home/pax/coding/dsh-ntr/src/client/store.ts) 的 `loadAgentCatalog`/`invalidateSeatCatalog` 与 [src/client/panel.tsx](file:///home/pax/coding/dsh-ntr/src/client/panel.tsx) 的 `ModelCatalogBlock`。
+   - 规则：面板在双列表里选择 `exposedModels`（左全量 / 右已选）后经 `agent/set-exposed-models` 原地修改 def 并持久化（`setExposedModels`），不重启 agent 进程；`agent/save` 会停掉子进程、杀死全部活动会话，只能用于命令/参数等真正需要重建的变更。浏览器半区必须在保存后失效并重读该 agent 的座位目录缓存（`loadAgentCatalog`），否则已打开的对话仍列旧集合。
+   - 规则（自动发现，2026-10-20）：每个 agent 可开 `autoDiscoverModels`（面板的「自动发现新模型」开关），经 `agent/set-auto-discover-models` 轻量切换，同样不重启进程、不改动现有选择。开启后 `absorbCatalog` 把**相对上一份已知目录新增**的模型追加进 `exposedModels` 并持久化——首次观察到的目录只是基线（不会把 500 个模型一次全选），用户主动取消勾选的模型不会被“复活”。任何 `exposedModels` / 开关变更（含自动追加）都必须广播 `agent/exposure`，浏览器据此更新设置卡的 `currentConfig` 并失效/重读 `seatCatalogs`；`agent/status` 不携带这两个字段，不能替代它。
+   - 原因：座位菜单没有搜索功能，筛选是高频微调操作；每次勾选都杀会话的代价不可接受。自动发现按「新出现的模型」而不是「不在选择里的模型」判定，否则用户每次取消一个不想在菜单里看到的模型，都会在下一次会话里被重新加回来。
+   - 证据：[src/bridge.ts](file:///home/pax/coding/dsh-ntr/src/bridge.ts) 的 `setExposedModels`/`setAutoDiscoverModels`/`autoExposeNewModels`/`broadcastExposure`（对比 `saveAgent`）、[src/client/store.ts](file:///home/pax/coding/dsh-ntr/src/client/store.ts) 的 `loadAgentCatalog`/`invalidateSeatCatalog`/`agent/exposure` 事件、[src/client/panel.tsx](file:///home/pax/coding/dsh-ntr/src/client/panel.tsx) 的 `ModelCatalogBlock`。
 
 10. **agent 进程死亡 ≠ 会话销毁：必须走 released → 发送即恢复（`session/load`）路径**
     - 规则（崩溃路径）：`connectionLost` 只能走 `AgentBridge.releaseAll`（会话标记 `released`、settled 权限、广播 `session/released`），严禁在崩溃路径删除会话记录或广播 `session/closed`。
@@ -300,7 +302,7 @@
 
 - **禁止修改 [`lib/`](file:///home/pax/coding/dsh-ntr/lib)**：任何对 `lib/` 的手动修改都会被 `npm run build` 覆盖。
 - **禁止在 [`tsdown.config.ts`](file:///home/pax/coding/dsh-ntr/tsdown.config.ts) 中取消 external**：`react`、`react/jsx-runtime`、`@deepseek-ai/cordis`、`@deepseek-ai/dsh-client-ui-slots` 必须由运行时提供，打包进 bundle 会破坏 context 并导致运行时报错。
-- **禁止在子进程中透传未清洗的环境变量**：必须经过 [src/impl.ts](file:///home/pax/coding/dsh-ntr/src/impl.ts) 的 `childEnv` 脱敏（敏感命名变量与 `DSH_*` 不进入子进程）。
+- **子进程环境按「同级 agent」处理，严禁重新引入隐式凭据过滤**：ACP agent 不是 DSH 的子代理，用户期望它用起来像 DSH 原生 agent 一样顺畅。它的进程环境就是**完整的宿主环境**，再由该 agent 自己配置的 `env` 按键覆盖（[src/impl.ts](file:///home/pax/coding/dsh-ntr/src/impl.ts) 的 `childEnv`）。曾经按 `/KEY|PASSWORD|SECRET|TOKEN/i` 与 `DSH_*` 剥离环境变量，这会让依赖环境变量认证的 agent（pi 的 `$STEPFUN_API_KEY` 等自定义供应商）静默丢掉整个供应商的模型列表。若将来要恢复最小权限，必须做成**显式的 per-agent 开关**（如 `inheritEnv` 名单），不得用隐式规则重新砍掉默认继承。
 
 ## 常见任务配方
 
@@ -323,7 +325,7 @@
 ## 环境前置条件
 
 - **Node.js**：`>= 22.12.0`（`package.json` `engines`；代码依赖 Web Streams API 及 Node 22+ 特性）。
-- **Agent 密钥变量**：agent 子进程环境默认经 `childEnv` 脱敏、不隐式继承父进程密钥；agent 所需 Token 在 [cordis.patch.yml](file:///home/pax/coding/dsh-ntr/cordis.patch.yml) 的 `agents[].env` 中显式传递。
+- **Agent 密钥变量**：agent 子进程默认继承**完整的宿主环境**（与在终端里直接运行该 agent 一致），该 agent 自己配置的 `env`（设置页面板 / `cordis.patch.yml` 的 `agents[].env`）按键覆盖。依赖环境变量认证的 agent 因此能像在终端里一样看到它的全部供应商。
 
 ## 测试约定
 

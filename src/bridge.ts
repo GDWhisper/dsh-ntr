@@ -609,7 +609,7 @@ export class AgentBridge {
     this.stderrTail = []
     // Resolve (and, with npmPackage, auto-install) the executable before the
     // spawn; the resolved absolute path also pins the lookup to the host PATH
-    // plus the well-known extra dirs, not the scrubbed child env.
+    // plus the well-known extra dirs, not the child env the agent may override.
     const { command } = await ensureAgentExecutable(this.def, undefined, line => this.noteStderr(line))
     const cwd = safeSpawnCwd(this.def, this.wantedSpawnCwd)
     this.spawnCwd = cwd
@@ -1033,7 +1033,11 @@ export class AgentBridge {
     this.touch()
     const result = await conn.agent.request(methods.agent.session.setConfigOption, { sessionId: session.acpSessionId, configId, value }) as { configOptions?: unknown }
     // The response carries the full authoritative option set; some agents
-    // (pi-acp observed) never re-notify after a client-driven set.
+    // (pi-acp observed) never re-notify after a client-driven set. It feeds the
+    // SESSION snapshot only — never the agent-level catalog: `currentValue` in
+    // a per-session answer describes this session's pick, and promoting it to
+    // the catalog would turn the seat's own choice into `reasoning.defaultEffort`
+    // for every other conversation (and back onto itself next turn).
     if (Array.isArray(result.configOptions)) session.configOptions = result.configOptions as unknown[]
     this.publishMeta(session)
   }
@@ -2809,11 +2813,63 @@ export class BridgeManager {
     const catalog = parseCatalogOptions(configOptions)
     this.catalogStale.delete(agentId)
     const existing = this.catalogs.get(agentId)
-    if (existing !== undefined && JSON.stringify(existing.catalog) === JSON.stringify(catalog)) return existing
+    // Auto-discovery compares this observation against the catalog known
+    // BEFORE it. The first observation is only a baseline — nothing is "new"
+    // yet, and calling every choice of a 500-model catalog "new" would flood
+    // the selection the switch is meant to keep tidy.
+    const exposedChanged = this.autoExposeNewModels(agentId, catalog, existing?.catalog)
+    if (existing !== undefined && JSON.stringify(existing.catalog) === JSON.stringify(catalog)) {
+      if (exposedChanged) this.broadcastExposure(agentId)
+      return existing
+    }
     const entry = { catalog, updatedAt: Date.now() }
     this.catalogs.set(agentId, entry)
     this.persistCatalogs()
+    // The browser caches the seat surface per agent and only re-reads it when
+    // it is told to. A catalog learned from a REAL session is exactly the
+    // moment a conversation that was opened before that session needs the new
+    // list (first-turn convergence); probing it again would spawn a process.
+    this.hub.broadcast({ type: 'catalog/updated', agentId, updatedAt: entry.updatedAt })
+    // After the catalog lands, so a re-read triggered by this frame already
+    // sees the new models in `agent/catalog`'s variant expansion.
+    if (exposedChanged) this.broadcastExposure(agentId)
     return entry
+  }
+
+  /**
+   * Append models this observation newly introduced to the agent's selection.
+   *
+   * "Newly introduced" means present in `next` but absent from the catalog
+   * known `before` — NOT "absent from the selection". Comparing against the
+   * selection would resurrect a model the user deliberately unchecked every
+   * time the agent repeats its catalog. The first observation has no baseline
+   * (`before === undefined`), so it adds nothing; the user can still add the
+   * whole list with one click in the settings card.
+   */
+  private autoExposeNewModels(agentId: string, next: AcpAgentCatalog, before: AcpAgentCatalog | undefined): boolean {
+    const def = this.defsMap.get(agentId)
+    if (def?.autoDiscoverModels !== true || before === undefined) return false
+    const known = new Set((before.model?.choices ?? []).map(choice => choice.value))
+    const exposed = new Set(def.exposedModels ?? [])
+    const added = (next.model?.choices ?? [])
+      .map(choice => choice.value)
+      .filter(value => !known.has(value) && !exposed.has(value))
+    if (added.length === 0) return false
+    def.exposedModels = [...(def.exposedModels ?? []), ...added]
+    this.persistAgents()
+    return true
+  }
+
+  /** Tell the browser an agent's model-visibility surface changed outside `agent/save`. */
+  private broadcastExposure(agentId: string): void {
+    const def = this.defsMap.get(agentId)
+    if (def === undefined) return
+    this.hub.broadcast({
+      type: 'agent/exposure',
+      agentId,
+      exposedModels: [...(def.exposedModels ?? [])],
+      autoDiscoverModels: def.autoDiscoverModels === true,
+    })
   }
 
   catalogFor(agentId: string): AcpAgentCatalog | undefined {
@@ -3198,6 +3254,22 @@ export class BridgeManager {
       state: bridge?.state ?? 'stopped',
       ...(bridge === undefined ? {} : { agent: bridge.view() }),
     })
+    this.broadcastExposure(agentId)
+  }
+
+  /**
+   * Toggle auto-discovery of newly published models. Lightweight like
+   * `setExposedModels`: the def is mutated in place (live bridges share the
+   * object) and persisted; no process is restarted, and the current selection
+   * is left exactly as it is.
+   */
+  async setAutoDiscoverModels(agentId: string, autoDiscoverModels: boolean): Promise<void> {
+    const def = this.defsMap.get(agentId)
+    if (def === undefined) throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
+    if (autoDiscoverModels) def.autoDiscoverModels = true
+    else delete def.autoDiscoverModels
+    this.persistAgents()
+    this.broadcastExposure(agentId)
   }
 
   async deleteAgent(agentId: string): Promise<void> {

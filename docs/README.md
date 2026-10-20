@@ -7,7 +7,8 @@
   - 对话内的 NTR 面：三块芯片（agent / 模型 / 思考等级）的权威来源各自是什么、模型面为什么另走 `agent/catalog`、权限档整格占空，以及 NTR 视图 tab 如何用 `session/chat-transcript` 渲染计划、完整工具输出与 unified diff
   - 双向模型隔离：宿主侧"什么都不广告"（ACP 模型不进 DSH 目录，`/model` 弹窗也不例外）+ 浏览器侧由 `createModelSeatClaim` 接管原生座位（occupant 是 NTR 底座本体，按当前会话 preset 动态注册；注册后用 `entriesOfSlot` 核实 cell 的 head 是不是自己，被抢走就再注册一次，上限 `MAX_SEAT_CLAIMS`，到顶如实报「被谁占着」；放弃时回到原生座位）
 - [NTR 待办清单](./acp-todo.md)
-  - 用户已报告、尚未落地的 NTR 面意向：模型列表获取不完全（含浏览器端目录缓存一层）、NTR 模式下原生输入框透传 agent 自己的命令（同名命令会被客户端命令层消费）。agent 底座首轮开始时隐藏并锁定、改由输入框上边缘挂牌显示（首轮无可见输出则回滚），已落地
+  - 用户已报告、尚未落地的 NTR 面意向：模型列表获取不完全（含浏览器端目录缓存一层）、NTR 模式下原生输入框透传 agent 自己的命令（同名命令会被客户端命令层消费）
+  - agent 底座首轮开始时隐藏并锁定、改由输入框上边缘挂牌显示（首轮无可见输出则回滚）已落地，去向见文末
   - 每条附已核实事实、预分析纠错、实施步骤与验收标准；落地后结论并回 AGENTS.md，本文件留下落点去向
 - [ACP 会话的权限对齐调研（DSH Access mode ↔ ACP 权限）](./acp-permission-and-sandbox.md)
   - 两个权限旋钮的实体与证据（preset / projection / sandbox / approval）
