@@ -29,6 +29,8 @@ import {
   acpModeFromPresetEvent, rowAgentPreset, stagedIsAcpMode, stagedSessionOf,
 } from './acp-ui.tsx'
 import type { AcpChatInjected, AcpSessionFace, AcpSessionsSnapshot, SessionListSource } from './acp-ui.tsx'
+import { createSlashIsolation, slashAcpVerdict } from './slash-isolation.ts'
+import type { SlashSource } from './slash-isolation.ts'
 
 export const name = 'dsh-ntr-client'
 export const inject = ['slots', 'connection']
@@ -78,6 +80,15 @@ const zh = typeof navigator !== 'undefined' && /^zh\b/i.test(navigator.language)
  * (the resolve-loop the one-shot ask was bought to prevent).
  */
 const ACP_MODE_VERDICT_TTL_MS = 2000
+
+/**
+ * Slash-source discovery retry (see the slash-isolation effect): a source
+ * registers with no event, so a module that loads after this one is found by
+ * polling the roster a bounded number of times. 20 × 500ms covers a slow page
+ * load; the timer stops as soon as a source is wrapped.
+ */
+const SLASH_SYNC_ATTEMPTS = 20
+const SLASH_SYNC_DELAY_MS = 500
 
 export function apply(ctx: Context): void {
   const connection = ctx.get('connection') as BrowserConnection | undefined
@@ -517,6 +528,124 @@ export function apply(ctx: Context): void {
       store.notePermissionSeatDiag('gate disposed')
     }
   }, 'dsh-ntr: ACP mode tracking')
+
+  /**
+   * Slash isolation (`src/client/slash-isolation.ts`): in an ACP conversation
+   * the composer's `/` menu, Enter and Space adjudication belong to the AGENT.
+   * The host's slash sources describe commands THIS runtime would execute, and
+   * a name they recognize never reaches the prompt sink — so `/model` in an NTR
+   * conversation would run DSH's model picker instead of reaching the agent.
+   *
+   * The host pipeline offers no per-session seam (adjudication polls sources in
+   * registration order; duplicates throw; no availability hook), so the live
+   * sources are wrapped in memory. The verdict is the same two-source read the
+   * seat gate uses: the staged row's own preset, else the host's answer.
+   *
+   * Re-runs on `internal/service` (a late `inputTriggers`) and on store traffic
+   * (a source registering after us), and is idempotent. Everything is restored
+   * on teardown so a plugin reload never leaves the previous instance's
+   * callbacks behind.
+   */
+  ctx.effect(() => {
+    let warned = ''
+    const isolation = createSlashIsolation({
+      sources: () => {
+        const triggers = service<{ live?: { sources?: unknown } }>('inputTriggers')
+        // A host WITHOUT the trigger service has no slash menu, so there is
+        // nothing to isolate and nothing to report. A service whose shape is
+        // not what this module knows is different: that returns undefined and
+        // is reported (the seam degraded open, which needs a line).
+        if (triggers === undefined) return []
+        const sources = triggers.live?.sources
+        return Array.isArray(sources) ? sources as SlashSource[] : undefined
+      },
+      verdict: (sessionId) => slashAcpVerdict(
+        sessionsList()?.getSnapshot(),
+        sessionId,
+        id => store.getSnapshot().acpMode[id],
+      ),
+      ensureVerdict: async (sessionId) => {
+        const held = (): boolean | undefined => slashAcpVerdict(
+          sessionsList()?.getSnapshot(),
+          sessionId,
+          id => store.getSnapshot().acpMode[id],
+        )
+        const known = held()
+        if (known !== undefined) return known
+        await store.loadChatSessions(sessionId)
+        return held()
+      },
+      // The LIVE session's declaration wins; a conversation that has not sent
+      // its first message yet falls back to the agent-level cache learned from
+      // earlier sessions (`agent/catalog` → `commands`). That fallback is what
+      // makes `/` list the agent's commands immediately, like the native menu,
+      // instead of waiting for a session that only the first message creates.
+      commands: async (sessionId) => {
+        const live = store.chatSessionCommands(sessionId)
+        if (live !== undefined) return live
+        const agentId = store.chatAgentFor(sessionId)
+        if (agentId === undefined) return undefined
+        const cached = store.agentCommands(agentId)
+        if (cached !== undefined) return cached
+        // `agent/catalog` is pure memory on the host — no probe is spawned by
+        // this read (constraint 8); an agent with no cached list simply stays
+        // absent, and the menu shows nothing until its first session declares.
+        await store.loadAgentCatalog(agentId)
+        return store.agentCommands(agentId)
+      },
+      refresh: (sessionId) => { void store.loadChatSessions(sessionId) },
+      onDiag: (line) => {
+        store.noteSlashDiag(line)
+        // Console once per distinct line: the NTR view shows the same string,
+        // but a shape change is exactly the kind of thing a bug report needs a
+        // timestamped console record of.
+        if (warned === line) return
+        warned = line
+        if (line !== 'idle') console.warn(`[dsh-ntr] slash isolation: ${line}`)
+      },
+    })
+    /**
+     * Sources register with no event of their own: `inputTriggers` announces
+     * the SERVICE, not the roster. A client module that loads after this one
+     * therefore adds the `command` source in silence. The retry below is the
+     * bounded answer to that gap — stop as soon as something is wrapped, and
+     * give up after {@link SLASH_SYNC_ATTEMPTS} so a host with no slash
+     * pipeline does not keep a timer alive.
+     */
+    let retryTimer: ReturnType<typeof setTimeout> | undefined
+    let attempts = 0
+    const sync = (): void => {
+      if (isolation.sync()) {
+        if (retryTimer !== undefined) {
+          clearTimeout(retryTimer)
+          retryTimer = undefined
+        }
+        return
+      }
+      // The service's arrival is announced (`internal/service`), so there is
+      // nothing to poll for until it exists; the gap this retry closes is a
+      // roster that is still empty while the service is already there.
+      if (service('inputTriggers') === undefined) return
+      if (retryTimer !== undefined || attempts >= SLASH_SYNC_ATTEMPTS) return
+      attempts += 1
+      retryTimer = setTimeout(() => {
+        retryTimer = undefined
+        sync()
+      }, SLASH_SYNC_DELAY_MS)
+    }
+    sync()
+    const stopService = ctx.on('internal/service', sync)
+    // Store traffic is guaranteed after mount; sync is cheap and idempotent
+    // once everything is wrapped.
+    const stopStore = store.subscribe(sync)
+    return () => {
+      if (retryTimer !== undefined) clearTimeout(retryTimer)
+      stopStore()
+      stopService()
+      isolation.dispose()
+      store.noteSlashDiag('idle')
+    }
+  }, 'dsh-ntr: slash isolation')
 
   // The ACP view tab: the agent's real stream (tool cards, plans, unified
   // diffs). Session-scope list entry; the view ring renders it one tab at a

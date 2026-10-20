@@ -2694,6 +2694,55 @@ describe('pre-chat pick persistence (isolated manager)', () => {
     await gm.shutdownAll()
   })
 
+  it('reports the agent\'s own slash commands with the chat session view', async () => {
+    const gm = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, `${tmpdir()}/acp-pick-commands-${Date.now()}.json`)
+    gm.bindChatAgent('dsh-pick-cmd', 'picked')
+    for await (const _ of gm.streamPrompt({
+      model: 'picked',
+      sessionId: 'dsh-pick-cmd',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    } as never)) { /* drain */ }
+
+    // The composer's `/` menu is the agent's in an NTR conversation, and these
+    // are its rows: the whole row the agent declared, not just a name.
+    expect(gm.chatSessions('dsh-pick-cmd')[0]?.availableCommands).toEqual([
+      { name: 'greet', description: 'say hi' },
+    ])
+    // The same declaration is cached per agent, so a conversation that has no
+    // session yet can list it before its first message.
+    expect(gm.agentCatalog('picked').commands).toEqual([{ name: 'greet', description: 'say hi' }])
+    await gm.shutdownAll()
+  }, 30_000)
+
+  it('keeps the agent\'s slash commands across a host restart', async () => {
+    // The cache is what `/` reads in a brand-new conversation, so it has to
+    // outlive the process that learned it — like the model catalog does.
+    const home = join(tmpdir(), `acp-cmd-cache-${Date.now()}`)
+    mkdirSync(home, { recursive: true })
+    const previous = process.env.DSH_NTR_STATE_DIR
+    process.env.DSH_NTR_STATE_DIR = join(home, 'state')
+    try {
+      const first = new BridgeManager([{ ...def, id: 'cmd-cache' }], pickHub, 500, join(home, 'agents.json'))
+      first.bindChatAgent('dsh-cmd-1', 'cmd-cache')
+      for await (const _ of first.streamPrompt({
+        model: 'cmd-cache',
+        sessionId: 'dsh-cmd-1',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      } as never)) { /* drain */ }
+      await first.shutdownAll()
+
+      const second = new BridgeManager([{ ...def, id: 'cmd-cache' }], pickHub, 500, join(home, 'agents.json'))
+      // No live session for this conversation...
+      expect(second.chatSessions('dsh-cmd-1')).toEqual([])
+      // ...but the agent-level answer is there.
+      expect(second.agentCatalog('cmd-cache').commands).toEqual([{ name: 'greet', description: 'say hi' }])
+      await second.shutdownAll()
+    } finally {
+      if (previous === undefined) delete process.env.DSH_NTR_STATE_DIR
+      else process.env.DSH_NTR_STATE_DIR = previous
+    }
+  }, 30_000)
+
   it('survives a host restart, because the pick belongs to the conversation, not the process', async () => {
     const storage = `${tmpdir()}/acp-pick-restart-${Date.now()}.json`
     const first = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)

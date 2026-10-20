@@ -812,7 +812,7 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
    * session-list rows that carry no `agentPreset`, so the row cannot answer and
    * only the verdict map can.
    */
-  function makeHost(options: { silentRow?: boolean; withList?: boolean } = {}) {
+  function makeHost(options: { silentRow?: boolean; withList?: boolean; triggers?: unknown[] } = {}) {
     interface Entry { component: unknown; options: { priority: number; registrant?: string }; inject?: unknown }
     const cells = new Map<string, Entry[]>()
     const declared = new Set<string>([MODEL_SEAT_KEY, PERMISSION_SEAT_KEY])
@@ -897,6 +897,9 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
         if (key === 'sessions') {
           if (options.withList === false) return undefined
           return { binding: () => undefined, list }
+        }
+        if (key === 'inputTriggers') {
+          return options.triggers === undefined ? undefined : { live: { sources: options.triggers } }
         }
         if (key === 'remote') return { $on: (event: string, cb: (...args: unknown[]) => void) => {
           const handlers = remoteHandlers.get(event) ?? []
@@ -1110,5 +1113,38 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  /**
+   * The slash-isolation WIRING, through the real `apply()`: the registry is a
+   * service this bundle does not depend on (`ctx.get('inputTriggers')`), and
+   * the per-call verdict has to come from the same staged-row/host-read pair
+   * the seat gate uses. The wrapper's own decision table is covered in
+   * tests/slash-isolation.spec.ts; this pins that the live source is actually
+   * reached from the entry point, and that an ordinary session keeps the
+   * host's answers.
+   */
+  it('isolates the live slash source for the ACP session only (real apply)', async () => {
+    const calls: string[] = []
+    const source = {
+      trigger: '/',
+      name: 'command',
+      candidates: async (..._args: unknown[]) => { calls.push('candidates'); return [{ name: 'model' }] },
+      matchEnter: async (..._args: unknown[]) => { calls.push('matchEnter'); return 'handled' },
+      matchSpace: (..._args: unknown[]) => { calls.push('matchSpace'); return { claim: { name: 'model' } } },
+      onPick: (..._args: unknown[]) => { calls.push('onPick'); return 'handled' },
+    }
+    const host = makeHost({ triggers: [source] })
+    apply(host.ctx as never)
+    host.stage('s1', { agentPreset: ACP_PRESET_ID })
+
+    expect(await source.matchEnter({ sessionId: 's1' }, '/model', new AbortController().signal, { attachments: 0 })).toBeUndefined()
+    expect(source.matchSpace({ sessionId: 's1' }, '/model')).toBeUndefined()
+    expect(source.onPick({ candidate: { name: 'model' }, session: { sessionId: 's1' } })).toEqual({ text: '/model ' })
+
+    // A conversation that is not in ACP mode is untouched.
+    expect(await source.matchEnter({ sessionId: 's2' }, '/model', new AbortController().signal, { attachments: 0 })).toBe('handled')
+    expect(source.matchSpace({ sessionId: 's2' }, '/model')).toEqual({ claim: { name: 'model' } })
+    expect(calls).toEqual(['matchEnter', 'matchSpace'])
   })
 })

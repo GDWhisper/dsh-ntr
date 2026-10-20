@@ -8,6 +8,9 @@
 
 import type { AcpConversationChoice, AcpEvent, AcpPresetStatus, AgentCatalogResult, AgentProbeModelsResult, AgentSavePayload, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, SessionView } from '../protocol.ts'
 
+/** One slash command the ACP agent declared, whole row (the menu draws name, description and `input.hint`). */
+export type AgentCommand = NonNullable<ChatSessionView['availableCommands']>[number]
+
 /** The unary RPC face (narrowed `ctx.connection.rpc.call`). */
 export type RpcCall = (channel: string, endpoint: string, payload: unknown) => Promise<
   | { ok: true; value: unknown }
@@ -206,6 +209,13 @@ export interface UiState {
    * Diagnostic summary from the permission-seat blanking gate (`conversation.input.permission`).
    */
   permissionSeatDiag: string
+  /**
+   * Why slash isolation is not in force, when it is not (`idle` while it is).
+   * Isolation degrades OPEN — an unrecognized source shape leaves the host's
+   * commands in charge — so without this line the only symptom would be a menu
+   * that quietly lists the wrong commands.
+   */
+  slashDiag: string
   /**
    * Observed ACP transcripts keyed by ACP session id. Only sessions the
    * conversation's ACP view asked for are watched (live `session/update`
@@ -447,6 +457,7 @@ export class AcpStore {
     chatChoice: {},
     seatDiag: 'idle',
     permissionSeatDiag: 'idle',
+    slashDiag: 'idle',
   }
 
   private readonly listeners = new Set<Listener>()
@@ -455,7 +466,7 @@ export class AcpStore {
   /** Sessions with a finalized turn (dedups the cancel-fallback + late real turn/end pair). */
   private readonly openTurns = new Set<string>()
   /** In-flight `session/chat-list` reads, keyed by chat session id. */
-  private readonly chatSessionReads = new Map<string, { dropped: boolean }>()
+  private readonly chatSessionReads = new Map<string, { dropped: boolean; done: Promise<void> }>()
   /**
    * Chat sessions whose list has answered at least once in this page. The
    * FIRST answer only seeds the lock; a lock appearing on a later answer is a
@@ -896,13 +907,26 @@ export class AcpStore {
    * framed can still be learned from. Composer readers pass nothing and keep
    * the frame's authority.
    */
-  async loadChatSessions(dshSessionId: string, options?: { settleVerdict?: boolean }): Promise<void> {
+  loadChatSessions(dshSessionId: string, options?: { settleVerdict?: boolean }): Promise<void> {
     // Two composer entries read this (the agent-mode control and the ACP
     // cluster) and both re-read when a turn settles; one round-trip answers
-    // for both instead of two racing ones.
-    if (this.chatSessionReads.has(dshSessionId)) return
-    const read = { dropped: false }
+    // for both instead of two racing ones. A caller arriving mid-read waits
+    // for THAT read rather than returning immediately: the slash source's
+    // one-shot "do I have a verdict yet?" ask is only useful if it can
+    // receive the answer of a read already in flight.
+    const inFlight = this.chatSessionReads.get(dshSessionId)
+    if (inFlight !== undefined) return inFlight.done
+    const read: { dropped: boolean; done: Promise<void> } = { dropped: false, done: Promise.resolve() }
     this.chatSessionReads.set(dshSessionId, read)
+    read.done = this.readChatSessionList(dshSessionId, options, read)
+    return read.done
+  }
+
+  private async readChatSessionList(
+    dshSessionId: string,
+    options: { settleVerdict?: boolean } | undefined,
+    read: { dropped: boolean },
+  ): Promise<void> {
     const settle = options?.settleVerdict === true || !this.acpModeLive.has(dshSessionId)
     try {
       const { sessions, acpMode, boundAgentId, lockedAgentId, choice } = await this.call<{ sessions: ChatSessionView[]; acpMode?: boolean; boundAgentId?: string; lockedAgentId?: string; choice?: AcpConversationChoice }>('session/chat-list', { dshSessionId, refresh: true })
@@ -1003,6 +1027,50 @@ export class AcpStore {
   }
 
   /**
+   * The slash commands the LIVE ACP session declared for one chat session, as
+   * read by {@link loadChatSessions} (`available_commands_update` →
+   * `session/chat-list`).
+   *
+   * `undefined` covers both "no answer has landed yet" and "there is no live
+   * session (or it has not declared anything)" — in every one of those cases
+   * the caller falls back to the agent-level cache ({@link agentCommands}),
+   * which is what makes `/` list commands before the first message exists.
+   */
+  chatSessionCommands(dshSessionId: string): readonly AgentCommand[] | undefined {
+    if (this.state.chatSessionsFor !== dshSessionId) return undefined
+    return this.state.chatSessions[0]?.availableCommands
+  }
+
+  /**
+   * The slash commands the agent declared in its most recent session, from
+   * `agent/catalog` (host-cached per agent, see `AgentCatalogResult.commands`).
+   * The pre-first-turn source for the `/` menu.
+   */
+  agentCommands(agentId: string | undefined): readonly AgentCommand[] | undefined {
+    if (agentId === undefined) return undefined
+    return this.state.seatCatalogs[agentId]?.commands
+  }
+
+  /**
+   * Which agent serves one conversation as far as this page can tell, without
+   * reading any catalog: live ACP session → agent lock → host/optimistic
+   * binding → persisted pick → plugin default. Used to find the agent whose
+   * cached commands the `/` menu should offer before a session exists.
+   */
+  chatAgentFor(dshSessionId: string): string | undefined {
+    if (this.state.chatSessionsFor === dshSessionId) {
+      const live = this.state.chatSessions[0]
+      if (live !== undefined) return live.agentId
+    }
+    // The lock outlives the session: after the first turn it is the durable
+    // answer even when the ACP session is gone.
+    return this.state.chatLockedAgent[dshSessionId]
+      ?? this.state.chatBoundAgent[dshSessionId]
+      ?? this.state.chatChoice[dshSessionId]?.agentId
+      ?? this.state.defaultAgent
+  }
+
+  /**
    * Record the verdict a committed `agent-preset/selected` frame carries, folded
    * from the frame's own preset field ({@link acpModeFromPresetEvent}). The
    * frame is authoritative: it marks the session live-settled, so no later host
@@ -1034,6 +1102,15 @@ export class AcpStore {
   notePermissionSeatDiag(text: string): void {
     if (this.state.permissionSeatDiag === text) return
     this.mutate({ permissionSeatDiag: text })
+  }
+
+  /**
+   * Record the slash-isolation seam's last verdict (`idle` = in force, or no
+   * problem to report). No-op when unchanged, like the seat lines.
+   */
+  noteSlashDiag(text: string): void {
+    if (this.state.slashDiag === text) return
+    this.mutate({ slashDiag: text })
   }
 
   /**
@@ -1427,9 +1504,10 @@ export class AcpStore {
         return Promise.resolve()
       }
       case 'catalog/updated': {
-        // The host learned a new catalog from a real session (its session/new,
-        // session/load, or a config_option_update). The seat list is a cached
-        // projection of it, so drop and re-read it — deduped by
+        // The host learned a new catalog, or a new slash-command list, from a
+        // real session (its session/new, session/load, a config_option_update,
+        // or an available_commands_update). The seat list is a cached
+        // projection of both, so drop and re-read it — deduped by
         // `loadAgentCatalog`, and memory-only on the host, so this never starts
         // a probe.
         this.invalidateSeatCatalog(event.agentId)

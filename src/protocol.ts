@@ -227,12 +227,14 @@ export type AcpEvent =
   }
   | { type: 'session/update'; sessionId: string; seq: number; update: SessionUpdate }
   /**
-   * One agent's model catalog changed on the host because a real session
-   * published new `configOptions` (its `session/new` / `session/load`, or a
-   * `config_option_update`). The browser must drop its cached seat catalog for
-   * that agent and re-read `agent/catalog`; without this, a conversation opened
-   * before the agent's first real session keeps rendering yesterday's model
-   * list until someone presses "detect models" (user report, 2026-10-19).
+   * One agent's learned surface changed on the host because a real session
+   * published new `configOptions` or `availableCommands` (its `session/new` /
+   * `session/load`, a `config_option_update`, or an
+   * `available_commands_update`). The browser must drop its cached seat
+   * catalog for that agent and re-read `agent/catalog`; without this, a
+   * conversation opened before the agent's first real session keeps rendering
+   * yesterday's model list (user report, 2026-10-19) — and a conversation
+   * opened after it would miss the agent's slash commands until a reload.
    */
   | { type: 'catalog/updated'; agentId: string; updatedAt: number }
   /**
@@ -322,8 +324,9 @@ export type SessionsListResult = { sessions: SessionView[] }
 /**
  * One ACP agent session currently backing a DSH chat session, looked up by the
  * chat session id the composer already knows. This is what lets the browser
- * expose an agent's OWN mode list, model and thought level in the conversation
- * (the ACP-native controls), independently of DSH's model selection.
+ * expose an agent's OWN mode list, model, thought level AND slash commands in
+ * the conversation (the ACP-native controls), independently of DSH's model
+ * selection and command catalog.
  */
 export interface ChatSessionView {
   agentId: string
@@ -342,6 +345,13 @@ export interface ChatSessionView {
   reasoningEffort?: string
   /** The agent's declared modes, when it has any (`session/new` / `session/load`). */
   modes?: SessionView['modes']
+  /**
+   * The slash commands the agent declared (`available_commands_update`). The
+   * composer's `/` menu shows THESE in an ACP conversation — the host's own
+   * command catalog describes commands this runtime would execute, which the
+   * agent can never see.
+   */
+  availableCommands?: SessionView['availableCommands']
   /** The agent process died; the session awaits a `session/load` resume. */
   released?: boolean
 }
@@ -643,6 +653,19 @@ export interface AgentCatalogResult {
     currentValue?: string
     choices: Array<{ id: string; name: string; description?: string }>
   }
+  /**
+   * The slash commands this agent declared in its most recent session
+   * (`available_commands_update`), cached per agent.
+   *
+   * A live session reports its own list through `session/chat-list`, and that
+   * one always wins. This copy exists for the window BEFORE a conversation has
+   * an ACP session: typing `/` in a fresh NTR conversation must list the
+   * agent's commands, the way the native menu lists DSH's — waiting for the
+   * first message to discover them is what makes the menu look empty.
+   */
+  commands?: SessionView['availableCommands']
+  /** When those commands were last observed. */
+  commandsUpdatedAt?: number
   /** A probe has produced a catalog for this agent (`false` → base entry only). */
   probed: boolean
   /** When the cached catalog was last refreshed. */

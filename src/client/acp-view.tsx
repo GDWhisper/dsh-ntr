@@ -492,6 +492,17 @@ export function AcpConversationView(props: AcpViewProps) {
               {t('权限底座', 'permission seat')} · {ui.permissionSeatDiag}
             </div>
           )}
+          {/*
+            Slash isolation degrades open (an unrecognized host source shape
+            leaves the host's commands in charge). That is the safe failure,
+            but it looks exactly like the feature never having existed — the
+            menu simply lists DSH's commands again. Say so.
+          */}
+          {ui.slashDiag !== 'idle' && (
+            <div className="ntr-acp-empty-hint ntr-acp-seat-diag">
+              {t('斜杠菜单', 'slash menu')} · {ui.slashDiag}
+            </div>
+          )}
         </div>
       </div>
     )

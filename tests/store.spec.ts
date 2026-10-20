@@ -357,6 +357,96 @@ describe('AcpStore agent management', () => {
     expect(store.getSnapshot().notice).toBeUndefined()
   })
 
+  it('exposes the agent slash commands a chat-list answer carries', async () => {
+    const store = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint === 'session/chat-list') {
+        return {
+          ok: true,
+          value: {
+            sessions: [{
+              agentId: 'pi',
+              sessionId: 's1',
+              availableCommands: [{ name: 'compact', description: 'compress the context' }, { name: 'session' }],
+            }],
+          },
+        }
+      }
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+
+    // No answer for this conversation yet: the caller may ask.
+    expect(store.chatSessionCommands('chat-1')).toBeUndefined()
+    await store.loadChatSessions('chat-1')
+    expect(store.chatSessionCommands('chat-1')).toEqual([
+      { name: 'compact', description: 'compress the context' },
+      { name: 'session' },
+    ])
+    // Another conversation is not answered by this one's read.
+    expect(store.chatSessionCommands('chat-2')).toBeUndefined()
+
+    // A read that lands with no live ACP session has no LIVE declaration —
+    // `undefined`, so the caller falls back to the agent-level cache instead
+    // of reading "no session" as "this agent has no commands".
+    const idle = new AcpStore(async () => ({ ok: true, value: { sessions: [] } }), (zh) => zh)
+    await idle.loadChatSessions('chat-1')
+    expect(idle.chatSessionCommands('chat-1')).toBeUndefined()
+  })
+
+  it('offers the agent-level command cache before the conversation has a session', async () => {
+    const store = new AcpStore(async (_channel, endpoint, payload) => {
+      if (endpoint === 'session/chat-list') {
+        return { ok: true, value: { sessions: [], acpMode: true, boundAgentId: 'pi' } }
+      }
+      if (endpoint === 'agent/catalog') {
+        expect(payload).toEqual({ agentId: 'pi' })
+        return {
+          ok: true,
+          value: {
+            agentId: 'pi',
+            title: 'Pi',
+            base: { id: 'pi', name: 'Pi' },
+            variants: [],
+            probed: true,
+            commands: [{ name: 'compact', description: 'compress the context' }],
+          },
+        }
+      }
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+
+    await store.loadChatSessions('chat-1')
+    // No live declaration...
+    expect(store.chatSessionCommands('chat-1')).toBeUndefined()
+    // ...so the menu asks which agent serves the conversation, then that
+    // agent's cached catalogue.
+    expect(store.chatAgentFor('chat-1')).toBe('pi')
+    expect(store.agentCommands('pi')).toBeUndefined()
+    await store.loadAgentCatalog('pi')
+    expect(store.agentCommands('pi')).toEqual([{ name: 'compact', description: 'compress the context' }])
+  })
+
+  it('makes a caller that arrives mid-read wait for THAT read', async () => {
+    let release: (() => void) | undefined
+    const reads: string[] = []
+    const store = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint === 'session/chat-list') {
+        reads.push('read')
+        await new Promise<void>(resolve => { release = resolve })
+        return { ok: true, value: { sessions: [{ agentId: 'pi', sessionId: 's1', availableCommands: [{ name: 'compact' }] }] } }
+      }
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+
+    const first = store.loadChatSessions('chat-1')
+    // The slash source asks while the composer's read is still in flight: it
+    // must receive the answer of that read, not resolve against the old state.
+    const second = store.loadChatSessions('chat-1')
+    release?.()
+    await Promise.all([first, second])
+    expect(reads).toEqual(['read'])
+    expect(store.chatSessionCommands('chat-1')).toEqual([{ name: 'compact' }])
+  })
+
   it('degrades silently when the host has no chat-session mode surface', async () => {
     const store = new AcpStore(async () => ({ ok: false, error: { code: 'unknown_endpoint', message: 'nope' } }), (zh) => zh)
     await store.loadChatSessions('chat-1')

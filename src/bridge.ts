@@ -342,6 +342,8 @@ export class AgentBridge {
     private readonly onConnectionLost: (bridge: AgentBridge, reason: string) => void,
     /** Observes `configOptions` from any real session so the manager's model catalog stays warm. */
     private readonly onCatalog?: (agentId: string, configOptions: unknown) => void,
+    /** Observes `availableCommands` from any real session so the agent's slash menu survives its sessions. */
+    private readonly onCommands?: (agentId: string, commands: NonNullable<SessionView['availableCommands']>) => void,
     tuning?: BridgeTuning,
     /**
      * Resolved per ask (not captured) so a requester wired after this bridge
@@ -1357,10 +1359,12 @@ export class AgentBridge {
         // Spread the whole command, not just name+description: the protocol
         // grows fields (and agents already send `input` hints), and a room the
         // picker has no widget for is still something the agent declared.
-        session.availableCommands = update.availableCommands.map(c => ({
+        const commands = update.availableCommands.map(c => ({
           ...(c as unknown as Record<string, unknown>),
           ...(c.description !== null && c.description !== undefined ? { description: c.description } : {}),
-        })) as typeof session.availableCommands
+        })) as NonNullable<SessionView['availableCommands']>
+        session.availableCommands = commands
+        this.onCommands?.(this.def.id, commands)
         break
       case 'plan':
         session.plan = update.entries
@@ -2034,8 +2038,13 @@ export class BridgeManager {
     routeBindingRegistry().defaultModel = this.defaultAgent()
   }
 
-  private makeBridge(def: AcpAgentDef, onConnectionLost: (bridge: AgentBridge, reason: string) => void, onCatalog?: (agentId: string, configOptions: unknown) => void): AgentBridge {
-    return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, this.tuning, () => this.approvalRequester, () => this.sessionWorkspaceResolver)
+  private makeBridge(
+    def: AcpAgentDef,
+    onConnectionLost: (bridge: AgentBridge, reason: string) => void,
+    onCatalog?: (agentId: string, configOptions: unknown) => void,
+    onCommands?: (agentId: string, commands: NonNullable<SessionView['availableCommands']>) => void,
+  ): AgentBridge {
+    return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, onCommands, this.tuning, () => this.approvalRequester, () => this.sessionWorkspaceResolver)
   }
 
   /**
@@ -2176,6 +2185,7 @@ export class BridgeManager {
         ...(session.modelId === undefined ? {} : { modelId: session.modelId }),
         ...(session.reasoningEffort === undefined ? {} : { reasoningEffort: session.reasoningEffort }),
         ...(session.modes === undefined ? {} : { modes: session.modes }),
+        ...(session.availableCommands === undefined ? {} : { availableCommands: session.availableCommands }),
         ...(session.released ? { released: true } : {}),
       })
     }
@@ -2722,6 +2732,17 @@ export class BridgeManager {
 
   private readonly catalogs = new Map<string, { catalog: AcpAgentCatalog; updatedAt: number }>()
   /**
+   * The slash commands each agent declared in its most recent session, cached
+   * per agent and persisted alongside the model catalog.
+   *
+   * This is what makes `/` list an agent's commands in a conversation that has
+   * not sent its first message yet: before `session/new` there is no live
+   * session to ask, and the native menu's immediacy is the bar. A live
+   * session's own declaration always outranks this cache. It is learned, never
+   * probed — a `session/new` for a menu would spawn an agent (constraint 8).
+   */
+  private readonly commandCache = new Map<string, { commands: NonNullable<SessionView['availableCommands']>; updatedAt: number }>()
+  /**
    * Catalog schema the persisted file was written with. Bumped when a parser
    * gains a category, so a cache written by an older build is KNOWN to be
    * incomplete — a persisted `{model, thought}` catalog from v1 would otherwise
@@ -2775,7 +2796,15 @@ export class BridgeManager {
       const stale = parsed.version !== BridgeManager.CATALOG_SCHEMA
       for (const [agentId, raw] of Object.entries(agents)) {
         if (typeof raw !== 'object' || raw === null) continue
-        const row = raw as { catalog?: unknown; updatedAt?: unknown }
+        const row = raw as { catalog?: unknown; updatedAt?: unknown; commands?: unknown; commandsUpdatedAt?: unknown }
+        // Commands and the model catalog are learned independently (a session
+        // may declare one before the other), so either half alone is a valid row.
+        if (Array.isArray(row.commands)) {
+          this.commandCache.set(agentId, {
+            commands: row.commands as NonNullable<SessionView['availableCommands']>,
+            updatedAt: typeof row.commandsUpdatedAt === 'number' ? row.commandsUpdatedAt : 0,
+          })
+        }
         if (typeof row.catalog !== 'object' || row.catalog === null) continue
         this.catalogs.set(agentId, {
           catalog: row.catalog as AcpAgentCatalog,
@@ -2792,8 +2821,16 @@ export class BridgeManager {
     const filePath = this.getCatalogStoragePath()
     if (!filePath) return
     try {
-      const agents: Record<string, { catalog: AcpAgentCatalog; updatedAt: number }> = {}
-      for (const [agentId, entry] of this.catalogs) agents[agentId] = entry
+      const agents: Record<string, {
+        catalog?: AcpAgentCatalog
+        updatedAt?: number
+        commands?: NonNullable<SessionView['availableCommands']>
+        commandsUpdatedAt?: number
+      }> = {}
+      for (const [agentId, entry] of this.catalogs) agents[agentId] = { catalog: entry.catalog, updatedAt: entry.updatedAt }
+      for (const [agentId, entry] of this.commandCache) {
+        agents[agentId] = { ...(agents[agentId] ?? {}), commands: entry.commands, commandsUpdatedAt: entry.updatedAt }
+      }
       writeFileSync(filePath, JSON.stringify({ version: BridgeManager.CATALOG_SCHEMA, agents }, null, 2), 'utf-8')
     } catch {
       // Storage persist failure is non-fatal
@@ -2834,6 +2871,30 @@ export class BridgeManager {
     // sees the new models in `agent/catalog`'s variant expansion.
     if (exposedChanged) this.broadcastExposure(agentId)
     return entry
+  }
+
+  /**
+   * Remember the slash commands an agent declared in a real session.
+   *
+   * Unlike {@link absorbCatalog} this does NOT feed a model surface — it keeps
+   * the agent's `/` menu populated before the next conversation has a session
+   * of its own. The live session's declaration is still the authority; this is
+   * only what a fresh conversation has to draw from.
+   *
+   * Deduped on content: agents restate their list freely, and a broadcast per
+   * restatement would make every open composer re-read `agent/catalog`.
+   */
+  private absorbCommands(agentId: string, commands: NonNullable<SessionView['availableCommands']>): void {
+    const existing = this.commandCache.get(agentId)
+    if (existing !== undefined && JSON.stringify(existing.commands) === JSON.stringify(commands)) return
+    const entry = { commands, updatedAt: Date.now() }
+    this.commandCache.set(agentId, entry)
+    this.persistCatalogs()
+    // Same signal as a model catalog learned from a real session: the browser
+    // caches `agent/catalog` per agent and re-reads it only when told to. A
+    // conversation opened before this session needs the new list for its very
+    // first `/`, when there is still no live session to ask.
+    this.hub.broadcast({ type: 'catalog/updated', agentId, updatedAt: entry.updatedAt })
   }
 
   /**
@@ -2983,6 +3044,7 @@ export class BridgeManager {
       ? title
       : `${title} · ${currentModelChoice.name}`
     const modeOption = entry?.catalog.mode
+    const commands = this.commandCache.get(agentId)
     return {
       agentId: def.id,
       title,
@@ -3018,6 +3080,13 @@ export class BridgeManager {
         },
       }),
       ...(entry === undefined ? {} : { updatedAt: entry.updatedAt }),
+      // The agent's last declared slash commands, for a conversation whose own
+      // ACP session does not exist yet. Live sessions still answer through
+      // `session/chat-list`; this is the pre-first-message fallback only.
+      ...(commands === undefined ? {} : {
+        commands: commands.commands,
+        commandsUpdatedAt: commands.updatedAt,
+      }),
     }
   }
 
@@ -3134,6 +3203,8 @@ export class BridgeManager {
         this.connectionLost(b, reason)
       }, (observedAgentId, configOptions) => {
         this.absorbCatalog(observedAgentId, configOptions)
+      }, (observedAgentId, commands) => {
+        this.absorbCommands(observedAgentId, commands)
       })
       this.bridges.set(agentId, bridge)
     }
@@ -3288,7 +3359,11 @@ export class BridgeManager {
       if (splitAdapterModelId(model).agentId === agentId) routeBindingRegistry().conversations.delete(dshSessionId)
     }
     if (routeBindingRegistry().defaultModel === agentId) routeBindingRegistry().defaultModel = undefined
-    if (this.catalogs.delete(agentId)) this.persistCatalogs()
+    // Both maps are independent (either may be missing), so delete both before
+    // deciding whether the file needs rewriting.
+    const droppedCatalog = this.catalogs.delete(agentId)
+    const droppedCommands = this.commandCache.delete(agentId)
+    if (droppedCatalog || droppedCommands) this.persistCatalogs()
     this.persistAgents()
     this.hub.broadcast({
       type: 'agent/status',
