@@ -1,0 +1,126 @@
+# 浏览器半区：座位、芯片与视图
+
+本文是 [AGENTS.md](../../AGENTS.md) 的展开层，覆盖 `src/client/` 的接线纪律。
+浏览器半区**严禁**引入 Node 内置模块或 `@agentclientprotocol/sdk`，通信只走 RPC / SSE。
+
+## 1. 模型底座：占座与闸门
+
+NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮前启动 / 切换 agent 的入口**：下拉里只有智能体列表（`menuFor('agent')` 只返回 `agentSection`），模型 / 思考等级 / agent 模式各有自己的控件。菜单只有一个标题「选择你的 Agent」。
+
+- **位置**：底座占的是原生模型底座那个 `single` cell——composer bar 行尾（`.trailing` 组，`margin-left: auto`）、提交键左边。原生 occupant 是宿主 `client-ui-model-selection` 的 `ModelSelect`（列 DSH 全量 provider，点一下写全局默认模型），所以 NTR 会话里必须由我们接管。
+- **一个 cell、一个 occupant**。底座是 `ntr-acp-cluster` 的**最后一个子元素**（其余 chip 只能往它左边排），CSS `:last-child { flex: none }` 保证长模型名压不扁它。曾经底座是第一个子元素，每多一个 chip 就把它往左推，切 agent 时整条 bar 重排。
+- **隔离靠闸门，不靠组件自隐**：`src/client/index.tsx` 的 `syncAcpMode` 只在舞台会话跑 ACP preset 时创建 claim，切走即 `release()`。非 NTR 会话里这条 entry 根本不存在。
+- **claim 机制**（`src/client/model-seat.tsx` · `createModelSeatClaim`）：
+  - cell 归属由客户端 runner 的页面级递减计数器决定（非 chain 槽位的声明优先级被改写，最后一个注册者赢）。`@hytime/dsh-thinking-effort` 也往这个 cell 注 slider，且排在我们之后注册。
+  - claim 必须用 `entriesOfSlot` 核实 head 是不是自己，不是就再注册一次（有界 `MAX_SEAT_CLAIMS`、如实报「被谁占着 / 放弃」），触发来自 gate 评估与 `slots/changed`。
+  - 注册经 `ctx.slots.inject`（裸 `register` 对未声明 slot 会 throw，而 gate 跑在每次 store 变更上）。
+  - **严禁**带回 undercut rank 算术、退注册重注册、`abdicate` 恢复 / `seatBroken`。也**不要**把「组件里 `return null` 就是隔离」当结论——那是修过的真实缺陷。
+  - 旧的 `AcpModelSeat` / `AcpModelSeatShadow` / `shouldShadowModelSeat` / `ensureSeatWins` / `seatBroken` 均已删除，不要带回来。详见 [retired.md](./retired.md)。
+
+## 2. 底座退场与挂牌
+
+首轮**开始**时（ACP 会话 materialize、`chat/agent-locked` 广播）锁定 agent，agent chip 从 cluster 消失，粉碎 → 挂牌动效同时开始。锁定语义见 [architecture.md §7](./architecture.md)。
+
+- 判定走 `lockedAgentOf`（宿主 `lockedAgentId` → 活/挂起 ACP 会话）与 `agentBaseHidden`，不拿插件默认 agent 兜底，也不查 roster。首轮之前底座一直在，用户可以先选好再改。
+- 退场后当前 agent 由 `conversation.input.overlay` 的挂牌 `AcpComposerAgentTag` 显示（`NTR · <agent>`，样式 `.ntr-acp-tag`）：骑在 composer 卡片上边缘，一半在卡片外、一半压在上边框（overlay anchor `top: 0` + `translateY(-50%)`）。
+- 挂牌**只读**（`AcpChip` 无 `onClick` 时渲染静态 `span`、无 caret），换 agent 只能新建会话。
+- 挂牌自带闸门 `agentTagVisible`：显式 `acpMode === false` 压过残留 `chatSessions`，`undefined` 才回落到锁本身。
+- **动效**：底座立即播放 460ms 粉碎（`.ntr-acp-shatter` + `AcpShatterParts` 的 `out` 沙粒），随后挂牌以 540ms 凝聚（`.ntr-acp-tag.is-forming` + `in` 沙粒）。
+  - 两半在**不同的 slot**（`conversation.input.model` / `conversation.input.overlay`），所以共读 `agent-lock-anim.ts` 的同一相位钟，**严禁**各自计时。
+  - **不在轮次结束时播**：事件就是开始信号。首轮无输出被回滚（`chat/agent-unlocked`）时底座直接回来，不播反向动效。
+  - 只在本页经历过的锁定上播放：`AcpStore.agentLockReveal` 在 `chat/agent-locked` 帧到达时（或非首次 `session/chat-list` 回答首次报出 `lockedAgentId` 的兜底路径）递增。打开一条早已锁定的会话不播。`chatUnlocked` 集合挡住「回滚前发出、回滚后才落地」的读，防止把锁复活。
+  - 重试成功会得到新的 reveal serial，`agent-lock-anim.ts` 用 epoch 让旧 ceremony 的定时器失效。`agentLockPhaseOf` 对「有新 reveal 但动画尚未启动」直接返回 `shatter`，避免中间一帧「两处都没有」。`prefers-reduced-motion` 下整段跳过。
+- 首轮开始前已打开的 picker 必须 `closeAcpMenu`，否则会留下一个点击必然 `agent_locked` 的活控件。
+
+## 3. 三条轴的来源
+
+`AcpSessionControls` **严禁**自建 agent/model/effort 状态，也**严禁**读 DSH 模型目录或写任何 DSH 模型路由。
+
+| 轴 | 权威来源 | 写入 |
+|---|---|---|
+| 这条会话由哪个 agent 服务 | 插件自己的绑定：`describeRoute` / `routeAgentId`（活会话 `bound` 优先 → `chatChoice` 的 pick，且只在 `choice.agentId === agentId` 时生效 → `chatBoundAgent` 乐观读 → 插件默认 agent） | `bindChatAgent`（传裸 `agentId`） |
+| 这个 agent 有哪些模型 / 思考等级 | `agent/catalog`（`AcpStore.loadAgentCatalog`，只对「这条会话真的指向某个 agent」的会话读；读会触发探测） | — |
+| 当前在哪个模型 / 思考等级 | `bound?.modelId ?? pick?.modelId`；`bound?.reasoningEffort ?? pick?.effort`；没选过时回落 `catalog.currentModel` 与 `catalog.reasoning.defaultEffort` | `setChatSessionModel` / `setChatSessionEffort` |
+
+- **严禁**回到 `directory.select` / `selectModel`。
+- 没有绑定 / pick / 默认 agent 时 `routeAgentId` 返回 `undefined`，`describeRoute` 每条轴都退化成空。芯片**严禁**借 `agents[0]?.id` 填名字（审计 F5：芯片写着某个 agent，却没有任何消息会送到它）。此时 agent chip 由 `agentBaseChip` 渲染成「接入 NTR / Use NTR」入口，tooltip 明说「这条会话当前没有 NTR agent 服务；点开可选择 agent」。
+- 会话权限档**插件不提供切换面**（整格占空，见 [permissions.md](./permissions.md)）。
+
+### 3.1 模型 picker 一行一个模型
+
+`agent/catalog` 的 `base` 是**路由**（裸 `agentId` = 「让 agent 自己选」），`currentModel` 是**模型值**（`model.currentValue`）。两者不是一回事：
+
+- 一行一个模型值，裸路由与它的 variant 合并。
+- 被勾中的那行必须写出模型名。
+- `base.name` 拼成 `<agent> · <当前模型>`；`variants[].name` 只写模型名（picker 已说明是谁的模型，重复是噪音）。
+- `resolveAdapterModel` 仍返回 `<agent> · <model>`——那是 DSH 侧的模型身份，与 picker 行无关。
+- `exposedModels` 只是**可见性**过滤（不改变可用性）。会话当前所在的变体即使不在列表里，也必须以带「当前」的行列在列表顶部，否则 picker 会默认成「会话跑的是默认模型」。detail 必须同时写两个可能原因：「在设置 → NTR 里取消了勾选」与「已从 agent 的目录掉出」——只怪可见性会让人去找一个早就勾上的框。
+
+### 3.2 codec 手拷贝
+
+`splitAcpModelId`（`src/client/acp-ui.tsx`）是宿主 `splitAdapterModelId` 的手拷贝（浏览器半区不得 import 宿主平面模块，`protocol.ts` 又只能是纯类型）。改其一必须同步另一处，`tests/acp-view.spec.ts` 用同一样本集做等价断言。`isAbsolutePathLike` 与宿主 `isAbsolutePath` 同理（见 [paths.md](./paths.md)）。
+
+## 4. agent mode 控件
+
+注册在 `conversation.input.left`（`src/client/composer-mode.tsx`），调用 agent 自己的 `session/set_mode`。
+
+- **不写可见标签**：agent 下发的 mode 名自解释（omp `Default`/`Plan`，codebuddy `Always Ask`/`Accept Edits`/…）。解释留在 `title` 与 `aria-label`（可访问性不能删）。
+- **选项不依赖活会话**：先取活会话的 `modes`，没有时回落 `agent/catalog` 的 `mode`（探测来的 `category: 'mode'` select，与 `session/new` 同源）。
+- **控件是否出现由「agent 发布了什么轴」决定，不能由「用户点过什么」决定**。`describeRoute` 让 `modelLabel` 只在有 pick 时才有值是真实回归：只点过思考等级的会话整块模型 chip 消失。配套：`agentCatalog` 必须同时回 `currentModel` 与 `mode`。
+- **自带 ACP 闸门**（`ui.acpMode[dshSessionId]` 或活会话存在）：它在 `conversation.input.left`，不在 `syncAcpMode` 的 claim 生命周期里，而 `agentId` 会回落到插件默认 `defaultAgent`，不闸就是普通会话凭空多一个 ACP 控件。
+- `setChatSessionMode` 对没有活会话的会话只记录 pick、不 spawn（与 `setChatSessionModel` 一致），`applyChatChoice` 在建 / 恢复会话时再应用。
+- 该 series 的公开 `.d.ts` 里 slot 条目**不含 `owner` 字段**（`OwnerOf` 解析为 `object`），所以组件里声明结构类型（`ComposerModeProps`），注册处 `as unknown as SlotComponent<any>`；新增 client 模块依赖要加进 package.json 的 `dsh.client.inject`。
+
+## 5. NTR 视图 tab
+
+真工具卡只能在 `conversation.view` 的 NTR tab（`src/client/acp-view.tsx`）里画。
+
+- 数据必须走 `session/chat-transcript`（按 **DSH 聊天会话 id** 寻址：浏览器在看到返回前并不知道 ACP 会话 id）。
+- **严禁**让 LLM adapter 旁路转发工具事件；**严禁**在视图里做 prompt / cancel / spawn（它只读）。
+- 流式更新靠 store 把 SSE 的 `session/update` 折进被观察的 transcript（`chatTranscripts` + `MAX_WATCHED` 上限）；**严禁**视图自己轮询。
+
+**空状态有两种含义**：`chatTranscriptOf` 回 `undefined` 同时覆盖「从没被 NTR agent 服务过」与「ACP 会话记录已经没了」（`closeSession` / `forgetDshSession` 销毁记录，进程停掉就丢 bridge），而绑定与 chip 仍指着那个 agent。用一句话描述两种状态会让视图与芯片互相矛盾。
+
+- `boundAgentOf`（活会话 → 宿主 `chatBoundAgent` → 持久 `chatChoice`）先判「这台会话有没有 agent」，`acpEmptyCopy` 再选文案。
+- 有绑定时说「这个会话当前没有可显示的 ACP 会话」并提示「给它发一条消息」，hint 写 `绑定的是 · <agent>`；什么都没有时才说「这个会话还没有 NTR agent 参与」。
+- hint 只在该控件真的存在时才指：`acpMode === true` 才指输入框右侧的 NTR 底座；`false` 说「这个会话不在 NTR 模式」；宿主还没答（`undefined`）就不给那一行——猜测比不说更坏。
+
+**diff 的「新增文件」脚注**只由**旧侧**判定（`isNewFileDiff`：`oldText` 为 `null` / `''` / 与 `newText` 逐字相同）。**严禁**改用「删除行数为 0」——只加行的既有文件同样零删除，把它标成「新增文件」等于把真实编辑藏在错徽章后面（审计 F8）。
+
+## 6. 斜杠菜单隔离
+
+NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_commands_update` 声明的命令；Enter 对 `/xxx` **不被宿主认领**（整行原样进 agent）；选中菜单项只把 `/<name> ` 插回草稿，**绝不执行**宿主命令；宿主来源的 `warm` / `lexicon` / `header` 同步停用。非 ACP 会话的斜杠行为一字不变。
+
+**机制**（`src/client/slash-isolation.ts`）：宿主没有受支持的 per-session 接缝——`InputTriggerService.adjudicate` 按注册顺序轮询（`order` 只排菜单）、同 `(trigger,name)` 重复注册直接抛、来源没有 `available(session)`。所以只能**在运行时包装活的来源对象**（`inputTriggers.live.sources` 中 `trigger === '/'` 的项，当前是 `command` 与 `skill`）。
+
+- **严禁**改写上游文件、注册第二个 `/` 来源、改 preset 行来伪装，或替换整个 `conversation.composer`。
+- agent 命令清单**只由一个来源承载**（按名字优先 `command`，缺席回落第一个 `/` 来源），其余来源在 ACP 会话里返回空——否则同一份清单每组各画一遍。
+- 每次调用按会话判定：舞台行自己的 `agentPreset` 优先，否则用 `session/chat-list` 的 `acpMode`；**没有证据时一律当作非 ACP（fail-open）**。
+- `candidates` 每敲一键都会重取，「按需重问宿主」（`ASK_INTERVAL_MS`）与「没有任何命令时补读一次」（`REFRESH_INTERVAL_MS`）都必须节流。数据侧见 [state.md](./state.md) 的「斜杠命令缓存」。
+- **失败一律放开**：服务缺失不算故障；服务在但 `live.sources` 形状不认识、或来源没有 `candidates`，就什么都不包、照旧沿用宿主行为，原因写进 `UiState.slashDiag`（ACP 视图空态渲染）与一次 `console.warn`。`dispose` 只还原自己装的包装（跨实例标记 `Symbol.for('dsh-ntr.slash-isolation')` 带 owner）；`sync` 幂等，可在 `internal/service` 与 store 变更时重跑。
+
+## 7. 快照读取与失败放开
+
+- **session list 快照两代形态**：DSH 0.1.7-rc.2 是 `{ ids, byId, phase, projectionsBySession }`——没有 `current` 也没有 `currentAddress`；舞台上会话 = `retainedBy.mainView > 0` 的行，preset 在 `byId[id].projectionValues.agentPreset`，subagent 行以 `origin === 'subagent'` 标记。旧运行时才是 `{ current, currentAddress, byId[id].agentPreset }`。
+- 读取一律经 `stagedSessionOf` / `rowAgentPreset`（`src/client/acp-ui.tsx`），不要再手写 `snapshot.current` / `byId[..].agentPreset`。
+- **失败放开**：服务未就位 / 槽位未声明 / 注册被拒 / 当前是 addressed subagent 路由 / 座位渲染崩溃（slot 错误边界会 abdicate 该条目），都必须回到原生座位并清掉「座位已接管」标志。claim 的 `sync()` 可重跑：下一次求值（store 变更、列表通知、preset 帧、cell 变化）会再试；诊断如实报告每次失败，不假装已安装。唯一允许的失败模式是「不接管」。
+- `ACP_PRESET_ID` 三处必须一致：浏览器半区、宿主 `src/bridge.ts`、声明里的 `config.id`（`presets/acp/acp.patch.yml`）。
+- **可选宿主服务严禁写进 `inject`**（缺服务会让插件整体加载失败；顶层 `inject` 只有 `slots` + `connection`）。只能经 `service<T>(name)` 在调用点 `ctx.get` 惰性解析（缺服务返 `undefined`、服务后到也能拿到），解析包 try/catch（见 `faceFor`）。
+- **结构类型只许写框架真的递过来的成员**：session 作用域入口能拿到 `sessionId` + `use<Name>` 选择器钩子（`useSession` / `useConversation` / `useInput` / `useWorkspaces` / `useChat` / `useProjection`）+ `inputActions` + 自己的 owner share（`conversation.input.model` 的 `locked`）。`conversation.input.left` 的 owner share 是**空对象**，严禁声明 / 读取任何别的字段——曾写 `session.sessionId` 让整条 entry 崩掉并被 abdicate；可选链泄漏进 `props.session?.running` 更阴：不炸，但重读永远不触发。需要「会话是否在跑」只能 `useSession(s => s.running)`（`AcpSessionHook`）。
+
+## 8. 设置页
+
+- 每张 agent 卡保持「紧凑行 + 展开详情」两段，详情体**常挂载**、只用 `display: none` 折叠——条件渲染会重挂载表单 `useState`，丢掉用户编辑中的值。
+- 工作区保存语义：单根模式（非空 `cwd`）把 `allowedCwdRoots` 收窄为 `[cwd]`；`cwd` 为空则两者都不发送（走宿主 `defaultAgentWorkspace()`）；多根模式发送编辑后的去重绝对路径。初始状态带 >1 个 root 的 agent 必须直接进多根模式，避免仅仅打开表单就收窄白名单。
+- 审批卡与权限策略文案见 [permissions.md](./permissions.md)。
+
+## 代码索引
+
+| 主题 | 位置 |
+|---|---|
+| 底座 / 菜单 | `src/client/session-controls.tsx` · `AcpSessionControls` / `AcpSessionMenu` / `menuFor` / `describeRoute` / `routeAgentId` / `agentBaseChip` |
+| 座位 | `src/client/model-seat.tsx` · `createModelSeatClaim` / `createPermissionSeatClaim`；`src/client/index.tsx` · `syncAcpMode` |
+| 锁定 UI | `src/client/session-controls.tsx` · `lockedAgentOf` / `agentBaseHidden` / `agentTagVisible` / `AcpComposerAgentTag`；`src/client/agent-lock-anim.ts` |
+| 视图 | `src/client/acp-view.tsx` · `boundAgentOf` / `acpEmptyCopy` / `diffRows` / `isNewFileDiff` |
+| 斜杠 | `src/client/slash-isolation.ts` · `createSlashIsolation` / `slashAcpVerdict` / `commandCandidates` |
+| 设置页 | `src/client/panel.tsx` · `AcpSettingsSection` / `AgentRow` / `WorkspaceBlock` / `initialForm` / `buildPayload` |

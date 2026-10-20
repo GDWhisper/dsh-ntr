@@ -1,11 +1,16 @@
 # DSH 插件开发文档
 
+- [实现约束细节（分层，入口：architecture.md）](./agents/architecture.md)
+  - 由 AGENTS.md 的 30 条硬约束索引、按主题拆开的展开文档：架构 / 协议 / 界面 / 权限 / 状态 / 宿主接线 / 路径 / 已退役方向
 - [NTR 模式：把会话交给另一个 agent](./acp-mode.md)
   - 原生上下文确实被转发的证据（`agent/pre-step` 折入顺序 + 真实会话日志）与宿主侧修复（`selectForwardPrompt`、`purpose` 拒绝）
   - NTR 模式 = agent preset（`presets/acp`）：清空宿主对模型可见的一切；loop 不可替换的硬约束
   - 不替 agent 裁决（permission 原样映射给用户，宿主不再有 `decidePermission` / `authorizeWrite` 这一层）、转发内容严格等于用户文本、fs 写只剩 `guardFsPath` 的 workspace containment；做不到的边界（宿主侧无 per-session 目录过滤缝、Access mode 控件）
   - 对话内的 NTR 面：三块芯片（agent / 模型 / 思考等级）的权威来源各自是什么、模型面为什么另走 `agent/catalog`、权限档整格占空，以及 NTR 视图 tab 如何用 `session/chat-transcript` 渲染计划、完整工具输出与 unified diff
   - 双向模型隔离：宿主侧"什么都不广告"（ACP 模型不进 DSH 目录，`/model` 弹窗也不例外）+ 浏览器侧由 `createModelSeatClaim` 接管原生座位（occupant 是 NTR 底座本体，按当前会话 preset 动态注册；注册后用 `entriesOfSlot` 核实 cell 的 head 是不是自己，被抢走就再注册一次，上限 `MAX_SEAT_CLAIMS`，到顶如实报「被谁占着」；放弃时回到原生座位）
+- [待办清单](./todo.md)
+  - 本仓唯一的待办清单：只留尚未落地的项，用户确认完结即删（结论并入 AGENTS.md 对应约束，不留「已落地」历史）
+  - 当前为空
 - [ACP 会话的权限对齐调研（DSH Access mode ↔ ACP 权限）](./acp-permission-and-sandbox.md)
   - 两个权限旋钮的实体与证据（preset / projection / sandbox / approval）
   - 现状接线错误（`never` → ACP 请求被全拒、只读档可被审批放行、沙箱对 ACP 无作用力）
