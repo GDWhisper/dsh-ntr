@@ -297,20 +297,35 @@ export function apply(ctx: Context) {
 ```
 
 2. **前端打包配置（`tsdown.config.ts`）**：
-前端产物必须输出到 `lib/client.js`，且必须保持 react 及 cordis 相关的依赖外部化（由 DSH SPA 的 `ModuleLoader` 供给）：
+前端产物必须输出到 `lib/client.js`，且必须保持 react 及 cordis 相关的依赖外部化（由 DSH SPA 的 `ModuleLoader` 供给）。
+**产物形状是 CJS 工厂函数，不是裸 ESM**：DSH 前端微内核的加载器是一张惰性 CJS 模块表，浏览器半区必须用 banner/footer 把整包裹成
+`window.__ModuleLoader__.load({ id, factory })`。输出裸 ESM（`format: 'esm'`）会在运行时解析失败，前端静默不加载。
+（dsh-ntr 自己的配置见 `tsdown.config.ts`，AGENTS.md 约束 1 是同一结论。）
 ```ts
 import { defineConfig } from 'tsdown'
 
 export default defineConfig({
-  entry: ['./src/client/index.tsx'],
+  name: 'my-dsh-plugin/client',
+  entry: { client: 'src/client/index.tsx' },
   outDir: './lib',
-  format: 'esm', // 按照 loader 契约输出
-  external: [
-    'react',
-    'react/jsx-runtime',
-    '@deepseek-ai/cordis',
-    '@deepseek-ai/dsh-client-ui-settings',
-  ],
+  // 关键：CJS + banner/footer 工厂壳，严禁 format: 'esm'
+  format: 'cjs',
+  platform: 'browser',
+  dts: false,
+  deps: {
+    neverBundle: [
+      'react',
+      'react/jsx-runtime',
+      '@deepseek-ai/cordis',
+      '@deepseek-ai/dsh-client-ui-settings',
+    ],
+  },
+  outputOptions: {
+    entryFileNames: 'client.js',
+    banner: 'window.__ModuleLoader__.load({ id: "my-dsh-plugin", factory: (require) => {',
+    footer: 'return module.exports; } });',
+    intro: 'var module = { exports: {} }; var exports = module.exports;',
+  },
 })
 ```
 

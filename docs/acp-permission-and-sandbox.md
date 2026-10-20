@@ -32,8 +32,9 @@
 
 1. `BridgeManager.streamPrompt`（`src/bridge.ts`）只把**最后一条 user 文本**转成 ACP prompt。
    > **已修正（原文假设错误）**：宿主把上下文段折在用户消息**之后**（`dsh-agent-instructions` 的 pre-step 监听器源码注释、driver 追加的运行时快照），所以“最后一条 user 消息”实测就是注入内容——`Current DSH file policy: …` **确实**会被转给 ACP agent（连同 AGENTS.md 摘要与技能目录）。修复见 [acp-mode.md](./acp-mode.md) §1（`selectForwardPrompt` 按 `source.kind === 'user'` 挑消息）与 [AGENTS.md](../AGENTS.md) 约束 16。
-2. ACP 的 `tool_call` / `tool_call_update` 在 `streamPrompt` 里被拍平成 text/reasoning 片段（`> 🛠️ [Tool: …]`）→ DSH 不执行它们 →
+2. ACP 的 `tool_call` / `tool_call_update` 在 `streamPrompt` 里变成了内联散文（`🛠️ **<name>** · `<input>`，工具输出跑进一个代码块），插在思考与答案之间的位置上 → DSH 不执行它们 →
    **DSH 文件沙箱对 ACP agent 的内部 bash / 编辑没有任何作用力**。
+   > **已修正（原文前半句两度改写，结论始终成立）**：中间曾把工具活动升级成真的 `tool-call` block 序列（`openToolCallBlock` / `acpToolCallDelta` / `recordAcpToolOutput`，配套两步形状与 guard 虚拟工具）；现行构建已退回内联散文——一个 ACP 回合只是宿主的一步，卡片无法落在“步与步之间”，只能跟在整条消息下面，而含 `tool-call` 块的消息被 `latestAnswer` 拒绝当答案。这不改变本节结论：DSH 的文件沙箱仍然管不到 agent 自己进程里的 bash / 编辑——宿主执行的卡片是展示面，与 agent 进程内的工具是两件事。根因与利弊见 [acp-convergence.md](./acp-convergence.md) §1.7；「不替 agent 裁决」的现行结论见同文 §2.3。
 3. 唯一真正连上的旋钮是 approval（`AgentBridge.askNativeApproval` → `ctx.approval.request`）。于是三档实际行为：
    - 工作区内修改（ask）：ACP 权限询问 → composer 审批卡 ✅
    - 仅可查看（ask）：用户点「允许一次」就能写 ❌（违背只读语义）
@@ -52,6 +53,10 @@
   数据侧我们已有 `session.modes` + `setMode`，只需补一条按 DSH 会话 id 查/设 mode 的 RPC。
 
 ## 4. 方案 1（原生 Access mode 驱动 ACP）设计
+
+> **【已退役，2026-10-14 / 约束 15】整节作废，按历史记载读，不要照着实现。** 按用户意图——**ACP agent 完全自治，DSH 的 Access mode / sandboxPolicy 不参与裁决**——宿主不再坐在中间替 agent 判一遍。现行代码：`AgentBridge.permissionDecision` 只读 agent 自己的 `def.permission`（`ask` 走约束 13 的原生审批链，`allow` / `reject` 本地作答）；`AgentBridge.handleFsWrite` 只剩 `guardFsPath` 的 workspace containment（`resolveFsPath` 的 roots 校验**无条件**生效，`danger-full-access` 之类的 access mode 到不了这条路径，也放宽不了它）；`decidePermission` / `authorizeWrite` / `dshSessionPolicyOf` / `wireAccessMode` 全部已删。本节唯一仍然有效的是下面「同一个 `workspaceRoot` 也是聊天会话的 ACP 工作目录」那一段（约束 15 的「工作目录」「进程 cwd」两条）。
+>
+> 「二者互补」这个说法同样作废：让 ACP 模式控件出现的闸门会把原生 Access mode 整格占空，两个控件**从不同屏**。
 
 分层原则：**原生 Access mode 管"边界 + 要不要问人"，ACP 自己的 mode 管"agent 用什么方式干活"**。二者互补，不是二选一。
 
@@ -111,7 +116,7 @@
 
 ## 6. 落地顺序（本仓）
 
-> 状态更新：第 1、2 项已落地（方案 1 语义 + `conversation.input.left` 模式控件），并新增 **NTR 模式 agent preset** 与其附带的裁决降级（`decidePermission(..., { narrateOnly: true })`）——完整设计、证据与边界见 [acp-mode.md](./acp-mode.md)。第 3、4 项仍未做。
+> 状态更新（2026-10-14 / 2026-10-18 两次修订）：第 1 项**已退役**——方案 1 语义随约束 15 一起作废，宿主不再替 agent 裁决（见 §4 顶部的退役说明）。第 2 项已落地（`conversation.input.left` 的 ACP mode 控件 + `session/set_mode` RPC），并且它现在**不与原生 Access mode 同屏**：NTR 会话里后者被 `createPermissionSeatClaim` 整格占空。第 3、4 项仍未做。
 
 1. **方案 1 语义**（宿主侧，正确性修复）：per-session 快照 → 判定替换 `def.permission`；`never` 不再递 `ctx.approval`；fs 写栅栏按 mode 生效。（原文还包括 policy 叙述注入 prompt 前缀，已放弃。）
 2. **方案 2b 控件**：`conversation.input.left` 注册 ACP mode 选择器 + `session/set_mode` RPC（按 DSH 会话 id 定位）。

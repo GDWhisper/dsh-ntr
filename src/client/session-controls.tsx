@@ -25,6 +25,26 @@
  * here "which agent", "which of ITS models" and "how hard it thinks" are three
  * chips, because those are the three things a person actually thinks in.
  *
+ * ONE CONVERSATION, ONE AGENT (user decision, 2026-10-20): once this
+ * conversation's first turn STARTS — its ACP session materializes, before the
+ * prompt is sent — the agent base steps aside and the conversation is LOCKED to
+ * that agent. The current agent then lives on a small, read-only tag that rides
+ * the composer card's top edge (`AcpComposerAgentTag`, installed in
+ * `conversation.input.overlay`). Before that first turn the base stays, so a
+ * pick can still be changed before it is committed to a message. See
+ * `agentBaseHidden`.
+ *
+ * The lock is provisional until that first turn delivers something: a turn
+ * that ends without any visible block (an error before the first chunk, a
+ * silent provider failure, a cancel) is rolled back by the host, the base
+ * returns, and the picker works again. The composer learns both transitions
+ * from `chat/agent-locked` / `chat/agent-unlocked`, not from a list read.
+ *
+ * The hand-off is a shatter-and-condense animation (`agent-lock-anim.ts`): the
+ * base breaks into debris, then the tag forms from it. The two live in
+ * different slots, so they share that module's phase clock rather than trying
+ * to animate across slot boundaries.
+ *
  * It is deliberately quiet: the base renders NOTHING for a conversation no ACP
  * agent has served, so an ordinary chat is untouched even before the gate
  * stands down. The ACP view tab is the entry point for those (and for re-entry
@@ -35,9 +55,10 @@ import { useEffect, useState } from 'react'
 // Type-only: pulls the ui-conversation SlotMap merge into this program.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import {
-  AcpChip, AcpMenu, buildAcpModelId, closeAcpMenu, ensureAcpStyle, openAcpMenu,
-  setAcpMenuError, splitAcpModelId, useAcpMenu, useUi,
+  AcpChip, AcpMenu, AcpShatterParts, buildAcpModelId, closeAcpMenu, ensureAcpStyle,
+  openAcpMenu, setAcpMenuError, splitAcpModelId, useAcpMenu, useUi,
 } from './acp-ui.tsx'
+import { playAgentLockAnim, useAgentLockPhase } from './agent-lock-anim.ts'
 import type {
   AcpChatInjected, AcpMenuKind, AcpMenuItem, AcpMenuSection, AcpSessionHook,
 } from './acp-ui.tsx'
@@ -103,6 +124,14 @@ function boundSession(ui: { chatSessions: ChatSessionView[]; chatSessionsFor?: s
  * outranks the live session because a switch applies from the next message:
  * until that turn materializes a session for the new agent, the live list still
  * names the previous one, and the chip must not read as "the click did nothing".
+ *
+ * `undefined` IS an answer, not a gap: with no binding, no live session and no
+ * plugin default the guard's route rewrite has nothing to rewrite with and the
+ * turn runs on the deployment default provider (see `boundModelFor` in
+ * presets/acp/acp-guard.mjs). This function used to end in `agents[0]?.id`,
+ * which put the first configured agent on the chip in exactly that state — a
+ * name no message would ever reach (audit finding F5). The honest chip there is
+ * the "接入 NTR" entry point, not a borrowed name.
  */
 function routeAgentId(
   boundAgentId: string | undefined,
@@ -113,13 +142,73 @@ function routeAgentId(
   if (boundAgentId !== undefined && agents.some(agent => agent.id === boundAgentId)) return boundAgentId
   if (bound?.agentId !== undefined) return bound.agentId
   if (defaultAgent !== undefined && agents.some(agent => agent.id === defaultAgent)) return defaultAgent
-  return agents[0]?.id
+  return undefined
+}
+
+/**
+ * The agent this conversation is LOCKED to, if its first ACP turn has run.
+ *
+ * The host's `lockedAgentId` is the durable answer: it is written when the
+ * first ACP session materializes and it survives restarts, so it is the only
+ * source that can still answer after the session is gone. The live/released
+ * session is the fallback for a host half from before the lock existed — the
+ * moment a session exists, the conversation already has context with it.
+ *
+ * There is deliberately no roster check: a deleted agent still owns the
+ * conversation's context, and pretending the conversation is unbound would
+ * bring back a picker the turn path has to refuse. The tag names the id even
+ * when no title is left.
+ */
+export function lockedAgentOf(
+  hostLockedAgentId: string | undefined,
+  bound: ChatSessionView | undefined,
+): string | undefined {
+  return hostLockedAgentId ?? bound?.agentId
+}
+
+/**
+ * Whether the composer's agent base has done its job and should step aside.
+ *
+ * The timing is the product decision (2026-10-20): at the START of this
+ * conversation's first turn. A conversation that merely recorded a pick is
+ * still being set up; the user may change their mind before sending, and
+ * hiding the base there would strand the pick. Once locked, the base only
+ * comes back if the host ROLLS THE LOCK BACK — a first turn that delivered
+ * nothing, so there is no context to protect. It also stays retired when the
+ * locked agent has been deleted from the roster: the conversation's context
+ * still belongs to it.
+ */
+export function agentBaseHidden(lockedTo: string | undefined): boolean {
+  return lockedTo !== undefined
+}
+
+/**
+ * Whether the composer-edge `NTR · <agent>` tag should render.
+ *
+ * The tag is the locked agent's nameplate: it appears exactly when the base
+ * has stood down. The `acpMode` gate matters because the overlay entry is
+ * registered for EVERY conversation while `ui.chatSessions` can still carry an
+ * ACP session record after a conversation switched back to an ordinary preset:
+ * an explicit `false` verdict must win over that lingering record, or the tag
+ * would keep advertising an agent the conversation no longer runs. `undefined`
+ * is "the host has not answered yet" and falls back to the lock itself, which
+ * is proof this conversation was served by an agent.
+ */
+export function agentTagVisible(
+  acpMode: boolean | undefined,
+  lockedTo: string | undefined,
+): boolean {
+  return (acpMode ?? true) && lockedTo !== undefined
 }
 
 /**
  * Describe this conversation's ACP agent from the binding (the host's record of
  * which agent actually serves it) + the agent roster + the agent's own model
  * surface (`agent/catalog`).
+ *
+ * An `undefined` agentId means nothing serves this conversation's next message
+ * (see `routeAgentId`); every axis then degrades to nothing rather than naming
+ * an agent the request path will never use.
  *
  * The model axis reads the ACP catalog, NOT any DSH model directory: an ACP
  * agent's models are the agent's own (see the module header), so there is
@@ -186,6 +275,117 @@ export function describeRoute(
   }
 }
 
+/**
+ * The agent base chip's label and tooltip (audit findings F5 and F26).
+ *
+ * The label names an agent ONLY when one actually serves this conversation:
+ * `route.agentId` is the binding, the live session or the plugin default, and
+ * each of those is a name the request path uses (see `routeAgentId`). With none
+ * of them the chip is the "接入 NTR" entry point and says so — the old
+ * `agents[0]` fallback put a stranger's name on a conversation whose next
+ * message would run on the deployment default provider.
+ *
+ * The tooltip claims only what the menu behind the chip does: switch the agent.
+ * The agent's models and thought levels have chips of their own (user decision,
+ * 2026-10-17), so the previous wording — "switch the agent, its model and the
+ * thought level" — promised a menu that holds the roster alone.
+ */
+export function agentBaseChip(
+  route: RouteInfo,
+  routed: boolean,
+  acp: AcpChatInjected['acp'],
+): { label: string; title: string } {
+  const label = route.agentTitle === undefined
+    ? (routed ? 'NTR' : acp.label('接入 NTR', 'Use NTR'))
+    : `NTR · ${route.agentTitle}`
+  const title = route.agentId === undefined
+    ? acp.label(
+      '这条会话当前没有 NTR agent 服务；点开可选择 agent',
+      'No NTR agent is serving this conversation right now — open to choose one',
+    )
+    : acp.label(
+      '这条会话由外接 NTR agent 服务；点开可切换 agent',
+      'This conversation is served by an external NTR agent — open to switch the agent',
+    )
+  return { label, title }
+}
+
+/**
+ * The composer-edge tag's label and tooltip.
+ *
+ * This tag is where the agent identity lives once the composer base steps
+ * aside (see `agentBaseHidden`), so it names the agent unconditionally — the
+ * caller only mounts it when the conversation is locked. It is a nameplate,
+ * not a control: the tooltip says the lock is one-way and points at the only
+ * way to use another agent (a new conversation).
+ */
+export function agentTagChip(agentTitle: string, acp: AcpChatInjected['acp']): { label: string; title: string } {
+  return {
+    label: `NTR · ${agentTitle}`,
+    title: acp.label(
+      `这条会话已锁定在 ${agentTitle}；首轮开始后不能切换 agent（上下文属于它）。换 agent 请新建会话。`,
+      `This conversation is locked to ${agentTitle}. It cannot switch agents once the first turn has started — the context belongs to it. Start a new conversation to use another agent.`,
+    ),
+  }
+}
+
+/**
+ * The agent tag riding the composer card's top edge
+ * (`conversation.input.overlay`).
+ *
+ * The composer's agent base retires when the conversation's first ACP turn
+ * starts, and that turn LOCKS the conversation to its agent (user decision,
+ * 2026-10-20): a different agent would have none of the context. This tag is
+ * therefore a NAMEPLATE, not a control — it keeps "who serves this
+ * conversation" on screen and says why it cannot change. It deliberately has
+ * no click target and no caret: the only way to use another agent is a new
+ * conversation. If the turn delivered nothing, the host rolls the lock back
+ * and this tag leaves with it.
+ *
+ * WHERE IT SITS: the overlay anchor is a zero-height absolute box at the top
+ * edge of the composer card, so the tag's wrapper straddles that edge (see
+ * `.ntr-acp-tag` in acp-ui.tsx) — half above the card, half inside it, like a
+ * small nameplate hung on the box. This is deliberately NOT the session
+ * header: the tag belongs to the input it describes, and the header is shared
+ * with conversation chrome that is not about the agent.
+ *
+ * It gates itself: the overlay slot is registered for EVERY conversation, so
+ * it must not leak `NTR · <agent>` into ordinary chats, and it may only appear
+ * once the base has actually stood down (see `agentTagVisible`).
+ */
+export function AcpComposerAgentTag(props: AcpClusterProps) {
+  ensureAcpStyle()
+  const { acp, sessionId, useSession } = props
+  const ui = useUi(acp)
+  const running = useSession(snapshot => snapshot.running)
+  useEffect(() => {
+    void acp.loadChatSessions(sessionId)
+  }, [acp, sessionId, running])
+  const bound = boundSession(ui, sessionId)
+  const lockedTo = lockedAgentOf(ui.chatLockedAgent[sessionId], bound)
+  const reveal = ui.agentLockReveal[sessionId]
+  const phase = useAgentLockPhase(sessionId, reveal)
+  // Both surfaces start the same clock; whichever effect runs first wins and
+  // the other is a no-op (playAgentLockAnim is idempotent per reveal). The
+  // lock arrives at the START of the first turn (chat/agent-locked), so the
+  // hand-off plays while the turn runs — see agent-lock-anim.ts.
+  useEffect(() => {
+    if (reveal !== undefined) playAgentLockAnim(sessionId, reveal)
+  }, [reveal, sessionId])
+  // The tag stays away while the base is still breaking apart: the hand-off is
+  // base → debris → tag, never both on screen at once.
+  if (phase === 'shatter') return null
+  if (!agentTagVisible(ui.acpMode[sessionId], lockedTo) || lockedTo === undefined) return null
+  const agentTitle = ui.agents.find(agent => agent.id === lockedTo)?.title ?? bound?.agentTitle ?? lockedTo
+  return (
+    <span className={`ntr-acp-tag${phase === 'form' ? ' is-forming' : ''}`}>
+      <AcpChip {...agentTagChip(agentTitle, acp)}>
+        {phase === 'form' && <AcpShatterParts mode="in" />}
+      </AcpChip>
+    </span>
+  )
+}
+
 /** The composer cluster: agent, model and thought level — or nothing at all. */
 export function AcpSessionControls(props: AcpClusterProps) {
   ensureAcpStyle()
@@ -199,8 +399,23 @@ export function AcpSessionControls(props: AcpClusterProps) {
   const bound = boundSession(ui, sessionId)
   const agents = ui.agents
   const choice = ui.chatChoice[sessionId]
-  const agentId = routeAgentId(ui.chatBoundAgent[sessionId], bound, agents, ui.defaultAgent)
-  const catalog = agentId === undefined ? undefined : ui.seatCatalogs[agentId]
+  // The lock is resolved BEFORE the agent route: a locked conversation belongs
+  // to its agent even when no session is live, so it must never fall back to
+  // the plugin default (that would put another agent's models and thought
+  // levels on its bar).
+  const lockedTo = lockedAgentOf(ui.chatLockedAgent[sessionId], bound)
+  // The lock hand-off (see agent-lock-anim.ts): the tag slot in the overlay
+  // starts the same clock from its own effect; either call arms it once.
+  const reveal = ui.agentLockReveal[sessionId]
+  const lockPhase = useAgentLockPhase(sessionId, reveal)
+  useEffect(() => {
+    if (reveal !== undefined) playAgentLockAnim(sessionId, reveal)
+  }, [reveal, sessionId])
+  const agentId = lockedTo ?? routeAgentId(ui.chatBoundAgent[sessionId], bound, agents, ui.defaultAgent)
+  // A deleted locked agent has no surface to show: suppress its chips instead
+  // of keeping a dead agent's last-known model menu interactive.
+  const agentListed = agentId !== undefined && agents.some(agent => agent.id === agentId)
+  const catalog = agentListed ? ui.seatCatalogs[agentId] : undefined
   // Read the catalog ONLY for a conversation that actually points at an agent.
   // `routeAgentId` falls back to the plugin's global default so the picker can
   // offer a way in — but that fallback must not cause a READ of an unrelated
@@ -208,9 +423,17 @@ export function AcpSessionControls(props: AcpClusterProps) {
   // 2026-10-18: a conversation served by one agent had another one start up).
   const served = bound !== undefined || choice !== undefined || ui.chatBoundAgent[sessionId] !== undefined
   useEffect(() => {
-    if (served && agentId !== undefined) void acp.loadAgentCatalog(agentId)
-  }, [acp, served, agentId])
-  const route = describeRoute(agents, bound, ui.defaultAgent, catalog, ui.chatBoundAgent[sessionId], choice)
+    if (served && agentListed && agentId !== undefined) void acp.loadAgentCatalog(agentId)
+  }, [acp, served, agentListed, agentId])
+  const route = describeRoute(
+    agents,
+    bound,
+    // A locked conversation has no default fallback: the lock is the answer.
+    lockedTo === undefined ? ui.defaultAgent : undefined,
+    catalog,
+    lockedTo ?? ui.chatBoundAgent[sessionId],
+    choice,
+  )
   // A conversation with no ACP story to tell gets no chrome: the ACP view tab
   // owns the entry point for starting one.
   if (bound === undefined && agents.length === 0) return null
@@ -219,6 +442,31 @@ export function AcpSessionControls(props: AcpClusterProps) {
   // the model and thought level can be chosen up front, and they must show as
   // chosen rather than as nothing at all.
   const routed = bound !== undefined || choice !== undefined || ui.chatBoundAgent[sessionId] !== undefined
+  // The base's retirement and the conversation's one-way agent lock are the
+  // same event (see `agentBaseHidden`): the first ACP turn. From then on the
+  // base never comes back, and the tag is the only place the agent's name
+  // lives.
+  //
+  // The picker could already be open when the first turn starts (clicking the
+  // send button is inside the composer card, which AcpMenu treats as its own
+  // furniture, so it does not close the menu). Once locked, that menu can only
+  // offer a switch the host will refuse — close it instead of leaving a live
+  // control over a locked conversation.
+  useEffect(() => {
+    if (lockedTo === undefined || menu === null) return
+    if (menu.sessionId === sessionId && menu.kind === 'agent') closeAcpMenu()
+  }, [lockedTo, menu?.sessionId, menu?.kind, sessionId])
+  // Keep the base mounted for the shatter half even though the lock already
+  // retired it: unmounting on the same commit the lock arrives would skip the
+  // transition entirely (the tag waits for the same phase to leave 'shatter').
+  const shattering = lockPhase === 'shatter' && lockedTo !== undefined
+  const showAgentBase = !agentBaseHidden(lockedTo) || shattering
+  const modelLabel = routed ? route.modelLabel : undefined
+  const showModel = agentListed && modelLabel !== undefined
+  const showThought = agentListed && routed && route.efforts.length > 0
+  // Nothing left to show: the cell stays claimed (the claim owns it), but this
+  // occupant renders an empty cluster rather than a bare wrapper.
+  if (!showAgentBase && !showModel && !showThought) return null
   const open = (kind: AcpMenuKind, trigger: HTMLElement): void => { openAcpMenu(sessionId, kind, trigger) }
 
   // The AGENT base is pinned to the RIGHT edge (user decision, 2026-10-17).
@@ -230,15 +478,15 @@ export function AcpSessionControls(props: AcpClusterProps) {
   // reads as the whole bar reflowing when you switch agents.
   return (
     <span className="ntr-acp-cluster">
-      {routed && route.modelLabel !== undefined && (
+      {showModel && modelLabel !== undefined && (
         <AcpChip
-          label={route.modelLabel}
+          label={modelLabel}
           title={acp.label('agent 自己的模型目录', "the agent's own model directory")}
           active={menu?.sessionId === sessionId && menu.kind === 'model'}
           onClick={(trigger) => { open('model', trigger) }}
         />
       )}
-      {routed && route.efforts.length > 0 && (
+      {showThought && (
         <AcpChip
           label={`${acp.label('思考', 'think')} · ${route.effortLabel ?? acp.label('默认', 'default')}`}
           title={acp.label('思考等级（agent 的 thought_level）', "Thought level (the agent's thought_level)")}
@@ -246,18 +494,20 @@ export function AcpSessionControls(props: AcpClusterProps) {
           onClick={(trigger) => { open('thought', trigger) }}
         />
       )}
-      {/* Last on purpose: this is the fixed right-hand anchor of the cluster. */}
-      <AcpChip
-        label={route.agentTitle === undefined
-          ? (routed ? 'NTR' : acp.label('接入 NTR', 'Use NTR'))
-          : `NTR · ${route.agentTitle}`}
-        title={acp.label(
-          '这个会话由外接 NTR agent 服务；点开可切换 agent、它的模型与思考等级',
-          'This conversation is served by an external NTR agent — open to switch the agent, its model and the thought level',
-        )}
-        active={routed}
-        onClick={(trigger) => { open('agent', trigger) }}
-      />
+      {/* Last on purpose while present: the fixed right-hand anchor of the
+          cluster. It retires after the first ACP turn (user decision,
+          2026-10-20) and the composer-edge tag replaces it; the retirement
+          itself is the shatter played here (see `shattering`). */}
+      {showAgentBase && (
+        <AcpChip
+          {...agentBaseChip(route, routed, acp)}
+          active={routed}
+          className={shattering ? 'ntr-acp-shatter' : undefined}
+          onClick={shattering ? undefined : (trigger) => { open('agent', trigger) }}
+        >
+          {shattering && <AcpShatterParts mode="out" />}
+        </AcpChip>
+      )}
     </span>
   )
 }
@@ -352,13 +602,16 @@ function modelSection(context: MenuContext): AcpMenuSection | undefined {
   if (inForce !== undefined && !offered.has(inForce)) {
     // Either the agent is on a model its own exposure filter hides, or the
     // conversation picked one that has dropped out of the catalog. Named either
-    // way — `route.modelLabel` already resolves the stale-variant case.
+    // way — `route.modelLabel` already resolves the stale-variant case — so the
+    // row's detail must name BOTH causes: blaming only the Settings → NTR
+    // checkbox sent people looking for a box they had already ticked (audit
+    // finding F25).
     rows.push({
       id: buildAcpModelId(route.agentId, inForce),
       label: `${inForce === current?.value ? current?.name ?? inForce : route.modelLabel ?? inForce} · ${acp.label('当前', 'current')}`,
       detail: acp.label(
-        '未在「设置 → NTR」里勾选可见；仍然可用。',
-        'Not checked as visible in Settings → NTR; still usable.',
+        '不在此列表出的模型里：可能在「设置 → NTR」里取消了勾选，也可能已从 agent 的目录掉出。仍然可用。',
+        "Not among the models listed here: it may be unchecked in Settings → NTR, or it may have dropped out of the agent's catalog. Still usable.",
       ),
       active: true,
     })
@@ -400,8 +653,15 @@ function modelSection(context: MenuContext): AcpMenuSection | undefined {
 function thoughtSection(context: MenuContext): AcpMenuSection {
   const { acp, route } = context
   const items: AcpMenuItem[] = [{
+    // The id keeps its historical name on purpose: it is an internal sentinel
+    // the pick handler compares against, and no user ever reads it. The LABEL is
+    // the user-visible claim, and "provider default" was false (audit finding
+    // F43): this axis is the agent's own `thought_level`, with no DSH provider
+    // anywhere on it (`listModels('acp')` answers an empty catalog). Clearing
+    // the pick leaves the agent's own `reasoning.defaultEffort` in force, which
+    // is what `effectiveEffort` reports.
     id: 'provider-default',
-    label: acp.label('跟随 provider 默认', 'Provider default'),
+    label: acp.label('跟随 agent 默认', 'Agent default'),
     active: route.effectiveEffort === undefined,
   }]
   for (const level of route.efforts) {

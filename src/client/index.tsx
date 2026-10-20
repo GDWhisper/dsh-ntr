@@ -16,7 +16,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { AcpStore, type RpcCall } from './store.ts'
 import { AcpSettingsSection } from './panel.tsx'
 import { AcpComposerMode } from './composer-mode.tsx'
-import { AcpSessionControls, AcpSessionMenu } from './session-controls.tsx'
+import { AcpComposerAgentTag, AcpSessionControls, AcpSessionMenu } from './session-controls.tsx'
 import { AcpConversationView } from './acp-view.tsx'
 import {
   createModelSeatClaim,
@@ -148,6 +148,21 @@ export function apply(ctx: Context): void {
     order: 10,
     inject: (sessionId: unknown) => chatFace(sessionId),
   }, AcpSessionMenu as unknown as SlotComponent<any>)), 'dsh-ntr: composer ACP picker')
+
+  // The agent tag riding the composer card's top edge. The agent base steps
+  // aside after the conversation's first ACP turn, which also LOCKS the
+  // conversation to its agent (`agentBaseHidden` in session-controls.tsx); this
+  // tag is the read-only nameplate that keeps naming it. It shares the overlay
+  // seat with the picker itself; both are positioned floating entries inside
+  // the card, while the tag is pinned to the card's top edge
+  // (`.ntr-acp-tag`). Registered for every conversation, gated inside the
+  // component.
+  ctx.effect(() => ctx.slots.inject('conversation.input.overlay', () => ctx.slots.register({
+    name: 'conversation.input.overlay',
+    id: 'acp-agent-tag',
+    order: 5,
+    inject: (sessionId: unknown) => chatFace(sessionId),
+  }, AcpComposerAgentTag as unknown as SlotComponent<any>)), 'dsh-ntr: composer agent tag')
 
   /**
    * The client runtime's session list store, read structurally. Used to find

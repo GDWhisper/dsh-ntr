@@ -153,9 +153,17 @@ export function quoteCommandToken(token: string): string {
  * (`codebuddy --acp`) belongs in that one field, and its extra tokens are folded
  * IN FRONT of `args`. Two reasons this is the host's job and not the panel's:
  * `agent/save` / `agent/test` are callable without the panel, and
- * `loadPersistedAgents` re-validates stored defs on every boot. A def in the
- * canonical shape (bare command + args array — every preset, everything this
- * function returns) parses back to exactly itself, so the fold is idempotent.
+ * `loadPersistedAgents` re-validates stored defs on every boot.
+ *
+ * The fold is idempotent ONLY for a whitespace-free command. When the command
+ * carries whitespace (a quoted Windows path such as `C:\Program Files\a.exe`),
+ * the returned `command` is the BARE path — spawn needs it unquoted
+ * (`findExecutable` runs `existsSync` on it, `windowsShimLaunch` re-quotes for
+ * cmd.exe; both in src/bridge.ts) — so re-validating that bare command splits it
+ * at the space instead of round-tripping. `loadPersistedAgents` closes the gap
+ * with `quoteLegacyCommand` (src/bridge.ts): it re-quotes the command token
+ * before the re-validate, and only when the path exists on disk. Do not "fix"
+ * this by quoting `command` here — that breaks the spawn above.
  */
 export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
   if (typeof entry !== 'object' || entry === null) throw new AcpError('bad_config', `acp: ${label} is not an object`)
@@ -486,12 +494,16 @@ export function canonicalizeFsPath(sessionCwd: string, requested: string, realpa
   if (isExtendedLength(requested)) {
     // Refused before the relative-join branch can swallow it as a filename: a
     // verbatim path is a form this layer cannot judge, not a path under the cwd.
-    throw new AcpError('bad_path', `acp: fs path does not exist: ${requested}`)
+    // Say so — "does not exist" is a lie when the file is right there.
+    throw new AcpError('bad_path', `acp: fs path is a form this layer cannot resolve: ${requested}`)
   }
   const collapsed = isAbsolutePath(requested) ? requested : joinWithin(sessionCwd, requested)
   const parsed = segmentize(collapsed)
   if (parsed === undefined) {
-    throw new AcpError('bad_path', `acp: fs path does not exist: ${requested}`)
+    // segmentize returns undefined for a form it does not interpret — chiefly a
+    // UNC head missing its share (`\\host`). Not "does not exist": the target may
+    // resolve fine; this layer just cannot address it.
+    throw new AcpError('bad_path', `acp: fs path is a form this layer cannot resolve: ${requested}`)
   }
   const segments = collapseSegments(parsed.segments)
   let canonical: string | undefined
@@ -518,14 +530,15 @@ export function canonicalizeFsPath(sessionCwd: string, requested: string, realpa
 }
 
 /**
- * {@link canonicalizeFsPath} plus the allowed-root containment check: escaping
- * the roots throws (`cwd_denied`) and the caller answers the agent's request
- * with that error instead of touching the disk.
+ * {@link canonicalizeFsPath} plus the allowed-root containment check: a path
+ * outside the given `roots` throws (`cwd_denied`) and the caller answers the
+ * agent's request with that error instead of touching the disk.
  *
- * The split from canonicalization exists because containment is conditional on
- * the resolved access mode — under DSH's `danger-full-access` the canonical path
- * is used as-is (that mode's whole promise is "no restriction"), while every
- * other mode keeps the agent's own `allowedCwdRoots` as a hard cap.
+ * The containment is UNCONDITIONAL — there is deliberately no access-mode layer
+ * here. The one caller (`guardFsPath` in src/bridge.ts) always passes the
+ * agent's own `allowedCwdRoots` plus the session cwd as a hard cap; a DSH
+ * access mode such as `danger-full-access` never reaches this path and never
+ * lifts the cap.
  */
 export function resolveFsPath(sessionCwd: string, roots: readonly string[], requested: string, realpath: (p: string) => string): string {
   const full = canonicalizeFsPath(sessionCwd, requested, realpath)
@@ -556,10 +569,11 @@ export function childEnv(parent: NodeJS.ProcessEnv, extra: Record<string, string
 // ---- Model catalog (pure parsing of ACP `configOptions`) ----
 
 /**
- * Extract the `model` and `thought_level` select options from a raw ACP
- * `configOptions` payload. Tolerant by design: unknown categories, boolean
- * options, grouped choices, missing `name`, and the legacy `id` field (pre-
- * spec agents) are all handled; anything unusable is skipped silently.
+ * Extract the `model`, `thought_level`, and `mode` select options from a raw
+ * ACP `configOptions` payload (three categories → the `model` / `thought` /
+ * `mode` slots of `AcpAgentCatalog`). Tolerant by design: unknown categories,
+ * boolean options, grouped choices, missing `name`, and the legacy `id` field
+ * (pre-spec agents) are all handled; anything unusable is skipped silently.
  */
 export function parseCatalogOptions(configOptions: unknown): AcpAgentCatalog {
   const out: AcpAgentCatalog = {}
@@ -643,148 +657,68 @@ export function buildAdapterModelId(agentId: string, choice: string): string {
   return `${agentId}@${choice}`
 }
 
-// ---- ACP tool-call notifications → DSH tool-call stream chunks ----
+// ---- ACP tool activity → inline chat text ----
 
 /**
- * One ACP tool call, narrowed to what the Chat plane's tool-call renderer shows.
+ * Tool activity as inline chat TEXT, never as a `tool-call` block.
  *
- * `callId` is the ACP `toolCallId` — it is the only identity the agent gives, and
- * the Chat renderer uses it to group a call with its updates. `name` is the
- * agent's own label (`title`, falling back to nothing at all: the renderer shows
- * the call id when a name is missing). `argsRaw` accumulates whatever the agent
- * chose to disclose — ACP has no mandatory arguments field, so an agent that
- * sends none simply produces an empty block, which is honest.
- */
-export interface AcpToolCallSnapshot {
-  callId: string
-  name: string
-  /** Accumulated argument text (ACP has no fixed vocabulary for it). */
-  argsRaw: string
-  /** The call's other named fields (`kind`, `status`, `locations`, `terminalId`, `meta`) as `key: value` lines. */
-  details?: string
-  /** Pretty-printed JSON of the latest full notification, truncated only at {@link ACP_TOOL_RAW_MAX}. */
-  raw?: string
-}
-
-/** A delta of tool-call content, folded into the open snapshot. */
-export type AcpToolCallDelta =
-  | { kind: 'name'; name: string }
-  | { kind: 'args'; text: string }
-  /** Replacement text of the call's other named fields (kind/status/locations/…). */
-  | { kind: 'details'; text: string }
-  /** Replacement JSON of the whole notification (see {@link AcpToolCallSnapshot.raw}). */
-  | { kind: 'raw'; text: string }
-
-/**
- * Fold one ACP `tool_call` notification into a snapshot.
+ * Why text and not a card: the Chat plane cannot draw a `tool-call` block inside
+ * the message body (`AssistantMarkdown` skips it). What the plane shows instead
+ * is the host loop's EXECUTION of that call, appended as its own node after the
+ * whole assistant message settles — so every card of a turn piles up below all
+ * the prose. A native turn hides this because its cards sit BETWEEN two model
+ * steps; an ACP turn is ONE host step (the agent runs its own loop inside one
+ * `session/prompt`), so there is no second step to interleave with. Ordering is
+ * therefore unreachable through the card path, and the honest fix is to not ask
+ * for a card. The full card — arguments, diffs, status — still lives in the ACP
+ * view tab, which already renders in arrival order.
  *
- * The snapshot keeps the fields the card itself renders (`title`, input text),
- * the call's other named fields (`kind`, `status`, `locations`, `terminalId`,
- * `meta`) in {@link AcpToolCallSnapshot.details}, and the whole raw notification
- * in {@link AcpToolCallSnapshot.raw} — an agent's call may carry a shape this
- * plugin has never seen, and the settled card can still show it verbatim.
- * Returns `undefined` only when the notification has no id: without one there is
- * nothing to group the card with, and inventing an id would be a lie.
+ * See docs/acp-convergence.md §1.7.
  */
-export function acpToolCallFromUpdate(update: Record<string, unknown>): AcpToolCallSnapshot | undefined {
-  const callId = typeof update.toolCallId === 'string' ? update.toolCallId.trim() : ''
-  if (callId === '') return undefined
-  const name = typeof update.title === 'string' ? update.title : ''
-  const details = acpToolCallDetailsOf(update)
-  return { callId, name, argsRaw: acpToolCallArgsOf(update), ...(details === '' ? {} : { details }), raw: dumpJson(update) }
-}
 
-/** The ordered `key: value` rendering of a tool call's non-text fields (see {@link AcpToolCallSnapshot.details}). */
-export function acpToolCallDetailsOf(update: Record<string, unknown>): string {
-  const lines: string[] = []
-  for (const key of ['kind', 'status', 'locations', 'terminalId', 'meta'] as const) {
-    const value = update[key]
-    if (value === undefined || value === null || value === '') continue
-    if (key === 'locations' && Array.isArray(value) && value.length === 0) continue
-    lines.push(`${key}: ${typeof value === 'string' ? value : jsonOf(value)}`)
-  }
-  return lines.join('\n')
-}
-
-/** Keys {@link acpToolCallDetailsOf} already accounts for (everything else is announced as an extra key). */
-const ACP_TOOL_CALL_KNOWN_KEYS = new Set(['sessionUpdate', 'toolCallId', 'title', 'rawInput', 'arguments', 'content', 'kind', 'status', 'locations', 'terminalId', 'meta'])
+/** Glyph an inline tool-activity line opens with. */
+const TOOL_ACTIVITY_GLYPH = '🛠️'
 
 /**
- * Fold one ACP `tool_call_update` into an open snapshot, in place.
+ * One tool call's headline: what it is, what it was asked, and where it stands.
  *
- * ACP updates carry FULL replacement snapshots (`rawInput` restated in whole on
- * every change), while the host's accumulator CONCATENATES `argumentsDelta` —
- * so the deltas produced here are the extension suffix only, and the snapshot
- * itself always moves to the latest known text (the closing `block-end` frame
- * replaces the block wholesale, which is what makes a non-extension update
- * land correctly in the settled card).
+ * @param name - the agent's own label for the call (`title`); empty stays honest.
+ * @param input - the arguments / raw input the agent disclosed (may be `''`).
+ * @param status - the ACP status (`pending` / `in_progress` / `completed` / …).
+ */
+export function acpToolActivityLine(name: string, input: string, status: string): string {
+  const label = name === '' ? 'tool' : name
+  const tail = status === '' ? '' : ` · ${status}`
+  if (input === '') return `\n${TOOL_ACTIVITY_GLYPH} **${label}**${tail}\n`
+  if (input.includes('\n')) return `\n${TOOL_ACTIVITY_GLYPH} **${label}**${tail}\n\`\`\`\n${input}\n\`\`\`\n`
+  return `\n${TOOL_ACTIVITY_GLYPH} **${label}**${tail} · \`${inlineCodeOf(input)}\`\n`
+}
+
+/**
+ * What one tool call printed, as a fenced block the chat plane renders verbatim.
  *
- * Input (`rawInput` / `arguments`) outranks `content`: the card's argument text
- * is what the agent asked the tool to do, not what the tool printed back. Once
- * input has been seen, content updates stop contributing — a `content` fold
- * only fills a call whose agent never sent input at all.
+ * Fenced rather than quoted: tool output is machine text, and a quote block lets
+ * the plane's markdown read its `#` / `|` / `-` characters as prose structure.
  */
-export function acpToolCallDelta(
-  snapshot: AcpToolCallSnapshot,
-  update: Record<string, unknown>,
-): AcpToolCallDelta[] {
-  const deltas: AcpToolCallDelta[] = []
-  const title = update.title
-  if (typeof title === 'string' && title !== '' && title !== snapshot.name) {
-    deltas.push({ kind: 'name', name: title })
-    snapshot.name = title
-  }
-  const input = acpToolCallInputOf(update)
-  if (input !== undefined) {
-    const suffix = extensionSuffixOf(snapshot.argsRaw, input)
-    if (suffix !== '') deltas.push({ kind: 'args', text: suffix })
-    snapshot.argsRaw = input
-  } else if (snapshot.argsRaw === '') {
-    const text = updateContentToText(update.content)
-    if (text !== '') {
-      deltas.push({ kind: 'args', text })
-      snapshot.argsRaw = text
-    }
-  }
-  const details = acpToolCallDetailsOf(update)
-  if (details !== '') {
-    deltas.push({ kind: 'details', text: details })
-    snapshot.details = details
-  }
-  // `kind` / `status` name themselves; an unknown key is the one thing a shape
-  // we have never seen would carry, so it is announced here rather than only
-  // sitting in the raw JSON.
-  const extra = Object.keys(update).filter(key => !ACP_TOOL_CALL_KNOWN_KEYS.has(key))
-  if (extra.length > 0) {
-    deltas.push({ kind: 'details', text: `other keys: ${extra.join(', ')}` })
-  }
-  const raw = dumpJson(update)
-  deltas.push({ kind: 'raw', text: raw })
-  snapshot.raw = raw
-  return deltas
+export function acpToolActivityOutput(text: string): string {
+  return `\n\`\`\`\n${text}\n\`\`\`\n`
+}
+
+/** A backtick inside an inline-code span would close it early; fold it to a quote. */
+function inlineCodeOf(text: string): string {
+  return text.replace(/`/g, "'")
 }
 
 /**
- * The part of `next` that extends `previous` — the only thing a concatenating
- * delta consumer can express. A replacement (the agent rewrote its input) has
- * no honest delta; the caller updates the snapshot regardless and lets the
- * closing snapshot tell the truth.
- */
-function extensionSuffixOf(previous: string, next: string): string {
-  if (previous === '') return next
-  return next.startsWith(previous) ? next.slice(previous.length) : ''
-}
-
-/**
- * The argument INPUT an ACP tool-call notification carries, if any.
+ * The argument INPUT an ACP tool-call notification carries, or `''` when it
+ * discloses none.
  *
  * Accepts the spellings seen in the wild: `rawInput` / `arguments` as a string,
  * an object, or an ARRAY (some agents batch several calls as one input). Every
- * non-empty value is serialized as-is — a stringified object is accepted as-is,
- * because the card shows raw text and re-serializing would only risk throwing.
- * Only an absent / empty / null value counts as "no input".
+ * non-empty value is serialized as-is — re-serializing a stringified object
+ * would only risk throwing.
  */
-function acpToolCallInputOf(update: Record<string, unknown>): string | undefined {
+export function acpToolInputOf(update: Record<string, unknown>): string {
   for (const key of ['rawInput', 'arguments'] as const) {
     const value = update[key]
     if (typeof value === 'string') {
@@ -797,21 +731,10 @@ function acpToolCallInputOf(update: Record<string, unknown>): string | undefined
     }
     if (typeof value === 'object' && value !== null) return jsonOf(value)
   }
-  return undefined
+  return ''
 }
 
-/**
- * The argument text an ACP tool-call notification carries, if any.
- *
- * Same spellings as {@link acpToolCallInputOf}, plus a `content` array folded to
- * text, and refuses to invent one: an agent that sends no arguments gets `''`,
- * which renders as an empty card rather than a fabricated placeholder.
- */
-export function acpToolCallArgsOf(update: Record<string, unknown>): string {
-  return acpToolCallInputOf(update) ?? updateContentToText(update.content)
-}
-
-/** The fields of one ACP content block that a diff row carries. */
+/** One structured edit as plain text: its path, then `-`/`+` lines with three lines of context. */
 export interface AcpDiffPayload {
   path: string
   oldText: string | null
@@ -953,8 +876,13 @@ export const BOOKKEEPING_UPDATES: ReadonlySet<string> = new Set([
  * Human-readable text of an ACP notification this build has no card of its own
  * for. The text is what the native chat stream shows and what the guard answers
  * the host loop's execution of that card with, so it must carry the payload —
- * a plan's entries, a mode change, an unknown kind's whole JSON — rather than
- * only a name.
+ * a plan's entries, an unknown kind's whole JSON — rather than only a name.
+ *
+ * The routine bookkeeping kinds (`current_mode_update`, `available_commands_update`,
+ * and the rest of `BOOKKEEPING_UPDATES`) never reach this function on the live
+ * path: `streamPrompt` drops them before it announces a kind inline — it is the
+ * only caller. The two branches below that name them are a defensive fallback
+ * for a direct caller, NOT a live route into the chat stream.
  */
 export function describeUnhandledUpdate(kind: string, update: Record<string, unknown>): string {
   const label = kind === '' ? 'session update' : kind
@@ -1031,37 +959,6 @@ export function selectForwardPrompt(messages: readonly {
   }
   if (last !== undefined) return { kind: 'prompt', ...last }
   return sawUserRole ? { kind: 'no-user-input' } : { kind: 'empty' }
-}
-
-/**
- * Whether this request is the CONTINUATION step of a turn whose first step
- * settled with tool-call blocks — which is exactly what the ACP agent's display
- * cards are. The host agent-loop starts a next step whenever the settled
- * assistant message contains `tool-call` blocks, feeding it the staged tool
- * results: the request's message list then has `tool`-sourced messages AFTER
- * the last user-sourced one. A fresh prompt never does (the person's new words
- * are the last message); history from earlier turns sits before the new user
- * text, so it cannot trip this.
- *
- * The adapter replays the buffered answer on such a step instead of touching
- * the ACP agent — its turn already ran to completion in step 1 (see
- * `BridgeManager.streamPrompt` and docs/acp-convergence.md §1.6).
- */
-export function isAcpToolContinuation(messages: readonly {
-  source?: { kind?: string }
-}[]): boolean {
-  let lastTool = -1
-  for (let i = 0; i < messages.length; i += 1) {
-    if (messages[i]?.source?.kind === 'tool') lastTool = i
-  }
-  if (lastTool < 0) return false
-  for (let i = lastTool + 1; i < messages.length; i += 1) {
-    const kind = messages[i]?.source?.kind
-    // A source-less message counts as user input — the same convention
-    // `selectForwardPrompt` uses for hand-built requests.
-    if (kind === undefined || kind === 'user') return false
-  }
-  return true
 }
 
 // ---- The agent's own permission vocabulary ----
@@ -1350,8 +1247,12 @@ export interface AcpManager {
   /**
    * The ACP model surface for one agent (the seats' data source): base entry,
    * the `exposedModels` variants, and the agent's own reasoning efforts.
-   * Memory-only — never spawns; an agent without a cached catalog gets a
-   * background probe so the next read is complete.
+   * Memory-only — never spawns and never probes: an agent without a cached
+   * catalog is reported with `probed: false` and whatever (possibly empty)
+   * content memory holds, NOT probed on read. A catalog is filled only by
+   * `agent/probe-models` (the settings-card button) and by the agent's own
+   * `session/new` / `session/load` — reading the seat must never start a
+   * process, or opening the page would launch every configured agent.
    */
   agentCatalog(agentId: string): AgentCatalogResult
   /**
@@ -1410,6 +1311,14 @@ export interface AcpManager {
    * so a switch shows BEFORE the next turn materializes it.
    */
   chatAgentFor?(dshSessionId: string): string | undefined
+  /**
+   * The agent one DSH chat conversation is LOCKED to after its first ACP turn,
+   * if any. Read-only report for `session/chat-list`: the composer hides its
+   * agent picker and shows the locked agent instead. Unlike `chatAgentFor`,
+   * this deliberately ignores the roster — a deleted agent still owns the
+   * conversation's context.
+   */
+  lockedAgentFor?(dshSessionId: string): string | undefined
   /**
    * The conversation's whole persisted pick — agent, model, thought level —
    * readable BEFORE the conversation has an ACP session. This is what makes a
@@ -1530,6 +1439,7 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         // DON'T pass `refresh` keep the per-session cache (repeat reads stay
         // cheap); the browser half always sets it (see AcpStore.loadChatSessions).
         if (body.refresh === true) manager.invalidateAcpMode?.(dshSessionId)
+        const lockedAgentId = manager.lockedAgentFor?.(dshSessionId)
         return ok({
           sessions: manager.chatSessions?.(dshSessionId) ?? [],
           // The plugin's own binding for this conversation — who serves its
@@ -1537,6 +1447,11 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
           // is visible before the next turn materializes a session for the
           // new agent (the live-session list below lags one message by design).
           boundAgentId: manager.chatAgentFor?.(dshSessionId),
+          // Set once the first ACP turn has run: the conversation is locked to
+          // this agent and the composer offers no picker any more. Reported
+          // even when the agent is no longer in the roster (its context still
+          // belongs to this conversation).
+          ...(lockedAgentId === undefined ? {} : { lockedAgentId }),
           // The rest of the persisted pick (model + thought level). Read
           // BEFORE any ACP session exists, which is what lets the composer show
           // a conversation set up ahead of its first message as it really is.

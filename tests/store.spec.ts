@@ -306,6 +306,27 @@ describe('AcpStore agent management', () => {
     expect(legacy.getSnapshot().approvalRouted).toBe(false)
   })
 
+  it('answers a pending permission ask even when the host reports the native chain', async () => {
+    // `approvalRouted` says the host HAS the approval service; it does not
+    // promise THIS ask reached the conversation. An ask is in `ui.permissions`
+    // only because it fell back to the ledger (the service was unavailable
+    // this time, or the session has no chat identity), so the panel must still
+    // render the answerable card — the old rule showed a read-only count
+    // instead and left the ask with no button anywhere.
+    const { permissionLedgerCard } = await import('../src/client/panel.tsx')
+    const pending = [{ requestId: 'r1', sessionId: 's1', title: 'mock dangerous operation', options: [{ optionId: 'allow1', name: 'Allow once', kind: 'allow_once' }] }]
+
+    expect(permissionLedgerCard({ approvalRouted: true, permissions: pending }))
+      .toEqual({ visible: true, fellBackFromConversation: true })
+    expect(permissionLedgerCard({ approvalRouted: false, permissions: pending }))
+      .toEqual({ visible: true, fellBackFromConversation: false })
+    // Nothing pending: no card, whatever the capability report says.
+    expect(permissionLedgerCard({ approvalRouted: true, permissions: [] }))
+      .toEqual({ visible: false, fellBackFromConversation: false })
+    expect(permissionLedgerCard({ approvalRouted: false, permissions: [] }))
+      .toEqual({ visible: false, fellBackFromConversation: false })
+  })
+
   it('loads the chat-bound ACP sessions by chat id and switches the agent mode', async () => {
     const calls: Array<{ endpoint: string; payload: unknown }> = []
     let listed = { sessions: [] as unknown[] }
@@ -404,6 +425,96 @@ describe('AcpStore agent management', () => {
     await legacy.bindChatAgent('chat-1', 'pi')
     await legacy.loadChatSessions('chat-1')
     expect(legacy.getSnapshot().chatBoundAgent['chat-1']).toBe('pi')
+  })
+
+  it('records the one-way agent lock from session/chat-list', async () => {
+    let listed: { sessions: unknown[]; lockedAgentId?: string } = { sessions: [], lockedAgentId: 'pi' }
+    const store = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint === 'session/chat-list') return { ok: true, value: listed }
+      return { ok: true, value: { done: true } }
+    }, (zh) => zh)
+
+    await store.loadChatSessions('chat-1')
+    expect(store.getSnapshot().chatLockedAgent['chat-1']).toBe('pi')
+
+    // The lock is one-way: a read that omits the field is an older host half,
+    // not an unlock. Keeping it is what stops the picker coming back.
+    listed = { sessions: [] }
+    await store.loadChatSessions('chat-1')
+    expect(store.getSnapshot().chatLockedAgent['chat-1']).toBe('pi')
+
+    // Conversations are independent.
+    listed = { sessions: [], lockedAgentId: 'omp' }
+    await store.loadChatSessions('chat-2')
+    expect(store.getSnapshot().chatLockedAgent['chat-2']).toBe('omp')
+  })
+
+  it('takes the start-of-turn lock from the host frame, and honours a rolled-back lock', async () => {
+    let listed: { sessions: unknown[]; lockedAgentId?: string } = { sessions: [], lockedAgentId: 'pi' }
+    const store = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint === 'session/chat-list') return { ok: true, value: listed }
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+    const apply = (event: unknown): Promise<void> =>
+      (store as unknown as { applyEvent(event: unknown): Promise<void> }).applyEvent(event)
+
+    // The host locks the conversation when the first ACP turn starts and says
+    // so immediately: that frame is the hand-off trigger, not a later read.
+    await apply({ type: 'chat/agent-locked', dshSessionId: 'chat-1', agentId: 'pi' })
+    expect(store.getSnapshot().chatLockedAgent['chat-1']).toBe('pi')
+    expect(store.getSnapshot().chatBoundAgent['chat-1']).toBe('pi')
+    expect(store.getSnapshot().agentLockReveal['chat-1']).toBe(1)
+
+    // A read confirming the same lock is not a second hand-off.
+    await store.loadChatSessions('chat-1')
+    expect(store.getSnapshot().agentLockReveal['chat-1']).toBe(1)
+
+    // The first turn delivered nothing: the host rolled the lock back.
+    await apply({ type: 'chat/agent-unlocked', dshSessionId: 'chat-1' })
+    expect(store.getSnapshot().chatLockedAgent['chat-1']).toBeUndefined()
+
+    // A list read that started before the rollback can still report the lock;
+    // it must not revive a conversation the host has explicitly unlocked.
+    await store.loadChatSessions('chat-1')
+    expect(store.getSnapshot().chatLockedAgent['chat-1']).toBeUndefined()
+
+    // The user retries: the new lock frame supersedes the rollback marker and
+    // announces a fresh ceremony (the animation's serial advances).
+    await apply({ type: 'chat/agent-locked', dshSessionId: 'chat-1', agentId: 'pi' })
+    expect(store.getSnapshot().chatLockedAgent['chat-1']).toBe('pi')
+    expect(store.getSnapshot().agentLockReveal['chat-1']).toBe(2)
+  })
+
+  it('announces a lock only when this page watched it arrive', async () => {
+    // The composer plays a shatter/condense hand-off on this serial (see
+    // agent-lock-anim.ts). A lock that was already there when the page opened
+    // is not a transition and must not replay the ceremony on every reload.
+    let listed: { sessions: unknown[]; lockedAgentId?: string } = { sessions: [] }
+    const store = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint === 'session/chat-list') return { ok: true, value: listed }
+      return { ok: true, value: { done: true } }
+    }, (zh) => zh)
+
+    await store.loadChatSessions('chat-1')
+    expect(store.getSnapshot().agentLockReveal['chat-1']).toBeUndefined()
+
+    // The first turn lands: a later read reports the lock.
+    listed = { sessions: [], lockedAgentId: 'pi' }
+    await store.loadChatSessions('chat-1')
+    expect(store.getSnapshot().agentLockReveal['chat-1']).toBe(1)
+
+    // Restating the lock is not another transition.
+    await store.loadChatSessions('chat-1')
+    expect(store.getSnapshot().agentLockReveal['chat-1']).toBe(1)
+
+    // A page that opens an already-locked conversation seeds the lock silently.
+    const reloaded = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint === 'session/chat-list') return { ok: true, value: { sessions: [], lockedAgentId: 'pi' } }
+      return { ok: true, value: { done: true } }
+    }, (zh) => zh)
+    await reloaded.loadChatSessions('chat-1')
+    expect(reloaded.getSnapshot().chatLockedAgent['chat-1']).toBe('pi')
+    expect(reloaded.getSnapshot().agentLockReveal).toEqual({})
   })
 
   it('folds a committed preset frame into the verdict instead of re-reading the log', async () => {

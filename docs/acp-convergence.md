@@ -108,10 +108,14 @@ ACP 的 `tool_call` 被 `switchToBlock('reasoning')` 降级成
 `argumentsDelta` 用 agent 给的内容。参数型 ACP agent 若给结构化 input/arguments，
 就作为 `argumentsDelta` 送。
 
+> **现行状态（2026-10-19）**：上面“要做的事”做了（见 §1.5、§1.6），又被 §1.7 退回了——它交换掉的是时间顺序，不值。现行构建不发 `tool-call` chunk，工具活动是内联 `text`。
+
 **注意**：`block-end` 的 `block` 会经 `toAssistantBlock` **替换**整个 block，
 所以最后一个 `block-end` 必须带完整内容（accumulator 的 `block-end` 分支是覆盖不是合并）。
 
 ### 1.5 展示卡的隐性代价：宿主 loop 会续跑，原话会被重发（oml「你好」会话事故，2026-10-11）
+
+> **现行状态（2026-10-19）**：§1.4–§1.6 整条卡片路径（含本节与下节的两步形状修复）已被 §1.7 退役——现行构建不发 `tool-call` 块，所以这里描述的续跑与重发在现行代码里**不会再发生**。本节与下节按历史记载读：它们记录的是「卡片路径走不通」的完整证据。
 
 §1.4 的方案落地后，oml 项目的「你好」会话暴露了它没算到的代价。用户报告
 「ACP agent 侧不断地反复接收到我发出去的话」。会话日志（`session-afd36498`，
@@ -178,45 +182,74 @@ callId 显式断块；同 callId 重发的 `tool_call` 按更新折叠。
 现象：ACP 回合结束后，整个回合（思考、**答案、工具卡**）折叠进「已完成，
 用时 N 秒」的过程行，看起来「agent 的话全成了思考」；工具卡片永远钉在回合
 底部。日志证明桥的发射无罪——settled `assistant/message` 的块数组交错正确
-（reasoning / tool-call / text），正式答案就在 `text` 块里；英文思考与
-「过渡句在两个通道各发一遍」是 codebuddy 自己的行为。两条规则都在 DSH 侧
+（reasoning / tool-call / text），正式答案就在 `text` 块里。两条规则都在 DSH 侧
 （asar 内 `@deepseek-ai/dsh-client-ui-chat`）：
 
 1. **答案判定**（`latestAnswer(turn)`）：只要最后一步消息的 blocks 含任何
-   `tool-call` 块就返回 `null`——原生回合在工具调用后会有「干净的第二条答案
-   消息」，ACP 回合是单条消息，必不合格。`answerAnchorSeq === null` 使全回合
-   节点都成为「过程成员」，compact / standard / detailed 三档全部
-   `foldCompletedTurns: true`（仅 verbose 不折叠；默认 `detailed`），回合一
-   结束就整体折叠。`StreamChunk` 没有 step/消息边界 chunk，adapter 拆不出
-   「干净的第二条答案消息」，所以在插件侧无解。
+   `tool-call` 块就返回 `null`。
 2. **消息内卡片不渲染**（`AssistantMarkdown`）：消息体对 `tool-call` 块显式
    跳过（`case "tool-call": break`）；卡片只由宿主 loop 在消息落定**之后**
-   执行的 `tool/call` 审计事件创建（执行对象是 guard 注册的虚拟工具，输出
-   回放自共享注册表 `toolResults`——链路实测有效，Read 卡的结果就是真实文件
-   内容），节点顺序恒为答案在前、卡片在后 → 置底，流式期间同样最后才出现。
+   执行的 `tool/call` 审计事件创建。
 
-插件侧的修复（2026-10-11 当日落地，acp-test-3 复测后用户确认）：**两步形状**。
-`latestAnswer` 只看最后一步的 assistant 消息，那就让答案自己成为第二步：
-step 1 流式发 reasoning + 工具卡，第一张卡之后的文本**缓冲不发**
-（`answerBuffer`），turn 收尾 stash 进 `pendingToolAnswers`（src/bridge.ts，
-按 dshSessionId 有界）；loop 执行完卡片后提出的续跑步由
-`isAcpToolContinuation`（src/impl.ts：最后一条用户来源消息之后跟着 tool
-来源消息——新鲜 prompt 的用户消息永远在最后，不会误判）认出，adapter
-**原样回放缓冲文本成第二条无工具消息**，不碰 ACP agent（它的 turn 在
-step 1 已跑完）。配套改动：guard 虚拟工具**不再调 `exec.concludeTurn()`**
-（loop 必须提出续跑步）；pre-step 闸门为「callId 都在共享注册表里」的 tool
-批次开唯一例外（其余无用户批次照旧 reject）；`recordAcpToolOutput` 空
-content 也记录（闸门成员判定靠它）；缓冲空时续步发「只调了工具没输出」的
-指引文案。DSH 侧仍值得提的两条——`latestAnswer` 放宽、消息体按原位渲染
-tool-call——在插件侧修好可见性之后只剩锦上添花。
+2026-10-11 当日的第一版修复是**两步形状**（`answerBuffer` +
+`pendingToolAnswers` + `isAcpToolContinuation` + guard 的虚拟工具与闸门例外）。
+它修好了「答案不折叠」，但留下了 §1.7 的分层。那一版现已废弃。
 
-同日操作记录：`session-34788953` 的历史日志因旧构建的重复 tool-call 块被宿主
-`@deepseek-ai/dsh-session-persistence-jsonl` 拒载（`SessionFormatError:
-assistant/message repeats advertised tool call`，校验在 `verifyCurrentGeneration`
-一族）。修复：每 id 保留**首个**块（首个带真实 name/args，末个多为空名空参
-的退化重述），删 32 行重复的 `tool/call` + `tool/result` 审计行（结果全是
-`unknown tool` 错误），重排 seq，用宿主自己的校验器验证 `ok:true`；原文件
-备份为同目录 `session.v4.jsonl.zstd.bak-1791707886`。
+### 1.7 分层是真缺陷：一步回合拿不到「步与步之间」，工具活动必须是内联散文（2026-10-19）
+
+用户报告「ACP 的回合上面一整块思考、下面一整堆工具卡，而原生对话是交错的」。
+三条事实，逐条查证：
+
+1. **块顺序本来就是时间序。** `BlockAssembler`（`@deepseek-ai/dsh-llm`
+   `lib/types/assembler.js`）用 `order` 数组输出，首次见到某个 index 就 push，
+   `assembled()` 只有一行 `this.order.map(index => …)`，**不按类型分组**。
+   agent-loop 把 `assembler.blocks()` 原样写进 `assistant/message`。所以
+   「重排」不是解法——顺序从来没错。
+2. **卡片不在消息体内画**（§1.6 第 2 条），而 `tool/call` 是 loop 在消息
+   **落定之后**才 append 的（`dsh-agent-loop` 的 `appendToolCall`，由
+   `step()` 里 `toolCalls.length === 0 ? completed : executeToolCalls` 驱动）。
+   卡片因此在结构上永远排在整个 assistant 节点下面。
+3. **原生回合之所以交错，靠的是「步」，不是块顺序。** 原生：step 1 思考 + 工具
+   块 → 消息落定 → loop 执行 → `tool/call` 卡片 → step 2 思考 + 答案。卡片夹在
+   两个 assistant 节点之间，所以看起来是交错的。ACP 回合没有这个结构：agent
+   在自己的进程里跑自己的 loop，插件只发一次 `session/prompt`，思考/工具/答案
+   全部在一次调用里流回来，**宿主只看到一个 step**。ACP 协议没有「内部一轮
+   结束」的信号，`StreamChunk` 里也没有步边界块。
+
+**在一个 step 内部，卡片只能置底。时间序在卡片路径上不可达。**
+
+**现行修复：工具活动改发内联 `text`。** `streamPrompt` 不再发 `tool-call` 块：
+`tool_call` / `tool_call_update` 走 `noteToolActivity`，在它发生的**位置**发一行
+`🛠️ **<name>** · <status> · `<input>``；有输出时紧跟一个围栏块。没有 card 的
+通知种类（plan / mode / 新种类）同理，每种类一行、内容变了才重发。
+`agent_message_chunk` 全程按到达顺序进 `text`。一个气泡内因此是
+思考 → 工具 → 思考 → 工具 → 答案。完整卡片（参数、diff、状态）仍在
+NTR 视图 tab（那里一直是时间序：src/client/store.ts 的 `foldUpdate` 按到达
+push，`acp-view.tsx` 直接 map `transcript.blocks`）。
+
+**连带退役**（一整片机制随之消失，不要带回来）：
+
+- `answerBuffer` / `streamedAnswerLength` / `pendingToolAnswers` /
+  `isAcpToolContinuation`：没有工具块就 `toolCalls.length === 0`，loop 直接
+  `completed`，**不存在续跑步**；答案也不必再缓冲，`latestAnswer` 认中这条
+  干净消息，回合不再折叠。
+- guard 的第四职责（`tools/execute` 虚拟工具）：没有卡片要执行。
+- guard 第三职责的唯一例外：没有本行自己的续跑步可放行，`agent/pre-step`
+  回到「无用户来源即 reject」的纯闸门。
+- `recordAcpToolOutput` 与共享注册表 `toolResults` / `cardOutputs`：只服务上面
+  两条。注册表只剩 `conversations` + `defaultModel`。
+- `acpToolCallFromUpdate` / `acpToolCallDelta` / `acpToolCallDetailsOf` /
+  `acpToolCallArgsOf` / `AcpToolCallSnapshot` / `AcpToolCallDelta`：快照与
+  delta 语义是为拼接式 `argumentsDelta` 造的，散文不需要它们。新增
+  `acpToolActivityLine` / `acpToolActivityOutput` / `acpToolInputOf`（src/impl.ts）。
+
+**代价**：主聊天平面没有原生工具卡。这是换时间序付的钱。
+
+同日（2026-10-11）的操作记录仍适用：`session-34788953` 的历史日志曾因旧构建的
+重复 tool-call 块被宿主 `@deepseek-ai/dsh-session-persistence-jsonl` 拒载
+（`SessionFormatError: assistant/message repeats advertised tool call`）。修复：
+每 id 保留**首个**块，删重复的 `tool/call` + `tool/result` 审计行，重排 seq。
+现行构建不再产出重复的 tool-call 块，这类旧日志不会再出现。
 
 ---
 
@@ -229,7 +262,8 @@ conversation.input.left
 └── acp-mode        (order 20)  agent 自己的 mode（session/set_mode）
 
 conversation.input.model   ← NTR 底座（NTR 模式下由闸门动态安装）
-                            第一级：选 agent；其下多级菜单接 模型 / 思考等级
+                            底座菜单只有一级：选 agent
+                            （模型 / 思考等级是同一 cluster 里的独立芯片，各开各的菜单）
 ```
 
 底座占的是**原生模型底座那个座位**——composer bar 行尾（`.trailing`，`margin-left: auto`）、
@@ -246,6 +280,12 @@ conversation.input.model   ← NTR 底座（NTR 模式下由闸门动态安装�
 
 > 权限档不在菜单里：agent 报什么就问什么（§2.3），没有"档"可切。约束 18 里
 > 描述的 `boundarySection`（DSH Access mode 档位）已随那条轴一起删除。
+
+> **没有 agent 服务时，底座是入口而不是一个借来的名字**（2026-10-19，审计 F5）：没有绑定、
+> 没有活会话、没有插件默认 agent 时 `routeAgentId` 返回 `undefined`，guard 的 `boundModelFor`
+> 也没有可改写的东西——下一条消息跑部署默认 provider。芯片由 `agentBaseChip` 渲染成
+> 「接入 NTR / Use NTR」，roster 没有任何行标记为当前；模型 / 思考 chip 与各轴一律退化成空。
+> 旧实现以 `agents[0]?.id` 收尾，会把一个永远收不到消息的 agent 放到芯片上。
 
 ### 2.2 prompt 触发：插件自己的会话映射
 
@@ -279,6 +319,24 @@ selection，而 driver 每轮解析的路由（`selectionFor(agent).current`：p
 `session/request_permission` 到达时，宿主**不裁决**：把 ACP 的
 `options` / `toolCall` 详情 / allow-deny 原样送到界面，用户点什么就回什么给 agent。
 宿主不再有 `decidePermission` / `authorizeWrite` 这一层。
+
+**降级路径与兜底语义（2026-10-19 补记）**：`ask` 优先走宿主 `ctx.approval`
+（审批出现在对话 composer 里，不抢答、不设定时器）。走不到的三条原因由
+`LedgerFallbackReason` 区分，全部回落到设置页的 `PermissionLedger`：
+
+- `no-requester` / `no-chat-session`：**设计内**的 ledger 路径（宿主没有审批服务；
+  `/acp` RPC 会话没有聊天 turn 可挂审计对）。答案入口就是设置页那张卡，
+  `permissionTimeoutMs` 默认 `0` = 无限等人答。
+- `unavailable`：**降级**——服务在，这一次却失败了，用户正在看的对话里不会出现这个问题。
+  无限等待等于把 turn 挂在没人看得见的问题上，所以它改走
+  `permissionFallbackTimeoutMs`（默认 300_000 = 5 分钟）到时代答 `cancelled`；
+  填 `0` 连这条也关掉。`permissionTimeoutMs > 0` 时它对三条路径一视同仁。
+
+原因在广播前记进 `ledgerFallbacks`，`streamPrompt` 据此写聊天里那行提示：
+设计内路径照旧「please approve in Settings」，降级路径要说清「审批服务不可用」
+并带上倒计时。面板侧 (`permissionLedgerCard`)：**只要 `ui.permissions` 非空就渲染
+可答复的卡片**，与 `approvalRouted` 无关——那个旗标只说宿主有审批链，不说这一条
+询问进了对话；有待处理项就等于对话没在展示它。
 
 ### 2.4 原生模型座位：遮蔽是显示层要求，与路由无关
 
@@ -438,12 +496,12 @@ outlet 读的就是它）核对这个 cell 的 head 是不是我们自己的组�
 **`impl.ts` 里随之删除的**：`AccessModeSessionLike` 改名 `SessionLogLike`（它现在只服务
 preset fold，不再有 access-mode 语义）。
 
-### 批次 5：主平面工具卡（**进行中**）
+### 批次 5：主平面工具卡（**已上线后因 §1.7 退回**）
 
-见 §1.4。**不需要写 `ConversationNodeDefinition`，不需要 append 事件**——
-把 `BridgeManager.streamPrompt` 里被降级成 reasoning 散文的
-`tool_call` / `tool_call_update` 分支改成发真正的 tool-call chunk 序列即可，
-宿主与官方 chat 包已注册好渲染器。
+见 §1.4 、§1.5 、§1.6：接缝确实存在（宿主支持 `tool-call` 块），
+而且我们真的发了。但一个 ACP 回合只是宿主的一步，卡片只能置底
+（§1.7），所以现行构建改发内联 `text`：时间顺序保留，主平面没有原生卡片。
+这一批的“完成”是真实的（接缝找到了、代码上线过），只是它换来的东西不值得。
 
 ---
 
@@ -455,13 +513,13 @@ preset fold，不再有 access-mode 语义）。
 | 2 座位遮蔽 | ✅ 完成（2026-10-07 修正为 claim；2026-10-14 改为接管） | `tests/model-seat.spec.ts` 16 例断言底座的条件、生命周期与夺回 |
 | 3 RPC 清理 | ✅ 完成 | `default/agent` 等新端点在 bundle 中；`tests/store.spec.ts` 的 "the conversation↔agent binding" |
 | 批次 4 权限裁决链 | ✅ 完成 | `tests/impl.spec.ts` 的 "the retired permission axis" 断言 helper 已不存在 |
-| 5 主平面工具卡 | ✅ 完成 | `streamPrompt` 改发 `tool-call` block 序列；`tests/bridge.spec.ts` 的 "implements LlmAdapter" 断言 reasoning 里**不再有** `mock tool` |
+| 5 主平面工具卡 | ✅ 上线后因 §1.7 退回（接缝找到并上线，但它交换掉了时间顺序） | `streamPrompt` 现发内联 `text`；`tests/bridge.spec.ts` 的 "implements LlmAdapter" 断言无 `tool-call-delta` 且 `toolAt < answerAt` |
 | 6 原生模型座位接管 | ✅ 完成，**2026-10-07 / 2026-10-14 两次修正**（见 §2.4） | `createModelSeatClaim` 把 NTR 底座装进该 cell 并核实夺回；`tests/model-seat.spec.ts` 16 例（含"后来注册的对手抢走 cell 后夺回"、有界放弃、释放栈）|
 
-**测试基线**：224 passed（2026-10-14）。模型座位套件 16 例，其中 claim 部分对着一个**按 runner 真实规则**
+**测试基线**：312 passed（2026-10-19）。模型座位套件 16 例，其中 claim 部分对着一个**按 runner 真实规则**
 实现替身注册表（声明优先级被丢弃、页面级递减 rank、最后注册者赢）跑，而不是对着我们自己写的数字跑。
 
-**验收标准的实际数字**：`tsc --noEmit` 干净；`lib/client.js` 181.30 kB（gzip 46.25 kB）。
+**验收标准的实际数字**：`tsc --noEmit` 干净；`lib/client.js` 213.91 kB（gzip 55.80 kB）。
 
 **桌面临场验收（2026-10-07）**：临时 `DSH_HOME` + 桌面 asar 内 CLI 起一个只装
 `dsh-ntr` + `@hytime/dsh-thinking-effort` 的 web profile（`--port 0`，独立 junction 的 profile node_modules），
@@ -499,8 +557,8 @@ preset fold，不再有 access-mode 语义）。
 - **不改宿主**——`modelAvailable` 是宿主自己的 advisory 契约问题，不是我们的 bug
 - **不重加 `policyNotice`**——prompt 必须严格等于用户文本
 - **不删 AGENTS.md 里那些【已废弃】约束的「证据」段**——失败方向的第一手记录比假装它没发生过更有价值
-- **不把原生模型 seat 改成第二个 ACP 模型入口**——`conversation.input.left` 的底座已经承担选 agent，
-  同一个 cell 里再放一个模型面只会把「agent 的模型」和「DSH 的模型」混成一个东西。遮蔽是渲染空白，不是替代
+- **不把原生模型 seat 改成第二个 ACP 模型入口**——`conversation.input.model` 的 NTR 底座已经承担选 agent，
+  同一个 cell 里再放一个模型面只会把「agent 的模型」和「DSH 的模型」混成一个东西。注意这个 cell 现在是**接管**（occupant 是 NTR 底座本体 `AcpSessionControls`），不是渲染空白——「遮蔽是渲染空白，不是替代」是 2026-10-14 第二次修正前的旧结论，现行形状见 §2.4
 - **不把 rank 算术当手段**：cell 的归属由 runner 的页面级计数器决定（最后一个注册者赢），
   声明多少都不算数。所以只有一件事值得做——**核实 head 是不是自己，不是就再注册一次**（有界、可报告）。
   旧的 undercut 算术、退注册重注册、`onEntryError` abdicate 恢复、`seatBroken` 都不带回来：

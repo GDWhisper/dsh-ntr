@@ -46,7 +46,7 @@ DSH 的"模式"就是 **agent preset**：一条 `@deepseek-ai/dsh-agent-preset` 
 - 不挂任何 `tool-*` 行 → 工具目录为空（对端 agent 的工具在它自己进程里）；
 - 不挂 `agent-instructions` / `tool-skill` / `skill-filesystem` → 没有 AGENTS.md 摘要，也没有 `<available_skills>` 大块；
 - 不挂 `plan-mode` / `tool-todo` / `tool-goal` / `compaction-basic` / `command-compact` / 委派行 → 这些原生状态机与辅助调用不再作用于该会话；
-- `acp-guard.mjs` 行：三个监听器。① `agent/pre-step` 步进闸门：过滤 `agent-instructions` / `skill-catalog` / 一切 `plugin` 来源（保证后来新增的行或 host 平面的注入也不会悄悄回到模型视野），并**拒绝「strip 后仍有内容、却没有用户来源」的批次**——那是宿主 agent-loop 看见 ACP agent 的展示型工具卡后续跑出来的下一步（staged tool results），放行就会把人的原话重发给 agent（oml「你好」会话事故，见 [acp-convergence.md](acp-convergence.md) §1.5）；`reject` 让 turn 以 blocked 收尾，注入轮的空批次仍走原 completed 空转，无 source 的消息算用户输入（与 bridge 取词约定一致）。**唯一例外**是本行卡片续跑出的批次：每条 staged tool result 的 callId 都在共享注册表里（`toolResults.has`），adapter 会对它回放缓冲的答案文本而不碰 ACP agent——这是两步形状的答案回放步（见 [acp-convergence.md](acp-convergence.md) §1.6）；注册表里查不到的 callId 照旧 reject。② `tools/execute` 展示卡执行器：宿主 loop 会「执行」每张 ACP 展示卡（卡片渲染依赖执行记录，掐不得），preset 没挂工具时每张卡曾记一条 `unknown tool` 错误。此监听器对解析不到的工具名**即时注册一个 agent 作用域的虚拟工具**，工具体从共享注册表 `toolResults` 取该 callId 的真实输出回给宿主；真实输出由 `recordAcpToolOutput` 在折叠循环写入（空 content 也记录，闸门成员判定靠它）。工具体**不调 `concludeTurn()`**——宿主聊天包的答案判定拒绝任何含 tool-call 块的消息，loop 必须提出续跑步，缓冲的答案才有地方落（①的例外就是给它开的）；真实工具与 `tools` 服务缺席时静默放行（闸门兜底）。③ `agent/request` 路由改写（`{ prepend: true }`）——把 driver 解析出的请求配置改写成插件绑定指向的 `acp/<agent>`，否则从未跑过 ACP 轮次的会话发到部署默认 provider、已跑过的永远回放旧 agent（`prepend` 是因为 harness 自己的 `installModelSelection` 改写先注册，只有最外层能让绑定赢）。绑定经 `globalThis[Symbol.for('dsh-ntr.acp-binding')]` 与插件共享（guard 是 Loader 加载的独立模块实例），机制见 [acp-convergence.md](acp-convergence.md) §2.2。该行以**包名**引用（`dsh-ntr/acp-guard`，由 package.json 的 `exports` 映射到 `presets/acp/acp-guard.mjs`）：声明里的插件名是按**声明者 Loader 的解析基准**（profile 目录）解析的，`./acp-guard.mjs` 这种相对路径会落到 profile 目录里一个不存在的文件上。
+- `acp-guard.mjs` 行：两个监听器。① `agent/pre-step` 步进闸门：过滤 `agent-instructions` / `skill-catalog` / 一切 `plugin` 来源（保证后来新增的行或 host 平面的注入也不会悄悄回到模型视野），并**拒绝「strip 后仍有内容、却没有用户来源」的批次**——那是宿主 agent-loop 看见 settled assistant 消息里有 `tool-call` 块后续跑出来的下一步（staged tool results），放行就会把人的原话重发给 agent（oml「你好」会话事故，见 [acp-convergence.md](acp-convergence.md) §1.5）；`reject` 让 turn 以 blocked 收尾，注入轮的空批次仍走原 completed 空转，无 source 的消息算用户输入（与 bridge 取词约定一致）。**现行构建不再产生 `tool-call` 块**（工具活动是内联散文，见 §1.7），所以这样的批次必然是外来的，闸门没有例外。② `agent/request` 路由改写（`{ prepend: true }`）——把 driver 解析出的请求配置改写成插件绑定指向的 `acp/<agent>`，否则从未跑过 ACP 轮次的会话发到部署默认 provider、已跑过的永远回放旧 agent（`prepend` 是因为 harness 自己的 `installModelSelection` 改写先注册，只有最外层能让绑定赢）。绑定经 `globalThis[Symbol.for('dsh-ntr.acp-binding')]` 与插件共享（guard 是 Loader 加载的独立模块实例），机制见 [acp-convergence.md](acp-convergence.md) §2.2。该行以**包名**引用（`dsh-ntr/acp-guard`，由 package.json 的 `exports` 映射到 `presets/acp/acp-guard.mjs`）：声明里的插件名是按**声明者 Loader 的解析基准**（profile 目录）解析的，`./acp-guard.mjs` 这种相对路径会落到 profile 目录里一个不存在的文件上。
 
 安装：**没有安装步骤**——声明是插件包自己的 bundle patch，模式 chip 随包出现。只有「声明到了 roster 但激活失败」才需要人看：设置页那张卡读宿主 roster（`ctx.agentPresets` 的 `list()`，缺席即隐藏）并原样显示宿主的诊断。`preset/status` 只读，没有 `preset/install`：往那个没人读的旧目录里复制文件曾经让 UI 显示"已安装"而模式 chip 依然不见。
 
@@ -60,6 +60,8 @@ DSH 的"模式"就是 **agent preset**：一条 `@deepseek-ai/dsh-agent-preset` 
 
 **现行方向**：agent 侧 `session/request_permission` 原样映射到界面上。每个 agent 的权限形态不同（有的给选项列表、有的给 allow/deny、有的带 tool call 详情），接住它的载荷、渲染给人、把人的选择按 ACP 协议回包即可，宿主不预先判 allow/reject。
 
+**询问落在哪里，由它实际走的路决定**：`ask` 优先走宿主 `ctx.approval`（审批出现在对话 composer 里，不抢答）。走不到的三条原因见 [acp-convergence.md](acp-convergence.md) §2.3 的补记——设计内路径（没有审批服务、会话没有对话身份）落在设置页的 ledger 卡上等人答；**降级路径**（服务在、这次失败）落在同一张卡上，但带 5 分钟倒计时（`permissionFallbackTimeoutMs`），超时代答 `cancelled`。设置页那张卡**只要有待处理项就渲染可按钮**，不因 `approvalRouted` 而隐藏。
+
 **prompt 仍然严格等于用户文本**：这一条与权限怎么走无关，必须继续遵守。每轮转发给 ACP 的 prompt 严禁拼任何边界/策略句子（早期有 `policyNotice` 前缀叙述，已按用户要求彻底移除，不要以"agent 不知道边界"为由重加）。
 
 **工作区来自侧栏，这条继续有效**：ACP `session/new` / `session/load` 的 cwd 必须是该 DSH 会话自己的工作区（sidebar 点开的路径），且同一个工作区还要作为**子进程自己的 cwd**（`safeSpawnCwd`）——有一类 agent（实测 codebuddy）在进程启动那一刻就把 workspace 定死，它在读任何 ACP 请求之前先打印 `Workspace Path: <process cwd>`，其 file policy、给模型看的 env 块、项目态全按它来，`session/new` 的 cwd 对它们太晚。
@@ -72,14 +74,15 @@ DSH 的"模式"就是 **agent preset**：一条 `@deepseek-ai/dsh-agent-preset` 
 
 | 座位 | 文件 | 干什么 |
 | --- | --- | --- |
-| `conversation.input.model` | `src/client/session-controls.tsx` 的 `AcpSessionControls` | **NTR 底座：第一级是选 agent**；agent 自己的模型、思考等级由该底座的多级菜单承担。它占的是原生模型底座那个座位（composer bar 行尾、提交键左边），且只在 NTR 模式下由 `createModelSeatClaim` 注册 |
+| `conversation.input.model` | `src/client/session-controls.tsx` 的 `AcpSessionControls` | **NTR 底座：它的菜单里只有 agent 一级**（`menuFor('agent')` 只返回 agent 列表，2026-10-17 按用户要求收敛：一个控件一件事）。agent 自己的模型、思考等级是同一个 cluster 里各自独立的芯片（`menuFor('model')` / `menuFor('thought')`），各开自己的菜单。它占的是原生模型底座那个座位（composer bar 行尾、提交键左边），且只在 NTR 模式下由 `createModelSeatClaim` 注册。**首轮开始时 agent chip 退场并锁定会话**（`agentBaseHidden` / `lockedAgentOf`：ACP 会话 materialize 即锁，`chat/agent-locked` 广播；插件默认 agent 和首轮前的 pick 都不算锁定），首轮前保留以便改选；首轮没有任何可见输出就结束（报错 / 静默失败 / 取消）时宿主回滚锁定（`chat/agent-unlocked`），底座回来 |
 | `conversation.input.left` | `src/client/composer-mode.tsx` 的 `AcpComposerMode` | agent 自己的 `session/set_mode` 模式控件（与底座分开，留在工具行） |
-| `conversation.input.overlay` | `src/client/session-controls.tsx` 的 `AcpSessionMenu` | 底座的下拉选择器（浮在 composer 卡片上方，与 `/` 命令菜单同一个锚点） |
+| `conversation.input.overlay` | `src/client/session-controls.tsx` 的 `AcpComposerAgentTag` | 底座退场后的当前 agent 挂牌：`NTR · <agent>` 骑在 composer 卡片上边缘（`.ntr-acp-tag`，一半在卡片外）。**只读**——首轮开始后会话锁定在该 agent 上，换 agent 只能新建会话；首轮无可见输出时锁定回滚，挂牌随之消失、底座回来。自带 ACP 闸门（显式 `acpMode === false` 压过残留会话记录） |
+| `conversation.input.overlay` | `src/client/session-controls.tsx` 的 `AcpSessionMenu` | 底座与模型 / 思考芯片的下拉选择器（浮在 composer 卡片上方，与 `/` 命令菜单同一个锚点）；锁定后底座退场，它只剩模型 / 思考菜单 |
 | `conversation.view` | `src/client/acp-view.tsx` | **NTR tab**：对端 agent 的真实工具调用 / 计划 / unified diff / 用量 |
 
 **消息展示在主聊天平面**：用户说的话与 agent 的回包都渲染进原生聊天流，不另起炉灶。
 
-**agent 自己的模型面读 `agent/catalog`**：`base`（裸 `agentId` = agent 默认模型）+ `exposedModels` 过滤后的 `agent@choice` 变体 + agent 自己的 `thought_level`（作为 `reasoning`）。这份读是**纯内存**的（未热时只允许后台探针，绝不在渲染路径上 spawn），按 agent 缓存于 `AcpStore.seatCatalogs`，并在探测或勾选变动后失效重读。
+**agent 自己的模型面读 `agent/catalog`**：`base`（裸 `agentId` = agent 默认模型）+ `exposedModels` 过滤后的 `agent@choice` 变体 + agent 自己的 `thought_level`（作为 `reasoning`）。这份读是**纯内存**的：**不 spawn、也不顺手起探测**——没有缓存的 agent 如实报 `probed: false` 与内存里现有的（可能为空的）内容。探测只允许三种有手势的来源：`agent/probe-models`（设置页卡片按钮，一次点击一个 agent）、agent 自己的 `session/new` / `session/load`（用户正在跟它说话）、旧 schema 的磁盘缓存（不重探，被下一次活会话顺带修好）。`probeModelsOnBoot` 因此是**死配置**：`validateConfig` 仍收它，但 `bootstrapCatalogs()` 是空实现，没有任何自动 spawn 留给它关。目录按 agent 缓存于 `AcpStore.seatCatalogs`，并在探测或勾选变动后失效重读。
 
 ### 【历史做法】那条 provider 路由与共享的模型目录
 
@@ -93,15 +96,17 @@ DSH 的"模式"就是 **agent preset**：一条 `@deepseek-ai/dsh-agent-preset` 
 
 **保留下来的是 `useDirectory` 的解析纪律**：`ModelDirectoryResolver.directoryFor(sessionId)` 在会话运行期 scope 尚未物化时会 throw（真实实例实测：页面加载后约 0.2s 报 `cannot get property "remote.session" without inject`，命中的正是当台会话），这与"addressed subagent 会话被设计性拒绝"是完全不同的第二种失败。所以 `resolveDirectory` 必须有界重试、拿到目录即停——一次性 memo 会让整页 NTR 芯片永久消失。
 
-**会话边界（Access mode）放在 NTR 芯片的菜单里**，而不是并排再放一个下拉：原生 Access mode 就在同一条工具行上，并排再摆一个只会被读成重复控件。菜单里那一栏叫「会话边界（DSH Access mode）」，数据来自 `permissions` 投影，切换走 `SessionFace.command('/permission <preset>')`（宿主自己的命令，插件不实现开关），旁注写明它规定的是宿主给我们这道闸门的边界。
+**【已退役，2026-10-18】「会话边界（Access mode）放在 NTR 芯片的菜单里」**：早年这一栏在底座菜单里，数据来自 `permissions` 投影，切换走 `SessionFace.command('/permission <preset>')`。现行实现里 `conversation.input.permission` 是一个 `single` 槽位，`createPermissionSeatClaim` 在 NTR 模式会话里占住并渲染 `null`——插件**不提供任何权限档切换面**，菜单里那一栏随之删除（`joinPermissionSelect` / `boundarySection` / `usePermissionSelect` 都已不存在）。读法按上面「仍然有效的边界」里那条执行。
 
-**为什么工具卡必须另开一个视图 tab**：LLM adapter 的 chunk 词表只有 `text` / `reasoning`，所以对端 agent 的工具调用进入原生聊天时只能是 `> 🛠️ [Tool: …]` 这样的散文行，diff 只剩文件名。NTR tab 读的是同一份 durable transcript（经 `session/chat-transcript`，按 **DSH 聊天会话 id** 寻址——浏览器在看到返回值前并不知道 ACP 会话 id），于是：
+**为什么工具卡必须另开一个视图 tab**：一个 ACP 回合只是宿主的一步，卡片只能跟在整条消息下面，所以它们在主聊天平面里只能是内联散文（见 [acp-convergence.md](acp-convergence.md) §1.7）。完整的工具卡（参数、diff、状态）只能由 NTR tab 自己画。NTR tab 读的是同一份 durable transcript（经 `session/chat-transcript`，按 **DSH 聊天会话 id** 寻址——浏览器在看到返回值前并不知道 ACP 会话 id），于是：
 
 - 工具卡按 `kind`（read / edit / execute / search / fetch / think / switch_mode …）给图标，`status` 给色调，输出折叠（默认 12 行）；
-- `content: [{ type: 'diff' }]` 被 `foldUpdate` 单独抽成结构化字段（不是压成 `diff <path>` 字符串），渲染为真 unified diff：先剪公共前后缀，再对中间段做 LCS 对齐（超过 300 行退化为“全删全加”），带 `+N -M` 统计；
+- `content: [{ type: 'diff' }]` 被 `foldUpdate` 单独抽成结构化字段（不是压成 `diff <path>` 字符串），渲染为真 unified diff：先剪公共前后缀，再对中间段做 LCS 对齐（超过 300 行退化为“全删全加”），带 `+N -M` 统计。「新增文件」脚注**只看旧侧**（`isNewFileDiff`：`oldText` 为 `null` / `''` / 与 `newText` 逐字相同）——早期用「删除行数为 0」判断，一个只加行的既有文件同样零删除，于是真实编辑被盖上一个错徽章（审计 F8）；
 - 计划是一张勾选表（`✓ / ▸ / ○`），思考是折叠块，消息是左右气泡（含围栏代码与行内 code/bold）。
 
 流式更新不需要轮询：store 把 SSE 的 `session/update` 直接折进被观察的 transcript（`chatTranscripts`，上限 `MAX_WATCHED` 条，最旧的淘汰），`session/reset`（resume 重放）会同时清空块与 seq 水位，`session/closed` 直接丢弃——**已关闭的会话不提供幽灵历史**。视图本身只读，没有任何 prompt/cancel/spawn 能力。
+
+**空状态有两种含义，别用一句话盖住两种**（2026-10-19）：`chatTranscriptOf` 回 `undefined` 既是「这条会话从没被 NTR agent 服务过」，也是「它的 ACP 会话记录已经没了」（`closeSession` / `forgetDshSession` 销毁记录、agent 进程停掉就丢 bridge），而绑定与 composer 芯片仍指着那个 agent。`boundAgentOf`（活会话 → 宿主绑定 → 持久 pick）先判有没有 agent，`acpEmptyCopy` 再选文案：有绑定时说「这个会话当前没有可显示的 ACP 会话」并提示发一条消息；hint 只在控件真的存在时才指——`acpMode === true` 才指输入框右侧的 NTR 底座（普通会话里那个 cell 还是宿主的模型选择器），`false` 时说不在 NTR 模式，宿主还没答就**不给那一行**。
 
 ### 【历史做法】默认 agent（★）、路由强制与 `modelSelection`
 
@@ -132,11 +137,14 @@ DSH 的"模式"就是 **agent preset**：一条 `@deepseek-ai/dsh-agent-preset` 
 
 ### 仍然有效的边界
 
-- **不能替换原生 Access mode 下拉**：它不是 slot（由 `ui-conversation` 的 InputBar 直接渲染 `PermissionSelect`），数据来自被 `dsh-permission-presets` 独占注册的 `permissions` 投影。可以读、可以用 `/permission <preset>` 切，不能改它的项。
-- **原生聊天里曾经只有文字——现已不再是缺口**：批次 5 之后，`BridgeManager.streamPrompt` 直接把 ACP 的 `tool_call` / `tool_call_update` 折成真正的 `block-start('tool-call')` + `tool-call-delta` + 完整快照 `block-end`，宿主 `AssistantStreamAccumulator` 自己会折成 `{ kind:'tool-call', callId, name, argsRaw }`，官方 chat 包的 tool-call 渲染器画卡片。NTR tab 保留下来承担**计划 / 折叠明细**这类 Card 之外的内容，不再是工具卡的唯一去处。（host 侧 chunk 词表一直是够的，缺的只是我们没用。）
+- **【已退役，2026-10-18】「不能替换原生 Access mode 下拉」**：这一条早年断定 `conversation.input.permission` 不是 slot（由 `ui-conversation` 的 InputBar 直接渲染 `PermissionSelect`），插件只能读 `permissions` 投影、只能用 `/permission <preset>` 切。现行实现里它是一个 `single` 槽位：`src/client/model-seat.tsx` 的 `createPermissionSeatClaim` 与模型底座同享 `syncAcpMode` 闸门，在 NTR 模式会话里注册一个渲染 `null` 的占主，**清掉原生 Access mode**——DSH 的 Access mode 规定的是宿主对自己工具的写策略，对外部 agent 进程毫无作用力，留着只会误导。读取路径（`joinPermissionSelect` / `boundarySection` / `usePermissionSelect`）随之删除。NTR 模式的权限面完全属于 agent，现行结论见 [acp-convergence.md](acp-convergence.md) §2.3 与 §3 批次 4。
+- **原生聊天平面没有工具卡，这是换时间顺序付的代价**：批次 5 曾让 `streamPrompt` 发真的 `block-start('tool-call')` + `tool-call-delta` + `block-end`，宿主 `AssistantStreamAccumulator` 折成 `{ kind:'tool-call', callId, name, argsRaw }`，官方 chat 包的渲染器确实画出了卡片。但卡片不在消息体内渲染，而 `tool/call` 是 loop 在整条 assistant 消息**落定之后**才 append 的，所以它们永远堆在回合底部；而含 `tool-call` 块的消息被 `latestAnswer` 拒绝当答案。现行构建改发内联 `text`（思考 → 工具 → 答案），完整卡片回到 NTR tab。根因与利弊见 [acp-convergence.md](acp-convergence.md) §1.7。
 - **模式只能在空白会话选**：想中途切换到 NTR 模式（preset）需要新建会话。历史上下文不会追送（只转发人说的话），所以中途接管是"从这里开始由它接手"。
 - **芯片不出现于普通会话**：从没跑过 NTR agent 的会话不渲染任何 NTR 芯片（工具行保持干净）。
 - **一个 NTR 轮次的"结束"由对端 agent 决定，宿主不替它收尾**：`turn/end` 只在 `session/prompt` 的**响应**返回时发出，不在最后一个 chunk 到达时——所以"已经不再吐字了但仍显示正在输出"这段时间属于 agent 自己的内部节奏。实测（codebuddy，首轮）：它要先完成自己的标题生成才回应 prompt，期间一个通知都不发（它自己的日志：`Timed out waiting for pending title generation … timeoutMs=5000`），于是首轮的可视收尾被推迟约 5s。这是**记录在案的边界，不是待修 bug**：宿主无法区分"agent 正在想"与"agent 在磨蹭"，任何强制定稿（提前发 `turn/end`）都会把真实答案切在流中间；能提前给出响应的只有 agent 自己。唯一已有的强制定稿兜底是 `session/cancel` 之后的 `cancelFallbackMs`（见 `armCancelFallback`）——那是用户已经叫停的场合，与这里的语义完全不同，不得复用。兜底定时器带 **turn 世代守卫**（`session.turnSeq`）：agent 迟到结算了旧 turn、用户已发新 turn 时，定时器不得误杀新 turn，且强制定稿要同时解开 `settled` 闸门，否则适配器路径的下一轮 prompt 卡在 `unsettled`。
 - **粘滞取消吞消息**：一部分 agent（实测 codebuddy 2.161.4）异步清理 cancel 状态，落在清理窗口内的**下一条** prompt 被秒回 `cancelled`（复用旧 requestId、不生成 turn），用户消息无痕消失。`runPrompt` 的判据是「本世代是否发起过 cancel」（`cancelRequestedAtTurn` 对比 `turnSeq`），不是延时；判为粘滞就等 `staleCancelRetryDelayMs`（默认 600ms，须长于 agent 清理窗口）原样重发，有界 `staleCancelMaxRetries`（默认 2）。取材自 OmniTerm 的同型事故（`src/acp/client.rs` 的 `STALE_CANCEL_RETRY_DELAY_MS`）。
-- **正常结束却零可见产出必须显式报出**：一部分 agent 把上游失败（provider 403、认证、计费）折叠成合法 `end_turn`（实测 pi-acp），聊天平面只剩一个空气泡。`streamPrompt` 结算时按 `sawVisibleBlock`（text / reasoning / tool-call 的 block-start，usage 等记账帧不算）记账，零可见块就把告警文本作为 text 块发出——这是**报告**不是收尾，turn 照常以 stop 结束。
+- **正常结束却零可见产出必须显式报出**：一部分 agent 把上游失败（provider 403、认证、计费）折叠成合法 `end_turn`（实测 pi-acp），聊天平面只剩一个空气泡。`streamPrompt` 结算时按 `sawVisibleBlock`（text / reasoning 的 block-start，usage 等记账帧不算）记账，零可见块就把告警文本作为 text 块发出——这是**报告**不是收尾，turn 照常以 stop 结束。
+- **没有 agent 服务时，芯片说「接入 NTR」而不是借一个名字**：没有绑定、没有活会话、没有插件默认 agent 时 `routeAgentId` 返回 `undefined`（guard 的 `boundModelFor` 也没有可改写的东西，下一条消息跑部署默认 provider）。此时 agent 底座 chip 由 `agentBaseChip` 渲染成入口（「接入 NTR / Use NTR」，tooltip 明说当前没有 NTR agent 服务），roster 没有任何行标记为当前。旧实现以 `agents[0]?.id` 收尾，会把一个永远收不到消息的 agent 名字放到芯片上（审计 F5）。模型 / 思考 chip 与 picker 的各轴一律退化成空，而不是退化成一个请求路径不会用的 agent。
+- **agent 模式控件的 tooltip 不许把 Access mode 叫「互补」**：让这个 select 出现的 ACP-mode 闸门同时在权限座位渲染 `null`（`createPermissionSeatClaim`），所以在它可见的会话里 DSH 的 Access mode 根本不显示，两个控件**从不同屏**（审计 F27）。解释放在 `agentModeTitle` 的 title 里：agent 自己定义、Access mode 不显示、模式就在此切换。
+- **思考等级的「清空 pick」行叫「跟随 agent 默认」**：这条轴是 agent 自己的 `thought_level`，`listModels('acp')` 返空目录，所以「provider default」描述了一个不存在的参与者（审计 F43）。行的 id 仍是内部哨兵 `provider-default`，标签是用户读的那一句。
 - **codec 是手拷贝**：`splitAcpModelId`（浏览器）与 `splitAdapterModelId`（宿主）必须同步，由 `tests/acp-view.spec.ts` 的等价断言看住。

@@ -9,6 +9,7 @@
  *  - "EMPTY" → only a usage_update, then a legal end_turn: the silent-failure
  *              shape wild agents produce (pi-acp folds a provider 403 into a
  *              normal stop), zero visible output
+ *  - "FAIL"  → the prompt request fails (JSON-RPC error), zero visible output
  *  - "IGNORE_CANCEL" → ignores session/cancel for ~1.2s, then finishes normally
  *
  * Stale-cancel window: for 300ms after a `session/cancel` the NEXT prompt is
@@ -178,6 +179,10 @@ const app = agent({ name: 'mock-acp-agent' })
     const cleanupUntil = cancelCleanupUntil.get(sessionId)
     if (cleanupUntil !== undefined && Date.now() < cleanupUntil) {
       return { stopReason: 'cancelled' }
+    }
+
+    if (text.includes('FAIL')) {
+      throw new Error('mock prompt failure')
     }
 
     if (text.includes('EMPTY')) {

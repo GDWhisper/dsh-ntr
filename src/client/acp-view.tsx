@@ -19,15 +19,18 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { ensureAcpStyle, useUi } from './acp-ui.tsx'
 import type { AcpChatInjected } from './acp-ui.tsx'
 import type { Block, ChatTranscript } from './store.ts'
-import type { ChatSessionView } from '../protocol.ts'
+import type { AgentView, ChatSessionView } from '../protocol.ts'
 
 /** Props of the ACP view entry (injected face + the frame's session id). */
 export interface AcpViewProps extends AcpChatInjected {
   sessionId: string
 }
 
-/** The store's bilingual label function. */
-type Translate = (zh: string, en: string) => string
+/**
+ * The store's bilingual label function (`AcpStore.label`). Exported because the
+ * empty-state copy builder takes one and the bundle emits declarations.
+ */
+export type Translate = (zh: string, en: string) => string
 
 /** Glyph per ACP tool kind, so a call's nature reads before its title does. */
 const TOOL_GLYPH: Record<string, string> = {
@@ -170,11 +173,25 @@ function RichText({ text }: { text: string }) {
   )
 }
 
+/**
+ * Whether one structured edit is a NEW FILE.
+ *
+ * Decided by the old side, never by the removal count: an existing file that
+ * only gained lines also diffs to zero removals, and labelling that "new file"
+ * hid a real edit behind a wrong badge (the audit's F8). The only old sides
+ * that mean "nothing was there" are an absent one and one byte-identical to
+ * the new content — the degenerate case where there is no edit at all.
+ */
+export function isNewFileDiff(oldText: string | null, newText: string): boolean {
+  return oldText === null || oldText === '' || oldText === newText
+}
+
 /** One structured edit, rendered as a unified diff. */
 function DiffView({ diff, t }: { diff: { path: string; oldText: string | null; newText: string }; t: Translate }) {
   const rows = diffRows(diff.oldText, diff.newText)
   const added = rows.filter(row => row.sign === '+').length
   const removed = rows.filter(row => row.sign === '-').length
+  const isNewFile = isNewFileDiff(diff.oldText, diff.newText)
   return (
     <div className="ntr-acp-diff">
       <div className="ntr-acp-diff-head">
@@ -191,7 +208,7 @@ function DiffView({ diff, t }: { diff: { path: string; oldText: string | null; n
           </div>
         ))}
       </div>
-      {removed === 0 && <div className="ntr-acp-diff-note">{t('新增文件', 'new file')}</div>}
+      {isNewFile && <div className="ntr-acp-diff-note">{t('新增文件', 'new file')}</div>}
     </div>
   )
 }
@@ -314,6 +331,102 @@ function boundSession(list: readonly ChatSessionView[]): ChatSessionView | undef
 }
 
 /**
+ * Everything the view can read that says "this conversation is set up on an
+ * agent": a live or parked ACP session, the host's binding (`session/chat-list`'s
+ * `boundAgentId`, which outlives a closed session), and the persisted pick.
+ *
+ * The transcript is deliberately NOT one of these sources: it is a record of
+ * turns, and it is dropped when a session is destroyed, so reading it alone
+ * answered "has an agent ever served this conversation" with "no" for
+ * conversations that had just run one.
+ */
+export function boundAgentOf(
+  session: ChatSessionView | undefined,
+  hostBoundAgentId: string | undefined,
+  pickedAgentId: string | undefined,
+  agents: readonly AgentView[],
+): { id: string; title: string } | undefined {
+  const id = session?.agentId ?? hostBoundAgentId ?? pickedAgentId
+  if (id === undefined) return undefined
+  return { id, title: session?.agentTitle ?? agents.find(agent => agent.id === id)?.title ?? id }
+}
+
+/** What the view knows about this conversation when it has no transcript. */
+export interface AcpEmptyFacts {
+  /** The agent this conversation is set up on, when there is one. */
+  bound?: { id: string; title: string }
+  /** Whether any agent is configured at all. */
+  hasAgents: boolean
+  /**
+   * This conversation's NTR-mode verdict, as the seat gate reads it
+   * (`UiState.acpMode`). `undefined` while the host has not answered: the view
+   * must not claim either way.
+   */
+  acpMode?: boolean
+}
+
+/** The three lines of the empty state, already localized. */
+export interface AcpEmptyCopy {
+  title: string
+  body: string
+  /** The "what to do next" line; absent when nothing honest can be said. */
+  hint?: string
+}
+
+/**
+ * The empty state's copy, decided from the facts the view can actually read.
+ *
+ * A pure function on purpose: the bundle has no DOM test, and this decision is
+ * where two real defects lived. `chatTranscriptOf` answering `undefined` covers
+ * TWO different states — "this conversation has never been served by an NTR
+ * agent" and "its ACP session record is gone" (a closed session is destroyed by
+ * `closeSession`/`forgetDshSession`, a stopped agent drops its bridge) while the
+ * binding and the composer chip still name the agent. Claiming the first state
+ * in both cases made the view contradict the chip sitting one row above it.
+ *
+ * The hint has its own defect: it pointed at the composer's NTR base, which only
+ * the ACP-mode gate installs (`syncAcpMode` in src/client/index.tsx) — in an
+ * ordinary conversation that cell still holds the host's own model selector, so
+ * the hint sent the user to a control that is not there.
+ */
+export function acpEmptyCopy(facts: AcpEmptyFacts, t: Translate): AcpEmptyCopy {
+  const bound = facts.bound
+  if (bound !== undefined) {
+    return {
+      title: t('这个会话当前没有可显示的 ACP 会话', 'This conversation has no ACP session to show right now'),
+      body: t(
+        '给它发一条消息，它就会开始服务这个会话：原生聊天里会出现它的文字回复与思考过程，而它的工具调用、计划和 diff 会完整地出现在这个视图里。',
+        'Send it a message and it starts serving this conversation: the native chat shows its prose and reasoning, while its tool calls, plans and diffs appear here in full.',
+      ),
+      hint: `${t('绑定的是', 'bound to')} · ${bound.title}`,
+    }
+  }
+  const copy: AcpEmptyCopy = {
+    title: t('这个会话还没有 NTR agent 参与', 'No NTR agent has run in this conversation yet'),
+    body: t(
+      '选中一个 NTR agent 后，本会话的对话就由它服务：原生聊天里会出现它的文字回复与思考过程，而它的工具调用、计划和 diff 会完整地出现在这个视图里。',
+      "Pick a NTR agent and it serves this conversation: the native chat shows its prose and reasoning, while its tool calls, plans and diffs appear here in full.",
+    ),
+  }
+  if (!facts.hasAgents) {
+    return { ...copy, hint: `${t('还没有配置 agent', 'No agent configured')} · ${t('设置 → NTR', 'Settings → NTR')}` }
+  }
+  // The base is only on screen in NTR mode; naming it anywhere else points at
+  // the host's model selector. A host that has not answered yet gets no line
+  // rather than a guess (the seat diagnostics below still say what they saw).
+  if (facts.acpMode === true) {
+    return { ...copy, hint: t('用输入框右侧的 NTR 底座选择一个 agent', 'pick one from the NTR base in the composer') }
+  }
+  if (facts.acpMode === false) {
+    return {
+      ...copy,
+      hint: `${t('这个会话不在 NTR 模式', 'This conversation is not in NTR mode')} · ${t('新建会话时可以选择 NTR 模式', 'NTR is chosen when a conversation starts')}`,
+    }
+  }
+  return copy
+}
+
+/**
  * The ACP view tab body: who serves this conversation and how it is doing,
  * then the agent's own stream.
  */
@@ -324,6 +437,10 @@ export function AcpConversationView(props: AcpViewProps) {
   const ui = useUi(acp)
   const bound = ui.chatSessionsFor === sessionId ? boundSession(ui.chatSessions) : undefined
   const transcript: ChatTranscript | undefined = acp.chatTranscriptOf(sessionId)
+  // Who this conversation is set up on — readable with no transcript at all,
+  // which is the whole point: the transcript is a record of turns, the binding
+  // is the conversation's own state.
+  const boundAgent = boundAgentOf(bound, ui.chatBoundAgent[sessionId], ui.chatChoice[sessionId]?.agentId, ui.agents)
   const streamRef = useRef<HTMLDivElement>(null)
   const pinned = useRef(true)
 
@@ -343,21 +460,20 @@ export function AcpConversationView(props: AcpViewProps) {
   }, [blockCount, tail])
 
   if (transcript === undefined) {
+    // `ui.acpMode[sessionId]` is `undefined` until the host has answered for
+    // this conversation; the copy builder reads that as "unknown" and says
+    // nothing rather than guessing.
+    const empty = acpEmptyCopy({
+      bound: boundAgent,
+      hasAgents: ui.agents.length > 0,
+      acpMode: ui.acpMode[sessionId],
+    }, t)
     return (
       <div className="ntr-acp-view">
         <div className="ntr-acp-empty">
-          <div className="ntr-acp-empty-title">{t('这个会话还没有 NTR agent 参与', 'No NTR agent has run in this conversation yet')}</div>
-          <p className="ntr-acp-empty-body">
-            {t(
-              '选中一个 NTR agent 后，本会话的对话就由它服务：原生聊天里会出现它的文字回复与思考过程，而它的工具调用、计划和 diff 会完整地出现在这个视图里。',
-              "Pick a NTR agent and it serves this conversation: the native chat shows its prose and reasoning, while its tool calls, plans and diffs appear here in full.",
-            )}
-          </p>
-          {bound !== undefined
-            ? <div className="ntr-acp-empty-hint">{t('绑定的是', 'bound to')} · {bound.agentTitle ?? bound.agentId}</div>
-            : ui.agents.length === 0
-              ? <div className="ntr-acp-empty-hint">{t('还没有配置 agent', 'No agent configured')} · {t('设置 → NTR', 'Settings → NTR')}</div>
-              : <div className="ntr-acp-empty-hint">{t('用输入框右侧的 NTR 底座选择一个 agent', 'pick one from the NTR base in the composer')}</div>}
+          <div className="ntr-acp-empty-title">{empty.title}</div>
+          <p className="ntr-acp-empty-body">{empty.body}</p>
+          {empty.hint !== undefined && <div className="ntr-acp-empty-hint">{empty.hint}</div>}
           {/*
             The model-seat gate's last verdict. When the ACP base does not take
             over the composer's model seat — the native model selector is still

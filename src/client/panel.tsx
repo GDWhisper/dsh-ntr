@@ -3,8 +3,10 @@
  *
  * Scope is deliberately narrow — this is a CONFIGURATION surface. Runtime
  * interaction lives in the conversation: permission asks are answered in the
- * chat composer through the host approval chain (`approvalRouted` below), and
- * the ledger card is only the degraded fallback for a host without it.
+ * chat composer through the host approval chain. The ledger card answers
+ * whatever did NOT reach the conversation — a host without the chain, a
+ * session with no chat identity behind it, or an ask whose native route
+ * degraded to unavailable (see `permissionLedgerCard`).
  *
  * Each configured agent is one compact row (status + current model + badges)
  * that expands into the full connection form and model catalog. The row stays
@@ -16,7 +18,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { formatCommandLine, isAbsolutePathLike, splitCommandLine } from './acp-ui.tsx'
 import { DEFAULT_KNOWN_PRESETS } from './store.ts'
-import type { AcpStore } from './store.ts'
+import type { AcpStore, UiState } from './store.ts'
 import type { AcpAgentDef, AgentSavePayload, AgentView, DetectedAgentInfo, PermissionMode } from '../protocol.ts'
 
 interface WithStore { acp: AcpStore }
@@ -245,11 +247,33 @@ function payloadEquals(payload: AgentSavePayload, current: AcpAgentDef): boolean
   return true
 }
 
+/**
+ * The settings panel's permission-ledger rule.
+ *
+ * A pending ask ALWAYS gets an answerable card here, whatever `approvalRouted`
+ * says. That flag reports that the host HAS an approval service — it does not
+ * promise THIS ask reached the conversation. An ask lands in `ui.permissions`
+ * only on the ledger path (`AgentBridge.handlePermissionRequest` broadcasts
+ * `permission/request` there and nowhere else), so a pending entry is by
+ * definition a question the conversation is not showing. The previous rule
+ * (`approvalRouted` → a read-only count, no buttons) hid the only answer
+ * entry exactly when the native route had degraded to unavailable, and the
+ * ask then hung until its timeout.
+ *
+ * `fellBackFromConversation` is the case the card has to explain: the host
+ * can route asks, and this one still did not make it.
+ */
+export function permissionLedgerCard(ui: Pick<UiState, 'approvalRouted' | 'permissions'>): { visible: boolean; fellBackFromConversation: boolean } {
+  const visible = ui.permissions.length > 0
+  return { visible, fellBackFromConversation: visible && ui.approvalRouted }
+}
+
 /** Settings configuration section for ACP agents. */
 export function AcpSettingsSection(props: WithStore) {
   const acp = props.acp
   ensureStyle()
   const ui = useUi(acp)
+  const ledger = permissionLedgerCard(ui)
   // The agent list section opens by default. `addTarget === undefined` means
   // "follow the first available preset"; an explicit chip click pins the
   // selection until the next create resets it.
@@ -281,25 +305,23 @@ export function AcpSettingsSection(props: WithStore) {
         </button>
       </div>
 
-      {/* Approvals live in the conversation now: keep a read-only count so the
-          settings page is not silently hiding work in progress. */}
-      {ui.approvalRouted && ui.permissions.length > 0 && (
-        <div className="dwa-card" style={{ marginBottom: 16 }}>
-          <span className="dwa-hint">
-            {acp.label(
-              `审批已改在对话中处理（${String(ui.permissions.length)} 项待处理）`,
-              `Approvals are handled in the conversation (${String(ui.permissions.length)} pending)`,
-            )}
-          </span>
-        </div>
-      )}
-
-      {/* Degraded path: no native approval chain → the panel keeps the ledger. */}
-      {!ui.approvalRouted && ui.permissions.length > 0 && (
+      {/* Any pending ask gets an answerable card here, whatever
+          `approvalRouted` says (see `permissionLedgerCard`): an ask is in
+          `ui.permissions` only because it fell back to the ledger, which
+          means the conversation is NOT showing it. */}
+      {ledger.visible && (
         <div className="dwa-card dwa-card-warn" style={{ marginBottom: 16 }}>
           <div style={{ fontWeight: 600, marginBottom: 8 }}>
             {acp.label('待处理权限请求', 'Pending Permission Requests')}
           </div>
+          {ledger.fellBackFromConversation && (
+            <div className="dwa-hint" style={{ marginBottom: 8 }}>
+              {acp.label(
+                '这些询问没有进入对话（审批服务本次不可用，或会话没有对话身份），请在此回答。',
+                'These asks did not reach the conversation (the approval service was unavailable, or the session has no chat identity) — answer them here.',
+              )}
+            </div>
+          )}
           {ui.permissions.map(permission => (
             <div key={permission.requestId} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, flexWrap: 'wrap' }}>
               <span style={{ flex: 1, minWidth: 160 }}>{permission.title}</span>
@@ -370,8 +392,8 @@ export function AcpSettingsSection(props: WithStore) {
         {configured.length === 0 && (
           <div className="dwa-card" style={{ textAlign: 'center', color: 'var(--ntr-muted)', padding: 20 }}>
             {acp.label(
-              '尚未启用任何 Agent。从下方「Agent 列表」选择检测到的预设一键启用，或新建自定义 Agent。',
-              'No agents configured yet. Pick a detected preset from the "Agent List" below to enable it, or create a custom one from scratch.',
+              '尚未启用任何 Agent。从下方「Agent 列表」点一个检测到的预设（会展开预填命令的创建卡），再点「保存并启用」；也可以直接新建自定义 Agent。',
+              'No agents configured yet. Pick a detected preset from the "Agent List" below (it opens a creation card prefilled with its command), then click "Save & Enable" — or create a custom one from scratch.',
             )}
           </div>
         )}
@@ -681,6 +703,14 @@ interface AgentForm {
  */
 const DEFAULT_IDLE_RELEASE_MS = 1_800_000
 
+/**
+ * Hand copy of `DEFAULT_TUNING.probeIdleTimeoutMs` (src/bridge.ts). A process
+ * that has never hosted a session — the model probe / post-save probe — lives
+ * by THIS window whatever the agent's own field says, so the placeholder has to
+ * name both windows. Keep the two in sync.
+ */
+const DEFAULT_PROBE_RELEASE_MS = 300_000
+
 function initialForm(detected: DetectedAgentInfo, activeAgent: AgentView | undefined): AgentForm {
   const config = detected.currentConfig
   const roots = [...(activeAgent?.allowedCwdRoots ?? config?.allowedCwdRoots ?? [])]
@@ -942,8 +972,10 @@ function AgentDetails({
           whether the agent asks a human at all. It is the only knob — the host
           arbitrates nothing in front of the agent. With `ask` the question is
           mapped through unchanged and surfaces in the chat composer when the
-          host approval chain exists (see `approvalRouted`), otherwise at the top
-          of this page. `allow`/`reject` never surface anything. */}
+          host approval chain exists (see `approvalRouted`); whatever does not
+          reach the conversation — no chain, no chat identity, or a degraded
+          route — falls back to the ledger card at the top of this page (see
+          `permissionLedgerCard`). `allow`/`reject` never surface anything. */}
       <div className="dwa-form-row">
         <div className="dwa-form-col" style={{ flex: 2 }}>
           <label className="dwa-form-label">{acp.label('agent 自己的权限策略（要不要问人）', "The agent's own permission policy (whether to ask)")}</label>
@@ -958,7 +990,7 @@ function AgentDetails({
           </select>
           <span className="dwa-hint">
             {ui.approvalRouted
-              ? acp.label('选「询问」时审批出现在对话里（不在本页）。', 'With “ask”, approvals appear in the conversation (not here).')
+              ? acp.label('选「询问」时审批出现在对话里；审批服务不可用时回落到本页顶部。', 'With “ask”, approvals appear in the conversation; when the approval service is unavailable they fall back to the top of this page.')
               : acp.label('选「询问」时审批出现在本页顶部。', 'With “ask”, approvals appear at the top of this page.')}
           </span>
         </div>
@@ -975,7 +1007,10 @@ function AgentDetails({
       {/* Idle release: scoped to agents with NO live session (see
           AgentBridge.releaseIfIdle), so it reclaims the processes that the
           model probe / post-save probe leave behind without ever costing a
-          chat a cold start. */}
+          chat a cold start. TWO windows exist (AgentBridge.currentIdleTimeoutMs):
+          this field is the chat window of a process that HAS hosted a session;
+          a never-used process (a probe) always gets the short probe window and
+          ignores this field — which is why the copy below names both. */}
       <div className="dwa-form-row">
         <div className="dwa-form-col">
           <label className="dwa-form-label">{acp.label('空闲释放（毫秒）', 'Idle Release (ms)')}</label>
@@ -984,8 +1019,8 @@ function AgentDetails({
             value={form.idleStr}
             onChange={e => patch({ idleStr: e.target.value })}
             placeholder={acp.label(
-              `留空 = 宿主默认（${String(DEFAULT_IDLE_RELEASE_MS / 60_000)} 分钟）`,
-              `Blank = host default (${String(DEFAULT_IDLE_RELEASE_MS / 60_000)} min)`,
+              `留空 = 宿主默认（承载会话 ${String(DEFAULT_IDLE_RELEASE_MS / 60_000)} 分钟 / 探测进程 ${String(DEFAULT_PROBE_RELEASE_MS / 60_000)} 分钟）`,
+              `Blank = host default (${String(DEFAULT_IDLE_RELEASE_MS / 60_000)} min for a chat process / ${String(DEFAULT_PROBE_RELEASE_MS / 60_000)} min for a probe)`,
             )}
           />
           <span className={idleInvalid ? 'dwa-error' : 'dwa-hint'}>
@@ -995,8 +1030,8 @@ function AgentDetails({
                 'Must be 0 (never release) or an integer in [1000, 86400000] ms.',
               )
               : acp.label(
-                '该 Agent 没有活动会话时，空闲超过此时长就释放进程（下次使用自动重启并恢复会话）；0 = 永不释放。有活动会话的 Agent 不会被释放。',
-                'With no live session, the process is released once it has been idle this long (the next use restarts it and resumes the session); 0 = never. Agents with a live session are never released.',
+                '没有活动会话时，空闲超过此时长就释放进程（下次使用自动重启并恢复会话）；0 = 永不释放；有活动会话的进程不会被释放。此窗口只对承载过会话的进程生效：保存后拉起的模型探测进程（面板显示「已连接」的那个）固定 5 分钟释放，填 0 也拦不住。',
+                'With no live session, the process is released once it has been idle this long (the next use restarts it and resumes the session); 0 = never; a process with a live session is never released. This window applies only to a process that has hosted a session: the model-probe process (the one the panel shows as "connected" after a save) is always released after 5 minutes, and 0 does not stop it.',
               )}
           </span>
         </div>
@@ -1472,8 +1507,8 @@ function ModelCatalogBlock({
                 className="dwa-hint"
                 style={{ marginLeft: 6, fontWeight: 400 }}
                 title={acp.label(
-                  'NTR 模式下的对话只会列出这里勾选的模型；未勾选的仍可用（比如会话里已选中的那个），只是不在这里列出来。',
-                  'The NTR surfaces only list what is checked here; unchecked models still work (e.g. the one a session already selected) — they are just not offered.',
+                  'NTR 模式下的对话只列出这里勾选的模型；未勾选的仍可用——正在生效的那个也会以「· 当前」列出来，其余不列出。',
+                  'The NTR surfaces only list what is checked here; unchecked models still work, and the one currently in force is still listed with a "· current" row — the rest are not offered.',
                 )}
               >
                 {acp.label('（NTR 座位 / 芯片的下拉列表）', '(the NTR seat and chip pickers)')}

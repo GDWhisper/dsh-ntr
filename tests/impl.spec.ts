@@ -4,8 +4,9 @@ import {
   EventHub,
   PermissionLedger,
   Transcript,
-  acpToolCallDelta,
-  acpToolCallFromUpdate,
+  acpToolActivityLine,
+  acpToolActivityOutput,
+  acpToolInputOf,
   buildAdapterModelId,
   describeUnhandledUpdate,
   updateContentToText,
@@ -22,7 +23,6 @@ import {
   resolveFsPath,
   resolveSessionCwd,
   selectForwardPrompt,
-  isAcpToolContinuation,
   sessionAgentPreset,
   sessionAgentPresetFromLog,
   splitAdapterModelId,
@@ -192,120 +192,6 @@ describe('adapter model id split/build', () => {
   })
 })
 
-describe('ACP tool-call notifications → Chat tool-call chunks', () => {
-  it('reads the identity and label an agent announces, and refuses to invent arguments', () => {
-    expect(acpToolCallFromUpdate({ toolCallId: 'call_1', title: 'mock tool', kind: 'read' })).toMatchObject({ callId: 'call_1', name: 'mock tool', argsRaw: '' })
-    // No arguments is legal ACP: the card is empty, not fabricated.
-    expect(acpToolCallFromUpdate({ toolCallId: 'call_2' })).toMatchObject({ callId: 'call_2', name: '', argsRaw: '' })
-    // Fields the card does not render as text are kept, not dropped.
-    expect(acpToolCallFromUpdate({ toolCallId: 'call_1', title: 'mock tool', kind: 'read' }).details).toBe('kind: read')
-    expect(acpToolCallFromUpdate({ toolCallId: 'call_1', title: 'mock tool' }).raw).toContain('"title": "mock tool"')
-  })
-
-  it('drops a notification with no call identity — the renderer groups by it', () => {
-    expect(acpToolCallFromUpdate({ title: 'no id' })).toBeUndefined()
-    expect(acpToolCallFromUpdate({ toolCallId: '   ' })).toBeUndefined()
-    expect(acpToolCallFromUpdate({})).toBeUndefined()
-  })
-
-  it('accepts the argument spellings agents use in the wild', () => {
-    expect(acpToolCallFromUpdate({ toolCallId: 'c', rawInput: '{"a":1}' })).toMatchObject({ argsRaw: '{"a":1}' })
-    expect(acpToolCallFromUpdate({ toolCallId: 'c', arguments: 'plain' })).toMatchObject({ argsRaw: 'plain' })
-    expect(acpToolCallFromUpdate({ toolCallId: 'c', arguments: { a: 1 } })).toMatchObject({ argsRaw: '{"a":1}' })
-    // An array (batched input) is an argument spelling too, not an empty one.
-    expect(acpToolCallFromUpdate({ toolCallId: 'c', arguments: [{ a: 1 }] })).toMatchObject({ argsRaw: '[{"a":1}]' })
-    // An unserializable value degrades to text rather than failing the card.
-    const circular: Record<string, unknown> = {}
-    circular.self = circular
-    expect(acpToolCallFromUpdate({ toolCallId: 'c', arguments: circular }).argsRaw).toBe('[object Object]')
-  })
-
-  it('folds an update into the open snapshot, naming only real changes', () => {
-    const snapshot = { callId: 'call_1', name: 'mock tool', argsRaw: '' }
-    // A restatement with nothing new still refreshes the raw snapshot.
-    expect(acpToolCallDelta(snapshot, { toolCallId: 'call_1' })).toEqual([{ kind: 'raw', text: expect.any(String) }])
-    // Content becomes argument text.
-    expect(acpToolCallDelta(snapshot, {
-      toolCallId: 'call_1',
-      content: [{ type: 'content', content: { type: 'text', text: 'tool result line' } }],
-    })).toEqual([{ kind: 'args', text: 'tool result line' }, { kind: 'raw', text: expect.any(String) }])
-    expect(snapshot).toMatchObject({ callId: 'call_1', name: 'mock tool', argsRaw: 'tool result line' })
-    // A retitled agent gets a name delta and the snapshot follows.
-    expect(acpToolCallDelta(snapshot, { toolCallId: 'call_1', title: 'renamed tool' }))
-      .toEqual([{ kind: 'name', name: 'renamed tool' }, { kind: 'raw', text: expect.any(String) }])
-    expect(snapshot.name).toBe('renamed tool')
-    // `status` is not a parameter: it rides `details`, never `argumentsDelta`.
-    expect(acpToolCallDelta(snapshot, { toolCallId: 'call_1', title: 'renamed tool', status: 'in_progress' }))
-      .toEqual([{ kind: 'details', text: 'status: in_progress' }, { kind: 'raw', text: expect.any(String) }])
-    expect(snapshot.details).toBe('status: in_progress')
-  })
-
-  it('keeps the content kinds the Chat card cannot render, instead of placeholders', () => {
-    const text = updateContentToText([
-      { type: 'content', content: { type: 'text', text: 'first' } },
-      { type: 'diff', path: '/w/a.ts', oldText: 'one\ntwo\n', newText: 'one\nTWO\n' },
-      { type: 'content', content: { type: 'image', data: 'abc' } },
-      { type: 'terminal', terminalId: 't1' },
-    ])
-    expect(text).toContain('first')
-    // A diff becomes its path plus -/+ lines, not a `[diff path]` stub.
-    expect(text).toContain('/w/a.ts')
-    expect(text).toContain('- two')
-    expect(text).toContain('+ TWO')
-    // Unknown kinds keep their whole payload.
-    expect(text).toContain('"data":"abc"')
-    expect(text).toContain('"terminalId":"t1"')
-  })
-
-  it('treats a restated rawInput as a snapshot, not an append', () => {
-    // ACP updates restate the whole input on every change; the host's
-    // accumulator CONCATENATES deltas, so folding a full snapshot as one would
-    // grow `{"cmd":""}{"cmd":"ls -la"}…` garbage (the oml session bug). Only
-    // a genuine string extension becomes a delta (plain-text args grow like
-    // that); a replacement pushes nothing and moves the snapshot, which the
-    // closing `block-end` frame states in full.
-    const snapshot = { callId: 'c', name: 't', argsRaw: 'Running the build' }
-    expect(acpToolCallDelta(snapshot, { toolCallId: 'c', arguments: 'Running the build for the oml workspace' }))
-      .toEqual([{ kind: 'args', text: ' for the oml workspace' }, { kind: 'raw', text: expect.any(String) }])
-    expect(snapshot.argsRaw).toBe('Running the build for the oml workspace')
-    // JSON growth is a REWRITE, not an extension — the closing brace moves.
-    expect(acpToolCallDelta(snapshot, { toolCallId: 'call_1', rawInput: '{"file":"a.md"}' }))
-      .toEqual([{ kind: 'raw', text: expect.any(String) }])
-    expect(snapshot.argsRaw).toBe('{"file":"a.md"}')
-    // A verbatim restatement moves nothing but the raw snapshot.
-    expect(acpToolCallDelta(snapshot, { toolCallId: 'call_1', rawInput: '{"file":"a.md"}' }))
-      .toEqual([{ kind: 'raw', text: expect.any(String) }])
-    expect(snapshot.argsRaw).toBe('{"file":"a.md"}')
-  })
-
-  it('lets input outrank content: the card shows what the tool was asked, not what it printed', () => {
-    const snapshot = { callId: 'c', name: 't', argsRaw: '{"file":"a.md"}' }
-    // The result text arrives as `content` AFTER input was seen: it is output,
-    // not arguments — ignored, or a Read card would swallow the whole file.
-    expect(acpToolCallDelta(snapshot, {
-      toolCallId: 'c',
-      content: [{ type: 'content', content: { type: 'text', text: '   1→ entire file body' } }],
-    })).toEqual([{ kind: 'raw', text: expect.any(String) }])
-    expect(snapshot.argsRaw).toBe('{"file":"a.md"}')
-    // Content only fills a call whose agent never sent input at all.
-    const silent = { callId: 'd', name: 't', argsRaw: '' }
-    expect(acpToolCallDelta(silent, {
-      toolCallId: 'd',
-      content: [{ type: 'content', content: { type: 'text', text: 'tool result line' } }],
-    })).toEqual([{ kind: 'args', text: 'tool result line' }, { kind: 'raw', text: expect.any(String) }])
-    expect(silent.argsRaw).toBe('tool result line')
-  })
-
-  it('describes a notification it has no card for without dropping its payload', () => {
-    expect(describeUnhandledUpdate('plan', {
-      entries: [{ content: 'fix the bug', status: 'in_progress', priority: 'high' }],
-    })).toBe('[in_progress] [high] fix the bug')
-    expect(describeUnhandledUpdate('current_mode_update', { currentModeId: 'plan' })).toBe('current_mode_update: plan')
-    expect(describeUnhandledUpdate('brand_new_kind', { sessionUpdate: 'brand_new_kind', extra: [1, 2] }))
-      .toContain('"extra": [')
-  })
-})
-
 describe('selectForwardPrompt (host request → forwarded ACP prompt)', () => {
   const user = (text: string, id = 'u1') => ({ role: 'user', id, source: { kind: 'user' }, content: [{ type: 'text', text }] })
   const injected = (kind: string, text: string) => ({ role: 'user', source: { kind }, content: [{ type: 'text', text }] })
@@ -340,25 +226,72 @@ describe('selectForwardPrompt (host request → forwarded ACP prompt)', () => {
   })
 })
 
-describe('isAcpToolContinuation (staged tool results after the person said something)', () => {
-  const user = (text: string) => ({ source: { kind: 'user' }, content: [{ type: 'text', text }] })
-  const tool = (callId: string) => ({ role: 'tool', source: { kind: 'tool', callId }, content: [] })
+const TOOL_ACTIVITY_LINES = ['🛠️'] as const
 
-  it('is true exactly when tool results trail the last user message', () => {
-    expect(isAcpToolContinuation([])).toBe(false)
-    expect(isAcpToolContinuation([user('fresh words')])).toBe(false)
-    expect(isAcpToolContinuation([user('run the tests'), tool('c1')])).toBe(true)
-    expect(isAcpToolContinuation([tool('c1')])).toBe(true)
-    expect(isAcpToolContinuation([user('older'), tool('c1'), tool('c2')])).toBe(true)
+describe('ACP tool activity → inline chat text', () => {
+  it('names the call, what it was asked, and where it stands', () => {
+    expect(acpToolActivityLine('mock tool', '{"cmd":"ls -la"}', 'pending'))
+      .toBe('\n🛠️ **mock tool** · pending · `{"cmd":"ls -la"}`\n')
+    // A single-line input stays on the headline; a multi-line one gets a fence
+    // so the plane's markdown cannot read it as prose.
+    expect(acpToolActivityLine('Read', 'one\ntwo', ''))
+      .toBe('\n🛠️ **Read**\n```\none\ntwo\n```\n')
+    // An agent that discloses nothing still gets an honest line, not a blank.
+    expect(acpToolActivityLine('', '', '')).toBe('\n🛠️ **tool**\n')
   })
 
-  it('is false when a user message follows the tools (a fresh prompt, not a replay)', () => {
-    expect(isAcpToolContinuation([tool('c1'), user('next question')])).toBe(false)
-    expect(isAcpToolContinuation([user('run the tests'), tool('c1'), user('now commit')])).toBe(false)
-    // A source-less message counts as user input — the same convention
-    // `selectForwardPrompt` uses for hand-built requests.
-    expect(isAcpToolContinuation([user('run the tests'), tool('c1'), { role: 'user', content: [{ type: 'text', text: 'again' }] }])).toBe(false)
-    expect(isAcpToolContinuation([{ role: 'tool', source: { kind: 'tool', callId: 'c1' } }, { role: 'user', content: [] }])).toBe(false)
+  it('fences what a tool printed, and folds backticks that would close the code span', () => {
+    expect(acpToolActivityOutput('tool result line')).toBe('\n```\ntool result line\n```\n')
+    expect(acpToolActivityLine('Bash', 'echo `hi`', '')).toContain("`echo 'hi'`")
+  })
+
+  it('reads the input spellings agents use in the wild, and nothing when they send none', () => {
+    expect(acpToolInputOf({ rawInput: '{"a":1}' })).toBe('{"a":1}')
+    expect(acpToolInputOf({ arguments: 'plain' })).toBe('plain')
+    expect(acpToolInputOf({ arguments: { a: 1 } })).toBe('{"a":1}')
+    // An array (batched input) is an argument spelling too, not an empty one.
+    expect(acpToolInputOf({ arguments: [{ a: 1 }] })).toBe('[{"a":1}]')
+    // An unserializable value degrades to text rather than failing the turn.
+    const circular: Record<string, unknown> = {}
+    circular.self = circular
+    expect(acpToolInputOf({ arguments: circular })).toBe('[object Object]')
+    // No input at all is legal ACP: `''`, not a fabricated placeholder.
+    expect(acpToolInputOf({ toolCallId: 'c' })).toBe('')
+  })
+
+  it('opens every line with the tool glyph so the plane cannot read it as prose', () => {
+    for (const line of [
+      acpToolActivityLine('t', 'input', 'completed'),
+      acpToolActivityLine('t', '', ''),
+    ]) {
+      expect(line).toContain(TOOL_ACTIVITY_LINES[0] as string)
+    }
+  })
+
+  it('keeps the content kinds the Chat plane cannot render, instead of placeholders', () => {
+    const text = updateContentToText([
+      { type: 'content', content: { type: 'text', text: 'first' } },
+      { type: 'diff', path: '/w/a.ts', oldText: 'one\ntwo\n', newText: 'one\nTWO\n' },
+      { type: 'content', content: { type: 'image', data: 'abc' } },
+      { type: 'terminal', terminalId: 't1' },
+    ])
+    expect(text).toContain('first')
+    // A diff becomes its path plus -/+ lines, not a `[diff path]` stub.
+    expect(text).toContain('/w/a.ts')
+    expect(text).toContain('- two')
+    expect(text).toContain('+ TWO')
+    // Unknown kinds keep their whole payload.
+    expect(text).toContain('"data":"abc"')
+    expect(text).toContain('"terminalId":"t1"')
+  })
+
+  it('describes a notification it has no card for without dropping its payload', () => {
+    expect(describeUnhandledUpdate('plan', {
+      entries: [{ content: 'fix the bug', status: 'in_progress', priority: 'high' }],
+    })).toBe('[in_progress] [high] fix the bug')
+    expect(describeUnhandledUpdate('current_mode_update', { currentModeId: 'plan' })).toBe('current_mode_update: plan')
+    expect(describeUnhandledUpdate('brand_new_kind', { sessionUpdate: 'brand_new_kind', extra: [1, 2] }))
+      .toContain('"extra": [')
   })
 })
 
@@ -475,6 +408,19 @@ describe('command lines', () => {
     expect(validateAgentDef({ id: 'x', command: '"C:\\Program Files\\x.exe" --acp' }))
       .toMatchObject({ command: 'C:\\Program Files\\x.exe', args: ['--acp'] })
     expect(() => validateAgentDef({ id: 'x', command: '"' })).toThrow(AcpError)
+  })
+
+  it('does NOT round-trip a whitespace command through a bare re-validate (quoting restores it)', () => {
+    // The returned `command` is the BARE path (spawn needs it unquoted). A bare
+    // command with a space is not re-parseable: splitCommandLine splits it again,
+    // so the fold's idempotence holds only for whitespace-free commands.
+    const def = validateAgentDef({ id: 'x', command: '"C:\\Program Files\\x.exe" --acp' })
+    expect(def).toMatchObject({ command: 'C:\\Program Files\\x.exe', args: ['--acp'] })
+    expect(validateAgentDef(def)).toMatchObject({ command: 'C:\\Program', args: ['Files\\x.exe', '--acp'] })
+    // What `loadPersistedAgents` does before re-validating (quoteLegacyCommand,
+    // when the path exists): re-quote the command token and it round-trips.
+    const requoted = validateAgentDef({ ...def, command: quoteCommandToken(def.command) })
+    expect(requoted).toMatchObject({ command: 'C:\\Program Files\\x.exe', args: ['--acp'] })
   })
 })
 
@@ -625,7 +571,7 @@ describe('cross-platform paths (Windows)', () => {
     expect(() => resolveFsPath('C:/ws', ['C:/ws'], 'C:/ws/link/x', winRealpath)).toThrow(/outside/)
     expect(() => resolveFsPath('C:/ws', ['C:/ws'], 'C:/ws2/file.txt', winRealpath)).toThrow(/outside/)
     expect(() => resolveFsPath('C:/ws', ['C:/ws'], '\\\\srv\\share\\file.txt', winRealpath)).toThrow(/outside/)
-    expect(() => canonicalizeFsPath('C:/ws', '\\\\?\\C:\\ws\\x', winRealpath)).toThrow(/does not exist/)
+    expect(() => canonicalizeFsPath('C:/ws', '\\\\?\\C:\\ws\\x', winRealpath)).toThrow(/cannot resolve/)
   })
   it('resolveFsPath contains a UNC workspace under its share root', () => {
     expect(resolveFsPath('//srv/share/proj', ['//srv/share'], 'file.txt', winRealpath)).toBe('//srv/share/proj/file.txt')
@@ -669,8 +615,25 @@ describe('cross-platform paths (Windows)', () => {
     expect(isAbsolutePath('\\\\?\\C:\\ws')).toBe(false)
     expect(() => validateAgentDef({ id: 'win', command: 'x', cwd: '\\\\?\\C:\\ws' })).toThrow(/absolute/)
     expect(() => validateAgentDef({ id: 'win', command: 'x', allowedCwdRoots: ['\\\\?\\C:\\ws'] })).toThrow(/absolute/)
-    expect(() => resolveFsPath('C:/ws', ['C:/ws'], '\\\\?\\C:\\ws\\x', winRealpath)).toThrow(/does not exist/)
-    expect(() => resolveFsPath('C:/ws', ['C:/ws'], '//?/C:/ws/x', winRealpath)).toThrow(/does not exist/)
+    expect(() => resolveFsPath('C:/ws', ['C:/ws'], '\\\\?\\C:\\ws\\x', winRealpath)).toThrow(/cannot resolve/)
+    expect(() => resolveFsPath('C:/ws', ['C:/ws'], '//?/C:/ws/x', winRealpath)).toThrow(/cannot resolve/)
+  })
+
+  it('blames the unjudgeable FORM, not a missing file, when realpath says everything exists', () => {
+    // A realpath that resolves ANY path: so the only reason these two forms are
+    // refused is that this layer cannot address them — the error must say that,
+    // not the false "does not exist".
+    const allExist = (p: string): string => p
+    // Extended-length / verbatim head (`\\?\…`, `//?/…`).
+    expect(() => canonicalizeFsPath('C:/ws', '\\\\?\\C:\\ws\\file.txt', allExist)).toThrow(/cannot resolve/)
+    expect(() => canonicalizeFsPath('C:/ws', '//?/C:/ws/file.txt', allExist)).toThrow(/cannot resolve/)
+    // Share-less UNC head (`\\host`, `//host`): host but no share, so segmentize
+    // returns undefined and the path is unaddressable — again not "does not exist".
+    expect(() => canonicalizeFsPath('C:/ws', '\\\\host', allExist)).toThrow(/cannot resolve/)
+    expect(() => canonicalizeFsPath('C:/ws', '//host', allExist)).toThrow(/cannot resolve/)
+    // A genuinely absent path still reports the honest "does not exist".
+    const nothing = (): string => { throw new Error('ENOENT') }
+    expect(() => canonicalizeFsPath('C:/ws', 'C:\\ws\\gone.txt', nothing)).toThrow(/does not exist/)
   })
 
   it('folds a Windows workspace root against declared locations (the surviving containment)', () => {
@@ -795,6 +758,13 @@ describe('dispatchRpc', () => {
     const acpModeOn = { ...manager, chatSessionAcpMode: (dshSessionId: string) => dshSessionId === 'chat-1' }
     await expect(dispatchRpc(acpModeOn, 'session/chat-list', { dshSessionId: 'chat-1' })).resolves.toEqual({ ok: true, value: { sessions: [], acpMode: true } })
     await expect(dispatchRpc(acpModeOn, 'session/chat-list', { dshSessionId: 'chat-2' })).resolves.toEqual({ ok: true, value: { sessions: [], acpMode: false } })
+    // The one-way agent lock: reported alongside the binding, and absent (not a
+    // false field) on a manager from before the lock existed.
+    const locked = { ...manager, lockedAgentFor: (dshSessionId: string) => (dshSessionId === 'chat-1' ? 'pi' : undefined) }
+    await expect(dispatchRpc(locked, 'session/chat-list', { dshSessionId: 'chat-1' }))
+      .resolves.toMatchObject({ ok: true, value: { lockedAgentId: 'pi' } })
+    await expect(dispatchRpc(manager, 'session/chat-list', { dshSessionId: 'chat-1' }))
+      .resolves.toEqual({ ok: true, value: { sessions: [], acpMode: false } })
     await expect(dispatchRpc(manager, 'session/chat-mode-set', { dshSessionId: 'chat-1', modeId: 'strict' })).resolves.toEqual({ ok: true, value: { done: true } })
     await expect(dispatchRpc(manager, 'session/chat-list', {})).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     // The ACP view's data source: addressed by the CHAT session id, because

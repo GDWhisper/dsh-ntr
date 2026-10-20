@@ -1,12 +1,20 @@
 /**
  * ACP-native mode control for the conversation composer
  * (`conversation.input.left` — the seat the slot contract reserves for a small
- * control beside the resident Access mode chrome).
+ * native control).
  *
- * The two controls are deliberately different layers, which is what keeps them
- * from reading as duplicates: the host's Access mode (仅可查看 / 工作区内修改 /
- * 完全权限) decides what the session may TOUCH, while this one is the agent's own
- * `session/set_mode` vocabulary (`plan`, `acceptEdits`, …) deciding HOW it works.
+ * THE TWO MODE CONTROLS NEVER SHARE A SCREEN (audit finding F27): the ACP-mode
+ * gate that lets this entry render also occupies the host's Access mode seat
+ * with a claim that renders nothing (`createPermissionSeatClaim` in
+ * model-seat.tsx) — the host's write policy (仅可查看 / 工作区内修改 / 完全权限)
+ * says nothing about an external agent process, so showing it next to an ACP
+ * conversation only misleads. This select is therefore NOT "complementary" to
+ * the Access mode: in the only conversation where it appears, the Access mode is
+ * hidden and this IS the mode switch. What it switches is the agent's own
+ * `session/set_mode` vocabulary (`plan`, `acceptEdits`, …). An ordinary
+ * conversation renders nothing here at all — the entry is registered
+ * unconditionally and gates itself (see `isAcp` below).
+ *
  * The host supplies the data by chat session id (`session/chat-list`), so the
  * control renders nothing until an ACP agent has actually run in this
  * conversation, and nothing at all for an agent that declares no modes.
@@ -43,6 +51,20 @@ function useUi(acp: AcpStore) {
   return useSyncExternalStore(cb => acp.subscribe(cb), () => acp.getSnapshot())
 }
 
+/**
+ * The mode select's tooltip (audit finding F27). It must not call the host's
+ * Access mode "complementary": the ACP-mode gate that puts this select on screen
+ * also hides that control (`createPermissionSeatClaim` renders nothing in the
+ * permission seat), so in the conversation where this appears the Access mode is
+ * gone and this select is the mode switch the user actually has.
+ */
+export function agentModeTitle(agentId: string | undefined, acp: AcpStore): string {
+  return acp.label(
+    `agent 模式（${agentId ?? 'agent'}）：由 agent 自己定义。NTR 会话里 DSH 的 Access mode 不显示，模式就在此切换。`,
+    `agent mode (${agentId ?? 'agent'}): defined by the agent. In an NTR conversation the DSH access mode is not shown, so this is where the mode is switched.`,
+  )
+}
+
 export function AcpComposerMode({ acp, sessionId, useSession }: ComposerModeProps) {
   const ui = useUi(acp)
   const dshSessionId = String(sessionId)
@@ -77,6 +99,11 @@ export function AcpComposerMode({ acp, sessionId, useSession }: ComposerModeProp
   // to do with and read ITS catalog — and reading a catalog can spawn a probe
   // (user report, 2026-10-18: an unrelated agent showed up "已连接").
   const agentId = target?.agentId
+    // A locked conversation belongs to this agent even when no session is live
+    // (after a restart / agent stop). It must outrank the binding read and the
+    // plugin default: reading another agent's catalog here would put THAT
+    // agent's modes on a locked conversation.
+    ?? ui.chatLockedAgent[dshSessionId]
     ?? ui.chatBoundAgent[dshSessionId]
     ?? ui.chatChoice[dshSessionId]?.agentId
     ?? (isAcp ? ui.defaultAgent : undefined)
@@ -119,10 +146,7 @@ export function AcpComposerMode({ acp, sessionId, useSession }: ComposerModeProp
       // read as what they are on their own — a caption beside a single select
       // only adds a second line of chrome to a control whose value already says
       // it. The explanation stays in the tooltip for whoever goes looking.
-      title={acp.label(
-        `agent 模式（${agentId ?? 'agent'}）：由 agent 自己定义，与 DSH 的 Access mode 互补`,
-        `agent mode (${agentId ?? 'agent'}): defined by the agent, complementary to the DSH access mode`,
-      )}
+      title={agentModeTitle(agentId, acp)}
     >
       <select
         aria-label={acp.label('agent 模式', 'agent mode')}

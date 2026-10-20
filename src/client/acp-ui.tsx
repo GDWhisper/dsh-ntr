@@ -599,28 +599,119 @@ export function AcpMenu({ model, anchor, onPick, onClose }: AcpMenuProps) {
 
 // ---- Chips ----
 
-/** One composer chip (the trigger of a picker). */
+/**
+ * One composer chip. With `onClick` it is the trigger of a picker; without it
+ * it is a static nameplate (the locked agent on the composer edge) — same
+ * shape, no button semantics and no caret, so it does not read as a control
+ * that does nothing.
+ *
+ * `className` exists for the lock hand-off: the base needs the shatter
+ * keyframes (`ntr-acp-shatter`) while it is still mounted, and that class must
+ * ride the chip itself to keep the cluster's `:last-child` layout rule intact.
+ */
 export function AcpChip(props: {
   label: string
   title?: string
   active?: boolean
-  onClick: (trigger: HTMLElement) => void
+  onClick?: (trigger: HTMLElement) => void
   children?: ReactNode
   style?: CSSProperties
+  className?: string
 }) {
+  const onClick = props.onClick
+  const className = `ntr-acp-chip${onClick === undefined ? ' is-static' : ''}${props.active === true ? ' is-active' : ''}${props.className === undefined ? '' : ` ${props.className}`}`
+  if (onClick === undefined) {
+    return (
+      <span className={className} title={props.title} style={props.style}>
+        {props.children}
+        <span className="ntr-acp-chip-label">{props.label}</span>
+      </span>
+    )
+  }
   return (
     <button
       type="button"
-      className={`ntr-acp-chip${props.active === true ? ' is-active' : ''}`}
+      className={className}
       title={props.title}
       aria-haspopup="menu"
-      onClick={(event) => { props.onClick(event.currentTarget) }}
+      onClick={(event) => { onClick(event.currentTarget) }}
       style={props.style}
     >
       {props.children}
       <span className="ntr-acp-chip-label">{props.label}</span>
       <span className="ntr-acp-caret" aria-hidden>▾</span>
     </button>
+  )
+}
+
+/**
+ * The debris layer of the lock hand-off (see `agent-lock-anim.ts`).
+ *
+ * `out` scatters the base's fragments; `in` plays the same particles backwards
+ * under the arriving tag, so the plate reads as condensed from what the base
+ * broke into. Purely decorative: `aria-hidden`, no pointer events, and the
+ * whole layer is gone once the phase ends.
+ */
+interface AcpShard {
+  /** Resting position inside the chip, in percent. */
+  x: number
+  y: number
+  width: number
+  height: number
+  /**
+   * Scatter offset and spin for the outbound half. The base sits at the RIGHT
+   * of the composer bar while the tag hangs near its left edge, so the debris
+   * drifts leftward: it reads as the same cloud that later streams in from the
+   * right to re-form the tag (see `inX` / `inY`).
+   */
+  dx: number
+  dy: number
+  /** Where the inbound half starts: to the right of the tag, off toward the base. */
+  inX: number
+  inY: number
+  rotate: number
+  scale: number
+  delay: number
+}
+
+const ACP_SHARDS: readonly AcpShard[] = [
+  { x: 8, y: 30, width: 5, height: 7, dx: -42, dy: -22, inX: 150, inY: -18, rotate: -120, scale: 0.35, delay: 0 },
+  { x: 18, y: 55, width: 4, height: 5, dx: -28, dy: 24, inX: 118, inY: 24, rotate: 90, scale: 0.55, delay: 20 },
+  { x: 28, y: 20, width: 6, height: 4, dx: -20, dy: -30, inX: 196, inY: -10, rotate: -45, scale: 0.45, delay: 10 },
+  { x: 38, y: 65, width: 5, height: 6, dx: -14, dy: 28, inX: 132, inY: 30, rotate: 140, scale: 0.4, delay: 30 },
+  { x: 48, y: 35, width: 4, height: 8, dx: -36, dy: -26, inX: 210, inY: -4, rotate: 75, scale: 0.5, delay: 0 },
+  { x: 56, y: 60, width: 6, height: 5, dx: -24, dy: 24, inX: 164, inY: 20, rotate: -90, scale: 0.55, delay: 25 },
+  { x: 66, y: 25, width: 4, height: 4, dx: -30, dy: -20, inX: 128, inY: -24, rotate: 120, scale: 0.4, delay: 5 },
+  { x: 74, y: 58, width: 5, height: 7, dx: -18, dy: 20, inX: 182, inY: 14, rotate: -140, scale: 0.5, delay: 15 },
+  { x: 84, y: 32, width: 4, height: 5, dx: -10, dy: -14, inX: 112, inY: -32, rotate: 60, scale: 0.4, delay: 20 },
+  { x: 13, y: 45, width: 3, height: 4, dx: -34, dy: 6, inX: 206, inY: 8, rotate: 180, scale: 0.3, delay: 35 },
+  { x: 43, y: 48, width: 3, height: 3, dx: -26, dy: 16, inX: 176, inY: 4, rotate: -60, scale: 0.3, delay: 40 },
+  { x: 88, y: 50, width: 3, height: 4, dx: -8, dy: 8, inX: 142, inY: 26, rotate: 160, scale: 0.3, delay: 35 },
+]
+
+export function AcpShatterParts(props: { mode: 'out' | 'in' }) {
+  return (
+    <span className={`ntr-acp-shards is-${props.mode}`} aria-hidden>
+      {ACP_SHARDS.map((shard, index) => (
+        <span
+          key={index}
+          className="ntr-acp-shard"
+          style={{
+            left: `${shard.x}%`,
+            top: `${shard.y}%`,
+            width: shard.width,
+            height: shard.height,
+            animationDelay: `${shard.delay}ms`,
+            '--ntr-shard-dx': `${shard.dx}px`,
+            '--ntr-shard-dy': `${shard.dy}px`,
+            '--ntr-shard-in-x': `${shard.inX}px`,
+            '--ntr-shard-in-y': `${shard.inY}px`,
+            '--ntr-shard-rotate': `${shard.rotate}deg`,
+            '--ntr-shard-scale': shard.scale,
+          } as CSSProperties}
+        />
+      ))}
+    </span>
   )
 }
 
@@ -633,11 +724,56 @@ const STYLE = `
    squeeze. Without this a long model name could compress the base instead,
    which is the same "it moved" symptom as reordering it was meant to fix. */
 .ntr-acp-cluster > .ntr-acp-chip:last-child { flex: none; }
-.ntr-acp-chip { display: inline-flex; align-items: center; gap: 5px; max-width: 220px; font: inherit; font-size: 12px; line-height: 1.4; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: inherit; cursor: pointer; }
+/* The agent tag after the base retires. It rides the composer card's top edge:
+   the overlay anchor is a zero-height absolute box at that edge, so translateY
+   (-50%) puts half the tag above the card and half inside it — a nameplate
+   hanging on the box. Above the menu's siblings but below the picker (z 100). */
+.ntr-acp-tag { position: absolute; top: 0; left: 24px; z-index: 90; transform: translateY(-50%); display: inline-flex; max-width: calc(100% - 48px); }
+.ntr-acp-tag > .ntr-acp-chip { font-size: 11px; line-height: 1.35; padding: 1px 8px; background: var(--dsw-specific-input-major, var(--dsw-alias-bg-layer-1, #fff)); box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12); }
+.ntr-acp-tag > .ntr-acp-chip.is-static:hover { background: var(--dsw-specific-input-major, var(--dsw-alias-bg-layer-1, #fff)); }
+.ntr-acp-chip { position: relative; display: inline-flex; align-items: center; gap: 5px; max-width: 220px; font: inherit; font-size: 12px; line-height: 1.4; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: inherit; cursor: pointer; }
 .ntr-acp-chip:hover { background: var(--dsw-alias-interactive-bg-active, #0000000d); }
+.ntr-acp-chip.is-static { cursor: default; }
+.ntr-acp-chip.is-static:hover { background: var(--dsw-alias-bg-layer-2, #f3f4f6); }
 .ntr-acp-chip.is-active { border-color: var(--dsw-alias-state-business-primary, #2563eb); color: var(--dsw-alias-state-business-primary, #2563eb); background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 10%, transparent); }
 .ntr-acp-chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ntr-acp-caret { opacity: 0.6; font-size: 10px; }
+/* The lock hand-off (src/client/agent-lock-anim.ts): the outgoing agent base
+   breaks into debris for 460ms, then the edge tag condenses from the same
+   particles. Both halves read one shared clock in that module; these durations
+   must stay equal to SHATTER_MS / FORM_MS there. */
+.ntr-acp-shards { position: absolute; inset: 0; display: block; pointer-events: none; overflow: visible; }
+.ntr-acp-shard { position: absolute; border-radius: 1px; background: currentColor; opacity: 0; }
+.ntr-acp-shards.is-out .ntr-acp-shard { animation: ntr-acp-shard-out 460ms cubic-bezier(0.2, 0.7, 0.3, 1) both; }
+.ntr-acp-shards.is-in .ntr-acp-shard { animation: ntr-acp-shard-in 540ms cubic-bezier(0.16, 0.84, 0.28, 1) both; }
+.ntr-acp-chip.ntr-acp-shatter { animation: ntr-acp-shatter-chip 460ms cubic-bezier(0.4, 0, 0.8, 0.4) both; pointer-events: none; }
+.ntr-acp-tag.is-forming > .ntr-acp-chip { animation: ntr-acp-form-chip 540ms cubic-bezier(0.16, 0.84, 0.28, 1) both; }
+@keyframes ntr-acp-shatter-chip {
+  0% { opacity: 1; transform: none; filter: blur(0); }
+  22% { opacity: 1; transform: scale(1.05); filter: blur(0); }
+  55% { opacity: 0.55; filter: blur(1.5px); }
+  100% { opacity: 0; transform: scale(0.84); filter: blur(4px); }
+}
+@keyframes ntr-acp-form-chip {
+  0% { opacity: 0; transform: scale(0.55) translateY(2px); filter: blur(6px); }
+  60% { opacity: 1; filter: blur(0); }
+  100% { opacity: 1; transform: none; filter: blur(0); }
+}
+@keyframes ntr-acp-shard-out {
+  0% { opacity: 0; transform: translate(0, 0) scale(1) rotate(0deg); }
+  18% { opacity: 0.95; }
+  100% { opacity: 0; transform: translate(var(--ntr-shard-dx), var(--ntr-shard-dy)) scale(var(--ntr-shard-scale)) rotate(var(--ntr-shard-rotate)); }
+}
+@keyframes ntr-acp-shard-in {
+  0% { opacity: 0; transform: translate(var(--ntr-shard-in-x), var(--ntr-shard-in-y)) scale(var(--ntr-shard-scale)) rotate(var(--ntr-shard-rotate)); }
+  22% { opacity: 0.9; }
+  70% { opacity: 0.5; }
+  100% { opacity: 0; transform: translate(0, 0) scale(0.35) rotate(0deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ntr-acp-shards { display: none; }
+  .ntr-acp-chip.ntr-acp-shatter, .ntr-acp-tag.is-forming > .ntr-acp-chip { animation: none; }
+}
 .ntr-acp-seat { display: inline-flex; align-items: center; gap: 6px; max-width: 260px; font: inherit; font-size: 12px; line-height: 1.4; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: inherit; cursor: pointer; }
 .ntr-acp-seat:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-active, #0000000d); }
 .ntr-acp-seat:disabled { opacity: 0.5; cursor: default; }

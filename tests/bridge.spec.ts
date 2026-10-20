@@ -234,14 +234,32 @@ describe('ACP bridge over stdio (mock agent)', () => {
       chunks.push(chunk)
     }
 
-    // The notification that has no card of its own — the agent's plan — is
-    // still announced on the stream as an `acp_plan` card rather than dropped.
-    // (The command list is session state and stays off the stream.)
-    const cardNames = chunks
-      .filter((c): c is Extract<StreamChunk, { type: 'tool-call-delta' }> => c.type === 'tool-call-delta')
-      .map(c => c.name)
-      .filter((name): name is string => name !== undefined)
-    expect(cardNames).toEqual(expect.arrayContaining(['acp_plan', 'mock tool']))
+    // Tool activity rides the SAME prose channel as the answer, in the order
+    // the agent produced it. The Chat plane cannot draw a `tool-call` block
+    // inside the message body; what it shows instead is the host loop's
+    // EXECUTION of the call, appended as its own node below the whole message.
+    // A native turn hides that (its cards sit between two model steps); an ACP
+    // turn is ONE host step, so chronological order is only reachable as prose.
+    // The full card stays in the ACP view tab (docs/acp-convergence.md §1.7).
+    const text = chunks
+      .filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
+      .map(c => c.text).join('')
+    expect(text).toContain('🛠️ **mock tool**')
+    expect(text).toContain('tool result line')
+    // The agent's plan is announced inline too, one line per kind, not a card.
+    expect(text).toContain('[in_progress]')
+    expect(text).toContain('MOCK: echo hello from native chat perm=none')
+
+    // …and the tool activity comes BEFORE the answer, because that is the order
+    // the agent sent them. Chronology is the whole point of this shape.
+    expect(text.indexOf('🛠️')).toBeGreaterThan(-1)
+    expect(text.indexOf('MOCK: echo')).toBeGreaterThan(text.indexOf('🛠️'))
+
+    // Nothing here asks the host loop to execute anything: no `tool-call` block
+    // means no continuation step and no card node below the message.
+    expect(chunks.some(c => c.type === 'tool-call-delta')).toBe(false)
+    expect(chunks.filter(c => c.type === 'block-start').map(c => (c as { blockType: string }).blockType))
+      .not.toContain('tool-call')
 
     const types = chunks.map(c => c.type)
     expect(types).toContain('block-start')
@@ -251,49 +269,12 @@ describe('ACP bridge over stdio (mock agent)', () => {
     expect(types).toContain('finish')
 
     // Reasoning block: the agent's own thoughts and NOTHING else. A tool call
-    // used to be flattened into a `> 🛠️ [Tool: …]` prose line here; that
-    // downgrade is exactly what made the Chat plane unable to draw a card.
+    // used to be flattened into a `> 🛠️ [Tool: …]` prose line here; today it is
+    // its own inline line in the text channel, where it belongs.
     const reasoningDeltas = chunks.filter((c): c is Extract<StreamChunk, { type: 'reasoning-delta' }> => c.type === 'reasoning-delta')
     const thoughtText = reasoningDeltas.map(c => c.text).join('')
     expect(thoughtText).toContain('thinking…')
     expect(thoughtText).not.toContain('mock tool')
-
-    // Tool call: a REAL block sequence, which the host's accumulator folds into
-    // `{ kind: 'tool-call', callId, name, argsRaw }` — the shape the Chat
-    // plane's tool-call renderer consumes. Two deltas for this mock: the
-    // announcement (id + name, no arguments — the mock sends none) and the
-    // result content. Updates that carry nothing new emit nothing.
-    const toolDeltas = chunks.filter((c): c is Extract<StreamChunk, { type: 'tool-call-delta' }> => c.type === 'tool-call-delta' && c.id === 'call_1')
-    expect(toolDeltas.length).toBeGreaterThanOrEqual(2)
-    expect(new Set(toolDeltas.map(c => c.id))).toEqual(new Set(['call_1']))
-    // The announcement carries the call identity and the agent's own label.
-    expect(toolDeltas[0]).toMatchObject({ id: 'call_1', name: 'mock tool' })
-    // The update carries the result text the agent published (after the
-    // per-update `raw` refresh delta, which carries no arguments).
-    expect(toolDeltas.some(c => c.argumentsDelta.includes('tool result line'))).toBe(true)
-
-    // The block it opens and closes is a `tool-call` block, and the closing
-    // frame carries the COMPLETE snapshot — the host REPLACES on `block-end`
-    // rather than merging, so a partial here would blank the card.
-    const toolStart = chunks.find((c): c is Extract<StreamChunk, { type: 'block-start' }> =>
-      c.type === 'block-start' && c.blockType === 'tool-call')
-    expect(toolStart).toBeDefined()
-    const toolEnd = chunks.find((c): c is Extract<StreamChunk, { type: 'block-end' }> =>
-      c.type === 'block-end'
-      && typeof c.block === 'object' && c.block !== null
-      && (c.block as { type?: string }).type === 'tool-call'
-      && (c.block as { id?: string }).id === 'call_1')
-    expect(toolEnd?.block).toMatchObject({ type: 'tool-call', id: 'call_1', name: 'mock tool' })
-    expect((toolEnd?.block as { arguments?: string }).arguments).toContain('tool result line')
-
-    // The answer text does NOT stream here: the mock's message chunks arrive
-    // after the tool card, and the Chat plane's answer detection refuses any
-    // message containing a tool-call block — so they buffered for the
-    // continuation step (`pendingToolAnswers`).
-    // (The plan card opened before any real call — see the `acp_plan` card
-    // above — so this turn's message text still counts as an answer buffer.)
-    const textDeltas = chunks.filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
-    expect(textDeltas).toHaveLength(0)
 
     // Usage and finish
     const usage = chunks.find((c): c is Extract<StreamChunk, { type: 'usage' }> => c.type === 'usage')
@@ -302,39 +283,31 @@ describe('ACP bridge over stdio (mock agent)', () => {
     const finish = chunks.find((c): c is Extract<StreamChunk, { type: 'finish' }> => c.type === 'finish')
     expect(finish?.reason).toEqual({ kind: 'stop' })
 
-    // The continuation step — staged tool results after the person's words —
-    // replays the buffer as a SECOND, tool-free message: the shape the Chat
-    // plane's answer detection accepts as the answer.
+    // A batch of staged tool results is not a turn this adapter answers: the
+    // ACP agent's turn already ran to completion, and there is no buffered
+    // answer to replay. It carries no user input, so it ends with no output
+    // rather than being forwarded to the agent.
     const continued: StreamChunk[] = []
     for await (const chunk of adapter.stream({
       provider: 'acp',
       model: 'mock',
       sessionId: 'dsh-native-test-1',
       messages: [
-        { role: 'user', content: [{ type: 'text', text: 'hello from native chat' }] },
         { role: 'tool', source: { kind: 'tool', callId: 'call_1' }, content: [{ type: 'text', text: 'tool result line' }] },
       ],
     })) {
       continued.push(chunk)
     }
-    const answer = continued
-      .filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
-      .map(c => c.text).join('')
-    expect(answer).toBe('MOCK: echo hello from native chat perm=none')
-    const answerEnd = continued.find((c): c is Extract<StreamChunk, { type: 'block-end' }> => c.type === 'block-end')
-    expect(answerEnd?.block).toEqual({ type: 'text', text: answer })
-    expect(continued.find((c): c is Extract<StreamChunk, { type: 'finish' }> => c.type === 'finish')?.reason).toEqual({ kind: 'stop' })
-    // Usage rode step 1; the replay step adds none (no double counting).
-    expect(continued.some(c => c.type === 'usage')).toBe(false)
+    expect(continued.some(c => c.type === 'text-delta')).toBe(false)
+    expect(continued.find((c): c is Extract<StreamChunk, { type: 'finish' }> => c.type === 'finish')?.reason)
+      .toMatchObject({ kind: 'error', failure: { code: 'empty_prompt' } })
   }, 30_000)
 
-  it('gives every tool call its own block and treats restated input as a snapshot', async () => {
-    // The oml session bug, at both layers. ACP agents announce a call with a
-    // `rawInput` snapshot and then RESTATE the whole input on every update;
-    // folding those as append-deltas grew `{"cmd":""}{"cmd":"ls -la"}` garbage
-    // in the card arguments. And a second call announced while the first card
-    // was still open used to fold into the SAME block (the type-equality
-    // early-return), merging two cards into one.
+  it('announces every tool call where it happened and never repeats a restatement', async () => {
+    // The oml session bug's other half, now that tool activity is prose: the
+    // agent restates a call in whole on every progress tick, and with parallel
+    // calls the restatements interleave (t1, t2, t1…). A line per restatement
+    // would bury the conversation — only real news is announced.
     const adapter = new AcpLlmAdapter(manager)
     const chunks: StreamChunk[] = []
     for await (const chunk of adapter.stream({
@@ -348,91 +321,29 @@ describe('ACP bridge over stdio (mock agent)', () => {
       chunks.push(chunk)
     }
 
-    // Three announced calls — t1, t2, call_1 — three separate tool-call blocks,
-    // even though every one of them switches from a tool-call block to a
-    // tool-call block.
-    const starts = chunks.filter((c): c is Extract<StreamChunk, { type: 'block-start' }> =>
-      c.type === 'block-start' && c.blockType === 'tool-call')
-    // One announcement card (the plan) plus three calls.
-    expect(starts).toHaveLength(4)
-
-    // The restated `tool_call` for t1 folds as an update (no new block, no
-    // delta), and the replacement `rawInput` update pushes nothing — a
-    // replacement is not expressible as an append. call_1 keeps its standard
-    // two deltas (announcement + result content).
-    // One delta per distinct change: t1's announcement and its two
-    // restatements, t2's announcement, then call_1's announcement, its
-    // three progress ticks and its result. A delta is also the carrier for
-    // `details` / `raw` changes, so a restatement is never silent.
-    const toolDeltas = chunks.filter((c): c is Extract<StreamChunk, { type: 'tool-call-delta' }> => c.type === 'tool-call-delta' && !c.id.startsWith('unhandled'))
-    expect(toolDeltas.map(c => c.id)).toEqual(['t1', 't1', 't1', 't2', 'call_1', 'call_1', 'call_1', 'call_1', 'call_1', 'call_1'])
-    expect(toolDeltas[0]).toMatchObject({ id: 't1', name: 'first tool', argumentsDelta: '{"cmd":""}' })
-    const t2Deltas = toolDeltas.filter(c => c.id === 't2')
-    expect(t2Deltas[0]).toMatchObject({ id: 't2', name: 'second tool', argumentsDelta: '{"path":"a.md"}' })
-
-    // The settled cards carry the LATEST snapshot each — block-end replaces
-    // the block wholesale, so the replacement update lands verbatim instead
-    // of concatenating behind the announcement.
-    const settled = chunks.filter((c): c is Extract<StreamChunk, { type: 'block-end' }> =>
-      c.type === 'block-end'
-      && typeof c.block === 'object' && c.block !== null
-      && (c.block as { type?: string }).type === 'tool-call')
-    expect(settled.filter(c => !(c.block as { id?: string }).id?.startsWith('unhandled')).map(c => (c.block as { id?: string }).id)).toEqual(['t1', 't2', 'call_1'])
-    const calls = settled.filter(c => !(c.block as { id?: string }).id?.startsWith('unhandled'))
-    expect((calls[0]?.block as { arguments?: string }).arguments).toBe('{"cmd":"ls -la"}')
-    expect((calls[1]?.block as { arguments?: string }).arguments).toBe('{"path":"a.md"}')
-
-    // The codebuddy interleave: t1's titled restatement arrives while t2's card
-    // is the open block. It must NOT open a duplicate t1 card — three calls,
-    // three cards (indices 1..3; the mock's leading thought chunk owns 0) — and
-    // t1's final content-only update lands in the shared tool-output record the
-    // guard's virtual tools answer from.
-    // The plan card sits at 1; the three call cards follow it.
-    expect(starts.map(c => (c as { index: number }).index)).toEqual([1, 2, 3, 4])
-    expect(routeBindingRegistry().toolResults.get('t1')).toBe('T1 OUTPUT LINE')
-    routeBindingRegistry().toolResults.delete('t1')
-
-    // The answer replay: the mock's message chunks arrived after the first
-    // card, so they buffered; the continuation step delivers them as the
-    // tool-free answer message.
-    const continued: StreamChunk[] = []
-    for await (const chunk of adapter.stream({
-      provider: 'acp',
-      model: 'mock',
-      sessionId: 'dsh-native-test-2',
-      messages: [
-        { role: 'user', content: [{ type: 'text', text: 'TWOTOOLS please' }] },
-        { role: 'tool', source: { kind: 'tool', callId: 't1' }, content: [{ type: 'text', text: 'T1 OUTPUT LINE' }] },
-      ],
-    })) {
-      continued.push(chunk)
-    }
-    expect(continued
-      .filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
-      .map(c => c.text).join('')).toBe('MOCK: echo TWOTOOLS please perm=none')
-  }, 30_000)
-
-  it('answers a tool-only turn with a pointer note on the continuation step', async () => {
-    // Cards executed but the agent sent no text: the stash is empty, so the
-    // continuation delivers the note instead of a silent bubble.
-    const adapter = new AcpLlmAdapter(manager)
-    const chunks: StreamChunk[] = []
-    for await (const chunk of adapter.stream({
-      provider: 'acp',
-      model: 'mock',
-      sessionId: 'dsh-native-toolonly',
-      messages: [
-        { role: 'tool', source: { kind: 'tool', callId: 'call_x' }, content: [{ type: 'text', text: 'x' }] },
-      ],
-    })) {
-      chunks.push(chunk)
-    }
     const text = chunks
       .filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
       .map(c => c.text).join('')
-    expect(text).toContain('sent no text reply')
-    expect(chunks.find((c): c is Extract<StreamChunk, { type: 'finish' }> => c.type === 'finish')?.reason).toEqual({ kind: 'stop' })
-  })
+
+    // t1 announced, retitled (`ls -la`), then its result: three lines for the
+    // call, not one per restatement (the mock restates it four times).
+    expect(text).toContain('**first tool**')
+    expect(text).toContain('{"cmd":"ls -la"}')
+    expect(text).toContain('T1 OUTPUT LINE')
+    expect(text.match(/T1 OUTPUT LINE/g)?.length).toBe(1)
+    // t2 announced once with its object input serialized, never restated.
+    expect(text.match(/\*\*second tool\*\*/g)?.length).toBe(1)
+    expect(text).toContain('{"path":"a.md"}')
+    // …and the answer is still there, after all of it.
+    expect(text).toContain('MOCK: echo TWOTOOLS please perm=none')
+
+    // Chronology: every call is announced before the answer that follows it.
+    expect(text.indexOf('**first tool**')).toBeLessThan(text.indexOf('MOCK: echo'))
+    expect(text.indexOf('**second tool**')).toBeLessThan(text.indexOf('MOCK: echo'))
+
+    // No card, so no call for the host loop to execute.
+    expect(chunks.some(c => c.type === 'tool-call-delta')).toBe(false)
+  }, 30_000)
 
   it('reports the ACP-mode preset from the harness roster it is wired to', async () => {
     // No roster reader wired (a host without `agentPresets`): no verdict, which
@@ -524,19 +435,26 @@ describe('ACP bridge over stdio (mock agent)', () => {
     })) {
       chunks.push(chunk)
     }
-    // The echo does not stream in step 1: the mock's message chunks arrive
-    // after its tool call, so they buffered for the continuation step.
+    // The echo streams in step 1 itself: tool activity is prose now, so there
+    // is no card-bearing message to buffer behind (§1.7).
     const answer = chunks
       .filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
       .map(c => c.text).join('')
-    expect(answer).toBe('')
+    expect(answer).toContain('MOCK: echo hello from the person perm=none')
+    // …and the injected sections never reached the agent: its echo carries the
+    // person's words and nothing the harness appended behind them.
+    expect(answer).not.toContain('workspace instructions')
+    expect(answer).not.toContain('Current runtime context')
+
+    // A batch of staged tool results is no longer a turn this adapter serves:
+    // with no `tool-call` block there is no continuation step, and forwarding
+    // such a batch would re-send the person's words to the agent.
     const continued: StreamChunk[] = []
     for await (const chunk of adapter.stream({
       provider: 'acp',
       model: 'mock',
       sessionId,
       messages: [
-        { role: 'user', id: 'u1', source: { kind: 'user' }, content: [{ type: 'text', text: 'hello from the person' }] },
         { role: 'tool', source: { kind: 'tool', callId: 'call_1' }, content: [{ type: 'text', text: 'tool result line' }] },
       ],
     })) {
@@ -544,7 +462,7 @@ describe('ACP bridge over stdio (mock agent)', () => {
     }
     expect(continued
       .filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
-      .map(c => c.text).join('')).toBe('MOCK: echo hello from the person perm=none')
+      .map(c => c.text).join('')).toBe('')
 
     // A session-title call rides the same logged route; it must not become an
     // ACP turn (it would spend a remote turn on a title, or fold a harness
@@ -619,23 +537,12 @@ describe('ACP bridge over stdio (mock agent)', () => {
       chunks.push(chunk)
     }
 
-    // The echo rides the continuation step (the two-step turn shape).
-    const continued: StreamChunk[] = []
-    for await (const chunk of adapter.stream({
-      provider: 'acp',
-      model: 'mock',
-      sessionId: 'dsh-native-perm-test',
-      messages: [
-        { role: 'user', content: [{ type: 'text', text: 'hello PERM allowed' }] },
-        { role: 'tool', source: { kind: 'tool', callId: 'call_1' }, content: [{ type: 'text', text: 'tool result line' }] },
-      ],
-    })) {
-      continued.push(chunk)
-    }
-    const answer = continued
+    // One step carries the whole turn, echo included: no continuation step to
+    // ride (see docs/acp-convergence.md §1.7).
+    const text = chunks
       .filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
       .map(c => c.text).join('')
-    expect(answer).toBe('MOCK: echo hello PERM allowed perm=allow1')
+    expect(text).toContain('MOCK: echo hello PERM allowed perm=allow1')
 
     await manager.setPermission('mock', 'ask')
   }, 30_000)
@@ -1559,6 +1466,302 @@ describe('native approval routing (isolated manager)', () => {
 })
 
 /**
+ * The ledger fallback when the native approval chain is wired but DEGRADES.
+ *
+ * `approvalRouted` reports that the host HAS the approval service; it does not
+ * promise every ask reaches the conversation. When the service answers
+ * `unavailable` for one ask, the ask falls back to the settings-panel ledger
+ * and two things must hold: the turn must not hang forever behind a question
+ * the conversation never showed, and the line folded into the chat must name
+ * the path the ask actually took instead of pointing at a composer prompt that
+ * failed. The DESIGNED ledger paths (no approval service at all, a session
+ * with no chat identity) keep waiting for the human — their answer entry is
+ * the settings panel, which is where the chat line sends the user.
+ */
+describe('a degraded approval route still answers the turn (isolated manager)', () => {
+  const degradeHub = new EventHub()
+  const degradeEvents: AcpEvent[] = []
+  degradeHub.subscribe(event => { degradeEvents.push(event) })
+  // `permissionTimeoutMs` stays at its 0 default ("approvals belong to a
+  // person"); only the degraded-route fallback is shortened so the case runs
+  // in seconds instead of the production five minutes.
+  const degradeManager = new BridgeManager([{ ...def, id: 'degrade' }], degradeHub, 500, undefined, undefined, true, { permissionFallbackTimeoutMs: 2_000 })
+  const degradeAdapter = new AcpLlmAdapter(degradeManager)
+
+  degradeManager.setApprovalRequester(() => Promise.resolve('unavailable'))
+
+  afterAll(async () => {
+    await degradeManager.shutdownAll()
+  })
+
+  function degradeWaitFor<T extends AcpEvent['type']>(type: T, since: number, predicate: (event: Extract<AcpEvent, { type: T }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: T }>> {
+    const matches = (event: AcpEvent): event is Extract<AcpEvent, { type: T }> =>
+      event.type === type && predicate(event as Extract<AcpEvent, { type: T }>)
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${type}`)), timeoutMs)
+      const unsub = degradeHub.subscribe(event => {
+        if (degradeEvents.indexOf(event) >= since && matches(event)) {
+          clearTimeout(timer)
+          unsub()
+          resolve(event)
+        }
+      })
+      const existing = degradeEvents.find((event, index) => index >= since && matches(event))
+      if (existing !== undefined) {
+        clearTimeout(timer)
+        unsub()
+        resolve(existing)
+      }
+    })
+  }
+
+  /** Drain one adapter turn, collecting the reasoning text it streamed. */
+  async function degradeTurn(sessionId: string, text: string): Promise<{ reasoning: () => string; drained: Promise<void> }> {
+    const parts: string[] = []
+    const drained = (async () => {
+      for await (const chunk of degradeAdapter.stream({
+        provider: 'acp',
+        model: 'degrade',
+        sessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+      })) {
+        if (chunk.type === 'reasoning-delta') parts.push(chunk.text)
+      }
+    })()
+    return { reasoning: () => parts.join(''), drained }
+  }
+
+  async function degradeEcho(sessionId: string): Promise<string> {
+    const transcript = await dispatchRpc(degradeManager, 'transcript/get', { sessionId })
+    if (!transcript.ok) throw new Error('transcript failed')
+    return (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
+      .filter(e => e.update.sessionUpdate === 'agent_message_chunk')
+      .map(e => String((e.update.content as { text?: string }).text ?? ''))
+      .join('')
+  }
+
+  it('ends the turn instead of hanging when nobody answers the degraded ask', async () => {
+    const since = degradeEvents.length
+    const { drained } = await degradeTurn('dsh-degrade-hang', 'PERM degrade hang')
+    const request = await degradeWaitFor('permission/request', since, () => true)
+
+    // Nobody answers. The degraded-route deadline must answer `cancelled` on
+    // the human's behalf — with the default `permissionTimeoutMs: 0` this is
+    // the only thing keeping the turn from hanging forever.
+    const notice = await degradeWaitFor('agent/notice', since, event => event.text.includes('timed out after 2s'))
+    expect(notice.text).toContain('cancelled')
+    await drained
+    expect(await degradeEcho(request.sessionId)).toContain('perm=cancelled')
+  }, 30_000)
+
+  it('words the chat line by the path the ask took (degraded native route)', async () => {
+    const since = degradeEvents.length
+    const { reasoning, drained } = await degradeTurn('dsh-degrade-line', 'PERM degrade line')
+    const request = await degradeWaitFor('permission/request', since, () => true)
+
+    // A human CAN still answer in the settings panel; answering clears the
+    // deadline, and the turn completes on that answer.
+    await dispatchRpc(degradeManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
+    await drained
+    // The composer prompt the user is waiting for failed, and the ask now
+    // carries a deadline: the line has to say both.
+    expect(reasoning()).toContain('the approval service is unavailable')
+    expect(reasoning()).toContain('approve in Settings within 2s or this request is cancelled')
+    expect(reasoning()).not.toContain('please approve in Settings')
+    expect(await degradeEcho(request.sessionId)).toContain('perm=allow1')
+  }, 30_000)
+})
+
+/**
+ * The DESIGNED ledger path: a host with no approval service at all.
+ *
+ * Every ask rides the ledger and the settings panel's card is the answer
+ * entry, so `permissionTimeoutMs: 0` must keep meaning "wait for the human" —
+ * the degraded-route deadline must not leak into this path — and the chat
+ * line names the panel plainly.
+ */
+describe('the designed ledger path still waits for the human (isolated manager)', () => {
+  const plainHub = new EventHub()
+  const plainEvents: AcpEvent[] = []
+  plainHub.subscribe(event => { plainEvents.push(event) })
+  // A shortened degraded-route deadline that must NEVER fire on this path.
+  const plainManager = new BridgeManager([{ ...def, id: 'plain' }], plainHub, 500, undefined, undefined, true, { permissionFallbackTimeoutMs: 150 })
+  const plainAdapter = new AcpLlmAdapter(plainManager)
+
+  afterAll(async () => {
+    await plainManager.shutdownAll()
+  })
+
+  it('keeps waiting with permissionTimeoutMs 0 and says "approve in Settings"', async () => {
+    expect(plainManager.approvalRouting()).toBe(false)
+    const since = plainEvents.length
+    const parts: string[] = []
+    const drained = (async () => {
+      for await (const chunk of plainAdapter.stream({
+        provider: 'acp',
+        model: 'plain',
+        sessionId: 'dsh-plain-ledger',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'PERM plain ledger' }] }],
+      })) {
+        if (chunk.type === 'reasoning-delta') parts.push(chunk.text)
+      }
+    })()
+    const request = await new Promise<Extract<AcpEvent, { type: 'permission/request' }>>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timeout waiting for permission/request')), 15_000)
+      const unsub = plainHub.subscribe(event => {
+        if (plainEvents.indexOf(event) >= since && event.type === 'permission/request') {
+          clearTimeout(timer)
+          unsub()
+          resolve(event)
+        }
+      })
+    })
+
+    // Well past the shortened degraded-route deadline: no notice, no
+    // auto-cancel. The panel card is the designed answer entry here.
+    await new Promise(resolve => setTimeout(resolve, 600))
+    expect(plainEvents.slice(since).filter(e => e.type === 'agent/notice')).toHaveLength(0)
+    // Still pending — `respond` throws `unknown_request` for an ask that is not.
+    const responded = await dispatchRpc(plainManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
+    expect(responded.ok).toBe(true)
+    await drained
+
+    const reasoning = parts.join('')
+    expect(reasoning).toContain('please approve in Settings')
+    expect(reasoning).not.toContain('unavailable')
+    const transcript = await dispatchRpc(plainManager, 'transcript/get', { sessionId: request.sessionId })
+    expect(transcript.ok).toBe(true)
+    if (!transcript.ok) return
+    const echo = (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
+      .filter(e => e.update.sessionUpdate === 'agent_message_chunk')
+      .map(e => String((e.update.content as { text?: string }).text ?? ''))
+      .join('')
+    expect(echo).toContain('perm=allow1')
+  }, 30_000)
+})
+
+/**
+ * One ACP turn is ONE host step, and it must read in the agent's own order.
+ *
+ * A native turn interleaves because its cards sit between two model steps; an
+ * ACP turn has no second step (the agent runs its own loop inside one
+ * `session/prompt`), and a card the host loop executes can only be appended
+ * below the whole assistant message. Tool activity therefore has to be inline
+ * prose — see docs/acp-convergence.md §1.7.
+ */
+describe("one ACP turn is one host step, in the agent's own order (isolated manager)", () => {
+  /**
+   * A fake agent whose answer is INTERLEAVED with its tool activity: text
+   * before the first call, then a call, then the rest of the answer — the
+   * shape a native turn gets by running two model steps with the cards in
+   * between, and the shape an ACP turn has inside ONE `session/prompt`.
+   *
+   * Written inline (`node -e`) so no new fixture file is needed; its `cwd` is
+   * the repository root so the dynamic SDK import resolves.
+   */
+  const interleavedScript = [
+    '(async () => {',
+    "  const { agent, methods, ndJsonStream, PROTOCOL_VERSION } = await import('@agentclientprotocol/sdk')",
+    "  const { Writable, Readable } = require('node:stream')",
+    "  agent({ name: 'interleaved-fake' })",
+    '    .onRequest(methods.agent.initialize, () => ({',
+    '      protocolVersion: PROTOCOL_VERSION,',
+    "      agentCapabilities: { loadSession: false, promptCapabilities: { image: false, audio: false, embeddedContext: false } },",
+    '      authMethods: [],',
+    '    }))',
+    "    .onRequest(methods.agent.session.new, () => ({ sessionId: 'interleaved-1' }))",
+    '    .onRequest(methods.agent.session.prompt, async ctx => {',
+    '      const send = update => ctx.client.notify(methods.client.session.update, { sessionId: ctx.params.sessionId, update })',
+    "      await send({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thinking…' } })",
+    "      await send({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'PRE-CALL ANSWER' } })",
+    "      await send({ sessionUpdate: 'tool_call', toolCallId: 'c1', title: 'fake tool', kind: 'other', status: 'pending' })",
+    "      await send({ sessionUpdate: 'tool_call_update', toolCallId: 'c1', status: 'completed', content: [{ type: 'content', content: { type: 'text', text: 'FAKE TOOL OUTPUT' } }] })",
+    "      await send({ sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'POST-CALL ANSWER' } })",
+    "      return { stopReason: 'end_turn' }",
+    '    })',
+    "    .connect(ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin)))",
+    '})()',
+  ].join('\n')
+  const interleavedHub = new EventHub()
+  const interleavedManager = new BridgeManager([{
+    ...def,
+    id: 'interleaved',
+    args: ['-e', interleavedScript],
+    cwd: process.cwd(),
+    allowedCwdRoots: [process.cwd()],
+  }], interleavedHub, 500)
+  const interleavedAdapter = new AcpLlmAdapter(interleavedManager)
+
+  afterAll(async () => {
+    await interleavedManager.shutdownAll()
+  })
+
+  const textOf = (chunks: readonly StreamChunk[]): string => chunks
+    .filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
+    .map(c => c.text)
+    .join('')
+
+  it('streams the whole turn in the order the agent produced it, in ONE step', async () => {
+    const chunks: StreamChunk[] = []
+    for await (const chunk of interleavedAdapter.stream({
+      provider: 'acp',
+      model: 'interleaved',
+      sessionId: 'dsh-interleaved-1',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'go' }] }],
+    })) {
+      chunks.push(chunk)
+    }
+
+    const text = textOf(chunks)
+    expect(text).toContain('PRE-CALL ANSWER')
+    expect(text).toContain('🛠️ **fake tool**')
+    expect(text).toContain('FAKE TOOL OUTPUT')
+    expect(text).toContain('POST-CALL ANSWER')
+
+    // The order the agent said them in — prose, tool, prose — not prose above
+    // and tools below. This is the defect this shape fixes.
+    const preAt = text.indexOf('PRE-CALL ANSWER')
+    const toolAt = text.indexOf('🛠️')
+    const postAt = text.indexOf('POST-CALL ANSWER')
+    expect(preAt).toBeGreaterThan(-1)
+    expect(preAt).toBeLessThan(toolAt)
+    expect(toolAt).toBeLessThan(postAt)
+
+    // One step means one answer the plane can recognise: no `tool-call` block
+    // anywhere, so the message is the answer and the turn is not folded into a
+    // collapsed process line.
+    expect(chunks.some(c => c.type === 'tool-call-delta')).toBe(false)
+    expect(chunks.filter(c => c.type === 'block-start').map(c => (c as { blockType: string }).blockType))
+      .not.toContain('tool-call')
+    expect(chunks.find(c => c.type === 'finish')?.reason).toEqual({ kind: 'stop' })
+  }, 30_000)
+
+  it('still refuses a staged-tool-result batch: it is not a turn this adapter serves', async () => {
+    // The host loop only proposes such a step when a settled message carries
+    // `tool-call` blocks. It never does now, so a batch of staged results is
+    // foreign by construction — and forwarding one would re-send the person's
+    // words to an agent whose turn already finished.
+    const chunks: StreamChunk[] = []
+    for await (const chunk of interleavedAdapter.stream({
+      provider: 'acp',
+      model: 'interleaved',
+      sessionId: 'dsh-interleaved-2',
+      messages: [
+        { role: 'tool', source: { kind: 'tool', callId: 'c1' }, content: [{ type: 'text', text: 'FAKE TOOL OUTPUT' }] },
+      ],
+    })) {
+      chunks.push(chunk)
+    }
+    // No user-sourced message to forward → the adapter refuses before
+    // touching the agent. Nothing streams, nothing is sent.
+    expect(textOf(chunks)).toBe('')
+    expect(chunks.find(c => c.type === 'finish')?.reason)
+      .toMatchObject({ kind: 'error', failure: { code: 'empty_prompt' } })
+  }, 30_000)
+})
+
+
+/**
  * Permission mapping and the agent's own modes.
  *
  * The retired axis resolved a DSH access mode and pre-judged every ask against
@@ -2165,8 +2368,11 @@ describe('observed chat transcripts (isolated manager)', () => {
 
     await expect(dispatchRpc(txManager, 'session/close', { sessionId })).resolves.toEqual({ ok: true, value: { done: true } })
     expect(txManager.chatTranscripts('dsh-tx-2')).toEqual([])
-    expect((await dispatchRpc(txManager, 'session/chat-list', { dshSessionId: 'dsh-tx-2' })))
-      .toEqual({ ok: true, value: { sessions: [], acpMode: false } })
+    const listed = await dispatchRpc(txManager, 'session/chat-list', { dshSessionId: 'dsh-tx-2' })
+    expect(listed).toMatchObject({ ok: true, value: { sessions: [], acpMode: false } })
+    // Closing the ACP session does not unlock the conversation: the lock
+    // belongs to the conversation, and its next turn resumes the same agent.
+    expect(listed).toMatchObject({ ok: true, value: { lockedAgentId: 'tx' } })
   }, 30_000)
 })
 
@@ -2233,6 +2439,151 @@ describe('conversation ↔ agent binding (isolated manager)', () => {
  * materializes (§ "apply on create/resume"), which is the OmniTerm behavior
  * this mirrors (its `config_prefs` agent-level + session-level restore).
  */
+describe('agent lock at the start of the first turn (isolated manager)', () => {
+  const lockHub = new EventHub()
+  const lockAgents = [
+    { ...def, id: 'lock-a', title: 'Lock A' },
+    { ...def, id: 'lock-b', title: 'Lock B' },
+  ]
+  const turn = async (gm: BridgeManager, dshSessionId: string, agentId: string): Promise<void> => {
+    for await (const _ of gm.streamPrompt({
+      model: agentId,
+      sessionId: dshSessionId,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    } as never)) { /* drain */ }
+  }
+
+  it('locks the conversation at the first turn\'s start, and refuses a switch everywhere', async () => {
+    const gm = new BridgeManager(lockAgents, lockHub, 500, `${tmpdir()}/acp-lock-${Date.now()}.json`)
+    gm.bindChatAgent('dsh-lock-1', 'lock-a')
+    // A pick is not a lock: before the first turn the user may still change it.
+    expect(gm.lockedAgentFor('dsh-lock-1')).toBeUndefined()
+    gm.bindChatAgent('dsh-lock-1', 'lock-b')
+    gm.bindChatAgent('dsh-lock-1', 'lock-a')
+
+    // The lock is announced when the turn STARTS, before the agent has said
+    // anything: the browser plays its hand-off while the turn is running, and
+    // does not need to wait for the session list to settle.
+    const seen: AcpEvent[] = []
+    const off = lockHub.subscribe(event => { seen.push(event) })
+    try {
+      await turn(gm, 'dsh-lock-1', 'lock-a')
+    } finally {
+      off()
+    }
+    const lockAt = seen.findIndex(event => event.type === 'chat/agent-locked')
+    const turnAt = seen.findIndex(event => event.type === 'turn/start')
+    expect(lockAt).toBeGreaterThanOrEqual(0)
+    expect(turnAt).toBeGreaterThanOrEqual(0)
+    expect(lockAt).toBeLessThan(turnAt)
+    expect(gm.lockedAgentFor('dsh-lock-1')).toBe('lock-a')
+    expect(gm.chatChoice('dsh-lock-1')).toMatchObject({ agentId: 'lock-a', locked: true })
+
+    // The picker path, the model path (a model id names its agent), and the
+    // turn path all refuse another agent; re-binding the same one is a no-op.
+    expect(() => gm.bindChatAgent('dsh-lock-1', 'lock-b')).toThrow(/locked/)
+    expect(() => gm.bindChatAgent('dsh-lock-1', 'lock-a')).not.toThrow()
+    // Over the browser's RPC the same refusal keeps its code, so the picker can
+    // tell "you may not switch" apart from a transport failure.
+    await expect(dispatchRpc(gm, 'session/chat-bind', { dshSessionId: 'dsh-lock-1', agentId: 'lock-b' }))
+      .resolves.toMatchObject({ ok: false, error: { code: 'agent_locked' } })
+    await expect(gm.setChatSessionModel('dsh-lock-1', 'lock-b@opus')).rejects.toMatchObject({ code: 'agent_locked' })
+    await expect(gm.getOrCreateDshSession('dsh-lock-1', 'lock-b')).rejects.toMatchObject({ code: 'agent_locked' })
+
+    // A turn arriving with another agent's model (a stale header, or a route
+    // registry entry purged by a delete/re-add) is served by the LOCKED agent,
+    // not rejected and never redirected.
+    const staleChunks: StreamChunk[] = []
+    for await (const chunk of gm.streamPrompt({
+      model: 'lock-b',
+      sessionId: 'dsh-lock-1',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'again' }] }],
+    } as never)) staleChunks.push(chunk)
+    expect(staleChunks.find(chunk => chunk.type === 'finish')?.reason).toEqual({ kind: 'stop' })
+    expect(gm.chatSessions('dsh-lock-1').map(session => session.agentId)).toEqual(['lock-a'])
+
+    // The browser learns the lock from the same read that names the binding.
+    const listed = await dispatchRpc(gm, 'session/chat-list', { dshSessionId: 'dsh-lock-1' })
+    expect(listed).toMatchObject({ ok: true, value: { lockedAgentId: 'lock-a', boundAgentId: 'lock-a' } })
+    await gm.shutdownAll()
+  }, 30_000)
+
+  it('keeps the lock across a host restart, when no session is live', async () => {
+    const storage = `${tmpdir()}/acp-lock-restart-${Date.now()}.json`
+    const first = new BridgeManager(lockAgents, lockHub, 500, storage)
+    first.bindChatAgent('dsh-lock-2', 'lock-a')
+    await turn(first, 'dsh-lock-2', 'lock-a')
+    await first.shutdownAll()
+
+    const second = new BridgeManager(lockAgents, lockHub, 500, storage)
+    // No live session exists on the fresh host; the persisted lock is the only
+    // thing keeping the conversation on its agent.
+    expect(second.chatSessions('dsh-lock-2')).toEqual([])
+    expect(second.lockedAgentFor('dsh-lock-2')).toBe('lock-a')
+    expect(second.chatChoice('dsh-lock-2')).toMatchObject({ agentId: 'lock-a', locked: true })
+    // ...and the persisted record is back on the REQUEST path, not just in the
+    // map: the guard's rewrite and the adapter's own check read this registry,
+    // which starts empty on a fresh process.
+    expect(routeBindingRegistry().conversations.get('dsh-lock-2')).toBe('lock-a')
+    expect(() => second.bindChatAgent('dsh-lock-2', 'lock-b')).toThrow(/locked/)
+    await second.shutdownAll()
+  }, 30_000)
+
+  it('gives the conversation back when the first turn delivers nothing', async () => {
+    const gm = new BridgeManager(lockAgents, lockHub, 500, `${tmpdir()}/acp-lock-empty-${Date.now()}.json`)
+    gm.bindChatAgent('dsh-lock-empty', 'lock-a')
+    const seen: AcpEvent[] = []
+    const off = lockHub.subscribe(event => { seen.push(event) })
+    try {
+      const chunks: StreamChunk[] = []
+      for await (const chunk of gm.streamPrompt({
+        model: 'lock-a',
+        sessionId: 'dsh-lock-empty',
+        // The mock answers this with bookkeeping only, then a legal end_turn:
+        // the silent provider-failure shape. Nothing was exchanged.
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'EMPTY' }] }],
+      } as never)) chunks.push(chunk)
+      // The empty-turn warning is still reported (rule 23)...
+      expect(chunks.find(chunk => chunk.type === 'finish')?.reason).toEqual({ kind: 'stop' })
+      expect(chunks.some(chunk => chunk.type === 'text-delta' && chunk.text.includes('no visible output'))).toBe(true)
+      // ...but the conversation is not trapped on an agent that produced nothing.
+      expect(seen.map(event => event.type)).toEqual(expect.arrayContaining(['chat/agent-locked', 'chat/agent-unlocked']))
+      expect(gm.lockedAgentFor('dsh-lock-empty')).toBeUndefined()
+      expect(gm.chatChoice('dsh-lock-empty')).toEqual({ agentId: 'lock-a' })
+      expect(gm.chatSessions('dsh-lock-empty')).toEqual([])
+      // The picker accepts another agent again.
+      expect(() => gm.bindChatAgent('dsh-lock-empty', 'lock-b')).not.toThrow()
+    } finally {
+      off()
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
+  it('rolls the lock back when the first prompt itself fails', async () => {
+    const gm = new BridgeManager(lockAgents, lockHub, 500, `${tmpdir()}/acp-lock-fail-${Date.now()}.json`)
+    gm.bindChatAgent('dsh-lock-fail', 'lock-a')
+    const seen: AcpEvent[] = []
+    const off = lockHub.subscribe(event => { seen.push(event) })
+    try {
+      const chunks: StreamChunk[] = []
+      for await (const chunk of gm.streamPrompt({
+        model: 'lock-a',
+        sessionId: 'dsh-lock-fail',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'FAIL' }] }],
+      } as never)) chunks.push(chunk)
+      expect(chunks.find(chunk => chunk.type === 'finish')?.reason).toMatchObject({ kind: 'error' })
+      expect(seen.map(event => event.type)).toEqual(expect.arrayContaining(['chat/agent-locked', 'chat/agent-unlocked']))
+      expect(gm.lockedAgentFor('dsh-lock-fail')).toBeUndefined()
+      expect(gm.chatChoice('dsh-lock-fail')).toEqual({ agentId: 'lock-a' })
+      expect(gm.chatSessions('dsh-lock-fail')).toEqual([])
+      expect(() => gm.bindChatAgent('dsh-lock-fail', 'lock-b')).not.toThrow()
+    } finally {
+      off()
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+})
+
 describe('pre-chat pick persistence (isolated manager)', () => {
   const pickHub = new EventHub()
 
@@ -2481,7 +2832,7 @@ describe('request-path binding (isolated manager)', () => {
     return { role: 'user', content: [{ type: 'text', text }] }
   }
 
-  it('serves the bound agent even when the turn still names the previous one', async () => {
+  it('serves the bound agent even when the turn still names another one', async () => {
     const gm = new BridgeManager(
       [{ ...def, id: 'alpha' }, { ...def, id: 'beta' }],
       bindingHub,
@@ -2490,27 +2841,25 @@ describe('request-path binding (isolated manager)', () => {
     )
     const adapter = new AcpLlmAdapter(gm)
     try {
-      // Turn 1 has no binding: the requested agent serves, and materializing
-      // the session pins what the conversation runs on.
-      await drain(adapter.stream({ provider: 'acp', model: 'alpha', sessionId: 'dsh-redir-1', messages: [userTurn('first')] }))
-      expect(gm.chatSessions('dsh-redir-1').map(session => session.agentId)).toEqual(['alpha'])
-      expect(routeBindingRegistry().conversations.get('dsh-redir-1')).toBe('alpha')
-
-      // The picker click: point the conversation at beta.
+      // The picker click happens BEFORE the first turn: a switch after the
+      // first turn is refused by the lock (see the agent-lock suite), so the
+      // stale-route scenario is set up while the conversation is still open.
       gm.bindChatAgent('dsh-redir-1', 'beta')
       expect(routeBindingRegistry().conversations.get('dsh-redir-1')).toBe('beta')
 
-      // Turn 2 arrives with the STALE route (the logged request header still
-      // names alpha — nothing outside the guard ever rewrites it). The binding
-      // wins: beta serves, in its OWN session (context separation per agent).
-      await drain(adapter.stream({ provider: 'acp', model: 'alpha', sessionId: 'dsh-redir-1', messages: [userTurn('second')] }))
+      // Turn 1 arrives with the STALE route (the logged request header names
+      // alpha — nothing outside the guard ever rewrites it). The binding wins:
+      // beta serves, in its OWN session (context separation per agent).
+      await drain(adapter.stream({ provider: 'acp', model: 'alpha', sessionId: 'dsh-redir-1', messages: [userTurn('first')] }))
       const sessions = gm.chatSessions('dsh-redir-1')
-      expect(sessions.map(session => session.agentId)).toContain('beta')
+      expect(sessions.map(session => session.agentId)).toEqual(['beta'])
       // The turn's record names what actually served it (the bound agent), not
       // the stale id the driver arrived with.
       expect(sessions.find(session => session.agentId === 'beta')?.modelId).toBe('beta')
       // …and the record of what the conversation is on follows the binding.
       expect(routeBindingRegistry().conversations.get('dsh-redir-1')).toBe('beta')
+      // That first turn locked beta; alpha cannot take the conversation back.
+      expect(() => gm.bindChatAgent('dsh-redir-1', 'alpha')).toThrow(/locked/)
     } finally {
       routeBindingRegistry().conversations.delete('dsh-redir-1')
       await gm.shutdownAll()

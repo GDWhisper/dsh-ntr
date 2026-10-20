@@ -3,9 +3,12 @@
 - [NTR 模式：把会话交给另一个 agent](./acp-mode.md)
   - 原生上下文确实被转发的证据（`agent/pre-step` 折入顺序 + 真实会话日志）与宿主侧修复（`selectForwardPrompt`、`purpose` 拒绝）
   - NTR 模式 = agent preset（`presets/acp`）：清空宿主对模型可见的一切；loop 不可替换的硬约束
-  - 不替 agent 裁决（`narrateOnly`）、转发内容严格等于用户文本、保留的 fs 写栅栏；做不到的边界（宿主侧无 per-session 目录过滤缝、Access mode 控件）
-  - 对话内的 NTR 面：三块芯片（agent / 模型 / 思考等级）怎么写进 per-session 模型目录、模型面为什么另走 `agent/catalog`、边界档为什么放在芯片菜单里，以及 NTR 视图 tab 如何用 `session/chat-transcript` 渲染真工具卡与 unified diff
-  - 双向模型隔离：宿主侧"什么都不广告"（ACP 模型不进 DSH 目录，`/model` 弹窗也不例外）+ 浏览器侧 `priority: -1` 遮蔽原生座位（按当前会话 preset 动态注册，失败一律回到原生座位）
+  - 不替 agent 裁决（permission 原样映射给用户，宿主不再有 `decidePermission` / `authorizeWrite` 这一层）、转发内容严格等于用户文本、fs 写只剩 `guardFsPath` 的 workspace containment；做不到的边界（宿主侧无 per-session 目录过滤缝、Access mode 控件）
+  - 对话内的 NTR 面：三块芯片（agent / 模型 / 思考等级）的权威来源各自是什么、模型面为什么另走 `agent/catalog`、权限档整格占空，以及 NTR 视图 tab 如何用 `session/chat-transcript` 渲染计划、完整工具输出与 unified diff
+  - 双向模型隔离：宿主侧"什么都不广告"（ACP 模型不进 DSH 目录，`/model` 弹窗也不例外）+ 浏览器侧由 `createModelSeatClaim` 接管原生座位（occupant 是 NTR 底座本体，按当前会话 preset 动态注册；注册后用 `entriesOfSlot` 核实 cell 的 head 是不是自己，被抢走就再注册一次，上限 `MAX_SEAT_CLAIMS`，到顶如实报「被谁占着」；放弃时回到原生座位）
+- [NTR 待办清单](./acp-todo.md)
+  - 用户已报告、尚未落地的 NTR 面意向：模型列表获取不完全（含浏览器端目录缓存一层）、NTR 模式下原生输入框透传 agent 自己的命令（同名命令会被客户端命令层消费）。agent 底座首轮开始时隐藏并锁定、改由输入框上边缘挂牌显示（首轮无可见输出则回滚），已落地
+  - 每条附已核实事实、预分析纠错、实施步骤与验收标准；落地后结论并回 AGENTS.md，本文件留下落点去向
 - [ACP 会话的权限对齐调研（DSH Access mode ↔ ACP 权限）](./acp-permission-and-sandbox.md)
   - 两个权限旋钮的实体与证据（preset / projection / sandbox / approval）
   - 现状接线错误（`never` → ACP 请求被全拒、只读档可被审批放行、沙箱对 ACP 无作用力）

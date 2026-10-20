@@ -31,9 +31,9 @@ import {
   EventHub,
   PermissionLedger,
   Transcript,
-  acpToolCallDelta,
-  acpToolCallFromUpdate,
-  acpToolCallDetailsOf,
+  acpToolActivityLine,
+  acpToolActivityOutput,
+  acpToolInputOf,
   buildAdapterModelId,
   childEnv,
   isUnderPath,
@@ -45,17 +45,15 @@ import {
   resolveFsPath,
   resolveSessionCwd,
   selectForwardPrompt,
-  isAcpToolContinuation,
   acpPresetStatusFromRoster,
   splitAdapterModelId,
   updateContentToText,
-  dumpJson,
   describeUnhandledUpdate,
   BOOKKEEPING_UPDATES,
   validateAgentDef,
 } from './impl.ts'
 import type {
-  AcpToolCallSnapshot, PermissionDecision, RosterPresetRow,
+  PermissionDecision, RosterPresetRow,
 } from './impl.ts'
 import type {
   AcpAgentCatalog, AcpAgentDef, AcpConversationChoice, AcpPresetStatus, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
@@ -125,6 +123,15 @@ interface LiveSession {
    */
   settledResolve?: () => void
   /**
+   * This session's first turn wrote the conversation's agent lock just now
+   * (the conversation had none before). The lock is provisional until that
+   * turn produces a visible block: a first turn that delivers nothing — an
+   * error, a silent provider failure folded into a normal stop, or even a
+   * cancel — rolls the lock back and closes this session, so the user can
+   * choose another agent. Cleared as soon as the first turn settles.
+   */
+  provisionalLock?: boolean
+  /**
    * Monotonic per-session counter, bumped at every turn start (both the
    * `/acp` RPC path and the adapter's `streamPrompt`). Turn-scoped timers —
    * the cancel fallback — capture it when armed and compare when they fire:
@@ -147,6 +154,18 @@ interface LiveSession {
 export interface BridgeTuning {
   startupTimeoutMs?: number
   permissionTimeoutMs?: number
+  /**
+   * Deadline for a permission ask whose native route DEGRADED to unavailable
+   * (see {@link LedgerFallbackReason}). Applies when `permissionTimeoutMs` is
+   * 0 — its "approvals belong to a person, wait forever" default — because a
+   * degraded ask has no visible answer entry in the conversation the user is
+   * looking at, and waiting forever would hang the turn on a question nobody
+   * can see there. The DESIGNED ledger paths (no approval service at all, a
+   * session with no chat identity) keep waiting: their answer entry is the
+   * settings panel, which is exactly where the chat line sends the user. `0`
+   * disables even this fallback.
+   */
+  permissionFallbackTimeoutMs?: number
   cancelFallbackMs?: number
   /**
    * How long to wait before resending a prompt the agent answered `cancelled`
@@ -196,6 +215,27 @@ export interface ApprovalRequestContext {
 export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
 
 /**
+ * Why one permission ask rides the settings-panel ledger instead of the native
+ * approval chain, recorded when the ask is broadcast.
+ *
+ * `no-requester` and `no-chat-session` are the DESIGNED ledger paths: a host
+ * without the approval service, and an `/acp`-RPC session that has no chat
+ * turn to route into. `unavailable` is a DEGRADATION — the service is wired
+ * and this ask still failed, so the conversation the user is looking at will
+ * never show the question. That difference decides both the chat line's
+ * wording (see `BridgeManager.streamPrompt`) and whether a deadline is armed
+ * (`handlePermissionRequest`).
+ */
+export type LedgerFallbackReason = 'no-requester' | 'no-chat-session' | 'unavailable'
+
+/** One recorded ledger fallback: why the ask is here, and the deadline armed for it. */
+export interface LedgerFallback {
+  reason: LedgerFallbackReason
+  /** Effective deadline in ms; `0` = no timer (wait for the human). */
+  timeoutMs: number
+}
+
+/**
  * Asks the host approval service (`ctx.approval`) for one decision. Never
  * throws: any failure is reported as `'unavailable'` so the caller can fall
  * back to the settings-panel ledger.
@@ -223,6 +263,7 @@ export type AcpModeResolver = (dshSessionId: string) => boolean | undefined | Pr
 const DEFAULT_TUNING: Required<BridgeTuning> = {
   startupTimeoutMs: 60_000,
   permissionTimeoutMs: 0,
+  permissionFallbackTimeoutMs: 300_000,
   cancelFallbackMs: 15_000,
   staleCancelRetryDelayMs: 600,
   staleCancelMaxRetries: 2,
@@ -249,8 +290,18 @@ export class AgentBridge {
   /** Inflight `session/load` resumes, shared so concurrent prompts don't double-resume. */
   private readonly resuming = new Map<string, Promise<LiveSession>>()
   readonly permissions = new PermissionLedger()
+  /**
+   * Why each outstanding ledger ask is on the ledger, keyed by request id and
+   * recorded before the `permission/request` broadcast (the hub is
+   * synchronous, so a subscriber can read it the moment the frame goes out).
+   * Entries live exactly as long as the ask: the ledger's resolve callback
+   * deletes them, and every terminal path (answer, timeout, session close,
+   * process death) resolves through it.
+   */
+  private readonly ledgerFallbacks = new Map<string, LedgerFallback>
   private readonly startupTimeoutMs: number
   private readonly permissionTimeoutMs: number
+  private readonly permissionFallbackTimeoutMs: number
   private readonly cancelFallbackMs: number
   private readonly staleCancelRetryDelayMs: number
   private readonly staleCancelMaxRetries: number
@@ -306,6 +357,7 @@ export class AgentBridge {
     const merged = { ...DEFAULT_TUNING, ...tuning }
     this.startupTimeoutMs = merged.startupTimeoutMs
     this.permissionTimeoutMs = merged.permissionTimeoutMs
+    this.permissionFallbackTimeoutMs = merged.permissionFallbackTimeoutMs
     this.cancelFallbackMs = merged.cancelFallbackMs
     this.staleCancelRetryDelayMs = merged.staleCancelRetryDelayMs
     this.staleCancelMaxRetries = merged.staleCancelMaxRetries
@@ -1079,17 +1131,18 @@ export class AgentBridge {
     if (decision === 'allow') return selectOption(options, 'allow')
     if (decision === 'reject') return selectOption(options, 'reject')
     if (session === undefined || session.closed) return { outcome: { outcome: 'cancelled' } }
-    // Native approval first (answered in the chat composer); `undefined` means
+    // Native approval first (answered in the chat composer); a `reason` means
     // no route is available and the settings-panel ledger takes over.
-    const routed = await this.askNativeApproval(session, toolCall, options, signal)
-    if (routed !== undefined) {
+    const native = await this.askNativeApproval(session, toolCall, options, signal)
+    if ('response' in native) {
       this.touch()
-      return routed
+      return native.response
     }
     return new Promise<RequestPermissionResponse>(resolve => {
       let timer: ReturnType<typeof setTimeout> | undefined
       const requestId = this.permissions.create(session.sessionId, (outcome: PermissionOutcome) => {
         clearTimeout(timer)
+        this.ledgerFallbacks.delete(requestId)
         this.touch()
         this.hub.broadcast({
           type: 'permission/resolved',
@@ -1101,20 +1154,31 @@ export class AgentBridge {
           ? { outcome: { outcome: 'selected', optionId: outcome.optionId } }
           : { outcome: { outcome: 'cancelled' } })
       })
-      // Optional deadline (`permissionTimeoutMs`): an approval left unanswered
-      // is answered `cancelled` on the human's behalf instead of hanging the
-      // turn forever. Off by default — approvals belong to a person.
-      if (this.permissionTimeoutMs > 0) {
+      // Deadline (`permissionTimeoutMs`): an approval left unanswered is
+      // answered `cancelled` on the human's behalf instead of hanging the turn
+      // forever. Off by default — approvals belong to a person. The one
+      // exception is a DEGRADED native route: the conversation just failed to
+      // show the question, so waiting forever would hang the turn behind an
+      // ask nobody can see there, and the fallback deadline applies instead
+      // (see `BridgeTuning.permissionFallbackTimeoutMs`).
+      const timeoutMs = this.permissionTimeoutMs > 0
+        ? this.permissionTimeoutMs
+        : native.reason === 'unavailable' ? this.permissionFallbackTimeoutMs : 0
+      // Recorded before the broadcast: the hub is synchronous, and the chat
+      // line `streamPrompt` folds from this frame words itself by the path
+      // this ask actually took.
+      this.ledgerFallbacks.set(requestId, { reason: native.reason, timeoutMs })
+      if (timeoutMs > 0) {
         timer = setTimeout(() => {
           if (!this.permissions.has(requestId)) return
           this.hub.broadcast({
             type: 'agent/notice',
             agentId: this.def.id,
             level: 'info',
-            text: `acp: permission request timed out after ${String(Math.round(this.permissionTimeoutMs / 1000))}s; answered "cancelled"`,
+            text: `acp: permission request timed out after ${String(Math.round(timeoutMs / 1000))}s; answered "cancelled"`,
           })
           this.permissions.respond(requestId, { outcome: 'cancelled' })
-        }, this.permissionTimeoutMs)
+        }, timeoutMs)
         timer.unref?.()
       }
       this.hub.broadcast({
@@ -1128,6 +1192,16 @@ export class AgentBridge {
   }
 
   /**
+   * Why one ledger ask is on the ledger, as recorded by
+   * {@link handlePermissionRequest}. The manager's `streamPrompt` reads it to
+   * word the chat line by the path the ask took; `undefined` once the ask is
+   * answered, timed out, or settled.
+   */
+  ledgerFallbackOf(requestId: string): LedgerFallback | undefined {
+    return this.ledgerFallbacks.get(requestId)
+  }
+
+  /**
    * Ask the host approval service for this permission (`ctx.approval` → the
    * browser's composer takeover). Only sessions bound to a DSH chat session
    * qualify: the service appends its audit pair to that session inside an
@@ -1137,16 +1211,18 @@ export class AgentBridge {
    * No `permissionTimeoutMs` timer is armed here on purpose: the human answers
    * inside the conversation, and a host-side deadline would answer for them.
    *
-   * @returns the agent-facing response, or `undefined` to fall back to the ledger.
+   * @returns the agent-facing response, or the reason the ask must fall back
+   * to the ledger (see {@link LedgerFallbackReason}).
    */
   private async askNativeApproval(
     session: LiveSession,
     toolCall: unknown,
     options: PermissionOption[],
     signal?: AbortSignal,
-  ): Promise<RequestPermissionResponse | undefined> {
+  ): Promise<{ response: RequestPermissionResponse } | { reason: LedgerFallbackReason }> {
     const requester = this.approvalRequester?.()
-    if (requester === undefined || session.dshSessionId === undefined) return undefined
+    if (requester === undefined) return { reason: 'no-requester' }
+    if (session.dshSessionId === undefined) return { reason: 'no-chat-session' }
     let outcome: ApprovalOutcome
     try {
       outcome = await requester({
@@ -1160,7 +1236,7 @@ export class AgentBridge {
       // ledger. An approval failure must never break the agent's turn.
       outcome = 'unavailable'
     }
-    if (outcome === 'unavailable') return undefined
+    if (outcome === 'unavailable') return { reason: 'unavailable' }
     const response = nativeOutcomeResponse(outcome, options)
     // Keep the event stream symmetric with the ledger path: a routed decision
     // is still a resolution, and the browser uses it to drop any card it may
@@ -1174,7 +1250,7 @@ export class AgentBridge {
         ? { outcome: 'selected', optionId: response.outcome.optionId }
         : { outcome: 'cancelled' },
     })
-    return response
+    return { response }
   }
 
   /**
@@ -1902,22 +1978,6 @@ export const ACP_ROUTE_BINDING_KEY = Symbol.for('dsh-ntr.acp-binding')
 export interface AcpRouteBindingRegistry {
   /** DSH chat session id → the adapter model (`agentId` | `agentId@choice`) its next turn runs on. */
   readonly conversations: Map<string, string>
-  /**
-   * ACP tool call id → the tool's output folded to plain text. The guard's
-   * `tools/execute` listener answers the host loop's execution of an ACP
-   * display card from here, so the card records the tool's REAL output
-   * instead of an `unknown tool` error (see `recordAcpToolOutput`).
-   */
-  readonly toolResults: Map<string, string>
-  /**
-   * Display-card call id → its folded text, for cards that are NOT agent tool
-   * calls (the one-per-kind cards of {@link noteUnhandledUpdate}: a plan, a
-   * mode or command-list update, a notification kind newer than this plugin).
-   * Kept apart from {@link toolResults} because the guard's pre-step gate reads
-   * that map as "these staged results are my own continuation step" — a plan is
-   * neither a call id the agent issued nor a tool result.
-   */
-  cardOutputs?: Map<string, string>
   /** Bare agent id served when a conversation carries no explicit binding (`undefined`: no rewrite). */
   defaultModel?: string
 }
@@ -1931,50 +1991,9 @@ export function routeBindingRegistry(): AcpRouteBindingRegistry {
   const host = globalThis as unknown as { [ACP_ROUTE_BINDING_KEY]?: AcpRouteBindingRegistry }
   const existing = host[ACP_ROUTE_BINDING_KEY]
   if (existing !== undefined) return existing
-  const registry: AcpRouteBindingRegistry = { conversations: new Map(), toolResults: new Map() }
+  const registry: AcpRouteBindingRegistry = { conversations: new Map() }
   host[ACP_ROUTE_BINDING_KEY] = registry
   return registry
-}
-
-/** Bounds for the shared tool-output record (see {@link recordAcpToolOutput}). */
-const TOOL_OUTPUT_MAX_ENTRIES = 200
-/**
- * Cap on one tool result's text in the shared registry (the guard's virtual
- * tools answer the host loop from it). Sized for real output — a build log or a
- * file read — not for a preview: cutting here is the one place a truncation
- * would change what the model sees, not just what the card shows.
- */
-const TOOL_OUTPUT_MAX_CHARS = 1_000_000
-
-/** Bounds for {@link BridgeManager.pendingToolAnswers} (one per conversation, transient). */
-const PENDING_TOOL_ANSWERS_MAX = 32
-
-/**
- * Record one ACP tool call for the guard's virtual tools. The host loop
- * "executes" every tool-call block in a settled ACP message (that execution
- * record is what draws the card); the preset registers no tools, so each call
- * used to record `Error: unknown tool "<name>"`. The guard's `tools/execute`
- * listener instead registers a scoped virtual tool per name, and its body
- * answers with THIS record — the tool's real output, folded by the same helper
- * the ACP view uses. Every seen call id is recorded, even with empty output:
- * the guard's pre-step gate identifies its own continuation batches by exactly
- * this membership. Bounded: entries are transient, but an agent that inlines
- * whole files must not grow the process-wide map without limit.
- */
-export function recordAcpToolOutput(callId: string, text: string): void {
-  if (callId === '') return
-  const registry = routeBindingRegistry()
-  const kept = text.length > TOOL_OUTPUT_MAX_CHARS ? `${text.slice(0, TOOL_OUTPUT_MAX_CHARS)}\n… [truncated ${String(text.length - TOOL_OUTPUT_MAX_CHARS)} chars]` : text
-  // Empty output is recorded too (the guard's gate keys on membership). An
-  // EMPTY record must not overwrite a non-empty one: some agents send their
-  // result in one notification and an empty `content` restatement after it.
-  if (kept === '' && (registry.toolResults.get(callId) ?? '') !== '') return
-  registry.toolResults.set(callId, kept)
-  while (registry.toolResults.size > TOOL_OUTPUT_MAX_ENTRIES) {
-    const oldest = registry.toolResults.keys().next().value
-    if (oldest === undefined) break
-    registry.toolResults.delete(oldest)
-  }
 }
 
 /** Routes host session ids to their owning bridge. */
@@ -1983,18 +2002,6 @@ export class BridgeManager {
   private readonly defsMap = new Map<string, AcpAgentDef>()
   /** The plugin's own default ACP agent id (persisted; see `persistAgents`). */
   private defaultAgentId?: string
-  /**
-   * Answer text buffered for the continuation step of a tool-bearing turn
-   * (`dshSessionId` → text). The Chat plane's answer detection refuses any
-   * message containing a tool-call block (`dsh-client-ui-chat`'s
-   * `latestAnswer`), so the ACP agent's answer — which arrives interleaved
-   * with its tool cards — must reach it as a SECOND, tool-free message: step 1
-   * streams reasoning + the cards and buffers the text from the first card on;
-   * the loop's continuation step (staged tool results,
-   * `isAcpToolContinuation`) replays it. Consumed by the very next
-   * continuation step; dropped at the next real prompt.
-   */
-  private readonly pendingToolAnswers = new Map<string, string>()
 
   constructor(
     defs: readonly AcpAgentDef[],
@@ -2155,7 +2162,7 @@ export class BridgeManager {
   chatSessions(dshSessionId: string): ChatSessionView[] {
     const out: ChatSessionView[] = []
     for (const session of this.dshSessionMap.values()) {
-      if (session.dshSessionId !== dshSessionId) continue
+      if (session.dshSessionId !== dshSessionId || session.closed) continue
       const title = this.defsMap.get(session.agentId)?.title
       out.push({
         agentId: session.agentId,
@@ -2189,6 +2196,20 @@ export class BridgeManager {
     if (!this.defsMap.has(agentId)) {
       throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
     }
+    // ONE CONVERSATION, ONE AGENT (user decision, 2026-10-20): once the first
+    // ACP turn has run, the conversation is locked to its agent. A different
+    // agent has none of the context on its side, so switching is refused
+    // rather than silently starting a second, empty conversation. Re-picking
+    // the SAME agent is idempotent. The lock is persisted with the choice, so
+    // this holds across restarts and after the ACP session is gone.
+    const lockedTo = this.lockedAgentFor(dshSessionId)
+    if (lockedTo !== undefined) {
+      if (lockedTo === agentId) return
+      throw new AcpError(
+        'agent_locked',
+        `acp: conversation is locked to agent "${lockedTo}" once its first turn has started; start a new conversation to use another agent`,
+      )
+    }
     // A switch to a DIFFERENT agent drops its model/effort/mode: those values
     // are the PREVIOUS agent's vocabulary (a `choice` from its catalog, a value
     // of ITS `thought_level`, one of ITS `session/set_mode` ids) and would be
@@ -2208,6 +2229,88 @@ export class BridgeManager {
       if (session.dshSessionId === dshSessionId && !session.closed) return session.agentId
     }
     return undefined
+  }
+
+  /**
+   * The agent a conversation is LOCKED to, if its first ACP turn has run.
+   *
+   * The persisted `locked` flag is the durable answer and deliberately ignores
+   * the roster: a deleted agent still owns the conversation's context, and the
+   * conversation must not pretend it is unbound (that would offer a switch the
+   * turn path then has to refuse). The live/released session fallback covers
+   * conversations recorded before the flag existed; the next turn writes the
+   * flag (`lockChatAgent`).
+   */
+  lockedAgentFor(dshSessionId: string): string | undefined {
+    const recorded = this.chatAgentIntent.get(dshSessionId)
+    if (recorded?.locked === true) return recorded.agentId
+    for (const session of this.dshSessionMap.values()) {
+      if (session.dshSessionId === dshSessionId && !session.closed) return session.agentId
+    }
+    return undefined
+  }
+
+  /**
+   * Write the conversation's agent lock and announce it once.
+   *
+   * Called at the START of the conversation's first ACP turn (the session was
+   * just materialized), so the composer can play its base→tag hand-off while
+   * the turn is running instead of waiting for it to settle. Returns true when
+   * this call created the lock; the caller marks a newly created session
+   * `provisionalLock`, and a first turn that delivers nothing rolls it back
+   * (`rollbackFirstTurn`). The broadcast is what lets the browser react at
+   * once: a `session/chat-list` read is a round-trip behind.
+   */
+  private lockChatAgent(dshSessionId: string, agentId: string): boolean {
+    const current = this.chatAgentIntent.get(dshSessionId)
+    if (current?.locked === true && current.agentId === agentId) return false
+    const newlyLocked = current?.locked !== true
+    this.patchChatChoice(dshSessionId, { agentId, locked: true })
+    if (newlyLocked) {
+      this.hub.broadcast({ type: 'chat/agent-locked', dshSessionId, agentId })
+    }
+    return newlyLocked
+  }
+
+  /**
+   * Undo the provisional lock of a first turn that delivered nothing, and drop
+   * the failed session with it.
+   *
+   * A turn that produced an error before any text/reasoning, or a silent
+   * provider failure folded into a normal stop, exchanged nothing with the
+   * agent: there is no context to protect, so the conversation may choose
+   * another agent. The session is CLOSED rather than kept, because both lock
+   * readers (`lockedAgentFor` here and `lockedAgentOf` in the browser) treat a
+   * live session as a lock — keeping it would leave a visually locked
+   * conversation whose picker the host still accepts.
+   *
+   * The pick itself (agent/model/effort/mode) stays recorded: the base comes
+   * back showing the same agent, ready to be changed or retried.
+   */
+  private rollbackFirstTurn(session: LiveSession): void {
+    session.provisionalLock = false
+    const dshSessionId = session.dshSessionId
+    if (dshSessionId === undefined) return
+    const current = this.chatAgentIntent.get(dshSessionId)
+    if (current?.locked === true && current.agentId === session.agentId) {
+      const next: AcpConversationChoice = { ...current }
+      delete next.locked
+      this.chatAgentIntent.set(dshSessionId, next)
+      this.persistAgents()
+      // Keep the request-path binding on the picked agent: it is still what
+      // the base shows and what an unchanged retry should run.
+      this.syncConversationRoute(dshSessionId)
+      this.hub.broadcast({ type: 'chat/agent-unlocked', dshSessionId })
+    }
+    // Drop the chat-keyed record BEFORE the asynchronous agent-side close: the
+    // browser's very next `session/chat-list` must not see this session.
+    this.forgetDshSession(session.sessionId)
+    // Use the existing bridge, not `this.bridge(id)`: the agent may have been
+    // deleted while its first turn was failing, and a rollback must never throw.
+    const failed = this.bridges.get(session.agentId)
+    if (failed !== undefined) {
+      void failed.closeSession(session, 'closed').catch(() => { /* already gone */ })
+    }
   }
 
   /**
@@ -2287,6 +2390,7 @@ export class BridgeManager {
     // other fields are the previous agent's vocabulary and must not survive.
     const base = patch.agentId !== undefined && patch.agentId !== current?.agentId ? {} : current
     const next: AcpConversationChoice = { ...base, ...patch, agentId }
+    if (next.locked !== true) delete next.locked
     if (next.modelId === undefined) delete next.modelId
     if (next.effort === undefined) delete next.effort
     if (next.mode === undefined) delete next.mode
@@ -2301,6 +2405,12 @@ export class BridgeManager {
     const def = this.defsMap.get(agentId)
     if (def === undefined) {
       throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
+    }
+    // A model id names its agent, so this call can also be an agent switch.
+    // Once locked, only the locked agent's models are accepted.
+    const lockedTo = this.lockedAgentFor(dshSessionId)
+    if (lockedTo !== undefined && lockedTo !== agentId) {
+      throw new AcpError('agent_locked', `acp: conversation is locked to agent "${lockedTo}" once its first turn has started`)
     }
     // The pick is recorded even when NO live session exists yet — that is the
     // "choose the model before the first message" case. A session that
@@ -2406,6 +2516,12 @@ export class BridgeManager {
    * switch is itself a reason to bring the agent back.
    */
   async setChatSessionMode(dshSessionId: string, modeId: string, agentId?: string): Promise<void> {
+    if (agentId !== undefined) {
+      const lockedTo = this.lockedAgentFor(dshSessionId)
+      if (lockedTo !== undefined && lockedTo !== agentId) {
+        throw new AcpError('agent_locked', `acp: conversation is locked to agent "${lockedTo}" once its first turn has started`)
+      }
+    }
     const candidates = [...this.dshSessionMap.values()].filter(session => session.dshSessionId === dshSessionId)
     const target = agentId === undefined
       ? (candidates.find(session => !session.released) ?? candidates[0])
@@ -2560,15 +2676,22 @@ export class BridgeManager {
     if (raw === null || typeof raw !== 'object') return
     for (const [dshSessionId, row] of Object.entries(raw as Record<string, unknown>)) {
       if (dshSessionId === '' || row === null || typeof row !== 'object') continue
-      const { agentId, modelId, effort, mode } = row as { agentId?: unknown; modelId?: unknown; effort?: unknown; mode?: unknown }
+      const { agentId, locked, modelId, effort, mode } = row as { agentId?: unknown; locked?: unknown; modelId?: unknown; effort?: unknown; mode?: unknown }
       if (typeof agentId !== 'string' || agentId === '') continue
       this.chatAgentIntent.set(dshSessionId, {
         agentId,
+        ...(locked === true ? { locked: true } : {}),
         ...(typeof modelId === 'string' && modelId !== '' ? { modelId } : {}),
         ...(typeof effort === 'string' && effort !== '' ? { effort } : {}),
         ...(typeof mode === 'string' && mode !== '' ? { mode } : {}),
       })
     }
+    // Put every restored record back on the REQUEST path, not just in this
+    // map: the guard's rewrite and `conversationRouteModel` read the route
+    // registry, which starts empty on a fresh process. Without this a host
+    // restart would send a bound (and possibly locked) conversation to the
+    // deployment default until its next turn re-pinned it.
+    for (const dshSessionId of this.chatAgentIntent.keys()) this.syncConversationRoute(dshSessionId)
   }
 
   private persistAgents(): void {
@@ -3296,9 +3419,25 @@ export class BridgeManager {
   private readonly acpModeInflight = new Map<string, Promise<boolean | undefined>>()
 
   async getOrCreateDshSession(dshSessionId: string | undefined, agentId: string, cwd?: string): Promise<LiveSession> {
+    // The lock also guards the TURN path, not just the picker: a stale request
+    // header or a route rewrite must not start a second, context-less session
+    // with another agent under the same conversation.
+    if (dshSessionId !== undefined) {
+      const lockedTo = this.lockedAgentFor(dshSessionId)
+      if (lockedTo !== undefined && lockedTo !== agentId) {
+        throw new AcpError(
+          'agent_locked',
+          `acp: conversation is locked to agent "${lockedTo}" once its first turn has started; start a new conversation to use another agent`,
+        )
+      }
+    }
     const key = `${dshSessionId ?? 'ephemeral'}:${agentId}`
     const existing = this.dshSessionMap.get(key)
     if (existing !== undefined && !existing.closed && !existing.released) {
+      // An existing session already carries context, so this is never a
+      // provisional lock; it only repairs a record from before the flag (the
+      // next turn's start writes/announces the lock).
+      if (dshSessionId !== undefined) this.lockChatAgent(dshSessionId, agentId)
       return existing
     }
     // The session's agent died earlier: resume in place so the conversation
@@ -3312,12 +3451,16 @@ export class BridgeManager {
       // conversation was ON (its own model string when one was recorded). The
       // recorded pick wins when there is one (it carries the model half).
       if (dshSessionId !== undefined) {
+        this.lockChatAgent(dshSessionId, agentId)
         if (this.chatAgentIntent.has(dshSessionId)) this.syncConversationRoute(dshSessionId)
         else routeBindingRegistry().conversations.set(dshSessionId, resumed.modelId ?? agentId)
       }
       // ...and the persisted pick (model / thought level) is re-applied to the
       // freshly loaded session, whose config comes back at the agent's defaults.
       await this.applyChatChoice(resumed)
+      // A RESUMED session had context before this call; a lock written here is
+      // not provisional even if the conversation record was missing it.
+      resumed.provisionalLock = false
       return resumed
     }
     // A chat session runs where its DSH session lives, not in the plugin's
@@ -3352,6 +3495,13 @@ export class BridgeManager {
     // `session/new` answered with the agent's defaults; without this the first
     // turn would run on them and the pick would only take effect afterwards.
     await this.applyChatChoice(session)
+    if (dshSessionId !== undefined) {
+      // The first ACP session is the moment the conversation's context starts
+      // belonging to this agent. The lock is PROVISIONAL until this turn shows
+      // something: if it delivers nothing, `rollbackFirstTurn` gives the
+      // conversation back (a failed first attempt must not trap it).
+      session.provisionalLock = this.lockChatAgent(dshSessionId, agentId)
+    }
     return session
   }
 
@@ -3360,9 +3510,21 @@ export class BridgeManager {
     // (see `bindChatAgent`): the driver may arrive here with the previous
     // agent's id (the logged request header replays) or a session that has
     // never run an ACP turn at all. An explicit binding outranks it.
+    //
+    // A LOCKED conversation outranks even that: its agent is the one holding
+    // the context, so the turn must not be redirected by a stale header, a
+    // route registry entry purged by a delete/re-add, or the deployment
+    // default. The persisted model half is used when the route no longer names
+    // the locked agent.
+    const lockedTo = options.sessionId === undefined ? undefined : this.lockedAgentFor(options.sessionId)
+    const routed = options.sessionId === undefined ? undefined : this.conversationRouteModel(options.sessionId)
     const model = options.sessionId === undefined
       ? options.model
-      : this.conversationRouteModel(options.sessionId) ?? options.model
+      : lockedTo !== undefined
+        ? (routed !== undefined && splitAdapterModelId(routed).agentId === lockedTo
+          ? routed
+          : this.chatChoice(options.sessionId)?.modelId ?? lockedTo)
+        : routed ?? options.model
     const { agentId, choice } = splitAdapterModelId(model)
     const def = this.defsMap.get(agentId)
     if (def === undefined) {
@@ -3370,35 +3532,6 @@ export class BridgeManager {
         type: 'finish',
         reason: { kind: 'error', failure: { message: `acp: agent "${agentId}" is not configured`, code: 'unknown_agent' } },
       }
-      return
-    }
-
-    // A tool-bearing ACP turn arrives as TWO driver steps. The host loop
-    // starts a next step whenever the settled assistant message contains
-    // `tool-call` blocks — which is exactly what the ACP agent's cards are —
-    // feeding it the staged tool results. The Chat plane's answer detection
-    // (`latestAnswer`) refuses any message that contains a tool-call block,
-    // so the answer text must land in a SECOND, tool-free message: step 1
-    // streamed reasoning + the cards and buffered the text since the first
-    // card opened; this step replays that buffer. Nothing is sent to the ACP
-    // agent — its turn already ran to completion in step 1 (see
-    // `isAcpToolContinuation` and docs/acp-convergence.md §1.6).
-    if (isAcpToolContinuation(options.messages ?? [])) {
-      const buffered = options.sessionId === undefined
-        ? undefined
-        : this.pendingToolAnswers.get(options.sessionId)
-      if (options.sessionId !== undefined) this.pendingToolAnswers.delete(options.sessionId)
-      if (options.signal?.aborted) {
-        yield { type: 'finish', reason: { kind: 'aborted', failure: { message: 'aborted', code: 'ABORTED' } } }
-        return
-      }
-      const text = buffered === undefined || buffered === ''
-        ? `\n[dsh-ntr] agent "${agentId}" executed its tool call(s) but sent no text reply this turn — the tool details are in the ACP transcript view.\n`
-        : buffered
-      yield { type: 'block-start', index: 0, blockType: 'text' }
-      yield { type: 'text-delta', index: 0, text }
-      yield { type: 'block-end', index: 0, block: { type: 'text', text } }
-      yield { type: 'finish', reason: { kind: 'stop' } }
       return
     }
 
@@ -3421,10 +3554,6 @@ export class BridgeManager {
       }
       return
     }
-
-    // A real prompt: any stash left over from an interrupted turn is dead —
-    // the continuation step that would have consumed it never ran.
-    if (options.sessionId !== undefined) this.pendingToolAnswers.delete(options.sessionId)
 
     // Forward the person's own words: the host folds its context sections
     // (AGENTS.md digest, skill catalog, runtime snapshot) after the claimed user
@@ -3464,6 +3593,10 @@ export class BridgeManager {
     // the AGENT's slot until it acknowledges the cancel (see `claimTurn`).
     const claim = await bridge.claimTurn(session)
     if (!claim.ok) {
+      // A first turn that never got the prompt slot delivered nothing either:
+      // give the conversation back instead of leaving it locked to an agent
+      // that refused the only message it was asked to serve.
+      if (session.provisionalLock === true) this.rollbackFirstTurn(session)
       yield {
         type: 'finish',
         reason: {
@@ -3522,69 +3655,58 @@ export class BridgeManager {
     this.hub.broadcast({ type: 'turn/start', sessionId: session.sessionId, turnId, text: promptText })
 
     let currentBlockIndex = -1
-    let activeBlockType: 'reasoning' | 'text' | 'tool-call' | null = null
+    let activeBlockType: 'reasoning' | 'text' | null = null
     let activeBlockText = ''
-    /**
-     * Answer text held back from this stream. Text that arrives AFTER the
-     * first tool-call card belongs to the answer, and the Chat plane's answer
-     * detection refuses any message containing a tool-call block — so it must
-     * reach the plane as a second, tool-free message. It is stashed at turn
-     * end (see `pendingToolAnswers`) and replayed by the continuation step.
-     */
-    let answerBuffer = ''
-    /**
-     * The open tool-call block's accumulated snapshot, or `undefined` while the
-     * active block is prose. ACP has no fixed shape for tool-call content, so
-     * this is where `callId` / `name` / `argsRaw` live until the block closes —
-     * `block-end` carries a COMPLETE snapshot because the host's accumulator
-     * replaces the block on `block-end` rather than merging into it.
-     */
-    let activeToolCall: AcpToolCallSnapshot | undefined
     let latestUsage: { inputTokens: number; outputTokens: number } | null = null
     /**
      * Whether the fold loop pushed at least one block the chat plane renders
-     * (text / reasoning / tool-call). Usage and other bookkeeping updates do
-     * NOT count: some agents fold an upstream failure (provider 403, auth,
-     * billing) into a legal `end_turn` while emitting only bookkeeping frames
-     * (observed on pi-acp), and the user is left with an empty bubble and no
-     * hint. A normal stop with zero visible output is reported below.
+     * (text / reasoning). Usage and other bookkeeping updates do NOT count:
+     * some agents fold an upstream failure (provider 403, auth, billing) into a
+     * legal `end_turn` while emitting only bookkeeping frames (observed on
+     * pi-acp), and the user is left with an empty bubble and no hint. A normal
+     * stop with zero visible output is reported below.
      */
     let sawVisibleBlock = false
     /**
-     * Tool calls already given a card this turn. ACP agents (codebuddy) restate
-     * the WHOLE `tool_call` on every progress tick — announcement, a
-     * command-titled rewrite, then a final restatement carrying the result as
-     * `content` — and with parallel calls the restatements interleave
-     * (A, B, A, B, …). A restatement for a call whose card already CLOSED used
-     * to open a duplicate card: 2 real calls became 6 cards, each executed by
-     * the host loop. A call gets exactly one card; later restatements only
-     * refresh the output record (see `recordAcpToolOutput`).
+     * The provisional lock written at the start of this conversation's first
+     * turn only becomes permanent once the agent has produced something the
+     * chat plane shows. A first turn that ends without ANY visible block — an
+     * error before the first chunk, a silent provider failure folded into a
+     * normal stop, or a cancel — is rolled back: nothing was exchanged, so the
+     * conversation must remain free to choose another agent.
      */
-    const seenCalls = new Set<string>()
+    const settleProvisionalLock = (): void => {
+      if (session.provisionalLock !== true) return
+      session.provisionalLock = false
+      if (!sawVisibleBlock) this.rollbackFirstTurn(session)
+    }
+    /**
+     * Tool activity already announced this turn, by ACP call id: the name,
+     * input, status and output last published for that call.
+     *
+     * Agents restate a call in whole on every progress tick — announcement, a
+     * command-titled rewrite, then a final restatement carrying the result —
+     * and with parallel calls the restatements interleave (A, B, A, B, …).
+     * Only real news is announced: a verbatim restatement is silence, or one
+     * call would bury the conversation it belongs to.
+     */
+    const toolActivity = new Map<string, { name: string; input: string; status: string; output: string }>()
+    /** The last inline text announced for a notification kind that has no card of its own. */
+    const announcedKinds = new Map<string, string>()
 
     const blockEndChunk = () => ({
       type: 'block-end' as const,
       index: currentBlockIndex,
-      block: activeBlockType === 'tool-call' && activeToolCall !== undefined
-        ? {
-          type: 'tool-call' as const,
-          id: activeToolCall.callId,
-          name: activeToolCall.name,
-          arguments: activeToolCall.argsRaw,
-          ...(activeToolCall.details === undefined ? {} : { details: activeToolCall.details }),
-          ...(activeToolCall.raw === undefined ? {} : { raw: activeToolCall.raw }),
-        }
-        : { type: activeBlockType as 'reasoning' | 'text', text: activeBlockText },
+      block: { type: activeBlockType as 'reasoning' | 'text', text: activeBlockText },
     })
 
     const closeOpenBlock = () => {
       if (activeBlockType === null) return
       queue.push(blockEndChunk())
       activeBlockType = null
-      activeToolCall = undefined
     }
 
-    const switchToBlock = (targetType: 'reasoning' | 'text' | 'tool-call') => {
+    const switchToBlock = (targetType: 'reasoning' | 'text') => {
       if (activeBlockType === targetType) return
       closeOpenBlock()
       currentBlockIndex++
@@ -3599,47 +3721,63 @@ export class BridgeManager {
     }
 
     /**
-     * Open a tool-call block for one call. This is `switchToBlock` with a
-     * callId twist the prose helper cannot express: two adjacent tool calls
-     * have the SAME block type, and a type-equality early-return would fold
-     * the second call into the first card — every call needs its own block.
+     * Append to the open prose block, opening a `text` block when the stream is
+     * between blocks. Tool activity and the agent's answer share this channel:
+     * both are prose the plane renders in place, which is what keeps the turn
+     * in the order the agent produced it.
      */
-    const openToolCallBlock = (snapshot: AcpToolCallSnapshot) => {
-      closeOpenBlock()
-      currentBlockIndex++
-      activeBlockType = 'tool-call'
-      activeBlockText = ''
-      activeToolCall = snapshot
-      sawVisibleBlock = true
-      queue.push({
-        type: 'block-start',
-        index: currentBlockIndex,
-        blockType: 'tool-call',
-      })
-      queue.push({
-        type: 'tool-call-delta',
-        index: currentBlockIndex,
-        id: snapshot.callId,
-        ...(snapshot.name === '' ? {} : { name: snapshot.name }),
-        argumentsDelta: snapshot.argsRaw,
-      })
+    const emitText = (text: string) => {
+      switchToBlock('text')
+      activeBlockText += text
+      queue.push({ type: 'text-delta', index: currentBlockIndex, text })
     }
 
-    /** Fold an in-place update of the open call into name/argument deltas. */
-    const foldToolCallUpdate = (update: Record<string, unknown>) => {
-      if (activeToolCall === undefined) return
-      for (const delta of acpToolCallDelta(activeToolCall, update)) {
-        // `name` + `args` extend the card's parameter text. `details` / `raw`
-        // are not parameters: appending them to `argumentsDelta` would splice
-        // `kind: execute` into the JSON the host shows as the call's args.
-        // They ride the closing snapshot instead.
-        queue.push({
-          type: 'tool-call-delta',
-          index: currentBlockIndex,
-          id: activeToolCall.callId,
-          ...(delta.kind === 'name' ? { name: delta.name } : {}),
-          argumentsDelta: delta.kind === 'args' ? delta.text : '',
-        })
+    /**
+     * Announce one ACP tool call inline, at the position it happened.
+     *
+     * NOT as a `tool-call` block: the plane cannot draw one inside the message
+     * body, and what it shows instead is the host loop's EXECUTION of the call,
+     * appended as its own node after the whole message settles — so every card
+     * of a turn piles up below all the prose. A native turn hides that because
+     * its cards sit between two model steps; an ACP turn is ONE host step, so
+     * there is no second step to interleave with. The full card — arguments,
+     * diffs, status — stays in the ACP view tab (docs/acp-convergence.md §1.7).
+     */
+    const noteToolActivity = (update: Record<string, unknown>) => {
+      const callId = typeof update.toolCallId === 'string' ? update.toolCallId.trim() : ''
+      if (callId === '') return
+      const status = typeof update.status === 'string' ? update.status : ''
+      const output = updateContentToText(update.content)
+      const known = toolActivity.get(callId)
+      if (known === undefined) {
+        // An update for a call the agent never announced is the same event as
+        // an announcement here: dropping it would lose the call entirely.
+        const name = typeof update.title === 'string' ? update.title : ''
+        const input = acpToolInputOf(update)
+        toolActivity.set(callId, { name, input, status, output })
+        emitText(acpToolActivityLine(name, input, status))
+        if (output !== '') emitText(acpToolActivityOutput(output))
+        return
+      }
+      // A restatement. A title the agent retitled, or an input it rewrote, is
+      // news; an empty one is not (that is the restatement carrying only a
+      // result), and neither is a status that merely moved on.
+      let changed = false
+      const name = typeof update.title === 'string' ? update.title : ''
+      if (name !== '' && name !== known.name) {
+        known.name = name
+        changed = true
+      }
+      const input = acpToolInputOf(update)
+      if (input !== '' && input !== known.input) {
+        known.input = input
+        changed = true
+      }
+      if (status !== '' && status !== known.status) known.status = status
+      if (changed) emitText(acpToolActivityLine(known.name, known.input, known.status))
+      if (output !== '' && output !== known.output) {
+        known.output = output
+        emitText(acpToolActivityOutput(output))
       }
     }
 
@@ -3671,68 +3809,6 @@ export class BridgeManager {
       return ''
     }
 
-    /**
-     * Cards already streamed for this turn, by callId: real ACP tool calls and
-     * the one-per-kind cards of {@link noteUnhandledUpdate} both live here.
-     */
-    /** The open one-per-kind card of {@link noteUnhandledUpdate}, by notification kind (`''` = unnamed). */
-    const unhandledCards = new Map<string, AcpToolCallSnapshot>()
-    /**
-     * Announce an ACP update this build does not render as a card of its own.
-     *
-     * The card is a `tool-call` block because that is the only card the Chat
-     * plane draws — its chunk vocabulary is text/reasoning/tool-call. The name
-     * satisfies the host's `^[A-Za-z0-9_-]{1,64}$` tool-name rule. ONE card per
-     * notification KIND per turn, updated in place: agents restate a plan in
-     * full on every step, and a card per restatement would bury the
-     * conversation. Restatements therefore reuse the SAME callId — a second id
-     * would also look like a second call to the host loop, which executes every
-     * card it sees. The newest payload is what the settled snapshot carries.
-     */
-    const noteUnhandledUpdate = (kind: string, update: Record<string, unknown>) => {
-      const text = describeUnhandledUpdate(kind, update)
-      const open = unhandledCards.get(kind)
-      const card = open ?? {
-        callId: `unhandled:${kind === '' ? 'update' : kind}`,
-        name: kind === '' ? 'unhandled_update' : `acp_${kind.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 56)}`,
-        argsRaw: '',
-      }
-      card.raw = dumpJson(update)
-      noteExtraCard(card.callId, text)
-      if (open === undefined) {
-        unhandledCards.set(kind, card)
-        openToolCallBlock(card)
-      } else if (activeBlockType === 'tool-call' && activeToolCall?.callId === card.callId) {
-        // The card is still open: nothing to restart, the closing snapshot
-        // carries the new payload.
-      } else {
-        // Already closed (a real call followed it): reopen it in place so the
-        // latest payload is visible where it happened instead of vanishing.
-        openToolCallBlock(card)
-      }
-    }
-
-    /**
-     * Register a display card that is NOT an agent tool call (see
-     * {@link noteUnhandledUpdate}) so the guard can both answer the host loop's
-     * execution of the card and recognise its own continuation step.
-     *
-     * A plan has no call id and its text is not a tool result, so it must stay
-     * out of `toolResults` (the pre-step gate reads that map as "these are
-     * staged tool results, this is my own continuation"). It lives in
-     * `cardOutputs`, which the guard probes read-only.
-     */
-    const noteExtraCard = (callId: string, text: string) => {
-      const registry = routeBindingRegistry()
-      const cards = registry.cardOutputs ?? (registry.cardOutputs = new Map<string, string>())
-      cards.set(callId, text)
-      while (cards.size > TOOL_OUTPUT_MAX_ENTRIES) {
-        const oldest = cards.keys().next().value
-        if (oldest === undefined) break
-        cards.delete(oldest)
-      }
-    }
-
     const unsubscribe = this.hub.subscribe(event => {
       if (!('sessionId' in event) || event.sessionId !== session.sessionId) return
       if (event.type === 'session/update') {
@@ -3745,87 +3821,47 @@ export class BridgeManager {
             activeBlockText += text
             queue.push({ type: 'reasoning-delta', index: currentBlockIndex, text })
           }
-        } else if (kind === 'tool_call') {
-          // A real tool call, not prose: the host's accumulator turns these
-          // deltas into `{ kind: 'tool-call', callId, name, argsRaw }` and the
-          // Chat plane renders the card the ACP view used to own. A restated
-          // `tool_call` for a call that already has a card is never a second
-          // card — agents announce a call once and then restate it (open card:
-          // an update; closed card: only the output record can still change).
-          const snapshot = acpToolCallFromUpdate(update)
-          if (snapshot !== undefined) {
-            recordAcpToolOutput(snapshot.callId, updateContentToText(update.content))
-            // The most recent RESTATEMENT is what the card's settled shape
-            // should be, even when the card itself is already open: agents
-            // restate a call in full on every progress tick (codebuddy) and
-            // the closing snapshot must carry the newest fields.
-            if (activeBlockType === 'tool-call' && activeToolCall?.callId === snapshot.callId) {
-              foldToolCallUpdate(update)
-              if (snapshot.details !== undefined) activeToolCall.details = snapshot.details
-              if (snapshot.raw !== undefined) activeToolCall.raw = snapshot.raw
-              if (snapshot.name !== '') activeToolCall.name = snapshot.name
-            } else if (!seenCalls.has(snapshot.callId)) {
-              seenCalls.add(snapshot.callId)
-              openToolCallBlock(snapshot)
-            }
-          }
-        } else if (kind === 'tool_call_update') {
-          // Fold the update into the open card. An update for a call that is
-          // not open (the agent skipped its `tool_call` announcement) opens one:
-          // dropping it would lose the result entirely. A call that already has
-          // a closed card only refreshes the output record.
-          const callId = typeof update.toolCallId === 'string' ? update.toolCallId.trim() : ''
-          if (callId !== '') {
-            recordAcpToolOutput(callId, updateContentToText(update.content))
-            if (activeBlockType === 'tool-call' && activeToolCall?.callId === callId) {
-              activeToolCall.raw = dumpJson(update)
-              if (activeToolCall.details === undefined) {
-                const details = acpToolCallDetailsOf(update)
-                if (details !== '') activeToolCall.details = details
-              }
-              foldToolCallUpdate(update)
-            } else if (!seenCalls.has(callId)) {
-              const reopened = acpToolCallFromUpdate({ ...update, toolCallId: callId })
-              if (reopened !== undefined) {
-                seenCalls.add(callId)
-                openToolCallBlock(reopened)
-              }
-            }
-          }
+        } else if (kind === 'tool_call' || kind === 'tool_call_update') {
+          noteToolActivity(update)
         } else if (kind === 'agent_message_chunk') {
           const text = chunkTextOf(update.content)
-          if (text !== '') {
-            if (seenCalls.size > 0) {
-              // After the first card this is the ANSWER: the Chat plane
-              // refuses any message containing a tool-call block, so it must
-              // not join this stream's message. Buffer it for the continuation
-              // step (replayed via `pendingToolAnswers`).
-              answerBuffer += text
-            } else {
-              switchToBlock('text')
-              activeBlockText += text
-              queue.push({ type: 'text-delta', index: currentBlockIndex, text })
-            }
-          }
+          if (text !== '') emitText(text)
         } else if (kind === 'usage_update') {
           const used = typeof update.used === 'number' ? update.used : 0
           const size = typeof update.size === 'number' ? update.size : 0
           latestUsage = { inputTokens: size, outputTokens: used }
-        } else {
-          // A notification kind this build does not render (available commands,
-          // a plan, a mode change, or something newer than this plugin). It
-          // already reaches the ACP view through the transcript; open a card for
-          // it so the native chat stream carries it too. Bookkeeping kinds
-          // (`current_mode_update`, `config_option_update`, `available_commands_update`,
-          // `session_info_update`) stay silent — they are routine, not content.
-          if (!BOOKKEEPING_UPDATES.has(kind)) noteUnhandledUpdate(kind, update)
+        } else if (!BOOKKEEPING_UPDATES.has(kind)) {
+          // A notification kind this build has no card of its own (a plan, a
+          // mode change, an available-command list, or something newer than
+          // this plugin). It already reaches the ACP view through the
+          // transcript; announce it inline at the position it happened. ONE
+          // line per kind per turn: agents restate a plan in full on every
+          // step, and a line per restatement would bury the conversation.
+          const text = describeUnhandledUpdate(kind, update)
+          if (announcedKinds.get(kind) !== text) {
+            announcedKinds.set(kind, text)
+            emitText(`\n${text}\n`)
+          }
         }
       } else if (event.type === 'permission/request') {
         switchToBlock('reasoning')
         const title = typeof (event.toolCall as { title?: unknown } | undefined)?.title === 'string'
           ? String((event.toolCall as { title: string }).title)
           : 'permission'
-        const line = `\n> 🔐 [Permission Required: ${title}] - please approve in Settings\n`
+        // The line must not point at a place with no answer entry, and the
+        // bridge knows which path this ask took (`ledgerFallbackOf`, recorded
+        // before this frame was broadcast). On the DESIGNED ledger paths the
+        // settings panel's card is the answer entry, so it is named plainly.
+        // A DEGRADED native route is different: the composer prompt the user
+        // is waiting for failed, and the ask now carries a deadline — the line
+        // has to say both, or "approve in Settings" reads as a choice when it
+        // is a countdown.
+        const fallback = bridge.ledgerFallbackOf(event.requestId)
+        const line = fallback?.reason === 'unavailable'
+          ? fallback.timeoutMs > 0
+            ? `\n> 🔐 [Permission Required: ${title}] - the approval service is unavailable; approve in Settings within ${String(Math.round(fallback.timeoutMs / 1000))}s or this request is cancelled\n`
+            : `\n> 🔐 [Permission Required: ${title}] - the approval service is unavailable; please approve in Settings\n`
+          : `\n> 🔐 [Permission Required: ${title}] - please approve in Settings\n`
         activeBlockText += line
         queue.push({ type: 'reasoning-delta', index: currentBlockIndex, text: line })
       }
@@ -3840,13 +3876,15 @@ export class BridgeManager {
     const finishStream = (reason: { kind: 'stop' } | { kind: 'aborted'; failure?: { message: string; code: string } } | { kind: 'error'; failure?: { message: string; code: string } }) => {
       if (finished) return
       finished = true
+      // `sawVisibleBlock` still describes what the AGENT produced here: the
+      // synthesized empty-turn warning below is added after this settle.
+      settleProvisionalLock()
       options.signal?.removeEventListener('abort', onAbort)
       unsubscribe()
       session.running = false
       if (activeBlockType !== null) {
         queue.push(blockEndChunk())
         activeBlockType = null
-        activeToolCall = undefined
       }
       if (latestUsage !== null) {
         queue.push({ type: 'usage', usage: latestUsage })
@@ -3869,27 +3907,9 @@ export class BridgeManager {
           if (stopReason === 'cancelled') {
             finishStream({ kind: 'aborted', failure: { message: 'Turn was cancelled', code: 'CANCELLED' } })
           } else {
-            if (seenCalls.size > 0) {
-              // Cards streamed: the loop will execute them (the guard's virtual
-              // tools answer with the real outputs) and propose the continuation
-              // step, which replays this buffer as the answer message. An EMPTY
-              // buffer is a legal stash — the continuation then reports the
-              // tool-only turn instead of silence.
-              if (session.dshSessionId !== undefined) {
-                this.pendingToolAnswers.set(session.dshSessionId, answerBuffer)
-                while (this.pendingToolAnswers.size > PENDING_TOOL_ANSWERS_MAX) {
-                  const oldest = this.pendingToolAnswers.keys().next().value
-                  if (oldest === undefined) break
-                  this.pendingToolAnswers.delete(oldest)
-                }
-              } else if (answerBuffer !== '') {
-                // No conversation id to hand the buffer to: flush it into this
-                // stream rather than dropping the answer.
-                switchToBlock('text')
-                activeBlockText += answerBuffer
-                queue.push({ type: 'text-delta', index: currentBlockIndex, text: answerBuffer })
-              }
-            }
+            // Settle BEFORE the synthesized warning: the warning is our text,
+            // not evidence that the first turn actually delivered anything.
+            settleProvisionalLock()
             if (!sawVisibleBlock) {
               // The silent-failure report: a normal stop with nothing the chat
               // plane renders. An aborted or already-failing turn needs no

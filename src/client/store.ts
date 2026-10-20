@@ -122,11 +122,14 @@ export interface UiState {
    */
   probeErrors: Record<string, string>
   /**
-   * Host reports that permission asks are answered through the native
-   * approval chain (chat composer). When true the settings panel must not
-   * render the permission card — the question is already in the conversation.
-   * False on an older host or when the approval service is unavailable, in
-   * which case the panel keeps the ledger fallback.
+   * Host reports that it HAS the native approval chain (permission asks are
+   * answered in the chat composer). This is a capability report, not a
+   * per-ask promise: an individual ask still falls back to the settings-panel
+   * ledger when the service is unavailable this time, or when the session has
+   * no chat identity behind it (`AgentBridge.askNativeApproval`). The panel
+   * therefore answers ANY pending ask, whatever this flag says — see
+   * `permissionLedgerCard` in panel.tsx. False on an older host or when the
+   * approval service is missing, in which case the ledger is the only path.
    */
   approvalRouted: boolean
   /**
@@ -154,6 +157,31 @@ export interface UiState {
    * new agent, and the chip would otherwise keep naming the previous agent.
    */
   chatBoundAgent: Record<string, string>
+  /**
+   * Per-chat-session agent lock, as reported by `chat/agent-locked` (the live
+   * path) or `session/chat-list`'s `lockedAgentId` (the fallback): the first
+   * ACP turn has STARTED, so this conversation belongs to that agent and
+   * cannot be switched. The lock is provisional until that turn shows
+   * something; `chat/agent-unlocked` removes it when it delivers nothing. The
+   * composer hides its agent base and shows a read-only tag for this agent.
+   * The id is kept even when the agent has been deleted from the roster — the
+   * conversation is still locked to it.
+   */
+  chatLockedAgent: Record<string, string>
+  /**
+   * Per-chat-session serial for a lock THIS page saw arrive — bumped by the
+   * `chat/agent-locked` frame (the live path, sent when the first turn starts)
+   * or by a later `session/chat-list` answer that first reports `lockedAgentId`
+   * (the fallback when the frame was missed). A rolled-back first turn followed
+   * by a retry therefore gets a fresh serial, and its ceremony plays again.
+   *
+   * This is the animation's trigger, and the reason it cannot replay on a page
+   * load: a conversation that is already locked when its list is first read
+   * has no entry here. The composer's base and its edge tag
+   * (`agent-lock-anim.ts`) play the shatter/condense hand-off only for a serial
+   * they have not consumed.
+   */
+  agentLockReveal: Record<string, number>
   /**
    * The conversation's persisted pick — model and thought level — as reported by
    * `session/chat-list`'s `choice`, and written optimistically the moment a
@@ -414,6 +442,8 @@ export class AcpStore {
     chatTranscripts: {},
     acpMode: {},
     chatBoundAgent: {},
+    chatLockedAgent: {},
+    agentLockReveal: {},
     chatChoice: {},
     seatDiag: 'idle',
     permissionSeatDiag: 'idle',
@@ -426,6 +456,21 @@ export class AcpStore {
   private readonly openTurns = new Set<string>()
   /** In-flight `session/chat-list` reads, keyed by chat session id. */
   private readonly chatSessionReads = new Map<string, { dropped: boolean }>()
+  /**
+   * Chat sessions whose list has answered at least once in this page. The
+   * FIRST answer only seeds the lock; a lock appearing on a later answer is a
+   * transition this page actually witnessed, and only that one is announced via
+   * {@link UiState.agentLockReveal}.
+   */
+  private readonly chatListLoaded = new Set<string>()
+  /**
+   * Conversations whose provisional first-turn lock the host rolled back
+   * (`chat/agent-unlocked`, no visible output in the first turn). A
+   * `session/chat-list` read that started BEFORE the rollback can still name
+   * `lockedAgentId`; it must not revive the lock. A new `chat/agent-locked`
+   * frame clears the entry (the user retried and the turn really started).
+   */
+  private readonly chatUnlocked = new Set<string>()
   /**
    * Sessions whose ACP-mode verdict a committed `agent-preset/selected` frame
    * settled. A frame settles the verdict; the host's log read can lag a switch
@@ -841,14 +886,40 @@ export class AcpStore {
     this.chatSessionReads.set(dshSessionId, read)
     const settle = options?.settleVerdict === true || !this.acpModeLive.has(dshSessionId)
     try {
-      const { sessions, acpMode, boundAgentId, choice } = await this.call<{ sessions: ChatSessionView[]; acpMode?: boolean; boundAgentId?: string; choice?: AcpConversationChoice }>('session/chat-list', { dshSessionId, refresh: true })
+      const { sessions, acpMode, boundAgentId, lockedAgentId, choice } = await this.call<{ sessions: ChatSessionView[]; acpMode?: boolean; boundAgentId?: string; lockedAgentId?: string; choice?: AcpConversationChoice }>('session/chat-list', { dshSessionId, refresh: true })
       // A committed `agent-preset/selected` frame may have settled this
       // session's verdict while the read was in flight; the host answer then
       // describes the log as of BEFORE that switch and must not overwrite it.
       if (read.dropped) return
+      // The first answer for a conversation only seeds what is already true: a
+      // lock reported there belongs to an earlier page. A lock that appears on
+      // a LATER answer is the first-turn transition unfolding in front of the
+      // user, and only that one is announced to the hand-off animation.
+      const firstAnswer = !this.chatListLoaded.has(dshSessionId)
+      this.chatListLoaded.add(dshSessionId)
+      // The lock is one-way, so a read that no longer reports one is an older
+      // host half, not an unlock: keep what we already know in that case. The
+      // one explicit unlock is the host's rollback frame, tracked separately.
+      // A read that AGREES there is no lock clears the rollback marker, so a
+      // later legitimate lock (even with its frame missed) is accepted again.
+      if (lockedAgentId === undefined) this.chatUnlocked.delete(dshSessionId)
+      const reportedLock = lockedAgentId !== undefined && this.chatUnlocked.has(dshSessionId)
+        ? undefined
+        : lockedAgentId
+      const chatLockedAgent = reportedLock === undefined
+        ? this.state.chatLockedAgent
+        : { ...this.state.chatLockedAgent, [dshSessionId]: reportedLock }
+      const witnessedLock = !firstAnswer
+        && reportedLock !== undefined
+        && this.state.chatLockedAgent[dshSessionId] === undefined
+      const agentLockReveal = witnessedLock
+        ? { ...this.state.agentLockReveal, [dshSessionId]: (this.state.agentLockReveal[dshSessionId] ?? 0) + 1 }
+        : this.state.agentLockReveal
       this.mutate({
         chatSessions: sessions,
         chatSessionsFor: dshSessionId,
+        chatLockedAgent,
+        agentLockReveal,
         // The host's binding (intent + live-session fallback) outranks the
         // optimistic entry this store wrote on the click; a host without the
         // field (older half) simply leaves the optimistic value standing.
@@ -1352,6 +1423,33 @@ export class AcpStore {
       }
       case 'permission/resolved': {
         this.mutate({ permissions: this.state.permissions.filter(p => p.requestId !== event.requestId) })
+        return Promise.resolve()
+      }
+      case 'chat/agent-locked': {
+        // The host locks a conversation at the START of its first ACP turn and
+        // says so at once; this frame is what makes the hand-off animation run
+        // at the start rather than on the turn-settled list read. It is emitted
+        // only on the transition, so it always announces a new ceremony — even
+        // if a racing list read already seeded the lock itself.
+        this.chatUnlocked.delete(event.dshSessionId)
+        this.mutate({
+          chatLockedAgent: { ...this.state.chatLockedAgent, [event.dshSessionId]: event.agentId },
+          chatBoundAgent: { ...this.state.chatBoundAgent, [event.dshSessionId]: event.agentId },
+          agentLockReveal: { ...this.state.agentLockReveal, [event.dshSessionId]: (this.state.agentLockReveal[event.dshSessionId] ?? 0) + 1 },
+        })
+        return Promise.resolve()
+      }
+      case 'chat/agent-unlocked': {
+        // The first turn delivered nothing and the host rolled the lock back.
+        // The base must return; the failed ACP session is closed host-side, so
+        // drop a cached list that still names it and let the next read confirm.
+        this.chatUnlocked.add(event.dshSessionId)
+        const chatLockedAgent = { ...this.state.chatLockedAgent }
+        delete chatLockedAgent[event.dshSessionId]
+        this.mutate({
+          chatLockedAgent,
+          ...(this.state.chatSessionsFor === event.dshSessionId ? { chatSessions: [] } : {}),
+        })
         return Promise.resolve()
       }
       case 'turn/start': {

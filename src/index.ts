@@ -24,7 +24,12 @@ export const inject = ['webServer', 'connection']
 /** Structural view of the host approval service (`@deepseek-ai/dsh-user-approval`). */
 interface ApprovalServiceLike {
   request(req: { agent: unknown; toolName: string; reason?: string; signal?: AbortSignal }): Promise<ApprovalOutcome>
-  /** Deployment-wide default policy, read only when the session log carries no override. */
+  /**
+   * Present on the host service, but NEVER read by this plugin: the only call
+   * made here is `request` (see `wireApproval`). A deployment-wide default
+   * policy is the host's own business — this plugin's per-agent policy is
+   * `AcpAgentDef.permission`.
+   */
   config?: { policy?: string }
 }
 
@@ -101,8 +106,11 @@ export function apply(ctx: Context, config?: unknown): void {
     },
   )
   const adapter = new AcpLlmAdapter(manager)
-  // Warm the model catalog at boot (no-op under test runners or when
-  // probeModelsOnBoot is disabled): background spawn per uncached agent only.
+  // Boot hook kept only so this entry point's shape does not change:
+  // `bootstrapCatalogs` is intentionally empty — boot never spawns an agent,
+  // in any environment and for any `probeModelsOnBoot` value. Catalogs fill
+  // from a gesture instead (a real session, `agent/probe-models`, or an
+  // on-disk cache — see `BridgeManager.bootstrapCatalogs` / `agentCatalog`).
   manager.bootstrapCatalogs()
 
   /**

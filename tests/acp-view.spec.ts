@@ -7,9 +7,10 @@
  * payload into the only reviewable form the chat plane cannot show.
  */
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { ACP_PRESET_ID, acpModeFromPresetEvent, formatCommandLine, isAbsolutePathLike, placeMenu, rowAgentPreset, splitAcpModelId, splitCommandLine, stagedIsAcpMode, stagedSessionOf, tokenizeCommandLine } from '../src/client/acp-ui.tsx'
-import { diffRows } from '../src/client/acp-view.tsx'
+import { agentLockPhaseOf, FORM_MS, playAgentLockAnim, SHATTER_MS } from '../src/client/agent-lock-anim.ts'
+import { acpEmptyCopy, boundAgentOf, diffRows, isNewFileDiff } from '../src/client/acp-view.tsx'
 import { describeRoute, menuFor } from '../src/client/session-controls.tsx'
 import { AcpStore } from '../src/client/store.ts'
 import { isAbsolutePath, splitAdapterModelId, splitCommandLine as hostSplitCommandLine, tokenizeCommandLine as hostTokenizeCommandLine } from '../src/impl.ts'
@@ -598,6 +599,109 @@ describe('diffRows (ACP view)', () => {
   })
 })
 
+describe('isNewFileDiff (the diff footnote)', () => {
+  it('calls a file new only when there was no old side', () => {
+    // THE rule (audit F8): the footnote used to read `removed === 0`, and an
+    // EXISTING file that only gained lines also diffs to zero removals — so a
+    // real edit was labelled "new file". The old side decides, never the count.
+    expect(isNewFileDiff(null, 'a\nb')).toBe(true)
+    expect(isNewFileDiff('', 'a\nb')).toBe(true)
+    // Identical payloads: nothing was removed either, and there is no edit to
+    // mislabel, so the degenerate case keeps the footnote it always had.
+    expect(isNewFileDiff('a\nb', 'a\nb')).toBe(true)
+
+    expect(isNewFileDiff('a\n', 'a\nb\n')).toBe(false)
+    expect(isNewFileDiff('a\nb\n', 'a\nB\nb\n')).toBe(false)
+    // A pure removal edits an existing file; it is the opposite of a new one.
+    expect(isNewFileDiff('a\nb\n', 'a\n')).toBe(false)
+  })
+
+  it('is not reachable from the row counts the old rule used', () => {
+    // The proof the row count cannot decide it: both of these diffs have zero
+    // removals, and only one of them is a new file.
+    const grown = diffRows('a\n', 'a\nb\n')
+    const created = diffRows(null, 'a\nb\n')
+    expect(grown.filter(row => row.sign === '-')).toHaveLength(0)
+    expect(created.filter(row => row.sign === '-')).toHaveLength(0)
+    expect(isNewFileDiff('a\n', 'a\nb\n')).toBe(false)
+    expect(isNewFileDiff(null, 'a\nb\n')).toBe(true)
+  })
+})
+
+/**
+ * The empty state of the conversation's ACP view.
+ *
+ * Its copy is a pure function (`acpEmptyCopy`) because this bundle has no DOM
+ * test, and the copy IS the defect: `chatTranscriptOf` answering `undefined`
+ * covers both "no agent has ever served this conversation" and "its ACP session
+ * record is gone", and one sentence claimed the first for both.
+ */
+describe('the ACP view empty state (no transcript to show)', () => {
+  const agent: AgentView = {
+    id: 'pi', title: 'Pi', command: 'pi-acp', args: [], permission: 'ask',
+    allowedCwdRoots: [], state: 'ready', liveSessions: [],
+  }
+  /** Read the English side, so the assertions name what a user would read. */
+  const en = (_zh: string, text: string): string => text
+  const zh = (text: string): string => text
+
+  it('reads the binding the transcript does not carry', () => {
+    // THE F6 case: the ACP session was destroyed (`closeSession` →
+    // `forgetDshSession` drops the record, so `chatTranscriptOf` answers
+    // undefined) while the host binding still names the agent — the composer
+    // chip says "NTR · Pi" one row above this view.
+    expect(boundAgentOf(undefined, 'pi', undefined, [agent])).toEqual({ id: 'pi', title: 'Pi' })
+    // A live or parked session outranks the recorded binding.
+    expect(boundAgentOf({ agentId: 'omp', agentTitle: 'Omp', sessionId: 's1' }, 'pi', undefined, [agent]))
+      .toEqual({ id: 'omp', title: 'Omp' })
+    // The persisted pick covers the window before the first turn.
+    expect(boundAgentOf(undefined, undefined, 'pi', [agent])).toEqual({ id: 'pi', title: 'Pi' })
+    // Nothing anywhere: this conversation really has no agent.
+    expect(boundAgentOf(undefined, undefined, undefined, [agent])).toBeUndefined()
+    // An agent the roster no longer has still names itself.
+    expect(boundAgentOf(undefined, 'ghost', undefined, [agent])).toEqual({ id: 'ghost', title: 'ghost' })
+  })
+
+  it('does not claim "no NTR agent has run" while an agent is bound', () => {
+    const copy = acpEmptyCopy({ bound: { id: 'pi', title: 'Pi' }, hasAgents: true, acpMode: true }, en)
+    expect(copy.title).not.toMatch(/No NTR agent has run/)
+    expect(copy.title).toBe('This conversation has no ACP session to show right now')
+    // The next step is a message, not a pick: the agent is already chosen.
+    expect(copy.body).toMatch(/Send it a message/)
+    expect(copy.hint).toBe('bound to · Pi')
+    // The Chinese side says the same thing, not a stale variant of it.
+    expect(acpEmptyCopy({ bound: { id: 'pi', title: 'Pi' }, hasAgents: true, acpMode: true }, zh).title)
+      .toBe('这个会话当前没有可显示的 ACP 会话')
+  })
+
+  it('keeps the honest "nothing has run" title when nothing is bound', () => {
+    const copy = acpEmptyCopy({ hasAgents: true, acpMode: true }, en)
+    expect(copy.title).toBe('No NTR agent has run in this conversation yet')
+    expect(copy.body).toMatch(/Pick a NTR agent/)
+  })
+
+  it('points at the composer base only inside an NTR-mode conversation', () => {
+    // THE F7 case: the base is installed by the ACP-mode gate alone
+    // (`syncAcpMode`), and the NTR view tab is registered unconditionally — so
+    // in an ordinary conversation that cell still holds the host's own model
+    // selector and the hint sent the user to a control that is not there.
+    expect(acpEmptyCopy({ hasAgents: true, acpMode: true }, en).hint)
+      .toBe('pick one from the NTR base in the composer')
+    const ordinary = acpEmptyCopy({ hasAgents: true, acpMode: false }, en)
+    expect(ordinary.hint).toBe('This conversation is not in NTR mode · NTR is chosen when a conversation starts')
+    expect(ordinary.hint).not.toMatch(/composer/)
+    // A host that never answered (older half) gets no line rather than a guess.
+    expect(acpEmptyCopy({ hasAgents: true }, en).hint).toBeUndefined()
+  })
+
+  it('sends a deployment with no configured agent to the settings page', () => {
+    expect(acpEmptyCopy({ hasAgents: false, acpMode: true }, en).hint)
+      .toBe('No agent configured · Settings → NTR')
+    // No agents means no base to point at either way.
+    expect(acpEmptyCopy({ hasAgents: false }, en).hint).toBe('No agent configured · Settings → NTR')
+  })
+})
+
 describe('placeMenu (the picker docks to the control that opened it)', () => {
   const menu = { width: 360, height: 200 }
   const viewport = { width: 1200, height: 800 }
@@ -625,5 +729,60 @@ describe('placeMenu (the picker docks to the control that opened it)', () => {
     // settles against the bottom edge instead of hanging out of the window.
     expect(placeMenu({ left: 800, right: 900, top: 10, bottom: 40 }, menu, { width: 1200, height: 250 }))
       .toEqual({ x: 540, y: 42 })
+  })
+})
+
+describe('the agent-lock hand-off clock', () => {
+  it('shatters, then forms, then settles — and never replays a consumed reveal', () => {
+    vi.useFakeTimers()
+    try {
+      const session = 'chat-lock-anim-1'
+      // The commit that first sees a witnessed lock already renders the base in
+      // its shatter phase (no frame with neither surface), even before the
+      // effect arms the clock.
+      expect(agentLockPhaseOf(session, 1)).toBe('shatter')
+      playAgentLockAnim(session, 1)
+      expect(agentLockPhaseOf(session, 1)).toBe('shatter')
+      vi.advanceTimersByTime(SHATTER_MS - 1)
+      expect(agentLockPhaseOf(session, 1)).toBe('shatter')
+      vi.advanceTimersByTime(1)
+      expect(agentLockPhaseOf(session, 1)).toBe('form')
+      vi.advanceTimersByTime(FORM_MS - 1)
+      expect(agentLockPhaseOf(session, 1)).toBe('form')
+      vi.advanceTimersByTime(1)
+      expect(agentLockPhaseOf(session, 1)).toBe('idle')
+
+      // Opening the page again carries no reveal at all; and even an effect
+      // re-run with the same serial cannot start a second ceremony.
+      expect(agentLockPhaseOf(session)).toBe('idle')
+      playAgentLockAnim(session, 1)
+      expect(agentLockPhaseOf(session, 1)).toBe('idle')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('lets a retry after a rolled-back first turn start a fresh ceremony', () => {
+    vi.useFakeTimers()
+    try {
+      const session = 'chat-lock-anim-retry'
+      playAgentLockAnim(session, 1)
+      vi.advanceTimersByTime(SHATTER_MS)
+      expect(agentLockPhaseOf(session, 1)).toBe('form')
+      // The host rolled the lock back; the retry witnesses reveal 2 while the
+      // old ceremony would still be forming. The new reveal must shatter.
+      expect(agentLockPhaseOf(session, 2)).toBe('shatter')
+      playAgentLockAnim(session, 2)
+      expect(agentLockPhaseOf(session, 2)).toBe('shatter')
+      // At t = SHATTER + FORM the OLD form timer fires. If it were not fenced
+      // by its epoch it would delete the retry's ceremony; the retry itself
+      // moved to form at SHATTER after its start.
+      vi.advanceTimersByTime(FORM_MS)
+      expect(agentLockPhaseOf(session, 2)).toBe('form')
+      vi.advanceTimersByTime(SHATTER_MS)
+      expect(agentLockPhaseOf(session, 2)).toBe('idle')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

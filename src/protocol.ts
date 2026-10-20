@@ -7,8 +7,12 @@
  * - RPC payloads: browser → host unary calls on the `/acp` Connection channel.
  *
  * Security invariants encoded here (enforced host-side in impl.ts):
- * - The browser never names a program to spawn; it selects a configured
- *   agent id and a cwd that must resolve inside the agent's allowed roots.
+ * - A SESSION never names a program to spawn: `session/start` and the
+ *   conversation↔agent binding only select a configured agent id and a cwd
+ *   that must resolve inside the agent's allowed roots. Naming a program is
+ *   a CONFIGURATION act instead — the browser may do it through `agent/save`
+ *   / `agent/test`, both of which run the command through `validateAgentDef`
+ *   (a command line, not a bare path) and both of which really spawn.
  * - Agent environment variables flow config → child process only.
  */
 
@@ -33,7 +37,14 @@ export interface AcpAgentDef {
   id: string
   /** Display name (defaults to the id). */
   title?: string
-  /** Executable spawned over stdio; NEVER supplied by the browser. */
+  /**
+   * Executable spawned over stdio, as a full command line (`codebuddy --acp`),
+   * parsed by `validateAgentDef`. The browser MAY set it — that is exactly
+   * what the settings panel's single command box does, through `agent/save`
+   * (persist, then probe) and `agent/test` (spawn a throwaway handshake). A
+   * SESSION never can: `session/start` and the conversation binding only
+   * select a configured agent id (see the module header).
+   */
   command: string
   /** Argument vector (no shell interpretation). */
   args?: string[]
@@ -84,11 +95,15 @@ export interface AcpPluginConfig {
   /** Per-session transcript ring bound (default 600 entries). */
   transcriptMaxEntries?: number
   /**
-   * Probe each configured agent's model catalog by spawning a throwaway ACP
-   * session. Defaults to `true` (boot probe for agents without a persisted
-   * catalog, plus a lazy probe when an ACP seat first asks for a list).
-   * `false` disables every automatic spawn; the catalog then only fills from
-   * real sessions or the manual probe button.
+   * DEAD CONFIG — nothing in this plugin reads it. `validateConfig` still
+   * accepts it and the host entry still threads it into the `BridgeManager`
+   * constructor, but boot no longer probes (`bootstrapCatalogs` is
+   * intentionally empty) and `agent/catalog` is pure memory, so there is no
+   * automatic spawn left for it to switch off. Catalogs fill only from a
+   * gesture: the agent's own `session/new` / `session/load`, the settings
+   * card's `agent/probe-models` button, or an on-disk cache. Kept only so
+   * that removing it can be a separate cross-file change (impl.ts, bridge.ts
+   * and the host entry all touch it today).
    */
   probeModelsOnBoot?: boolean
   /**
@@ -205,6 +220,19 @@ export type AcpEvent =
   | { type: 'permission/resolved'; requestId: string; sessionId: string; outcome: PermissionOutcome }
   | { type: 'turn/start'; sessionId: string; turnId: string; text: string }
   | { type: 'turn/end'; sessionId: string; turnId: string; stopReason?: string; error?: string }
+  /**
+   * A DSH chat conversation was locked to its agent at the start of its first
+   * ACP turn. Addressed by the CHAT session id (the browser may not know the
+   * ACP session yet). The composer plays its base→tag hand-off on this frame;
+   * a `session/chat-list` read is only the fallback (it can arrive a turn late).
+   */
+  | { type: 'chat/agent-locked'; dshSessionId: string; agentId: string }
+  /**
+   * The provisional lock of a first turn that delivered no visible output was
+   * rolled back: the conversation may switch agents again, and its base must
+   * return. The failed ACP session is closed with it.
+   */
+  | { type: 'chat/agent-unlocked'; dshSessionId: string }
 
 export interface PermissionOptionView {
   optionId: string
@@ -259,7 +287,6 @@ export interface AgentsListResult {
    */
   approvalRouted?: boolean
 }
-export type SessionStartResult = { sessionId: string; session: SessionView }
 export type SessionPromptResult = { accepted: true; turnId: string }
 export type TranscriptResult = { session: SessionView; entries: Array<{ seq: number; update: SessionUpdate }> }
 export type SessionsListResult = { sessions: SessionView[] }
@@ -301,6 +328,17 @@ export type ChatSessionsListResult = { sessions: ChatSessionView[] }
  */
 export interface ChatSessionListResult extends ChatSessionsListResult {
   acpMode?: boolean
+  /**
+   * The agent this conversation is LOCKED to, once its first ACP turn has run.
+   *
+   * The composer's agent base retires at that point and the composer-edge tag
+   * shows this agent; the tag is display-only because a different agent would
+   * have none of the conversation's context. The lock is persisted with the
+   * conversation record, so it outlives the ACP session (and a host restart),
+   * and it is reported even when the agent is no longer in the roster — the
+   * conversation still belongs to it.
+   */
+  lockedAgentId?: string
   /**
    * The conversation's persisted pick (agent + model + thought level), when one
    * exists. This is what the composer reads BEFORE the conversation has an ACP
@@ -468,6 +506,17 @@ export interface AcpConversationChoice {
   /** The ACP agent serving this conversation. */
   agentId: string
   /**
+   * Whether this conversation has LOCKED its agent: its first ACP turn has
+   * STARTED. From then on the agent cannot be switched — a different agent has
+   * none of the context — so the composer hides its picker and the host
+   * refuses `session/chat-bind` to another agent (`agent_locked`). The lock is
+   * provisional until that turn produces a visible block: a first turn that
+   * delivers nothing is rolled back and the conversation is free again. Once
+   * delivered, the lock is permanent; start a new conversation to use another
+   * agent.
+   */
+  locked?: boolean
+  /**
    * The agent's model as an adapter model id (`agentId` = the agent's default,
    * `agentId@choice` = an explicit variant). Absent means "the agent's default".
    */
@@ -508,8 +557,12 @@ export interface AgentProbeModelsResult {
  * to filter the global catalog with, so "advertise nothing" is the only
  * structurally honest isolation.
  *
- * Read-only and memory-only: it never spawns. An agent without a cached
- * catalog merely gets a background probe, exactly like the old selector path.
+ * Read-only and memory-only: it never spawns and never starts a probe, not
+ * even for an agent with no cached catalog — that case is reported honestly
+ * (`probed: false`, `base` entry only). A catalog fills only from a gesture:
+ * the agent's own `session/new` / `session/load`, the settings card's
+ * `agent/probe-models` button, or an on-disk cache. (Boot-time probing used
+ * to exist and no longer does — see `BridgeManager.bootstrapCatalogs`.)
  */
 export interface AgentCatalogResult {
   agentId: string
