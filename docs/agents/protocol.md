@@ -38,9 +38,11 @@
 
 ## 5. 空闲释放
 
-- **范围**：`AgentBridge.releaseIfIdle` 只释放 `state === 'ready'` 且没有 live session、没有 `pendingProbes` / `resuming` / 待答审批的 bridge。该判据由 `isQuiet()` 独占实现，工作区就地重启复用同一谓词。**严禁**释放有活动会话的 agent——那是把常驻进程问题换成每条消息一次冷启动。
+- **范围**：`AgentBridge.releaseIfIdle` 只释放 `state === 'ready'` 且 `hasActiveWork() === false` 的 bridge。活跃 = 有进行中的 turn（含已 abort、agent 尚未结算，`running || settled`）、待答审批、mode/config 命令在途（`pendingCommands`）、`pendingProbes` / `resuming` / `starting`。**空闲的 live 会话不算活跃**：释放把它们挂起为 `released`（不是关闭），下一条消息经 `session/load` 恢复，30 分钟窗口因此对聊天进程真正生效。
+- **可恢复性闸门**：agent 未声明 `loadSession` 时，有 live 会话的 bridge 不释放——无法 reload 的会话会在下一条消息时丢失上下文；这类 agent 仍等价于旧的「无 live 会话才释放」。
+- **工作区搬迁不共用这条放宽**：`ensureReady` 的就地重启仍要求 `isQuiet()`（无 live 会话且无活跃工作），避免多个工作区的会话互相把进程搬来搬去。两个谓词共享 `hasActiveWork()`，「无 live 会话」只属于搬迁。
 - **动作**：必须走 `releaseAll(reason)` 而不是 `stop()`——`stop` 会 `released.clear()`，毁掉尚未恢复的会话上下文。释放**静默进行，严禁广播 `agent/notice`**；`agent/notice` 只留给异常或伴随用户动作的事件（探测失败、权限超时、就地搬迁工作区）。
-- **计时**：只有 `ready` 才武装定时器，延迟按 `lastActivityAt + currentIdleTimeoutMs` 计算；判定为「忙」时必须 `touch()` 重置窗口，否则会以 0ms 延迟自旋。
+- **计时**：只有 `ready` 才武装定时器，窗口从 `lastActivityAt` 起算；`touch()` 会清掉已武装的定时器并按最新活动重排，因此窗口永远量到「最近一次活动」而不是更早的武装时刻。判定为「忙」时必须 `touch()` 重置窗口，否则会以 0ms 延迟自旋。
 - **两档窗口**（`currentIdleTimeoutMs`）：
   - 从未登记过真实会话的 bridge（`everHostedSession === false`，探测拉起的进程，`probeConfigOptions` 刻意不登记会话）走 `DEFAULT_TUNING.probeIdleTimeoutMs`（默认 5 分钟）。`def.idleTimeoutMs`（含 `0` = 永不释放）是关于聊天进程的承诺，不管探测进程。
   - 第一个登记的会话（`createSession` / `doResumeSession`）把 bridge 翻转为 `def.idleTimeoutMs ?? DEFAULT_TUNING.idleTimeoutMs`（默认 30 分钟；`0` = 永不释放；`validateAgentDef` 只接受 0 或 [1000, 86400000] 的整数）。翻转时必须 `clearIdleTimer()` 再 `touch()` 重排。

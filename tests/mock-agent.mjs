@@ -97,7 +97,7 @@ const app = agent({ name: 'mock-acp-agent' })
   .onRequest(methods.agent.initialize, () => ({
     protocolVersion: PROTOCOL_VERSION,
     agentCapabilities: {
-      loadSession: true,
+      loadSession: process.env.MOCK_NO_LOAD !== '1',
       sessionCapabilities: { close: {} },
       promptCapabilities: { image: false, audio: false, embeddedContext: false },
     },

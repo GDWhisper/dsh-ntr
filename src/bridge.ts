@@ -308,12 +308,14 @@ export class AgentBridge {
   private readonly turnSettleMs: number
   private readonly defaultIdleTimeoutMs: number
   private readonly probeIdleTimeoutMs: number
-  /** Armed while READY; fires the idle-release check (never per-event). */
+  /** Armed while READY; fires the idle-release check. */
   private idleTimer?: ReturnType<typeof setTimeout>
   /** Last observable activity; the idle window is measured from here. */
   private lastActivityAt = 0
   /** Throwaway catalog probes in flight — they hold no live session of their own. */
   private pendingProbes = 0
+  /** Host→agent session commands in flight (mode / config); not turns. */
+  private pendingCommands = 0
   /**
    * Whether a REAL session has ever been registered on this bridge. Probes
    * bypass session bookkeeping, so a bridge that has never hosted anything was
@@ -396,17 +398,19 @@ export class AgentBridge {
   /**
    * Restart the idle-release clock. Every observable activity calls this, so a
    * bridge is only ever released after a FULL quiet window — never while it is
-   * being used.
+   * being used. Rescheduling here keeps the window measured from the LATEST
+   * activity; letting an already-armed timer fire early would not.
    */
   private touch(): void {
     this.lastActivityAt = Date.now()
+    this.clearIdleTimer()
     this.armIdleRelease()
   }
 
   /**
-   * Arm the single idle timer. The delay is what is left of the window measured
-   * from the last activity, so a timer that fires early (one timer is armed and
-   * not rescheduled per event) self-corrects rather than releasing a busy agent.
+   * Arm the single idle timer for a full window from the last activity. The
+   * callback re-checks {@link canIdleRelease} anyway, so a late activity that
+   * lands while it runs can only postpone the release.
    */
   private armIdleRelease(): void {
     if (this.currentIdleTimeoutMs <= 0 || this.state !== 'ready' || this.idleTimer !== undefined) return
@@ -431,10 +435,10 @@ export class AgentBridge {
    * exactly such children, see {@link probeConfigOptions}), the agent's own
    * residency window once a real session has landed.
    *
-   * Deliberately scoped to bridges with NO live session: killing a process the
-   * user is chatting with would trade a resident process for a cold start on the
-   * next message. Parked `released` records do not block a release and survive
-   * it — they are resumable on a fresh child by design (`session/load`).
+   * Scoped to bridges with no ACTIVE work, not merely no live session: an idle
+   * conversation should not keep a process resident forever. Releasing parks its
+   * sessions as `released` (not closed), and the next prompt resumes them on a
+   * fresh child through `session/load` — the same path a crash uses.
    *
    * `releaseAll` (not `stop`) is the right teardown: `stop` drops resumable
    * records, which would destroy the context of sessions parked by an earlier
@@ -448,7 +452,7 @@ export class AgentBridge {
    */
   private releaseIfIdle(): void {
     if (this.state !== 'ready') return
-    if (!this.isQuiet()) {
+    if (!this.canIdleRelease()) {
       // Busy after all: the quiet window starts now, not at the last event.
       this.touch()
       return
@@ -547,18 +551,43 @@ export class AgentBridge {
   }
 
   /**
-   * Nothing depends on this child's identity right now: no live session, no
-   * probe, no resume, no open permission ask, nothing starting. The one shared
-   * predicate behind both the idle release and the workspace move below — two
-   * copies of it would drift, and "is it safe to drop this child" is exactly
-   * the question that must never be answered twice, differently.
+   * Work a teardown would interrupt: a turn in flight (or one the agent is
+   * still settling after an abort), a permission ask waiting for an answer, a
+   * probe, a resume, or a start. A registered-but-idle session is NOT work.
+   */
+  private hasActiveWork(): boolean {
+    if (this.pendingProbes > 0
+      || this.pendingCommands > 0
+      || this.resuming.size > 0
+      || this.permissions.sessionIds().length > 0
+      || this.starting !== undefined) return true
+    for (const session of this.sessions.values()) {
+      if (session.running || session.settled !== undefined) return true
+    }
+    return false
+  }
+
+  /**
+   * Nothing depends on this child's identity right now: no live session and no
+   * work. This is the WORKSPACE MOVE's predicate. It stays stricter than the
+   * idle release on purpose: an idle live session still pins the process to its
+   * spawn cwd (see `ensureReady`), so moving would trade workspace-aware agent
+   * state for a restart on every cross-workspace turn.
    */
   private isQuiet(): boolean {
-    return this.sessions.size === 0
-      && this.pendingProbes === 0
-      && this.resuming.size === 0
-      && this.permissions.sessionIds().length === 0
-      && this.starting === undefined
+    return this.sessions.size === 0 && !this.hasActiveWork()
+  }
+
+  /**
+   * An idle teardown is safe when nothing is WORKING. Idle live sessions do not
+   * block it: `releaseAll` parks them as `released` (never closed), and the next
+   * prompt brings them back with `session/load`. The exception is an agent that
+   * does not advertise `loadSession`: releasing would lose a conversation it
+   * cannot reload, so there the old session-less rule stands.
+   */
+  private canIdleRelease(): boolean {
+    if (this.hasActiveWork()) return false
+    return this.sessions.size === 0 || this.initResult?.agentCapabilities?.loadSession === true
   }
 
   /**
@@ -819,10 +848,12 @@ export class AgentBridge {
     if (conn === undefined || session.closed || session.released) throw new AcpError('session_closed', 'acp: session is closed')
     this.touch()
     for (let attempt = 0; ; attempt += 1) {
+      // The response is activity too: the idle window must start at the turn's
+      // END, not at the prompt that may have started a long time ago.
       const result = await conn.agent.request(methods.agent.session.prompt, {
         sessionId: session.acpSessionId,
         prompt: [{ type: 'text', text }],
-      })
+      }).finally(() => { this.touch() })
       if (result.stopReason !== 'cancelled' || session.cancelRequestedAtTurn === session.turnSeq) {
         return result.stopReason
       }
@@ -970,7 +1001,7 @@ export class AgentBridge {
     }
   }
 
-  /** Release all live sessions (agent process died): keep them resumable, settle permissions, drop the connection. */
+  /** Release all live sessions (process died or went idle): keep them resumable, settle permissions, drop the connection. */
   releaseAll(reason: string): void {
     this.clearIdleTimer()
     for (const session of [...this.sessions.values()]) {
@@ -1018,11 +1049,22 @@ export class AgentBridge {
     return this.resuming.get(sessionId)
   }
 
+  /** Run one host→agent command as work, so an idle teardown cannot cut it. */
+  private async runCommand<T>(request: () => Promise<T>): Promise<T> {
+    this.pendingCommands += 1
+    this.touch()
+    try {
+      return await request()
+    } finally {
+      this.pendingCommands -= 1
+      this.touch()
+    }
+  }
+
   async setMode(session: LiveSession, modeId: string): Promise<void> {
     const conn = this.conn
     if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
-    this.touch()
-    await conn.agent.request(methods.agent.session.setMode, { sessionId: session.acpSessionId, modeId })
+    await this.runCommand(() => conn.agent.request(methods.agent.session.setMode, { sessionId: session.acpSessionId, modeId }))
     // Well-behaved agents push `current_mode_update`, but the spec does not
     // require it — apply locally so the browser selector never goes stale.
     if (session.modes !== undefined) session.modes = { ...session.modes, currentModeId: modeId }
@@ -1032,8 +1074,7 @@ export class AgentBridge {
   async setConfigOption(session: LiveSession, configId: string, value: string | boolean): Promise<void> {
     const conn = this.conn
     if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
-    this.touch()
-    const result = await conn.agent.request(methods.agent.session.setConfigOption, { sessionId: session.acpSessionId, configId, value }) as { configOptions?: unknown }
+    const result = await this.runCommand(() => conn.agent.request(methods.agent.session.setConfigOption, { sessionId: session.acpSessionId, configId, value })) as { configOptions?: unknown }
     // The response carries the full authoritative option set; some agents
     // (pi-acp observed) never re-notify after a client-driven set. It feeds the
     // SESSION snapshot only — never the agent-level catalog: `currentValue` in
@@ -1051,8 +1092,8 @@ export class AgentBridge {
   async closeSession(session: LiveSession, reason: 'closed' | 'agent-stopped' | 'agent-died'): Promise<void> {
     if (session.closed) return
     session.closed = true
-    // Closing the last session is what makes a chat agent idle: start the
-    // window here rather than at the prompt that opened it.
+    // Closing a session is activity of its own: restart the idle window here
+    // rather than at the prompt that opened it.
     this.touch()
     const conn = this.conn
     if (conn !== undefined && this.state === 'ready') {

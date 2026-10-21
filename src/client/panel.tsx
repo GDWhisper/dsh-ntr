@@ -1054,8 +1054,8 @@ function AgentDetails({
                 'Must be 0 (never release) or an integer in [1000, 86400000] ms.',
               )
               : acp.label(
-                '没有活动会话时，空闲超过此时长就释放进程（下次使用自动重启并恢复会话）；0 = 永不释放；有活动会话的进程不会被释放。此窗口只对承载过会话的进程生效：保存后拉起的模型探测进程（面板显示「已连接」的那个）固定 5 分钟释放，填 0 也拦不住。',
-                'With no live session, the process is released once it has been idle this long (the next use restarts it and resumes the session); 0 = never; a process with a live session is never released. This window applies only to a process that has hosted a session: the model-probe process (the one the panel shows as "connected" after a save) is always released after 5 minutes, and 0 does not stop it.',
+                '没有进行中的回合或待答审批时，空闲超过此时长就挂起进程（会话保留，下一条消息自动重启并恢复）；0 = 永不释放；有回合在跑、取消尚未结算或审批待答的进程不会被释放。此窗口只对承载过会话的进程生效：保存后拉起的模型探测进程（面板显示「已连接」的那个）固定 5 分钟释放，填 0 也拦不住。',
+                'With no turn in flight or approval awaiting an answer, the process is parked once it has been idle this long (sessions are kept and resume on the next message); 0 = never; a process with a running turn, an unsettled cancel, or a pending approval is never released. This window applies only to a process that has hosted a session: the model-probe process (the one the panel shows as "connected" after a save) is always released after 5 minutes, and 0 does not stop it.',
               )}
           </span>
         </div>

@@ -2300,19 +2300,59 @@ describe('idle release (isolated manager)', () => {
     }
   }, 30_000)
 
-  it('holds a live session\u2019 process and releases it once the session closes', async () => {
-    const { manager } = idleManager('idle-live', { idleTimeoutMs: 200 })
+  it('releases an idle chat process on the chat window and resumes its session on the next prompt', async () => {
+    const { events, manager } = idleManager('idle-live', { idleTimeoutMs: 200 })
     try {
       const { sessionId } = await manager.startSession('idle-live', undefined)
-      await new Promise(resolve => setTimeout(resolve, 700))
-      // Two full windows elapsed: a session the user may still type into keeps
-      // its process (the whole point of scoping the release to session-less
-      // bridges).
-      expect(manager.agentViews()[0]).toMatchObject({ state: 'ready', liveSessions: [sessionId] })
-      await manager.closeSession(sessionId)
+      // An idle conversation does not keep the process resident: the window
+      // passes and the bridge parks the session.
       expect(await waitUntil(() => manager.agentViews()[0]?.state === 'stopped')).toBe(true)
-      // Releasing is not closing: the record stays resumable.
-      expect(manager.sessions()).toEqual([])
+      expect(manager.agentViews()[0]?.liveSessions).toEqual([])
+      expect(manager.sessions()).toEqual([expect.objectContaining({ sessionId, released: true })])
+      expect(events.some(event => event.type === 'session/released' && event.sessionId === sessionId)).toBe(true)
+      expect(events.some(event => event.type === 'agent/notice')).toBe(false)
+
+      // Releasing is not closing: the next prompt respawns and reloads it.
+      await manager.prompt(sessionId, 'back again')
+      expect(await waitUntil(() => events.some(event => event.type === 'turn/end'
+        && event.sessionId === sessionId && event.stopReason === 'end_turn'))).toBe(true)
+      expect(manager.agentViews()[0]?.liveSessions).toEqual([sessionId])
+      const { entries } = manager.transcript(sessionId, undefined)
+      const text = (entries as Array<{ update: Record<string, unknown> }>)
+        .filter(entry => entry.update.sessionUpdate === 'agent_message_chunk')
+        .map(entry => String((entry.update.content as { text?: string }).text ?? ''))
+        .join('')
+      expect(text).toContain('REPLAYED: earlier conversation')
+      expect(text).toContain('MOCK: echo back again')
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
+  it('holds the process while a turn is running, then releases it once the turn settles', async () => {
+    const { manager } = idleManager('idle-busy', { idleTimeoutMs: 200 })
+    try {
+      const { sessionId } = await manager.startSession('idle-busy', undefined)
+      await manager.prompt(sessionId, 'SLOW please')
+      // Two full windows pass while the turn is in flight: being registered is
+      // not enough, but RUNNING definitely blocks the release.
+      await new Promise(resolve => setTimeout(resolve, 700))
+      expect(manager.agentViews()[0]).toMatchObject({ state: 'ready', liveSessions: [sessionId] })
+      await manager.cancel(sessionId)
+      expect(await waitUntil(() => manager.agentViews()[0]?.state === 'stopped')).toBe(true)
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
+  it('does not release a process whose agent cannot reload the session', async () => {
+    const { manager } = idleManager('idle-no-load', { idleTimeoutMs: 200 }, { env: { MOCK_NO_LOAD: '1' } })
+    try {
+      const { sessionId } = await manager.startSession('idle-no-load', undefined)
+      await new Promise(resolve => setTimeout(resolve, 700))
+      // Without `loadSession`, releasing would destroy a conversation that the
+      // next prompt could not bring back — the session-less rule still stands.
+      expect(manager.agentViews()[0]).toMatchObject({ state: 'ready', liveSessions: [sessionId] })
     } finally {
       await manager.shutdownAll()
     }
