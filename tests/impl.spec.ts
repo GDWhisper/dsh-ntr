@@ -4,9 +4,9 @@ import {
   EventHub,
   PermissionLedger,
   Transcript,
-  acpToolActivityLine,
-  acpToolActivityOutput,
-  acpToolInputOf,
+  acpToolCallArgsOf,
+  acpToolCallDelta,
+  acpToolCallFromUpdate,
   buildAdapterModelId,
   describeUnhandledUpdate,
   updateContentToText,
@@ -15,6 +15,7 @@ import {
   dispatchRpc,
   ACP_PRESET_SOURCE,
   acpPresetStatusFromRoster,
+  isAcpToolContinuation,
   isAbsolutePath,
   isUnderPath,
   parseCatalogOptions,
@@ -42,7 +43,6 @@ function agentDef(overrides: Partial<AcpAgentDef> = {}): AcpAgentDef {
     command: 'demo-agent',
     args: [],
     env: {},
-    permission: 'ask',
     cwd: '/work',
     allowedCwdRoots: ['/work'],
     ...overrides,
@@ -52,7 +52,7 @@ function agentDef(overrides: Partial<AcpAgentDef> = {}): AcpAgentDef {
 describe('validateConfig', () => {
   it('applies defaults', () => {
     const config = validateConfig({ agents: [{ id: 'a', command: 'run-a' }] })
-    expect(config.agents[0]).toMatchObject({ id: 'a', title: 'a', args: [], env: {}, permission: 'ask', allowedCwdRoots: [] })
+    expect(config.agents[0]).toMatchObject({ id: 'a', title: 'a', args: [], env: {}, allowedCwdRoots: [] })
     expect(config.transcriptMaxEntries).toBe(600)
   })
   it('derives allowedCwdRoots from cwd', () => {
@@ -103,7 +103,7 @@ describe('validateConfig', () => {
 })
 
 describe('parseCatalogOptions', () => {
-  it('extracts model and thought_level categories from spec-shaped options', () => {
+  it('extracts model and thought_level categories and collects the remaining selects as extras', () => {
     const catalog = parseCatalogOptions([
       { configId: 'model', name: 'Model', type: 'select', category: 'model', currentValue: 'a', options: [
         { value: 'a', name: 'Model A' },
@@ -124,9 +124,14 @@ describe('parseCatalogOptions', () => {
     })
     expect(catalog.thought?.configId).toBe('think')
     expect(catalog.thought?.currentValue).toBe('high')
+    // Every other SELECT is an extra (the composer's advanced base); a boolean
+    // carries no choices and is skipped.
+    expect(catalog.extras).toEqual([
+      { configId: 'temp', name: 'Temp', currentValue: 'mid', choices: [{ value: 'mid', name: 'mid' }] },
+    ])
   })
 
-  it('falls back to the legacy id field, flattens grouped options, dedupes, and skips unknown categories', () => {
+  it('falls back to the legacy id field, flattens grouped options, dedupes, and keeps unknown categories as extras', () => {
     const catalog = parseCatalogOptions([
       { id: 'model', category: 'model', currentValue: 'x', options: [
         { groupId: 'g', name: 'Group G', options: [{ value: 'x', name: 'X' }, { value: 'z', name: 'Z', description: 'own text' }] },
@@ -145,6 +150,9 @@ describe('parseCatalogOptions', () => {
       { value: 'y', name: 'y' },
     ])
     expect(catalog.thought).toBeUndefined()
+    expect(catalog.extras).toEqual([
+      { configId: 'weird', name: 'weird', currentValue: 'z', choices: [{ value: 'z', name: 'Z' }] },
+    ])
   })
 
   it('returns an empty catalog for non-arrays and choice-less options', () => {
@@ -173,11 +181,19 @@ describe('parseCatalogOptions', () => {
       currentValue: 'default',
       choices: [{ value: 'default', name: 'Always Ask' }, { value: 'plan', name: 'Plan' }],
     })
-    // `sandbox` and vendor extensions stay unparsed: they have no control, and
-    // half-reading them would be worse than not reading them at all.
+    // Unknown / vendor categories (and options with no category at all) are
+    // surfaced as extras: the advanced base gives them a control instead of
+    // dropping them on the floor.
     expect(parseCatalogOptions([
       { configId: 'sandbox', category: 'sandbox', currentValue: 'false', options: [{ value: 'false', name: 'Local' }] },
-    ])).toEqual({})
+    ])).toEqual({
+      extras: [{
+        configId: 'sandbox',
+        name: 'sandbox',
+        currentValue: 'false',
+        choices: [{ value: 'false', name: 'Local' }],
+      }],
+    })
   })
 })
 
@@ -226,46 +242,75 @@ describe('selectForwardPrompt (host request → forwarded ACP prompt)', () => {
   })
 })
 
-const TOOL_ACTIVITY_LINES = ['🛠️'] as const
-
-describe('ACP tool activity → inline chat text', () => {
-  it('names the call, what it was asked, and where it stands', () => {
-    expect(acpToolActivityLine('mock tool', '{"cmd":"ls -la"}', 'pending'))
-      .toBe('\n🛠️ **mock tool** · pending · `{"cmd":"ls -la"}`\n')
-    // A single-line input stays on the headline; a multi-line one gets a fence
-    // so the plane's markdown cannot read it as prose.
-    expect(acpToolActivityLine('Read', 'one\ntwo', ''))
-      .toBe('\n🛠️ **Read**\n```\none\ntwo\n```\n')
-    // An agent that discloses nothing still gets an honest line, not a blank.
-    expect(acpToolActivityLine('', '', '')).toBe('\n🛠️ **tool**\n')
-  })
-
-  it('fences what a tool printed, and folds backticks that would close the code span', () => {
-    expect(acpToolActivityOutput('tool result line')).toBe('\n```\ntool result line\n```\n')
-    expect(acpToolActivityLine('Bash', 'echo `hi`', '')).toContain("`echo 'hi'`")
+describe('ACP tool-call notifications → tool-call stream chunks', () => {
+  it('folds an announcement into a snapshot: id, title, and whatever input it disclosed', () => {
+    expect(acpToolCallFromUpdate({ toolCallId: ' c1 ', title: 'Bash', rawInput: '{"cmd":"ls"}' }))
+      .toEqual({ callId: 'c1', name: 'Bash', argsRaw: '{"cmd":"ls"}' })
+    // No id is not a tool call; no title and no input are legal ACP — an
+    // honest empty card, not a fabricated placeholder.
+    expect(acpToolCallFromUpdate({ title: 'no id' })).toBeUndefined()
+    expect(acpToolCallFromUpdate({ toolCallId: 'c2' })).toEqual({ callId: 'c2', name: '', argsRaw: '' })
   })
 
   it('reads the input spellings agents use in the wild, and nothing when they send none', () => {
-    expect(acpToolInputOf({ rawInput: '{"a":1}' })).toBe('{"a":1}')
-    expect(acpToolInputOf({ arguments: 'plain' })).toBe('plain')
-    expect(acpToolInputOf({ arguments: { a: 1 } })).toBe('{"a":1}')
+    expect(acpToolCallArgsOf({ rawInput: '{"a":1}' })).toBe('{"a":1}')
+    expect(acpToolCallArgsOf({ arguments: 'plain' })).toBe('plain')
+    expect(acpToolCallArgsOf({ arguments: { a: 1 } })).toBe('{"a":1}')
     // An array (batched input) is an argument spelling too, not an empty one.
-    expect(acpToolInputOf({ arguments: [{ a: 1 }] })).toBe('[{"a":1}]')
+    expect(acpToolCallArgsOf({ arguments: [{ a: 1 }] })).toBe('[{"a":1}]')
     // An unserializable value degrades to text rather than failing the turn.
     const circular: Record<string, unknown> = {}
     circular.self = circular
-    expect(acpToolInputOf({ arguments: circular })).toBe('[object Object]')
+    expect(acpToolCallArgsOf({ arguments: circular })).toBe('[object Object]')
     // No input at all is legal ACP: `''`, not a fabricated placeholder.
-    expect(acpToolInputOf({ toolCallId: 'c' })).toBe('')
+    expect(acpToolCallArgsOf({ toolCallId: 'c' })).toBe('')
   })
 
-  it('opens every line with the tool glyph so the plane cannot read it as prose', () => {
-    for (const line of [
-      acpToolActivityLine('t', 'input', 'completed'),
-      acpToolActivityLine('t', '', ''),
-    ]) {
-      expect(line).toContain(TOOL_ACTIVITY_LINES[0] as string)
-    }
+  it('emits deltas only for true prefix extensions; replacements move the snapshot for the closing block', () => {
+    // The accumulator CONCATENATES `argumentsDelta`, while ACP restates the
+    // whole input: only a real prefix extension can become a delta.
+    let snapshot = acpToolCallFromUpdate({ toolCallId: 't1', title: 'first tool', rawInput: '{"cmd":"' })!
+    expect(acpToolCallDelta(snapshot, { toolCallId: 't1', rawInput: '{"cmd":"ls -la"}' }))
+      .toEqual([{ kind: 'args', text: 'ls -la"}' }])
+    expect(snapshot.argsRaw).toBe('{"cmd":"ls -la"}')
+    // A rewrite (not an extension) has no honest delta: the snapshot moves,
+    // and the closing `block-end` replaces the block wholesale.
+    snapshot = acpToolCallFromUpdate({ toolCallId: 't1', rawInput: '{"cmd":""}' })!
+    expect(acpToolCallDelta(snapshot, { toolCallId: 't1', rawInput: '{"cmd":"ls -la"}' })).toEqual([])
+    expect(snapshot.argsRaw).toBe('{"cmd":"ls -la"}')
+    // A retitle is a name delta; input outranks content for the args text,
+    // and content only fills a call whose agent never sent input at all.
+    snapshot = acpToolCallFromUpdate({ toolCallId: 't1', title: 'a' })!
+    expect(acpToolCallDelta(snapshot, { toolCallId: 't1', title: 'b', content: [{ type: 'content', content: { type: 'text', text: 'OUT' } }] }))
+      .toEqual([{ kind: 'name', name: 'b' }, { kind: 'args', text: 'OUT' }])
+    expect(snapshot.argsRaw).toBe('OUT')
+  })
+
+  it('recognizes the continuation steps of a card-bearing turn, and only those', () => {
+    // Tool-sourced messages AFTER the last user one: the staged results the
+    // host loop feeds a card-bearing turn's next step with.
+    expect(isAcpToolContinuation([
+      { role: 'user', source: { kind: 'user' } },
+      { role: 'tool', source: { kind: 'tool', callId: 'c1' } },
+    ])).toBe(true)
+    // The person's new words are the last message: a fresh prompt.
+    expect(isAcpToolContinuation([
+      { role: 'tool', source: { kind: 'tool', callId: 'c1' } },
+      { role: 'user', source: { kind: 'user' } },
+    ])).toBe(false)
+    // History from earlier turns sits BEFORE the new user text.
+    expect(isAcpToolContinuation([
+      { role: 'tool', source: { kind: 'tool', callId: 'c0' } },
+      { role: 'user', source: { kind: 'user' } },
+      { role: 'tool', source: { kind: 'tool', callId: 'c1' } },
+    ])).toBe(true)
+    // A source-less message counts as user input (the hand-built convention).
+    expect(isAcpToolContinuation([
+      { role: 'tool', source: { kind: 'tool', callId: 'c1' } },
+      { role: 'user' },
+    ])).toBe(false)
+    expect(isAcpToolContinuation([{ role: 'user', source: { kind: 'user' } }])).toBe(false)
+    expect(isAcpToolContinuation([])).toBe(false)
   })
 
   it('keeps the content kinds the Chat plane cannot render, instead of placeholders', () => {
@@ -304,7 +349,6 @@ describe('validateAgentDef', () => {
       command: 'pi-acp',
       args: [],
       env: {},
-      permission: 'ask',
       cwd: undefined,
       allowedCwdRoots: [],
     })
@@ -720,7 +764,6 @@ function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } {
     bindChatAgent: (dshSessionId, agentId) => { calls.push(['bindChatAgent', dshSessionId, agentId]) },
     setChatSessionModel: async (dshSessionId, modelId) => { calls.push(['setChatSessionModel', dshSessionId, modelId]) },
     setChatSessionEffort: async (dshSessionId, effort) => { calls.push(['setChatSessionEffort', dshSessionId, effort]) },
-    setPermission: async (id, p) => { calls.push(['setPermission', { id, p }]) },
     detectAgents: async () => { calls.push(['detect', undefined]); return [] },
     saveAgent: async def => { calls.push(['save', def]) },
     deleteAgent: async id => { calls.push(['delete', id]) },
@@ -857,9 +900,6 @@ describe('dispatchRpc', () => {
     await expect(dispatchRpc(manager, 'session/chat-effort-set', { dshSessionId: 'chat-1' })).resolves.toEqual({ ok: true, value: { done: true } })
     expect(manager.calls).toContainEqual(['setChatSessionEffort', 'chat-1', undefined])
     await expect(dispatchRpc(manager, 'session/chat-bind', { dshSessionId: 'chat-1' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
-    await expect(dispatchRpc(manager, 'agent/set-permission', { agentId: 'custom', permission: 'allow' })).resolves.toEqual({ ok: true, value: { done: true } })
-    expect(manager.calls).toContainEqual(['setPermission', { id: 'custom', p: 'allow' }])
-    await expect(dispatchRpc(manager, 'agent/set-permission', { agentId: 'custom', permission: 'invalid' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     await expect(dispatchRpc(manager, 'agent/probe-models', { agentId: 'pi' })).resolves.toMatchObject({
       ok: true,
       value: { agentId: 'pi', catalog: { model: { configId: 'model' } } },

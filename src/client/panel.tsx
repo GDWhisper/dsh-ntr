@@ -19,7 +19,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { formatCommandLine, isAbsolutePathLike, splitCommandLine } from './acp-ui.tsx'
 import { DEFAULT_KNOWN_PRESETS } from './store.ts'
 import type { AcpStore, UiState } from './store.ts'
-import type { AcpAgentDef, AcpCatalogChoice, AgentSavePayload, AgentView, DetectedAgentInfo, PermissionMode } from '../protocol.ts'
+import type { AcpAgentDef, AcpCatalogChoice, AgentSavePayload, AgentView, DetectedAgentInfo } from '../protocol.ts'
 
 interface WithStore { acp: AcpStore }
 
@@ -57,6 +57,9 @@ const STYLE = `
 .dwa-btn-danger { color: var(--ntr-danger); border-color: #fca5a5; }
 .dwa-btn-danger:hover { background: #fee2e2; }
 .dwa-btn-secondary { background: var(--dsw-alias-bg-layer-2, #f3f4f6); border-color: var(--dsw-alias-border-l2, #d1d5db); }
+.dwa-caret { font-size: 16px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; width: 1em; }
+.dwa-caret-btn { font: inherit; border: none; background: none; padding: 2px 4px; border-radius: var(--ntr-radius-sm); display: inline-flex; align-items: center; color: inherit; cursor: pointer; }
+.dwa-caret-btn:hover { background: var(--dsw-alias-interactive-bg-active, #0000000d); }
 .dwa-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
 .dwa-badge { font-size: var(--ntr-font-xs); border-radius: 4px; padding: 2px 8px; background: #6b728022; font-weight: 500; display: inline-flex; align-items: center; gap: var(--ntr-gap-1); }
 .dwa-badge-success { background: #22c55e22; color: #16a34a; font-weight: 600; }
@@ -226,7 +229,6 @@ function persistedDef(detected: DetectedAgentInfo, activeAgent: AgentView | unde
     title: activeAgent.title,
     command: activeAgent.command,
     args: [...activeAgent.args],
-    permission: activeAgent.permission,
     ...(activeAgent.cwd === undefined ? {} : { cwd: activeAgent.cwd }),
     allowedCwdRoots: [...activeAgent.allowedCwdRoots],
     env: {},
@@ -246,7 +248,6 @@ function payloadEquals(payload: AgentSavePayload, current: AcpAgentDef): boolean
   if ((payload.title ?? payload.id) !== (current.title ?? current.id)) return false
   if (!sameStringArray(payload.args ?? [], current.args ?? [])) return false
   if ((payload.npmPackage ?? '') !== (current.npmPackage ?? '')) return false
-  if (payload.permission !== (current.permission ?? 'ask')) return false
   if ((payload.cwd ?? '') !== (current.cwd ?? '')) return false
   if (!sameStringArray(payload.allowedCwdRoots ?? [], current.allowedCwdRoots ?? [])) return false
   if (!sameStringMap(payload.env ?? {}, current.env ?? {})) return false
@@ -429,7 +430,7 @@ export function AcpSettingsSection(props: WithStore) {
           click. Selection follows the first available preset until pinned. */}
       <div>
         <button type="button" className="dwa-btn dwa-btn-secondary" onClick={() => setAddOpen(open => !open)}>
-          {addOpen ? '▾' : '▸'} {acp.label('Agent 列表', 'Agent List')}
+          <span className="dwa-caret" aria-hidden>{addOpen ? '▾' : '▸'}</span> {acp.label('Agent 列表', 'Agent List')}
         </button>
         {addOpen && (
           <div style={{ marginTop: 12 }}>
@@ -601,13 +602,12 @@ function AgentRow({
       <div className="dwa-agent-row">
         <button
           type="button"
-          className="dwa-btn"
-          style={{ border: 'none', background: 'none', padding: '0 4px', fontSize: 12 }}
+          className="dwa-caret-btn"
           aria-expanded={open}
           onClick={() => setExpanded(value => !value)}
           title={open ? acp.label('收起', 'Collapse') : acp.label('展开配置与模型', 'Expand configuration and models')}
         >
-          {open ? '▾' : '▸'}
+          <span className="dwa-caret" aria-hidden>{open ? '▾' : '▸'}</span>
         </button>
         {state !== undefined && <span className="dwa-dot" style={{ background: state.color }} title={state.title ?? activeAgent?.state} />}
         <span className="dwa-agent-name" title={detected.executablePath ?? detected.description}>{displayName}</span>
@@ -704,7 +704,6 @@ interface AgentForm {
    */
   commandLine: string
   npmPackage: string
-  permission: PermissionMode
   cwd: string
   /** Advanced: edit every allowed root, not just the single workspace dir. */
   rootsOpen: boolean
@@ -744,7 +743,6 @@ function initialForm(detected: DetectedAgentInfo, activeAgent: AgentView | undef
       activeAgent?.args ?? config?.args ?? detected.defaultArgs,
     ),
     npmPackage: config?.npmPackage ?? '',
-    permission: activeAgent?.permission ?? config?.permission ?? 'ask',
     cwd: activeAgent?.cwd ?? config?.cwd ?? '',
     // An agent already carrying more than one root opens in advanced mode:
     // single-root mode narrows the allow-list to `cwd` on save, which must
@@ -799,7 +797,6 @@ function buildPayload(form: AgentForm, detected: DetectedAgentInfo, newCustom: b
     command: parsed.command,
     args: parsed.args,
     ...(form.npmPackage.trim() === '' ? {} : { npmPackage: form.npmPackage.trim() }),
-    permission: form.permission,
     env,
     ...(form.exposed === undefined ? {} : { exposedModels: form.exposed }),
     ...(form.autoDiscoverModels ? { autoDiscoverModels: true } : {}),
@@ -949,7 +946,7 @@ function AgentDetails({
           aria-expanded={advancedOpen}
           onClick={() => setAdvancedOpen(value => !value)}
         >
-          {advancedOpen ? '▾' : '▸'} {acp.label('高级参数', 'Advanced Parameters')}
+          <span className="dwa-caret" aria-hidden>{advancedOpen ? '▾' : '▸'}</span> {acp.label('高级参数', 'Advanced Parameters')}
         </button>
         {!advancedOpen && (cwdInvalid || rootsInvalid) && (
           <span className="dwa-error">
@@ -989,34 +986,6 @@ function AgentDetails({
             onChange={e => patch({ npmPackage: e.target.value })}
             placeholder={acp.label('原生支持 ACP 的 agent 无需填写', 'Not needed for agents with native ACP support')}
           />
-        </div>
-      </div>
-
-      {/* The agent's OWN permission field (see `AgentBridge.handlePermissionRequest`):
-          whether the agent asks a human at all. It is the only knob — the host
-          arbitrates nothing in front of the agent. With `ask` the question is
-          mapped through unchanged and surfaces in the chat composer when the
-          host approval chain exists (see `approvalRouted`); whatever does not
-          reach the conversation — no chain, no chat identity, or a degraded
-          route — falls back to the ledger card at the top of this page (see
-          `permissionLedgerCard`). `allow`/`reject` never surface anything. */}
-      <div className="dwa-form-row">
-        <div className="dwa-form-col" style={{ flex: 2 }}>
-          <label className="dwa-form-label">{acp.label('agent 自己的权限策略（要不要问人）', "The agent's own permission policy (whether to ask)")}</label>
-          <select
-            className="dwa-select"
-            value={form.permission}
-            onChange={e => patch({ permission: e.target.value as PermissionMode })}
-          >
-            <option value="ask">{acp.label('询问人类 (ask)', 'Ask human (ask)')}</option>
-            <option value="allow">{acp.label('始终允许，不询问 (allow)', 'Always allow, never ask (allow)')}</option>
-            <option value="reject">{acp.label('自动拒绝，不询问 (reject)', 'Reject all, never ask (reject)')}</option>
-          </select>
-          <span className="dwa-hint">
-            {ui.approvalRouted
-              ? acp.label('选「询问」时审批出现在对话里；审批服务不可用时回落到本页顶部。', 'With “ask”, approvals appear in the conversation; when the approval service is unavailable they fall back to the top of this page.')
-              : acp.label('选「询问」时审批出现在本页顶部。', 'With “ask”, approvals appear at the top of this page.')}
-          </span>
         </div>
       </div>
 
@@ -1402,11 +1371,14 @@ function ModelCatalogBlock({
 }) {
   const ui = useUi(acp)
   const [saveError, setSaveError] = useState<string | undefined>(undefined)
-  const [switching, setSwitching] = useState(false)
   const [search, setSearch] = useState('')
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const pending = useRef<string[] | undefined>(undefined)
   const hasPending = useRef(false)
+  // In-flight auto-discovery toggle. A ref, not state: the switch saves
+  // silently, and a "saving" render here made the row wrap and snap back
+  // (user report, 2026-10-21). The guard only prevents double-submits.
+  const autoDiscoverBusy = useRef(false)
   // Latest host-confirmed filter: the rollback target when a save fails.
   const serverValue = useRef(exposed)
   serverValue.current = detected.currentConfig?.exposedModels
@@ -1433,15 +1405,12 @@ function ModelCatalogBlock({
 
   /** Persist a filter now (mode switch); a failure restores the editor. */
   const commit = async (next: string[] | undefined): Promise<void> => {
-    setSwitching(true)
     setSaveError(undefined)
     try {
       await acp.setExposedModels(agentId, next)
       onExposedChange(next)
     } catch (error) {
       rollback(error)
-    } finally {
-      setSwitching(false)
     }
   }
 
@@ -1458,16 +1427,17 @@ function ModelCatalogBlock({
   }
 
   const toggleAutoDiscover = async (next: boolean): Promise<void> => {
+    if (autoDiscoverBusy.current) return
+    autoDiscoverBusy.current = true
     onAutoDiscoverChange(next)
     setSaveError(undefined)
-    setSwitching(true)
     try {
       await acp.setAutoDiscoverModels(agentId, next)
     } catch (error) {
       onAutoDiscoverChange(!next)
       setSaveError(error instanceof Error ? error.message : String(error))
     } finally {
-      setSwitching(false)
+      autoDiscoverBusy.current = false
     }
   }
 
@@ -1553,7 +1523,6 @@ function ModelCatalogBlock({
           <input
             type="checkbox"
             checked={autoDiscover}
-            disabled={switching}
             onChange={e => void toggleAutoDiscover(e.target.checked)}
             style={{ margin: 0, accentColor: '#2563eb' }}
           />
@@ -1562,7 +1531,6 @@ function ModelCatalogBlock({
         <span className="dwa-hint">
           {acp.label('开启后，agent 新增的模型会自动加入已选列表；现有勾选不受影响。', 'When on, models the agent adds are appended to the selection; existing picks are untouched.')}
         </span>
-        {switching && <span className="dwa-hint">{acp.label('保存中...', 'Saving...')}</span>}
       </div>
       {saveError !== undefined && <div className="dwa-error" style={{ marginTop: 4 }}>{saveError}</div>}
       {probeError !== undefined && (

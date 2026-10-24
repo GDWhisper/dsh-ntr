@@ -3,11 +3,12 @@
  * (`conversation.input.model`) and its picker (`conversation.input.overlay`).
  *
  * WHAT IT IS: the base of an ACP conversation. The first level is WHICH agent
- * serves it; hanging off that are the three things the agent itself owns —
- * its own permission preset, its own model, its own thought level. All three
- * come from the agent (`agent/catalog`, the agent's own mode list), never from
- * DSH's model catalog: an ACP agent is not a DSH provider, and DSH's catalog
- * has no per-session seam to filter it with anyway. See
+ * serves it; hanging off that are the things the agent itself owns — its own
+ * permission preset, its own model, its own thought level, and any further
+ * config options it publishes (the "advanced" base). All of them come from the
+ * agent (`agent/catalog`, the agent's own mode list), never from DSH's model
+ * catalog: an ACP agent is not a DSH provider, and DSH's catalog has no
+ * per-session seam to filter it with anyway. See
  * docs/acp-convergence.md §2.1.
  *
  * WHERE IT SITS: the composer's model seat — the trailing group of the bar,
@@ -20,10 +21,13 @@
  * the staged conversation runs the ACP preset — so an ordinary chat gets the
  * native selector back and sees no ACP chrome at all.
  *
- * WHAT IT ADDS over a bare model selector: the three axes are separate. A
- * native selector would flatten them into one list of "Agent · Model" rows;
- * here "which agent", "which of ITS models" and "how hard it thinks" are three
- * chips, because those are the three things a person actually thinks in.
+ * WHAT IT ADDS over a bare model selector: the axes are separate. A native
+ * selector would flatten them into one list of "Agent · Model" rows; here
+ * "which agent", "which of ITS models", "how hard it thinks" and every extra
+ * option the agent publishes are chips of their own. Before the first turn the
+ * agent base is the fixed right-hand anchor; the advanced entry sits left of
+ * the model, and model / thought sit between them. Once the lock retires the
+ * base, model / thought inherit the right edge (user decision, 2026-10-21).
  *
  * ONE CONVERSATION, ONE AGENT (user decision, 2026-10-20): once this
  * conversation's first turn STARTS — its ACP session materializes, before the
@@ -131,7 +135,7 @@ function boundSession(ui: { chatSessions: ChatSessionView[]; chatSessionsFor?: s
  * presets/acp/acp-guard.mjs). This function used to end in `agents[0]?.id`,
  * which put the first configured agent on the chip in exactly that state — a
  * name no message would ever reach (audit finding F5). The honest chip there is
- * the "接入 NTR" entry point, not a borrowed name.
+ * the "选择 Agent" entry point, not a borrowed name.
  */
 function routeAgentId(
   boundAgentId: string | undefined,
@@ -275,13 +279,50 @@ export function describeRoute(
   }
 }
 
+/** One extra config option as the advanced base presents it. */
+export interface AdvancedOption {
+  configId: string
+  name: string
+  /** The conversation's pick, else the value the agent reports as current. */
+  value?: string
+  choices: readonly { id: string; name: string; description?: string }[]
+}
+
+/**
+ * The agent's extra config options for one conversation, with the
+ * conversation's own pick folded over the agent-reported current value.
+ *
+ * `choice` only applies when it belongs to the catalog's agent: a stale pick
+ * from a previous agent is the previous agent's vocabulary and must not label
+ * the new one's menu (same rule as `describeRoute`). Options are whatever the
+ * agent publishes beyond model / thought level / mode — those have their own
+ * controls, and duplicating them here would present two truths for one axis.
+ */
+export function advancedOptions(
+  catalog: AgentCatalogResult | undefined,
+  choice?: AcpConversationChoice,
+): AdvancedOption[] {
+  const extras = catalog?.extras ?? []
+  if (catalog === undefined || extras.length === 0) return []
+  const picked = choice !== undefined && choice.agentId === catalog.agentId ? choice.extraConfigs : undefined
+  return extras.map(option => {
+    const value = picked?.[option.configId] ?? option.currentValue
+    return {
+      configId: option.configId,
+      name: option.name,
+      ...(value === undefined ? {} : { value }),
+      choices: option.choices,
+    }
+  })
+}
+
 /**
  * The agent base chip's label and tooltip (audit findings F5 and F26).
  *
  * The label names an agent ONLY when one actually serves this conversation:
  * `route.agentId` is the binding, the live session or the plugin default, and
  * each of those is a name the request path uses (see `routeAgentId`). With none
- * of them the chip is the "接入 NTR" entry point and says so — the old
+ * of them the chip is the "选择 Agent" entry point and says so — the old
  * `agents[0]` fallback put a stranger's name on a conversation whose next
  * message would run on the deployment default provider.
  *
@@ -296,7 +337,7 @@ export function agentBaseChip(
   acp: AcpChatInjected['acp'],
 ): { label: string; title: string } {
   const label = route.agentTitle === undefined
-    ? (routed ? 'NTR' : acp.label('接入 NTR', 'Use NTR'))
+    ? (routed ? 'NTR' : acp.label('选择 Agent', 'Choose agent'))
     : `NTR · ${route.agentTitle}`
   const title = route.agentId === undefined
     ? acp.label(
@@ -464,20 +505,35 @@ export function AcpSessionControls(props: AcpClusterProps) {
   const modelLabel = routed ? route.modelLabel : undefined
   const showModel = agentListed && modelLabel !== undefined
   const showThought = agentListed && routed && route.efforts.length > 0
+  const extras = advancedOptions(catalog, choice)
+  const showAdvanced = agentListed && routed && extras.length > 0
   // Nothing left to show: the cell stays claimed (the claim owns it), but this
   // occupant renders an empty cluster rather than a bare wrapper.
-  if (!showAgentBase && !showModel && !showThought) return null
+  if (!showAgentBase && !showAdvanced && !showModel && !showThought) return null
   const open = (kind: AcpMenuKind, trigger: HTMLElement): void => { openAcpMenu(sessionId, kind, trigger) }
 
-  // The AGENT base is pinned to the RIGHT edge (user decision, 2026-10-17).
-  // Ordering, not luck: it is the last child, and the cluster is the rightmost
-  // cell of the composer bar, so whatever the agent publishes can only push
-  // into the space to its left. Before this the base was the FIRST child, so
-  // each extra chip (model, thought level) shoved it further left — the base
-  // visibly moved depending on what the agent happened to advertise, which
-  // reads as the whole bar reflowing when you switch agents.
+  // Ordering (user decision, 2026-10-21): the AGENT base stays the fixed
+  // right-hand anchor BEFORE the first turn — that is where users know it
+  // from, and it must not be squeezed out by chips the agent happens to
+  // publish. The advanced entry sits immediately left of the model, so the
+  // agent's extra options never push the primary axes around. Once the first
+  // turn locks the conversation the base retires (2026-10-20) and the
+  // model / thought pair inherits the right edge.
   return (
     <span className="ntr-acp-cluster">
+      {/* Immediately left of the model: the advanced base collects everything
+          the agent publishes that is NOT one of the primary axes. */}
+      {showAdvanced && (
+        <AcpChip
+          label={`${acp.label('高级', 'Advanced')} · ${String(extras.length)}`}
+          title={acp.label(
+            `agent 的额外配置项：${extras.map(option => option.name).join('、')}`,
+            `extra agent config options: ${extras.map(option => option.name).join(', ')}`,
+          )}
+          active={menu?.sessionId === sessionId && menu.kind === 'advanced'}
+          onClick={(trigger) => { open('advanced', trigger) }}
+        />
+      )}
       {showModel && modelLabel !== undefined && (
         <AcpChip
           label={modelLabel}
@@ -494,8 +550,10 @@ export function AcpSessionControls(props: AcpClusterProps) {
           onClick={(trigger) => { open('thought', trigger) }}
         />
       )}
-      {/* Last on purpose while present: the fixed right-hand anchor of the
-          cluster. It retires after the first ACP turn (user decision,
+      {/* Last on purpose while present: the fixed right-hand anchor before the
+          lock. CSS gives the last chip `flex: none`, so a long model name or
+          an extra chip can only squeeze what is to its left — the agent base
+          never disappears. It retires after the first ACP turn (user decision,
           2026-10-20) and the composer-edge tag replaces it; the retirement
           itself is the shatter played here (see `shattering`). */}
       {showAgentBase && (
@@ -519,8 +577,21 @@ export interface MenuContext {
   route: RouteInfo
   /** The bound agent's own model surface (`agent/catalog`), if it has loaded. */
   catalog?: AgentCatalogResult
+  /** The conversation's persisted pick (the advanced menu overlays its extras). */
+  choice?: AcpConversationChoice
+  /** A `agent/probe-models` request for this agent is in flight. */
+  probing?: boolean
   error?: string
 }
+
+/**
+ * The model picker's explicit refresh row. It is an ACTION, not a model: the
+ * pick handler intercepts it and probes the agent instead of recording a pick.
+ * The id cannot collide with a real row — agent ids match
+ * `[a-z0-9][a-z0-9._-]{0,63}` (no underscores) and variant ids always carry
+ * `agentId@value`.
+ */
+export const REFRESH_CATALOG_ITEM = '__refresh-catalog__'
 
 /** The agent roster rows: one row per configured ACP agent, current one marked. */
 function agentSection(context: MenuContext): AcpMenuSection {
@@ -563,13 +634,30 @@ function agentSection(context: MenuContext): AcpMenuSection {
 function modelSection(context: MenuContext): AcpMenuSection | undefined {
   const { acp, route, catalog } = context
   if (route.agentId === undefined) return undefined
+  // An explicit gesture, not a render side effect: opening the picker stays
+  // cache-first (reading must never spawn), and the user asks for a fresh
+  // directory by picking this row. The host's `agent/probe-models` may start
+  // or reuse that agent's process.
+  const refresh: AcpMenuItem = {
+    id: REFRESH_CATALOG_ITEM,
+    label: context.probing === true
+      ? acp.label('正在检测…', 'Detecting…')
+      : acp.label('刷新目录', 'Refresh list'),
+    detail: acp.label('向 agent 重新读取模型列表', 're-read the model list from the agent'),
+    disabled: context.probing === true,
+  }
   if (catalog === undefined) {
     // No catalog yet (a fresh conversation, or a host still probing): the
-    // current model is the only row we can honestly show.
-    return route.modelId === undefined ? undefined : {
+    // current model is the only row we can honestly show — plus the refresh
+    // action, which is how a first catalog gets fetched on demand.
+    const items: AcpMenuItem[] = route.modelId === undefined
+      ? []
+      : [{ id: route.modelId, label: route.modelLabel ?? route.modelId, active: true }]
+    items.push(refresh)
+    return {
       id: 'model',
       title: acp.label(`${route.agentTitle ?? 'agent'} 的模型`, `Models of ${route.agentTitle ?? 'the agent'}`),
-      items: [{ id: route.modelId, label: route.modelLabel ?? route.modelId, active: true }],
+      items,
     }
   }
   // Which model is IN FORCE, as a model VALUE (not a route). `route.modelId` is
@@ -605,13 +693,14 @@ function modelSection(context: MenuContext): AcpMenuSection | undefined {
     // way — `route.modelLabel` already resolves the stale-variant case — so the
     // row's detail must name BOTH causes: blaming only the Settings → NTR
     // checkbox sent people looking for a box they had already ticked (audit
-    // finding F25).
+    // finding F25). A dropped model is NOT silently replaced: the host refuses
+    // the send (`model_unavailable`), so the detail must not promise a fallback.
     rows.push({
       id: buildAcpModelId(route.agentId, inForce),
       label: `${inForce === current?.value ? current?.name ?? inForce : route.modelLabel ?? inForce} · ${acp.label('当前', 'current')}`,
       detail: acp.label(
-        '不在此列表出的模型里：可能在「设置 → NTR」里取消了勾选，也可能已从 agent 的目录掉出。仍然可用。',
-        "Not among the models listed here: it may be unchecked in Settings → NTR, or it may have dropped out of the agent's catalog. Still usable.",
+        '不在此列表出的模型里：可能在「设置 → NTR」里取消了勾选，也可能已从 agent 的目录掉出；若 agent 已不再提供，发送会被拒绝，请改选或用「刷新目录」重新读取。',
+        "Not among the models listed here: it may be unchecked in Settings → NTR, or it may have dropped out of the agent's catalog. If the agent no longer offers it, sending is refused — pick another model or use Refresh list to re-read the directory.",
       ),
       active: true,
     })
@@ -633,6 +722,7 @@ function modelSection(context: MenuContext): AcpMenuSection | undefined {
     })
   }
   rows.push(...offered.values())
+  rows.push(refresh)
   return {
     id: 'model',
     title: acp.label(`${route.agentTitle ?? 'agent'} 的模型`, `Models of ${route.agentTitle ?? 'the agent'}`),
@@ -680,6 +770,27 @@ function thoughtSection(context: MenuContext): AcpMenuSection {
     ),
     items,
   }
+}
+
+/**
+ * The advanced base's sections: one per extra config option.
+ *
+ * Section ids carry a `config:` prefix because `AcpMenu.onPick` hands the
+ * section id back and the other pickers already own `agent` / `model` /
+ * `thought` — an agent could legitimately name one of its options `model`,
+ * and the pick would then be read as the primary model axis.
+ */
+function advancedSections(context: MenuContext): AcpMenuSection[] {
+  return advancedOptions(context.catalog, context.choice).map(option => ({
+    id: `config:${option.configId}`,
+    title: option.name,
+    items: option.choices.map(choice => ({
+      id: choice.id,
+      label: choice.name,
+      ...(choice.description === undefined ? {} : { detail: choice.description }),
+      active: choice.id === option.value,
+    })),
+  }))
 }
 
 /**
@@ -734,6 +845,17 @@ export function menuFor(kind: AcpMenuKind, context: MenuContext): {
     return { title: section.title ?? acp.label('思考等级', 'Thought level'), note: section.note, sections: [{ ...section, title: undefined, note: undefined }] }
   }
 
+  if (kind === 'advanced') {
+    return {
+      title: acp.label('高级选项', 'Advanced options'),
+      note: acp.label(
+        'agent 自己发布的额外配置项；选中只作用于这条会话，下一条消息生效。',
+        'Extra config options published by the agent; a pick belongs to this conversation and applies from the next message.',
+      ),
+      sections: advancedSections(context),
+    }
+  }
+
   return { title: acp.label('NTR', 'NTR'), sections: [] }
 }
 
@@ -751,7 +873,11 @@ export function AcpSessionMenu(props: AcpClusterProps) {
   const bound = boundSession(ui, sessionId)
   const agents = ui.agents
   const choice = ui.chatChoice[sessionId]
-  const agentId = routeAgentId(ui.chatBoundAgent[sessionId], bound, agents, ui.defaultAgent)
+  // Same lock rule as the cluster: a locked conversation belongs to its agent
+  // even when the host's bound-agent mirror or the plugin default says
+  // otherwise — the menu must list ITS extras, not a stranger's.
+  const lockedTo = lockedAgentOf(ui.chatLockedAgent[sessionId], bound)
+  const agentId = lockedTo ?? routeAgentId(ui.chatBoundAgent[sessionId], bound, agents, ui.defaultAgent)
   const catalog = agentId === undefined ? undefined : ui.seatCatalogs[agentId]
   // Same rule as the cluster: a menu that is not open, or a conversation that
   // points at no agent, must not read (and so must not probe) anybody's catalog.
@@ -761,19 +887,30 @@ export function AcpSessionMenu(props: AcpClusterProps) {
   }, [acp, menu, served, agentId])
 
   if (menu === null || menu.sessionId !== sessionId) return null
-  const route = describeRoute(agents, bound, ui.defaultAgent, catalog, ui.chatBoundAgent[sessionId], choice)
+  const route = describeRoute(
+    agents,
+    bound,
+    lockedTo === undefined ? ui.defaultAgent : undefined,
+    catalog,
+    lockedTo ?? ui.chatBoundAgent[sessionId],
+    choice,
+  )
   // A menu-model bug must never retire the whole picker: a render throw inside
   // this slot entry makes the error boundary ABDICATE it for the rest of the
   // session (every later click silently opens nothing). Show the failure inside
   // the menu instead of dying.
   let model: ReturnType<typeof menuFor>
   try {
+    const probing = menu.kind === 'model' && agentId !== undefined && ui.probingModels[agentId] === true
+    const menuError = menu.error ?? (menu.kind === 'model' && agentId !== undefined ? ui.probeErrors[agentId] : undefined)
     model = menuFor(menu.kind, {
       acp,
       agents,
       route,
       ...catalog === undefined ? {} : { catalog },
-      ...menu.error === undefined ? {} : { error: menu.error },
+      ...choice === undefined ? {} : { choice },
+      ...probing ? { probing: true } : {},
+      ...menuError === undefined ? {} : { error: menuError },
     })
   } catch (error) {
     model = {
@@ -787,12 +924,23 @@ export function AcpSessionMenu(props: AcpClusterProps) {
     // Everything here writes into the PLUGIN's own binding for this chat
     // session — never a DSH model route (see the module header).
     try {
+      if (sectionId === 'model' && itemId === REFRESH_CATALOG_ITEM) {
+        // The one explicit refresh gesture: an `agent/probe-models` request.
+        // Opening the menu never probes; this row does. Keep the picker open so
+        // the fresh list (or the probe error) lands where the user asked.
+        if (agentId !== undefined) await acp.probeModels(agentId)
+        return
+      }
       if (sectionId === 'agent') {
         await acp.bindChatAgent(sessionId, itemId)
       } else if (sectionId === 'model') {
         await acp.setChatSessionModel(sessionId, itemId)
       } else if (sectionId === 'thought') {
         await acp.setChatSessionEffort(sessionId, itemId === 'provider-default' ? undefined : itemId)
+      } else if (sectionId.startsWith('config:')) {
+        // One section per extra option; the id after the prefix names the
+        // agent's own `configId` (see advancedSections).
+        await acp.setChatSessionConfig(sessionId, sectionId.slice('config:'.length), itemId)
       } else {
         // `agent-mode` used to be handled here; the agent's mode list now lives
         // only in the composer-mode control (see the removed-section note).

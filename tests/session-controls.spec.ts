@@ -19,6 +19,7 @@
 import { describe, expect, it } from 'vitest'
 import { agentModeTitle } from '../src/client/composer-mode.tsx'
 import {
+  advancedOptions,
   agentBaseChip,
   agentBaseHidden,
   agentTagChip,
@@ -26,6 +27,7 @@ import {
   describeRoute,
   lockedAgentOf,
   menuFor,
+  REFRESH_CATALOG_ITEM,
 } from '../src/client/session-controls.tsx'
 import { AcpStore } from '../src/client/store.ts'
 import type { AgentCatalogResult, AgentView, ChatSessionView } from '../src/protocol.ts'
@@ -33,7 +35,7 @@ import type { AgentCatalogResult, AgentView, ChatSessionView } from '../src/prot
 describe('the agent base chip names only an agent that serves the conversation', () => {
   const acp = new AcpStore(async () => ({ ok: true, value: {} }), zh => zh)
   const agent: AgentView = {
-    id: 'pi', title: 'Pi', command: 'pi-acp', args: [], permission: 'ask',
+    id: 'pi', title: 'Pi', command: 'pi-acp', args: [],
     allowedCwdRoots: [], state: 'ready', liveSessions: [],
   }
   const other: AgentView = { ...agent, id: 'omp', title: 'Omp' }
@@ -58,7 +60,7 @@ describe('the agent base chip names only an agent that serves the conversation',
     const route = describeRoute(roster, undefined, undefined)
     expect(route.agentId).toBeUndefined()
     const chip = agentBaseChip(route, false, acp)
-    expect(chip.label).toBe('接入 NTR')
+    expect(chip.label).toBe('选择 Agent')
     expect(chip.title).toBe('这条会话当前没有 NTR agent 服务；点开可选择 agent')
   })
 
@@ -153,7 +155,7 @@ describe('the agent base retires after the first turn, locks the agent, and the 
 describe('the model picker names both reasons a current model is not on offer', () => {
   const acp = new AcpStore(async () => ({ ok: true, value: {} }), zh => zh)
   const agent: AgentView = {
-    id: 'pi', title: 'Pi', command: 'pi-acp', args: [], permission: 'ask',
+    id: 'pi', title: 'Pi', command: 'pi-acp', args: [],
     allowedCwdRoots: [], state: 'ready', liveSessions: [],
   }
   const bound: ChatSessionView = { agentId: 'pi', agentTitle: 'Pi', sessionId: 's1', modelId: 'pi' }
@@ -176,6 +178,11 @@ describe('the model picker names both reasons a current model is not on offer', 
     expect(row?.id).toBe('pi@gone')
     expect(row?.detail).toContain('设置 → NTR')
     expect(row?.detail).toContain('掉出')
+    // A dropped model is NOT silently replaced: the host refuses the turn and
+    // the picker points at the refresh gesture instead of promising a fallback.
+    expect(row?.detail).not.toContain('仍然可用')
+    expect(row?.detail).toContain('拒绝')
+    expect(row?.detail).toContain('刷新目录')
   })
 
   it('keeps both causes in the detail when the exposure filter hides the model', () => {
@@ -188,12 +195,34 @@ describe('the model picker names both reasons a current model is not on offer', 
     expect(row?.detail).toContain('设置 → NTR')
     expect(row?.detail).toContain('掉出')
   })
+
+  it('ends the model menu with an explicit refresh row and shows a probe in flight', () => {
+    const route = describeRoute([agent], bound, undefined, catalog)
+    const idle = menuFor('model', { acp, agents: [agent], catalog, route })
+    // The action is a ROW, not a model: it carries no active mark, and it is
+    // last so the model rows keep their order.
+    expect(idle.sections[0]?.items.at(-1)).toMatchObject({
+      id: REFRESH_CATALOG_ITEM,
+      label: '刷新目录',
+      disabled: false,
+    })
+    const busy = menuFor('model', { acp, agents: [agent], catalog, route, probing: true })
+    expect(busy.sections[0]?.items.at(-1)).toMatchObject({
+      id: REFRESH_CATALOG_ITEM,
+      label: '正在检测…',
+      disabled: true,
+    })
+    // Even before any catalog has loaded, the refresh action is the way to
+    // fetch one on demand.
+    const cold = menuFor('model', { acp, agents: [agent], route: describeRoute([agent], bound, undefined) })
+    expect(cold.sections[0]?.items.at(-1)?.id).toBe(REFRESH_CATALOG_ITEM)
+  })
 })
 
 describe('the thought picker calls its cleared-pick row the agent default', () => {
   const acp = new AcpStore(async () => ({ ok: true, value: {} }), zh => zh)
   const agent: AgentView = {
-    id: 'pi', title: 'Pi', command: 'pi-acp', args: [], permission: 'ask',
+    id: 'pi', title: 'Pi', command: 'pi-acp', args: [],
     allowedCwdRoots: [], state: 'ready', liveSessions: [],
   }
   const bound: ChatSessionView = { agentId: 'pi', agentTitle: 'Pi', sessionId: 's1', modelId: 'pi' }
@@ -211,6 +240,74 @@ describe('the thought picker calls its cleared-pick row the agent default', () =
       label: '跟随 agent 默认',
       active: true,
     })
+  })
+})
+
+describe('the advanced base collects the agent’s remaining config options', () => {
+  const acp = new AcpStore(async () => ({ ok: true, value: {} }), zh => zh)
+  const agent: AgentView = {
+    id: 'pi', title: 'Pi', command: 'pi-acp', args: [],
+    allowedCwdRoots: [], state: 'ready', liveSessions: [],
+  }
+  const catalog: AgentCatalogResult = {
+    agentId: 'pi',
+    title: 'Pi',
+    base: { id: 'pi', name: 'Pi' },
+    variants: [],
+    probed: true,
+    extras: [
+      {
+        configId: 'temp',
+        name: 'Temperature',
+        currentValue: 'mid',
+        choices: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }],
+      },
+      {
+        configId: 'brave',
+        name: 'Brave Mode',
+        choices: [{ id: 'on', name: 'On' }, { id: 'off', name: 'Off' }],
+      },
+    ],
+  }
+  const route = describeRoute([agent], undefined, undefined, catalog, 'pi')
+
+  it('overlays the conversation pick and ignores another agent’s pick', () => {
+    expect(advancedOptions(catalog, { agentId: 'pi', extraConfigs: { temp: 'high' } })).toEqual([
+      {
+        configId: 'temp',
+        name: 'Temperature',
+        value: 'high',
+        choices: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }],
+      },
+      {
+        configId: 'brave',
+        name: 'Brave Mode',
+        choices: [{ id: 'on', name: 'On' }, { id: 'off', name: 'Off' }],
+      },
+    ])
+    // A pick from the previous agent is that agent's vocabulary: it must not
+    // label this catalog's first option.
+    expect(advancedOptions(catalog, { agentId: 'omp', extraConfigs: { temp: 'low' } })[0]?.value).toBe('mid')
+    expect(advancedOptions(undefined, undefined)).toEqual([])
+  })
+
+  it('builds one config-prefixed section per option, with the pick checked', () => {
+    const menu = menuFor('advanced', {
+      acp,
+      agents: [agent],
+      route,
+      catalog,
+      choice: { agentId: 'pi', extraConfigs: { temp: 'high' } },
+    })
+    expect(menu.title).toBe('高级选项')
+    // The prefix keeps an agent option literally named `model` from colliding
+    // with the primary model picker's section id.
+    expect(menu.sections.map(section => section.id)).toEqual(['config:temp', 'config:brave'])
+    expect(menu.sections[0]).toMatchObject({ title: 'Temperature' })
+    expect(menu.sections[0]?.items).toEqual([
+      { id: 'low', label: 'Low', active: false },
+      { id: 'high', label: 'High', active: true },
+    ])
   })
 })
 

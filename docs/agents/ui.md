@@ -8,7 +8,7 @@
 NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮前启动 / 切换 agent 的入口**：下拉里只有智能体列表（`menuFor('agent')` 只返回 `agentSection`），模型 / 思考等级 / agent 模式各有自己的控件。菜单只有一个标题「选择你的 Agent」。
 
 - **位置**：底座占的是原生模型底座那个 `single` cell——composer bar 行尾（`.trailing` 组，`margin-left: auto`）、提交键左边。原生 occupant 是宿主 `client-ui-model-selection` 的 `ModelSelect`（列 DSH 全量 provider，点一下写全局默认模型），所以 NTR 会话里必须由我们接管。
-- **一个 cell、一个 occupant**。底座是 `ntr-acp-cluster` 的**最后一个子元素**（其余 chip 只能往它左边排），CSS `:last-child { flex: none }` 保证长模型名压不扁它。曾经底座是第一个子元素，每多一个 chip 就把它往左推，切 agent 时整条 bar 重排。
+- **一个 cell、一个 occupant**。cluster 内顺序固定 `高级 → model → thought → agent`：首轮前 agent 底座是右端锚点（它也是 `:last-child`，CSS `flex: none`，长模型名或额外 chip 只能挤压它左边的内容，**严禁**把 agent 底座排在前面——实测会被挤到看不见）；首轮锁定、底座退场后，`thought`（没有时 `model`）成为右端锚点。高级底座始终紧贴模型左侧。
 - **隔离靠闸门，不靠组件自隐**：`src/client/index.tsx` 的 `syncAcpMode` 只在舞台会话跑 ACP preset 时创建 claim，切走即 `release()`。非 NTR 会话里这条 entry 根本不存在。
 - **claim 机制**（`src/client/model-seat.tsx` · `createModelSeatClaim`）：
   - cell 归属由客户端 runner 的页面级递减计数器决定（非 chain 槽位的声明优先级被改写，最后一个注册者赢）。`@hytime/dsh-thinking-effort` 也往这个 cell 注 slider，且排在我们之后注册。
@@ -32,18 +32,19 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
   - 重试成功会得到新的 reveal serial，`agent-lock-anim.ts` 用 epoch 让旧 ceremony 的定时器失效。`agentLockPhaseOf` 对「有新 reveal 但动画尚未启动」直接返回 `shatter`，避免中间一帧「两处都没有」。`prefers-reduced-motion` 下整段跳过。
 - 首轮开始前已打开的 picker 必须 `closeAcpMenu`，否则会留下一个点击必然 `agent_locked` 的活控件。
 
-## 3. 三条轴的来源
+## 3. 各轴的来源
 
-`AcpSessionControls` **严禁**自建 agent/model/effort 状态，也**严禁**读 DSH 模型目录或写任何 DSH 模型路由。
+`AcpSessionControls` **严禁**自建 agent/model/effort/config 状态，也**严禁**读 DSH 模型目录或写任何 DSH 模型路由。
 
 | 轴 | 权威来源 | 写入 |
 |---|---|---|
 | 这条会话由哪个 agent 服务 | 插件自己的绑定：`describeRoute` / `routeAgentId`（活会话 `bound` 优先 → `chatChoice` 的 pick，且只在 `choice.agentId === agentId` 时生效 → `chatBoundAgent` 乐观读 → 插件默认 agent） | `bindChatAgent`（传裸 `agentId`） |
 | 这个 agent 有哪些模型 / 思考等级 | `agent/catalog`（`AcpStore.loadAgentCatalog`，只对「这条会话真的指向某个 agent」的会话读；读会触发探测） | — |
 | 当前在哪个模型 / 思考等级 | `bound?.modelId ?? pick?.modelId`；`bound?.reasoningEffort ?? pick?.effort`；没选过时回落 `catalog.currentModel` 与 `catalog.reasoning.defaultEffort` | `setChatSessionModel` / `setChatSessionEffort` |
+| agent 的额外 config options | `agent/catalog` 的 `extras`（model / thought_level / mode 之外的 select，含未知 category） | `setChatSessionConfig`（`session/chat-config-set`），落 `AcpConversationChoice.extraConfigs` |
 
 - **严禁**回到 `directory.select` / `selectModel`。
-- 没有绑定 / pick / 默认 agent 时 `routeAgentId` 返回 `undefined`，`describeRoute` 每条轴都退化成空。芯片**严禁**借 `agents[0]?.id` 填名字（审计 F5：芯片写着某个 agent，却没有任何消息会送到它）。此时 agent chip 由 `agentBaseChip` 渲染成「接入 NTR / Use NTR」入口，tooltip 明说「这条会话当前没有 NTR agent 服务；点开可选择 agent」。
+- 没有绑定 / pick / 默认 agent 时 `routeAgentId` 返回 `undefined`，`describeRoute` 每条轴都退化成空。芯片**严禁**借 `agents[0]?.id` 填名字（审计 F5：芯片写着某个 agent，却没有任何消息会送到它）。此时 agent chip 由 `agentBaseChip` 渲染成「选择 Agent / Choose agent」入口，tooltip 明说「这条会话当前没有 NTR agent 服务；点开可选择 agent」。
 - 会话权限档**插件不提供切换面**（整格占空，见 [permissions.md](./permissions.md)）。
 
 ### 3.1 模型 picker 一行一个模型
@@ -54,11 +55,19 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 - 被勾中的那行必须写出模型名。
 - `base.name` 拼成 `<agent> · <当前模型>`；`variants[].name` 只写模型名（picker 已说明是谁的模型，重复是噪音）。
 - `resolveAdapterModel` 仍返回 `<agent> · <model>`——那是 DSH 侧的模型身份，与 picker 行无关。
-- `exposedModels` 只是**可见性**过滤（不改变可用性）。会话当前所在的变体即使不在列表里，也必须以带「当前」的行列在列表顶部，否则 picker 会默认成「会话跑的是默认模型」。detail 必须同时写两个可能原因：「在设置 → NTR 里取消了勾选」与「已从 agent 的目录掉出」——只怪可见性会让人去找一个早就勾上的框。
+- `exposedModels` 只是**可见性**过滤（不改变可用性）。会话当前所在的变体即使不在列表里，也必须以带「当前」的行列在列表顶部，否则 picker 会默认成「会话跑的是默认模型」。detail 必须同时写两个可能原因：「在设置 → NTR 里取消了勾选」与「已从 agent 的目录掉出」——只怪可见性会让人去找一个早就勾上的框。**被可见性过滤的模型仍可用；已从目录掉出的模型不可用**：宿主会拒绝本轮发送（`model_unavailable`）并保留选择，用户改选后才能继续，因此 detail **严禁**再写「仍然可用」或承诺回落。模型菜单末尾还有一行显式「刷新目录」动作（`REFRESH_CATALOG_ITEM`）：打开菜单不探测，点它才发 `agent/probe-models`，菜单保持打开等新列表 / 错误落地。
 
 ### 3.2 codec 手拷贝
 
 `splitAcpModelId`（`src/client/acp-ui.tsx`）是宿主 `splitAdapterModelId` 的手拷贝（浏览器半区不得 import 宿主平面模块，`protocol.ts` 又只能是纯类型）。改其一必须同步另一处，`tests/acp-view.spec.ts` 用同一样本集做等价断言。`isAbsolutePathLike` 与宿主 `isAbsolutePath` 同理（见 [paths.md](./paths.md)）。
+
+### 3.3 高级底座
+
+- 只有 agent 发布了主位之外的 select（且有 choices）才渲染，位置在**模型 chip 左侧**；chip 文案 `高级 · <N>`，菜单里每个配置项一节。
+- section id 必须带 `config:` 前缀（`config:<configId>`）：picker 把 section id 原样交给 pick 处理器，而 `agent` / `model` / `thought` 已被三条主位占用。agent 完全可以把某个额外项命名为 `model`。
+- 当前值 = `choice.extraConfigs[configId]` ?? `catalog.extras[].currentValue`；`choice.agentId` 与 catalog 的 agent 不一致时**严禁**套用（那是上一个 agent 的词汇，`advancedOptions` 负责过滤）。
+- 写入经 `setChatSessionConfig`：宿主先用活会话的 `configOptions`（更权威）再回落 catalog 校验值是否真由 agent 发布；记录进 `extraConfigs` 后，有活会话立即 `set_config_option`，没有会话则等下一次 `applyChatChoice`。失败只广播 `agent/notice`，不失败回合。
+- 首轮前没有会话也能选——这正是 extras 要进 `agent/catalog` 缓存、而不是只读 live session 的原因。
 
 ## 4. agent mode 控件
 
@@ -112,13 +121,13 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 
 - 每张 agent 卡保持「紧凑行 + 展开详情」两段，详情体**常挂载**、只用 `display: none` 折叠——条件渲染会重挂载表单 `useState`，丢掉用户编辑中的值。
 - 工作区保存语义：单根模式（非空 `cwd`）把 `allowedCwdRoots` 收窄为 `[cwd]`；`cwd` 为空则两者都不发送（走宿主 `defaultAgentWorkspace()`）；多根模式发送编辑后的去重绝对路径。初始状态带 >1 个 root 的 agent 必须直接进多根模式，避免仅仅打开表单就收窄白名单。
-- 审批卡与权限策略文案见 [permissions.md](./permissions.md)。
+- 审批卡与权限路由见 [permissions.md](./permissions.md)。
 
 ## 代码索引
 
 | 主题 | 位置 |
 |---|---|
-| 底座 / 菜单 | `src/client/session-controls.tsx` · `AcpSessionControls` / `AcpSessionMenu` / `menuFor` / `describeRoute` / `routeAgentId` / `agentBaseChip` |
+| 底座 / 菜单 | `src/client/session-controls.tsx` · `AcpSessionControls` / `AcpSessionMenu` / `menuFor` / `describeRoute` / `routeAgentId` / `agentBaseChip` / `advancedOptions` |
 | 座位 | `src/client/model-seat.tsx` · `createModelSeatClaim` / `createPermissionSeatClaim`；`src/client/index.tsx` · `syncAcpMode` |
 | 锁定 UI | `src/client/session-controls.tsx` · `lockedAgentOf` / `agentBaseHidden` / `agentTagVisible` / `AcpComposerAgentTag`；`src/client/agent-lock-anim.ts` |
 | 视图 | `src/client/acp-view.tsx` · `boundAgentOf` / `acpEmptyCopy` / `diffRows` / `isNewFileDiff` |

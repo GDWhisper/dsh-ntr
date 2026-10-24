@@ -31,15 +31,14 @@ import {
   EventHub,
   PermissionLedger,
   Transcript,
-  acpToolActivityLine,
-  acpToolActivityOutput,
-  acpToolInputOf,
+  acpToolCallDelta,
+  acpToolCallFromUpdate,
   buildAdapterModelId,
   childEnv,
+  isAcpToolContinuation,
   isUnderPath,
   parseCatalogOptions,
   permissionToolKind,
-  permissionToolPaths,
   quoteCommandToken,
   randomUUID,
   resolveFsPath,
@@ -53,11 +52,12 @@ import {
   validateAgentDef,
 } from './impl.ts'
 import type {
-  PermissionDecision, RosterPresetRow,
+  AcpToolCallSnapshot,
+  RosterPresetRow,
 } from './impl.ts'
 import type {
   AcpAgentCatalog, AcpAgentDef, AcpConversationChoice, AcpPresetStatus, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
-  LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo, PermissionMode,
+  LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo,
   PermissionOutcome, PermissionOptionView, PreparedAdapterCall, SessionView, StreamChunk,
 } from './protocol.ts'
 
@@ -527,7 +527,6 @@ export class AgentBridge {
       title: this.def.title ?? this.def.id,
       command: this.def.command,
       args: [...(this.def.args ?? [])],
-      permission: this.def.permission ?? 'ask',
       cwd: this.def.cwd,
       allowedCwdRoots: [...(this.def.allowedCwdRoots ?? [])],
       state: this.state,
@@ -543,11 +542,6 @@ export class AgentBridge {
       liveSessions: [...this.sessions.keys()],
       idleTimeoutMs: this.idleTimeoutMs,
     }
-  }
-
-  setPermission(mode: PermissionMode): void {
-    this.def.permission = mode
-    this.publishStatus()
   }
 
   /**
@@ -1165,18 +1159,12 @@ export class AgentBridge {
   }
 
   /**
-   * Answer one ACP permission ask. The governing policy is the session's DSH
-   * access mode when it has one (chat-backed sessions — see
-   * `docs/acp-permission-and-sandbox.md`); otherwise the agent's own
-   * `permission` field, exactly as before the mapping existed. `ask` always
-   * means "a human decides": the native approval chain first, the ledger
-   * otherwise.
+   * Answer one ACP permission ask. Every ask reaches a human: the native
+   * approval chain first (answered in the chat composer), the settings-panel
+   * ledger otherwise.
    */
   private async handlePermissionRequest(acpSessionId: string, toolCall: unknown, options: PermissionOption[], signal?: AbortSignal): Promise<RequestPermissionResponse> {
     const session = this.acpIndex.get(acpSessionId)
-    const decision = this.permissionDecision(session, toolCall)
-    if (decision === 'allow') return selectOption(options, 'allow')
-    if (decision === 'reject') return selectOption(options, 'reject')
     if (session === undefined || session.closed) return { outcome: { outcome: 'cancelled' } }
     // Native approval first (answered in the chat composer); a `reason` means
     // no route is available and the settings-panel ledger takes over.
@@ -1300,24 +1288,6 @@ export class AgentBridge {
     return { response }
   }
 
-  /**
-   * The effective decision for one ask.
-   *
-   * The agent's own `permission` field is the only knob, because the host no
-   * longer sits in the middle: an ACP agent is fully autonomous, and what it
-   * asks is mapped to the user unchanged (`askNativeApproval`). The retired
-   * axis resolved a DSH access mode and pre-judged every ask with it — which
-   * both inverted `never` into "deny everything" and let `allow` skip the
-   * human entirely. See docs/acp-convergence.md §2.3.
-   */
-  private permissionDecision(_session: LiveSession | undefined, _toolCall: unknown): PermissionDecision {
-    switch (this.def.permission ?? 'ask') {
-      case 'allow': return 'allow'
-      case 'reject': return 'reject'
-      default: return 'ask'
-    }
-  }
-
   private settlePermissions(session: LiveSession): void {
     this.permissions.settleFor(p => p.sessionId === session.sessionId)
   }
@@ -1432,20 +1402,6 @@ export class AgentBridge {
 function permissionToolName(toolCall: unknown): string {
   const row = (typeof toolCall === 'object' && toolCall !== null ? toolCall : {}) as Record<string, unknown>
   return typeof row.title === 'string' && row.title !== '' ? row.title : 'tool call'
-}
-
-/**
- * Choose the agent's own option for a decided ask. The specific variants are
- * preferred over the `always` ones because neither DSH's approval chain nor our
- * mode mapping ever grants a standing permission.
- */
-function selectOption(options: PermissionOption[], direction: 'allow' | 'reject'): RequestPermissionResponse {
-  const wanted: readonly string[] = direction === 'allow' ? ['allow_once', 'allow_always'] : ['reject_once', 'reject_always']
-  for (const kind of wanted) {
-    const option = options.find(o => o.kind === kind)
-    if (option !== undefined) return { outcome: { outcome: 'selected', optionId: option.optionId } }
-  }
-  return { outcome: { outcome: 'cancelled' } }
 }
 
 /**
@@ -1739,6 +1695,70 @@ export const AGENT_PRESETS: AgentPreset[] = [
     defaultCommand: 'codebuddy',
     defaultArgs: ['--acp'],
   },
+  {
+    id: 'claude',
+    name: 'Claude Code',
+    description: 'Claude Agent SDK adapter — run as `npx -y @agentclientprotocol/claude-agent-acp` over stdio',
+    executables: ['npx'],
+    defaultCommand: 'npx',
+    defaultArgs: ['-y', '@agentclientprotocol/claude-agent-acp'],
+  },
+  {
+    id: 'codex',
+    name: 'Codex',
+    description: 'OpenAI Codex adapter — run as `npx -y @agentclientprotocol/codex-acp` over stdio',
+    executables: ['npx'],
+    defaultCommand: 'npx',
+    defaultArgs: ['-y', '@agentclientprotocol/codex-acp'],
+  },
+  {
+    id: 'gemini',
+    name: 'Gemini CLI',
+    description: 'Google Gemini CLI — run as `gemini --experimental-acp` over stdio',
+    executables: ['gemini'],
+    defaultCommand: 'gemini',
+    defaultArgs: ['--experimental-acp'],
+  },
+  {
+    id: 'opencode',
+    name: 'OpenCode',
+    description: 'OpenCode — run as `opencode acp` over stdio',
+    executables: ['opencode'],
+    defaultCommand: 'opencode',
+    defaultArgs: ['acp'],
+  },
+  {
+    id: 'qwen',
+    name: 'Qwen Code',
+    description: 'Qwen Code — run as `qwen --experimental-acp` over stdio',
+    executables: ['qwen'],
+    defaultCommand: 'qwen',
+    defaultArgs: ['--experimental-acp'],
+  },
+  {
+    id: 'kiro',
+    name: 'Kiro',
+    description: 'Kiro CLI — run as `kiro-cli acp` over stdio',
+    executables: ['kiro-cli'],
+    defaultCommand: 'kiro-cli',
+    defaultArgs: ['acp'],
+  },
+  {
+    id: 'qoder',
+    name: 'Qoder',
+    description: 'Qoder CLI — run as `qodercli --acp` over stdio',
+    executables: ['qodercli'],
+    defaultCommand: 'qodercli',
+    defaultArgs: ['--acp'],
+  },
+  {
+    id: 'qoder-cn',
+    name: 'Qoder CN',
+    description: 'Qoder CLI (China) — run as `qoderclicn --acp` over stdio',
+    executables: ['qoderclicn'],
+    defaultCommand: 'qoderclicn',
+    defaultArgs: ['--acp'],
+  },
 ]
 
 export function findExecutable(command: string): string | undefined {
@@ -2027,8 +2047,30 @@ export const ACP_ROUTE_BINDING_KEY = Symbol.for('dsh-ntr.acp-binding')
 export interface AcpRouteBindingRegistry {
   /** DSH chat session id → the adapter model (`agentId` | `agentId@choice`) its next turn runs on. */
   readonly conversations: Map<string, string>
+  /**
+   * ACP tool call id → the tool's output folded to plain text. The guard's
+   * `tools/execute` listener answers the host loop's execution of an ACP
+   * display card from here, so the card records the tool's REAL output
+   * instead of an `unknown tool` error (see `recordAcpToolOutput`).
+   */
+  readonly toolResults: Map<string, string>
+  /**
+   * Resolvers waiting for a call's output to land, keyed by call id. Under the
+   * segmented turn shape the host loop executes a card the moment its segment
+   * settles — often BEFORE the agent has reported the tool's output — so the
+   * guard's virtual tool parks here until `recordAcpToolOutput` (or the turn's
+   * settlement, or the bounded timeout) releases it.
+   */
+  readonly toolOutputWaiters: Map<string, Set<(text: string | undefined) => void>>
   /** Bare agent id served when a conversation carries no explicit binding (`undefined`: no rewrite). */
   defaultModel?: string
+  /**
+   * Wait for a call's output to land (the plugin's implementation, shared via
+   * the registry so the preset's separate module instance can reach it). The
+   * guard's virtual tools call this when the host loop executes a card whose
+   * tool is still running inside the ACP agent.
+   */
+  waitForToolOutput?: (callId: string, timeoutMs: number) => Promise<string | undefined>
 }
 
 /**
@@ -2039,10 +2081,555 @@ export interface AcpRouteBindingRegistry {
 export function routeBindingRegistry(): AcpRouteBindingRegistry {
   const host = globalThis as unknown as { [ACP_ROUTE_BINDING_KEY]?: AcpRouteBindingRegistry }
   const existing = host[ACP_ROUTE_BINDING_KEY]
-  if (existing !== undefined) return existing
-  const registry: AcpRouteBindingRegistry = { conversations: new Map() }
+  if (existing !== undefined) {
+    // A registry from an older build may predate the waiter seam: re-attach
+    // the (upgraded) implementation so the guard can always use it.
+    if (existing.waitForToolOutput === undefined) existing.waitForToolOutput = (callId, timeoutMs) => waitForToolOutput(callId, timeoutMs)
+    return existing
+  }
+  const registry: AcpRouteBindingRegistry = {
+    conversations: new Map(),
+    toolResults: new Map(),
+    toolOutputWaiters: new Map(),
+    waitForToolOutput: (callId, timeoutMs) => waitForToolOutput(callId, timeoutMs),
+  }
   host[ACP_ROUTE_BINDING_KEY] = registry
   return registry
+}
+
+/** Bounds for the shared tool-output record (see {@link recordAcpToolOutput}). */
+const TOOL_OUTPUT_MAX_ENTRIES = 200
+const TOOL_OUTPUT_MAX_CHARS = 16_000
+
+/**
+ * Record one ACP tool call for the guard's virtual tools. The host loop
+ * "executes" every tool-call block in a settled ACP message (that execution
+ * record is what draws the card); the preset registers no tools, so each call
+ * would record `Error: unknown tool "<name>"`. The guard's `tools/execute`
+ * listener instead registers a scoped virtual tool per name, and its body
+ * answers with THIS record — the tool's real output, folded by the same helper
+ * the ACP view uses. Every seen call id is recorded, even with empty output:
+ * the guard's pre-step gate identifies its own continuation batches by exactly
+ * this membership. Bounded: entries are transient, but an agent that inlines
+ * whole files must not grow the process-wide map without limit.
+ */
+export function recordAcpToolOutput(callId: string, text: string): void {
+  if (callId === '') return
+  const registry = routeBindingRegistry()
+  registry.toolResults.set(callId, text.length > TOOL_OUTPUT_MAX_CHARS ? `${text.slice(0, TOOL_OUTPUT_MAX_CHARS)}…` : text)
+  while (registry.toolResults.size > TOOL_OUTPUT_MAX_ENTRIES) {
+    const oldest = registry.toolResults.keys().next().value
+    if (oldest === undefined) break
+    registry.toolResults.delete(oldest)
+  }
+  const waiters = registry.toolOutputWaiters.get(callId)
+  if (waiters !== undefined) {
+    registry.toolOutputWaiters.delete(callId)
+    for (const waiter of [...waiters]) waiter(registry.toolResults.get(callId))
+  }
+}
+
+/**
+ * Wait for a tool call's output to land in the shared registry. The host loop
+ * executes a card as soon as its segment settles, which routinely happens
+ * while the ACP agent is still running the tool; the guard's virtual tool
+ * parks here so the card's execution record ends up with the real output.
+ *
+ * Resolves with the output text, or `undefined` when the bounded timeout
+ * elapses or the turn settles first (the caller then answers with a pointer to
+ * the ACP transcript view). Never rejects and never waits past the timeout.
+ */
+export function waitForToolOutput(callId: string, timeoutMs: number): Promise<string | undefined> {
+  const registry = routeBindingRegistry()
+  const landed = registry.toolResults.get(callId)
+  if (landed !== undefined || callId === '') return Promise.resolve(landed)
+  return new Promise<string | undefined>(resolve => {
+    let settled = false
+    const done = (text: string | undefined): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      const waiters = registry.toolOutputWaiters.get(callId)
+      if (waiters !== undefined) {
+        waiters.delete(done)
+        if (waiters.size === 0) registry.toolOutputWaiters.delete(callId)
+      }
+      resolve(text)
+    }
+    const timer = setTimeout(() => done(undefined), Math.max(0, timeoutMs))
+    timer.unref?.()
+    let waiters = registry.toolOutputWaiters.get(callId)
+    if (waiters === undefined) {
+      waiters = new Set()
+      registry.toolOutputWaiters.set(callId, waiters)
+    }
+    waiters.add(done)
+  })
+}
+
+/** Release every output waiter (a turn settled; nothing more can land for it). */
+export function releaseAllToolOutputWaiters(): void {
+  const registry = routeBindingRegistry()
+  const waiters = [...registry.toolOutputWaiters.values()]
+  registry.toolOutputWaiters.clear()
+  for (const set of waiters) for (const waiter of [...set]) waiter(undefined)
+}
+
+// ---- Segmented turn streaming ----
+
+/**
+ * One driver step's stream: its own chunk queue and block state. A turn is
+ * MANY segments when it carries tool calls — each segment ends where a tool
+ * card should sit as the LAST block of the settled assistant message, so the
+ * host loop executes the card between two assistant messages exactly like a
+ * native multi-step turn (see docs/acp-convergence.md §1.7).
+ */
+interface SegmentState {
+  queue: AsyncQueue<StreamChunk>
+  /** Block index within THIS segment (the host accumulator is per-stream-call). */
+  index: number
+  activeType: 'reasoning' | 'text' | 'tool-call' | null
+  activeText: string
+  /** The open tool-call block's snapshot, while `activeType === 'tool-call'`. */
+  activeToolCall: AcpToolCallSnapshot | undefined
+  /** Whether this segment opened at least one tool-call block. */
+  hasCard: boolean
+  finished: boolean
+}
+
+/** How one segment's stream ends, in `StreamChunk.finish` terms. */
+type SegmentFinishReason =
+  | { kind: 'stop' }
+  | { kind: 'aborted'; failure?: { message: string; code: string } }
+  | { kind: 'error'; failure?: { message: string; code: string } }
+
+/** Why a turn ended, as seen by {@link TurnStreamController.settle}. */
+type TurnSettle =
+  | { kind: 'stop'; stopReason: string }
+  | { kind: 'cancelled' }
+  | { kind: 'error'; message: string }
+
+/**
+ * The state of ONE ACP prompt, shared across every driver step of the turn.
+ *
+ * The controller owns the hub subscription (for the whole agent-side turn, not
+ * per stream() call), the transcript cursor (segments resume by replaying
+ * `transcript.since(cursor)` — events that arrive while no segment is open are
+ * recorded, never lost), the seen-call registry (a call id gets exactly one
+ * card per turn, wherever its restatements land), and the turn-level facts
+ * (`sawVisibleBlock`, usage) that outlive any single segment.
+ */
+class TurnStreamController {
+  private segment: SegmentState | undefined
+  private settled = false
+  private disposed = false
+  private readonly seenCalls = new Set<string>()
+  private readonly announcedKinds = new Map<string, string>()
+  private latestUsage: { inputTokens: number; outputTokens: number } | null = null
+  /** Narrative lines (permission asks) that arrived while no segment was open. */
+  private readonly pendingProse: string[] = []
+  sawVisibleBlock = false
+  private cursorSeq: number
+
+  constructor(
+    private readonly manager: BridgeManager,
+    private readonly hub: EventHub,
+    private readonly bridge: AgentBridge,
+    readonly session: LiveSession,
+    readonly turnId: string,
+    /** Releases the agent-side turn slot (the `beginTurn` settler; idempotent). */
+    private readonly endTurn: () => void,
+    private readonly rollbackFirstTurn: (session: LiveSession) => void,
+  ) {
+    this.turnSeqAtStart = session.turnSeq
+    this.cursorSeq = session.transcript.head
+    this.unsubscribe = hub.subscribe(event => this.onEvent(event))
+  }
+
+  private readonly unsubscribe: () => void
+  private readonly turnSeqAtStart: number
+
+  /** The transcript cursor: everything at or below it is already folded or recorded. */
+  get replayCursor(): number {
+    return this.cursorSeq
+  }
+
+  /** Whether the agent already settled its `session/prompt` for this turn. */
+  get hasSettled(): boolean {
+    return this.settled
+  }
+
+  /** Generation guard: a controller whose turn has been superseded must not touch the session. */
+  get stale(): boolean {
+    return this.disposed || this.session.turnSeq !== this.turnSeqAtStart
+  }
+
+  /**
+   * Open the next segment and replay everything that landed since the cursor.
+   * Visible events fold into the new segment (a card that was announced
+   * between segments opens here); tool records are idempotent. Replaying may
+   * itself finish the segment (card followed by prose — the prose belongs to
+   * the NEXT message): the replay stops AT the cutting event without
+   * consuming it, so the next segment replays it again.
+   */
+  startSegment(): SegmentState {
+    const seg: SegmentState = {
+      queue: new AsyncQueue<StreamChunk>(),
+      index: -1,
+      activeType: null,
+      activeText: '',
+      activeToolCall: undefined,
+      hasCard: false,
+      finished: false,
+    }
+    this.segment = seg
+    const entries = this.session.transcript.since(this.cursorSeq)
+    for (const entry of entries) {
+      if (seg.finished) break
+      if (!this.foldInto(seg, entry.update as Record<string, unknown>)) break
+      this.cursorSeq = entry.seq
+    }
+    if (!seg.finished && this.pendingProse.length > 0) {
+      // Narrative that arrived between segments (a permission ask during card
+      // execution): it belongs to the turn's story, so it opens this segment.
+      const lines = this.pendingProse.splice(0, this.pendingProse.length).join('')
+      this.emitProse(seg, 'reasoning', lines)
+    }
+    if (this.settled) this.finishAfterSettle(seg)
+    return seg
+  }
+
+  /** Finish the segment on air (if any). Used by cancel paths and teardown. */
+  finishActive(reason: SegmentFinishReason): void {
+    if (this.segment !== undefined) this.finishSegment(this.segment, reason)
+  }
+
+  /** The agent settled its `session/prompt`. Ends the turn's streaming face. */
+  settle(outcome: TurnSettle): void {
+    if (this.settled) return
+    this.settled = true
+    const reason = outcome.kind === 'cancelled'
+      ? { kind: 'aborted' as const, failure: { message: 'Turn was cancelled', code: 'CANCELLED' } }
+      : outcome.kind === 'error'
+        ? { kind: 'error' as const, failure: { message: outcome.message, code: 'INTERNAL' } }
+        : { kind: 'stop' as const }
+    if (outcome.kind === 'cancelled') {
+      this.hub.broadcast({ type: 'turn/end', sessionId: this.session.sessionId, turnId: this.turnId, stopReason: 'cancelled' })
+    } else if (outcome.kind === 'error') {
+      this.hub.broadcast({ type: 'turn/end', sessionId: this.session.sessionId, turnId: this.turnId, error: outcome.message })
+    } else {
+      this.hub.broadcast({ type: 'turn/end', sessionId: this.session.sessionId, turnId: this.turnId, stopReason: outcome.stopReason })
+    }
+    // The provisional lock settles BEFORE any synthesized warning below: the
+    // warning is our text, not evidence that the first turn delivered anything.
+    if (this.session.provisionalLock === true) {
+      this.session.provisionalLock = false
+      if (!this.sawVisibleBlock) this.rollbackFirstTurn(this.session)
+    }
+    const seg = this.segment
+    if (seg !== undefined) {
+      if (outcome.kind !== 'stop') {
+        this.finishSegment(seg, reason)
+      } else {
+        if (!this.sawVisibleBlock) {
+          // The silent-failure report: a normal stop with nothing the chat
+          // plane renders. Aborted or failing turns need no extra hint; this
+          // is specifically "protocol says success, the bubble is empty".
+          const line = `\n[dsh-ntr] agent "${this.session.agentId}" ended the turn with no visible output (stop reason: ${outcome.stopReason}). Some agents fold upstream failures — auth, billing, rate limits — into a normal stop; try resending, and check the agent process logs if it repeats.\n`
+          this.emitProse(seg, 'text', line)
+        }
+        this.finishSegment(seg, reason)
+      }
+    }
+    // When no segment is on air (the turn ended on a card) the FINAL
+    // continuation step collects the tail: `startSegment` sees `settled` and
+    // finishes it with the appropriate closing line.
+    this.session.running = false
+    this.endTurn()
+    releaseAllToolOutputWaiters()
+    // The controller stays indexed only while a continuation step can still
+    // come for its cards. A cancelled, failed, or card-less turn has none:
+    // retire it now; the next turn's `rememberTurnStream` would anyway.
+    if (outcome.kind !== 'stop' || this.seenCalls.size === 0) this.dispose()
+  }
+
+  /** Cancelled by the user: finish the on-air segment and release the turn's slots. */
+  abortActiveSegment(): void {
+    if (this.stale) return
+    this.finishActive({ kind: 'aborted', failure: { message: 'aborted', code: 'ABORTED' } })
+    // The agent may take its time acknowledging the cancel, but OUR face of
+    // the turn ends now: the session stops running and a provisional first
+    // lock settles against what was actually shown. The turn SLOT stays
+    // claimed, though: the agent-side prompt is still in flight, and a second
+    // prompt sent into that window would be a concurrent `session/prompt` the
+    // protocol forbids — `settle` (or the cancel fallback) releases the slot.
+    this.session.running = false
+    if (this.session.provisionalLock === true) {
+      this.session.provisionalLock = false
+      if (!this.sawVisibleBlock) this.rollbackFirstTurn(this.session)
+    }
+    releaseAllToolOutputWaiters()
+  }
+
+  /** Stop observing and release the manager's index. Idempotent. */
+  dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    this.unsubscribe()
+    this.manager.forgetTurnStream(this)
+    releaseAllToolOutputWaiters()
+  }
+
+  // ---- internals ----
+
+  private finishSegment(seg: SegmentState, reason: SegmentFinishReason): void {
+    if (seg.finished) return
+    seg.finished = true
+    if (seg.activeType !== null) {
+      seg.queue.push({
+        type: 'block-end',
+        index: seg.index,
+        block: seg.activeType === 'tool-call' && seg.activeToolCall !== undefined
+          ? { type: 'tool-call' as const, id: seg.activeToolCall.callId, name: seg.activeToolCall.name, arguments: seg.activeToolCall.argsRaw }
+          : { type: seg.activeType as 'reasoning' | 'text', text: seg.activeText },
+      })
+      seg.activeType = null
+      seg.activeToolCall = undefined
+    }
+    if (this.latestUsage !== null) seg.queue.push({ type: 'usage', usage: this.latestUsage })
+    seg.queue.push({ type: 'finish', reason })
+    seg.queue.close()
+    if (this.segment === seg) this.segment = undefined
+  }
+
+  /** A segment opened on an already-settled turn: replay, then close it out. */
+  private finishAfterSettle(seg: SegmentState): void {
+    if (seg.finished) return
+    if (this.sawVisibleBlock) {
+      // The turn delivered its message(s); this last continuation step has
+      // nothing new to show. An empty assistant message is not something the
+      // plane can render honestly, so close with a one-line pointer.
+      if (seg.index < 0 && this.pendingProse.length === 0) {
+        const line = `\n[dsh-ntr] agent "${this.session.agentId}" executed its tool call(s) but sent no text reply this turn — the tool details are in the ACP transcript view.\n`
+        this.emitProse(seg, 'text', line)
+      }
+      this.finishSegment(seg, { kind: 'stop' })
+    } else {
+      // A settled turn that never showed anything: the zero-output warning the
+      // plane would have gotten from a single-stream turn (constraint 23).
+      const line = `\n[dsh-ntr] agent "${this.session.agentId}" ended the turn with no visible output. Some agents fold upstream failures — auth, billing, rate limits — into a normal stop; try resending, and check the agent process logs if it repeats.\n`
+      if (seg.index < 0) this.emitProse(seg, 'text', line)
+      this.finishSegment(seg, { kind: 'stop' })
+    }
+  }
+
+  private onEvent(event: unknown): void {
+    if (this.disposed) return
+    const row = event as { type?: string; sessionId?: string }
+    if (row.sessionId !== undefined && row.sessionId !== this.session.sessionId) return
+    if (row.type === 'session/update') {
+      const typed = event as { sessionId: string; seq: number; update: unknown }
+      if (typed.seq <= this.cursorSeq) return
+      const update = typed.update as Record<string, unknown>
+      const seg = this.segment
+      if (seg === undefined || seg.finished) {
+        // Between segments: tool outputs still reach the shared registry (the
+        // guard's virtual tool may be parked on this very record) and usage
+        // keeps the turn's tally fresh, but the cursor does NOT advance — the
+        // next segment replays everything since it, which re-records those
+        // idempotently and folds the prose the agent streamed while its cards
+        // executed on the host.
+        this.recordWithoutSegment(update)
+        return
+      }
+      // The cursor advances only past events fully consumed into this
+      // segment; the event that CUTS the segment belongs to the next one.
+      if (this.foldInto(seg, update)) this.cursorSeq = typed.seq
+    } else if (row.type === 'permission/request') {
+      const typed = event as { toolCall: unknown; requestId: string }
+      const seg = this.segment
+      const line = this.permissionLine(typed)
+      if (seg === undefined || seg.finished) {
+        if (line !== '') this.pendingProse.push(line)
+        return
+      }
+      if (seg.hasCard) {
+        // The card must stay the segment's last block: park the line for the
+        // next segment instead of streaming it below the card.
+        this.pendingProse.push(line)
+        this.finishSegment(seg, { kind: 'stop' })
+        return
+      }
+      if (line !== '') this.emitProse(seg, 'reasoning', line)
+    }
+  }
+
+  /** Events that arrive between segments: recorded, replayed into the next one. */
+  private recordWithoutSegment(update: Record<string, unknown>): void {
+    const kind = String(update.sessionUpdate ?? '')
+    if (kind === 'usage_update') {
+      this.noteUsage(update)
+    } else if (kind === 'tool_call' || kind === 'tool_call_update') {
+      this.noteToolRecord(update)
+    }
+  }
+
+  private noteUsage(update: Record<string, unknown>): void {
+    const used = typeof update.used === 'number' ? update.used : 0
+    const size = typeof update.size === 'number' ? update.size : 0
+    this.latestUsage = { inputTokens: size, outputTokens: used }
+  }
+
+  /** Record a tool call's output (idempotent) and wake any waiter. */
+  private noteToolRecord(update: Record<string, unknown>): void {
+    const callId = typeof update.toolCallId === 'string' ? update.toolCallId.trim() : ''
+    if (callId === '') return
+    recordAcpToolOutput(callId, updateContentToText(update.content))
+  }
+
+  /**
+   * The turn's whole fold, shared by live events and segment replay. Visible
+   * non-tool events END a card-bearing segment instead of joining it — that is
+   * the segmentation rule that puts each card between two assistant messages.
+   * Returns whether the event was consumed into this segment: the cutting
+   * event is left unconsumed (and thus behind the cursor) for the next one.
+   */
+  private foldInto(seg: SegmentState, update: Record<string, unknown>): boolean {
+    const kind = String(update.sessionUpdate ?? '')
+    if (kind === 'agent_thought_chunk' || kind === 'agent_message_chunk') {
+      const text = chunkTextOf(update.content)
+      if (text === '') return true
+      if (seg.hasCard) {
+        this.finishSegment(seg, { kind: 'stop' })
+        return false
+      }
+      this.emitProse(seg, kind === 'agent_thought_chunk' ? 'reasoning' : 'text', text)
+      return true
+    } else if (kind === 'tool_call' || kind === 'tool_call_update') {
+      this.noteToolRecord(update)
+      const snapshot = acpToolCallFromUpdate(update)
+      if (snapshot === undefined) return true
+      if (seg.activeType === 'tool-call' && seg.activeToolCall?.callId === snapshot.callId) {
+        for (const delta of acpToolCallDelta(seg.activeToolCall, update)) {
+          seg.queue.push(delta.kind === 'name'
+            ? { type: 'tool-call-delta', index: seg.index, id: seg.activeToolCall.callId, name: delta.name, argumentsDelta: '' }
+            : { type: 'tool-call-delta', index: seg.index, id: seg.activeToolCall.callId, argumentsDelta: delta.text })
+        }
+        return true
+      }
+      if (this.seenCalls.has(snapshot.callId)) return true // a restatement of a card already settled
+      this.seenCalls.add(snapshot.callId)
+      this.openToolCallBlock(seg, snapshot)
+      return true
+    } else if (kind === 'usage_update') {
+      this.noteUsage(update)
+      return true
+    } else if (!BOOKKEEPING_UPDATES.has(kind)) {
+      const text = describeUnhandledUpdate(kind, update)
+      if (this.announcedKinds.get(kind) === text) return true
+      if (seg.hasCard) {
+        this.finishSegment(seg, { kind: 'stop' })
+        return false
+      }
+      this.announcedKinds.set(kind, text)
+      this.emitProse(seg, 'text', `\n${text}\n`)
+      return true
+    }
+    return true
+  }
+
+  private emitProse(seg: SegmentState, type: 'reasoning' | 'text', text: string): void {
+    if (seg.finished) return
+    if (seg.activeType !== type) {
+      if (seg.activeType !== null) {
+        seg.queue.push({
+          type: 'block-end',
+          index: seg.index,
+          block: seg.activeType === 'tool-call' && seg.activeToolCall !== undefined
+            ? { type: 'tool-call' as const, id: seg.activeToolCall.callId, name: seg.activeToolCall.name, arguments: seg.activeToolCall.argsRaw }
+            : { type: seg.activeType as 'reasoning' | 'text', text: seg.activeText },
+        })
+      }
+      seg.index += 1
+      seg.activeType = type
+      seg.activeText = ''
+      this.sawVisibleBlock = true
+      seg.queue.push({ type: 'block-start', index: seg.index, blockType: type })
+    }
+    seg.activeText += text
+    seg.queue.push({ type: type === 'reasoning' ? 'reasoning-delta' : 'text-delta', index: seg.index, text })
+  }
+
+  /**
+   * Open a tool-call block for one call. Two adjacent tool calls share a block
+   * TYPE, so the switch helper's type-equality early return cannot be used
+   * here — every call needs its own block.
+   */
+  private openToolCallBlock(seg: SegmentState, snapshot: AcpToolCallSnapshot): void {
+    if (seg.finished) return
+    if (seg.activeType !== null) {
+      seg.queue.push({
+        type: 'block-end',
+        index: seg.index,
+        block: seg.activeType === 'tool-call' && seg.activeToolCall !== undefined
+          ? { type: 'tool-call' as const, id: seg.activeToolCall.callId, name: seg.activeToolCall.name, arguments: seg.activeToolCall.argsRaw }
+          : { type: seg.activeType as 'reasoning' | 'text', text: seg.activeText },
+      })
+    }
+    seg.index += 1
+    seg.activeType = 'tool-call'
+    seg.activeText = ''
+    seg.activeToolCall = snapshot
+    this.sawVisibleBlock = true
+    seg.hasCard = true
+    seg.queue.push({ type: 'block-start', index: seg.index, blockType: 'tool-call' })
+    seg.queue.push({
+      type: 'tool-call-delta',
+      index: seg.index,
+      id: snapshot.callId,
+      ...(snapshot.name === '' ? {} : { name: snapshot.name }),
+      argumentsDelta: snapshot.argsRaw,
+    })
+  }
+
+  private permissionLine(event: { toolCall: unknown; requestId: string }): string {
+    const title = typeof (event.toolCall as { title?: unknown } | undefined)?.title === 'string'
+      ? String((event.toolCall as { title: string }).title)
+      : 'permission'
+    // The line must not point at a place with no answer entry, and the bridge
+    // knows which path this ask took (`ledgerFallbackOf`, recorded before the
+    // frame was broadcast). On the DESIGNED ledger paths the settings panel's
+    // card is the answer entry. A DEGRADED native route carries a deadline.
+    const fallback = this.bridge.ledgerFallbackOf(event.requestId)
+    return fallback?.reason === 'unavailable'
+      ? fallback.timeoutMs > 0
+        ? `\n> 🔐 [Permission Required: ${title}] - the approval service is unavailable; approve in Settings within ${String(Math.round(fallback.timeoutMs / 1000))}s or this request is cancelled\n`
+        : `\n> 🔐 [Permission Required: ${title}] - the approval service is unavailable; please approve in Settings\n`
+      : `\n> 🔐 [Permission Required: ${title}] - please approve in Settings\n`
+  }
+}
+
+/** Chunk text shared by the controller's fold (string / object / array forms). */
+function chunkTextOf(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    const parts: string[] = []
+    for (const item of content) {
+      if (typeof item === 'string') parts.push(item)
+      else if (typeof item === 'object' && item !== null) {
+        const row = item as Record<string, unknown>
+        if (typeof row.text === 'string') parts.push(row.text)
+        else parts.push(JSON.stringify(item))
+      }
+    }
+    return parts.join('')
+  }
+  if (typeof content === 'object' && content !== null) {
+    const row = content as Record<string, unknown>
+    if (typeof row.text === 'string') return row.text
+    if (row.type === 'text' || row.type === undefined) return JSON.stringify(content)
+  }
+  return ''
 }
 
 /** Routes host session ids to their owning bridge. */
@@ -2051,6 +2638,46 @@ export class BridgeManager {
   private readonly defsMap = new Map<string, AcpAgentDef>()
   /** The plugin's own default ACP agent id (persisted; see `persistAgents`). */
   private defaultAgentId?: string
+  /**
+   * The in-flight (or just-settled) segmented turn of one DSH chat session.
+   * Keyed by chat session id because the continuation steps of a segmented
+   * turn arrive as fresh `streamPrompt` calls that must find the SAME
+   * controller — its transcript cursor, seen-call registry and turn facts are
+   * what let them resume the prompt instead of re-sending it. An entry is
+   * replaced by the conversation's next turn and removed on cancel, session
+   * close/release, or agent stop.
+   */
+  private readonly turnStreams = new Map<string, TurnStreamController>()
+
+  /** The segmented turn a continuation step of one chat session must resume. */
+  turnStreamFor(dshSessionId: string): TurnStreamController | undefined {
+    return this.turnStreams.get(dshSessionId)
+  }
+
+  /** Index a turn's controller, retiring whatever turn it supersedes. */
+  rememberTurnStream(dshSessionId: string, controller: TurnStreamController): void {
+    const previous = this.turnStreams.get(dshSessionId)
+    if (previous !== undefined && previous !== controller) previous.dispose()
+    this.turnStreams.set(dshSessionId, controller)
+  }
+
+  /** Drop a controller from the index (its own `dispose` calls back into this). */
+  forgetTurnStream(controller: TurnStreamController): void {
+    for (const [key, value] of this.turnStreams) {
+      if (value === controller) this.turnStreams.delete(key)
+    }
+  }
+
+  /** Tear down the turn streams of every session of one bridge (close/release/stop). */
+  private disposeTurnStreamsOf(match: (controller: TurnStreamController) => boolean): void {
+    for (const [key, controller] of [...this.turnStreams]) {
+      if (match(controller)) {
+        controller.finishActive({ kind: 'aborted', failure: { message: 'session ended', code: 'SESSION_CLOSED' } })
+        controller.dispose()
+        this.turnStreams.delete(key)
+      }
+    }
+  }
 
   constructor(
     defs: readonly AcpAgentDef[],
@@ -2265,10 +2892,11 @@ export class BridgeManager {
         `acp: conversation is locked to agent "${lockedTo}" once its first turn has started; start a new conversation to use another agent`,
       )
     }
-    // A switch to a DIFFERENT agent drops its model/effort/mode: those values
-    // are the PREVIOUS agent's vocabulary (a `choice` from its catalog, a value
-    // of ITS `thought_level`, one of ITS `session/set_mode` ids) and would be
-    // rejected or silently remapped by the new one. Re-picking the SAME agent
+    // A switch to a DIFFERENT agent drops its model/effort/mode/configs: those
+    // values are the PREVIOUS agent's vocabulary (a `choice` from its catalog, a
+    // value of ITS `thought_level`, one of ITS `session/set_mode` ids, one of ITS
+    // extra config options) and would be rejected or silently remapped by the
+    // new one. Re-picking the SAME agent
     // is not a switch, so its picks stand. `patchChatChoice` owns that rule —
     // both entry points go through it so the two cannot drift.
     this.patchChatChoice(dshSessionId, { agentId })
@@ -2339,8 +2967,8 @@ export class BridgeManager {
    * live session as a lock — keeping it would leave a visually locked
    * conversation whose picker the host still accepts.
    *
-   * The pick itself (agent/model/effort/mode) stays recorded: the base comes
-   * back showing the same agent, ready to be changed or retried.
+   * The pick itself (agent/model/effort/mode/extra configs) stays recorded: the
+   * base comes back showing the same agent, ready to be changed or retried.
    */
   private rollbackFirstTurn(session: LiveSession): void {
     session.provisionalLock = false
@@ -2426,8 +3054,9 @@ export class BridgeManager {
   /**
    * Record one field of a conversation's pick and persist it.
    *
-   * Every bottom-bar control (agent, model, thought level, the agent's own mode)
-   * is one field of the SAME record, and the setters used to spell the record
+   * Every bottom-bar control (agent, model, thought level, the agent's own mode,
+   * the advanced base's extra config values) is one field of the SAME record,
+   * and the setters used to spell the record
    * out by hand each time — which is exactly how `mode` ended up as the one
    * control that reset on every restart: no setter wrote it. Patch through here
    * so a new axis cannot be half-wired.
@@ -2449,6 +3078,7 @@ export class BridgeManager {
     if (next.modelId === undefined) delete next.modelId
     if (next.effort === undefined) delete next.effort
     if (next.mode === undefined) delete next.mode
+    if (next.extraConfigs === undefined || Object.keys(next.extraConfigs).length === 0) delete next.extraConfigs
     this.chatAgentIntent.set(dshSessionId, next)
     this.persistAgents()
     this.syncConversationRoute(dshSessionId)
@@ -2467,6 +3097,17 @@ export class BridgeManager {
     if (lockedTo !== undefined && lockedTo !== agentId) {
       throw new AcpError('agent_locked', `acp: conversation is locked to agent "${lockedTo}" once its first turn has started`)
     }
+    // A model the live session's agent no longer lists is refused HERE too:
+    // recording it would look like a successful switch while the next send is
+    // doomed to `model_unavailable`. Before a session exists there is nothing
+    // authoritative to validate against — the send-time gate covers it.
+    for (const session of this.dshSessionMap.values()) {
+      if (session.dshSessionId !== dshSessionId || session.agentId !== agentId || session.released) continue
+      const stale = choice === undefined ? undefined : this.staleModelChoice(session, choice)
+      if (stale !== undefined) {
+        throw new AcpError('model_unavailable', `acp: agent "${agentId}" no longer offers model "${stale}"`)
+      }
+    }
     // The pick is recorded even when NO live session exists yet — that is the
     // "choose the model before the first message" case. A session that
     // materializes later reads it back (`applyChatChoice`).
@@ -2474,8 +3115,8 @@ export class BridgeManager {
     for (const session of this.dshSessionMap.values()) {
       if (session.dshSessionId !== dshSessionId || session.agentId !== agentId) continue
       if (session.released) continue
-      session.choice = choice
       await this.alignSessionConfig(session, choice, session.reasoningEffort)
+      session.choice = choice
       session.modelId = modelId
     }
   }
@@ -2487,8 +3128,55 @@ export class BridgeManager {
     this.patchChatChoice(dshSessionId, { effort })
     for (const session of this.dshSessionMap.values()) {
       if (session.dshSessionId !== dshSessionId || session.released) continue
-      session.reasoningEffort = effort
-      await this.alignSessionConfig(session, session.choice, effort)
+      const aligned = await this.alignSessionConfig(session, session.choice, effort)
+      // Same rule as the model axis: a dropped level is no longer "in force".
+      session.reasoningEffort = aligned.effortStale ? undefined : effort
+    }
+  }
+
+  /**
+   * Set one of the agent's EXTRA config options for one chat session (the
+   * composer's advanced base). The value is validated against what the agent
+   * actually publishes — the live session's own options first, the cached
+   * catalog second — and recorded even when no session exists yet, so the pick
+   * applies when the first turn materializes one (`applyChatChoice`).
+   *
+   * A live session is updated immediately; a failure there is warned about and
+   * the pick still stands, exactly like the model/effort alignment path.
+   */
+  async setChatSessionConfig(dshSessionId: string, configId: string, value: string): Promise<void> {
+    const agentId = this.chatAgentFor(dshSessionId)
+    if (agentId === undefined) {
+      throw new AcpError('unknown_session', `acp: no ACP agent is bound to chat session ${dshSessionId}`)
+    }
+    const live = [...this.dshSessionMap.values()].find(session =>
+      session.dshSessionId === dshSessionId && session.agentId === agentId && !session.released)
+    const observed = live === undefined
+      ? undefined
+      : parseCatalogOptions(live.configOptions).extras?.find(option => option.configId === configId)
+    const advertised = this.catalogs.get(agentId)?.catalog.extras?.find(option => option.configId === configId)
+    const option = observed ?? advertised
+    if (option === undefined) {
+      throw new AcpError('unknown_config', `acp: agent "${agentId}" publishes no extra config option "${configId}"`)
+    }
+    if (!option.choices.some(choice => choice.value === value)) {
+      throw new AcpError('bad_config', `acp: "${value}" is not a value of config option "${configId}"`)
+    }
+    const current = this.chatAgentIntent.get(dshSessionId)
+    const extraConfigs = current?.agentId === agentId ? { ...current.extraConfigs } : {}
+    this.patchChatChoice(dshSessionId, { agentId, extraConfigs: { ...extraConfigs, [configId]: value } })
+    for (const session of this.dshSessionMap.values()) {
+      if (session.dshSessionId !== dshSessionId || session.agentId !== agentId || session.released) continue
+      try {
+        await this.bridge(agentId).setConfigOption(session, configId, value)
+      } catch (error) {
+        this.hub.broadcast({
+          type: 'agent/notice',
+          agentId,
+          level: 'error',
+          text: `acp: failed to set config "${configId}" to "${value}": ${describeError(error)}`,
+        })
+      }
     }
   }
 
@@ -2499,9 +3187,11 @@ export class BridgeManager {
    * This is what makes an up-front choice real rather than decorative: the
    * session/new and session/load answers come back with the AGENT's defaults,
    * which would otherwise run the first message on a model the user already
-   * replaced. Best effort, exactly like the turn path's alignment: a stale pick
-   * (a choice the agent dropped, a thought level it no longer offers) is warned
-   * about and skipped, never turned into a failed turn.
+   * replaced. Best effort, exactly like the turn path's alignment: a stale
+   * model is not applied (and NOT dropped — `streamPrompt` refuses to run a
+   * turn on an unknown model until the user reselects), a stale thought level
+   * is dropped with a notice, and the agent's own configuration is used in the
+   * meantime. Never turned into a different model than the one selected.
    */
   private async applyChatChoice(session: LiveSession): Promise<void> {
     const dshSessionId = session.dshSessionId
@@ -2509,14 +3199,18 @@ export class BridgeManager {
     const choice = this.chatAgentIntent.get(dshSessionId)
     if (choice === undefined || choice.agentId !== session.agentId) return
     const { choice: modelChoice } = splitAdapterModelId(choice.modelId ?? '')
-    await this.alignSessionConfig(session, modelChoice, choice.effort)
-    // Mirror the pick onto the session so `session/chat-list` reports what is
-    // actually in force, not just what was requested.
+    const aligned = await this.alignSessionConfig(session, modelChoice, choice.effort)
+    // Mirror the pick onto the session so `session/chat-list` reports the
+    // conversation's selection. A stale model stays mirrored on purpose: the
+    // chip must keep naming what the user chose, and the next send refuses
+    // with a message pointing at it.
     if (choice.modelId !== undefined) {
       session.modelId = choice.modelId
       session.choice = modelChoice
     }
-    if (choice.effort !== undefined) session.reasoningEffort = choice.effort
+    if (choice.effort !== undefined) {
+      session.reasoningEffort = aligned.effortStale ? undefined : choice.effort
+    }
     // The agent's own mode is the third control in the same composer bar, so it
     // follows the same contract: a mode the agent no longer declares is skipped
     // (warning, not a failed turn) — `session/new` and `session/load` both come
@@ -2541,6 +3235,42 @@ export class BridgeManager {
           level: 'error',
           text: `acp: agent "${session.agentId}" no longer offers mode "${choice.mode}"; keeping its own`,
         })
+      }
+    }
+    // The advanced base's picks follow the same contract: apply what the agent
+    // still offers, warn and skip what it dropped, never fail the turn.
+    if (choice.extraConfigs !== undefined) {
+      const extras = parseCatalogOptions(session.configOptions).extras ?? []
+      for (const [configId, value] of Object.entries(choice.extraConfigs)) {
+        const option = extras.find(entry => entry.configId === configId)
+        if (option === undefined) {
+          this.hub.broadcast({
+            type: 'agent/notice',
+            agentId: session.agentId,
+            level: 'error',
+            text: `acp: agent "${session.agentId}" no longer offers config "${configId}"; keeping its own`,
+          })
+          continue
+        }
+        if (!option.choices.some(entry => entry.value === value)) {
+          this.hub.broadcast({
+            type: 'agent/notice',
+            agentId: session.agentId,
+            level: 'error',
+            text: `acp: agent "${session.agentId}" no longer offers "${value}" for config "${configId}"; keeping its own`,
+          })
+          continue
+        }
+        try {
+          await this.bridge(session.agentId).setConfigOption(session, configId, value)
+        } catch (error) {
+          this.hub.broadcast({
+            type: 'agent/notice',
+            agentId: session.agentId,
+            level: 'error',
+            text: `acp: failed to restore config "${configId}" to "${value}": ${describeError(error)}`,
+          })
+        }
       }
     }
   }
@@ -2731,14 +3461,21 @@ export class BridgeManager {
     if (raw === null || typeof raw !== 'object') return
     for (const [dshSessionId, row] of Object.entries(raw as Record<string, unknown>)) {
       if (dshSessionId === '' || row === null || typeof row !== 'object') continue
-      const { agentId, locked, modelId, effort, mode } = row as { agentId?: unknown; locked?: unknown; modelId?: unknown; effort?: unknown; mode?: unknown }
+      const { agentId, locked, modelId, effort, mode, extraConfigs } = row as {
+        agentId?: unknown; locked?: unknown; modelId?: unknown; effort?: unknown; mode?: unknown; extraConfigs?: unknown
+      }
       if (typeof agentId !== 'string' || agentId === '') continue
+      const configs = extraConfigs !== null && typeof extraConfigs === 'object' && !Array.isArray(extraConfigs)
+        ? Object.fromEntries(Object.entries(extraConfigs as Record<string, unknown>)
+          .filter(([, value]) => typeof value === 'string' && value !== '')) as Record<string, string>
+        : {}
       this.chatAgentIntent.set(dshSessionId, {
         agentId,
         ...(locked === true ? { locked: true } : {}),
         ...(typeof modelId === 'string' && modelId !== '' ? { modelId } : {}),
         ...(typeof effort === 'string' && effort !== '' ? { effort } : {}),
         ...(typeof mode === 'string' && mode !== '' ? { mode } : {}),
+        ...(Object.keys(configs).length === 0 ? {} : { extraConfigs: configs }),
       })
     }
     // Put every restored record back on the REQUEST path, not just in this
@@ -2757,8 +3494,9 @@ export class BridgeManager {
         version: 2,
         ...(this.defaultAgentId === undefined ? {} : { defaultAgentId: this.defaultAgentId }),
         agents: [...this.defsMap.values()],
-        // The per-conversation picks: agent + model + thought level chosen in
-        // the composer, including for conversations with no live session yet.
+        // The per-conversation picks: agent + model + thought level + mode +
+        // extra config values chosen in the composer, including for
+        // conversations with no live session yet.
         ...(this.chatAgentIntent.size === 0
           ? {}
           : { conversations: Object.fromEntries(this.chatAgentIntent) }),
@@ -2796,8 +3534,9 @@ export class BridgeManager {
    * defect this marker used to cause (user report, 2026-10-18).
    *
    * v2 = `mode` (`category: 'mode'`) joined `model` / `thought_level`.
+   * v3 = every other select joined as `extras` (the composer's advanced base).
    */
-  private static readonly CATALOG_SCHEMA = 2
+  private static readonly CATALOG_SCHEMA = 3
   /** Agents whose persisted catalog predates {@link CATALOG_SCHEMA}. */
   private readonly catalogStale = new Set<string>()
   /** Auto-spawning probes are suppressed under test runners so suites stay deterministic. */
@@ -3085,6 +3824,7 @@ export class BridgeManager {
       ? title
       : `${title} · ${currentModelChoice.name}`
     const modeOption = entry?.catalog.mode
+    const extraOptions = entry?.catalog.extras ?? []
     const commands = this.commandCache.get(agentId)
     return {
       agentId: def.id,
@@ -3119,6 +3859,21 @@ export class BridgeManager {
             ...(choice.description === undefined ? {} : { description: choice.description }),
           })),
         },
+      }),
+      // The advanced base's content: every select without a dedicated control.
+      // The browser overlays the conversation's `extraConfigs` on these current
+      // values, so a pick made before the first session still shows as chosen.
+      ...(extraOptions.length === 0 ? {} : {
+        extras: extraOptions.map(option => ({
+          configId: option.configId,
+          name: option.name,
+          ...(option.currentValue === null ? {} : { currentValue: option.currentValue }),
+          choices: option.choices.map(choice => ({
+            id: choice.value,
+            name: choice.name,
+            ...(choice.description === undefined ? {} : { description: choice.description }),
+          })),
+        })),
       }),
       ...(entry === undefined ? {} : { updatedAt: entry.updatedAt }),
       // The agent's last declared slash commands, for a conversation whose own
@@ -3201,11 +3956,26 @@ export class BridgeManager {
    * `session/set_config_option` only for drifting entries. Best effort by
    * design — failures broadcast a notice and the turn proceeds with the
    * agent's current configuration.
+   *
+   * A requested model the agent no longer offers (it publishes a non-empty
+   * choice list without it) is STALE. Alignment does NOT apply it and does NOT
+   * delete the pick: the caller refuses the turn so another model is never run
+   * unexpectedly (see `staleModelChoice` / `streamPrompt`), and the user can
+   * see which selection needs replacing. A stale thought level is still
+   * dropped with a one-time notice: it does not change WHICH model runs.
+   * The notice is tied to that transition, not to every turn — the turn path
+   * aligns twice (session materialization, then the prompt) and both calls
+   * would otherwise report the same drop.
    */
-  private async alignSessionConfig(session: LiveSession, modelChoice: string | undefined, effort: string | undefined): Promise<void> {
+  private async alignSessionConfig(
+    session: LiveSession,
+    modelChoice: string | undefined,
+    effort: string | undefined,
+  ): Promise<{ modelStale: boolean; effortStale: boolean }> {
     const wantedModel = modelChoice !== undefined && modelChoice !== '' ? modelChoice : undefined
     const wantedEffort = effort !== undefined && effort !== '' ? effort : undefined
-    if (wantedModel === undefined && wantedEffort === undefined) return
+    const result = { modelStale: false, effortStale: false }
+    if (wantedModel === undefined && wantedEffort === undefined) return result
     const catalog = parseCatalogOptions(session.configOptions)
     const bridge = this.bridge(session.agentId)
     const notice = (level: 'info' | 'error', text: string): void => {
@@ -3215,7 +3985,14 @@ export class BridgeManager {
       const model = catalog.model
       if (model === undefined) {
         notice('error', `acp: agent "${session.agentId}" exposes no model selector; ignoring model "${wantedModel}"`)
-      } else if (model.currentValue !== wantedModel && (model.choices.length === 0 || model.choices.some(c => c.value === wantedModel))) {
+      } else if (model.currentValue === wantedModel) {
+        // Already in force: nothing to do.
+      } else if (model.choices.length > 0 && !model.choices.some(choice => choice.value === wantedModel)) {
+        // Do NOT drop the pick or fall back here: the caller refuses the turn
+        // (see `staleModelChoice`), so the conversation can never silently run
+        // a model the user did not choose.
+        result.modelStale = true
+      } else {
         try {
           await bridge.setConfigOption(session, model.configId, wantedModel)
         } catch (error) {
@@ -3225,7 +4002,16 @@ export class BridgeManager {
     }
     if (wantedEffort !== undefined) {
       const thought = catalog.thought
-      if (thought !== undefined && thought.currentValue !== wantedEffort && (thought.choices.length === 0 || thought.choices.some(c => c.value === wantedEffort))) {
+      if (thought === undefined) {
+        // The agent publishes no thought_level option: there is nothing this
+        // pick could ever be applied to (the chip is absent too).
+      } else if (thought.currentValue === wantedEffort) {
+        // Already in force.
+      } else if (thought.choices.length > 0 && !thought.choices.some(choice => choice.value === wantedEffort)) {
+        result.effortStale = true
+        if (this.dropStalePick(session, 'effort', wantedEffort)) {
+          notice('error', `acp: agent "${session.agentId}" no longer offers thought level "${wantedEffort}"; using its own current level`)
+        }      } else {
         try {
           await bridge.setConfigOption(session, thought.configId, wantedEffort)
         } catch (error) {
@@ -3233,6 +4019,55 @@ export class BridgeManager {
         }
       }
     }
+    return result
+  }
+
+  /**
+   * Remove one persisted pick the agent no longer honours. Only the thought
+   * level uses this today: a stale MODEL pick is deliberately kept and the
+   * turn refused, so the user can see which selection must be replaced.
+   * Returns true only when a record actually changed — that transition is the
+   * news the notice reports.
+   */
+  private dropStalePick(session: LiveSession, field: 'model' | 'effort', value: string): boolean {
+    const dshSessionId = session.dshSessionId
+    if (dshSessionId === undefined) return false
+    const choice = this.chatAgentIntent.get(dshSessionId)
+    if (choice === undefined || choice.agentId !== session.agentId) return false
+    const matches = field === 'model'
+      ? choice.modelId === buildAdapterModelId(session.agentId, value)
+      : choice.effort === value
+    if (!matches) return false
+    if (field === 'model') this.patchChatChoice(dshSessionId, { modelId: undefined })
+    else this.patchChatChoice(dshSessionId, { effort: undefined })
+    return true
+  }
+
+  /**
+   * The requested model value this session's agent no longer offers, if any —
+   * the gate the turn path uses to refuse before sending anything.
+   *
+   * Reads only the session's OWN latest `configOptions` (the same authority
+   * alignment uses): a non-empty choice list without the value means the agent
+   * dropped it, and applying is impossible. `undefined` means either no model
+   * was requested, it is in force, or nothing authoritative is available (no
+   * selector, or a selector without choices) — those keep the previous
+   * best-effort behavior instead of wedging the conversation.
+   *
+   * Falling back to "whatever the agent runs" here is exactly the surprise this
+   * gate forbids: a different model can differ in price and capability. The
+   * pick is kept so the failure names a selection the user can act on.
+   */
+  private staleModelChoice(session: LiveSession, modelChoice: string | undefined): string | undefined {
+    const wanted = modelChoice !== undefined && modelChoice !== '' ? modelChoice : undefined
+    if (wanted === undefined) return undefined
+    const model = parseCatalogOptions(session.configOptions).model
+    if (model === undefined) return undefined
+    if (model.currentValue === wanted) return undefined
+    // A selector without a choice list is unvalidatable; applying it is the
+    // existing best effort and the agent decides.
+    if (model.choices.length === 0) return undefined
+    return model.choices.some(choice => choice.value === wanted) ? undefined : wanted
   }
 
   private bridge(agentId: string): AgentBridge {
@@ -3295,6 +4130,10 @@ export class BridgeManager {
   }
 
   private connectionLost(bridge: AgentBridge, reason: string): void {
+    // A dead process cannot settle its prompt: the turn streams riding it end
+    // here (their `runPrompt` promise also rejects into settle, but this also
+    // covers a promise the connection teardown leaves pending).
+    this.disposeTurnStreamsOf(controller => controller.session.agentId === bridge.def.id)
     bridge.releaseAll(reason)
   }
 
@@ -3482,6 +4321,9 @@ export class BridgeManager {
   }
 
   async closeSession(sessionId: string): Promise<void> {
+    // The turn stream of this session dies with it: a continuation step that
+    // is already on its way must not resume a closed session.
+    this.disposeTurnStreamsOf(controller => controller.session.sessionId === sessionId)
     const live = this.tryLocate(sessionId)
     if (live !== undefined) {
       await live.bridge.closeSession(live.session, 'closed')
@@ -3541,16 +4383,14 @@ export class BridgeManager {
     for (const [key, session] of this.dshSessionMap) {
       if (session.agentId === agentId) this.dshSessionMap.delete(key)
     }
+    this.disposeTurnStreamsOf(controller => controller.session.agentId === agentId)
     await this.bridges.get(agentId)?.stop('agent-stopped')
   }
 
   async shutdownAll(): Promise<void> {
     this.dshSessionMap.clear()
+    this.disposeTurnStreamsOf(() => true)
     await Promise.all([...this.bridges.values()].map(b => b.stop('agent-stopped')))
-  }
-
-  async setPermission(agentId: string, permission: PermissionMode): Promise<void> {
-    this.bridge(agentId).setPermission(permission)
   }
 
   /** Host-side reader of the harness preset roster (`ctx.agentPresets`), for `presetStatus`. */
@@ -3743,6 +4583,44 @@ export class BridgeManager {
       return
     }
 
+    // A segmented tool-bearing turn arrives as MANY driver steps. The host
+    // loop starts a next step whenever the settled assistant message contains
+    // `tool-call` blocks — which is exactly what the ACP agent's cards are —
+    // feeding it the staged tool results. Each such step RESUMES the same
+    // in-flight `session/prompt` from the transcript cursor: nothing is sent
+    // to the ACP agent (it runs its own loop inside ONE prompt call — see
+    // `isAcpToolContinuation` and docs/acp-convergence.md §1.7).
+    if (isAcpToolContinuation(options.messages ?? [])) {
+      const controller = options.sessionId === undefined ? undefined : this.turnStreamFor(options.sessionId)
+      if (controller === undefined || controller.stale) {
+        // No in-flight turn of ours owns these staged results (a foreign
+        // continuation, or one that outlived its turn): answer with one
+        // closing message instead of touching the agent.
+        const line = `\n[dsh-ntr] this conversation has no in-flight ACP turn to resume; the tool details are in the ACP transcript view.\n`
+        yield { type: 'block-start', index: 0, blockType: 'text' }
+        yield { type: 'text-delta', index: 0, text: line }
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: line } }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+        return
+      }
+      const segment = controller.startSegment()
+      const onAbort = () => {
+        void this.bridge(controller.session.agentId).cancel(controller.session)
+        controller.abortActiveSegment()
+      }
+      if (options.signal?.aborted) onAbort()
+      else options.signal?.addEventListener('abort', onAbort, { once: true })
+      try {
+        yield* segment.queue
+      } finally {
+        options.signal?.removeEventListener('abort', onAbort)
+        // The FINAL continuation step retires the controller: settle ran, this
+        // segment closed, and no further continuation can come for its cards.
+        if (controller.hasSettled && segment.finished) controller.dispose()
+      }
+      return
+    }
+
     // Forward the person's own words: the host folds its context sections
     // (AGENTS.md digest, skill catalog, runtime snapshot) after the claimed user
     // batch precisely so a consumer can tell them apart by `source` — see
@@ -3777,6 +4655,29 @@ export class BridgeManager {
 
     const bridge = this.bridge(agentId)
 
+    // The model the conversation asks for is not one this agent offers any
+    // more: refuse BEFORE sending anything. Falling back to "whatever the agent
+    // runs" would silently spend the user's turn on a model they did not
+    // choose (different price and capability); the pick is kept so the error
+    // and the chip both name the selection that must be replaced.
+    const blockedModel = this.staleModelChoice(session, choice)
+    if (blockedModel !== undefined) {
+      // Nothing was exchanged, so a provisional first turn must hand the
+      // conversation back (same rule as any other zero-output failure).
+      if (session.provisionalLock === true) this.rollbackFirstTurn(session)
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            message: `acp: the selected model "${blockedModel}" is not offered by agent "${agentId}" any more; choose another model and send again`,
+            code: 'model_unavailable',
+          },
+        },
+      }
+      return
+    }
+
     // One prompt slot per session, and a turn the user aborted still occupies
     // the AGENT's slot until it acknowledges the cancel (see `claimTurn`).
     const claim = await bridge.claimTurn(session)
@@ -3809,7 +4710,24 @@ export class BridgeManager {
     const turnEffort = requestedEffort !== undefined && requestedEffort === this.modelDefaultEffort(agentId)
       ? undefined
       : requestedEffort
-    await this.alignSessionConfig(session, choice, turnEffort)
+    const aligned = await this.alignSessionConfig(session, choice, turnEffort)
+    // The config may have changed between the pre-flight check and this
+    // alignment (a `config_option_update` landed in that window). Same rule:
+    // never run a model the user did not select.
+    if (aligned.modelStale) {
+      if (session.provisionalLock === true) this.rollbackFirstTurn(session)
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            message: `acp: the selected model "${choice ?? ''}" is not offered by agent "${agentId}" any more; choose another model and send again`,
+            code: 'model_unavailable',
+          },
+        },
+      }
+      return
+    }
     // Record what this conversation is now on, so `session/chat-list` can show
     // it without the browser having to derive it from anything else. A
     // materialized-default effort leaves the recorded pick standing: the agent
@@ -3817,7 +4735,8 @@ export class BridgeManager {
     // the chip claim "default" for a conversation the user explicitly tuned.
     session.modelId = model
     session.choice = choice
-    if (turnEffort !== undefined) session.reasoningEffort = turnEffort
+    if (aligned.effortStale) session.reasoningEffort = undefined
+    else if (turnEffort !== undefined) session.reasoningEffort = turnEffort
 
     const promptText = selection.text
 
@@ -3836,249 +4755,32 @@ export class BridgeManager {
       session.acpMode = false
     }
 
-    const queue = new AsyncQueue<StreamChunk>()
     session.running = true
     session.turnSeq += 1
     const turnId = randomUUID()
     this.hub.broadcast({ type: 'turn/start', sessionId: session.sessionId, turnId, text: promptText })
 
-    let currentBlockIndex = -1
-    let activeBlockType: 'reasoning' | 'text' | null = null
-    let activeBlockText = ''
-    let latestUsage: { inputTokens: number; outputTokens: number } | null = null
-    /**
-     * Whether the fold loop pushed at least one block the chat plane renders
-     * (text / reasoning). Usage and other bookkeeping updates do NOT count:
-     * some agents fold an upstream failure (provider 403, auth, billing) into a
-     * legal `end_turn` while emitting only bookkeeping frames (observed on
-     * pi-acp), and the user is left with an empty bubble and no hint. A normal
-     * stop with zero visible output is reported below.
-     */
-    let sawVisibleBlock = false
-    /**
-     * The provisional lock written at the start of this conversation's first
-     * turn only becomes permanent once the agent has produced something the
-     * chat plane shows. A first turn that ends without ANY visible block — an
-     * error before the first chunk, a silent provider failure folded into a
-     * normal stop, or a cancel — is rolled back: nothing was exchanged, so the
-     * conversation must remain free to choose another agent.
-     */
-    const settleProvisionalLock = (): void => {
-      if (session.provisionalLock !== true) return
-      session.provisionalLock = false
-      if (!sawVisibleBlock) this.rollbackFirstTurn(session)
-    }
-    /**
-     * Tool activity already announced this turn, by ACP call id: the name,
-     * input, status and output last published for that call.
-     *
-     * Agents restate a call in whole on every progress tick — announcement, a
-     * command-titled rewrite, then a final restatement carrying the result —
-     * and with parallel calls the restatements interleave (A, B, A, B, …).
-     * Only real news is announced: a verbatim restatement is silence, or one
-     * call would bury the conversation it belongs to.
-     */
-    const toolActivity = new Map<string, { name: string; input: string; status: string; output: string }>()
-    /** The last inline text announced for a notification kind that has no card of its own. */
-    const announcedKinds = new Map<string, string>()
-
-    const blockEndChunk = () => ({
-      type: 'block-end' as const,
-      index: currentBlockIndex,
-      block: { type: activeBlockType as 'reasoning' | 'text', text: activeBlockText },
-    })
-
-    const closeOpenBlock = () => {
-      if (activeBlockType === null) return
-      queue.push(blockEndChunk())
-      activeBlockType = null
-    }
-
-    const switchToBlock = (targetType: 'reasoning' | 'text') => {
-      if (activeBlockType === targetType) return
-      closeOpenBlock()
-      currentBlockIndex++
-      activeBlockType = targetType
-      activeBlockText = ''
-      sawVisibleBlock = true
-      queue.push({
-        type: 'block-start',
-        index: currentBlockIndex,
-        blockType: targetType,
-      })
-    }
-
-    /**
-     * Append to the open prose block, opening a `text` block when the stream is
-     * between blocks. Tool activity and the agent's answer share this channel:
-     * both are prose the plane renders in place, which is what keeps the turn
-     * in the order the agent produced it.
-     */
-    const emitText = (text: string) => {
-      switchToBlock('text')
-      activeBlockText += text
-      queue.push({ type: 'text-delta', index: currentBlockIndex, text })
-    }
-
-    /**
-     * Announce one ACP tool call inline, at the position it happened.
-     *
-     * NOT as a `tool-call` block: the plane cannot draw one inside the message
-     * body, and what it shows instead is the host loop's EXECUTION of the call,
-     * appended as its own node after the whole message settles — so every card
-     * of a turn piles up below all the prose. A native turn hides that because
-     * its cards sit between two model steps; an ACP turn is ONE host step, so
-     * there is no second step to interleave with. The full card — arguments,
-     * diffs, status — stays in the ACP view tab (docs/acp-convergence.md §1.7).
-     */
-    const noteToolActivity = (update: Record<string, unknown>) => {
-      const callId = typeof update.toolCallId === 'string' ? update.toolCallId.trim() : ''
-      if (callId === '') return
-      const status = typeof update.status === 'string' ? update.status : ''
-      const output = updateContentToText(update.content)
-      const known = toolActivity.get(callId)
-      if (known === undefined) {
-        // An update for a call the agent never announced is the same event as
-        // an announcement here: dropping it would lose the call entirely.
-        const name = typeof update.title === 'string' ? update.title : ''
-        const input = acpToolInputOf(update)
-        toolActivity.set(callId, { name, input, status, output })
-        emitText(acpToolActivityLine(name, input, status))
-        if (output !== '') emitText(acpToolActivityOutput(output))
-        return
-      }
-      // A restatement. A title the agent retitled, or an input it rewrote, is
-      // news; an empty one is not (that is the restatement carrying only a
-      // result), and neither is a status that merely moved on.
-      let changed = false
-      const name = typeof update.title === 'string' ? update.title : ''
-      if (name !== '' && name !== known.name) {
-        known.name = name
-        changed = true
-      }
-      const input = acpToolInputOf(update)
-      if (input !== '' && input !== known.input) {
-        known.input = input
-        changed = true
-      }
-      if (status !== '' && status !== known.status) known.status = status
-      if (changed) emitText(acpToolActivityLine(known.name, known.input, known.status))
-      if (output !== '' && output !== known.output) {
-        known.output = output
-        emitText(acpToolActivityOutput(output))
-      }
-    }
-
-    /**
-     * Text of a `text` / `thinking` chunk's `content`. Some agents send the
-     * block's innards as an OBJECT (`{ type: 'text', text }` one level down) or
-     * as an ARRAY of blocks; both are read rather than dropped, and a shape
-     * nobody predicts still contributes its JSON.
-     */
-    const chunkTextOf = (content: unknown): string => {
-      if (typeof content === 'string') return content
-      if (Array.isArray(content)) {
-        const parts: string[] = []
-        for (const item of content) {
-          if (typeof item === 'string') parts.push(item)
-          else if (typeof item === 'object' && item !== null) {
-            const row = item as Record<string, unknown>
-            if (typeof row.text === 'string') parts.push(row.text)
-            else parts.push(JSON.stringify(item))
-          }
-        }
-        return parts.join('')
-      }
-      if (typeof content === 'object' && content !== null) {
-        const row = content as Record<string, unknown>
-        if (typeof row.text === 'string') return row.text
-        if (row.type === 'text' || row.type === undefined) return JSON.stringify(content)
-      }
-      return ''
-    }
-
-    const unsubscribe = this.hub.subscribe(event => {
-      if (!('sessionId' in event) || event.sessionId !== session.sessionId) return
-      if (event.type === 'session/update') {
-        const update = event.update as Record<string, unknown>
-        const kind = String(update.sessionUpdate ?? '')
-        if (kind === 'agent_thought_chunk') {
-          const text = chunkTextOf(update.content)
-          if (text !== '') {
-            switchToBlock('reasoning')
-            activeBlockText += text
-            queue.push({ type: 'reasoning-delta', index: currentBlockIndex, text })
-          }
-        } else if (kind === 'tool_call' || kind === 'tool_call_update') {
-          noteToolActivity(update)
-        } else if (kind === 'agent_message_chunk') {
-          const text = chunkTextOf(update.content)
-          if (text !== '') emitText(text)
-        } else if (kind === 'usage_update') {
-          const used = typeof update.used === 'number' ? update.used : 0
-          const size = typeof update.size === 'number' ? update.size : 0
-          latestUsage = { inputTokens: size, outputTokens: used }
-        } else if (!BOOKKEEPING_UPDATES.has(kind)) {
-          // A notification kind this build has no card of its own (a plan, a
-          // mode change, an available-command list, or something newer than
-          // this plugin). It already reaches the ACP view through the
-          // transcript; announce it inline at the position it happened. ONE
-          // line per kind per turn: agents restate a plan in full on every
-          // step, and a line per restatement would bury the conversation.
-          const text = describeUnhandledUpdate(kind, update)
-          if (announcedKinds.get(kind) !== text) {
-            announcedKinds.set(kind, text)
-            emitText(`\n${text}\n`)
-          }
-        }
-      } else if (event.type === 'permission/request') {
-        switchToBlock('reasoning')
-        const title = typeof (event.toolCall as { title?: unknown } | undefined)?.title === 'string'
-          ? String((event.toolCall as { title: string }).title)
-          : 'permission'
-        // The line must not point at a place with no answer entry, and the
-        // bridge knows which path this ask took (`ledgerFallbackOf`, recorded
-        // before this frame was broadcast). On the DESIGNED ledger paths the
-        // settings panel's card is the answer entry, so it is named plainly.
-        // A DEGRADED native route is different: the composer prompt the user
-        // is waiting for failed, and the ask now carries a deadline — the line
-        // has to say both, or "approve in Settings" reads as a choice when it
-        // is a countdown.
-        const fallback = bridge.ledgerFallbackOf(event.requestId)
-        const line = fallback?.reason === 'unavailable'
-          ? fallback.timeoutMs > 0
-            ? `\n> 🔐 [Permission Required: ${title}] - the approval service is unavailable; approve in Settings within ${String(Math.round(fallback.timeoutMs / 1000))}s or this request is cancelled\n`
-            : `\n> 🔐 [Permission Required: ${title}] - the approval service is unavailable; please approve in Settings\n`
-          : `\n> 🔐 [Permission Required: ${title}] - please approve in Settings\n`
-        activeBlockText += line
-        queue.push({ type: 'reasoning-delta', index: currentBlockIndex, text: line })
-      }
-    })
-
-    const onAbort = () => {
+    // The segmented turn: ONE controller for the whole agent-side prompt, one
+    // segment per driver step. The first segment streams until a card-bearing
+    // stretch meets the next non-tool event (or the prompt settles); the host
+    // loop then executes the card and proposes the continuation step, which
+    // resumes the SAME prompt through the branch above.
+    const endTurn = bridge.beginTurn(session)
+    const controller = new TurnStreamController(
+      this,
+      this.hub,
+      bridge,
+      session,
+      turnId,
+      endTurn,
+      victim => this.rollbackFirstTurn(victim),
+    )
+    if (session.dshSessionId !== undefined) this.rememberTurnStream(session.dshSessionId, controller)
+    const segment = controller.startSegment()
+    const onAbort = (): void => {
+      if (controller.stale) return
       void bridge.cancel(session)
-      finishStream({ kind: 'aborted', failure: { message: 'aborted', code: 'ABORTED' } })
-    }
-
-    let finished = false
-    const finishStream = (reason: { kind: 'stop' } | { kind: 'aborted'; failure?: { message: string; code: string } } | { kind: 'error'; failure?: { message: string; code: string } }) => {
-      if (finished) return
-      finished = true
-      // `sawVisibleBlock` still describes what the AGENT produced here: the
-      // synthesized empty-turn warning below is added after this settle.
-      settleProvisionalLock()
-      options.signal?.removeEventListener('abort', onAbort)
-      unsubscribe()
-      session.running = false
-      if (activeBlockType !== null) {
-        queue.push(blockEndChunk())
-        activeBlockType = null
-      }
-      if (latestUsage !== null) {
-        queue.push({ type: 'usage', usage: latestUsage })
-      }
-      queue.push({ type: 'finish', reason })
-      queue.close()
+      controller.abortActiveSegment()
     }
 
     if (options.signal?.aborted) {
@@ -4087,39 +4789,28 @@ export class BridgeManager {
       options.signal?.addEventListener('abort', onAbort, { once: true })
       // The agent-side turn is in flight from here until its response lands
       // (or the connection dies): that window, not our own stream, is what the
-      // next turn has to respect.
-      const endTurn = bridge.beginTurn(session)
+      // next turn has to respect. Settlement reaches the controller, which
+      // releases the slot (`endTurn`) whether the segment on air is the first
+      // or a continuation one.
       bridge.runPrompt(session, promptText, turnId)
         .then(stopReason => {
-          this.hub.broadcast({ type: 'turn/end', sessionId: session.sessionId, turnId, stopReason })
-          if (stopReason === 'cancelled') {
-            finishStream({ kind: 'aborted', failure: { message: 'Turn was cancelled', code: 'CANCELLED' } })
-          } else {
-            // Settle BEFORE the synthesized warning: the warning is our text,
-            // not evidence that the first turn actually delivered anything.
-            settleProvisionalLock()
-            if (!sawVisibleBlock) {
-              // The silent-failure report: a normal stop with nothing the chat
-              // plane renders. An aborted or already-failing turn needs no
-              // extra hint; this is specifically the "protocol says success,
-              // the bubble is empty" case.
-              switchToBlock('text')
-              const line = `\n[dsh-ntr] agent "${session.agentId}" ended the turn with no visible output (stop reason: ${stopReason}). Some agents fold upstream failures — auth, billing, rate limits — into a normal stop; try resending, and check the agent process logs if it repeats.\n`
-              activeBlockText += line
-              queue.push({ type: 'text-delta', index: currentBlockIndex, text: line })
-            }
-            finishStream({ kind: 'stop' })
-          }
+          controller.settle(stopReason === 'cancelled'
+            ? { kind: 'cancelled' }
+            : { kind: 'stop', stopReason })
         })
         .catch((err: unknown) => {
-          const desc = describeError(err)
-          this.hub.broadcast({ type: 'turn/end', sessionId: session.sessionId, turnId, error: desc })
-          finishStream({ kind: 'error', failure: { message: desc, code: 'INTERNAL' } })
+          controller.settle({ kind: 'error', message: describeError(err) })
         })
-        .finally(endTurn)
     }
 
-    yield* queue
+    try {
+      yield* segment.queue
+    } finally {
+      options.signal?.removeEventListener('abort', onAbort)
+      // The FIRST segment never retires its controller here: a card-bearing
+      // turn keeps it indexed so its continuation steps can resume the prompt,
+      // and a card-less or cancelled one already disposed itself in `settle`.
+    }
   }
 }
 

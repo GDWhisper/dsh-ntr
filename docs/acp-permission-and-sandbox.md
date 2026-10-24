@@ -34,7 +34,7 @@
    > **已修正（原文假设错误）**：宿主把上下文段折在用户消息**之后**（`dsh-agent-instructions` 的 pre-step 监听器源码注释、driver 追加的运行时快照），所以“最后一条 user 消息”实测就是注入内容——`Current DSH file policy: …` **确实**会被转给 ACP agent（连同 AGENTS.md 摘要与技能目录）。修复见 [acp-mode.md](./acp-mode.md) §1（`selectForwardPrompt` 按 `source.kind === 'user'` 挑消息）与 [AGENTS.md](../AGENTS.md) 约束 16。
 2. ACP 的 `tool_call` / `tool_call_update` 在 `streamPrompt` 里变成了内联散文（`🛠️ **<name>** · `<input>`，工具输出跑进一个代码块），插在思考与答案之间的位置上 → DSH 不执行它们 →
    **DSH 文件沙箱对 ACP agent 的内部 bash / 编辑没有任何作用力**。
-   > **已修正（原文前半句两度改写，结论始终成立）**：中间曾把工具活动升级成真的 `tool-call` block 序列（`openToolCallBlock` / `acpToolCallDelta` / `recordAcpToolOutput`，配套两步形状与 guard 虚拟工具）；现行构建已退回内联散文——一个 ACP 回合只是宿主的一步，卡片无法落在“步与步之间”，只能跟在整条消息下面，而含 `tool-call` 块的消息被 `latestAnswer` 拒绝当答案。这不改变本节结论：DSH 的文件沙箱仍然管不到 agent 自己进程里的 bash / 编辑——宿主执行的卡片是展示面，与 agent 进程内的工具是两件事。根因与利弊见 [acp-convergence.md](./acp-convergence.md) §1.7；「不替 agent 裁决」的现行结论见同文 §2.3。
+   > **已修正（原文前半句两度改写，结论始终成立）**：中间曾把工具活动升级成真的 `tool-call` block 序列，又短暂退回内联散文（一步回合放不下「步与步之间」），现行（2026-10-24）是**逐步切分**（[acp-convergence.md](./acp-convergence.md) §1.8）：段在卡后主动结束，宿主执行卡、续跑下一步，续读同一个在飞的 `session/prompt`。这不改变本节结论：DSH 的文件沙箱仍然管不到 agent 自己进程里的 bash / 编辑——宿主执行的卡片是展示面（虚拟工具体答的是 agent 已产出并记录在案的输出），与 agent 进程内的工具是两件事。「不替 agent 裁决」的现行结论见同文 §2.3。
 3. 唯一真正连上的旋钮是 approval（`AgentBridge.askNativeApproval` → `ctx.approval.request`）。于是三档实际行为：
    - 工作区内修改（ask）：ACP 权限询问 → composer 审批卡 ✅
    - 仅可查看（ask）：用户点「允许一次」就能写 ❌（违背只读语义）

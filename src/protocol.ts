@@ -20,17 +20,6 @@ import type { SessionUpdate } from '@agentclientprotocol/sdk'
 
 // ---- Configuration (host side, from the profile layer) ----
 
-/**
- * Per-agent *policy* for `session/request_permission` — it decides whether a
- * human is asked at all, NOT where the question is rendered.
- *
- * - `ask`: surface every request to a human. The surface is picked by host
- *   capability: the chat composer when the native approval chain is wired
- *   (see `AgentsListResult.approvalRouted`), otherwise the settings panel.
- * - `allow` / `reject`: answer automatically, nothing is ever surfaced.
- */
-export type PermissionMode = 'ask' | 'allow' | 'reject'
-
 /** One pre-configured ACP agent executable. */
 export interface AcpAgentDef {
   /** Stable id the browser selects by. `^[a-z0-9][a-z0-9._-]*$`. */
@@ -61,8 +50,6 @@ export interface AcpAgentDef {
   cwd?: string
   /** Absolute roots a session cwd may resolve under. Defaults to `[cwd]`. */
   allowedCwdRoots?: string[]
-  /** Permission policy: `ask` (default, surfaces the human), `allow`, `reject`. */
-  permission?: PermissionMode
   /**
    * Which probed `category: model` choices this agent offers as `agentId@choice`
    * variants in the plugin's own ACP seats (the chips/picker in the chat
@@ -124,8 +111,8 @@ export interface AcpPluginConfig {
    */
   startupTimeoutMs?: number
   /**
-   * How long a pending `session/request_permission` (`permission: ask`) may
-   * sit unanswered before the host answers `cancelled` on the user's behalf.
+   * How long a pending `session/request_permission` may sit unanswered before
+   * the host answers `cancelled` on the user's behalf.
    * `0` (default) waits forever — the human decides, matching the ACP spec's
    * stance that approvals belong to a person.
    */
@@ -183,7 +170,6 @@ export interface AgentView {
   title: string
   command: string
   args: string[]
-  permission: PermissionMode
   cwd?: string
   allowedCwdRoots: string[]
   state: AgentProcessState
@@ -416,7 +402,6 @@ export interface SessionModeSetPayload { sessionId: string; modeId: string }
 export interface SessionConfigSetPayload { sessionId: string; configId: string; value: string | boolean }
 export interface TranscriptGetPayload { sessionId: string; afterSeq?: number }
 export interface AgentIdPayload { agentId: string }
-export interface AgentPermissionSetPayload { agentId: string; permission: PermissionMode }
 /**
  * The plugin's OWN default ACP agent (the panel's ★ gesture): which agent an
  * ACP-mode conversation starts on. Plugin-private state — the host never sees a
@@ -461,7 +446,6 @@ export interface AgentSavePayload {
   npmPackage?: string
   cwd?: string
   allowedCwdRoots?: string[]
-  permission?: PermissionMode
   env?: Record<string, string>
   exposedModels?: string[]
   /** Keep newer models the agent publishes in the selection (see {@link AcpAgentDef.autoDiscoverModels}). */
@@ -524,11 +508,19 @@ export interface AcpCatalogOption {
  * window in which the composer must still show the control (user report,
  * 2026-10-18: the mode select vanished on a conversation set up ahead of its
  * first message).
+ *
+ * `extras` are the agent's REMAINING select options (temperature, vendor
+ * switches, `model_config` entries, anything unknown). They have no dedicated
+ * control in the composer, so they ride the "advanced" base to the left of the
+ * model chip. Keeping them here — rather than in the browser's raw
+ * `configOptions` — is what lets a conversation with no live session show and
+ * set them.
  */
 export interface AcpAgentCatalog {
   model?: AcpCatalogOption
   thought?: AcpCatalogOption
   mode?: AcpCatalogOption
+  extras?: AcpCatalogOption[]
 }
 
 /**
@@ -573,6 +565,14 @@ export interface AcpConversationChoice {
    * the one control that resets every time the process restarts.
    */
   mode?: string
+  /**
+   * The agent's extra `configOptions`, by `configId` (the "advanced" base).
+   * Absent means "none chosen"; individual keys absent mean "the agent's own
+   * current value". These are the same values `session/set_config_option`
+   * accepts, persisted per conversation so a pick survives a restart and is
+   * re-applied when its ACP session is recreated or resumed.
+   */
+  extraConfigs?: Record<string, string>
 }
 
 /** Result of `agent/probe-models`: the freshly probed (or cached) catalog. */
@@ -580,6 +580,16 @@ export interface AgentProbeModelsResult {
   agentId: string
   catalog: AcpAgentCatalog
   updatedAt: number
+}
+
+/** One of the agent's extra select options, shaped for the composer's advanced menu. */
+export interface AgentCatalogExtraOption {
+  configId: string
+  /** The agent's own option name (falls back to the config id host-side). */
+  name: string
+  /** The value the agent reports as current, when it reports one. */
+  currentValue?: string
+  choices: Array<{ id: string; name: string; description?: string }>
 }
 
 /**
@@ -653,6 +663,12 @@ export interface AgentCatalogResult {
     currentValue?: string
     choices: Array<{ id: string; name: string; description?: string }>
   }
+  /**
+   * The agent's remaining select options — everything that is not the model,
+   * the thought level, or the mode. Empty/absent means the composer shows no
+   * advanced base.
+   */
+  extras?: AgentCatalogExtraOption[]
   /**
    * The slash commands this agent declared in its most recent session
    * (`available_commands_update`), cached per agent.

@@ -285,6 +285,16 @@ describe('acp-guard preset row', () => {
     }
   }
 
+  /** A fake `tools` service: a scoped `get` view plus a `register` spy. */
+  function toolsServiceOf(existing: Record<string, unknown> = {}) {
+    const registered = new Map<string, unknown>()
+    return {
+      registered,
+      get: vi.fn((name: string) => existing[name] ?? registered.get(name)),
+      register: vi.fn((definition: { name: string }) => { registered.set(definition.name, definition) }),
+    }
+  }
+
   it('registers the route rewrite outermost so the binding outranks the harness selection', async () => {
     const ctx = guardCtx()
     await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
@@ -362,36 +372,102 @@ describe('acp-guard preset row', () => {
     }
   })
 
-  it('registers no tools/execute listener at all: the ACP stream carries no tool call', async () => {
-    // The fourth duty is gone. A `tool-call` block is a card the host loop
-    // EXECUTES below the whole assistant message, which is what layered
-    // thinking above and tools below; the bridge now announces tool activity as
-    // inline prose, so there is nothing for this row to register a virtual
-    // tool for (docs/acp-convergence.md §1.7).
+  it('registers the tools/execute listener: cards execute as real results again', async () => {
+    // The fourth duty is back, upgraded: under the segmented turn shape the
+    // host loop executes a card the moment its segment settles — often before
+    // the agent reports the output — so the virtual tool's body parks on the
+    // registry's `waitForToolOutput` instead of answering instantly.
     const ctx = guardCtx()
     await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
-    expect(ctx.listeners.has('tools/execute')).toBe(false)
-    // …and the two duties that remain are still the two it must register.
+    expect(ctx.listeners.has('tools/execute')).toBe(true)
     expect(ctx.listeners.has('agent/pre-step')).toBe(true)
     expect(ctx.listeners.has('agent/request')).toBe(true)
   })
 
-  it('refuses a tool-result batch even when the bridge saw those call ids', async () => {
-    // The third duty's one exception is gone with the fourth: with no
-    // `tool-call` block there is no continuation step of our own, so a batch of
-    // staged results is foreign whatever it names — forwarding one would
-    // re-send the person's last words to an agent whose turn already finished.
-    const ctx = guardCtx()
-    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
-    const step = ctx.listeners.get('agent/pre-step')
-    if (step === undefined) throw new Error('guard registered no pre-step listener')
+  it('answers a card execution from the registry, and waits when the output has not landed yet', async () => {
+    const { routeBindingRegistry, recordAcpToolOutput, releaseAllToolOutputWaiters } = await import('../src/bridge.ts')
+    // A name that resolves to a REAL tool passes untouched (this row must
+    // never shadow the host's own tools).
+    const realTool = { name: 'real', execute: () => ({ text: 'real' }) }
+    const toolsWithReal = toolsServiceOf({ real: realTool })
+    const ctxReal = guardCtx({ tools: toolsWithReal })
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctxReal as never, undefined))
+    const execReal = ctxReal.listeners.get('tools/execute')
+    if (execReal === undefined) throw new Error('no tools/execute listener')
+    const downstream = vi.fn(async () => ({ text: 'downstream' }))
+    await execReal.listener({ name: 'real', agent: {}, exec: { callId: 'r1' } }, downstream)
+    expect(toolsWithReal.register).not.toHaveBeenCalled()
+    expect(downstream).toHaveBeenCalledTimes(1)
 
-    const decision = {
-      messages: [
-        { role: 'tool', source: { kind: 'tool', callId: 'own-1' }, content: [{ type: 'text', text: 'output' }] },
-      ],
+    // An unknown name registers a scoped virtual tool whose body first answers
+    // from the registry when the output already landed…
+    recordAcpToolOutput('wait-1', 'REAL OUTPUT')
+    try {
+      const unknown = toolsServiceOf()
+      const ctxCard = guardCtx({ tools: unknown })
+      await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctxCard as never, undefined))
+      const execCard = ctxCard.listeners.get('tools/execute')
+      if (execCard === undefined) throw new Error('no tools/execute listener')
+      const next = vi.fn(async () => ({ text: 'would-execute' }))
+      await execCard.listener({ name: 'Bash', agent: {}, exec: { callId: 'wait-1' } }, next)
+      expect(unknown.register).toHaveBeenCalledTimes(1)
+      expect(unknown.register.mock.calls[0][0]).toMatchObject({ name: 'Bash' })
+      const definition = unknown.register.mock.calls[0][0] as { execute: (args: unknown, exec: { callId: string }) => Promise<{ text: string }> }
+      expect(await definition.execute(undefined, { callId: 'wait-1' })).toEqual({ text: 'REAL OUTPUT' })
+
+      // …and parks on `waitForToolOutput` when it has not, released by the
+      // record itself (the guard must not answer with a pointer while the
+      // agent is still running the tool).
+      const parking = definition.execute(undefined, { callId: 'wait-2' })
+      let settled = false
+      void parking.then(() => { settled = true })
+      await new Promise(resolve => setTimeout(resolve, 20))
+      expect(settled).toBe(false)
+      recordAcpToolOutput('wait-2', 'LATE OUTPUT')
+      expect(await parking).toEqual({ text: 'LATE OUTPUT' })
+
+      // A turn's settlement releases every parked waiter with the pointer.
+      const parked = definition.execute(undefined, { callId: 'wait-3' })
+      releaseAllToolOutputWaiters()
+      expect(await parked).toMatchObject({ text: expect.stringContaining('ACP transcript view') })
+    } finally {
+      releaseAllToolOutputWaiters()
+      routeBindingRegistry().toolResults.clear()
     }
-    expect(await step.listener(decision, async () => decision)).toEqual({ kind: 'reject' })
+  })
+
+  it('lets its own continuation steps through, and still refuses a foreign staged batch', async () => {
+    // The third duty's exception is back with the fourth: a staged batch whose
+    // every call id the bridge recorded is the continuation of OUR cards (the
+    // adapter resumes the same in-flight prompt for it). One unknown id makes
+    // the batch foreign — forwarding it would re-send the person's last words.
+    const { routeBindingRegistry } = await import('../src/bridge.ts')
+    routeBindingRegistry().toolResults.set('own-1', 'output')
+    try {
+      const ctx = guardCtx()
+      await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+      const step = ctx.listeners.get('agent/pre-step')
+      if (step === undefined) throw new Error('guard registered no pre-step listener')
+
+      const own = {
+        messages: [
+          { role: 'tool', source: { kind: 'tool', callId: 'own-1' }, content: [{ type: 'text', text: 'output' }] },
+        ],
+      }
+      expect(await step.listener(own, async () => ({ kind: 'enter', messages: own.messages })))
+        .toEqual({ kind: 'enter', messages: own.messages })
+
+      const foreign = {
+        messages: [
+          { role: 'tool', source: { kind: 'tool', callId: 'own-1' }, content: [{ type: 'text', text: 'output' }] },
+          { role: 'tool', source: { kind: 'tool', callId: 'never-seen' }, content: [{ type: 'text', text: '?' }] },
+        ],
+      }
+      expect(await step.listener(foreign, async () => ({ kind: 'enter', messages: foreign.messages })))
+        .toEqual({ kind: 'reject' })
+    } finally {
+      routeBindingRegistry().toolResults.clear()
+    }
   })
 
   it('rejects a continuation step fed with nothing the person said', async () => {

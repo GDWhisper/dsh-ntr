@@ -41,8 +41,8 @@
 
 1. **NTR 底座在 `conversation.input.model`**：只作首轮前启动 / 切换 agent 的入口，下拉只有 agent 列表。模型、思考等级、agent 自己的 mode 各有控件。底座占原生模型底座那个 cell（composer bar 行尾、提交键左边）。
 2. **会话绑定走插件自己的映射**：`session/chat-bind` / `chat-model-set` / `chat-effort-set` / `chat-mode-set` 指向「这条会话由哪个 agent 服务」，不写 DSH 模型路由。消息仍走宿主 driver，绑定由 guard 的 `agent/request` waterfall 接到请求路径上。
-3. **permission 原样映射**：agent 报什么就问什么，宿主不预先裁决。agent 自己的 `def.permission` 是唯一开关。
-4. **消息展示在主聊天平面**：文字 / 思考走原生 chunk；工具活动发内联散文，不发 `tool-call` 块（因此没有续跑步）。完整卡片只在 NTR 视图 tab。
+3. **permission 原样映射**：agent 报什么就问什么，宿主不预先裁决，也没有本地代答开关。
+4. **消息展示在主聊天平面，逐步切分交错如原生**：一个 ACP turn 按工具活动切成多个宿主 step——段以 `tool-call` 卡收尾即 `finish`，宿主执行卡（guard 虚拟工具答真实输出）后续跑，续跑段用 transcript 游标**续读同一个仍在飞的 `session/prompt`**（绝不新发 prompt），卡片因此夹在两个 assistant 节点之间。完整参数 / diff 卡仍在 NTR 视图 tab。→ [protocol.md](./docs/agents/protocol.md) / [acp-convergence.md §1.8](./docs/acp-convergence.md)
 5. **NTR 会话跑 ACP preset 外壳**：不带工具、不带项目指令、不带 compaction；`agent/pre-step` 只放用户来源的内容。
 6. **首轮开始即锁定 agent**：底座粉碎成 composer 上边缘的只读挂牌 `NTR · <agent>`；首轮零可见输出则回滚解锁。
 7. **NTR 会话的 `/` 属于 agent**：菜单只列 agent 自己声明的命令，Enter 不被宿主认领。
@@ -84,11 +84,11 @@
 
 ### 配置、目录与状态（7–9、21、27、28）
 
-7. **agent 定义必须过 `validateAgentDef` / `saveAgent`**：严格校验命令 / id / args / permission，自动施加 `allowedCwdRoots`；默认工作区取 `defaultAgentWorkspace()`，**严禁把 `process.cwd()` 塞进 roots**。默认启动命令预设 `AGENT_PRESETS`（bridge.ts）与 `DEFAULT_KNOWN_PRESETS`（client/store.ts）是手拷贝，必须同步。→ [state.md](./docs/agents/state.md)
-8. **【旧隔离前提已退役】ACP 模型不进 DSH 模型目录；模型面只走 `agent/catalog`**：`listModels('acp')` 返回空。`agent/catalog` **纯内存、绝不 spawn**；探测只允许三种有手势来源（按钮 / 该 agent 自己的 session new·load / 旧缓存被顺带修好）。变体按需、`exposedModels` 只做可见性过滤、目录变化必须广播 `catalog/updated`。→ [state.md](./docs/agents/state.md)
+7. **agent 定义必须过 `validateAgentDef` / `saveAgent`**：严格校验命令 / id / args，自动施加 `allowedCwdRoots`；默认工作区取 `defaultAgentWorkspace()`，**严禁把 `process.cwd()` 塞进 roots**。默认启动命令预设 `AGENT_PRESETS`（bridge.ts）与 `DEFAULT_KNOWN_PRESETS`（client/store.ts）是手拷贝，必须同步。→ [state.md](./docs/agents/state.md)
+8. **【旧隔离前提已退役】ACP 模型不进 DSH 模型目录；模型面只走 `agent/catalog`**：`listModels('acp')` 返回空。`agent/catalog` **纯内存、绝不 spawn**；探测只允许三种有手势来源（设置页按钮或模型菜单「刷新目录」/ 该 agent 自己的 session new·load / 旧缓存被顺带修好）。变体按需、`exposedModels` 只做可见性过滤、目录变化必须广播 `catalog/updated`。→ [state.md](./docs/agents/state.md)
 9. **可见性筛选走轻量 RPC**：`agent/set-exposed-models` / `set-auto-discover-models` 原地修改、不重启进程（`agent/save` 会杀全部活动会话）。自动发现只追加「相对上一份目录新增」的模型；任何变更都广播 `agent/exposure`。→ [state.md](./docs/agents/state.md)
 21. **NTR preset 只能由 bundle patch 声明**：`package.json` 的 `dsh.bundle.patch` + `presets/acp/acp.patch.yml`。**严禁**再往 `~/.dsh/.agent-presets/` 复制文件，**严禁**新增「安装 / 修复 preset」入口。声明内插件名按 profile 基准解析，本地插件只能经包名子路径 `dsh-ntr/acp-guard` 引用。面板读宿主 roster。→ [host.md](./docs/agents/host.md)
-27. **底部栏的选择属于「会话」且必须持久化**：`agentId` / `modelId` / `effort` / `mode` 记在 `AcpConversationChoice`，落 `agents.json` 的 `conversations`。`applyChatChoice` 必须在 create 与 resume 两条路径调用；`syncConversationRoute` 把 model 半接到请求路径且只增不减；切 agent（锁前）清空派生选择；所有写入只经 `patchChatChoice`。→ [state.md](./docs/agents/state.md)
+27. **底部栏的选择属于「会话」且必须持久化**：`agentId` / `modelId` / `effort` / `mode` / `extraConfigs` 记在 `AcpConversationChoice`，落 `agents.json` 的 `conversations`。`applyChatChoice` 必须在 create 与 resume 两条路径调用；`syncConversationRoute` 把 model 半接到请求路径且只增不减；切 agent（锁前）清空派生选择；所有写入只经 `patchChatChoice`。agent 不再提供的 model **必须拦截本轮**（`model_unavailable`，不发送 prompt、保留选择、首轮零输出照常回滚锁），**严禁**自动换成另一个模型；失效 effort 从记录里删除并广播一次 notice。→ [state.md](./docs/agents/state.md)
 28. **一切运行时落盘只在 `~/.dsh/dsh-ntr/`**：`agents.json` / `model-catalog.json` / `workspaces/`。位置一律经 `pluginStateDir()`（`DSH_NTR_STATE_DIR` 可覆盖），派生的老路径从它反推。迁移必须同时改写 agent 里的绝对路径并回写磁盘。→ [state.md](./docs/agents/state.md)
 
 ### 进程与回合（10–12、19、23、26、29）
@@ -103,8 +103,8 @@
 
 ### 权限（13–15）
 
-13. **审批优先走宿主 `ctx.approval`**：`ask` + 有 requester + 有 `dshSessionId` 时在对话 composer 里问；否则回落到 ledger（`no-requester` / `no-chat-session` 属设计内路径，`unavailable` 是降级并有 5 分钟倒计时）。成功路由不启动定时器，但广播 `permission/resolved`。`approval` / `agents` 服务只能 `ctx.get` + `ctx.inject` 补注册。→ [permissions.md](./docs/agents/permissions.md)
-14. **审批 UI 归对话，设置页只做配置**：`ui.permissions` 非空就渲染可答复卡片，与 `approvalRouted` 无关（否则降级时藏掉唯一入口）。权限策略文案必须说明它是 agent 自己的策略。agent mode 控件在 `conversation.input.left`，不写可见标签、选项不依赖活会话、自带 ACP 闸门。agent 卡详情常挂载，工作区保存语义固定。→ [permissions.md](./docs/agents/permissions.md) / [ui.md](./docs/agents/ui.md)
+13. **审批优先走宿主 `ctx.approval`**：有 requester + 有 `dshSessionId` 时在对话 composer 里问；否则回落到 ledger（`no-requester` / `no-chat-session` 属设计内路径，`unavailable` 是降级并有 5 分钟倒计时）。成功路由不启动定时器，但广播 `permission/resolved`。`approval` / `agents` 服务只能 `ctx.get` + `ctx.inject` 补注册。→ [permissions.md](./docs/agents/permissions.md)
+14. **审批 UI 归对话，设置页只做配置**：`ui.permissions` 非空就渲染可答复卡片，与 `approvalRouted` 无关（否则降级时藏掉唯一入口）。设置页没有权限策略开关：任何询问都必须交给人。agent mode 控件在 `conversation.input.left`，不写可见标签、选项不依赖活会话、自带 ACP 闸门。agent 卡详情常挂载，工作区保存语义固定。→ [permissions.md](./docs/agents/permissions.md) / [ui.md](./docs/agents/ui.md)
 15. **【裁决部分已退役】工作区即侧栏路径**：聊天会话的 `session/new` / `session/load` cwd 与子进程 `spawnCwd` 都必须是 DSH 会话自己的工作区，并以 `extraRoots` 传入（create 与 resume 都要）。prompt 严格等于用户文本，不叙述任何边界。agent 的 mode 只经 `session/chat-list` / `chat-mode-set` 与 `agent/catalog` 上报。DSH Access mode 裁决整条已删除。→ [architecture.md](./docs/agents/architecture.md) / [retired.md](./docs/agents/retired.md)
 
 ### 转发与 preset（16–17）
@@ -118,7 +118,7 @@
 
 ### 界面（18、20、30）
 
-18. **对话内的 NTR 面只借显示层**：模型 / 思考等级读 `agent/catalog`；哪条会话由哪个 agent 服务读插件绑定（`routeAgentId`，无答案时**严禁**用 `agents[0]` 填名字）；写入只走 `bindChatAgent` / `setChatSessionModel` / `setChatSessionEffort`，严禁 `directory.select` / `selectModel`。模型 picker 一行一个模型值，勾中的行必须写模型名。NTR 视图只读 `session/chat-transcript`。空状态要区分「没服务过」与「ACP 会话没了」。→ [ui.md](./docs/agents/ui.md)
+18. **对话内的 NTR 面只借显示层**：模型 / 思考等级 / 额外 config options 读 `agent/catalog`；哪条会话由哪个 agent 服务读插件绑定（`routeAgentId`，无答案时**严禁**用 `agents[0]` 填名字）；写入只走 `bindChatAgent` / `setChatSessionModel` / `setChatSessionEffort` / `setChatSessionConfig`，严禁 `directory.select` / `selectModel`。cluster 顺序固定为 `高级 → model → thought → agent`：首轮前 agent 底座是右端锚点（不能被挤没），额外选项收进模型左侧的「高级」底座；首轮锁定、底座退场后，model / thought 成为右端锚点。模型 picker 一行一个模型值，勾中的行必须写模型名。NTR 视图只读 `session/chat-transcript`。空状态要区分「没服务过」与「ACP 会话没了」。→ [ui.md](./docs/agents/ui.md)
 20. **【竞争式遮蔽已退役】座位靠 claim 接管，失败一律放开**：`createModelSeatClaim` 用 `entriesOfSlot` 核实 head，不中就有界重注册（`MAX_SEAT_CLAIMS`），注册经 `ctx.slots.inject`。只读舞台会话 `agentPreset === ACP_PRESET_ID`，切走即撤；`stagedSessionOf` / `rowAgentPreset` 兼容两代快照；服务 / 槽位 / 注册 / 渲染任何不确定都回到原生座位。`ACP_PRESET_ID` 三处同步。旧竞争式遮蔽见 [retired.md](./docs/agents/retired.md)。→ [ui.md](./docs/agents/ui.md)
 30. **NTR 会话的 `/` 属于 agent**：只列 agent 经 `available_commands_update` 声明的命令，Enter 不被宿主认领，选中只插回草稿。实现只能运行时包装活的 `/` 来源（`slash-isolation.ts`），严禁注册第二个来源或替换 composer；命令清单只由一个来源承载；没有证据时 fail-open。命令声明还要按 agent 缓存进 `model-catalog.json`，供首条消息前使用。→ [ui.md](./docs/agents/ui.md) / [state.md](./docs/agents/state.md)
 

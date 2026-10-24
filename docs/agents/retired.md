@@ -20,6 +20,11 @@
 - **退役**：`decidePermission` / `authorizeWrite` / `dshSessionPolicyOf` / `sandboxDenialMarker` / `wireAccessMode` / `setSessionPolicyResolver` / `DshSessionPolicy`。宿主不再坐在中间替 agent 判一遍，`approval === 'never'` 之类的全局 knob 不参与。
 - **仍然有效**：工作区即侧栏路径（session cwd + 进程 cwd，见 [architecture.md §4](./architecture.md)）；prompt 严格等于用户文本、不叙述边界；agent 自己的 mode 只经 `session/chat-list` / `session/chat-mode-set` 上报与切换。fs 只剩 `guardFsPath` 的 workspace containment。见 [permissions.md](./permissions.md)。
 
+### agent 定义上的权限策略字段
+
+- **退役**：`AcpAgentDef.permission`（`ask` / `allow` / `reject`）、RPC `agent/set-permission`、`AgentBridge.permissionDecision`、设置页的「权限策略 / 要不要问人」下拉。它让插件替 agent 代答（`allow` / `reject`），与「agent 报什么就问什么」矛盾；要不要问由 agent 自己的 mode 决定。
+- **仍然有效**：审批按「原生 composer → 设置页 ledger」两级路由，每一问都必须到人面前。见 [permissions.md](./permissions.md)。
+
 ### 约束 17：narrateOnly 裁决
 
 - **退役**：`decidePermission(..., { narrateOnly: true })` + 保留 `authorizeWrite` 栅栏 + 「不叙述边界」的组合。宿主仍替 agent 判一遍，只是判得宽松。
@@ -51,11 +56,21 @@ AcpDefaultModelGuard  reconcileDefaultModel  settleAcpRoute  watchRoute
 selectAcpRoute  setDefaultModelGuard  wireDefaultModelGuard
 decidePermission  authorizeWrite  dshSessionPolicyOf  sandboxDenialMarker
 wireAccessMode  setSessionPolicyResolver  DshSessionPolicy
-answerBuffer  streamedAnswerLength  pendingToolAnswers  isAcpToolContinuation
-recordAcpToolOutput  toolResults  cardOutputs
-acpToolCallFromUpdate  acpToolCallDelta  acpToolCallDetailsOf  acpToolCallArgsOf
-registryHasToolCall  toolOutputFor
+PermissionMode  permissionDecision  agent/set-permission  def.permission
+answerBuffer  streamedAnswerLength  pendingToolAnswers  cardOutputs
+acpToolCallDetailsOf  acpToolActivityLine  acpToolActivityOutput  acpToolInputOf
+noteToolActivity
 useDirectory  resolveDirectory  ModelDirectoryResolver  directoryFor
 ```
+
+> 工具卡路径的符号（`isAcpToolContinuation` / `recordAcpToolOutput` /
+> `toolResults` / `acpToolCallFromUpdate` / `acpToolCallDelta` /
+> `acpToolCallArgsOf` / `registryHasToolCall` / `toolOutputFor` / guard 的
+> 虚拟工具）**不在**幽灵清单里：它们在 2026-10-19 随 §1.7 的散文形态短暂
+> 退役，又随 [acp-convergence.md](../acp-convergence.md) §1.8 的逐步切分
+> 复活（升级了可等待的 `waitForToolOutput`）。仍退役的是**缓冲重放**那一套
+> （`answerBuffer` / `pendingToolAnswers` / `cardOutputs`）：切段后答案自然
+> 落在卡后的新消息里，缓冲没有存在理由；散文一族
+> （`acpToolActivityLine` / `noteToolActivity` …）同样不要再回来。
 
 `tests/impl.spec.ts` 的 "the retired permission axis" 套件断言其中一部分 helper 已不存在。

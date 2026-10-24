@@ -27,13 +27,13 @@
 - 只有注入消息的唤醒轮（goal / subagent / skill 注入）不发 NTR 轮次，直接以 `stop` 结束。
 - `purpose !== undefined`（`session-title` / `compaction`）必须在 `getOrCreateDshSession` **之前**以 `unsupported_purpose` 失败。标题生成复用同一会话 route，不看 `purpose` 会把「起个标题」当成一轮真实 prompt。
 
-### 2.2 展示：文本进主平面，工具走内联散文
+### 2.2 展示：逐步切分，卡片夹在两个 assistant 节点之间
 
 - agent 的文字与思考由 `streamPrompt` 发真正的 `text` / `reasoning` block chunk，经宿主 driver 折成 `assistant/live-chunk` 与 `assistant/message`，由原生聊天平面渲染。
-- 工具活动**不发 `tool-call` 块**。在发生的位置发一行内联散文（`acpToolActivityLine`：🛠️ + 工具名 + 状态 + 输入），有输出时紧跟围栏块（`acpToolActivityOutput`）。完整卡片只在 NTR 视图 tab。
-- **为什么卡片只能置底**：`AssistantMarkdown` 跳过 `tool-call` 块，而 `tool/call` 由宿主 loop 在 assistant 消息落定后才 append。原生回合的交错靠「步」（step 1 含工具块 → loop 执行 → step 2），ACP 回合只有**一个 step**（插件只发一次 `session/prompt`，协议没有内部轮次信号），所以一个 step 内卡片只能排在整条消息末尾。完整推导见 [acp-convergence.md §1.7](../acp-convergence.md)。
-- **连带退役**：没有工具块就不存在续跑步，`answerBuffer` / `streamedAnswerLength` / `pendingToolAnswers` / `isAcpToolContinuation`、guard 的 `tools/execute` 虚拟工具、`recordAcpToolOutput` / `toolResults` / `cardOutputs`、拼接式 `acpToolCall*` 系列均已删除，不要再带回来。
-- **重述去重**：agent 会把整条 `tool_call` 重发多遍当进度（并行调用还会交错）。`noteToolActivity` 按 callId 记住已公布的名字 / 输入 / 状态 / 输出，**只有真变化才发下一行**。无卡片的通知种类（plan / mode）同理，`announcedKinds` 每种类一行、文本变了才重发。
+- 工具活动发真正的 `tool-call` 块（`acpToolCallFromUpdate` / `acpToolCallDelta`：快照 + 前缀扩展 delta，每个 callId 一个 turn 内只开一张卡）。完整参数 / diff 卡仍在 NTR 视图 tab。
+- **逐步切分**（[acp-convergence.md §1.8](../acp-convergence.md)）：一个 ACP turn = 多个宿主 step。段内开过卡、且下一条非 tool 事件到达时切段（`block-end` + `finish(stop)`）；宿主 loop 落定消息 → 执行卡（guard 虚拟工具从共享注册表 `toolResults` 答真实输出，未到则 `waitForToolOutput` 挂起）→ 续跑。续跑批次（`isAcpToolContinuation`：最后 user 消息之后全是 tool 来源）由 `TurnStreamController.startSegment()` 用 transcript 游标补读段间事件再订阅，**绝不新发 `session/prompt`**。以卡收尾的 turn 由最后一个续跑段收口（指针行），避免空气泡。
+- **turn 级语义跨段成立**：`turnSeq` 世代守卫、prompt slot（agent 未确认取消前不解开 `settled` 闸门）、`armCancelFallback`、段间事件只记账不推进游标（下一段重放补齐），全部在 `TurnStreamController`。
+- **重述去重**：agent 会把整条 `tool_call` 重发多遍当进度（并行调用还会交错）。`seenCalls` 按 callId 一卡；重述只刷 `recordAcpToolOutput` 的输出记录（并唤醒等待中的虚拟工具）。无卡片的通知种类（plan / mode）同理，`announcedKinds` 每种类一行、文本变了才重发。
 
 ### 2.3 收尾
 
@@ -72,9 +72,10 @@
 
 NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 行）：`persona` 行 `complete: true` + `includeRuntimeContext: false`，**不挂**工具行 / `agent-instructions` / `tool-skill` / plan-mode / todo / compaction / 委派行。
 
-`acp-guard.mjs` 挂两个监听器：
+`acp-guard.mjs` 挂三个监听器：
 
-- `agent/pre-step` 步进闸门：过滤注入内容；**拒绝「strip 后仍有内容、却没有用户来源」的批次**，`reject` 使 turn 以 blocked 收尾。空批次仍走原 completed 空转；无 source 的消息算用户输入。**没有例外**（工具卡路径退役后不存在续跑步）。
+- `agent/pre-step` 步进闸门：过滤注入内容；**拒绝「strip 后仍有内容、却没有用户来源」的批次**，`reject` 使 turn 以 blocked 收尾。空批次仍走原 completed 空转；无 source 的消息算用户输入。**唯一例外**：staged tool results 的每个 callId 都在共享注册表 `toolResults` 里（本行自己卡片的续跑步，§2.2 的逐步切分）——放行，adapter 会续读同一 prompt 而不是转发批次。
+- `tools/execute` 虚拟工具（§2.2）：解析不到的工具名即时注册 agent 作用域虚拟工具，工具体从 `toolResults` 取真实输出，未到则挂 `waitForToolOutput`（记录 / turn settle / 30 分钟兜底解除）。真实工具与缺席的 `tools` 服务原样放行。
 - `agent/request` 路由改写：见 §3。
 
 纪律：
@@ -111,7 +112,7 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 | 主题 | 位置 |
 |---|---|
 | 消息选择 / 转发 | `src/impl.ts` · `selectForwardPrompt`；`src/bridge.ts` · `streamPrompt` |
-| 工具散文 / 数据兜底 | `src/impl.ts` · `acpToolActivityLine` / `acpToolActivityOutput`；详见 [protocol.md](./protocol.md) |
+| 工具卡快照 / delta / 输出注册 | `src/impl.ts` · `acpToolCallFromUpdate` / `acpToolCallDelta` / `acpToolCallArgsOf`；`src/bridge.ts` · `recordAcpToolOutput` / `waitForToolOutput`；详见 [protocol.md](./protocol.md) |
 | 绑定 RPC | `src/impl.ts` · `dispatchRpc('session/chat-*')`；`src/bridge.ts` · `bindChatAgent` / `setChatSessionModel` / `setChatSessionEffort` / `setChatSessionMode` |
 | 请求改写 | `presets/acp/acp-guard.mjs`；`src/bridge.ts` · `conversationRouteModel` |
 | 工作区 | `src/index.ts` · `wireWorkspace`；`src/bridge.ts` · `chatWorkspaceRoot` / `getOrCreateDshSession` / `doResumeSession` |

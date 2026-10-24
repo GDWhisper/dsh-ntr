@@ -56,11 +56,11 @@ agent 的回复和思考显示在主聊天区。工具活动按发生顺序插�
 
 ### NTR 底座（输入框行尾）
 
-点一下，选哪个 agent 服务这条会话。这个菜单里只有 agent 列表——一个控件一件事。agent 自己的模型和思考等级是同一行里各自独立的芯片，各开各的菜单；那些清单由 agent 自己上报，不是你熟悉的 DSH 模型列表。
+点一下，选哪个 agent 服务这条会话。这个菜单里只有 agent 列表——一个控件一件事。agent 自己的模型和思考等级是同一行里各自独立的芯片，各开各的菜单；如果 agent 还发布了额外配置项（温度、供应商开关等），模型芯片左边会多一个「高级」底座，点开逐项设置。首轮之前 agent 底座固定在行尾最右侧；锁定后它退场，模型和思考等级接管右端。那些清单由 agent 自己上报，不是你熟悉的 DSH 模型列表。
 
 底座只出现在 **NTR 模式**的会话里。普通会话里看到的是 DSH 原生的模型选择器。
 
-**一个会话一个 agent。** 首条消息发出前，底座一直在，你可以先选好、也可以反悔改选。首轮**开始**时会话就**锁定**在这个 agent 上：底座粉碎，名字变成**输入框卡片上边缘的小挂牌**（`NTR · <agent>`，骑在顶边上），挂牌只显示、不能点击——换 agent 请新建会话。模型和思考等级芯片留在原位，它们属于同一个 agent，不涉及上下文迁移。如果首轮还没产生任何可见输出就失败/取消，锁定会自动回滚，底座回来，可以直接重选。
+**一个会话一个 agent。** 首条消息发出前，底座一直在，你可以先选好、也可以反悔改选。首轮**开始**时会话就**锁定**在这个 agent 上：底座粉碎，名字变成**输入框卡片上边缘的小挂牌**（`NTR · <agent>`，骑在顶边上），挂牌只显示、不能点击——换 agent 请新建会话。模型、思考等级和「高级」芯片留在原位，它们属于同一个 agent，不涉及上下文迁移。如果首轮还没产生任何可见输出就失败/取消，锁定会自动回滚，底座回来，可以直接重选。
 
 ### `/` 命令属于 agent
 
@@ -95,10 +95,9 @@ agent 要动敏感的东西时会问你。审批卡直接出现在聊天输入�
 
 - **已接入的 NTR 智能体**：每个 agent 一行，标着进程状态。点开「展开配置与模型」看全部细节。
 - **`★ 默认`**：新建 NTR 会话默认用哪个 agent。
-- **每张 agent 卡片**：显示名、启动命令、npm 包名、环境变量、权限策略、工作目录，全部直接摆在你面前，没有藏起来的默认值。
+- **每张 agent 卡片**：显示名、启动命令、npm 包名、环境变量、工作目录，全部直接摆在你面前，没有藏起来的默认值。
 - **启动命令是一整行**：程序加参数，例如 `codebuddy --acp`。含空格的路径用引号包住。输入框下方会实时显示插件解析出的「程序 / 参数」。
 - **测试按钮**：用当前表单里的值拉起一个一次性进程做握手，不保存、不注册。适合在改配置前先验证。
-- **权限策略**（这是插件侧的兜底，不是 agent 的权限模式）：只决定 agent 的每次权限请求交不交给人。`询问人类 (ask)` 会把请求显示在对话里等你作答；审批服务这次不可用、或这条会话没有对话身份时，请求改到本页顶部的「待处理权限请求」卡里回答（审批服务不可用的那一种带 5 分钟倒计时，超时代答「取消」；没有审批服务的部署则一直等人答）。`始终允许` 和 `自动拒绝` 由插件直接代答，你不会收到审批卡。agent 自己的权限模式仍在输入框工具行切换，两者互不替代。
 - **工作区目录**：agent 在哪个目录里干活。
 - **对话中可见的模型**：agent 能报几百个模型时，这里挑你想在模型芯片菜单里看到的。没勾的仍然可用，只是不列出来。
 
@@ -118,7 +117,7 @@ agent 要动敏感的东西时会问你。审批卡直接出现在聊天输入�
 
 **为什么首轮开始后，输入框行尾不显示 agent 名字了？**
 
-一个会话一个 agent。首轮之前底座留着让你改选；首轮一开始，会话就锁在这个 agent 上，名字变成挂在输入框卡片上边缘的 `NTR · <agent>` 只读小挂牌。换 agent 会丢掉它这边的上下文，所以确认锁定后只能新建会话。模型和思考等级芯片不受影响。首轮没有任何可见输出就失败/取消时，锁定会回滚，底座回来。
+一个会话一个 agent。首轮之前底座留着让你改选；首轮一开始，会话就锁在这个 agent 上，名字变成挂在输入框卡片上边缘的 `NTR · <agent>` 只读小挂牌。换 agent 会丢掉它这边的上下文，所以确认锁定后只能新建会话。模型、思考等级和高级配置芯片不受影响。首轮没有任何可见输出就失败/取消时，锁定会回滚，底座回来。
 
 **锁定后想换 agent 怎么办？**
 
@@ -190,7 +189,6 @@ agent 要动敏感的东西时会问你。审批卡直接出现在聊天输入�
         command: /path/to/bin/pi-acp     # 例如 "codebuddy --acp"
         cwd: ~/.dsh/dsh-ntr/workspaces
         allowedCwdRoots: [~/.dsh/dsh-ntr/workspaces]
-        permission: ask                  # ask 才问人；allow / reject 本地代答
 ```
 
 可选的 agent 字段：`npmPackage`（PATH 里找不到时自动 `npm install -g`）、`exposedModels`（NTR 座位菜单列哪些变体）、`idleTimeoutMs`（聊天进程的空闲释放窗口，`0` = 永不释放，默认 30 分钟）。插件级还有 `transcriptMaxEntries`（会话事件缓冲上限，默认 600）与 `probeModelsOnBoot`（保留字段，启动时已不再为每个 agent 探测，见 `bootstrapCatalogs` 的注释）。可靠性超时与重试的默认值（`startupTimeoutMs`、`cancelFallbackMs`、`staleCancelRetryDelayMs`、`staleCancelMaxRetries`、`permissionTimeoutMs` 与 `permissionFallbackTimeoutMs`）见 [AGENTS.md](./AGENTS.md) 约束 12 与 13；设置页能改的都在设置页改。
@@ -214,9 +212,9 @@ dsh plugin --profile web add ./   # 挂载到 Web Profile
 - **工作区即侧栏路径**：侧栏点开的目录必须成为 `session/new` 的 cwd **和** agent 子进程自己的 cwd。有一条 agent（codebuddy）在进程启动那一刻就定死工作区。
 - **NTR 模式 = agent preset**：由 `presets/acp/acp.patch.yml` 随包声明，不挂工具、不注入项目指令、不做 compaction，让模型可见的表面完全属于对端 agent。
 - **转发严格等于用户文本**：按 `source.kind === 'user'` 挑消息，不转发标题生成、compaction 这类辅助调用，也不拼任何边界叙述。
-- **一步回合 = 内联散文**：一个 ACP 回合只是宿主的一步，卡片只能跟在整条消息后面，而含 `tool-call` 块的消息会被 `latestAnswer` 拒绝当答案。工具活动因此发成内联 text：时间顺序保留，代价是主聊天区没有原生工具卡。
+- **逐步切分 = 原生交错的工具卡**：一个 ACP turn 按工具活动切成多个宿主 step——段以 `tool-call` 卡收尾即结束本次 stream，宿主落定消息、执行卡（真实输出经 guard 虚拟工具应答）、续跑下一步；续跑段续读同一个仍在飞的 `session/prompt`，绝不新发 prompt。卡片因此夹在两个 assistant 节点之间，与原生多步对话一致。
 - **绑定必须接到请求路径上**：guard 的 `agent/request` waterfall（`prepend: true`）把请求改写成绑定指向的 `acp/<agent>`，adapter 再做一次复查。
-- **权限模式与审批是两层，都以 agent 为准**：`composer-mode.tsx` 的控件只渲染 agent 经 `session/set_mode` 下发的 `availableModes`，不写可见标签、不翻译选项名；`session/request_permission` 原样映射给用户。插件只剩 agent 定义上的 `permission`（`ask` / `allow` / `reject`）决定要不要问人。早先那套由宿主替 agent 裁定的端口语义（`decidePermission`、fs 写栅栏）已删除，见 `docs/acp-convergence.md` §2.3。
+- **权限模式与审批是两层，都以 agent 为准**：`composer-mode.tsx` 的控件只渲染 agent 经 `session/set_mode` 下发的 `availableModes`，不写可见标签、不翻译选项名；`session/request_permission` 原样映射给用户。插件没有自己的权限开关：agent 问了就一定到人面前。早先那套由宿主替 agent 裁定的端口语义（`decidePermission`、fs 写栅栏）已删除，见 `docs/acp-convergence.md` §2.3。
 - **跨平台路径**：`impl.ts` 不能 import `node:path`，绝对路径判定与 containment 全部手写，Windows 与 UNC 有专门用例。
 
 ### 文档索引

@@ -27,8 +27,7 @@ interface ApprovalServiceLike {
   /**
    * Present on the host service, but NEVER read by this plugin: the only call
    * made here is `request` (see `wireApproval`). A deployment-wide default
-   * policy is the host's own business — this plugin's per-agent policy is
-   * `AcpAgentDef.permission`.
+   * policy is the host's own business.
    */
   config?: { policy?: string }
 }

@@ -7,8 +7,8 @@
 
 import { randomUUID } from './ids.ts'
 import type {
-  AcpAgentCatalog, AcpAgentDef, AcpConversationChoice, AcpEvent, AcpPluginConfig, AcpPresetStatus, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult,
-  AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionMode, PermissionOutcome, RpcResult,
+  AcpAgentCatalog, AcpAgentDef, AcpCatalogOption, AcpConversationChoice, AcpEvent, AcpPluginConfig, AcpPresetStatus, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult,
+  AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionOutcome, RpcResult,
 } from './protocol.ts'
 
 export { randomUUID }
@@ -190,10 +190,6 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
       env[k] = v
     }
   }
-  const permission = row.permission ?? 'ask'
-  if (permission !== 'ask' && permission !== 'allow' && permission !== 'reject') {
-    throw new AcpError('bad_config', `acp: agent "${id}" permission must be ask|allow|reject`)
-  }
   const cwd = row.cwd
   if (cwd !== undefined && (typeof cwd !== 'string' || !isAbsolutePath(cwd))) {
     throw new AcpError('bad_config', `acp: agent "${id}" cwd must be an absolute path`)
@@ -236,7 +232,6 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
     args: args as string[],
     ...(npmPackage !== undefined ? { npmPackage } : {}),
     env,
-    permission: permission as AcpAgentDef['permission'],
     cwd: cwd as string | undefined,
     allowedCwdRoots: roots as string[],
     ...(exposedModels !== undefined ? { exposedModels } : {}),
@@ -574,15 +569,19 @@ export function childEnv(parent: NodeJS.ProcessEnv, extra: Record<string, string
 // ---- Model catalog (pure parsing of ACP `configOptions`) ----
 
 /**
- * Extract the `model`, `thought_level`, and `mode` select options from a raw
- * ACP `configOptions` payload (three categories → the `model` / `thought` /
- * `mode` slots of `AcpAgentCatalog`). Tolerant by design: unknown categories,
- * boolean options, grouped choices, missing `name`, and the legacy `id` field
- * (pre-spec agents) are all handled; anything unusable is skipped silently.
+ * Extract select options from a raw ACP `configOptions` payload.
+ *
+ * `model`, `thought_level` and `mode` get dedicated slots. Every OTHER select
+ * with at least one choice lands in `extras` (deduped by `configId`, last
+ * definition wins) — that is what the composer's advanced base lists and sets.
+ * Tolerant by design: unknown categories, boolean options, grouped choices,
+ * missing `name`, and the legacy `id` field (pre-spec agents) are all handled;
+ * anything unusable is skipped silently.
  */
 export function parseCatalogOptions(configOptions: unknown): AcpAgentCatalog {
   const out: AcpAgentCatalog = {}
   if (!Array.isArray(configOptions)) return out
+  const extras = new Map<string, AcpCatalogOption>()
   for (const raw of configOptions) {
     if (typeof raw !== 'object' || raw === null) continue
     const row = raw as Record<string, unknown>
@@ -594,20 +593,27 @@ export function parseCatalogOptions(configOptions: unknown): AcpAgentCatalog {
         : category === 'mode'
           ? 'mode'
           : undefined
-    if (slot === undefined) continue
     const configIdRaw = row.configId ?? row.id
     if (typeof configIdRaw !== 'string' && typeof configIdRaw !== 'number') continue
     const configId = String(configIdRaw)
     if (configId === '') continue
     const choices: NonNullable<AcpAgentCatalog['model']>['choices'] = []
     collectCatalogChoices(row.options, choices)
-    out[slot] = {
+    const option: AcpCatalogOption = {
       configId,
       name: typeof row.name === 'string' && row.name !== '' ? row.name : configId,
       currentValue: typeof row.currentValue === 'string' && row.currentValue !== '' ? row.currentValue : null,
       choices,
     }
+    if (slot !== undefined) {
+      out[slot] = option
+      continue
+    }
+    // Choice-less options have nothing to pick; they would render an empty
+    // section in the advanced menu, so they stay out of the catalog entirely.
+    if (choices.length > 0) extras.set(configId, option)
   }
+  if (extras.size > 0) out.extras = [...extras.values()]
   return out
 }
 
@@ -662,68 +668,52 @@ export function buildAdapterModelId(agentId: string, choice: string): string {
   return `${agentId}@${choice}`
 }
 
-// ---- ACP tool activity → inline chat text ----
+// ---- ACP tool-call notifications → DSH tool-call stream chunks ----
 
 /**
- * Tool activity as inline chat TEXT, never as a `tool-call` block.
+ * Tool activity as REAL `tool-call` blocks, one driver step per tool activity.
  *
- * Why text and not a card: the Chat plane cannot draw a `tool-call` block inside
- * the message body (`AssistantMarkdown` skips it). What the plane shows instead
- * is the host loop's EXECUTION of that call, appended as its own node after the
- * whole assistant message settles — so every card of a turn piles up below all
- * the prose. A native turn hides this because its cards sit BETWEEN two model
- * steps; an ACP turn is ONE host step (the agent runs its own loop inside one
- * `session/prompt`), so there is no second step to interleave with. Ordering is
- * therefore unreachable through the card path, and the honest fix is to not ask
- * for a card. The full card — arguments, diffs, status — still lives in the ACP
- * view tab, which already renders in arrival order.
- *
- * See docs/acp-convergence.md §1.7.
+ * The ordering problem (docs/acp-convergence.md §1.7) is solved by SEGMENTING
+ * the turn, not by prose: the adapter ends its stream when a tool-bearing
+ * segment has a card and the next non-tool event arrives, the host settles the
+ * assistant message, executes the card (the guard's virtual tool answers with
+ * the agent's real output from the shared registry), and its agent loop then
+ * proposes the continuation step — whose stream() call resumes reading the SAME
+ * in-flight `session/prompt` from the transcript cursor. Cards therefore sit
+ * between two assistant messages, exactly like a native multi-step turn.
  */
-
-/** Glyph an inline tool-activity line opens with. */
-const TOOL_ACTIVITY_GLYPH = '🛠️'
 
 /**
- * One tool call's headline: what it is, what it was asked, and where it stands.
+ * One ACP tool call, narrowed to what the Chat plane's tool-call renderer shows.
  *
- * @param name - the agent's own label for the call (`title`); empty stays honest.
- * @param input - the arguments / raw input the agent disclosed (may be `''`).
- * @param status - the ACP status (`pending` / `in_progress` / `completed` / …).
+ * `callId` is the ACP `toolCallId` — it is the only identity the agent gives, and
+ * the Chat renderer uses it to group a call with its updates. `name` is the
+ * agent's own label (`title`, falling back to nothing at all: the renderer shows
+ * the call id when a name is missing). `argsRaw` accumulates whatever the agent
+ * chose to disclose — ACP has no mandatory arguments field, so an agent that
+ * sends none simply produces an empty block, which is honest.
  */
-export function acpToolActivityLine(name: string, input: string, status: string): string {
-  const label = name === '' ? 'tool' : name
-  const tail = status === '' ? '' : ` · ${status}`
-  if (input === '') return `\n${TOOL_ACTIVITY_GLYPH} **${label}**${tail}\n`
-  if (input.includes('\n')) return `\n${TOOL_ACTIVITY_GLYPH} **${label}**${tail}\n\`\`\`\n${input}\n\`\`\`\n`
-  return `\n${TOOL_ACTIVITY_GLYPH} **${label}**${tail} · \`${inlineCodeOf(input)}\`\n`
+export interface AcpToolCallSnapshot {
+  callId: string
+  name: string
+  /** Accumulated argument text (ACP has no fixed vocabulary for it). */
+  argsRaw: string
 }
 
-/**
- * What one tool call printed, as a fenced block the chat plane renders verbatim.
- *
- * Fenced rather than quoted: tool output is machine text, and a quote block lets
- * the plane's markdown read its `#` / `|` / `-` characters as prose structure.
- */
-export function acpToolActivityOutput(text: string): string {
-  return `\n\`\`\`\n${text}\n\`\`\`\n`
-}
-
-/** A backtick inside an inline-code span would close it early; fold it to a quote. */
-function inlineCodeOf(text: string): string {
-  return text.replace(/`/g, "'")
-}
+/** A delta of tool-call content, folded into the open snapshot. */
+export type AcpToolCallDelta =
+  | { kind: 'name'; name: string }
+  | { kind: 'args'; text: string }
 
 /**
- * The argument INPUT an ACP tool-call notification carries, or `''` when it
- * discloses none.
+ * The argument text an ACP tool-call notification carries, if any.
  *
- * Accepts the spellings seen in the wild: `rawInput` / `arguments` as a string,
- * an object, or an ARRAY (some agents batch several calls as one input). Every
- * non-empty value is serialized as-is — re-serializing a stringified object
- * would only risk throwing.
+ * Accepts the spellings seen in the wild (`rawInput` / `arguments` as a string,
+ * an object, or an ARRAY of inputs) and refuses to invent one: an agent that
+ * sends no arguments gets `''`, which renders as an empty card rather than a
+ * fabricated placeholder.
  */
-export function acpToolInputOf(update: Record<string, unknown>): string {
+export function acpToolCallArgsOf(update: Record<string, unknown>): string {
   for (const key of ['rawInput', 'arguments'] as const) {
     const value = update[key]
     if (typeof value === 'string') {
@@ -737,6 +727,97 @@ export function acpToolInputOf(update: Record<string, unknown>): string {
     if (typeof value === 'object' && value !== null) return jsonOf(value)
   }
   return ''
+}
+
+/**
+ * Fold one ACP `tool_call` notification into a snapshot.
+ *
+ * `rawInput` / `arguments` are accepted when present: some agents send structured
+ * input, and a tool card that cannot show its arguments is half a card. Anything
+ * else is ignored — a tool call with only an id and a title is legal ACP.
+ */
+export function acpToolCallFromUpdate(update: Record<string, unknown>): AcpToolCallSnapshot | undefined {
+  const callId = typeof update.toolCallId === 'string' ? update.toolCallId.trim() : ''
+  if (callId === '') return undefined
+  const name = typeof update.title === 'string' ? update.title : ''
+  return { callId, name, argsRaw: acpToolCallArgsOf(update) }
+}
+
+/**
+ * Fold one ACP `tool_call_update` into an open snapshot, in place.
+ *
+ * ACP updates carry FULL replacement snapshots (`rawInput` restated in whole on
+ * every change), while the host's accumulator CONCATENATES `argumentsDelta` —
+ * so the deltas produced here are the extension suffix only, and the snapshot
+ * itself always moves to the latest known text (the closing `block-end` frame
+ * replaces the block wholesale, which is what makes a non-extension update
+ * land correctly in the settled card).
+ */
+export function acpToolCallDelta(
+  snapshot: AcpToolCallSnapshot,
+  update: Record<string, unknown>,
+): AcpToolCallDelta[] {
+  const deltas: AcpToolCallDelta[] = []
+  const title = update.title
+  if (typeof title === 'string' && title !== '' && title !== snapshot.name) {
+    deltas.push({ kind: 'name', name: title })
+    snapshot.name = title
+  }
+  const input = acpToolCallArgsOf(update)
+  if (input !== '') {
+    const suffix = extensionSuffixOf(snapshot.argsRaw, input)
+    if (suffix !== '') deltas.push({ kind: 'args', text: suffix })
+    snapshot.argsRaw = input
+  } else if (snapshot.argsRaw === '') {
+    const text = updateContentToText(update.content)
+    if (text !== '') {
+      deltas.push({ kind: 'args', text })
+      snapshot.argsRaw = text
+    }
+  }
+  return deltas
+}
+
+/**
+ * The part of `next` that extends `previous` — the only thing a concatenating
+ * delta consumer can express. A replacement (the agent rewrote its input) has
+ * no honest delta; the caller updates the snapshot regardless and lets the
+ * closing snapshot tell the truth.
+ */
+function extensionSuffixOf(previous: string, next: string): string {
+  if (previous === '') return next
+  return next.startsWith(previous) ? next.slice(previous.length) : ''
+}
+
+/**
+ * Whether this request is the CONTINUATION step of a turn whose previous step
+ * settled with tool-call blocks — which is exactly what the ACP agent's display
+ * cards are. The host agent-loop starts a next step whenever the settled
+ * assistant message contains `tool-call` blocks, feeding it the staged tool
+ * results: the request's message list then has `tool`-sourced messages AFTER
+ * the last user-sourced one. A fresh prompt never does (the person's new words
+ * are the last message); history from earlier turns sits before the new user
+ * text, so it cannot trip this.
+ *
+ * The adapter answers such a step by resuming the SAME in-flight ACP prompt
+ * from the transcript cursor instead of sending a new one (see
+ * `BridgeManager.streamPrompt` and docs/acp-convergence.md §1.7).
+ */
+export function isAcpToolContinuation(messages: readonly {
+  source?: { kind?: string }
+}[]): boolean {
+  let lastTool = -1
+  for (let i = 0; i < messages.length; i += 1) {
+    if (messages[i]?.source?.kind === 'tool') lastTool = i
+  }
+  if (lastTool < 0) return false
+  for (let i = lastTool + 1; i < messages.length; i += 1) {
+    const kind = messages[i]?.source?.kind
+    // A source-less message counts as user input — the same convention
+    // `selectForwardPrompt` uses for hand-built requests.
+    if (kind === undefined || kind === 'user') return false
+  }
+  return true
 }
 
 /** One structured edit as plain text: its path, then `-`/`+` lines with three lines of context. */
@@ -967,19 +1048,6 @@ export function selectForwardPrompt(messages: readonly {
 }
 
 // ---- The agent's own permission vocabulary ----
-
-/**
- * The ACP agent's OWN permission field (`ask` / `allow` / `reject`), declared
- * per agent in the plugin's registry.
- *
- * This is now the ONLY knob. It used to be outranked by a DSH access mode
- * resolved per turn; that mapping is retired because an ACP agent is fully
- * autonomous and DSH's sandbox cannot reach into the agent's own process (see
- * docs/acp-convergence.md §2.3).
- */
-
-/** What one ACP permission ask resolves to before the routing layer runs. */
-export type PermissionDecision = 'ask' | 'allow' | 'reject'
 
 /** ACP `ToolCall.kind` values that are known to take a file effect. */
 const WRITE_TOOL_KINDS = new Set(['edit', 'delete', 'move'])
@@ -1236,7 +1304,6 @@ export interface AcpManager {
   defaultAgent?(): string | undefined
   /** Set (or clear, with `undefined`) the default ACP agent. */
   setDefaultAgent?(agentId: string | undefined): Promise<void>
-  setPermission?(agentId: string, permission: PermissionMode): Promise<void>
   detectAgents?(): Promise<DetectedAgentInfo[]>
   saveAgent?(def: AcpAgentDef): Promise<void>
   deleteAgent?(agentId: string): Promise<void>
@@ -1337,6 +1404,8 @@ export interface AcpManager {
   setChatSessionModel?(dshSessionId: string, modelId: string): Promise<void>
   /** Switch the bound agent's reasoning effort for one chat session. */
   setChatSessionEffort?(dshSessionId: string, effort: string | undefined): Promise<void>
+  /** Set one of the bound agent's EXTRA config options for one chat session. */
+  setChatSessionConfig?(dshSessionId: string, configId: string, value: string): Promise<void>
   /**
    * State of the ACP-mode agent preset in the harness's OWN roster. Read-only
    * report for the settings panel: the preset is a declaration this package
@@ -1504,6 +1573,13 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         await manager.setChatSessionEffort?.(dshSessionId, optionalStr(body, 'effort', 64))
         return ok({ done: true })
       }
+      case 'session/chat-config-set': {
+        const dshSessionId = str(body, 'dshSessionId', 128)
+        const configId = str(body, 'configId', 128)
+        const value = str(body, 'value', 512)
+        await manager.setChatSessionConfig?.(dshSessionId, configId, value)
+        return ok({ done: true })
+      }
       case 'preset/status':
         return ok({ preset: await manager.presetStatus?.() ?? null })
       case 'agent/stop':
@@ -1522,15 +1598,6 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
       case 'default/agent-set': {
         const agentId = optionalStr(body, 'agentId', 64)
         await manager.setDefaultAgent?.(agentId)
-        return ok({ done: true })
-      }
-      case 'agent/set-permission': {
-        const agentId = str(body, 'agentId', 64)
-        const permission = str(body, 'permission', 16)
-        if (permission !== 'ask' && permission !== 'allow' && permission !== 'reject') {
-          throw new AcpError('bad_payload', 'acp: permission must be ask|allow|reject')
-        }
-        await manager.setPermission?.(agentId, permission as PermissionMode)
         return ok({ done: true })
       }
       case 'agent/set-exposed-models': {

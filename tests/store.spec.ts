@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { AcpStore, foldUpdate, type Block } from '../src/client/store.ts'
 import { acpModeFromPresetEvent, stagedIsAcpMode } from '../src/client/acp-ui.tsx'
 
@@ -29,6 +29,38 @@ describe('foldUpdate', () => {
     )
     expect(blocks.map(b => b.kind)).toEqual(['user', 'thought'])
     expect(blocks[0]).toMatchObject({ text: 'ab' })
+  })
+
+  it('replaces blocks immutably: appended chunks swap the tail object, untouched rows keep their identity', () => {
+    // The ACP view memoizes rows on the block object; a mutated tail would
+    // look unchanged to React and the streamed text would never re-render.
+    const blocks: Block[] = []
+    foldUpdate(blocks, { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'one' } })
+    const firstRef = blocks[0]
+    foldUpdate(blocks, { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: ' two' } })
+    expect(blocks[0]).not.toBe(firstRef)
+    expect(blocks[0]).toMatchObject({ text: 'one two' })
+    foldUpdate(blocks, { sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'next' } })
+    expect(blocks[0]).toBe(blocks[0]) // the untouched earlier row keeps its identity
+    expect(blocks[0]).toMatchObject({ text: 'one two' })
+  })
+
+  it('answers whether anything changed, and keeps raw lazy until a view reads it', () => {
+    // Usage ticks fold to `false`: the batch then skips copying the blocks
+    // array entirely (the coalescing flush keys off this return value).
+    const blocks: Block[] = []
+    expect(foldUpdate(blocks, { sessionUpdate: 'usage_update', used: 1, size: 2 })).toBe(false)
+    expect(foldUpdate(blocks, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hi' } })).toBe(true)
+    expect(foldUpdate(blocks, { sessionUpdate: 'config_option_update', configOptions: [] })).toBe(false)
+
+    // `raw` is a lazy getter: folding a tool card costs no JSON, and reading
+    // it once caches the pretty-print for the view's later renders.
+    const toolBlocks: Block[] = []
+    foldUpdate(toolBlocks, { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'Bash', rawInput: '{"cmd":"ls"}' })
+    const card = toolBlocks[0] as Extract<Block, { kind: 'tool' }>
+    const raw = card.raw
+    expect(raw).toContain('"toolCallId": "t1"')
+    expect(card.raw).toBe(raw)
   })
 
   it('keeps a non-text chunk as its payload instead of a placeholder', () => {
@@ -969,6 +1001,43 @@ describe('AcpStore event application (released / reset / turn dedup)', () => {
     return { store, apply }
   }
 
+  it('coalesces a frame of streaming updates into one fold and one notification', async () => {
+    // Agents stream at token granularity; folding and notifying per chunk
+    // re-rendered every store consumer per chunk (the whole-system lag this
+    // coalescing exists to fix). With a frame scheduler present, the frames
+    // queue up and ONE flush folds the batch with ONE listener notification.
+    const frames: Array<() => void> = []
+    vi.stubGlobal('requestAnimationFrame', (cb: () => void): number => {
+      frames.push(cb)
+      return frames.length
+    })
+    try {
+      const { store, apply } = await makeStore()
+      await apply({ type: 'session/created', sessionId: 's1', session: view() })
+      await apply({ type: 'turn/start', sessionId: 's1', turnId: 't1', text: 'hi' })
+      let notifications = 0
+      store.subscribe(() => { notifications += 1 })
+
+      await apply({ type: 'session/update', sessionId: 's1', seq: 1, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Hello ' } } })
+      await apply({ type: 'session/update', sessionId: 's1', seq: 2, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'world' } } })
+      await apply({ type: 'session/update', sessionId: 's1', seq: 3, update: { sessionUpdate: 'usage_update', used: 5, size: 50 } })
+
+      // Nothing folded yet: the frame has not run.
+      expect(notifications).toBe(0)
+      expect(store.getSnapshot().blocks.filter(b => b.kind === 'agent')).toHaveLength(0)
+
+      // One frame runs the whole batch: one notification, one merged block.
+      const pending = frames.splice(0)
+      for (const frame of pending) frame()
+      expect(notifications).toBe(1)
+      const agentBlocks = store.getSnapshot().blocks.filter(b => b.kind === 'agent')
+      expect(agentBlocks).toHaveLength(1)
+      expect(agentBlocks[0]).toMatchObject({ text: 'Hello world' })
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   function view(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
     return {
       sessionId: 's1',
@@ -1170,22 +1239,32 @@ describe('the conversation↔agent binding (no DSH model route)', () => {
     return { store, calls }
   }
 
-  it('binds, re-models and re-efforts a conversation through its own RPCs', async () => {
+  it('binds, re-models, re-efforts and configures a conversation through its own RPCs', async () => {
     const { store, calls } = makeStore()
 
     await store.bindChatAgent('chat-1', 'codebuddy')
     await store.setChatSessionModel('chat-1', 'codebuddy@hy3')
     await store.setChatSessionEffort('chat-1', 'high')
     await store.setChatSessionEffort('chat-1', undefined)
+    await store.setChatSessionConfig('chat-1', 'temp', 'high')
 
     expect(calls.map(c => c.endpoint)).toEqual([
       'session/chat-bind', 'session/chat-model-set', 'session/chat-effort-set', 'session/chat-effort-set',
+      'session/chat-config-set',
     ])
     expect(calls[0].payload).toEqual({ dshSessionId: 'chat-1', agentId: 'codebuddy' })
     expect(calls[1].payload).toEqual({ dshSessionId: 'chat-1', modelId: 'codebuddy@hy3' })
     expect(calls[2].payload).toEqual({ dshSessionId: 'chat-1', effort: 'high' })
     // An absent effort is a clear, not an empty string.
     expect(calls[3].payload).toEqual({ dshSessionId: 'chat-1' })
+    expect(calls[4].payload).toEqual({ dshSessionId: 'chat-1', configId: 'temp', value: 'high' })
+    // The advanced pick is part of the SAME conversation record, written
+    // optimistically so the menu's checkmark moves on the click.
+    expect(store.getSnapshot().chatChoice['chat-1']).toMatchObject({
+      agentId: 'codebuddy',
+      modelId: 'codebuddy@hy3',
+      extraConfigs: { temp: 'high' },
+    })
   })
 
   it('surfaces a failed binding as a notice AND rethrows, so the menu shows the error', async () => {

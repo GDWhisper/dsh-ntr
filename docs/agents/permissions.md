@@ -2,9 +2,9 @@
 
 本文是 [AGENTS.md](../../AGENTS.md) 的展开层。核心：**agent 报什么就问什么，宿主不预先裁决**。
 
-## 1. 映射与唯一的开关
+## 1. 映射
 
-ACP `session/request_permission` 原样映射：选项列表 / allow-deny / tool call 详情都按 ACP 协议接住并回包。`AgentBridge.permissionDecision` 只读 agent 自己的 `def.permission`（`ask` / `allow` / `reject`）——它是**agent 的策略**（要不要问人），不是审批通道。`permission: allow` 时原生审批根本不会触发（`handlePermissionRequest` 在此之前短路），把策略误当成审批开关会得出「原生审批失效」的错误结论。
+ACP `session/request_permission` 原样映射：选项列表 / allow-deny / tool call 详情都按 ACP 协议接住并回包。每一问都必须交给人——原生审批链在时进对话 composer，否则进设置页 ledger。插件没有任何本地代答开关（`permission: allow` / `reject` 与 `agent/set-permission` 已删除）：agent 自己决定要不要问，宿主不替它回答。
 
 已删除、不要带回：`decidePermission` / `authorizeWrite` / `dshSessionPolicyOf` / `sandboxDenialMarker` / `wireAccessMode` / `setSessionPolicyResolver` / `DshSessionPolicy`。DSH 的 Access mode / sandboxPolicy 不参与 ACP 裁决。
 
@@ -14,7 +14,7 @@ ACP `session/request_permission` 原样映射：选项列表 / allow-deny / tool
 
 ## 2. 原生审批路由
 
-**路由条件**：`policy === 'ask'` 且桥已拿到 requester 且会话有 `dshSessionId`（经 `AcpLlmAdapter` 起的聊天会话）时，必须调用宿主 `ctx.approval.request({ agent, toolName, signal })`，让审批出现在对话 composer 里。`dshSessionId` 只允许在 `BridgeManager.getOrCreateDshSession` 的两条分支（新建、released 后 resume）写入。
+**路由条件**：桥已拿到 requester 且会话有 `dshSessionId`（经 `AcpLlmAdapter` 起的聊天会话）时，必须调用宿主 `ctx.approval.request({ agent, toolName, signal })`，让审批出现在对话 composer 里。`dshSessionId` 只允许在 `BridgeManager.getOrCreateDshSession` 的两条分支（新建、released 后 resume）写入。
 
 **降级**：三条路径都必须回落到 `PermissionLedger` + `permission/request` 广播，严禁让异常冒泡到 agent 的 turn。`askNativeApproval` 用原因区分（`LedgerFallbackReason`）：
 
@@ -37,7 +37,7 @@ ACP `session/request_permission` 原样映射：选项列表 / allow-deny / tool
 - 按 `approvalRouted` 隐藏按钮会在原生路由降级成 `unavailable` 时藏掉唯一入口，询问挂到超时。
 - `fellBackFromConversation`（有待处理项且 `approvalRouted`）是卡片必须多解释一句的情况：宿主能路由，这一条却没进去。测试：`tests/store.spec.ts` 的 "answers a pending permission ask even when the host reports the native chain"。
 
-**表单文案**：「权限策略」必须在 label 与旁注里写清它是 agent 自己的策略、不是审批通道；旁注按 `ui.approvalRouted` 说明审批出现在对话里还是本页顶部（`true` 时补一句「审批服务不可用时回落到本页顶部」）。`accessModeRouted` 已删除，不要引用。
+**设置页没有权限开关**：agent 卡不再提供「权限策略 / 要不要问人」。要不要问由 agent 自己的 mode 决定，问了就一定会到人面前。
 
 **会话权限档整格占空**：NTR 模式下 `conversation.input.permission` 由 `createPermissionSeatClaim`（`src/client/model-seat.tsx`）占领并渲染 `null`（配合 safe inject `{}` 防 session scope 崩溃）。DSH 原生 Access mode 规定的是宿主对自己工具的写策略，对外部 agent 进程毫无作用且容易误导。
 
@@ -55,7 +55,7 @@ ACP `session/request_permission` 原样映射：选项列表 / allow-deny / tool
 
 | 主题 | 位置 |
 |---|---|
-| 权限决策 | `src/bridge.ts` · `permissionDecision` / `handlePermissionRequest` |
+| 权限请求处理 | `src/bridge.ts` · `handlePermissionRequest` |
 | 原生审批 | `src/bridge.ts` · `askNativeApproval` / `nativeOutcomeResponse` / `setApprovalRequester` / `approvalRouting` / `ledgerFallbackOf`；`src/index.ts` · `wireApproval` |
 | fs 围栏 | `src/bridge.ts` · `handleFsWrite` / `guardFsPath`；`src/impl.ts` · `resolveFsPath` |
 | ledger UI | `src/client/panel.tsx` · `permissionLedgerCard` |

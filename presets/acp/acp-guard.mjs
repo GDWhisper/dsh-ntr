@@ -18,24 +18,40 @@
  * construction. `user` and `tool` sources are kept: the first is the person,
  * the second is loop-internal continuity this session still needs.
  *
- * NO-USER-INPUT STEPS ARE REJECTED (third duty): a batch that carries no
+ * NO-USER-INPUT STEPS ARE REJECTED (third duty) — with ONE exception: the
+ * continuation steps of this row's OWN display cards. A batch that carries no
  * user-sourced message is the fuel of a host-side CONTINUATION step — the
- * agent loop re-runs whenever a settled assistant message contains `tool-call`
- * blocks, feeding it the staged tool results. Forwarding one would re-send the
- * person's last words to the ACP agent, which runs its OWN loop and must hear a
- * prompt exactly once. Batches that DO carry user input keep flowing (stripped
- * as configured), and a source-less message counts as user input — the same
- * convention the bridge's forward picker uses, so a hand-assembled batch is
- * never eaten. An empty batch keeps the plain enter: the loop ends a first step
- * with no messages as a completed no-op (the injected-wake path).
+ * agent loop re-runs whenever the settled assistant message contains
+ * `tool-call` blocks, which is exactly what the ACP agent's segmented stream
+ * produces (one card-bearing message per tool activity; see
+ * docs/acp-convergence.md §1.7). The host "executes" the cards and proposes
+ * the next step fed with those results, and the adapter answers that step by
+ * resuming the SAME in-flight `session/prompt` from the transcript cursor —
+ * never by sending a new one. Forwarding an arbitrary such batch would
+ * re-send the person's last words to the ACP agent — the agent runs its OWN
+ * loop and must hear a prompt once — so anything whose staged tool results
+ * the bridge never saw is refused (`reject` ends the turn). But a batch whose
+ * every staged call id sits in the shared registry (`toolResults`) is one of
+ * OUR continuation steps and passes. Batches that DO carry user input keep
+ * flowing (stripped as configured), and a source-less message counts as user
+ * input — the same convention the bridge's forward picker uses, so a
+ * hand-assembled batch is never eaten.
  *
- * This row no longer registers virtual tools and no longer lets a continuation
- * through. The ACP stream carries NO `tool-call` blocks — the bridge announces
- * the agent's tool activity as inline text, because a card the host loop
- * executes can only ever be appended below the whole message, which is what
- * layered thinking above tools below (see docs/acp-convergence.md §1.7). With
- * no tool-call block there is no continuation step to answer, and the third
- * duty is once again a plain gate.
+ * DISPLAY CARDS EXECUTE AS REAL RESULTS (fourth duty): the card the Chat
+ * plane draws IS the execution record, so the call must execute and record a
+ * result. With no tool registered it would record `Error: unknown tool
+ * "Bash"` (a red pile of errors). The `tools/execute` waterfall is the seam:
+ * for a name nothing resolves, this row registers a SCOPED virtual tool (this
+ * ctx is the ACP session's agent scope, so the registration shadows nothing
+ * outside it) whose body answers with the call's real output — the bridge
+ * records every `tool_call` / `tool_call_update` content into the shared
+ * registry (`toolResults`, keyed by call id). Under the SEGMENTED turn shape
+ * the loop executes a card the moment its segment settles, which is often
+ * BEFORE the agent reports the tool's output, so the body first parks on the
+ * registry's `waitForToolOutput` (released by the record itself, by the
+ * turn's settlement, or by a bounded timeout). A name that resolves to a REAL
+ * tool passes untouched; a missing `tools` service degrades to the old
+ * error-result behavior.
  *
  * Config:
  *   strippedSources?: string[]  — source kinds to strip (default below; `[]`
@@ -115,12 +131,97 @@ function boundModelFor(dshSessionId) {
 }
 
 /**
- * Register the step gate and the route rewrite for this preset's agent scope.
+ * The ACP tool call's real output, as the bridge folded it. `undefined` when
+ * the call carried no content (the card then shows a plain note).
+ */
+function toolOutputFor(callId) {
+  try {
+    if (typeof callId !== 'string' || callId === '') return undefined
+    const registry = globalThis[BINDING_KEY]
+    const text = registry?.toolResults?.get?.(callId)
+    return typeof text === 'string' && text !== '' ? text : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Whether the bridge saw this call id in the ACP update stream — the marker
+ * that a staged tool result belongs to this row's own continuation steps (and
+ * not to some foreign continuation this gate must refuse).
+ */
+function registryHasToolCall(callId) {
+  try {
+    if (typeof callId !== 'string' || callId === '') return false
+    const registry = globalThis[BINDING_KEY]
+    return registry?.toolResults?.has?.(callId) === true
+  } catch {
+    return false
+  }
+}
+
+/** A tool body's return value: the shared `output.schema` below validates this shape. */
+function virtualToolValue(callId) {
+  return { text: toolOutputFor(callId) ?? 'This tool call ran inside the ACP agent process; its output lives in the ACP transcript view.' }
+}
+
+/** The marker set for definitions this row registered (never shadow a real tool). */
+function makeVirtualDefs() {
+  return new WeakSet()
+}
+
+/**
+ * One scoped virtual tool per ACP tool name. Returns the registry definition.
+ *
+ * The body first answers from the shared registry when the output has already
+ * landed, and otherwise parks on `registry.waitForToolOutput` — under the
+ * segmented turn shape the loop executes a card while the ACP agent may still
+ * be running the tool, and the wait is released by the record itself, by the
+ * turn's settlement, or by the bounded timeout (in that order).
+ */
+function virtualToolDefinition(toolName) {
+  return {
+    name: toolName,
+    description: 'dsh-ntr: display card of a tool the ACP agent already executed in its own process.',
+    parameters: { type: 'object', properties: {} },
+    output: {
+      schema: { type: 'object', properties: {} },
+      render: (_arguments, value) => [{ type: 'text', text: String(value?.text ?? '') }],
+    },
+    execute: async (_arguments, exec) => {
+      const callId = typeof exec?.callId === 'string' ? exec.callId : ''
+      const registry = globalThis[BINDING_KEY]
+      if (toolOutputFor(callId) !== undefined) return virtualToolValue(callId)
+      if (typeof registry?.waitForToolOutput === 'function') {
+        try {
+          const text = await registry.waitForToolOutput(callId, TOOL_OUTPUT_WAIT_MS)
+          if (typeof text === 'string' && text !== '') return { text }
+        } catch {
+          // A waiter failure degrades to the transcript pointer, never to an error.
+        }
+      }
+      return virtualToolValue(callId)
+    },
+  }
+}
+
+/**
+ * How long a virtual tool parks on `waitForToolOutput` before answering with
+ * the transcript pointer. Generous on purpose: the ACP agent runs the tool on
+ * its own clock, and the turn's settlement releases the wait long before this
+ * fires in every healthy case — this bound only caps a wedged agent.
+ */
+const TOOL_OUTPUT_WAIT_MS = 30 * 60 * 1000
+
+/**
+ * Register the step gate, the display-card executor, and the route rewrite for
+ * this preset's agent scope.
  * @param ctx - the preset-scoped context the row is mounted under.
  * @param config - optional `strippedSources` override.
  */
 export function apply(ctx, config) {
   const stripped = strippedSourcesOf(config)
+  const virtualDefs = makeVirtualDefs()
   ctx.on('agent/pre-step', async (_payload, next) => {
     // Downstream failures propagate untouched; only this gate's own logic is guarded.
     const decision = await next()
@@ -135,13 +236,19 @@ export function apply(ctx, config) {
         })
         if (filtered.length !== kept.length) kept = filtered
       }
-      // Anything with no user input rejects. The ACP stream carries no
-      // `tool-call` blocks any more (the bridge announces tool activity as
-      // inline text — see the module header), so there is no continuation step
-      // of our own to let through: a no-user batch here is always foreign, and
-      // forwarding one would re-send the person's last words to the agent. An
-      // EMPTY batch keeps the plain enter: the loop ends a first step with no
-      // messages as a completed no-op (the injected-wake path).
+      // The ONE legal no-user step: the continuation of this row's own display
+      // cards. Every message is a staged tool result whose call id the bridge
+      // recorded; the adapter answers that step by resuming the same in-flight
+      // ACP prompt (see the module header). Anything else with no user input
+      // still rejects — forwarding it would re-send the person's last words to
+      // the agent. An EMPTY batch keeps the plain enter: the loop ends a first
+      // step with no messages as a completed no-op (the injected-wake path).
+      const isOwnToolContinuation = kept.length > 0 && kept.every(message => {
+        if (message?.source?.kind !== 'tool') return false
+        const callId = message?.source?.callId ?? message?.toolCallId
+        return registryHasToolCall(typeof callId === 'string' ? callId : '')
+      })
+      if (isOwnToolContinuation) return decision
       const hasUserInput = kept.some(message => {
         const kind = message?.source?.kind
         return kind === undefined || kind === 'user'
@@ -151,6 +258,31 @@ export function apply(ctx, config) {
     } catch {
       // A gate bug must never eat context: degrade to keeping every message.
       return decision
+    }
+  })
+
+  // The display-card executor: answer the loop's execution of an ACP tool card
+  // with the call's real output (fourth duty — see the module header).
+  ctx.on('tools/execute', async (exec, next) => {
+    try {
+      if (exec === null || typeof exec !== 'object') return next()
+      if (typeof exec.name !== 'string' || exec.name === '' || exec.name === 'run_code') return next()
+      const tools = typeof ctx.get === 'function' ? ctx.get('tools') : undefined
+      if (tools === undefined || typeof tools.get !== 'function' || typeof tools.register !== 'function') return next()
+      // The scope-aware lookup mirrors `resolveExecution`: scoped tools shadow
+      // globals, and the global view would not see this session's own layer.
+      const existing = tools.get(exec.name, exec.agent)
+      if (existing !== undefined && !virtualDefs.has(existing)) return next()
+      if (existing === undefined) {
+        const definition = virtualToolDefinition(exec.name)
+        tools.register(definition)
+        virtualDefs.add(definition)
+      }
+      return next()
+    } catch {
+      // Registration is an upgrade, not a dependency: the old error-result
+      // behavior (and the pre-step gate) still bounds the damage.
+      return next()
     }
   })
 

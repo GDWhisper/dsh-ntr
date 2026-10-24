@@ -108,14 +108,14 @@ ACP 的 `tool_call` 被 `switchToBlock('reasoning')` 降级成
 `argumentsDelta` 用 agent 给的内容。参数型 ACP agent 若给结构化 input/arguments，
 就作为 `argumentsDelta` 送。
 
-> **现行状态（2026-10-19）**：上面“要做的事”做了（见 §1.5、§1.6），又被 §1.7 退回了——它交换掉的是时间顺序，不值。现行构建不发 `tool-call` chunk，工具活动是内联 `text`。
+> **现行状态（2026-10-24）**：本节「要做的事」重新生效——但形态升级为**逐步切分**（§1.8）：adapter 发真 `tool-call` 块，且每个工具活动段结束时**主动结束本次 stream()**，宿主落定消息、执行卡、续跑下一步，下一步继续读同一个仍在飞的 `session/prompt`。中间的历史（做成后又被 §1.7 的散文形态替换）按 §1.5–§1.7 读。
 
 **注意**：`block-end` 的 `block` 会经 `toAssistantBlock` **替换**整个 block，
 所以最后一个 `block-end` 必须带完整内容（accumulator 的 `block-end` 分支是覆盖不是合并）。
 
 ### 1.5 展示卡的隐性代价：宿主 loop 会续跑，原话会被重发（oml「你好」会话事故，2026-10-11）
 
-> **现行状态（2026-10-19）**：§1.4–§1.6 整条卡片路径（含本节与下节的两步形状修复）已被 §1.7 退役——现行构建不发 `tool-call` 块，所以这里描述的续跑与重发在现行代码里**不会再发生**。本节与下节按历史记载读：它们记录的是「卡片路径走不通」的完整证据。
+> **现行状态（2026-10-24）**：本节的续跑机制**重新生效**——§1.8 的逐步切分靠的正是它（loop 看见 `tool-call` 块就续跑）。原话重发由 guard 第三职责的例外 + bridge 侧「续跑 = 续读同一 prompt」共同防止；虚拟工具（第四职责）带着可等待的 `waitForToolOutput` 一并复活。中间（2026-10-19 → 10-24）的散文形态短暂退役了这些机制。本节按历史记载读：它们记录的是「单段发完全部内容」方案的缺陷——§1.8 的切段让它不再发生。
 
 §1.4 的方案落地后，oml 项目的「你好」会话暴露了它没算到的代价。用户报告
 「ACP agent 侧不断地反复接收到我发出去的话」。会话日志（`session-afd36498`，
@@ -193,9 +193,13 @@ callId 显式断块；同 callId 重发的 `tool_call` 按更新折叠。
 
 2026-10-11 当日的第一版修复是**两步形状**（`answerBuffer` +
 `pendingToolAnswers` + `isAcpToolContinuation` + guard 的虚拟工具与闸门例外）。
-它修好了「答案不折叠」，但留下了 §1.7 的分层。那一版现已废弃。
+它修好了「答案不折叠」，但留下了 §1.7 的分层。那一版（缓冲重放的两步形状）
+现已废弃——§1.8 的切段不需要缓冲：答案自然落在卡后新开的消息里，最后一段
+无卡即答案，`latestAnswer` 直接认中。
 
-### 1.7 分层是真缺陷：一步回合拿不到「步与步之间」，工具活动必须是内联散文（2026-10-19）
+### 1.7 分层是真缺陷：一步回合拿不到「步与步之间」（2026-10-19；现行解法见 §1.8）
+
+> **现行状态（2026-10-24）**：本节的诊断（分层源于「一步回合」）仍然成立，但结论「必须是内联散文」已被 §1.8 的**逐步切分**取代：段在卡后主动结束，宿主自己制造出「步与步之间」。内联散文形态（`noteToolActivity` / `acpToolActivityLine` 一族）就此退役。本节按历史记载读。
 
 用户报告「ACP 的回合上面一整块思考、下面一整堆工具卡，而原生对话是交错的」。
 三条事实，逐条查证：
@@ -218,32 +222,62 @@ callId 显式断块；同 callId 重发的 `tool_call` 按更新折叠。
 
 **在一个 step 内部，卡片只能置底。时间序在卡片路径上不可达。**
 
-**现行修复：工具活动改发内联 `text`。** `streamPrompt` 不再发 `tool-call` 块：
-`tool_call` / `tool_call_update` 走 `noteToolActivity`，在它发生的**位置**发一行
-`🛠️ **<name>** · <status> · `<input>``；有输出时紧跟一个围栏块。没有 card 的
-通知种类（plan / mode / 新种类）同理，每种类一行、内容变了才重发。
-`agent_message_chunk` 全程按到达顺序进 `text`。一个气泡内因此是
-思考 → 工具 → 思考 → 工具 → 答案。完整卡片（参数、diff、状态）仍在
-NTR 视图 tab（那里一直是时间序：src/client/store.ts 的 `foldUpdate` 按到达
-push，`acp-view.tsx` 直接 map `transcript.blocks`）。
+**当时的修复（2026-10-19，已被 §1.8 取代）**：工具活动改发内联 `text`。
+`noteToolActivity` 在发生的**位置**发一行 `🛠️ **<name>** · <status> · `<input>``
+（`acpToolActivityLine` / `acpToolActivityOutput` / `acpToolInputOf`，src/impl.ts）。
+代价是主聊天平面没有原生工具卡——那是用展示形态换时间序。连带退役的一整片
+机制（两步形状、guard 虚拟工具、续跑例外、快照 / delta 函数）随 §1.8 复活。
 
-**连带退役**（一整片机制随之消失，不要带回来）：
+### 1.8 逐步切分：让宿主自己造出「步与步之间」（2026-10-24，现行）
 
-- `answerBuffer` / `streamedAnswerLength` / `pendingToolAnswers` /
-  `isAcpToolContinuation`：没有工具块就 `toolCalls.length === 0`，loop 直接
-  `completed`，**不存在续跑步**；答案也不必再缓冲，`latestAnswer` 认中这条
-  干净消息，回合不再折叠。
-- guard 的第四职责（`tools/execute` 虚拟工具）：没有卡片要执行。
-- guard 第三职责的唯一例外：没有本行自己的续跑步可放行，`agent/pre-step`
-  回到「无用户来源即 reject」的纯闸门。
-- `recordAcpToolOutput` 与共享注册表 `toolResults` / `cardOutputs`：只服务上面
-  两条。注册表只剩 `conversations` + `defaultModel`。
-- `acpToolCallFromUpdate` / `acpToolCallDelta` / `acpToolCallDetailsOf` /
-  `acpToolCallArgsOf` / `AcpToolCallSnapshot` / `AcpToolCallDelta`：快照与
-  delta 语义是为拼接式 `argumentsDelta` 造的，散文不需要它们。新增
-  `acpToolActivityLine` / `acpToolActivityOutput` / `acpToolInputOf`（src/impl.ts）。
+§1.7 的根因是「插件只发一次 `session/prompt`，宿主只看到一个 step」。真正的
+解法不是放弃卡片，而是**把一个 ACP turn 切成多个宿主 step**：
 
-**代价**：主聊天平面没有原生工具卡。这是换时间序付的钱。
+1. **段（segment）**：一次 `stream()` 调用就是一个段。文字 / 思考按到达顺序
+   流式；`tool_call` / `tool_call_update` 折成真正的 `tool-call` 块
+   （`acpToolCallFromUpdate` / `acpToolCallDelta`，每个 callId 一个 turn 内
+   只开一张卡，重述按快照 / 前缀扩展折叠）。
+2. **切段点**：段内开过卡、且下一条**非 tool 事件**（文字 / 思考 / 无卡通知 /
+   权限请求）到达时，`TurnStreamController` 先 `block-end` 再发 `finish(stop)`
+   ——段尾就是卡，宿主落定的消息因此以卡收尾。
+3. **宿主制造步**：loop 看见 settled 消息含 `tool-call` 块 → `executeToolCalls`
+   → 卡片（guard 的虚拟工具从共享注册表 `toolResults` 取**真实输出**；输出未到
+   时工主体 `waitForToolOutput` 挂起，由 `recordAcpToolOutput`、turn settle 或
+   30 分钟兜底解除）→ 续跑下一步（staged tool results）。
+4. **续跑 = 续读**：续跑批次被 `isAcpToolContinuation` 识别，**绝不新发
+   `session/prompt`**——`TurnStreamController.startSegment()` 用 transcript
+   游标（`cursorSeq`）补读段间事件再订阅，答案 / 后续卡落在后面的新消息里。
+   卡片因此夹在两个 assistant 节点之间，与原生多步回合一致。
+5. **guard**：第三职责的唯一例外（本行自己的续跑批次放行，callId 全部在
+   `toolResults` 注册表里）与第四职责（`tools/execute` 虚拟工具）一并复活。
+6. **turn 级语义不变**：`turn/end` 仍只在 `session/prompt` 响应返回时发出；
+   以卡收尾的 turn 由**最后一个续跑段**收口（一条「工具已执行、无更多文字」
+   的指针行，避免空气泡消息）；cancel 世代（`turnSeq`）与 prompt slot
+   （agent 未确认取消前不解开 `settled` 闸门）跨段成立；段间事件只记账
+   （usage / 工具输出唤醒等待者），游标不动，下一段重放补齐。
+
+**同一轮的性能改造**（用户报告：流式期间整机卡顿、时钟跳跃）。排查结论：
+宿主端逐 chunk 成本是 O(1)（广播 + 每连接一次 stringify），压力主因在
+浏览器端**每条 SSE chunk 一次「数组复制 + 全 state 重建 + 所有订阅组件
+重渲染」**，且 NTR 视图无 memo、`t` 每渲染新建、工具块即时
+`JSON.stringify`（单块上限 256KB）。修复三项：
+
+- **微批合帧**（src/client/store.ts）：`session/update` 入 `pendingUpdates`，
+  每个动画帧一次 `flushUpdates()`——一帧一折叠、一次 `mutate`；
+  `usage_update` 等 `STATE_ONLY_UPDATES` 折叠返回 `false`，纯状态 tick
+  不复制 blocks 数组、patch 为空时完全不通知。
+- **行级 memo**（src/client/acp-view.tsx）：`BlockView` 用 `React.memo`，
+  props 是块对象与 store 实例绑定的 `label`；`foldUpdate` 因此改为
+  **immutable**（追加 chunk 替换尾块对象，未变行保持引用），只有变化的行
+  重渲染。
+- **`raw` 惰性化**：工具 / 事件块的 `raw` 从 fold 时的即时
+  pretty-print 改为 lazy getter（首次读取缓存）——进度 tick 密集的
+  agent 不再每 tick 付 256KB 的 stringify，NTR 视图未开时永不付费。
+
+**delta 合帧透传（曾列的优化 4）评估结论：不做。** 切段后每段只覆盖两个
+工具活动之间的短文本，段内 delta 数量天然变少；宿主端逐 chunk 成本本就是
+O(1)；浏览器端已由合帧 + memo 吸收。若实测仍有 agent（`usage_update` 密集
+的段）把原生平面拖卡，再在段内做 50–100ms 时间窗合并，不预先付这笔复杂度。
 
 同日（2026-10-11）的操作记录仍适用：`session-34788953` 的历史日志曾因旧构建的
 重复 tool-call 块被宿主 `@deepseek-ai/dsh-session-persistence-jsonl` 拒载

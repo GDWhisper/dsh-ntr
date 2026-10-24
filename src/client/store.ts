@@ -430,6 +430,70 @@ export const DEFAULT_KNOWN_PRESETS: DetectedAgentInfo[] = [
     defaultCommand: 'codebuddy',
     defaultArgs: ['--acp'],
   },
+  {
+    id: 'claude',
+    name: 'Claude Code',
+    description: 'Claude Agent SDK adapter — run as `npx -y @agentclientprotocol/claude-agent-acp` over stdio',
+    detected: false,
+    defaultCommand: 'npx',
+    defaultArgs: ['-y', '@agentclientprotocol/claude-agent-acp'],
+  },
+  {
+    id: 'codex',
+    name: 'Codex',
+    description: 'OpenAI Codex adapter — run as `npx -y @agentclientprotocol/codex-acp` over stdio',
+    detected: false,
+    defaultCommand: 'npx',
+    defaultArgs: ['-y', '@agentclientprotocol/codex-acp'],
+  },
+  {
+    id: 'gemini',
+    name: 'Gemini CLI',
+    description: 'Google Gemini CLI — run as `gemini --experimental-acp` over stdio',
+    detected: false,
+    defaultCommand: 'gemini',
+    defaultArgs: ['--experimental-acp'],
+  },
+  {
+    id: 'opencode',
+    name: 'OpenCode',
+    description: 'OpenCode — run as `opencode acp` over stdio',
+    detected: false,
+    defaultCommand: 'opencode',
+    defaultArgs: ['acp'],
+  },
+  {
+    id: 'qwen',
+    name: 'Qwen Code',
+    description: 'Qwen Code — run as `qwen --experimental-acp` over stdio',
+    detected: false,
+    defaultCommand: 'qwen',
+    defaultArgs: ['--experimental-acp'],
+  },
+  {
+    id: 'kiro',
+    name: 'Kiro',
+    description: 'Kiro CLI — run as `kiro-cli acp` over stdio',
+    detected: false,
+    defaultCommand: 'kiro-cli',
+    defaultArgs: ['acp'],
+  },
+  {
+    id: 'qoder',
+    name: 'Qoder',
+    description: 'Qoder CLI — run as `qodercli --acp` over stdio',
+    detected: false,
+    defaultCommand: 'qodercli',
+    defaultArgs: ['--acp'],
+  },
+  {
+    id: 'qoder-cn',
+    name: 'Qoder CN',
+    description: 'Qoder CLI (China) — run as `qoderclicn --acp` over stdio',
+    detected: false,
+    defaultCommand: 'qoderclicn',
+    defaultArgs: ['--acp'],
+  },
 ]
 
 export class AcpStore {
@@ -527,6 +591,82 @@ export class AcpStore {
       blocks: blocksChanged ? [...this.state.blocks] : patch.blocks ?? this.state.blocks,
     }
     for (const listener of [...this.listeners]) listener()
+  }
+
+  // ---- Streaming update coalescing ----
+
+  /**
+   * Live `session/update` frames waiting to be folded. Agents stream at token
+   * granularity — hundreds of frames a second with usage ticks interleaved —
+   * and folding plus notifying listeners per frame re-rendered every store
+   * consumer per chunk. Frames are coalesced into ONE fold + ONE mutate per
+   * animation frame instead; the order inside a batch is preserved, and the
+   * transcript watermark (`lastSeq`) advances per batch.
+   */
+  private readonly pendingUpdates: Array<{ sessionId: string; seq: number; update: unknown }> = []
+  private updateFlushArmed = false
+
+  /** Fold everything pending now (idempotent; the scheduler clears its flag). */
+  flushUpdates(): void {
+    const batch = this.pendingUpdates.splice(0, this.pendingUpdates.length)
+    this.updateFlushArmed = false
+    if (batch.length === 0) return
+    const bySession = new Map<string, Array<{ seq: number; update: unknown }>>()
+    for (const item of batch) {
+      const list = bySession.get(item.sessionId)
+      if (list === undefined) bySession.set(item.sessionId, [item])
+      else list.push(item)
+    }
+    let chatTranscripts = this.state.chatTranscripts
+    let blocksChanged = false
+    for (const [sessionId, items] of bySession) {
+      const last = items[items.length - 1]
+      // The observed transcript folds every frame (a watched session's cards
+      // and prose); blocks are copied only when something actually changed, so
+      // a usage-only tick costs one record object, not a re-render payload.
+      const record = chatTranscripts[sessionId]
+      if (record !== undefined) {
+        let changed = false
+        for (const item of items) {
+          if (foldUpdate(record.blocks, item.update as Record<string, unknown>)) changed = true
+        }
+        chatTranscripts = {
+          ...chatTranscripts,
+          [sessionId]: { ...record, seq: last.seq, ...(changed ? { blocks: [...record.blocks] } : {}) },
+        }
+      }
+      if (sessionId !== this.state.activeSessionId) {
+        this.lastSeq.set(sessionId, last.seq)
+        continue
+      }
+      const seen = this.lastSeq.get(sessionId)
+      const contiguous = seen === undefined
+        || (items[0].seq === seen + 1 && items.every((item, index) => index === 0 || item.seq === items[index - 1].seq + 1))
+      this.lastSeq.set(sessionId, last.seq)
+      if (!contiguous) {
+        void this.loadTranscript(sessionId) // gap detected → replay
+        continue
+      }
+      for (const item of items) {
+        if (foldUpdate(this.state.blocks, item.update as Record<string, unknown>)) blocksChanged = true
+      }
+    }
+    const patch: Partial<UiState> = {}
+    if (chatTranscripts !== this.state.chatTranscripts) patch.chatTranscripts = chatTranscripts
+    if (blocksChanged) patch.blocks = [...this.state.blocks]
+    if (Object.keys(patch).length > 0) this.mutate(patch)
+  }
+
+  private armUpdateFlush(): void {
+    if (this.updateFlushArmed) return
+    this.updateFlushArmed = true
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => { this.updateFlushArmed = false; this.flushUpdates() })
+      return
+    }
+    // No frame scheduler (a plain Node runtime): fold at once, keeping the
+    // same one-mutate-per-batch contract for non-browser consumers.
+    this.flushUpdates()
   }
 
   // ---- Transport ----
@@ -1228,18 +1368,6 @@ export class AcpStore {
     return out
   }
 
-  /**
-   * Apply one live frame to an observed transcript. Returns the next map, or
-   * `undefined` when nobody is watching that session, so callers fold it into
-   * their own state patch instead of mutating twice.
-   */
-  private foldWatched(sessionId: string, update: (record: ChatTranscript) => ChatTranscript): Record<string, ChatTranscript> | undefined {
-    const current = this.state.chatTranscripts[sessionId]
-    if (current === undefined) return undefined
-    const next = update(current)
-    return { ...this.state.chatTranscripts, [sessionId]: { ...next, blocks: [...next.blocks] } }
-  }
-
   /** Re-publish an observed transcript's session snapshot (mode / released flips). */
   private watchedSessionPatch(sessionId: string, session: SessionView): { chatTranscripts?: Record<string, ChatTranscript> } {
     const current = this.state.chatTranscripts[sessionId]
@@ -1352,6 +1480,20 @@ export class AcpStore {
     }
   }
 
+  /** Set one of the bound agent's EXTRA config options for one chat session. */
+  async setChatSessionConfig(dshSessionId: string, configId: string, value: string): Promise<void> {
+    try {
+      await this.call('session/chat-config-set', { dshSessionId, configId, value })
+      this.writeChoice(dshSessionId, choice => ({
+        ...choice,
+        extraConfigs: { ...choice.extraConfigs, [configId]: value },
+      }))
+    } catch (error) {
+      this.flashError(error)
+      throw error
+    }
+  }
+
   /**
    * Patch one conversation's optimistic pick. The agent half is required by the
    * record (a model or thought level belongs to an agent), so a conversation
@@ -1365,18 +1507,12 @@ export class AcpStore {
     this.mutate({ chatChoice: { ...this.state.chatChoice, [dshSessionId]: { ...next, agentId } } })
   }
 
-  async setPermission(agentId: string, permission: 'ask' | 'allow' | 'reject'): Promise<void> {
-    try {
-      await this.call('agent/set-permission', { agentId, permission })
-      await this.resync()
-    } catch (error) {
-      this.flashError(error)
-    }
-  }
-
-  label(zh: string, en: string): string {
-    return this.locale(zh, en)
-  }
+  /**
+   * Localize one string. BOUND to the instance in the constructor: the ACP
+   * view hands this reference to memoized rows, so it must stay stable across
+   * renders or every row re-renders on every store notification.
+   */
+  label: (zh: string, en: string) => string = (zh: string, en: string): string => this.locale(zh, en)
 
   clearNotice(): void {
     this.mutate({ notice: undefined })
@@ -1482,25 +1618,9 @@ export class AcpStore {
         return Promise.resolve()
       }
       case 'session/update': {
-        const folded = this.foldWatched(event.sessionId, record => {
-          foldUpdate(record.blocks, event.update as unknown as Record<string, unknown>)
-          return { ...record, seq: event.seq }
-        })
-        if (event.sessionId !== this.state.activeSessionId) {
-          // Background session: bump its seq bound; full refresh happens on select.
-          this.lastSeq.set(event.sessionId, event.seq)
-          if (folded !== undefined) this.mutate({ chatTranscripts: folded })
-          return Promise.resolve()
-        }
-        const seen = this.lastSeq.get(event.sessionId)
-        if (seen !== undefined && event.seq !== seen + 1) {
-          void this.loadTranscript(event.sessionId) // gap detected → replay
-          if (folded !== undefined) this.mutate({ chatTranscripts: folded })
-          return Promise.resolve()
-        }
-        this.lastSeq.set(event.sessionId, event.seq)
-        foldUpdate(this.state.blocks, event.update as unknown as Record<string, unknown>)
-        this.mutate({ blocks: [...this.state.blocks], ...(folded === undefined ? {} : { chatTranscripts: folded }) })
+        // Coalesced (see `pendingUpdates`): one fold + one mutate per frame.
+        this.pendingUpdates.push({ sessionId: event.sessionId, seq: event.seq, update: event.update })
+        this.armUpdateFlush()
         return Promise.resolve()
       }
       case 'catalog/updated': {
@@ -1615,7 +1735,19 @@ export class AcpStore {
 }
 
 /** Merge a raw ACP update into the block list (mutates in place). */
-export function foldUpdate(blocks: Block[], update: Record<string, unknown>): void {
+/**
+ * Fold one transcript update into a block list. IMMUTABLE per block: the ACP
+ * view memoizes rows on the block object, so an appended chunk replaces the
+ * tail block instead of mutating it (array copies stay the caller's job, one
+ * per folded batch). Returns whether any block changed — a usage-only tick
+ * folds to `false` and the batch skips copying the array.
+ *
+ * `raw` is a lazy getter: pretty-printing a tool payload costs up to
+ * {@link RAW_MAX} characters of JSON per call, and progress ticks restate
+ * whole calls at high frequency — the cost is paid once, by the view that
+ * actually shows the card, never by the fold loop.
+ */
+export function foldUpdate(blocks: Block[], update: Record<string, unknown>): boolean {
   const kind = String(update.sessionUpdate ?? '')
   const content = update.content as Record<string, unknown> | undefined
   switch (kind) {
@@ -1624,75 +1756,75 @@ export function foldUpdate(blocks: Block[], update: Record<string, unknown>): vo
     case 'agent_thought_chunk': {
       const targetKind = kind === 'user_message_chunk' ? 'user' : kind === 'agent_message_chunk' ? 'agent' : 'thought'
       const text = chunkText(content)
-      if (text === '') return
+      if (text === '') return false
       const messageId = typeof update.messageId === 'string' ? update.messageId : undefined
       const last = blocks[blocks.length - 1]
       if (targetKind === 'agent' && last?.kind === 'agent' && ((messageId !== undefined && last.messageId === messageId) || (messageId === undefined && last.messageId === undefined))) {
-        last.text += text
+        blocks[blocks.length - 1] = { ...last, text: last.text + text }
       } else if (targetKind !== 'agent' && last?.kind === targetKind) {
-        last.text += text
+        blocks[blocks.length - 1] = { ...last, text: last.text + text }
       } else if (targetKind === 'agent') {
         blocks.push({ kind: 'agent', ...(messageId === undefined ? {} : { messageId }), text })
       } else {
         blocks.push({ kind: targetKind, text })
       }
-      return
+      return true
     }
     case 'tool_call': {
-      const parsed = splitToolContent(update.content)
-      const input = toolInputOf(update)
-      const details = toolDetailsOf(update)
+      let rawOf: string | undefined
       blocks.push({
         kind: 'tool',
         toolCallId: String(update.toolCallId ?? ''),
         title: String(update.title ?? ''),
         status: String(update.status ?? 'pending'),
         ...(typeof update.kind === 'string' ? { toolKind: update.kind } : {}),
-        lines: parsed.lines,
-        ...(parsed.diffs === undefined ? {} : { diffs: parsed.diffs }),
-        ...(parsed.extras.length === 0 ? {} : { extras: parsed.extras }),
-        ...(input === undefined ? {} : { input }),
-        ...(details.length === 0 ? {} : { details }),
-        raw: jsonText(update),
+        ...splitToolContent(update.content),
+        ...toolInputFields(update),
+        get raw() { return rawOf ??= jsonText(update) },
       })
-      return
+      return true
     }
     case 'tool_call_update': {
       const id = String(update.toolCallId ?? '')
       for (let i = blocks.length - 1; i >= 0; i--) {
         const block = blocks[i]
         if (block?.kind !== 'tool' || block.toolCallId !== id) continue
-        if (typeof update.title === 'string' && update.title !== '') block.title = update.title
-        if (typeof update.status === 'string') block.status = update.status
-        if (typeof update.kind === 'string') block.toolKind = update.kind
+        // An update restates the call in whole, but every field it does NOT
+        // carry keeps the block's previous value (the restatement that only
+        // brings a result must not wipe the arguments the card shows).
         const parsed = splitToolContent(update.content)
-        if (parsed.lines.length > 0) block.lines = parsed.lines
-        if (parsed.diffs !== undefined) block.diffs = parsed.diffs
-        if (parsed.extras.length > 0) block.extras = parsed.extras
         const input = toolInputOf(update)
-        if (input !== undefined) block.input = input
         const details = toolDetailsOf(update)
-        if (details.length > 0) block.details = details
-        block.raw = jsonText(update)
-        return
+        let rawOf: string | undefined
+        blocks[i] = {
+          kind: 'tool',
+          toolCallId: id,
+          title: typeof update.title === 'string' && update.title !== '' ? update.title : block.title,
+          status: typeof update.status === 'string' ? update.status : block.status,
+          ...(typeof update.kind === 'string' ? { toolKind: update.kind } : block.toolKind === undefined ? {} : { toolKind: block.toolKind }),
+          lines: parsed.lines.length > 0 ? parsed.lines : block.lines,
+          ...(parsed.diffs === undefined
+            ? block.diffs === undefined ? {} : { diffs: block.diffs }
+            : { diffs: parsed.diffs }),
+          ...(parsed.extras.length > 0 ? { extras: parsed.extras } : block.extras === undefined ? {} : { extras: block.extras }),
+          ...(input === undefined ? block.input === undefined ? {} : { input: block.input } : { input }),
+          ...(details.length > 0 ? { details } : block.details === undefined ? {} : { details: block.details }),
+          get raw() { return rawOf ??= jsonText(update) },
+        }
+        return true
       }
       // Update for a tool call that rolled out of the transcript window.
-      const parsed = splitToolContent(update.content)
-      const input = toolInputOf(update)
-      const details = toolDetailsOf(update)
+      let rawOf: string | undefined
       blocks.push({
         kind: 'tool',
         toolCallId: id,
         title: id,
         status: String(update.status ?? 'completed'),
-        lines: parsed.lines,
-        ...(parsed.diffs === undefined ? {} : { diffs: parsed.diffs }),
-        ...(parsed.extras.length === 0 ? {} : { extras: parsed.extras }),
-        ...(input === undefined ? {} : { input }),
-        ...(details.length === 0 ? {} : { details }),
-        raw: jsonText(update),
+        ...splitToolContent(update.content),
+        ...toolInputFields(update),
+        get raw() { return rawOf ??= jsonText(update) },
       })
-      return
+      return true
     }
     case 'plan': {
       const entries = Array.isArray(update.entries)
@@ -1702,13 +1834,14 @@ export function foldUpdate(blocks: Block[], update: Record<string, unknown>): vo
           ...(typeof e.priority === 'string' ? { priority: e.priority } : {}),
         }))
         : []
-      const existing = [...blocks].reverse().find(b => b.kind === 'plan')
-      if (existing !== undefined && existing.kind === 'plan') {
-        existing.entries = entries
-      } else {
-        blocks.push({ kind: 'plan', entries })
+      for (let i = blocks.length - 1; i >= 0; i--) {
+        const block = blocks[i]
+        if (block?.kind !== 'plan') continue
+        blocks[i] = { ...block, entries }
+        return true
       }
-      return
+      blocks.push({ kind: 'plan', entries })
+      return true
     }
     default: {
       // Every remaining notification kind is kept, not dropped: a command list,
@@ -1716,11 +1849,26 @@ export function foldUpdate(blocks: Block[], update: Record<string, unknown>): vo
       // say nothing new (`config_option_update` / `usage_update` /
       // `session_info_update`) ride the SessionView snapshot — they are state,
       // not stream content, and a row per tick would be noise.
-      if (kind === '' || STATE_ONLY_UPDATES.has(kind)) return
-      blocks.push({ kind: 'event', event: kind, text: describeEvent(kind, update), raw: jsonText(update) })
-      return
+      if (kind === '' || STATE_ONLY_UPDATES.has(kind)) return false
+      let rawOf: string | undefined
+      blocks.push({ kind: 'event', event: kind, text: describeEvent(kind, update), get raw() { return rawOf ??= jsonText(update) } })
+      return true
     }
   }
+}
+
+/**
+ * The input / detail fields a tool block carries from an update, spread-ready.
+ * Kept apart from the content split so `tool_call` and `tool_call_update` share
+ * one spelling of "when does a field appear".
+ */
+function toolInputFields(update: Record<string, unknown>): Record<string, unknown> {
+  const fields: Record<string, unknown> = {}
+  const input = toolInputOf(update)
+  if (input !== undefined) fields.input = input
+  const details = toolDetailsOf(update)
+  if (details.length > 0) fields.details = details
+  return fields
 }
 
 /** Notifications that update the SessionView snapshot instead of the block stream. */

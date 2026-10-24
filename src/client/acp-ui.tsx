@@ -379,7 +379,7 @@ export interface SessionListSource {
 // ---- The one open menu (composer overlay slot) ----
 
 /** Which picker the composer overlay is showing. */
-export type AcpMenuKind = 'agent' | 'model' | 'thought'
+export type AcpMenuKind = 'agent' | 'model' | 'thought' | 'advanced'
 
 interface MenuState {
   sessionId: string
@@ -602,8 +602,9 @@ export function AcpMenu({ model, anchor, onPick, onClose }: AcpMenuProps) {
 /**
  * One composer chip. With `onClick` it is the trigger of a picker; without it
  * it is a static nameplate (the locked agent on the composer edge) — same
- * shape, no button semantics and no caret, so it does not read as a control
- * that does nothing.
+ * shape and no button semantics, so it does not read as a control that does
+ * nothing. Neither variant draws a caret: the chips are a compact status row,
+ * and the disclosure arrow added visual noise without carrying information.
  *
  * `className` exists for the lock hand-off: the base needs the shatter
  * keyframes (`ntr-acp-shatter`) while it is still mounted, and that class must
@@ -639,7 +640,6 @@ export function AcpChip(props: {
     >
       {props.children}
       <span className="ntr-acp-chip-label">{props.label}</span>
-      <span className="ntr-acp-caret" aria-hidden>▾</span>
     </button>
   )
 }
@@ -719,10 +719,11 @@ export function AcpShatterParts(props: { mode: 'out' | 'in' }) {
 
 const STYLE = `
 .ntr-acp-cluster { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; flex-wrap: nowrap; }
-/* The agent base is the cluster's fixed right-hand anchor: it never shrinks
-   below its own label, while the agent-published chips to its left absorb the
-   squeeze. Without this a long model name could compress the base instead,
-   which is the same "it moved" symptom as reordering it was meant to fix. */
+/* The last chip is the cluster's fixed right-hand anchor: it never shrinks
+   below its label, while the chips to its left absorb the squeeze. Before the
+   lock that is the agent base; after it retires, the model / thought pair
+   inherits the edge. Without this a long model name could compress the agent
+   base into invisibility — the "selector disappeared" symptom. */
 .ntr-acp-cluster > .ntr-acp-chip:last-child { flex: none; }
 /* The agent tag after the base retires. It rides the composer card's top edge:
    the overlay anchor is a zero-height absolute box at that edge, so translateY
@@ -737,7 +738,6 @@ const STYLE = `
 .ntr-acp-chip.is-static:hover { background: var(--dsw-alias-bg-layer-2, #f3f4f6); }
 .ntr-acp-chip.is-active { border-color: var(--dsw-alias-state-business-primary, #2563eb); color: var(--dsw-alias-state-business-primary, #2563eb); background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 10%, transparent); }
 .ntr-acp-chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ntr-acp-caret { opacity: 0.6; font-size: 10px; }
 /* The lock hand-off (src/client/agent-lock-anim.ts): the outgoing agent base
    breaks into debris for 460ms, then the edge tag condenses from the same
    particles. Both halves read one shared clock in that module; these durations

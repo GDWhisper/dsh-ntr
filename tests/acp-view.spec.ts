@@ -11,10 +11,21 @@ import { describe, expect, it, vi } from 'vitest'
 import { ACP_PRESET_ID, acpModeFromPresetEvent, formatCommandLine, isAbsolutePathLike, placeMenu, rowAgentPreset, splitAcpModelId, splitCommandLine, stagedIsAcpMode, stagedSessionOf, tokenizeCommandLine } from '../src/client/acp-ui.tsx'
 import { agentLockPhaseOf, FORM_MS, playAgentLockAnim, SHATTER_MS } from '../src/client/agent-lock-anim.ts'
 import { acpEmptyCopy, boundAgentOf, diffRows, isNewFileDiff } from '../src/client/acp-view.tsx'
-import { describeRoute, menuFor } from '../src/client/session-controls.tsx'
+import { describeRoute, menuFor, REFRESH_CATALOG_ITEM } from '../src/client/session-controls.tsx'
 import { AcpStore } from '../src/client/store.ts'
 import { isAbsolutePath, splitAdapterModelId, splitCommandLine as hostSplitCommandLine, tokenizeCommandLine as hostTokenizeCommandLine } from '../src/impl.ts'
 import type { AgentCatalogResult, AgentView, ChatSessionView } from '../src/protocol.ts'
+
+/**
+ * Model-row ids only. The picker's last row is the explicit refresh ACTION
+ * (`REFRESH_CATALOG_ITEM`, covered by session-controls.spec.ts); these
+ * assertions are about which models are offered.
+ */
+function modelRowIds(menu: ReturnType<typeof menuFor>): string[] {
+  return (menu.sections[0]?.items ?? [])
+    .map(item => item.id)
+    .filter(id => id !== REFRESH_CATALOG_ITEM)
+}
 
 describe('splitAcpModelId', () => {
   const samples = [
@@ -244,7 +255,7 @@ describe('stagedIsAcpMode (does the staged conversation run the ACP preset)', ()
 describe('ACP composer picker (agent / its models / its thought level)', () => {
   const acp = new AcpStore(async () => ({ ok: true, value: {} }), zh => zh)
   const agent: AgentView = {
-    id: 'pi', title: 'Pi', command: 'pi-acp', args: [], permission: 'ask',
+    id: 'pi', title: 'Pi', command: 'pi-acp', args: [],
     allowedCwdRoots: [], state: 'ready', liveSessions: [],
   }
   /** What `agent/catalog` answers for this agent (`exposedModels` already applied). */
@@ -283,7 +294,7 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
     const models = menu.sections[0]
     // The bare `agentId` row (the agent's default model) is never filtered out;
     // everything after it is what `exposedModels` let through.
-    expect(models?.items.map(item => item.id)).toEqual(['pi', 'pi@claude-sonnet-4'])
+    expect(modelRowIds(menu)).toEqual(['pi', 'pi@claude-sonnet-4'])
     expect(models?.items[0]).toMatchObject({ label: 'Pi · 默认', active: true })
   })
 
@@ -386,7 +397,7 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
     // ONE row for the model the agent is on — not a "默认" row plus a variant row.
     // The row is the VARIANT row (it is in `exposedModels`), so it carries that
     // row's label; what matters is that it is marked and that it names a model.
-    expect(menu.sections[0]?.items.map(item => item.id)).toEqual(['pi@claude-sonnet-4'])
+    expect(modelRowIds(menu)).toEqual(['pi@claude-sonnet-4'])
     expect(menu.sections[0]?.items[0]).toMatchObject({ active: true })
     expect(menu.sections[0]?.items[0]?.label).toContain('Claude Sonnet 4')
     // The chip names the model too, not the agent (the agent chip already does).
@@ -401,7 +412,7 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
       currentModel: { value: 'hy3', name: 'Hy3' },
     }
     const offMenu = menuFor('model', { acp, agents: [agent], catalog: offList, route: describeRoute([agent], undefined, undefined, offList, 'pi') })
-    expect(offMenu.sections[0]?.items.map(item => item.id)).toEqual(['pi@hy3', 'pi@other-model'])
+    expect(modelRowIds(offMenu)).toEqual(['pi@hy3', 'pi@other-model'])
     expect(offMenu.sections[0]?.items[0]).toMatchObject({ active: true, label: 'Hy3 · 当前' })
     expect(offMenu.sections[0]?.items[1]).toMatchObject({ active: false })
   })
@@ -457,11 +468,11 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
     expect(menuFor('agent', { acp, agents: [agent], catalog: silent, route }).sections.map(s => s.id)).toEqual(['agent'])
     // The MODEL picker still degrades honestly: `variants: []` means the base
     // row is all this agent offers, which is exactly one row — not an error.
-    expect(menuFor('model', { acp, agents: [agent], catalog: silent, route }).sections[0]?.items.map(item => item.id))
+    expect(modelRowIds(menuFor('model', { acp, agents: [agent], catalog: silent, route })))
       .toEqual(['pi'])
     const noCatalog = describeRoute([agent], bound, undefined)
     const fallback = menuFor('model', { acp, agents: [agent], route: noCatalog })
-    expect(fallback.sections[0]?.items.map(item => item.id)).toEqual(['pi'])
+    expect(modelRowIds(fallback)).toEqual(['pi'])
   })
 
   it('keeps the single-axis pickers header-shaped as before', () => {
@@ -478,11 +489,11 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
     // a marked row above the offered ones.
     const hidden = describeRoute([agent], { ...bound, modelId: 'pi@gone' }, undefined, catalog)
     const menu = menuFor('model', { acp, agents: [agent], catalog, route: hidden })
-    expect(menu.sections[0]?.items.map(item => item.id)).toEqual(['pi@gone', 'pi', 'pi@claude-sonnet-4'])
+    expect(modelRowIds(menu)).toEqual(['pi@gone', 'pi', 'pi@claude-sonnet-4'])
     expect(menu.sections[0]?.items[0]).toMatchObject({ active: true })
     // The default route is the base row itself — never duplicated.
     const onDefault = menuFor('model', { ...base, route: routed })
-    expect(onDefault.sections[0]?.items.map(item => item.id)).toEqual(['pi', 'pi@claude-sonnet-4'])
+    expect(modelRowIds(onDefault)).toEqual(['pi', 'pi@claude-sonnet-4'])
   })
 
   it('points an unfiltered agent at the exposure editor instead of looking broken', () => {
@@ -519,7 +530,7 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
     // The base lists the roster only; the models this agent OFFERS are readable
     // before the first turn — through the model chip's own picker.
     expect(menuFor('agent', { ...base, route: fresh }).sections.map(s => s.id)).toEqual(['agent'])
-    expect(menuFor('model', { ...base, route: fresh }).sections[0]?.items.map(i => i.id))
+    expect(modelRowIds(menuFor('model', { ...base, route: fresh })))
       .toEqual(['pi', 'pi@claude-sonnet-4'])
     // No effort axis: nothing has run, so there is no current effort to mark.
     expect(menuFor('agent', { ...base, route: fresh }).sections.map(s => s.id)).not.toContain('thought')
@@ -529,7 +540,7 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
 describe('the picker survives a host projection that is not what we assumed', () => {
   const acp = new AcpStore(async () => ({ ok: true, value: {} }), zh => zh)
   const agent: AgentView = {
-    id: 'pi', title: 'Pi', command: 'pi-acp', args: [], permission: 'ask',
+    id: 'pi', title: 'Pi', command: 'pi-acp', args: [],
     allowedCwdRoots: [], state: 'ready', liveSessions: [],
   }
   const routed = describeRoute([agent], { agentId: 'pi', sessionId: 's1' }, undefined)
@@ -638,7 +649,7 @@ describe('isNewFileDiff (the diff footnote)', () => {
  */
 describe('the ACP view empty state (no transcript to show)', () => {
   const agent: AgentView = {
-    id: 'pi', title: 'Pi', command: 'pi-acp', args: [], permission: 'ask',
+    id: 'pi', title: 'Pi', command: 'pi-acp', args: [],
     allowedCwdRoots: [], state: 'ready', liveSessions: [],
   }
   /** Read the English side, so the assertions name what a user would read. */

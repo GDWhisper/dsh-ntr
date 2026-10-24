@@ -13,7 +13,7 @@
  */
 
 import type { ReactNode } from 'react'
-import { useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
 // Type-only: pulls the ui-conversation SlotMap merge into this program.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { ensureAcpStyle, useUi } from './acp-ui.tsx'
@@ -300,8 +300,15 @@ function PlanCard({ entries, t }: { entries: Extract<Block, { kind: 'plan' }>['e
   )
 }
 
-/** One stream block, dispatched by kind. */
-function BlockView({ block, t }: { block: Block; t: Translate }) {
+/**
+ * One stream block, dispatched by kind. Memoized on its props — `block` and
+ * the store's instance-bound `label` — so a folded batch re-renders only the
+ * rows whose block object changed (`foldUpdate` replaces blocks immutably)
+ * instead of the whole transcript on every store notification. `key` stays the
+ * index on purpose: blocks fold append-only, and identity is the block object.
+ */
+const BlockView = memo(function BlockView({ block, label }: { block: Block; label: Translate }) {
+  const t = label
   switch (block.kind) {
     case 'user':
       return <div className="ntr-acp-bubble is-user"><RichText text={block.text} /></div>
@@ -323,7 +330,7 @@ function BlockView({ block, t }: { block: Block; t: Translate }) {
     default:
       return <div className={`ntr-acp-notice is-${block.tone}`}>{block.text}</div>
   }
-}
+})
 
 /** The bound ACP session for this chat, preferring the live one. */
 function boundSession(list: readonly ChatSessionView[]): ChatSessionView | undefined {
@@ -540,7 +547,7 @@ export function AcpConversationView(props: AcpViewProps) {
       >
         {transcript.blocks.length === 0
           ? <div className="ntr-acp-empty-hint">{t('还没有消息：在下面的输入框里发给它。', 'Nothing yet — send it a message below.')}</div>
-          : transcript.blocks.map((block, index) => <BlockView key={index} block={block} t={t} />)}
+          : transcript.blocks.map((block, index) => <BlockView key={index} block={block} label={acp.label} />)}
       </div>
     </div>
   )
