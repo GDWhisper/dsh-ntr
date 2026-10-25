@@ -3765,6 +3765,24 @@ export class BridgeManager {
   }
 
   /**
+   * The settings panel's PERSISTENT catalog read: the last catalog observed for
+   * one agent, or `undefined` when it has never published one.
+   *
+   * Pure memory (the same map `agentCatalog` reads, hydrated from
+   * `model-catalog.json` at boot), so opening the settings page costs no agent
+   * process. This is what lets the model panes show the configured selection
+   * and the last known model list on mount instead of staying blank until
+   * someone clicks 「检测可用模型」 — that button is a REFRESH of this cache
+   * (models the agent newly publishes appear, models it stopped advertising
+   * drop out), not the price of admission.
+   */
+  cachedAgentModels(agentId: string): AgentProbeModelsResult | undefined {
+    const entry = this.catalogs.get(agentId)
+    if (entry === undefined) return undefined
+    return { agentId, catalog: entry.catalog, updatedAt: entry.updatedAt }
+  }
+
+  /**
    * Probe one agent right now: spawn (if needed), open a throwaway session,
    * read its `configOptions`, close it. Errors propagate to the caller (the
    * RPC result or a notice broadcast).

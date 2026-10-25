@@ -158,7 +158,16 @@ const STYLE = `
 .dwa-model-pane-head { display: flex; align-items: center; gap: 6px; padding: 7px 9px; border-bottom: var(--ntr-line); font-size: var(--ntr-font-xs); font-weight: 600; color: var(--dsw-alias-text-secondary, #4b5563); }
 .dwa-model-pane-head .dwa-btn { margin-left: auto; min-height: 26px; padding: 2px 8px; font-size: var(--ntr-font-xs); }
 .dwa-model-list { display: flex; flex-direction: column; gap: 2px; padding: 5px; flex: 1 1 auto; min-height: 0; overflow-y: auto; }
-.dwa-model-search { width: 220px; min-height: 30px; margin-left: auto; }
+.dwa-model-section { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; font-size: 12px; }
+.dwa-model-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* The actions group keeps 「检测可用模型」 and the filter together and wraps as
+   one unit; the status line takes the leftover space on the first row, so a
+   narrow panel puts [detect][search] on its own row starting under the label
+   instead of floating them to the right edge. */
+.dwa-model-toolbar-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dwa-model-status { margin-left: auto; white-space: nowrap; }
+.dwa-model-search { width: 200px; min-height: 30px; }
+.dwa-model-empty { padding: 6px; }
 .dwa-model-row { display: flex; align-items: center; gap: 6px; width: 100%; border: none; background: none; padding: 5px 6px; border-radius: 5px; cursor: pointer; color: inherit; font: inherit; font-size: var(--ntr-font-sm); text-align: left; }
 .dwa-model-row:hover { background: var(--dsw-alias-interactive-bg-active, #f3f4f6); }
 .dwa-model-row.is-on { background: #3b82f614; color: #2563eb; }
@@ -182,6 +191,8 @@ const STYLE = `
   .dwa-page-actions { width: 100%; }
   .dwa-page-actions .dwa-btn { width: 100%; }
   .dwa-model-transfer { grid-template-columns: 1fr; }
+  .dwa-model-toolbar-actions { width: 100%; }
+  .dwa-model-search { flex: 1 1 auto; width: auto; }
   .dwa-subsection-head, .dwa-preference-row { align-items: flex-start; flex-direction: column; }
   .dwa-default-hint { align-items: flex-start; flex-direction: column; }
 }
@@ -827,6 +838,7 @@ function AgentRow({
               agentId={detected.id}
               detected={detected}
               acp={acp}
+              active={open}
               exposed={form.exposed}
               onExposedChange={exposed => patch({ exposed })}
               autoDiscover={form.autoDiscoverModels}
@@ -938,6 +950,13 @@ function initialForm(detected: DetectedAgentInfo, activeAgent: AgentView | undef
 
 function idleText(value: number | undefined): string {
   return value === undefined ? '' : String(value)
+}
+
+/** `MM-DD HH:mm`, local time — compact enough for the catalog's status line. */
+function formatStamp(ms: number): string {
+  const date = new Date(ms)
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
 /**
@@ -1517,12 +1536,19 @@ function RowMenu({
 }
 
 /**
- * Probed model / thought-level catalog display plus the native-selector
- * visibility filter, as a two-pane transfer list: every probed model on the
- * left, the selection that reaches the NTR surfaces on the right. Variants are
- * still opt-in — an empty selection is a legitimate state (base entry only) —
- * and edits save themselves (debounced), so there is no apply button and no
- * second dirty state to lose track of.
+ * Model / thought-level catalog display plus the native-selector visibility
+ * filter, as a two-pane transfer list: every known model on the left, the
+ * selection that reaches the NTR surfaces on the right. Variants are still
+ * opt-in — an empty selection is a legitimate state (base entry only) — and
+ * edits save themselves (debounced), so there is no apply button and no second
+ * dirty state to lose track of.
+ *
+ * The panes are ALWAYS shown, never gated on a probe: the right side comes from
+ * the agent definition (`exposedModels`) and the left from the host's persisted
+ * catalog cache, so opening the card shows what is already configured instead
+ * of an empty box that costs one click per visit. 「检测可用模型」 therefore
+ * sits with the list and acts as a REFRESH of the left pane only — models the
+ * agent newly publishes appear, models it stopped advertising drop out.
  *
  * The auto-discovery switch is a per-agent POLICY, not a one-shot action: it
  * appends models the agent NEWLY publishes to the selection (see
@@ -1533,6 +1559,7 @@ function ModelCatalogBlock({
   agentId,
   detected,
   acp,
+  active,
   exposed,
   onExposedChange,
   autoDiscover,
@@ -1542,6 +1569,8 @@ function ModelCatalogBlock({
   agentId: string
   detected: DetectedAgentInfo
   acp: AcpStore
+  /** The card's body is visible; the display read waits for the first expand. */
+  active: boolean
   exposed: string[] | undefined
   onExposedChange: (next: string[] | undefined) => void
   autoDiscover: boolean
@@ -1566,6 +1595,17 @@ function ModelCatalogBlock({
   const probeError = ui.probeErrors[agentId]
   const result = ui.modelCatalogs[agentId]
   const modelChoices = result?.catalog.model?.choices ?? []
+  /** Result of the last click on 「检测可用模型」 (what the refresh changed). */
+  const [detectNote, setDetectNote] = useState<string | undefined>(undefined)
+
+  // Display read, not a probe: the host answers from its persisted catalog
+  // cache, so the panes already list the known models the first time the card
+  // opens. Gated on `active` because every configured agent's body stays
+  // mounted (display-toggled) and a collapsed card has nothing to show.
+  useEffect(() => {
+    if (!active) return
+    void acp.loadCachedModels(agentId)
+  }, [active, agentId])
 
   useEffect(() => () => {
     if (timer.current === undefined) return
@@ -1660,23 +1700,62 @@ function ModelCatalogBlock({
     apply([])
   }
 
+  /**
+   * Refresh the left pane from the agent: re-probe, then report what moved.
+   * The note is what makes the button legible — a refresh that changes nothing
+   * looks identical to a dead button otherwise (the catalog `updatedAt` does
+   * not even move, since the host keeps the entry when the answer is equal).
+   */
+  const detect = async (): Promise<void> => {
+    const before = new Set(modelChoices.map(choice => choice.value))
+    setDetectNote(undefined)
+    await acp.probeModels(agentId)
+    const state = acp.getSnapshot()
+    if (state.probeErrors[agentId] !== undefined) return
+    const after = state.modelCatalogs[agentId]?.catalog.model?.choices ?? []
+    const afterValues = new Set(after.map(choice => choice.value))
+    const added = after.filter(choice => !before.has(choice.value)).length
+    const removed = [...before].filter(value => !afterValues.has(value)).length
+    setDetectNote(added === 0 && removed === 0
+      ? acp.label('目录无变化', 'Catalog unchanged')
+      : acp.label(
+        `新增 ${String(added)} · 移除 ${String(removed)}`,
+        `${String(added)} added · ${String(removed)} removed`,
+      ))
+  }
+
+  const selectionBadge = modelChoices.length > 0
+    ? acp.label(
+      `已选 ${String(selectedInCatalog)}/${String(modelChoices.length)}`,
+      `Selected ${String(selectedInCatalog)}/${String(modelChoices.length)}`,
+    )
+    : acp.label(`已选 ${String(basis.length)}`, `Selected ${String(basis.length)}`)
+
+  // Freshness of the cached list (a probe that finds nothing new keeps the old
+  // stamp by design — see `detect`), superseded by the click's own outcome.
+  const catalogStatus = detectNote ?? (
+    result !== undefined && result.updatedAt > 0
+      ? acp.label(`目录更新于 ${formatStamp(result.updatedAt)}`, `Catalog from ${formatStamp(result.updatedAt)}`)
+      : undefined
+  )
+
+  const leftEmptyCopy = visibleChoices.length > 0
+    ? undefined
+    : modelChoices.length > 0
+      ? acp.label('无匹配模型', 'No matching models')
+      : result === undefined
+        ? acp.label('尚未读取模型目录，点「检测可用模型」从 Agent 读取。', 'No catalog yet — click "Detect available models" to read it from the agent.')
+        : acp.label('该 Agent 未暴露模型选择器（category: model）。', 'This agent exposes no model selector (category: model).')
+
   return (
     <div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-        <button className="dwa-btn dwa-btn-secondary" disabled={probing} onClick={() => void acp.probeModels(agentId)}>
-          {probing ? acp.label('模型检测中...', 'Probing models...') : acp.label('检测可用模型', 'Detect Available Models')}
-        </button>
-        {!isDefault && (
+      {!isDefault && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
           <button className="dwa-btn" onClick={() => void acp.setDefaultAgent(agentId)}>
             {acp.label('设为默认智能体', 'Set as default agent')}
           </button>
-        )}
-        {result !== undefined && result.catalog.model === undefined && (
-          <span className="dwa-hint">
-            {acp.label('该 Agent 未暴露模型选择器（category: model）', 'Agent exposes no model selector (category: model)')}
-          </span>
-        )}
-      </div>
+        </div>
+      )}
       {isDefault && (
         // This default belongs to the plugin, not the deployment model route.
         <div className="dwa-hint" style={{ marginTop: 8 }}>
@@ -1714,28 +1793,46 @@ function ModelCatalogBlock({
         </div>
       )}
 
-      {result !== undefined && modelChoices.length > 0 && (
-        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8, fontSize: 12 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            <span className="dwa-form-label">
-              {acp.label('对话中可见的模型', 'Models offered in the conversation')}
-              <span
-                className="dwa-hint"
-                style={{ marginLeft: 6, fontWeight: 400 }}
-                title={acp.label(
-                  'NTR 模式下的对话只列出这里勾选的模型；未勾选的仍可用——正在生效的那个也会以「· 当前」列出来，其余不列出。',
-                  'The NTR surfaces only list what is checked here; unchecked models still work, and the one currently in force is still listed with a "· current" row — the rest are not offered.',
-                )}
-              >
-                {acp.label('（NTR 座位 / 芯片的下拉列表）', '(the NTR seat and chip pickers)')}
-              </span>
-            </span>
-            <span className="dwa-badge dwa-badge-info">
-              {acp.label(
-                `已选 ${String(selectedInCatalog)}/${String(modelChoices.length)}`,
-                `Selected ${String(selectedInCatalog)}/${String(modelChoices.length)}`,
+      {/* Always rendered, never gated on a probe: the selection is known from
+          the agent definition and the left list from the host's persisted
+          catalog cache. A card that only fills in after a click makes the
+          configured state invisible on every visit. */}
+      <div className="dwa-model-section">
+        <div className="dwa-model-toolbar">
+          <span className="dwa-form-label">
+            {acp.label('对话中可见的模型', 'Models offered in the conversation')}
+            <span
+              className="dwa-hint"
+              style={{ marginLeft: 6, fontWeight: 400 }}
+              title={acp.label(
+                'NTR 模式下的对话只列出这里勾选的模型；未勾选的仍可用——正在生效的那个也会以「· 当前」列出来，其余不列出。',
+                'The NTR surfaces only list what is checked here; unchecked models still work, and the one currently in force is still listed with a "· current" row — the rest are not offered.',
               )}
+            >
+              {acp.label('（NTR 座位 / 芯片的下拉列表）', '(the NTR seat and chip pickers)')}
             </span>
+          </span>
+          <span className="dwa-badge dwa-badge-info">{selectionBadge}</span>
+          {/* Freshness of the list stays on the header line, right-aligned; the
+              controls below it wrap as one unit. */}
+          {catalogStatus !== undefined && <span className="dwa-hint dwa-model-status">{catalogStatus}</span>}
+          <div className="dwa-model-toolbar-actions">
+            {/* Sits with the list it acts on: a refresh of the LEFT pane only.
+                Detection is not what reveals the models — the cache read above
+                already does — so keeping it at the top made it read as the
+                price of seeing anything at all. */}
+            <button
+              type="button"
+              className="dwa-btn dwa-btn-secondary"
+              disabled={probing}
+              onClick={() => void detect()}
+              title={acp.label(
+                '重新读取 Agent 的模型目录：新增的加入左侧，已下架的从左侧移除；已选列表不受影响。',
+                'Re-read the agent catalog: newly published models join the left list, withdrawn ones drop out. The selection is untouched.',
+              )}
+            >
+              {probing ? acp.label('模型检测中...', 'Probing models...') : acp.label('检测可用模型', 'Detect available models')}
+            </button>
             {/* The filter lives above BOTH panes, not inside the left one: a
                 search field between the pane head and its list made that pane
                 structurally taller, so the two could never share one height. */}
@@ -1746,110 +1843,107 @@ function ModelCatalogBlock({
               placeholder={acp.label('搜索模型…', 'Search models…')}
             />
           </div>
+        </div>
 
-          <>
-              <div className="dwa-model-transfer">
-                <div className="dwa-model-pane">
-                  <div className="dwa-model-pane-head">
-                    <span>{acp.label('全部模型', 'All models')}</span>
-                    <span className="dwa-badge">{modelChoices.length}</span>
-                    <button
-                      type="button"
-                      className="dwa-btn dwa-btn-secondary"
-                      disabled={visibleChoices.length === 0}
-                      onClick={addVisible}
-                      title={acp.label('把当前搜索范围内的模型全部加入右侧', 'Add every model matching the current search')}
-                    >
-                      {acp.label('全部加入', 'Add all')}
-                    </button>
-                  </div>
-                  <div className="dwa-model-list">
-                    {visibleChoices.map(choice => {
-                      const checked = selected.has(choice.value)
-                      // group 前缀仅来自 agent 返回的 SessionConfigSelectGroup（见 impl.ts
-                      // pushCatalogChoice）；供应商可见性兜底靠原样展示 value，严禁从
-                      // value 路径截取供应商段做标签（约束 8）。
-                      const title = choice.description === undefined
-                        ? choice.value
-                        : `${choice.value}\n${choice.description}`
-                      return (
-                        <button
-                          type="button"
-                          key={choice.value}
-                          className={`dwa-model-row${checked ? ' is-on' : ''}`}
-                          title={title}
-                          onClick={() => toggleChoice(choice.value)}
-                        >
-                          <span className="dwa-model-row-mark">{checked ? '✓' : '+'}</span>
-                          <span className="dwa-model-row-name">
-                            {choice.group !== undefined && <span style={{ opacity: 0.7 }}>{choice.group} · </span>}
-                            {choice.name}
-                          </span>
-                          {choice.value !== choice.name && (
-                            <span className="dwa-model-row-value">{choice.value}</span>
-                          )}
-                        </button>
-                      )
-                    })}
-                    {visibleChoices.length === 0 && (
-                      <span className="dwa-hint" style={{ padding: '4px 6px' }}>{acp.label('无匹配模型', 'No matching models')}</span>
+        <div className="dwa-model-transfer">
+          <div className="dwa-model-pane">
+            <div className="dwa-model-pane-head">
+              <span>{acp.label('全部模型', 'All models')}</span>
+              {result !== undefined && <span className="dwa-badge">{modelChoices.length}</span>}
+              <button
+                type="button"
+                className="dwa-btn dwa-btn-secondary"
+                disabled={visibleChoices.length === 0}
+                onClick={addVisible}
+                title={acp.label('把当前搜索范围内的模型全部加入右侧', 'Add every model matching the current search')}
+              >
+                {acp.label('全部加入', 'Add all')}
+              </button>
+            </div>
+            <div className="dwa-model-list">
+              {visibleChoices.map(choice => {
+                const checked = selected.has(choice.value)
+                // group 前缀仅来自 agent 返回的 SessionConfigSelectGroup（见 impl.ts
+                // pushCatalogChoice）；供应商可见性兜底靠原样展示 value，严禁从
+                // value 路径截取供应商段做标签（约束 8）。
+                const title = choice.description === undefined
+                  ? choice.value
+                  : `${choice.value}\n${choice.description}`
+                return (
+                  <button
+                    type="button"
+                    key={choice.value}
+                    className={`dwa-model-row${checked ? ' is-on' : ''}`}
+                    title={title}
+                    onClick={() => toggleChoice(choice.value)}
+                  >
+                    <span className="dwa-model-row-mark">{checked ? '✓' : '+'}</span>
+                    <span className="dwa-model-row-name">
+                      {choice.group !== undefined && <span style={{ opacity: 0.7 }}>{choice.group} · </span>}
+                      {choice.name}
+                    </span>
+                    {choice.value !== choice.name && (
+                      <span className="dwa-model-row-value">{choice.value}</span>
                     )}
-                  </div>
-                </div>
+                  </button>
+                )
+              })}
+              {leftEmptyCopy !== undefined && <span className="dwa-hint dwa-model-empty">{leftEmptyCopy}</span>}
+            </div>
+          </div>
 
-                <div className="dwa-model-pane">
-                  <div className="dwa-model-pane-head">
-                    <span>{acp.label('已选模型', 'Selected models')}</span>
-                    <span className="dwa-badge dwa-badge-info">{basis.length}</span>
-                    <button
-                      type="button"
-                      className="dwa-btn dwa-btn-secondary"
-                      disabled={basis.length === 0}
-                      onClick={clearAll}
-                    >
-                      {acp.label('清空', 'Clear')}
-                    </button>
-                  </div>
-                  <div className="dwa-model-list">
-                    {selectedChoices.length === 0 && (
-                      <span className="dwa-hint" style={{ padding: '4px 6px' }}>
-                        {acp.label('还没有选择模型（点左侧的模型加入）', 'Nothing selected yet — pick models on the left')}
-                      </span>
-                    )}
-                    {selectedChoices.map(choice => (
-                      <button
-                        type="button"
-                        key={choice.value}
-                        className="dwa-model-row is-on"
-                        title={choice.description === undefined ? choice.value : `${choice.value}\n${choice.description}`}
-                        onClick={() => toggleChoice(choice.value)}
-                      >
-                        <span className="dwa-model-row-name">
-                          {choice.group !== undefined && <span style={{ opacity: 0.7 }}>{choice.group} · </span>}
-                          {choice.name}
-                        </span>
-                        {choice.value !== choice.name && (
-                          <span className="dwa-model-row-value">{choice.value}</span>
-                        )}
-                        <span className="dwa-model-row-remove" aria-hidden="true">×</span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-          </>
-          {result.catalog.thought !== undefined && (
-            <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' }}>
-              <span className="dwa-form-label">{acp.label('思考等级', 'Thought Levels')}</span>
-              {result.catalog.thought.choices.map(choice => (
-                <span key={choice.value} className="dwa-badge" title={choice.description}>
-                  {choice.name}
+          <div className="dwa-model-pane">
+            <div className="dwa-model-pane-head">
+              <span>{acp.label('已选模型', 'Selected models')}</span>
+              <span className="dwa-badge dwa-badge-info">{basis.length}</span>
+              <button
+                type="button"
+                className="dwa-btn dwa-btn-secondary"
+                disabled={basis.length === 0}
+                onClick={clearAll}
+              >
+                {acp.label('清空', 'Clear')}
+              </button>
+            </div>
+            <div className="dwa-model-list">
+              {selectedChoices.length === 0 && (
+                <span className="dwa-hint dwa-model-empty">
+                  {acp.label('还没有选择模型（点左侧的模型加入）', 'Nothing selected yet — pick models on the left')}
                 </span>
+              )}
+              {selectedChoices.map(choice => (
+                <button
+                  type="button"
+                  key={choice.value}
+                  className="dwa-model-row is-on"
+                  title={choice.description === undefined ? choice.value : `${choice.value}\n${choice.description}`}
+                  onClick={() => toggleChoice(choice.value)}
+                >
+                  <span className="dwa-model-row-name">
+                    {choice.group !== undefined && <span style={{ opacity: 0.7 }}>{choice.group} · </span>}
+                    {choice.name}
+                  </span>
+                  {choice.value !== choice.name && (
+                    <span className="dwa-model-row-value">{choice.value}</span>
+                  )}
+                  <span className="dwa-model-row-remove" aria-hidden="true">×</span>
+                </button>
               ))}
             </div>
-          )}
+          </div>
         </div>
-      )}
+
+        {result?.catalog.thought !== undefined && (
+          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' }}>
+            <span className="dwa-form-label">{acp.label('思考等级', 'Thought Levels')}</span>
+            {result.catalog.thought.choices.map(choice => (
+              <span key={choice.value} className="dwa-badge" title={choice.description}>
+                {choice.name}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   )
 }

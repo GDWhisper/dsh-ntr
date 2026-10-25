@@ -578,6 +578,8 @@ export class AcpStore {
   private readonly acpModeUnsettled = new Set<string>()
   /** In-flight `agent/catalog` reads, keyed by agent id. */
   private readonly seatCatalogReads = new Set<string>()
+  /** In-flight `agent/cached-models` reads, keyed by agent id. */
+  private readonly cachedModelReads = new Set<string>()
 
   constructor(private readonly rpc: RpcCall, private readonly locale: (zh: string, en: string) => string) {}
 
@@ -805,6 +807,34 @@ export class AcpStore {
         : msg
       this.mutate({ notice })
       throw error
+    }
+  }
+
+  /**
+   * Seed one agent's model panes from the host's PERSISTENT catalog cache
+   * (`agent/cached-models`, memory-only: it never spawns).
+   *
+   * The settings card used to learn a catalog only from `agent/probe-models`,
+   * so its panes stayed blank until the user clicked 「检测可用模型」 on every
+   * visit — including the models already configured, which are known from the
+   * agent definition and the on-disk catalog. This read fills both panes on
+   * mount; the probe stays the explicit REFRESH (add what the agent newly
+   * publishes, drop what it stopped advertising).
+   */
+  async loadCachedModels(agentId: string): Promise<void> {
+    if (this.state.modelCatalogs[agentId] !== undefined || this.cachedModelReads.has(agentId)) return
+    this.cachedModelReads.add(agentId)
+    try {
+      const result = await this.call<AgentProbeModelsResult | null>('agent/cached-models', { agentId })
+      // `null` = this agent never published a catalog. A probe may have landed
+      // while this read was in flight; a fresh probe always wins.
+      if (result === null || result === undefined || this.state.modelCatalogs[agentId] !== undefined) return
+      this.mutate({ modelCatalogs: { ...this.state.modelCatalogs, [agentId]: result } })
+    } catch {
+      // Older host without the endpoint, or an agent deleted meanwhile: the
+      // panes fall back to the selection alone, exactly as before a probe.
+    } finally {
+      this.cachedModelReads.delete(agentId)
     }
   }
 

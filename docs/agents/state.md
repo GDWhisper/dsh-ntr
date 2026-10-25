@@ -47,6 +47,7 @@
   1. `agent/probe-models`（设置页按钮，或会话模型菜单末尾的「刷新目录」行——一次点击一个 agent；**打开菜单本身仍是纯缓存读**）；
   2. 某 agent **自己的** `session/new` / `session/load`（用户正在跟它说话，进程本来就在）；
   3. 旧 schema 的磁盘缓存——**不重探**，而是被 ② 顺带修好（`absorbCatalog` 清 `catalogStale`）。
+- **`agent/cached-models` 是同一份内存的第二个读口**（`BridgeManager.cachedAgentModels`）：返回某 agent 最后一次观测到的目录（无则 `null`），供设置页模型区常驻显示「全部模型」。它同样**绝不 spawn**，也**不在**上面三条手势清单里——只读缓存；刷新仍由 `agent/probe-models` 承担。注意探测在「答案没变」时会保留旧 `updatedAt`，所以面板的「新增 N / 移除 M」必须由点击前后两份列表对比得出，不能靠 `updatedAt` 变化。
 - 客户端 `loadAgentCatalog` 的调用点必须先判定「这条会话真的指向某个 agent」：`routeAgentId` 有答案即可（活会话 / pick / `chatBoundAgent` / **插件默认 agent**）。默认回落**不是**「别人的目录」：guard 的 `agent/request` 改写就是用它，且 `agent/catalog` 纯内存、绝不 spawn。**严禁**的是借 `agents[0]` 之类的名字读一条没有 agent 会服务的会话。`/` 菜单的懒读同理，按 `chatAgentFor` 找到实际会服务这条会话的 agent。测试：`tests/bridge.spec.ts` 的 "NEVER spawns an agent just because a catalog was read"。
 - **结构**：`base`（裸 `agentId` = agent 默认模型）+ `exposedModels` 过滤后的 `variants` + agent 自己的 `thought_level` 作为 `reasoning` + 其余 select 作为 `extras`（`CATALOG_SCHEMA = 3`；旧缓存仍可读并标记待修复）。`resolveAdapterModel` 对已知 agent 的任何输入都不得 throw（过期变体降级为裸 id 条目），仅对未配置 agent throw；`exposedModels` 过滤只作用于 `agentCatalog` 的变体展开（`base` 永不过滤），严禁影响 `resolveAdapterModel`。
 - **变体按需**：未设置 / 空 = 只留 `base`。真实 agent 动辄数百个 choice，默认全暴露在无搜索的菜单里就是列表风暴。供应商 `group` 只能来自 agent 自己返回的 ACP `SessionConfigSelectGroup` 标签，严禁从名称前缀 / value 路径 / 家族词猜测（任何供应商都可能供应别家模型）。

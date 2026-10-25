@@ -779,6 +779,12 @@ function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } {
       calls.push(['probe', agentId])
       return { agentId, catalog: { model: { configId: 'model', name: 'Model', currentValue: 'a', choices: [{ value: 'a', name: 'A' }] } }, updatedAt: 1 }
     },
+    // Stands in for the host's persisted catalog (`cachedAgentModels`) — the
+    // read that fills the settings panes on mount without a probe.
+    cachedAgentModels: agentId => {
+      calls.push(['cachedModels', agentId])
+      return { agentId, catalog: { model: { configId: 'model', name: 'Model', currentValue: 'a', choices: [{ value: 'a', name: 'A' }] } }, updatedAt: 2 }
+    },
     agentCatalog: agentId => {
       calls.push(['catalog', agentId])
       return {
@@ -919,6 +925,17 @@ describe('dispatchRpc', () => {
     await expect(dispatchRpc(manager, 'agent/probe-models', {})).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     const bare = { ...manager, probeAgentModels: undefined }
     await expect(dispatchRpc(bare, 'agent/probe-models', { agentId: 'pi' })).resolves.toMatchObject({ ok: false, error: { code: 'unsupported' } })
+    // The settings panel's mount read: the host's persisted catalog, no probe.
+    await expect(dispatchRpc(manager, 'agent/cached-models', { agentId: 'pi' })).resolves.toMatchObject({
+      ok: true,
+      value: { agentId: 'pi', updatedAt: 2 },
+    })
+    expect(manager.calls).toContainEqual(['cachedModels', 'pi'])
+    await expect(dispatchRpc(manager, 'agent/cached-models', {})).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    // An older host half without the read answers `null` rather than failing:
+    // the panel then shows its empty state and the button still works.
+    await expect(dispatchRpc({ ...manager, cachedAgentModels: undefined }, 'agent/cached-models', { agentId: 'pi' }))
+      .resolves.toEqual({ ok: true, value: null })
     // `agent/catalog` is the seats' model list — the ONLY place ACP models are
     // offered, since the `acp` route advertises nothing in DSH's own catalog.
     await expect(dispatchRpc(manager, 'agent/catalog', { agentId: 'pi' })).resolves.toMatchObject({

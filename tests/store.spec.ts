@@ -1030,6 +1030,96 @@ describe('AcpStore agent management', () => {
     // The stale failure must not stay pinned at the top of the panel.
     expect(state.notice).toBeUndefined()
   })
+
+  it('loadCachedModels fills the panes from the persisted catalog, once per agent', async () => {
+    const endpoints: string[] = []
+    const store = new AcpStore(
+      async (_channel, endpoint) => {
+        endpoints.push(endpoint)
+        if (endpoint !== 'agent/cached-models') return { ok: true, value: {} }
+        return {
+          ok: true,
+          value: {
+            agentId: 'codebuddy',
+            catalog: {
+              model: {
+                configId: 'model',
+                name: 'Model',
+                currentValue: 'a',
+                choices: [{ value: 'a', name: 'A' }, { value: 'b', name: 'B' }],
+              },
+            },
+            updatedAt: 7,
+          },
+        }
+      },
+      (zh) => zh,
+    )
+
+    await store.loadCachedModels('codebuddy')
+    // This is the whole point of the read: the list is there before any probe,
+    // so a configured selection is visible on open instead of after a click.
+    expect(store.getSnapshot().modelCatalogs.codebuddy?.catalog.model?.choices.map(c => c.value)).toEqual(['a', 'b'])
+    // A probe never ran.
+    expect(endpoints).not.toContain('agent/probe-models')
+
+    // Collapse/expand and the next panel open mount the card again; the read is
+    // memory-only but still deduped by the cached entry.
+    await store.loadCachedModels('codebuddy')
+    expect(endpoints.filter(endpoint => endpoint === 'agent/cached-models')).toHaveLength(1)
+  })
+
+  it('loadCachedModels never overwrites a probe and tolerates null or an older host', async () => {
+    const probed = new AcpStore(
+      async (_channel, endpoint) => {
+        if (endpoint === 'agent/probe-models') {
+          return {
+            ok: true,
+            value: {
+              agentId: 'pi',
+              catalog: { model: { configId: 'model', name: 'Model', choices: [{ value: 'fresh', name: 'Fresh' }] } },
+              updatedAt: 2,
+            },
+          }
+        }
+        if (endpoint === 'agent/cached-models') {
+          return {
+            ok: true,
+            value: {
+              agentId: 'pi',
+              catalog: { model: { configId: 'model', name: 'Model', choices: [{ value: 'stale', name: 'Stale' }] } },
+              updatedAt: 1,
+            },
+          }
+        }
+        return { ok: true, value: {} }
+      },
+      (zh) => zh,
+    )
+    await probed.probeModels('pi')
+    await probed.loadCachedModels('pi')
+    expect(probed.getSnapshot().modelCatalogs.pi?.catalog.model?.choices.map(c => c.value)).toEqual(['fresh'])
+
+    // `null` = the agent has never published a catalog; an `unknown_endpoint`
+    // error = an older host half. Neither may surface as a failure.
+    const empty = new AcpStore(
+      async (_channel, endpoint) => (endpoint === 'agent/cached-models'
+        ? { ok: true, value: null }
+        : { ok: true, value: {} }),
+      (zh) => zh,
+    )
+    await empty.loadCachedModels('pi')
+    expect(empty.getSnapshot().modelCatalogs.pi).toBeUndefined()
+
+    const older = new AcpStore(
+      async (_channel, endpoint) => (endpoint === 'agent/cached-models'
+        ? { ok: false, error: { code: 'unknown_endpoint', message: 'acp: unknown endpoint agent/cached-models' } }
+        : { ok: true, value: {} }),
+      (zh) => zh,
+    )
+    await expect(older.loadCachedModels('pi')).resolves.toBeUndefined()
+    expect(older.getSnapshot().notice).toBeUndefined()
+  })
 })
 
 describe('AcpStore event application (released / reset / turn dedup)', () => {

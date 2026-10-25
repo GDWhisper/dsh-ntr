@@ -1348,6 +1348,16 @@ export interface AcpManager {
    */
   agentCatalog(agentId: string): AgentCatalogResult
   /**
+   * The last catalog observed for one agent, or `undefined` when it has never
+   * published one. Memory-only (hydrated from disk at boot), never spawns.
+   *
+   * This is the settings panel's mount read: it fills the model panes with the
+   * already-configured selection and the last known model list, so a cache hit
+   * is visible without clicking 「检测可用模型」. That button only REFRESHES the
+   * cache (newly published models appear, withdrawn ones drop out).
+   */
+  cachedAgentModels?(agentId: string): AgentProbeModelsResult | undefined
+  /**
    * True when ACP permission asks are routed to the host's native approval
    * service (answered in the chat composer) instead of the settings-panel
    * ledger. Read-only capability report for `agents/list`.
@@ -1656,6 +1666,13 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         // Must invoke as a method: extracting the function would drop the
         // manager receiver (`this`) and crash the real BridgeManager.
         return ok(await manager.probeAgentModels(str(body, 'agentId', 64)))
+      }
+      case 'agent/cached-models': {
+        // Persistent-cache read for the settings panel. `null` (not an error)
+        // when the host has no cached catalog for this agent yet: the panel
+        // renders its empty state, and the probe button is how it gets filled.
+        const agentId = str(body, 'agentId', 64)
+        return ok(manager.cachedAgentModels?.(agentId) ?? null)
       }
       case 'agent/catalog':
         // The seats' model list. Read-only and memory-only on purpose: the

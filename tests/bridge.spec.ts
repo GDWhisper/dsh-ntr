@@ -845,6 +845,12 @@ describe('model catalog (isolated manager)', () => {
     expect(() => catalogManager.agentCatalog('ghost')).toThrow(/not configured/)
   })
 
+  it('reports no cached catalog before the agent has ever published one', () => {
+    // The settings panel's mount read: `undefined` here is what makes it show
+    // 「尚未读取模型目录」 instead of an empty list that looks like a failed probe.
+    expect(catalogManager.cachedAgentModels('mock')).toBeUndefined()
+  })
+
   it('probes configOptions, expands variants with reasoning metadata, degrades stale ids', async () => {
     const probe = await catalogManager.probeAgentModels('mock')
     expect(probe.agentId).toBe('mock')
@@ -931,6 +937,11 @@ describe('model catalog (isolated manager)', () => {
     const reloaded = new BridgeManager([def], hub, 500, undefined, catalogPath)
     // Nothing exposed yet, so the base entry is the whole surface…
     expect(reloaded.agentCatalog('mock')).toMatchObject({ probed: true, variants: [] })
+    // …and the panel's own read answers from the same disk cache: this is what
+    // fills the model panes on mount, before (and without) a probe.
+    const cached = reloaded.cachedAgentModels('mock')
+    expect(cached?.catalog.model?.choices.map(choice => choice.value)).toEqual(['mock-model-a', 'mock-model-b'])
+    expect(cached?.updatedAt).toBeGreaterThan(0)
     // …but the catalog really did come off disk: exposing a choice is enough to
     // offer it, and that path never spawns an agent.
     await reloaded.setExposedModels('mock', ['mock-model-a', 'mock-model-b'])
