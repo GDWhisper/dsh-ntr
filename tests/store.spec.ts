@@ -159,7 +159,7 @@ describe('AcpStore agent management', () => {
     expect(state.detectedAgents).toHaveLength(1)
     expect(state.detectedAgents[0].id).toBe('pi')
     expect(state.detecting).toBe(false)
-    expect(state.detectSummary).toBe('已检测 1 个预设：1 个已安装，其余可从「Agent 列表」启用。')
+    expect(state.detectSummary).toBe('已检测 1 个预设：1 个已安装，其余可从「添加智能体」启用。')
   })
 
   it('detectAgents reports the fallback preset list as the summary when the host detects nothing', async () => {

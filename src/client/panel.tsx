@@ -46,74 +46,141 @@ const NEW_AGENT_SEED: DetectedAgentInfo = {
 const EXPOSURE_SAVE_DEBOUNCE_MS = 400
 
 const STYLE = `
-/* Local design tokens: one place to converge spacing, radii and type sizes. */
-.dwa-root { --ntr-gap-1: 4px; --ntr-gap-2: 8px; --ntr-gap-3: 12px; --ntr-gap-4: 16px; --ntr-radius: 8px; --ntr-radius-sm: 6px; --ntr-font: 13px; --ntr-font-sm: 12px; --ntr-font-xs: 11px; --ntr-line: 1px solid var(--dsw-alias-border-l2, #e5e7eb); --ntr-muted: var(--dsw-alias-text-secondary, #6b7280); --ntr-danger: #dc2626; --ntr-warn: #b45309; }
-.dwa-root { padding: var(--ntr-gap-4); overflow: auto; font-size: var(--ntr-font); line-height: 1.5; }
-.dwa-btn { font: inherit; border-radius: var(--ntr-radius-sm); border: 1px solid var(--dsw-alias-border-l2, #bbb); background: var(--dsw-alias-button-tool-bar-fill, transparent); padding: 5px 12px; cursor: pointer; color: inherit; font-size: var(--ntr-font-sm); display: inline-flex; align-items: center; gap: 5px; transition: background 0.15s ease; }
-.dwa-btn:hover { background: var(--dsw-alias-interactive-bg-active, #0000000d); }
+.dwa-root {
+  --ntr-gap-1: 4px; --ntr-gap-2: 8px; --ntr-gap-3: 12px; --ntr-gap-4: 16px;
+  --ntr-radius: 10px; --ntr-radius-sm: 7px;
+  --ntr-font: 13px; --ntr-font-sm: 12px; --ntr-font-xs: 11px;
+  --ntr-line: 1px solid var(--dsw-alias-border-l2, #e5e7eb);
+  --ntr-muted: var(--dsw-alias-text-secondary, #6b7280);
+  --ntr-danger: #dc2626; --ntr-warn: #b45309;
+  --ntr-accent: var(--dsw-alias-button-primary-fill, #2563eb);
+  width: 100%; max-width: 960px; box-sizing: border-box; margin: 0 auto;
+  padding: 20px; overflow: auto; font-size: var(--ntr-font); line-height: 1.55;
+}
+.dwa-root button, .dwa-root input, .dwa-root select { font-family: inherit; }
+.dwa-root button:focus-visible, .dwa-root input:focus-visible, .dwa-root select:focus-visible {
+  outline: 2px solid var(--ntr-accent); outline-offset: 2px;
+}
+.dwa-page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 20px; }
+.dwa-page-heading { min-width: 0; }
+.dwa-page-title { margin: 0; font-size: 20px; line-height: 1.35; font-weight: 650; letter-spacing: -0.02em; }
+.dwa-page-description { margin: 5px 0 0; color: var(--ntr-muted); font-size: var(--ntr-font-sm); }
+.dwa-page-status { display: flex; align-items: center; gap: 8px; margin-top: 10px; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
+.dwa-page-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.dwa-btn {
+  min-height: 32px; box-sizing: border-box; font: inherit; border-radius: var(--ntr-radius-sm);
+  border: 1px solid var(--dsw-alias-border-l2, #d1d5db); background: var(--dsw-alias-bg-layer-1, #fff);
+  padding: 5px 12px; cursor: pointer; color: inherit; font-size: var(--ntr-font-sm);
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  white-space: nowrap; transition: background 0.15s ease, border-color 0.15s ease, opacity 0.15s ease;
+}
+.dwa-btn:hover { background: var(--dsw-alias-interactive-bg-active, #f3f4f6); border-color: var(--dsw-alias-border-l1, #9ca3af); }
 .dwa-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-.dwa-btn-primary { background: var(--dsw-alias-button-primary-fill, #2563eb); color: var(--dsw-alias-button-primary-invert, #fff); border-color: transparent; font-weight: 500; }
-.dwa-btn-primary:hover { opacity: 0.9; }
-/* Segmented control: joined options in one pill, the active one filled.
-   Used where the choices are exclusive and small (halo mode / speed). */
-.dwa-seg { display: inline-flex; border-radius: var(--ntr-radius-sm); border: 1px solid var(--dsw-alias-border-l2, #d1d5db); overflow: hidden; vertical-align: middle; }
-.dwa-seg > button { font: inherit; font-size: var(--ntr-font-sm); color: inherit; border: none; background: var(--dsw-alias-bg-layer-1, #fff); padding: 5px 14px; cursor: pointer; transition: background 0.15s ease; }
-.dwa-seg > button + button { border-left: 1px solid var(--dsw-alias-border-l2, #d1d5db); }
-.dwa-seg > button:hover { background: var(--dsw-alias-interactive-bg-active, #0000000d); }
-.dwa-seg > button.is-on { background: var(--dsw-alias-button-primary-fill, #2563eb); color: var(--dsw-alias-button-primary-invert, #fff); font-weight: 500; }
+.dwa-btn-primary { background: var(--ntr-accent); color: var(--dsw-alias-button-primary-invert, #fff); border-color: transparent; font-weight: 550; }
+.dwa-btn-primary:hover { background: var(--ntr-accent); border-color: transparent; opacity: 0.88; }
+.dwa-btn-secondary { background: var(--dsw-alias-bg-layer-2, #f3f4f6); }
 .dwa-btn-danger { color: var(--ntr-danger); border-color: #fca5a5; }
 .dwa-btn-danger:hover { background: #fee2e2; }
-.dwa-btn-secondary { background: var(--dsw-alias-bg-layer-2, #f3f4f6); border-color: var(--dsw-alias-border-l2, #d1d5db); }
-.dwa-caret { font-size: 16px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; width: 1em; }
-.dwa-caret-btn { font: inherit; border: none; background: none; padding: 2px 4px; border-radius: var(--ntr-radius-sm); display: inline-flex; align-items: center; color: inherit; cursor: pointer; }
-.dwa-caret-btn:hover { background: var(--dsw-alias-interactive-bg-active, #0000000d); }
-.dwa-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
-.dwa-badge { font-size: var(--ntr-font-xs); border-radius: 4px; padding: 2px 8px; background: #6b728022; font-weight: 500; display: inline-flex; align-items: center; gap: var(--ntr-gap-1); }
-.dwa-badge-success { background: #22c55e22; color: #16a34a; font-weight: 600; }
-.dwa-badge-warn { background: #f59e0b22; color: #d97706; font-weight: 600; }
-.dwa-badge-info { background: #3b82f622; color: #2563eb; font-weight: 500; }
-.dwa-card { border: var(--ntr-line); border-radius: var(--ntr-radius); padding: var(--ntr-gap-3) 14px; background: var(--dsw-alias-bg-layer-1, #fafafa); font-size: var(--ntr-font); line-height: 1.5; }
-.dwa-card-warn { border-left: 4px solid var(--dsw-alias-state-warn-primary, #d97706); background: var(--dsw-alias-state-warn-secondary, #fffbeb); }
-.dwa-select { font: inherit; font-size: var(--ntr-font-sm); padding: 5px 8px; border: 1px solid var(--dsw-alias-border-l2, #ccc); border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-1, #fff); color: inherit; }
-.dwa-input { font: inherit; font-size: var(--ntr-font-sm); padding: 5px 8px; border: 1px solid var(--dsw-alias-border-l2, #ccc); border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-1, #fff); color: inherit; width: 100%; box-sizing: border-box; }
-.dwa-input:focus, .dwa-select:focus { outline: none; border-color: var(--dsw-alias-button-primary-fill, #2563eb); }
-.dwa-input-mono, .dwa-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
-.dwa-stderr { max-height: 120px; overflow: auto; font-family: monospace; font-size: var(--ntr-font-xs); white-space: pre-wrap; color: var(--ntr-warn); margin: var(--ntr-gap-1) 0 0; }
-
-.dwa-section-title { font-size: var(--ntr-font); font-weight: 600; margin: 0 0 var(--ntr-gap-2); display: flex; align-items: center; justify-content: space-between; }
-.dwa-agent-card { border: var(--ntr-line); border-radius: var(--ntr-radius); background: var(--dsw-alias-bg-layer-1, #fff); margin-bottom: var(--ntr-gap-2); box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.03); }
-.dwa-agent-row { display: flex; align-items: center; gap: var(--ntr-gap-2); padding: 10px 14px; flex-wrap: wrap; }
-.dwa-agent-name { font-size: var(--ntr-font); font-weight: 600; }
-.dwa-agent-body { border-top: var(--ntr-line); padding: var(--ntr-gap-3) 14px; }
-.dwa-form-row { display: flex; gap: var(--ntr-gap-3); margin-bottom: 10px; align-items: flex-start; }
-.dwa-form-col { flex: 1; display: flex; flex-direction: column; gap: var(--ntr-gap-1); min-width: 0; }
-.dwa-form-label { font-size: var(--ntr-font-sm); font-weight: 600; color: var(--dsw-alias-text-secondary, #4b5563); }
-.dwa-hint { font-size: var(--ntr-font-xs); color: var(--ntr-muted); }
+.dwa-section { margin-bottom: 24px; }
+.dwa-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.dwa-section-title { font-size: 14px; font-weight: 650; margin: 0; display: flex; align-items: center; gap: 8px; }
+.dwa-section-copy { margin: 3px 0 0; font-size: var(--ntr-font-xs); color: var(--ntr-muted); }
+.dwa-card { border: var(--ntr-line); border-radius: var(--ntr-radius); padding: 16px; background: var(--dsw-alias-bg-layer-1, #fff); font-size: var(--ntr-font); line-height: 1.55; }
+.dwa-card-warn { border-left: 3px solid var(--dsw-alias-state-warn-primary, #d97706); background: var(--dsw-alias-state-warn-secondary, #fffbeb); }
+.dwa-mode-banner { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 16px; align-items: start; margin-bottom: 24px; padding: 14px 16px; }
+.dwa-mode-title { display: flex; align-items: center; gap: 8px; font-weight: 650; }
+.dwa-mode-copy { grid-column: 1 / -1; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
+.dwa-mode-source { display: block; margin-top: 5px; overflow-wrap: anywhere; opacity: 0.85; }
+.dwa-badge { font-size: var(--ntr-font-xs); line-height: 1.4; border-radius: 999px; padding: 2px 8px; background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: var(--ntr-muted); font-weight: 550; display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.dwa-badge-success { background: #22c55e1c; color: #15803d; }
+.dwa-badge-warn { background: #f59e0b1f; color: #b45309; }
+.dwa-badge-info { background: #3b82f61a; color: #2563eb; }
+.dwa-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.dwa-agent-list { display: flex; flex-direction: column; gap: 8px; }
+.dwa-agent-card { border: var(--ntr-line); border-radius: var(--ntr-radius); background: var(--dsw-alias-bg-layer-1, #fff); overflow: visible; transition: border-color 0.15s ease; }
+.dwa-agent-card.is-open { border-color: var(--dsw-alias-border-l1, #c7ccd1); }
+.dwa-agent-row { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 12px 14px; }
+.dwa-caret { font-size: 14px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; width: 1em; }
+.dwa-caret-btn { font: inherit; border: none; background: var(--dsw-alias-bg-layer-2, #f3f4f6); width: 28px; height: 28px; padding: 0; border-radius: var(--ntr-radius-sm); display: inline-flex; align-items: center; justify-content: center; color: var(--ntr-muted); cursor: pointer; }
+.dwa-caret-btn:hover { background: var(--dsw-alias-interactive-bg-active, #e5e7eb); color: inherit; }
+.dwa-agent-summary { min-width: 0; }
+.dwa-agent-titleline { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
+.dwa-agent-name { font-size: 13px; font-weight: 650; overflow-wrap: anywhere; }
+.dwa-agent-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 4px; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
+.dwa-agent-meta-separator { opacity: 0.45; }
+.dwa-agent-body { border-top: var(--ntr-line); padding: 0 16px 16px; }
+.dwa-subsection { padding-top: 16px; }
+.dwa-subsection + .dwa-subsection { margin-top: 16px; border-top: var(--ntr-line); }
+.dwa-subsection-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.dwa-subsection-title { margin: 0; font-size: 13px; font-weight: 650; }
+.dwa-subsection-copy { margin: 3px 0 0; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
+.dwa-form-row { display: flex; gap: var(--ntr-gap-3); margin-bottom: 14px; align-items: flex-start; }
+.dwa-form-col { flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.dwa-form-label { font-size: var(--ntr-font-sm); font-weight: 600; color: var(--dsw-alias-text-primary, #374151); }
+.dwa-hint { font-size: var(--ntr-font-xs); line-height: 1.55; color: var(--ntr-muted); }
 .dwa-error { font-size: var(--ntr-font-xs); color: var(--ntr-danger); }
-.dwa-default-hint { background: var(--dsw-alias-bg-layer-2, #f9fafb); border: 1px dashed var(--dsw-alias-border-l2, #d1d5db); border-radius: var(--ntr-radius-sm); padding: 6px 10px; font-size: var(--ntr-font-sm); display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; gap: var(--ntr-gap-2); }
-.dwa-menu-wrap { position: relative; margin-left: auto; }
-.dwa-menu { position: absolute; right: 0; top: calc(100% + 4px); z-index: 20; min-width: 190px; border: var(--ntr-line); border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-1, #fff); box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12); padding: var(--ntr-gap-1); display: flex; flex-direction: column; }
-.dwa-menu-item { font: inherit; font-size: var(--ntr-font-sm); text-align: left; border: none; background: none; padding: 6px 10px; border-radius: 4px; cursor: pointer; color: inherit; }
-.dwa-menu-item:hover { background: var(--dsw-alias-interactive-bg-active, #0000000d); }
+.dwa-input { min-height: 36px; font: inherit; font-size: var(--ntr-font-sm); padding: 7px 10px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-1, #fff); color: inherit; width: 100%; box-sizing: border-box; }
+.dwa-select { min-height: 32px; font: inherit; font-size: var(--ntr-font-sm); padding: 5px 8px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-1, #fff); color: inherit; }
+.dwa-input:hover, .dwa-select:hover { border-color: var(--dsw-alias-border-l1, #9ca3af); }
+.dwa-input:focus, .dwa-select:focus { border-color: var(--ntr-accent); }
+.dwa-input-mono, .dwa-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+.dwa-stderr { max-height: 120px; overflow: auto; font-family: monospace; font-size: var(--ntr-font-xs); white-space: pre-wrap; color: var(--ntr-warn); margin: 12px 0 0; }
+.dwa-default-hint { background: var(--dsw-alias-bg-layer-2, #f9fafb); border: var(--ntr-line); border-radius: var(--ntr-radius-sm); padding: 10px 12px; font-size: var(--ntr-font-sm); display: flex; align-items: center; justify-content: space-between; margin: 12px 0 14px; gap: 12px; }
+.dwa-form-actions { display: flex; align-items: center; gap: 8px; margin-top: 16px; padding-top: 14px; border-top: var(--ntr-line); flex-wrap: wrap; }
+.dwa-form-actions .dwa-btn-primary { min-width: 88px; }
+.dwa-menu-wrap { position: relative; }
+.dwa-menu-wrap > .dwa-btn { width: 32px; padding: 0; }
+.dwa-menu { position: absolute; right: 0; top: calc(100% + 4px); z-index: 20; min-width: 190px; border: var(--ntr-line); border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-1, #fff); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12); padding: 4px; display: flex; flex-direction: column; }
+.dwa-menu-item { font: inherit; font-size: var(--ntr-font-sm); text-align: left; border: none; background: none; padding: 7px 10px; border-radius: 5px; cursor: pointer; color: inherit; }
+.dwa-menu-item:hover { background: var(--dsw-alias-interactive-bg-active, #f3f4f6); }
 .dwa-menu-item-danger { color: var(--ntr-danger); }
-.dwa-menu-confirm { display: flex; align-items: center; gap: var(--ntr-gap-1); padding: 4px 6px; }
-.dwa-chip { font: inherit; font-size: var(--ntr-font-sm); border: var(--ntr-line); border-radius: 999px; padding: 3px 12px; background: var(--dsw-alias-bg-layer-2, #f3f4f6); cursor: pointer; color: inherit; }
-.dwa-chip-active { border-color: var(--dsw-alias-button-primary-fill, #2563eb); background: #3b82f622; color: #2563eb; font-weight: 500; }
-.dwa-chip-list { display: flex; gap: var(--ntr-gap-1); flex-wrap: wrap; align-items: center; margin-top: var(--ntr-gap-2); }
-.dwa-switch { display: inline-flex; align-items: center; gap: 6px; font-size: var(--ntr-font-sm); cursor: pointer; user-select: none; }
-.dwa-model-transfer { display: flex; gap: 10px; align-items: stretch; }
-.dwa-model-pane { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; border: var(--ntr-line); border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-1, #fff); overflow: hidden; }
-.dwa-model-pane-head { display: flex; align-items: center; gap: 6px; padding: 5px 8px; border-bottom: var(--ntr-line); font-size: var(--ntr-font-xs); font-weight: 600; color: var(--dsw-alias-text-secondary, #4b5563); }
-.dwa-model-pane-head .dwa-btn { margin-left: auto; padding: 2px 8px; font-size: var(--ntr-font-xs); }
-.dwa-model-list { display: flex; flex-direction: column; gap: 1px; padding: 4px; max-height: 240px; overflow-y: auto; }
-.dwa-model-row { display: flex; align-items: center; gap: 6px; width: 100%; border: none; background: none; padding: 3px 6px; border-radius: 4px; cursor: pointer; color: inherit; font: inherit; font-size: var(--ntr-font-sm); text-align: left; }
-.dwa-model-row:hover { background: var(--dsw-alias-interactive-bg-active, #0000000d); }
-.dwa-model-row.is-on { background: #3b82f622; color: #2563eb; }
+.dwa-menu-confirm { display: flex; align-items: center; gap: 4px; padding: 4px; }
+.dwa-add-panel { border: var(--ntr-line); border-radius: var(--ntr-radius); background: var(--dsw-alias-bg-layer-1, #fff); }
+.dwa-add-toggle { width: 100%; border: 0; background: transparent; color: inherit; padding: 13px 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; text-align: left; cursor: pointer; border-radius: var(--ntr-radius); }
+.dwa-add-toggle:hover { background: var(--dsw-alias-interactive-bg-active, #f9fafb); }
+.dwa-add-content { border-top: var(--ntr-line); padding: 14px 16px 16px; }
+.dwa-chip { min-height: 30px; font: inherit; font-size: var(--ntr-font-sm); border: var(--ntr-line); border-radius: 999px; padding: 4px 12px; background: var(--dsw-alias-bg-layer-1, #fff); cursor: pointer; color: inherit; }
+.dwa-chip:hover { background: var(--dsw-alias-interactive-bg-active, #f3f4f6); }
+.dwa-chip-active { border-color: var(--ntr-accent); background: #3b82f614; color: #2563eb; font-weight: 550; }
+.dwa-chip-list { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin: 0 0 12px; }
+.dwa-switch { display: inline-flex; align-items: center; gap: 7px; font-size: var(--ntr-font-sm); cursor: pointer; user-select: none; }
+.dwa-inline-setting { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-2, #f9fafb); }
+.dwa-inline-setting .dwa-switch { flex-shrink: 0; margin-top: 1px; }
+.dwa-setting-copy { color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
+.dwa-model-transfer { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; align-items: stretch; }
+.dwa-model-pane { min-width: 0; display: flex; flex-direction: column; border: var(--ntr-line); border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-1, #fff); overflow: hidden; }
+.dwa-model-pane-head { display: flex; align-items: center; gap: 6px; padding: 7px 9px; border-bottom: var(--ntr-line); font-size: var(--ntr-font-xs); font-weight: 600; color: var(--dsw-alias-text-secondary, #4b5563); }
+.dwa-model-pane-head .dwa-btn { margin-left: auto; min-height: 26px; padding: 2px 8px; font-size: var(--ntr-font-xs); }
+.dwa-model-list { display: flex; flex-direction: column; gap: 2px; padding: 5px; max-height: 240px; overflow-y: auto; }
+.dwa-model-row { display: flex; align-items: center; gap: 6px; width: 100%; border: none; background: none; padding: 5px 6px; border-radius: 5px; cursor: pointer; color: inherit; font: inherit; font-size: var(--ntr-font-sm); text-align: left; }
+.dwa-model-row:hover { background: var(--dsw-alias-interactive-bg-active, #f3f4f6); }
+.dwa-model-row.is-on { background: #3b82f614; color: #2563eb; }
 .dwa-model-row-mark { width: 12px; flex: none; text-align: center; opacity: 0.75; }
 .dwa-model-row-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dwa-model-row-value { flex: 0 1 auto; max-width: 45%; opacity: 0.55; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dwa-model-row-remove { flex: none; opacity: 0.5; padding: 0 2px; }
 .dwa-model-row:hover .dwa-model-row-remove { opacity: 1; }
+.dwa-seg { display: inline-flex; border-radius: var(--ntr-radius-sm); border: 1px solid var(--dsw-alias-border-l2, #d1d5db); overflow: hidden; vertical-align: middle; }
+.dwa-seg > button { min-height: 30px; font: inherit; font-size: var(--ntr-font-sm); color: inherit; border: none; background: var(--dsw-alias-bg-layer-1, #fff); padding: 4px 14px; cursor: pointer; }
+.dwa-seg > button + button { border-left: 1px solid var(--dsw-alias-border-l2, #d1d5db); }
+.dwa-seg > button:hover { background: var(--dsw-alias-interactive-bg-active, #f3f4f6); }
+.dwa-seg > button.is-on { background: var(--ntr-accent); color: var(--dsw-alias-button-primary-invert, #fff); font-weight: 550; }
+.dwa-preference-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 0; }
+.dwa-preference-row + .dwa-preference-row { border-top: var(--ntr-line); }
+.dwa-preference-label { font-size: var(--ntr-font-sm); font-weight: 600; }
+.dwa-preference-copy { margin-top: 2px; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
+@media (max-width: 640px) {
+  .dwa-root { padding: 14px; }
+  .dwa-page-header { flex-direction: column; }
+  .dwa-page-actions { width: 100%; }
+  .dwa-page-actions .dwa-btn { width: 100%; }
+  .dwa-model-transfer { grid-template-columns: 1fr; }
+  .dwa-subsection-head, .dwa-preference-row { align-items: flex-start; flex-direction: column; }
+  .dwa-default-hint { align-items: flex-start; flex-direction: column; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dwa-root *, .dwa-root *::before, .dwa-root *::after { transition: none !important; }
+}
 `
 
 let styleMounted = false
@@ -304,25 +371,35 @@ export function AcpSettingsSection(props: WithStore) {
 
   return (
     <div className="dwa-root">
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
-        <span
-          className="dwa-dot"
-          style={{ background: ui.stream === 'live' ? '#22c55e' : ui.stream === 'down' ? '#ef4444' : '#9ca3af' }}
-          title={ui.stream}
-        />
-        <span className="dwa-hint" style={{ flex: 1 }}>{streamText(ui.stream, acp)}</span>
-        {ui.detectSummary !== undefined && <span className="dwa-hint">{ui.detectSummary}</span>}
-        <button
-          className="dwa-btn"
-          onClick={() => {
-            void acp.resync()
-            void acp.detectAgents()
-          }}
-          disabled={ui.detecting}
-        >
-          {ui.detecting ? acp.label('检测中...', 'Detecting...') : acp.label('重新检测与刷新', 'Re-detect & Refresh')}
-        </button>
-      </div>
+      <header className="dwa-page-header">
+        <div className="dwa-page-heading">
+          <h2 className="dwa-page-title">{acp.label('NTR 智能体', 'NTR Agents')}</h2>
+          <p className="dwa-page-description">
+            {acp.label('管理智能体连接、可用模型与对话显示偏好。', 'Manage agent connections, available models, and conversation display preferences.')}
+          </p>
+          <div className="dwa-page-status">
+            <span
+              className="dwa-dot"
+              style={{ background: ui.stream === 'live' ? '#22c55e' : ui.stream === 'down' ? '#ef4444' : '#9ca3af' }}
+              title={ui.stream}
+            />
+            <span>{streamText(ui.stream, acp)}</span>
+            {ui.detectSummary !== undefined && <span>· {ui.detectSummary}</span>}
+          </div>
+        </div>
+        <div className="dwa-page-actions">
+          <button
+            className="dwa-btn"
+            onClick={() => {
+              void acp.resync()
+              void acp.detectAgents()
+            }}
+            disabled={ui.detecting}
+          >
+            {ui.detecting ? acp.label('检测中...', 'Detecting...') : acp.label('重新检测与刷新', 'Re-detect & Refresh')}
+          </button>
+        </div>
+      </header>
 
       {/* Any pending ask gets an answerable card here, whatever
           `approvalRouted` says (see `permissionLedgerCard`): an ask is in
@@ -375,26 +452,22 @@ export function AcpSettingsSection(props: WithStore) {
           so the card is a read-only window onto the harness roster: it exists
           to say why the mode is missing when its activation failed. */}
       {ui.preset !== undefined && (
-        <div className="dwa-card" style={{ marginBottom: 16 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            <span style={{ fontWeight: 600, flex: 1 }}>
-              {acp.label('NTR 模式（智能体预设）', 'NTR mode (agent preset)')}
-            </span>
+        <div className="dwa-card dwa-mode-banner">
+          <div className="dwa-mode-title">
+            {acp.label('NTR 模式', 'NTR mode')}
             <span className="dwa-badge">{ui.preset.id}</span>
           </div>
-          <div className="dwa-hint" style={{ marginTop: 6 }}>
+          <span className={`dwa-badge ${ui.preset.installed ? 'dwa-badge-success' : 'dwa-badge-warn'}`}>
+            {ui.preset.installed ? acp.label('已就绪', 'Ready') : acp.label('需检查', 'Needs attention')}
+          </span>
+          <div className="dwa-mode-copy">
             {ui.preset.installed
-              ? acp.label(
-                `已进入宿主模式列表（声明：${ui.preset.source}）。在新建会话页的模式选择里选「NTR 模式」。`,
-                `In the harness roster (declared at ${ui.preset.source}). Pick “NTR mode” in the new-session mode picker.`,
-              )
-              : acp.label(
-                `宿主模式列表里没有可用的「NTR 模式」（声明：${ui.preset.source}）。`,
-                `The harness roster carries no usable “NTR mode” (declared at ${ui.preset.source}).`,
-              )}
+              ? acp.label('已加入宿主模式列表，新建会话时选择「NTR 模式」即可使用。', 'Added to the harness roster. Pick “NTR mode” when creating a session.')
+              : acp.label('宿主模式列表中没有可用的「NTR 模式」，请检查预设声明。', 'The harness roster has no usable “NTR mode”. Check the preset declaration.')}
+            <code className="dwa-mode-source dwa-mono">{ui.preset.source}</code>
           </div>
           {ui.preset.problem !== undefined && (
-            <div className="dwa-hint" style={{ marginTop: 4, color: '#f59e0b' }}>
+            <div className="dwa-hint" style={{ gridColumn: '1 / -1', color: 'var(--ntr-warn)' }}>
               {acp.label(`宿主报告：${ui.preset.problem}`, `Harness reported: ${ui.preset.problem}`)}
             </div>
           )}
@@ -402,46 +475,58 @@ export function AcpSettingsSection(props: WithStore) {
       )}
 
       {/* Connected ACP agents: one compact row per agent, details on demand */}
-      <div style={{ marginBottom: 24 }}>
-        <div className="dwa-section-title">
-          <span>{acp.label('已接入的 NTR 智能体', 'Connected NTR Agents')}</span>
-          <span className="dwa-badge">{configured.length}</span>
+      <section className="dwa-section">
+        <div className="dwa-section-heading">
+          <div>
+            <h3 className="dwa-section-title">
+              {acp.label('已接入的智能体', 'Connected agents')}
+              <span className="dwa-badge">{configured.length}</span>
+            </h3>
+            <p className="dwa-section-copy">{acp.label('展开智能体可管理模型、启动命令与工作区。', 'Expand an agent to manage its models, launch command, and workspace.')}</p>
+          </div>
         </div>
 
         {configured.length === 0 && (
           <div className="dwa-card" style={{ textAlign: 'center', color: 'var(--ntr-muted)', padding: 20 }}>
             {acp.label(
-              '尚未启用任何 Agent。从下方「Agent 列表」点一个检测到的预设（会展开预填命令的创建卡），再点「保存并启用」；也可以直接新建自定义 Agent。',
-              'No agents configured yet. Pick a detected preset from the "Agent List" below (it opens a creation card prefilled with its command), then click "Save & Enable" — or create a custom one from scratch.',
+              '尚未启用任何 Agent。从下方「添加智能体」点一个检测到的预设（会展开预填命令的创建卡），再点「保存并启用」；也可以直接新建自定义 Agent。',
+              'No agents configured yet. Pick a detected preset from "Add agent" below (it opens a creation card prefilled with its command), then click "Save & Enable" — or create a custom one from scratch.',
             )}
           </div>
         )}
 
-        {configured.map(({ info, synthesized }) => {
-          const activeAgent = ui.agents.find(a => a.id === info.id)
-          return (
-            <AgentRow
-              key={info.id}
-              detected={info}
-              activeAgent={activeAgent}
-              acp={acp}
-              isDefault={ui.defaultAgent === info.id}
-              synthesized={synthesized}
-            />
-          )
-        })}
-      </div>
+        <div className="dwa-agent-list">
+          {configured.map(({ info, synthesized }) => {
+            const activeAgent = ui.agents.find(a => a.id === info.id)
+            return (
+              <AgentRow
+                key={info.id}
+                detected={info}
+                activeAgent={activeAgent}
+                acp={acp}
+                isDefault={ui.defaultAgent === info.id}
+                synthesized={synthesized}
+              />
+            )
+          })}
+        </div>
+      </section>
 
       {/* Agent list: available presets plus the from-scratch creation form,
           open by default so the page answers "what can I enable" without a
           click. Selection follows the first available preset until pinned. */}
-      <div>
-        <button type="button" className="dwa-btn dwa-btn-secondary" onClick={() => setAddOpen(open => !open)}>
-          <span className="dwa-caret" aria-hidden>{addOpen ? '▾' : '▸'}</span> {acp.label('Agent 列表', 'Agent List')}
-        </button>
-        {addOpen && (
-          <div style={{ marginTop: 12 }}>
-            <div className="dwa-chip-list" style={{ marginTop: 0, marginBottom: 4 }}>
+      <section className="dwa-section">
+        <div className="dwa-add-panel">
+          <button type="button" className="dwa-add-toggle" aria-expanded={addOpen} onClick={() => setAddOpen(open => !open)}>
+            <span>
+              <span className="dwa-section-title">{acp.label('添加智能体', 'Add agent')}</span>
+              <span className="dwa-section-copy" style={{ display: 'block' }}>{acp.label('从预设快速启用，或创建自定义连接。', 'Enable a preset or create a custom connection.')}</span>
+            </span>
+            <span className="dwa-caret-btn" aria-hidden><span className="dwa-caret">{addOpen ? '▾' : '▸'}</span></span>
+          </button>
+          {addOpen && (
+            <div className="dwa-add-content">
+              <div className="dwa-chip-list">
               {available.map(info => (
                 <button
                   key={info.id}
@@ -482,61 +567,64 @@ export function AcpSettingsSection(props: WithStore) {
                 setCreateNonce(nonce => nonce + 1)
               }}
             />
-          </div>
-        )}
-      </div>
+            </div>
+          )}
+        </div>
+      </section>
 
       {/* Agent 挂牌光晕: how the composer tag shows a live agent. Plugin
           display preference — host-persisted with the agent registry, so it
           follows the profile rather than this one browser. Kept at the BOTTOM
           of the section: the cards above answer "what serves my turns", this
           one only decorates their nameplate. */}
-      <div className="dwa-card" style={{ marginBottom: 16 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <span style={{ fontWeight: 600, flex: 1 }}>
-            {acp.label('Agent 挂牌光晕', 'Agent Tag Halo')}
-          </span>
-          <span className="dwa-badge">{ui.tagHalo.mode === 'breath' ? acp.label('呼吸', 'Breath') : acp.label('常亮', 'Steady')}</span>
-        </div>
-        <div className="dwa-hint" style={{ marginTop: 6 }}>
-          {acp.label(
-            '对话里的 NTR 挂牌用蓝色光晕提示 agent 进程存活：呼吸为脉动光，常亮为恒定光。',
-            'The NTR tag in a conversation glows blue while the agent process is up: breathing pulses, steady is a constant glow.',
-          )}
-        </div>
-        <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-          <span className="dwa-hint">{acp.label('模式', 'Mode')}</span>
-          <div className="dwa-seg">
-            {(['breath', 'steady'] as const).map(mode => (
-              <button
-                key={mode}
-                type="button"
-                className={ui.tagHalo.mode === mode ? 'is-on' : ''}
-                onClick={() => void acp.setTagHalo({ ...ui.tagHalo, mode })}
-              >
-                {mode === 'breath' ? acp.label('呼吸', 'Breathe') : acp.label('常亮', 'Steady')}
-              </button>
-            ))}
+      <section className="dwa-section">
+        <div className="dwa-section-heading">
+          <div>
+            <h3 className="dwa-section-title">{acp.label('对话外观', 'Conversation appearance')}</h3>
+            <p className="dwa-section-copy">{acp.label('设置对话中 NTR 挂牌的进程存活提示。', 'Choose how the NTR tag indicates a running agent process.')}</p>
           </div>
         </div>
-        {ui.tagHalo.mode === 'breath' && (
-          <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-            <span className="dwa-hint">{acp.label('呼吸频率', 'Speed')}</span>
+        <div className="dwa-card" style={{ paddingTop: 4, paddingBottom: 4 }}>
+          <div className="dwa-preference-row">
+            <div>
+              <div className="dwa-preference-label">{acp.label('挂牌光晕', 'Tag halo')}</div>
+              <div className="dwa-preference-copy">{acp.label('呼吸为脉动光，常亮为恒定光。', 'Breathe pulses gently; steady keeps a constant glow.')}</div>
+            </div>
             <div className="dwa-seg">
-              {(['slow', 'normal', 'fast'] as const).map(speed => (
+              {(['breath', 'steady'] as const).map(mode => (
                 <button
-                  key={speed}
+                  key={mode}
                   type="button"
-                  className={ui.tagHalo.speed === speed ? 'is-on' : ''}
-                  onClick={() => void acp.setTagHalo({ ...ui.tagHalo, speed })}
+                  className={ui.tagHalo.mode === mode ? 'is-on' : ''}
+                  onClick={() => void acp.setTagHalo({ ...ui.tagHalo, mode })}
                 >
-                  {speed === 'slow' ? acp.label('慢速', 'Slow') : speed === 'normal' ? acp.label('正常', 'Normal') : acp.label('快速', 'Fast')}
+                  {mode === 'breath' ? acp.label('呼吸', 'Breathe') : acp.label('常亮', 'Steady')}
                 </button>
               ))}
             </div>
           </div>
-        )}
-      </div>
+          {ui.tagHalo.mode === 'breath' && (
+            <div className="dwa-preference-row">
+              <div>
+                <div className="dwa-preference-label">{acp.label('呼吸频率', 'Breathing speed')}</div>
+                <div className="dwa-preference-copy">{acp.label('控制光晕的脉动速度。', 'Controls how quickly the halo pulses.')}</div>
+              </div>
+              <div className="dwa-seg">
+                {(['slow', 'normal', 'fast'] as const).map(speed => (
+                  <button
+                    key={speed}
+                    type="button"
+                    className={ui.tagHalo.speed === speed ? 'is-on' : ''}
+                    onClick={() => void acp.setTagHalo({ ...ui.tagHalo, speed })}
+                  >
+                    {speed === 'slow' ? acp.label('慢速', 'Slow') : speed === 'normal' ? acp.label('正常', 'Normal') : acp.label('快速', 'Fast')}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
     </div>
   )
 }
@@ -657,7 +745,7 @@ function AgentRow({
   const open = expanded || (activeAgent?.state === 'error' && configured)
 
   return (
-    <div className="dwa-agent-card">
+    <div className={`dwa-agent-card${open ? ' is-open' : ''}`}>
       <div className="dwa-agent-row">
         <button
           type="button"
@@ -668,43 +756,52 @@ function AgentRow({
         >
           <span className="dwa-caret" aria-hidden>{open ? '▾' : '▸'}</span>
         </button>
-        {state !== undefined && <span className="dwa-dot" style={{ background: state.color }} title={state.title ?? activeAgent?.state} />}
-        <span className="dwa-agent-name" title={detected.executablePath ?? detected.description}>{displayName}</span>
-        {state !== undefined && <span className="dwa-hint">{state.text}</span>}
-        {configured && (
-          <span className="dwa-hint">
-            {currentModel === undefined ? acp.label('未探测模型', 'Model not probed') : `${acp.label('模型', 'Model')}: ${currentModel}`}
-          </span>
-        )}
-        {errorSummary !== undefined && (
-          <span className="dwa-error dwa-mono" style={{ flexBasis: '100%', wordBreak: 'break-all' }}>{errorSummary}</span>
-        )}
-        {activeAgent?.state === 'error' && (
-          <button className="dwa-btn" disabled={testing} onClick={() => void handleTest()}>
-            {testing ? acp.label('测试中...', 'Testing...') : acp.label('测试', 'Test')}
-          </button>
-        )}
-        {!isPreset && !newCustom && <span className="dwa-hint">{acp.label('自定义', 'Custom')}</span>}
-        {!synthesized && !newCustom && !detected.detected && (
-          <span className="dwa-hint" style={{ color: 'var(--ntr-warn)' }} title={detected.description}>
-            {acp.label('未在 PATH 中检测到', 'Not in PATH')}
-          </span>
-        )}
-        {isDefault && (
-          <span className="dwa-badge dwa-badge-success">
-            ★ {acp.label('默认', 'Default')}
-          </span>
-        )}
-        {configured && (
-          <RowMenu
-            acp={acp}
-            canStop={activeAgent !== undefined && activeAgent.state !== 'stopped'}
-            onStop={() => void acp.stopAgent(detected.id)}
-            // The store already surfaced the failure as a notice; swallowing it
-            // here only prevents an unhandled rejection.
-            onRemove={async () => { await acp.deleteAgent(detected.id).catch(() => { /* notice shown by the store */ }) }}
-          />
-        )}
+        <div className="dwa-agent-summary">
+          <div className="dwa-agent-titleline">
+            <span className="dwa-agent-name" title={detected.executablePath ?? detected.description}>{displayName}</span>
+            {isDefault && <span className="dwa-badge dwa-badge-success">{acp.label('默认', 'Default')}</span>}
+            {!isPreset && !newCustom && <span className="dwa-badge">{acp.label('自定义', 'Custom')}</span>}
+          </div>
+          <div className="dwa-agent-meta">
+            {state !== undefined && (
+              <span title={state.title ?? activeAgent?.state} style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                <span className="dwa-dot" style={{ background: state.color }} />
+                {state.text}
+              </span>
+            )}
+            {configured && (
+              <>
+                {state !== undefined && <span className="dwa-agent-meta-separator">·</span>}
+                <span>{currentModel === undefined ? acp.label('未探测模型', 'Model not probed') : `${acp.label('模型', 'Model')}: ${currentModel}`}</span>
+              </>
+            )}
+            {!synthesized && !newCustom && !detected.detected && (
+              <span style={{ color: 'var(--ntr-warn)' }} title={detected.description}>
+                · {acp.label('未在 PATH 中检测到', 'Not in PATH')}
+              </span>
+            )}
+          </div>
+          {errorSummary !== undefined && (
+            <div className="dwa-error dwa-mono" style={{ marginTop: 6, wordBreak: 'break-all' }}>{errorSummary}</div>
+          )}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          {activeAgent?.state === 'error' && (
+            <button className="dwa-btn" disabled={testing} onClick={() => void handleTest()}>
+              {testing ? acp.label('测试中...', 'Testing...') : acp.label('测试', 'Test')}
+            </button>
+          )}
+          {configured && (
+            <RowMenu
+              acp={acp}
+              canStop={activeAgent !== undefined && activeAgent.state !== 'stopped'}
+              onStop={() => void acp.stopAgent(detected.id)}
+              // The store already surfaced the failure as a notice; swallowing it
+              // here only prevents an unhandled rejection.
+              onRemove={async () => { await acp.deleteAgent(detected.id).catch(() => { /* notice shown by the store */ }) }}
+            />
+          )}
+        </div>
       </div>
 
       {/* display-toggled (not conditionally mounted) so an in-progress edit
@@ -712,39 +809,55 @@ function AgentRow({
       <div className="dwa-agent-body" style={open ? undefined : { display: 'none' }}>
         {stderr.length > 0 && <pre className="dwa-stderr">{stderr.join('\n')}</pre>}
         {configured && (
-          <ModelCatalogBlock
-            agentId={detected.id}
-            detected={detected}
-            acp={acp}
-            exposed={form.exposed}
-            onExposedChange={exposed => patch({ exposed })}
-            autoDiscover={form.autoDiscoverModels}
-            onAutoDiscoverChange={autoDiscoverModels => patch({ autoDiscoverModels })}
-            isDefault={isDefault}
-          />
+          <section className="dwa-subsection">
+            <div className="dwa-subsection-head">
+              <div>
+                <h4 className="dwa-subsection-title">{acp.label('模型与默认值', 'Models & defaults')}</h4>
+                <p className="dwa-subsection-copy">{acp.label('检测模型目录，并控制对话中可选择的模型。', 'Detect the model catalog and choose what appears in conversations.')}</p>
+              </div>
+            </div>
+            <ModelCatalogBlock
+              agentId={detected.id}
+              detected={detected}
+              acp={acp}
+              exposed={form.exposed}
+              onExposedChange={exposed => patch({ exposed })}
+              autoDiscover={form.autoDiscoverModels}
+              onAutoDiscoverChange={autoDiscoverModels => patch({ autoDiscoverModels })}
+              isDefault={isDefault}
+            />
+          </section>
         )}
-        <AgentDetails
-          acp={acp}
-          detected={detected}
-          form={form}
-          patch={patch}
-          isConfigured={configured}
-          newCustom={newCustom}
-          formIncomplete={formIncomplete}
-          idValid={idValid}
-          idTaken={idTaken}
-          cwdInvalid={cwdInvalid}
-          rootsInvalid={rootsInvalid}
-          idleInvalid={idleInvalid}
-          saving={saving}
-          savedSuccess={savedSuccess}
-          testing={testing}
-          testResult={testResult}
-          showSaveWarning={showSaveWarning}
-          onUseDefault={handleUseDefault}
-          onSave={() => void handleSave()}
-          onTest={() => void handleTest()}
-        />
+        <section className="dwa-subsection">
+          <div className="dwa-subsection-head">
+            <div>
+              <h4 className="dwa-subsection-title">{acp.label('连接配置', 'Connection')}</h4>
+              <p className="dwa-subsection-copy">{acp.label('设置显示名与启动命令，高级选项按需展开。', 'Set the display name and launch command; expand advanced options only when needed.')}</p>
+            </div>
+          </div>
+          <AgentDetails
+            acp={acp}
+            detected={detected}
+            form={form}
+            patch={patch}
+            isConfigured={configured}
+            newCustom={newCustom}
+            formIncomplete={formIncomplete}
+            idValid={idValid}
+            idTaken={idTaken}
+            cwdInvalid={cwdInvalid}
+            rootsInvalid={rootsInvalid}
+            idleInvalid={idleInvalid}
+            saving={saving}
+            savedSuccess={savedSuccess}
+            testing={testing}
+            testResult={testResult}
+            showSaveWarning={showSaveWarning}
+            onUseDefault={handleUseDefault}
+            onSave={() => void handleSave()}
+            onTest={() => void handleTest()}
+          />
+        </section>
       </div>
     </div>
   )
@@ -930,7 +1043,7 @@ function AgentDetails({
     : `${acp.label('程序', 'Program')}: ${parsedCommand.command}`
       + (parsedCommand.args.length === 0 ? '' : `　${acp.label('参数', 'Arguments')}: ${parsedCommand.args.join(' ')}`)
   return (
-    <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px dashed var(--dsw-alias-border-l2, #e5e7eb)' }}>
+    <div>
       {/* 基础参数: id / display name / command / args — the preset chip already
           filled command+args, so a plain "enable this agent" flow needs
           nothing below. Everything else lives under 高级参数. */}
@@ -1134,14 +1247,14 @@ function AgentDetails({
       </div>
       </div>
 
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
+      <div className="dwa-form-actions">
         <button
           className="dwa-btn"
           onClick={onTest}
           disabled={testing || saving || formIncomplete}
           title={acp.label('用当前表单值拉起一次性进程并完成 ACP 握手，不保存配置', 'Spawns a throwaway process from the form values and completes the ACP handshake; nothing is saved')}
         >
-          {testing ? acp.label('测试中...', 'Testing...') : acp.label('测试', 'Test')}
+          {testing ? acp.label('测试中...', 'Testing...') : acp.label('测试连接', 'Test Connection')}
         </button>
 
         <button
@@ -1548,21 +1661,8 @@ function ModelCatalogBlock({
         </button>
         {!isDefault && (
           <button className="dwa-btn" onClick={() => void acp.setDefaultAgent(agentId)}>
-            ★ {acp.label('设为默认 Agent', 'Set as Default Agent')}
+            {acp.label('设为默认智能体', 'Set as default agent')}
           </button>
-        )}
-        {isDefault && (
-          // Says out loud what this gesture is — and what it is NOT. It is the
-          // plugin's own default ACP agent (which agent a new ACP-mode
-          // conversation starts on); it deliberately does NOT write the
-          // deployment default model, which stays native so ordinary
-          // conversations in every other mode are untouched.
-          <span className="dwa-hint">
-            {acp.label(
-              '默认 Agent：新的 NTR 模式会话直接由它服务（其他模式的默认模型不受影响）',
-              "Default agent: a new NTR-mode conversation starts on it (other modes' default model is untouched)",
-            )}
-          </span>
         )}
         {result !== undefined && result.catalog.model === undefined && (
           <span className="dwa-hint">
@@ -1570,8 +1670,17 @@ function ModelCatalogBlock({
           </span>
         )}
       </div>
+      {isDefault && (
+        // This default belongs to the plugin, not the deployment model route.
+        <div className="dwa-hint" style={{ marginTop: 8 }}>
+          {acp.label(
+            '当前为默认智能体：新的 NTR 会话由它服务，不影响其他模式的默认模型。',
+            "This is the default agent for new NTR sessions; other modes' default models are untouched.",
+          )}
+        </div>
+      )}
 
-      <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', fontSize: 12 }}>
+      <div className="dwa-inline-setting" style={{ marginTop: 12 }}>
         <label
           className="dwa-switch"
           title={acp.label(
@@ -1587,8 +1696,8 @@ function ModelCatalogBlock({
           />
           {acp.label('自动发现新模型', 'Auto-discover new models')}
         </label>
-        <span className="dwa-hint">
-          {acp.label('开启后，agent 新增的模型会自动加入已选列表；现有勾选不受影响。', 'When on, models the agent adds are appended to the selection; existing picks are untouched.')}
+        <span className="dwa-setting-copy">
+          {acp.label('新增模型自动加入已选列表，现有勾选不受影响。', 'New models join the selected list automatically; existing picks are untouched.')}
         </span>
       </div>
       {saveError !== undefined && <div className="dwa-error" style={{ marginTop: 4 }}>{saveError}</div>}

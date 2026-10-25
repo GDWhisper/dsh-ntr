@@ -757,8 +757,8 @@ export class AcpStore {
         detectedAgents: agents,
         detecting: false,
         detectSummary: this.locale(
-          `已检测 ${String(agents.length)} 个预设：${String(installed)} 个已安装，其余可从「Agent 列表」启用。`,
-          `Detected ${String(agents.length)} presets: ${String(installed)} installed, enable the rest via the "Agent List".`,
+          `已检测 ${String(agents.length)} 个预设：${String(installed)} 个已安装，其余可从「添加智能体」启用。`,
+          `Detected ${String(agents.length)} presets: ${String(installed)} installed, enable the rest via "Add agent".`,
         ),
       })
     } catch (error) {

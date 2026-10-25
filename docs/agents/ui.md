@@ -25,7 +25,7 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 - 退场后当前 agent 由 `conversation.input.overlay` 的挂牌 `AcpComposerAgentTag` 显示（`NTR · <agent>`，样式 `.ntr-acp-tag`）：骑在 composer 卡片上边缘，一半在卡片外、一半压在上边框（overlay anchor `top: 0` + `translateY(-50%)`）。
 - 挂牌**只读**（`AcpChip` 无 `onClick` 时渲染静态 `span`、无 caret），换 agent 只能新建会话。
 - 挂牌自带闸门 `agentTagVisible`：显式 `acpMode === false` 压过残留 `chatSessions`，`undefined` 才回落到锁本身。
-- **存活光晕**：挂牌判定 `agentTagAlive(bound, lockedTo)`——会话视图存在、未 released、且属于被挂牌的 agent——为真时按设置页「Agent 挂牌光晕」卡的选择展示：`breath`（蓝色呼吸光晕，慢速 5.2s / 正常 3.2s / 快速 1.2s，经挂牌 span 上的 `--ntr-halo-period` 变量下发，映射在 `TAG_HALO_PERIODS` / `agentTagHaloPresentation`）或 `steady`（恒定光，无动画）。reduced-motion 下都退化为静态光。偏好持久化在 `agents.json` 的 `tagHalo` 键，经 `ui/tag-halo` / `ui/tag-halo-set` 读写；store 写入先行（乐观），失败回退。耦合不变量：`session/released` / `session/closed` 事件必须同步翻转 / 删除 store 的 `chatSessions` 行（composer 自己的清单），否则挂牌对着已释放进程一直呼吸；没有别的路径会替 composer 重读这份清单。
+- **存活光晕**：挂牌判定 `agentTagAlive(bound, lockedTo)`——会话视图存在、未 released、且属于被挂牌的 agent——为真时按设置页「对话外观 → 挂牌光晕」的选择展示：`breath`（蓝色呼吸光晕，慢速 5.2s / 正常 3.2s / 快速 1.2s，经挂牌 span 上的 `--ntr-halo-period` 变量下发，映射在 `TAG_HALO_PERIODS` / `agentTagHaloPresentation`）或 `steady`（恒定光，无动画）。reduced-motion 下都退化为静态光。偏好持久化在 `agents.json` 的 `tagHalo` 键，经 `ui/tag-halo` / `ui/tag-halo-set` 读写；store 写入先行（乐观），失败回退。耦合不变量：`session/released` / `session/closed` 事件必须同步翻转 / 删除 store 的 `chatSessions` 行（composer 自己的清单），否则挂牌对着已释放进程一直呼吸；没有别的路径会替 composer 重读这份清单。
 - **动效**：底座立即播放 460ms 粉碎（`.ntr-acp-shatter` + `AcpShatterParts` 的 `out` 沙粒），随后挂牌以 540ms 凝聚（`.ntr-acp-tag.is-forming` + `in` 沙粒）。
   - 两半在**不同的 slot**（`conversation.input.model` / `conversation.input.overlay`），所以共读 `agent-lock-anim.ts` 的同一相位钟，**严禁**各自计时。
   - **不在轮次结束时播**：事件就是开始信号。首轮无输出被回滚（`chat/agent-unlocked`）时底座直接回来，不播反向动效。
@@ -123,6 +123,7 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 ## 8. 设置页
 
 - 每张 agent 卡保持「紧凑行 + 展开详情」两段，详情体**常挂载**、只用 `display: none` 折叠——条件渲染会重挂载表单 `useState`，丢掉用户编辑中的值。
+- 页面按 `section` 分组：页头（标题 / 描述 / 流状态）→ 模式横幅 → 已接入的智能体 → 添加智能体 → 对话外观。文案里点名的控件名必须与可见标题一致：store 的 `detectSummary` 与空态提示都指向「添加智能体」，改名要三处同步（`store.ts` / `panel.tsx` / `tests/store.spec.ts`）。
 - 工作区保存语义：单根模式（非空 `cwd`）把 `allowedCwdRoots` 收窄为 `[cwd]`；`cwd` 为空则两者都不发送（走宿主 `defaultAgentWorkspace()`）；多根模式发送编辑后的去重绝对路径。初始状态带 >1 个 root 的 agent 必须直接进多根模式，避免仅仅打开表单就收窄白名单。
 - 审批卡与权限路由见 [permissions.md](./permissions.md)。
 
