@@ -147,7 +147,9 @@ const STYLE = `
 .dwa-inline-setting { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-2, #f9fafb); }
 .dwa-inline-setting .dwa-switch { flex-shrink: 0; margin-top: 1px; }
 .dwa-setting-copy { color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
-.dwa-model-transfer { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; align-items: stretch; }
+/* Each pane hugs its own rows: a stretched pane with fewer entries leaves a
+   bordered white slab under the last row that reads as a broken empty box. */
+.dwa-model-transfer { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; align-items: start; }
 .dwa-model-pane { min-width: 0; display: flex; flex-direction: column; border: var(--ntr-line); border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-1, #fff); overflow: hidden; }
 .dwa-model-pane-head { display: flex; align-items: center; gap: 6px; padding: 7px 9px; border-bottom: var(--ntr-line); font-size: var(--ntr-font-xs); font-weight: 600; color: var(--dsw-alias-text-secondary, #4b5563); }
 .dwa-model-pane-head .dwa-btn { margin-left: auto; min-height: 26px; padding: 2px 8px; font-size: var(--ntr-font-xs); }
