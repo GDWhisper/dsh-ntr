@@ -2151,6 +2151,11 @@ describe('chat session workspace (isolated manager)', () => {
     }
     const started = wsEvents.slice(since).find(event => event.type === 'turn/start' && event.text === text)
     if (started === undefined) throw new Error('the turn never started')
+    // A segmented turn ends this adapter stream at its first tool card; the
+    // agent keeps streaming into the transcript until its prompt settles. Wait
+    // for that settlement before reading, or the echo below races the last
+    // chunk (the helper never runs the host loop's continuation steps).
+    await wsWaitFor('turn/end', event => event.turnId === started.turnId)
     const transcript = await dispatchRpc(wsManager, 'transcript/get', { sessionId: started.sessionId })
     if (!transcript.ok) throw new Error('transcript failed')
     const echoed = (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
