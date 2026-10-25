@@ -254,6 +254,12 @@ export function describeRoute(
   }
   const parsed = splitAcpModelId(modelId ?? '')
   const variant = catalog?.variants.find(entry => entry.id === modelId)
+  // A model the conversation picked may be outside `exposedModels` (the pick
+  // outlives the visibility filter). Its NAME is still known from the catalog's
+  // `currentModel` when the values agree — show that instead of the raw value.
+  const currentName = catalog?.currentModel !== undefined && parsed.choice === catalog.currentModel.value
+    ? catalog.currentModel.name
+    : undefined
   const effectiveEffort = effort ?? reasoning?.defaultEffort
   // The chip names the MODEL, not the agent (user report, 2026-10-18): the agent
   // is already the chip to its right, so "CodeBuddy Code" beside "ACP · CodeBuddy
@@ -265,7 +271,7 @@ export function describeRoute(
       // Bare route: name the model it resolves to. `base.name` already spells out
       // `<agent> · <model>`, so prefer the model half when we have it.
       ? agentModel?.name ?? catalog?.base.name ?? agentTitle
-      : variant?.name ?? parsed.choice
+      : variant?.name ?? currentName ?? parsed.choice
   return {
     agentId,
     agentTitle,
@@ -457,12 +463,15 @@ export function AcpSessionControls(props: AcpClusterProps) {
   // of keeping a dead agent's last-known model menu interactive.
   const agentListed = agentId !== undefined && agents.some(agent => agent.id === agentId)
   const catalog = agentListed ? ui.seatCatalogs[agentId] : undefined
-  // Read the catalog ONLY for a conversation that actually points at an agent.
-  // `routeAgentId` falls back to the plugin's global default so the picker can
-  // offer a way in — but that fallback must not cause a READ of an unrelated
-  // agent's surface: reading is what can spawn a probe process (user report,
-  // 2026-10-18: a conversation served by one agent had another one start up).
-  const served = bound !== undefined || choice !== undefined || ui.chatBoundAgent[sessionId] !== undefined
+  // Read the catalog ONLY for a conversation that actually points at an agent
+  // (`routeAgentId`'s answer, which includes the plugin default). The old gate
+  // listed only bound / pick / optimistic binding, so a NEW conversation
+  // served by the default agent showed no model/thought chips until the user
+  // re-picked the agent by hand. `agent/catalog` is pure memory (it never
+  // spawns), so reading the default agent's surface cannot start a process.
+  // (The 2026-10-18 spawn report is about the retired probe-on-read path;
+  // the host answers this RPC from memory.)
+  const served = agentId !== undefined
   useEffect(() => {
     if (served && agentListed && agentId !== undefined) void acp.loadAgentCatalog(agentId)
   }, [acp, served, agentListed, agentId])
@@ -478,11 +487,11 @@ export function AcpSessionControls(props: AcpClusterProps) {
   // A conversation with no ACP story to tell gets no chrome: the ACP view tab
   // owns the entry point for starting one.
   if (bound === undefined && agents.length === 0) return null
-  // Set up = an ACP session exists OR the conversation carries a persisted pick.
-  // The second half is what makes the cluster usable BEFORE the first message:
-  // the model and thought level can be chosen up front, and they must show as
-  // chosen rather than as nothing at all.
-  const routed = bound !== undefined || choice !== undefined || ui.chatBoundAgent[sessionId] !== undefined
+  // Set up = an agent serves this conversation: a live session, a persisted
+  // pick, the host's optimistic binding, OR the plugin default the guard's
+  // route rewrite falls back to. The last one is what makes a brand-new
+  // conversation show its model / thought chips without a manual re-pick.
+  const routed = route.agentId !== undefined
   // The base's retirement and the conversation's one-way agent lock are the
   // same event (see `agentBaseHidden`): the first ACP turn. From then on the
   // base never comes back, and the tag is the only place the agent's name
@@ -880,8 +889,9 @@ export function AcpSessionMenu(props: AcpClusterProps) {
   const agentId = lockedTo ?? routeAgentId(ui.chatBoundAgent[sessionId], bound, agents, ui.defaultAgent)
   const catalog = agentId === undefined ? undefined : ui.seatCatalogs[agentId]
   // Same rule as the cluster: a menu that is not open, or a conversation that
-  // points at no agent, must not read (and so must not probe) anybody's catalog.
-  const served = bound !== undefined || choice !== undefined || ui.chatBoundAgent[sessionId] !== undefined
+  // points at no agent, must not read anybody's catalog. The default agent is
+  // included: the guard's route rewrite uses it, and the read is memory-only.
+  const served = agentId !== undefined
   useEffect(() => {
     if (menu !== null && served && agentId !== undefined) void acp.loadAgentCatalog(agentId)
   }, [acp, menu, served, agentId])
@@ -934,13 +944,13 @@ export function AcpSessionMenu(props: AcpClusterProps) {
       if (sectionId === 'agent') {
         await acp.bindChatAgent(sessionId, itemId)
       } else if (sectionId === 'model') {
-        await acp.setChatSessionModel(sessionId, itemId)
+        await acp.setChatSessionModel(sessionId, itemId, agentId)
       } else if (sectionId === 'thought') {
-        await acp.setChatSessionEffort(sessionId, itemId === 'provider-default' ? undefined : itemId)
+        await acp.setChatSessionEffort(sessionId, itemId === 'provider-default' ? undefined : itemId, agentId)
       } else if (sectionId.startsWith('config:')) {
         // One section per extra option; the id after the prefix names the
         // agent's own `configId` (see advancedSections).
-        await acp.setChatSessionConfig(sessionId, sectionId.slice('config:'.length), itemId)
+        await acp.setChatSessionConfig(sessionId, sectionId.slice('config:'.length), itemId, agentId)
       } else {
         // `agent-mode` used to be handled here; the agent's mode list now lives
         // only in the composer-mode control (see the removed-section note).

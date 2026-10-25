@@ -421,8 +421,10 @@ export type DefaultAgentResult = { agentId?: string }
 export interface ChatBindPayload { dshSessionId: string; agentId: string }
 /** `session/chat-model-set`: switch the bound agent's model (`agentId@choice`). */
 export interface ChatModelSetPayload { dshSessionId: string; modelId: string }
-/** `session/chat-effort-set`: switch (or clear, by omitting) the bound agent's effort. */
-export interface ChatEffortSetPayload { dshSessionId: string; effort?: string }
+/** `session/chat-effort-set`: switch (or clear, by omitting) the agent's effort; `agentId` names the agent a not-yet-bound conversation is served by (the plugin default). */
+export interface ChatEffortSetPayload { dshSessionId: string; effort?: string; agentId?: string }
+/** `session/chat-config-set`: set one of the agent's extra config options. */
+export interface ChatConfigSetPayload { dshSessionId: string; configId: string; value: string; agentId?: string }
 
 /** Host-detected agent presence and tested defaults. */
 export interface DetectedAgentInfo {

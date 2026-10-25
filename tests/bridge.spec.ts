@@ -15,7 +15,7 @@ import {
   type ApprovalOutcome, type ApprovalRequestContext, type BridgeTuning,
 } from '../src/bridge.ts'
 import { EventHub, dispatchRpc } from '../src/impl.ts'
-import type { AcpAgentDef, AcpEvent, AgentCatalogResult, ChatSessionView, StreamChunk } from '../src/protocol.ts'
+import type { AcpAgentCatalog, AcpAgentDef, AcpEvent, AgentCatalogResult, ChatSessionView, StreamChunk } from '../src/protocol.ts'
 
 const MOCK = fileURLToPath(new URL('./mock-agent.mjs', import.meta.url))
 
@@ -3079,6 +3079,145 @@ describe('pre-chat pick persistence (isolated manager)', () => {
     await gm.shutdownAll()
   })
 
+  it('records a thought/config pick when the conversation is served by the plugin default', async () => {
+    const gm = new BridgeManager([{ ...def, id: 'mock' }], pickHub, 500, `${tmpdir()}/acp-default-pick-${Date.now()}.json`)
+    try {
+      // The advanced options are validated against the agent's catalog, so the
+      // host needs to know it; the agent id in the RPC is what names the agent
+      // before any session exists (`chatAgentFor` cannot answer yet).
+      await gm.probeAgentModels('mock')
+      await gm.setDefaultAgent('mock')
+      await gm.setChatSessionEffort('dsh-default-pick', 'off', 'mock')
+      await gm.setChatSessionConfig('dsh-default-pick', 'temp', 'high', 'mock')
+      expect(gm.chatChoice('dsh-default-pick')).toMatchObject({
+        agentId: 'mock',
+        effort: 'off',
+        extraConfigs: { temp: 'high' },
+      })
+      // The route for the next turn carries the agent the pick belongs to.
+      expect(routeBindingRegistry().conversations.get('dsh-default-pick')).toBe('mock')
+      // An agent id that is not configured is refused, not recorded.
+      await expect(gm.setChatSessionEffort('dsh-default-pick', 'high', 'ghost'))
+        .rejects.toMatchObject({ code: 'unknown_agent' })
+    } finally {
+      await gm.setDefaultAgent(undefined)
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
+  /**
+   * A conversation with no explicit pick shows the agent catalog's current
+   * model / thought level / extras in the composer. The first `session/new`
+   * comes back with the agent's OWN defaults, so without pinning the displayed
+   * values the first message runs a different model than the one on screen —
+   * the reported "displayed model was not used" defect (user report, 2026-10-24).
+   */
+  it('runs the values the composer showed when the first turn starts with no pick', async () => {
+    const hub = new EventHub()
+    const gm = new BridgeManager([{ ...def, id: 'mock' }], hub, 500, `${tmpdir()}/acp-displayed-defaults-${Date.now()}.json`)
+    try {
+      // The catalog the composer reads before this conversation has a session:
+      // model B / thought off / temperature high. `session/new` will answer A /
+      // high / mid, so a seed that does not happen is visible in the result.
+      const internal = gm as unknown as { catalogs: Map<string, { catalog: AcpAgentCatalog; updatedAt: number }> }
+      internal.catalogs.set('mock', {
+        catalog: {
+          model: {
+            configId: 'model',
+            name: 'Model',
+            currentValue: 'mock-model-b',
+            choices: [{ value: 'mock-model-a', name: 'Mock Model A' }, { value: 'mock-model-b', name: 'Mock Model B' }],
+          },
+          thought: {
+            configId: 'thought',
+            name: 'Thought Level',
+            currentValue: 'off',
+            choices: [{ value: 'off', name: 'Off' }, { value: 'high', name: 'High' }],
+          },
+          extras: [{
+            configId: 'temp',
+            name: 'Temperature',
+            currentValue: 'high',
+            choices: [{ value: 'low', name: 'low' }, { value: 'mid', name: 'mid' }, { value: 'high', name: 'high' }],
+          }],
+        },
+        updatedAt: 1,
+      })
+      // No manual bind: the plugin default is what the guard's route rewrite
+      // answers a never-bound conversation with.
+      await gm.setDefaultAgent('mock')
+
+      for await (const _ of gm.streamPrompt({
+        model: 'mock',
+        sessionId: 'dsh-displayed-defaults',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      } as never)) { /* drain */ }
+
+      // The displayed values became the conversation's pick...
+      expect(gm.chatChoice('dsh-displayed-defaults')).toMatchObject({
+        agentId: 'mock',
+        modelId: 'mock@mock-model-b',
+        effort: 'off',
+        extraConfigs: { temp: 'high' },
+      })
+      // ...the session reports what is actually in force...
+      const [session] = gm.chatSessions('dsh-displayed-defaults')
+      expect(session?.modelId).toBe('mock@mock-model-b')
+      expect(session?.reasoningEffort).toBe('off')
+      // ...and the agent really received them, not its own defaults.
+      const live = (gm.sessions() as Array<{
+        agentId: string
+        configOptions?: Array<{ configId: string; currentValue: unknown }>
+      }>).find(entry => entry.agentId === 'mock')
+      expect(live?.configOptions?.find(option => option.configId === 'model')?.currentValue).toBe('mock-model-b')
+      expect(live?.configOptions?.find(option => option.configId === 'thought')?.currentValue).toBe('off')
+      expect(live?.configOptions?.find(option => option.configId === 'temp')?.currentValue).toBe('high')
+      // The route for the NEXT turn carries the variant, not the bare agent.
+      expect(routeBindingRegistry().conversations.get('dsh-displayed-defaults')).toBe('mock@mock-model-b')
+    } finally {
+      routeBindingRegistry().conversations.delete('dsh-displayed-defaults')
+      await gm.setDefaultAgent(undefined)
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
+  it('does not pin a displayed model the fresh session no longer offers', async () => {
+    const hub = new EventHub()
+    const gm = new BridgeManager([{ ...def, id: 'mock' }], hub, 500, `${tmpdir()}/acp-displayed-stale-${Date.now()}.json`)
+    try {
+      const internal = gm as unknown as { catalogs: Map<string, { catalog: AcpAgentCatalog; updatedAt: number }> }
+      internal.catalogs.set('mock', {
+        catalog: {
+          model: {
+            configId: 'model',
+            name: 'Model',
+            currentValue: 'mock-model-gone',
+            choices: [{ value: 'mock-model-gone', name: 'Gone' }],
+          },
+        },
+        updatedAt: 1,
+      })
+      await gm.setDefaultAgent('mock')
+      const chunks: StreamChunk[] = []
+      for await (const chunk of gm.streamPrompt({
+        model: 'mock',
+        sessionId: 'dsh-displayed-stale',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      } as never)) chunks.push(chunk)
+
+      // The stale catalog value is skipped rather than wedging the first turn.
+      expect(chunks.at(-1)).toMatchObject({ type: 'finish' })
+      expect(chunks.at(-1)).not.toMatchObject({ reason: { kind: 'error' } })
+      expect(gm.chatChoice('dsh-displayed-stale')?.modelId).toBeUndefined()
+      const [session] = gm.chatSessions('dsh-displayed-stale')
+      expect(session?.modelId).toBe('mock@mock-model-a')
+    } finally {
+      routeBindingRegistry().conversations.delete('dsh-displayed-stale')
+      await gm.setDefaultAgent(undefined)
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
   /**
    * The other half of "picks are real": a model the agent has DROPPED must
    * never be silently replaced by another one. The turn is refused with
@@ -3204,8 +3343,11 @@ describe('request-path binding (isolated manager)', () => {
       const sessions = gm.chatSessions('dsh-redir-1')
       expect(sessions.map(session => session.agentId)).toEqual(['beta'])
       // The turn's record names what actually served it (the bound agent), not
-      // the stale id the driver arrived with.
-      expect(sessions.find(session => session.agentId === 'beta')?.modelId).toBe('beta')
+      // the stale id the driver arrived with. With no model pick the record
+      // names the model the agent itself reported (`session/new`'s current
+      // value), not a bare route — a bare route would make the composer read
+      // the agent-level catalog, which other conversations can move.
+      expect(sessions.find(session => session.agentId === 'beta')?.modelId).toBe('beta@mock-model-a')
       // …and the record of what the conversation is on follows the binding.
       expect(routeBindingRegistry().conversations.get('dsh-redir-1')).toBe('beta')
       // That first turn locked beta; alpha cannot take the conversation back.

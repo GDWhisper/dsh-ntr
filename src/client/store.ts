@@ -1453,13 +1453,13 @@ export class AcpStore {
   }
 
   /** Switch the bound agent's model (`agentId@choice`) for one chat session. */
-  async setChatSessionModel(dshSessionId: string, modelId: string): Promise<void> {
+  async setChatSessionModel(dshSessionId: string, modelId: string, agentId?: string): Promise<void> {
     try {
       await this.call('session/chat-model-set', { dshSessionId, modelId })
       // Optimistic for the same reason the binding is: the host recorded the
       // pick, and a conversation with no ACP session yet would otherwise show
       // the agent's default until its first turn created one.
-      this.writeChoice(dshSessionId, choice => ({ ...choice, modelId }))
+      this.writeChoice(dshSessionId, choice => ({ ...choice, modelId }), agentId)
     } catch (error) {
       this.flashError(error)
       throw error
@@ -1467,13 +1467,17 @@ export class AcpStore {
   }
 
   /** Switch the bound agent's reasoning effort for one chat session. */
-  async setChatSessionEffort(dshSessionId: string, effort: string | undefined): Promise<void> {
+  async setChatSessionEffort(dshSessionId: string, effort: string | undefined, agentId?: string): Promise<void> {
     try {
-      await this.call('session/chat-effort-set', { dshSessionId, ...(effort === undefined ? {} : { effort }) })
+      await this.call('session/chat-effort-set', {
+        dshSessionId,
+        ...(effort === undefined ? {} : { effort }),
+        ...(agentId === undefined ? {} : { agentId }),
+      })
       this.writeChoice(dshSessionId, choice => {
         const { effort: _dropped, ...rest } = choice
         return effort === undefined ? rest : { ...rest, effort }
-      })
+      }, agentId)
     } catch (error) {
       this.flashError(error)
       throw error
@@ -1481,13 +1485,18 @@ export class AcpStore {
   }
 
   /** Set one of the bound agent's EXTRA config options for one chat session. */
-  async setChatSessionConfig(dshSessionId: string, configId: string, value: string): Promise<void> {
+  async setChatSessionConfig(dshSessionId: string, configId: string, value: string, agentId?: string): Promise<void> {
     try {
-      await this.call('session/chat-config-set', { dshSessionId, configId, value })
+      await this.call('session/chat-config-set', {
+        dshSessionId,
+        configId,
+        value,
+        ...(agentId === undefined ? {} : { agentId }),
+      })
       this.writeChoice(dshSessionId, choice => ({
         ...choice,
         extraConfigs: { ...choice.extraConfigs, [configId]: value },
-      }))
+      }), agentId)
     } catch (error) {
       this.flashError(error)
       throw error
@@ -1496,15 +1505,22 @@ export class AcpStore {
 
   /**
    * Patch one conversation's optimistic pick. The agent half is required by the
-   * record (a model or thought level belongs to an agent), so a conversation
-   * whose binding is not known yet is left alone: the host answer will carry it.
+   * record (a model or thought level belongs to an agent). Its owner is the
+   * route the picker used, else the recorded pick, the optimistic binding, or
+   * the plugin default — that last one really serves a never-bound conversation
+   * (the guard routes to it), so waiting for `session/chat-list` would leave the
+   * chip behind the click. Only a conversation with none of those is left alone.
    */
-  private writeChoice(dshSessionId: string, update: (choice: AcpConversationChoice) => AcpConversationChoice): void {
+  private writeChoice(dshSessionId: string, update: (choice: AcpConversationChoice) => AcpConversationChoice, agentId?: string): void {
     const current = this.state.chatChoice[dshSessionId]
-    const agentId = current?.agentId ?? this.state.chatBoundAgent[dshSessionId]
-    if (agentId === undefined) return
-    const next = update({ ...current, agentId })
-    this.mutate({ chatChoice: { ...this.state.chatChoice, [dshSessionId]: { ...next, agentId } } })
+    // The plugin default is a real route (the host applies it to a conversation
+    // nobody bound), so an optimistic pick in a fresh conversation belongs to
+    // it — without this the host recorded the pick but the chip waited for the
+    // next `session/chat-list`.
+    const owner = agentId ?? current?.agentId ?? this.state.chatBoundAgent[dshSessionId] ?? this.state.defaultAgent
+    if (owner === undefined) return
+    const next = update({ ...current, agentId: owner })
+    this.mutate({ chatChoice: { ...this.state.chatChoice, [dshSessionId]: { ...next, agentId: owner } } })
   }
 
   /**

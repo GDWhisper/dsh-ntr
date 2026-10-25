@@ -1267,6 +1267,20 @@ describe('the conversation↔agent binding (no DSH model route)', () => {
     })
   })
 
+  it('attributes a pick to the plugin default before anything was bound', async () => {
+    // A fresh conversation served by the default agent has no binding and no
+    // choice yet. The host records the pick for that agent; the optimistic
+    // chip must do the same instead of waiting for the next `session/chat-list`.
+    const { store, calls } = makeStore('codebuddy')
+    await store.resync()
+    await store.setChatSessionEffort('chat-2', 'high', 'codebuddy')
+    expect(calls.at(-1)).toEqual({
+      endpoint: 'session/chat-effort-set',
+      payload: { dshSessionId: 'chat-2', effort: 'high', agentId: 'codebuddy' },
+    })
+    expect(store.getSnapshot().chatChoice['chat-2']).toEqual({ agentId: 'codebuddy', effort: 'high' })
+  })
+
   it('surfaces a failed binding as a notice AND rethrows, so the menu shows the error', async () => {
     const store = new AcpStore(async (_channel, endpoint) => {
       if (endpoint === 'session/chat-bind') return { ok: false, error: { code: 'unknown_agent', message: 'no such agent' } }

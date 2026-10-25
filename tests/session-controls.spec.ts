@@ -77,6 +77,28 @@ describe('the agent base chip names only an agent that serves the conversation',
     expect(chip.title).toBe('这条会话由外接 NTR agent 服务；点开可切换 agent')
   })
 
+  it('names the model and thought level for a conversation served by the plugin default', () => {
+    // A brand-new ACP conversation has no binding and no pick yet; the guard's
+    // route rewrite falls back to the plugin default, and the composer must
+    // show that agent's own surface right away instead of waiting for a manual
+    // re-pick (user report, 2026-10-24).
+    const withModel: AgentCatalogResult = {
+      ...catalog,
+      currentModel: { value: 'claude-sonnet-4', name: 'Claude Sonnet 4' },
+    }
+    const served = describeRoute(roster, undefined, 'pi', withModel)
+    expect(served).toMatchObject({
+      agentId: 'pi',
+      modelLabel: 'Claude Sonnet 4',
+      effectiveEffort: 'high',
+      effortLabel: 'High',
+    })
+    // The route is still the bare agent ("let the agent choose"); the label is
+    // the model that route currently resolves to.
+    expect(served.modelId).toBeUndefined()
+    expect(served.efforts.map(level => level.id)).toEqual(['high'])
+  })
+
   it('promises only the roster behind the agent base', () => {
     // The agent's models and thought levels have chips of their own (user
     // decision, 2026-10-17); the menu behind this chip holds the agent list
@@ -194,6 +216,15 @@ describe('the model picker names both reasons a current model is not on offer', 
     expect(row?.label).toContain('当前')
     expect(row?.detail).toContain('设置 → NTR')
     expect(row?.detail).toContain('掉出')
+  })
+
+  it('names a picked current model by its catalog name even when the filter hides it', () => {
+    // Pinning the displayed default makes it a normal variant pick. If that
+    // model is not in `exposedModels`, the chip must still say "Hy3", not the
+    // raw agent-facing value.
+    const offList: AgentCatalogResult = { ...catalog, variants: [], currentModel: { value: 'hy3', name: 'Hy3' } }
+    const route = describeRoute([agent], { ...bound, modelId: 'pi@hy3' }, undefined, offList)
+    expect(route.modelLabel).toBe('Hy3')
   })
 
   it('ends the model menu with an explicit refresh row and shows a probe in flight', () => {

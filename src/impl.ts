@@ -1402,10 +1402,10 @@ export interface AcpManager {
   chatChoice?(dshSessionId: string): AcpConversationChoice | undefined
   /** Switch the bound agent's model (`agentId@choice`) for one chat session. */
   setChatSessionModel?(dshSessionId: string, modelId: string): Promise<void>
-  /** Switch the bound agent's reasoning effort for one chat session. */
-  setChatSessionEffort?(dshSessionId: string, effort: string | undefined): Promise<void>
-  /** Set one of the bound agent's EXTRA config options for one chat session. */
-  setChatSessionConfig?(dshSessionId: string, configId: string, value: string): Promise<void>
+  /** Switch the reasoning effort for one chat session (agentId names the default-agent case). */
+  setChatSessionEffort?(dshSessionId: string, effort: string | undefined, agentId?: string): Promise<void>
+  /** Set one of the agent's EXTRA config options for one chat session. */
+  setChatSessionConfig?(dshSessionId: string, configId: string, value: string, agentId?: string): Promise<void>
   /**
    * State of the ACP-mode agent preset in the harness's OWN roster. Read-only
    * report for the settings panel: the preset is a declaration this package
@@ -1570,14 +1570,14 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
       }
       case 'session/chat-effort-set': {
         const dshSessionId = str(body, 'dshSessionId', 128)
-        await manager.setChatSessionEffort?.(dshSessionId, optionalStr(body, 'effort', 64))
+        await manager.setChatSessionEffort?.(dshSessionId, optionalStr(body, 'effort', 64), optionalStr(body, 'agentId', 64))
         return ok({ done: true })
       }
       case 'session/chat-config-set': {
         const dshSessionId = str(body, 'dshSessionId', 128)
         const configId = str(body, 'configId', 128)
         const value = str(body, 'value', 512)
-        await manager.setChatSessionConfig?.(dshSessionId, configId, value)
+        await manager.setChatSessionConfig?.(dshSessionId, configId, value, optionalStr(body, 'agentId', 64))
         return ok({ done: true })
       }
       case 'preset/status':
