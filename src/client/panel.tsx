@@ -54,6 +54,13 @@ const STYLE = `
 .dwa-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .dwa-btn-primary { background: var(--dsw-alias-button-primary-fill, #2563eb); color: var(--dsw-alias-button-primary-invert, #fff); border-color: transparent; font-weight: 500; }
 .dwa-btn-primary:hover { opacity: 0.9; }
+/* Segmented control: joined options in one pill, the active one filled.
+   Used where the choices are exclusive and small (halo mode / speed). */
+.dwa-seg { display: inline-flex; border-radius: var(--ntr-radius-sm); border: 1px solid var(--dsw-alias-border-l2, #d1d5db); overflow: hidden; vertical-align: middle; }
+.dwa-seg > button { font: inherit; font-size: var(--ntr-font-sm); color: inherit; border: none; background: var(--dsw-alias-bg-layer-1, #fff); padding: 5px 14px; cursor: pointer; transition: background 0.15s ease; }
+.dwa-seg > button + button { border-left: 1px solid var(--dsw-alias-border-l2, #d1d5db); }
+.dwa-seg > button:hover { background: var(--dsw-alias-interactive-bg-active, #0000000d); }
+.dwa-seg > button.is-on { background: var(--dsw-alias-button-primary-fill, #2563eb); color: var(--dsw-alias-button-primary-invert, #fff); font-weight: 500; }
 .dwa-btn-danger { color: var(--ntr-danger); border-color: #fca5a5; }
 .dwa-btn-danger:hover { background: #fee2e2; }
 .dwa-btn-secondary { background: var(--dsw-alias-bg-layer-2, #f3f4f6); border-color: var(--dsw-alias-border-l2, #d1d5db); }
@@ -475,6 +482,58 @@ export function AcpSettingsSection(props: WithStore) {
                 setCreateNonce(nonce => nonce + 1)
               }}
             />
+          </div>
+        )}
+      </div>
+
+      {/* Agent 挂牌光晕: how the composer tag shows a live agent. Plugin
+          display preference — host-persisted with the agent registry, so it
+          follows the profile rather than this one browser. Kept at the BOTTOM
+          of the section: the cards above answer "what serves my turns", this
+          one only decorates their nameplate. */}
+      <div className="dwa-card" style={{ marginBottom: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <span style={{ fontWeight: 600, flex: 1 }}>
+            {acp.label('Agent 挂牌光晕', 'Agent Tag Halo')}
+          </span>
+          <span className="dwa-badge">{ui.tagHalo.mode === 'breath' ? acp.label('呼吸', 'Breath') : acp.label('常亮', 'Steady')}</span>
+        </div>
+        <div className="dwa-hint" style={{ marginTop: 6 }}>
+          {acp.label(
+            '对话里的 NTR 挂牌用蓝色光晕提示 agent 进程存活：呼吸为脉动光，常亮为恒定光。',
+            'The NTR tag in a conversation glows blue while the agent process is up: breathing pulses, steady is a constant glow.',
+          )}
+        </div>
+        <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          <span className="dwa-hint">{acp.label('模式', 'Mode')}</span>
+          <div className="dwa-seg">
+            {(['breath', 'steady'] as const).map(mode => (
+              <button
+                key={mode}
+                type="button"
+                className={ui.tagHalo.mode === mode ? 'is-on' : ''}
+                onClick={() => void acp.setTagHalo({ ...ui.tagHalo, mode })}
+              >
+                {mode === 'breath' ? acp.label('呼吸', 'Breathe') : acp.label('常亮', 'Steady')}
+              </button>
+            ))}
+          </div>
+        </div>
+        {ui.tagHalo.mode === 'breath' && (
+          <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            <span className="dwa-hint">{acp.label('呼吸频率', 'Speed')}</span>
+            <div className="dwa-seg">
+              {(['slow', 'normal', 'fast'] as const).map(speed => (
+                <button
+                  key={speed}
+                  type="button"
+                  className={ui.tagHalo.speed === speed ? 'is-on' : ''}
+                  onClick={() => void acp.setTagHalo({ ...ui.tagHalo, speed })}
+                >
+                  {speed === 'slow' ? acp.label('慢速', 'Slow') : speed === 'normal' ? acp.label('正常', 'Normal') : acp.label('快速', 'Fast')}
+                </button>
+              ))}
+            </div>
           </div>
         )}
       </div>

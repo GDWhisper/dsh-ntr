@@ -2781,6 +2781,20 @@ describe('pre-chat pick persistence (isolated manager)', () => {
     await gm.shutdownAll()
   })
 
+  it('persists the tag halo preference and reloads it', async () => {
+    const storage = `${tmpdir()}/acp-halo-${Date.now()}.json`
+    const gm = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
+    // The default before anything was ever saved.
+    expect(gm.tagHalo()).toEqual({ mode: 'breath', speed: 'normal' })
+
+    await gm.setTagHalo({ mode: 'steady', speed: 'slow' })
+    // A fresh manager (host restart) reads the same registry file back.
+    const reloaded = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
+    expect(reloaded.tagHalo()).toEqual({ mode: 'steady', speed: 'slow' })
+    await reloaded.shutdownAll()
+    await gm.shutdownAll()
+  })
+
   it('records an extra config option and applies it when the first session materializes', async () => {
     const storage = `${tmpdir()}/acp-pick-config-${Date.now()}.json`
     const gm = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)

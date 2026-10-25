@@ -413,6 +413,22 @@ export interface DefaultAgentSetPayload { agentId?: string }
 export type DefaultAgentResult = { agentId?: string }
 
 /**
+ * How the composer-edge agent tag shows liveness (the blue halo). `breath`
+ * pulses the halo at the speed below; `steady` shows a constant glow.
+ * Plugin-private display preference, persisted with the agent registry.
+ */
+export interface AcpTagHalo {
+  mode: 'breath' | 'steady'
+  speed: 'slow' | 'normal' | 'fast'
+}
+/** Default when nothing was ever saved: the breathing halo at normal speed. */
+export const DEFAULT_TAG_HALO: AcpTagHalo = { mode: 'breath', speed: 'normal' }
+/** `ui/tag-halo`: read the halo preference. */
+export type TagHaloResult = { halo: AcpTagHalo }
+/** `ui/tag-halo-set`: write the halo preference. */
+export interface TagHaloSetPayload { halo: AcpTagHalo }
+
+/**
  * `session/chat-bind`: point one DSH chat conversation at an ACP agent. The
  * plugin's own conversation↔agent mapping — deliberately NOT a DSH model
  * selection, which is what polluting the deployment default and getting

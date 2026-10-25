@@ -283,6 +283,45 @@ describe('AcpStore agent management', () => {
     expect(older.getSnapshot().preset).toBeUndefined()
   })
 
+  it('reads the tag halo on resync and writes it back optimistically', async () => {
+    const store = new (await import('../src/client/store.ts')).AcpStore(
+      async (_channel, endpoint) => {
+        if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
+        if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'ui/tag-halo') return { ok: true, value: { halo: { mode: 'steady', speed: 'slow' } } }
+        return { ok: true, value: {} }
+      },
+      (zh) => zh,
+    )
+    // The host answer is the authority; the initial local default gives way.
+    await store.resync()
+    expect(store.getSnapshot().tagHalo).toEqual({ mode: 'steady', speed: 'slow' })
+
+    // The write lands optimistically (the tag's look changes with the click)
+    // and the RPC carries the full halo object.
+    await store.setTagHalo({ mode: 'breath', speed: 'fast' })
+    expect(store.getSnapshot().tagHalo).toEqual({ mode: 'breath', speed: 'fast' })
+
+    // A failed write reverts to the previous setting instead of leaving the
+    // tag looking like something the host refused.
+    const failing = new (await import('../src/client/store.ts')).AcpStore(
+      async (_channel, endpoint) => {
+        if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
+        if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'ui/tag-halo-set') return { ok: false, error: { code: 'bad_payload', message: 'no' } }
+        return { ok: true, value: {} }
+      },
+      (zh) => zh,
+    )
+    await failing.resync()
+    await failing.setTagHalo({ mode: 'steady', speed: 'normal' })
+    // The revert target is what resync last knew: the host default, because
+    // this mock never answers `ui/tag-halo`.
+    expect(failing.getSnapshot().tagHalo).toEqual({ mode: 'breath', speed: 'normal' })
+  })
+
   it('testAgent posts the form payload as-is and returns the host verdict', async () => {
     const payloads: Array<Record<string, unknown>> = []
     const store = new (await import('../src/client/store.ts')).AcpStore(
@@ -1206,6 +1245,30 @@ describe('AcpStore observed ACP transcripts (the ACP view tab)', () => {
     expect(store.chatTranscriptOf('chat-1')?.session.running).toBe(true)
     await apply({ type: 'turn/end', sessionId: 'acp-s1', turnId: 't9', stopReason: 'end_turn' })
     expect(store.chatTranscriptOf('chat-1')?.session.running).toBe(false)
+  })
+
+  it('flips the composer session view to released on session/released', async () => {
+    // The agent tag's live halo reads this list; without the flip it keeps
+    // breathing for a process that is gone until the next turn re-reads.
+    let listed = { sessions: [{ agentId: 'pi', sessionId: 'acp-s1' }] }
+    const store = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint === 'session/chat-list') return { ok: true, value: listed }
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+    const apply = (event: unknown): Promise<void> =>
+      (store as unknown as { applyEvent(event: unknown): Promise<void> }).applyEvent(event)
+
+    await store.loadChatSessions('chat-1')
+    expect(store.getSnapshot().chatSessions[0]).toMatchObject({ sessionId: 'acp-s1' })
+    expect(store.getSnapshot().chatSessions[0]?.released).toBeUndefined()
+
+    await apply({ type: 'session/released', sessionId: 'acp-s1', session: view({ released: true }), reason: 'idle release' })
+    expect(store.getSnapshot().chatSessions[0]).toMatchObject({ sessionId: 'acp-s1', released: true })
+
+    // Resuming on a fresh process un-releases via the next authoritative read.
+    listed = { sessions: [{ agentId: 'pi', sessionId: 'acp-s1' }] }
+    await store.loadChatSessions('chat-1')
+    expect(store.getSnapshot().chatSessions[0]?.released).toBeUndefined()
   })
 
   it('bounds how many transcripts stay resident', async () => {

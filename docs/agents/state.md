@@ -6,7 +6,7 @@
 
 `pluginStateDir()`（`~/.dsh/dsh-ntr`）下只有三样东西：
 
-- `agents.json` —— agent 注册表 + 默认 agent + 每会话选择
+- `agents.json` —— agent 注册表 + 默认 agent + 每会话选择 + 插件私有显示偏好（`tagHalo`，经 `ui/tag-halo` RPC 读写）
 - `model-catalog.json` —— 模型目录 + agent 最近一次声明的斜杠命令
 - `workspaces/` —— 默认执行工作区
 

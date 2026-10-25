@@ -56,6 +56,7 @@
  */
 
 import { useEffect, useState } from 'react'
+import type { CSSProperties } from 'react'
 // Type-only: pulls the ui-conversation SlotMap merge into this program.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import {
@@ -66,7 +67,7 @@ import { playAgentLockAnim, useAgentLockPhase } from './agent-lock-anim.ts'
 import type {
   AcpChatInjected, AcpMenuKind, AcpMenuItem, AcpMenuSection, AcpSessionHook,
 } from './acp-ui.tsx'
-import type { AcpConversationChoice, AgentCatalogResult, AgentView, ChatSessionView } from '../protocol.ts'
+import type { AcpConversationChoice, AcpTagHalo, AgentCatalogResult, AgentView, ChatSessionView } from '../protocol.ts'
 
 /**
  * Props every entry in this file receives: the injected face (built in
@@ -203,6 +204,44 @@ export function agentTagVisible(
   lockedTo: string | undefined,
 ): boolean {
   return (acpMode ?? true) && lockedTo !== undefined
+}
+
+/**
+ * Whether the tagged agent is LIVE: an ACP session serves this conversation
+ * right now and it is not released (the process is up, or at least the host
+ * has not marked the session suspended). This drives the tag's breathing
+ * halo — released must turn it off, and the named agent must be the one the
+ * live session actually serves. No session view at all reads as not alive:
+ * before the first answer the state says nothing about the process.
+ */
+export function agentTagAlive(
+  bound: ChatSessionView | undefined,
+  lockedTo: string | undefined,
+): boolean {
+  return bound !== undefined && !bound.released && bound.agentId === lockedTo
+}
+
+/** One breath cycle per halo speed, in seconds. Settings card offers these three. */
+export const TAG_HALO_PERIODS: Record<AcpTagHalo['speed'], string> = {
+  slow: '5.2s',
+  normal: '3.2s',
+  fast: '1.2s',
+}
+
+/**
+ * The tag's halo presentation for one setting: the extra classes for the tag
+ * span (`alive` — the session is live; steady mode replaces the pulse with a
+ * constant glow) and the CSS variable the stylesheet reads for the period.
+ * The variable is set for breath mode only: in steady mode nothing animates,
+ * so a stale variable could never leak into the reduced-motion fallback.
+ */
+export function agentTagHaloPresentation(
+  halo: AcpTagHalo,
+  alive: boolean,
+): { classes: string; style: CSSProperties } {
+  if (!alive) return { classes: '', style: {} }
+  if (halo.mode === 'steady') return { classes: ' is-alive is-steady', style: {} }
+  return { classes: ' is-alive', style: { '--ntr-halo-period': TAG_HALO_PERIODS[halo.speed] } as CSSProperties }
 }
 
 /**
@@ -424,8 +463,15 @@ export function AcpComposerAgentTag(props: AcpClusterProps) {
   if (phase === 'shatter') return null
   if (!agentTagVisible(ui.acpMode[sessionId], lockedTo) || lockedTo === undefined) return null
   const agentTitle = ui.agents.find(agent => agent.id === lockedTo)?.title ?? bound?.agentTitle ?? lockedTo
+  // The halo rides the settled tag only: while the forming animation owns the
+  // chip its `animation` shorthand must not be overridden mid-flight.
+  const alive = phase !== 'form' && agentTagAlive(bound, lockedTo)
+  const halo = agentTagHaloPresentation(ui.tagHalo, alive)
   return (
-    <span className={`ntr-acp-tag${phase === 'form' ? ' is-forming' : ''}`}>
+    <span
+      className={`ntr-acp-tag${phase === 'form' ? ' is-forming' : ''}${halo.classes}`}
+      style={halo.style}
+    >
       <AcpChip {...agentTagChip(agentTitle, acp)}>
         {phase === 'form' && <AcpShatterParts mode="in" />}
       </AcpChip>

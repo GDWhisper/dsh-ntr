@@ -23,6 +23,8 @@ import {
   agentBaseChip,
   agentBaseHidden,
   agentTagChip,
+  agentTagAlive,
+  agentTagHaloPresentation,
   agentTagVisible,
   describeRoute,
   lockedAgentOf,
@@ -163,6 +165,37 @@ describe('the agent base retires after the first turn, locks the agent, and the 
     // lock, which itself proves ACP.
     expect(agentTagVisible(false, 'pi')).toBe(false)
     expect(agentTagVisible(undefined, 'pi')).toBe(true)
+  })
+
+  it('reads the tag as alive only for a live session of the tagged agent', () => {
+    // A live, unreleased session of the locked agent breathes.
+    expect(agentTagAlive(ran, 'pi')).toBe(true)
+    // Released (process gone / idle-released) turns the halo off; the tag
+    // itself stays, so the halo must not keep claiming a process that is not.
+    expect(agentTagAlive({ ...ran, released: true }, 'pi')).toBe(false)
+    // The live session must be the tagged agent's own: a view naming another
+    // agent (a stale roster entry after a delete/re-add) is not "alive".
+    expect(agentTagAlive({ ...ran, agentId: 'other' }, 'pi')).toBe(false)
+    // No session view at all (host has not answered yet): not alive.
+    expect(agentTagAlive(undefined, 'pi')).toBe(false)
+    expect(agentTagAlive(ran, undefined)).toBe(false)
+  })
+
+  it('maps the halo setting to the tag classes and the animation period', () => {
+    // Not alive: no halo classes and no CSS variable at all — a stale period
+    // could never leak into some future non-animated state.
+    expect(agentTagHaloPresentation({ mode: 'breath', speed: 'fast' }, false))
+      .toEqual({ classes: '', style: {} })
+    // Breath mode carries the period variable for the stylesheet.
+    expect(agentTagHaloPresentation({ mode: 'breath', speed: 'slow' }, true))
+      .toEqual({ classes: ' is-alive', style: { '--ntr-halo-period': '5.2s' } })
+    expect(agentTagHaloPresentation({ mode: 'breath', speed: 'normal' }, true))
+      .toEqual({ classes: ' is-alive', style: { '--ntr-halo-period': '3.2s' } })
+    expect(agentTagHaloPresentation({ mode: 'breath', speed: 'fast' }, true))
+      .toEqual({ classes: ' is-alive', style: { '--ntr-halo-period': '1.2s' } })
+    // Steady mode: constant glow, no animation, therefore no variable.
+    expect(agentTagHaloPresentation({ mode: 'steady', speed: 'normal' }, true))
+      .toEqual({ classes: ' is-alive is-steady', style: {} })
   })
 
   it('names the locked agent and says switching is closed', () => {

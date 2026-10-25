@@ -50,16 +50,18 @@ import {
   describeUnhandledUpdate,
   BOOKKEEPING_UPDATES,
   validateAgentDef,
+  validateTagHalo,
 } from './impl.ts'
 import type {
   AcpToolCallSnapshot,
   RosterPresetRow,
 } from './impl.ts'
 import type {
-  AcpAgentCatalog, AcpAgentDef, AcpConversationChoice, AcpPresetStatus, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
+  AcpAgentCatalog, AcpAgentDef, AcpConversationChoice, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
   LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo,
   PermissionOutcome, PermissionOptionView, PreparedAdapterCall, SessionView, StreamChunk,
 } from './protocol.ts'
+import { DEFAULT_TAG_HALO } from './protocol.ts'
 
 const STDERR_TAIL_LINES = 40
 /** Single fs/read_text_file answer cap — agents reading huge files must page via `line`/`limit`. */
@@ -2645,6 +2647,8 @@ export class BridgeManager {
   private readonly defsMap = new Map<string, AcpAgentDef>()
   /** The plugin's own default ACP agent id (persisted; see `persistAgents`). */
   private defaultAgentId?: string
+  /** The agent tag's halo preference (persisted; see `persistAgents`). */
+  private tagHaloSetting: AcpTagHalo = { ...DEFAULT_TAG_HALO }
   /**
    * The in-flight (or just-settled) segmented turn of one DSH chat session.
    * Keyed by chat session id because the continuation steps of a segmented
@@ -3477,6 +3481,14 @@ export class BridgeManager {
         // `defaultAgent()` is the accessor that filters a stale id out, so a
         // temporarily unreadable agent list cannot silently erase the choice.
         if (typeof stored === 'string' && stored !== '') this.defaultAgentId = stored
+        // The halo preference is validated on write, but the file is user- or
+        // version-editable: an unreadable value falls back to the default
+        // rather than poisoning every read.
+        try {
+          this.tagHaloSetting = validateTagHalo((parsed as { tagHalo?: unknown }).tagHalo)
+        } catch {
+          this.tagHaloSetting = { ...DEFAULT_TAG_HALO }
+        }
         this.loadPersistedChoices((parsed as { conversations?: unknown }).conversations)
       }
     } catch {
@@ -3527,6 +3539,7 @@ export class BridgeManager {
       const payload = {
         version: 2,
         ...(this.defaultAgentId === undefined ? {} : { defaultAgentId: this.defaultAgentId }),
+        tagHalo: this.tagHaloSetting,
         agents: [...this.defsMap.values()],
         // The per-conversation picks: agent + model + thought level + mode +
         // extra config values chosen in the composer, including for
@@ -4450,6 +4463,19 @@ export class BridgeManager {
     this.persistAgents()
     // The request-path rewrite falls back to it for never-bound conversations.
     routeBindingRegistry().defaultModel = agentId
+  }
+
+  /** The agent tag's halo preference (composer display, plugin-private). */
+  tagHalo(): AcpTagHalo {
+    return this.tagHaloSetting
+  }
+
+  async setTagHalo(halo: AcpTagHalo): Promise<void> {
+    // Rebuild through the validator so every write passes the same gate the
+    // RPC route used, whatever the caller (a direct `manager` consumer today,
+    // a future non-RPC path tomorrow).
+    this.tagHaloSetting = validateTagHalo(halo)
+    this.persistAgents()
   }
 
   private readonly dshSessionMap = new Map<string, LiveSession>()

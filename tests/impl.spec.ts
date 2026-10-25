@@ -761,6 +761,8 @@ function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } {
     stopAgent: async id => { calls.push(['stop', id]) },
     defaultAgent: () => 'mock',
     setDefaultAgent: async id => { calls.push(['setDefaultAgent', id]) },
+    tagHalo: () => ({ mode: 'breath', speed: 'slow' }),
+    setTagHalo: async halo => { calls.push(['setTagHalo', halo]) },
     bindChatAgent: (dshSessionId, agentId) => { calls.push(['bindChatAgent', dshSessionId, agentId]) },
     setChatSessionModel: async (dshSessionId, modelId) => { calls.push(['setChatSessionModel', dshSessionId, modelId]) },
     setChatSessionEffort: async (dshSessionId, effort) => { calls.push(['setChatSessionEffort', dshSessionId, effort]) },
@@ -889,6 +891,15 @@ describe('dispatchRpc', () => {
     // Clearing the default is legal and is the only way to remove a star.
     await expect(dispatchRpc(manager, 'default/agent-set', {})).resolves.toEqual({ ok: true, value: { done: true } })
     expect(manager.calls).toContainEqual(['setDefaultAgent', undefined])
+    // The tag halo preference: read falls back to the default on an older host
+    // half; writes are validated (only the settings card's enums pass).
+    await expect(dispatchRpc(manager, 'ui/tag-halo', {})).resolves.toEqual({ ok: true, value: { halo: { mode: 'breath', speed: 'slow' } } })
+    await expect(dispatchRpc({ ...manager, tagHalo: undefined }, 'ui/tag-halo', {})).resolves.toEqual({ ok: true, value: { halo: { mode: 'breath', speed: 'normal' } } })
+    await expect(dispatchRpc(manager, 'ui/tag-halo-set', { halo: { mode: 'steady', speed: 'fast' } })).resolves.toEqual({ ok: true, value: { done: true } })
+    expect(manager.calls).toContainEqual(['setTagHalo', { mode: 'steady', speed: 'fast' }])
+    await expect(dispatchRpc(manager, 'ui/tag-halo-set', { halo: { mode: 'blink', speed: 'fast' } })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc(manager, 'ui/tag-halo-set', { halo: { mode: 'breath', speed: 'ludicrous' } })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc(manager, 'ui/tag-halo-set', {})).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     // The conversation↔agent mapping: the plugin's own binding, never a model route.
     await expect(dispatchRpc(manager, 'session/chat-bind', { dshSessionId: 'chat-1', agentId: 'pi' })).resolves.toEqual({ ok: true, value: { done: true } })
     expect(manager.calls).toContainEqual(['bindChatAgent', 'chat-1', 'pi'])

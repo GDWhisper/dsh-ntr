@@ -6,7 +6,8 @@
  * Deliberately framework-free: React binds through `useSyncExternalStore`.
  */
 
-import type { AcpConversationChoice, AcpEvent, AcpPresetStatus, AgentCatalogResult, AgentProbeModelsResult, AgentSavePayload, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, SessionView } from '../protocol.ts'
+import type { AcpConversationChoice, AcpEvent, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSavePayload, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, SessionView } from '../protocol.ts'
+import { DEFAULT_TAG_HALO } from '../protocol.ts'
 
 /** One slash command the ACP agent declared, whole row (the menu draws name, description and `input.hint`). */
 export type AgentCommand = NonNullable<ChatSessionView['availableCommands']>[number]
@@ -143,6 +144,12 @@ export interface UiState {
   chatSessions: ChatSessionView[]
   /** The DSH chat session id {@link chatSessions} was loaded for. */
   chatSessionsFor?: string
+  /**
+   * The agent tag's halo preference (settings-editable display choice). The
+   * tag reads it per render; the host answer in `resync` is the authority and
+   * a write lands optimistically first.
+   */
+  tagHalo: AcpTagHalo
   /**
    * Per-chat-session "does this conversation run the ACP preset" verdicts, as
    * reported by `session/chat-list` (host-read from the session log). The
@@ -513,6 +520,7 @@ export class AcpStore {
     probeErrors: {},
     approvalRouted: false,
     chatSessions: [],
+    tagHalo: { ...DEFAULT_TAG_HALO },
     chatTranscripts: {},
     acpMode: {},
     chatBoundAgent: {},
@@ -707,7 +715,7 @@ export class AcpStore {
   /** Snapshot refresh used on panel open and after a stream outage. */
   async resync(): Promise<void> {
     try {
-      const [{ agents, approvalRouted }, { sessions }, defaultAgentInfo, detectResult, presetResult] = await Promise.all([
+      const [{ agents, approvalRouted }, { sessions }, defaultAgentInfo, detectResult, presetResult, tagHaloResult] = await Promise.all([
         this.call<{ agents: AgentView[]; approvalRouted?: boolean }>('agents/list'),
         this.call<{ sessions: SessionView[] }>('sessions/list'),
         // The plugin's OWN default ACP agent — a plugin-private id, not a DSH
@@ -716,6 +724,8 @@ export class AcpStore {
         this.call<{ agents: DetectedAgentInfo[] }>('agents/detect').catch(() => null),
         // `null` (host without a preset roster) hides the panel block.
         this.call<{ preset: AcpPresetStatus | null }>('preset/status').catch(() => null),
+        // Host without the endpoint (older half) keeps the local default.
+        this.call<{ halo: AcpTagHalo }>('ui/tag-halo').catch(() => ({ halo: { ...DEFAULT_TAG_HALO } })),
       ])
       const detectedAgents = (detectResult && detectResult.agents.length > 0)
         ? detectResult.agents
@@ -728,6 +738,7 @@ export class AcpStore {
         detectedAgents,
         approvalRouted: approvalRouted === true,
         preset: presetResult?.preset ?? undefined,
+        tagHalo: tagHaloResult?.halo ?? { ...DEFAULT_TAG_HALO },
       })
       const active = this.state.activeSessionId ?? sessions[0]?.sessionId
       if (active !== undefined) await this.loadTranscript(active)
@@ -1430,6 +1441,22 @@ export class AcpStore {
   }
 
   /**
+   * Write the agent tag's halo preference (settings card). The value is
+   * validated host-side; this side writes optimistically first so the tag's
+   * look changes with the click, and reverts to the host answer on a failure.
+   */
+  async setTagHalo(halo: AcpTagHalo): Promise<void> {
+    const previous = this.state.tagHalo
+    this.mutate({ tagHalo: halo })
+    try {
+      await this.call('ui/tag-halo-set', { halo })
+    } catch (error) {
+      this.mutate({ tagHalo: previous })
+      this.flashError(error)
+    }
+  }
+
+  /**
    * Bind one DSH chat session to an ACP agent. This is the plugin's own
    * conversation↔agent mapping: it does NOT write a DSH model route, so it
    * cannot pollute the deployment default model and cannot be refused by the
@@ -1578,10 +1605,15 @@ export class AcpStore {
         this.openTurns.delete(event.sessionId)
         const closedTranscripts = { ...this.state.chatTranscripts }
         delete closedTranscripts[event.sessionId]
+        // The composer's chat-list view must lose the closed row too: a stale
+        // entry would keep reading as a live session (the agent tag's halo
+        // breathes on `!released`) until some future turn re-reads the list.
+        const chatSessions = this.state.chatSessions.filter(s => s.sessionId !== event.sessionId)
         this.mutate({
           sessions,
           activeSessionId: active,
           chatTranscripts: closedTranscripts,
+          ...(chatSessions.length !== this.state.chatSessions.length ? { chatSessions } : {}),
           permissions: this.state.permissions.filter(p => p.sessionId !== event.sessionId),
           ...(event.reason === 'agent-died' ? { notice: this.locale('会话因 agent 进程退出而终止', 'session ended: agent process died') } : {}),
         })
@@ -1594,8 +1626,15 @@ export class AcpStore {
           ? this.state.sessions.map(s => (s.sessionId === event.sessionId ? event.session : s))
           : [...this.state.sessions, event.session]
         this.openTurns.delete(event.sessionId)
+        // The composer's own list (`session/chat-list` views) must flip too, or
+        // the agent tag's live halo keeps breathing for a process that is gone:
+        // nothing else re-reads this list until the next turn settles.
+        const chatSessions = this.state.chatSessions.some(s => s.sessionId === event.sessionId)
+          ? this.state.chatSessions.map(s => (s.sessionId === event.sessionId ? { ...s, released: true } : s))
+          : this.state.chatSessions
         this.mutate({
           sessions,
+          ...(chatSessions !== this.state.chatSessions ? { chatSessions } : {}),
           permissions: this.state.permissions.filter(p => p.sessionId !== event.sessionId),
           // An observed transcript keeps its buffer but flips to released, so
           // the ACP view can say "会恢复" instead of silently looking dead.

@@ -7,9 +7,10 @@
 
 import { randomUUID } from './ids.ts'
 import type {
-  AcpAgentCatalog, AcpAgentDef, AcpCatalogOption, AcpConversationChoice, AcpEvent, AcpPluginConfig, AcpPresetStatus, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult,
+  AcpAgentCatalog, AcpAgentDef, AcpCatalogOption, AcpConversationChoice, AcpEvent, AcpPluginConfig, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult,
   AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionOutcome, RpcResult,
 } from './protocol.ts'
+import { DEFAULT_TAG_HALO } from './protocol.ts'
 
 export { randomUUID }
 
@@ -80,6 +81,19 @@ export function normalizeExposedModels(raw: unknown, label: string, code: 'bad_c
     out.push(value)
   }
   return out
+}
+
+/**
+ * Rebuild the agent tag's halo preference from untrusted input. Only the two
+ * enums the settings UI offers are accepted; anything else fails loudly
+ * instead of silently switching the tag's look.
+ */
+export function validateTagHalo(value: unknown): AcpTagHalo {
+  if (value === null || typeof value !== 'object') throw new AcpError('bad_payload', 'acp: tag halo must be an object')
+  const { mode, speed } = value as { mode?: unknown; speed?: unknown }
+  if (mode !== 'breath' && mode !== 'steady') throw new AcpError('bad_payload', 'acp: tag halo mode must be "breath" or "steady"')
+  if (speed !== 'slow' && speed !== 'normal' && speed !== 'fast') throw new AcpError('bad_payload', 'acp: tag halo speed must be "slow", "normal" or "fast"')
+  return { mode, speed }
 }
 
 // ---- Command lines (`AcpAgentDef.command` is a command LINE, not a bare program) ----
@@ -1304,6 +1318,10 @@ export interface AcpManager {
   defaultAgent?(): string | undefined
   /** Set (or clear, with `undefined`) the default ACP agent. */
   setDefaultAgent?(agentId: string | undefined): Promise<void>
+  /** The agent tag's halo preference (composer display, plugin-private). */
+  tagHalo?(): AcpTagHalo
+  /** Write the halo preference (persisted with the agent registry). */
+  setTagHalo?(halo: AcpTagHalo): Promise<void>
   detectAgents?(): Promise<DetectedAgentInfo[]>
   saveAgent?(def: AcpAgentDef): Promise<void>
   deleteAgent?(agentId: string): Promise<void>
@@ -1598,6 +1616,14 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
       case 'default/agent-set': {
         const agentId = optionalStr(body, 'agentId', 64)
         await manager.setDefaultAgent?.(agentId)
+        return ok({ done: true })
+      }
+      case 'ui/tag-halo':
+        // Absent on a host half from before the setting existed: the browser
+        // falls back to its own default instead of failing the read.
+        return ok({ halo: manager.tagHalo?.() ?? DEFAULT_TAG_HALO })
+      case 'ui/tag-halo-set': {
+        await manager.setTagHalo?.(validateTagHalo(body.halo))
         return ok({ done: true })
       }
       case 'agent/set-exposed-models': {

@@ -748,6 +748,24 @@ const STYLE = `
 .ntr-acp-shards.is-in .ntr-acp-shard { animation: ntr-acp-shard-in 540ms cubic-bezier(0.16, 0.84, 0.28, 1) both; }
 .ntr-acp-chip.ntr-acp-shatter { animation: ntr-acp-shatter-chip 460ms cubic-bezier(0.4, 0, 0.8, 0.4) both; pointer-events: none; }
 .ntr-acp-tag.is-forming > .ntr-acp-chip { animation: ntr-acp-form-chip 540ms cubic-bezier(0.16, 0.84, 0.28, 1) both; }
+/* A live agent's nameplate breathes: a soft blue halo pulses while the ACP
+   session serving this conversation is up and not released (agentTagAlive in
+   session-controls.tsx). The period comes from the settings card through the
+   --ntr-halo-period variable on the tag span; the base shadow from the plain
+   tag chip rides inside every keyframe so elevation never flickers. */
+.ntr-acp-tag.is-alive > .ntr-acp-chip {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 40%, transparent);
+  animation: ntr-acp-tag-breath var(--ntr-halo-period, 3.2s) ease-in-out infinite;
+}
+/* Steady mode: the same halo, constant. Same rule as reduced-motion below. */
+.ntr-acp-tag.is-alive.is-steady > .ntr-acp-chip {
+  animation: none;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12), 0 0 6px color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 35%, transparent), 0 0 14px color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 20%, transparent);
+}
+@keyframes ntr-acp-tag-breath {
+  0%, 100% { box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12), 0 0 4px color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 18%, transparent); }
+  50% { box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12), 0 0 9px color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 50%, transparent), 0 0 18px color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 28%, transparent); }
+}
 @keyframes ntr-acp-shatter-chip {
   0% { opacity: 1; transform: none; filter: blur(0); }
   22% { opacity: 1; transform: scale(1.05); filter: blur(0); }
@@ -773,7 +791,11 @@ const STYLE = `
 @media (prefers-reduced-motion: reduce) {
   .ntr-acp-shards { display: none; }
   .ntr-acp-chip.ntr-acp-shatter, .ntr-acp-tag.is-forming > .ntr-acp-chip { animation: none; }
-}
+  /* No pulsing, but the alive state stays visible as a static halo. */
+  .ntr-acp-tag.is-alive > .ntr-acp-chip {
+    animation: none;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12), 0 0 6px color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 35%, transparent);
+  }}
 .ntr-acp-seat { display: inline-flex; align-items: center; gap: 6px; max-width: 260px; font: inherit; font-size: 12px; line-height: 1.4; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: inherit; cursor: pointer; }
 .ntr-acp-seat:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-active, #0000000d); }
 .ntr-acp-seat:disabled { opacity: 0.5; cursor: default; }
