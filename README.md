@@ -1,6 +1,8 @@
 # dsh-ntr
 
-在 DeepSeek Harness (DSH) 的网页里，用你习惯的界面，直接和任意一个 **ACP agent**（CodeBuddy、Pi、Oh My Pi 等）对话。
+[English](./README.en.md) | 简体中文
+
+在 [DSH（DeepSeek Harness）](https://github.com/deepseek-ai/deepseek-harness) 的网页/桌面端里，用你习惯的界面，直接和任意一个 **ACP agent**（CodeBuddy、Pi、Oh My Pi、Claude Code、OpenCode、Qoder 等）对话。
 
 **DSH 提供界面，agent 提供能力。** 会话列表、输入框、侧栏、消息展示全部来自 DSH；推理、工具执行、文件读写、权限判断全部由你自己配置的那个 agent 完成，它跑在独立进程里，完全自治。这个插件只做一件事：把两边接通，并把 agent 的输出原样画到 DSH 的界面上。
 
@@ -13,17 +15,6 @@
 **NTR = Negotiated Target Routing（协商式目标路由）**。
 
 一句话：你的宿主 Agent 作为 ACP 客户端，和目标 Agent 协商能力与权限，把这一轮任务交给它执行。
-
-界面上的品牌名统一是 **NTR**：
-
-| 你在界面哪里看到它 | 它是什么 |
-| --- | --- |
-| 新建会话页的模式选择「**NTR 模式**」 | 让这条会话交给外部 agent 服务 |
-| 对话头部的 **NTR** 标签页 | 外部 agent 的原始流：工具调用、计划、diff |
-| 输入框行尾的 **NTR 底座** | 点开选 agent；模型与思考等级是同一行里各自独立的芯片。首轮开始后，agent 名变成挂在输入框上边缘的只读小挂牌（首轮没有任何输出则回滚，底座回来） |
-| 设置页的 **NTR** 分区 | 配置和管理 agent |
-
-讲协议本身的地方仍然写 ACP（启动命令、握手、`/acp` 接口路径），那是协议的名字，不是这个插件的名字。
 
 ---
 
