@@ -18,6 +18,50 @@ In one sentence: your host agent acts as an ACP client, negotiates capabilities 
 
 ---
 
+## Installation
+
+This plugin is a DSH **bundle**: `package.json`'s `dsh.bundle.patch` declares the two patches shipped with the package — the plugin's own `cordis.patch.yml`, and the NTR-mode preset at `presets/acp/acp.patch.yml`. After `dsh plugin` installs it, the package joins the profile's `dsh.profile.bundles` and the patch layers take effect **automatically** — no config file needs editing by hand.
+
+### Option 1: from the npm registry
+
+```bash
+dsh plugin --profile web add dsh-ntr@latest
+```
+
+Run the same command again to upgrade.
+
+> **Always pass `@latest`**: without it the package manager keeps reusing the version it wrote the first time, and `update` won't get you off it afterwards.
+
+### Option 2: via the [dsh-market](https://github.com/dsh-market/dsh-market) plugin market
+
+First install the market itself:
+
+```bash
+dsh plugin --profile web add dshmarket
+```
+
+Restart `dsh web` and open the **Plugins** page: on dsh 0.2.1+ the market is the **Plugin Market** tab next to **Installed**; on older hosts it lives under **Settings → Plugin Market**. Search for `dsh-ntr`, confirm the source, and install in one click — refresh the page and it's live; update checks and upgrades afterwards also happen in the market. The official DSH Desktop app ships with this market preset, so just search and install from the app's **Plugins** page.
+
+> The market's catalog comes from the curated [awesome-dsh-plugin](https://awesome-dsh-plugin.com) registry and refreshes daily. If `dsh-ntr` doesn't show up in search yet, install it from npm with Option 1 — nothing is lost.
+
+### Option 3: from source
+
+Requires Node.js ≥ 22.12.0.
+
+```bash
+git clone https://github.com/GDWhisper/dsh-ntr.git
+cd dsh-ntr
+npm install        # build dependencies (typescript, …)
+npm run build      # compile host TS + browser bundle into lib/ (build output is not committed — this step is required)
+dsh plugin --profile web add ./
+```
+
+To upgrade later: `git pull` → `npm run build` → restart `dsh web`. `add .` installs the directory as `link:`, so a rebuild plus a restart picks up the changes — no re-add needed.
+
+> `dsh plugin` is a pnpm forwarder — `--profile <name>` is required, and `add .` installs the current directory as `link:`. The official desktop app's profile is owned by its own plugin manager; don't run the CLI against it.
+
+---
+
 ## Getting started
 
 ### What you need
