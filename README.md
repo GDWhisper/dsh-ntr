@@ -58,6 +58,8 @@ dsh plugin --profile web add ./
 
 之后升级：`git pull` → `npm run build` → 重启 `dsh web`。`add .` 以 `link:` 方式安装，重建后重启即生效，不需要重新 add。
 
+> 从源码安装切到 npm / 市场版前，先在插件管理器里卸载旧版，并删掉 profile 里的 `node_modules/dsh-ntr`。pnpm 的 hoisted 布局会把 `link:` 目标里的 `node_modules` 留在包目录内，旧依赖会遮蔽新装的 SDK，典型报错见「常见问题」里的 `EPERM ... zod`。
+
 > `dsh plugin` 是 pnpm 转发器，`--profile <name>` 必填；`add .` 会把当前目录以 `link:` 方式装进 profile。官方桌面 App 的 profile 由它自己的插件管理器掌管，不要对着它的 profile 跑命令行。
 
 ---
@@ -193,6 +195,10 @@ agent 要动敏感的东西时会问你。审批卡直接出现在聊天输入�
 **导入了 agent，但它的权限模式和别的 agent 不一样？**
 
 正常。模式清单由每个 agent 自己声明（`session/set_mode` 下发），插件照原样列出，不统一翻译、也不补默认值。想改叫法要在 agent 自己的配置里改。
+
+**从源码安装切到 npm / 市场版后，启用时报 `EPERM ... zod`？**
+
+这是旧依赖残留，不是插件缺文件：错误路径里会出现 `node_modules/dsh-ntr/node_modules/.pnpm/...`。源码安装用 `link:` 指向你的仓库；pnpm 的 hoisted 布局在切到 registry 版时会把包目录换成真实文件，但会留下链接目标里的 `node_modules`。这份旧树（旧版 `@agentclientprotocol/sdk` 及其失效的 `zod` 软链）会遮蔽新装的依赖，DSH 导入时 stat 到坏链就报 `EPERM`。处理：在插件管理器里卸载 `dsh-ntr`，删除 `~/.dsh/profiles/<profile>/node_modules/dsh-ntr`（或只删它下面的 `node_modules`），再重装并重启。桌面 App 的 profile 请直接在 App 的插件页卸载/重装，不要用命令行。
 
 ---
 

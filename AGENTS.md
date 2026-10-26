@@ -130,6 +130,10 @@
 
 25. **`/acp` 必须用 owner 显式的 `connection.register`**：`rpc.handle` 在 0.1.7-rc.x 桌面 composition 上抛 `cannot get property "webServer" without inject`，导致所有 `POST /acp/*` 变 HTTP 405。`register` 缺失或抛错才回落 `rpc.handle`；信封协议与鉴权仍由 Connection 实现。→ [host.md](./docs/agents/host.md)
 
+### 依赖（31）
+
+31. **ACP SDK 的 `zod` peer 必须是直接依赖**：SDK 入口加载时就会 `import` `zod`，而宿主 profile 的 pnpm 可能设 `autoInstallPeers: false`；只靠 peer 自动安装会在官方安装里缺包。`zod` 必须留在 `dependencies`，范围与 SDK 的 peer 一致（`^3.25.0 || ^4.0.0`）。→ [README.md](./README.md#安装)
+
 ## 边界与禁区
 
 - **禁止修改 [`lib/`](./lib)**：会被 `npm run build` 全量覆盖。

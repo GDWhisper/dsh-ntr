@@ -34,7 +34,8 @@
     "prepack": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^1.4.0"
+    "@agentclientprotocol/sdk": "^1.4.0",
+    "zod": "^3.25.0 || ^4.0.0"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.2",

@@ -58,6 +58,8 @@ dsh plugin --profile web add ./
 
 To upgrade later: `git pull` → `npm run build` → restart `dsh web`. `add .` installs the directory as `link:`, so a rebuild plus a restart picks up the changes — no re-add needed.
 
+> Before switching from the source install to the npm/market build, uninstall the old version and delete `node_modules/dsh-ntr` from the profile. pnpm's hoisted layout leaves the linked checkout's `node_modules` inside the package directory, and the stale dependencies shadow the newly installed SDK — see the `EPERM ... zod` entry in the FAQ.
+
 > `dsh plugin` is a pnpm forwarder — `--profile <name>` is required, and `add .` installs the current directory as `link:`. The official desktop app's profile is owned by its own plugin manager; don't run the CLI against it.
 
 ---
@@ -193,6 +195,10 @@ That's the agent's own permission mode; the option text comes straight from it. 
 **Imported an agent, and its permission modes differ from other agents'?**
 
 Normal. Mode lists are declared by each agent itself (sent via `session/set_mode`); the plugin lists them verbatim — no unified translation, no defaults filled in. To change the wording, edit the agent's own config.
+
+**Activation fails with `EPERM ... zod` after switching from the source install to npm / the market?**
+
+That's stale dependency state, not a missing plugin file: the failing path will contain `node_modules/dsh-ntr/node_modules/.pnpm/...`. The source install uses `link:` to your checkout; pnpm's hoisted layout replaces the package directory with the registry files but leaves the link target's `node_modules` behind. That old tree (an older `@agentclientprotocol/sdk` plus its broken `zod` symlink) shadows the freshly installed dependency, so DSH's import hits the bad link and fails with `EPERM`. Fix: uninstall `dsh-ntr` in the plugin manager, remove `~/.dsh/profiles/<profile>/node_modules/dsh-ntr` (or just its nested `node_modules`), then reinstall and restart. For the desktop app's profile, uninstall/reinstall from the app's Plugins page instead of the CLI.
 
 ---
 
