@@ -50,6 +50,22 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      - name: Pin latest to the version just published
+        if: ${{ !inputs.dry_run }}
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          for _ in $(seq 1 30); do
+            npm view "dsh-ntr@$VERSION" version >/dev/null 2>&1 && break
+            sleep 10
+          done
+          npm view "dsh-ntr@$VERSION" version >/dev/null 2>&1 || {
+            echo "::error::dsh-ntr@$VERSION never became available on the registry"
+            exit 1
+          }
+          npm dist-tag add "dsh-ntr@$VERSION" latest
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       - name: Publish (rehearsal)
         if: ${{ inputs.dry_run }}
         run: npm publish --access public --provenance --dry-run
