@@ -147,16 +147,18 @@ const STYLE = `
 .dwa-inline-setting { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-2, #f9fafb); }
 .dwa-inline-setting .dwa-switch { flex-shrink: 0; margin-top: 1px; }
 .dwa-setting-copy { color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
-/* Panes stay flush (equal height) whatever the two list lengths are; the
-   shorter list's list body grows to fill, so its leftover is scrolling room
-   inside the list rather than a detached block under the last row. */
-.dwa-model-transfer { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; align-items: stretch; }
-/* Tall enough for a comfortable selection (about ten rows) before scrolling:
-   both panes share this ceiling, so equal heights cost at most one row of
-   slack on the shorter side instead of a whole empty half. */
+/* Stacked, not side by side: the rows carry name, id and credit, and a
+   half-width pane truncated them at every realistic settings width. Each list
+   gets the whole column instead. */
+.dwa-model-transfer { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+/* Tall enough for a comfortable selection (about ten rows) before scrolling;
+   the cap keeps the two stacked panes from pushing the rest of the card away. */
 .dwa-model-pane { min-width: 0; max-height: 360px; display: flex; flex-direction: column; border: var(--ntr-line); border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-1, #fff); overflow: hidden; }
 .dwa-model-pane-head { display: flex; align-items: center; gap: 6px; padding: 7px 9px; border-bottom: var(--ntr-line); font-size: var(--ntr-font-xs); font-weight: 600; color: var(--dsw-alias-text-secondary, #4b5563); }
 .dwa-model-pane-head .dwa-btn { margin-left: auto; min-height: 26px; padding: 2px 8px; font-size: var(--ntr-font-xs); }
+.dwa-model-pane-head .dwa-caret-btn { flex: none; width: 22px; height: 22px; background: transparent; }
+.dwa-model-pane-head .dwa-caret-btn:hover { background: var(--dsw-alias-interactive-bg-active, #e5e7eb); }
+.dwa-model-pane.is-collapsed .dwa-model-list { display: none; }
 .dwa-model-list { display: flex; flex-direction: column; gap: 2px; padding: 5px; flex: 1 1 auto; min-height: 0; overflow-y: auto; }
 .dwa-model-section { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; font-size: 12px; }
 .dwa-model-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -173,7 +175,19 @@ const STYLE = `
 .dwa-model-row.is-on { background: #3b82f614; color: #2563eb; }
 .dwa-model-row-mark { width: 12px; flex: none; text-align: center; opacity: 0.75; }
 .dwa-model-row-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dwa-model-row-value { flex: 0 1 auto; max-width: 45%; opacity: 0.55; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Name and credit keep their room; the id is the only cell that collapses. */
+.dwa-model-row-desc { flex: 0 0 auto; max-width: 45%; opacity: 0.75; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The trailing 14px is reserved for the fade mask: while the id fits, the
+   gradient only covers empty padding; once it overflows, its tail dissolves
+   instead of ending in a hard ellipsis. armModelIdMarquee reads the same
+   padding to scroll the full text under the pointer. */
+.dwa-model-row-value { flex: 0 1 auto; flex-shrink: 1000; box-sizing: border-box; min-width: 0; max-width: 45%; padding-right: 14px; opacity: 0.55; font-size: 10px; overflow: hidden; white-space: nowrap; mask-image: linear-gradient(to right, #000 calc(100% - 14px), transparent); -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 14px), transparent); }
+.dwa-model-row-value-text { display: inline-block; white-space: nowrap; }
+.dwa-model-row:hover .dwa-model-row-value-text { animation: dwa-model-id-marquee var(--dwa-id-duration, 1.4s) ease-in-out 0.2s infinite alternate; }
+@keyframes dwa-model-id-marquee {
+  from { transform: translateX(0); }
+  to { transform: translateX(var(--dwa-id-shift, 0px)); }
+}
 .dwa-model-row-remove { flex: none; opacity: 0.5; padding: 0 2px; }
 .dwa-model-row:hover .dwa-model-row-remove { opacity: 1; }
 .dwa-seg { display: inline-flex; border-radius: var(--ntr-radius-sm); border: 1px solid var(--dsw-alias-border-l2, #d1d5db); overflow: hidden; vertical-align: middle; }
@@ -190,7 +204,6 @@ const STYLE = `
   .dwa-page-header { flex-direction: column; }
   .dwa-page-actions { width: 100%; }
   .dwa-page-actions .dwa-btn { width: 100%; }
-  .dwa-model-transfer { grid-template-columns: 1fr; }
   .dwa-model-toolbar-actions { width: 100%; }
   .dwa-model-search { flex: 1 1 auto; width: auto; }
   .dwa-subsection-head, .dwa-preference-row { align-items: flex-start; flex-direction: column; }
@@ -198,6 +211,7 @@ const STYLE = `
 }
 @media (prefers-reduced-motion: reduce) {
   .dwa-root *, .dwa-root *::before, .dwa-root *::after { transition: none !important; }
+  .dwa-model-row:hover .dwa-model-row-value-text { animation: none !important; }
 }
 `
 
@@ -1536,6 +1550,23 @@ function RowMenu({
 }
 
 /**
+ * Measure the id cell on row hover so its CSS marquee can reach the end of the
+ * text. The id is the only cell that yields width, and the panel is resizable,
+ * so the overflow is re-read on every entry rather than cached. The animation
+ * itself lives in CSS and only runs while the row is hovered; `title` on the
+ * row stays the fallback for reduced-motion users.
+ */
+function armModelIdMarquee(row: HTMLElement): void {
+  const view = row.querySelector<HTMLElement>('.dwa-model-row-value')
+  const text = view?.querySelector<HTMLElement>('.dwa-model-row-value-text')
+  if (view === null || view === undefined || text === null || text === undefined) return
+  const fade = Number.parseFloat(getComputedStyle(view).paddingRight) || 0
+  const shift = Math.max(0, text.offsetWidth - (view.clientWidth - fade))
+  row.style.setProperty('--dwa-id-shift', `${String(-shift)}px`)
+  row.style.setProperty('--dwa-id-duration', `${String(Math.min(4, Math.max(1.2, shift / 30)))}s`)
+}
+
+/**
  * Model / thought-level catalog display plus the native-selector visibility
  * filter, as a two-pane transfer list: every known model on the left, the
  * selection that reaches the NTR surfaces on the right. Variants are still
@@ -1597,6 +1628,11 @@ function ModelCatalogBlock({
   const modelChoices = result?.catalog.model?.choices ?? []
   /** Result of the last click on 「检测可用模型」 (what the refresh changed). */
   const [detectNote, setDetectNote] = useState<string | undefined>(undefined)
+  // Each list folds on its own so a long selection can be parked while the
+  // other pane keeps the full column. The list stays mounted (display-toggled)
+  // to keep its scroll position.
+  const [allCollapsed, setAllCollapsed] = useState(false)
+  const [selectedCollapsed, setSelectedCollapsed] = useState(false)
 
   // Display read, not a probe: the host answers from its persisted catalog
   // cache, so the panes already list the known models the first time the card
@@ -1846,7 +1882,7 @@ function ModelCatalogBlock({
         </div>
 
         <div className="dwa-model-transfer">
-          <div className="dwa-model-pane">
+          <div className={`dwa-model-pane${allCollapsed ? ' is-collapsed' : ''}`}>
             <div className="dwa-model-pane-head">
               <span>{acp.label('全部模型', 'All models')}</span>
               {result !== undefined && <span className="dwa-badge">{modelChoices.length}</span>}
@@ -1858,6 +1894,15 @@ function ModelCatalogBlock({
                 title={acp.label('把当前搜索范围内的模型全部加入右侧', 'Add every model matching the current search')}
               >
                 {acp.label('全部加入', 'Add all')}
+              </button>
+              <button
+                type="button"
+                className="dwa-caret-btn"
+                aria-expanded={!allCollapsed}
+                onClick={() => setAllCollapsed(value => !value)}
+                title={allCollapsed ? acp.label('展开全部模型', 'Expand all models') : acp.label('收起全部模型', 'Collapse all models')}
+              >
+                <span className="dwa-caret" aria-hidden>{allCollapsed ? '▸' : '▾'}</span>
               </button>
             </div>
             <div className="dwa-model-list">
@@ -1876,6 +1921,7 @@ function ModelCatalogBlock({
                     className={`dwa-model-row${checked ? ' is-on' : ''}`}
                     title={title}
                     onClick={() => toggleChoice(choice.value)}
+                    onPointerEnter={event => { armModelIdMarquee(event.currentTarget) }}
                   >
                     <span className="dwa-model-row-mark">{checked ? '✓' : '+'}</span>
                     <span className="dwa-model-row-name">
@@ -1883,7 +1929,17 @@ function ModelCatalogBlock({
                       {choice.name}
                     </span>
                     {choice.value !== choice.name && (
-                      <span className="dwa-model-row-value">{choice.value}</span>
+                      <span className="dwa-model-row-value">
+                        <span className="dwa-model-row-value-text">{choice.value}</span>
+                      </span>
+                    )}
+                    {/* Credit / capability notes belong on the row itself: the
+                        list exists to compare models, and a hover-only price
+                        cannot be scanned. Grouped choices reuse the group label
+                        as their fallback description — that one is already
+                        printed before the name. */}
+                    {choice.description !== undefined && choice.description !== choice.group && (
+                      <span className="dwa-model-row-desc">{choice.description}</span>
                     )}
                   </button>
                 )
@@ -1892,7 +1948,7 @@ function ModelCatalogBlock({
             </div>
           </div>
 
-          <div className="dwa-model-pane">
+          <div className={`dwa-model-pane${selectedCollapsed ? ' is-collapsed' : ''}`}>
             <div className="dwa-model-pane-head">
               <span>{acp.label('已选模型', 'Selected models')}</span>
               <span className="dwa-badge dwa-badge-info">{basis.length}</span>
@@ -1903,6 +1959,15 @@ function ModelCatalogBlock({
                 onClick={clearAll}
               >
                 {acp.label('清空', 'Clear')}
+              </button>
+              <button
+                type="button"
+                className="dwa-caret-btn"
+                aria-expanded={!selectedCollapsed}
+                onClick={() => setSelectedCollapsed(value => !value)}
+                title={selectedCollapsed ? acp.label('展开已选模型', 'Expand selected models') : acp.label('收起已选模型', 'Collapse selected models')}
+              >
+                <span className="dwa-caret" aria-hidden>{selectedCollapsed ? '▸' : '▾'}</span>
               </button>
             </div>
             <div className="dwa-model-list">
@@ -1918,13 +1983,19 @@ function ModelCatalogBlock({
                   className="dwa-model-row is-on"
                   title={choice.description === undefined ? choice.value : `${choice.value}\n${choice.description}`}
                   onClick={() => toggleChoice(choice.value)}
+                  onPointerEnter={event => { armModelIdMarquee(event.currentTarget) }}
                 >
                   <span className="dwa-model-row-name">
                     {choice.group !== undefined && <span style={{ opacity: 0.7 }}>{choice.group} · </span>}
                     {choice.name}
                   </span>
                   {choice.value !== choice.name && (
-                    <span className="dwa-model-row-value">{choice.value}</span>
+                    <span className="dwa-model-row-value">
+                      <span className="dwa-model-row-value-text">{choice.value}</span>
+                    </span>
+                  )}
+                  {choice.description !== undefined && choice.description !== choice.group && (
+                    <span className="dwa-model-row-desc">{choice.description}</span>
                   )}
                   <span className="dwa-model-row-remove" aria-hidden="true">×</span>
                 </button>
