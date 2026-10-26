@@ -66,6 +66,13 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      # npmmirror caches packuments indefinitely; without this, a stale "latest"
+      # (e.g. an early placeholder release) keeps resolving for CN users.
+      - name: Request npmmirror sync
+        if: ${{ !inputs.dry_run }}
+        continue-on-error: true
+        run: curl -fsS -X PUT "https://registry.npmmirror.com/-/package/dsh-ntr/syncs"
+
       - name: Publish (rehearsal)
         if: ${{ inputs.dry_run }}
         run: npm publish --access public --provenance --dry-run
