@@ -59,7 +59,19 @@ interface StructuralServices {
   }
 }
 
-const zh = typeof navigator !== 'undefined' && /^zh\b/i.test(navigator.language)
+const browserPrefersZh = typeof navigator !== 'undefined' && /^zh\b/i.test(navigator.language)
+
+/**
+ * Structural view of the shell's locale service (`@deepseek-ai/dsh-client-locale`).
+ *
+ * Read through {@link ctx.get} rather than injected: a composition without the
+ * service must still load, and the label pairs carry their own browser-derived
+ * fallback for exactly that case.
+ */
+interface LocaleFace {
+  resolveText?(text: Record<string, string>): string
+  subscribe?(listener: () => void): () => void
+}
 
 /**
  * How long a host verdict may stand as the gate's ONLY fact source before the
@@ -97,8 +109,6 @@ export function apply(ctx: Context): void {
     throw new Error('dsh-ntr: browser connection.rpc is unavailable')
   }
   const call: RpcCall = (channel, endpoint, payload) => rpc.call(channel, endpoint, payload)
-  const store = new AcpStore(call, (zhText, enText) => (zh ? zhText : enText))
-  store.start()
 
   /**
    * Resolve one optional service without injecting it. A plain `ctx.get` at
@@ -107,6 +117,37 @@ export function apply(ctx: Context): void {
    * also making its absence fatal.
    */
   const service = <T,>(name: string): T | undefined => (ctx as unknown as { get(key: string): unknown }).get(name) as T | undefined
+
+  /**
+   * Resolve a Chinese/English pair against the shell's active locale. Read per
+   * call, so a language switch reaches every render-time `label()` call without
+   * rebuilding the store. A host without the locale service keeps the
+   * browser-derived choice the pairs shipped with.
+   */
+  const label = (zhText: string, enText: string): string => {
+    const resolved = service<LocaleFace>('locale')?.resolveText?.({ zh: zhText, en: enText })
+    return typeof resolved === 'string' && resolved !== '' ? resolved : browserPrefersZh ? zhText : enText
+  }
+
+  const store = new AcpStore(call, label)
+  store.start()
+
+  // A locale switch changes no data, only which side of each pair renders;
+  // republishing the snapshot is what re-runs them. Attached through
+  // `internal/service` so a late-arriving locale service is still hooked.
+  ctx.effect(() => {
+    let stop: (() => void) | undefined
+    const attach = (): void => {
+      if (stop !== undefined) return
+      stop = service<LocaleFace>('locale')?.subscribe?.(() => { store.refreshLocale() })
+    }
+    attach()
+    const stopService = ctx.on('internal/service', attach)
+    return () => {
+      stopService()
+      stop?.()
+    }
+  }, 'dsh-ntr: locale switch re-render')
 
   /** This session's command/projection face (`ctx.sessions`); `undefined` before it materializes. */
   const faceFor = (sessionId: string): AcpSessionFace | undefined => {

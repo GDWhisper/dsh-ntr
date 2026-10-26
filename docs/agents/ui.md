@@ -128,6 +128,13 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 - 工作区保存语义：单根模式（非空 `cwd`）把 `allowedCwdRoots` 收窄为 `[cwd]`；`cwd` 为空则两者都不发送（走宿主 `defaultAgentWorkspace()`）；多根模式发送编辑后的去重绝对路径。初始状态带 >1 个 root 的 agent 必须直接进多根模式，避免仅仅打开表单就收窄白名单。
 - 审批卡与权限路由见 [permissions.md](./permissions.md)。
 
+## 9. 双语文案与语言切换
+
+- 调用点一律写 `label(zh, en)` 对（`AcpStore.label`，实例绑定，可安全交给 memo 行）；运行时经宿主 `ctx.locale.resolveText({ zh, en })` 解析当前语言。`locale` 服务按 `ctx.get` 结构化读取（`LocaleFace`），缺失时回落到 `navigator.language`（`browserPrefersZh`）——不允许因此加载失败。
+- 热切换：`index.tsx` 订阅 locale 服务（`internal/service` 兜底晚到），回调 `store.refreshLocale()` **重新发布快照**（`localeRev` 自增）；`useSyncExternalStore` 因此重跑渲染期 `label()`。memo 化的 transcript 行（`BlockView`）props 不变就不会重渲染，所以它必须拿到 `localeRev`。切换不改数据，只改解析结果。
+- 已定型字符串不随切换回译：notice、权限标题兜底在事件发生时解析。唯一例外是 `detectSummary`——store 记住 `detectCounts`，在 `refreshLocale` 里重建，避免旧语言的成功行留在设置页。
+- 插件卡标题 / 描述不走这套：包内 `locale/en.json` / `locale/zh.json` 的 `meta.description` 由宿主 `readPluginMeta` 读取，经 `exports` 的 `./locale/*.json` 暴露。`en.json` 必须存在且与 `package.json.description` 一致（回退值），缺它整组本地化不生效。
+
 ## 代码索引
 
 | 主题 | 位置 |
@@ -137,4 +144,5 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 | 锁定 UI | `src/client/session-controls.tsx` · `lockedAgentOf` / `agentBaseHidden` / `agentTagVisible` / `agentTagAlive` / `agentTagHaloPresentation` / `AcpComposerAgentTag`；`src/client/agent-lock-anim.ts` |
 | 视图 | `src/client/acp-view.tsx` · `boundAgentOf` / `acpEmptyCopy` / `diffRows` / `isNewFileDiff` |
 | 斜杠 | `src/client/slash-isolation.ts` · `createSlashIsolation` / `slashAcpVerdict` / `commandCandidates` |
+| 文案 | `src/client/index.tsx` · `label` / `LocaleFace` / `browserPrefersZh`；`src/client/store.ts` · `refreshLocale` / `detectSummaryOf`；`locale/*.json` |
 | 设置页 | `src/client/panel.tsx` · `AcpSettingsSection` / `AgentRow` / `WorkspaceBlock` / `initialForm` / `buildPayload` |

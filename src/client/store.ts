@@ -83,6 +83,12 @@ export interface ChatTranscript {
 
 export interface UiState {
   open: boolean
+  /**
+   * Bumped by {@link AcpStore.refreshLocale}. Labels resolve while rendering,
+   * but memoized transcript rows compare props — this counter is what tells
+   * them the language switched.
+   */
+  localeRev: number
   stream: 'init' | 'live' | 'down'
   agents: AgentView[]
   sessions: SessionView[]
@@ -506,6 +512,7 @@ export const DEFAULT_KNOWN_PRESETS: DetectedAgentInfo[] = [
 export class AcpStore {
   private state: UiState = {
     open: false,
+    localeRev: 0,
     stream: 'init',
     agents: [],
     sessions: [],
@@ -580,6 +587,8 @@ export class AcpStore {
   private readonly seatCatalogReads = new Set<string>()
   /** In-flight `agent/cached-models` reads, keyed by agent id. */
   private readonly cachedModelReads = new Set<string>()
+  /** Counts behind the last successful explicit re-detect, so a locale switch can re-render its summary. */
+  private detectCounts: { total: number; installed: number } | undefined
 
   constructor(private readonly rpc: RpcCall, private readonly locale: (zh: string, en: string) => string) {}
 
@@ -755,19 +764,18 @@ export class AcpStore {
       const result = await this.call<{ agents: DetectedAgentInfo[] }>('agents/detect')
       const agents = result.agents.length > 0 ? result.agents : [...DEFAULT_KNOWN_PRESETS]
       const installed = agents.filter(agent => agent.detected).length
+      this.detectCounts = { total: agents.length, installed }
       this.mutate({
         detectedAgents: agents,
         detecting: false,
-        detectSummary: this.locale(
-          `已检测 ${String(agents.length)} 个预设：${String(installed)} 个已安装，其余可从「添加智能体」启用。`,
-          `Detected ${String(agents.length)} presets: ${String(installed)} installed, enable the rest via "Add agent".`,
-        ),
+        detectSummary: this.detectSummaryOf(agents.length, installed),
       })
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error)
       const notice = msg.includes('unknown endpoint agents/detect')
         ? this.locale('宿主服务运行着旧版本代码，请在终端重启 dsh web 服务以激活主机检测功能。', 'Host running older version. Please restart dsh web to enable agent detection.')
         : msg
+      this.detectCounts = undefined
       this.mutate({
         detecting: false,
         notice,
@@ -776,6 +784,13 @@ export class AcpStore {
         detectSummary: undefined,
       })
     }
+  }
+
+  private detectSummaryOf(total: number, installed: number): string {
+    return this.locale(
+      `已检测 ${String(total)} 个预设：${String(installed)} 个已安装，其余可从「添加智能体」启用。`,
+      `Detected ${String(total)} presets: ${String(installed)} installed, enable the rest via "Add agent".`,
+    )
   }
 
   async saveAgent(payload: AgentSavePayload): Promise<void> {
@@ -1586,6 +1601,20 @@ export class AcpStore {
    * renders or every row re-renders on every store notification.
    */
   label: (zh: string, en: string) => string = (zh: string, en: string): string => this.locale(zh, en)
+
+  /**
+   * Republish the snapshot after a locale switch. Every `label()` resolves
+   * against the current language while rendering, so a notification is all
+   * that is needed — except the detect summary, which the store owns as an
+   * already-resolved string and rebuilds from its counts here.
+   */
+  refreshLocale(): void {
+    const counts = this.detectCounts
+    this.mutate({
+      localeRev: this.state.localeRev + 1,
+      ...(counts === undefined ? {} : { detectSummary: this.detectSummaryOf(counts.total, counts.installed) }),
+    })
+  }
 
   clearNotice(): void {
     this.mutate({ notice: undefined })

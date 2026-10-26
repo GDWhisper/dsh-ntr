@@ -1122,6 +1122,59 @@ describe('AcpStore agent management', () => {
   })
 })
 
+describe('AcpStore locale switching', () => {
+  it('rebuilds the detect summary in the newly active language', async () => {
+    let zh = true
+    const store = new AcpStore(
+      async (_channel, endpoint) => (endpoint === 'agents/detect'
+        ? { ok: true, value: { agents: [{ id: 'pi', name: 'Pi Agent', detected: true, defaultCommand: 'pi-acp', defaultArgs: [] }] } }
+        : { ok: true, value: {} }),
+      (zhText, enText) => (zh ? zhText : enText),
+    )
+    await store.detectAgents()
+    expect(store.getSnapshot().detectSummary).toContain('个预设')
+
+    zh = false
+    store.refreshLocale()
+    expect(store.getSnapshot().detectSummary).toContain('presets')
+    // The counts, not the prose, survive the switch.
+    expect(store.getSnapshot().detectedAgents).toHaveLength(1)
+  })
+
+  it('notifies subscribers even when no stored string is locale-derived', () => {
+    const store = new AcpStore(async () => ({ ok: true, value: {} }), (zh) => zh)
+    const before = store.getSnapshot()
+    let notified = 0
+    const stop = store.subscribe(() => { notified++ })
+    store.refreshLocale()
+    stop()
+    expect(notified).toBe(1)
+    // A fresh snapshot reference is what re-runs render-time `label()` pairs;
+    // `localeRev` is what memoized transcript rows compare to notice it.
+    expect(store.getSnapshot()).not.toBe(before)
+    expect(store.getSnapshot().localeRev).toBe(before.localeRev + 1)
+  })
+
+  it('drops a stale detect summary once a re-detect fails, so the switch cannot revive it', async () => {
+    let failing = false
+    const store = new AcpStore(
+      async (_channel, endpoint) => {
+        if (endpoint !== 'agents/detect') return { ok: true, value: {} }
+        return failing
+          ? { ok: false, error: { code: 'internal', message: 'host offline' } }
+          : { ok: true, value: { agents: [{ id: 'pi', name: 'Pi Agent', detected: true, defaultCommand: 'pi-acp', defaultArgs: [] }] } }
+      },
+      (zh) => zh,
+    )
+    await store.detectAgents()
+    expect(store.getSnapshot().detectSummary).toBeDefined()
+    failing = true
+    await store.detectAgents()
+    store.refreshLocale()
+    expect(store.getSnapshot().detectSummary).toBeUndefined()
+  })
+})
+
 describe('AcpStore event application (released / reset / turn dedup)', () => {
   function makeStore(): { store: AcpStore; apply: (event: unknown) => Promise<void> } {
     const store = new AcpStore(async () => ({ ok: true, value: {} }), (zh) => zh)

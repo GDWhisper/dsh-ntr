@@ -301,13 +301,14 @@ function PlanCard({ entries, t }: { entries: Extract<Block, { kind: 'plan' }>['e
 }
 
 /**
- * One stream block, dispatched by kind. Memoized on its props — `block` and
- * the store's instance-bound `label` — so a folded batch re-renders only the
- * rows whose block object changed (`foldUpdate` replaces blocks immutably)
+ * One stream block, dispatched by kind. Memoized on its props — `block`, the
+ * store's instance-bound `label`, and `localeRev` (it moves on a language
+ * switch, so translated copy re-renders) — so a folded batch re-renders only
+ * the rows whose block object changed (`foldUpdate` replaces blocks immutably)
  * instead of the whole transcript on every store notification. `key` stays the
  * index on purpose: blocks fold append-only, and identity is the block object.
  */
-const BlockView = memo(function BlockView({ block, label }: { block: Block; label: Translate }) {
+const BlockView = memo(function BlockView({ block, label }: { block: Block; label: Translate; localeRev: number }) {
   const t = label
   switch (block.kind) {
     case 'user':
@@ -547,7 +548,7 @@ export function AcpConversationView(props: AcpViewProps) {
       >
         {transcript.blocks.length === 0
           ? <div className="ntr-acp-empty-hint">{t('还没有消息：在下面的输入框里发给它。', 'Nothing yet — send it a message below.')}</div>
-          : transcript.blocks.map((block, index) => <BlockView key={index} block={block} label={acp.label} />)}
+          : transcript.blocks.map((block, index) => <BlockView key={index} block={block} label={acp.label} localeRev={ui.localeRev} />)}
       </div>
     </div>
   )

@@ -1,0 +1,5 @@
+{
+  "meta": {
+    "description": "面向 DSH Web 界面的 ACP（Agent Client Protocol）客户端：接入任意支持 ACP 的 agent，实时展示它的会话，权限请求由你亲自答复。"
+  }
+}

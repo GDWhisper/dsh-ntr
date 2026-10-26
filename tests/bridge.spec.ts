@@ -434,6 +434,30 @@ describe('ACP bridge over stdio (mock agent)', () => {
     expect(existsSync(join(root, guardTarget.replace(/^\.\//, '')))).toBe(true)
   })
 
+  it('ships the locale dictionaries the plugin card resolves through', () => {
+    // DSH resolves `<package>/locale/en.json` through the package's exports map
+    // and treats the file's directory as the whole dictionary set; the English
+    // entry doubles as the fallback, so it must stay identical to the manifest.
+    const root = fileURLToPath(new URL('..', import.meta.url))
+    const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf-8')) as {
+      description: string
+      exports: Record<string, string>
+      files: string[]
+    }
+    expect(manifest.exports['./locale/*.json']).toBe('./locale/*.json')
+    expect(manifest.files).toContain('locale')
+
+    const descriptionOf = (lang: string): string | undefined => {
+      const dict = JSON.parse(readFileSync(join(root, 'locale', `${lang}.json`), 'utf-8')) as {
+        meta?: { description?: string }
+      }
+      return dict.meta?.description
+    }
+    expect(descriptionOf('en')).toBe(manifest.description)
+    expect(descriptionOf('zh')).toBeTruthy()
+    expect(descriptionOf('zh')).not.toBe(descriptionOf('en'))
+  })
+
   it('ships a persona row the persona row schema accepts', () => {
     // The row's schema is `prefix: string` (required) + `suffix?: string` + the
     // two flags. A stale key (`text` used to be the persona prose key) makes the

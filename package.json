@@ -17,12 +17,14 @@
     },
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json",
-    "./acp-guard": "./presets/acp/acp-guard.mjs"
+    "./acp-guard": "./presets/acp/acp-guard.mjs",
+    "./locale/*.json": "./locale/*.json"
   },
   "files": [
     "lib",
     "src",
     "presets",
+    "locale",
     "cordis.patch.yml"
   ],
   "scripts": {
