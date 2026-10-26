@@ -2,6 +2,7 @@
   "name": "dsh-ntr",
   "version": "0.1.0",
   "description": "Interactive Agent Client Protocol (ACP) client for the DSH web UI: attach any ACP-capable agent, stream its session, answer permission requests as a human.",
+  "repository": "https://github.com/GDWhisper/dsh-ntr.git",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
