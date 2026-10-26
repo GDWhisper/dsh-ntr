@@ -27,7 +27,7 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "tsc -p tsconfig.json && tsdown",
+    "build": "tsc -p tsconfig.json && tsdown --config-loader native",
     "test": "vitest run tests",
     "prepack": "npm run typecheck && npm test && npm run build"
   },
