@@ -358,7 +358,7 @@ function payloadEquals(payload: AgentSavePayload, current: AcpAgentDef): boolean
   if (!sameStringArray(payload.allowedCwdRoots ?? [], current.allowedCwdRoots ?? [])) return false
   if (!sameStringMap(payload.env ?? {}, current.env ?? {})) return false
   if (exposureKey(payload.exposedModels) !== exposureKey(current.exposedModels)) return false
-  if ((payload.autoDiscoverModels === true) !== (current.autoDiscoverModels === true)) return false
+  if ((payload.autoDiscoverModels !== false) !== (current.autoDiscoverModels !== false)) return false
   // An absent field means "use the host default" — which is what `current`
   // already resolved to (see `resolvedIdleTimeoutMs`), so it is not a change.
   if (payload.idleTimeoutMs !== undefined && payload.idleTimeoutMs !== current.idleTimeoutMs) return false
@@ -701,7 +701,7 @@ function AgentRow({
     // background resyncs never clobber in-progress checkbox edits.
   }, [serverExposureKey])
 
-  const serverAutoDiscover = detected.currentConfig?.autoDiscoverModels === true
+  const serverAutoDiscover = detected.currentConfig?.autoDiscoverModels !== false
   useEffect(() => {
     // The switch saves itself through the lightweight RPC, so the host is the
     // truth; this keeps the form (and therefore a later full save) in step.
@@ -956,7 +956,7 @@ function initialForm(detected: DetectedAgentInfo, activeAgent: AgentView | undef
     roots,
     envRows: Object.entries(config?.env ?? {}).map(([key, value]) => ({ key, value })),
     exposed: config?.exposedModels === undefined ? undefined : [...config.exposedModels],
-    autoDiscoverModels: config?.autoDiscoverModels === true,
+    autoDiscoverModels: config?.autoDiscoverModels !== false,
     // Prefer the host's resolved value: it is the one actually in effect.
     idleStr: idleText(activeAgent?.idleTimeoutMs ?? config?.idleTimeoutMs),
   }
@@ -1011,7 +1011,9 @@ function buildPayload(form: AgentForm, detected: DetectedAgentInfo, newCustom: b
     ...(form.npmPackage.trim() === '' ? {} : { npmPackage: form.npmPackage.trim() }),
     env,
     ...(form.exposed === undefined ? {} : { exposedModels: form.exposed }),
-    ...(form.autoDiscoverModels ? { autoDiscoverModels: true } : {}),
+    // Auto-discovery is ON by default: only an unchecked switch records the
+    // opt-out, otherwise a full save would silently re-enable it.
+    ...(form.autoDiscoverModels ? {} : { autoDiscoverModels: false }),
     // `''` sends nothing: the host then applies its own default.
     ...(idleRaw === '' || !idleValid(idleRaw) ? {} : { idleTimeoutMs: Number(idleRaw) }),
   }
