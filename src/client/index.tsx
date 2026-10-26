@@ -18,6 +18,7 @@ import { AcpSettingsSection } from './panel.tsx'
 import { AcpComposerMode } from './composer-mode.tsx'
 import { AcpComposerAgentTag, AcpSessionControls, AcpSessionMenu } from './session-controls.tsx'
 import { AcpConversationView } from './acp-view.tsx'
+import { AcpSettingsDialog } from './settings-dialog.tsx'
 import {
   createModelSeatClaim,
   createPermissionSeatClaim,
@@ -172,6 +173,19 @@ export function apply(ctx: Context): void {
     label: () => 'NTR',
     inject: () => ({ acp: store }),
   }, AcpSettingsSection)), 'dsh-ntr: settings section')
+
+  // The same NTR settings, opened from the composer when the agent roster is
+  // empty (the agent base's picker action). It rides the frame's overlay layer
+  // because the composer seat and the dialog live in unrelated slot trees; the
+  // host settings shell has no programmatic open seam, so the dialog mounts the
+  // same section the shell mounts (see settings-dialog.tsx). Renders nothing
+  // while closed.
+  ctx.effect(() => ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+    name: 'shell.overlay',
+    id: 'acp-settings-dialog',
+    order: 30,
+    inject: () => ({ acp: store }),
+  }, AcpSettingsDialog as unknown as SlotComponent<any>)), 'dsh-ntr: NTR settings dialog')
 
   // The agent's OWN modes sit in the composer tool row — the seat the slot
   // contract reserves for exactly this ("entries sit beside that chrome, never

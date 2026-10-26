@@ -49,10 +49,12 @@
  * different slots, so they share that module's phase clock rather than trying
  * to animate across slot boundaries.
  *
- * It is deliberately quiet: the base renders NOTHING for a conversation no ACP
- * agent has served, so an ordinary chat is untouched even before the gate
- * stands down. The ACP view tab is the entry point for those (and for re-entry
- * after a detour through another provider).
+ * It is deliberately quiet: outside ACP mode the gate never mounts it, and
+ * before the host has answered the agent roster it renders nothing. Once the
+ * roster is KNOWN to be empty the base stays and its picker carries the
+ * "open NTR settings" action — an NTR conversation with nothing configured
+ * still has a way forward instead of an empty cell. The ACP view tab remains
+ * the entry point for conversations no agent has served.
  */
 
 import { useEffect, useState } from 'react'
@@ -61,7 +63,7 @@ import type { CSSProperties } from 'react'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import {
   AcpChip, AcpMenu, AcpShatterParts, buildAcpModelId, closeAcpMenu, ensureAcpStyle,
-  openAcpMenu, setAcpMenuError, splitAcpModelId, useAcpMenu, useUi,
+  openAcpMenu, openAcpSettingsDialog, setAcpMenuError, splitAcpModelId, useAcpMenu, useUi,
 } from './acp-ui.tsx'
 import { playAgentLockAnim, useAgentLockPhase } from './agent-lock-anim.ts'
 import type {
@@ -148,6 +150,23 @@ function routeAgentId(
   if (bound?.agentId !== undefined) return bound.agentId
   if (defaultAgent !== undefined && agents.some(agent => agent.id === defaultAgent)) return defaultAgent
   return undefined
+}
+
+/**
+ * Whether the agent base has anything honest to show.
+ *
+ * An empty roster has two meanings, and they must not be conflated: before the
+ * host answers `agents/list` it means "not read yet" (rendering a setup entry
+ * there would accuse a correctly configured deployment on every page load),
+ * while after the answer it means "nothing is configured" — exactly the state
+ * that must keep the base and offer the way into NTR settings.
+ */
+export function agentBaseHasData(
+  bound: ChatSessionView | undefined,
+  agents: readonly AgentView[],
+  rosterLoaded: boolean,
+): boolean {
+  return bound !== undefined || agents.length > 0 || rosterLoaded
 }
 
 /**
@@ -374,21 +393,29 @@ export function advancedOptions(
  * The tooltip claims only what the menu behind the chip does: switch the agent.
  * The agent's models and thought levels have chips of their own (user decision,
  * 2026-10-17), so the previous wording — "switch the agent, its model and the
- * thought level" — promised a menu that holds the roster alone.
+ * thought level" — promised a menu that holds the roster alone. An EMPTY
+ * roster is its own case: the menu cannot switch to anything, it offers the
+ * way into NTR settings, so the tooltip says that instead of promising a pick.
  */
 export function agentBaseChip(
   route: RouteInfo,
   routed: boolean,
   acp: AcpChatInjected['acp'],
+  rosterEmpty = false,
 ): { label: string; title: string } {
   const label = route.agentTitle === undefined
     ? (routed ? 'NTR' : acp.label('选择 Agent', 'Choose agent'))
     : `NTR · ${route.agentTitle}`
   const title = route.agentId === undefined
-    ? acp.label(
-      '这条会话当前没有 NTR agent 服务；点开可选择 agent',
-      'No NTR agent is serving this conversation right now — open to choose one',
-    )
+    ? rosterEmpty
+      ? acp.label(
+        '这条会话当前没有 NTR agent；点开可前往 NTR 设置添加',
+        'No NTR agent is serving this conversation — open to set one up in NTR settings',
+      )
+      : acp.label(
+        '这条会话当前没有 NTR agent 服务；点开可选择 agent',
+        'No NTR agent is serving this conversation right now — open to choose one',
+      )
     : acp.label(
       '这条会话由外接 NTR agent 服务；点开可切换 agent',
       'This conversation is served by an external NTR agent — open to switch the agent',
@@ -530,9 +557,12 @@ export function AcpSessionControls(props: AcpClusterProps) {
     lockedTo ?? ui.chatBoundAgent[sessionId],
     choice,
   )
-  // A conversation with no ACP story to tell gets no chrome: the ACP view tab
-  // owns the entry point for starting one.
-  if (bound === undefined && agents.length === 0) return null
+  // An empty roster is the SETUP case, not "no story": the base stays and its
+  // picker carries the way into NTR settings. Only the window before the host
+  // has answered `agents/list` stays blank — `agents: []` there means "not read
+  // yet", and the setup entry would accuse a configured deployment (see
+  // `agentBaseHasData`).
+  if (!agentBaseHasData(bound, agents, ui.agentsLoaded)) return null
   // Set up = an agent serves this conversation: a live session, a persisted
   // pick, the host's optimistic binding, OR the plugin default the guard's
   // route rewrite falls back to. The last one is what makes a brand-new
@@ -613,7 +643,7 @@ export function AcpSessionControls(props: AcpClusterProps) {
           itself is the shatter played here (see `shattering`). */}
       {showAgentBase && (
         <AcpChip
-          {...agentBaseChip(route, routed, acp)}
+          {...agentBaseChip(route, routed, acp, agents.length === 0)}
           active={routed}
           className={shattering ? 'ntr-acp-shatter' : undefined}
           onClick={shattering ? undefined : (trigger) => { open('agent', trigger) }}
@@ -648,6 +678,14 @@ export interface MenuContext {
  */
 export const REFRESH_CATALOG_ITEM = '__refresh-catalog__'
 
+/**
+ * The empty roster's setup action. Like the model picker's refresh row it is an
+ * ACTION inside the picker, not an agent: agent ids match
+ * `[a-z0-9][a-z0-9._-]{0,63}` (no leading underscore), so no real id can
+ * collide with it.
+ */
+export const OPEN_SETTINGS_ITEM = '__open-settings__'
+
 /** The agent roster rows: one row per configured ACP agent, current one marked. */
 function agentSection(context: MenuContext): AcpMenuSection {
   const { acp, route } = context
@@ -659,11 +697,20 @@ function agentSection(context: MenuContext): AcpMenuSection {
     active: route.agentId === agent.id,
   }))
   if (items.length === 0) {
+    // The base stays on an empty roster (see `agentBaseHasData`), so this menu
+    // is the setup surface: a status row that says what is missing, then an
+    // ACTION row that opens the NTR settings. The action is a row of its own
+    // because a disabled status row cannot be the way forward.
     items.push({
       id: 'none',
       label: acp.label('还没有配置 NTR agent', 'No NTR agent configured yet'),
-      detail: acp.label('设置 → NTR', 'Settings → NTR'),
+      detail: acp.label('添加并启用一个 agent 后即可开始对话', 'Add and enable an agent to start'),
       disabled: true,
+    })
+    items.push({
+      id: OPEN_SETTINGS_ITEM,
+      label: acp.label('打开 NTR 设置', 'Open NTR settings'),
+      detail: acp.label('添加或启用 agent', 'Add or enable an agent'),
     })
   }
   return {
@@ -985,6 +1032,15 @@ export function AcpSessionMenu(props: AcpClusterProps) {
         // Opening the menu never probes; this row does. Keep the picker open so
         // the fresh list (or the probe error) lands where the user asked.
         if (agentId !== undefined) await acp.probeModels(agentId)
+        return
+      }
+      if (sectionId === 'agent' && itemId === OPEN_SETTINGS_ITEM) {
+        // The empty roster's way out (see `agentSection`): there is no agent to
+        // bind, so this row opens the NTR settings surface instead. Close the
+        // picker first — the dialog is a frame overlay and the menu must not
+        // linger behind it.
+        closeAcpMenu()
+        openAcpSettingsDialog()
         return
       }
       if (sectionId === 'agent') {

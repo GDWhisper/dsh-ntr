@@ -22,6 +22,7 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 首轮**开始**时（ACP 会话 materialize、`chat/agent-locked` 广播）锁定 agent，agent chip 从 cluster 消失，粉碎 → 挂牌动效同时开始。锁定语义见 [architecture.md §7](./architecture.md)。
 
 - 判定走 `lockedAgentOf`（宿主 `lockedAgentId` → 活/挂起 ACP 会话）与 `agentBaseHidden`，不拿插件默认 agent 兜底，也不查 roster。首轮之前底座一直在，用户可以先选好再改。
+- **空 roster 也保留底座**：`agents` 为空且宿主已经答过 `agents/list`（`ui.agentsLoaded`）时，底座照常渲染成「选择 Agent」（tooltip 改说「前往 NTR 设置添加」，不再承诺一个菜单给不出的选择），菜单里第一行是不可点的「还没有配置 NTR agent」，第二行是动作「打开 NTR 设置」（`OPEN_SETTINGS_ITEM`）。动作打开插件自己的 NTR 设置对话框（`settings-dialog.tsx` · `AcpSettingsDialog`，挂在根级 `shell.overlay`），里面挂的是与设置外壳同一个 `AcpSettingsSection`。宿主设置外壳**没有**从对话面编程打开的接缝：`settings.launcher` 是 account 菜单占用的 single 座，`openSection` 只发给 `settings.onboarding`，所以不要假装能驱动外壳模态。`agentsLoaded` 之前（宿主尚未回答）底座不渲染——那时的 `agents: []` 表示「还没读到」，不是「没配置」。→ 见 §8。
 - 退场后当前 agent 由 `conversation.input.overlay` 的挂牌 `AcpComposerAgentTag` 显示（`NTR · <agent>`，样式 `.ntr-acp-tag`）：骑在 composer 卡片上边缘，一半在卡片外、一半压在上边框（overlay anchor `top: 0` + `translateY(-50%)`）。
 - 挂牌**只读**（`AcpChip` 无 `onClick` 时渲染静态 `span`、无 caret），换 agent 只能新建会话。
 - 挂牌自带闸门 `agentTagVisible`：显式 `acpMode === false` 压过残留 `chatSessions`，`undefined` 才回落到锁本身。
@@ -122,6 +123,7 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 
 ## 8. 设置页
 
+- **同一个设置页有两个入口**：宿主设置外壳里的 `settings.section`（`AcpSettingsSection`），以及对话内底座空 roster 菜单打开的 `AcpSettingsDialog`（`shell.overlay`）。两处挂的是同一个组件，配置逻辑只有一份；对话框不做第二套表单。宿主外壳的打开状态归它自己，插件无法从对话面驱动（见 §2）。
 - 模型区（`ModelCatalogBlock`）**常驻渲染**，严禁挂在探测结果上：右侧「已选模型」来自 agent 配置的 `exposedModels`，左侧「全部模型」来自宿主目录缓存（`agent/cached-models`，纯内存、不 spawn，见 [state.md §4](./state.md)），所以打开卡片就能看到已配置的东西。`检测可用模型` 只是**左侧列表的刷新**（新增的加进来、下架的去出去），与搜索框同放在模型区自己的工具栏里（不在区块顶部），点击后在标题行回报「新增 N · 移除 M / 目录无变化」。空目录时左侧给引导文案（未读取 / 该 Agent 未暴露 `category: model`），而不是隐藏整块。
 - 每张 agent 卡保持「紧凑行 + 展开详情」两段，详情体**常挂载**、只用 `display: none` 折叠——条件渲染会重挂载表单 `useState`，丢掉用户编辑中的值。缓存读按 `active`（展开态）触发，折叠的卡片不发请求。
 - 页面按 `section` 分组：页头（标题 / 描述 / 流状态）→ 模式横幅 → 已接入的智能体 → 添加智能体 → 对话外观。文案里点名的控件名必须与可见标题一致：store 的 `detectSummary` 与空态提示都指向「添加智能体」，改名要三处同步（`store.ts` / `panel.tsx` / `tests/store.spec.ts`）。
@@ -146,3 +148,4 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 | 斜杠 | `src/client/slash-isolation.ts` · `createSlashIsolation` / `slashAcpVerdict` / `commandCandidates` |
 | 文案 | `src/client/index.tsx` · `label` / `LocaleFace` / `browserPrefersZh`；`src/client/store.ts` · `refreshLocale` / `detectSummaryOf`；`locale/*.json` |
 | 设置页 | `src/client/panel.tsx` · `AcpSettingsSection` / `AgentRow` / `WorkspaceBlock` / `initialForm` / `buildPayload` |
+| 设置对话框 | `src/client/settings-dialog.tsx` · `AcpSettingsDialog`；`src/client/acp-ui.tsx` · `openAcpSettingsDialog` / `closeAcpSettingsDialog` / `useAcpSettingsDialogOpen` |

@@ -434,6 +434,54 @@ export function useAcpMenu(): MenuState | null {
   )
 }
 
+// ---- The NTR settings dialog ----
+
+/**
+ * Open state of the frame-wide NTR settings dialog (`settings-dialog.tsx`).
+ *
+ * Module-level because the two ends live in unrelated slot trees: the trigger
+ * is the composer's agent base (a session-scoped model-seat entry) and the
+ * dialog itself rides the root `shell.overlay` layer. A React context cannot
+ * span that boundary, so this is the same tiny external-store seam the menu
+ * uses above.
+ */
+let settingsDialogOpen = false
+const settingsDialogListeners = new Set<() => void>()
+
+function emitSettingsDialog(): void {
+  for (const listener of [...settingsDialogListeners]) listener()
+}
+
+/** Open the NTR settings dialog (the empty agent roster's way forward). */
+export function openAcpSettingsDialog(): void {
+  if (settingsDialogOpen) return
+  settingsDialogOpen = true
+  emitSettingsDialog()
+}
+
+/** Close the NTR settings dialog (close button, mask click, Escape). */
+export function closeAcpSettingsDialog(): void {
+  if (!settingsDialogOpen) return
+  settingsDialogOpen = false
+  emitSettingsDialog()
+}
+
+/** Current dialog state, for tests and non-React readers. */
+export function acpSettingsDialogIsOpen(): boolean {
+  return settingsDialogOpen
+}
+
+/** Subscribe to the dialog state (the root overlay entry reads it). */
+export function useAcpSettingsDialogOpen(): boolean {
+  return useSyncExternalStore(
+    cb => {
+      settingsDialogListeners.add(cb)
+      return () => { settingsDialogListeners.delete(cb) }
+    },
+    acpSettingsDialogIsOpen,
+  )
+}
+
 // ---- Menu presentation ----
 
 /** One selectable row of a picker. */
@@ -883,6 +931,26 @@ const STYLE = `
 .ntr-acp-empty-hint { color: var(--dsw-alias-text-secondary, #6b7280); font-size: 12px; }
 .ntr-acp-seat-diag { font-family: var(--dsw-alias-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); opacity: 0.72; word-break: break-word; }
 .ntr-acp-empty-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+/* ---- NTR settings dialog (shell.overlay) ---- */
+/* Frame-wide surface opened from the agent base's empty-roster menu. The
+   overlay layer itself is click-through, so the layer opts back in and blocks
+   the app while it is up. */
+.ntr-acp-dialog-layer { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; pointer-events: auto; }
+.ntr-acp-dialog-mask { position: absolute; inset: 0; background: var(--dsw-alias-bg-mask-1, rgba(0, 0, 0, 0.4)); }
+.ntr-acp-dialog {
+  position: relative; display: flex; flex-direction: column; overflow: hidden;
+  width: min(920px, calc(100vw - 48px)); height: min(820px, calc(100vh - 48px));
+  background: var(--dsw-alias-bg-layer-2, #fff); color: inherit;
+  border-radius: 24px; box-shadow: var(--dsw-elevation-prominent, 0 24px 60px rgba(0, 0, 0, 0.25));
+}
+.ntr-acp-dialog-head { flex: none; display: flex; align-items: center; gap: 8px; padding: 16px 16px 8px 24px; }
+.ntr-acp-dialog-title { flex: 1; font-size: 16px; font-weight: 600; }
+.ntr-acp-dialog-close { font: inherit; font-size: 14px; line-height: 1; width: 30px; height: 30px; padding: 0; border: none; border-radius: 999px; background: none; color: inherit; cursor: pointer; }
+.ntr-acp-dialog-close:hover { background: var(--dsw-alias-interactive-bg-active, #0000000d); }
+.ntr-acp-dialog-body { flex: 1; min-height: 0; overflow: auto; }
+/* The section brings its own page scroll for the settings shell's content
+   column; the dialog body is the scroll owner here. */
+.ntr-acp-dialog-body > .dwa-root { max-width: none; overflow: visible; }
 `
 
 let styleMounted = false

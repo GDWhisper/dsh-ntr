@@ -2,7 +2,8 @@
  * The composer's ACP cluster: what the agent base chip claims, what the model
  * picker says about a model that is not on offer, what the thought-level picker
  * calls its "follow the default" row, and what the agent-mode tooltip says about
- * the host's Access mode.
+ * the host's Access mode. Also: an empty agent roster keeps the base and offers
+ * the way into NTR settings.
  *
  * These are the audit's text/behavior mismatches in this area (F5, F25, F26,
  * F27, F43): a chip that named an agent no request path would ever use, a picker
@@ -19,8 +20,14 @@
 import { describe, expect, it } from 'vitest'
 import { agentModeTitle } from '../src/client/composer-mode.tsx'
 import {
+  acpSettingsDialogIsOpen,
+  closeAcpSettingsDialog,
+  openAcpSettingsDialog,
+} from '../src/client/acp-ui.tsx'
+import {
   advancedOptions,
   agentBaseChip,
+  agentBaseHasData,
   agentBaseHidden,
   agentTagChip,
   agentTagAlive,
@@ -29,6 +36,7 @@ import {
   describeRoute,
   lockedAgentOf,
   menuFor,
+  OPEN_SETTINGS_ITEM,
   REFRESH_CATALOG_ITEM,
 } from '../src/client/session-controls.tsx'
 import { AcpStore } from '../src/client/store.ts'
@@ -118,6 +126,47 @@ describe('the agent base chip names only an agent that serves the conversation',
     // Nothing is running and nothing is picked, so no row may read as current.
     const menu = menuFor('agent', { acp, agents: roster, route: describeRoute(roster, undefined, undefined) })
     expect(menu.sections[0]?.items.every(item => item.active !== true)).toBe(true)
+  })
+})
+
+describe('an empty agent roster keeps the base and offers the settings entry', () => {
+  const acp = new AcpStore(async () => ({ ok: true, value: {} }), zh => zh)
+
+  it('waits for the host roster answer before calling the roster empty', () => {
+    // Before `agents/list` answers, `agents: []` means "not read yet". Offering
+    // the setup entry there would accuse a configured deployment on every load.
+    expect(agentBaseHasData(undefined, [], false)).toBe(false)
+    expect(agentBaseHasData(undefined, [], true)).toBe(true)
+    // A live session or a non-empty roster is evidence on its own.
+    expect(agentBaseHasData(undefined, [{ id: 'pi' } as AgentView], false)).toBe(true)
+    expect(agentBaseHasData({ agentId: 'pi', sessionId: 's1' }, [], false)).toBe(true)
+  })
+
+  it('keeps the base chip and puts the setup action inside its picker', () => {
+    const route = describeRoute([], undefined, undefined)
+    // The base still says what it always said: nothing serves this conversation.
+    expect(agentBaseChip(route, false, acp).label).toBe('选择 Agent')
+    // ...but with an empty roster the tooltip points at settings, not at a pick
+    // the menu cannot offer.
+    const emptyChip = agentBaseChip(route, false, acp, true)
+    expect(emptyChip.title).toContain('NTR 设置')
+    expect(emptyChip.title).not.toContain('可选择 agent')
+    const menu = menuFor('agent', { acp, agents: [], route })
+    const items = menu.sections[0]?.items ?? []
+    // Status first (not clickable), then the action row that opens settings.
+    expect(items.map(item => item.id)).toEqual(['none', OPEN_SETTINGS_ITEM])
+    expect(items[0]?.disabled).toBe(true)
+    expect(items[1]).toMatchObject({ label: '打开 NTR 设置' })
+    expect(items[1]?.disabled).toBeUndefined()
+  })
+
+  it('opens and closes the frame-wide settings dialog', () => {
+    closeAcpSettingsDialog()
+    expect(acpSettingsDialogIsOpen()).toBe(false)
+    openAcpSettingsDialog()
+    expect(acpSettingsDialogIsOpen()).toBe(true)
+    closeAcpSettingsDialog()
+    expect(acpSettingsDialogIsOpen()).toBe(false)
   })
 })
 

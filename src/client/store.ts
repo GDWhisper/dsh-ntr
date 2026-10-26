@@ -91,6 +91,12 @@ export interface UiState {
   localeRev: number
   stream: 'init' | 'live' | 'down'
   agents: AgentView[]
+  /**
+   * Whether the host has answered `agents/list` at least once in this page.
+   * `agents: []` alone cannot tell "no agent configured" from "not read yet";
+   * a surface that offers a setup entry on an empty roster must wait for this.
+   */
+  agentsLoaded: boolean
   sessions: SessionView[]
   activeSessionId?: string
   blocks: Block[]
@@ -515,6 +521,7 @@ export class AcpStore {
     localeRev: 0,
     stream: 'init',
     agents: [],
+    agentsLoaded: false,
     sessions: [],
     blocks: [],
     permissions: [],
@@ -744,6 +751,7 @@ export class AcpStore {
       // Absent on an older host: keep the settings-panel card (degraded path).
       this.mutate({
         agents,
+        agentsLoaded: true,
         sessions,
         defaultAgent: defaultAgentInfo?.agentId,
         detectedAgents,
