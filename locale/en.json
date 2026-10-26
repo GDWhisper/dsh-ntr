@@ -1,5 +1,5 @@
 {
   "meta": {
-    "description": "Interactive Agent Client Protocol (ACP) client for the DSH web UI: attach any ACP-capable agent, stream its session, answer permission requests as a human."
+    "description": "Interactive Agent Client Protocol (ACP) client for the DSH web UI: attach any ACP-capable agent and stream its session."
   }
 }
