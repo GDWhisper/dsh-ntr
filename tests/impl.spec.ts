@@ -18,7 +18,10 @@ import {
   isAcpToolContinuation,
   isAbsolutePath,
   isUnderPath,
+  MAX_CONFIG_OPTIONS_BYTES,
+  mergeCatalogShape,
   parseCatalogOptions,
+  usableConfigOptions,
   permissionToolKind,
   permissionToolPaths,
   resolveFsPath,
@@ -124,10 +127,31 @@ describe('parseCatalogOptions', () => {
     })
     expect(catalog.thought?.configId).toBe('think')
     expect(catalog.thought?.currentValue).toBe('high')
-    // Every other SELECT is an extra (the composer's advanced base); a boolean
-    // carries no choices and is skipped.
+    // Every other SELECT is an extra (the composer's advanced base). A boolean
+    // toggle is one too: it carries no choices, and `kind` is what tells the
+    // composer to render a checkbox instead of a select.
     expect(catalog.extras).toEqual([
       { configId: 'temp', name: 'Temp', currentValue: 'mid', choices: [{ value: 'mid', name: 'mid' }] },
+      { configId: 'flag', name: 'Flag', kind: 'boolean', currentValue: 'true', choices: [] },
+    ])
+  })
+
+  it('sends a boolean to the advanced base even when it claims a select category', () => {
+    // Some agents publish their thinking switch as a `thought_level` BOOLEAN.
+    // The thought chip picks among levels and has none to show for it, so the
+    // toggle must stay reachable as a checkbox rather than vanish into a slot
+    // with an empty choice list.
+    const catalog = parseCatalogOptions([
+      { configId: 'think', name: 'Thinking', type: 'boolean', category: 'thought_level', currentValue: false },
+      { configId: 'nocard', name: 'No card', category: 'model', currentValue: true },
+    ])
+    expect(catalog.thought).toBeUndefined()
+    expect(catalog.model).toBeUndefined()
+    expect(catalog.extras).toEqual([
+      { configId: 'think', name: 'Thinking', kind: 'boolean', currentValue: 'false', choices: [] },
+      // `type` is absent, but a JSON boolean current value with no choices is
+      // still a toggle (defensive: not every agent fills `type`).
+      { configId: 'nocard', name: 'No card', kind: 'boolean', currentValue: 'true', choices: [] },
     ])
   })
 
@@ -194,6 +218,100 @@ describe('parseCatalogOptions', () => {
         choices: [{ value: 'false', name: 'Local' }],
       }],
     })
+  })
+})
+
+describe('mergeCatalogShape', () => {
+  it('adopts a newly observed slot without its per-session currentValue', () => {
+    // The shape absorb is fed `session/set_config_option` answers, where the
+    // current value is ONE session's pick (opencode: `effort` appears only
+    // after switching to a model with variants). Promoting it would make that
+    // pick `reasoning.defaultEffort` for every other conversation.
+    const merged = mergeCatalogShape({ model: modelOption(['a'], 'a') }, {
+      model: modelOption(['a'], 'b'),
+      thought: { configId: 'effort', name: 'Effort', currentValue: 'high', choices: choiceList(['low', 'high', 'default']) },
+    })
+    expect(merged.thought).toEqual({
+      configId: 'effort',
+      name: 'Effort',
+      currentValue: null,
+      choices: choiceList(['low', 'high', 'default']),
+    })
+    // An existing slot keeps the CATALOG's current value, not the answer's.
+    expect(merged.model?.currentValue).toBe('a')
+  })
+
+  it('keeps the catalog value while the observed choices still offer it, and drops it when they do not', () => {
+    const existing = {
+      thought: { configId: 'effort', name: 'Effort', currentValue: 'xhigh', choices: choiceList(['xhigh', 'default']) },
+    }
+    expect(mergeCatalogShape(existing, { thought: { configId: 'effort', name: 'Effort', currentValue: 'default', choices: choiceList(['xhigh', 'default']) } })
+      .thought?.currentValue).toBe('xhigh')
+    // The new model's vocabulary no longer offers it: back to "agent default".
+    expect(mergeCatalogShape(existing, { thought: { configId: 'effort', name: 'Effort', currentValue: 'default', choices: choiceList(['low', 'max', 'default']) } })
+      .thought?.currentValue).toBeNull()
+  })
+
+  it('leaves slots the answer omits alone and merges extras by configId', () => {
+    const existing = {
+      model: modelOption(['a'], 'a'),
+      extras: [{ configId: 'temp', name: 'Temp', currentValue: 'mid', choices: choiceList(['mid']) }],
+    }
+    const merged = mergeCatalogShape(existing, {
+      thought: { configId: 'effort', name: 'Effort', currentValue: 'default', choices: choiceList(['default']) },
+      extras: [{ configId: 'style', name: 'Style', currentValue: 'plain', choices: choiceList(['plain']) }],
+    })
+    // Omitted: untouched (another model may still offer them).
+    expect(merged.model).toEqual(existing.model)
+    expect(merged.mode).toBeUndefined()
+    // Extras union: the unobserved one survives, the observed one lands beside it.
+    expect(merged.extras?.map(option => option.configId)).toEqual(['temp', 'style'])
+    expect(merged.extras?.[0]?.currentValue).toBe('mid')
+    expect(merged.extras?.[1]?.currentValue).toBeNull()
+  })
+
+  it('keeps a boolean extra a boolean, adopting its shape without the per-session value', () => {
+    const existing = {
+      extras: [{ configId: 'stream', name: 'Stream', kind: 'boolean' as const, currentValue: 'false', choices: [] }],
+    }
+    const observed = parseCatalogOptions([
+      { configId: 'stream', name: 'Stream', type: 'boolean', currentValue: true },
+      { configId: 'verbose', name: 'Verbose', type: 'boolean', currentValue: true },
+    ])
+    const merged = mergeCatalogShape(existing, observed)
+    // Known toggle: shape absorbed, catalog default untouched.
+    expect(merged.extras?.[0]).toEqual({ configId: 'stream', name: 'Stream', kind: 'boolean', currentValue: 'false', choices: [] })
+    // New toggle: the answer's `true` is that session's pick, not the default.
+    expect(merged.extras?.[1]).toEqual({ configId: 'verbose', name: 'Verbose', kind: 'boolean', currentValue: null, choices: [] })
+  })
+})
+
+function modelOption(values: string[], currentValue: string | null) {
+  return { configId: 'model', name: 'Model', currentValue, choices: choiceList(values) }
+}
+
+function choiceList(values: string[]) {
+  return values.map(value => ({ value, name: value }))
+}
+
+describe('usableConfigOptions', () => {
+  it('treats an empty or absent answer as a non-answer', () => {
+    // Agents return `configOptions: []` in intermediate states (observed with
+    // ccb / opencode on OmniTerm's side); overwriting known state with it would
+    // wipe a perfectly good catalog for a state that passes.
+    expect(usableConfigOptions(undefined)).toBe(false)
+    expect(usableConfigOptions(null)).toBe(false)
+    expect(usableConfigOptions([])).toBe(false)
+    expect(usableConfigOptions('nope')).toBe(false)
+    expect(usableConfigOptions([{ configId: 'model' }])).toBe(true)
+  })
+
+  it('drops absurdly large answers instead of absorbing them', () => {
+    // A misbehaving agent must not turn every notification into an unbounded
+    // write (the same red line OmniTerm caps its config snapshots at).
+    const huge = [{ configId: 'model', name: 'x'.repeat(MAX_CONFIG_OPTIONS_BYTES) }]
+    expect(usableConfigOptions(huge)).toBe(false)
+    expect(usableConfigOptions([{ configId: 'model', name: 'x'.repeat(1024) }])).toBe(true)
   })
 })
 
@@ -375,11 +493,11 @@ describe('validateAgentDef', () => {
     expect(() => validateAgentDef({ id: 'pi', command: 'x', exposedModels: ['y'.repeat(513)] })).toThrow(/exposedModels/)
   })
 
-  it('keeps autoDiscoverModels as an optional boolean (false and absent are "off")', () => {
-    expect(validateAgentDef({ id: 'pi', command: 'x', autoDiscoverModels: true }).autoDiscoverModels).toBe(true)
-    // Stored only when true: false and absent are the same host-side state.
-    expect('autoDiscoverModels' in validateAgentDef({ id: 'pi', command: 'x', autoDiscoverModels: false })).toBe(false)
+  it('treats autoDiscoverModels as on by default; only the explicit opt-out is persisted', () => {
+    // Default-on: `true` and absent are the same state, so neither is stored.
+    expect('autoDiscoverModels' in validateAgentDef({ id: 'pi', command: 'x', autoDiscoverModels: true })).toBe(false)
     expect('autoDiscoverModels' in validateAgentDef({ id: 'pi', command: 'x' })).toBe(false)
+    expect(validateAgentDef({ id: 'pi', command: 'x', autoDiscoverModels: false }).autoDiscoverModels).toBe(false)
     expect(() => validateAgentDef({ id: 'pi', command: 'x', autoDiscoverModels: 'yes' })).toThrow(/autoDiscoverModels/)
   })
 

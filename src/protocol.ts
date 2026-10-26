@@ -66,12 +66,13 @@ export interface AcpAgentDef {
    */
   exposedModels?: string[]
   /**
-   * Auto-discovery for {@link exposedModels}: when true, every model the agent
-   * NEWLY publishes (present in an observed catalog but absent from the one
-   * known before it) is appended to `exposedModels` automatically. It never
+   * Auto-discovery for {@link exposedModels}, ON by default: every model the
+   * agent NEWLY publishes (present in an observed catalog but absent from the
+   * one known before it) is appended to `exposedModels` automatically. It never
    * touches models the user already had selected, and the very first catalog
-   * observation is a baseline (nothing is "new" yet). Set from the settings
-   * card's lightweight `agent/set-auto-discover-models` RPC — never by
+   * observation is a baseline (nothing is "new" yet). `false` is the explicit
+   * opt-out and the only value persisted; unset means "on". Flipped from the
+   * settings card's lightweight `agent/set-auto-discover-models` RPC — never by
    * `agent/save`, which restarts the process for connection changes.
    */
   autoDiscoverModels?: boolean
@@ -440,7 +441,7 @@ export interface ChatModelSetPayload { dshSessionId: string; modelId: string }
 /** `session/chat-effort-set`: switch (or clear, by omitting) the agent's effort; `agentId` names the agent a not-yet-bound conversation is served by (the plugin default). */
 export interface ChatEffortSetPayload { dshSessionId: string; effort?: string; agentId?: string }
 /** `session/chat-config-set`: set one of the agent's extra config options. */
-export interface ChatConfigSetPayload { dshSessionId: string; configId: string; value: string; agentId?: string }
+export interface ChatConfigSetPayload { dshSessionId: string; configId: string; value: string | boolean; agentId?: string }
 
 /** Host-detected agent presence and tested defaults. */
 export interface DetectedAgentInfo {
@@ -466,7 +467,7 @@ export interface AgentSavePayload {
   allowedCwdRoots?: string[]
   env?: Record<string, string>
   exposedModels?: string[]
-  /** Keep newer models the agent publishes in the selection (see {@link AcpAgentDef.autoDiscoverModels}). */
+  /** Opt out of auto-discovery with `false`; absent keeps the default (on). See {@link AcpAgentDef.autoDiscoverModels}. */
   autoDiscoverModels?: boolean
   /** Absent → keep the host default (30 minutes); `0` = never release. */
   idleTimeoutMs?: number
@@ -511,6 +512,12 @@ export interface AcpCatalogChoice {
 export interface AcpCatalogOption {
   configId: string
   name: string
+  /**
+   * `'boolean'` for an on/off toggle: `currentValue` is the string `'true'` /
+   * `'false'` (the catalog stays string-typed so every existing reader keeps
+   * working) and `choices` is empty. Absent means the ordinary select.
+   */
+  kind?: 'boolean'
   /** Currently selected value at parse time (may be absent from `choices`). */
   currentValue: string | null
   choices: AcpCatalogChoice[]
@@ -590,7 +597,7 @@ export interface AcpConversationChoice {
    * accepts, persisted per conversation so a pick survives a restart and is
    * re-applied when its ACP session is recreated or resumed.
    */
-  extraConfigs?: Record<string, string>
+  extraConfigs?: Record<string, string | boolean>
 }
 
 /** Result of `agent/probe-models`: the freshly probed (or cached) catalog. */
@@ -605,6 +612,13 @@ export interface AgentCatalogExtraOption {
   configId: string
   /** The agent's own option name (falls back to the config id host-side). */
   name: string
+  /**
+   * `'boolean'` for an on/off toggle (`currentValue` is `'true'` / `'false'`,
+   * `choices` is empty and the composer renders a checkbox row). Absent means
+   * the ordinary select. Kept optional so cached catalogs written before
+   * toggles existed still read.
+   */
+  kind?: 'boolean'
   /** The value the agent reports as current, when it reports one. */
   currentValue?: string
   choices: Array<{ id: string; name: string; description?: string }>

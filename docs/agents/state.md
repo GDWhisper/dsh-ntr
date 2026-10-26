@@ -49,17 +49,18 @@
   3. 旧 schema 的磁盘缓存——**不重探**，而是被 ② 顺带修好（`absorbCatalog` 清 `catalogStale`）。
 - **`agent/cached-models` 是同一份内存的第二个读口**（`BridgeManager.cachedAgentModels`）：返回某 agent 最后一次观测到的目录（无则 `null`），供设置页模型区常驻显示「全部模型」。它同样**绝不 spawn**，也**不在**上面三条手势清单里——只读缓存；刷新仍由 `agent/probe-models` 承担。注意探测在「答案没变」时会保留旧 `updatedAt`，所以面板的「新增 N / 移除 M」必须由点击前后两份列表对比得出，不能靠 `updatedAt` 变化。
 - 客户端 `loadAgentCatalog` 的调用点必须先判定「这条会话真的指向某个 agent」：`routeAgentId` 有答案即可（活会话 / pick / `chatBoundAgent` / **插件默认 agent**）。默认回落**不是**「别人的目录」：guard 的 `agent/request` 改写就是用它，且 `agent/catalog` 纯内存、绝不 spawn。**严禁**的是借 `agents[0]` 之类的名字读一条没有 agent 会服务的会话。`/` 菜单的懒读同理，按 `chatAgentFor` 找到实际会服务这条会话的 agent。测试：`tests/bridge.spec.ts` 的 "NEVER spawns an agent just because a catalog was read"。
-- **结构**：`base`（裸 `agentId` = agent 默认模型）+ `exposedModels` 过滤后的 `variants` + agent 自己的 `thought_level` 作为 `reasoning` + 其余 select 作为 `extras`（`CATALOG_SCHEMA = 3`；旧缓存仍可读并标记待修复）。`resolveAdapterModel` 对已知 agent 的任何输入都不得 throw（过期变体降级为裸 id 条目），仅对未配置 agent throw；`exposedModels` 过滤只作用于 `agentCatalog` 的变体展开（`base` 永不过滤），严禁影响 `resolveAdapterModel`。
+- **结构**：`base`（裸 `agentId` = agent 默认模型）+ `exposedModels` 过滤后的 `variants` + agent 自己的 `thought_level` 作为 `reasoning` + 其余 select / boolean 作为 `extras`（`CATALOG_SCHEMA = 3`；旧缓存仍可读并标记待修复）。boolean 带 `kind: 'boolean'`、`choices: []`，`currentValue` 编码为 `'true'` / `'false'`（catalog 全体保持字符串类型），即使它自称 `category: thought_level` 也不进 `thought` 槽——等级控件没有可选等级，进槽等于让控件消失。`resolveAdapterModel` 对已知 agent 的任何输入都不得 throw（过期变体降级为裸 id 条目），仅对未配置 agent throw；`exposedModels` 过滤只作用于 `agentCatalog` 的变体展开（`base` 永不过滤），严禁影响 `resolveAdapterModel`。
 - **变体按需**：未设置 / 空 = 只留 `base`。真实 agent 动辄数百个 choice，默认全暴露在无搜索的菜单里就是列表风暴。供应商 `group` 只能来自 agent 自己返回的 ACP `SessionConfigSelectGroup` 标签，严禁从名称前缀 / value 路径 / 家族词猜测（任何供应商都可能供应别家模型）。
 - **热更新**：真实会话观察到新目录时（`session/new` / `session/load` 响应、`config_option_update`），`absorbCatalog` 只要内容变化就必须广播 `catalog/updated`（`agentId` + `updatedAt`）；浏览器 `applyEvent` 收到后失效该 agent 的 `seatCatalogs` 并重读 `agent/catalog`（`loadAgentCatalog` 的 dedupe 保留）。不广播，首轮前打开的会话会永远停在旧列表（omp 实测 `session/new` 报 780，磁盘 / 浏览器停在 774）。
-- `session/set_config_option` 的响应**只**反哺 `session.configOptions`，**严禁**喂进 `absorbCatalog`：那里的 `currentValue` 是这条会话的选择，升格成 agent 级 `reasoning.defaultEffort` 会让下一轮把座位刚选的思考等级静默改回去。
+- `session/set_config_option` 的响应有两半，**严禁**整包喂进 `absorbCatalog`：`currentValue` 是这条会话的选择，升格成 agent 级 `reasoning.defaultEffort` 会让下一轮把座位刚选的思考等级静默改回去。但**形状**（哪些 option 存在、各有哪些 choice）必须经 `absorbCatalogShape`（纯函数 `mergeCatalogShape`）合进 agent 级目录并广播 `catalog/updated`——opencode 只给带 variants 的模型发 `thought_level`、切模型后又不推 `config_option_update`，这个响应是唯一来源，不吃形状思考等级芯片就永远不出现。合并规则：已存在槽位保留目录已知的 `currentValue`（观测 choice 列表不再提供它则退回 `null`）、新槽位一律 `null`；响应未提及的槽位 / extra 原样保留；不触发 `autoExposeNewModels`、不清 `catalogStale`（这不是 agent 级观测）。测试：`tests/impl.spec.ts` · `mergeCatalogShape`。
+- **空 / 超大 `configOptions` 应答一律视为「非应答」**：`usableConfigOptions`（`src/impl.ts`，上限 `MAX_CONFIG_OPTIONS_BYTES` = 1 MiB）守卫六个入口——`session/new`、`session/load`、`session/set_config_option` 响应、`config_option_update` 通知、`absorbCatalog`、`absorbCatalogShape`。`[]` / `undefined` / 超限都不覆盖已知状态（catalog 与 `session.configOptions` 保持原样、不广播）：agent 在重置中 / provider 加载中会回空集，按「这个 agent 现在没有选项」处理会抹掉正在显示的模型列表与会话快照。测试：`tests/impl.spec.ts` · `usableConfigOptions`、`tests/bridge.spec.ts` · "EMPTY configOptions answer"。
 - **DSH 自己的模型目录里没有 ACP 条目**（`AcpLlmAdapter.listModels('acp')` 返回空数组）。宿主目录构建是 per-request，一旦广告就等于对每条会话广告；`listModels` 契约本身写明目录是 advisory，空列表不影响解析、选择与流式。把 ACP 模型整体搬进 `agent/catalog` 是唯一结构性诚实的隔离。
 
 ## 5. 模型可见性筛选
 
 - `exposedModels`（左全量 / 右已选）经 `agent/set-exposed-models` 原地修改 def 并持久化（`setExposedModels`），**不重启 agent 进程**。`agent/save` 会停掉子进程、杀死全部活动会话，只能用于命令 / 参数等真正需要重建的变更。
 - 浏览器在保存后必须失效并重读该 agent 的座位目录缓存（`loadAgentCatalog`），否则已打开的对话仍列旧集合。
-- **自动发现**（`autoDiscoverModels`，面板「自动发现新模型」开关，经 `agent/set-auto-discover-models` 轻量切换）：开启后 `absorbCatalog` 把**相对上一份已知目录新增**的模型追加进 `exposedModels` 并持久化。首次观察到的目录只是基线（不会把 500 个模型一次全选），用户主动取消勾选的模型不会被复活。
+- **自动发现**（`autoDiscoverModels`，面板「自动发现新模型」开关，**默认开启**，经 `agent/set-auto-discover-models` 轻量切换）：`absorbCatalog` 把**相对上一份已知目录新增**的模型追加进 `exposedModels` 并持久化。首次观察到的目录只是基线（不会把 500 个模型一次全选），用户主动取消勾选的模型不会被复活。落盘只记录显式关闭（`autoDiscoverModels: false`）；缺省与 `true` 等价，均为开启。
 - 任何 `exposedModels` / 开关变更（含自动追加）都必须广播 `agent/exposure`；浏览器据此更新设置卡 `currentConfig` 并失效 / 重读 `seatCatalogs`。`agent/status` 不携带这两个字段，不能替代它。
 
 ## 6. 斜杠命令缓存
@@ -77,5 +78,5 @@
 | 状态目录 | `src/bridge.ts` · `pluginStateDir` / `hostStateDir` / `stateDirExplicit` / `legacyStatePaths` / `migrateLegacyState` / `rewriteLegacyWorkspaceRoots` / `defaultAgentWorkspace` |
 | 校验 | `src/impl.ts` · `validateAgentDef` / `validateConfig`；`src/bridge.ts` · `saveAgent` |
 | 会话选择 | `src/bridge.ts` · `chatChoice` / `patchChatChoice` / `applyChatChoice` / `syncConversationRoute` / `loadPersistedChoices` / `persistAgents` |
-| 目录 | `src/bridge.ts` · `agentCatalog` / `resolveAdapterModel` / `absorbCatalog` / `setExposedModels` / `setAutoDiscoverModels` / `autoExposeNewModels` / `broadcastExposure` |
+| 目录 | `src/bridge.ts` · `agentCatalog` / `resolveAdapterModel` / `absorbCatalog` / `absorbCatalogShape` / `setExposedModels` / `setAutoDiscoverModels` / `autoExposeNewModels` / `broadcastExposure`；`src/impl.ts` · `parseCatalogOptions` / `mergeCatalogShape` / `usableConfigOptions` |
 | 斜杠缓存 | `src/bridge.ts` · `chatSessions` / `absorbCommands`；`src/client/store.ts` · `chatSessionCommands` / `loadChatSessions` |

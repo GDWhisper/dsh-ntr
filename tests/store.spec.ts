@@ -1453,10 +1453,13 @@ describe('the conversation↔agent binding (no DSH model route)', () => {
     await store.setChatSessionEffort('chat-1', 'high')
     await store.setChatSessionEffort('chat-1', undefined)
     await store.setChatSessionConfig('chat-1', 'temp', 'high')
+    // A toggle keeps its boolean across the RPC; the checkbox value is not
+    // stringified on the way out.
+    await store.setChatSessionConfig('chat-1', 'stream', true)
 
     expect(calls.map(c => c.endpoint)).toEqual([
       'session/chat-bind', 'session/chat-model-set', 'session/chat-effort-set', 'session/chat-effort-set',
-      'session/chat-config-set',
+      'session/chat-config-set', 'session/chat-config-set',
     ])
     expect(calls[0].payload).toEqual({ dshSessionId: 'chat-1', agentId: 'codebuddy' })
     expect(calls[1].payload).toEqual({ dshSessionId: 'chat-1', modelId: 'codebuddy@hy3' })
@@ -1464,12 +1467,13 @@ describe('the conversation↔agent binding (no DSH model route)', () => {
     // An absent effort is a clear, not an empty string.
     expect(calls[3].payload).toEqual({ dshSessionId: 'chat-1' })
     expect(calls[4].payload).toEqual({ dshSessionId: 'chat-1', configId: 'temp', value: 'high' })
+    expect(calls[5].payload).toEqual({ dshSessionId: 'chat-1', configId: 'stream', value: true })
     // The advanced pick is part of the SAME conversation record, written
     // optimistically so the menu's checkmark moves on the click.
     expect(store.getSnapshot().chatChoice['chat-1']).toMatchObject({
       agentId: 'codebuddy',
       modelId: 'codebuddy@hy3',
-      extraConfigs: { temp: 'high' },
+      extraConfigs: { temp: 'high', stream: true },
     })
   })
 

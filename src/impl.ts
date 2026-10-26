@@ -226,8 +226,9 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
   const exposedModels = row.exposedModels === undefined
     ? undefined
     : normalizeExposedModels(row.exposedModels, `agent "${id}" exposedModels`, 'bad_config')
-  // Optional boolean; stored only when true (absent and false are the same
-  // "off" state, so the persisted file does not carry noise).
+  // Optional boolean, ON by default. Only the explicit opt-out is stored:
+  // `true` and absent are the same "on" state, so the persisted file does not
+  // carry noise.
   const autoDiscoverModels = row.autoDiscoverModels
   if (autoDiscoverModels !== undefined && typeof autoDiscoverModels !== 'boolean') {
     throw new AcpError('bad_config', `acp: agent "${id}" autoDiscoverModels must be a boolean`)
@@ -249,7 +250,7 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
     cwd: cwd as string | undefined,
     allowedCwdRoots: roots as string[],
     ...(exposedModels !== undefined ? { exposedModels } : {}),
-    ...(autoDiscoverModels === true ? { autoDiscoverModels: true } : {}),
+    ...(autoDiscoverModels === false ? { autoDiscoverModels: false } : {}),
     ...(idleTimeoutMs === undefined ? {} : { idleTimeoutMs: idleTimeoutMs as number }),
   }
 }
@@ -613,22 +614,108 @@ export function parseCatalogOptions(configOptions: unknown): AcpAgentCatalog {
     if (configId === '') continue
     const choices: NonNullable<AcpAgentCatalog['model']>['choices'] = []
     collectCatalogChoices(row.options, choices)
+    // A boolean toggle has no `options` at all; its current value is a JSON
+    // boolean. It is encoded as 'true' / 'false' so the catalog stays
+    // string-typed for every existing reader, and carries `kind` so the
+    // composer renders a checkbox instead of a select.
+    const booleanKind = row.type === 'boolean'
+      || (typeof row.currentValue === 'boolean' && choices.length === 0)
     const option: AcpCatalogOption = {
       configId,
       name: typeof row.name === 'string' && row.name !== '' ? row.name : configId,
-      currentValue: typeof row.currentValue === 'string' && row.currentValue !== '' ? row.currentValue : null,
+      ...(booleanKind ? { kind: 'boolean' as const } : {}),
+      currentValue: booleanKind
+        ? row.currentValue === true || row.currentValue === 'true'
+          ? 'true'
+          : row.currentValue === false || row.currentValue === 'false' ? 'false' : null
+        : typeof row.currentValue === 'string' && row.currentValue !== '' ? row.currentValue : null,
       choices,
     }
-    if (slot !== undefined) {
+    // A toggle is never a model / thought / mode SELECT: those controls pick
+    // among choices. It belongs to the advanced base, where it is a checkbox.
+    if (slot !== undefined && !booleanKind) {
       out[slot] = option
       continue
     }
     // Choice-less options have nothing to pick; they would render an empty
-    // section in the advanced menu, so they stay out of the catalog entirely.
-    if (choices.length > 0) extras.set(configId, option)
+    // section in the advanced menu, so they stay out of the catalog entirely —
+    // except a boolean, whose whole point is that it has no choices.
+    if (choices.length > 0 || booleanKind) extras.set(configId, option)
   }
   if (extras.size > 0) out.extras = [...extras.values()]
   return out
+}
+
+/**
+ * Fold one per-session option answer's SHAPE into an agent-level catalog.
+ *
+ * `session/set_config_option` answers are often the ONLY place an agent
+ * publishes how its option set changes with the model — opencode offers
+ * `thought_level` (`effort`) just for models with variants and never
+ * re-notifies after a client-driven set — and the composer's thought chip is
+ * driven by the agent-level catalog. What is agent knowledge there is the
+ * SHAPE (which slots exist, which choices they offer); `currentValue` is not:
+ * in a per-session answer it is that session's pick, and promoting it would
+ * turn one conversation's choice into `reasoning.defaultEffort` for every
+ * other one. A merged slot therefore keeps the catalog's known current value
+ * while the observed choices still offer it, and `null` ("the agent's own
+ * default") otherwise. Slots the answer does not mention are left alone — a
+ * different model may still offer them.
+ */
+export function mergeCatalogShape(existing: AcpAgentCatalog | undefined, observed: AcpAgentCatalog): AcpAgentCatalog {
+  const out: AcpAgentCatalog = {}
+  const merge = (prev: AcpCatalogOption | undefined, next: AcpCatalogOption): AcpCatalogOption => {
+    const kept = prev?.currentValue ?? null
+    return {
+      configId: next.configId,
+      name: next.name,
+      ...(next.kind === 'boolean' ? { kind: 'boolean' as const } : {}),
+      // A boolean has no choices to test `kept` against; it keeps the
+      // catalog's known default like any other slot (the answer's value is
+      // still one session's truth, not the agent's).
+      currentValue: kept !== null && (next.choices.length === 0 || next.choices.some(choice => choice.value === kept)) ? kept : null,
+      choices: next.choices,
+    }
+  }
+  for (const slot of ['model', 'thought', 'mode'] as const) {
+    const prev = existing?.[slot]
+    const next = observed[slot]
+    if (next === undefined) {
+      if (prev !== undefined) out[slot] = prev
+      continue
+    }
+    out[slot] = merge(prev, next)
+  }
+  // Extras merge by configId: observed entries refresh their shape, entries
+  // only the earlier answer knew survive (another model may still offer them).
+  const extras = new Map<string, AcpCatalogOption>()
+  for (const option of existing?.extras ?? []) extras.set(option.configId, option)
+  for (const option of observed.extras ?? []) extras.set(option.configId, merge(extras.get(option.configId), option))
+  if (extras.size > 0) out.extras = [...extras.values()]
+  return out
+}
+
+/**
+ * Size ceiling for one `configOptions` answer to be believed. Normal answers
+ * are a few KB (a 500-model catalog is well under this); beyond it the agent is
+ * misbehaving and absorbing/persisting it would turn every notification into
+ * an unbounded write.
+ */
+export const MAX_CONFIG_OPTIONS_BYTES = 1 << 20
+
+/**
+ * Whether a `configOptions` answer may overwrite known state.
+ *
+ * An EMPTY (or absent) answer is a non-answer: observed agents return
+ * `configOptions: []` in intermediate states, and treating that as "this agent
+ * now has no options" would wipe a perfectly good catalog and session
+ * snapshot for a state that passes (the rule OmniTerm settles on for the same
+ * observation — empty sets never overwrite the last known state). Oversized
+ * answers are dropped for the same reason: see {@link MAX_CONFIG_OPTIONS_BYTES}.
+ */
+export function usableConfigOptions(configOptions: unknown): configOptions is unknown[] {
+  if (!Array.isArray(configOptions) || configOptions.length === 0) return false
+  return JSON.stringify(configOptions).length <= MAX_CONFIG_OPTIONS_BYTES
 }
 
 /** Flatten select `options` (plain values or `SessionConfigSelectGroup`s) into choices, deduped by value. */
@@ -1433,7 +1520,7 @@ export interface AcpManager {
   /** Switch the reasoning effort for one chat session (agentId names the default-agent case). */
   setChatSessionEffort?(dshSessionId: string, effort: string | undefined, agentId?: string): Promise<void>
   /** Set one of the agent's EXTRA config options for one chat session. */
-  setChatSessionConfig?(dshSessionId: string, configId: string, value: string, agentId?: string): Promise<void>
+  setChatSessionConfig?(dshSessionId: string, configId: string, value: string | boolean, agentId?: string): Promise<void>
   /**
    * State of the ACP-mode agent preset in the harness's OWN roster. Read-only
    * report for the settings panel: the preset is a declaration this package
@@ -1604,8 +1691,12 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
       case 'session/chat-config-set': {
         const dshSessionId = str(body, 'dshSessionId', 128)
         const configId = str(body, 'configId', 128)
-        const value = str(body, 'value', 512)
-        await manager.setChatSessionConfig?.(dshSessionId, configId, value, optionalStr(body, 'agentId', 64))
+        const value = body.value
+        if (typeof value === 'boolean') {
+          await manager.setChatSessionConfig?.(dshSessionId, configId, value, optionalStr(body, 'agentId', 64))
+          return ok({ done: true })
+        }
+        await manager.setChatSessionConfig?.(dshSessionId, configId, str(body, 'value', 512), optionalStr(body, 'agentId', 64))
         return ok({ done: true })
       }
       case 'preset/status':

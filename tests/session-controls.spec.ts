@@ -380,6 +380,14 @@ describe('the advanced base collects the agent’s remaining config options', ()
         name: 'Brave Mode',
         choices: [{ id: 'on', name: 'On' }, { id: 'off', name: 'Off' }],
       },
+      {
+        // A boolean toggle: no choices, `kind` marks the checkbox form.
+        configId: 'stream',
+        name: 'Stream Mode',
+        kind: 'boolean',
+        currentValue: 'false',
+        choices: [],
+      },
     ],
   }
   const route = describeRoute([agent], undefined, undefined, catalog, 'pi')
@@ -396,6 +404,13 @@ describe('the advanced base collects the agent’s remaining config options', ()
         configId: 'brave',
         name: 'Brave Mode',
         choices: [{ id: 'on', name: 'On' }, { id: 'off', name: 'Off' }],
+      },
+      {
+        configId: 'stream',
+        name: 'Stream Mode',
+        kind: 'boolean',
+        value: 'false',
+        choices: [],
       },
     ])
     // A pick from the previous agent is that agent's vocabulary: it must not
@@ -415,12 +430,37 @@ describe('the advanced base collects the agent’s remaining config options', ()
     expect(menu.title).toBe('高级选项')
     // The prefix keeps an agent option literally named `model` from colliding
     // with the primary model picker's section id.
-    expect(menu.sections.map(section => section.id)).toEqual(['config:temp', 'config:brave'])
+    expect(menu.sections.map(section => section.id)).toEqual(['config:temp', 'config:brave', 'config:stream'])
     expect(menu.sections[0]).toMatchObject({ title: 'Temperature' })
     expect(menu.sections[0]?.items).toEqual([
       { id: 'low', label: 'Low', active: false },
       { id: 'high', label: 'High', active: true },
     ])
+  })
+
+  it('draws a boolean option as ONE checkbox row that sends the opposite value', () => {
+    const menu = menuFor('advanced', {
+      acp,
+      agents: [agent],
+      route,
+      catalog,
+      choice: { agentId: 'pi', extraConfigs: { stream: true } },
+    })
+    // No section title: the row's own label carries the option name, and a
+    // title above a single checkbox would say it twice.
+    expect(menu.sections[2]).toEqual({
+      id: 'config:stream',
+      items: [{ id: 'false', label: 'Stream Mode', active: true, checkbox: true }],
+    })
+    // Off: the row is unchecked and clicking it sets 'true'.
+    const off = menuFor('advanced', {
+      acp,
+      agents: [agent],
+      route,
+      catalog,
+      choice: { agentId: 'pi', extraConfigs: { stream: false } },
+    })
+    expect(off.sections[2]?.items).toEqual([{ id: 'true', label: 'Stream Mode', active: false, checkbox: true }])
   })
 })
 

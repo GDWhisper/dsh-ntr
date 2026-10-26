@@ -6,6 +6,7 @@
 ## 1. 配置与错误
 
 - **`session/set_config_option` 响应必须反哺本地快照**：调用后从响应提取权威 `configOptions` 并广播 `session/meta`，不能只等 `config_option_update`。部分 agent（pi-acp 0.8.0）更新配置后不再推事件，不回灌 UI 会停在旧值。见 `src/bridge.ts` · `setConfigOption`。
+- **boolean 配置项必须先声明能力**：`initialize` 的 `clientCapabilities.session.configOptions.boolean = {}`。不声明，agent 可以合法地不发布 `type: 'boolean'` 项（本仓曾因此只看到 select）。写回时 `session/set_config_option` 的 boolean 分支必须发 `{ type: 'boolean', value: boolean }`——请求联合按 `type` 判别，只发 value 会被当成 select 的值 id。
 - **JSON-RPC `-32603 Internal error` 必须优先解析 `error.data`**：agent 的业务阻塞错误（`billing_error` / `rate_limit` / `auth_error`）放在 `data` 里，只读 `error.message` 会丢原因。见 `src/bridge.ts` · `describeError`。
 - **fs 请求错误必须用 `new RequestError(code, message, { message })`**：`RequestError.internalError(x)` 的第一个参数是 **data** 不是 message，传字符串会让 wire 上只剩 `Internal error`。
 

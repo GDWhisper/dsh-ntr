@@ -1033,10 +1033,88 @@ describe('model catalog (isolated manager)', () => {
     await gm.shutdownAll()
   }, 30_000)
 
-  it('auto-discovers models the agent newly publishes, without touching the existing selection', async () => {
+  it('absorbs the option SHAPE of a set_config_option answer, never its currentValue', async () => {
+    // opencode publishes `thought_level` (its `effort`) only for models WITH
+    // variants and never re-notifies after a client-driven set: the answer to
+    // `session/set_config_option` is the ONLY place the thought chip's levels
+    // can come from. Its `currentValue`, though, is THIS session's pick —
+    // promoting it would make `reasoning.defaultEffort` out of one
+    // conversation's choice.
+    const shapePath = `${tmpdir()}/acp-catalog-shape-${Date.now()}.json`
+    const shapeHub = new EventHub()
+    const announced: AcpEvent[] = []
+    shapeHub.subscribe(event => { announced.push(event) })
+    const shapeDef: AcpAgentDef = { ...def, env: { ...def.env, MOCK_MODEL: 'mock-model-plain' } }
+    const gm = new BridgeManager([shapeDef], shapeHub, 500, undefined, shapePath)
+
+    const start = await dispatchRpc(gm, 'session/start', { agentId: 'mock' })
+    expect(start.ok).toBe(true)
+    if (!start.ok) return
+    const sessionId = (start.value as { sessionId: string }).sessionId
+
+    // The session starts on a variant-less model: no thought_level is ever
+    // published for it, and the seat must not invent one.
+    expect(gm.agentCatalog('mock').reasoning).toBeUndefined()
+    expect(gm.cachedAgentModels('mock')?.catalog.thought).toBeUndefined()
+    const beforeSet = announced.filter(event => event.type === 'catalog/updated').length
+
+    // Switching to a variant-bearing model answers WITH the effort option.
+    await dispatchRpc(gm, 'session/config-set', { sessionId, configId: 'model', value: 'mock-model-b' })
+
+    // The shape lands in the agent catalog (the thought chip now has levels)…
+    const seat = gm.agentCatalog('mock')
+    expect(seat.reasoning?.efforts.map(e => e.id)).toEqual(['off', 'high'])
+    // …while the answer's currentValue (this session's `high` pick) stays out
+    // of the agent's default effort.
+    expect(seat.reasoning?.defaultEffort).toBeUndefined()
+    // The change is announced so open conversations re-read the seat surface.
+    expect(announced.filter(event => event.type === 'catalog/updated').length).toBe(beforeSet + 1)
+
+    await gm.shutdownAll()
+  }, 30_000)
+
+  it('never lets an EMPTY configOptions answer wipe known catalog or session state', async () => {
+    // Observed agents (ccb, opencode) answer `configOptions: []` in
+    // intermediate states — mid-reset, or while a provider is still loading.
+    // That is a non-answer: absorbing it would drop the model list the seat is
+    // showing and the session's own snapshot for a state that passes moments
+    // later (the rule OmniTerm settles on: empty sets never overwrite the last
+    // known state).
+    const emptyPath = `${tmpdir()}/acp-catalog-empty-${Date.now()}.json`
+    const emptyHub = new EventHub()
+    const announced: AcpEvent[] = []
+    emptyHub.subscribe(event => { announced.push(event) })
+    const gm = new BridgeManager([def], emptyHub, 500, undefined, emptyPath)
+
+    const start = await dispatchRpc(gm, 'session/start', { agentId: 'mock' })
+    expect(start.ok).toBe(true)
+    if (!start.ok) return
+    const sessionId = (start.value as { sessionId: string }).sessionId
+
+    const catalogBefore = JSON.stringify(gm.catalogFor('mock'))
+    expect(gm.catalogFor('mock')?.thought).toBeDefined()
+    const optionsBefore = (gm.sessions()[0] as { configOptions?: unknown[] }).configOptions
+    expect(optionsBefore?.length).toBeGreaterThan(0)
+    const announcedBefore = announced.filter(event => event.type === 'catalog/updated').length
+
+    // The agent answers the set with `[]` AND pushes a `[]` notification.
+    const set = await dispatchRpc(gm, 'session/config-set', { sessionId, configId: 'mock-empty-answer', value: 'x' })
+    expect(set.ok).toBe(true)
+
+    // Catalog and session snapshot are exactly what they were.
+    expect(JSON.stringify(gm.catalogFor('mock'))).toBe(catalogBefore)
+    expect((gm.sessions()[0] as { configOptions?: unknown[] }).configOptions).toEqual(optionsBefore)
+    // …and nothing was announced, because nothing changed.
+    expect(announced.filter(event => event.type === 'catalog/updated').length).toBe(announcedBefore)
+
+    await gm.shutdownAll()
+  }, 30_000)
+
+  it('auto-discovers models the agent newly publishes by default, without touching the existing selection', async () => {
     // Baseline: the host knew only model A, and the user had selected exactly
-    // it. The agent then adds model B; the switch must append B and nothing
-    // else — no settings-panel visit, no resurrection of unchecked models.
+    // it. The agent then adds model B; discovery is ON by default (the def
+    // says nothing), so B is appended and nothing else — no settings-panel
+    // visit, no resurrection of unchecked models.
     const autoCatalogPath = `${tmpdir()}/acp-catalog-auto-${Date.now()}.json`
     const autoAgentsPath = `${tmpdir()}/acp-agents-auto-${Date.now()}.json`
     writeFileSync(autoCatalogPath, JSON.stringify({
@@ -1061,7 +1139,6 @@ describe('model catalog (isolated manager)', () => {
     const autoDef: AcpAgentDef = {
       ...def,
       exposedModels: ['mock-model-a'],
-      autoDiscoverModels: true,
     }
     const auto = new BridgeManager([autoDef], autoHub, 500, autoAgentsPath, autoCatalogPath)
 
@@ -1072,19 +1149,25 @@ describe('model catalog (isolated manager)', () => {
       .toEqual(['mock@mock-model-a', 'mock@mock-model-b'])
     expect(announced.filter((event): event is Extract<AcpEvent, { type: 'agent/exposure' }> => event.type === 'agent/exposure'))
       .toMatchObject([{ agentId: 'mock', exposedModels: ['mock-model-a', 'mock-model-b'], autoDiscoverModels: true }])
-    // A persisted policy change, not a live-only tweak.
+    // A persisted policy change, not a live-only tweak. On is the default, so
+    // the file carries no switch field until someone opts out.
     const stored = JSON.parse(readFileSync(autoAgentsPath, 'utf-8')) as {
       agents: Array<{ exposedModels?: string[]; autoDiscoverModels?: boolean }>
     }
     expect(stored.agents[0]).toMatchObject({
       exposedModels: ['mock-model-a', 'mock-model-b'],
-      autoDiscoverModels: true,
     })
+    expect('autoDiscoverModels' in (stored.agents[0] ?? {})).toBe(false)
 
-    // Switching it off keeps what was already discovered.
+    // Switching it off keeps what was already discovered and persists the
+    // explicit opt-out — the only value this field ever stores.
     await auto.setAutoDiscoverModels('mock', false)
     expect(auto.agentCatalog('mock').variants.map(variant => variant.id))
       .toEqual(['mock@mock-model-a', 'mock@mock-model-b'])
+    const optedOut = JSON.parse(readFileSync(autoAgentsPath, 'utf-8')) as {
+      agents: Array<{ autoDiscoverModels?: boolean }>
+    }
+    expect(optedOut.agents[0]?.autoDiscoverModels).toBe(false)
     await auto.shutdownAll()
   }, 30_000)
 
@@ -2847,15 +2930,28 @@ describe('pre-chat pick persistence (isolated manager)', () => {
           { id: 'mid', name: 'mid' },
           { id: 'high', name: 'high' },
         ],
+      }, {
+        // A boolean toggle: `kind` is what makes the composer draw a checkbox
+        // row instead of an empty select.
+        configId: 'stream',
+        name: 'Stream Mode',
+        kind: 'boolean',
+        currentValue: 'false',
+        choices: [],
       }])
 
       gm.bindChatAgent('dsh-pick-config', 'picked')
       await dispatchRpc(gm, 'session/chat-config-set', {
         dshSessionId: 'dsh-pick-config', configId: 'temp', value: 'high',
       })
+      // A checkbox pick arrives as 'true' / 'false' from the browser row and is
+      // stored as a real boolean.
+      await dispatchRpc(gm, 'session/chat-config-set', {
+        dshSessionId: 'dsh-pick-config', configId: 'stream', value: 'true',
+      })
       expect(gm.chatChoice('dsh-pick-config')).toMatchObject({
         agentId: 'picked',
-        extraConfigs: { temp: 'high' },
+        extraConfigs: { temp: 'high', stream: true },
       })
 
       // The first turn creates the session; the pick reaches the agent before
@@ -2870,14 +2966,19 @@ describe('pre-chat pick persistence (isolated manager)', () => {
         configOptions?: Array<{ configId: string; currentValue: unknown }>
       }>).find(session => session.agentId === 'picked')
       expect(live?.configOptions?.find(option => option.configId === 'temp')?.currentValue).toBe('high')
+      // The toggle reached the agent as a real boolean (`type: 'boolean'` is
+      // enforced by the mock, which throws on a bare value).
+      expect(live?.configOptions?.find(option => option.configId === 'stream')?.currentValue).toBe(true)
 
-      // The primary axes are not extras; unknown values are refused.
+      // The primary axes are not extras; unknown values are refused, and a
+      // toggle only accepts its own vocabulary.
       await expect(gm.setChatSessionConfig('dsh-pick-config', 'temp', 'nope')).rejects.toMatchObject({ code: 'bad_config' })
       await expect(gm.setChatSessionConfig('dsh-pick-config', 'model', 'mock-model-a')).rejects.toMatchObject({ code: 'unknown_config' })
+      await expect(gm.setChatSessionConfig('dsh-pick-config', 'stream', 'nope')).rejects.toMatchObject({ code: 'bad_config' })
 
       // It is part of the conversation record, not process state.
       const reloaded = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
-      expect(reloaded.chatChoice('dsh-pick-config')).toMatchObject({ extraConfigs: { temp: 'high' } })
+      expect(reloaded.chatChoice('dsh-pick-config')).toMatchObject({ extraConfigs: { temp: 'high', stream: true } })
       await reloaded.shutdownAll()
     } finally {
       await gm.shutdownAll()

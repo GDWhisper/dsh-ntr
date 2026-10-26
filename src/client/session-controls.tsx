@@ -347,6 +347,8 @@ export function describeRoute(
 export interface AdvancedOption {
   configId: string
   name: string
+  /** `'boolean'` for an on/off toggle (`value` is `'true'` / `'false'`, no choices). */
+  kind?: 'boolean'
   /** The conversation's pick, else the value the agent reports as current. */
   value?: string
   choices: readonly { id: string; name: string; description?: string }[]
@@ -370,10 +372,14 @@ export function advancedOptions(
   if (catalog === undefined || extras.length === 0) return []
   const picked = choice !== undefined && choice.agentId === catalog.agentId ? choice.extraConfigs : undefined
   return extras.map(option => {
-    const value = picked?.[option.configId] ?? option.currentValue
+    const raw = picked?.[option.configId] ?? option.currentValue
+    // A toggle's catalog value is 'true' / 'false'; a conversation pick stores
+    // the real boolean. Both collapse to the string form the menu speaks.
+    const value = typeof raw === 'boolean' ? (raw ? 'true' : 'false') : raw
     return {
       configId: option.configId,
       name: option.name,
+      ...(option.kind === 'boolean' ? { kind: 'boolean' as const } : {}),
       ...(value === undefined ? {} : { value }),
       choices: option.choices,
     }
@@ -883,16 +889,28 @@ function thoughtSection(context: MenuContext): AcpMenuSection {
  * and the pick would then be read as the primary model axis.
  */
 function advancedSections(context: MenuContext): AcpMenuSection[] {
-  return advancedOptions(context.catalog, context.choice).map(option => ({
-    id: `config:${option.configId}`,
-    title: option.name,
-    items: option.choices.map(choice => ({
-      id: choice.id,
-      label: choice.name,
-      ...(choice.description === undefined ? {} : { detail: choice.description }),
-      active: choice.id === option.value,
-    })),
-  }))
+  return advancedOptions(context.catalog, context.choice).map(option => {
+    if (option.kind === 'boolean') {
+      // A toggle is ONE checkbox row, not an On/Off pair: the row's check is
+      // the current value and the pick sends the OPPOSITE, which `onPick`
+      // forwards verbatim (the host normalizes 'true' / 'false' to a boolean).
+      const checked = option.value === 'true'
+      return {
+        id: `config:${option.configId}`,
+        items: [{ id: checked ? 'false' : 'true', label: option.name, active: checked, checkbox: true }],
+      }
+    }
+    return {
+      id: `config:${option.configId}`,
+      title: option.name,
+      items: option.choices.map(choice => ({
+        id: choice.id,
+        label: choice.name,
+        ...(choice.description === undefined ? {} : { detail: choice.description }),
+        active: choice.id === option.value,
+      })),
+    }
+  })
 }
 
 /**

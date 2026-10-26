@@ -43,7 +43,7 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 | 这条会话由哪个 agent 服务 | 插件自己的绑定：`describeRoute` / `routeAgentId`（活会话 `bound` 优先 → `chatChoice` 的 pick，且只在 `choice.agentId === agentId` 时生效 → `chatBoundAgent` 乐观读 → 插件默认 agent） | `bindChatAgent`（传裸 `agentId`） |
 | 这个 agent 有哪些模型 / 思考等级 | `agent/catalog`（`AcpStore.loadAgentCatalog`，只对 `routeAgentId` 有答案的会话读，**含插件默认 agent**；宿主纯内存，不探测） | — |
 | 当前在哪个模型 / 思考等级 | `bound?.modelId ?? pick?.modelId`；`bound?.reasoningEffort ?? pick?.effort`；没选过时回落 `catalog.currentModel` 与 `catalog.reasoning.defaultEffort` | `setChatSessionModel` / `setChatSessionEffort` |
-| agent 的额外 config options | `agent/catalog` 的 `extras`（model / thought_level / mode 之外的 select，含未知 category） | `setChatSessionConfig`（`session/chat-config-set`），落 `AcpConversationChoice.extraConfigs` |
+| agent 的额外 config options | `agent/catalog` 的 `extras`（model / thought_level / mode 之外的 select 与 boolean，含未知 category） | `setChatSessionConfig`（`session/chat-config-set`），落 `AcpConversationChoice.extraConfigs`（select 存字符串，boolean 存真布尔） |
 
 - **默认 agent 也算 routed**：新会话没有绑定 / pick 时，`routeAgentId` 回落到插件默认 agent；它和手动选中的 agent 一样展示 model / 思考 / 高级 chip，并读取该 agent 的 catalog（纯内存）。**严禁**要求用户先手动点一次 agent 才出现这些控件。
 - **显示什么就必须跑什么**：首轮前显示的 catalog 当前值在 `session/new` 前被捕获，并在新会话提供时写成这条会话的 pick（`displayedChatDefaults` / `seedChatChoiceFromCatalog`，见 [state.md §3](./state.md)）。否则就是「芯片写 B、agent 跑 A」——新会话的 agent 默认模型与缓存目录不同时必然发生。
@@ -67,10 +67,11 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 
 ### 3.3 高级底座
 
-- 只有 agent 发布了主位之外的 select（且有 choices）才渲染，位置在**模型 chip 左侧**；chip 文案 `高级 · <N>`，菜单里每个配置项一节。
+- 只有 agent 发布了主位之外的配置项（select 且有 choices，或 boolean 开关）才渲染，位置在**模型 chip 左侧**；chip 文案 `高级 · <N>`，菜单里每个配置项一节。
+- **boolean 渲染为一行复选框**：section 不带 title（行标签就是选项名），单个 item 的 `active` 是当前值、`checkbox: true` 让它按 `menuitemcheckbox` 渲染，`id` 是点击后要写入的**相反**值（`'true'` / `'false'`）。布尔项永远不进 `thought` / `model` / `mode` 槽位——那些控件是在 choices 里挑一个，空 choices 只会让控件消失（`parseCatalogOptions` 把 boolean 一律放进 `extras` 并带 `kind: 'boolean'`）。
 - section id 必须带 `config:` 前缀（`config:<configId>`）：picker 把 section id 原样交给 pick 处理器，而 `agent` / `model` / `thought` 已被三条主位占用。agent 完全可以把某个额外项命名为 `model`。
 - 当前值 = `choice.extraConfigs[configId]` ?? `catalog.extras[].currentValue`；`choice.agentId` 与 catalog 的 agent 不一致时**严禁**套用（那是上一个 agent 的词汇，`advancedOptions` 负责过滤）。
-- 写入经 `setChatSessionConfig`：宿主先用活会话的 `configOptions`（更权威）再回落 catalog 校验值是否真由 agent 发布；记录进 `extraConfigs` 后，有活会话立即 `set_config_option`，没有会话则等下一次 `applyChatChoice`。失败只广播 `agent/notice`，不失败回合。
+- 写入经 `setChatSessionConfig`：宿主先用活会话的 `configOptions`（更权威）再回落 catalog 校验值是否真由 agent 发布；boolean 额外接受复选框送来的 `'true'` / `'false'` 字符串并归一为真布尔（`extraConfigs` 里存布尔）。记录进 `extraConfigs` 后，有活会话立即 `set_config_option`，没有会话则等下一次 `applyChatChoice`。失败只广播 `agent/notice`，不失败回合。
 - 首轮前没有会话也能选——这正是 extras 要进 `agent/catalog` 缓存、而不是只读 live session 的原因。
 
 ## 4. agent mode 控件

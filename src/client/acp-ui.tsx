@@ -494,6 +494,12 @@ export interface AcpMenuItem {
   disabled?: boolean
   /** Leading status dot color (agent process state). */
   dot?: string
+  /**
+   * Render as a checkbox row (`menuitemcheckbox`) rather than a radio row.
+   * The advanced base uses it for the agent's boolean config options: one row
+   * whose check IS the current value, whose `id` is the value a click sets.
+   */
+  checkbox?: boolean
 }
 
 /** One titled block of rows. */
@@ -623,15 +629,18 @@ export function AcpMenu({ model, anchor, onPick, onClose }: AcpMenuProps) {
               <button
                 key={`${section.id}/${item.id}`}
                 type="button"
-                role="menuitemradio"
+                role={item.checkbox === true ? 'menuitemcheckbox' : 'menuitemradio'}
                 aria-checked={item.active === true}
                 className={`ntr-acp-menu-item${item.active === true ? ' is-active' : ''}`}
                 disabled={item.disabled === true}
                 onClick={() => { onPick(item.id, section.id) }}
               >
                 {item.dot !== undefined && <span className="ntr-acp-dot" style={{ background: item.dot }} aria-hidden />}
+                {item.checkbox === true && (
+                  <span className={`ntr-acp-check${item.active === true ? ' is-on' : ''}`} aria-hidden>{item.active === true ? '✓' : ''}</span>
+                )}
                 <span className="ntr-acp-menu-item-label">{item.label}</span>
-                {item.active === true && <span className="ntr-acp-tick" aria-hidden>✓</span>}
+                {item.active === true && item.checkbox !== true && <span className="ntr-acp-tick" aria-hidden>✓</span>}
                 {item.detail !== undefined && <span className="ntr-acp-menu-item-detail">{item.detail}</span>}
               </button>
             ))}
@@ -853,6 +862,8 @@ const STYLE = `
 .ntr-acp-seat-sub { color: var(--dsw-alias-text-secondary, #6b7280); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ntr-acp-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
 .ntr-acp-tick { margin-left: auto; color: var(--dsw-alias-state-business-primary, #2563eb); }
+.ntr-acp-check { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 13px; height: 13px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); border-radius: 3px; font-size: 10px; line-height: 1; color: var(--dsw-alias-state-business-primary, #2563eb); }
+.ntr-acp-check.is-on { border-color: var(--dsw-alias-state-business-primary, #2563eb); }
 .ntr-acp-menu { position: absolute; bottom: calc(100% + 8px); left: 8px; z-index: 100; width: min(360px, 100%); max-height: min(420px, 60vh); display: flex; flex-direction: column; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); border-radius: 10px; background: var(--dsw-alias-bg-layer-1, #fff); box-shadow: 0 12px 32px rgba(0, 0, 0, 0.16); font-size: 12px; overflow: hidden; }
 .ntr-acp-menu-head { padding: 8px 10px 6px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
 .ntr-acp-menu-title { flex: 1; }

@@ -1565,7 +1565,7 @@ export class AcpStore {
   }
 
   /** Set one of the bound agent's EXTRA config options for one chat session. */
-  async setChatSessionConfig(dshSessionId: string, configId: string, value: string, agentId?: string): Promise<void> {
+  async setChatSessionConfig(dshSessionId: string, configId: string, value: string | boolean, agentId?: string): Promise<void> {
     try {
       await this.call('session/chat-config-set', {
         dshSessionId,

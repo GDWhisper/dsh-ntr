@@ -37,7 +37,9 @@ import {
   childEnv,
   isAcpToolContinuation,
   isUnderPath,
+  mergeCatalogShape,
   parseCatalogOptions,
+  usableConfigOptions,
   permissionToolKind,
   quoteCommandToken,
   randomUUID,
@@ -73,7 +75,7 @@ const FS_MAX_WRITE_BYTES = 2 * 1024 * 1024
 interface DisplayedChatDefaults {
   modelId?: string
   effort?: string
-  extraConfigs?: Record<string, string>
+  extraConfigs?: Record<string, string | boolean>
 }
 
 interface LiveSession {
@@ -351,8 +353,14 @@ export class AgentBridge {
     private readonly transcriptMax: number,
     /** Called when the connection dies so the manager can settle outstanding prompts. */
     private readonly onConnectionLost: (bridge: AgentBridge, reason: string) => void,
-    /** Observes `configOptions` from any real session so the manager's model catalog stays warm. */
-    private readonly onCatalog?: (agentId: string, configOptions: unknown) => void,
+    /**
+     * Observes `configOptions` from any real session so the manager's model
+     * catalog stays warm. `shapeOnly` marks a per-session answer (a
+     * `session/set_config_option` response): only the option SHAPE belongs in
+     * the agent-level catalog, never its `currentValue` — see
+     * {@link BridgeManager.absorbCatalogShape}.
+     */
+    private readonly onCatalog?: (agentId: string, configOptions: unknown, shapeOnly?: boolean) => void,
     /** Observes `availableCommands` from any real session so the agent's slash menu survives its sessions. */
     private readonly onCommands?: (agentId: string, commands: NonNullable<SessionView['availableCommands']>) => void,
     tuning?: BridgeTuning,
@@ -707,7 +715,14 @@ export class AgentBridge {
         protocolVersion: PROTOCOL_VERSION,
         // The fs handlers are implemented below behind the same workspace
         // sandbox that gates session cwds; terminal is not implemented.
-        clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: false },
+        // `session.configOptions.boolean` advertises the toggle form of
+        // `configOptions`; agents that gate `type: "boolean"` entries on it
+        // would otherwise never publish them.
+        clientCapabilities: {
+          fs: { readTextFile: true, writeTextFile: true },
+          terminal: false,
+          session: { configOptions: { boolean: {} } },
+        },
         clientInfo: { name: 'dsh-ntr', title: 'DSH NTR', version: '0.1.0' },
       }),
       'initialize',
@@ -765,7 +780,8 @@ export class AgentBridge {
       conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: [] }),
       'session/new',
     )
-    if (this.onCatalog !== undefined && result.configOptions !== undefined && result.configOptions !== null) {
+    // An empty `configOptions` answer is a non-answer — see `usableConfigOptions`.
+    if (this.onCatalog !== undefined && usableConfigOptions(result.configOptions)) {
       this.onCatalog(this.def.id, result.configOptions)
     }
     const session: LiveSession = {
@@ -790,7 +806,7 @@ export class AgentBridge {
           },
         }
         : {}),
-      ...(result.configOptions !== undefined && result.configOptions !== null ? { configOptions: result.configOptions } : {}),
+      ...(usableConfigOptions(result.configOptions) ? { configOptions: result.configOptions } : {}),
     }
     this.sessions.set(session.sessionId, session)
     this.acpIndex.set(session.acpSessionId, session)
@@ -970,7 +986,7 @@ export class AgentBridge {
         conn.agent.request(methods.agent.session.load, { sessionId: session.acpSessionId, cwd: resolved, mcpServers: [] }),
         'session/load',
       )
-      if (this.onCatalog !== undefined && result.configOptions !== undefined && result.configOptions !== null) {
+      if (this.onCatalog !== undefined && usableConfigOptions(result.configOptions)) {
         this.onCatalog(this.def.id, result.configOptions)
       }
       session.modes = result.modes !== undefined && result.modes !== null
@@ -983,7 +999,7 @@ export class AgentBridge {
           })),
         }
         : session.modes
-      if (Array.isArray(result.configOptions)) session.configOptions = result.configOptions
+      if (usableConfigOptions(result.configOptions)) session.configOptions = result.configOptions
       this.sessions.set(session.sessionId, session)
       this.released.delete(session.sessionId)
       // Same flip as `createSession`: a registered session makes this a chat
@@ -1077,14 +1093,26 @@ export class AgentBridge {
   async setConfigOption(session: LiveSession, configId: string, value: string | boolean): Promise<void> {
     const conn = this.conn
     if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
-    const result = await this.runCommand(() => conn.agent.request(methods.agent.session.setConfigOption, { sessionId: session.acpSessionId, configId, value })) as { configOptions?: unknown }
+    // A toggle must say so on the wire: the request union discriminates on
+    // `type`, and a bare boolean `value` is not a select value id.
+    const params = typeof value === 'boolean'
+      ? { sessionId: session.acpSessionId, configId, value, type: 'boolean' as const }
+      : { sessionId: session.acpSessionId, configId, value }
+    const result = await this.runCommand(() => conn.agent.request(methods.agent.session.setConfigOption, params)) as { configOptions?: unknown }
     // The response carries the full authoritative option set; some agents
     // (pi-acp observed) never re-notify after a client-driven set. It feeds the
-    // SESSION snapshot only — never the agent-level catalog: `currentValue` in
-    // a per-session answer describes this session's pick, and promoting it to
-    // the catalog would turn the seat's own choice into `reasoning.defaultEffort`
-    // for every other conversation (and back onto itself next turn).
-    if (Array.isArray(result.configOptions)) session.configOptions = result.configOptions as unknown[]
+    // SESSION snapshot first — `currentValue` in a per-session answer describes
+    // this session's pick, and promoting it to the catalog would turn the
+    // seat's own choice into `reasoning.defaultEffort` for every other
+    // conversation (and back onto itself next turn). The option SHAPE still
+    // reaches the agent-level catalog (`shapeOnly`): this response is often the
+    // only place an agent publishes how its option set changes with the model
+    // (opencode offers `thought_level` just for models with variants), and the
+    // composer's thought chip is driven by the catalog.
+    if (usableConfigOptions(result.configOptions)) {
+      session.configOptions = result.configOptions
+      this.onCatalog?.(this.def.id, result.configOptions, true)
+    }
     this.publishMeta(session)
   }
 
@@ -1372,7 +1400,9 @@ export class AgentBridge {
         session.modes = { ...session.modes, currentModeId: update.currentModeId }
         break
       case 'config_option_update':
-        session.configOptions = update.configOptions ?? []
+        // Empty answers never overwrite the last known set — see `usableConfigOptions`.
+        if (!usableConfigOptions(update.configOptions)) break
+        session.configOptions = update.configOptions
         this.onCatalog?.(this.def.id, session.configOptions)
         break
       case 'available_commands_update':
@@ -2720,7 +2750,7 @@ export class BridgeManager {
   private makeBridge(
     def: AcpAgentDef,
     onConnectionLost: (bridge: AgentBridge, reason: string) => void,
-    onCatalog?: (agentId: string, configOptions: unknown) => void,
+    onCatalog?: (agentId: string, configOptions: unknown, shapeOnly?: boolean) => void,
     onCommands?: (agentId: string, commands: NonNullable<SessionView['availableCommands']>) => void,
   ): AgentBridge {
     return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, onCommands, this.tuning, () => this.approvalRequester, () => this.sessionWorkspaceResolver)
@@ -3173,7 +3203,7 @@ export class BridgeManager {
    * A live session is updated immediately; a failure there is warned about and
    * the pick still stands, exactly like the model/effort alignment path.
    */
-  async setChatSessionConfig(dshSessionId: string, configId: string, value: string, agentId?: string): Promise<void> {
+  async setChatSessionConfig(dshSessionId: string, configId: string, value: string | boolean, agentId?: string): Promise<void> {
     // `agentId` is the route the composer showed — including the plugin
     // default, which `chatAgentFor` cannot report before the first session.
     const bound = agentId ?? this.chatAgentFor(dshSessionId)
@@ -3197,8 +3227,18 @@ export class BridgeManager {
     if (option === undefined) {
       throw new AcpError('unknown_config', `acp: agent "${bound}" publishes no extra config option "${configId}"`)
     }
-    if (!option.choices.some(choice => choice.value === value)) {
-      throw new AcpError('bad_config', `acp: "${value}" is not a value of config option "${configId}"`)
+    if (option.kind === 'boolean') {
+      // The browser sends 'true' / 'false' from a checkbox row; the wire and
+      // the persisted pick both use the real boolean.
+      const toggle = typeof value === 'boolean'
+        ? value
+        : value === 'true' ? true : value === 'false' ? false : undefined
+      if (toggle === undefined) {
+        throw new AcpError('bad_config', `acp: "${String(value)}" is not a boolean value of config option "${configId}"`)
+      }
+      value = toggle
+    } else if (typeof value !== 'string' || !option.choices.some(choice => choice.value === value)) {
+      throw new AcpError('bad_config', `acp: "${String(value)}" is not a value of config option "${configId}"`)
     }
     const current = this.chatAgentIntent.get(dshSessionId)
     const extraConfigs = current?.agentId === bound ? { ...current.extraConfigs } : {}
@@ -3290,12 +3330,17 @@ export class BridgeManager {
           })
           continue
         }
-        if (!option.choices.some(entry => entry.value === value)) {
+        // A toggle's truth is its boolean itself; a select's is membership in
+        // the choices the agent still offers.
+        const usable = option.kind === 'boolean'
+          ? typeof value === 'boolean'
+          : typeof value === 'string' && option.choices.some(entry => entry.value === value)
+        if (!usable) {
           this.hub.broadcast({
             type: 'agent/notice',
             agentId: session.agentId,
             level: 'error',
-            text: `acp: agent "${session.agentId}" no longer offers "${value}" for config "${configId}"; keeping its own`,
+            text: `acp: agent "${session.agentId}" no longer offers "${String(value)}" for config "${configId}"; keeping its own`,
           })
           continue
         }
@@ -3513,7 +3558,7 @@ export class BridgeManager {
       if (typeof agentId !== 'string' || agentId === '') continue
       const configs = extraConfigs !== null && typeof extraConfigs === 'object' && !Array.isArray(extraConfigs)
         ? Object.fromEntries(Object.entries(extraConfigs as Record<string, unknown>)
-          .filter(([, value]) => typeof value === 'string' && value !== '')) as Record<string, string>
+          .filter(([, value]) => typeof value === 'boolean' || (typeof value === 'string' && value !== ''))) as Record<string, string | boolean>
         : {}
       this.chatAgentIntent.set(dshSessionId, {
         agentId,
@@ -3674,6 +3719,8 @@ export class BridgeManager {
    * current `parseCatalogOptions` has now seen this agent's real answer.
    */
   private absorbCatalog(agentId: string, configOptions: unknown): { catalog: AcpAgentCatalog; updatedAt: number } {
+    // Empty / absurd answers never overwrite known state — see `usableConfigOptions`.
+    if (!usableConfigOptions(configOptions)) return this.catalogs.get(agentId) ?? { catalog: {}, updatedAt: 0 }
     const catalog = parseCatalogOptions(configOptions)
     this.catalogStale.delete(agentId)
     const existing = this.catalogs.get(agentId)
@@ -3698,6 +3745,29 @@ export class BridgeManager {
     // sees the new models in `agent/catalog`'s variant expansion.
     if (exposedChanged) this.broadcastExposure(agentId)
     return entry
+  }
+
+  /**
+   * Fold a per-session option answer's SHAPE into the agent's catalog.
+   *
+   * The counterpart of {@link absorbCatalog} for `session/set_config_option`
+   * responses: which options exist and which choices they offer is agent
+   * knowledge the seat must show (the composer's thought chip only renders
+   * when the catalog has `thought_level`, and some agents publish it only in
+   * the answer to a model change), while a per-session `currentValue` stays
+   * out of it. No auto-exposure and no staleness discharge either — this is
+   * one session's answer, not the agent-level observation those marks track.
+   */
+  private absorbCatalogShape(agentId: string, configOptions: unknown): void {
+    if (!usableConfigOptions(configOptions)) return
+    const observed = parseCatalogOptions(configOptions)
+    const existing = this.catalogs.get(agentId)
+    const catalog = mergeCatalogShape(existing?.catalog, observed)
+    if (existing !== undefined && JSON.stringify(existing.catalog) === JSON.stringify(catalog)) return
+    const entry = { catalog, updatedAt: Date.now() }
+    this.catalogs.set(agentId, entry)
+    this.persistCatalogs()
+    this.hub.broadcast({ type: 'catalog/updated', agentId, updatedAt: entry.updatedAt })
   }
 
   /**
@@ -3732,11 +3802,12 @@ export class BridgeManager {
    * selection would resurrect a model the user deliberately unchecked every
    * time the agent repeats its catalog. The first observation has no baseline
    * (`before === undefined`), so it adds nothing; the user can still add the
-   * whole list with one click in the settings card.
+   * whole list with one click in the settings card. Discovery is ON unless the
+   * agent definition explicitly opts out with `autoDiscoverModels: false`.
    */
   private autoExposeNewModels(agentId: string, next: AcpAgentCatalog, before: AcpAgentCatalog | undefined): boolean {
     const def = this.defsMap.get(agentId)
-    if (def?.autoDiscoverModels !== true || before === undefined) return false
+    if (def === undefined || def.autoDiscoverModels === false || before === undefined) return false
     const known = new Set((before.model?.choices ?? []).map(choice => choice.value))
     const exposed = new Set(def.exposedModels ?? [])
     const added = (next.model?.choices ?? [])
@@ -3756,7 +3827,7 @@ export class BridgeManager {
       type: 'agent/exposure',
       agentId,
       exposedModels: [...(def.exposedModels ?? [])],
-      autoDiscoverModels: def.autoDiscoverModels === true,
+      autoDiscoverModels: def.autoDiscoverModels !== false,
     })
   }
 
@@ -3932,6 +4003,7 @@ export class BridgeManager {
         extras: extraOptions.map(option => ({
           configId: option.configId,
           name: option.name,
+          ...(option.kind === 'boolean' ? { kind: 'boolean' as const } : {}),
           ...(option.currentValue === null ? {} : { currentValue: option.currentValue }),
           choices: option.choices.map(choice => ({
             id: choice.value,
@@ -4142,8 +4214,9 @@ export class BridgeManager {
     if (bridge === undefined) {
       bridge = this.makeBridge(def, (b, reason) => {
         this.connectionLost(b, reason)
-      }, (observedAgentId, configOptions) => {
-        this.absorbCatalog(observedAgentId, configOptions)
+      }, (observedAgentId, configOptions, shapeOnly) => {
+        if (shapeOnly) this.absorbCatalogShape(observedAgentId, configOptions)
+        else this.absorbCatalog(observedAgentId, configOptions)
       }, (observedAgentId, commands) => {
         this.absorbCommands(observedAgentId, commands)
       })
@@ -4277,13 +4350,14 @@ export class BridgeManager {
    * Toggle auto-discovery of newly published models. Lightweight like
    * `setExposedModels`: the def is mutated in place (live bridges share the
    * object) and persisted; no process is restarted, and the current selection
-   * is left exactly as it is.
+   * is left exactly as it is. On is the default, so only the opt-out
+   * (`false`) is written to the file.
    */
   async setAutoDiscoverModels(agentId: string, autoDiscoverModels: boolean): Promise<void> {
     const def = this.defsMap.get(agentId)
     if (def === undefined) throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
-    if (autoDiscoverModels) def.autoDiscoverModels = true
-    else delete def.autoDiscoverModels
+    if (autoDiscoverModels) delete def.autoDiscoverModels
+    else def.autoDiscoverModels = false
     this.persistAgents()
     this.broadcastExposure(agentId)
   }
@@ -4546,9 +4620,15 @@ export class BridgeManager {
     // `defaultEffort` only when the current value is one of the agent's levels.
     const effort = this.reasoningMeta(agentId)?.defaultEffort
     if (effort !== undefined) out.effort = effort
-    const extraConfigs: Record<string, string> = {}
+    const extraConfigs: Record<string, string | boolean> = {}
     for (const option of catalog.extras ?? []) {
       const value = option.currentValue
+      if (option.kind === 'boolean') {
+        // The catalog encodes a toggle as 'true' / 'false'; the pick stores the
+        // real boolean, exactly like an explicit checkbox click.
+        if (value === 'true' || value === 'false') extraConfigs[option.configId] = value === 'true'
+        continue
+      }
       if (value !== null && value !== undefined && value !== '') extraConfigs[option.configId] = value
     }
     if (Object.keys(extraConfigs).length > 0) out.extraConfigs = extraConfigs
@@ -4602,7 +4682,11 @@ export class BridgeManager {
         if (extraConfigs[configId] !== undefined) continue
         const option = options.extras?.find(entry => entry.configId === configId)
         if (option === undefined) continue
-        if (option.choices.length > 0 && !option.choices.some(choice => choice.value === value)) continue
+        // The fresh session's own option set is the authority for BOTH forms:
+        // a toggle must still be a toggle, a select must still offer the value.
+        if (option.kind === 'boolean'
+          ? typeof value !== 'boolean'
+          : typeof value !== 'string' || (option.choices.length > 0 && !option.choices.some(choice => choice.value === value))) continue
         extraConfigs[configId] = value
         changed = true
       }

@@ -38,7 +38,10 @@ const cancelWaiters = new Map()
 const cancelCleanupUntil = new Map()
 let counter = 0
 
-function mockConfigOptions(state = { temp: 'mid', model: 'mock-model-a', effort: 'high' }) {
+// The model a fresh session starts on (tests may pin one via MOCK_MODEL).
+const DEFAULT_MODEL = process.env.MOCK_MODEL ?? 'mock-model-a'
+
+function mockConfigOptions(state = { temp: 'mid', model: DEFAULT_MODEL, effort: 'high' }) {
   return [
     {
       configId: 'model',
@@ -51,7 +54,10 @@ function mockConfigOptions(state = { temp: 'mid', model: 'mock-model-a', effort:
         { value: 'mock-model-b', name: 'Mock Model B', description: 'The stronger mock model' },
       ],
     },
-    {
+    // `mock-model-plain` stands for a model with NO variants: like opencode's
+    // `effort` option, a thought_level is published only for models that have
+    // one — switching the model is what reveals it.
+    ...(state.model === 'mock-model-plain' ? [] : [{
       configId: 'thought',
       name: 'Thought Level',
       type: 'select',
@@ -61,7 +67,7 @@ function mockConfigOptions(state = { temp: 'mid', model: 'mock-model-a', effort:
         { value: 'off', name: 'Off' },
         { value: 'high', name: 'High' },
       ],
-    },
+    }]),
     {
       configId: 'temp',
       name: 'Temperature',
@@ -72,6 +78,15 @@ function mockConfigOptions(state = { temp: 'mid', model: 'mock-model-a', effort:
         { value: 'mid', name: 'mid' },
         { value: 'high', name: 'high' },
       ],
+    },
+    // A boolean toggle (ACP `type: 'boolean'`, no choices). The composer
+    // renders it as a checkbox; the host must send it back as
+    // `type: 'boolean'` with a real boolean value.
+    {
+      configId: 'stream',
+      name: 'Stream Mode',
+      type: 'boolean',
+      currentValue: state.stream === true,
     },
   ]
 }
@@ -106,7 +121,7 @@ const app = agent({ name: 'mock-acp-agent' })
   }))
   .onRequest(methods.agent.session.new, ctx => {
     const sessionId = `mock-sess-${String(++counter)}`
-    sessions.set(sessionId, { cwd: ctx.params.cwd, modeId: 'default', temp: 'mid', model: 'mock-model-a', effort: 'high' })
+    sessions.set(sessionId, { cwd: ctx.params.cwd, modeId: 'default', temp: 'mid', model: DEFAULT_MODEL, effort: 'high', stream: false })
     return {
       sessionId,
       modes: {
@@ -132,7 +147,7 @@ const app = agent({ name: 'mock-acp-agent' })
     const { sessionId, cwd } = ctx.params
     // Stand-in for agent-side persistence: recreate the record, replay a
     // marker update, then answer with the session state.
-    sessions.set(sessionId, { cwd, modeId: 'default', temp: 'mid', model: 'mock-model-a', effort: 'high' })
+    sessions.set(sessionId, { cwd, modeId: 'default', temp: 'mid', model: DEFAULT_MODEL, effort: 'high', stream: false })
     const send = update => ctx.client.notify(methods.client.session.update, { sessionId, update })
     await send({ sessionUpdate: 'tool_call', toolCallId: 'replay_tool', title: 'replayed tool', kind: 'other', status: 'completed' })
     await send({ sessionUpdate: 'agent_message_chunk', messageId: 'replay-1', content: { type: 'text', text: 'REPLAYED: earlier conversation' } })
@@ -147,12 +162,30 @@ const app = agent({ name: 'mock-acp-agent' })
       configOptions: mockConfigOptions(sessions.get(sessionId)),
     }
   })
-  .onRequest(methods.agent.session.setConfigOption, ctx => {
+  .onRequest(methods.agent.session.setConfigOption, async ctx => {
     const session = sessions.get(ctx.params.sessionId)
     if (session === undefined) throw new Error('no such session')
+    // Test knob: an agent mid-reset answering (and pushing) an EMPTY option
+    // set. The host must treat it as a non-answer that never wipes known state.
+    if (ctx.params.configId === 'mock-empty-answer') {
+      await ctx.client.notify(methods.client.session.update, {
+        sessionId: ctx.params.sessionId,
+        update: { sessionUpdate: 'config_option_update', configOptions: [] },
+      })
+      return { configOptions: [] }
+    }
     if (ctx.params.configId === 'temp') session.temp = String(ctx.params.value)
     else if (ctx.params.configId === 'model') session.model = String(ctx.params.value)
     else if (ctx.params.configId === 'thought') session.effort = String(ctx.params.value)
+    else if (ctx.params.configId === 'stream') {
+      // A boolean option must arrive discriminated: `type: 'boolean'` + a real
+      // boolean. The request union keys on `type`, so a client that forgets it
+      // is sending a select value id at a toggle.
+      if (ctx.params.type !== 'boolean' || typeof ctx.params.value !== 'boolean') {
+        throw new Error('stream is a boolean option: expected type "boolean" and a boolean value')
+      }
+      session.stream = ctx.params.value
+    }
     return { configOptions: mockConfigOptions(session) }
   })
   .onRequest(methods.agent.session.setMode, async ctx => {
