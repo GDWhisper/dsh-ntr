@@ -22,7 +22,11 @@
 
 本插件是一个 DSH **bundle**：`package.json` 的 `dsh.bundle.patch` 声明了随包分发的两层补丁——插件本体的 `cordis.patch.yml`，与 NTR 模式 preset 的 `presets/acp/acp.patch.yml`。用 `dsh plugin` 安装后，包会加入 profile 的 `dsh.profile.bundles`，补丁层**自动生效**，无需手动编辑任何配置文件。
 
-### 方式一：从 npm registry 安装
+### 方式一：从官方界面安装
+
+打开 DSH 侧边栏的**插件**页，点**添加插件**，输入 `dsh-ntr`，点安装。装完刷新页面即可使用。
+
+### 方式二：从 npm registry 安装
 
 ```bash
 dsh plugin --profile web add dsh-ntr@latest
@@ -32,7 +36,7 @@ dsh plugin --profile web add dsh-ntr@latest
 
 > `add` 时**务必带 `@latest`**：不带的话包管理器会一直复用首次写入的版本号，之后连 `update` 也升不上去。
 
-### 方式二：经 [dsh-market](https://github.com/dsh-market/dsh-market) 插件市场安装
+### 方式三：经 [dsh-market](https://github.com/dsh-market/dsh-market) 插件市场安装
 
 先装市场本体：
 
@@ -42,9 +46,9 @@ dsh plugin --profile web add dshmarket
 
 重启 `dsh web`，打开**插件**页：dsh 0.2.1 起市场是「已安装」旁边的**插件市场**标签页；更早的版本在**设置 → 插件市场**。搜索 `dsh-ntr`，确认来源后一键安装，装完刷新页面即可使用；之后的更新检查与升级也在市场里完成。官方 DSH 桌面 App 自带这个市场，直接在 App 的**插件**页里搜索安装即可。
 
-> 市场的插件清单来自 [awesome-dsh-plugin](https://awesome-dsh-plugin.com) 精选目录，每天自动刷新。若搜索结果里暂时没有 `dsh-ntr`，用方式一从 npm 安装，不影响使用。
+> 市场的插件清单来自 [awesome-dsh-plugin](https://awesome-dsh-plugin.com) 精选目录，每天自动刷新。若搜索结果里暂时没有 `dsh-ntr`，用方式二从 npm 安装，不影响使用。
 
-### 方式三：从源码安装
+### 方式四：从源码安装
 
 需要 Node.js ≥ 22.12.0。
 

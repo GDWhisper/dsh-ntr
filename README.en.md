@@ -22,7 +22,11 @@ In one sentence: your host agent acts as an ACP client, negotiates capabilities 
 
 This plugin is a DSH **bundle**: `package.json`'s `dsh.bundle.patch` declares the two patches shipped with the package — the plugin's own `cordis.patch.yml`, and the NTR-mode preset at `presets/acp/acp.patch.yml`. After `dsh plugin` installs it, the package joins the profile's `dsh.profile.bundles` and the patch layers take effect **automatically** — no config file needs editing by hand.
 
-### Option 1: from the npm registry
+### Option 1: from the official UI
+
+Open the **Plugins** page in DSH's sidebar, click **Add plugin**, enter `dsh-ntr`, and click install. Refresh the page and it's ready to use.
+
+### Option 2: from the npm registry
 
 ```bash
 dsh plugin --profile web add dsh-ntr@latest
@@ -32,7 +36,7 @@ Run the same command again to upgrade.
 
 > **Always pass `@latest`**: without it the package manager keeps reusing the version it wrote the first time, and `update` won't get you off it afterwards.
 
-### Option 2: via the [dsh-market](https://github.com/dsh-market/dsh-market) plugin market
+### Option 3: via the [dsh-market](https://github.com/dsh-market/dsh-market) plugin market
 
 First install the market itself:
 
@@ -42,9 +46,9 @@ dsh plugin --profile web add dshmarket
 
 Restart `dsh web` and open the **Plugins** page: on dsh 0.2.1+ the market is the **Plugin Market** tab next to **Installed**; on older hosts it lives under **Settings → Plugin Market**. Search for `dsh-ntr`, confirm the source, and install in one click — refresh the page and it's live; update checks and upgrades afterwards also happen in the market. The official DSH Desktop app ships with this market preset, so just search and install from the app's **Plugins** page.
 
-> The market's catalog comes from the curated [awesome-dsh-plugin](https://awesome-dsh-plugin.com) registry and refreshes daily. If `dsh-ntr` doesn't show up in search yet, install it from npm with Option 1 — nothing is lost.
+> The market's catalog comes from the curated [awesome-dsh-plugin](https://awesome-dsh-plugin.com) registry and refreshes daily. If `dsh-ntr` doesn't show up in search yet, install it from npm with Option 2 — nothing is lost.
 
-### Option 3: from source
+### Option 4: from source
 
 Requires Node.js ≥ 22.12.0.
 
