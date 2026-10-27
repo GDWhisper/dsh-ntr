@@ -65,6 +65,33 @@ afterAll(async () => {
 })
 
 /**
+ * Wait until a session's transcript stops growing.
+ *
+ * The SDK paces the agent's output independently of the `session/prompt`
+ * RESPONSE: a notification is routed into the session mailbox and handed to
+ * `handleSessionUpdate` on a later microtask, so `prompt()` — and with it the
+ * adapter stream — can resolve while the agent's LAST chunk is still queued.
+ * Reading the transcript the instant a turn ends therefore races, and it lost
+ * often enough to fail a release (CI saw the mock's echo come back as `MOCK:`
+ * with the `perm=` suffix missing). Quiescence is the honest wait: two
+ * consecutive reads agreeing means the fold caught up.
+ *
+ * Used by every `…Echo` helper below, not just the one that flaked — they all
+ * read the same buffer the same way.
+ */
+async function settleTranscript(manager: BridgeManager, sessionId: string, attempts = 40): Promise<void> {
+  let previous = -1
+  for (let i = 0; i < attempts; i++) {
+    const answer = await dispatchRpc(manager, 'transcript/get', { sessionId })
+    if (!answer.ok) throw new Error('transcript failed')
+    const head = (answer.value as { entries: Array<{ seq: number }> }).entries.at(-1)?.seq ?? 0
+    if (head === previous && head > 0) return
+    previous = head
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+}
+
+/**
  * Drive the adapter the way the host agent-loop does (docs/acp-convergence.md
  * §1.5/§1.7): stream one step; while its chunks carried `tool-call` blocks and
  * it finished with `stop`, stage those calls' results as tool-sourced messages
@@ -1774,6 +1801,7 @@ describe('native approval routing (isolated manager)', () => {
   }
 
   async function echoOf(sessionId: string, text: string): Promise<string> {
+    await settleTranscript(approvalManager, sessionId)
     const transcript = await dispatchRpc(approvalManager, 'transcript/get', { sessionId })
     if (!transcript.ok) throw new Error('transcript failed')
     return (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
@@ -1920,6 +1948,7 @@ describe('a degraded approval route still answers the turn (isolated manager)', 
   }
 
   async function degradeEcho(sessionId: string): Promise<string> {
+    await settleTranscript(degradeManager, sessionId)
     const transcript = await dispatchRpc(degradeManager, 'transcript/get', { sessionId })
     if (!transcript.ok) throw new Error('transcript failed')
     return (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
@@ -2039,6 +2068,7 @@ describe('a native approval route that never answers still answers the turn (iso
   }
 
   async function silentEcho(sessionId: string): Promise<string> {
+    await settleTranscript(silentManager, sessionId)
     const transcript = await dispatchRpc(silentManager, 'transcript/get', { sessionId })
     if (!transcript.ok) throw new Error('transcript failed')
     return (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
@@ -2482,7 +2512,11 @@ describe('permission mapping and the agent\'s own modes (isolated manager)', () 
     })
   }
 
-  /** Drain one adapter turn and return the mock agent's own echo of what it saw. */
+  /**
+   * Wait until the session's transcript stops growing, then read the mock
+   * agent's own echo of what it saw. See the module-level `settleTranscript`
+   * for why the wait is not optional.
+   */
   async function modeTurn(sessionId: string, text: string): Promise<string> {
     const since = modeEvents.length
     for await (const chunk of modeAdapter.stream({
@@ -2495,6 +2529,7 @@ describe('permission mapping and the agent\'s own modes (isolated manager)', () 
     }
     const started = modeEvents.slice(since).find(event => event.type === 'turn/start' && event.text === text)
     if (started === undefined) throw new Error('the turn never started')
+    await settleTranscript(modeManager, started.sessionId)
     const transcript = await dispatchRpc(modeManager, 'transcript/get', { sessionId: started.sessionId })
     if (!transcript.ok) throw new Error('transcript failed')
     return (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
