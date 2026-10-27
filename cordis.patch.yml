@@ -34,6 +34,19 @@
         #                                DEGRADED native route the turn still ends, after
         #                                `permissionFallbackTimeoutMs` (default 300000) —
         #                                see `LedgerFallbackReason`.
+        # nativeApprovalTimeoutMs: 120000
+        #                              How long the native approval route (the composer
+        #                              takeover) may stay unanswered before the ask is
+        #                              WITHDRAWN and re-asked on the settings ledger. 0 waits
+        #                              for the host forever. Raise it if users read long
+        #                              commands before answering; lower it if a host that
+        #                              never renders the takeover should be noticed sooner.
+        # permissionFallbackTimeoutMs: 300000
+        #                              Deadline for a DEGRADED ask (`unavailable`, or
+        #                              `native-timeout` after the withdrawal above): past it
+        #                              the ask is answered `cancelled` instead of hanging the
+        #                              turn. 0 disables even this. `permissionTimeoutMs > 0`
+        #                              governs every path alike and overrides both.
         # cancelFallbackMs: 15000    # force-finalize a turn the agent ignores after session/cancel (0 = off)
         # staleCancelRetryDelayMs: 600  # resend a prompt answered cancelled with no cancel requested (0 = at once)
         # staleCancelMaxRetries: 2      # cap on those resends before the cancelled stop is reported as-is

@@ -283,6 +283,17 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
   if (typeof permissionTimeoutMs !== 'number' || !Number.isInteger(permissionTimeoutMs) || permissionTimeoutMs < 0 || permissionTimeoutMs > 86_400_000) {
     throw new AcpError('bad_config', 'acp: permissionTimeoutMs must be an integer in [0, 86400000] (0 = wait forever)')
   }
+  // Both degraded-route deadlines share the `permissionTimeoutMs` range: `0` is
+  // the meaningful value (never withdraw / never auto-cancel), and anything up
+  // to a day is a legitimate "ask again later" window.
+  const nativeApprovalTimeoutMs = value.nativeApprovalTimeoutMs ?? 120_000
+  if (typeof nativeApprovalTimeoutMs !== 'number' || !Number.isInteger(nativeApprovalTimeoutMs) || nativeApprovalTimeoutMs < 0 || nativeApprovalTimeoutMs > 86_400_000) {
+    throw new AcpError('bad_config', 'acp: nativeApprovalTimeoutMs must be an integer in [0, 86400000] (0 = wait for the host approval chain forever)')
+  }
+  const permissionFallbackTimeoutMs = value.permissionFallbackTimeoutMs ?? 300_000
+  if (typeof permissionFallbackTimeoutMs !== 'number' || !Number.isInteger(permissionFallbackTimeoutMs) || permissionFallbackTimeoutMs < 0 || permissionFallbackTimeoutMs > 86_400_000) {
+    throw new AcpError('bad_config', 'acp: permissionFallbackTimeoutMs must be an integer in [0, 86400000] (0 = never answer a degraded ask on the human\'s behalf)')
+  }
   const cancelFallbackMs = value.cancelFallbackMs ?? 15_000
   if (typeof cancelFallbackMs !== 'number' || !Number.isInteger(cancelFallbackMs) || cancelFallbackMs < 0 || cancelFallbackMs > 600_000) {
     throw new AcpError('bad_config', 'acp: cancelFallbackMs must be an integer in [0, 600000] (0 = disable the fallback)')
@@ -301,6 +312,8 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
     probeModelsOnBoot,
     startupTimeoutMs,
     permissionTimeoutMs,
+    nativeApprovalTimeoutMs,
+    permissionFallbackTimeoutMs,
     cancelFallbackMs,
     staleCancelRetryDelayMs,
     staleCancelMaxRetries,

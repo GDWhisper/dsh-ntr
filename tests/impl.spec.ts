@@ -91,6 +91,31 @@ describe('validateConfig', () => {
     expect(validateConfig({ agents: [], permissionTimeoutMs: 60_000, cancelFallbackMs: 0 }).cancelFallbackMs).toBe(0)
     expect(validateConfig({ agents: [], staleCancelRetryDelayMs: 0, staleCancelMaxRetries: 0 }).staleCancelMaxRetries).toBe(0)
   })
+  it('exposes both degraded-route approval deadlines as config knobs', () => {
+    // The two windows an unanswered ask can hang on, both settable because the
+    // right trade-off is per deployment: how long a composer takeover may stay
+    // silent before the question moves to Settings, and how long a question the
+    // conversation is NOT showing may sit before the turn ends. OmniTerm ships
+    // the same pair as `acp_perm_timeout_secs` (30 s steps, hot-updatable) plus
+    // a mode; here `0` is the per-deadline "never" tier, and no mode exists
+    // because every ask must reach a human.
+    const config = validateConfig({ agents: [] })
+    expect(config.nativeApprovalTimeoutMs).toBe(120_000)
+    expect(config.permissionFallbackTimeoutMs).toBe(300_000)
+
+    // 0 = never withdraw / never answer on the human's behalf (the pre-deadline
+    // behavior, restored on purpose rather than by omission).
+    const off = validateConfig({ agents: [], nativeApprovalTimeoutMs: 0, permissionFallbackTimeoutMs: 0 })
+    expect(off.nativeApprovalTimeoutMs).toBe(0)
+    expect(off.permissionFallbackTimeoutMs).toBe(0)
+    expect(validateConfig({ agents: [], nativeApprovalTimeoutMs: 1_800_000 }).nativeApprovalTimeoutMs).toBe(1_800_000)
+
+    expect(() => validateConfig({ agents: [], nativeApprovalTimeoutMs: -1 })).toThrow(/nativeApprovalTimeoutMs/)
+    expect(() => validateConfig({ agents: [], nativeApprovalTimeoutMs: 1.5 })).toThrow(/nativeApprovalTimeoutMs/)
+    expect(() => validateConfig({ agents: [], nativeApprovalTimeoutMs: 86_400_001 })).toThrow(/nativeApprovalTimeoutMs/)
+    expect(() => validateConfig({ agents: [], permissionFallbackTimeoutMs: -1 })).toThrow(/permissionFallbackTimeoutMs/)
+    expect(() => validateConfig({ agents: [], permissionFallbackTimeoutMs: 86_400_001 })).toThrow(/permissionFallbackTimeoutMs/)
+  })
   it('keeps idleTimeoutMs optional per agent and bounds it when present', () => {
     // Absent means "host default": a config stored before this field existed
     // must keep validating, or `loadPersistedAgents` would drop the agent.

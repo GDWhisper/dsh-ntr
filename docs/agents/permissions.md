@@ -25,6 +25,14 @@ ACP `session/request_permission` 原样映射：选项列表 / allow-deny / tool
 | `unavailable` | 服务在、这一次失败 | 降级路径：改走 `permissionFallbackTimeoutMs`（默认 300_000 = 5 分钟），到时代答 `cancelled`；填 `0` 关闭 |
 | `native-timeout` | 宿主**收了问题却不答**（answerer 不在浏览器 scope、对话未挂载、remote 事件没送达） | 同上；另外路由本身有 `nativeApprovalTimeoutMs`（默认 120_000），到点撤回后才会走到这里 |
 
+- **两个期限都是配置项**（`AcpPluginConfig`，`cordis.patch.yml` 里注释了默认值）：`nativeApprovalTimeoutMs`
+  （撤回窗口，默认 120_000）与 `permissionFallbackTimeoutMs`（降级询问的代答窗口，默认 300_000）。
+  `0` = 对应期限永不触发（恢复加期限之前的行为）；`permissionTimeoutMs > 0` 时它对所有路径一视同仁、
+  覆盖这两个值。OmniTerm dev 把同一对窗口做成 `acp_perm_timeout_secs`（30 秒步进、上限 1 小时、
+  原子量热更新）+ `acp_perm_timeout_mode` 三档；本插件只取两档——`0` 即 OmniTerm 的 `wait`，
+  现行行为即 `abort`，`auto`（代答）与「每一问都必须交给人」冲突，不设。热更新未做：配置在
+  `apply()` 时读一次，改配置要重启插件进程。
+
 - **路由有截止期限**（`BridgeTuning.nativeApprovalTimeoutMs`）： routed ask 的唯一答案入口就是 composer 接管，且**不广播任何帧**——宿主收了问题却不渲染，turn 就挂在一个人看不见的地方（issue #2 的实测：只剩 agent 侧心跳，会话永久挂起）。到点即**撤回**：abort 交给宿主的 signal（宿主 waterfall 用同一个 signal 赛跑答案，遂以 `cancelled` 收尾、composer 面板消失），再把同一问题改走 ledger。撤回**不是代答**——人照样能在设置页回答同一个问题；填 `0` 关闭该期限（恢复无限等待）。
 - `permissionTimeoutMs > 0` 时对四条路径一视同仁。路由成功时**不启动**任何定时器（人在对话里答，不能抢答），但仍广播一条 `permission/resolved` 保持事件流对称。
 - 原因必须在广播**之前**记进 `ledgerFallbacks`（`ledgerFallbackOf` 读）。`streamPrompt` 据此写聊天提示：设计内路径说「please approve in Settings」；降级路径必须说清为什么对话没展示这个问题（`unavailable` = 审批服务不可用；`native-timeout` = 问题从未到达对话）并带倒计时——否则「去设置页批准」读起来像一个选择，而它其实是 deadline。

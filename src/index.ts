@@ -99,6 +99,8 @@ export function apply(ctx: Context, config?: unknown): void {
     {
       startupTimeoutMs: resolved.startupTimeoutMs,
       permissionTimeoutMs: resolved.permissionTimeoutMs,
+      nativeApprovalTimeoutMs: resolved.nativeApprovalTimeoutMs,
+      permissionFallbackTimeoutMs: resolved.permissionFallbackTimeoutMs,
       cancelFallbackMs: resolved.cancelFallbackMs,
       staleCancelRetryDelayMs: resolved.staleCancelRetryDelayMs,
       staleCancelMaxRetries: resolved.staleCancelMaxRetries,

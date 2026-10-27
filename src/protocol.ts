@@ -119,6 +119,32 @@ export interface AcpPluginConfig {
    */
   permissionTimeoutMs?: number
   /**
+   * How long the NATIVE approval route may wait for the host approval chain to
+   * answer before the ask is withdrawn and handed to the settings-panel ledger
+   * (the `native-timeout` fallback). A routed ask has exactly one answer entry
+   * — the composer takeover — and broadcasts nothing, so a host that takes the
+   * question and never renders it would hang the turn behind something
+   * invisible; this deadline is what bounds that state. Withdrawing is NOT
+   * answering: the same question stays answerable in Settings.
+   *
+   * Default 120000 ms (2 minutes) — long enough that a slow first paint does not
+   * trip it, short enough that a broken route is noticed. `0` waits for the host
+   * forever (the pre-withdrawal behavior). OmniTerm's equivalent is the reaper's
+   * permission-timeout threshold (30 min default, 30 s steps, hot-updatable);
+   * this is the same knob without their `auto` tier, which this plugin does not
+   * have (every ask must reach a human).
+   */
+  nativeApprovalTimeoutMs?: number
+  /**
+   * Deadline for a permission ask whose native route DEGRADED (`unavailable`, or
+   * `native-timeout` after the withdrawal above): the conversation is not
+   * showing the question, so waiting forever would hang the turn on something
+   * nobody can see there. Past it the ask is answered `cancelled`. Applies only
+   * while `permissionTimeoutMs` is `0`; that knob, when non-zero, governs every
+   * path alike. Default 300000 ms; `0` disables even this fallback.
+   */
+  permissionFallbackTimeoutMs?: number
+  /**
    * After `session/cancel`, how long to wait for the agent to settle the turn
    * before the host force-finalizes it. An agent that ignores the cancel
    * notification must not wedge the session in `running` forever.
