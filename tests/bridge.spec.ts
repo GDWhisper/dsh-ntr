@@ -13,6 +13,7 @@ import {
   AcpLlmAdapter, AgentBridge, BridgeManager, defaultAgentWorkspace,
   detectHostAgents, ensureAgentExecutable, findExecutable, killProcessTree, pluginStateDir, routeBindingRegistry, windowsShimLaunch,
   type ApprovalOutcome, type ApprovalRequestContext, type BridgeTuning,
+  permissionToolName,
 } from '../src/bridge.ts'
 import { EventHub, dispatchRpc } from '../src/impl.ts'
 import type { AcpAgentCatalog, AcpAgentDef, AcpEvent, AgentCatalogResult, ChatSessionView, StreamChunk } from '../src/protocol.ts'
@@ -165,6 +166,40 @@ describe('ACP bridge over stdio (mock agent)', () => {
     await dispatchRpc(manager, 'session/cancel', { sessionId: id })
     const end = await waitFor('turn/end', event => event.sessionId === id)
     expect(end.stopReason).toBe('cancelled')
+  }, 30_000)
+
+  it('answers a pending permission with cancelled when the turn is cancelled', async () => {
+    // The ACP spec's other half of `session/cancel`: a client that cancels MUST
+    // answer every pending `session/request_permission` with `cancelled`. Without
+    // it the agent's tool call stays blocked on an answer that can no longer
+    // arrive, and the ledger keeps a card for a turn that is already over
+    // (OmniTerm: `PermissionManager::cancel_all`, called from `AcpClient::cancel`).
+    const start = await dispatchRpc(manager, 'session/start', { agentId: 'mock' })
+    if (!start.ok) throw new Error('start failed')
+    const id = (start.value as { sessionId: string }).sessionId
+    const since = events.length
+    await dispatchRpc(manager, 'session/prompt', { sessionId: id, text: 'hello PERM cancel me' })
+    const permission = await waitFor('permission/request', event => event.sessionId === id && events.indexOf(event) >= since)
+    expect(permission.options.map(o => o.kind)).toEqual(['allow_once', 'reject_once'])
+
+    await dispatchRpc(manager, 'session/cancel', { sessionId: id })
+    const resolved = await waitFor('permission/resolved', event => event.requestId === permission.requestId && events.indexOf(event) >= since)
+    expect(resolved.outcome).toEqual({ outcome: 'cancelled' })
+    // The ask is gone from the ledger: answering it now is an error, not a
+    // second chance.
+    const late = await dispatchRpc(manager, 'permission/respond', { requestId: permission.requestId, optionId: 'allow1' })
+    expect(late).toMatchObject({ ok: false, error: { code: 'unknown_request' } })
+    // And the agent was NOT left blocked on our answer: it received `cancelled`
+    // and finished the turn on its own.
+    await waitFor('turn/end', event => event.sessionId === id && events.indexOf(event) >= since)
+    const transcript = await dispatchRpc(manager, 'transcript/get', { sessionId: id })
+    expect(transcript.ok).toBe(true)
+    if (!transcript.ok) return
+    const echo = (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
+      .filter(e => e.update.sessionUpdate === 'agent_message_chunk')
+      .map(e => String((e.update.content as { text?: string }).text ?? ''))
+      .join('')
+    expect(echo).toContain('perm=cancelled')
   }, 30_000)
 
   it('enforces the cwd allow-list before touching the agent', async () => {
@@ -842,6 +877,150 @@ describe('ACP bridge over stdio (mock agent)', () => {
     await wsManager.shutdownAll()
   })
 })
+
+/**
+ * The MCP servers an agent is told to connect to.
+ *
+ * Two things are asserted here, and both were measured against codebuddy:
+ *
+ *  1. THE WIRE SHAPE. The ACP union is asymmetric — its stdio variant carries
+ *     NO `type` field (an entry with `type:'stdio'` is accepted by the agent
+ *     and then silently dropped: the server never connects), while http/sse
+ *     DO carry one, and `env`/`headers` are `[{name,value}]` arrays.
+ *  2. ONE LIST PER AGENT PROCESS. The servers land in the agent's PROCESS
+ *     scope, so a session created with a DIFFERENT list replaces the scope and
+ *     drops the MCP servers of the live sessions on the same connection.
+ *     That is why the catalog probe sends the agent's own list too.
+ */
+describe('MCP servers on the wire (isolated manager)', () => {
+  const mcpDef: AcpAgentDef = {
+    id: 'mcp',
+    title: 'MCP',
+    command: process.execPath,
+    args: [MOCK],
+    env: {},
+    cwd: tmpdir(),
+    allowedCwdRoots: [tmpdir()],
+    mcpServers: [
+      { name: 'local', transport: 'stdio', command: '/opt/servers/local', args: ['--mcp'], env: { TOKEN: 'x' } },
+      { name: 'remote', transport: 'http', url: 'https://example.test/mcp', headers: { Authorization: 'Bearer t' } },
+    ],
+  }
+  const mcpHub = new EventHub()
+  const mcpEvents: AcpEvent[] = []
+  const mcpManager = new BridgeManager([mcpDef], mcpHub, 500)
+
+  afterAll(async () => {
+    await mcpManager.shutdownAll()
+  })
+
+  function waitForMcp(type: 'turn/end', predicate: (event: Extract<AcpEvent, { type: 'turn/end' }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: 'turn/end' }>> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${type}`)), timeoutMs)
+      const unsub = mcpHub.subscribe(event => {
+        if (event.type === type && predicate(event as Extract<AcpEvent, { type: 'turn/end' }>)) {
+          clearTimeout(timer)
+          unsub()
+          resolve(event as Extract<AcpEvent, { type: 'turn/end' }>)
+        }
+      })
+      const existing = mcpEvents.find(event => event.type === type && predicate(event as Extract<AcpEvent, { type: 'turn/end' }>))
+      if (existing !== undefined) {
+        clearTimeout(timer)
+        unsub()
+        resolve(existing as Extract<AcpEvent, { type: 'turn/end' }>)
+      }
+    })
+  }
+
+  /** The agent's own echo of the MCP servers its session was created with. */
+  async function echoedWire(sessionId: string): Promise<Array<Record<string, unknown>>> {
+    // Polled rather than waited for: the turn that carries the echo may
+    // already have ended when the test looks, and on the resume path the
+    // transcript is RESET and refilled.
+    const deadline = Date.now() + 15_000
+    for (;;) {
+      const transcript = await dispatchRpc(mcpManager, 'transcript/get', { sessionId })
+      if (transcript.ok) {
+        const text = (transcript.value as { entries: Array<{ update: Record<string, unknown> }> })
+          .entries
+          .filter(e => e.update.sessionUpdate === 'agent_message_chunk')
+          .map(e => String((e.update.content as { text?: string }).text ?? ''))
+          .join('')
+        const begin = text.indexOf('MCPS_BEGIN')
+        const end = text.indexOf('MCPS_END')
+        if (begin >= 0 && end > begin) {
+          return JSON.parse(text.slice(begin + 'MCPS_BEGIN'.length, end)) as Array<Record<string, unknown>>
+        }
+      }
+      if (Date.now() > deadline) throw new Error('the agent never echoed the MCP servers')
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+  }
+
+  it('sends the configured servers to session/new in the ACP wire shape', async () => {
+    mcpHub.subscribe(event => { mcpEvents.push(event) })
+    const start = await dispatchRpc(mcpManager, 'session/start', { agentId: 'mcp' })
+    if (!start.ok) throw new Error('start failed')
+    const id = (start.value as { sessionId: string }).sessionId
+
+    await dispatchRpc(mcpManager, 'session/prompt', { sessionId: id, text: 'MCPS please' })
+    await waitForMcp('turn/end', event => event.sessionId === id)
+
+    const wire = await echoedWire(id)
+    // The stdio entry must NOT carry `type` — the agent drops it otherwise.
+    expect(wire[0]).toEqual({
+      name: 'local',
+      command: '/opt/servers/local',
+      args: ['--mcp'],
+      env: [{ name: 'TOKEN', value: 'x' }],
+    })
+    expect('type' in wire[0]).toBe(false)
+    // The http entry DOES carry one, and its headers are the wire's array form.
+    expect(wire[1]).toEqual({
+      type: 'http',
+      name: 'remote',
+      url: 'https://example.test/mcp',
+      headers: [{ name: 'Authorization', value: 'Bearer t' }],
+    })
+  }, 30_000)
+
+  it('gives the catalog probe the SAME list, so probing cannot strip a live session', async () => {
+    // Measured against codebuddy: the MCP servers land in the agent's process
+    // scope, so a probe session created with an EMPTY list replaces that scope
+    // and the live session loses its MCP tools (the agent logged
+    // `serverManager.delete("injected")`). The probe therefore sends the
+    // agent's own list.
+    const probe = await mcpManager.probeAgentModels('mcp')
+    expect(probe.agentId).toBe('mcp')
+
+    // A session created after the probe still gets the full list — the probe
+    // did not replace the process scope with an empty one.
+    const start = await dispatchRpc(mcpManager, 'session/start', { agentId: 'mcp' })
+    if (!start.ok) throw new Error('start failed')
+    const id = (start.value as { sessionId: string }).sessionId
+    await dispatchRpc(mcpManager, 'session/prompt', { sessionId: id, text: 'MCPS again' })
+    await waitForMcp('turn/end', event => event.sessionId === id)
+    const wire = await echoedWire(id)
+    expect(wire.map(entry => entry.name)).toEqual(['local', 'remote'])
+  }, 30_000)
+
+  it('sends the same list on the resume path', async () => {
+    // A released session resumes through `session/load`; that request carries
+    // the MCP servers too, so the resumed session keeps its tool surface.
+    const start = await dispatchRpc(mcpManager, 'session/start', { agentId: 'mcp' })
+    if (!start.ok) throw new Error('start failed')
+    const id = (start.value as { sessionId: string }).sessionId
+    await dispatchRpc(mcpManager, 'session/prompt', { sessionId: id, text: 'DIE now' })
+    await waitForMcp('session/released' as 'turn/end', event => (event as unknown as { sessionId: string }).sessionId === id)
+
+    await dispatchRpc(mcpManager, 'session/prompt', { sessionId: id, text: 'MCPS resumed' })
+    await waitForMcp('turn/end', event => event.sessionId === id)
+    const wire = await echoedWire(id)
+    expect(wire.map(entry => entry.name)).toEqual(['local', 'remote'])
+  }, 30_000)
+})
+
 
 describe('model catalog (isolated manager)', () => {
   const catalogPath = `${tmpdir()}/acp-catalog-test-${Date.now()}.json`
@@ -1782,6 +1961,250 @@ describe('a degraded approval route still answers the turn (isolated manager)', 
 })
 
 /**
+ * The native approval route TAKING a question and never answering it.
+ *
+ * A routed ask has exactly one answer entry — the composer takeover — and no
+ * broadcast at all, so a host that accepts the question and then never renders
+ * it (the answerer sits outside the browser scope, the conversation is not
+ * mounted, the client never received the remote event) hangs the turn behind
+ * something invisible: no card, no chat line, no deadline. Reported as issue
+ * #2: the ask is logged host-side and nothing ever answers it.
+ *
+ * The bridge bounds that state instead of trusting the host: past
+ * `nativeApprovalTimeoutMs` the ask is WITHDRAWN (the signal handed to the host
+ * aborts, settling its waterfall `cancelled` and dropping the composer panel)
+ * and re-asked on the ledger, where the chat line and the settings card are
+ * both visible. Withdrawing is not answering — the same question stays
+ * answerable in Settings — and the ledger's degraded-route deadline still ends
+ * the turn if nobody answers there either.
+ */
+describe('a native approval route that never answers still answers the turn (isolated manager)', () => {
+  const silentHub = new EventHub()
+  const silentEvents: AcpEvent[] = []
+  silentHub.subscribe(event => { silentEvents.push(event) })
+  const silentManager = new BridgeManager([{ ...def, id: 'silent' }], silentHub, 500, undefined, undefined, true, {
+    nativeApprovalTimeoutMs: 1_200,
+    permissionFallbackTimeoutMs: 2_000,
+  })
+  const silentAdapter = new AcpLlmAdapter(silentManager)
+  /** Signals handed to the host approval chain, so a withdrawal is observable. */
+  const hostAsks: { signal: AbortSignal | undefined }[] = []
+
+  silentManager.setApprovalRequester(request => {
+    hostAsks.push({ signal: request.signal })
+    // A host that took the question and will never answer it.
+    return new Promise<ApprovalOutcome>(() => { /* never settles */ })
+  })
+
+  afterAll(async () => {
+    await silentManager.shutdownAll()
+  })
+
+  function silentWaitFor<T extends AcpEvent['type']>(type: T, since: number, predicate: (event: Extract<AcpEvent, { type: T }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: T }>> {
+    const matches = (event: AcpEvent): event is Extract<AcpEvent, { type: T }> =>
+      event.type === type && predicate(event as Extract<AcpEvent, { type: T }>)
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${type}`)), timeoutMs)
+      const unsub = silentHub.subscribe(event => {
+        if (silentEvents.indexOf(event) >= since && matches(event)) {
+          clearTimeout(timer)
+          unsub()
+          resolve(event)
+        }
+      })
+      const existing = silentEvents.find((event, index) => index >= since && matches(event))
+      if (existing !== undefined) {
+        clearTimeout(timer)
+        unsub()
+        resolve(existing)
+      }
+    })
+  }
+
+  /** Drain one adapter turn, collecting the reasoning text it streamed. */
+  async function silentTurn(sessionId: string, text: string): Promise<{ reasoning: () => string; drained: Promise<void> }> {
+    const parts: string[] = []
+    const drained = (async () => {
+      const { chunks } = await hostLoopTurn(silentAdapter, {
+        provider: 'acp',
+        model: 'silent',
+        sessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+      })
+      for (const chunk of chunks) {
+        if (chunk.type === 'reasoning-delta') parts.push(chunk.text)
+      }
+    })()
+    return { reasoning: () => parts.join(''), drained }
+  }
+
+  async function silentEcho(sessionId: string): Promise<string> {
+    const transcript = await dispatchRpc(silentManager, 'transcript/get', { sessionId })
+    if (!transcript.ok) throw new Error('transcript failed')
+    return (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
+      .filter(e => e.update.sessionUpdate === 'agent_message_chunk')
+      .map(e => String((e.update.content as { text?: string }).text ?? ''))
+      .join('')
+  }
+
+  it('withdraws the ask from the host and re-asks it on the ledger', async () => {
+    const since = silentEvents.length
+    const { reasoning, drained } = await silentTurn('dsh-silent-withdraw', 'PERM silent withdraw')
+    const request = await silentWaitFor('permission/request', since, () => true)
+
+    // Exactly one host ask, and it was withdrawn: the signal the bridge handed
+    // over aborted, which is what settles the host waterfall `cancelled` in
+    // production and drops the composer panel.
+    expect(hostAsks).toHaveLength(1)
+    expect(hostAsks[0]?.signal?.aborted).toBe(true)
+
+    // A human can still answer — in the settings panel now.
+    await dispatchRpc(silentManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
+    await drained
+    // The line must not claim the service is unavailable (it answered nothing,
+    // which is not the same failure) and must name the deadline it now carries.
+    // The cause stays an OBSERVED FACT — a slow human and a host that never
+    // rendered the question look identical from here.
+    expect(reasoning()).toContain('no answer in the conversation within 1s')
+    expect(reasoning()).toContain('approve in Settings within 2s or this request is cancelled')
+    expect(reasoning()).not.toContain('please approve in Settings')
+    expect(await silentEcho(request.sessionId)).toContain('perm=allow1')
+  }, 30_000)
+
+  it('ends the turn instead of hanging when nobody answers the withdrawn ask', async () => {
+    const since = silentEvents.length
+    const { drained } = await silentTurn('dsh-silent-hang', 'PERM silent hang')
+    const request = await silentWaitFor('permission/request', since, () => true)
+
+    // Nobody answers anywhere. The degraded-route deadline answers `cancelled`
+    // on the human's behalf — the only thing keeping the turn from hanging
+    // forever behind a question the conversation never showed.
+    const notice = await silentWaitFor('agent/notice', since, event => event.text.includes('timed out after 2s'))
+    expect(notice.text).toContain('cancelled')
+    await drained
+    expect(await silentEcho(request.sessionId)).toContain('perm=cancelled')
+  }, 30_000)
+
+  it('lists the outstanding ledger asks for a reconnecting client', async () => {
+    // The `permission/request` frame is broadcast ONCE. A client that connects
+    // later — page reload, second tab, stream outage — would never learn this
+    // ask exists, and for a ledger ask the settings card is the only answer
+    // entry (OmniTerm closes the same hole by replaying
+    // `pending_events()` on every WS connect). The manager must therefore be
+    // able to name every outstanding ask with the view it was shown.
+    const since = silentEvents.length
+    const { drained } = await silentTurn('dsh-silent-replay', 'PERM silent replay')
+    const request = await silentWaitFor('permission/request', since, () => true)
+
+    const views = silentManager.pendingPermissionViews()
+    expect(views).toHaveLength(1)
+    expect(views[0]).toMatchObject({
+      requestId: request.requestId,
+      sessionId: request.sessionId,
+      toolCall: request.toolCall,
+      options: request.options,
+    })
+
+    await dispatchRpc(silentManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
+    await drained
+    expect(silentManager.pendingPermissionViews()).toHaveLength(0)
+  }, 30_000)
+
+  it('leaves a promptly answered native ask alone', async () => {
+    // The deadline is a withdrawal, not an answer: a host that answers inside
+    // the window must never reach the ledger, and the ask must not be counted
+    // twice.
+    const before = hostAsks.length
+    const since = silentEvents.length
+    silentManager.setApprovalRequester(request => {
+      hostAsks.push({ signal: request.signal })
+      return new Promise<ApprovalOutcome>(resolve => { setTimeout(() => { resolve('allowed-once') }, 50) })
+    })
+    const { drained } = await silentTurn('dsh-silent-prompt', 'PERM silent prompt')
+    await drained
+    expect(hostAsks).toHaveLength(before + 1)
+    expect(silentEvents.slice(since).filter(e => e.type === 'permission/request')).toHaveLength(0)
+    const turn = silentEvents.find(e => e.type === 'turn/start' && e.text === 'PERM silent prompt')
+    expect(turn).toBeDefined()
+    expect(await silentEcho(turn!.sessionId)).toContain('perm=allow1')
+    // Restore the never-answering requester for any later case.
+    silentManager.setApprovalRequester(request => {
+      hostAsks.push({ signal: request.signal })
+      return new Promise<ApprovalOutcome>(() => { /* never settles */ })
+    })
+  }, 30_000)
+
+  it('adopts a deadline the settings page writes while a session is live', async () => {
+    // The whole point of the settings card over a config-file edit: the window
+    // changes WITHOUT restarting the bridge, which would cost the user every
+    // running session. Built with a window far too long to observe, then
+    // shortened through the settings route — the withdrawal must follow the new
+    // number, not the one the bridge was constructed with.
+    const hotHub = new EventHub()
+    const hotEvents: AcpEvent[] = []
+    hotHub.subscribe(event => { hotEvents.push(event) })
+    const hotManager = new BridgeManager([{ ...def, id: 'hot' }], hotHub, 500, undefined, undefined, true, {
+      nativeApprovalTimeoutMs: 600_000,
+      permissionFallbackTimeoutMs: 600_000,
+    })
+    const hotAsks: { signal: AbortSignal | undefined }[] = []
+    hotManager.setApprovalRequester(request => {
+      hotAsks.push({ signal: request.signal })
+      return new Promise<ApprovalOutcome>(() => { /* never settles */ })
+    })
+    const hotWaitFor = <T extends AcpEvent['type']>(type: T, since: number, predicate: (event: Extract<AcpEvent, { type: T }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: T }>> => {
+      const matches = (event: AcpEvent): event is Extract<AcpEvent, { type: T }> =>
+        event.type === type && predicate(event as Extract<AcpEvent, { type: T }>)
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`timeout waiting for ${type}`)), timeoutMs)
+        const unsub = hotHub.subscribe(event => {
+          if (hotEvents.indexOf(event) >= since && matches(event)) {
+            clearTimeout(timer)
+            unsub()
+            resolve(event)
+          }
+        })
+        const existing = hotEvents.find((event, index) => index >= since && matches(event))
+        if (existing !== undefined) {
+          clearTimeout(timer)
+          unsub()
+          resolve(existing)
+        }
+      })
+    }
+    try {
+      // The settings write, on a manager that has never run a turn.
+      await hotManager.setApprovalDeadlines({ nativeApprovalTimeoutMs: 400, permissionFallbackTimeoutMs: 700 })
+      const since = hotEvents.length
+      const parts: string[] = []
+      const drained = (async () => {
+        const { chunks } = await hostLoopTurn(new AcpLlmAdapter(hotManager), {
+          provider: 'acp',
+          model: 'hot',
+          sessionId: 'dsh-silent-hot',
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'PERM silent hot' }] }],
+        })
+        for (const chunk of chunks) {
+          if (chunk.type === 'reasoning-delta') parts.push(chunk.text)
+        }
+      })()
+      const request = await hotWaitFor('permission/request', since, () => true)
+      // Withdrawn on the NEW 400ms window, not the 600s one it was built with.
+      expect(hotAsks).toHaveLength(1)
+      expect(hotAsks[0]?.signal?.aborted).toBe(true)
+      // And the ledger's degraded-route deadline followed too (700ms → "1s").
+      const notice = await hotWaitFor('agent/notice', since, event => event.text.includes('timed out after 1s'), 5_000)
+      expect(notice.text).toContain('cancelled')
+      await drained
+      expect(parts.join('')).toContain('no answer in the conversation within 0s')
+      expect(request.requestId).not.toBe('')
+    } finally {
+      await hotManager.shutdownAll()
+    }
+  }, 30_000)
+})
+
+/**
  * The DESIGNED ledger path: a host with no approval service at all.
  *
  * Every ask rides the ledger and the settings panel's card is the answer
@@ -2019,6 +2442,22 @@ describe('permission mapping and the agent\'s own modes (isolated manager)', () 
 
   afterAll(async () => {
     await modeManager.shutdownAll()
+  })
+
+  it('names the tool an ask is about, whatever field the agent declared it in', () => {
+    // `title` is OPTIONAL in ACP and real agents omit it: codebuddy sends the
+    // name in `_meta["codebuddy.ai/toolName"]` (observed live — without the
+    // fallback the timeout notice reads `for "tool call"`, which tells the
+    // human nothing about what they missed).
+    expect(permissionToolName({ title: 'mock dangerous operation' })).toBe('mock dangerous operation')
+    expect(permissionToolName({ _meta: { 'codebuddy.ai/toolName': 'Bash' } })).toBe('Bash')
+    expect(permissionToolName({ _meta: { toolName: 'Edit' } })).toBe('Edit')
+    expect(permissionToolName({ kind: 'execute' })).toBe('execute')
+    expect(permissionToolName({})).toBe('tool call')
+    expect(permissionToolName(undefined)).toBe('tool call')
+    // A non-string or empty declaration is not a name; the chain keeps going.
+    expect(permissionToolName({ title: '', _meta: { 'x/toolName': 'Bash' } })).toBe('Bash')
+    expect(permissionToolName({ _meta: { 'x/toolName': 42 } })).toBe('tool call')
   })
 
   /** Wait for a fresh event (the hub keeps older cases' frames, so `since` is mandatory). */
@@ -2909,6 +3348,70 @@ describe('pre-chat pick persistence (isolated manager)', () => {
     // A fresh manager (host restart) reads the same registry file back.
     const reloaded = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
     expect(reloaded.tagHalo()).toEqual({ mode: 'steady', speed: 'slow' })
+    await reloaded.shutdownAll()
+    await gm.shutdownAll()
+  })
+
+  it('edits an approval deadline live, persists it, and resets to the config file', async () => {
+    const storage = `${tmpdir()}/acp-deadlines-${Date.now()}.json`
+    const gm = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
+    // Nothing configured, nothing overridden: the built-in 5-minute window.
+    expect(gm.approvalDeadlines()).toEqual({ nativeApprovalTimeoutMs: 300_000, permissionFallbackTimeoutMs: 300_000 })
+    // A deployment that names only ONE window in `cordis.patch.yml` reports only
+    // that one: the other is a built-in default, not a configured value, and the
+    // settings card has to be able to tell the two apart.
+    gm.setConfiguredApprovalDeadlines({ nativeApprovalTimeoutMs: 600_000 })
+    expect(gm.approvalDeadlines()).toMatchObject({
+      nativeApprovalTimeoutMs: 600_000,
+      permissionFallbackTimeoutMs: 300_000,
+      configured: { nativeApprovalTimeoutMs: 600_000 },
+    })
+
+    // The UI write outranks the config file and reaches the LIVE bridge without
+    // restarting anything — the whole point over an `agent/save`-style reload,
+    // which would cost the user every running session.
+    const tuningOf = (b: AgentBridge): { nativeApprovalTimeoutMs: number; permissionFallbackTimeoutMs: number } =>
+      b as unknown as { nativeApprovalTimeoutMs: number; permissionFallbackTimeoutMs: number }
+    const liveBridge = new AgentBridge({ ...def, id: 'live' }, pickHub, 500, () => { /* no manager behind it */ })
+    ;(gm as unknown as { bridges: Map<string, AgentBridge> }).bridges.set('live', liveBridge)
+    await gm.setApprovalDeadlines({ nativeApprovalTimeoutMs: 30_000 })
+    expect(gm.approvalDeadlines()).toMatchObject({
+      nativeApprovalTimeoutMs: 30_000,
+      permissionFallbackTimeoutMs: 300_000,
+      configured: { nativeApprovalTimeoutMs: 600_000 },
+    })
+    expect(tuningOf(liveBridge).nativeApprovalTimeoutMs).toBe(30_000)
+    // The untouched window keeps the config-file value rather than being reset.
+    expect(tuningOf(liveBridge).permissionFallbackTimeoutMs).toBe(300_000)
+
+    // Persisted: a host restart comes back on the value the user picked, not the
+    // deployment baseline. The host entry re-declares the patch file's baseline
+    // on every boot, so the override has to keep outranking it after a restart.
+    const reloaded = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
+    reloaded.setConfiguredApprovalDeadlines({ nativeApprovalTimeoutMs: 600_000 })
+    expect(reloaded.approvalDeadlines()).toMatchObject({
+      nativeApprovalTimeoutMs: 30_000,
+      permissionFallbackTimeoutMs: 300_000,
+      configured: { nativeApprovalTimeoutMs: 600_000 },
+    })
+
+    // Reset drops the override: the config file decides again.
+    await reloaded.setApprovalDeadlines({}, true)
+    expect(reloaded.approvalDeadlines()).toMatchObject({
+      nativeApprovalTimeoutMs: 600_000,
+      permissionFallbackTimeoutMs: 300_000,
+    })
+    // A fresh manager over the same file sees the same thing (the reset persisted).
+    const afterReset = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
+    afterReset.setConfiguredApprovalDeadlines({ nativeApprovalTimeoutMs: 600_000 })
+    expect(afterReset.approvalDeadlines()).toMatchObject({ nativeApprovalTimeoutMs: 600_000 })
+
+    // An out-of-range write is refused before it can reach state, and the value
+    // in force is untouched.
+    await expect(reloaded.setApprovalDeadlines({ permissionFallbackTimeoutMs: -1 })).rejects.toThrow(/permissionFallbackTimeoutMs/)
+    expect(reloaded.approvalDeadlines().permissionFallbackTimeoutMs).toBe(300_000)
+
+    await afterReset.shutdownAll()
     await reloaded.shutdownAll()
     await gm.shutdownAll()
   })

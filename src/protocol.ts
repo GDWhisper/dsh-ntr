@@ -86,7 +86,58 @@ export interface AcpAgentDef {
    * resumed with `session/load` on the next send.
    */
   idleTimeoutMs?: number
+  /**
+   * MCP servers this agent should connect to, in the plugin's NORMALIZED shape
+   * (see {@link AcpMcpServerDef}) — not the ACP wire shape.
+   *
+   * WHY A NORMALIZED SHAPE: the ACP wire union is asymmetric — its stdio
+   * variant carries NO `type` field while http/sse do, and `env`/`headers` are
+   * `[{name,value}]` arrays. A hand-written config that guessed the wire
+   * shape wrong is accepted by the agent and then SILENTLY DROPPED (measured:
+   * a stdio entry carrying `type:'stdio'` never connects). The normalized
+   * shape has one explicit discriminant, so the wire conversion happens in
+   * exactly one place (bridge.ts) and TypeScript checks it against the SDK's
+   * `McpServer` union.
+   *
+   * An agent's OWN MCP configuration (e.g. `~/.codebuddy/.mcp.json`) is read
+   * by the agent itself and needs no declaration here — this field only adds
+   * servers ON TOP of that.
+   */
+  mcpServers?: AcpMcpServerDef[]
 }
+
+/** How an MCP server is reached. `acp` (agent→client `mcp/message`) is NOT supported. */
+export type AcpMcpTransport = 'stdio' | 'http' | 'sse'
+
+/**
+ * One MCP server, in the plugin's normalized shape.
+ *
+ * The ACP-transport variant (agent calls back into the client over
+ * `mcp/message`) is deliberately absent: the client side of that method is
+ * not in the ACP SDK's stable surface, and no agent advertises the
+ * capability. `validateAgentDef` rejects it with that reason.
+ */
+export type AcpMcpServerDef =
+  | {
+    /** Namespaces the agent's tools as `mcp__<name>__<tool>`; unique per agent. */
+    name: string
+    transport: 'stdio'
+    /** Executable to spawn for this server. */
+    command: string
+    /** Arguments for the command. */
+    args?: string[]
+    /** Environment for the server process (layered over the agent's own env). */
+    env?: Record<string, string>
+  }
+  | {
+    /** Namespaces the agent's tools as `mcp__<name>__<tool>`; unique per agent. */
+    name: string
+    transport: 'http' | 'sse'
+    /** The server's URL. */
+    url: string
+    /** Extra request headers (e.g. authorization). */
+    headers?: Record<string, string>
+  }
 
 export interface AcpPluginConfig {
   agents: AcpAgentDef[]
@@ -118,6 +169,42 @@ export interface AcpPluginConfig {
    * stance that approvals belong to a person.
    */
   permissionTimeoutMs?: number
+  /**
+   * How long the NATIVE approval route may wait for the host approval chain to
+   * answer before the ask is withdrawn and handed to the settings-panel ledger
+   * (the `native-timeout` fallback). A routed ask has exactly one answer entry
+   * — the composer takeover — and broadcasts nothing, so a host that takes the
+   * question and never renders it would hang the turn behind something
+   * invisible; this deadline is what bounds that state. Withdrawing is NOT
+   * answering: the same question stays answerable in Settings.
+   *
+   * Default 300000 ms (5 minutes) — the same window as
+   * `permissionFallbackTimeoutMs`, so "this route is not working" is one number
+   * instead of two arbitrary ones. A takeover that is going to render does so
+   * immediately, and the host replays a pending approval across reconnects, so
+   * the deadline only fires for a host that took the question and never showed
+   * it. `0` waits for the host forever (the pre-withdrawal behavior). OmniTerm's
+   * equivalent is the reaper's permission-timeout threshold (30 min default,
+   * 30 s steps, hot-updatable); this is the same knob without their `auto` tier,
+   * which this plugin does not have (every ask must reach a human).
+   *
+   * Editable from the settings page (`ui/approval-deadlines-set`), which
+   * persists an override in the plugin's own state file and applies it to the
+   * running bridges without restarting anything; the value here is the
+   * deployment baseline that override falls back to. See {@link AcpApprovalDeadlines}.
+   */
+  nativeApprovalTimeoutMs?: number
+  /**
+   * Deadline for a permission ask whose native route DEGRADED (`unavailable`, or
+   * `native-timeout` after the withdrawal above): the conversation is not
+   * showing the question, so waiting forever would hang the turn on something
+   * nobody can see there. Past it the ask is answered `cancelled`. Applies only
+   * while `permissionTimeoutMs` is `0`; that knob, when non-zero, governs every
+   * path alike. Default 300000 ms; `0` disables even this fallback.
+   *
+   * Editable from the settings page, like {@link nativeApprovalTimeoutMs}.
+   */
+  permissionFallbackTimeoutMs?: number
   /**
    * After `session/cancel`, how long to wait for the agent to settle the turn
    * before the host force-finalizes it. An agent that ignores the cancel
@@ -235,6 +322,17 @@ export type AcpEvent =
   | { type: 'agent/exposure'; agentId: string; exposedModels: string[]; autoDiscoverModels: boolean }
   | { type: 'permission/request'; requestId: string; sessionId: string; toolCall: unknown; options: PermissionOptionView[] }
   | { type: 'permission/resolved'; requestId: string; sessionId: string; outcome: PermissionOutcome }
+  /**
+   * Terminator of the pending-permission REPLAY a freshly connected client
+   * receives (see the `/api/acp/stream` route). A `permission/request` frame is
+   * broadcast once, when the ask is created — a client that connects later (page
+   * reload, a second tab, a stream outage) would otherwise never learn the ask
+   * exists, and the settings-panel ledger card is the only answer entry for it.
+   * The replay re-sends every outstanding ask and then this frame, whose
+   * `requestIds` is the authoritative live set: the client drops any pending ask
+   * of its own that is not in it (one resolved while it was disconnected).
+   */
+  | { type: 'permission/synced'; requestIds: string[] }
   | { type: 'turn/start'; sessionId: string; turnId: string; text: string }
   | { type: 'turn/end'; sessionId: string; turnId: string; stopReason?: string; error?: string }
   /**
@@ -429,6 +527,42 @@ export type TagHaloResult = { halo: AcpTagHalo }
 /** `ui/tag-halo-set`: write the halo preference. */
 export interface TagHaloSetPayload { halo: AcpTagHalo }
 
+/** The two approval deadlines the settings page can edit, by field name. */
+export type ApprovalDeadlineKey = 'nativeApprovalTimeoutMs' | 'permissionFallbackTimeoutMs'
+
+/**
+ * What the settings page's approval-deadline card shows: the values in force,
+ * plus the two facts that explain why a value the user did not pick is winning.
+ *
+ * `configured` is present only when `cordis.patch.yml` names a key — a settings
+ * override outranks it, and the card must say so rather than silently showing
+ * the override. `permissionTimeoutMs` is the config-file-only knob that
+ * overrides BOTH deadlines when non-zero; it rides along so the card can warn
+ * instead of letting a user tune a number that is not being read.
+ */
+export interface AcpApprovalDeadlines {
+  nativeApprovalTimeoutMs: number
+  permissionFallbackTimeoutMs: number
+  configured?: Partial<Record<ApprovalDeadlineKey, number>>
+  permissionTimeoutMs?: number
+}
+/**
+ * `ui/approval-deadlines`: read the deadlines in force. `deadlines` is absent
+ * on a host half from before the card existed, which hides the card rather than
+ * showing a number the browser invented.
+ */
+export type ApprovalDeadlinesResult = { deadlines?: AcpApprovalDeadlines }
+/**
+ * `ui/approval-deadlines-set`: write one or both deadlines. Omitted keys keep
+ * their current value; `reset: true` drops the persisted override so the
+ * `cordis.patch.yml` baseline (or the built-in default) applies again.
+ */
+export interface ApprovalDeadlinesSetPayload {
+  nativeApprovalTimeoutMs?: number
+  permissionFallbackTimeoutMs?: number
+  reset?: boolean
+}
+
 /**
  * `session/chat-bind`: point one DSH chat conversation at an ACP agent. The
  * plugin's own conversation↔agent mapping — deliberately NOT a DSH model
@@ -471,6 +605,8 @@ export interface AgentSavePayload {
   autoDiscoverModels?: boolean
   /** Absent → keep the host default (30 minutes); `0` = never release. */
   idleTimeoutMs?: number
+  /** MCP servers to connect to, in the normalized shape. See {@link AcpAgentDef.mcpServers}. */
+  mcpServers?: AcpMcpServerDef[]
 }
 
 /** Result of `agent/test`: spawn + initialize a throwaway process from form values, then tear it down. */

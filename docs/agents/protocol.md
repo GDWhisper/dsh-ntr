@@ -10,6 +10,16 @@
 - **JSON-RPC `-32603 Internal error` 必须优先解析 `error.data`**：agent 的业务阻塞错误（`billing_error` / `rate_limit` / `auth_error`）放在 `data` 里，只读 `error.message` 会丢原因。见 `src/bridge.ts` · `describeError`。
 - **fs 请求错误必须用 `new RequestError(code, message, { message })`**：`RequestError.internalError(x)` 的第一个参数是 **data** 不是 message，传字符串会让 wire 上只剩 `Internal error`。
 
+**MCP 服务器随会话建立下发**：agent 级 `mcpServers`（见 [state.md §2](./state.md)）在三个建会话点**各发一次**，内容是同一份列表：
+
+- `createSession`（`session/new`）
+- `probeConfigOptions`（目录探测也走 `session/new`）
+- resume 路径的 `session/load`
+
+**三处必须是同一份列表**：实测 codebuddy 把这些服务器放进 agent **进程级**的作用域，而不是会话级 —— 同进程里先建一个带注入的会话、再建一个 `mcpServers: []` 的会话，后者会把作用域换成空的，前者的 MCP 工具随之消失（agent 日志 `serverManager.delete("injected")`）。目录探测恰恰复用同一条连接建会话，所以探测若发空列表，用户在设置页点一次「检测可用模型」就会静默剥掉正在聊的会话的 MCP 工具。
+
+线格式由 `toAcpMcpServers` 一次性转换：**stdio 那条不带 `type`**（带了 agent 会静默丢弃），http/sse 带 `type`；`env` / `headers` 是 `[{name,value}]` 数组。
+
 ## 2. 进程死亡 ≠ 会话销毁
 
 **崩溃路径**：`connectionLost` 只能走 `AgentBridge.releaseAll`——会话标记 `released`、settled 权限、广播 `session/released`。严禁在崩溃路径删除会话记录或广播 `session/closed`。
@@ -100,3 +110,4 @@
 | 收尾与分段 | `src/bridge.ts` · `streamPrompt` / `TurnStreamController` / `sawVisibleBlock` / `isAcpToolContinuation`（分段续读与收尾见 [architecture.md §2.2](./architecture.md)） |
 | 数据折叠 | `src/impl.ts` · `acpContentRows` / `formatAcpDiff` / `dumpJson` / `describeUnhandledUpdate` / `acpToolCallFromUpdate` / `acpToolCallDelta` |
 | 启动命令 | `src/impl.ts` · `validateAgentDef` / `splitCommandLine`；`src/bridge.ts` · `quoteLegacyCommand` |
+| MCP 下发 | `src/bridge.ts` · `toAcpMcpServers`（线格式转换）；`src/impl.ts` · `validateMcpServers`（配置校验）；面板三处同步见 `src/client/panel.tsx` · `initialForm` / `buildPayload` / `payloadEquals` |

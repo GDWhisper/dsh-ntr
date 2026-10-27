@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { AcpStore, foldUpdate, type Block } from '../src/client/store.ts'
 import { acpModeFromPresetEvent, stagedIsAcpMode } from '../src/client/acp-ui.tsx'
+import type { AcpAgentDef, DetectedAgentInfo } from '../src/protocol.ts'
 
 function fold(...updates: Array<Record<string, unknown>>): Block[] {
   const blocks: Block[] = []
@@ -322,6 +323,72 @@ describe('AcpStore agent management', () => {
     expect(failing.getSnapshot().tagHalo).toEqual({ mode: 'breath', speed: 'normal' })
   })
 
+  it('reads the approval deadlines on resync and writes one back optimistically', async () => {
+    const sent: Array<Record<string, unknown>> = []
+    const store = new (await import('../src/client/store.ts')).AcpStore(
+      async (_channel, endpoint, payload) => {
+        if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
+        if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'ui/approval-deadlines') {
+          return { ok: true, value: { deadlines: { nativeApprovalTimeoutMs: 600_000, permissionFallbackTimeoutMs: 300_000, configured: { nativeApprovalTimeoutMs: 600_000 } } } }
+        }
+        if (endpoint === 'ui/approval-deadlines-set') {
+          sent.push(payload as Record<string, unknown>)
+          // The host answer is the authority: it echoes what is now in force.
+          return { ok: true, value: { deadlines: { nativeApprovalTimeoutMs: 30_000, permissionFallbackTimeoutMs: 300_000, configured: { nativeApprovalTimeoutMs: 600_000 } } } }
+        }
+        return { ok: true, value: {} }
+      },
+      (zh) => zh,
+    )
+    await store.resync()
+    expect(store.getSnapshot().approvalDeadlines).toMatchObject({ nativeApprovalTimeoutMs: 600_000, permissionFallbackTimeoutMs: 300_000 })
+
+    // Only the touched key travels; the host answer replaces the optimistic value.
+    await store.setApprovalDeadline('nativeApprovalTimeoutMs', 30_000)
+    expect(sent).toEqual([{ nativeApprovalTimeoutMs: 30_000 }])
+    expect(store.getSnapshot().approvalDeadlines).toMatchObject({ nativeApprovalTimeoutMs: 30_000, permissionFallbackTimeoutMs: 300_000 })
+
+    // `reset` is its own payload, not a deadline.
+    await store.resetApprovalDeadlines()
+    expect(sent[1]).toEqual({ reset: true })
+
+    // A host half without the route leaves the card hidden rather than showing
+    // a number this browser invented.
+    const older = new (await import('../src/client/store.ts')).AcpStore(
+      async (_channel, endpoint) => {
+        if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
+        if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'ui/approval-deadlines') return { ok: false, error: { code: 'unknown_endpoint', message: 'no' } }
+        return { ok: true, value: {} }
+      },
+      (zh) => zh,
+    )
+    await older.resync()
+    expect(older.getSnapshot().approvalDeadlines).toBeUndefined()
+
+    // A refused write reverts to the last host answer instead of leaving the
+    // card showing a window that is not running.
+    const failing = new (await import('../src/client/store.ts')).AcpStore(
+      async (_channel, endpoint) => {
+        if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
+        if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'ui/approval-deadlines') {
+          return { ok: true, value: { deadlines: { nativeApprovalTimeoutMs: 300_000, permissionFallbackTimeoutMs: 300_000 } } }
+        }
+        if (endpoint === 'ui/approval-deadlines-set') return { ok: false, error: { code: 'bad_payload', message: 'no' } }
+        return { ok: true, value: {} }
+      },
+      (zh) => zh,
+    )
+    await failing.resync()
+    await failing.setApprovalDeadline('nativeApprovalTimeoutMs', 30_000)
+    expect(failing.getSnapshot().approvalDeadlines).toEqual({ nativeApprovalTimeoutMs: 300_000, permissionFallbackTimeoutMs: 300_000 })
+  })
+
   it('testAgent posts the form payload as-is and returns the host verdict', async () => {
     const payloads: Array<Record<string, unknown>> = []
     const store = new (await import('../src/client/store.ts')).AcpStore(
@@ -396,6 +463,59 @@ describe('AcpStore agent management', () => {
       .toEqual({ visible: false, fellBackFromConversation: false })
     expect(permissionLedgerCard({ approvalRouted: false, permissions: [] }))
       .toEqual({ visible: false, fellBackFromConversation: false })
+  })
+
+  it('round-trips the agent MCP server list through the settings form', async () => {
+    // The MCP list lives in the agent DEFINITION, so the form must carry it:
+    // an agent whose MCP servers are configured must not lose them because
+    // the user opened the settings page and saved some OTHER field.
+    const { buildPayload, initialForm, payloadEquals } = await import('../src/client/panel.tsx')
+    const mcpServers = [
+      { name: 'local', transport: 'stdio' as const, command: '/opt/servers/local', args: ['--mcp'] },
+      { name: 'remote', transport: 'http' as const, url: 'https://example.test/mcp' },
+    ]
+    const config: AcpAgentDef = {
+      id: 'pi',
+      title: 'pi',
+      command: 'pi-acp',
+      args: [],
+      env: {},
+      allowedCwdRoots: [],
+      mcpServers,
+    }
+    const detected: DetectedAgentInfo = {
+      id: 'pi',
+      name: 'pi',
+      detected: true,
+      defaultCommand: 'pi-acp',
+      defaultArgs: [],
+      currentConfig: config,
+    }
+
+    // The form seeds itself from the stored list…
+    const form = initialForm(detected, undefined)
+    expect(form.mcpText).toContain('"local"')
+
+    // …and saving it unchanged is NOT a change (otherwise the card would be
+    // permanently dirty and every save would restart the agent).
+    const payload = buildPayload(form, detected, false)
+    expect(payload.mcpServers).toEqual(mcpServers)
+    expect(payloadEquals(payload, config)).toBe(true)
+
+    // Reformatting the text (reordering keys, re-indenting) is not a change
+    // either.
+    const reformatted = initialForm(detected, undefined)
+    reformatted.mcpText = JSON.stringify([{ transport: 'http', url: 'https://example.test/mcp', name: 'remote' }, { name: 'local', command: '/opt/servers/local', args: ['--mcp'], transport: 'stdio' }], null, 4)
+    expect(payloadEquals(buildPayload(reformatted, detected, false), config)).toBe(true)
+
+    // An agent with no MCP servers sends none, and an empty list is the same
+    // state as none.
+    const bare: AcpAgentDef = { id: 'pi', title: 'pi', command: 'pi-acp', args: [], env: {}, allowedCwdRoots: [] }
+    const bareDetected: DetectedAgentInfo = { ...detected, currentConfig: bare }
+    const bareForm = initialForm(bareDetected, undefined)
+    expect(bareForm.mcpText).toBe('')
+    expect(buildPayload(bareForm, bareDetected, false).mcpServers).toBeUndefined()
+    expect(payloadEquals(buildPayload(bareForm, bareDetected, false), bare)).toBe(true)
   })
 
   it('loads the chat-bound ACP sessions by chat id and switches the agent mode', async () => {
@@ -1245,6 +1365,28 @@ describe('AcpStore event application (released / reset / turn dedup)', () => {
     expect(state.sessions[0]).toMatchObject({ sessionId: 's1', released: true })
     expect(state.permissions).toHaveLength(0)
     expect(state.notice).toMatch(/resume|恢复/)
+  })
+
+  it('re-establishes the pending asks on reconnect and prunes the stale ones', async () => {
+    // A `permission/request` is broadcast ONCE, so a client that connects later
+    // never learns the ask exists. The stream replays every outstanding ask and
+    // terminates with the live id set; this client holds one ask that was
+    // resolved while it was disconnected, which must not survive as a card that
+    // can only answer `unknown_request`.
+    const { store, apply } = await makeStore()
+    await apply({ type: 'permission/request', requestId: 'stale', sessionId: 's1', toolCall: { title: 'old' }, options: [] })
+    await apply({ type: 'permission/request', requestId: 'live', sessionId: 's2', toolCall: { title: 'new' }, options: [] })
+    expect(store.getSnapshot().permissions.map(p => p.requestId)).toEqual(['stale', 'live'])
+
+    // The replay re-sends the outstanding ask (idempotent by request id — it may
+    // also have arrived live) and then names what is actually live.
+    await apply({ type: 'permission/request', requestId: 'live', sessionId: 's2', toolCall: { title: 'new' }, options: [] })
+    await apply({ type: 'permission/synced', requestIds: ['live'] })
+    expect(store.getSnapshot().permissions.map(p => p.requestId)).toEqual(['live'])
+
+    // Nothing outstanding at all: the terminator alone must clear the list.
+    await apply({ type: 'permission/synced', requestIds: [] })
+    expect(store.getSnapshot().permissions).toEqual([])
   })
 
   it('resets blocks and the seq watermark on session/reset so the replay folds fresh', async () => {

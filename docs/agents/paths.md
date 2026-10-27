@@ -16,6 +16,7 @@
   - 请求就是根自身时返回根的绝对写法（`/`、`C:/`），而不是去尾斜杠后的 `''` / `C:`。
   - `resolveSessionCwd` / `canonicalizeFsPath` 的 realpath 结果经 `foldSeparators` 以 `/` 形式返回。
 - **浏览器半区**的表单校验必须用 `isAbsolutePathLike`（`src/client/acp-ui.tsx`），它是宿主 `isAbsolutePath` 的手拷贝；`tests/acp-view.spec.ts` 用同一批样本对两边做等价断言（同 `splitAcpModelId` 纪律）。
+- **`mcpServers` 里的路径不做本层的判定**：其中的 `command`（stdio）与 `url`（http/sse）由 **agent 进程自己**解析与连接，本插件只把字符串原样转成线格式（见 [state.md §2](./state.md)）。约束 24 管的是本插件自己要判定的路径（会话 cwd 与 roots），不是转交给 agent 的值 —— 对后者套 `isAbsolutePath` 只会拒掉合法的配置（比如交给 agent 由它自己找 PATH 上的程序）。
 
 ## 原因
 

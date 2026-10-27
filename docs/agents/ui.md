@@ -127,7 +127,8 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 - **同一个设置页有两个入口**：宿主设置外壳里的 `settings.section`（`AcpSettingsSection`），以及对话内底座空 roster 菜单打开的 `AcpSettingsDialog`（`shell.overlay`）。两处挂的是同一个组件，配置逻辑只有一份；对话框不做第二套表单。宿主外壳的打开状态归它自己，插件无法从对话面驱动（见 §2）。
 - 模型区（`ModelCatalogBlock`）**常驻渲染**，严禁挂在探测结果上：右侧「已选模型」来自 agent 配置的 `exposedModels`，左侧「全部模型」来自宿主目录缓存（`agent/cached-models`，纯内存、不 spawn，见 [state.md §4](./state.md)），所以打开卡片就能看到已配置的东西。`检测可用模型` 只是**左侧列表的刷新**（新增的加进来、下架的去出去），与搜索框同放在模型区自己的工具栏里（不在区块顶部），点击后在标题行回报「新增 N · 移除 M / 目录无变化」。空目录时左侧给引导文案（未读取 / 该 Agent 未暴露 `category: model`），而不是隐藏整块。模型行**直接展示** `description`（如 agent 给出的积分消耗 `x0.29 credits`），严禁只放进 `title` 靠 hover 才能看到；分组兜底 description 与 `group` 相同时不重复展示。空间不足时名称与 credit 优先保留，模型 id 是唯一可收缩的格子：右缘渐隐（mask）而不是硬省略号，hover 时由 `armModelIdMarquee` 实测溢出量并滚动展示全文，`title` 仍保留完整值（reduced-motion 的兜底）。「全部模型」与「已选模型」两块列表**上下堆叠**，不再左右分栏——半宽面板会把名称 / id / credit 同时挤掉。两块面板各自带收纳按钮（`▾` / `▸`，`aria-expanded`）：只隐藏列表本体、保留标题与计数，列表继续挂载以保住滚动位置。
 - 每张 agent 卡保持「紧凑行 + 展开详情」两段，详情体**常挂载**、只用 `display: none` 折叠——条件渲染会重挂载表单 `useState`，丢掉用户编辑中的值。缓存读按 `active`（展开态）触发，折叠的卡片不发请求。
-- 页面按 `section` 分组：页头（标题 / 描述 / 流状态）→ 模式横幅 → 已接入的智能体 → 添加智能体 → 对话外观。文案里点名的控件名必须与可见标题一致：store 的 `detectSummary` 与空态提示都指向「添加智能体」，改名要三处同步（`store.ts` / `panel.tsx` / `tests/store.spec.ts`）。
+- 页面按 `section` 分组：页头（标题 / 描述 / 流状态）→ 模式横幅 → 已接入的智能体 → 添加智能体 → **审批时限** → 对话外观。文案里点名的控件名必须与可见标题一致：store 的 `detectSummary` 与空态提示都指向「添加智能体」，改名要三处同步（`store.ts` / `panel.tsx` / `tests/store.spec.ts`）。审批时限卡的位置在「对话外观」之上：它改变的是回合会发生什么，那张卡只装饰挂牌。
+- **审批时限卡**（`ApprovalDeadlinesCard` / `DeadlineRow`）改两个降级窗口，热生效、不重启（取值三层与覆盖语义见 [permissions.md §2.3](./permissions.md)）。每行是「预设 seg + 自由秒数输入」两路：秒数字段是**草稿**，只有能解析成非负整数才提交，失焦时非法草稿回滚而不写入宿主会拒的值。卡片还必须显示宿主只在相关时才上报的两个事实：`configured[key]` 与生效值不同（配置文件被覆盖，给重置按钮）、`permissionTimeoutMs > 0`（它一视同仁，本卡调的两个数都没被读）。宿主没有这条 RPC 时整卡不渲染——不显示浏览器自己编的数。
 - 工作区保存语义：单根模式（非空 `cwd`）把 `allowedCwdRoots` 收窄为 `[cwd]`；`cwd` 为空则两者都不发送（走宿主 `defaultAgentWorkspace()`）；多根模式发送编辑后的去重绝对路径。初始状态带 >1 个 root 的 agent 必须直接进多根模式，避免仅仅打开表单就收窄白名单。
 - 审批卡与权限路由见 [permissions.md](./permissions.md)。
 
@@ -148,5 +149,5 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 | 视图 | `src/client/acp-view.tsx` · `boundAgentOf` / `acpEmptyCopy` / `diffRows` / `isNewFileDiff` |
 | 斜杠 | `src/client/slash-isolation.ts` · `createSlashIsolation` / `slashAcpVerdict` / `commandCandidates` |
 | 文案 | `src/client/index.tsx` · `label` / `LocaleFace` / `browserPrefersZh`；`src/client/store.ts` · `refreshLocale` / `detectSummaryOf`；`locale/*.json` |
-| 设置页 | `src/client/panel.tsx` · `AcpSettingsSection` / `AgentRow` / `WorkspaceBlock` / `initialForm` / `buildPayload` |
+| 设置页 | `src/client/panel.tsx` · `AcpSettingsSection` / `AgentRow` / `WorkspaceBlock` / `initialForm` / `buildPayload` / `ApprovalDeadlinesCard` |
 | 设置对话框 | `src/client/settings-dialog.tsx` · `AcpSettingsDialog`；`src/client/acp-ui.tsx` · `openAcpSettingsDialog` / `closeAcpSettingsDialog` / `useAcpSettingsDialogOpen` |

@@ -6,7 +6,7 @@
  * Deliberately framework-free: React binds through `useSyncExternalStore`.
  */
 
-import type { AcpConversationChoice, AcpEvent, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSavePayload, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, SessionView } from '../protocol.ts'
+import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSavePayload, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlineKey, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, SessionView } from '../protocol.ts'
 import { DEFAULT_TAG_HALO } from '../protocol.ts'
 
 /** One slash command the ACP agent declared, whole row (the menu draws name, description and `input.hint`). */
@@ -162,6 +162,13 @@ export interface UiState {
    * a write lands optimistically first.
    */
   tagHalo: AcpTagHalo
+  /**
+   * The approval deadlines in force, as the settings card edits them. Absent on
+   * a host half from before the card existed, which hides the card rather than
+   * showing a number this browser invented. Writes land optimistically and the
+   * host answer (returned by the same route) is the authority.
+   */
+  approvalDeadlines?: AcpApprovalDeadlines
   /**
    * Per-chat-session "does this conversation run the ACP preset" verdicts, as
    * reported by `session/chat-list` (host-read from the session log). The
@@ -535,6 +542,7 @@ export class AcpStore {
     approvalRouted: false,
     chatSessions: [],
     tagHalo: { ...DEFAULT_TAG_HALO },
+    approvalDeadlines: undefined,
     chatTranscripts: {},
     acpMode: {},
     chatBoundAgent: {},
@@ -733,7 +741,7 @@ export class AcpStore {
   /** Snapshot refresh used on panel open and after a stream outage. */
   async resync(): Promise<void> {
     try {
-      const [{ agents, approvalRouted }, { sessions }, defaultAgentInfo, detectResult, presetResult, tagHaloResult] = await Promise.all([
+      const [{ agents, approvalRouted }, { sessions }, defaultAgentInfo, detectResult, presetResult, tagHaloResult, deadlinesResult] = await Promise.all([
         this.call<{ agents: AgentView[]; approvalRouted?: boolean }>('agents/list'),
         this.call<{ sessions: SessionView[] }>('sessions/list'),
         // The plugin's OWN default ACP agent — a plugin-private id, not a DSH
@@ -744,6 +752,9 @@ export class AcpStore {
         this.call<{ preset: AcpPresetStatus | null }>('preset/status').catch(() => null),
         // Host without the endpoint (older half) keeps the local default.
         this.call<{ halo: AcpTagHalo }>('ui/tag-halo').catch(() => ({ halo: { ...DEFAULT_TAG_HALO } })),
+        // `undefined` (older half) hides the deadline card instead of showing a
+        // number this browser made up.
+        this.call<ApprovalDeadlinesResult>('ui/approval-deadlines').catch(() => ({ deadlines: undefined })),
       ])
       const detectedAgents = (detectResult && detectResult.agents.length > 0)
         ? detectResult.agents
@@ -758,6 +769,7 @@ export class AcpStore {
         approvalRouted: approvalRouted === true,
         preset: presetResult?.preset ?? undefined,
         tagHalo: tagHaloResult?.halo ?? { ...DEFAULT_TAG_HALO },
+        approvalDeadlines: deadlinesResult.deadlines,
       })
       const active = this.state.activeSessionId ?? sessions[0]?.sessionId
       if (active !== undefined) await this.loadTranscript(active)
@@ -1510,6 +1522,47 @@ export class AcpStore {
   }
 
   /**
+   * Write one approval deadline (settings card), or drop the persisted override
+   * with `reset` so the `cordis.patch.yml` baseline applies again.
+   *
+   * The host answer — the same route returns the deadlines now in force — is the
+   * authority, so an optimistic write that the host trims (out of range, or
+   * merged with a value this browser did not know about) self-corrects instead
+   * of drifting from what runs.
+   */
+  async setApprovalDeadline(key: ApprovalDeadlineKey, ms: number): Promise<void> {
+    await this.writeApprovalDeadlines({ [key]: ms })
+  }
+
+  /** Drop the persisted override: the config file (or the built-in default) decides again. */
+  async resetApprovalDeadlines(): Promise<void> {
+    await this.writeApprovalDeadlines({ reset: true })
+  }
+
+  private async writeApprovalDeadlines(payload: ApprovalDeadlinesSetPayload): Promise<void> {
+    const previous = this.state.approvalDeadlines
+    // Optimistic only where it is safe: the effective numbers move now, and the
+    // override facts (`configured`) stay as the host last reported them. A
+    // failure restores the whole view.
+    if (previous !== undefined) {
+      this.mutate({
+        approvalDeadlines: {
+          ...previous,
+          ...(payload.nativeApprovalTimeoutMs === undefined ? {} : { nativeApprovalTimeoutMs: payload.nativeApprovalTimeoutMs }),
+          ...(payload.permissionFallbackTimeoutMs === undefined ? {} : { permissionFallbackTimeoutMs: payload.permissionFallbackTimeoutMs }),
+        },
+      })
+    }
+    try {
+      const result = await this.call<ApprovalDeadlinesResult>('ui/approval-deadlines-set', payload)
+      this.mutate({ approvalDeadlines: result.deadlines })
+    } catch (error) {
+      this.mutate({ approvalDeadlines: previous })
+      this.flashError(error)
+    }
+  }
+
+  /**
    * Bind one DSH chat session to an ACP agent. This is the plugin's own
    * conversation↔agent mapping: it does NOT write a DSH model route, so it
    * cannot pollute the deployment default model and cannot be refused by the
@@ -1793,6 +1846,16 @@ export class AcpStore {
       }
       case 'permission/resolved': {
         this.mutate({ permissions: this.state.permissions.filter(p => p.requestId !== event.requestId) })
+        return Promise.resolve()
+      }
+      case 'permission/synced': {
+        // Terminator of the reconnect replay: the host just re-sent every
+        // outstanding ask, and this set is the authoritative live list. Drop
+        // anything this client still holds from before the disconnect — an ask
+        // resolved while it was away is gone host-side, and answering it would
+        // only earn `unknown_request`.
+        const live = new Set(event.requestIds)
+        this.mutate({ permissions: this.state.permissions.filter(p => live.has(p.requestId)) })
         return Promise.resolve()
       }
       case 'chat/agent-locked': {

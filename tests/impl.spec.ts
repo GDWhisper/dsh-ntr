@@ -21,6 +21,7 @@ import {
   MAX_CONFIG_OPTIONS_BYTES,
   mergeCatalogShape,
   parseCatalogOptions,
+  permissionReplayFrames,
   usableConfigOptions,
   permissionToolKind,
   permissionToolPaths,
@@ -34,6 +35,7 @@ import {
   quoteCommandToken,
   tokenizeCommandLine,
   validateAgentDef,
+  validateApprovalDeadlines,
   validateConfig,
 } from '../src/impl.ts'
 import type { AcpManager } from '../src/impl.ts'
@@ -89,6 +91,48 @@ describe('validateConfig', () => {
     expect(() => validateConfig({ agents: [], staleCancelMaxRetries: 6 })).toThrow(/staleCancelMaxRetries/)
     expect(validateConfig({ agents: [], permissionTimeoutMs: 60_000, cancelFallbackMs: 0 }).cancelFallbackMs).toBe(0)
     expect(validateConfig({ agents: [], staleCancelRetryDelayMs: 0, staleCancelMaxRetries: 0 }).staleCancelMaxRetries).toBe(0)
+  })
+  it('exposes both degraded-route approval deadlines as config knobs', () => {
+    // The two windows an unanswered ask can hang on, both settable because the
+    // right trade-off is per deployment: how long a composer takeover may stay
+    // silent before the question moves to Settings, and how long a question the
+    // conversation is NOT showing may sit before the turn ends. OmniTerm ships
+    // the same pair as `acp_perm_timeout_secs` (30 s steps, hot-updatable) plus
+    // a mode; here `0` is the per-deadline "never" tier, and no mode exists
+    // because every ask must reach a human.
+    const config = validateConfig({ agents: [] })
+    expect(config.nativeApprovalTimeoutMs).toBe(300_000)
+    expect(config.permissionFallbackTimeoutMs).toBe(300_000)
+
+    // 0 = never withdraw / never answer on the human's behalf (the pre-deadline
+    // behavior, restored on purpose rather than by omission).
+    const off = validateConfig({ agents: [], nativeApprovalTimeoutMs: 0, permissionFallbackTimeoutMs: 0 })
+    expect(off.nativeApprovalTimeoutMs).toBe(0)
+    expect(off.permissionFallbackTimeoutMs).toBe(0)
+    expect(validateConfig({ agents: [], nativeApprovalTimeoutMs: 1_800_000 }).nativeApprovalTimeoutMs).toBe(1_800_000)
+
+    expect(() => validateConfig({ agents: [], nativeApprovalTimeoutMs: -1 })).toThrow(/nativeApprovalTimeoutMs/)
+    expect(() => validateConfig({ agents: [], nativeApprovalTimeoutMs: 1.5 })).toThrow(/nativeApprovalTimeoutMs/)
+    expect(() => validateConfig({ agents: [], nativeApprovalTimeoutMs: 86_400_001 })).toThrow(/nativeApprovalTimeoutMs/)
+    expect(() => validateConfig({ agents: [], permissionFallbackTimeoutMs: -1 })).toThrow(/permissionFallbackTimeoutMs/)
+    expect(() => validateConfig({ agents: [], permissionFallbackTimeoutMs: 86_400_001 })).toThrow(/permissionFallbackTimeoutMs/)
+  })
+
+  it('gates the settings-page deadline write through the same range as the config file', () => {
+    // The card and `cordis.patch.yml` are two doors onto the same knob, so they
+    // must share one gate: a window the UI can save has to survive the next
+    // boot's re-validation, or the setting would silently revert.
+    expect(validateApprovalDeadlines({ nativeApprovalTimeoutMs: 60_000 })).toEqual({ nativeApprovalTimeoutMs: 60_000 })
+    expect(validateApprovalDeadlines({})).toEqual({})
+    expect(validateApprovalDeadlines({ nativeApprovalTimeoutMs: 0, permissionFallbackTimeoutMs: 0 }))
+      .toEqual({ nativeApprovalTimeoutMs: 0, permissionFallbackTimeoutMs: 0 })
+    // `reset` is not a deadline and must not land in the persisted override.
+    expect(validateApprovalDeadlines({ reset: true })).toEqual({})
+    for (const bad of [-1, 1.5, 86_400_001, '60000', null]) {
+      expect(() => validateApprovalDeadlines({ nativeApprovalTimeoutMs: bad })).toThrow(/nativeApprovalTimeoutMs/)
+      expect(() => validateApprovalDeadlines({ permissionFallbackTimeoutMs: bad })).toThrow(/permissionFallbackTimeoutMs/)
+    }
+    expect(() => validateApprovalDeadlines(null)).toThrow(/approval deadlines must be an object/)
   })
   it('keeps idleTimeoutMs optional per agent and bounds it when present', () => {
     // Absent means "host default": a config stored before this field existed
@@ -517,6 +561,66 @@ describe('validateAgentDef', () => {
     expect(() => validateAgentDef({ id: 'pi', command: '' })).toThrow(AcpError)
     expect(() => validateAgentDef({ id: 'PI AGENT', command: 'pi-acp' })).toThrow(AcpError)
   })
+
+  // The MCP server list. The plugin stores it in its OWN normalized shape
+  // (every entry carries an explicit `transport`), because the ACP wire shape
+  // is asymmetric: its stdio variant carries NO `type` field, so a config
+  // written in the wire shape by hand is accepted by the agent and then
+  // silently dropped (measured: the server never connects). The wire
+  // conversion lives in bridge.ts; these cases cover the shape the HOST
+  // accepts and persists.
+  it('accepts MCP servers in the normalized shape and keeps them verbatim', () => {
+    const servers = [
+      { name: 'local', transport: 'stdio', command: '/opt/servers/local', args: ['--mcp'], env: { TOKEN: 'x' } },
+      { name: 'remote', transport: 'http', url: 'https://example.test/mcp', headers: { Authorization: 'Bearer t' } },
+      { name: 'events', transport: 'sse', url: 'https://example.test/sse' },
+    ]
+    const def = validateAgentDef({ id: 'pi', command: 'x', mcpServers: servers })
+    // Verbatim: the host validates, it does not reshape. A host that filled in
+    // defaults would make the settings panel report a change where there is
+    // none.
+    expect(def.mcpServers).toEqual(servers)
+    // And it survives the REBUILD: a field not listed in validateAgentDef's
+    // return is silently stripped, which would delete the whole feature.
+    expect('mcpServers' in def).toBe(true)
+  })
+
+  it('treats an absent MCP list as "none" rather than storing an empty one', () => {
+    expect('mcpServers' in validateAgentDef({ id: 'pi', command: 'x' })).toBe(false)
+    expect(validateAgentDef({ id: 'pi', command: 'x', mcpServers: [] }).mcpServers).toEqual([])
+  })
+
+  it('rejects malformed MCP server entries', () => {
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: 'nope' })).toThrow(/mcpServers/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: [{ transport: 'stdio', command: 'x' }] })).toThrow(/name/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: [{ name: 'a', transport: 'stdio' }] })).toThrow(/command/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: [{ name: 'a', transport: 'http' }] })).toThrow(/url/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: [{ name: 'a', transport: 'sse' }] })).toThrow(/url/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: [{ name: 'a', transport: 'ftp', url: 'x' }] })).toThrow(/transport/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: [{ name: 'a', transport: 'stdio', command: 'x', args: [1] }] })).toThrow(/args/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: [{ name: 'a', transport: 'stdio', command: 'x', env: { K: 1 } }] })).toThrow(/env/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: [{ name: 'a', transport: 'http', url: 'u', headers: { K: 1 } }] })).toThrow(/headers/)
+    // Two servers sharing a name would collide inside the agent, where the name
+    // namespaces the tools (`mcp__<name>__<tool>`).
+    expect(() => validateAgentDef({
+      id: 'pi',
+      command: 'x',
+      mcpServers: [{ name: 'a', transport: 'stdio', command: 'x' }, { name: 'a', transport: 'stdio', command: 'y' }],
+    })).toThrow(/more than one/)
+  })
+
+  it('refuses the ACP transport variant, which the client side cannot serve', () => {
+    // `transport: 'acp'` means the agent calls back into this plugin over
+    // `mcp/message` — a method the stable ACP SDK does not expose on the
+    // client side. Accepting it would store a server the agent can never
+    // reach.
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: [{ name: 'a', transport: 'acp', serverId: 's' }] })).toThrow(/not supported/)
+  })
+
+  it('bounds the MCP server list', () => {
+    const many = Array.from({ length: 40 }, (_, i) => ({ name: `s${String(i)}`, transport: 'stdio', command: 'x' }))
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: many })).toThrow(/at most/)
+  })
 })
 
 /**
@@ -860,6 +964,31 @@ describe('PermissionLedger', () => {
     expect(ledger.sessionIds()).toHaveLength(0)
     void rb
   })
+
+  it('replays only asks that carry a view, as their original request frame', () => {
+    const ledger = new PermissionLedger()
+    const view = {
+      toolCall: { title: 'Bash' },
+      options: [{ optionId: 'allow1', name: 'Allow once', kind: 'allow_once' }],
+    }
+    const shown = ledger.create('s1', () => {}, view)
+    // An entry without a view still answers — it just cannot be re-shown.
+    const hidden = ledger.create('s2', () => {})
+
+    expect(ledger.pendingViews()).toEqual([{ requestId: shown, sessionId: 's1', ...view }])
+
+    const frames = permissionReplayFrames(ledger.pendingViews())
+    // The ask rides its ORIGINAL frame: the client folds both by request id,
+    // so a replay that arrived alongside the live broadcast is idempotent.
+    expect(frames[0]).toEqual({ type: 'permission/request', requestId: shown, sessionId: 's1', ...view })
+    // …and the terminator carries the live set, so a client that reconnects
+    // drops anything it still holds from before the disconnect.
+    expect(frames.at(-1)).toEqual({ type: 'permission/synced', requestIds: [shown] })
+
+    ledger.respond(shown, { outcome: 'cancelled' })
+    expect(permissionReplayFrames(ledger.pendingViews())).toEqual([{ type: 'permission/synced', requestIds: [] }])
+    void hidden
+  })
 })
 
 function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } {
@@ -881,6 +1010,8 @@ function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } {
     setDefaultAgent: async id => { calls.push(['setDefaultAgent', id]) },
     tagHalo: () => ({ mode: 'breath', speed: 'slow' }),
     setTagHalo: async halo => { calls.push(['setTagHalo', halo]) },
+    approvalDeadlines: () => ({ nativeApprovalTimeoutMs: 300_000, permissionFallbackTimeoutMs: 120_000 }),
+    setApprovalDeadlines: async (patch, reset) => { calls.push(['setApprovalDeadlines', patch, reset]) },
     bindChatAgent: (dshSessionId, agentId) => { calls.push(['bindChatAgent', dshSessionId, agentId]) },
     setChatSessionModel: async (dshSessionId, modelId) => { calls.push(['setChatSessionModel', dshSessionId, modelId]) },
     setChatSessionEffort: async (dshSessionId, effort) => { calls.push(['setChatSessionEffort', dshSessionId, effort]) },
@@ -1024,6 +1155,40 @@ describe('dispatchRpc', () => {
     await expect(dispatchRpc(manager, 'ui/tag-halo-set', { halo: { mode: 'blink', speed: 'fast' } })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     await expect(dispatchRpc(manager, 'ui/tag-halo-set', { halo: { mode: 'breath', speed: 'ludicrous' } })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     await expect(dispatchRpc(manager, 'ui/tag-halo-set', {})).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    // The approval deadlines: read is `undefined` on an older host half (which
+    // hides the card), and a write is validated before it reaches the manager —
+    // the same range the config file is held to, so a value the card can send is
+    // a value the next boot accepts.
+    await expect(dispatchRpc(manager, 'ui/approval-deadlines', {})).resolves.toEqual({
+      ok: true,
+      value: { deadlines: { nativeApprovalTimeoutMs: 300_000, permissionFallbackTimeoutMs: 120_000 } },
+    })
+    await expect(dispatchRpc({ ...manager, approvalDeadlines: undefined }, 'ui/approval-deadlines', {})).resolves.toEqual({
+      ok: true,
+      value: { deadlines: undefined },
+    })
+    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { nativeApprovalTimeoutMs: 60_000 })).resolves.toEqual({
+      ok: true,
+      value: { deadlines: { nativeApprovalTimeoutMs: 300_000, permissionFallbackTimeoutMs: 120_000 } },
+    })
+    // Only the touched key travels: the manager merges, so a card that edited one
+    // slider must not reset the other.
+    expect(manager.calls).toContainEqual(['setApprovalDeadlines', { nativeApprovalTimeoutMs: 60_000 }, false])
+    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { reset: true })).resolves.toMatchObject({ ok: true })
+    expect(manager.calls).toContainEqual(['setApprovalDeadlines', {}, true])
+    for (const bad of [-1, 1.5, 86_400_001, '60000']) {
+      await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { nativeApprovalTimeoutMs: bad }))
+        .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+      await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { permissionFallbackTimeoutMs: bad }))
+        .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    }
+    // `0` is the meaningful value on both, not a rejection.
+    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { nativeApprovalTimeoutMs: 0, permissionFallbackTimeoutMs: 0 }))
+      .resolves.toMatchObject({ ok: true })
+    expect(manager.calls).toContainEqual(['setApprovalDeadlines', { nativeApprovalTimeoutMs: 0, permissionFallbackTimeoutMs: 0 }, false])
+    // An unknown key is dropped rather than persisted into state.
+    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { permissionTimeoutMs: 5 })).resolves.toMatchObject({ ok: true })
+    expect(manager.calls).toContainEqual(['setApprovalDeadlines', {}, false])
     // The conversation↔agent mapping: the plugin's own binding, never a model route.
     await expect(dispatchRpc(manager, 'session/chat-bind', { dshSessionId: 'chat-1', agentId: 'pi' })).resolves.toEqual({ ok: true, value: { done: true } })
     expect(manager.calls).toContainEqual(['bindChatAgent', 'chat-1', 'pi'])

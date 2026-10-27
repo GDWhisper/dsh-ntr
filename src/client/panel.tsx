@@ -19,7 +19,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { formatCommandLine, isAbsolutePathLike, splitCommandLine } from './acp-ui.tsx'
 import { DEFAULT_KNOWN_PRESETS } from './store.ts'
 import type { AcpStore, UiState } from './store.ts'
-import type { AcpAgentDef, AcpCatalogChoice, AgentSavePayload, AgentView, DetectedAgentInfo } from '../protocol.ts'
+import type { AcpAgentDef, AcpCatalogChoice, AcpMcpServerDef, AgentSavePayload, AgentView, ApprovalDeadlineKey, DetectedAgentInfo } from '../protocol.ts'
 
 interface WithStore { acp: AcpStore }
 
@@ -199,6 +199,10 @@ const STYLE = `
 .dwa-preference-row + .dwa-preference-row { border-top: var(--ntr-line); }
 .dwa-preference-label { font-size: var(--ntr-font-sm); font-weight: 600; }
 .dwa-preference-copy { margin-top: 2px; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
+.dwa-deadline-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dwa-deadline-input { width: 76px; min-height: 30px; padding: 4px 8px; text-align: right; }
+.dwa-deadline-input[aria-invalid="true"] { border-color: var(--ntr-danger); }
+.dwa-deadline-unit { white-space: nowrap; }
 @media (max-width: 640px) {
   .dwa-root { padding: 14px; }
   .dwa-page-header { flex-direction: column; }
@@ -277,6 +281,72 @@ function sameStringMap(a: Record<string, string>, b: Record<string, string>): bo
 }
 
 /**
+ * Canonical comparable form of the MCP server list. Unset and empty mean the
+ * same thing host-side (no extra MCP servers), so they share a key — treating
+ * them as different would leave a card permanently dirty.
+ *
+ * The list is compared by CANONICAL JSON (object keys sorted, the servers
+ * themselves sorted by name): reformatting the text — reordering keys,
+ * re-indenting, listing the servers in another order — is not a change. The
+ * ARGV array inside a server keeps its order, because there it is the command
+ * line. The browser half needs no copy of the host's per-server validation: a
+ * list the host would reject simply never matches, and the host's own error is
+ * what the user sees.
+ */
+function mcpKey(servers: readonly AcpMcpServerDef[] | undefined): string {
+  if (servers === undefined || servers.length === 0) return 'none'
+  const canonical = servers
+    .map(canonicalJson)
+    .sort((a, b) => {
+      const nameA = String((a as { name?: unknown }).name ?? '')
+      const nameB = String((b as { name?: unknown }).name ?? '')
+      return nameA < nameB ? -1 : nameA > nameB ? 1 : 0
+    })
+  return JSON.stringify(canonical)
+}
+
+/** One value in canonical JSON form: object keys sorted, arrays kept in order. */
+function canonicalJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJson)
+  if (value === null || typeof value !== 'object') return value
+  const entries = Object.entries(value as Record<string, unknown>)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([key, entry]) => [key, canonicalJson(entry)])
+  return Object.fromEntries(entries)
+}
+
+/**
+ * The MCP server list as the form holds it: the raw JSON text the user typed.
+ *
+ * Parsing happens on the way OUT (`buildPayload`), never on the way in, so a
+ * half-typed value never throws inside a render. An unparseable text yields
+ * `undefined`, which the form reports as invalid (`mcpInvalid`) and refuses to
+ * save — better than sending a truncated list.
+ */
+function parseMcpServers(text: string): AcpMcpServerDef[] | undefined {
+  const trimmed = text.trim()
+  if (trimmed === '') return undefined
+  try {
+    const parsed: unknown = JSON.parse(trimmed)
+    if (!Array.isArray(parsed)) return undefined
+    return parsed as AcpMcpServerDef[]
+  } catch {
+    return undefined
+  }
+}
+
+/** Whether the MCP server text parses as a list at all (the host validates the rest). */
+function mcpTextValid(text: string): boolean {
+  const trimmed = text.trim()
+  if (trimmed === '') return true
+  try {
+    return Array.isArray(JSON.parse(trimmed))
+  } catch {
+    return false
+  }
+}
+
+/**
  * Detected presets split by configured-ness, plus configured agents missing
  * from detection (custom / legacy persisted defs) synthesized into card
  * entries so they stay manageable.
@@ -349,7 +419,7 @@ function persistedDef(detected: DetectedAgentInfo, activeAgent: AgentView | unde
  * about; `exposedModels === undefined` means "offer no variants", which is the
  * same state as an empty list.
  */
-function payloadEquals(payload: AgentSavePayload, current: AcpAgentDef): boolean {
+export function payloadEquals(payload: AgentSavePayload, current: AcpAgentDef): boolean {
   if (payload.command !== current.command) return false
   if ((payload.title ?? payload.id) !== (current.title ?? current.id)) return false
   if (!sameStringArray(payload.args ?? [], current.args ?? [])) return false
@@ -358,6 +428,7 @@ function payloadEquals(payload: AgentSavePayload, current: AcpAgentDef): boolean
   if (!sameStringArray(payload.allowedCwdRoots ?? [], current.allowedCwdRoots ?? [])) return false
   if (!sameStringMap(payload.env ?? {}, current.env ?? {})) return false
   if (exposureKey(payload.exposedModels) !== exposureKey(current.exposedModels)) return false
+  if (mcpKey(payload.mcpServers) !== mcpKey(current.mcpServers)) return false
   if ((payload.autoDiscoverModels !== false) !== (current.autoDiscoverModels !== false)) return false
   // An absent field means "use the host default" — which is what `current`
   // already resolved to (see `resolvedIdleTimeoutMs`), so it is not a change.
@@ -384,6 +455,195 @@ function payloadEquals(payload: AgentSavePayload, current: AcpAgentDef): boolean
 export function permissionLedgerCard(ui: Pick<UiState, 'approvalRouted' | 'permissions'>): { visible: boolean; fellBackFromConversation: boolean } {
   const visible = ui.permissions.length > 0
   return { visible, fellBackFromConversation: visible && ui.approvalRouted }
+}
+
+/**
+ * One-click windows for an approval deadline, in ms. `0` is spelled out rather
+ * than hidden behind a big number because "never" is the value a cautious user
+ * picks first, and a preset row that cannot express it would make them type.
+ */
+const DEADLINE_PRESETS = [0, 30_000, 60_000, 300_000, 900_000] as const
+
+/** Both editable windows, for the loops that treat them alike. */
+const DEADLINE_FIELDS: readonly ApprovalDeadlineKey[] = ['nativeApprovalTimeoutMs', 'permissionFallbackTimeoutMs']
+
+/** `5 分钟` / `30 秒` / `关` — the readout and the preset label, one formatter. */
+function deadlineText(ms: number, acp: AcpStore): string {
+  if (ms <= 0) return acp.label('关', 'Off')
+  const seconds = Math.round(ms / 1000)
+  if (seconds < 60) return acp.label(`${String(seconds)} 秒`, `${String(seconds)}s`)
+  const minutes = Math.round(seconds / 60)
+  return acp.label(`${String(minutes)} 分`, `${String(minutes)}m`)
+}
+
+/**
+ * One editable deadline: presets for the windows people actually pick, plus a
+ * free-form seconds field for everything else.
+ *
+ * The field is a DRAFT, not the value: it only commits a parseable whole number
+ * of seconds (0 allowed), and an unparseable draft reverts on blur instead of
+ * writing garbage the host would refuse. The host answer is what the row then
+ * shows, so a value the host trims never lingers in the UI.
+ */
+function DeadlineRow(props: {
+  acp: AcpStore
+  field: ApprovalDeadlineKey
+  label: string
+  copy: string
+  value: number
+}) {
+  const { acp, field, label, copy, value } = props
+  const [draft, setDraft] = useState<string | undefined>(undefined)
+  const text = draft ?? String(Math.round(value / 1000))
+  const parsed = /^\d+$/.test(text.trim()) ? Number(text.trim()) * 1000 : undefined
+  const commit = (): void => {
+    const next = parsed
+    setDraft(undefined)
+    // A no-op write is still a write: it is what pins the value into the
+    // persisted override, which is what makes it survive a restart.
+    if (next !== undefined && next !== value) void acp.setApprovalDeadline(field, next)
+  }
+  return (
+    <div className="dwa-preference-row">
+      <div>
+        <div className="dwa-preference-label">{label}</div>
+        <div className="dwa-preference-copy">{copy}</div>
+      </div>
+      <div className="dwa-deadline-controls">
+        <div className="dwa-seg">
+          {DEADLINE_PRESETS.map(preset => (
+            <button
+              key={preset}
+              type="button"
+              className={value === preset ? 'is-on' : ''}
+              title={deadlineText(preset, acp)}
+              onClick={() => void acp.setApprovalDeadline(field, preset)}
+            >
+              {deadlineText(preset, acp)}
+            </button>
+          ))}
+        </div>
+        <input
+          className="dwa-input dwa-deadline-input"
+          type="text"
+          inputMode="numeric"
+          aria-label={label}
+          aria-invalid={parsed === undefined}
+          value={text}
+          onChange={event => setDraft(event.target.value)}
+          onBlur={commit}
+          onKeyDown={event => { if (event.key === 'Enter') commit() }}
+        />
+        <span className="dwa-hint dwa-deadline-unit">{acp.label('秒', 'sec')}</span>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * The approval-deadline card.
+ *
+ * Both windows are about the SAME failure — an ask nobody answered — reached
+ * from two different routes, which is exactly why they need an explanation
+ * rather than two bare sliders: the first bounds a host that took the question
+ * into the composer and never rendered it, the second bounds an ask that never
+ * reached the conversation at all. Neither is an answer on the user's behalf
+ * being hidden from them: withdrawing re-asks on the ledger, and the fallback
+ * says what it did in a notice.
+ *
+ * `configured` and `permissionTimeoutMs` are reported by the host only when
+ * they are actually in play, and both are shown here rather than swallowed:
+ * a user tuning a number that something else is overriding deserves to be told.
+ */
+function ApprovalDeadlinesCard(props: { acp: AcpStore; ui: UiState }) {
+  const { acp, ui } = props
+  const deadlines = ui.approvalDeadlines
+  // Older host half: no card rather than a number this browser invented.
+  if (deadlines === undefined) return null
+  const configured = deadlines.configured ?? {}
+  const inForce: Record<ApprovalDeadlineKey, number> = {
+    nativeApprovalTimeoutMs: deadlines.nativeApprovalTimeoutMs,
+    permissionFallbackTimeoutMs: deadlines.permissionFallbackTimeoutMs,
+  }
+  const overrideNote = (field: ApprovalDeadlineKey): string | undefined => {
+    const baseline = configured[field]
+    // Equal (or unconfigured) means nothing is being outranked: stay silent.
+    if (baseline === undefined || baseline === inForce[field]) return undefined
+    return acp.label(
+      `cordis.patch.yml 里是 ${deadlineText(baseline, acp)}，设置页的值优先。`,
+      `cordis.patch.yml asks for ${deadlineText(baseline, acp)}; the value set here wins.`,
+    )
+  }
+  // An override is in force exactly when a note says so — a configured baseline
+  // that AGREES with the running value is not an override, and offering a reset
+  // for it would be a button that does nothing (observed live).
+  const overridden = DEADLINE_FIELDS.some(field => overrideNote(field) !== undefined)
+  return (
+    <section className="dwa-section">
+      <div className="dwa-section-heading">
+        <div>
+          <h3 className="dwa-section-title">{acp.label('审批时限', 'Approval deadlines')}</h3>
+          <p className="dwa-section-copy">
+            {acp.label(
+              '没人答复的权限询问多久后由插件接手。两者都不是替你批准：撤回后会改到设置页再问一次，代答前会先发一条说明。',
+              'How long an unanswered permission ask waits before the plugin takes over. Neither approves on your behalf: a withdrawal re-asks in Settings, and an auto-answer announces itself first.',
+            )}
+          </p>
+        </div>
+      </div>
+      <div className="dwa-card" style={{ paddingTop: 4, paddingBottom: 4 }}>
+        <DeadlineRow
+          acp={acp}
+          field="nativeApprovalTimeoutMs"
+          label={acp.label('对话审批撤回窗口', 'Composer approval withdrawal')}
+          copy={acp.label(
+            '宿主把询问接进对话后，多久没出现就撤回并改到设置页问。会渲染的接管是立即出现的，所以这个期限只为「收了却不渲染」而响。',
+            'How long an ask the host took into the composer may stay invisible before it is withdrawn and re-asked in Settings. A takeover that renders does so immediately, so this only fires for one that never showed up.',
+          )}
+          value={deadlines.nativeApprovalTimeoutMs}
+        />
+        {overrideNote('nativeApprovalTimeoutMs') !== undefined && (
+          <div className="dwa-hint" style={{ paddingBottom: 8 }}>{overrideNote('nativeApprovalTimeoutMs')}</div>
+        )}
+        <DeadlineRow
+          acp={acp}
+          field="permissionFallbackTimeoutMs"
+          label={acp.label('降级询问代答窗口', 'Degraded-ask auto-answer')}
+          copy={acp.label(
+            '询问没能进入对话时（审批服务不可用，或已被撤回），多久后答复 cancelled。',
+            'How long an ask that never reached the conversation (approval service unavailable, or withdrawn above) waits before it is answered cancelled.',
+          )}
+          value={deadlines.permissionFallbackTimeoutMs}
+        />
+        {overrideNote('permissionFallbackTimeoutMs') !== undefined && (
+          <div className="dwa-hint" style={{ paddingBottom: 8 }}>{overrideNote('permissionFallbackTimeoutMs')}</div>
+        )}
+        {deadlines.permissionTimeoutMs !== undefined && (
+          <div className="dwa-hint" style={{ paddingBottom: 8 }}>
+            {acp.label(
+              `注意：cordis.patch.yml 里 permissionTimeoutMs = ${deadlineText(deadlines.permissionTimeoutMs, acp)}，它一视同仁，覆盖上面两个窗口。`,
+              `Note: cordis.patch.yml sets permissionTimeoutMs = ${deadlineText(deadlines.permissionTimeoutMs, acp)}, which governs every path alike and overrides both windows above.`,
+            )}
+          </div>
+        )}
+        {overridden && (
+          <div className="dwa-preference-row">
+            <div>
+              <div className="dwa-preference-copy">
+                {acp.label(
+                  '设置页的值写在插件自己的状态文件里，重启后仍然有效；重置后回到 cordis.patch.yml 的配置。',
+                  'A value set here lives in the plugin\'s own state file and survives a restart; resetting returns to whatever cordis.patch.yml asks for.',
+                )}
+              </div>
+            </div>
+            <button type="button" className="dwa-btn" onClick={() => void acp.resetApprovalDeadlines()}>
+              {acp.label('恢复配置文件的值', 'Use config file value')}
+            </button>
+          </div>
+        )}
+      </div>
+    </section>
+  )
 }
 
 /** Settings configuration section for ACP agents. */
@@ -445,8 +705,8 @@ export function AcpSettingsSection(props: WithStore) {
           {ledger.fellBackFromConversation && (
             <div className="dwa-hint" style={{ marginBottom: 8 }}>
               {acp.label(
-                '这些询问没有进入对话（审批服务本次不可用，或会话没有对话身份），请在此回答。',
-                'These asks did not reach the conversation (the approval service was unavailable, or the session has no chat identity) — answer them here.',
+                '这些询问没有进入对话（审批服务本次不可用、问题从未到达对话，或会话没有对话身份），请在此回答。',
+                'These asks did not reach the conversation (the approval service was unavailable, the question never reached the conversation, or the session has no chat identity) — answer them here.',
               )}
             </div>
           )}
@@ -604,6 +864,11 @@ export function AcpSettingsSection(props: WithStore) {
         </div>
       </section>
 
+      {/* Approval deadlines: the two windows that bound an ask nobody
+          answered. Placed above the appearance card because it changes what
+          happens to a turn, and that card only decorates a nameplate. */}
+      <ApprovalDeadlinesCard acp={acp} ui={ui} />
+
       {/* Agent 挂牌光晕: how the composer tag shows a live agent. Plugin
           display preference — host-persisted with the agent registry, so it
           follows the profile rather than this one browser. Kept at the BOTTOM
@@ -715,7 +980,8 @@ function AgentRow({
   const rootValues = form.roots.map(root => root.trim()).filter(root => root !== '')
   const rootsInvalid = form.rootsOpen && (rootValues.length === 0 || rootValues.some(root => !isAbsolutePathLike(root)))
   const idleInvalid = !idleValid(form.idleStr)
-  const formIncomplete = splitCommandLine(form.commandLine).command === '' || !idValid || idTaken || cwdInvalid || rootsInvalid || idleInvalid
+  const mcpInvalid = !mcpTextValid(form.mcpText)
+  const formIncomplete = splitCommandLine(form.commandLine).command === '' || !idValid || idTaken || cwdInvalid || rootsInvalid || idleInvalid || mcpInvalid
 
   const payload = buildPayload(form, detected, newCustom)
   const current = persistedDef(detected, activeAgent)
@@ -881,6 +1147,7 @@ function AgentRow({
             cwdInvalid={cwdInvalid}
             rootsInvalid={rootsInvalid}
             idleInvalid={idleInvalid}
+            mcpInvalid={mcpInvalid}
             saving={saving}
             savedSuccess={savedSuccess}
             testing={testing}
@@ -919,6 +1186,14 @@ interface AgentForm {
   autoDiscoverModels: boolean
   /** Raw text of the idle-release window in ms ('' = host default, '0' = never). */
   idleStr: string
+  /**
+   * Raw JSON text of the agent's MCP server list (the plugin's normalized
+   * shape — every entry carries a `transport`). '' = no extra MCP servers.
+   *
+   * Kept as TEXT so a half-typed value survives editing instead of being
+   * silently reshaped; it is parsed on the way out.
+   */
+  mcpText: string
 }
 
 /**
@@ -937,7 +1212,7 @@ const DEFAULT_IDLE_RELEASE_MS = 1_800_000
  */
 const DEFAULT_PROBE_RELEASE_MS = 300_000
 
-function initialForm(detected: DetectedAgentInfo, activeAgent: AgentView | undefined): AgentForm {
+export function initialForm(detected: DetectedAgentInfo, activeAgent: AgentView | undefined): AgentForm {
   const config = detected.currentConfig
   const roots = [...(activeAgent?.allowedCwdRoots ?? config?.allowedCwdRoots ?? [])]
   return {
@@ -959,6 +1234,10 @@ function initialForm(detected: DetectedAgentInfo, activeAgent: AgentView | undef
     autoDiscoverModels: config?.autoDiscoverModels !== false,
     // Prefer the host's resolved value: it is the one actually in effect.
     idleStr: idleText(activeAgent?.idleTimeoutMs ?? config?.idleTimeoutMs),
+    // The MCP list comes back from the host in its NORMALIZED shape (defaults
+    // filled in), so re-serializing it reproduces exactly what is stored —
+    // that is what keeps the card from being permanently dirty.
+    mcpText: config?.mcpServers === undefined ? '' : JSON.stringify(config.mcpServers, null, 2),
   }
 }
 
@@ -991,7 +1270,7 @@ function idleValid(raw: string): boolean {
   return value === 0 || (value >= 1_000 && value <= 86_400_000)
 }
 
-function buildPayload(form: AgentForm, detected: DetectedAgentInfo, newCustom: boolean): AgentSavePayload {
+export function buildPayload(form: AgentForm, detected: DetectedAgentInfo, newCustom: boolean): AgentSavePayload {
   const env: Record<string, string> = {}
   for (const row of form.envRows) {
     const key = row.key.trim()
@@ -1003,6 +1282,9 @@ function buildPayload(form: AgentForm, detected: DetectedAgentInfo, newCustom: b
   // The field is a command line; the host validates it the same way, so what
   // the preview under the input shows is what will actually be spawned.
   const parsed = splitCommandLine(form.commandLine)
+  // An unparseable MCP text yields `undefined` here and `mcpInvalid` in the
+  // form, which disables saving — so this never throws inside a render.
+  const mcpServers = parseMcpServers(form.mcpText)
   const payload: AgentSavePayload = {
     id: newCustom ? form.agentId.trim() : detected.id,
     ...(form.title.trim() === '' ? {} : { title: form.title.trim() }),
@@ -1016,6 +1298,9 @@ function buildPayload(form: AgentForm, detected: DetectedAgentInfo, newCustom: b
     ...(form.autoDiscoverModels ? {} : { autoDiscoverModels: false }),
     // `''` sends nothing: the host then applies its own default.
     ...(idleRaw === '' || !idleValid(idleRaw) ? {} : { idleTimeoutMs: Number(idleRaw) }),
+    // The MCP list is OPTIONAL: absent = the agent connects only to the
+    // servers it configures for itself.
+    ...(mcpServers === undefined ? {} : { mcpServers }),
   }
   if (form.rootsOpen) {
     if (cwd !== '') payload.cwd = cwd
@@ -1044,6 +1329,7 @@ function AgentDetails({
   cwdInvalid,
   rootsInvalid,
   idleInvalid,
+  mcpInvalid,
   saving,
   savedSuccess,
   testing,
@@ -1065,6 +1351,7 @@ function AgentDetails({
   cwdInvalid: boolean
   rootsInvalid: boolean
   idleInvalid: boolean
+  mcpInvalid: boolean
   saving: boolean
   savedSuccess: boolean
   testing: boolean
@@ -1165,6 +1452,11 @@ function AgentDetails({
         {!advancedOpen && (cwdInvalid || rootsInvalid) && (
           <span className="dwa-error">
             {acp.label('里面有非法的工作空间路径', 'Contains an invalid workspace path')}
+          </span>
+        )}
+        {!advancedOpen && mcpInvalid && (
+          <span className="dwa-error">
+            {acp.label('里面的 MCP 服务器配置不是合法 JSON', 'Contains an invalid MCP server list')}
           </span>
         )}
       </div>
@@ -1286,6 +1578,29 @@ function AgentDetails({
             {acp.label('无自定义变量；子进程继承宿主环境。', 'No custom variables; the child inherits the host environment.')}
           </span>
         )}
+      </div>
+
+      <div className="dwa-form-row" style={{ flexDirection: 'column', gap: 6 }}>
+        <span className="dwa-form-label">{acp.label('MCP 服务器（JSON）', 'MCP Servers (JSON)')}</span>
+        <textarea
+          className="dwa-input dwa-input-mono"
+          style={{ minHeight: 96, resize: 'vertical' }}
+          value={form.mcpText}
+          onChange={e => patch({ mcpText: e.target.value })}
+          spellCheck={false}
+          placeholder={'[\n  { "name": "example", "transport": "stdio", "command": "/abs/path/to/server", "args": ["--mcp"] }\n]'}
+        />
+        {mcpInvalid && (
+          <span className="dwa-error">
+            {acp.label('必须是一个 JSON 数组；每个条目写明 name 与 transport。', 'Must be a JSON array; every entry needs a name and a transport.')}
+          </span>
+        )}
+        <span className="dwa-hint">
+          {acp.label(
+            '这些 MCP 服务器会在建会话时交给 agent，由 agent 自己拉起并使用（stdio 需填 command，可选 args / env；http 与 sse 需填 url，可选 headers）。agent 自己配置的 MCP 服务器不受影响，这里只是额外追加。',
+            'These MCP servers are handed to the agent when a session is created; the agent launches and uses them itself (stdio needs command, with optional args / env; http and sse need url, with optional headers). The MCP servers the agent configures for itself are unaffected — this only adds more.',
+          )}
+        </span>
       </div>
       </div>
 

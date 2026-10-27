@@ -7,8 +7,8 @@
 
 import { randomUUID } from './ids.ts'
 import type {
-  AcpAgentCatalog, AcpAgentDef, AcpCatalogOption, AcpConversationChoice, AcpEvent, AcpPluginConfig, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult,
-  AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionOutcome, RpcResult,
+  AcpAgentCatalog, AcpAgentDef, AcpCatalogOption, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpMcpServerDef, AcpPluginConfig, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult,
+  AgentView, ApprovalDeadlineKey, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionOptionView, PermissionOutcome, RpcResult,
 } from './protocol.ts'
 import { DEFAULT_TAG_HALO } from './protocol.ts'
 
@@ -94,6 +94,157 @@ export function validateTagHalo(value: unknown): AcpTagHalo {
   if (mode !== 'breath' && mode !== 'steady') throw new AcpError('bad_payload', 'acp: tag halo mode must be "breath" or "steady"')
   if (speed !== 'slow' && speed !== 'normal' && speed !== 'fast') throw new AcpError('bad_payload', 'acp: tag halo speed must be "slow", "normal" or "fast"')
   return { mode, speed }
+}
+
+/**
+ * Ceiling shared by every approval deadline: one day. Both knobs accept `0`
+ * (their meaningful "never" value) and anything up to this, so a range any
+ * longer would be a mis-typed number rather than a deliberate window.
+ */
+export const APPROVAL_DEADLINE_MAX_MS = 86_400_000
+
+/**
+ * Validate ONE approval deadline, shared by every layer that accepts one.
+ *
+ * Three callers, one gate: `validateConfig` (the `cordis.patch.yml` baseline),
+ * `validateApprovalDeadlines` (the settings-page write), and
+ * `BridgeManager.loadPersistedAgents` (the persisted override, re-validated on
+ * every boot because the state file is user-editable). They must agree — a
+ * value the panel can save has to survive the next boot, or the setting would
+ * silently revert.
+ */
+export function validateApprovalDeadlineMs(raw: unknown, label: string, code: 'bad_config' | 'bad_payload', hint: string): number {
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 0 || raw > APPROVAL_DEADLINE_MAX_MS) {
+    throw new AcpError(code, `acp: ${label} must be an integer in [0, ${String(APPROVAL_DEADLINE_MAX_MS)}] ${hint}`)
+  }
+  return raw
+}
+
+/**
+ * Validate a settings-page deadline write. Omitted keys are simply absent from
+ * the result — the manager merges, so a card that only touched one slider must
+ * not reset the other. `reset` is not a deadline and is dropped here.
+ */
+export function validateApprovalDeadlines(value: unknown): Partial<Record<ApprovalDeadlineKey, number>> {
+  if (value === null || typeof value !== 'object') throw new AcpError('bad_payload', 'acp: approval deadlines must be an object')
+  const { nativeApprovalTimeoutMs, permissionFallbackTimeoutMs } = value as {
+    nativeApprovalTimeoutMs?: unknown
+    permissionFallbackTimeoutMs?: unknown
+  }
+  const out: Partial<Record<ApprovalDeadlineKey, number>> = {}
+  if (nativeApprovalTimeoutMs !== undefined) {
+    out.nativeApprovalTimeoutMs = validateApprovalDeadlineMs(
+      nativeApprovalTimeoutMs,
+      'nativeApprovalTimeoutMs',
+      'bad_payload',
+      '(0 = wait for the host approval chain forever)',
+    )
+  }
+  if (permissionFallbackTimeoutMs !== undefined) {
+    out.permissionFallbackTimeoutMs = validateApprovalDeadlineMs(
+      permissionFallbackTimeoutMs,
+      'permissionFallbackTimeoutMs',
+      'bad_payload',
+      '(0 = never answer a degraded ask on the human\'s behalf)',
+    )
+  }
+  return out
+}
+
+/**
+ * Bound on the number of MCP servers one agent may declare. An MCP server is
+ * a process (stdio) or a remote endpoint the agent connects to at session
+ * setup, so this list is small in practice; the cap refuses a file-sized list
+ * rather than a hostile one.
+ */
+const MCP_SERVERS_MAX = 32
+
+/**
+ * Bound on one MCP server's `name`. The name namespaces the agent's tools as
+ * `mcp__<name>__<tool>`, so it has to stay short enough for a tool name.
+ */
+const MCP_SERVER_NAME_MAX = 64
+
+/**
+ * Validate one agent's `mcpServers` list (the plugin's normalized shape, NOT
+ * the ACP wire shape).
+ *
+ * THE ENTRIES ARE RETURNED AS THE USER WROTE THEM — not rebuilt, not
+ * defaulted. That is deliberate: the settings panel holds this list as JSON
+ * text, and it compares what it would send against what the host stored. A
+ * host that reshaped the entries (filling `args: []`, reordering the keys)
+ * would make the panel report a change where there is none, and the card
+ * would never come clean. So this function VALIDATES and leaves the shape
+ * alone; the ACP wire conversion (src/bridge.ts) supplies the defaults the
+ * protocol wants.
+ *
+ * The ACP-transport variant is rejected rather than ignored: it needs the
+ * client side of `mcp/message`, which is not in the ACP SDK's stable surface,
+ * and no agent advertises `mcpCapabilities.acp`. Accepting it would produce a
+ * server the agent can never reach.
+ */
+export function validateMcpServers(raw: unknown, label: string, code: 'bad_config' | 'bad_payload'): AcpMcpServerDef[] {
+  if (!Array.isArray(raw)) throw new AcpError(code, `acp: ${label} must be an array of MCP servers`)
+  if (raw.length > MCP_SERVERS_MAX) {
+    throw new AcpError(code, `acp: ${label} may hold at most ${String(MCP_SERVERS_MAX)} MCP servers`)
+  }
+  const seen = new Set<string>()
+  const out: AcpMcpServerDef[] = []
+  for (const [index, entry] of raw.entries()) {
+    const at = `${label}[${String(index)}]`
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new AcpError(code, `acp: ${at} must be an object`)
+    }
+    const row = entry as Record<string, unknown>
+    const name = row.name
+    if (typeof name !== 'string' || name.trim() === '' || name.length > MCP_SERVER_NAME_MAX) {
+      throw new AcpError(code, `acp: ${at}.name must be a non-empty string of at most ${String(MCP_SERVER_NAME_MAX)} chars`)
+    }
+    if (seen.has(name)) {
+      // The name namespaces the agent's tools (`mcp__<name>__<tool>`), so two
+      // servers sharing one would collide inside the agent.
+      throw new AcpError(code, `acp: ${at}.name "${name}" is used by more than one MCP server`)
+    }
+    seen.add(name)
+    const transport = row.transport
+    if (transport === 'acp') {
+      throw new AcpError(code, `acp: ${at}.transport "acp" is not supported (the agent would have to call back into this plugin over mcp/message)`)
+    }
+    if (transport === 'stdio') {
+      const command = row.command
+      if (typeof command !== 'string' || command.trim() === '') {
+        throw new AcpError(code, `acp: ${at}.command must be a non-empty string for a stdio MCP server`)
+      }
+      if (row.args !== undefined && (!Array.isArray(row.args) || row.args.some(a => typeof a !== 'string'))) {
+        throw new AcpError(code, `acp: ${at}.args must be an array of strings`)
+      }
+      stringMap(row.env, `${at}.env`, code)
+      out.push(entry as AcpMcpServerDef)
+      continue
+    }
+    if (transport === 'http' || transport === 'sse') {
+      const url = row.url
+      if (typeof url !== 'string' || url.trim() === '') {
+        throw new AcpError(code, `acp: ${at}.url must be a non-empty string for a ${transport} MCP server`)
+      }
+      stringMap(row.headers, `${at}.headers`, code)
+      out.push(entry as AcpMcpServerDef)
+      continue
+    }
+    throw new AcpError(code, `acp: ${at}.transport must be "stdio", "http" or "sse"`)
+  }
+  return out
+}
+
+/** One `Record<string,string>` field of an MCP server (env / headers). */
+function stringMap(value: unknown, label: string, code: 'bad_config' | 'bad_payload'): void {
+  if (value === undefined) return
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new AcpError(code, `acp: ${label} must be an object`)
+  }
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof entry !== 'string') throw new AcpError(code, `acp: ${label}.${key} must be a string`)
+  }
 }
 
 // ---- Command lines (`AcpAgentDef.command` is a command LINE, not a bare program) ----
@@ -240,6 +391,12 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
     || idleTimeoutMs > 86_400_000 || (idleTimeoutMs !== 0 && idleTimeoutMs < 1_000))) {
     throw new AcpError('bad_config', `acp: agent "${id}" idleTimeoutMs must be 0 (never release) or an integer in [1000, 86400000]`)
   }
+  // MCP servers the agent should connect to. Optional, so a stored config from
+  // before this field existed still validates (the agent then connects only to
+  // the servers IT configures for itself).
+  const mcpServers = row.mcpServers === undefined
+    ? undefined
+    : validateMcpServers(row.mcpServers, `agent "${id}" mcpServers`, 'bad_config')
   return {
     id,
     title,
@@ -252,6 +409,7 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
     ...(exposedModels !== undefined ? { exposedModels } : {}),
     ...(autoDiscoverModels === false ? { autoDiscoverModels: false } : {}),
     ...(idleTimeoutMs === undefined ? {} : { idleTimeoutMs: idleTimeoutMs as number }),
+    ...(mcpServers === undefined ? {} : { mcpServers }),
   }
 }
 
@@ -280,9 +438,26 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
     throw new AcpError('bad_config', 'acp: startupTimeoutMs must be a number in [1000, 600000]')
   }
   const permissionTimeoutMs = value.permissionTimeoutMs ?? 0
-  if (typeof permissionTimeoutMs !== 'number' || !Number.isInteger(permissionTimeoutMs) || permissionTimeoutMs < 0 || permissionTimeoutMs > 86_400_000) {
-    throw new AcpError('bad_config', 'acp: permissionTimeoutMs must be an integer in [0, 86400000] (0 = wait forever)')
+  if (typeof permissionTimeoutMs !== 'number' || !Number.isInteger(permissionTimeoutMs) || permissionTimeoutMs < 0 || permissionTimeoutMs > APPROVAL_DEADLINE_MAX_MS) {
+    throw new AcpError('bad_config', `acp: permissionTimeoutMs must be an integer in [0, ${String(APPROVAL_DEADLINE_MAX_MS)}] (0 = wait forever)`)
   }
+  // Both degraded-route deadlines share the `permissionTimeoutMs` range: `0` is
+  // the meaningful value (never withdraw / never auto-cancel), and anything up
+  // to a day is a legitimate "ask again later" window. Same validator as the
+  // settings-page write, so a baseline the panel can display is a baseline the
+  // panel can also produce.
+  const nativeApprovalTimeoutMs = validateApprovalDeadlineMs(
+    value.nativeApprovalTimeoutMs ?? 300_000,
+    'nativeApprovalTimeoutMs',
+    'bad_config',
+    '(0 = wait for the host approval chain forever)',
+  )
+  const permissionFallbackTimeoutMs = validateApprovalDeadlineMs(
+    value.permissionFallbackTimeoutMs ?? 300_000,
+    'permissionFallbackTimeoutMs',
+    'bad_config',
+    '(0 = never answer a degraded ask on the human\'s behalf)',
+  )
   const cancelFallbackMs = value.cancelFallbackMs ?? 15_000
   if (typeof cancelFallbackMs !== 'number' || !Number.isInteger(cancelFallbackMs) || cancelFallbackMs < 0 || cancelFallbackMs > 600_000) {
     throw new AcpError('bad_config', 'acp: cancelFallbackMs must be an integer in [0, 600000] (0 = disable the fallback)')
@@ -301,6 +476,8 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
     probeModelsOnBoot,
     startupTimeoutMs,
     permissionTimeoutMs,
+    nativeApprovalTimeoutMs,
+    permissionFallbackTimeoutMs,
     cancelFallbackMs,
     staleCancelRetryDelayMs,
     staleCancelMaxRetries,
@@ -1342,14 +1519,28 @@ export interface PendingPermission {
   requestId: string
   sessionId: string
   resolve: (outcome: PermissionOutcome) => void
+  /**
+   * The ask as the browser was shown it, kept for the REPLAY a reconnecting
+   * client receives (see `permissionReplayFrames`). Absent on entries created
+   * without a view — those still answer, they just cannot be re-shown.
+   */
+  view?: { toolCall: unknown; options: PermissionOptionView[] }
+}
+
+/** One outstanding ask as a reconnecting client must be re-shown it. */
+export interface PendingPermissionView {
+  requestId: string
+  sessionId: string
+  toolCall: unknown
+  options: PermissionOptionView[]
 }
 
 export class PermissionLedger {
   private readonly pending = new Map<string, PendingPermission>()
 
-  create(sessionId: string, executor: (outcome: PermissionOutcome) => void): string {
+  create(sessionId: string, executor: (outcome: PermissionOutcome) => void, view?: PendingPermission['view']): string {
     const requestId = randomUUID()
-    this.pending.set(requestId, { requestId, sessionId, resolve: executor })
+    this.pending.set(requestId, { requestId, sessionId, resolve: executor, ...(view === undefined ? {} : { view }) })
     return requestId
   }
 
@@ -1379,6 +1570,55 @@ export class PermissionLedger {
   sessionIds(): Array<{ requestId: string; sessionId: string }> {
     return [...this.pending.values()].map(e => ({ requestId: e.requestId, sessionId: e.sessionId }))
   }
+
+  /**
+   * Outstanding asks WITH the view the browser was shown, for the reconnect
+   * replay. Entries created without a view are skipped: replaying a frame the
+   * client cannot render (no title, no options) would show an unanswerable
+   * card, which is worse than showing nothing.
+   */
+  pendingViews(): PendingPermissionView[] {
+    const views: PendingPermissionView[] = []
+    for (const entry of this.pending.values()) {
+      if (entry.view === undefined) continue
+      views.push({
+        requestId: entry.requestId,
+        sessionId: entry.sessionId,
+        toolCall: entry.view.toolCall,
+        options: entry.view.options,
+      })
+    }
+    return views
+  }
+}
+
+/**
+ * Frames that re-establish a freshly connected client's view of the pending
+ * permission asks: every outstanding ask re-sent as its original
+ * `permission/request`, then one `permission/synced` carrying the live id set.
+ *
+ * Why a replay at all: a `permission/request` is broadcast ONCE, when the ask is
+ * created. A client that connects later — page reload, second tab, stream
+ * outage — never receives it, and for a ledger ask (the `/acp` RPC path, or a
+ * native route that degraded) that card is the ONLY answer entry, so the ask is
+ * invisible to exactly the client that needs it. OmniTerm closes the same hole
+ * with `PermissionManager::pending_events()` + a `PermissionsSynced` marker on
+ * every WS connect.
+ *
+ * Why the terminator is mandatory: the replay is a snapshot, so an ask resolved
+ * while this client was disconnected is not in it. Without the live set the
+ * client would keep a stale card forever — the ask is gone host-side and
+ * `respond` would answer `unknown_request`.
+ */
+export function permissionReplayFrames(pending: readonly PendingPermissionView[]): AcpEvent[] {
+  const requests: AcpEvent[] = pending.map(p => ({
+    type: 'permission/request' as const,
+    requestId: p.requestId,
+    sessionId: p.sessionId,
+    toolCall: p.toolCall,
+    options: p.options,
+  }))
+  return [...requests, { type: 'permission/synced', requestIds: pending.map(p => p.requestId) }]
 }
 
 // ---- RPC surface ----
@@ -1409,6 +1649,19 @@ export interface AcpManager {
   tagHalo?(): AcpTagHalo
   /** Write the halo preference (persisted with the agent registry). */
   setTagHalo?(halo: AcpTagHalo): Promise<void>
+  /**
+   * The approval deadlines in force, with the facts that explain an override
+   * (the `cordis.patch.yml` baseline it outranks, and a `permissionTimeoutMs`
+   * that overrides both). `undefined` on a host half from before the card
+   * existed, which hides the settings card instead of guessing a value.
+   */
+  approvalDeadlines?(): AcpApprovalDeadlines | undefined
+  /**
+   * Write one or both approval deadlines (omitted keys keep their value), or
+   * drop the persisted override with `reset` so the config-file baseline
+   * applies again. Applies to the running bridges without a restart.
+   */
+  setApprovalDeadlines?(patch: Partial<Record<ApprovalDeadlineKey, number>>, reset?: boolean): Promise<void>
   detectAgents?(): Promise<DetectedAgentInfo[]>
   saveAgent?(def: AcpAgentDef): Promise<void>
   deleteAgent?(agentId: string): Promise<void>
@@ -1726,6 +1979,18 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
       case 'ui/tag-halo-set': {
         await manager.setTagHalo?.(validateTagHalo(body.halo))
         return ok({ done: true })
+      }
+      case 'ui/approval-deadlines':
+        // Absent on a host half from before the card existed: the browser then
+        // renders nothing rather than a number it cannot trust.
+        return ok({ deadlines: manager.approvalDeadlines?.() })
+      case 'ui/approval-deadlines-set': {
+        const patch = validateApprovalDeadlines({
+          nativeApprovalTimeoutMs: body.nativeApprovalTimeoutMs,
+          permissionFallbackTimeoutMs: body.permissionFallbackTimeoutMs,
+        })
+        await manager.setApprovalDeadlines?.(patch, body.reset === true)
+        return ok({ deadlines: manager.approvalDeadlines?.() })
       }
       case 'agent/set-exposed-models': {
         const agentId = str(body, 'agentId', 64)

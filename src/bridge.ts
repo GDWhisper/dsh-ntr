@@ -21,6 +21,10 @@ import {
   RequestError,
   type ClientConnection,
   type InitializeResponse,
+  type McpServer,
+  type McpServerHttp,
+  type McpServerSse,
+  type McpServerStdio,
   type PermissionOption,
   type RequestPermissionResponse,
   type SessionNotification,
@@ -53,15 +57,17 @@ import {
   BOOKKEEPING_UPDATES,
   validateAgentDef,
   validateTagHalo,
+  validateApprovalDeadlines,
 } from './impl.ts'
 import type {
   AcpToolCallSnapshot,
+  PendingPermissionView,
   RosterPresetRow,
 } from './impl.ts'
 import type {
-  AcpAgentCatalog, AcpAgentDef, AcpConversationChoice, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
+  AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpMcpServerDef, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
   LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo,
-  PermissionOutcome, PermissionOptionView, PreparedAdapterCall, SessionView, StreamChunk,
+  ApprovalDeadlineKey, PermissionOutcome, PermissionOptionView, PreparedAdapterCall, SessionView, StreamChunk,
 } from './protocol.ts'
 import { DEFAULT_TAG_HALO } from './protocol.ts'
 
@@ -177,6 +183,37 @@ export interface BridgeTuning {
    * disables even this fallback.
    */
   permissionFallbackTimeoutMs?: number
+  /**
+   * Deadline for the NATIVE approval route itself: how long
+   * {@link AgentBridge.askNativeApproval} waits for the host approval chain to
+   * answer before withdrawing the ask and handing it to the settings-panel
+   * ledger (`native-timeout`, see {@link LedgerFallbackReason}).
+   *
+   * A routed ask shows no card and broadcasts no frame — the composer takeover
+   * IS the answer entry — so a host that accepts the question and then never
+   * renders it (answerer absent from the browser scope, the conversation not
+   * mounted, a client that never received the remote event) leaves the turn
+   * hanging behind a question the user cannot see anywhere. The deadline is
+   * what makes that state bounded: past it the ask is withdrawn (the request
+   * signal is aborted, which settles the host ask `cancelled`) and re-asked on
+   * the ledger, where the chat line and the settings card are both visible.
+   *
+   * This is NOT an answer on the human's behalf: a human mid-decision simply
+   * finds the same question in the settings panel. `0` disables it (wait for
+   * the host forever).
+   *
+   * Default 300000 ms — the SAME window as
+   * {@link BridgeTuning.permissionFallbackTimeoutMs}, so "this route is not
+   * working" is one number instead of two arbitrary ones. A takeover that is
+   * going to render does so immediately, and the host replays a pending
+   * approval across reconnects (verified live on DSH web 0.2.1-rc.2), so the
+   * deadline only ever fires for a host that took the question and never showed
+   * it. OmniTerm's equivalent is its reaper's permission-timeout threshold
+   * (30 min default, 30 s steps, hot-updatable); this is the same knob without
+   * their `auto` tier, which this plugin does not have (every ask must reach a
+   * human).
+   */
+  nativeApprovalTimeoutMs?: number
   cancelFallbackMs?: number
   /**
    * How long to wait before resending a prompt the agent answered `cancelled`
@@ -233,17 +270,28 @@ export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unava
  * without the approval service, and an `/acp`-RPC session that has no chat
  * turn to route into. `unavailable` is a DEGRADATION — the service is wired
  * and this ask still failed, so the conversation the user is looking at will
- * never show the question. That difference decides both the chat line's
- * wording (see `BridgeManager.streamPrompt`) and whether a deadline is armed
- * (`handlePermissionRequest`).
+ * never show the question. `native-timeout` is the other degradation: the host
+ * TOOK the question and never answered it inside
+ * {@link BridgeTuning.nativeApprovalTimeoutMs}, so it is withdrawn and re-asked
+ * here. The last two decide both the chat line's wording (see
+ * `BridgeManager.streamPrompt`) and whether a deadline is armed
+ * ({@link AgentBridge.handlePermissionRequest}).
  */
-export type LedgerFallbackReason = 'no-requester' | 'no-chat-session' | 'unavailable'
+export type LedgerFallbackReason = 'no-requester' | 'no-chat-session' | 'unavailable' | 'native-timeout'
 
 /** One recorded ledger fallback: why the ask is here, and the deadline armed for it. */
 export interface LedgerFallback {
   reason: LedgerFallbackReason
   /** Effective deadline in ms; `0` = no timer (wait for the human). */
   timeoutMs: number
+  /**
+   * How long the NATIVE route waited before withdrawing this ask, on the
+   * `native-timeout` path only. The chat line reports it as an observed fact
+   * ("no answer in the conversation within Ns") rather than guessing a cause:
+   * a slow human and a host that never rendered the question look identical
+   * from here.
+   */
+  waitedMs?: number
 }
 
 /**
@@ -271,10 +319,63 @@ export type SessionWorkspaceResolver = (dshSessionId: string) => { workspaceRoot
  */
 export type AcpModeResolver = (dshSessionId: string) => boolean | undefined | Promise<boolean | undefined>
 
+/**
+ * The plugin's normalized MCP server shape → the ACP wire shape.
+ *
+ * THE WIRE SHAPE IS ASYMMETRIC, and getting it wrong is SILENT:
+ *
+ *  - the stdio variant carries NO `type` field — an entry that carries
+ *    `type:'stdio'` is accepted by the agent and then never connected
+ *    (measured against codebuddy: the server never appeared, the agent just
+ *    reported the tool as missing);
+ *  - http/sse DO carry `type`;
+ *  - `env` / `headers` are `[{name,value}]` arrays on the wire, while the
+ *    plugin stores them as records (like `AcpAgentDef.env`).
+ *
+ * So the conversion lives here, once, and each branch is annotated with the
+ * SDK's OWN variant type — a wrong conversion does not compile. (The bare
+ * `McpServer` union is too loose to catch it: its excess-property check
+ * accepts any member's keys, so a stdio entry carrying `type:'stdio'` would
+ * type-check against the http variant and only fail at runtime, inside the
+ * agent, as a server that never connects.)
+ */
+function toAcpMcpServers(defs: AcpMcpServerDef[] | undefined): McpServer[] {
+  if (defs === undefined) return []
+  return defs.map(def => {
+    if (def.transport === 'stdio') {
+      // NO `type` here — see the note above.
+      const server: McpServerStdio = {
+        name: def.name,
+        command: def.command,
+        args: def.args ?? [],
+        env: Object.entries(def.env ?? {}).map(([name, value]) => ({ name, value })),
+      }
+      return server
+    }
+    if (def.transport === 'http') {
+      const server: McpServerHttp & { type: 'http' } = {
+        type: 'http',
+        name: def.name,
+        url: def.url,
+        headers: Object.entries(def.headers ?? {}).map(([name, value]) => ({ name, value })),
+      }
+      return server
+    }
+    const server: McpServerSse & { type: 'sse' } = {
+      type: 'sse',
+      name: def.name,
+      url: def.url,
+      headers: Object.entries(def.headers ?? {}).map(([name, value]) => ({ name, value })),
+    }
+    return server
+  })
+}
+
 const DEFAULT_TUNING: Required<BridgeTuning> = {
   startupTimeoutMs: 60_000,
   permissionTimeoutMs: 0,
   permissionFallbackTimeoutMs: 300_000,
+  nativeApprovalTimeoutMs: 300_000,
   cancelFallbackMs: 15_000,
   staleCancelRetryDelayMs: 600,
   staleCancelMaxRetries: 2,
@@ -312,7 +413,18 @@ export class AgentBridge {
   private readonly ledgerFallbacks = new Map<string, LedgerFallback>
   private readonly startupTimeoutMs: number
   private readonly permissionTimeoutMs: number
-  private readonly permissionFallbackTimeoutMs: number
+  /**
+   * The two approval deadlines are NOT readonly, unlike their neighbors: the
+   * settings page rewrites them on a running bridge
+   * ({@link AgentBridge.applyApprovalDeadlines}), so a user editing the window
+   * does not have to kill every live session to see it take effect. Both are
+   * read per ask — `nativeApprovalTimeoutMs` when the native ask is armed,
+   * `permissionFallbackTimeoutMs` when the ledger ask's deadline is chosen — so
+   * a reassignment reaches every ask from that moment on. An ask already
+   * holding an armed timer keeps the window it was started with.
+   */
+  private permissionFallbackTimeoutMs: number
+  private nativeApprovalTimeoutMs: number
   private readonly cancelFallbackMs: number
   private readonly staleCancelRetryDelayMs: number
   private readonly staleCancelMaxRetries: number
@@ -379,12 +491,28 @@ export class AgentBridge {
     this.startupTimeoutMs = merged.startupTimeoutMs
     this.permissionTimeoutMs = merged.permissionTimeoutMs
     this.permissionFallbackTimeoutMs = merged.permissionFallbackTimeoutMs
+    this.nativeApprovalTimeoutMs = merged.nativeApprovalTimeoutMs
     this.cancelFallbackMs = merged.cancelFallbackMs
     this.staleCancelRetryDelayMs = merged.staleCancelRetryDelayMs
     this.staleCancelMaxRetries = merged.staleCancelMaxRetries
     this.turnSettleMs = merged.turnSettleMs
     this.defaultIdleTimeoutMs = merged.idleTimeoutMs
     this.probeIdleTimeoutMs = merged.probeIdleTimeoutMs
+  }
+
+  /**
+   * Adopt a rewritten approval deadline (the settings page's write). Only the
+   * two degraded-route windows live here; every other tuning value is fixed at
+   * construction, because a live bridge cannot meaningfully adopt a new startup
+   * or cancel window mid-flight.
+   *
+   * Deliberately does NOT re-arm anything: an ask that already holds a timer
+   * keeps the window it was started with, and the next ask reads the new value.
+   * Re-arming would move the goalposts under a human who is already deciding.
+   */
+  applyApprovalDeadlines(patch: { nativeApprovalTimeoutMs?: number; permissionFallbackTimeoutMs?: number }): void {
+    if (patch.nativeApprovalTimeoutMs !== undefined) this.nativeApprovalTimeoutMs = patch.nativeApprovalTimeoutMs
+    if (patch.permissionFallbackTimeoutMs !== undefined) this.permissionFallbackTimeoutMs = patch.permissionFallbackTimeoutMs
   }
 
   /**
@@ -777,7 +905,7 @@ export class AgentBridge {
     if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
     const resolved = resolveSessionCwd(this.def, cwd, p => realpathSync(p), extraRoots)
     const result = await this.withStartupTimeout(
-      conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: [] }),
+      conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: toAcpMcpServers(this.def.mcpServers) }),
       'session/new',
     )
     // An empty `configOptions` answer is a non-answer — see `usableConfigOptions`.
@@ -825,6 +953,15 @@ export class AgentBridge {
    * Spawn a throwaway ACP session purely to read its `configOptions` (the
    * model catalog probe). Deliberately bypasses the live-session bookkeeping
    * so probe sessions never surface in the browser session list.
+   *
+   * THE PROBE SENDS THE AGENT'S OWN MCP LIST, not an empty one. Measured
+   * against codebuddy: the servers handed to `session/new` land in the
+   * agent PROCESS's dynamic MCP scope, so a probe that sent an empty list
+   * would REPLACE that scope and drop the MCP servers of the live sessions
+   * on the same connection (the agent logged
+   * `serverManager.delete("injected")` and the live session's
+   * `mcp__injected__*` tools disappeared). One list per agent process is the
+   * only shape that keeps every session of that process consistent.
    */
   async probeConfigOptions(): Promise<unknown[]> {
     // A probe is the reason an agent process can be resident with NOTHING else
@@ -837,7 +974,7 @@ export class AgentBridge {
       if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
       const resolved = resolveSessionCwd(this.def, undefined, p => realpathSync(p))
       const result = await this.withStartupTimeout(
-        conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: [] }),
+        conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: toAcpMcpServers(this.def.mcpServers) }),
         'session/new',
       )
       await conn.agent.request(methods.agent.session.close, { sessionId: result.sessionId }).catch(() => { /* optional capability */ })
@@ -891,6 +1028,13 @@ export class AgentBridge {
     // own turn apart from a later one.
     session.cancelRequestedAtTurn = session.turnSeq
     await this.conn.agent.notify(methods.agent.session.cancel, { sessionId: session.acpSessionId }).catch(() => { /* best effort */ })
+    // The ACP spec's counterpart to the notification we just sent: a client that
+    // cancels MUST answer every pending `session/request_permission` with
+    // `cancelled`. Leaving them open would hold the agent's tool call blocked on
+    // an answer that can no longer arrive — the turn is over, the human's
+    // decision is "stop". OmniTerm does the same from `AcpClient::cancel`
+    // (`PermissionManager::cancel_all`).
+    this.settlePermissions(session)
     this.armCancelFallback(session)
   }
 
@@ -983,7 +1127,7 @@ export class AgentBridge {
       this.acpIndex.set(session.acpSessionId, session)
       this.hub.broadcast({ type: 'session/reset', sessionId: session.sessionId, session: snapshot(session) })
       const result = await this.withStartupTimeout(
-        conn.agent.request(methods.agent.session.load, { sessionId: session.acpSessionId, cwd: resolved, mcpServers: [] }),
+        conn.agent.request(methods.agent.session.load, { sessionId: session.acpSessionId, cwd: resolved, mcpServers: toAcpMcpServers(this.def.mcpServers) }),
         'session/load',
       )
       if (this.onCatalog !== undefined && usableConfigOptions(result.configOptions)) {
@@ -1225,6 +1369,11 @@ export class AgentBridge {
         resolve(outcome.outcome === 'selected'
           ? { outcome: { outcome: 'selected', optionId: outcome.optionId } }
           : { outcome: { outcome: 'cancelled' } })
+      }, {
+        // Kept for the reconnect replay: a client that connects after the ask
+        // was broadcast must be re-shown the very card it has to answer.
+        toolCall,
+        options: options.map((o): PermissionOptionView => ({ optionId: o.optionId, name: o.name, kind: o.kind })),
       })
       // Deadline (`permissionTimeoutMs`): an approval left unanswered is
       // answered `cancelled` on the human's behalf instead of hanging the turn
@@ -1232,14 +1381,22 @@ export class AgentBridge {
       // exception is a DEGRADED native route: the conversation just failed to
       // show the question, so waiting forever would hang the turn behind an
       // ask nobody can see there, and the fallback deadline applies instead
-      // (see `BridgeTuning.permissionFallbackTimeoutMs`).
+      // (see `BridgeTuning.permissionFallbackTimeoutMs`). `native-timeout` is
+      // the same degradation reached from the other side: the host took the
+      // ask and never answered it.
       const timeoutMs = this.permissionTimeoutMs > 0
         ? this.permissionTimeoutMs
-        : native.reason === 'unavailable' ? this.permissionFallbackTimeoutMs : 0
+        : native.reason === 'unavailable' || native.reason === 'native-timeout'
+          ? this.permissionFallbackTimeoutMs
+          : 0
       // Recorded before the broadcast: the hub is synchronous, and the chat
       // line `streamPrompt` folds from this frame words itself by the path
       // this ask actually took.
-      this.ledgerFallbacks.set(requestId, { reason: native.reason, timeoutMs })
+      this.ledgerFallbacks.set(requestId, {
+        reason: native.reason,
+        timeoutMs,
+        ...(native.reason === 'native-timeout' ? { waitedMs: this.nativeApprovalTimeoutMs } : {}),
+      })
       if (timeoutMs > 0) {
         timer = setTimeout(() => {
           if (!this.permissions.has(requestId)) return
@@ -1247,7 +1404,10 @@ export class AgentBridge {
             type: 'agent/notice',
             agentId: this.def.id,
             level: 'info',
-            text: `acp: permission request timed out after ${String(Math.round(timeoutMs / 1000))}s; answered "cancelled"`,
+            // Name what was missed, the way a human needs it: which operation
+            // sat unanswered, and for how long (OmniTerm's reaper writes the
+            // same "you missed this" notice before it acts).
+            text: `acp: permission request for "${permissionToolName(toolCall)}" timed out after ${String(Math.round(timeoutMs / 1000))}s; answered "cancelled"`,
           })
           this.permissions.respond(requestId, { outcome: 'cancelled' })
         }, timeoutMs)
@@ -1280,8 +1440,19 @@ export class AgentBridge {
    * open turn, so a session started over `/acp` (no chat turn) cannot be
    * routed and must stay on the ledger path.
    *
-   * No `permissionTimeoutMs` timer is armed here on purpose: the human answers
-   * inside the conversation, and a host-side deadline would answer for them.
+   * The ask is raced against {@link BridgeTuning.nativeApprovalTimeoutMs}. A
+   * routed ask has exactly one answer entry — the composer takeover — and no
+   * broadcast at all, so a host that takes the question and never renders it
+   * would leave the turn hanging behind something invisible. Past the deadline
+   * the ask is WITHDRAWN (the signal handed to the host aborts, which settles
+   * its waterfall `cancelled` and drops the composer panel) and reported as
+   * `native-timeout`, sending the question to the ledger where the chat line
+   * and the settings card are both visible. Withdrawing is not answering: a
+   * human mid-decision finds the same question in the settings panel.
+   *
+   * No deadline is armed on the ledger paths (`no-requester`,
+   * `no-chat-session`): those never reach the host, and their answer entry is
+   * the settings panel the chat line already points at.
    *
    * @returns the agent-facing response, or the reason the ask must fall back
    * to the ledger (see {@link LedgerFallbackReason}).
@@ -1295,18 +1466,48 @@ export class AgentBridge {
     const requester = this.approvalRequester?.()
     if (requester === undefined) return { reason: 'no-requester' }
     if (session.dshSessionId === undefined) return { reason: 'no-chat-session' }
+    // One signal carries both withdrawals: the agent's own cancel (whatever
+    // aborted the ACP request) and the deadline. The host's waterfall races its
+    // answerers against this signal, so aborting is a clean withdrawal rather
+    // than a leak.
+    const withdraw = new AbortController()
+    const askSignal = signal === undefined ? withdraw.signal : AbortSignal.any([signal, withdraw.signal])
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let timedOut = false
+    const deadline = this.nativeApprovalTimeoutMs > 0
+      ? new Promise<{ timedOut: true }>(resolve => {
+        timer = setTimeout(() => {
+          timedOut = true
+          withdraw.abort()
+          resolve({ timedOut: true })
+        }, this.nativeApprovalTimeoutMs)
+        timer.unref?.()
+      })
+      : undefined
     let outcome: ApprovalOutcome
     try {
-      outcome = await requester({
+      const asked = requester({
         dshSessionId: session.dshSessionId,
         agentId: this.def.id,
         toolName: permissionToolName(toolCall),
-        ...(signal === undefined ? {} : { signal }),
+        signal: askSignal,
       })
+      // A withdrawn ask settles on the host's own schedule; dropping it here
+      // must not surface as an unhandled rejection later.
+      asked.catch(() => { /* withdrawn: the ledger owns this ask now */ })
+      const settled = deadline === undefined
+        ? await asked.then(o => ({ outcome: o }))
+        : await Promise.race([asked.then(o => ({ outcome: o })), deadline])
+      // The flag, not the race winner, decides: the host may settle `cancelled`
+      // from the very abort the deadline caused, and that is still a timeout.
+      if (timedOut || 'timedOut' in settled) return { reason: 'native-timeout' }
+      outcome = settled.outcome
     } catch {
       // Synchronous throw or rejection, either way: the ask falls back to the
       // ledger. An approval failure must never break the agent's turn.
       outcome = 'unavailable'
+    } finally {
+      clearTimeout(timer)
     }
     if (outcome === 'unavailable') return { reason: 'unavailable' }
     const response = nativeOutcomeResponse(outcome, options)
@@ -1438,9 +1639,28 @@ export class AgentBridge {
 }
 
 /** Human-facing identity of an ACP tool call (the approval headline). */
-function permissionToolName(toolCall: unknown): string {
+/**
+ * Human-facing name of the tool an ask is about, for the chat line and the
+ * timeout notice.
+ *
+ * The ACP `toolCall.title` is the declared field, but it is OPTIONAL and real
+ * agents omit it: codebuddy puts the name in `_meta["codebuddy.ai/toolName"]`
+ * (observed live — without the fallback the notice reads `for "tool call"`,
+ * which tells the human nothing about what they missed). So read `title` first,
+ * then any `_meta` key whose last segment is `toolName`, then the standard
+ * `kind`, and only then give up with the generic phrase. Nothing is invented:
+ * every step reads a key the agent itself declared.
+ */
+export function permissionToolName(toolCall: unknown): string {
   const row = (typeof toolCall === 'object' && toolCall !== null ? toolCall : {}) as Record<string, unknown>
-  return typeof row.title === 'string' && row.title !== '' ? row.title : 'tool call'
+  if (typeof row.title === 'string' && row.title !== '') return row.title
+  const meta = (typeof row._meta === 'object' && row._meta !== null ? row._meta : {}) as Record<string, unknown>
+  for (const [key, value] of Object.entries(meta)) {
+    const segment = key.split('/').at(-1) ?? key
+    if (segment.toLowerCase() === 'toolname' && typeof value === 'string' && value !== '') return value
+  }
+  if (typeof row.kind === 'string' && row.kind !== '') return row.kind
+  return 'tool call'
 }
 
 /**
@@ -2638,13 +2858,24 @@ class TurnStreamController {
     // The line must not point at a place with no answer entry, and the bridge
     // knows which path this ask took (`ledgerFallbackOf`, recorded before the
     // frame was broadcast). On the DESIGNED ledger paths the settings panel's
-    // card is the answer entry. A DEGRADED native route carries a deadline.
+    // card is the answer entry. A DEGRADED native route carries a deadline and
+    // has to say why the conversation is not showing the question — as an
+    // OBSERVED FACT, not a guessed cause: "no answer within Ns" is true whether
+    // the human was slow or the host never rendered the question.
     const fallback = this.bridge.ledgerFallbackOf(event.requestId)
-    return fallback?.reason === 'unavailable'
-      ? fallback.timeoutMs > 0
-        ? `\n> 🔐 [Permission Required: ${title}] - the approval service is unavailable; approve in Settings within ${String(Math.round(fallback.timeoutMs / 1000))}s or this request is cancelled\n`
-        : `\n> 🔐 [Permission Required: ${title}] - the approval service is unavailable; please approve in Settings\n`
-      : `\n> 🔐 [Permission Required: ${title}] - please approve in Settings\n`
+    const why = fallback === undefined
+      ? undefined
+      : fallback.reason === 'unavailable'
+        ? 'the approval service is unavailable'
+        : fallback.reason === 'native-timeout'
+          ? `no answer in the conversation within ${String(Math.round((fallback.waitedMs ?? 0) / 1000))}s`
+          : undefined
+    if (fallback === undefined || why === undefined) {
+      return `\n> 🔐 [Permission Required: ${title}] - please approve in Settings\n`
+    }
+    return fallback.timeoutMs > 0
+      ? `\n> 🔐 [Permission Required: ${title}] - ${why}; approve in Settings within ${String(Math.round(fallback.timeoutMs / 1000))}s or this request is cancelled\n`
+      : `\n> 🔐 [Permission Required: ${title}] - ${why}; please approve in Settings\n`
   }
 }
 
@@ -2679,6 +2910,41 @@ export class BridgeManager {
   private defaultAgentId?: string
   /** The agent tag's halo preference (persisted; see `persistAgents`). */
   private tagHaloSetting: AcpTagHalo = { ...DEFAULT_TAG_HALO }
+  /**
+   * What `cordis.patch.yml` asked for, by key — ONLY the keys it actually
+   * names. This is the deployment baseline, kept apart from
+   * {@link deadlineOverride} so the settings card can tell the user which of
+   * the two is winning. Empty when the file says nothing about either window,
+   * in which case {@link baselineDeadlines} (the built-in default) applies.
+   */
+  private configuredDeadlines: Partial<Record<ApprovalDeadlineKey, number>> = {}
+  /**
+   * The value each deadline had before any override — the tuning this manager
+   * was constructed with, which already carries the validated config file (the
+   * host entry passes `validateConfig`'s output) or the built-in default.
+   *
+   * Held separately from {@link configuredDeadlines} because the two answer
+   * different questions: this one is what RUNS when nothing is overridden, that
+   * one is what the config file NAMED (which the card shows as the reset target
+   * and a bare default does not deserve). A manager built without tuning at all
+   * — a direct consumer, a test — gets `DEFAULT_TUNING` here and stays correct.
+   */
+  private baselineDeadlines: { nativeApprovalTimeoutMs: number; permissionFallbackTimeoutMs: number }
+  /**
+   * The settings page's own write, persisted with the agent registry. Merged
+   * OVER {@link baselineDeadlines}: once a user picks a window in the UI, that
+   * pick is what runs, and the config file becomes the value the reset button
+   * returns to. Without this split a hand-edited `cordis.patch.yml` and a UI
+   * write would fight with no way to tell which one is live.
+   */
+  private deadlineOverride: Partial<Record<ApprovalDeadlineKey, number>> = {}
+  /**
+   * Tuning in force, defaults applied. The two approval deadlines are rewritten
+   * IN PLACE by {@link applyDeadlineTuning}, which is why this is a live object
+   * rather than the constructor's parameter: every bridge built afterwards
+   * inherits the rewrite instead of the boot-time value.
+   */
+  private readonly tuning: Required<BridgeTuning>
   /**
    * The in-flight (or just-settled) segmented turn of one DSH chat session.
    * Keyed by chat session id because the continuation steps of a segmented
@@ -2728,8 +2994,20 @@ export class BridgeManager {
     private readonly catalogStoragePath?: string,
     /** Auto-probe agents for model catalogs (boot + lazy); manual probes always run. */
     private readonly probeModelsOnBoot = true,
-    private readonly tuning?: BridgeTuning,
+    tuning?: BridgeTuning,
   ) {
+    // Held as a live object rather than the raw parameter: the two approval
+    // deadlines are rewritten in place when the settings page writes them (see
+    // `applyDeadlineTuning`), and every bridge built afterwards must inherit
+    // the rewrite instead of the boot-time value.
+    this.tuning = { ...DEFAULT_TUNING, ...tuning }
+    // The pre-override deadline values, snapshotted before anything can rewrite
+    // them. Everything else in `tuning` is fixed for the manager's lifetime, so
+    // only this pair needs a snapshot.
+    this.baselineDeadlines = {
+      nativeApprovalTimeoutMs: this.tuning.nativeApprovalTimeoutMs,
+      permissionFallbackTimeoutMs: this.tuning.permissionFallbackTimeoutMs,
+    }
     for (const def of defs) {
       this.defsMap.set(def.id, def)
     }
@@ -2742,6 +3020,9 @@ export class BridgeManager {
     }
     this.loadPersistedAgents()
     this.loadPersistedCatalogs()
+    // A persisted deadline override must reach the tuning the bridges are built
+    // from, not just the settings card's readout.
+    this.applyDeadlineTuning()
     // The request-path rewrite falls back to this default for a conversation
     // the user never bound explicitly — the same agent the composer chip shows.
     routeBindingRegistry().defaultModel = this.defaultAgent()
@@ -2769,6 +3050,19 @@ export class BridgeManager {
   /** True when permission asks go to native approval instead of the settings panel. */
   approvalRouting(): boolean {
     return this.approvalRequester !== undefined
+  }
+
+  /**
+   * Every outstanding ledger ask, across all agents, with the view the browser
+   * was shown it — the source of the reconnect replay (see
+   * `permissionReplayFrames`). Asks on the native route are deliberately
+   * absent: they broadcast nothing and their answer entry is the composer
+   * takeover the client already holds.
+   */
+  pendingPermissionViews(): PendingPermissionView[] {
+    const views: PendingPermissionView[] = []
+    for (const bridge of this.bridges.values()) views.push(...bridge.permissions.pendingViews())
+    return views
   }
 
   /**
@@ -3534,6 +3828,16 @@ export class BridgeManager {
         } catch {
           this.tagHaloSetting = { ...DEFAULT_TAG_HALO }
         }
+        // The settings page's approval-deadline override. Re-validated on every
+        // boot because the state file is user- and version-editable: an
+        // unreadable value must not poison the deadline, and a value the
+        // validator accepts must be the value that runs (a UI write that did
+        // not survive a restart would read as a broken setting).
+        try {
+          this.deadlineOverride = validateApprovalDeadlines((parsed as { approvalDeadlines?: unknown }).approvalDeadlines ?? {})
+        } catch {
+          this.deadlineOverride = {}
+        }
         this.loadPersistedChoices((parsed as { conversations?: unknown }).conversations)
       }
     } catch {
@@ -3586,6 +3890,11 @@ export class BridgeManager {
         ...(this.defaultAgentId === undefined ? {} : { defaultAgentId: this.defaultAgentId }),
         tagHalo: this.tagHaloSetting,
         agents: [...this.defsMap.values()],
+        // The settings page's approval deadlines. Absent while none was ever
+        // written, so a fresh deployment's state file stays exactly as it was.
+        ...(Object.keys(this.deadlineOverride).length === 0
+          ? {}
+          : { approvalDeadlines: { ...this.deadlineOverride } }),
         // The per-conversation picks: agent + model + thought level + mode +
         // extra config values chosen in the composer, including for
         // conversations with no live session yet.
@@ -4568,6 +4877,78 @@ export class BridgeManager {
     // a future non-RPC path tomorrow).
     this.tagHaloSetting = validateTagHalo(halo)
     this.persistAgents()
+  }
+
+  /**
+   * Declare the deployment baseline for the two approval deadlines — the values
+   * `cordis.patch.yml` names, passed RAW (only the keys it actually contains).
+   *
+   * Kept separate from the validated tuning because "the file says 600000" and
+   * "the file says nothing, so 300000 applies" are different facts: the settings
+   * card shows the first as the reset target and the second as a built-in
+   * default. Called once by the host entry, before any bridge exists — and it
+   * also moves the baseline, so a manager built without tuning (a direct
+   * consumer, a test) still runs what the deployment asked for.
+   */
+  setConfiguredApprovalDeadlines(values: Partial<Record<ApprovalDeadlineKey, number>>): void {
+    this.configuredDeadlines = { ...values }
+    if (values.nativeApprovalTimeoutMs !== undefined) this.baselineDeadlines.nativeApprovalTimeoutMs = values.nativeApprovalTimeoutMs
+    if (values.permissionFallbackTimeoutMs !== undefined) this.baselineDeadlines.permissionFallbackTimeoutMs = values.permissionFallbackTimeoutMs
+    this.applyDeadlineTuning()
+  }
+
+  /**
+   * The approval deadlines in force, plus the two facts that explain a value the
+   * user did not pick: the config-file baseline an override is outranking, and a
+   * `permissionTimeoutMs` that overrides BOTH windows when non-zero. Both are
+   * reported only when they are actually in play, so the card can stay silent
+   * about a plain default.
+   */
+  approvalDeadlines(): AcpApprovalDeadlines {
+    const deadlines: AcpApprovalDeadlines = {
+      nativeApprovalTimeoutMs: this.tuning.nativeApprovalTimeoutMs,
+      permissionFallbackTimeoutMs: this.tuning.permissionFallbackTimeoutMs,
+    }
+    if (Object.keys(this.configuredDeadlines).length > 0) deadlines.configured = { ...this.configuredDeadlines }
+    if (this.tuning.permissionTimeoutMs > 0) deadlines.permissionTimeoutMs = this.tuning.permissionTimeoutMs
+    return deadlines
+  }
+
+  /**
+   * Write one or both approval deadlines (omitted keys keep their value), or
+   * drop the persisted override with `reset` so the config-file baseline — or
+   * the built-in default — applies again.
+   *
+   * HOT: the rewrite reaches every live bridge, so a user changing the window
+   * never has to kill a running session to see it take effect (the one thing an
+   * `agent/save`-style restart would cost them). Only asks armed AFTER the
+   * write see the new window; an ask already holding a timer keeps the one it
+   * started with.
+   */
+  async setApprovalDeadlines(patch: Partial<Record<ApprovalDeadlineKey, number>>, reset = false): Promise<void> {
+    // Merged BEFORE validating, so the whole resulting override passes the same
+    // gate the config file does (an override written by an older build is
+    // re-gated here rather than trusted). `validateApprovalDeadlines` also drops
+    // unknown keys, which is what keeps a stale payload from poisoning state.
+    const merged = reset ? {} : { ...this.deadlineOverride, ...patch }
+    this.deadlineOverride = validateApprovalDeadlines(merged)
+    this.applyDeadlineTuning()
+    this.persistAgents()
+  }
+
+  /**
+   * Recompute the two deadlines from override → deployment baseline, and push
+   * the result to every live bridge.
+   */
+  private applyDeadlineTuning(): void {
+    const nativeApprovalTimeoutMs = this.deadlineOverride.nativeApprovalTimeoutMs
+      ?? this.baselineDeadlines.nativeApprovalTimeoutMs
+    const permissionFallbackTimeoutMs = this.deadlineOverride.permissionFallbackTimeoutMs
+      ?? this.baselineDeadlines.permissionFallbackTimeoutMs
+    this.tuning.nativeApprovalTimeoutMs = nativeApprovalTimeoutMs
+    this.tuning.permissionFallbackTimeoutMs = permissionFallbackTimeoutMs
+    const patch = { nativeApprovalTimeoutMs, permissionFallbackTimeoutMs }
+    for (const bridge of this.bridges.values()) bridge.applyApprovalDeadlines(patch)
   }
 
   private readonly dshSessionMap = new Map<string, LiveSession>()

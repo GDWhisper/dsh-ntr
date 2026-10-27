@@ -87,6 +87,50 @@ describe('host plugin contract', () => {
     expect(() => apply(ctx as never, { agents: [{ command: 'x' }] })).toThrow(/id/)
   })
 
+  it('emits the pending-permission replay on a fresh SSE connection', async () => {
+    // The `permission/request` frame is broadcast ONCE, when the ask is created.
+    // A client that connects later — page reload, second tab, stream outage —
+    // never receives it, and for a ledger ask the settings card is the only
+    // answer entry. The route must therefore emit the replay right after
+    // `stream/open`; the empty case still has to terminate with the live set, or
+    // a reconnecting client keeps whatever card it held from before.
+    //
+    // Only the WIRING is asserted here (the loop runs, in order, on this route):
+    // a non-empty replay needs a live ask, which needs a spawned child — the
+    // frame content itself is covered by `permissionReplayFrames`
+    // (tests/impl.spec.ts) and `pendingPermissionViews` (tests/bridge.spec.ts).
+    const ctx = fakeCtx()
+    apply(ctx as never, { agents: [{ id: 'a', command: 'x' }] })
+    const descriptor = ctx.connection.fetch.register.mock.calls.at(-1)?.[0] as {
+      fetch: (request: { signal: AbortSignal }) => Promise<Response>
+    } | undefined
+    expect(descriptor).toBeDefined()
+
+    const controller = new AbortController()
+    const response = await descriptor!.fetch({ signal: controller.signal })
+    expect(response.headers.get('content-type')).toContain('text/event-stream')
+    const reader = (response.body as ReadableStream<Uint8Array>).getReader()
+    const decoder = new TextDecoder()
+    const frames: unknown[] = []
+    try {
+      while (frames.length < 2) {
+        const { value, done } = await reader.read()
+        if (done) break
+        const text = decoder.decode(value)
+        const payload = /^data: (.*)\n\n$/s.exec(text)?.[1]
+        if (payload !== undefined) frames.push(JSON.parse(payload))
+      }
+    } finally {
+      controller.abort()
+      await reader.cancel().catch(() => { /* the abort already closed it */ })
+    }
+
+    expect(frames[0]).toEqual({ type: 'stream/open' })
+    // Nothing is outstanding (no child was ever spawned), and the terminator
+    // still rides along: an empty live set is what clears a stale card.
+    expect(frames[1]).toEqual({ type: 'permission/synced', requestIds: [] })
+  })
+
   it('registers the AcpLlmAdapter when llm service is available', () => {
     const ctx = fakeCtx()
     const registerAdapter = vi.fn()
@@ -220,6 +264,45 @@ describe('host plugin contract', () => {
     services.sessionPersistence = undefined
     const bare = await ask('session-unknown')
     expect(bare.acpMode).toBe(false)
+  })
+
+  it('carries the config file\'s approval deadlines into the settings card, and lets the card override them', async () => {
+    // The wiring `dispatchRpc`'s fake manager cannot see: the host entry has to
+    // hand the manager the RAW patch values, so the card can tell "the file
+    // asked for 10 minutes" from "nothing was configured, 5 is the built-in
+    // default" — and a settings write has to outrank the file afterwards.
+    const ctx = fakeCtx()
+    let rpcHandler: ((endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>) | undefined
+    ctx.connection.rpc.handle = vi.fn((_channel: string, handler: unknown) => {
+      rpcHandler = handler as typeof rpcHandler
+      return () => Promise.resolve()
+    })
+    apply(ctx as never, {
+      agents: [{ id: 'agent-1', command: 'run' }],
+      // One window named, one left to the default: the card must show only the
+      // named one as the reset target.
+      nativeApprovalTimeoutMs: 600_000,
+    })
+    const ask = async (endpoint: string, payload: unknown = {}): Promise<Record<string, unknown>> => {
+      const answer = await rpcHandler!(endpoint, payload, new AbortController().signal)
+      return (answer as { value: Record<string, unknown> }).value
+    }
+
+    expect((await ask('ui/approval-deadlines')).deadlines).toEqual({
+      nativeApprovalTimeoutMs: 600_000,
+      permissionFallbackTimeoutMs: 300_000,
+      configured: { nativeApprovalTimeoutMs: 600_000 },
+    })
+
+    // The settings write wins from here on, without a restart.
+    expect((await ask('ui/approval-deadlines-set', { nativeApprovalTimeoutMs: 30_000 })).deadlines)
+      .toMatchObject({ nativeApprovalTimeoutMs: 30_000 })
+    expect((await ask('ui/approval-deadlines')).deadlines)
+      .toMatchObject({ nativeApprovalTimeoutMs: 30_000, configured: { nativeApprovalTimeoutMs: 600_000 } })
+
+    // Reset returns to the file's value.
+    expect((await ask('ui/approval-deadlines-set', { reset: true })).deadlines)
+      .toMatchObject({ nativeApprovalTimeoutMs: 600_000 })
   })
 
   it('never touches the host model layer at all — no route, no default, no guard', async () => {
