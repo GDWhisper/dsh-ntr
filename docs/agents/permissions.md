@@ -23,10 +23,10 @@ ACP `session/request_permission` 原样映射：选项列表 / allow-deny / tool
 | `no-requester` | 无 approval 服务、`ctx.agents.get` 取不到、requester 抛错 | 设计内 ledger 路径；`permissionTimeoutMs` 默认 `0` 时无限等待 |
 | `no-chat-session` | `/acp` RPC 会话，没有聊天 turn 可挂审计对 | 同上 |
 | `unavailable` | 服务在、这一次失败 | 降级路径：改走 `permissionFallbackTimeoutMs`（默认 300_000 = 5 分钟），到时代答 `cancelled`；填 `0` 关闭 |
-| `native-timeout` | 宿主**收了问题却不答**（answerer 不在浏览器 scope、对话未挂载、remote 事件没送达） | 同上；另外路由本身有 `nativeApprovalTimeoutMs`（默认 120_000），到点撤回后才会走到这里 |
+| `native-timeout` | 宿主**收了问题却不答**（answerer 不在浏览器 scope、对话未挂载、remote 事件没送达） | 同上；另外路由本身有 `nativeApprovalTimeoutMs`（默认 300_000），到点撤回后才会走到这里 |
 
 - **两个期限都是配置项**（`AcpPluginConfig`，`cordis.patch.yml` 里注释了默认值）：`nativeApprovalTimeoutMs`
-  （撤回窗口，默认 120_000）与 `permissionFallbackTimeoutMs`（降级询问的代答窗口，默认 300_000）。
+  （撤回窗口，默认 300_000）与 `permissionFallbackTimeoutMs`（降级询问的代答窗口，默认 300_000）。
   `0` = 对应期限永不触发（恢复加期限之前的行为）；`permissionTimeoutMs > 0` 时它对所有路径一视同仁、
   覆盖这两个值。OmniTerm dev 把同一对窗口做成 `acp_perm_timeout_secs`（30 秒步进、上限 1 小时、
   原子量热更新）+ `acp_perm_timeout_mode` 三档；本插件只取两档——`0` 即 OmniTerm 的 `wait`，

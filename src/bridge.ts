@@ -196,6 +196,17 @@ export interface BridgeTuning {
    * This is NOT an answer on the human's behalf: a human mid-decision simply
    * finds the same question in the settings panel. `0` disables it (wait for
    * the host forever).
+   *
+   * Default 300000 ms — the SAME window as
+   * {@link BridgeTuning.permissionFallbackTimeoutMs}, so "this route is not
+   * working" is one number instead of two arbitrary ones. A takeover that is
+   * going to render does so immediately, and the host replays a pending
+   * approval across reconnects (verified live on DSH web 0.2.1-rc.2), so the
+   * deadline only ever fires for a host that took the question and never showed
+   * it. OmniTerm's equivalent is its reaper's permission-timeout threshold
+   * (30 min default, 30 s steps, hot-updatable); this is the same knob without
+   * their `auto` tier, which this plugin does not have (every ask must reach a
+   * human).
    */
   nativeApprovalTimeoutMs?: number
   cancelFallbackMs?: number
@@ -307,7 +318,7 @@ const DEFAULT_TUNING: Required<BridgeTuning> = {
   startupTimeoutMs: 60_000,
   permissionTimeoutMs: 0,
   permissionFallbackTimeoutMs: 300_000,
-  nativeApprovalTimeoutMs: 120_000,
+  nativeApprovalTimeoutMs: 300_000,
   cancelFallbackMs: 15_000,
   staleCancelRetryDelayMs: 600,
   staleCancelMaxRetries: 2,

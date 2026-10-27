@@ -127,12 +127,15 @@ export interface AcpPluginConfig {
    * invisible; this deadline is what bounds that state. Withdrawing is NOT
    * answering: the same question stays answerable in Settings.
    *
-   * Default 120000 ms (2 minutes) — long enough that a slow first paint does not
-   * trip it, short enough that a broken route is noticed. `0` waits for the host
-   * forever (the pre-withdrawal behavior). OmniTerm's equivalent is the reaper's
-   * permission-timeout threshold (30 min default, 30 s steps, hot-updatable);
-   * this is the same knob without their `auto` tier, which this plugin does not
-   * have (every ask must reach a human).
+   * Default 300000 ms (5 minutes) — the same window as
+   * `permissionFallbackTimeoutMs`, so "this route is not working" is one number
+   * instead of two arbitrary ones. A takeover that is going to render does so
+   * immediately, and the host replays a pending approval across reconnects, so
+   * the deadline only fires for a host that took the question and never showed
+   * it. `0` waits for the host forever (the pre-withdrawal behavior). OmniTerm's
+   * equivalent is the reaper's permission-timeout threshold (30 min default,
+   * 30 s steps, hot-updatable); this is the same knob without their `auto` tier,
+   * which this plugin does not have (every ask must reach a human).
    */
   nativeApprovalTimeoutMs?: number
   /**

@@ -286,7 +286,7 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
   // Both degraded-route deadlines share the `permissionTimeoutMs` range: `0` is
   // the meaningful value (never withdraw / never auto-cancel), and anything up
   // to a day is a legitimate "ask again later" window.
-  const nativeApprovalTimeoutMs = value.nativeApprovalTimeoutMs ?? 120_000
+  const nativeApprovalTimeoutMs = value.nativeApprovalTimeoutMs ?? 300_000
   if (typeof nativeApprovalTimeoutMs !== 'number' || !Number.isInteger(nativeApprovalTimeoutMs) || nativeApprovalTimeoutMs < 0 || nativeApprovalTimeoutMs > 86_400_000) {
     throw new AcpError('bad_config', 'acp: nativeApprovalTimeoutMs must be an integer in [0, 86400000] (0 = wait for the host approval chain forever)')
   }

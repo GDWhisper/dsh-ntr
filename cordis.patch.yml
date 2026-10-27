@@ -34,13 +34,16 @@
         #                                DEGRADED native route the turn still ends, after
         #                                `permissionFallbackTimeoutMs` (default 300000) —
         #                                see `LedgerFallbackReason`.
-        # nativeApprovalTimeoutMs: 120000
+        # nativeApprovalTimeoutMs: 300000
         #                              How long the native approval route (the composer
         #                              takeover) may stay unanswered before the ask is
         #                              WITHDRAWN and re-asked on the settings ledger. 0 waits
-        #                              for the host forever. Raise it if users read long
-        #                              commands before answering; lower it if a host that
-        #                              never renders the takeover should be noticed sooner.
+        #                              for the host forever. Default matches
+        #                              `permissionFallbackTimeoutMs`: one window for "this
+        #                              route is not working", not two. Raise it if a
+        #                              deployment's users routinely deliberate for minutes
+        #                              before answering (withdrawing only relocates the
+        #                              question to Settings — it never answers for them).
         # permissionFallbackTimeoutMs: 300000
         #                              Deadline for a DEGRADED ask (`unavailable`, or
         #                              `native-timeout` after the withdrawal above): past it

@@ -369,7 +369,7 @@ selection，而 driver 每轮解析的路由（`selectionFor(agent).current`：p
   routed ask 的唯一入口就是 composer 接管且不广播任何帧，所以宿主不渲染（answerer 不在
   浏览器 scope、对话未挂载、remote 事件没送达）时，turn 挂在完全不可见的地方：没有卡、
   没有聊天行、没有期限（实测 CodeBuddy 2.177.0 + 宿主审批提示关闭，只剩 agent 侧心跳）。
-  路由因此自带 `nativeApprovalTimeoutMs`（默认 120_000）：到点**撤回**——abort 交给宿主的
+  路由因此自带 `nativeApprovalTimeoutMs`（默认 300_000，与 `permissionFallbackTimeoutMs` 同一个窗口）：到点**撤回**——abort 交给宿主的
   signal（宿主 waterfall 用同一 signal 赛跑答案，遂以 `cancelled` 收尾、composer 面板消失），
   再把同一问题改走 ledger。撤回不是代答：人照样能在设置页回答同一个问题。填 `0` 关闭。
 

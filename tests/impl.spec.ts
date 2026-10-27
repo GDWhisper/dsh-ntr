@@ -100,7 +100,7 @@ describe('validateConfig', () => {
     // a mode; here `0` is the per-deadline "never" tier, and no mode exists
     // because every ask must reach a human.
     const config = validateConfig({ agents: [] })
-    expect(config.nativeApprovalTimeoutMs).toBe(120_000)
+    expect(config.nativeApprovalTimeoutMs).toBe(300_000)
     expect(config.permissionFallbackTimeoutMs).toBe(300_000)
 
     // 0 = never withdraw / never answer on the human's behalf (the pre-deadline
