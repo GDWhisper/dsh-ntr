@@ -1537,9 +1537,28 @@ export class AgentBridge {
 }
 
 /** Human-facing identity of an ACP tool call (the approval headline). */
-function permissionToolName(toolCall: unknown): string {
+/**
+ * Human-facing name of the tool an ask is about, for the chat line and the
+ * timeout notice.
+ *
+ * The ACP `toolCall.title` is the declared field, but it is OPTIONAL and real
+ * agents omit it: codebuddy puts the name in `_meta["codebuddy.ai/toolName"]`
+ * (observed live — without the fallback the notice reads `for "tool call"`,
+ * which tells the human nothing about what they missed). So read `title` first,
+ * then any `_meta` key whose last segment is `toolName`, then the standard
+ * `kind`, and only then give up with the generic phrase. Nothing is invented:
+ * every step reads a key the agent itself declared.
+ */
+export function permissionToolName(toolCall: unknown): string {
   const row = (typeof toolCall === 'object' && toolCall !== null ? toolCall : {}) as Record<string, unknown>
-  return typeof row.title === 'string' && row.title !== '' ? row.title : 'tool call'
+  if (typeof row.title === 'string' && row.title !== '') return row.title
+  const meta = (typeof row._meta === 'object' && row._meta !== null ? row._meta : {}) as Record<string, unknown>
+  for (const [key, value] of Object.entries(meta)) {
+    const segment = key.split('/').at(-1) ?? key
+    if (segment.toLowerCase() === 'toolname' && typeof value === 'string' && value !== '') return value
+  }
+  if (typeof row.kind === 'string' && row.kind !== '') return row.kind
+  return 'tool call'
 }
 
 /**

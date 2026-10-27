@@ -13,6 +13,7 @@ import {
   AcpLlmAdapter, AgentBridge, BridgeManager, defaultAgentWorkspace,
   detectHostAgents, ensureAgentExecutable, findExecutable, killProcessTree, pluginStateDir, routeBindingRegistry, windowsShimLaunch,
   type ApprovalOutcome, type ApprovalRequestContext, type BridgeTuning,
+  permissionToolName,
 } from '../src/bridge.ts'
 import { EventHub, dispatchRpc } from '../src/impl.ts'
 import type { AcpAgentCatalog, AcpAgentDef, AcpEvent, AgentCatalogResult, ChatSessionView, StreamChunk } from '../src/protocol.ts'
@@ -2228,6 +2229,22 @@ describe('permission mapping and the agent\'s own modes (isolated manager)', () 
 
   afterAll(async () => {
     await modeManager.shutdownAll()
+  })
+
+  it('names the tool an ask is about, whatever field the agent declared it in', () => {
+    // `title` is OPTIONAL in ACP and real agents omit it: codebuddy sends the
+    // name in `_meta["codebuddy.ai/toolName"]` (observed live — without the
+    // fallback the timeout notice reads `for "tool call"`, which tells the
+    // human nothing about what they missed).
+    expect(permissionToolName({ title: 'mock dangerous operation' })).toBe('mock dangerous operation')
+    expect(permissionToolName({ _meta: { 'codebuddy.ai/toolName': 'Bash' } })).toBe('Bash')
+    expect(permissionToolName({ _meta: { toolName: 'Edit' } })).toBe('Edit')
+    expect(permissionToolName({ kind: 'execute' })).toBe('execute')
+    expect(permissionToolName({})).toBe('tool call')
+    expect(permissionToolName(undefined)).toBe('tool call')
+    // A non-string or empty declaration is not a name; the chain keeps going.
+    expect(permissionToolName({ title: '', _meta: { 'x/toolName': 'Bash' } })).toBe('Bash')
+    expect(permissionToolName({ _meta: { 'x/toolName': 42 } })).toBe('tool call')
   })
 
   /** Wait for a fresh event (the hub keeps older cases' frames, so `since` is mandatory). */
