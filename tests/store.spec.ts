@@ -1247,6 +1247,28 @@ describe('AcpStore event application (released / reset / turn dedup)', () => {
     expect(state.notice).toMatch(/resume|恢复/)
   })
 
+  it('re-establishes the pending asks on reconnect and prunes the stale ones', async () => {
+    // A `permission/request` is broadcast ONCE, so a client that connects later
+    // never learns the ask exists. The stream replays every outstanding ask and
+    // terminates with the live id set; this client holds one ask that was
+    // resolved while it was disconnected, which must not survive as a card that
+    // can only answer `unknown_request`.
+    const { store, apply } = await makeStore()
+    await apply({ type: 'permission/request', requestId: 'stale', sessionId: 's1', toolCall: { title: 'old' }, options: [] })
+    await apply({ type: 'permission/request', requestId: 'live', sessionId: 's2', toolCall: { title: 'new' }, options: [] })
+    expect(store.getSnapshot().permissions.map(p => p.requestId)).toEqual(['stale', 'live'])
+
+    // The replay re-sends the outstanding ask (idempotent by request id — it may
+    // also have arrived live) and then names what is actually live.
+    await apply({ type: 'permission/request', requestId: 'live', sessionId: 's2', toolCall: { title: 'new' }, options: [] })
+    await apply({ type: 'permission/synced', requestIds: ['live'] })
+    expect(store.getSnapshot().permissions.map(p => p.requestId)).toEqual(['live'])
+
+    // Nothing outstanding at all: the terminator alone must clear the list.
+    await apply({ type: 'permission/synced', requestIds: [] })
+    expect(store.getSnapshot().permissions).toEqual([])
+  })
+
   it('resets blocks and the seq watermark on session/reset so the replay folds fresh', async () => {
     const { store, apply } = await makeStore()
     await apply({ type: 'session/created', sessionId: 's1', session: view() })

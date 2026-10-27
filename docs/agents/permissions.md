@@ -23,11 +23,38 @@ ACP `session/request_permission` 原样映射：选项列表 / allow-deny / tool
 | `no-requester` | 无 approval 服务、`ctx.agents.get` 取不到、requester 抛错 | 设计内 ledger 路径；`permissionTimeoutMs` 默认 `0` 时无限等待 |
 | `no-chat-session` | `/acp` RPC 会话，没有聊天 turn 可挂审计对 | 同上 |
 | `unavailable` | 服务在、这一次失败 | 降级路径：改走 `permissionFallbackTimeoutMs`（默认 300_000 = 5 分钟），到时代答 `cancelled`；填 `0` 关闭 |
+| `native-timeout` | 宿主**收了问题却不答**（answerer 不在浏览器 scope、对话未挂载、remote 事件没送达） | 同上；另外路由本身有 `nativeApprovalTimeoutMs`（默认 120_000），到点撤回后才会走到这里 |
 
-- `permissionTimeoutMs > 0` 时对三条路径一视同仁。路由成功时**不启动**任何定时器（人在对话里答，不能抢答），但仍广播一条 `permission/resolved` 保持事件流对称。
-- 原因必须在广播**之前**记进 `ledgerFallbacks`（`ledgerFallbackOf` 读）。`streamPrompt` 据此写聊天提示：设计内路径说「please approve in Settings」；降级路径必须说清「审批服务不可用」并带倒计时——否则「去设置页批准」读起来像一个选择，而它其实是 deadline。
+- **路由有截止期限**（`BridgeTuning.nativeApprovalTimeoutMs`）： routed ask 的唯一答案入口就是 composer 接管，且**不广播任何帧**——宿主收了问题却不渲染，turn 就挂在一个人看不见的地方（issue #2 的实测：只剩 agent 侧心跳，会话永久挂起）。到点即**撤回**：abort 交给宿主的 signal（宿主 waterfall 用同一个 signal 赛跑答案，遂以 `cancelled` 收尾、composer 面板消失），再把同一问题改走 ledger。撤回**不是代答**——人照样能在设置页回答同一个问题；填 `0` 关闭该期限（恢复无限等待）。
+- `permissionTimeoutMs > 0` 时对四条路径一视同仁。路由成功时**不启动**任何定时器（人在对话里答，不能抢答），但仍广播一条 `permission/resolved` 保持事件流对称。
+- 原因必须在广播**之前**记进 `ledgerFallbacks`（`ledgerFallbackOf` 读）。`streamPrompt` 据此写聊天提示：设计内路径说「please approve in Settings」；降级路径必须说清为什么对话没展示这个问题（`unavailable` = 审批服务不可用；`native-timeout` = 问题从未到达对话）并带倒计时——否则「去设置页批准」读起来像一个选择，而它其实是 deadline。
 - `approval` / `agents` 两个服务**严禁**写进 `src/index.ts` 的 `export const inject`（缺服务会让插件整体加载失败），只能 `ctx.get` + `ctx.inject(['approval','agents'], …)` 后补注册。
 - `approvalRouted` 由 `agents/list` 只读上报（缺失报 `false`）。它是**能力上报，不是每次询问的承诺**：单条询问仍可能因 `unavailable` 或没有对话身份落到 ledger，所以浏览器**不据此隐藏**待处理卡片。
+
+## 2.1 重连重放（未决询问不得只发一次）
+
+`permission/request` **只在询问创建时广播一次**。之后才连上来的客户端（刷新页面、第二个标签页、SSE 断线重连）永远收不到它——而 ledger 询问的唯一答案入口就是设置页那张卡，于是「最需要它的客户端恰好看不到」。OmniTerm dev 用
+`PermissionManager::pending_events()` + 连接时的 `PermissionsSynced` 标记帧堵住同一个洞，本插件照做：
+
+- `AgentBridge.handlePermissionRequest` 建 ledger 条目时把 `toolCall` / `options` 一并存进条目（`PermissionLedger.create` 第三参）；没有 view 的条目不参与重放——重放一张渲染不出来的卡比不重放更坏。
+- SSE 路由（`/api/acp/stream`）在 `stream/open` 之后、**订阅之后**取快照重放（`permissionReplayFrames`）：订阅后取快照，期间广播的询问会同时以实时帧和快照帧到达，客户端按 requestId 幂等折叠。
+- 终帧 `permission/synced` 带**活集合**：断线期间已被解决的询问不在其中，客户端据此丢掉自己还挂着的陈旧卡片（否则 `respond` 只会换来 `unknown_request`）。
+- 原生路由上的询问**不重放**：它们不广播任何帧，答案入口是客户端已经持有的 composer 接管。
+
+测试：`tests/impl.spec.ts` 的 "replays only asks that carry a view"、`tests/store.spec.ts` 的 "re-establishes the pending asks on reconnect and prunes the stale ones"、`tests/bridge.spec.ts` 的 "lists the outstanding ledger asks for a reconnecting client"。
+
+## 2.2 `session/cancel` 必须答复未决审批
+
+ACP 规范的另一半：client 发 `session/cancel` 后**必须**以 `cancelled` 答复所有未决
+`session/request_permission`。`AgentBridge.cancel` 因此在通知之后 `settlePermissions(session)`——
+否则 agent 的工具调用会一直阻塞在一个永远不会到来的答复上，ledger 还会留着一张属于已结束回合的卡
+（人再去点它只会得到 `unknown_request`）。这与 OmniTerm `AcpClient::cancel` →
+`PermissionManager::cancel_all` 是同一条规则。`releaseAll` / `closeSession` 本来就 settle，
+`cancel` 是漏的那一条。测试：`tests/bridge.spec.ts` 的 "answers a pending permission with
+cancelled when the turn is cancelled"。
+
+原生路由上的询问不受此影响（ledger 里没有条目）：它由 `nativeApprovalTimeoutMs` 到期撤回，
+composer 面板随之消失。
 
 ## 3. 审批 UI
 

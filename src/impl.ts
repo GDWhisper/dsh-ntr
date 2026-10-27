@@ -8,7 +8,7 @@
 import { randomUUID } from './ids.ts'
 import type {
   AcpAgentCatalog, AcpAgentDef, AcpCatalogOption, AcpConversationChoice, AcpEvent, AcpPluginConfig, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult,
-  AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionOutcome, RpcResult,
+  AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionOptionView, PermissionOutcome, RpcResult,
 } from './protocol.ts'
 import { DEFAULT_TAG_HALO } from './protocol.ts'
 
@@ -1342,14 +1342,28 @@ export interface PendingPermission {
   requestId: string
   sessionId: string
   resolve: (outcome: PermissionOutcome) => void
+  /**
+   * The ask as the browser was shown it, kept for the REPLAY a reconnecting
+   * client receives (see `permissionReplayFrames`). Absent on entries created
+   * without a view — those still answer, they just cannot be re-shown.
+   */
+  view?: { toolCall: unknown; options: PermissionOptionView[] }
+}
+
+/** One outstanding ask as a reconnecting client must be re-shown it. */
+export interface PendingPermissionView {
+  requestId: string
+  sessionId: string
+  toolCall: unknown
+  options: PermissionOptionView[]
 }
 
 export class PermissionLedger {
   private readonly pending = new Map<string, PendingPermission>()
 
-  create(sessionId: string, executor: (outcome: PermissionOutcome) => void): string {
+  create(sessionId: string, executor: (outcome: PermissionOutcome) => void, view?: PendingPermission['view']): string {
     const requestId = randomUUID()
-    this.pending.set(requestId, { requestId, sessionId, resolve: executor })
+    this.pending.set(requestId, { requestId, sessionId, resolve: executor, ...(view === undefined ? {} : { view }) })
     return requestId
   }
 
@@ -1379,6 +1393,55 @@ export class PermissionLedger {
   sessionIds(): Array<{ requestId: string; sessionId: string }> {
     return [...this.pending.values()].map(e => ({ requestId: e.requestId, sessionId: e.sessionId }))
   }
+
+  /**
+   * Outstanding asks WITH the view the browser was shown, for the reconnect
+   * replay. Entries created without a view are skipped: replaying a frame the
+   * client cannot render (no title, no options) would show an unanswerable
+   * card, which is worse than showing nothing.
+   */
+  pendingViews(): PendingPermissionView[] {
+    const views: PendingPermissionView[] = []
+    for (const entry of this.pending.values()) {
+      if (entry.view === undefined) continue
+      views.push({
+        requestId: entry.requestId,
+        sessionId: entry.sessionId,
+        toolCall: entry.view.toolCall,
+        options: entry.view.options,
+      })
+    }
+    return views
+  }
+}
+
+/**
+ * Frames that re-establish a freshly connected client's view of the pending
+ * permission asks: every outstanding ask re-sent as its original
+ * `permission/request`, then one `permission/synced` carrying the live id set.
+ *
+ * Why a replay at all: a `permission/request` is broadcast ONCE, when the ask is
+ * created. A client that connects later — page reload, second tab, stream
+ * outage — never receives it, and for a ledger ask (the `/acp` RPC path, or a
+ * native route that degraded) that card is the ONLY answer entry, so the ask is
+ * invisible to exactly the client that needs it. OmniTerm closes the same hole
+ * with `PermissionManager::pending_events()` + a `PermissionsSynced` marker on
+ * every WS connect.
+ *
+ * Why the terminator is mandatory: the replay is a snapshot, so an ask resolved
+ * while this client was disconnected is not in it. Without the live set the
+ * client would keep a stale card forever — the ask is gone host-side and
+ * `respond` would answer `unknown_request`.
+ */
+export function permissionReplayFrames(pending: readonly PendingPermissionView[]): AcpEvent[] {
+  const requests: AcpEvent[] = pending.map(p => ({
+    type: 'permission/request' as const,
+    requestId: p.requestId,
+    sessionId: p.sessionId,
+    toolCall: p.toolCall,
+    options: p.options,
+  }))
+  return [...requests, { type: 'permission/synced', requestIds: pending.map(p => p.requestId) }]
 }
 
 // ---- RPC surface ----

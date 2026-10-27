@@ -1795,6 +1795,16 @@ export class AcpStore {
         this.mutate({ permissions: this.state.permissions.filter(p => p.requestId !== event.requestId) })
         return Promise.resolve()
       }
+      case 'permission/synced': {
+        // Terminator of the reconnect replay: the host just re-sent every
+        // outstanding ask, and this set is the authoritative live list. Drop
+        // anything this client still holds from before the disconnect — an ask
+        // resolved while it was away is gone host-side, and answering it would
+        // only earn `unknown_request`.
+        const live = new Set(event.requestIds)
+        this.mutate({ permissions: this.state.permissions.filter(p => live.has(p.requestId)) })
+        return Promise.resolve()
+      }
       case 'chat/agent-locked': {
         // The host locks a conversation at the START of its first ACP turn and
         // says so at once; this frame is what makes the hand-off animation run

@@ -235,6 +235,17 @@ export type AcpEvent =
   | { type: 'agent/exposure'; agentId: string; exposedModels: string[]; autoDiscoverModels: boolean }
   | { type: 'permission/request'; requestId: string; sessionId: string; toolCall: unknown; options: PermissionOptionView[] }
   | { type: 'permission/resolved'; requestId: string; sessionId: string; outcome: PermissionOutcome }
+  /**
+   * Terminator of the pending-permission REPLAY a freshly connected client
+   * receives (see the `/api/acp/stream` route). A `permission/request` frame is
+   * broadcast once, when the ask is created — a client that connects later (page
+   * reload, a second tab, a stream outage) would otherwise never learn the ask
+   * exists, and the settings-panel ledger card is the only answer entry for it.
+   * The replay re-sends every outstanding ask and then this frame, whose
+   * `requestIds` is the authoritative live set: the client drops any pending ask
+   * of its own that is not in it (one resolved while it was disconnected).
+   */
+  | { type: 'permission/synced'; requestIds: string[] }
   | { type: 'turn/start'; sessionId: string; turnId: string; text: string }
   | { type: 'turn/end'; sessionId: string; turnId: string; stopReason?: string; error?: string }
   /**

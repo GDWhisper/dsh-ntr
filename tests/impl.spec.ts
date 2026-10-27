@@ -21,6 +21,7 @@ import {
   MAX_CONFIG_OPTIONS_BYTES,
   mergeCatalogShape,
   parseCatalogOptions,
+  permissionReplayFrames,
   usableConfigOptions,
   permissionToolKind,
   permissionToolPaths,
@@ -859,6 +860,31 @@ describe('PermissionLedger', () => {
     expect(b).toEqual({ outcome: 'cancelled' })
     expect(ledger.sessionIds()).toHaveLength(0)
     void rb
+  })
+
+  it('replays only asks that carry a view, as their original request frame', () => {
+    const ledger = new PermissionLedger()
+    const view = {
+      toolCall: { title: 'Bash' },
+      options: [{ optionId: 'allow1', name: 'Allow once', kind: 'allow_once' }],
+    }
+    const shown = ledger.create('s1', () => {}, view)
+    // An entry without a view still answers — it just cannot be re-shown.
+    const hidden = ledger.create('s2', () => {})
+
+    expect(ledger.pendingViews()).toEqual([{ requestId: shown, sessionId: 's1', ...view }])
+
+    const frames = permissionReplayFrames(ledger.pendingViews())
+    // The ask rides its ORIGINAL frame: the client folds both by request id,
+    // so a replay that arrived alongside the live broadcast is idempotent.
+    expect(frames[0]).toEqual({ type: 'permission/request', requestId: shown, sessionId: 's1', ...view })
+    // …and the terminator carries the live set, so a client that reconnects
+    // drops anything it still holds from before the disconnect.
+    expect(frames.at(-1)).toEqual({ type: 'permission/synced', requestIds: [shown] })
+
+    ledger.respond(shown, { outcome: 'cancelled' })
+    expect(permissionReplayFrames(ledger.pendingViews())).toEqual([{ type: 'permission/synced', requestIds: [] }])
+    void hidden
   })
 })
 

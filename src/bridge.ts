@@ -56,6 +56,7 @@ import {
 } from './impl.ts'
 import type {
   AcpToolCallSnapshot,
+  PendingPermissionView,
   RosterPresetRow,
 } from './impl.ts'
 import type {
@@ -177,6 +178,26 @@ export interface BridgeTuning {
    * disables even this fallback.
    */
   permissionFallbackTimeoutMs?: number
+  /**
+   * Deadline for the NATIVE approval route itself: how long
+   * {@link AgentBridge.askNativeApproval} waits for the host approval chain to
+   * answer before withdrawing the ask and handing it to the settings-panel
+   * ledger (`native-timeout`, see {@link LedgerFallbackReason}).
+   *
+   * A routed ask shows no card and broadcasts no frame — the composer takeover
+   * IS the answer entry — so a host that accepts the question and then never
+   * renders it (answerer absent from the browser scope, the conversation not
+   * mounted, a client that never received the remote event) leaves the turn
+   * hanging behind a question the user cannot see anywhere. The deadline is
+   * what makes that state bounded: past it the ask is withdrawn (the request
+   * signal is aborted, which settles the host ask `cancelled`) and re-asked on
+   * the ledger, where the chat line and the settings card are both visible.
+   *
+   * This is NOT an answer on the human's behalf: a human mid-decision simply
+   * finds the same question in the settings panel. `0` disables it (wait for
+   * the host forever).
+   */
+  nativeApprovalTimeoutMs?: number
   cancelFallbackMs?: number
   /**
    * How long to wait before resending a prompt the agent answered `cancelled`
@@ -233,17 +254,28 @@ export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unava
  * without the approval service, and an `/acp`-RPC session that has no chat
  * turn to route into. `unavailable` is a DEGRADATION — the service is wired
  * and this ask still failed, so the conversation the user is looking at will
- * never show the question. That difference decides both the chat line's
- * wording (see `BridgeManager.streamPrompt`) and whether a deadline is armed
- * (`handlePermissionRequest`).
+ * never show the question. `native-timeout` is the other degradation: the host
+ * TOOK the question and never answered it inside
+ * {@link BridgeTuning.nativeApprovalTimeoutMs}, so it is withdrawn and re-asked
+ * here. The last two decide both the chat line's wording (see
+ * `BridgeManager.streamPrompt`) and whether a deadline is armed
+ * ({@link AgentBridge.handlePermissionRequest}).
  */
-export type LedgerFallbackReason = 'no-requester' | 'no-chat-session' | 'unavailable'
+export type LedgerFallbackReason = 'no-requester' | 'no-chat-session' | 'unavailable' | 'native-timeout'
 
 /** One recorded ledger fallback: why the ask is here, and the deadline armed for it. */
 export interface LedgerFallback {
   reason: LedgerFallbackReason
   /** Effective deadline in ms; `0` = no timer (wait for the human). */
   timeoutMs: number
+  /**
+   * How long the NATIVE route waited before withdrawing this ask, on the
+   * `native-timeout` path only. The chat line reports it as an observed fact
+   * ("no answer in the conversation within Ns") rather than guessing a cause:
+   * a slow human and a host that never rendered the question look identical
+   * from here.
+   */
+  waitedMs?: number
 }
 
 /**
@@ -275,6 +307,7 @@ const DEFAULT_TUNING: Required<BridgeTuning> = {
   startupTimeoutMs: 60_000,
   permissionTimeoutMs: 0,
   permissionFallbackTimeoutMs: 300_000,
+  nativeApprovalTimeoutMs: 120_000,
   cancelFallbackMs: 15_000,
   staleCancelRetryDelayMs: 600,
   staleCancelMaxRetries: 2,
@@ -313,6 +346,7 @@ export class AgentBridge {
   private readonly startupTimeoutMs: number
   private readonly permissionTimeoutMs: number
   private readonly permissionFallbackTimeoutMs: number
+  private readonly nativeApprovalTimeoutMs: number
   private readonly cancelFallbackMs: number
   private readonly staleCancelRetryDelayMs: number
   private readonly staleCancelMaxRetries: number
@@ -379,6 +413,7 @@ export class AgentBridge {
     this.startupTimeoutMs = merged.startupTimeoutMs
     this.permissionTimeoutMs = merged.permissionTimeoutMs
     this.permissionFallbackTimeoutMs = merged.permissionFallbackTimeoutMs
+    this.nativeApprovalTimeoutMs = merged.nativeApprovalTimeoutMs
     this.cancelFallbackMs = merged.cancelFallbackMs
     this.staleCancelRetryDelayMs = merged.staleCancelRetryDelayMs
     this.staleCancelMaxRetries = merged.staleCancelMaxRetries
@@ -891,6 +926,13 @@ export class AgentBridge {
     // own turn apart from a later one.
     session.cancelRequestedAtTurn = session.turnSeq
     await this.conn.agent.notify(methods.agent.session.cancel, { sessionId: session.acpSessionId }).catch(() => { /* best effort */ })
+    // The ACP spec's counterpart to the notification we just sent: a client that
+    // cancels MUST answer every pending `session/request_permission` with
+    // `cancelled`. Leaving them open would hold the agent's tool call blocked on
+    // an answer that can no longer arrive — the turn is over, the human's
+    // decision is "stop". OmniTerm does the same from `AcpClient::cancel`
+    // (`PermissionManager::cancel_all`).
+    this.settlePermissions(session)
     this.armCancelFallback(session)
   }
 
@@ -1225,6 +1267,11 @@ export class AgentBridge {
         resolve(outcome.outcome === 'selected'
           ? { outcome: { outcome: 'selected', optionId: outcome.optionId } }
           : { outcome: { outcome: 'cancelled' } })
+      }, {
+        // Kept for the reconnect replay: a client that connects after the ask
+        // was broadcast must be re-shown the very card it has to answer.
+        toolCall,
+        options: options.map((o): PermissionOptionView => ({ optionId: o.optionId, name: o.name, kind: o.kind })),
       })
       // Deadline (`permissionTimeoutMs`): an approval left unanswered is
       // answered `cancelled` on the human's behalf instead of hanging the turn
@@ -1232,14 +1279,22 @@ export class AgentBridge {
       // exception is a DEGRADED native route: the conversation just failed to
       // show the question, so waiting forever would hang the turn behind an
       // ask nobody can see there, and the fallback deadline applies instead
-      // (see `BridgeTuning.permissionFallbackTimeoutMs`).
+      // (see `BridgeTuning.permissionFallbackTimeoutMs`). `native-timeout` is
+      // the same degradation reached from the other side: the host took the
+      // ask and never answered it.
       const timeoutMs = this.permissionTimeoutMs > 0
         ? this.permissionTimeoutMs
-        : native.reason === 'unavailable' ? this.permissionFallbackTimeoutMs : 0
+        : native.reason === 'unavailable' || native.reason === 'native-timeout'
+          ? this.permissionFallbackTimeoutMs
+          : 0
       // Recorded before the broadcast: the hub is synchronous, and the chat
       // line `streamPrompt` folds from this frame words itself by the path
       // this ask actually took.
-      this.ledgerFallbacks.set(requestId, { reason: native.reason, timeoutMs })
+      this.ledgerFallbacks.set(requestId, {
+        reason: native.reason,
+        timeoutMs,
+        ...(native.reason === 'native-timeout' ? { waitedMs: this.nativeApprovalTimeoutMs } : {}),
+      })
       if (timeoutMs > 0) {
         timer = setTimeout(() => {
           if (!this.permissions.has(requestId)) return
@@ -1247,7 +1302,10 @@ export class AgentBridge {
             type: 'agent/notice',
             agentId: this.def.id,
             level: 'info',
-            text: `acp: permission request timed out after ${String(Math.round(timeoutMs / 1000))}s; answered "cancelled"`,
+            // Name what was missed, the way a human needs it: which operation
+            // sat unanswered, and for how long (OmniTerm's reaper writes the
+            // same "you missed this" notice before it acts).
+            text: `acp: permission request for "${permissionToolName(toolCall)}" timed out after ${String(Math.round(timeoutMs / 1000))}s; answered "cancelled"`,
           })
           this.permissions.respond(requestId, { outcome: 'cancelled' })
         }, timeoutMs)
@@ -1280,8 +1338,19 @@ export class AgentBridge {
    * open turn, so a session started over `/acp` (no chat turn) cannot be
    * routed and must stay on the ledger path.
    *
-   * No `permissionTimeoutMs` timer is armed here on purpose: the human answers
-   * inside the conversation, and a host-side deadline would answer for them.
+   * The ask is raced against {@link BridgeTuning.nativeApprovalTimeoutMs}. A
+   * routed ask has exactly one answer entry — the composer takeover — and no
+   * broadcast at all, so a host that takes the question and never renders it
+   * would leave the turn hanging behind something invisible. Past the deadline
+   * the ask is WITHDRAWN (the signal handed to the host aborts, which settles
+   * its waterfall `cancelled` and drops the composer panel) and reported as
+   * `native-timeout`, sending the question to the ledger where the chat line
+   * and the settings card are both visible. Withdrawing is not answering: a
+   * human mid-decision finds the same question in the settings panel.
+   *
+   * No deadline is armed on the ledger paths (`no-requester`,
+   * `no-chat-session`): those never reach the host, and their answer entry is
+   * the settings panel the chat line already points at.
    *
    * @returns the agent-facing response, or the reason the ask must fall back
    * to the ledger (see {@link LedgerFallbackReason}).
@@ -1295,18 +1364,48 @@ export class AgentBridge {
     const requester = this.approvalRequester?.()
     if (requester === undefined) return { reason: 'no-requester' }
     if (session.dshSessionId === undefined) return { reason: 'no-chat-session' }
+    // One signal carries both withdrawals: the agent's own cancel (whatever
+    // aborted the ACP request) and the deadline. The host's waterfall races its
+    // answerers against this signal, so aborting is a clean withdrawal rather
+    // than a leak.
+    const withdraw = new AbortController()
+    const askSignal = signal === undefined ? withdraw.signal : AbortSignal.any([signal, withdraw.signal])
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let timedOut = false
+    const deadline = this.nativeApprovalTimeoutMs > 0
+      ? new Promise<{ timedOut: true }>(resolve => {
+        timer = setTimeout(() => {
+          timedOut = true
+          withdraw.abort()
+          resolve({ timedOut: true })
+        }, this.nativeApprovalTimeoutMs)
+        timer.unref?.()
+      })
+      : undefined
     let outcome: ApprovalOutcome
     try {
-      outcome = await requester({
+      const asked = requester({
         dshSessionId: session.dshSessionId,
         agentId: this.def.id,
         toolName: permissionToolName(toolCall),
-        ...(signal === undefined ? {} : { signal }),
+        signal: askSignal,
       })
+      // A withdrawn ask settles on the host's own schedule; dropping it here
+      // must not surface as an unhandled rejection later.
+      asked.catch(() => { /* withdrawn: the ledger owns this ask now */ })
+      const settled = deadline === undefined
+        ? await asked.then(o => ({ outcome: o }))
+        : await Promise.race([asked.then(o => ({ outcome: o })), deadline])
+      // The flag, not the race winner, decides: the host may settle `cancelled`
+      // from the very abort the deadline caused, and that is still a timeout.
+      if (timedOut || 'timedOut' in settled) return { reason: 'native-timeout' }
+      outcome = settled.outcome
     } catch {
       // Synchronous throw or rejection, either way: the ask falls back to the
       // ledger. An approval failure must never break the agent's turn.
       outcome = 'unavailable'
+    } finally {
+      clearTimeout(timer)
     }
     if (outcome === 'unavailable') return { reason: 'unavailable' }
     const response = nativeOutcomeResponse(outcome, options)
@@ -2638,13 +2737,24 @@ class TurnStreamController {
     // The line must not point at a place with no answer entry, and the bridge
     // knows which path this ask took (`ledgerFallbackOf`, recorded before the
     // frame was broadcast). On the DESIGNED ledger paths the settings panel's
-    // card is the answer entry. A DEGRADED native route carries a deadline.
+    // card is the answer entry. A DEGRADED native route carries a deadline and
+    // has to say why the conversation is not showing the question — as an
+    // OBSERVED FACT, not a guessed cause: "no answer within Ns" is true whether
+    // the human was slow or the host never rendered the question.
     const fallback = this.bridge.ledgerFallbackOf(event.requestId)
-    return fallback?.reason === 'unavailable'
-      ? fallback.timeoutMs > 0
-        ? `\n> 🔐 [Permission Required: ${title}] - the approval service is unavailable; approve in Settings within ${String(Math.round(fallback.timeoutMs / 1000))}s or this request is cancelled\n`
-        : `\n> 🔐 [Permission Required: ${title}] - the approval service is unavailable; please approve in Settings\n`
-      : `\n> 🔐 [Permission Required: ${title}] - please approve in Settings\n`
+    const why = fallback === undefined
+      ? undefined
+      : fallback.reason === 'unavailable'
+        ? 'the approval service is unavailable'
+        : fallback.reason === 'native-timeout'
+          ? `no answer in the conversation within ${String(Math.round((fallback.waitedMs ?? 0) / 1000))}s`
+          : undefined
+    if (fallback === undefined || why === undefined) {
+      return `\n> 🔐 [Permission Required: ${title}] - please approve in Settings\n`
+    }
+    return fallback.timeoutMs > 0
+      ? `\n> 🔐 [Permission Required: ${title}] - ${why}; approve in Settings within ${String(Math.round(fallback.timeoutMs / 1000))}s or this request is cancelled\n`
+      : `\n> 🔐 [Permission Required: ${title}] - ${why}; please approve in Settings\n`
   }
 }
 
@@ -2769,6 +2879,19 @@ export class BridgeManager {
   /** True when permission asks go to native approval instead of the settings panel. */
   approvalRouting(): boolean {
     return this.approvalRequester !== undefined
+  }
+
+  /**
+   * Every outstanding ledger ask, across all agents, with the view the browser
+   * was shown it — the source of the reconnect replay (see
+   * `permissionReplayFrames`). Asks on the native route are deliberately
+   * absent: they broadcast nothing and their answer entry is the composer
+   * takeover the client already holds.
+   */
+  pendingPermissionViews(): PendingPermissionView[] {
+    const views: PendingPermissionView[] = []
+    for (const bridge of this.bridges.values()) views.push(...bridge.permissions.pendingViews())
+    return views
   }
 
   /**

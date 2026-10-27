@@ -445,8 +445,8 @@ export function AcpSettingsSection(props: WithStore) {
           {ledger.fellBackFromConversation && (
             <div className="dwa-hint" style={{ marginBottom: 8 }}>
               {acp.label(
-                '这些询问没有进入对话（审批服务本次不可用，或会话没有对话身份），请在此回答。',
-                'These asks did not reach the conversation (the approval service was unavailable, or the session has no chat identity) — answer them here.',
+                '这些询问没有进入对话（审批服务本次不可用、问题从未到达对话，或会话没有对话身份），请在此回答。',
+                'These asks did not reach the conversation (the approval service was unavailable, the question never reached the conversation, or the session has no chat identity) — answer them here.',
               )}
             </div>
           )}

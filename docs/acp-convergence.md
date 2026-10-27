@@ -355,7 +355,7 @@ selection，而 driver 每轮解析的路由（`selectionFor(agent).current`：p
 宿主不再有 `decidePermission` / `authorizeWrite` 这一层。
 
 **降级路径与兜底语义（2026-10-19 补记）**：`ask` 优先走宿主 `ctx.approval`
-（审批出现在对话 composer 里，不抢答、不设定时器）。走不到的三条原因由
+（审批出现在对话 composer 里，不抢答、不设定时器）。走不到的原因由
 `LedgerFallbackReason` 区分，全部回落到设置页的 `PermissionLedger`：
 
 - `no-requester` / `no-chat-session`：**设计内**的 ledger 路径（宿主没有审批服务；
@@ -364,13 +364,35 @@ selection，而 driver 每轮解析的路由（`selectionFor(agent).current`：p
 - `unavailable`：**降级**——服务在，这一次却失败了，用户正在看的对话里不会出现这个问题。
   无限等待等于把 turn 挂在没人看得见的问题上，所以它改走
   `permissionFallbackTimeoutMs`（默认 300_000 = 5 分钟）到时代答 `cancelled`；
-  填 `0` 连这条也关掉。`permissionTimeoutMs > 0` 时它对三条路径一视同仁。
+  填 `0` 连这条也关掉。`permissionTimeoutMs > 0` 时它对所有路径一视同仁。
+- `native-timeout`：**另一种降级**（2026-10-27 补记，issue #2）——宿主**收了问题却不答**。
+  routed ask 的唯一入口就是 composer 接管且不广播任何帧，所以宿主不渲染（answerer 不在
+  浏览器 scope、对话未挂载、remote 事件没送达）时，turn 挂在完全不可见的地方：没有卡、
+  没有聊天行、没有期限（实测 CodeBuddy 2.177.0 + 宿主审批提示关闭，只剩 agent 侧心跳）。
+  路由因此自带 `nativeApprovalTimeoutMs`（默认 120_000）：到点**撤回**——abort 交给宿主的
+  signal（宿主 waterfall 用同一 signal 赛跑答案，遂以 `cancelled` 收尾、composer 面板消失），
+  再把同一问题改走 ledger。撤回不是代答：人照样能在设置页回答同一个问题。填 `0` 关闭。
 
 原因在广播前记进 `ledgerFallbacks`，`streamPrompt` 据此写聊天里那行提示：
-设计内路径照旧「please approve in Settings」，降级路径要说清「审批服务不可用」
-并带上倒计时。面板侧 (`permissionLedgerCard`)：**只要 `ui.permissions` 非空就渲染
+设计内路径照旧「please approve in Settings」，降级路径要说清为什么对话没展示这个问题
+（`unavailable` = 审批服务不可用；`native-timeout` = 对话内 N 秒无应答）并带上倒计时——
+措辞只陈述**可观事实**，不猜原因：人答得慢与宿主从没渲染过问题，在桥这一侧长得一模一样。
+面板侧 (`permissionLedgerCard`)：**只要 `ui.permissions` 非空就渲染
 可答复的卡片**，与 `approvalRouted` 无关——那个旗标只说宿主有审批链，不说这一条
 询问进了对话；有待处理项就等于对话没在展示它。
+
+**重连重放（2026-10-27 补记，对齐 OmniTerm dev）**：`permission/request` 只广播一次，
+之后连上来的客户端（刷新 / 新标签页 / SSE 重连）永远收不到它，而 ledger 卡正是它唯一的
+答案入口。SSE 路由因此在 `stream/open` 之后重放全部未决询问（`permissionReplayFrames`，
+快照在订阅**之后**取，实时帧与快照帧按 requestId 幂等折叠），并以 `permission/synced`
+的活集合收尾——断线期间已解决的询问必须被客户端丢掉。原生路由上的询问不重放（不广播、
+答案入口是客户端已持有的 composer 接管）。OmniTerm 的对应机制是
+`PermissionManager::pending_events()` + WS 连接时的 `PermissionsSynced` 标记帧。
+
+OmniTerm 的 reaper 另有一套三档策略（`abort` 取消并回收 / `auto` 代答 / `wait` 一直等，
+默认 30 分钟），本插件**只取其中两档**：`abort` ≈ 现行撤回 + 倒计时，`wait` ≈ 两个期限都填
+`0`。`auto`（代替用户选 allow）与「宿主不替 agent 回答、每一问都必须交给人」的硬约束冲突，
+不移植。
 
 ### 2.4 原生模型座位：遮蔽是显示层要求，与路由无关
 

@@ -167,6 +167,40 @@ describe('ACP bridge over stdio (mock agent)', () => {
     expect(end.stopReason).toBe('cancelled')
   }, 30_000)
 
+  it('answers a pending permission with cancelled when the turn is cancelled', async () => {
+    // The ACP spec's other half of `session/cancel`: a client that cancels MUST
+    // answer every pending `session/request_permission` with `cancelled`. Without
+    // it the agent's tool call stays blocked on an answer that can no longer
+    // arrive, and the ledger keeps a card for a turn that is already over
+    // (OmniTerm: `PermissionManager::cancel_all`, called from `AcpClient::cancel`).
+    const start = await dispatchRpc(manager, 'session/start', { agentId: 'mock' })
+    if (!start.ok) throw new Error('start failed')
+    const id = (start.value as { sessionId: string }).sessionId
+    const since = events.length
+    await dispatchRpc(manager, 'session/prompt', { sessionId: id, text: 'hello PERM cancel me' })
+    const permission = await waitFor('permission/request', event => event.sessionId === id && events.indexOf(event) >= since)
+    expect(permission.options.map(o => o.kind)).toEqual(['allow_once', 'reject_once'])
+
+    await dispatchRpc(manager, 'session/cancel', { sessionId: id })
+    const resolved = await waitFor('permission/resolved', event => event.requestId === permission.requestId && events.indexOf(event) >= since)
+    expect(resolved.outcome).toEqual({ outcome: 'cancelled' })
+    // The ask is gone from the ledger: answering it now is an error, not a
+    // second chance.
+    const late = await dispatchRpc(manager, 'permission/respond', { requestId: permission.requestId, optionId: 'allow1' })
+    expect(late).toMatchObject({ ok: false, error: { code: 'unknown_request' } })
+    // And the agent was NOT left blocked on our answer: it received `cancelled`
+    // and finished the turn on its own.
+    await waitFor('turn/end', event => event.sessionId === id && events.indexOf(event) >= since)
+    const transcript = await dispatchRpc(manager, 'transcript/get', { sessionId: id })
+    expect(transcript.ok).toBe(true)
+    if (!transcript.ok) return
+    const echo = (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
+      .filter(e => e.update.sessionUpdate === 'agent_message_chunk')
+      .map(e => String((e.update.content as { text?: string }).text ?? ''))
+      .join('')
+    expect(echo).toContain('perm=cancelled')
+  }, 30_000)
+
   it('enforces the cwd allow-list before touching the agent', async () => {
     // An existing directory outside the allow-list: /etc on POSIX, C:\Windows on Windows.
     const escapeCwd = process.platform === 'win32' ? 'C:\\Windows' : '/etc'
@@ -1778,6 +1812,181 @@ describe('a degraded approval route still answers the turn (isolated manager)', 
     expect(reasoning()).toContain('approve in Settings within 2s or this request is cancelled')
     expect(reasoning()).not.toContain('please approve in Settings')
     expect(await degradeEcho(request.sessionId)).toContain('perm=allow1')
+  }, 30_000)
+})
+
+/**
+ * The native approval route TAKING a question and never answering it.
+ *
+ * A routed ask has exactly one answer entry — the composer takeover — and no
+ * broadcast at all, so a host that accepts the question and then never renders
+ * it (the answerer sits outside the browser scope, the conversation is not
+ * mounted, the client never received the remote event) hangs the turn behind
+ * something invisible: no card, no chat line, no deadline. Reported as issue
+ * #2: the ask is logged host-side and nothing ever answers it.
+ *
+ * The bridge bounds that state instead of trusting the host: past
+ * `nativeApprovalTimeoutMs` the ask is WITHDRAWN (the signal handed to the host
+ * aborts, settling its waterfall `cancelled` and dropping the composer panel)
+ * and re-asked on the ledger, where the chat line and the settings card are
+ * both visible. Withdrawing is not answering — the same question stays
+ * answerable in Settings — and the ledger's degraded-route deadline still ends
+ * the turn if nobody answers there either.
+ */
+describe('a native approval route that never answers still answers the turn (isolated manager)', () => {
+  const silentHub = new EventHub()
+  const silentEvents: AcpEvent[] = []
+  silentHub.subscribe(event => { silentEvents.push(event) })
+  const silentManager = new BridgeManager([{ ...def, id: 'silent' }], silentHub, 500, undefined, undefined, true, {
+    nativeApprovalTimeoutMs: 1_200,
+    permissionFallbackTimeoutMs: 2_000,
+  })
+  const silentAdapter = new AcpLlmAdapter(silentManager)
+  /** Signals handed to the host approval chain, so a withdrawal is observable. */
+  const hostAsks: { signal: AbortSignal | undefined }[] = []
+
+  silentManager.setApprovalRequester(request => {
+    hostAsks.push({ signal: request.signal })
+    // A host that took the question and will never answer it.
+    return new Promise<ApprovalOutcome>(() => { /* never settles */ })
+  })
+
+  afterAll(async () => {
+    await silentManager.shutdownAll()
+  })
+
+  function silentWaitFor<T extends AcpEvent['type']>(type: T, since: number, predicate: (event: Extract<AcpEvent, { type: T }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: T }>> {
+    const matches = (event: AcpEvent): event is Extract<AcpEvent, { type: T }> =>
+      event.type === type && predicate(event as Extract<AcpEvent, { type: T }>)
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${type}`)), timeoutMs)
+      const unsub = silentHub.subscribe(event => {
+        if (silentEvents.indexOf(event) >= since && matches(event)) {
+          clearTimeout(timer)
+          unsub()
+          resolve(event)
+        }
+      })
+      const existing = silentEvents.find((event, index) => index >= since && matches(event))
+      if (existing !== undefined) {
+        clearTimeout(timer)
+        unsub()
+        resolve(existing)
+      }
+    })
+  }
+
+  /** Drain one adapter turn, collecting the reasoning text it streamed. */
+  async function silentTurn(sessionId: string, text: string): Promise<{ reasoning: () => string; drained: Promise<void> }> {
+    const parts: string[] = []
+    const drained = (async () => {
+      const { chunks } = await hostLoopTurn(silentAdapter, {
+        provider: 'acp',
+        model: 'silent',
+        sessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+      })
+      for (const chunk of chunks) {
+        if (chunk.type === 'reasoning-delta') parts.push(chunk.text)
+      }
+    })()
+    return { reasoning: () => parts.join(''), drained }
+  }
+
+  async function silentEcho(sessionId: string): Promise<string> {
+    const transcript = await dispatchRpc(silentManager, 'transcript/get', { sessionId })
+    if (!transcript.ok) throw new Error('transcript failed')
+    return (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
+      .filter(e => e.update.sessionUpdate === 'agent_message_chunk')
+      .map(e => String((e.update.content as { text?: string }).text ?? ''))
+      .join('')
+  }
+
+  it('withdraws the ask from the host and re-asks it on the ledger', async () => {
+    const since = silentEvents.length
+    const { reasoning, drained } = await silentTurn('dsh-silent-withdraw', 'PERM silent withdraw')
+    const request = await silentWaitFor('permission/request', since, () => true)
+
+    // Exactly one host ask, and it was withdrawn: the signal the bridge handed
+    // over aborted, which is what settles the host waterfall `cancelled` in
+    // production and drops the composer panel.
+    expect(hostAsks).toHaveLength(1)
+    expect(hostAsks[0]?.signal?.aborted).toBe(true)
+
+    // A human can still answer — in the settings panel now.
+    await dispatchRpc(silentManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
+    await drained
+    // The line must not claim the service is unavailable (it answered nothing,
+    // which is not the same failure) and must name the deadline it now carries.
+    // The cause stays an OBSERVED FACT — a slow human and a host that never
+    // rendered the question look identical from here.
+    expect(reasoning()).toContain('no answer in the conversation within 1s')
+    expect(reasoning()).toContain('approve in Settings within 2s or this request is cancelled')
+    expect(reasoning()).not.toContain('please approve in Settings')
+    expect(await silentEcho(request.sessionId)).toContain('perm=allow1')
+  }, 30_000)
+
+  it('ends the turn instead of hanging when nobody answers the withdrawn ask', async () => {
+    const since = silentEvents.length
+    const { drained } = await silentTurn('dsh-silent-hang', 'PERM silent hang')
+    const request = await silentWaitFor('permission/request', since, () => true)
+
+    // Nobody answers anywhere. The degraded-route deadline answers `cancelled`
+    // on the human's behalf — the only thing keeping the turn from hanging
+    // forever behind a question the conversation never showed.
+    const notice = await silentWaitFor('agent/notice', since, event => event.text.includes('timed out after 2s'))
+    expect(notice.text).toContain('cancelled')
+    await drained
+    expect(await silentEcho(request.sessionId)).toContain('perm=cancelled')
+  }, 30_000)
+
+  it('lists the outstanding ledger asks for a reconnecting client', async () => {
+    // The `permission/request` frame is broadcast ONCE. A client that connects
+    // later — page reload, second tab, stream outage — would never learn this
+    // ask exists, and for a ledger ask the settings card is the only answer
+    // entry (OmniTerm closes the same hole by replaying
+    // `pending_events()` on every WS connect). The manager must therefore be
+    // able to name every outstanding ask with the view it was shown.
+    const since = silentEvents.length
+    const { drained } = await silentTurn('dsh-silent-replay', 'PERM silent replay')
+    const request = await silentWaitFor('permission/request', since, () => true)
+
+    const views = silentManager.pendingPermissionViews()
+    expect(views).toHaveLength(1)
+    expect(views[0]).toMatchObject({
+      requestId: request.requestId,
+      sessionId: request.sessionId,
+      toolCall: request.toolCall,
+      options: request.options,
+    })
+
+    await dispatchRpc(silentManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
+    await drained
+    expect(silentManager.pendingPermissionViews()).toHaveLength(0)
+  }, 30_000)
+
+  it('leaves a promptly answered native ask alone', async () => {
+    // The deadline is a withdrawal, not an answer: a host that answers inside
+    // the window must never reach the ledger, and the ask must not be counted
+    // twice.
+    const before = hostAsks.length
+    const since = silentEvents.length
+    silentManager.setApprovalRequester(request => {
+      hostAsks.push({ signal: request.signal })
+      return new Promise<ApprovalOutcome>(resolve => { setTimeout(() => { resolve('allowed-once') }, 50) })
+    })
+    const { drained } = await silentTurn('dsh-silent-prompt', 'PERM silent prompt')
+    await drained
+    expect(hostAsks).toHaveLength(before + 1)
+    expect(silentEvents.slice(since).filter(e => e.type === 'permission/request')).toHaveLength(0)
+    const turn = silentEvents.find(e => e.type === 'turn/start' && e.text === 'PERM silent prompt')
+    expect(turn).toBeDefined()
+    expect(await silentEcho(turn!.sessionId)).toContain('perm=allow1')
+    // Restore the never-answering requester for any later case.
+    silentManager.setApprovalRequester(request => {
+      hostAsks.push({ signal: request.signal })
+      return new Promise<ApprovalOutcome>(() => { /* never settles */ })
+    })
   }, 30_000)
 })
 

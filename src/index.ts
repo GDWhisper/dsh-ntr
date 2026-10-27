@@ -9,7 +9,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { ConnectionRpcHandler, HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
 import { ACP_PRESET_ID, AcpLlmAdapter, BridgeManager } from './bridge.ts'
-import { EventHub, dispatchRpc, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
+import { EventHub, dispatchRpc, permissionReplayFrames, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
 import type { AcpEvent } from './protocol.ts'
 import type { ApprovalOutcome } from './bridge.ts'
 import type { RosterPresetRow, SessionLogLike } from './impl.ts'
@@ -396,6 +396,19 @@ export function apply(ctx: Context, config?: unknown): void {
               controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'stream/open' })}\n\n`))
             } catch {
               closed = true
+            }
+            // Then re-establish the client's view of the pending permission
+            // asks. Taken AFTER the subscription, so an ask broadcast in the
+            // meantime arrives both live and in the snapshot — the client folds
+            // both by request id — and the terminator's live set prunes anything
+            // this client still holds from before a disconnect.
+            for (const frame of permissionReplayFrames(manager.pendingPermissionViews())) {
+              try {
+                controller.enqueue(encoder.encode(formatSse(frame)))
+              } catch {
+                closed = true
+                break
+              }
             }
           },
         })
