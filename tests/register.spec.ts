@@ -87,6 +87,50 @@ describe('host plugin contract', () => {
     expect(() => apply(ctx as never, { agents: [{ command: 'x' }] })).toThrow(/id/)
   })
 
+  it('emits the pending-permission replay on a fresh SSE connection', async () => {
+    // The `permission/request` frame is broadcast ONCE, when the ask is created.
+    // A client that connects later — page reload, second tab, stream outage —
+    // never receives it, and for a ledger ask the settings card is the only
+    // answer entry. The route must therefore emit the replay right after
+    // `stream/open`; the empty case still has to terminate with the live set, or
+    // a reconnecting client keeps whatever card it held from before.
+    //
+    // Only the WIRING is asserted here (the loop runs, in order, on this route):
+    // a non-empty replay needs a live ask, which needs a spawned child — the
+    // frame content itself is covered by `permissionReplayFrames`
+    // (tests/impl.spec.ts) and `pendingPermissionViews` (tests/bridge.spec.ts).
+    const ctx = fakeCtx()
+    apply(ctx as never, { agents: [{ id: 'a', command: 'x' }] })
+    const descriptor = ctx.connection.fetch.register.mock.calls.at(-1)?.[0] as {
+      fetch: (request: { signal: AbortSignal }) => Promise<Response>
+    } | undefined
+    expect(descriptor).toBeDefined()
+
+    const controller = new AbortController()
+    const response = await descriptor!.fetch({ signal: controller.signal })
+    expect(response.headers.get('content-type')).toContain('text/event-stream')
+    const reader = (response.body as ReadableStream<Uint8Array>).getReader()
+    const decoder = new TextDecoder()
+    const frames: unknown[] = []
+    try {
+      while (frames.length < 2) {
+        const { value, done } = await reader.read()
+        if (done) break
+        const text = decoder.decode(value)
+        const payload = /^data: (.*)\n\n$/s.exec(text)?.[1]
+        if (payload !== undefined) frames.push(JSON.parse(payload))
+      }
+    } finally {
+      controller.abort()
+      await reader.cancel().catch(() => { /* the abort already closed it */ })
+    }
+
+    expect(frames[0]).toEqual({ type: 'stream/open' })
+    // Nothing is outstanding (no child was ever spawned), and the terminator
+    // still rides along: an empty live set is what clears a stale card.
+    expect(frames[1]).toEqual({ type: 'permission/synced', requestIds: [] })
+  })
+
   it('registers the AcpLlmAdapter when llm service is available', () => {
     const ctx = fakeCtx()
     const registerAdapter = vi.fn()
