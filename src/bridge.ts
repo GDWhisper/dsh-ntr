@@ -21,6 +21,10 @@ import {
   RequestError,
   type ClientConnection,
   type InitializeResponse,
+  type McpServer,
+  type McpServerHttp,
+  type McpServerSse,
+  type McpServerStdio,
   type PermissionOption,
   type RequestPermissionResponse,
   type SessionNotification,
@@ -60,7 +64,7 @@ import type {
   RosterPresetRow,
 } from './impl.ts'
 import type {
-  AcpAgentCatalog, AcpAgentDef, AcpConversationChoice, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
+  AcpAgentCatalog, AcpAgentDef, AcpConversationChoice, AcpMcpServerDef, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
   LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo,
   PermissionOutcome, PermissionOptionView, PreparedAdapterCall, SessionView, StreamChunk,
 } from './protocol.ts'
@@ -313,6 +317,58 @@ export type SessionWorkspaceResolver = (dshSessionId: string) => { workspaceRoot
  * browser's seat gate, which polls.
  */
 export type AcpModeResolver = (dshSessionId: string) => boolean | undefined | Promise<boolean | undefined>
+
+/**
+ * The plugin's normalized MCP server shape → the ACP wire shape.
+ *
+ * THE WIRE SHAPE IS ASYMMETRIC, and getting it wrong is SILENT:
+ *
+ *  - the stdio variant carries NO `type` field — an entry that carries
+ *    `type:'stdio'` is accepted by the agent and then never connected
+ *    (measured against codebuddy: the server never appeared, the agent just
+ *    reported the tool as missing);
+ *  - http/sse DO carry `type`;
+ *  - `env` / `headers` are `[{name,value}]` arrays on the wire, while the
+ *    plugin stores them as records (like `AcpAgentDef.env`).
+ *
+ * So the conversion lives here, once, and each branch is annotated with the
+ * SDK's OWN variant type — a wrong conversion does not compile. (The bare
+ * `McpServer` union is too loose to catch it: its excess-property check
+ * accepts any member's keys, so a stdio entry carrying `type:'stdio'` would
+ * type-check against the http variant and only fail at runtime, inside the
+ * agent, as a server that never connects.)
+ */
+function toAcpMcpServers(defs: AcpMcpServerDef[] | undefined): McpServer[] {
+  if (defs === undefined) return []
+  return defs.map(def => {
+    if (def.transport === 'stdio') {
+      // NO `type` here — see the note above.
+      const server: McpServerStdio = {
+        name: def.name,
+        command: def.command,
+        args: def.args ?? [],
+        env: Object.entries(def.env ?? {}).map(([name, value]) => ({ name, value })),
+      }
+      return server
+    }
+    if (def.transport === 'http') {
+      const server: McpServerHttp & { type: 'http' } = {
+        type: 'http',
+        name: def.name,
+        url: def.url,
+        headers: Object.entries(def.headers ?? {}).map(([name, value]) => ({ name, value })),
+      }
+      return server
+    }
+    const server: McpServerSse & { type: 'sse' } = {
+      type: 'sse',
+      name: def.name,
+      url: def.url,
+      headers: Object.entries(def.headers ?? {}).map(([name, value]) => ({ name, value })),
+    }
+    return server
+  })
+}
 
 const DEFAULT_TUNING: Required<BridgeTuning> = {
   startupTimeoutMs: 60_000,
@@ -823,7 +879,7 @@ export class AgentBridge {
     if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
     const resolved = resolveSessionCwd(this.def, cwd, p => realpathSync(p), extraRoots)
     const result = await this.withStartupTimeout(
-      conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: [] }),
+      conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: toAcpMcpServers(this.def.mcpServers) }),
       'session/new',
     )
     // An empty `configOptions` answer is a non-answer — see `usableConfigOptions`.
@@ -871,6 +927,15 @@ export class AgentBridge {
    * Spawn a throwaway ACP session purely to read its `configOptions` (the
    * model catalog probe). Deliberately bypasses the live-session bookkeeping
    * so probe sessions never surface in the browser session list.
+   *
+   * THE PROBE SENDS THE AGENT'S OWN MCP LIST, not an empty one. Measured
+   * against codebuddy: the servers handed to `session/new` land in the
+   * agent PROCESS's dynamic MCP scope, so a probe that sent an empty list
+   * would REPLACE that scope and drop the MCP servers of the live sessions
+   * on the same connection (the agent logged
+   * `serverManager.delete("injected")` and the live session's
+   * `mcp__injected__*` tools disappeared). One list per agent process is the
+   * only shape that keeps every session of that process consistent.
    */
   async probeConfigOptions(): Promise<unknown[]> {
     // A probe is the reason an agent process can be resident with NOTHING else
@@ -883,7 +948,7 @@ export class AgentBridge {
       if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
       const resolved = resolveSessionCwd(this.def, undefined, p => realpathSync(p))
       const result = await this.withStartupTimeout(
-        conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: [] }),
+        conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: toAcpMcpServers(this.def.mcpServers) }),
         'session/new',
       )
       await conn.agent.request(methods.agent.session.close, { sessionId: result.sessionId }).catch(() => { /* optional capability */ })
@@ -1036,7 +1101,7 @@ export class AgentBridge {
       this.acpIndex.set(session.acpSessionId, session)
       this.hub.broadcast({ type: 'session/reset', sessionId: session.sessionId, session: snapshot(session) })
       const result = await this.withStartupTimeout(
-        conn.agent.request(methods.agent.session.load, { sessionId: session.acpSessionId, cwd: resolved, mcpServers: [] }),
+        conn.agent.request(methods.agent.session.load, { sessionId: session.acpSessionId, cwd: resolved, mcpServers: toAcpMcpServers(this.def.mcpServers) }),
         'session/load',
       )
       if (this.onCatalog !== undefined && usableConfigOptions(result.configOptions)) {

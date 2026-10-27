@@ -86,3 +86,12 @@
         #                                #   shows as connected) is released after
         #                                #   `probeIdleTimeoutMs` (5 min) whatever this
         #                                #   says, 0 included.
+        #     mcpServers:                # extra MCP servers handed to the agent at
+        #       - name: codegraph        #   session setup (the agent starts them
+        #         transport: stdio       #   itself). The plugin's OWN shape: every
+        #         command: /opt/bin/codegraph   #   entry carries a name and a transport.
+        #         args: [serve, --mcp]    #   `stdio` needs command, `http`/`sse` need
+        #         env: { KEY: value }    #   url. NOT the ACP wire shape, whose stdio
+        #                                #   variant has no `type` field (an entry
+        #                                #   written that way is silently dropped by
+        #                                #   the agent).

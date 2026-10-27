@@ -240,7 +240,26 @@ Mount it in your profile's `cordis.patch.yml`. When `cwd` / `allowedCwdRoots` ar
         allowedCwdRoots: [~/.dsh/dsh-ntr/workspaces]
 ```
 
-Optional agent fields: `npmPackage` (auto `npm install -g` when not found on PATH), `exposedModels` (which variants the NTR seat menu lists), `idleTimeoutMs` (idle-release window for chat processes; `0` = never release, default 30 minutes). Plugin-level there are also `transcriptMaxEntries` (per-conversation event buffer cap, default 600) and `probeModelsOnBoot` (kept for compatibility; boot-time per-agent probing no longer happens — see the comment on `bootstrapCatalogs`). Reliability timeouts and retries (`startupTimeoutMs`, `cancelFallbackMs`, `staleCancelRetryDelayMs`, `staleCancelMaxRetries`, `permissionTimeoutMs`, `permissionFallbackTimeoutMs`) are covered by [AGENTS.md](./AGENTS.md) constraints 12 and 13; anything editable in the Settings page should be edited there.
+Optional agent fields: `npmPackage` (auto `npm install -g` when not found on PATH), `exposedModels` (which variants the NTR seat menu lists), `idleTimeoutMs` (idle-release window for chat processes; `0` = never release, default 30 minutes), `mcpServers` (extra MCP servers handed to the agent). Plugin-level there are also `transcriptMaxEntries` (per-conversation event buffer cap, default 600) and `probeModelsOnBoot` (kept for compatibility; boot-time per-agent probing no longer happens — see the comment on `bootstrapCatalogs`). Reliability timeouts and retries (`startupTimeoutMs`, `cancelFallbackMs`, `staleCancelRetryDelayMs`, `staleCancelMaxRetries`, `permissionTimeoutMs`, `permissionFallbackTimeoutMs`) are covered by [AGENTS.md](./AGENTS.md) constraints 12 and 13; anything editable in the Settings page should be edited there.
+
+`mcpServers` uses the plugin's OWN shape (every entry carries a `name` and a `transport`), not the ACP wire shape — the wire's stdio entry has no `type`, and an entry written in the wire shape is silently dropped by the agent:
+
+```yaml
+      - id: pi
+        command: pi-acp
+        mcpServers:
+          - name: codegraph
+            transport: stdio          # stdio needs command; http / sse need url
+            command: /opt/bin/codegraph
+            args: ["serve", "--mcp"]
+            env: { CODEGRAPH_INDEX: /srv/index }
+          - name: remote
+            transport: http
+            url: https://mcp.example.com/mcp
+            headers: { Authorization: "Bearer …" }
+```
+
+These servers are handed to the agent when a session is created; the agent launches and uses them itself. The MCP servers the agent configures for itself are unaffected — this only adds more.
 
 ### Build & install
 

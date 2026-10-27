@@ -19,7 +19,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { formatCommandLine, isAbsolutePathLike, splitCommandLine } from './acp-ui.tsx'
 import { DEFAULT_KNOWN_PRESETS } from './store.ts'
 import type { AcpStore, UiState } from './store.ts'
-import type { AcpAgentDef, AcpCatalogChoice, AgentSavePayload, AgentView, DetectedAgentInfo } from '../protocol.ts'
+import type { AcpAgentDef, AcpCatalogChoice, AcpMcpServerDef, AgentSavePayload, AgentView, DetectedAgentInfo } from '../protocol.ts'
 
 interface WithStore { acp: AcpStore }
 
@@ -277,6 +277,72 @@ function sameStringMap(a: Record<string, string>, b: Record<string, string>): bo
 }
 
 /**
+ * Canonical comparable form of the MCP server list. Unset and empty mean the
+ * same thing host-side (no extra MCP servers), so they share a key — treating
+ * them as different would leave a card permanently dirty.
+ *
+ * The list is compared by CANONICAL JSON (object keys sorted, the servers
+ * themselves sorted by name): reformatting the text — reordering keys,
+ * re-indenting, listing the servers in another order — is not a change. The
+ * ARGV array inside a server keeps its order, because there it is the command
+ * line. The browser half needs no copy of the host's per-server validation: a
+ * list the host would reject simply never matches, and the host's own error is
+ * what the user sees.
+ */
+function mcpKey(servers: readonly AcpMcpServerDef[] | undefined): string {
+  if (servers === undefined || servers.length === 0) return 'none'
+  const canonical = servers
+    .map(canonicalJson)
+    .sort((a, b) => {
+      const nameA = String((a as { name?: unknown }).name ?? '')
+      const nameB = String((b as { name?: unknown }).name ?? '')
+      return nameA < nameB ? -1 : nameA > nameB ? 1 : 0
+    })
+  return JSON.stringify(canonical)
+}
+
+/** One value in canonical JSON form: object keys sorted, arrays kept in order. */
+function canonicalJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJson)
+  if (value === null || typeof value !== 'object') return value
+  const entries = Object.entries(value as Record<string, unknown>)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([key, entry]) => [key, canonicalJson(entry)])
+  return Object.fromEntries(entries)
+}
+
+/**
+ * The MCP server list as the form holds it: the raw JSON text the user typed.
+ *
+ * Parsing happens on the way OUT (`buildPayload`), never on the way in, so a
+ * half-typed value never throws inside a render. An unparseable text yields
+ * `undefined`, which the form reports as invalid (`mcpInvalid`) and refuses to
+ * save — better than sending a truncated list.
+ */
+function parseMcpServers(text: string): AcpMcpServerDef[] | undefined {
+  const trimmed = text.trim()
+  if (trimmed === '') return undefined
+  try {
+    const parsed: unknown = JSON.parse(trimmed)
+    if (!Array.isArray(parsed)) return undefined
+    return parsed as AcpMcpServerDef[]
+  } catch {
+    return undefined
+  }
+}
+
+/** Whether the MCP server text parses as a list at all (the host validates the rest). */
+function mcpTextValid(text: string): boolean {
+  const trimmed = text.trim()
+  if (trimmed === '') return true
+  try {
+    return Array.isArray(JSON.parse(trimmed))
+  } catch {
+    return false
+  }
+}
+
+/**
  * Detected presets split by configured-ness, plus configured agents missing
  * from detection (custom / legacy persisted defs) synthesized into card
  * entries so they stay manageable.
@@ -349,7 +415,7 @@ function persistedDef(detected: DetectedAgentInfo, activeAgent: AgentView | unde
  * about; `exposedModels === undefined` means "offer no variants", which is the
  * same state as an empty list.
  */
-function payloadEquals(payload: AgentSavePayload, current: AcpAgentDef): boolean {
+export function payloadEquals(payload: AgentSavePayload, current: AcpAgentDef): boolean {
   if (payload.command !== current.command) return false
   if ((payload.title ?? payload.id) !== (current.title ?? current.id)) return false
   if (!sameStringArray(payload.args ?? [], current.args ?? [])) return false
@@ -358,6 +424,7 @@ function payloadEquals(payload: AgentSavePayload, current: AcpAgentDef): boolean
   if (!sameStringArray(payload.allowedCwdRoots ?? [], current.allowedCwdRoots ?? [])) return false
   if (!sameStringMap(payload.env ?? {}, current.env ?? {})) return false
   if (exposureKey(payload.exposedModels) !== exposureKey(current.exposedModels)) return false
+  if (mcpKey(payload.mcpServers) !== mcpKey(current.mcpServers)) return false
   if ((payload.autoDiscoverModels !== false) !== (current.autoDiscoverModels !== false)) return false
   // An absent field means "use the host default" — which is what `current`
   // already resolved to (see `resolvedIdleTimeoutMs`), so it is not a change.
@@ -715,7 +782,8 @@ function AgentRow({
   const rootValues = form.roots.map(root => root.trim()).filter(root => root !== '')
   const rootsInvalid = form.rootsOpen && (rootValues.length === 0 || rootValues.some(root => !isAbsolutePathLike(root)))
   const idleInvalid = !idleValid(form.idleStr)
-  const formIncomplete = splitCommandLine(form.commandLine).command === '' || !idValid || idTaken || cwdInvalid || rootsInvalid || idleInvalid
+  const mcpInvalid = !mcpTextValid(form.mcpText)
+  const formIncomplete = splitCommandLine(form.commandLine).command === '' || !idValid || idTaken || cwdInvalid || rootsInvalid || idleInvalid || mcpInvalid
 
   const payload = buildPayload(form, detected, newCustom)
   const current = persistedDef(detected, activeAgent)
@@ -881,6 +949,7 @@ function AgentRow({
             cwdInvalid={cwdInvalid}
             rootsInvalid={rootsInvalid}
             idleInvalid={idleInvalid}
+            mcpInvalid={mcpInvalid}
             saving={saving}
             savedSuccess={savedSuccess}
             testing={testing}
@@ -919,6 +988,14 @@ interface AgentForm {
   autoDiscoverModels: boolean
   /** Raw text of the idle-release window in ms ('' = host default, '0' = never). */
   idleStr: string
+  /**
+   * Raw JSON text of the agent's MCP server list (the plugin's normalized
+   * shape — every entry carries a `transport`). '' = no extra MCP servers.
+   *
+   * Kept as TEXT so a half-typed value survives editing instead of being
+   * silently reshaped; it is parsed on the way out.
+   */
+  mcpText: string
 }
 
 /**
@@ -937,7 +1014,7 @@ const DEFAULT_IDLE_RELEASE_MS = 1_800_000
  */
 const DEFAULT_PROBE_RELEASE_MS = 300_000
 
-function initialForm(detected: DetectedAgentInfo, activeAgent: AgentView | undefined): AgentForm {
+export function initialForm(detected: DetectedAgentInfo, activeAgent: AgentView | undefined): AgentForm {
   const config = detected.currentConfig
   const roots = [...(activeAgent?.allowedCwdRoots ?? config?.allowedCwdRoots ?? [])]
   return {
@@ -959,6 +1036,10 @@ function initialForm(detected: DetectedAgentInfo, activeAgent: AgentView | undef
     autoDiscoverModels: config?.autoDiscoverModels !== false,
     // Prefer the host's resolved value: it is the one actually in effect.
     idleStr: idleText(activeAgent?.idleTimeoutMs ?? config?.idleTimeoutMs),
+    // The MCP list comes back from the host in its NORMALIZED shape (defaults
+    // filled in), so re-serializing it reproduces exactly what is stored —
+    // that is what keeps the card from being permanently dirty.
+    mcpText: config?.mcpServers === undefined ? '' : JSON.stringify(config.mcpServers, null, 2),
   }
 }
 
@@ -991,7 +1072,7 @@ function idleValid(raw: string): boolean {
   return value === 0 || (value >= 1_000 && value <= 86_400_000)
 }
 
-function buildPayload(form: AgentForm, detected: DetectedAgentInfo, newCustom: boolean): AgentSavePayload {
+export function buildPayload(form: AgentForm, detected: DetectedAgentInfo, newCustom: boolean): AgentSavePayload {
   const env: Record<string, string> = {}
   for (const row of form.envRows) {
     const key = row.key.trim()
@@ -1003,6 +1084,9 @@ function buildPayload(form: AgentForm, detected: DetectedAgentInfo, newCustom: b
   // The field is a command line; the host validates it the same way, so what
   // the preview under the input shows is what will actually be spawned.
   const parsed = splitCommandLine(form.commandLine)
+  // An unparseable MCP text yields `undefined` here and `mcpInvalid` in the
+  // form, which disables saving — so this never throws inside a render.
+  const mcpServers = parseMcpServers(form.mcpText)
   const payload: AgentSavePayload = {
     id: newCustom ? form.agentId.trim() : detected.id,
     ...(form.title.trim() === '' ? {} : { title: form.title.trim() }),
@@ -1016,6 +1100,9 @@ function buildPayload(form: AgentForm, detected: DetectedAgentInfo, newCustom: b
     ...(form.autoDiscoverModels ? {} : { autoDiscoverModels: false }),
     // `''` sends nothing: the host then applies its own default.
     ...(idleRaw === '' || !idleValid(idleRaw) ? {} : { idleTimeoutMs: Number(idleRaw) }),
+    // The MCP list is OPTIONAL: absent = the agent connects only to the
+    // servers it configures for itself.
+    ...(mcpServers === undefined ? {} : { mcpServers }),
   }
   if (form.rootsOpen) {
     if (cwd !== '') payload.cwd = cwd
@@ -1044,6 +1131,7 @@ function AgentDetails({
   cwdInvalid,
   rootsInvalid,
   idleInvalid,
+  mcpInvalid,
   saving,
   savedSuccess,
   testing,
@@ -1065,6 +1153,7 @@ function AgentDetails({
   cwdInvalid: boolean
   rootsInvalid: boolean
   idleInvalid: boolean
+  mcpInvalid: boolean
   saving: boolean
   savedSuccess: boolean
   testing: boolean
@@ -1165,6 +1254,11 @@ function AgentDetails({
         {!advancedOpen && (cwdInvalid || rootsInvalid) && (
           <span className="dwa-error">
             {acp.label('里面有非法的工作空间路径', 'Contains an invalid workspace path')}
+          </span>
+        )}
+        {!advancedOpen && mcpInvalid && (
+          <span className="dwa-error">
+            {acp.label('里面的 MCP 服务器配置不是合法 JSON', 'Contains an invalid MCP server list')}
           </span>
         )}
       </div>
@@ -1286,6 +1380,29 @@ function AgentDetails({
             {acp.label('无自定义变量；子进程继承宿主环境。', 'No custom variables; the child inherits the host environment.')}
           </span>
         )}
+      </div>
+
+      <div className="dwa-form-row" style={{ flexDirection: 'column', gap: 6 }}>
+        <span className="dwa-form-label">{acp.label('MCP 服务器（JSON）', 'MCP Servers (JSON)')}</span>
+        <textarea
+          className="dwa-input dwa-input-mono"
+          style={{ minHeight: 96, resize: 'vertical' }}
+          value={form.mcpText}
+          onChange={e => patch({ mcpText: e.target.value })}
+          spellCheck={false}
+          placeholder={'[\n  { "name": "example", "transport": "stdio", "command": "/abs/path/to/server", "args": ["--mcp"] }\n]'}
+        />
+        {mcpInvalid && (
+          <span className="dwa-error">
+            {acp.label('必须是一个 JSON 数组；每个条目写明 name 与 transport。', 'Must be a JSON array; every entry needs a name and a transport.')}
+          </span>
+        )}
+        <span className="dwa-hint">
+          {acp.label(
+            '这些 MCP 服务器会在建会话时交给 agent，由 agent 自己拉起并使用（stdio 需填 command，可选 args / env；http 与 sse 需填 url，可选 headers）。agent 自己配置的 MCP 服务器不受影响，这里只是额外追加。',
+            'These MCP servers are handed to the agent when a session is created; the agent launches and uses them itself (stdio needs command, with optional args / env; http and sse need url, with optional headers). The MCP servers the agent configures for itself are unaffected — this only adds more.',
+          )}
+        </span>
       </div>
       </div>
 

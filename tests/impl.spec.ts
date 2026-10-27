@@ -543,6 +543,66 @@ describe('validateAgentDef', () => {
     expect(() => validateAgentDef({ id: 'pi', command: '' })).toThrow(AcpError)
     expect(() => validateAgentDef({ id: 'PI AGENT', command: 'pi-acp' })).toThrow(AcpError)
   })
+
+  // The MCP server list. The plugin stores it in its OWN normalized shape
+  // (every entry carries an explicit `transport`), because the ACP wire shape
+  // is asymmetric: its stdio variant carries NO `type` field, so a config
+  // written in the wire shape by hand is accepted by the agent and then
+  // silently dropped (measured: the server never connects). The wire
+  // conversion lives in bridge.ts; these cases cover the shape the HOST
+  // accepts and persists.
+  it('accepts MCP servers in the normalized shape and keeps them verbatim', () => {
+    const servers = [
+      { name: 'local', transport: 'stdio', command: '/opt/servers/local', args: ['--mcp'], env: { TOKEN: 'x' } },
+      { name: 'remote', transport: 'http', url: 'https://example.test/mcp', headers: { Authorization: 'Bearer t' } },
+      { name: 'events', transport: 'sse', url: 'https://example.test/sse' },
+    ]
+    const def = validateAgentDef({ id: 'pi', command: 'x', mcpServers: servers })
+    // Verbatim: the host validates, it does not reshape. A host that filled in
+    // defaults would make the settings panel report a change where there is
+    // none.
+    expect(def.mcpServers).toEqual(servers)
+    // And it survives the REBUILD: a field not listed in validateAgentDef's
+    // return is silently stripped, which would delete the whole feature.
+    expect('mcpServers' in def).toBe(true)
+  })
+
+  it('treats an absent MCP list as "none" rather than storing an empty one', () => {
+    expect('mcpServers' in validateAgentDef({ id: 'pi', command: 'x' })).toBe(false)
+    expect(validateAgentDef({ id: 'pi', command: 'x', mcpServers: [] }).mcpServers).toEqual([])
+  })
+
+  it('rejects malformed MCP server entries', () => {
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: 'nope' })).toThrow(/mcpServers/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: [{ transport: 'stdio', command: 'x' }] })).toThrow(/name/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: [{ name: 'a', transport: 'stdio' }] })).toThrow(/command/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: [{ name: 'a', transport: 'http' }] })).toThrow(/url/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: [{ name: 'a', transport: 'sse' }] })).toThrow(/url/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: [{ name: 'a', transport: 'ftp', url: 'x' }] })).toThrow(/transport/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: [{ name: 'a', transport: 'stdio', command: 'x', args: [1] }] })).toThrow(/args/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: [{ name: 'a', transport: 'stdio', command: 'x', env: { K: 1 } }] })).toThrow(/env/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: [{ name: 'a', transport: 'http', url: 'u', headers: { K: 1 } }] })).toThrow(/headers/)
+    // Two servers sharing a name would collide inside the agent, where the name
+    // namespaces the tools (`mcp__<name>__<tool>`).
+    expect(() => validateAgentDef({
+      id: 'pi',
+      command: 'x',
+      mcpServers: [{ name: 'a', transport: 'stdio', command: 'x' }, { name: 'a', transport: 'stdio', command: 'y' }],
+    })).toThrow(/more than one/)
+  })
+
+  it('refuses the ACP transport variant, which the client side cannot serve', () => {
+    // `transport: 'acp'` means the agent calls back into this plugin over
+    // `mcp/message` — a method the stable ACP SDK does not expose on the
+    // client side. Accepting it would store a server the agent can never
+    // reach.
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: [{ name: 'a', transport: 'acp', serverId: 's' }] })).toThrow(/not supported/)
+  })
+
+  it('bounds the MCP server list', () => {
+    const many = Array.from({ length: 40 }, (_, i) => ({ name: `s${String(i)}`, transport: 'stdio', command: 'x' }))
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: many })).toThrow(/at most/)
+  })
 })
 
 /**

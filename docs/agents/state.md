@@ -25,6 +25,9 @@
 - `def.cwd` 只是**兜底**（`/acp` RPC 会话 + 宿主未上报工作区的聊天会话）；聊天会话实际 cwd 取 DSH 会话自己的工作区（见 [architecture.md §4](./architecture.md)）。
 - `validateAgentDef` **重建返回对象**，新字段不纳入会被静默剥离；`loadPersistedAgents` 每次启动会用它重校验旧配置，所以 agent 级新字段必须 optional。`validateConfig` 只负责编排 agents 数组。
 - 默认启动命令预设存在两份手拷贝：`AGENT_PRESETS`（`src/bridge.ts`）与 `DEFAULT_KNOWN_PRESETS`（`src/client/store.ts`），改其一必须同步另一处（无类型系统强制）。
+- `mcpServers`（agent 级，可选）是**插件自己的归一形状**（`AcpMcpServerDef`）：每条必带 `name` 与 `transport`（`stdio` / `http` / `sse`），stdio 带 `command`（可选 `args` / `env`），http/sse 带 `url`（可选 `headers`）。它**不是** ACP 线格式：线格式的 stdio 变体**没有** `type` 字段（手写线格式的条目会被 agent 静默丢弃 —— 实测），所以归一形状给每条一个显式判别符，线格式的转换集中在 `bridge.ts` 的 `toAcpMcpServers`。`acp` 传输（agent 经 `mcp/message` 回调客户端）在校验期拒绝：稳定版 ACP SDK 的客户端侧没有这个方法，也没有 agent 声明 `mcpCapabilities.acp`。
+- **`mcpServers` 只校验、不改形状**（`validateMcpServers` 原样返回用户写的条目）。设置页把它当 JSON 文本持有，并拿「将要送出的」与「已存的」比：宿主若替它补默认值（`args: []` / `env: {}`）或重排字段，那张卡就会永远判脏、每次保存都重启 agent。同理，条目里的 `name` 不得重名（它决定 agent 侧工具命名空间 `mcp__<name>__<tool>`）。
+- **宿主侧 MCP 不经这条路**。宿主自己的 MCP 桥（`@deepseek-ai/dsh-mcp-client`）把工具注册进 `ctx.tools`，那是宿主模型面的工具，与 agent 进程内的 MCP 无关；插件既读不到那批服务器的配置（宿主不暴露可读服务），也无法把宿主 MCP 暴露给 agent（见 [architecture.md §5](./architecture.md)）。`mcpServers` 只是**额外**追加：agent 自己配置的 MCP 服务器照旧由 agent 读自己的配置文件。
 
 ## 3. 会话选择持久化
 
@@ -76,7 +79,7 @@
 | 主题 | 位置 |
 |---|---|
 | 状态目录 | `src/bridge.ts` · `pluginStateDir` / `hostStateDir` / `stateDirExplicit` / `legacyStatePaths` / `migrateLegacyState` / `rewriteLegacyWorkspaceRoots` / `defaultAgentWorkspace` |
-| 校验 | `src/impl.ts` · `validateAgentDef` / `validateConfig`；`src/bridge.ts` · `saveAgent` |
+| 校验 | `src/impl.ts` · `validateAgentDef` / `validateConfig` / `validateMcpServers`；`src/bridge.ts` · `saveAgent` |
 | 会话选择 | `src/bridge.ts` · `chatChoice` / `patchChatChoice` / `applyChatChoice` / `syncConversationRoute` / `loadPersistedChoices` / `persistAgents` |
 | 目录 | `src/bridge.ts` · `agentCatalog` / `resolveAdapterModel` / `absorbCatalog` / `absorbCatalogShape` / `setExposedModels` / `setAutoDiscoverModels` / `autoExposeNewModels` / `broadcastExposure`；`src/impl.ts` · `parseCatalogOptions` / `mergeCatalogShape` / `usableConfigOptions` |
 | 斜杠缓存 | `src/bridge.ts` · `chatSessions` / `absorbCommands`；`src/client/store.ts` · `chatSessionCommands` / `loadChatSessions` |

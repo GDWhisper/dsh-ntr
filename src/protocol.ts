@@ -86,7 +86,58 @@ export interface AcpAgentDef {
    * resumed with `session/load` on the next send.
    */
   idleTimeoutMs?: number
+  /**
+   * MCP servers this agent should connect to, in the plugin's NORMALIZED shape
+   * (see {@link AcpMcpServerDef}) — not the ACP wire shape.
+   *
+   * WHY A NORMALIZED SHAPE: the ACP wire union is asymmetric — its stdio
+   * variant carries NO `type` field while http/sse do, and `env`/`headers` are
+   * `[{name,value}]` arrays. A hand-written config that guessed the wire
+   * shape wrong is accepted by the agent and then SILENTLY DROPPED (measured:
+   * a stdio entry carrying `type:'stdio'` never connects). The normalized
+   * shape has one explicit discriminant, so the wire conversion happens in
+   * exactly one place (bridge.ts) and TypeScript checks it against the SDK's
+   * `McpServer` union.
+   *
+   * An agent's OWN MCP configuration (e.g. `~/.codebuddy/.mcp.json`) is read
+   * by the agent itself and needs no declaration here — this field only adds
+   * servers ON TOP of that.
+   */
+  mcpServers?: AcpMcpServerDef[]
 }
+
+/** How an MCP server is reached. `acp` (agent→client `mcp/message`) is NOT supported. */
+export type AcpMcpTransport = 'stdio' | 'http' | 'sse'
+
+/**
+ * One MCP server, in the plugin's normalized shape.
+ *
+ * The ACP-transport variant (agent calls back into the client over
+ * `mcp/message`) is deliberately absent: the client side of that method is
+ * not in the ACP SDK's stable surface, and no agent advertises the
+ * capability. `validateAgentDef` rejects it with that reason.
+ */
+export type AcpMcpServerDef =
+  | {
+    /** Namespaces the agent's tools as `mcp__<name>__<tool>`; unique per agent. */
+    name: string
+    transport: 'stdio'
+    /** Executable to spawn for this server. */
+    command: string
+    /** Arguments for the command. */
+    args?: string[]
+    /** Environment for the server process (layered over the agent's own env). */
+    env?: Record<string, string>
+  }
+  | {
+    /** Namespaces the agent's tools as `mcp__<name>__<tool>`; unique per agent. */
+    name: string
+    transport: 'http' | 'sse'
+    /** The server's URL. */
+    url: string
+    /** Extra request headers (e.g. authorization). */
+    headers?: Record<string, string>
+  }
 
 export interface AcpPluginConfig {
   agents: AcpAgentDef[]
@@ -511,6 +562,8 @@ export interface AgentSavePayload {
   autoDiscoverModels?: boolean
   /** Absent → keep the host default (30 minutes); `0` = never release. */
   idleTimeoutMs?: number
+  /** MCP servers to connect to, in the normalized shape. See {@link AcpAgentDef.mcpServers}. */
+  mcpServers?: AcpMcpServerDef[]
 }
 
 /** Result of `agent/test`: spawn + initialize a throwaway process from form values, then tear it down. */

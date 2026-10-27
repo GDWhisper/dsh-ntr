@@ -46,6 +46,7 @@
 5. **NTR 会话跑 ACP preset 外壳**：不带工具、不带项目指令、不带 compaction；`agent/pre-step` 只放用户来源的内容。
 6. **首轮开始即锁定 agent**：底座粉碎成 composer 上边缘的只读挂牌 `NTR · <agent>`；首轮零可见输出则回滚解锁。
 7. **NTR 会话的 `/` 属于 agent**：菜单只列 agent 自己声明的命令，Enter 不被宿主认领。
+8. **MCP 服务器由 agent 自己拉起**：agent 自带的 MCP 照旧生效；`AcpAgentDef.mcpServers` 只是额外追加（插件在建会话时把清单交给 agent）。MCP 工具**不在**宿主 `ctx.tools` 里，也不经 `tools/execute` 虚拟工具那条路 —— 与「NTR preset 不挂工具行」不矛盾。→ [state.md](./docs/agents/state.md) / [architecture.md](./docs/agents/architecture.md)
 
 细节见 [architecture.md](./docs/agents/architecture.md) 与 [ui.md](./docs/agents/ui.md)。
 
@@ -82,7 +83,7 @@
 5. **ACP 错误必须优先解析 `error.data`**：`-32603` 的 `billing_error` / `rate_limit` / `auth_error` 在 `data` 里，只读 message 会丢原因。→ [protocol.md](./docs/agents/protocol.md)
 6. **相对导入必须写 `.ts` / `.tsx` 后缀**：`rewriteRelativeImportExtensions` 只改写已带后缀的导入；无后缀在 `type: module` 的 `lib/` 产物里运行时 `ERR_MODULE_NOT_FOUND`。
 
-### 配置、目录与状态（7–9、21、27、28）
+### 配置、目录与状态（7–9、21、27、28、32）
 
 7. **agent 定义必须过 `validateAgentDef` / `saveAgent`**：严格校验命令 / id / args，自动施加 `allowedCwdRoots`；默认工作区取 `defaultAgentWorkspace()`，**严禁把 `process.cwd()` 塞进 roots**。默认启动命令预设 `AGENT_PRESETS`（bridge.ts）与 `DEFAULT_KNOWN_PRESETS`（client/store.ts）是手拷贝，必须同步。→ [state.md](./docs/agents/state.md)
 8. **【旧隔离前提已退役】ACP 模型不进 DSH 模型目录；模型面只走 `agent/catalog`**：`listModels('acp')` 返回空。`agent/catalog` **纯内存、绝不 spawn**；探测只允许三种有手势来源（设置页按钮或模型菜单「刷新目录」/ 该 agent 自己的 session new·load / 旧缓存被顺带修好）。变体按需、`exposedModels` 只做可见性过滤、目录变化必须广播 `catalog/updated`。→ [state.md](./docs/agents/state.md)
@@ -90,6 +91,7 @@
 21. **NTR preset 只能由 bundle patch 声明**：`package.json` 的 `dsh.bundle.patch` + `presets/acp/acp.patch.yml`。**严禁**再往 `~/.dsh/.agent-presets/` 复制文件，**严禁**新增「安装 / 修复 preset」入口。声明内插件名按 profile 基准解析，本地插件只能经包名子路径 `dsh-ntr/acp-guard` 引用。面板读宿主 roster。→ [host.md](./docs/agents/host.md)
 27. **底部栏的选择属于「会话」且必须持久化**：`agentId` / `modelId` / `effort` / `mode` / `extraConfigs` 记在 `AcpConversationChoice`，落 `agents.json` 的 `conversations`。`applyChatChoice` 必须在 create 与 resume 两条路径调用；`syncConversationRoute` 把 model 半接到请求路径且只增不减；切 agent（锁前）清空派生选择；所有写入只经 `patchChatChoice`。agent 不再提供的 model **必须拦截本轮**（`model_unavailable`，不发送 prompt、保留选择、首轮零输出照常回滚锁），**严禁**自动换成另一个模型；失效 effort 从记录里删除并广播一次 notice。→ [state.md](./docs/agents/state.md)
 28. **一切运行时落盘只在 `~/.dsh/dsh-ntr/`**：`agents.json` / `model-catalog.json` / `workspaces/`。位置一律经 `pluginStateDir()`（`DSH_NTR_STATE_DIR` 可覆盖），派生的老路径从它反推。迁移必须同时改写 agent 里的绝对路径并回写磁盘。→ [state.md](./docs/agents/state.md)
+32. **agent 可声明额外的 MCP 服务器，但走插件自己的归一形状**：`AcpAgentDef.mcpServers` 每条必带 `name` 与 `transport`（`stdio` / `http` / `sse`；`acp` 传输**不支持**，客户端侧没有 `mcp/message`）。**三个建会话点（`createSession` / `probeConfigOptions` / resume 的 `session/load`）必须传同一份列表**——agent 把它们放进**进程级**作用域，一份空列表就会顶掉同一连接上活动会话的 MCP 工具。线格式在 `bridge.ts` 的 `toAcpMcpServers` 一次性转换（**stdio 线格式不带 `type`**，带了 agent 会静默丢弃；`env` / `headers` 是 `[{name,value}]` 数组）。宿主只校验不改形状（改形状会让设置页永远判脏）。宿主侧 MCP（`ctx.tools`）**不经此路**转发。→ [state.md](./docs/agents/state.md) / [protocol.md](./docs/agents/protocol.md)
 
 ### 进程与回合（10–12、19、23、26、29）
 
@@ -144,7 +146,7 @@
 
 - **新增 / 修改 ACP RPC**：`src/protocol.ts` 加契约 → `src/impl.ts` 加进 `AcpManager` 并在 `dispatchRpc` 路由 + 校验 → `src/bridge.ts` 实现调度 → `src/client/store.ts` 加调用并测状态流转。验证：`npx vitest run tests/impl.spec.ts tests/store.spec.ts`。
 - **改 UI 与挂载槽位**：`panel.tsx` / `session-controls.tsx` / `acp-view.tsx` 调整组件 → `src/client/index.tsx` 经 `ctx.slots.inject` 管理注册（当前注册 `settings.section` 等，槽位清单见文件头注释）→ `npx tsdown` 验证 bundle。
-- **扩展配置字段**：`AcpAgentDef` / `AcpPluginConfig`（protocol.ts）→ `validateAgentDef`（会重建对象，新字段必须纳入且 optional）→ `AgentSavePayload` + panel 的 `initialForm` / `buildPayload` / `payloadEquals` 三处同步 → `cordis.patch.yml`。
+- **扩展配置字段**：`AcpAgentDef` / `AcpPluginConfig`（protocol.ts）→ `validateAgentDef`（会重建对象，新字段必须纳入且 optional）→ `AgentSavePayload` + panel 的 `initialForm` / `buildPayload` / `payloadEquals` 三处同步 → `cordis.patch.yml`。**宿主只校验不改形状**：改了形状（补默认值、重排字段）会让设置页拿「将要送出的」与「已存的」比不上，那张卡永远判脏、每次保存都重启 agent（`mcpServers` 就是这条纪律的实例，见约束 32）。
 
 ## 环境前置条件
 

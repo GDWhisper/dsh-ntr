@@ -21,6 +21,8 @@
  *  - "WRITEFILE <path>"  → writes 'written-by-mock-agent' through the client fs capability
  *  - "PWD"   → reports this PROCESS's own cwd (what an agent that derives its
  *              workspace from `process.cwd()` would answer)
+ *  - "MCPS"  → echoes the MCP servers this session was created with, as the
+ *              exact WIRE shape the host sent (`session/new` / `session/load`)
  * Every turn streams: thought, plan, available_commands, tool_call lifecycle,
  * two same-messageId chunks, usage_update.
  * `session/new` advertises spec-shaped configOptions: a `model` selector, a
@@ -121,7 +123,7 @@ const app = agent({ name: 'mock-acp-agent' })
   }))
   .onRequest(methods.agent.session.new, ctx => {
     const sessionId = `mock-sess-${String(++counter)}`
-    sessions.set(sessionId, { cwd: ctx.params.cwd, modeId: 'default', temp: 'mid', model: DEFAULT_MODEL, effort: 'high', stream: false })
+    sessions.set(sessionId, { cwd: ctx.params.cwd, modeId: 'default', temp: 'mid', model: DEFAULT_MODEL, effort: 'high', stream: false, mcpServers: ctx.params.mcpServers })
     return {
       sessionId,
       modes: {
@@ -147,7 +149,7 @@ const app = agent({ name: 'mock-acp-agent' })
     const { sessionId, cwd } = ctx.params
     // Stand-in for agent-side persistence: recreate the record, replay a
     // marker update, then answer with the session state.
-    sessions.set(sessionId, { cwd, modeId: 'default', temp: 'mid', model: DEFAULT_MODEL, effort: 'high', stream: false })
+    sessions.set(sessionId, { cwd, modeId: 'default', temp: 'mid', model: DEFAULT_MODEL, effort: 'high', stream: false, mcpServers: ctx.params.mcpServers })
     const send = update => ctx.client.notify(methods.client.session.update, { sessionId, update })
     await send({ sessionUpdate: 'tool_call', toolCallId: 'replay_tool', title: 'replayed tool', kind: 'other', status: 'completed' })
     await send({ sessionUpdate: 'agent_message_chunk', messageId: 'replay-1', content: { type: 'text', text: 'REPLAYED: earlier conversation' } })
@@ -254,6 +256,15 @@ const app = agent({ name: 'mock-acp-agent' })
       // start: this answer depends on where the child was SPAWNED, never on
       // `session/new`'s cwd.
       await send({ sessionUpdate: 'agent_message_chunk', messageId: 'cwd', content: { type: 'text', text: `PWD:${process.cwd()}` } })
+    }
+
+    if (text.includes('MCPS')) {
+      // Echoes back the MCP servers this session was created with, so a test
+      // can assert the exact WIRE shape the host sent (`session/new` /
+      // `session/load`). Delimited on both sides: the chunk is joined with the
+      // rest of the turn's text, so the JSON needs its own boundaries.
+      const session = sessions.get(sessionId)
+      await send({ sessionUpdate: 'agent_message_chunk', messageId: 'mcps', content: { type: 'text', text: `MCPS_BEGIN${JSON.stringify(session?.mcpServers ?? [])}MCPS_END` } })
     }
 
     await send({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thinking…' } })

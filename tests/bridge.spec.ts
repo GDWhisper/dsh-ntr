@@ -878,6 +878,150 @@ describe('ACP bridge over stdio (mock agent)', () => {
   })
 })
 
+/**
+ * The MCP servers an agent is told to connect to.
+ *
+ * Two things are asserted here, and both were measured against codebuddy:
+ *
+ *  1. THE WIRE SHAPE. The ACP union is asymmetric — its stdio variant carries
+ *     NO `type` field (an entry with `type:'stdio'` is accepted by the agent
+ *     and then silently dropped: the server never connects), while http/sse
+ *     DO carry one, and `env`/`headers` are `[{name,value}]` arrays.
+ *  2. ONE LIST PER AGENT PROCESS. The servers land in the agent's PROCESS
+ *     scope, so a session created with a DIFFERENT list replaces the scope and
+ *     drops the MCP servers of the live sessions on the same connection.
+ *     That is why the catalog probe sends the agent's own list too.
+ */
+describe('MCP servers on the wire (isolated manager)', () => {
+  const mcpDef: AcpAgentDef = {
+    id: 'mcp',
+    title: 'MCP',
+    command: process.execPath,
+    args: [MOCK],
+    env: {},
+    cwd: tmpdir(),
+    allowedCwdRoots: [tmpdir()],
+    mcpServers: [
+      { name: 'local', transport: 'stdio', command: '/opt/servers/local', args: ['--mcp'], env: { TOKEN: 'x' } },
+      { name: 'remote', transport: 'http', url: 'https://example.test/mcp', headers: { Authorization: 'Bearer t' } },
+    ],
+  }
+  const mcpHub = new EventHub()
+  const mcpEvents: AcpEvent[] = []
+  const mcpManager = new BridgeManager([mcpDef], mcpHub, 500)
+
+  afterAll(async () => {
+    await mcpManager.shutdownAll()
+  })
+
+  function waitForMcp(type: 'turn/end', predicate: (event: Extract<AcpEvent, { type: 'turn/end' }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: 'turn/end' }>> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${type}`)), timeoutMs)
+      const unsub = mcpHub.subscribe(event => {
+        if (event.type === type && predicate(event as Extract<AcpEvent, { type: 'turn/end' }>)) {
+          clearTimeout(timer)
+          unsub()
+          resolve(event as Extract<AcpEvent, { type: 'turn/end' }>)
+        }
+      })
+      const existing = mcpEvents.find(event => event.type === type && predicate(event as Extract<AcpEvent, { type: 'turn/end' }>))
+      if (existing !== undefined) {
+        clearTimeout(timer)
+        unsub()
+        resolve(existing as Extract<AcpEvent, { type: 'turn/end' }>)
+      }
+    })
+  }
+
+  /** The agent's own echo of the MCP servers its session was created with. */
+  async function echoedWire(sessionId: string): Promise<Array<Record<string, unknown>>> {
+    // Polled rather than waited for: the turn that carries the echo may
+    // already have ended when the test looks, and on the resume path the
+    // transcript is RESET and refilled.
+    const deadline = Date.now() + 15_000
+    for (;;) {
+      const transcript = await dispatchRpc(mcpManager, 'transcript/get', { sessionId })
+      if (transcript.ok) {
+        const text = (transcript.value as { entries: Array<{ update: Record<string, unknown> }> })
+          .entries
+          .filter(e => e.update.sessionUpdate === 'agent_message_chunk')
+          .map(e => String((e.update.content as { text?: string }).text ?? ''))
+          .join('')
+        const begin = text.indexOf('MCPS_BEGIN')
+        const end = text.indexOf('MCPS_END')
+        if (begin >= 0 && end > begin) {
+          return JSON.parse(text.slice(begin + 'MCPS_BEGIN'.length, end)) as Array<Record<string, unknown>>
+        }
+      }
+      if (Date.now() > deadline) throw new Error('the agent never echoed the MCP servers')
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+  }
+
+  it('sends the configured servers to session/new in the ACP wire shape', async () => {
+    mcpHub.subscribe(event => { mcpEvents.push(event) })
+    const start = await dispatchRpc(mcpManager, 'session/start', { agentId: 'mcp' })
+    if (!start.ok) throw new Error('start failed')
+    const id = (start.value as { sessionId: string }).sessionId
+
+    await dispatchRpc(mcpManager, 'session/prompt', { sessionId: id, text: 'MCPS please' })
+    await waitForMcp('turn/end', event => event.sessionId === id)
+
+    const wire = await echoedWire(id)
+    // The stdio entry must NOT carry `type` — the agent drops it otherwise.
+    expect(wire[0]).toEqual({
+      name: 'local',
+      command: '/opt/servers/local',
+      args: ['--mcp'],
+      env: [{ name: 'TOKEN', value: 'x' }],
+    })
+    expect('type' in wire[0]).toBe(false)
+    // The http entry DOES carry one, and its headers are the wire's array form.
+    expect(wire[1]).toEqual({
+      type: 'http',
+      name: 'remote',
+      url: 'https://example.test/mcp',
+      headers: [{ name: 'Authorization', value: 'Bearer t' }],
+    })
+  }, 30_000)
+
+  it('gives the catalog probe the SAME list, so probing cannot strip a live session', async () => {
+    // Measured against codebuddy: the MCP servers land in the agent's process
+    // scope, so a probe session created with an EMPTY list replaces that scope
+    // and the live session loses its MCP tools (the agent logged
+    // `serverManager.delete("injected")`). The probe therefore sends the
+    // agent's own list.
+    const probe = await mcpManager.probeAgentModels('mcp')
+    expect(probe.agentId).toBe('mcp')
+
+    // A session created after the probe still gets the full list — the probe
+    // did not replace the process scope with an empty one.
+    const start = await dispatchRpc(mcpManager, 'session/start', { agentId: 'mcp' })
+    if (!start.ok) throw new Error('start failed')
+    const id = (start.value as { sessionId: string }).sessionId
+    await dispatchRpc(mcpManager, 'session/prompt', { sessionId: id, text: 'MCPS again' })
+    await waitForMcp('turn/end', event => event.sessionId === id)
+    const wire = await echoedWire(id)
+    expect(wire.map(entry => entry.name)).toEqual(['local', 'remote'])
+  }, 30_000)
+
+  it('sends the same list on the resume path', async () => {
+    // A released session resumes through `session/load`; that request carries
+    // the MCP servers too, so the resumed session keeps its tool surface.
+    const start = await dispatchRpc(mcpManager, 'session/start', { agentId: 'mcp' })
+    if (!start.ok) throw new Error('start failed')
+    const id = (start.value as { sessionId: string }).sessionId
+    await dispatchRpc(mcpManager, 'session/prompt', { sessionId: id, text: 'DIE now' })
+    await waitForMcp('session/released' as 'turn/end', event => (event as unknown as { sessionId: string }).sessionId === id)
+
+    await dispatchRpc(mcpManager, 'session/prompt', { sessionId: id, text: 'MCPS resumed' })
+    await waitForMcp('turn/end', event => event.sessionId === id)
+    const wire = await echoedWire(id)
+    expect(wire.map(entry => entry.name)).toEqual(['local', 'remote'])
+  }, 30_000)
+})
+
+
 describe('model catalog (isolated manager)', () => {
   const catalogPath = `${tmpdir()}/acp-catalog-test-${Date.now()}.json`
   const catalogManager = new BridgeManager([def], hub, 500, undefined, catalogPath)

@@ -240,7 +240,26 @@ agent 要动敏感的东西时会问你。审批卡直接出现在聊天输入�
         allowedCwdRoots: [~/.dsh/dsh-ntr/workspaces]
 ```
 
-可选的 agent 字段：`npmPackage`（PATH 里找不到时自动 `npm install -g`）、`exposedModels`（NTR 座位菜单列哪些变体）、`idleTimeoutMs`（聊天进程的空闲释放窗口，`0` = 永不释放，默认 30 分钟）。插件级还有 `transcriptMaxEntries`（会话事件缓冲上限，默认 600）与 `probeModelsOnBoot`（保留字段，启动时已不再为每个 agent 探测，见 `bootstrapCatalogs` 的注释）。可靠性超时与重试的默认值（`startupTimeoutMs`、`cancelFallbackMs`、`staleCancelRetryDelayMs`、`staleCancelMaxRetries`、`permissionTimeoutMs` 与 `permissionFallbackTimeoutMs`）见 [AGENTS.md](./AGENTS.md) 约束 12 与 13；设置页能改的都在设置页改。
+可选的 agent 字段：`npmPackage`（PATH 里找不到时自动 `npm install -g`）、`exposedModels`（NTR 座位菜单列哪些变体）、`idleTimeoutMs`（聊天进程的空闲释放窗口，`0` = 永不释放，默认 30 分钟）、`mcpServers`（额外交给 agent 连接的 MCP 服务器）。插件级还有 `transcriptMaxEntries`（会话事件缓冲上限，默认 600）与 `probeModelsOnBoot`（保留字段，启动时已不再为每个 agent 探测，见 `bootstrapCatalogs` 的注释）。可靠性超时与重试的默认值（`startupTimeoutMs`、`cancelFallbackMs`、`staleCancelRetryDelayMs`、`staleCancelMaxRetries`、`permissionTimeoutMs` 与 `permissionFallbackTimeoutMs`）见 [AGENTS.md](./AGENTS.md) 约束 12 与 13；设置页能改的都在设置页改。
+
+`mcpServers` 是**插件自己的形状**（每条必带 `name` 与 `transport`），不是 ACP 线格式——线格式里 stdio 那条不带 `type`，照线格式手写会被 agent 静默丢弃：
+
+```yaml
+      - id: pi
+        command: pi-acp
+        mcpServers:
+          - name: codegraph
+            transport: stdio          # stdio 需 command；http / sse 需 url
+            command: /opt/bin/codegraph
+            args: ["serve", "--mcp"]
+            env: { CODEGRAPH_INDEX: /srv/index }
+          - name: remote
+            transport: http
+            url: https://mcp.example.com/mcp
+            headers: { Authorization: "Bearer …" }
+```
+
+这些服务器在**建会话时**交给 agent，由 agent 自己拉起并使用；agent 自己配置的 MCP 服务器不受影响，这里只是额外追加。
 
 ### 构建与安装
 

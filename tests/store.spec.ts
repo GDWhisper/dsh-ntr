@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { AcpStore, foldUpdate, type Block } from '../src/client/store.ts'
 import { acpModeFromPresetEvent, stagedIsAcpMode } from '../src/client/acp-ui.tsx'
+import type { AcpAgentDef, DetectedAgentInfo } from '../src/protocol.ts'
 
 function fold(...updates: Array<Record<string, unknown>>): Block[] {
   const blocks: Block[] = []
@@ -396,6 +397,59 @@ describe('AcpStore agent management', () => {
       .toEqual({ visible: false, fellBackFromConversation: false })
     expect(permissionLedgerCard({ approvalRouted: false, permissions: [] }))
       .toEqual({ visible: false, fellBackFromConversation: false })
+  })
+
+  it('round-trips the agent MCP server list through the settings form', async () => {
+    // The MCP list lives in the agent DEFINITION, so the form must carry it:
+    // an agent whose MCP servers are configured must not lose them because
+    // the user opened the settings page and saved some OTHER field.
+    const { buildPayload, initialForm, payloadEquals } = await import('../src/client/panel.tsx')
+    const mcpServers = [
+      { name: 'local', transport: 'stdio' as const, command: '/opt/servers/local', args: ['--mcp'] },
+      { name: 'remote', transport: 'http' as const, url: 'https://example.test/mcp' },
+    ]
+    const config: AcpAgentDef = {
+      id: 'pi',
+      title: 'pi',
+      command: 'pi-acp',
+      args: [],
+      env: {},
+      allowedCwdRoots: [],
+      mcpServers,
+    }
+    const detected: DetectedAgentInfo = {
+      id: 'pi',
+      name: 'pi',
+      detected: true,
+      defaultCommand: 'pi-acp',
+      defaultArgs: [],
+      currentConfig: config,
+    }
+
+    // The form seeds itself from the stored list…
+    const form = initialForm(detected, undefined)
+    expect(form.mcpText).toContain('"local"')
+
+    // …and saving it unchanged is NOT a change (otherwise the card would be
+    // permanently dirty and every save would restart the agent).
+    const payload = buildPayload(form, detected, false)
+    expect(payload.mcpServers).toEqual(mcpServers)
+    expect(payloadEquals(payload, config)).toBe(true)
+
+    // Reformatting the text (reordering keys, re-indenting) is not a change
+    // either.
+    const reformatted = initialForm(detected, undefined)
+    reformatted.mcpText = JSON.stringify([{ transport: 'http', url: 'https://example.test/mcp', name: 'remote' }, { name: 'local', command: '/opt/servers/local', args: ['--mcp'], transport: 'stdio' }], null, 4)
+    expect(payloadEquals(buildPayload(reformatted, detected, false), config)).toBe(true)
+
+    // An agent with no MCP servers sends none, and an empty list is the same
+    // state as none.
+    const bare: AcpAgentDef = { id: 'pi', title: 'pi', command: 'pi-acp', args: [], env: {}, allowedCwdRoots: [] }
+    const bareDetected: DetectedAgentInfo = { ...detected, currentConfig: bare }
+    const bareForm = initialForm(bareDetected, undefined)
+    expect(bareForm.mcpText).toBe('')
+    expect(buildPayload(bareForm, bareDetected, false).mcpServers).toBeUndefined()
+    expect(payloadEquals(buildPayload(bareForm, bareDetected, false), bare)).toBe(true)
   })
 
   it('loads the chat-bound ACP sessions by chat id and switches the agent mode', async () => {
