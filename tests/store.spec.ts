@@ -1421,6 +1421,50 @@ describe('AcpStore event application (released / reset / turn dedup)', () => {
     await apply({ type: 'turn/end', sessionId: 's1', turnId: 't2', stopReason: 'end_turn' })
     expect(store.getSnapshot().blocks).toHaveLength(3)
   })
+
+  it('refuses a transcript answer that is behind what this page already folded', async () => {
+    // The host fills its transcript from the notification pipeline, which the
+    // SDK paces independently of the `session/prompt` response — so a read taken
+    // right after a turn can still be missing the agent's last chunk. A refetch
+    // that lands inside that window used to REPLACE the folded blocks with the
+    // short answer, truncating a turn the user had just watched finish.
+    const store = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint !== 'transcript/get') return { ok: true, value: {} }
+      // Deliberately behind: only the first of the two chunks this page folds.
+      return { ok: true, value: { session: view(), entries: [
+        { seq: 1, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Hello' } } },
+      ] } }
+    }, (zh) => zh)
+    const apply = (event: unknown): Promise<void> =>
+      (store as unknown as { applyEvent(event: unknown): Promise<void> }).applyEvent(event)
+
+    store.selectSession('s1')
+    await apply({ type: 'session/created', sessionId: 's1', session: view() })
+    await apply({ type: 'turn/start', sessionId: 's1', turnId: 't1', text: 'hi' })
+    await apply({ type: 'session/update', sessionId: 's1', seq: 1, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Hello' } } })
+    await apply({ type: 'session/update', sessionId: 's1', seq: 2, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ' world' } } })
+    expect(store.getSnapshot().blocks).toEqual([{ kind: 'agent', text: 'Hello world' }])
+
+    // The stale answer must not replace the fold…
+    store.selectSession('s1')
+    // `selectSession` fires the refetch without awaiting it; let it land, so the
+    // assertion is about the answer's effect and not about it still being in flight.
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(store.getSnapshot().blocks).toEqual([{ kind: 'agent', text: 'Hello world' }])
+
+    // …but an answer that has caught up still refetches (a fresh mount, or a
+    // genuine replay after `session/reset` zeroed the watermark).
+    const caught = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint !== 'transcript/get') return { ok: true, value: {} }
+      return { ok: true, value: { session: view(), entries: [
+        { seq: 1, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Hello' } } },
+        { seq: 2, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ' world' } } },
+      ] } }
+    }, (zh) => zh)
+    caught.selectSession('s1')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(caught.getSnapshot().blocks).toEqual([{ kind: 'agent', text: 'Hello world' }])
+  })
 })
 
 describe('AcpStore observed ACP transcripts (the ACP view tab)', () => {

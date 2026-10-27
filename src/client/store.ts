@@ -1035,12 +1035,22 @@ export class AcpStore {
         'transcript/get',
         { sessionId },
       )
+      // An answer BEHIND what this page already folded must not replace it.
+      //
+      // The host fills its transcript from the notification pipeline, which the
+      // SDK paces independently of the `session/prompt` response, so a read
+      // taken right after a turn can still be missing the agent's last chunk.
+      // `lastSeq` already refuses to go backwards; the blocks must not either,
+      // or switching away and back inside that window truncates a turn the user
+      // just watched finish. A resumed session replays as fresh updates, but
+      // only after `session/reset` zeroes the watermark — so this cannot swallow
+      // a legitimate replay.
+      const seen = this.lastSeq.get(sessionId) ?? 0
+      if ((entries.at(-1)?.seq ?? 0) < seen) return
       const blocks: Block[] = []
       for (const entry of entries) {
-        const before = blocks.length
         foldUpdate(blocks, entry.update)
         this.lastSeq.set(sessionId, Math.max(this.lastSeq.get(sessionId) ?? 0, entry.seq))
-        void before
       }
       const sessions = this.state.sessions.some(s => s.sessionId === sessionId)
         ? this.state.sessions.map(s => (s.sessionId === sessionId ? session : s))
