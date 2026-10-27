@@ -394,6 +394,16 @@ OmniTerm 的 reaper 另有一套三档策略（`abort` 取消并回收 / `auto` 
 `0`。`auto`（代替用户选 allow）与「宿主不替 agent 回答、每一问都必须交给人」的硬约束冲突，
 不移植。
 
+**两个期限可在设置页热改（2026-10-27 补记）**：`cordis.patch.yml` 仍是部署基线，但
+`nativeApprovalTimeoutMs` / `permissionFallbackTimeoutMs` 也能在「NTR 设置 → 审批时限」里改
+（`ui/approval-deadlines` / `ui/approval-deadlines-set`），覆盖值落 `agents.json` 的
+`approvalDeadlines` 并压过配置文件，改完对**之后的询问**立即生效、不重启也不杀会话。这正是
+OmniTerm reaper 控件相对本插件原先形态多出来的那一部分：那边是模式下拉 + 30 秒步进滑块，
+经一个原子量热更新；这边只做两个窗口（`auto` 档不移植），预设 seg + 自由秒数两路输入，
+热应用只改 `AgentBridge` 的两个字段（**已启动的定时器不重排**，正在决定中的人不该被移动球门）。
+`permissionTimeoutMs` 保持只能改配置文件——它是「一视同仁」的总闸，不该有两个入口。
+三层取值优先级与卡片必须显示的两个事实见 [permissions.md §2.3](./agents/permissions.md)。
+
 ### 2.4 原生模型座位：遮蔽是显示层要求，与路由无关
 
 **这一节是补记**。批次 2 退役遮蔽机制时，文档写的是「原生座位**不再由本插件注册**」——

@@ -19,7 +19,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { formatCommandLine, isAbsolutePathLike, splitCommandLine } from './acp-ui.tsx'
 import { DEFAULT_KNOWN_PRESETS } from './store.ts'
 import type { AcpStore, UiState } from './store.ts'
-import type { AcpAgentDef, AcpCatalogChoice, AcpMcpServerDef, AgentSavePayload, AgentView, DetectedAgentInfo } from '../protocol.ts'
+import type { AcpAgentDef, AcpCatalogChoice, AcpMcpServerDef, AgentSavePayload, AgentView, ApprovalDeadlineKey, DetectedAgentInfo } from '../protocol.ts'
 
 interface WithStore { acp: AcpStore }
 
@@ -199,6 +199,10 @@ const STYLE = `
 .dwa-preference-row + .dwa-preference-row { border-top: var(--ntr-line); }
 .dwa-preference-label { font-size: var(--ntr-font-sm); font-weight: 600; }
 .dwa-preference-copy { margin-top: 2px; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
+.dwa-deadline-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dwa-deadline-input { width: 76px; min-height: 30px; padding: 4px 8px; text-align: right; }
+.dwa-deadline-input[aria-invalid="true"] { border-color: var(--ntr-danger); }
+.dwa-deadline-unit { white-space: nowrap; }
 @media (max-width: 640px) {
   .dwa-root { padding: 14px; }
   .dwa-page-header { flex-direction: column; }
@@ -453,6 +457,195 @@ export function permissionLedgerCard(ui: Pick<UiState, 'approvalRouted' | 'permi
   return { visible, fellBackFromConversation: visible && ui.approvalRouted }
 }
 
+/**
+ * One-click windows for an approval deadline, in ms. `0` is spelled out rather
+ * than hidden behind a big number because "never" is the value a cautious user
+ * picks first, and a preset row that cannot express it would make them type.
+ */
+const DEADLINE_PRESETS = [0, 30_000, 60_000, 300_000, 900_000] as const
+
+/** Both editable windows, for the loops that treat them alike. */
+const DEADLINE_FIELDS: readonly ApprovalDeadlineKey[] = ['nativeApprovalTimeoutMs', 'permissionFallbackTimeoutMs']
+
+/** `5 分钟` / `30 秒` / `关` — the readout and the preset label, one formatter. */
+function deadlineText(ms: number, acp: AcpStore): string {
+  if (ms <= 0) return acp.label('关', 'Off')
+  const seconds = Math.round(ms / 1000)
+  if (seconds < 60) return acp.label(`${String(seconds)} 秒`, `${String(seconds)}s`)
+  const minutes = Math.round(seconds / 60)
+  return acp.label(`${String(minutes)} 分`, `${String(minutes)}m`)
+}
+
+/**
+ * One editable deadline: presets for the windows people actually pick, plus a
+ * free-form seconds field for everything else.
+ *
+ * The field is a DRAFT, not the value: it only commits a parseable whole number
+ * of seconds (0 allowed), and an unparseable draft reverts on blur instead of
+ * writing garbage the host would refuse. The host answer is what the row then
+ * shows, so a value the host trims never lingers in the UI.
+ */
+function DeadlineRow(props: {
+  acp: AcpStore
+  field: ApprovalDeadlineKey
+  label: string
+  copy: string
+  value: number
+}) {
+  const { acp, field, label, copy, value } = props
+  const [draft, setDraft] = useState<string | undefined>(undefined)
+  const text = draft ?? String(Math.round(value / 1000))
+  const parsed = /^\d+$/.test(text.trim()) ? Number(text.trim()) * 1000 : undefined
+  const commit = (): void => {
+    const next = parsed
+    setDraft(undefined)
+    // A no-op write is still a write: it is what pins the value into the
+    // persisted override, which is what makes it survive a restart.
+    if (next !== undefined && next !== value) void acp.setApprovalDeadline(field, next)
+  }
+  return (
+    <div className="dwa-preference-row">
+      <div>
+        <div className="dwa-preference-label">{label}</div>
+        <div className="dwa-preference-copy">{copy}</div>
+      </div>
+      <div className="dwa-deadline-controls">
+        <div className="dwa-seg">
+          {DEADLINE_PRESETS.map(preset => (
+            <button
+              key={preset}
+              type="button"
+              className={value === preset ? 'is-on' : ''}
+              title={deadlineText(preset, acp)}
+              onClick={() => void acp.setApprovalDeadline(field, preset)}
+            >
+              {deadlineText(preset, acp)}
+            </button>
+          ))}
+        </div>
+        <input
+          className="dwa-input dwa-deadline-input"
+          type="text"
+          inputMode="numeric"
+          aria-label={label}
+          aria-invalid={parsed === undefined}
+          value={text}
+          onChange={event => setDraft(event.target.value)}
+          onBlur={commit}
+          onKeyDown={event => { if (event.key === 'Enter') commit() }}
+        />
+        <span className="dwa-hint dwa-deadline-unit">{acp.label('秒', 'sec')}</span>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * The approval-deadline card.
+ *
+ * Both windows are about the SAME failure — an ask nobody answered — reached
+ * from two different routes, which is exactly why they need an explanation
+ * rather than two bare sliders: the first bounds a host that took the question
+ * into the composer and never rendered it, the second bounds an ask that never
+ * reached the conversation at all. Neither is an answer on the user's behalf
+ * being hidden from them: withdrawing re-asks on the ledger, and the fallback
+ * says what it did in a notice.
+ *
+ * `configured` and `permissionTimeoutMs` are reported by the host only when
+ * they are actually in play, and both are shown here rather than swallowed:
+ * a user tuning a number that something else is overriding deserves to be told.
+ */
+function ApprovalDeadlinesCard(props: { acp: AcpStore; ui: UiState }) {
+  const { acp, ui } = props
+  const deadlines = ui.approvalDeadlines
+  // Older host half: no card rather than a number this browser invented.
+  if (deadlines === undefined) return null
+  const configured = deadlines.configured ?? {}
+  const inForce: Record<ApprovalDeadlineKey, number> = {
+    nativeApprovalTimeoutMs: deadlines.nativeApprovalTimeoutMs,
+    permissionFallbackTimeoutMs: deadlines.permissionFallbackTimeoutMs,
+  }
+  const overrideNote = (field: ApprovalDeadlineKey): string | undefined => {
+    const baseline = configured[field]
+    // Equal (or unconfigured) means nothing is being outranked: stay silent.
+    if (baseline === undefined || baseline === inForce[field]) return undefined
+    return acp.label(
+      `cordis.patch.yml 里是 ${deadlineText(baseline, acp)}，设置页的值优先。`,
+      `cordis.patch.yml asks for ${deadlineText(baseline, acp)}; the value set here wins.`,
+    )
+  }
+  // An override is in force exactly when a note says so — a configured baseline
+  // that AGREES with the running value is not an override, and offering a reset
+  // for it would be a button that does nothing (observed live).
+  const overridden = DEADLINE_FIELDS.some(field => overrideNote(field) !== undefined)
+  return (
+    <section className="dwa-section">
+      <div className="dwa-section-heading">
+        <div>
+          <h3 className="dwa-section-title">{acp.label('审批时限', 'Approval deadlines')}</h3>
+          <p className="dwa-section-copy">
+            {acp.label(
+              '没人答复的权限询问多久后由插件接手。两者都不是替你批准：撤回后会改到设置页再问一次，代答前会先发一条说明。',
+              'How long an unanswered permission ask waits before the plugin takes over. Neither approves on your behalf: a withdrawal re-asks in Settings, and an auto-answer announces itself first.',
+            )}
+          </p>
+        </div>
+      </div>
+      <div className="dwa-card" style={{ paddingTop: 4, paddingBottom: 4 }}>
+        <DeadlineRow
+          acp={acp}
+          field="nativeApprovalTimeoutMs"
+          label={acp.label('对话审批撤回窗口', 'Composer approval withdrawal')}
+          copy={acp.label(
+            '宿主把询问接进对话后，多久没出现就撤回并改到设置页问。会渲染的接管是立即出现的，所以这个期限只为「收了却不渲染」而响。',
+            'How long an ask the host took into the composer may stay invisible before it is withdrawn and re-asked in Settings. A takeover that renders does so immediately, so this only fires for one that never showed up.',
+          )}
+          value={deadlines.nativeApprovalTimeoutMs}
+        />
+        {overrideNote('nativeApprovalTimeoutMs') !== undefined && (
+          <div className="dwa-hint" style={{ paddingBottom: 8 }}>{overrideNote('nativeApprovalTimeoutMs')}</div>
+        )}
+        <DeadlineRow
+          acp={acp}
+          field="permissionFallbackTimeoutMs"
+          label={acp.label('降级询问代答窗口', 'Degraded-ask auto-answer')}
+          copy={acp.label(
+            '询问没能进入对话时（审批服务不可用，或已被撤回），多久后答复 cancelled。',
+            'How long an ask that never reached the conversation (approval service unavailable, or withdrawn above) waits before it is answered cancelled.',
+          )}
+          value={deadlines.permissionFallbackTimeoutMs}
+        />
+        {overrideNote('permissionFallbackTimeoutMs') !== undefined && (
+          <div className="dwa-hint" style={{ paddingBottom: 8 }}>{overrideNote('permissionFallbackTimeoutMs')}</div>
+        )}
+        {deadlines.permissionTimeoutMs !== undefined && (
+          <div className="dwa-hint" style={{ paddingBottom: 8 }}>
+            {acp.label(
+              `注意：cordis.patch.yml 里 permissionTimeoutMs = ${deadlineText(deadlines.permissionTimeoutMs, acp)}，它一视同仁，覆盖上面两个窗口。`,
+              `Note: cordis.patch.yml sets permissionTimeoutMs = ${deadlineText(deadlines.permissionTimeoutMs, acp)}, which governs every path alike and overrides both windows above.`,
+            )}
+          </div>
+        )}
+        {overridden && (
+          <div className="dwa-preference-row">
+            <div>
+              <div className="dwa-preference-copy">
+                {acp.label(
+                  '设置页的值写在插件自己的状态文件里，重启后仍然有效；重置后回到 cordis.patch.yml 的配置。',
+                  'A value set here lives in the plugin\'s own state file and survives a restart; resetting returns to whatever cordis.patch.yml asks for.',
+                )}
+              </div>
+            </div>
+            <button type="button" className="dwa-btn" onClick={() => void acp.resetApprovalDeadlines()}>
+              {acp.label('恢复配置文件的值', 'Use config file value')}
+            </button>
+          </div>
+        )}
+      </div>
+    </section>
+  )
+}
+
 /** Settings configuration section for ACP agents. */
 export function AcpSettingsSection(props: WithStore) {
   const acp = props.acp
@@ -670,6 +863,11 @@ export function AcpSettingsSection(props: WithStore) {
           )}
         </div>
       </section>
+
+      {/* Approval deadlines: the two windows that bound an ask nobody
+          answered. Placed above the appearance card because it changes what
+          happens to a turn, and that card only decorates a nameplate. */}
+      <ApprovalDeadlinesCard acp={acp} ui={ui} />
 
       {/* Agent 挂牌光晕: how the composer tag shows a live agent. Plugin
           display preference — host-persisted with the agent registry, so it

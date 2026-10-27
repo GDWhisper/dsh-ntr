@@ -187,6 +187,11 @@ export interface AcpPluginConfig {
    * equivalent is the reaper's permission-timeout threshold (30 min default,
    * 30 s steps, hot-updatable); this is the same knob without their `auto` tier,
    * which this plugin does not have (every ask must reach a human).
+   *
+   * Editable from the settings page (`ui/approval-deadlines-set`), which
+   * persists an override in the plugin's own state file and applies it to the
+   * running bridges without restarting anything; the value here is the
+   * deployment baseline that override falls back to. See {@link AcpApprovalDeadlines}.
    */
   nativeApprovalTimeoutMs?: number
   /**
@@ -196,6 +201,8 @@ export interface AcpPluginConfig {
    * nobody can see there. Past it the ask is answered `cancelled`. Applies only
    * while `permissionTimeoutMs` is `0`; that knob, when non-zero, governs every
    * path alike. Default 300000 ms; `0` disables even this fallback.
+   *
+   * Editable from the settings page, like {@link nativeApprovalTimeoutMs}.
    */
   permissionFallbackTimeoutMs?: number
   /**
@@ -519,6 +526,42 @@ export const DEFAULT_TAG_HALO: AcpTagHalo = { mode: 'breath', speed: 'normal' }
 export type TagHaloResult = { halo: AcpTagHalo }
 /** `ui/tag-halo-set`: write the halo preference. */
 export interface TagHaloSetPayload { halo: AcpTagHalo }
+
+/** The two approval deadlines the settings page can edit, by field name. */
+export type ApprovalDeadlineKey = 'nativeApprovalTimeoutMs' | 'permissionFallbackTimeoutMs'
+
+/**
+ * What the settings page's approval-deadline card shows: the values in force,
+ * plus the two facts that explain why a value the user did not pick is winning.
+ *
+ * `configured` is present only when `cordis.patch.yml` names a key — a settings
+ * override outranks it, and the card must say so rather than silently showing
+ * the override. `permissionTimeoutMs` is the config-file-only knob that
+ * overrides BOTH deadlines when non-zero; it rides along so the card can warn
+ * instead of letting a user tune a number that is not being read.
+ */
+export interface AcpApprovalDeadlines {
+  nativeApprovalTimeoutMs: number
+  permissionFallbackTimeoutMs: number
+  configured?: Partial<Record<ApprovalDeadlineKey, number>>
+  permissionTimeoutMs?: number
+}
+/**
+ * `ui/approval-deadlines`: read the deadlines in force. `deadlines` is absent
+ * on a host half from before the card existed, which hides the card rather than
+ * showing a number the browser invented.
+ */
+export type ApprovalDeadlinesResult = { deadlines?: AcpApprovalDeadlines }
+/**
+ * `ui/approval-deadlines-set`: write one or both deadlines. Omitted keys keep
+ * their current value; `reset: true` drops the persisted override so the
+ * `cordis.patch.yml` baseline (or the built-in default) applies again.
+ */
+export interface ApprovalDeadlinesSetPayload {
+  nativeApprovalTimeoutMs?: number
+  permissionFallbackTimeoutMs?: number
+  reset?: boolean
+}
 
 /**
  * `session/chat-bind`: point one DSH chat conversation at an ACP agent. The

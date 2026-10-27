@@ -7,8 +7,8 @@
 
 import { randomUUID } from './ids.ts'
 import type {
-  AcpAgentCatalog, AcpAgentDef, AcpCatalogOption, AcpConversationChoice, AcpEvent, AcpMcpServerDef, AcpPluginConfig, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult,
-  AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionOptionView, PermissionOutcome, RpcResult,
+  AcpAgentCatalog, AcpAgentDef, AcpCatalogOption, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpMcpServerDef, AcpPluginConfig, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult,
+  AgentView, ApprovalDeadlineKey, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionOptionView, PermissionOutcome, RpcResult,
 } from './protocol.ts'
 import { DEFAULT_TAG_HALO } from './protocol.ts'
 
@@ -94,6 +94,61 @@ export function validateTagHalo(value: unknown): AcpTagHalo {
   if (mode !== 'breath' && mode !== 'steady') throw new AcpError('bad_payload', 'acp: tag halo mode must be "breath" or "steady"')
   if (speed !== 'slow' && speed !== 'normal' && speed !== 'fast') throw new AcpError('bad_payload', 'acp: tag halo speed must be "slow", "normal" or "fast"')
   return { mode, speed }
+}
+
+/**
+ * Ceiling shared by every approval deadline: one day. Both knobs accept `0`
+ * (their meaningful "never" value) and anything up to this, so a range any
+ * longer would be a mis-typed number rather than a deliberate window.
+ */
+export const APPROVAL_DEADLINE_MAX_MS = 86_400_000
+
+/**
+ * Validate ONE approval deadline, shared by every layer that accepts one.
+ *
+ * Three callers, one gate: `validateConfig` (the `cordis.patch.yml` baseline),
+ * `validateApprovalDeadlines` (the settings-page write), and
+ * `BridgeManager.loadPersistedAgents` (the persisted override, re-validated on
+ * every boot because the state file is user-editable). They must agree — a
+ * value the panel can save has to survive the next boot, or the setting would
+ * silently revert.
+ */
+export function validateApprovalDeadlineMs(raw: unknown, label: string, code: 'bad_config' | 'bad_payload', hint: string): number {
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 0 || raw > APPROVAL_DEADLINE_MAX_MS) {
+    throw new AcpError(code, `acp: ${label} must be an integer in [0, ${String(APPROVAL_DEADLINE_MAX_MS)}] ${hint}`)
+  }
+  return raw
+}
+
+/**
+ * Validate a settings-page deadline write. Omitted keys are simply absent from
+ * the result — the manager merges, so a card that only touched one slider must
+ * not reset the other. `reset` is not a deadline and is dropped here.
+ */
+export function validateApprovalDeadlines(value: unknown): Partial<Record<ApprovalDeadlineKey, number>> {
+  if (value === null || typeof value !== 'object') throw new AcpError('bad_payload', 'acp: approval deadlines must be an object')
+  const { nativeApprovalTimeoutMs, permissionFallbackTimeoutMs } = value as {
+    nativeApprovalTimeoutMs?: unknown
+    permissionFallbackTimeoutMs?: unknown
+  }
+  const out: Partial<Record<ApprovalDeadlineKey, number>> = {}
+  if (nativeApprovalTimeoutMs !== undefined) {
+    out.nativeApprovalTimeoutMs = validateApprovalDeadlineMs(
+      nativeApprovalTimeoutMs,
+      'nativeApprovalTimeoutMs',
+      'bad_payload',
+      '(0 = wait for the host approval chain forever)',
+    )
+  }
+  if (permissionFallbackTimeoutMs !== undefined) {
+    out.permissionFallbackTimeoutMs = validateApprovalDeadlineMs(
+      permissionFallbackTimeoutMs,
+      'permissionFallbackTimeoutMs',
+      'bad_payload',
+      '(0 = never answer a degraded ask on the human\'s behalf)',
+    )
+  }
+  return out
 }
 
 /**
@@ -383,20 +438,26 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
     throw new AcpError('bad_config', 'acp: startupTimeoutMs must be a number in [1000, 600000]')
   }
   const permissionTimeoutMs = value.permissionTimeoutMs ?? 0
-  if (typeof permissionTimeoutMs !== 'number' || !Number.isInteger(permissionTimeoutMs) || permissionTimeoutMs < 0 || permissionTimeoutMs > 86_400_000) {
-    throw new AcpError('bad_config', 'acp: permissionTimeoutMs must be an integer in [0, 86400000] (0 = wait forever)')
+  if (typeof permissionTimeoutMs !== 'number' || !Number.isInteger(permissionTimeoutMs) || permissionTimeoutMs < 0 || permissionTimeoutMs > APPROVAL_DEADLINE_MAX_MS) {
+    throw new AcpError('bad_config', `acp: permissionTimeoutMs must be an integer in [0, ${String(APPROVAL_DEADLINE_MAX_MS)}] (0 = wait forever)`)
   }
   // Both degraded-route deadlines share the `permissionTimeoutMs` range: `0` is
   // the meaningful value (never withdraw / never auto-cancel), and anything up
-  // to a day is a legitimate "ask again later" window.
-  const nativeApprovalTimeoutMs = value.nativeApprovalTimeoutMs ?? 300_000
-  if (typeof nativeApprovalTimeoutMs !== 'number' || !Number.isInteger(nativeApprovalTimeoutMs) || nativeApprovalTimeoutMs < 0 || nativeApprovalTimeoutMs > 86_400_000) {
-    throw new AcpError('bad_config', 'acp: nativeApprovalTimeoutMs must be an integer in [0, 86400000] (0 = wait for the host approval chain forever)')
-  }
-  const permissionFallbackTimeoutMs = value.permissionFallbackTimeoutMs ?? 300_000
-  if (typeof permissionFallbackTimeoutMs !== 'number' || !Number.isInteger(permissionFallbackTimeoutMs) || permissionFallbackTimeoutMs < 0 || permissionFallbackTimeoutMs > 86_400_000) {
-    throw new AcpError('bad_config', 'acp: permissionFallbackTimeoutMs must be an integer in [0, 86400000] (0 = never answer a degraded ask on the human\'s behalf)')
-  }
+  // to a day is a legitimate "ask again later" window. Same validator as the
+  // settings-page write, so a baseline the panel can display is a baseline the
+  // panel can also produce.
+  const nativeApprovalTimeoutMs = validateApprovalDeadlineMs(
+    value.nativeApprovalTimeoutMs ?? 300_000,
+    'nativeApprovalTimeoutMs',
+    'bad_config',
+    '(0 = wait for the host approval chain forever)',
+  )
+  const permissionFallbackTimeoutMs = validateApprovalDeadlineMs(
+    value.permissionFallbackTimeoutMs ?? 300_000,
+    'permissionFallbackTimeoutMs',
+    'bad_config',
+    '(0 = never answer a degraded ask on the human\'s behalf)',
+  )
   const cancelFallbackMs = value.cancelFallbackMs ?? 15_000
   if (typeof cancelFallbackMs !== 'number' || !Number.isInteger(cancelFallbackMs) || cancelFallbackMs < 0 || cancelFallbackMs > 600_000) {
     throw new AcpError('bad_config', 'acp: cancelFallbackMs must be an integer in [0, 600000] (0 = disable the fallback)')
@@ -1588,6 +1649,19 @@ export interface AcpManager {
   tagHalo?(): AcpTagHalo
   /** Write the halo preference (persisted with the agent registry). */
   setTagHalo?(halo: AcpTagHalo): Promise<void>
+  /**
+   * The approval deadlines in force, with the facts that explain an override
+   * (the `cordis.patch.yml` baseline it outranks, and a `permissionTimeoutMs`
+   * that overrides both). `undefined` on a host half from before the card
+   * existed, which hides the settings card instead of guessing a value.
+   */
+  approvalDeadlines?(): AcpApprovalDeadlines | undefined
+  /**
+   * Write one or both approval deadlines (omitted keys keep their value), or
+   * drop the persisted override with `reset` so the config-file baseline
+   * applies again. Applies to the running bridges without a restart.
+   */
+  setApprovalDeadlines?(patch: Partial<Record<ApprovalDeadlineKey, number>>, reset?: boolean): Promise<void>
   detectAgents?(): Promise<DetectedAgentInfo[]>
   saveAgent?(def: AcpAgentDef): Promise<void>
   deleteAgent?(agentId: string): Promise<void>
@@ -1905,6 +1979,18 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
       case 'ui/tag-halo-set': {
         await manager.setTagHalo?.(validateTagHalo(body.halo))
         return ok({ done: true })
+      }
+      case 'ui/approval-deadlines':
+        // Absent on a host half from before the card existed: the browser then
+        // renders nothing rather than a number it cannot trust.
+        return ok({ deadlines: manager.approvalDeadlines?.() })
+      case 'ui/approval-deadlines-set': {
+        const patch = validateApprovalDeadlines({
+          nativeApprovalTimeoutMs: body.nativeApprovalTimeoutMs,
+          permissionFallbackTimeoutMs: body.permissionFallbackTimeoutMs,
+        })
+        await manager.setApprovalDeadlines?.(patch, body.reset === true)
+        return ok({ deadlines: manager.approvalDeadlines?.() })
       }
       case 'agent/set-exposed-models': {
         const agentId = str(body, 'agentId', 64)

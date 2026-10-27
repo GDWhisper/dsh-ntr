@@ -10,7 +10,7 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { ConnectionRpcHandler, HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
 import { ACP_PRESET_ID, AcpLlmAdapter, BridgeManager } from './bridge.ts'
 import { EventHub, dispatchRpc, permissionReplayFrames, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
-import type { AcpEvent } from './protocol.ts'
+import type { AcpEvent, ApprovalDeadlineKey } from './protocol.ts'
 import type { ApprovalOutcome } from './bridge.ts'
 import type { RosterPresetRow, SessionLogLike } from './impl.ts'
 
@@ -107,6 +107,19 @@ export function apply(ctx: Context, config?: unknown): void {
     },
   )
   const adapter = new AcpLlmAdapter(manager)
+  // The RAW patch-file deadlines, before validation filled the defaults in.
+  // `validateConfig` returns a number for every knob, so the validated object
+  // cannot tell "the deployment asked for 10 minutes" from "the deployment said
+  // nothing and 5 minutes is the built-in default" — and the settings card has
+  // to say which of the two the user is looking at (and what the reset button
+  // returns to). Only the keys the file actually names are declared.
+  const rawConfig = (config ?? {}) as Record<string, unknown>
+  const configuredDeadlines: Partial<Record<ApprovalDeadlineKey, number>> = {}
+  for (const key of ['nativeApprovalTimeoutMs', 'permissionFallbackTimeoutMs'] as const) {
+    const value = rawConfig[key]
+    if (typeof value === 'number' && Number.isFinite(value)) configuredDeadlines[key] = value
+  }
+  manager.setConfiguredApprovalDeadlines(configuredDeadlines)
   // Boot hook kept only so this entry point's shape does not change:
   // `bootstrapCatalogs` is intentionally empty — boot never spawns an agent,
   // in any environment and for any `probeModelsOnBoot` value. Catalogs fill

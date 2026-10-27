@@ -50,6 +50,13 @@
         #                              the ask is answered `cancelled` instead of hanging the
         #                              turn. 0 disables even this. `permissionTimeoutMs > 0`
         #                              governs every path alike and overrides both.
+        #                              `nativeApprovalTimeoutMs` and
+        #                              `permissionFallbackTimeoutMs` are ALSO editable at
+        #                              runtime (NTR 设置 → 审批时限). The card's value is
+        #                              persisted in the plugin's own state file and OUTRANKS
+        #                              this file; the card shows what this file asked for and
+        #                              offers a reset back to it. Only `permissionTimeoutMs`
+        #                              stays config-file-only, as the override of both.
         # cancelFallbackMs: 15000    # force-finalize a turn the agent ignores after session/cancel (0 = off)
         # staleCancelRetryDelayMs: 600  # resend a prompt answered cancelled with no cancel requested (0 = at once)
         # staleCancelMaxRetries: 2      # cap on those resends before the cancelled stop is reported as-is

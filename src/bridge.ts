@@ -57,6 +57,7 @@ import {
   BOOKKEEPING_UPDATES,
   validateAgentDef,
   validateTagHalo,
+  validateApprovalDeadlines,
 } from './impl.ts'
 import type {
   AcpToolCallSnapshot,
@@ -64,9 +65,9 @@ import type {
   RosterPresetRow,
 } from './impl.ts'
 import type {
-  AcpAgentCatalog, AcpAgentDef, AcpConversationChoice, AcpMcpServerDef, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
+  AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpMcpServerDef, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
   LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo,
-  PermissionOutcome, PermissionOptionView, PreparedAdapterCall, SessionView, StreamChunk,
+  ApprovalDeadlineKey, PermissionOutcome, PermissionOptionView, PreparedAdapterCall, SessionView, StreamChunk,
 } from './protocol.ts'
 import { DEFAULT_TAG_HALO } from './protocol.ts'
 
@@ -412,8 +413,18 @@ export class AgentBridge {
   private readonly ledgerFallbacks = new Map<string, LedgerFallback>
   private readonly startupTimeoutMs: number
   private readonly permissionTimeoutMs: number
-  private readonly permissionFallbackTimeoutMs: number
-  private readonly nativeApprovalTimeoutMs: number
+  /**
+   * The two approval deadlines are NOT readonly, unlike their neighbors: the
+   * settings page rewrites them on a running bridge
+   * ({@link AgentBridge.applyApprovalDeadlines}), so a user editing the window
+   * does not have to kill every live session to see it take effect. Both are
+   * read per ask — `nativeApprovalTimeoutMs` when the native ask is armed,
+   * `permissionFallbackTimeoutMs` when the ledger ask's deadline is chosen — so
+   * a reassignment reaches every ask from that moment on. An ask already
+   * holding an armed timer keeps the window it was started with.
+   */
+  private permissionFallbackTimeoutMs: number
+  private nativeApprovalTimeoutMs: number
   private readonly cancelFallbackMs: number
   private readonly staleCancelRetryDelayMs: number
   private readonly staleCancelMaxRetries: number
@@ -487,6 +498,21 @@ export class AgentBridge {
     this.turnSettleMs = merged.turnSettleMs
     this.defaultIdleTimeoutMs = merged.idleTimeoutMs
     this.probeIdleTimeoutMs = merged.probeIdleTimeoutMs
+  }
+
+  /**
+   * Adopt a rewritten approval deadline (the settings page's write). Only the
+   * two degraded-route windows live here; every other tuning value is fixed at
+   * construction, because a live bridge cannot meaningfully adopt a new startup
+   * or cancel window mid-flight.
+   *
+   * Deliberately does NOT re-arm anything: an ask that already holds a timer
+   * keeps the window it was started with, and the next ask reads the new value.
+   * Re-arming would move the goalposts under a human who is already deciding.
+   */
+  applyApprovalDeadlines(patch: { nativeApprovalTimeoutMs?: number; permissionFallbackTimeoutMs?: number }): void {
+    if (patch.nativeApprovalTimeoutMs !== undefined) this.nativeApprovalTimeoutMs = patch.nativeApprovalTimeoutMs
+    if (patch.permissionFallbackTimeoutMs !== undefined) this.permissionFallbackTimeoutMs = patch.permissionFallbackTimeoutMs
   }
 
   /**
@@ -2885,6 +2911,41 @@ export class BridgeManager {
   /** The agent tag's halo preference (persisted; see `persistAgents`). */
   private tagHaloSetting: AcpTagHalo = { ...DEFAULT_TAG_HALO }
   /**
+   * What `cordis.patch.yml` asked for, by key — ONLY the keys it actually
+   * names. This is the deployment baseline, kept apart from
+   * {@link deadlineOverride} so the settings card can tell the user which of
+   * the two is winning. Empty when the file says nothing about either window,
+   * in which case {@link baselineDeadlines} (the built-in default) applies.
+   */
+  private configuredDeadlines: Partial<Record<ApprovalDeadlineKey, number>> = {}
+  /**
+   * The value each deadline had before any override — the tuning this manager
+   * was constructed with, which already carries the validated config file (the
+   * host entry passes `validateConfig`'s output) or the built-in default.
+   *
+   * Held separately from {@link configuredDeadlines} because the two answer
+   * different questions: this one is what RUNS when nothing is overridden, that
+   * one is what the config file NAMED (which the card shows as the reset target
+   * and a bare default does not deserve). A manager built without tuning at all
+   * — a direct consumer, a test — gets `DEFAULT_TUNING` here and stays correct.
+   */
+  private baselineDeadlines: { nativeApprovalTimeoutMs: number; permissionFallbackTimeoutMs: number }
+  /**
+   * The settings page's own write, persisted with the agent registry. Merged
+   * OVER {@link baselineDeadlines}: once a user picks a window in the UI, that
+   * pick is what runs, and the config file becomes the value the reset button
+   * returns to. Without this split a hand-edited `cordis.patch.yml` and a UI
+   * write would fight with no way to tell which one is live.
+   */
+  private deadlineOverride: Partial<Record<ApprovalDeadlineKey, number>> = {}
+  /**
+   * Tuning in force, defaults applied. The two approval deadlines are rewritten
+   * IN PLACE by {@link applyDeadlineTuning}, which is why this is a live object
+   * rather than the constructor's parameter: every bridge built afterwards
+   * inherits the rewrite instead of the boot-time value.
+   */
+  private readonly tuning: Required<BridgeTuning>
+  /**
    * The in-flight (or just-settled) segmented turn of one DSH chat session.
    * Keyed by chat session id because the continuation steps of a segmented
    * turn arrive as fresh `streamPrompt` calls that must find the SAME
@@ -2933,8 +2994,20 @@ export class BridgeManager {
     private readonly catalogStoragePath?: string,
     /** Auto-probe agents for model catalogs (boot + lazy); manual probes always run. */
     private readonly probeModelsOnBoot = true,
-    private readonly tuning?: BridgeTuning,
+    tuning?: BridgeTuning,
   ) {
+    // Held as a live object rather than the raw parameter: the two approval
+    // deadlines are rewritten in place when the settings page writes them (see
+    // `applyDeadlineTuning`), and every bridge built afterwards must inherit
+    // the rewrite instead of the boot-time value.
+    this.tuning = { ...DEFAULT_TUNING, ...tuning }
+    // The pre-override deadline values, snapshotted before anything can rewrite
+    // them. Everything else in `tuning` is fixed for the manager's lifetime, so
+    // only this pair needs a snapshot.
+    this.baselineDeadlines = {
+      nativeApprovalTimeoutMs: this.tuning.nativeApprovalTimeoutMs,
+      permissionFallbackTimeoutMs: this.tuning.permissionFallbackTimeoutMs,
+    }
     for (const def of defs) {
       this.defsMap.set(def.id, def)
     }
@@ -2947,6 +3020,9 @@ export class BridgeManager {
     }
     this.loadPersistedAgents()
     this.loadPersistedCatalogs()
+    // A persisted deadline override must reach the tuning the bridges are built
+    // from, not just the settings card's readout.
+    this.applyDeadlineTuning()
     // The request-path rewrite falls back to this default for a conversation
     // the user never bound explicitly — the same agent the composer chip shows.
     routeBindingRegistry().defaultModel = this.defaultAgent()
@@ -3752,6 +3828,16 @@ export class BridgeManager {
         } catch {
           this.tagHaloSetting = { ...DEFAULT_TAG_HALO }
         }
+        // The settings page's approval-deadline override. Re-validated on every
+        // boot because the state file is user- and version-editable: an
+        // unreadable value must not poison the deadline, and a value the
+        // validator accepts must be the value that runs (a UI write that did
+        // not survive a restart would read as a broken setting).
+        try {
+          this.deadlineOverride = validateApprovalDeadlines((parsed as { approvalDeadlines?: unknown }).approvalDeadlines ?? {})
+        } catch {
+          this.deadlineOverride = {}
+        }
         this.loadPersistedChoices((parsed as { conversations?: unknown }).conversations)
       }
     } catch {
@@ -3804,6 +3890,11 @@ export class BridgeManager {
         ...(this.defaultAgentId === undefined ? {} : { defaultAgentId: this.defaultAgentId }),
         tagHalo: this.tagHaloSetting,
         agents: [...this.defsMap.values()],
+        // The settings page's approval deadlines. Absent while none was ever
+        // written, so a fresh deployment's state file stays exactly as it was.
+        ...(Object.keys(this.deadlineOverride).length === 0
+          ? {}
+          : { approvalDeadlines: { ...this.deadlineOverride } }),
         // The per-conversation picks: agent + model + thought level + mode +
         // extra config values chosen in the composer, including for
         // conversations with no live session yet.
@@ -4786,6 +4877,78 @@ export class BridgeManager {
     // a future non-RPC path tomorrow).
     this.tagHaloSetting = validateTagHalo(halo)
     this.persistAgents()
+  }
+
+  /**
+   * Declare the deployment baseline for the two approval deadlines — the values
+   * `cordis.patch.yml` names, passed RAW (only the keys it actually contains).
+   *
+   * Kept separate from the validated tuning because "the file says 600000" and
+   * "the file says nothing, so 300000 applies" are different facts: the settings
+   * card shows the first as the reset target and the second as a built-in
+   * default. Called once by the host entry, before any bridge exists — and it
+   * also moves the baseline, so a manager built without tuning (a direct
+   * consumer, a test) still runs what the deployment asked for.
+   */
+  setConfiguredApprovalDeadlines(values: Partial<Record<ApprovalDeadlineKey, number>>): void {
+    this.configuredDeadlines = { ...values }
+    if (values.nativeApprovalTimeoutMs !== undefined) this.baselineDeadlines.nativeApprovalTimeoutMs = values.nativeApprovalTimeoutMs
+    if (values.permissionFallbackTimeoutMs !== undefined) this.baselineDeadlines.permissionFallbackTimeoutMs = values.permissionFallbackTimeoutMs
+    this.applyDeadlineTuning()
+  }
+
+  /**
+   * The approval deadlines in force, plus the two facts that explain a value the
+   * user did not pick: the config-file baseline an override is outranking, and a
+   * `permissionTimeoutMs` that overrides BOTH windows when non-zero. Both are
+   * reported only when they are actually in play, so the card can stay silent
+   * about a plain default.
+   */
+  approvalDeadlines(): AcpApprovalDeadlines {
+    const deadlines: AcpApprovalDeadlines = {
+      nativeApprovalTimeoutMs: this.tuning.nativeApprovalTimeoutMs,
+      permissionFallbackTimeoutMs: this.tuning.permissionFallbackTimeoutMs,
+    }
+    if (Object.keys(this.configuredDeadlines).length > 0) deadlines.configured = { ...this.configuredDeadlines }
+    if (this.tuning.permissionTimeoutMs > 0) deadlines.permissionTimeoutMs = this.tuning.permissionTimeoutMs
+    return deadlines
+  }
+
+  /**
+   * Write one or both approval deadlines (omitted keys keep their value), or
+   * drop the persisted override with `reset` so the config-file baseline — or
+   * the built-in default — applies again.
+   *
+   * HOT: the rewrite reaches every live bridge, so a user changing the window
+   * never has to kill a running session to see it take effect (the one thing an
+   * `agent/save`-style restart would cost them). Only asks armed AFTER the
+   * write see the new window; an ask already holding a timer keeps the one it
+   * started with.
+   */
+  async setApprovalDeadlines(patch: Partial<Record<ApprovalDeadlineKey, number>>, reset = false): Promise<void> {
+    // Merged BEFORE validating, so the whole resulting override passes the same
+    // gate the config file does (an override written by an older build is
+    // re-gated here rather than trusted). `validateApprovalDeadlines` also drops
+    // unknown keys, which is what keeps a stale payload from poisoning state.
+    const merged = reset ? {} : { ...this.deadlineOverride, ...patch }
+    this.deadlineOverride = validateApprovalDeadlines(merged)
+    this.applyDeadlineTuning()
+    this.persistAgents()
+  }
+
+  /**
+   * Recompute the two deadlines from override → deployment baseline, and push
+   * the result to every live bridge.
+   */
+  private applyDeadlineTuning(): void {
+    const nativeApprovalTimeoutMs = this.deadlineOverride.nativeApprovalTimeoutMs
+      ?? this.baselineDeadlines.nativeApprovalTimeoutMs
+    const permissionFallbackTimeoutMs = this.deadlineOverride.permissionFallbackTimeoutMs
+      ?? this.baselineDeadlines.permissionFallbackTimeoutMs
+    this.tuning.nativeApprovalTimeoutMs = nativeApprovalTimeoutMs
+    this.tuning.permissionFallbackTimeoutMs = permissionFallbackTimeoutMs
+    const patch = { nativeApprovalTimeoutMs, permissionFallbackTimeoutMs }
+    for (const bridge of this.bridges.values()) bridge.applyApprovalDeadlines(patch)
   }
 
   private readonly dshSessionMap = new Map<string, LiveSession>()

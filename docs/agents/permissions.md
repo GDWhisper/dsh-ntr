@@ -25,13 +25,15 @@ ACP `session/request_permission` 原样映射：选项列表 / allow-deny / tool
 | `unavailable` | 服务在、这一次失败 | 降级路径：改走 `permissionFallbackTimeoutMs`（默认 300_000 = 5 分钟），到时代答 `cancelled`；填 `0` 关闭 |
 | `native-timeout` | 宿主**收了问题却不答**（answerer 不在浏览器 scope、对话未挂载、remote 事件没送达） | 同上；另外路由本身有 `nativeApprovalTimeoutMs`（默认 300_000），到点撤回后才会走到这里 |
 
-- **两个期限都是配置项**（`AcpPluginConfig`，`cordis.patch.yml` 里注释了默认值）：`nativeApprovalTimeoutMs`
+- **两个期限都是可设项**（`AcpPluginConfig`，`cordis.patch.yml` 里注释了默认值）：`nativeApprovalTimeoutMs`
   （撤回窗口，默认 300_000）与 `permissionFallbackTimeoutMs`（降级询问的代答窗口，默认 300_000）。
   `0` = 对应期限永不触发（恢复加期限之前的行为）；`permissionTimeoutMs > 0` 时它对所有路径一视同仁、
   覆盖这两个值。OmniTerm dev 把同一对窗口做成 `acp_perm_timeout_secs`（30 秒步进、上限 1 小时、
   原子量热更新）+ `acp_perm_timeout_mode` 三档；本插件只取两档——`0` 即 OmniTerm 的 `wait`，
-  现行行为即 `abort`，`auto`（代答）与「每一问都必须交给人」冲突，不设。热更新未做：配置在
-  `apply()` 时读一次，改配置要重启插件进程。
+  现行行为即 `abort`，`auto`（代答）与「每一问都必须交给人」冲突，不设。
+- **两个期限都能在设置页热改**（§2.3）：`ui/approval-deadlines` 读、`ui/approval-deadlines-set` 写，
+  覆盖值落 `agents.json` 的 `approvalDeadlines` 并压过 `cordis.patch.yml`。`permissionTimeoutMs`
+  仍是唯一只能改配置文件的项——它是「一视同仁」的总闸，不该有两个入口。
 
 - **路由有截止期限**（`BridgeTuning.nativeApprovalTimeoutMs`）： routed ask 的唯一答案入口就是 composer 接管，且**不广播任何帧**——宿主收了问题却不渲染，turn 就挂在一个人看不见的地方（issue #2 的实测：只剩 agent 侧心跳，会话永久挂起）。到点即**撤回**：abort 交给宿主的 signal（宿主 waterfall 用同一个 signal 赛跑答案，遂以 `cancelled` 收尾、composer 面板消失），再把同一问题改走 ledger。撤回**不是代答**——人照样能在设置页回答同一个问题；填 `0` 关闭该期限（恢复无限等待）。
 - `permissionTimeoutMs > 0` 时对四条路径一视同仁。路由成功时**不启动**任何定时器（人在对话里答，不能抢答），但仍广播一条 `permission/resolved` 保持事件流对称。
@@ -64,6 +66,38 @@ cancelled when the turn is cancelled"。
 原生路由上的询问不受此影响（ledger 里没有条目）：它由 `nativeApprovalTimeoutMs` 到期撤回，
 composer 面板随之消失。
 
+## 2.3 设置页热改两个期限
+
+`nativeApprovalTimeoutMs` / `permissionFallbackTimeoutMs` 在 **NTR 设置 → 审批时限** 卡片里改，
+不用重启插件进程，也不用杀活动会话。OmniTerm dev 的同类控件是一个模式下拉 + 30 秒步进滑块；本插件
+只做两个窗口（`auto` 档与「每一问都必须交给人」冲突），预设 + 自由秒数两路输入。
+
+**三层取值，优先级从高到低**：
+
+| 层 | 位置 | 说明 |
+|---|---|---|
+| 覆盖值 | `agents.json` 的 `approvalDeadlines` | 设置页写的值；重启后仍然有效 |
+| 部署基线 | `cordis.patch.yml` 的 `config` | 宿主入口在 `apply()` 里把**原始**值交给 manager（`setConfiguredApprovalDeadlines`）——`validateConfig` 已把默认值填满，分不出「文件写了 600000」和「文件没写、300000 是内置默认」，而卡片必须能区分：前者是重置按钮的去处，后者不是 |
+| 内置默认 | `DEFAULT_TUNING`（300_000） | 两层都没说时的值 |
+
+- **热应用**：`BridgeManager.applyDeadlineTuning` 改写自己持有的 tuning 并逐个调
+  `AgentBridge.applyApprovalDeadlines`。两个字段因此不是 `readonly`——它们每次询问时读取，
+  改写对之后的询问立即生效。**已启动的定时器不重排**：正在决定中的人不该被移动球门。
+- **持久化**：写进 `agents.json`（与 `tagHalo` / `conversations` 同一个文件），每次启动重新过
+  `validateApprovalDeadlines`——该文件用户可改，放一个越界值进去不能毒化期限。
+- **卡片必须说清两件事**，否则用户会在调一个不生效的数字：
+  `configured[key]` 与生效值不同时提示「cordis.patch.yml 里是 X，设置页的值优先」并给重置按钮；
+  `permissionTimeoutMs > 0` 时提示它一视同仁、覆盖本卡（它是唯一只读配置项，没有 UI 入口）。
+  重置行的显示条件与提示同行：**只有真的覆盖了才给重置按钮**——配置文件基线恰好等于生效值时也给一个
+  「恢复配置文件的值」，那颗按钮什么都不会做（实测发现后修正）。
+- 浏览器侧只乐观改生效数字，**宿主回包是权威**（写路由原样返回生效中的期限），失败即回滚。
+
+测试：`tests/impl.spec.ts` 的 "gates the settings-page deadline write through the same range as the
+config file"、`tests/register.spec.ts` 的 "carries the config file's approval deadlines into the
+settings card"、`tests/bridge.spec.ts` 的 "edits an approval deadline live, persists it, and resets
+to the config file" 与 "adopts a deadline the settings page writes while a session is live"、
+`tests/store.spec.ts` 的 "reads the approval deadlines on resync and writes one back optimistically"。
+
 ## 3. 审批 UI
 
 **ledger 卡**（`src/client/panel.tsx` · `permissionLedgerCard`）：只要 `ui.permissions` 非空就渲染可答复的卡片，**与 `ui.approvalRouted` 无关**。
@@ -92,6 +126,8 @@ composer 面板随之消失。
 |---|---|
 | 权限请求处理 | `src/bridge.ts` · `handlePermissionRequest` |
 | 原生审批 | `src/bridge.ts` · `askNativeApproval` / `nativeOutcomeResponse` / `setApprovalRequester` / `approvalRouting` / `ledgerFallbackOf`；`src/index.ts` · `wireApproval` |
+| 期限热改 | `src/bridge.ts` · `approvalDeadlines` / `setApprovalDeadlines` / `setConfiguredApprovalDeadlines` / `applyDeadlineTuning` / `AgentBridge.applyApprovalDeadlines`；`src/impl.ts` · `validateApprovalDeadlines` / `validateApprovalDeadlineMs`；`src/index.ts` · `apply()` 的原始配置透传 |
+| 期限 UI | `src/client/panel.tsx` · `ApprovalDeadlinesCard` / `DeadlineRow` / `deadlineText`；`src/client/store.ts` · `setApprovalDeadline` / `resetApprovalDeadlines` |
 | fs 围栏 | `src/bridge.ts` · `handleFsWrite` / `guardFsPath`；`src/impl.ts` · `resolveFsPath` |
 | ledger UI | `src/client/panel.tsx` · `permissionLedgerCard` |
 | 权限座位 | `src/client/model-seat.tsx` · `createPermissionSeatClaim` |

@@ -35,6 +35,7 @@ import {
   quoteCommandToken,
   tokenizeCommandLine,
   validateAgentDef,
+  validateApprovalDeadlines,
   validateConfig,
 } from '../src/impl.ts'
 import type { AcpManager } from '../src/impl.ts'
@@ -115,6 +116,23 @@ describe('validateConfig', () => {
     expect(() => validateConfig({ agents: [], nativeApprovalTimeoutMs: 86_400_001 })).toThrow(/nativeApprovalTimeoutMs/)
     expect(() => validateConfig({ agents: [], permissionFallbackTimeoutMs: -1 })).toThrow(/permissionFallbackTimeoutMs/)
     expect(() => validateConfig({ agents: [], permissionFallbackTimeoutMs: 86_400_001 })).toThrow(/permissionFallbackTimeoutMs/)
+  })
+
+  it('gates the settings-page deadline write through the same range as the config file', () => {
+    // The card and `cordis.patch.yml` are two doors onto the same knob, so they
+    // must share one gate: a window the UI can save has to survive the next
+    // boot's re-validation, or the setting would silently revert.
+    expect(validateApprovalDeadlines({ nativeApprovalTimeoutMs: 60_000 })).toEqual({ nativeApprovalTimeoutMs: 60_000 })
+    expect(validateApprovalDeadlines({})).toEqual({})
+    expect(validateApprovalDeadlines({ nativeApprovalTimeoutMs: 0, permissionFallbackTimeoutMs: 0 }))
+      .toEqual({ nativeApprovalTimeoutMs: 0, permissionFallbackTimeoutMs: 0 })
+    // `reset` is not a deadline and must not land in the persisted override.
+    expect(validateApprovalDeadlines({ reset: true })).toEqual({})
+    for (const bad of [-1, 1.5, 86_400_001, '60000', null]) {
+      expect(() => validateApprovalDeadlines({ nativeApprovalTimeoutMs: bad })).toThrow(/nativeApprovalTimeoutMs/)
+      expect(() => validateApprovalDeadlines({ permissionFallbackTimeoutMs: bad })).toThrow(/permissionFallbackTimeoutMs/)
+    }
+    expect(() => validateApprovalDeadlines(null)).toThrow(/approval deadlines must be an object/)
   })
   it('keeps idleTimeoutMs optional per agent and bounds it when present', () => {
     // Absent means "host default": a config stored before this field existed
@@ -992,6 +1010,8 @@ function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } {
     setDefaultAgent: async id => { calls.push(['setDefaultAgent', id]) },
     tagHalo: () => ({ mode: 'breath', speed: 'slow' }),
     setTagHalo: async halo => { calls.push(['setTagHalo', halo]) },
+    approvalDeadlines: () => ({ nativeApprovalTimeoutMs: 300_000, permissionFallbackTimeoutMs: 120_000 }),
+    setApprovalDeadlines: async (patch, reset) => { calls.push(['setApprovalDeadlines', patch, reset]) },
     bindChatAgent: (dshSessionId, agentId) => { calls.push(['bindChatAgent', dshSessionId, agentId]) },
     setChatSessionModel: async (dshSessionId, modelId) => { calls.push(['setChatSessionModel', dshSessionId, modelId]) },
     setChatSessionEffort: async (dshSessionId, effort) => { calls.push(['setChatSessionEffort', dshSessionId, effort]) },
@@ -1135,6 +1155,40 @@ describe('dispatchRpc', () => {
     await expect(dispatchRpc(manager, 'ui/tag-halo-set', { halo: { mode: 'blink', speed: 'fast' } })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     await expect(dispatchRpc(manager, 'ui/tag-halo-set', { halo: { mode: 'breath', speed: 'ludicrous' } })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     await expect(dispatchRpc(manager, 'ui/tag-halo-set', {})).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    // The approval deadlines: read is `undefined` on an older host half (which
+    // hides the card), and a write is validated before it reaches the manager —
+    // the same range the config file is held to, so a value the card can send is
+    // a value the next boot accepts.
+    await expect(dispatchRpc(manager, 'ui/approval-deadlines', {})).resolves.toEqual({
+      ok: true,
+      value: { deadlines: { nativeApprovalTimeoutMs: 300_000, permissionFallbackTimeoutMs: 120_000 } },
+    })
+    await expect(dispatchRpc({ ...manager, approvalDeadlines: undefined }, 'ui/approval-deadlines', {})).resolves.toEqual({
+      ok: true,
+      value: { deadlines: undefined },
+    })
+    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { nativeApprovalTimeoutMs: 60_000 })).resolves.toEqual({
+      ok: true,
+      value: { deadlines: { nativeApprovalTimeoutMs: 300_000, permissionFallbackTimeoutMs: 120_000 } },
+    })
+    // Only the touched key travels: the manager merges, so a card that edited one
+    // slider must not reset the other.
+    expect(manager.calls).toContainEqual(['setApprovalDeadlines', { nativeApprovalTimeoutMs: 60_000 }, false])
+    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { reset: true })).resolves.toMatchObject({ ok: true })
+    expect(manager.calls).toContainEqual(['setApprovalDeadlines', {}, true])
+    for (const bad of [-1, 1.5, 86_400_001, '60000']) {
+      await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { nativeApprovalTimeoutMs: bad }))
+        .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+      await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { permissionFallbackTimeoutMs: bad }))
+        .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    }
+    // `0` is the meaningful value on both, not a rejection.
+    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { nativeApprovalTimeoutMs: 0, permissionFallbackTimeoutMs: 0 }))
+      .resolves.toMatchObject({ ok: true })
+    expect(manager.calls).toContainEqual(['setApprovalDeadlines', { nativeApprovalTimeoutMs: 0, permissionFallbackTimeoutMs: 0 }, false])
+    // An unknown key is dropped rather than persisted into state.
+    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { permissionTimeoutMs: 5 })).resolves.toMatchObject({ ok: true })
+    expect(manager.calls).toContainEqual(['setApprovalDeadlines', {}, false])
     // The conversation↔agent mapping: the plugin's own binding, never a model route.
     await expect(dispatchRpc(manager, 'session/chat-bind', { dshSessionId: 'chat-1', agentId: 'pi' })).resolves.toEqual({ ok: true, value: { done: true } })
     expect(manager.calls).toContainEqual(['bindChatAgent', 'chat-1', 'pi'])

@@ -2133,6 +2133,75 @@ describe('a native approval route that never answers still answers the turn (iso
       return new Promise<ApprovalOutcome>(() => { /* never settles */ })
     })
   }, 30_000)
+
+  it('adopts a deadline the settings page writes while a session is live', async () => {
+    // The whole point of the settings card over a config-file edit: the window
+    // changes WITHOUT restarting the bridge, which would cost the user every
+    // running session. Built with a window far too long to observe, then
+    // shortened through the settings route — the withdrawal must follow the new
+    // number, not the one the bridge was constructed with.
+    const hotHub = new EventHub()
+    const hotEvents: AcpEvent[] = []
+    hotHub.subscribe(event => { hotEvents.push(event) })
+    const hotManager = new BridgeManager([{ ...def, id: 'hot' }], hotHub, 500, undefined, undefined, true, {
+      nativeApprovalTimeoutMs: 600_000,
+      permissionFallbackTimeoutMs: 600_000,
+    })
+    const hotAsks: { signal: AbortSignal | undefined }[] = []
+    hotManager.setApprovalRequester(request => {
+      hotAsks.push({ signal: request.signal })
+      return new Promise<ApprovalOutcome>(() => { /* never settles */ })
+    })
+    const hotWaitFor = <T extends AcpEvent['type']>(type: T, since: number, predicate: (event: Extract<AcpEvent, { type: T }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: T }>> => {
+      const matches = (event: AcpEvent): event is Extract<AcpEvent, { type: T }> =>
+        event.type === type && predicate(event as Extract<AcpEvent, { type: T }>)
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`timeout waiting for ${type}`)), timeoutMs)
+        const unsub = hotHub.subscribe(event => {
+          if (hotEvents.indexOf(event) >= since && matches(event)) {
+            clearTimeout(timer)
+            unsub()
+            resolve(event)
+          }
+        })
+        const existing = hotEvents.find((event, index) => index >= since && matches(event))
+        if (existing !== undefined) {
+          clearTimeout(timer)
+          unsub()
+          resolve(existing)
+        }
+      })
+    }
+    try {
+      // The settings write, on a manager that has never run a turn.
+      await hotManager.setApprovalDeadlines({ nativeApprovalTimeoutMs: 400, permissionFallbackTimeoutMs: 700 })
+      const since = hotEvents.length
+      const parts: string[] = []
+      const drained = (async () => {
+        const { chunks } = await hostLoopTurn(new AcpLlmAdapter(hotManager), {
+          provider: 'acp',
+          model: 'hot',
+          sessionId: 'dsh-silent-hot',
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'PERM silent hot' }] }],
+        })
+        for (const chunk of chunks) {
+          if (chunk.type === 'reasoning-delta') parts.push(chunk.text)
+        }
+      })()
+      const request = await hotWaitFor('permission/request', since, () => true)
+      // Withdrawn on the NEW 400ms window, not the 600s one it was built with.
+      expect(hotAsks).toHaveLength(1)
+      expect(hotAsks[0]?.signal?.aborted).toBe(true)
+      // And the ledger's degraded-route deadline followed too (700ms → "1s").
+      const notice = await hotWaitFor('agent/notice', since, event => event.text.includes('timed out after 1s'), 5_000)
+      expect(notice.text).toContain('cancelled')
+      await drained
+      expect(parts.join('')).toContain('no answer in the conversation within 0s')
+      expect(request.requestId).not.toBe('')
+    } finally {
+      await hotManager.shutdownAll()
+    }
+  }, 30_000)
 })
 
 /**
@@ -3279,6 +3348,70 @@ describe('pre-chat pick persistence (isolated manager)', () => {
     // A fresh manager (host restart) reads the same registry file back.
     const reloaded = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
     expect(reloaded.tagHalo()).toEqual({ mode: 'steady', speed: 'slow' })
+    await reloaded.shutdownAll()
+    await gm.shutdownAll()
+  })
+
+  it('edits an approval deadline live, persists it, and resets to the config file', async () => {
+    const storage = `${tmpdir()}/acp-deadlines-${Date.now()}.json`
+    const gm = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
+    // Nothing configured, nothing overridden: the built-in 5-minute window.
+    expect(gm.approvalDeadlines()).toEqual({ nativeApprovalTimeoutMs: 300_000, permissionFallbackTimeoutMs: 300_000 })
+    // A deployment that names only ONE window in `cordis.patch.yml` reports only
+    // that one: the other is a built-in default, not a configured value, and the
+    // settings card has to be able to tell the two apart.
+    gm.setConfiguredApprovalDeadlines({ nativeApprovalTimeoutMs: 600_000 })
+    expect(gm.approvalDeadlines()).toMatchObject({
+      nativeApprovalTimeoutMs: 600_000,
+      permissionFallbackTimeoutMs: 300_000,
+      configured: { nativeApprovalTimeoutMs: 600_000 },
+    })
+
+    // The UI write outranks the config file and reaches the LIVE bridge without
+    // restarting anything — the whole point over an `agent/save`-style reload,
+    // which would cost the user every running session.
+    const tuningOf = (b: AgentBridge): { nativeApprovalTimeoutMs: number; permissionFallbackTimeoutMs: number } =>
+      b as unknown as { nativeApprovalTimeoutMs: number; permissionFallbackTimeoutMs: number }
+    const liveBridge = new AgentBridge({ ...def, id: 'live' }, pickHub, 500, () => { /* no manager behind it */ })
+    ;(gm as unknown as { bridges: Map<string, AgentBridge> }).bridges.set('live', liveBridge)
+    await gm.setApprovalDeadlines({ nativeApprovalTimeoutMs: 30_000 })
+    expect(gm.approvalDeadlines()).toMatchObject({
+      nativeApprovalTimeoutMs: 30_000,
+      permissionFallbackTimeoutMs: 300_000,
+      configured: { nativeApprovalTimeoutMs: 600_000 },
+    })
+    expect(tuningOf(liveBridge).nativeApprovalTimeoutMs).toBe(30_000)
+    // The untouched window keeps the config-file value rather than being reset.
+    expect(tuningOf(liveBridge).permissionFallbackTimeoutMs).toBe(300_000)
+
+    // Persisted: a host restart comes back on the value the user picked, not the
+    // deployment baseline. The host entry re-declares the patch file's baseline
+    // on every boot, so the override has to keep outranking it after a restart.
+    const reloaded = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
+    reloaded.setConfiguredApprovalDeadlines({ nativeApprovalTimeoutMs: 600_000 })
+    expect(reloaded.approvalDeadlines()).toMatchObject({
+      nativeApprovalTimeoutMs: 30_000,
+      permissionFallbackTimeoutMs: 300_000,
+      configured: { nativeApprovalTimeoutMs: 600_000 },
+    })
+
+    // Reset drops the override: the config file decides again.
+    await reloaded.setApprovalDeadlines({}, true)
+    expect(reloaded.approvalDeadlines()).toMatchObject({
+      nativeApprovalTimeoutMs: 600_000,
+      permissionFallbackTimeoutMs: 300_000,
+    })
+    // A fresh manager over the same file sees the same thing (the reset persisted).
+    const afterReset = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
+    afterReset.setConfiguredApprovalDeadlines({ nativeApprovalTimeoutMs: 600_000 })
+    expect(afterReset.approvalDeadlines()).toMatchObject({ nativeApprovalTimeoutMs: 600_000 })
+
+    // An out-of-range write is refused before it can reach state, and the value
+    // in force is untouched.
+    await expect(reloaded.setApprovalDeadlines({ permissionFallbackTimeoutMs: -1 })).rejects.toThrow(/permissionFallbackTimeoutMs/)
+    expect(reloaded.approvalDeadlines().permissionFallbackTimeoutMs).toBe(300_000)
+
+    await afterReset.shutdownAll()
     await reloaded.shutdownAll()
     await gm.shutdownAll()
   })

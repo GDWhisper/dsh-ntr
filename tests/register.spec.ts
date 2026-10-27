@@ -266,6 +266,45 @@ describe('host plugin contract', () => {
     expect(bare.acpMode).toBe(false)
   })
 
+  it('carries the config file\'s approval deadlines into the settings card, and lets the card override them', async () => {
+    // The wiring `dispatchRpc`'s fake manager cannot see: the host entry has to
+    // hand the manager the RAW patch values, so the card can tell "the file
+    // asked for 10 minutes" from "nothing was configured, 5 is the built-in
+    // default" — and a settings write has to outrank the file afterwards.
+    const ctx = fakeCtx()
+    let rpcHandler: ((endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>) | undefined
+    ctx.connection.rpc.handle = vi.fn((_channel: string, handler: unknown) => {
+      rpcHandler = handler as typeof rpcHandler
+      return () => Promise.resolve()
+    })
+    apply(ctx as never, {
+      agents: [{ id: 'agent-1', command: 'run' }],
+      // One window named, one left to the default: the card must show only the
+      // named one as the reset target.
+      nativeApprovalTimeoutMs: 600_000,
+    })
+    const ask = async (endpoint: string, payload: unknown = {}): Promise<Record<string, unknown>> => {
+      const answer = await rpcHandler!(endpoint, payload, new AbortController().signal)
+      return (answer as { value: Record<string, unknown> }).value
+    }
+
+    expect((await ask('ui/approval-deadlines')).deadlines).toEqual({
+      nativeApprovalTimeoutMs: 600_000,
+      permissionFallbackTimeoutMs: 300_000,
+      configured: { nativeApprovalTimeoutMs: 600_000 },
+    })
+
+    // The settings write wins from here on, without a restart.
+    expect((await ask('ui/approval-deadlines-set', { nativeApprovalTimeoutMs: 30_000 })).deadlines)
+      .toMatchObject({ nativeApprovalTimeoutMs: 30_000 })
+    expect((await ask('ui/approval-deadlines')).deadlines)
+      .toMatchObject({ nativeApprovalTimeoutMs: 30_000, configured: { nativeApprovalTimeoutMs: 600_000 } })
+
+    // Reset returns to the file's value.
+    expect((await ask('ui/approval-deadlines-set', { reset: true })).deadlines)
+      .toMatchObject({ nativeApprovalTimeoutMs: 600_000 })
+  })
+
   it('never touches the host model layer at all — no route, no default, no guard', async () => {
     const ctx = fakeCtx()
     let rpcHandler: ((endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>) | undefined
