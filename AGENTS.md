@@ -144,6 +144,10 @@
 
 35. **CHANGELOG 只记确定性的净改动**：每次发版在 [`CHANGELOG.md`](./CHANGELOG.md) 顶部加一节，内容与 GitHub release note 同一套话、都带提交号；只写这一版留下的**最终用户可见行为**——被推翻、回退或只在开发过程中存在过的中间形态一律不记。→ [release.md](./docs/release.md)
 
+### 用量统计（36）
+
+36. **`usage_update` 是上下文占用，不是请求 token**：`used` / `size` 只写 `session.usage`（ACP 视图的 `used/size`）；原生聊天流的 `usage` 块只能是按段估算的输出 token（正文 + 思考字符 ÷4，`inputTokens: 0`），**严禁**把 `size` / `used` 映射成 input/output。缓存命中率无数据源，`inputTokens: 0` 让宿主自然不显示。工具参数不计入估算（部分 agent 整块重发 `rawInput`）。→ [protocol.md](./docs/agents/protocol.md)
+
 ## 边界与禁区
 
 - **禁止修改 [`lib/`](./lib)**：会被 `npm run build` 全量覆盖。

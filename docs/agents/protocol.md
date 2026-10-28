@@ -62,7 +62,7 @@
 ## 6. 轮次收尾与分段
 
 - `turn/end` 只在 `session/prompt` 的**响应**返回时发出。**严禁**为「agent 不再吐字但仍在 running」新增按空闲计时的强制定稿——宿主分不清「正在想」与「在忙自己的事」，提前收尾会把答案切在流中间。
-- 一个 turn 由**多个段**组成（逐步切分，[architecture.md §2.2](./architecture.md)）：段的 `finish(stop)` 是步边界不是轮边界；`TurnStreamController`（`src/bridge.ts`）持有跨段的游标 / `seenCalls` / 记账。续跑批次（`isAcpToolContinuation`）**绝不新发 prompt**，用 `transcript.since(cursorSeq)` 补读段间事件；段间事件只记账（usage / `recordAcpToolOutput` 唤醒等待者），游标不动。
+- 一个 turn 由**多个段**组成（逐步切分，[architecture.md §2.2](./architecture.md)）：段的 `finish(stop)` 是步边界不是轮边界；`TurnStreamController`（`src/bridge.ts`）持有跨段的游标 / `seenCalls` / 记账。续跑批次（`isAcpToolContinuation`）**绝不新发 prompt**，用 `transcript.since(cursorSeq)` 补读段间事件；段间事件只记账（`recordAcpToolOutput` 唤醒等待者），游标不动。
 - **取消与世代跨段成立**：任何段的 `AbortSignal` → `bridge.cancel` + `abortActiveSegment`；`turnSeq` 世代守卫让旧段迟到的回调动不了新 turn；prompt slot（`settled` 闸门）在 agent 确认取消**之前不解开**——`abortActiveSegment` 不得调 `endTurn`，否则下一个 prompt 会在 ACP 协议禁止的窗口并发发出。
 - 唯一允许的强制定稿是 `session/cancel` 后的 `armCancelFallback`，两者语义不同，不得复用。
 - **正常结束却零可见产出必须显式报出**：结算时 stop 非 cancelled 且本轮没发过任何可见块（`sawVisibleBlock`：text / reasoning / tool-call 的 block-start，跨段累计；usage 等记账帧不算），必须把告警文本作为 text 块发出。部分 agent 把上游失败（403 / 认证 / 计费）折叠成合法 `end_turn`（实测 pi-acp），否则用户只看到一个空气泡。这是**报告**不是收尾：turn 照常以 stop 结束，不重试不判错。
@@ -93,6 +93,7 @@
   - `agent_message_chunk` → `text`；`agent_thought_chunk` → `reasoning`；`tool_call` / `tool_call_update` → 真正的 `tool-call` 块（快照 + 前缀扩展 delta，重述按 callId 折进已开的卡）。
   - 其余 kind 在原生聊天流落成一行 `describeUnhandledUpdate` 文本（每种类一行、文本变了才重发）。**严禁** `default: 丢弃`。
   - 两张例外表分工不同：原生流对 `BOOKKEEPING_UPDATES`（`current_mode_update` / `config_option_update` / `available_commands_update` / `session_info_update` / `usage_update`）一个字都不发；ACP 视图只对 `STATE_ONLY_UPDATES`（`config_option_update` / `usage_update` / `session_info_update`）不落 block，其余（含 `current_mode_update` / `available_commands_update` / `plan`）落成带 `raw` 原文的 `event` block。
+  - **`usage_update` 是上下文占用，不是请求 token**：`used` / `size` 只写 `session.usage`（ACP 视图的 `used/size`）。原生聊天流的 `usage` 块是插件按段生成的**输出估算**——正文 + 思考的 UTF-16 单元数 ÷ 4，`inputTokens` 恒 `0`（issue #6）。**严禁**把 `size` / `used` 映射成 input/output：那会造出「17 步 × 1M」的总量和失真的 tok/s。`inputTokens: 0` 让宿主的缓存命中率自然不显示，而不是显示假 `0%`。工具参数不计入估算——部分 agent 每次重报整段 `rawInput`，会把瞬时字符记成输出。
 - **形状层**：块的 `content` 可以是字符串、对象或数组；`rawInput` / `arguments` 可以是字符串、对象或**数组**。这些都算「有值」，空字符串 / `null` / 空数组才算「没有」。**严禁**用 `content?.type === 'text'` 一类窄判定把别的形状读成空。
 - **字段层**：ACP 视图的工具卡把 `kind` / `status` / `locations` / `terminalId` / `meta` 进 `details`，整个通知原文进 `raw`（`dumpJson`，只在 `ACP_TOOL_RAW_MAX` 截断且带标记）。`available_commands` 条目整条保留（`...c` 展开）。
 - **diff**：同时保留结构化 diff（ACP 视图 `DiffView`）与文本（路径 + `-`/`+` 行，`formatAcpDiff`）。**严禁**退回 `[diff path]` 占位；未知 content kind 保留整条 JSON（`acpContentRows` 的 `other`）。这份文本也是虚拟工具答给宿主执行记录的输出，不能是占位符。

@@ -2400,12 +2400,17 @@ interface SegmentState {
   index: number
   activeType: 'reasoning' | 'text' | 'tool-call' | null
   activeText: string
+  /** UTF-16 units of this segment's text and reasoning chunks (the usage estimate). */
+  outputChars: number
   /** The open tool-call block's snapshot, while `activeType === 'tool-call'`. */
   activeToolCall: AcpToolCallSnapshot | undefined
   /** Whether this segment opened at least one tool-call block. */
   hasCard: boolean
   finished: boolean
 }
+
+/** ACP `usage_update` is context occupancy, not request tokens; host usage is a 4-chars/token OUTPUT estimate (tool args excluded). */
+const OUTPUT_CHARS_PER_TOKEN = 4
 
 /** How one segment's stream ends, in `StreamChunk.finish` terms. */
 type SegmentFinishReason =
@@ -2427,7 +2432,7 @@ type TurnSettle =
  * `transcript.since(cursor)` — events that arrive while no segment is open are
  * recorded, never lost), the seen-call registry (a call id gets exactly one
  * card per turn, wherever its restatements land), and the turn-level facts
- * (`sawVisibleBlock`, usage) that outlive any single segment.
+ * (`sawVisibleBlock`) that outlive any single segment.
  */
 class TurnStreamController {
   private segment: SegmentState | undefined
@@ -2435,7 +2440,6 @@ class TurnStreamController {
   private disposed = false
   private readonly seenCalls = new Set<string>()
   private readonly announcedKinds = new Map<string, string>()
-  private latestUsage: { inputTokens: number; outputTokens: number } | null = null
   /** Narrative lines (permission asks) that arrived while no segment was open. */
   private readonly pendingProse: string[] = []
   sawVisibleBlock = false
@@ -2487,6 +2491,7 @@ class TurnStreamController {
       index: -1,
       activeType: null,
       activeText: '',
+      outputChars: 0,
       activeToolCall: undefined,
       hasCard: false,
       finished: false,
@@ -2605,7 +2610,9 @@ class TurnStreamController {
       seg.activeType = null
       seg.activeToolCall = undefined
     }
-    if (this.latestUsage !== null) seg.queue.push({ type: 'usage', usage: this.latestUsage })
+    const outputTokens = Math.round(seg.outputChars / OUTPUT_CHARS_PER_TOKEN)
+    // Zero input keeps the host's cache-hit pill hidden instead of faking 0%.
+    if (outputTokens > 0) seg.queue.push({ type: 'usage', usage: { inputTokens: 0, outputTokens } })
     seg.queue.push({ type: 'finish', reason })
     seg.queue.close()
     if (this.segment === seg) this.segment = undefined
@@ -2643,11 +2650,10 @@ class TurnStreamController {
       const seg = this.segment
       if (seg === undefined || seg.finished) {
         // Between segments: tool outputs still reach the shared registry (the
-        // guard's virtual tool may be parked on this very record) and usage
-        // keeps the turn's tally fresh, but the cursor does NOT advance — the
-        // next segment replays everything since it, which re-records those
-        // idempotently and folds the prose the agent streamed while its cards
-        // executed on the host.
+        // guard's virtual tool may be parked on this very record), but the
+        // cursor does NOT advance — the next segment replays everything since
+        // it, which re-records those idempotently and folds the prose the agent
+        // streamed while its cards executed on the host.
         this.recordWithoutSegment(update)
         return
       }
@@ -2689,17 +2695,7 @@ class TurnStreamController {
   /** Events that arrive between segments: recorded, replayed into the next one. */
   private recordWithoutSegment(update: Record<string, unknown>): void {
     const kind = String(update.sessionUpdate ?? '')
-    if (kind === 'usage_update') {
-      this.noteUsage(update)
-    } else if (kind === 'tool_call' || kind === 'tool_call_update') {
-      this.noteToolRecord(update)
-    }
-  }
-
-  private noteUsage(update: Record<string, unknown>): void {
-    const used = typeof update.used === 'number' ? update.used : 0
-    const size = typeof update.size === 'number' ? update.size : 0
-    this.latestUsage = { inputTokens: size, outputTokens: used }
+    if (kind === 'tool_call' || kind === 'tool_call_update') this.noteToolRecord(update)
   }
 
   /** Record a tool call's output (idempotent) and wake any waiter. */
@@ -2725,6 +2721,7 @@ class TurnStreamController {
         this.finishSegment(seg, { kind: 'stop' })
         return false
       }
+      seg.outputChars += text.length
       this.emitProse(seg, kind === 'agent_thought_chunk' ? 'reasoning' : 'text', text)
       return true
     } else if (kind === 'tool_call' || kind === 'tool_call_update') {
@@ -2742,9 +2739,6 @@ class TurnStreamController {
       if (this.seenCalls.has(snapshot.callId)) return true // a restatement of a card already settled
       this.seenCalls.add(snapshot.callId)
       this.openToolCallBlock(seg, snapshot)
-      return true
-    } else if (kind === 'usage_update') {
-      this.noteUsage(update)
       return true
     } else if (!BOOKKEEPING_UPDATES.has(kind)) {
       const text = describeUnhandledUpdate(kind, update)

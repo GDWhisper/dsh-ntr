@@ -366,9 +366,17 @@ describe('ACP bridge over stdio (mock agent)', () => {
     expect(thoughtText).toContain('thinking…')
     expect(thoughtText).not.toContain('mock tool')
 
-    // Usage and finish
-    const usage = chunks.find((c): c is Extract<StreamChunk, { type: 'usage' }> => c.type === 'usage')
-    expect(usage?.usage).toEqual({ inputTokens: 1000, outputTokens: 123 })
+    // Usage is a per-segment OUTPUT estimate, never the ACP `usage_update` pair:
+    // `used` / `size` are context occupancy, and mapping them onto request
+    // tokens produced impossible totals and tok/s (issue #6). `inputTokens: 0`
+    // also hides the host's cache-hit pill instead of reporting a false 0%.
+    const usages = chunks.filter((c): c is Extract<StreamChunk, { type: 'usage' }> => c.type === 'usage')
+    expect(usages).toHaveLength(2)
+    expect(usages.every(c => c.usage.inputTokens === 0)).toBe(true)
+    const firstStepUsage = first.find((c): c is Extract<StreamChunk, { type: 'usage' }> => c.type === 'usage')
+    const secondStepUsage = second.find((c): c is Extract<StreamChunk, { type: 'usage' }> => c.type === 'usage')
+    expect(firstStepUsage?.usage).toEqual({ inputTokens: 0, outputTokens: Math.round('thinking…'.length / 4) })
+    expect(secondStepUsage?.usage).toEqual({ inputTokens: 0, outputTokens: Math.round(secondText.length / 4) })
 
     const finish = chunks.find((c): c is Extract<StreamChunk, { type: 'finish' }> => c.type === 'finish')
     expect(finish?.reason).toEqual({ kind: 'stop' })
