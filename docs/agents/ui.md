@@ -158,6 +158,15 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 - **设置页是镜像，不是替代**：`permissionLedgerCard` 只要 `ui.permissions` 非空就渲染可答复卡片（`approvalRouted` / `fellBackFromConversation` 已删除），文案是「对话打开时在那边的卡片上回答；这里兜底显示其他会话的询问。」每行写 `toolName`（有 `reason` 时附在后面），按钮同样原样。两个面回答的是同一份 `PendingPermission`，写入都走 `respondPermission`。
 - 聊天里那行提示（`TurnStreamController.permissionLine`）指向真正的答案面：有 `dshSessionId` 说「对话卡片」，`/acp` 询问说「设置页」。
 
+## 11. 主题与颜色
+
+主题完全归宿主：暗色 token 由 `body[data-ds-dark-theme]` 选出，原生控件（select / checkbox / 滚动条）靠宿主写在 `documentElement` 上的 `color-scheme` 继承。插件**不维护 JS 侧主题状态**，也**严禁**自己写 `color-scheme: light dark`——那会跟随系统偏好而不是宿主偏好，两者不一致时面板会和宿主断层。
+
+- **写死颜色只允许出现在 `var()` fallback 位**：`var(--dsw-alias-state-error-primary, #dc2626)`。宿主有 token 时跟随主题，缺 token 时保持原浅色。
+- **状态色按宿主配对**：`state-success|warn|business-tertiary` 作底，`state-*-primary` / `state-warn-label` 作前景；危险 hover 用 `interactive-bg-hover-danger`；diff 行用 `file-diff-added|deleted-bg`，统计数字用 `state-success|error-primary`；内联代码底用 `markdown-inline-code`；状态点用 `state-success|warn|error|idle-primary`。需要浅色文字对比时按宿主写法 `color-mix(in srgb, state-success-primary 72%, label-primary)` 派生，不为每种主题写死两份。
+- **宿主没有的 token**（引用它们只会永远落 fallback）：`--dsw-alias-text-primary` / `text-secondary` → `label-primary` / `label-secondary`；`--dsw-alias-button-primary-invert` → `label-primary-foreground`；`--dsw-alias-font-mono` → `--ds-font-family-code`。新增 token 引用前先在本机 DSH 的 `dsh-client-ui-theme/lib/client.js` 里核对定义。
+- `.ntr-acp-code` 的固定深色块（`#0f172a` / `#e2e8f0`）是有意的：两套主题下都可读，不参与 token 化。阴影 `rgba(0,0,0,α)` 同理可接受。
+
 ## 代码索引
 
 | 主题 | 位置 |

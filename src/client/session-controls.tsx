@@ -88,10 +88,10 @@ export interface AcpClusterProps extends AcpChatInjected {
 }
 
 const STATE_COLORS: Record<AgentView['state'], string> = {
-  ready: '#22c55e',
-  starting: '#eab308',
-  error: '#ef4444',
-  stopped: '#9ca3af',
+  ready: 'var(--dsw-alias-state-success-primary, #22c55e)',
+  starting: 'var(--dsw-alias-state-warn-primary, #eab308)',
+  error: 'var(--dsw-alias-state-error-primary, #ef4444)',
+  stopped: 'var(--dsw-alias-state-idle-primary, #9ca3af)',
 }
 
 function agentStateText(acp: AcpChatInjected['acp'], state: AgentView['state']): string {

@@ -283,10 +283,24 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
     // two entries for one setting and a four-section dump behind one gesture.
     const menu = menuFor('agent', { ...base, route: routed, agentModes: modes })
     expect(menu.sections.map(section => section.id)).toEqual(['agent'])
-    expect(menu.sections[0]?.items[0]).toMatchObject({ id: 'pi', active: true, dot: '#22c55e' })
+    expect(menu.sections[0]?.items[0]).toMatchObject({ id: 'pi', active: true, dot: 'var(--dsw-alias-state-success-primary, #22c55e)' })
     // The agent's own modes are adjacent to the roster but NOT in this menu:
     // they belong to the composer-mode select alone.
     expect(menu.sections.some(section => section.id === 'agent-mode')).toBe(false)
+  })
+
+  it('paints every agent state with a host alias token, never a literal', () => {
+    // Dark mode only follows the host palette when the dot resolves through
+    // the alias tokens; a raw hex would stay light in both themes (issue #4).
+    const agents: AgentView[] = (['ready', 'starting', 'error', 'stopped'] as const)
+      .map((state, index) => ({ ...agent, id: `agent-${index}`, state }))
+    const menu = menuFor('agent', { ...base, agents, route: routed })
+    expect(menu.sections[0]?.items.map(item => item.dot)).toEqual([
+      'var(--dsw-alias-state-success-primary, #22c55e)',
+      'var(--dsw-alias-state-warn-primary, #eab308)',
+      'var(--dsw-alias-state-error-primary, #ef4444)',
+      'var(--dsw-alias-state-idle-primary, #9ca3af)',
+    ])
   })
 
   it('shows the base entry plus the exposed variants in the MODEL picker', () => {

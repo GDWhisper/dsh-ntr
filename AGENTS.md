@@ -125,6 +125,7 @@
 20. **【竞争式遮蔽已退役】座位靠 claim 接管，失败一律放开**：`createModelSeatClaim` 用 `entriesOfSlot` 核实 head，不中就有界重注册（`MAX_SEAT_CLAIMS`），注册经 `ctx.slots.inject`。只读舞台会话 `agentPreset === ACP_PRESET_ID`，切走即撤；`stagedSessionOf` / `rowAgentPreset` 兼容两代快照；服务 / 槽位 / 注册 / 渲染任何不确定都回到原生座位。`ACP_PRESET_ID` 三处同步。旧竞争式遮蔽见 [retired.md](./docs/agents/retired.md)。→ [ui.md](./docs/agents/ui.md)
 30. **NTR 会话的 `/` 属于 agent**：只列 agent 经 `available_commands_update` 声明的命令，Enter 不被宿主认领，选中只插回草稿。实现只能运行时包装活的 `/` 来源（`slash-isolation.ts`），严禁注册第二个来源或替换 composer；命令清单只由一个来源承载；没有证据时 fail-open。命令声明还要按 agent 缓存进 `model-catalog.json`，供首条消息前使用。→ [ui.md](./docs/agents/ui.md) / [state.md](./docs/agents/state.md)
 33. **设置页文案有预算上限**：一个控件的说明**一行讲完**，机制解释进代码注释与 `docs/agents/`，不进 UI。同页参照是「呼吸频率 10 字 / 挂牌光晕 14 字 / 对话外观导语 15 字」；审批时限卡从 211 字压到 86 字是基准线，现为**两个控件**（默认档 55 字）。覆盖事实**必须看得见**——`configured[key]` 挂**被覆盖的那一行**，用警告色，不与其它灰色小字同层；重置按钮**只有真的覆盖了才出现**。文案里**点名控件名**必须与可见标题一致（改名要同步）。→ [ui.md](./docs/agents/ui.md) / [permissions.md](./docs/agents/permissions.md)
+34. **界面颜色只走宿主 alias token，写死颜色只能出现在 `var()` fallback**：主题归宿主（`body[data-ds-dark-theme]` + 根 `color-scheme` 继承），插件不维护 JS 主题状态，**严禁**自写 `color-scheme: light dark`（会跟系统偏好而非宿主）。状态色按宿主配对：`state-*-tertiary` 底 / `state-*-primary|*-label` 前景，diff 行 `file-diff-*-bg`，danger hover `interactive-bg-hover-danger`。宿主**不存在** `--dsw-alias-text-*` / `button-primary-invert` / `font-mono`，分别用 `label-*` / `label-primary-foreground` / `--ds-font-family-code`。→ [ui.md](./docs/agents/ui.md#11-主题与颜色)
 
 ### 路径（24）
 

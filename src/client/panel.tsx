@@ -51,8 +51,10 @@ const STYLE = `
   --ntr-radius: 10px; --ntr-radius-sm: 7px;
   --ntr-font: 13px; --ntr-font-sm: 12px; --ntr-font-xs: 11px;
   --ntr-line: 1px solid var(--dsw-alias-border-l2, #e5e7eb);
-  --ntr-muted: var(--dsw-alias-text-secondary, #6b7280);
-  --ntr-danger: #dc2626; --ntr-warn: #b45309;
+  --ntr-muted: var(--dsw-alias-label-secondary, #6b7280);
+  --ntr-danger: var(--dsw-alias-state-error-primary, #dc2626);
+  --ntr-warn: var(--dsw-alias-state-warn-label, #b45309);
+  --ntr-success: color-mix(in srgb, var(--dsw-alias-state-success-primary, #16a34a) 72%, var(--dsw-alias-label-primary, #111827));
   --ntr-accent: var(--dsw-alias-button-primary-fill, #2563eb);
   width: 100%; max-width: 960px; box-sizing: border-box; margin: 0 auto;
   padding: 20px; overflow: auto; font-size: var(--ntr-font); line-height: 1.55;
@@ -76,25 +78,25 @@ const STYLE = `
 }
 .dwa-btn:hover { background: var(--dsw-alias-interactive-bg-active, #f3f4f6); border-color: var(--dsw-alias-border-l1, #9ca3af); }
 .dwa-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-.dwa-btn-primary { background: var(--ntr-accent); color: var(--dsw-alias-button-primary-invert, #fff); border-color: transparent; font-weight: 550; }
+.dwa-btn-primary { background: var(--ntr-accent); color: var(--dsw-alias-label-primary-foreground, #fff); border-color: transparent; font-weight: 550; }
 .dwa-btn-primary:hover { background: var(--ntr-accent); border-color: transparent; opacity: 0.88; }
 .dwa-btn-secondary { background: var(--dsw-alias-bg-layer-2, #f3f4f6); }
-.dwa-btn-danger { color: var(--ntr-danger); border-color: #fca5a5; }
-.dwa-btn-danger:hover { background: #fee2e2; }
+.dwa-btn-danger { color: var(--ntr-danger); border-color: var(--dsw-alias-state-error-secondary, #fca5a5); }
+.dwa-btn-danger:hover { background: var(--dsw-alias-interactive-bg-hover-danger, #fee2e2); }
 .dwa-section { margin-bottom: 24px; }
 .dwa-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
 .dwa-section-title { font-size: 14px; font-weight: 650; margin: 0; display: flex; align-items: center; gap: 8px; }
 .dwa-section-copy { margin: 3px 0 0; font-size: var(--ntr-font-xs); color: var(--ntr-muted); }
 .dwa-card { border: var(--ntr-line); border-radius: var(--ntr-radius); padding: 16px; background: var(--dsw-alias-bg-layer-1, #fff); font-size: var(--ntr-font); line-height: 1.55; }
-.dwa-card-warn { border-left: 3px solid var(--dsw-alias-state-warn-primary, #d97706); background: var(--dsw-alias-state-warn-secondary, #fffbeb); }
+.dwa-card-warn { border-left: 3px solid var(--dsw-alias-state-warn-primary, #d97706); background: var(--dsw-alias-state-warn-tertiary, #fffbeb); }
 .dwa-mode-banner { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 16px; align-items: start; margin-bottom: 24px; padding: 14px 16px; }
 .dwa-mode-title { display: flex; align-items: center; gap: 8px; font-weight: 650; }
 .dwa-mode-copy { grid-column: 1 / -1; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
 .dwa-mode-source { display: block; margin-top: 5px; overflow-wrap: anywhere; opacity: 0.85; }
 .dwa-badge { font-size: var(--ntr-font-xs); line-height: 1.4; border-radius: 999px; padding: 2px 8px; background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: var(--ntr-muted); font-weight: 550; display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
-.dwa-badge-success { background: #22c55e1c; color: #15803d; }
-.dwa-badge-warn { background: #f59e0b1f; color: #b45309; }
-.dwa-badge-info { background: #3b82f61a; color: #2563eb; }
+.dwa-badge-success { background: var(--dsw-alias-state-success-tertiary, #dcfce7); color: var(--ntr-success); }
+.dwa-badge-warn { background: var(--dsw-alias-state-warn-tertiary, #fef3c7); color: var(--ntr-warn); }
+.dwa-badge-info { background: var(--dsw-alias-state-business-tertiary, #dbeafe); color: var(--dsw-alias-state-business-primary, #2563eb); }
 .dwa-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
 .dwa-agent-list { display: flex; flex-direction: column; gap: 8px; }
 .dwa-agent-card { border: var(--ntr-line); border-radius: var(--ntr-radius); background: var(--dsw-alias-bg-layer-1, #fff); overflow: visible; transition: border-color 0.15s ease; }
@@ -116,7 +118,7 @@ const STYLE = `
 .dwa-subsection-copy { margin: 3px 0 0; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
 .dwa-form-row { display: flex; gap: var(--ntr-gap-3); margin-bottom: 14px; align-items: flex-start; }
 .dwa-form-col { flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-.dwa-form-label { font-size: var(--ntr-font-sm); font-weight: 600; color: var(--dsw-alias-text-primary, #374151); }
+.dwa-form-label { font-size: var(--ntr-font-sm); font-weight: 600; color: var(--dsw-alias-label-primary, #374151); }
 .dwa-hint { font-size: var(--ntr-font-xs); line-height: 1.55; color: var(--ntr-muted); }
 .dwa-error { font-size: var(--ntr-font-xs); color: var(--ntr-danger); }
 .dwa-input { min-height: 36px; font: inherit; font-size: var(--ntr-font-sm); padding: 7px 10px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-1, #fff); color: inherit; width: 100%; box-sizing: border-box; }
@@ -141,7 +143,7 @@ const STYLE = `
 .dwa-add-content { border-top: var(--ntr-line); padding: 14px 16px 16px; }
 .dwa-chip { min-height: 30px; font: inherit; font-size: var(--ntr-font-sm); border: var(--ntr-line); border-radius: 999px; padding: 4px 12px; background: var(--dsw-alias-bg-layer-1, #fff); cursor: pointer; color: inherit; }
 .dwa-chip:hover { background: var(--dsw-alias-interactive-bg-active, #f3f4f6); }
-.dwa-chip-active { border-color: var(--ntr-accent); background: #3b82f614; color: #2563eb; font-weight: 550; }
+.dwa-chip-active { border-color: var(--ntr-accent); background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 8%, transparent); color: var(--dsw-alias-state-business-primary, #2563eb); font-weight: 550; }
 .dwa-chip-list { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin: 0 0 12px; }
 .dwa-switch { display: inline-flex; align-items: center; gap: 7px; font-size: var(--ntr-font-sm); cursor: pointer; user-select: none; }
 .dwa-inline-setting { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-2, #f9fafb); }
@@ -154,7 +156,7 @@ const STYLE = `
 /* Tall enough for a comfortable selection (about ten rows) before scrolling;
    the cap keeps the two stacked panes from pushing the rest of the card away. */
 .dwa-model-pane { min-width: 0; max-height: 360px; display: flex; flex-direction: column; border: var(--ntr-line); border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-1, #fff); overflow: hidden; }
-.dwa-model-pane-head { display: flex; align-items: center; gap: 6px; padding: 7px 9px; border-bottom: var(--ntr-line); font-size: var(--ntr-font-xs); font-weight: 600; color: var(--dsw-alias-text-secondary, #4b5563); }
+.dwa-model-pane-head { display: flex; align-items: center; gap: 6px; padding: 7px 9px; border-bottom: var(--ntr-line); font-size: var(--ntr-font-xs); font-weight: 600; color: var(--dsw-alias-label-secondary, #4b5563); }
 .dwa-model-pane-head .dwa-btn { margin-left: auto; min-height: 26px; padding: 2px 8px; font-size: var(--ntr-font-xs); }
 .dwa-model-pane-head .dwa-caret-btn { flex: none; width: 22px; height: 22px; background: transparent; }
 .dwa-model-pane-head .dwa-caret-btn:hover { background: var(--dsw-alias-interactive-bg-active, #e5e7eb); }
@@ -172,7 +174,7 @@ const STYLE = `
 .dwa-model-empty { padding: 6px; }
 .dwa-model-row { display: flex; align-items: center; gap: 6px; width: 100%; border: none; background: none; padding: 5px 6px; border-radius: 5px; cursor: pointer; color: inherit; font: inherit; font-size: var(--ntr-font-sm); text-align: left; }
 .dwa-model-row:hover { background: var(--dsw-alias-interactive-bg-active, #f3f4f6); }
-.dwa-model-row.is-on { background: #3b82f614; color: #2563eb; }
+.dwa-model-row.is-on { background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 8%, transparent); color: var(--dsw-alias-state-business-primary, #2563eb); }
 .dwa-model-row-mark { width: 12px; flex: none; text-align: center; opacity: 0.75; }
 .dwa-model-row-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Name and credit keep their room; the id is the only cell that collapses. */
@@ -194,7 +196,7 @@ const STYLE = `
 .dwa-seg > button { min-height: 30px; font: inherit; font-size: var(--ntr-font-sm); color: inherit; border: none; background: var(--dsw-alias-bg-layer-1, #fff); padding: 4px 14px; cursor: pointer; }
 .dwa-seg > button + button { border-left: 1px solid var(--dsw-alias-border-l2, #d1d5db); }
 .dwa-seg > button:hover { background: var(--dsw-alias-interactive-bg-active, #f3f4f6); }
-.dwa-seg > button.is-on { background: var(--ntr-accent); color: var(--dsw-alias-button-primary-invert, #fff); font-weight: 550; }
+.dwa-seg > button.is-on { background: var(--ntr-accent); color: var(--dsw-alias-label-primary-foreground, #fff); font-weight: 550; }
 .dwa-preference-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 0; }
 .dwa-preference-row + .dwa-preference-row { border-top: var(--ntr-line); }
 /* A control that needs the whole card: the label sits above it, not beside
@@ -255,9 +257,9 @@ function useUi(acp: AcpStore) {
 
 function stateVisual(state: AgentView['state'], acp: AcpStore): { color: string; text: string; title?: string } {
   switch (state) {
-    case 'ready': return { color: '#22c55e', text: acp.label('已连接', 'Connected') }
-    case 'starting': return { color: '#eab308', text: acp.label('启动中', 'Starting') }
-    case 'error': return { color: '#ef4444', text: acp.label('错误', 'Error') }
+    case 'ready': return { color: 'var(--dsw-alias-state-success-primary, #22c55e)', text: acp.label('已连接', 'Connected') }
+    case 'starting': return { color: 'var(--dsw-alias-state-warn-primary, #eab308)', text: acp.label('启动中', 'Starting') }
+    case 'error': return { color: 'var(--dsw-alias-state-error-primary, #ef4444)', text: acp.label('错误', 'Error') }
     // A configured-but-resting agent is the normal state, not a fault: the
     // process is not kept resident and connects on demand the first time a DSH
     // chat turn uses it. Surfacing a runtime lifecycle here ("stopped"/"idle")
@@ -265,7 +267,7 @@ function stateVisual(state: AgentView['state'], acp: AcpStore): { color: string;
     // which the config-time 测试连接 (agent/test) already answers. So the
     // resting state just says 已配置.
     default: return {
-      color: '#9ca3af',
+      color: 'var(--dsw-alias-state-idle-primary, #9ca3af)',
       text: acp.label('已配置', 'Configured'),
       title: acp.label(
         '已配置，进程不常驻。在 DSH 聊天中首次使用时自动连接；展开区可用「测试连接」验证命令能否正常起来。',
@@ -853,7 +855,7 @@ export function AcpSettingsSection(props: WithStore) {
           <div className="dwa-page-status">
             <span
               className="dwa-dot"
-              style={{ background: ui.stream === 'live' ? '#22c55e' : ui.stream === 'down' ? '#ef4444' : '#9ca3af' }}
+              style={{ background: ui.stream === 'live' ? 'var(--dsw-alias-state-success-primary, #22c55e)' : ui.stream === 'down' ? 'var(--dsw-alias-state-error-primary, #ef4444)' : 'var(--dsw-alias-state-idle-primary, #9ca3af)' }}
               title={ui.stream}
             />
             <span>{streamText(ui.stream, acp)}</span>
@@ -1650,7 +1652,7 @@ function AgentDetails({
               <span style={{ fontWeight: 600, marginRight: 6 }}>
                 {acp.label('官方测试默认命令:', 'Tested Default Command:')}
               </span>
-              <code className="dwa-input-mono" style={{ background: '#0000000a', padding: '2px 6px', borderRadius: 4 }}>
+              <code className="dwa-input-mono" style={{ background: 'var(--dsw-alias-markdown-inline-code, #0000000a)', padding: '2px 6px', borderRadius: 4 }}>
                 {detected.defaultCommand} {detected.defaultArgs.join(' ')}
               </code>
             </div>
@@ -1839,7 +1841,7 @@ function AgentDetails({
             fontSize: 12,
             whiteSpace: 'pre-wrap',
             wordBreak: 'break-all',
-            color: testResult.ok ? '#16a34a' : 'var(--ntr-danger)',
+            color: testResult.ok ? 'var(--ntr-success)' : 'var(--ntr-danger)',
           }}
         >
           {testResult.ok ? '✓ ' : '✕ '}{testResult.text}
@@ -2327,7 +2329,7 @@ function ModelCatalogBlock({
             type="checkbox"
             checked={autoDiscover}
             onChange={e => void toggleAutoDiscover(e.target.checked)}
-            style={{ margin: 0, accentColor: '#2563eb' }}
+            style={{ margin: 0, accentColor: 'var(--dsw-alias-state-business-primary, #2563eb)' }}
           />
           {acp.label('自动发现新模型', 'Auto-discover new models')}
         </label>
