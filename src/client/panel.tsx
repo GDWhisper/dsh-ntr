@@ -57,18 +57,34 @@ const STYLE = `
   --ntr-success: color-mix(in srgb, var(--dsw-alias-state-success-primary, #16a34a) 72%, var(--dsw-alias-label-primary, #111827));
   --ntr-accent: var(--dsw-alias-button-primary-fill, #2563eb);
   width: 100%; max-width: 960px; box-sizing: border-box; margin: 0 auto;
-  padding: 20px; overflow: auto; font-size: var(--ntr-font); line-height: 1.55;
+  padding: 28px 32px; min-width: 0; container-type: inline-size; font-size: var(--ntr-font); line-height: 1.55;
 }
-.dwa-root button, .dwa-root input, .dwa-root select { font-family: inherit; }
+.dwa-root [hidden] { display: none !important; }
+.dwa-root button, .dwa-root input, .dwa-root select, .dwa-root textarea { font-family: inherit; }
+.dwa-root input, .dwa-root textarea { min-width: 0; }
+.dwa-tabs { display: flex; gap: 24px; flex-wrap: wrap; border-bottom: var(--ntr-line); margin-bottom: 24px; }
+.dwa-tabs > button { font: inherit; color: var(--ntr-muted); background: transparent; border: 0; border-bottom: 2px solid transparent; padding: 0 0 12px; min-height: 40px; white-space: nowrap; cursor: pointer; }
+.dwa-tabs > button:hover { color: var(--dsw-alias-label-primary, #111827); }
+.dwa-tabs > button[aria-pressed="true"] { color: var(--dsw-alias-label-primary, #111827); border-bottom-color: currentColor; font-weight: 550; }
+.dwa-detail-tabs { margin: 4px 0 20px; gap: 20px; }
+.dwa-detail-tabs > button { font-size: var(--ntr-font-sm); }
+.dwa-row-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dwa-notice { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+.dwa-notice > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.dwa-empty { text-align: center; padding: 40px 16px; color: var(--ntr-muted); }
+.dwa-empty h3 { font-size: 16px; font-weight: 550; color: var(--dsw-alias-label-primary, #111827); margin: 0 0 8px; }
+.dwa-empty .dwa-btn { margin-top: 20px; }
+.dwa-health { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 24px; color: var(--ntr-muted); font-size: var(--ntr-font-sm); flex-wrap: wrap; }
+.dwa-health-status { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.dwa-health-status > span:last-child:not(:nth-child(2)) { padding-left: 12px; border-left: var(--ntr-line); }
+.dwa-back { margin-bottom: 16px; }
 .dwa-root button:focus-visible, .dwa-root input:focus-visible, .dwa-root select:focus-visible {
   outline: 2px solid var(--ntr-accent); outline-offset: 2px;
 }
-.dwa-page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 20px; }
+.dwa-page-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 28px; }
 .dwa-page-heading { min-width: 0; }
-.dwa-page-title { margin: 0; font-size: 20px; line-height: 1.35; font-weight: 650; letter-spacing: -0.02em; }
+.dwa-page-title { margin: 0; font-size: 20px; line-height: 1.35; font-weight: 550; letter-spacing: -0.02em; }
 .dwa-page-description { margin: 5px 0 0; color: var(--ntr-muted); font-size: var(--ntr-font-sm); }
-.dwa-page-status { display: flex; align-items: center; gap: 8px; margin-top: 10px; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
-.dwa-page-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .dwa-btn {
   min-height: 32px; box-sizing: border-box; font: inherit; border-radius: var(--ntr-radius-sm);
   border: 1px solid var(--dsw-alias-border-l2, #d1d5db); background: var(--dsw-alias-bg-layer-1, #fff);
@@ -81,14 +97,16 @@ const STYLE = `
 .dwa-btn-primary { background: var(--ntr-accent); color: var(--dsw-alias-label-primary-foreground, #fff); border-color: transparent; font-weight: 550; }
 .dwa-btn-primary:hover { background: var(--ntr-accent); border-color: transparent; opacity: 0.88; }
 .dwa-btn-secondary { background: var(--dsw-alias-bg-layer-2, #f3f4f6); }
+.dwa-btn-quiet { background: transparent; border-color: transparent; color: var(--ntr-muted); }
+.dwa-btn-quiet:hover { border-color: transparent; color: var(--dsw-alias-label-primary, #111827); }
 .dwa-btn-danger { color: var(--ntr-danger); border-color: var(--dsw-alias-state-error-secondary, #fca5a5); }
 .dwa-btn-danger:hover { background: var(--dsw-alias-interactive-bg-hover-danger, #fee2e2); }
 .dwa-section { margin-bottom: 24px; }
 .dwa-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
-.dwa-section-title { font-size: 14px; font-weight: 650; margin: 0; display: flex; align-items: center; gap: 8px; }
+.dwa-section-title { font-size: 13px; font-weight: 550; margin: 0; display: flex; align-items: center; gap: 8px; }
 .dwa-section-copy { margin: 3px 0 0; font-size: var(--ntr-font-xs); color: var(--ntr-muted); }
 .dwa-card { border: var(--ntr-line); border-radius: var(--ntr-radius); padding: 16px; background: var(--dsw-alias-bg-layer-1, #fff); font-size: var(--ntr-font); line-height: 1.55; }
-.dwa-card-warn { border-left: 3px solid var(--dsw-alias-state-warn-primary, #d97706); background: var(--dsw-alias-state-warn-tertiary, #fffbeb); }
+.dwa-card-warn { border-color: color-mix(in srgb, var(--ntr-warn) 30%, var(--dsw-alias-border-l2, #e5e7eb)); background: var(--dsw-alias-state-warn-tertiary, #fffbeb); }
 .dwa-mode-banner { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 16px; align-items: start; margin-bottom: 24px; padding: 14px 16px; }
 .dwa-mode-title { display: flex; align-items: center; gap: 8px; font-weight: 650; }
 .dwa-mode-copy { grid-column: 1 / -1; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
@@ -98,25 +116,21 @@ const STYLE = `
 .dwa-badge-warn { background: var(--dsw-alias-state-warn-tertiary, #fef3c7); color: var(--ntr-warn); }
 .dwa-badge-info { background: var(--dsw-alias-state-business-tertiary, #dbeafe); color: var(--dsw-alias-state-business-primary, #2563eb); }
 .dwa-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
-.dwa-agent-list { display: flex; flex-direction: column; gap: 8px; }
-.dwa-agent-card { border: var(--ntr-line); border-radius: var(--ntr-radius); background: var(--dsw-alias-bg-layer-1, #fff); overflow: visible; transition: border-color 0.15s ease; }
-.dwa-agent-card.is-open { border-color: var(--dsw-alias-border-l1, #c7ccd1); }
-.dwa-agent-row { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 12px 14px; }
+.dwa-agent-list { display: flex; flex-direction: column; border-top: var(--ntr-line); }
+.dwa-agent-card { border-bottom: var(--ntr-line); min-width: 0; }
+.dwa-agent-row { display: grid; grid-template-columns: 38px minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 16px 0; }
+.dwa-agent-avatar { display: grid; place-items: center; width: 38px; height: 38px; border: var(--ntr-line); border-radius: 9px; background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: var(--ntr-muted); font: 12px var(--ds-font-family-code, monospace); }
 .dwa-caret { font-size: 14px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; width: 1em; }
 .dwa-caret-btn { font: inherit; border: none; background: var(--dsw-alias-bg-layer-2, #f3f4f6); width: 28px; height: 28px; padding: 0; border-radius: var(--ntr-radius-sm); display: inline-flex; align-items: center; justify-content: center; color: var(--ntr-muted); cursor: pointer; }
 .dwa-caret-btn:hover { background: var(--dsw-alias-interactive-bg-active, #e5e7eb); color: inherit; }
 .dwa-agent-summary { min-width: 0; }
 .dwa-agent-titleline { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
-.dwa-agent-name { font-size: 13px; font-weight: 650; overflow-wrap: anywhere; }
+.dwa-agent-name { font-size: 13px; font-weight: 550; overflow-wrap: anywhere; }
 .dwa-agent-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 4px; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
 .dwa-agent-meta-separator { opacity: 0.45; }
-.dwa-agent-body { border-top: var(--ntr-line); padding: 0 16px 16px; }
-.dwa-subsection { padding-top: 16px; }
-.dwa-subsection + .dwa-subsection { margin-top: 16px; border-top: var(--ntr-line); }
-.dwa-subsection-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
-.dwa-subsection-title { margin: 0; font-size: 13px; font-weight: 650; }
-.dwa-subsection-copy { margin: 3px 0 0; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
-.dwa-form-row { display: flex; gap: var(--ntr-gap-3); margin-bottom: 14px; align-items: flex-start; }
+.dwa-agent-body { padding: 0 0 24px 52px; }
+.dwa-subsection { min-width: 0; }
+.dwa-form-row { display: flex; gap: var(--ntr-gap-3); margin-bottom: 14px; align-items: stretch; }
 .dwa-form-col { flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .dwa-form-label { font-size: var(--ntr-font-sm); font-weight: 600; color: var(--dsw-alias-label-primary, #374151); }
 .dwa-hint { font-size: var(--ntr-font-xs); line-height: 1.55; color: var(--ntr-muted); }
@@ -125,11 +139,13 @@ const STYLE = `
 .dwa-select { min-height: 32px; font: inherit; font-size: var(--ntr-font-sm); padding: 5px 8px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-1, #fff); color: inherit; }
 .dwa-input:hover, .dwa-select:hover { border-color: var(--dsw-alias-border-l1, #9ca3af); }
 .dwa-input:focus, .dwa-select:focus { border-color: var(--ntr-accent); }
-.dwa-input-mono, .dwa-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+.dwa-input-mono, .dwa-mono { font-family: var(--ds-font-family-code, ui-monospace), SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
 .dwa-stderr { max-height: 120px; overflow: auto; font-family: monospace; font-size: var(--ntr-font-xs); white-space: pre-wrap; color: var(--ntr-warn); margin: 12px 0 0; }
 .dwa-default-hint { background: var(--dsw-alias-bg-layer-2, #f9fafb); border: var(--ntr-line); border-radius: var(--ntr-radius-sm); padding: 10px 12px; font-size: var(--ntr-font-sm); display: flex; align-items: center; justify-content: space-between; margin: 12px 0 14px; gap: 12px; }
 .dwa-form-actions { display: flex; align-items: center; gap: 8px; margin-top: 16px; padding-top: 14px; border-top: var(--ntr-line); flex-wrap: wrap; }
 .dwa-form-actions .dwa-btn-primary { min-width: 88px; }
+.dwa-form-actions > .dwa-hint:first-child { margin-right: auto; }
+.dwa-form-actions > .dwa-hint:last-child:not(:first-child) { width: 100%; }
 .dwa-menu-wrap { position: relative; }
 .dwa-menu-wrap > .dwa-btn { width: 32px; padding: 0; }
 .dwa-menu { position: absolute; right: 0; top: calc(100% + 4px); z-index: 20; min-width: 190px; border: var(--ntr-line); border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-1, #fff); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12); padding: 4px; display: flex; flex-direction: column; }
@@ -137,10 +153,10 @@ const STYLE = `
 .dwa-menu-item:hover { background: var(--dsw-alias-interactive-bg-active, #f3f4f6); }
 .dwa-menu-item-danger { color: var(--ntr-danger); }
 .dwa-menu-confirm { display: flex; align-items: center; gap: 4px; padding: 4px; }
-.dwa-add-panel { border: var(--ntr-line); border-radius: var(--ntr-radius); background: var(--dsw-alias-bg-layer-1, #fff); }
-.dwa-add-toggle { width: 100%; border: 0; background: transparent; color: inherit; padding: 13px 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; text-align: left; cursor: pointer; border-radius: var(--ntr-radius); }
-.dwa-add-toggle:hover { background: var(--dsw-alias-interactive-bg-active, #f9fafb); }
-.dwa-add-content { border-top: var(--ntr-line); padding: 14px 16px 16px; }
+.dwa-add-panel .dwa-agent-row { display: none; }
+.dwa-add-panel .dwa-agent-body { padding: 0 0 24px; }
+.dwa-add-panel .dwa-agent-card { border: 0; }
+.dwa-add-content { padding-top: 10px; }
 .dwa-chip { min-height: 30px; font: inherit; font-size: var(--ntr-font-sm); border: var(--ntr-line); border-radius: 999px; padding: 4px 12px; background: var(--dsw-alias-bg-layer-1, #fff); cursor: pointer; color: inherit; }
 .dwa-chip:hover { background: var(--dsw-alias-interactive-bg-active, #f3f4f6); }
 .dwa-chip-active { border-color: var(--ntr-accent); background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 8%, transparent); color: var(--dsw-alias-state-business-primary, #2563eb); font-weight: 550; }
@@ -172,13 +188,13 @@ const STYLE = `
 .dwa-model-status { margin-left: auto; white-space: nowrap; }
 .dwa-model-search { width: 200px; min-height: 30px; }
 .dwa-model-empty { padding: 6px; }
-.dwa-model-row { display: flex; align-items: center; gap: 6px; width: 100%; border: none; background: none; padding: 5px 6px; border-radius: 5px; cursor: pointer; color: inherit; font: inherit; font-size: var(--ntr-font-sm); text-align: left; }
+.dwa-model-row { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 38px; border: none; background: none; padding: 7px 8px; border-radius: 5px; cursor: pointer; color: inherit; font: inherit; font-size: var(--ntr-font-sm); text-align: left; }
 .dwa-model-row:hover { background: var(--dsw-alias-interactive-bg-active, #f3f4f6); }
 .dwa-model-row.is-on { background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 8%, transparent); color: var(--dsw-alias-state-business-primary, #2563eb); }
 .dwa-model-row-mark { width: 12px; flex: none; text-align: center; opacity: 0.75; }
 .dwa-model-row-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Name and credit keep their room; the id is the only cell that collapses. */
-.dwa-model-row-desc { flex: 0 0 auto; max-width: 45%; opacity: 0.75; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dwa-model-row-desc { flex: 0 0 auto; max-width: 45%; opacity: 0.75; font-size: var(--ntr-font-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* The trailing 14px is reserved for the fade mask: while the id fits, the
    gradient only covers empty padding; once it overflows, its tail dissolves
    instead of ending in a hard ellipsis. armModelIdMarquee reads the same
@@ -192,12 +208,12 @@ const STYLE = `
 }
 .dwa-model-row-remove { flex: none; opacity: 0.5; padding: 0 2px; }
 .dwa-model-row:hover .dwa-model-row-remove { opacity: 1; }
-.dwa-seg { display: inline-flex; border-radius: var(--ntr-radius-sm); border: 1px solid var(--dsw-alias-border-l2, #d1d5db); overflow: hidden; vertical-align: middle; }
-.dwa-seg > button { min-height: 30px; font: inherit; font-size: var(--ntr-font-sm); color: inherit; border: none; background: var(--dsw-alias-bg-layer-1, #fff); padding: 4px 14px; cursor: pointer; }
-.dwa-seg > button + button { border-left: 1px solid var(--dsw-alias-border-l2, #d1d5db); }
+.dwa-seg { display: inline-flex; gap: 4px; padding: 4px; box-sizing: border-box; border-radius: var(--ntr-radius-sm); border: var(--ntr-line); background: var(--dsw-alias-bg-layer-2, #f3f4f6); vertical-align: middle; }
+.dwa-seg > button { min-height: 32px; font: inherit; font-size: var(--ntr-font-sm); color: var(--ntr-muted); border: 1px solid transparent; border-radius: 4px; background: transparent; padding: 4px 12px; cursor: pointer; white-space: nowrap; }
 .dwa-seg > button:hover { background: var(--dsw-alias-interactive-bg-active, #f3f4f6); }
-.dwa-seg > button.is-on { background: var(--ntr-accent); color: var(--dsw-alias-label-primary-foreground, #fff); font-weight: 550; }
-.dwa-preference-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 0; }
+.dwa-seg > button.is-on { background: var(--dsw-alias-bg-layer-1, #fff); border: var(--ntr-line); color: var(--dsw-alias-label-primary, #111827); font-weight: 550; }
+.dwa-preferences { border-top: var(--ntr-line); }
+.dwa-preference-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px 0; }
 .dwa-preference-row + .dwa-preference-row { border-top: var(--ntr-line); }
 /* A control that needs the whole card: the label sits above it, not beside
    it. A right-aligned segmented control squeezed its labels into two lines
@@ -222,13 +238,20 @@ const STYLE = `
 .dwa-deadline-warn { margin-top: 10px; padding: 9px 12px; border-left: 3px solid var(--dsw-alias-state-warn-primary, #d97706); background: var(--dsw-alias-state-warn-secondary, #fffbeb); border-radius: var(--ntr-radius-sm); font-size: var(--ntr-font-xs); line-height: 1.55; }
 .dwa-deadline-reset { display: flex; justify-content: flex-end; margin-top: 8px; }
 @media (max-width: 640px) {
-  .dwa-root { padding: 14px; }
-  .dwa-page-header { flex-direction: column; }
-  .dwa-page-actions { width: 100%; }
-  .dwa-page-actions .dwa-btn { width: 100%; }
+  .dwa-root { padding: 20px 16px; }
+}
+@container (max-width: 640px) {
+  .dwa-page-header { align-items: flex-start; flex-wrap: wrap; }
+  .dwa-agent-body { padding-left: 0; }
+  .dwa-agent-row { grid-template-columns: 32px minmax(0, 1fr) auto; gap: 10px; }
+  .dwa-agent-avatar { width: 32px; height: 32px; }
+  .dwa-section-heading { flex-wrap: wrap; }
+  .dwa-tabs { gap: 20px; }
+  .dwa-notice { flex-wrap: wrap; }
+  .dwa-seg-wide > button { padding-inline: 5px; }
   .dwa-model-toolbar-actions { width: 100%; }
   .dwa-model-search { flex: 1 1 auto; width: auto; }
-  .dwa-subsection-head, .dwa-preference-row { align-items: flex-start; flex-direction: column; }
+  .dwa-preference-row { align-items: flex-start; flex-direction: column; }
   .dwa-default-hint { align-items: flex-start; flex-direction: column; }
   /* The slider's scale: up to eight rungs with full unit words ("15 分钟")
      need a smaller face before they can collide on a narrow panel. The rung
@@ -809,7 +832,7 @@ function ApprovalDeadlinesCard(props: { acp: AcpStore; ui: UiState }) {
           </p>
         </div>
       </div>
-      <div className="dwa-card" style={{ paddingTop: 4, paddingBottom: 4 }}>
+      <div className="dwa-preferences">
         <DeadlineModeBlock acp={acp} mode={deadlines.mode} override={modeNote} />
         <DeadlineSliderBlock
           acp={acp}
@@ -829,51 +852,38 @@ function ApprovalDeadlinesCard(props: { acp: AcpStore; ui: UiState }) {
   )
 }
 
-/** Settings configuration section for ACP agents. */
+type SettingsPage = 'agents' | 'add' | 'approvals' | 'appearance' | 'diagnostics'
+
 export function AcpSettingsSection(props: WithStore) {
   const acp = props.acp
   ensureStyle()
   const ui = useUi(acp)
   const ledger = permissionLedgerCard(ui)
-  // The agent list section opens by default. `addTarget === undefined` means
-  // "follow the first available preset"; an explicit chip click pins the
-  // selection until the next create resets it.
-  const [addOpen, setAddOpen] = useState(true)
+  const [page, setPage] = useState<SettingsPage>('agents')
+  const [addOpen, setAddOpen] = useState(false)
   const [addTarget, setAddTarget] = useState<DetectedAgentInfo | undefined>(undefined)
-  const [createNonce, setCreateNonce] = useState(0)
   const { configured, available } = partitionAgents(ui.detectedAgents, ui.agents)
   const selected = addTarget ?? available[0] ?? NEW_AGENT_SEED
+  const openAdd = (): void => {
+    setAddOpen(true)
+    setPage('add')
+  }
+  const presetProblem = ui.preset !== undefined && (!ui.preset.installed || ui.preset.problem !== undefined)
 
   return (
     <div className="dwa-root">
       <header className="dwa-page-header">
         <div className="dwa-page-heading">
-          <h2 className="dwa-page-title">{acp.label('NTR 智能体', 'NTR Agents')}</h2>
+          <h2 className="dwa-page-title">{acp.label('NTR 设置', 'NTR settings')}</h2>
           <p className="dwa-page-description">
-            {acp.label('管理智能体连接、可用模型与对话显示偏好。', 'Manage agent connections, available models, and conversation display preferences.')}
+            {acp.label('连接智能体，设置你的对话偏好。', 'Connect agents and set your conversation preferences.')}
           </p>
-          <div className="dwa-page-status">
-            <span
-              className="dwa-dot"
-              style={{ background: ui.stream === 'live' ? 'var(--dsw-alias-state-success-primary, #22c55e)' : ui.stream === 'down' ? 'var(--dsw-alias-state-error-primary, #ef4444)' : 'var(--dsw-alias-state-idle-primary, #9ca3af)' }}
-              title={ui.stream}
-            />
-            <span>{streamText(ui.stream, acp)}</span>
-            {ui.detectSummary !== undefined && <span>· {ui.detectSummary}</span>}
-          </div>
         </div>
-        <div className="dwa-page-actions">
-          <button
-            className="dwa-btn"
-            onClick={() => {
-              void acp.resync()
-              void acp.detectAgents()
-            }}
-            disabled={ui.detecting}
-          >
-            {ui.detecting ? acp.label('检测中...', 'Detecting...') : acp.label('重新检测与刷新', 'Re-detect & Refresh')}
+        {page === 'agents' && configured.length > 0 && (
+          <button type="button" className="dwa-btn dwa-btn-primary" onClick={openAdd}>
+            {acp.label('添加智能体', 'Add agent')}
           </button>
-        </div>
+        )}
       </header>
 
       {/* The cross-session mirror: the conversation dock answers the asks
@@ -900,14 +910,15 @@ export function AcpSettingsSection(props: WithStore) {
               {permission.options.map(option => (
                 <button
                   key={option.optionId}
-                  className="dwa-btn dwa-btn-primary"
+                  type="button"
+                  className="dwa-btn"
                   onClick={() => { void acp.respondPermission(permission.requestId, option.optionId).catch(() => undefined) }}
                 >
                   {option.name}
                 </button>
               ))}
-              <button className="dwa-btn" onClick={() => { void acp.respondPermission(permission.requestId).catch(() => undefined) }}>
-                {acp.label('拒绝', 'Dismiss')}
+              <button type="button" className="dwa-btn dwa-btn-quiet" onClick={() => { void acp.respondPermission(permission.requestId).catch(() => undefined) }}>
+                {acp.label('取消', 'Cancel')}
               </button>
             </div>
           ))}
@@ -917,17 +928,34 @@ export function AcpSettingsSection(props: WithStore) {
       {ui.notice !== undefined && (
         <div className="dwa-card dwa-card-warn" style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
           <span style={{ flex: 1 }}>{ui.notice}</span>
-          <button className="dwa-btn" onClick={() => acp.clearNotice()}>✕</button>
+          <button type="button" className="dwa-btn dwa-btn-quiet" aria-label={acp.label('关闭通知', 'Dismiss notice')} onClick={() => acp.clearNotice()}>✕</button>
         </div>
       )}
 
-      {/* ACP 模式: the agent preset the new-session picker offers.
-
-          Nothing is installed from here — the preset is a declaration this
-          package ships in its OWN bundle patch (`presets/acp/acp.patch.yml`),
-          so the card is a read-only window onto the harness roster: it exists
-          to say why the mode is missing when its activation failed. */}
-      {ui.preset !== undefined && (
+      {presetProblem && (
+        <div className="dwa-card dwa-card-warn dwa-notice" role="status">
+          <span>{acp.label('NTR 模式需要检查，当前可能无法开始对话。', 'NTR mode needs attention; new conversations may be unavailable.')}</span>
+          <button type="button" className="dwa-btn" onClick={() => setPage('diagnostics')}>{acp.label('查看诊断', 'View diagnostics')}</button>
+        </div>
+      )}
+      <nav className="dwa-tabs" aria-label={acp.label('NTR 设置分类', 'NTR settings categories')}>
+        <button type="button" aria-pressed={page === 'agents'} onClick={() => setPage('agents')}>{acp.label('智能体', 'Agents')}</button>
+        {ui.approvalDeadlines !== undefined && <button type="button" aria-pressed={page === 'approvals'} onClick={() => setPage('approvals')}>{acp.label('审批时限', 'Approval deadlines')}</button>}
+        <button type="button" aria-pressed={page === 'appearance'} onClick={() => setPage('appearance')}>{acp.label('对话外观', 'Appearance')}</button>
+      </nav>
+      {page === 'diagnostics' && (
+        <section className="dwa-section">
+          <h3 className="dwa-section-title">{acp.label('连接诊断', 'Connection diagnostics')}</h3>
+          <div className="dwa-preference-row"><span>{acp.label('宿主事件流', 'Host event stream')}</span><span className="dwa-hint">{streamText(ui.stream, acp)}</span></div>
+          <div className="dwa-row-actions">
+            <button type="button" className="dwa-btn" onClick={() => { void acp.resync(); void acp.detectAgents() }} disabled={ui.detecting}>
+              {ui.detecting ? acp.label('检测中...', 'Detecting...') : acp.label('重新检测与刷新', 'Re-detect & Refresh')}
+            </button>
+            {ui.detectSummary !== undefined && <span className="dwa-hint" role="status">{ui.detectSummary}</span>}
+          </div>
+        </section>
+      )}
+      {page === 'diagnostics' && ui.preset !== undefined && (
         <div className="dwa-card dwa-mode-banner">
           <div className="dwa-mode-title">
             {acp.label('NTR 模式', 'NTR mode')}
@@ -950,24 +978,24 @@ export function AcpSettingsSection(props: WithStore) {
         </div>
       )}
 
-      {/* Connected ACP agents: one compact row per agent, details on demand */}
-      <section className="dwa-section">
+      {/* Keep editors mounted so navigation preserves unsaved values. */}
+      <section className="dwa-section" hidden={page !== 'agents'} aria-label={acp.label('已接入的智能体', 'Connected agents')}>
         <div className="dwa-section-heading">
           <div>
             <h3 className="dwa-section-title">
               {acp.label('已接入的智能体', 'Connected agents')}
-              <span className="dwa-badge">{configured.length}</span>
+              {ui.agentsLoaded && <span className="dwa-badge">{configured.length}</span>}
             </h3>
-            <p className="dwa-section-copy">{acp.label('展开智能体可管理模型、启动命令与工作区。', 'Expand an agent to manage its models, launch command, and workspace.')}</p>
           </div>
+          {configured.length > 0 && <span className="dwa-hint">{acp.label('默认项用于新的 NTR 会话', 'The default serves new NTR conversations')}</span>}
         </div>
 
-        {configured.length === 0 && (
-          <div className="dwa-card" style={{ textAlign: 'center', color: 'var(--ntr-muted)', padding: 20 }}>
-            {acp.label(
-              '尚未启用任何 Agent。从下方「添加智能体」点一个检测到的预设（会展开预填命令的创建卡），再点「保存并启用」；也可以直接新建自定义 Agent。',
-              'No agents configured yet. Pick a detected preset from "Add agent" below (it opens a creation card prefilled with its command), then click "Save & Enable" — or create a custom one from scratch.',
-            )}
+        {!ui.agentsLoaded && <div className="dwa-empty" role="status">{acp.label('正在读取智能体…', 'Loading agents…')}</div>}
+        {ui.agentsLoaded && configured.length === 0 && (
+          <div className="dwa-empty">
+            <h3>{acp.label('接入第一个智能体', 'Connect your first agent')}</h3>
+            <p className="dwa-section-copy">{acp.label('选择已有预设，或填写自己的 ACP 启动命令。', 'Choose a preset or enter your own ACP launch command.')}</p>
+            <button type="button" className="dwa-btn dwa-btn-primary" onClick={openAdd}>{acp.label('添加智能体', 'Add agent')}</button>
           </div>
         )}
 
@@ -982,24 +1010,22 @@ export function AcpSettingsSection(props: WithStore) {
                 acp={acp}
                 isDefault={ui.defaultAgent === info.id}
                 synthesized={synthesized}
+                active={page === 'agents'}
               />
             )
           })}
         </div>
       </section>
 
-      {/* Agent list: available presets plus the from-scratch creation form,
-          open by default so the page answers "what can I enable" without a
-          click. Selection follows the first available preset until pinned. */}
-      <section className="dwa-section">
+      <section className="dwa-section" hidden={page !== 'add'} aria-label={acp.label('添加智能体', 'Add agent')}>
+        <button type="button" className="dwa-btn dwa-btn-quiet dwa-back" onClick={() => setPage('agents')}>{acp.label('返回智能体列表', 'Back to agents')}</button>
         <div className="dwa-add-panel">
-          <button type="button" className="dwa-add-toggle" aria-expanded={addOpen} onClick={() => setAddOpen(open => !open)}>
-            <span>
-              <span className="dwa-section-title">{acp.label('添加智能体', 'Add agent')}</span>
-              <span className="dwa-section-copy" style={{ display: 'block' }}>{acp.label('从预设快速启用，或创建自定义连接。', 'Enable a preset or create a custom connection.')}</span>
-            </span>
-            <span className="dwa-caret-btn" aria-hidden><span className="dwa-caret">{addOpen ? '▾' : '▸'}</span></span>
-          </button>
+          <div className="dwa-section-heading">
+            <div>
+              <h3 className="dwa-section-title">{acp.label('添加智能体', 'Add agent')}</h3>
+              <p className="dwa-section-copy">{acp.label('从预设快速启用，或创建自定义连接。', 'Enable a preset or create a custom connection.')}</p>
+            </div>
+          </div>
           {addOpen && (
             <div className="dwa-add-content">
               <div className="dwa-chip-list">
@@ -1028,19 +1054,17 @@ export function AcpSettingsSection(props: WithStore) {
               </div>
             )}
             <AgentRow
-              key={selected.id === '' ? `custom-${createNonce}` : selected.id}
+              key={selected.id}
               detected={selected}
               acp={acp}
               isDefault={false}
               synthesized={false}
               newCustom={selected.id === ''}
+              active={page === 'add'}
               onCreated={() => {
-                // Creation done: drop the pin so the selection re-derives to
-                // the next available preset (or a fresh custom card), and bump
-                // the nonce so an all-custom reset still remounts empty
-                // instead of keeping the just-saved values in the form.
                 setAddTarget(undefined)
-                setCreateNonce(nonce => nonce + 1)
+                setAddOpen(false)
+                setPage('agents')
               }}
             />
             </div>
@@ -1048,24 +1072,16 @@ export function AcpSettingsSection(props: WithStore) {
         </div>
       </section>
 
-      {/* Approval deadlines: the two windows that bound an ask nobody
-          answered. Placed above the appearance card because it changes what
-          happens to a turn, and that card only decorates a nameplate. */}
-      <ApprovalDeadlinesCard acp={acp} ui={ui} />
+      <div hidden={page !== 'approvals'}><ApprovalDeadlinesCard acp={acp} ui={ui} /></div>
 
-      {/* Agent 挂牌光晕: how the composer tag shows a live agent. Plugin
-          display preference — host-persisted with the agent registry, so it
-          follows the profile rather than this one browser. Kept at the BOTTOM
-          of the section: the cards above answer "what serves my turns", this
-          one only decorates their nameplate. */}
-      <section className="dwa-section">
+      <section className="dwa-section" hidden={page !== 'appearance'} aria-label={acp.label('对话外观', 'Appearance')}>
         <div className="dwa-section-heading">
           <div>
             <h3 className="dwa-section-title">{acp.label('对话外观', 'Conversation appearance')}</h3>
             <p className="dwa-section-copy">{acp.label('设置对话中 NTR 挂牌的进程存活提示。', 'Choose how the NTR tag indicates a running agent process.')}</p>
           </div>
         </div>
-        <div className="dwa-card" style={{ paddingTop: 4, paddingBottom: 4 }}>
+        <div className="dwa-preferences">
           <div className="dwa-preference-row">
             <div>
               <div className="dwa-preference-label">{acp.label('挂牌光晕', 'Tag halo')}</div>
@@ -1106,6 +1122,14 @@ export function AcpSettingsSection(props: WithStore) {
           )}
         </div>
       </section>
+      <footer className="dwa-health">
+        <div className="dwa-health-status">
+          <span className="dwa-dot" style={{ background: ui.stream === 'live' ? 'var(--ntr-success)' : ui.stream === 'down' ? 'var(--ntr-danger)' : 'var(--ntr-muted)' }} />
+          <span>{streamText(ui.stream, acp)}</span>
+          {ui.preset !== undefined && <span>{ui.preset.installed && !presetProblem ? acp.label('NTR 模式已就绪', 'NTR mode ready') : acp.label('NTR 模式需检查', 'NTR mode needs attention')}</span>}
+        </div>
+        {page !== 'diagnostics' && <button type="button" className="dwa-btn dwa-btn-quiet" onClick={() => setPage('diagnostics')}>{acp.label('查看诊断', 'View diagnostics')}</button>}
+      </footer>
     </div>
   )
 }
@@ -1117,6 +1141,7 @@ function AgentRow({
   acp,
   isDefault,
   synthesized,
+  active,
   newCustom = false,
   onCreated,
 }: {
@@ -1125,6 +1150,7 @@ function AgentRow({
   acp: AcpStore
   isDefault: boolean
   synthesized: boolean
+  active: boolean
   /** From-scratch creation: the id is editable and no preset defaults exist. */
   newCustom?: boolean
   /** Fired after a creation-card save succeeds (the list re-derives its selection). */
@@ -1135,6 +1161,7 @@ function AgentRow({
   // A configured agent starts collapsed; a creation card opens straight away
   // (nothing to summarise yet).
   const [expanded, setExpanded] = useState(!configured)
+  const [detailPage, setDetailPage] = useState<'models' | 'connection' | 'advanced'>(configured ? 'models' : 'connection')
   const [form, setForm] = useState<AgentForm>(() => initialForm(detected, activeAgent))
   const [saving, setSaving] = useState(false)
   const [savedSuccess, setSavedSuccess] = useState(false)
@@ -1169,7 +1196,8 @@ function AgentRow({
 
   const payload = buildPayload(form, detected, newCustom)
   const current = persistedDef(detected, activeAgent)
-  const dirty = current !== undefined && !payloadEquals(payload, current)
+  const clearingIdleOverride = payload.idleTimeoutMs === undefined && detected.currentConfig?.idleTimeoutMs !== undefined
+  const dirty = current !== undefined && (!payloadEquals(payload, current) || clearingIdleOverride)
   // A save stops the child and kills every live session (see BridgeManager.saveAgent).
   const showSaveWarning = dirty && activeAgent !== undefined && activeAgent.state !== 'stopped'
 
@@ -1221,7 +1249,7 @@ function AgentRow({
     : (activeAgent?.title ?? detected.currentConfig?.title ?? detected.name)
   const stderr = activeAgent?.state === 'error' ? (activeAgent.stderrTail ?? []) : []
   const errorSummary = stderr.length > 0 ? stderr[stderr.length - 1] : undefined
-  const currentModel = ui.modelCatalogs[detected.id]?.catalog.model?.currentValue
+  const selectedModelCount = form.exposed?.length ?? 0
   const isPreset = PRESET_IDS.has(detected.id)
   // An error row opens itself so the stderr tail is never behind a click.
   const open = expanded || (activeAgent?.state === 'error' && configured)
@@ -1229,19 +1257,11 @@ function AgentRow({
   return (
     <div className={`dwa-agent-card${open ? ' is-open' : ''}`}>
       <div className="dwa-agent-row">
-        <button
-          type="button"
-          className="dwa-caret-btn"
-          aria-expanded={open}
-          onClick={() => setExpanded(value => !value)}
-          title={open ? acp.label('收起', 'Collapse') : acp.label('展开配置与模型', 'Expand configuration and models')}
-        >
-          <span className="dwa-caret" aria-hidden>{open ? '▾' : '▸'}</span>
-        </button>
+        <span className="dwa-agent-avatar" aria-hidden>{displayName.slice(0, 2).toUpperCase()}</span>
         <div className="dwa-agent-summary">
           <div className="dwa-agent-titleline">
             <span className="dwa-agent-name" title={detected.executablePath ?? detected.description}>{displayName}</span>
-            {isDefault && <span className="dwa-badge dwa-badge-success">{acp.label('默认', 'Default')}</span>}
+            {isDefault && <span className="dwa-badge dwa-badge-info">{acp.label('默认', 'Default')}</span>}
             {!isPreset && !newCustom && <span className="dwa-badge">{acp.label('自定义', 'Custom')}</span>}
           </div>
           <div className="dwa-agent-meta">
@@ -1254,7 +1274,7 @@ function AgentRow({
             {configured && (
               <>
                 {state !== undefined && <span className="dwa-agent-meta-separator">·</span>}
-                <span>{currentModel === undefined ? acp.label('未探测模型', 'Model not probed') : `${acp.label('模型', 'Model')}: ${currentModel}`}</span>
+                <span>{acp.label(`${String(selectedModelCount)} 个已选模型`, `${String(selectedModelCount)} selected models`)}</span>
               </>
             )}
             {!synthesized && !newCustom && !detected.detected && (
@@ -1267,7 +1287,12 @@ function AgentRow({
             <div className="dwa-error dwa-mono" style={{ marginTop: 6, wordBreak: 'break-all' }}>{errorSummary}</div>
           )}
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <div className="dwa-row-actions">
+          {configured && (
+            <button type="button" className="dwa-btn dwa-btn-quiet" aria-expanded={open} aria-label={acp.label(`${open ? '收起' : '管理'} ${displayName}`, `${open ? 'Collapse' : 'Manage'} ${displayName}`)} onClick={() => setExpanded(value => !value)}>
+              {open ? acp.label('收起', 'Collapse') : acp.label('管理', 'Manage')}
+            </button>
+          )}
           {activeAgent?.state === 'error' && (
             <button className="dwa-btn" disabled={testing} onClick={() => void handleTest()}>
               {testing ? acp.label('测试中...', 'Testing...') : acp.label('测试', 'Test')}
@@ -1290,19 +1315,18 @@ function AgentRow({
           survives collapsing the row. */}
       <div className="dwa-agent-body" style={open ? undefined : { display: 'none' }}>
         {stderr.length > 0 && <pre className="dwa-stderr">{stderr.join('\n')}</pre>}
+        <nav className="dwa-tabs dwa-detail-tabs" aria-label={acp.label(`${displayName} 配置`, `${displayName} settings`)}>
+          {configured && <button type="button" aria-pressed={detailPage === 'models'} onClick={() => setDetailPage('models')}>{acp.label('模型', 'Models')}</button>}
+          <button type="button" aria-pressed={detailPage === 'connection'} onClick={() => setDetailPage('connection')}>{acp.label('连接', 'Connection')}</button>
+          <button type="button" aria-pressed={detailPage === 'advanced'} onClick={() => setDetailPage('advanced')}>{acp.label('高级', 'Advanced')}</button>
+        </nav>
         {configured && (
-          <section className="dwa-subsection">
-            <div className="dwa-subsection-head">
-              <div>
-                <h4 className="dwa-subsection-title">{acp.label('模型与默认值', 'Models & defaults')}</h4>
-                <p className="dwa-subsection-copy">{acp.label('检测模型目录，并控制对话中可选择的模型。', 'Detect the model catalog and choose what appears in conversations.')}</p>
-              </div>
-            </div>
+          <section className="dwa-subsection" hidden={detailPage !== 'models'}>
             <ModelCatalogBlock
               agentId={detected.id}
               detected={detected}
               acp={acp}
-              active={open}
+              active={active && open && detailPage === 'models'}
               exposed={form.exposed}
               onExposedChange={exposed => patch({ exposed })}
               autoDiscover={form.autoDiscoverModels}
@@ -1311,15 +1335,11 @@ function AgentRow({
             />
           </section>
         )}
-        <section className="dwa-subsection">
-          <div className="dwa-subsection-head">
-            <div>
-              <h4 className="dwa-subsection-title">{acp.label('连接配置', 'Connection')}</h4>
-              <p className="dwa-subsection-copy">{acp.label('设置显示名与启动命令，高级选项按需展开。', 'Set the display name and launch command; expand advanced options only when needed.')}</p>
-            </div>
-          </div>
+        <section className="dwa-subsection" hidden={detailPage === 'models'}>
           <AgentDetails
             acp={acp}
+            advancedOpen={detailPage === 'advanced'}
+            dirty={dirty}
             detected={detected}
             form={form}
             patch={patch}
@@ -1502,6 +1522,8 @@ export function buildPayload(form: AgentForm, detected: DetectedAgentInfo, newCu
 /** The expanded body: connection form, workspace allow-list, env, actions. */
 function AgentDetails({
   acp,
+  advancedOpen,
+  dirty,
   detected,
   form,
   patch,
@@ -1524,6 +1546,8 @@ function AgentDetails({
   onTest,
 }: {
   acp: AcpStore
+  advancedOpen: boolean
+  dirty: boolean
   detected: DetectedAgentInfo
   form: AgentForm
   patch: (next: Partial<AgentForm>) => void
@@ -1545,8 +1569,6 @@ function AgentDetails({
   onSave: () => void
   onTest: () => void
 }) {
-  const ui = useUi(acp)
-  const [advancedOpen, setAdvancedOpen] = useState(false)
   // The same parse the host will run (`validateAgentDef` → `splitCommandLine`).
   // Showing it is what turns "the first box swallowed my arguments" into a
   // visible, fixable state instead of a spawn error.
@@ -1557,15 +1579,14 @@ function AgentDetails({
       + (parsedCommand.args.length === 0 ? '' : `　${acp.label('参数', 'Arguments')}: ${parsedCommand.args.join(' ')}`)
   return (
     <div>
-      {/* 基础参数: id / display name / command / args — the preset chip already
-          filled command+args, so a plain "enable this agent" flow needs
-          nothing below. Everything else lives under 高级参数. */}
+      <div hidden={advancedOpen}>
       {newCustom && (
         <div className="dwa-form-row">
           <div className="dwa-form-col">
             <label className="dwa-form-label">{acp.label('Agent ID（唯一标识，创建后不可改）', 'Agent ID (unique, immutable after creation)')}</label>
             <input
               className="dwa-input dwa-input-mono"
+              aria-label={acp.label('Agent ID', 'Agent ID')}
               value={form.agentId}
               onChange={e => patch({ agentId: e.target.value })}
               placeholder="e.g. my-agent"
@@ -1586,6 +1607,7 @@ function AgentDetails({
           <label className="dwa-form-label">{acp.label('显示名', 'Display Name')}</label>
           <input
             className="dwa-input"
+            aria-label={acp.label('显示名', 'Display Name')}
             value={form.title}
             onChange={e => patch({ title: e.target.value })}
             placeholder={detected.name === '' ? acp.label('我的 Agent', 'My Agent') : detected.name}
@@ -1604,6 +1626,7 @@ function AgentDetails({
           <label className="dwa-form-label">{acp.label('启动命令（程序 + 参数）', 'Launch Command (program + arguments)')}</label>
           <input
             className="dwa-input dwa-input-mono"
+            aria-label={acp.label('启动命令（程序 + 参数）', 'Launch Command (program + arguments)')}
             value={form.commandLine}
             onChange={e => patch({ commandLine: e.target.value })}
             placeholder={detected.defaultCommand === ''
@@ -1613,39 +1636,17 @@ function AgentDetails({
           <span className="dwa-hint">{commandPreview}</span>
           <span className="dwa-hint">
             {acp.label(
-              '参数直接跟在程序后面即可；路径里含空格时用引号包住整条路径，例如 "C:\\Program Files\\nodejs\\node.exe" --acp。',
-              'Arguments go right after the program; quote a whole path that contains spaces, e.g. "C:\\Program Files\\nodejs\\node.exe" --acp.',
+              '含空格的程序路径请加引号。',
+              'Quote the program path if it contains spaces.',
             )}
           </span>
         </div>
       </div>
 
-      {/* 高级参数: collapsed by default, hidden with `display: none` (never
-          unmounted) so an edit in progress survives the toggle. Path validity
-          is surfaced on the toggle itself — a collapsed section must not hide
-          an error that blocks saving. */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
-        <button
-          type="button"
-          className="dwa-btn dwa-btn-secondary"
-          aria-expanded={advancedOpen}
-          onClick={() => setAdvancedOpen(value => !value)}
-        >
-          <span className="dwa-caret" aria-hidden>{advancedOpen ? '▾' : '▸'}</span> {acp.label('高级参数', 'Advanced Parameters')}
-        </button>
-        {!advancedOpen && (cwdInvalid || rootsInvalid) && (
-          <span className="dwa-error">
-            {acp.label('里面有非法的工作空间路径', 'Contains an invalid workspace path')}
-          </span>
-        )}
-        {!advancedOpen && mcpInvalid && (
-          <span className="dwa-error">
-            {acp.label('里面的 MCP 服务器配置不是合法 JSON', 'Contains an invalid MCP server list')}
-          </span>
-        )}
+      <WorkspaceBlock acp={acp} form={form} patch={patch} cwdInvalid={cwdInvalid} rootsInvalid={rootsInvalid} />
       </div>
 
-      <div style={advancedOpen ? undefined : { display: 'none' }}>
+      <div hidden={!advancedOpen}>
         {!newCustom && (
           <div className="dwa-default-hint">
             <div>
@@ -1679,14 +1680,6 @@ function AgentDetails({
         </div>
       </div>
 
-      <WorkspaceBlock
-        acp={acp}
-        form={form}
-        patch={patch}
-        cwdInvalid={cwdInvalid}
-        rootsInvalid={rootsInvalid}
-      />
-
       {/* Idle release: scoped to agents with NO live session (see
           AgentBridge.releaseIfIdle), so it reclaims the processes that the
           model probe / post-save probe leave behind without ever costing a
@@ -1699,6 +1692,7 @@ function AgentDetails({
           <label className="dwa-form-label">{acp.label('空闲释放（毫秒）', 'Idle Release (ms)')}</label>
           <input
             className="dwa-input dwa-input-mono"
+            aria-label={acp.label('空闲释放（毫秒）', 'Idle Release (ms)')}
             value={form.idleStr}
             onChange={e => patch({ idleStr: e.target.value })}
             placeholder={acp.label(
@@ -1715,18 +1709,8 @@ function AgentDetails({
               : (
                 <>
                   {acp.label(
-                    '空闲超过此时长就挂起进程（会话保留，下一条消息自动恢复）。',
-                    'The process is parked once it has been idle this long (the session is kept and resumes on the next message).',
-                  )}
-                  <br />
-                  {acp.label(
-                    '0 = 永不释放；回合在跑、取消未结算或审批待答时不释放。',
-                    '0 = never; a process with a running turn, an unsettled cancel, or a pending approval is never released.',
-                  )}
-                  <br />
-                  {acp.label(
-                    '只对承载过会话的进程生效；探测进程固定 5 分钟释放，填 0 也拦不住。',
-                    'This window applies only to a process that has hosted a session; the model-probe process is always released after 5 minutes, and 0 does not stop it.',
+                    '承载过会话的进程空闲后挂起；0 不释放，探测进程固定 5 分钟。',
+                    'Park idle chat processes; 0 keeps them alive. Probe processes always release after 5 minutes.',
                   )}
                 </>
               )}
@@ -1783,6 +1767,7 @@ function AgentDetails({
         <textarea
           className="dwa-input dwa-input-mono"
           style={{ minHeight: 96, resize: 'vertical' }}
+          aria-label={acp.label('MCP 服务器（JSON）', 'MCP Servers (JSON)')}
           value={form.mcpText}
           onChange={e => patch({ mcpText: e.target.value })}
           spellCheck={false}
@@ -1795,14 +1780,17 @@ function AgentDetails({
         )}
         <span className="dwa-hint">
           {acp.label(
-            '这些 MCP 服务器会在建会话时交给 agent，由 agent 自己拉起并使用（stdio 需填 command，可选 args / env；http 与 sse 需填 url，可选 headers）。agent 自己配置的 MCP 服务器不受影响，这里只是额外追加。',
-            'These MCP servers are handed to the agent when a session is created; the agent launches and uses them itself (stdio needs command, with optional args / env; http and sse need url, with optional headers). The MCP servers the agent configures for itself are unaffected — this only adds more.',
+            '额外追加给智能体的 MCP 服务器，不影响其已有配置。',
+            'Additional MCP servers for the agent; its own configuration is unchanged.',
           )}
         </span>
       </div>
       </div>
 
+      {!advancedOpen && (mcpInvalid || idleInvalid) && <p className="dwa-error" role="alert">{acp.label('请检查「高级」中的无效配置。', 'Check the invalid settings in Advanced.')}</p>}
+      {advancedOpen && (!idValid || idTaken || cwdInvalid || rootsInvalid || parsedCommand.command === '') && <p className="dwa-error" role="alert">{acp.label('请检查「连接」中的未完成或无效配置。', 'Check the incomplete or invalid settings in Connection.')}</p>}
       <div className="dwa-form-actions">
+        <span className="dwa-hint">{isConfigured ? dirty ? acp.label('有未保存的更改', 'Unsaved changes') : acp.label('配置已保存', 'Settings saved') : ''}</span>
         <button
           className="dwa-btn"
           onClick={onTest}
@@ -1815,14 +1803,14 @@ function AgentDetails({
         <button
           className="dwa-btn dwa-btn-primary"
           onClick={onSave}
-          disabled={saving || testing || formIncomplete}
+          disabled={saving || testing || formIncomplete || (isConfigured && !dirty)}
         >
           {saving
             ? acp.label('保存中...', 'Saving...')
             : savedSuccess
               ? acp.label('✓ 已保存', '✓ Saved')
               : isConfigured
-                ? acp.label('保存', 'Save')
+                ? acp.label('保存更改', 'Save changes')
                 : acp.label('保存并启用', 'Save & Enable')}
         </button>
 
@@ -1896,8 +1884,8 @@ function WorkspaceBlock({
         )}
         <span className="dwa-hint">
           {acp.label(
-            '对话里的 NTR 会话以该 DSH 会话选中的工作区为工作目录（agent 进程也从那里启动）；此项只在 /acp 直连会话与宿主未上报工作区时生效。',
-            'An NTR session inside a conversation runs \u2014 and starts its agent process \u2014 in that DSH session\u2019s own workspace; this value applies to /acp-direct sessions and when the host reports no workspace.',
+            '聊天使用会话工作区；此处用于直连会话或宿主未提供工作区时。',
+            'Chats use their session workspace; this applies to direct sessions or when the host provides no workspace.',
           )}
         </span>
         {/* The effective allow-list stays visible in single-root mode too:
@@ -2360,7 +2348,7 @@ function ModelCatalogBlock({
                 'The NTR surfaces only list what is checked here; unchecked models still work, and the one currently in force is still listed with a "· current" row — the rest are not offered.',
               )}
             >
-              {acp.label('（NTR 座位 / 芯片的下拉列表）', '(the NTR seat and chip pickers)')}
+              {acp.label('仅影响菜单可见性', 'Menu visibility only')}
             </span>
           </span>
           <span className="dwa-badge dwa-badge-info">{selectionBadge}</span>
@@ -2389,6 +2377,7 @@ function ModelCatalogBlock({
                 structurally taller, so the two could never share one height. */}
             <input
               className="dwa-input dwa-model-search"
+              aria-label={acp.label('搜索模型', 'Search models')}
               value={search}
               onChange={e => setSearch(e.target.value)}
               placeholder={acp.label('搜索模型…', 'Search models…')}
@@ -2488,7 +2477,7 @@ function ModelCatalogBlock({
             <div className="dwa-model-list">
               {selectedChoices.length === 0 && (
                 <span className="dwa-hint dwa-model-empty">
-                  {acp.label('还没有选择模型（点左侧的模型加入）', 'Nothing selected yet — pick models on the left')}
+                  {acp.label('尚未选择模型，从「全部模型」中加入。', 'No models selected. Add from All models.')}
                 </span>
               )}
               {selectedChoices.map(choice => (
