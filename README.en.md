@@ -26,6 +26,8 @@ This plugin is a DSH **bundle**: `package.json`'s `dsh.bundle.patch` declares th
 
 Open the **Plugins** page in DSH's sidebar, click **Add plugin**, enter `dsh-ntr`, and click install. Refresh the page and it's ready to use.
 
+> DSH keeps a 24-hour safety window on the npm channel: a version published within it won't be picked as the latest, so entering plain `dsh-ntr` may install the previous release. To get the new version right away, include the explicit version in the box, e.g. `dsh-ntr@0.1.5`; otherwise wait out the window and install or upgrade as usual.
+
 ### Option 2: from the npm registry
 
 ```bash
