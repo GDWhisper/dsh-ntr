@@ -23,7 +23,7 @@ export const inject = ['webServer', 'connection']
 
 /** Structural view of the host approval service (`@deepseek-ai/dsh-user-approval`). */
 interface ApprovalServiceLike {
-  request(req: { agent: unknown; toolName: string; reason?: string; signal?: AbortSignal }): Promise<ApprovalOutcome>
+  request(req: { agent: unknown; toolName: string; reason?: string; callId?: string; signal?: AbortSignal }): Promise<ApprovalOutcome>
   /**
    * Present on the host service, but NEVER read by this plugin: the only call
    * made here is `request` (see `wireApproval`). A deployment-wide default
@@ -181,12 +181,18 @@ export function apply(ctx: Context, config?: unknown): void {
     const approval = (typeof ctx.get === 'function' ? ctx.get('approval') : (ctx as unknown as { approval?: ApprovalServiceLike }).approval) as ApprovalServiceLike | undefined
     const agents = (typeof ctx.get === 'function' ? ctx.get('agents') : (ctx as unknown as { agents?: AgentsServiceLike }).agents) as AgentsServiceLike | undefined
     if (approval === undefined || agents === undefined) return
-    manager.setApprovalRequester(async ({ dshSessionId, toolName, signal }) => {
+    manager.setApprovalRequester(async ({ dshSessionId, toolName, reason, callId, signal }) => {
       if (dshSessionId === undefined) return 'unavailable'
       const agent = agents.get(dshSessionId)
       if (agent === undefined) return 'unavailable'
       try {
-        return await approval.request({ agent, toolName, ...(signal === undefined ? {} : { signal }) })
+        return await approval.request({
+          agent,
+          toolName,
+          ...(reason === undefined ? {} : { reason }),
+          ...(callId === undefined ? {} : { callId }),
+          ...(signal === undefined ? {} : { signal }),
+        })
       } catch {
         // Never propagate: a failed ask must fall back, not break the turn.
         return 'unavailable'

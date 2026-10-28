@@ -13,7 +13,7 @@ import {
   AcpLlmAdapter, AgentBridge, BridgeManager, defaultAgentWorkspace,
   detectHostAgents, ensureAgentExecutable, findExecutable, killProcessTree, pluginStateDir, routeBindingRegistry, windowsShimLaunch,
   type ApprovalOutcome, type ApprovalRequestContext, type BridgeTuning,
-  permissionToolName,
+  permissionAskReason, permissionToolName,
 } from '../src/bridge.ts'
 import { EventHub, dispatchRpc } from '../src/impl.ts'
 import type { AcpAgentCatalog, AcpAgentDef, AcpEvent, AgentCatalogResult, ChatSessionView, StreamChunk } from '../src/protocol.ts'
@@ -1834,8 +1834,16 @@ describe('native approval routing (isolated manager)', () => {
     expect(rejectSession).toBeDefined()
     expect(await echoOf(rejectSession!, 'PERM deny me')).toContain('perm=reject1')
 
-    // The question travelled with the chat session identity and the tool name.
-    expect(calls.at(-1)).toMatchObject({ dshSessionId: 'dsh-approval-reject', agentId: 'appr', toolName: 'mock dangerous operation' })
+    // The question travelled with the chat session identity, the tool name,
+    // the card's headline reason, and the ACP call id the host card can attach
+    // its detail (the command) to.
+    expect(calls.at(-1)).toMatchObject({
+      dshSessionId: 'dsh-approval-reject',
+      agentId: 'appr',
+      toolName: 'mock dangerous operation',
+      reason: 'mock dangerous operation',
+      callId: 'call_1',
+    })
 
     // Routed asks never surface a settings-panel card: no `permission/request`
     // for this epoch, but the resolution frame still rides the stream.
@@ -2689,6 +2697,24 @@ describe('permission mapping and the agent\'s own modes (isolated manager)', () 
     // A non-string or empty declaration is not a name; the chain keeps going.
     expect(permissionToolName({ title: '', _meta: { 'x/toolName': 'Bash' } })).toBe('Bash')
     expect(permissionToolName({ _meta: { 'x/toolName': 42 } })).toBe('tool call')
+  })
+
+  it('turns the declared tool input into the approval card headline', () => {
+    // The host card body is `reason ?? "工具 X 请求越权执行"`; a bare tool name
+    // tells the human nothing about the operation they are approving.
+    expect(permissionAskReason({ title: 'mock dangerous operation' })).toBe('mock dangerous operation')
+    expect(permissionAskReason({ title: 'Bash', rawInput: { command: 'npm test' } })).toBe('Bash · npm test')
+    // A JSON-string rawInput is read for the same scalar, not echoed whole.
+    expect(permissionAskReason({ title: 'Bash', rawInput: '{"cmd":"ls -la"}' })).toBe('Bash · ls -la')
+    // The scalar already equal to the title is not repeated.
+    expect(permissionAskReason({ title: 'ls -la', rawInput: { command: 'ls -la' } })).toBe('ls -la')
+    // Arrays and unknown shapes never become the headline.
+    expect(permissionAskReason({ title: 'Edit', rawInput: [{ path: 'a.md' }] })).toBe('Edit')
+    expect(permissionAskReason({ title: 'Edit', rawInput: { mystery: 'x' } })).toBe('Edit')
+    // Capped: a pathological command cannot fill the card or the audit log.
+    const reason = permissionAskReason({ title: 'Bash', rawInput: { command: 'x'.repeat(1000) } })
+    expect(reason.length).toBe(240)
+    expect(reason.endsWith('…')).toBe(true)
   })
 
   /** Wait for a fresh event (the hub keeps older cases' frames, so `since` is mandatory). */

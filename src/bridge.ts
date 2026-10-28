@@ -254,6 +254,8 @@ export interface ApprovalRequestContext {
   /** Human-facing identity of the operation awaiting a decision. */
   toolName: string
   reason?: string
+  /** The ACP tool call this ask belongs to; the host card attaches its detail to it. */
+  callId?: string
   signal?: AbortSignal
 }
 
@@ -1497,10 +1499,17 @@ export class AgentBridge {
       : undefined
     let outcome: ApprovalOutcome
     try {
+      const row = (typeof toolCall === 'object' && toolCall !== null ? toolCall : {}) as Record<string, unknown>
       const asked = requester({
         dshSessionId: session.dshSessionId,
         agentId: this.def.id,
         toolName: permissionToolName(toolCall),
+        reason: permissionAskReason(toolCall),
+        // The ACP call id is the id the adapter streamed on the host tool card
+        // (`TurnStreamController` fills `tool-call` blocks from
+        // `snapshot.callId`), so the host's approval detail slot can attach
+        // the operation's own card to this ask.
+        ...(typeof row.toolCallId === 'string' && row.toolCallId !== '' ? { callId: row.toolCallId } : {}),
         signal: askSignal,
       })
       // A withdrawn ask settles on the host's own schedule; dropping it here
@@ -1732,6 +1741,61 @@ export function permissionToolName(toolCall: unknown): string {
   }
   if (typeof row.kind === 'string' && row.kind !== '') return row.kind
   return 'tool call'
+}
+
+/** Longest reason line the approval card headline carries. */
+const APPROVAL_REASON_MAX = 240
+
+/** Input keys that name the operation in one string, most specific first. */
+const APPROVAL_REASON_INPUT_KEYS = [
+  'command',
+  'cmd',
+  'path',
+  'file_path',
+  'filePath',
+  'pattern',
+  'query',
+  'url',
+  'description',
+] as const
+
+/**
+ * One line saying WHAT the native approval card is about.
+ *
+ * WHY: the host renders `reason ?? "工具 <name> 请求越权执行"`. Without a
+ * reason the human only sees the tool's NAME ("Bash") and cannot judge the
+ * request; the ACP tool call already declares the missing half — its title and
+ * (for execute/edit tools) a short scalar in `rawInput`. Only ONE declared
+ * string is used, never a serialized object or a whole file, and the line is
+ * capped so a pathological input cannot fill the card or the audit log.
+ */
+export function permissionAskReason(toolCall: unknown): string {
+  const row = (typeof toolCall === 'object' && toolCall !== null ? toolCall : {}) as Record<string, unknown>
+  const title = permissionToolName(toolCall)
+  const raw = row.rawInput
+  const input = raw !== null && typeof raw === 'object' && !Array.isArray(raw)
+    ? raw as Record<string, unknown>
+    : typeof raw === 'string' && raw.length <= APPROVAL_REASON_MAX * 4
+      // Some agents send the arguments as a JSON string; read one scalar out
+      // of it instead of echoing the blob.
+      ? (() => {
+          try {
+            const parsed: unknown = JSON.parse(raw)
+            return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+              ? parsed as Record<string, unknown>
+              : undefined
+          } catch {
+            return undefined
+          }
+        })()
+      : undefined
+  const detail = input === undefined
+    ? undefined
+    : APPROVAL_REASON_INPUT_KEYS
+      .map(key => input[key])
+      .find((value): value is string => typeof value === 'string' && value !== '')
+  const line = detail === undefined || detail === title ? title : `${title} · ${detail}`
+  return line.length > APPROVAL_REASON_MAX ? `${line.slice(0, APPROVAL_REASON_MAX - 1)}…` : line
 }
 
 /**
