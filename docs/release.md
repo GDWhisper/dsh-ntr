@@ -1,6 +1,6 @@
 # 发版
 
-一条线：改代码 → 验证 → 提交 → bump 版本 → `chore(release)` 提交 → push `main` → 打 `vX.Y.Z` tag → push tag（触发 npm 发布）→ 建 GitHub Release。
+一条线：改代码 → 验证 → 更新 `CHANGELOG.md` → 提交 → bump 版本 → `chore(release)` 提交 → push `main` → 打 `vX.Y.Z` tag → push tag（触发 npm 发布）→ 建 GitHub Release。
 
 ## 版本与 tag
 
@@ -13,6 +13,7 @@
 
 - [ ] 工作区干净（`git status --short` 无输出）
 - [ ] `npm run prepack` 通过（typecheck + 全部测试 + build）
+- [ ] `CHANGELOG.md` 已加本版一节，与 release note 同一套话、带提交号
 - [ ] release note 按下方「Release note 规则」写好
 - [ ] 要在本机 DSH 里自测：`npm run build` 后重启 DSH（宿主半区是进程内加载的）
 
@@ -35,7 +36,7 @@ npm version 0.1.6 --no-git-tag-version
 正文写这一版**面向用户**的改动（与 release note 同一套话）：
 
 ```sh
-git add package.json package-lock.json
+git add package.json package-lock.json CHANGELOG.md
 git commit -m "$(cat <<'EOF'
 chore(release): 0.1.6
 
@@ -77,8 +78,10 @@ npm view dsh-ntr@0.1.6 version dist-tags --json
 workflow 的权限是 `contents: read`，**不会**自动建 Release，需要手动：
 
 ```sh
-gh release create v0.1.6 --title "v0.1.6 — <一句话主题>" --notes "$(cat <<'EOF'
-## 改进
+gh release create v0.1.6 --title "v0.1.6" --notes "$(cat <<'EOF'
+<一句话总结这一版的主线>
+
+## 新增
 
 - ...
 
@@ -91,21 +94,24 @@ EOF
 
 ## Release note 规则（面向用户）
 
+- 标题只写 `vX.Y.Z`，**不加主题后缀**；正文第一行放一句话总结这一版的主线。
 - 只写用户能感知到的变化和怎么用；**不写根因、不写内部符号 / 文件名 / 实现机制**。
-- 一条一句话；有 issue 就挂链接。
-- 标题格式 `vX.Y.Z — 一句话主题`（例：`v0.1.5 — 审批请求不再静默挂起`）。
+- 一条一句话，末尾挂提交链接 `([abc1234](https://github.com/GDWhisper/dsh-ntr/commit/abc1234))`；有 issue 就再挂 issue 链接。
 - 分区只留用得上的：`## 新增` / `## 改进` / `## 修复`。
-- 示例（0.1.6）：
+- **只记确定性的改动**：写这一版留下的最终行为；被推翻、回退或只在开发过程中存在过的中间形态不写。`CHANGELOG.md` 与 release note 使用同一套话。
+- `CHANGELOG.md` 每节标题用 `## [X.Y.Z] - YYYY-MM-DD`，新版本加在最上方。
+- 示例（0.2.0）：
 
 ```markdown
-## 改进
+审批询问现在直接出现在对话里，每一条都会送到你面前，不会再隐形挂起（[#2](https://github.com/GDWhisper/dsh-ntr/issues/2)）。
 
-- **审批时限设置合并成一套**：「NTR 设置 → 审批时限」现在是一个「超时处理方式」（超时中止 / 自动推进 / 一直等待）加一根「等待时长」滑块。选「自动推进」时还可以选「不等待」。
-- **超时就地处理**：到点直接在原来的位置结束（拒绝或代答），不再把问题挪到设置页；到点后对话里会留一行说明。
+## 新增
+
+- **审批卡直接出现在对话里**：agent 要动敏感东西时，询问卡出现在聊天输入框上方，和输入框同宽居中；选项就是 agent 给的那些（包括「始终允许」），点哪个它就收到哪个。([78545b6](https://github.com/GDWhisper/dsh-ntr/commit/78545b6))
 
 ## 修复
 
-- **审批卡会显示具体操作**：标题带工具名和参数摘要（命令、路径等），Bash 等命令类操作会直接显示要执行的命令。
+- **审批卡与输入框对齐**：不再比输入框宽出一截。([fccd95b](https://github.com/GDWhisper/dsh-ntr/commit/fccd95b))
 ```
 
 ## Workflow 做了什么

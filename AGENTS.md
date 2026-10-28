@@ -18,11 +18,11 @@
 | [host.md](./docs/agents/host.md) | 改 `/acp` 通道、preset 声明、宿主服务探测、模型层 abstain |
 | [paths.md](./docs/agents/paths.md) | 改任何路径判定 / 比较 / 规范化 |
 | [retired.md](./docs/agents/retired.md) | 想知道「为什么不能回到 X」，或看到幽灵符号 |
-| [release.md](./docs/release.md) | 发版：bump 版本、打 tag、npm 发布、写 GitHub release note |
+| [release.md](./docs/release.md) | 发版：更新 CHANGELOG、bump 版本、打 tag、npm 发布、写 GitHub release note |
 
 历史推导与实测日志：[acp-convergence.md](./docs/acp-convergence.md)、[acp-mode.md](./docs/acp-mode.md)、[acp-permission-and-sandbox.md](./docs/acp-permission-and-sandbox.md)。待办：[todo.md](./docs/todo.md)（本仓唯一待办清单，当前为空）。
 
-**维护规则**：新增约束先在这里写一行规则 + 一个链接，细节写进对应文档。本文不写「某年某月修过什么」——那属于细节文档或收敛记录。
+**维护规则**：新增约束先在这里写一行规则 + 一个链接，细节写进对应文档。本文不写「某年某月修过什么」——版本层面的净改动写 [`CHANGELOG.md`](./CHANGELOG.md)（约束 35），其余属于细节文档或收敛记录。
 
 ## 心智模型
 
@@ -63,6 +63,7 @@
 - [`acp-workspaces/`](./acp-workspaces)：本仓开发 / 测试用的执行目录；运行时默认工作区是 `~/.dsh/dsh-ntr/workspaces`。
 - [`lib/`](./lib)：构建产物，禁改。
 - [`docs/`](./docs)：设计与收敛文档；本文件是索引层。
+- [`CHANGELOG.md`](./CHANGELOG.md)：面向用户的版本净改动记录，只记确定性改动（见约束 35）。
 
 ## 常用命令
 
@@ -138,6 +139,10 @@
 ### 依赖（31）
 
 31. **ACP SDK 的 `zod` peer 必须是直接依赖**：SDK 入口加载时就会 `import` `zod`，而宿主 profile 的 pnpm 可能设 `autoInstallPeers: false`；只靠 peer 自动安装会在官方安装里缺包。`zod` 必须留在 `dependencies`，范围与 SDK 的 peer 一致（`^3.25.0 || ^4.0.0`）。→ [README.md](./README.md#安装)
+
+### 发版与记录（35）
+
+35. **CHANGELOG 只记确定性的净改动**：每次发版在 [`CHANGELOG.md`](./CHANGELOG.md) 顶部加一节，内容与 GitHub release note 同一套话、都带提交号；只写这一版留下的**最终用户可见行为**——被推翻、回退或只在开发过程中存在过的中间形态一律不记。→ [release.md](./docs/release.md)
 
 ## 边界与禁区
 
