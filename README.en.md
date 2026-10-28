@@ -70,12 +70,12 @@ To upgrade later: `git pull` → `npm run build` → restart `dsh web`. `add .` 
 
 ---
 
-## Getting started
+## Quick start
 
 ### What you need
 
 1. A working DSH install (web or desktop).
-2. At least one ACP agent CLI. The plugin ships presets for common ones, and accepts any stdio-capable ACP agent.
+2. At least one ACP-capable agent, using its terminal build (CLI / TUI). For example Qoder CLI (`qodercli`), CodeBuddy Code (`codebuddy`), Claude Code, or OpenCode — presets for these ship with the plugin; any other agent that starts from the command line in the same `xxx --acp` style can be filled in directly.
 
 ### Three steps
 

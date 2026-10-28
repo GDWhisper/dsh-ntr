@@ -70,12 +70,12 @@ dsh plugin --profile web add ./
 
 ---
 
-## 上手
+## 快速开始
 
 ### 你需要什么
 
 1. 一个已经装好的 DSH（Web 或桌面版）。
-2. 至少一个 ACP agent 的命令行程序。插件内置了几个常见预设，也可以填任何支持 stdio 的 ACP agent。
+2. 至少一个支持 ACP 协议的 agent，用它的终端版本（CLI / TUI）即可。例如 Qoder CLI（`qodercli`）、CodeBuddy Code（`codebuddy`）、Claude Code、OpenCode——插件内置了这些常见预设；其他 agent 只要能以类似 `xxx --acp` 的方式从命令行启动，也可以直接填。
 
 ### 三步接入
 
