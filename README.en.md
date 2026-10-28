@@ -267,10 +267,13 @@ These servers are handed to the agent when a session is created; the agent launc
 
 ```bash
 npm install          # dependencies
+git config core.hooksPath .githooks   # enable the commit-msg check (rejects AI attribution)
 npm run build        # host TS declarations + browser bundle
 npm test             # test suite
 dsh plugin --profile web add ./   # mount into the Web profile
 ```
+
+`.githooks/commit-msg` only inspects the commit message: it rejects AI-tool attribution in `Co-Authored-By` / `Generated with` lines, while ordinary prose and human attribution pass. `core.hooksPath` is local config — run this once after cloning.
 
 ### Implementation notes
 

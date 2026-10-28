@@ -267,10 +267,13 @@ agent 要动敏感的东西时会问你。询问卡出现在对话里、聊天�
 
 ```bash
 npm install          # 依赖
+git config core.hooksPath .githooks   # 启用 commit-msg 校验（拒绝 AI 署名）
 npm run build        # 宿主 TS 声明 + 浏览器 Bundle
 npm test             # 测试套件
 dsh plugin --profile web add ./   # 挂载到 Web Profile
 ```
+
+`.githooks/commit-msg` 只校验提交信息：拒绝把 AI 工具写进 `Co-Authored-By` / `Generated with` 之类署名，普通正文与人类署名不受影响。`core.hooksPath` 是本地配置，clone 后执行一次即可。
 
 ### 实现要点
 
