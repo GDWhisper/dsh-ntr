@@ -6,7 +6,7 @@
  * Deliberately framework-free: React binds through `useSyncExternalStore`.
  */
 
-import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSavePayload, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlineKey, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, SessionView } from '../protocol.ts'
+import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSavePayload, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, PermissionTimeoutMode, SessionView } from '../protocol.ts'
 import { DEFAULT_TAG_HALO } from '../protocol.ts'
 
 /** One slash command the ACP agent declared, whole row (the menu draws name, description and `input.hint`). */
@@ -1532,7 +1532,7 @@ export class AcpStore {
   }
 
   /**
-   * Write one approval deadline (settings card), or drop the persisted override
+   * Write the approval deadline (settings card), or drop the persisted override
    * with `reset` so the `cordis.patch.yml` baseline applies again.
    *
    * The host answer — the same route returns the deadlines now in force — is the
@@ -1540,8 +1540,18 @@ export class AcpStore {
    * merged with a value this browser did not know about) self-corrects instead
    * of drifting from what runs.
    */
-  async setApprovalDeadline(key: ApprovalDeadlineKey, ms: number): Promise<void> {
-    await this.writeApprovalDeadlines({ [key]: ms })
+  async setApprovalDeadline(ms: number): Promise<void> {
+    await this.writeApprovalDeadlines({ permissionTimeoutMs: ms })
+  }
+
+  /**
+   * Write the mode: what an expired deadline DOES (`abort` refuses, `auto`
+   * answers with the option the agent's own kinds imply, `wait` never
+   * expires). Same write path as the window, so the host answer stays
+   * the authority.
+   */
+  async setApprovalTimeoutMode(mode: PermissionTimeoutMode): Promise<void> {
+    await this.writeApprovalDeadlines({ mode })
   }
 
   /** Drop the persisted override: the config file (or the built-in default) decides again. */
@@ -1551,15 +1561,15 @@ export class AcpStore {
 
   private async writeApprovalDeadlines(payload: ApprovalDeadlinesSetPayload): Promise<void> {
     const previous = this.state.approvalDeadlines
-    // Optimistic only where it is safe: the effective numbers move now, and the
-    // override facts (`configured`) stay as the host last reported them. A
-    // failure restores the whole view.
+    // Optimistic only where it is safe: the effective numbers and the mode move
+    // now, and the override facts (`configured`) stay as the host last reported
+    // them. A failure restores the whole view.
     if (previous !== undefined) {
       this.mutate({
         approvalDeadlines: {
           ...previous,
-          ...(payload.nativeApprovalTimeoutMs === undefined ? {} : { nativeApprovalTimeoutMs: payload.nativeApprovalTimeoutMs }),
-          ...(payload.permissionFallbackTimeoutMs === undefined ? {} : { permissionFallbackTimeoutMs: payload.permissionFallbackTimeoutMs }),
+          ...(payload.permissionTimeoutMs === undefined ? {} : { permissionTimeoutMs: payload.permissionTimeoutMs }),
+          ...(payload.mode === undefined ? {} : { mode: payload.mode }),
         },
       })
     }

@@ -22,6 +22,7 @@ import {
   mergeCatalogShape,
   parseCatalogOptions,
   permissionReplayFrames,
+  pickAutoOption,
   usableConfigOptions,
   permissionToolKind,
   permissionToolPaths,
@@ -39,7 +40,7 @@ import {
   validateConfig,
 } from '../src/impl.ts'
 import type { AcpManager } from '../src/impl.ts'
-import type { AcpAgentDef, AgentProbeModelsResult } from '../src/protocol.ts'
+import type { AcpAgentDef, AgentProbeModelsResult, PermissionOptionView } from '../src/protocol.ts'
 
 function agentDef(overrides: Partial<AcpAgentDef> = {}): AcpAgentDef {
   return {
@@ -80,7 +81,7 @@ describe('validateConfig', () => {
   it('defaults and bounds the reliability timeouts', () => {
     const config = validateConfig({ agents: [] })
     expect(config.startupTimeoutMs).toBe(60_000)
-    expect(config.permissionTimeoutMs).toBe(0)
+    expect(config.permissionTimeoutMs).toBe(300_000)
     expect(config.cancelFallbackMs).toBe(15_000)
     expect(config.staleCancelRetryDelayMs).toBe(600)
     expect(config.staleCancelMaxRetries).toBe(2)
@@ -92,45 +93,109 @@ describe('validateConfig', () => {
     expect(validateConfig({ agents: [], permissionTimeoutMs: 60_000, cancelFallbackMs: 0 }).cancelFallbackMs).toBe(0)
     expect(validateConfig({ agents: [], staleCancelRetryDelayMs: 0, staleCancelMaxRetries: 0 }).staleCancelMaxRetries).toBe(0)
   })
-  it('exposes both degraded-route approval deadlines as config knobs', () => {
-    // The two windows an unanswered ask can hang on, both settable because the
-    // right trade-off is per deployment: how long a composer takeover may stay
-    // silent before the question moves to Settings, and how long a question the
-    // conversation is NOT showing may sit before the turn ends. OmniTerm ships
-    // the same pair as `acp_perm_timeout_secs` (30 s steps, hot-updatable) plus
-    // a mode; here `0` is the per-deadline "never" tier, and no mode exists
-    // because every ask must reach a human.
+  it('exposes ONE approval window and the expiry mode as config knobs', () => {
+    // ONE window for both places an ask can wait (the conversation's approval
+    // card and the settings panel's ledger): they ask the same question, so
+    // they get the same answer. Two windows only made the settings card look
+    // like two unrelated knobs.
     const config = validateConfig({ agents: [] })
-    expect(config.nativeApprovalTimeoutMs).toBe(300_000)
-    expect(config.permissionFallbackTimeoutMs).toBe(300_000)
+    expect(config.permissionTimeoutMs).toBe(300_000)
 
-    // 0 = never withdraw / never answer on the human's behalf (the pre-deadline
-    // behavior, restored on purpose rather than by omission).
-    const off = validateConfig({ agents: [], nativeApprovalTimeoutMs: 0, permissionFallbackTimeoutMs: 0 })
-    expect(off.nativeApprovalTimeoutMs).toBe(0)
-    expect(off.permissionFallbackTimeoutMs).toBe(0)
-    expect(validateConfig({ agents: [], nativeApprovalTimeoutMs: 1_800_000 }).nativeApprovalTimeoutMs).toBe(1_800_000)
+    // 0 = 一直等: no deadline at all.
+    expect(validateConfig({ agents: [], permissionTimeoutMs: 0 }).permissionTimeoutMs).toBe(0)
+    expect(validateConfig({ agents: [], permissionTimeoutMs: 1_800_000 }).permissionTimeoutMs).toBe(1_800_000)
 
-    expect(() => validateConfig({ agents: [], nativeApprovalTimeoutMs: -1 })).toThrow(/nativeApprovalTimeoutMs/)
-    expect(() => validateConfig({ agents: [], nativeApprovalTimeoutMs: 1.5 })).toThrow(/nativeApprovalTimeoutMs/)
-    expect(() => validateConfig({ agents: [], nativeApprovalTimeoutMs: 86_400_001 })).toThrow(/nativeApprovalTimeoutMs/)
-    expect(() => validateConfig({ agents: [], permissionFallbackTimeoutMs: -1 })).toThrow(/permissionFallbackTimeoutMs/)
-    expect(() => validateConfig({ agents: [], permissionFallbackTimeoutMs: 86_400_001 })).toThrow(/permissionFallbackTimeoutMs/)
+    expect(() => validateConfig({ agents: [], permissionTimeoutMs: -1 })).toThrow(/permissionTimeoutMs/)
+    expect(() => validateConfig({ agents: [], permissionTimeoutMs: 1.5 })).toThrow(/permissionTimeoutMs/)
+    expect(() => validateConfig({ agents: [], permissionTimeoutMs: 86_400_001 })).toThrow(/permissionTimeoutMs/)
+  })
+  it('folds the two legacy windows into the single one', () => {
+    // An existing `cordis.patch.yml` named `nativeApprovalTimeoutMs` /
+    // `permissionFallbackTimeoutMs`. They are folded in rather than dropped, so
+    // an old file keeps meaning what it meant instead of silently reverting to
+    // the default.
+    expect(validateConfig({ agents: [], nativeApprovalTimeoutMs: 60_000 }).permissionTimeoutMs).toBe(60_000)
+    expect(validateConfig({ agents: [], permissionFallbackTimeoutMs: 120_000 }).permissionTimeoutMs).toBe(120_000)
+    // The new key wins when both are present.
+    expect(validateConfig({
+      agents: [],
+      permissionTimeoutMs: 30_000,
+      nativeApprovalTimeoutMs: 60_000,
+    }).permissionTimeoutMs).toBe(30_000)
+    // The legacy keys are resolved away, not carried into the running config.
+    const resolved = validateConfig({ agents: [], nativeApprovalTimeoutMs: 60_000 })
+    expect('nativeApprovalTimeoutMs' in resolved).toBe(false)
+    expect('permissionFallbackTimeoutMs' in resolved).toBe(false)
+  })
+  it('carries a legacy zero over as the wait mode, never as 不等待', () => {
+    // A legacy window of 0 meant "this window never fires". Today 0 means
+    // 不等待 (settle on arrival), so a legacy zero would silently turn "wait
+    // forever" into "answer immediately" — the one way this migration could
+    // hurt an unattended deployment. The only way to say "never expires" now
+    // is the `wait` mode, so that is what it carries over as.
+    const legacy = validateConfig({ agents: [], nativeApprovalTimeoutMs: 0 })
+    expect(legacy.permissionTimeoutMode).toBe('wait')
+    expect(legacy.permissionTimeoutMs).toBe(300_000)
+    // The same holds for the other legacy key, and for an explicit mode: the
+    // old meaning of a zero window was "never", whatever the mode said.
+    expect(validateConfig({ agents: [], permissionFallbackTimeoutMs: 0 }).permissionTimeoutMode).toBe('wait')
+    expect(validateConfig({
+      agents: [],
+      nativeApprovalTimeoutMs: 0,
+      permissionTimeoutMode: 'auto',
+    }).permissionTimeoutMode).toBe('wait')
+    // The NEW key's zero is the new meaning, and it is not second-guessed.
+    expect(validateConfig({ agents: [], permissionTimeoutMs: 0 })).toMatchObject({
+      permissionTimeoutMs: 0,
+      permissionTimeoutMode: 'wait',
+    })
+  })
+
+  it('keeps 不等待 to the auto mode: under 超时中止 it floors to a real wait', () => {
+    // 不等待 means "settle the ask the moment it arrives". Under 自动推进 that
+    // is harmless — the ask is ANSWERED, so the agent continues. Under 超时中止
+    // it would be refused on arrival, and the agent would stop at every gate
+    // it meets: not a timeout, a wall. So the mode does not offer that rung,
+    // and a zero reaching it floors to the shortest real wait.
+    expect(validateConfig({ agents: [], permissionTimeoutMs: 0, permissionTimeoutMode: 'auto' })).toMatchObject({
+      permissionTimeoutMs: 0,
+      permissionTimeoutMode: 'auto',
+    })
+    expect(validateConfig({ agents: [], permissionTimeoutMs: 0, permissionTimeoutMode: 'abort' })).toMatchObject({
+      permissionTimeoutMs: 30_000,
+      permissionTimeoutMode: 'abort',
+    })
+    // A real window is untouched in every mode.
+    expect(validateConfig({ agents: [], permissionTimeoutMs: 60_000, permissionTimeoutMode: 'abort' }).permissionTimeoutMs).toBe(60_000)
+  })
+
+  it('defaults the expiry mode to wait, and takes only the three modes', () => {
+    // `wait` is the default on purpose: a permission ask is a question FOR A
+    // HUMAN, so the safe default is to keep waiting rather than to refuse (or
+    // worse, approve) on their behalf. `abort` / `auto` are opt-in.
+    expect(validateConfig({ agents: [] }).permissionTimeoutMode).toBe('wait')
+    expect(validateConfig({ agents: [], permissionTimeoutMode: 'abort' }).permissionTimeoutMode).toBe('abort')
+    expect(validateConfig({ agents: [], permissionTimeoutMode: 'auto' }).permissionTimeoutMode).toBe('auto')
+    expect(validateConfig({ agents: [], permissionTimeoutMode: 'wait' }).permissionTimeoutMode).toBe('wait')
+    // Anything outside the three is a typo, not a new mode.
+    expect(() => validateConfig({ agents: [], permissionTimeoutMode: 'maybe' })).toThrow(/permissionTimeoutMode/)
+    expect(() => validateConfig({ agents: [], permissionTimeoutMode: true })).toThrow(/permissionTimeoutMode/)
   })
 
   it('gates the settings-page deadline write through the same range as the config file', () => {
     // The card and `cordis.patch.yml` are two doors onto the same knob, so they
     // must share one gate: a window the UI can save has to survive the next
     // boot's re-validation, or the setting would silently revert.
-    expect(validateApprovalDeadlines({ nativeApprovalTimeoutMs: 60_000 })).toEqual({ nativeApprovalTimeoutMs: 60_000 })
+    expect(validateApprovalDeadlines({ permissionTimeoutMs: 60_000 })).toEqual({ permissionTimeoutMs: 60_000 })
     expect(validateApprovalDeadlines({})).toEqual({})
-    expect(validateApprovalDeadlines({ nativeApprovalTimeoutMs: 0, permissionFallbackTimeoutMs: 0 }))
-      .toEqual({ nativeApprovalTimeoutMs: 0, permissionFallbackTimeoutMs: 0 })
+    expect(validateApprovalDeadlines({ permissionTimeoutMs: 0 })).toEqual({ permissionTimeoutMs: 0 })
     // `reset` is not a deadline and must not land in the persisted override.
     expect(validateApprovalDeadlines({ reset: true })).toEqual({})
+    // The legacy keys are gone from the write path: an old browser half must
+    // not be able to smuggle a second window back in.
+    expect(validateApprovalDeadlines({ nativeApprovalTimeoutMs: 60_000 })).toEqual({})
     for (const bad of [-1, 1.5, 86_400_001, '60000', null]) {
-      expect(() => validateApprovalDeadlines({ nativeApprovalTimeoutMs: bad })).toThrow(/nativeApprovalTimeoutMs/)
-      expect(() => validateApprovalDeadlines({ permissionFallbackTimeoutMs: bad })).toThrow(/permissionFallbackTimeoutMs/)
+      expect(() => validateApprovalDeadlines({ permissionTimeoutMs: bad })).toThrow(/permissionTimeoutMs/)
     }
     expect(() => validateApprovalDeadlines(null)).toThrow(/approval deadlines must be an object/)
   })
@@ -949,6 +1014,36 @@ describe('Transcript', () => {
   })
 })
 
+describe('pickAutoOption (what `auto` mode answers with)', () => {
+  const opt = (optionId: string, kind: string, name = optionId): PermissionOptionView => ({ optionId, name, kind })
+
+  it('picks by the kind the agent declared, broadest grant first', () => {
+    // ACP's `PermissionOption` has no "default option" field, so the kind IS
+    // the only statement the agent makes about the choice it is offering. The
+    // order is `allow_always` → `allow_once` → `reject_once` → `reject_always`
+    // — the same rule as OmniTerm dev's `pick_auto_option`.
+    expect(pickAutoOption([opt('r1', 'reject_once'), opt('a1', 'allow_once'), opt('a0', 'allow_always')])?.optionId).toBe('a0')
+    expect(pickAutoOption([opt('r1', 'reject_once'), opt('a1', 'allow_once')])?.optionId).toBe('a1')
+    expect(pickAutoOption([opt('r2', 'reject_always'), opt('r1', 'reject_once')])?.optionId).toBe('r1')
+    expect(pickAutoOption([opt('r2', 'reject_always')])?.optionId).toBe('r2')
+  })
+
+  it('falls back to the first option when the agent offered only its own kind', () => {
+    // An agent may declare a custom kind. Refusing to answer at all would hang
+    // the turn, so the first usable option is taken.
+    expect(pickAutoOption([opt('c1', 'custom_kind'), opt('c2', 'other')])?.optionId).toBe('c1')
+  })
+
+  it('answers nothing when there is nothing to answer', () => {
+    // `undefined` is the caller's cue to degrade to `abort`: guessing an option
+    // is worse than refusing, and hanging is worse than either.
+    expect(pickAutoOption([])).toBeUndefined()
+    // An option with no id cannot be answered with — it would be a reply the
+    // agent cannot match.
+    expect(pickAutoOption([opt('', 'allow_always')])).toBeUndefined()
+  })
+})
+
 describe('PermissionLedger', () => {
   it('resolves exactly once and settles scoped pendings as cancelled', () => {
     const ledger = new PermissionLedger()
@@ -1010,7 +1105,7 @@ function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } {
     setDefaultAgent: async id => { calls.push(['setDefaultAgent', id]) },
     tagHalo: () => ({ mode: 'breath', speed: 'slow' }),
     setTagHalo: async halo => { calls.push(['setTagHalo', halo]) },
-    approvalDeadlines: () => ({ nativeApprovalTimeoutMs: 300_000, permissionFallbackTimeoutMs: 120_000 }),
+    approvalDeadlines: () => ({ permissionTimeoutMs: 300_000, mode: 'abort' as const }),
     setApprovalDeadlines: async (patch, reset) => { calls.push(['setApprovalDeadlines', patch, reset]) },
     bindChatAgent: (dshSessionId, agentId) => { calls.push(['bindChatAgent', dshSessionId, agentId]) },
     setChatSessionModel: async (dshSessionId, modelId) => { calls.push(['setChatSessionModel', dshSessionId, modelId]) },
@@ -1161,33 +1256,41 @@ describe('dispatchRpc', () => {
     // a value the next boot accepts.
     await expect(dispatchRpc(manager, 'ui/approval-deadlines', {})).resolves.toEqual({
       ok: true,
-      value: { deadlines: { nativeApprovalTimeoutMs: 300_000, permissionFallbackTimeoutMs: 120_000 } },
+      value: { deadlines: { permissionTimeoutMs: 300_000, mode: 'abort' } },
     })
     await expect(dispatchRpc({ ...manager, approvalDeadlines: undefined }, 'ui/approval-deadlines', {})).resolves.toEqual({
       ok: true,
       value: { deadlines: undefined },
     })
-    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { nativeApprovalTimeoutMs: 60_000 })).resolves.toEqual({
+    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { permissionTimeoutMs: 60_000 })).resolves.toEqual({
       ok: true,
-      value: { deadlines: { nativeApprovalTimeoutMs: 300_000, permissionFallbackTimeoutMs: 120_000 } },
+      value: { deadlines: { permissionTimeoutMs: 300_000, mode: 'abort' } },
     })
-    // Only the touched key travels: the manager merges, so a card that edited one
-    // slider must not reset the other.
-    expect(manager.calls).toContainEqual(['setApprovalDeadlines', { nativeApprovalTimeoutMs: 60_000 }, false])
+    // Only the touched key travels: the manager merges, so a card that edited
+    // the window must not reset the mode.
+    expect(manager.calls).toContainEqual(['setApprovalDeadlines', { permissionTimeoutMs: 60_000 }, false])
+    // The mode travels through the same route, and only the three values pass.
+    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { mode: 'auto' })).resolves.toMatchObject({ ok: true })
+    expect(manager.calls).toContainEqual(['setApprovalDeadlines', { mode: 'auto' }, false])
+    for (const bad of ['maybe', '', 1, null]) {
+      await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { mode: bad }))
+        .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    }
     await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { reset: true })).resolves.toMatchObject({ ok: true })
     expect(manager.calls).toContainEqual(['setApprovalDeadlines', {}, true])
     for (const bad of [-1, 1.5, 86_400_001, '60000']) {
-      await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { nativeApprovalTimeoutMs: bad }))
-        .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
-      await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { permissionFallbackTimeoutMs: bad }))
+      await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { permissionTimeoutMs: bad }))
         .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     }
-    // `0` is the meaningful value on both, not a rejection.
-    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { nativeApprovalTimeoutMs: 0, permissionFallbackTimeoutMs: 0 }))
+    // `0` is the meaningful value (一直等), not a rejection.
+    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { permissionTimeoutMs: 0 }))
       .resolves.toMatchObject({ ok: true })
-    expect(manager.calls).toContainEqual(['setApprovalDeadlines', { nativeApprovalTimeoutMs: 0, permissionFallbackTimeoutMs: 0 }, false])
-    // An unknown key is dropped rather than persisted into state.
-    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { permissionTimeoutMs: 5 })).resolves.toMatchObject({ ok: true })
+    expect(manager.calls).toContainEqual(['setApprovalDeadlines', { permissionTimeoutMs: 0 }, false])
+    // An unknown key is dropped rather than persisted into state, and the two
+    // legacy windows can no longer be smuggled back in.
+    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { bogusKey: 5 })).resolves.toMatchObject({ ok: true })
+    expect(manager.calls).toContainEqual(['setApprovalDeadlines', {}, false])
+    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { nativeApprovalTimeoutMs: 60_000 })).resolves.toMatchObject({ ok: true })
     expect(manager.calls).toContainEqual(['setApprovalDeadlines', {}, false])
     // The conversation↔agent mapping: the plugin's own binding, never a model route.
     await expect(dispatchRpc(manager, 'session/chat-bind', { dshSessionId: 'chat-1', agentId: 'pi' })).resolves.toEqual({ ok: true, value: { done: true } })

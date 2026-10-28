@@ -1446,7 +1446,10 @@ describe('reliability (isolated manager, short timeouts)', () => {
     undefined,
     undefined,
     true,
-    { startupTimeoutMs: 2_500, permissionTimeoutMs: 700, cancelFallbackMs: 400 },
+    // `abort` is spelled out because the plugin's own default is `wait`
+    // (never expire), and `wait` outranks `permissionTimeoutMs` — the case
+    // below IS the deadline firing.
+    { startupTimeoutMs: 2_500, permissionTimeoutMs: 700, cancelFallbackMs: 400, permissionTimeoutMode: 'abort' },
   )
 
   function relWaitFor<T extends AcpEvent['type']>(type: T, predicate: (event: Extract<AcpEvent, { type: T }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: T }>> {
@@ -1897,10 +1900,12 @@ describe('a degraded approval route still answers the turn (isolated manager)', 
   const degradeHub = new EventHub()
   const degradeEvents: AcpEvent[] = []
   degradeHub.subscribe(event => { degradeEvents.push(event) })
-  // `permissionTimeoutMs` stays at its 0 default ("approvals belong to a
-  // person"); only the degraded-route fallback is shortened so the case runs
-  // in seconds instead of the production five minutes.
-  const degradeManager = new BridgeManager([{ ...def, id: 'degrade' }], degradeHub, 500, undefined, undefined, true, { permissionFallbackTimeoutMs: 2_000 })
+  // `permissionTimeoutMs` stays at its 0 default ("the two windows are in
+  // charge"); only the degraded-route fallback is shortened so the case runs
+  // in seconds instead of the production five minutes. The mode is `abort`
+  // because this case IS about the deadline firing — the plugin's own default
+  // is `wait` (never expire).
+  const degradeManager = new BridgeManager([{ ...def, id: 'degrade' }], degradeHub, 500, undefined, undefined, true, { permissionTimeoutMs: 2_000, permissionTimeoutMode: 'abort' })
   const degradeAdapter = new AcpLlmAdapter(degradeManager)
 
   degradeManager.setApprovalRequester(() => Promise.resolve('unavailable'))
@@ -1962,11 +1967,11 @@ describe('a degraded approval route still answers the turn (isolated manager)', 
     const { drained } = await degradeTurn('dsh-degrade-hang', 'PERM degrade hang')
     const request = await degradeWaitFor('permission/request', since, () => true)
 
-    // Nobody answers. The degraded-route deadline must answer `cancelled` on
-    // the human's behalf — with the default `permissionTimeoutMs: 0` this is
-    // the only thing keeping the turn from hanging forever.
+    // Nobody answers. The deadline must answer `cancelled` on the human's
+    // behalf — with the default `permissionTimeoutMs: 0` this is the only
+    // thing keeping the turn from hanging forever.
     const notice = await degradeWaitFor('agent/notice', since, event => event.text.includes('timed out after 2s'))
-    expect(notice.text).toContain('cancelled')
+    expect(notice.text).toContain('refused')
     await drained
     expect(await degradeEcho(request.sessionId)).toContain('perm=cancelled')
   }, 30_000)
@@ -1987,6 +1992,31 @@ describe('a degraded approval route still answers the turn (isolated manager)', 
     expect(reasoning()).not.toContain('please approve in Settings')
     expect(await degradeEcho(request.sessionId)).toContain('perm=allow1')
   }, 30_000)
+
+  it('lists the outstanding ledger asks for a reconnecting client', async () => {
+    // The `permission/request` frame is broadcast ONCE. A client that connects
+    // later — page reload, second tab, stream outage — would never learn this
+    // ask exists, and for a ledger ask the settings card is the only answer
+    // entry (OmniTerm closes the same hole by replaying
+    // `pending_events()` on every WS connect). The manager must therefore be
+    // able to name every outstanding ask with the view it was shown.
+    const since = degradeEvents.length
+    const { drained } = await degradeTurn('dsh-degrade-replay', 'PERM degrade replay')
+    const request = await degradeWaitFor('permission/request', since, () => true)
+
+    const views = degradeManager.pendingPermissionViews()
+    expect(views).toHaveLength(1)
+    expect(views[0]).toMatchObject({
+      requestId: request.requestId,
+      sessionId: request.sessionId,
+      toolCall: request.toolCall,
+      options: request.options,
+    })
+
+    await dispatchRpc(degradeManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
+    await drained
+    expect(degradeManager.pendingPermissionViews()).toHaveLength(0)
+  }, 30_000)
 })
 
 /**
@@ -2000,20 +2030,21 @@ describe('a degraded approval route still answers the turn (isolated manager)', 
  * #2: the ask is logged host-side and nothing ever answers it.
  *
  * The bridge bounds that state instead of trusting the host: past
- * `nativeApprovalTimeoutMs` the ask is WITHDRAWN (the signal handed to the host
- * aborts, settling its waterfall `cancelled` and dropping the composer panel)
- * and re-asked on the ledger, where the chat line and the settings card are
- * both visible. Withdrawing is not answering — the same question stays
- * answerable in Settings — and the ledger's degraded-route deadline still ends
- * the turn if nobody answers there either.
+ * `permissionTimeoutMs` the ask is settled WHERE IT WAS ASKED (the signal
+ * handed to the host aborts, settling its waterfall `cancelled` and dropping
+ * the composer panel). It is not moved to the ledger: that would send the
+ * question to a page the user is not looking at, where a second deadline
+ * would cancel it a few minutes later anyway.
  */
 describe('a native approval route that never answers still answers the turn (isolated manager)', () => {
   const silentHub = new EventHub()
   const silentEvents: AcpEvent[] = []
   silentHub.subscribe(event => { silentEvents.push(event) })
   const silentManager = new BridgeManager([{ ...def, id: 'silent' }], silentHub, 500, undefined, undefined, true, {
-    nativeApprovalTimeoutMs: 1_200,
-    permissionFallbackTimeoutMs: 2_000,
+    permissionTimeoutMs: 1_200,
+    // The case IS the deadline firing: the plugin's own default is `wait`
+    // (never expire), so the mode has to be picked explicitly here.
+    permissionTimeoutMode: 'abort',
   })
   const silentAdapter = new AcpLlmAdapter(silentManager)
   /** Signals handed to the host approval chain, so a withdrawal is observable. */
@@ -2077,10 +2108,10 @@ describe('a native approval route that never answers still answers the turn (iso
       .join('')
   }
 
-  it('withdraws the ask from the host and re-asks it on the ledger', async () => {
+  it('refuses the ask where it was asked, without moving it to the ledger', async () => {
     const since = silentEvents.length
     const { reasoning, drained } = await silentTurn('dsh-silent-withdraw', 'PERM silent withdraw')
-    const request = await silentWaitFor('permission/request', since, () => true)
+    const expired = await silentWaitFor('permission/expired', since, () => true)
 
     // Exactly one host ask, and it was withdrawn: the signal the bridge handed
     // over aborted, which is what settles the host waterfall `cancelled` in
@@ -2088,56 +2119,31 @@ describe('a native approval route that never answers still answers the turn (iso
     expect(hostAsks).toHaveLength(1)
     expect(hostAsks[0]?.signal?.aborted).toBe(true)
 
-    // A human can still answer — in the settings panel now.
-    await dispatchRpc(silentManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
+    // The ask is NOT relocated. It never becomes a ledger entry, so there is no
+    // card to answer and no second chance in a page the user is not looking
+    // at — the deadline ends the question where it was asked.
+    expect(silentEvents.slice(since).filter(e => e.type === 'permission/request')).toHaveLength(0)
+    expect(silentManager.pendingPermissionViews()).toHaveLength(0)
+
     await drained
-    // The line must not claim the service is unavailable (it answered nothing,
-    // which is not the same failure) and must name the deadline it now carries.
-    // The cause stays an OBSERVED FACT — a slow human and a host that never
-    // rendered the question look identical from here.
-    expect(reasoning()).toContain('no answer in the conversation within 1s')
-    expect(reasoning()).toContain('approve in Settings within 2s or this request is cancelled')
-    expect(reasoning()).not.toContain('please approve in Settings')
-    expect(await silentEcho(request.sessionId)).toContain('perm=allow1')
+    // The conversation says what happened to the question; otherwise the
+    // composer card just vanishes with nothing said about it.
+    expect(reasoning()).toContain('no answer within 1s; refused')
+    expect(await silentEcho(expired.sessionId)).toContain('perm=cancelled')
   }, 30_000)
 
-  it('ends the turn instead of hanging when nobody answers the withdrawn ask', async () => {
+  it('ends the turn at its own deadline instead of hanging', async () => {
     const since = silentEvents.length
     const { drained } = await silentTurn('dsh-silent-hang', 'PERM silent hang')
-    const request = await silentWaitFor('permission/request', since, () => true)
+    const expired = await silentWaitFor('permission/expired', since, () => true)
 
-    // Nobody answers anywhere. The degraded-route deadline answers `cancelled`
-    // on the human's behalf — the only thing keeping the turn from hanging
-    // forever behind a question the conversation never showed.
-    const notice = await silentWaitFor('agent/notice', since, event => event.text.includes('timed out after 2s'))
-    expect(notice.text).toContain('cancelled')
+    // Nobody answered anywhere. The deadline settles the ask IN PLACE — the
+    // turn ends on that answer instead of hanging behind a question the
+    // conversation never showed.
+    const notice = await silentWaitFor('agent/notice', since, event => event.text.includes('timed out after 1s'))
+    expect(notice.text).toContain('refused')
     await drained
-    expect(await silentEcho(request.sessionId)).toContain('perm=cancelled')
-  }, 30_000)
-
-  it('lists the outstanding ledger asks for a reconnecting client', async () => {
-    // The `permission/request` frame is broadcast ONCE. A client that connects
-    // later — page reload, second tab, stream outage — would never learn this
-    // ask exists, and for a ledger ask the settings card is the only answer
-    // entry (OmniTerm closes the same hole by replaying
-    // `pending_events()` on every WS connect). The manager must therefore be
-    // able to name every outstanding ask with the view it was shown.
-    const since = silentEvents.length
-    const { drained } = await silentTurn('dsh-silent-replay', 'PERM silent replay')
-    const request = await silentWaitFor('permission/request', since, () => true)
-
-    const views = silentManager.pendingPermissionViews()
-    expect(views).toHaveLength(1)
-    expect(views[0]).toMatchObject({
-      requestId: request.requestId,
-      sessionId: request.sessionId,
-      toolCall: request.toolCall,
-      options: request.options,
-    })
-
-    await dispatchRpc(silentManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
-    await drained
-    expect(silentManager.pendingPermissionViews()).toHaveLength(0)
+    expect(await silentEcho(expired.sessionId)).toContain('perm=cancelled')
   }, 30_000)
 
   it('leaves a promptly answered native ask alone', async () => {
@@ -2174,8 +2180,10 @@ describe('a native approval route that never answers still answers the turn (iso
     const hotEvents: AcpEvent[] = []
     hotHub.subscribe(event => { hotEvents.push(event) })
     const hotManager = new BridgeManager([{ ...def, id: 'hot' }], hotHub, 500, undefined, undefined, true, {
-      nativeApprovalTimeoutMs: 600_000,
-      permissionFallbackTimeoutMs: 600_000,
+      permissionTimeoutMs: 600_000,
+      // The write below shortens the windows; the MODE is what makes an
+      // expiry do something, and the plugin's default (`wait`) never expires.
+      permissionTimeoutMode: 'abort',
     })
     const hotAsks: { signal: AbortSignal | undefined }[] = []
     hotManager.setApprovalRequester(request => {
@@ -2204,7 +2212,7 @@ describe('a native approval route that never answers still answers the turn (iso
     }
     try {
       // The settings write, on a manager that has never run a turn.
-      await hotManager.setApprovalDeadlines({ nativeApprovalTimeoutMs: 400, permissionFallbackTimeoutMs: 700 })
+      await hotManager.setApprovalDeadlines({ permissionTimeoutMs: 600 })
       const since = hotEvents.length
       const parts: string[] = []
       const drained = (async () => {
@@ -2218,16 +2226,14 @@ describe('a native approval route that never answers still answers the turn (iso
           if (chunk.type === 'reasoning-delta') parts.push(chunk.text)
         }
       })()
-      const request = await hotWaitFor('permission/request', since, () => true)
-      // Withdrawn on the NEW 400ms window, not the 600s one it was built with.
+      // Settled on the NEW 600ms window, not the 600s one it was built with.
+      await hotWaitFor('permission/expired', since, () => true)
       expect(hotAsks).toHaveLength(1)
       expect(hotAsks[0]?.signal?.aborted).toBe(true)
-      // And the ledger's degraded-route deadline followed too (700ms → "1s").
       const notice = await hotWaitFor('agent/notice', since, event => event.text.includes('timed out after 1s'), 5_000)
-      expect(notice.text).toContain('cancelled')
+      expect(notice.text).toContain('refused')
       await drained
-      expect(parts.join('')).toContain('no answer in the conversation within 0s')
-      expect(request.requestId).not.toBe('')
+      expect(parts.join('')).toContain('no answer within 1s; refused')
     } finally {
       await hotManager.shutdownAll()
     }
@@ -2235,26 +2241,175 @@ describe('a native approval route that never answers still answers the turn (iso
 })
 
 /**
+ * The zero window: 不等待 — the ask is settled the moment it arrives.
+ *
+ * A window of `0` does not mean "waited for zero seconds"; it means nobody is
+ * going to be asked at all. The native route therefore never reaches the host
+ * (a composer card that appears and vanishes answers nothing), and the ledger
+ * route never creates an entry (there would be no card to answer).
+ *
+ * This rung belongs to the **auto** mode: it ANSWERS the ask with the option
+ * the agent's own kinds imply, so the agent continues. Under `abort` the same
+ * zero would REFUSE every ask on arrival — the agent stops at every gate it
+ * meets, which is not a timeout but a wall — so `abort` never offers it and
+ * floors to the shortest real wait. `wait` keeps its own meaning (it never
+ * expires), so a zero window under it still waits for the human.
+ */
+describe('a zero window settles the ask without asking anyone (isolated manager)', () => {
+  interface ZeroCase {
+    events: AcpEvent[]
+    /** How many times the HOST was asked for an answer. */
+    hostAsks: number
+    /** Asks still waiting for an answer on the ledger. */
+    pending: number
+    /** The window actually in force. */
+    effectiveWindow: number
+    reasoning: string
+    echo: string
+  }
+
+  /**
+   * Run one PERM turn on a manager whose window is `0`.
+   *
+   * The adapter is the only path that binds a DSH chat session id, so it is
+   * also the only path that can reach the native route — the case that has to
+   * prove the host is NOT asked.
+   */
+  async function zeroCase(id: string, mode: 'auto' | 'abort' | 'wait', withRequester = true): Promise<ZeroCase> {
+    const caseHub = new EventHub()
+    const caseEvents: AcpEvent[] = []
+    caseHub.subscribe(event => { caseEvents.push(event) })
+    const caseManager = new BridgeManager([{ ...def, id }], caseHub, 500, undefined, undefined, false, {
+      permissionTimeoutMs: 0,
+      permissionTimeoutMode: mode,
+    })
+    let hostAsks = 0
+    if (withRequester) {
+      caseManager.setApprovalRequester(() => {
+        hostAsks += 1
+        return Promise.resolve<ApprovalOutcome>('allowed-once')
+      })
+    }
+    const adapter = new AcpLlmAdapter(caseManager)
+    const parts: string[] = []
+    const sessionKey = `dsh-zero-${id}`
+    const prompt = `PERM zero ${id}`
+    try {
+      const { chunks } = await hostLoopTurn(adapter, {
+        provider: 'acp',
+        model: id,
+        sessionId: sessionKey,
+        messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+      })
+      for (const chunk of chunks) {
+        if (chunk.type === 'reasoning-delta') parts.push(chunk.text)
+      }
+      // The transcript is addressed by the ACP session id, which the turn
+      // announced — not by the chat session key the adapter was given.
+      const turn = caseEvents.find(e => e.type === 'turn/start' && e.text === prompt)
+      if (turn?.sessionId === undefined) throw new Error('no turn started')
+      await settleTranscript(caseManager, turn.sessionId)
+      const transcript = await dispatchRpc(caseManager, 'transcript/get', { sessionId: turn.sessionId })
+      if (!transcript.ok) throw new Error('transcript failed')
+      const echo = (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
+        .filter(e => e.update.sessionUpdate === 'agent_message_chunk')
+        .map(e => String((e.update.content as { text?: string }).text ?? ''))
+        .join('')
+      return {
+        events: caseEvents,
+        hostAsks,
+        pending: caseManager.pendingPermissionViews().length,
+        effectiveWindow: caseManager.approvalDeadlines().permissionTimeoutMs,
+        reasoning: parts.join(''),
+        echo,
+      }
+    } finally {
+      await caseManager.shutdownAll()
+    }
+  }
+
+  it('auto: answers on the spot, without asking the host', async () => {
+    const result = await zeroCase('zeroauto', 'auto')
+    // The host was NEVER asked: a card that appears and vanishes answers
+    // nothing, and there is no second chance for it.
+    expect(result.hostAsks).toBe(0)
+    // Nor is there a ledger entry left waiting for later.
+    expect(result.pending).toBe(0)
+    expect(result.events.filter(e => e.type === 'permission/request')).toHaveLength(0)
+    // The window in force IS 不等待.
+    expect(result.effectiveWindow).toBe(0)
+    // The agent still got an answer — the option its own kinds imply.
+    expect(result.echo).toContain('perm=allow1')
+    // And the conversation says so. "not waited for" is not "waited 0 seconds":
+    // the two say different things to the human reading the transcript.
+    expect(result.reasoning).toContain('not waited for; answered "Allow once" automatically, continuing')
+    const notice = result.events.find(e => e.type === 'agent/notice')
+    expect(notice?.text).toContain('was not waited for; answered "Allow once"')
+  }, 30_000)
+
+  it('abort: never settles on arrival — the ask still reaches the human', async () => {
+    const result = await zeroCase('zeroabort', 'abort')
+    // 不等待 is the auto mode's rung. Under 超时中止 a zero window would
+    // refuse every ask the instant it arrived: the agent stops at every gate
+    // it meets. So the window floors to the shortest REAL wait.
+    expect(result.effectiveWindow).toBe(30_000)
+    // Which means the host IS asked — the question was not answered behind
+    // the human's back.
+    expect(result.hostAsks).toBe(1)
+    expect(result.echo).toContain('perm=allow1')
+    // Nothing settled it on arrival: no expiry, no notice.
+    expect(result.events.filter(e => e.type === 'permission/expired')).toHaveLength(0)
+    expect(result.events.filter(e => e.type === 'agent/notice')).toHaveLength(0)
+  }, 30_000)
+
+  it('wait: keeps waiting, because the mode owns "never expires"', async () => {
+    const result = await zeroCase('zerowait', 'wait')
+    // `wait` says the ask never expires. The window is the OTHER axis, and the
+    // mode outranks it — a wait-mode ask still reaches the human.
+    expect(result.hostAsks).toBe(1)
+    expect(result.echo).toContain('perm=allow1')
+    // Nothing settled it behind the human's back.
+    expect(result.events.filter(e => e.type === 'permission/expired')).toHaveLength(0)
+    expect(result.events.filter(e => e.type === 'agent/notice')).toHaveLength(0)
+  }, 30_000)
+
+  it('the ledger route settles on the spot too, with no card to answer', async () => {
+    // No approval service at all → the ask would have ridden the ledger. It
+    // never does: nothing is pending, and no card is broadcast for a page the
+    // user is not looking at.
+    const result = await zeroCase('zeroledger', 'auto', false)
+    expect(result.hostAsks).toBe(0)
+    expect(result.pending).toBe(0)
+    expect(result.events.filter(e => e.type === 'permission/request')).toHaveLength(0)
+    expect(result.echo).toContain('perm=allow1')
+    expect(result.reasoning).toContain('not waited for; answered "Allow once" automatically, continuing')
+  }, 30_000)
+})
+
+/**
  * The DESIGNED ledger path: a host with no approval service at all.
  *
  * Every ask rides the ledger and the settings panel's card is the answer
- * entry, so `permissionTimeoutMs: 0` must keep meaning "wait for the human" —
- * the degraded-route deadline must not leak into this path — and the chat
- * line names the panel plainly.
+ * entry, so the chat line names the panel plainly. The ledger's own window
+ * applies here too — an ask nobody can see in the conversation is exactly the
+ * one that must not hang the turn — and the `wait` mode is the way to say
+ * "keep it pending until I come back".
  */
-describe('the designed ledger path still waits for the human (isolated manager)', () => {
+describe('the designed ledger path answers in Settings (isolated manager)', () => {
   const plainHub = new EventHub()
   const plainEvents: AcpEvent[] = []
   plainHub.subscribe(event => { plainEvents.push(event) })
-  // A shortened degraded-route deadline that must NEVER fire on this path.
-  const plainManager = new BridgeManager([{ ...def, id: 'plain' }], plainHub, 500, undefined, undefined, true, { permissionFallbackTimeoutMs: 150 })
+  // A shortened ledger deadline so the case runs in seconds instead of the
+  // production five minutes. The mode is `abort` because this case IS about
+  // the deadline firing — the plugin's own default is `wait` (never expire).
+  const plainManager = new BridgeManager([{ ...def, id: 'plain' }], plainHub, 500, undefined, undefined, true, { permissionTimeoutMs: 2_000, permissionTimeoutMode: 'abort' })
   const plainAdapter = new AcpLlmAdapter(plainManager)
 
   afterAll(async () => {
     await plainManager.shutdownAll()
   })
 
-  it('keeps waiting with permissionTimeoutMs 0 and says "approve in Settings"', async () => {
+  it('carries a deadline and says where to answer', async () => {
     expect(plainManager.approvalRouting()).toBe(false)
     const since = plainEvents.length
     const parts: string[] = []
@@ -2277,20 +2432,16 @@ describe('the designed ledger path still waits for the human (isolated manager)'
       })
     })
 
-    // Well past the shortened degraded-route deadline: no notice, no
-    // auto-cancel. The panel card is the designed answer entry here.
-    await new Promise(resolve => setTimeout(resolve, 600))
-    expect(plainEvents.slice(since).filter(e => e.type === 'agent/notice')).toHaveLength(0)
-    // Still pending — `respond` throws `unknown_request` for an ask that is not.
-    const responded = await dispatchRpc(plainManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
-    expect(responded.ok).toBe(true)
+    // Answering in Settings still works, and the line says where to answer and
+    // what happens if nobody does.
+    await dispatchRpc(plainManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
     const { chunks } = await plainDrained
     for (const chunk of chunks) {
       if (chunk.type === 'reasoning-delta') parts.push(chunk.text)
     }
 
     const reasoning = parts.join('')
-    expect(reasoning).toContain('please approve in Settings')
+    expect(reasoning).toContain('approve in Settings within 2s or this request is cancelled')
     expect(reasoning).not.toContain('unavailable')
     const transcript = await dispatchRpc(plainManager, 'transcript/get', { sessionId: request.sessionId })
     expect(transcript.ok).toBe(true)
@@ -2300,6 +2451,56 @@ describe('the designed ledger path still waits for the human (isolated manager)'
       .map(e => String((e.update.content as { text?: string }).text ?? ''))
       .join('')
     expect(echo).toContain('perm=allow1')
+  }, 30_000)
+
+  it('keeps the ask pending in the wait mode', async () => {
+    // `wait` means "never expire": the ask stays on the ledger, visibly,
+    // until a human answers it or the session is cancelled.
+    const waitHub = new EventHub()
+    const waitEvents: AcpEvent[] = []
+    waitHub.subscribe(event => { waitEvents.push(event) })
+    const waitManager = new BridgeManager([{ ...def, id: 'wait' }], waitHub, 500, undefined, undefined, true, {
+      permissionTimeoutMs: 150,
+      permissionTimeoutMode: 'wait',
+    })
+    const waitAdapter = new AcpLlmAdapter(waitManager)
+    try {
+      const since = waitEvents.length
+      const parts: string[] = []
+      const waitDrained = hostLoopTurn(waitAdapter, {
+        provider: 'acp',
+        model: 'wait',
+        sessionId: 'dsh-plain-wait',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'PERM plain wait' }] }],
+      })
+      const request = await new Promise<Extract<AcpEvent, { type: 'permission/request' }>>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('timeout waiting for permission/request')), 15_000)
+        const unsub = waitHub.subscribe(event => {
+          if (waitEvents.indexOf(event) >= since && event.type === 'permission/request') {
+            clearTimeout(timer)
+            unsub()
+            resolve(event)
+          }
+        })
+      })
+
+      // Well past the window: no notice, no auto-answer. The panel card is the
+      // answer entry and it waits for the human.
+      await new Promise(resolve => setTimeout(resolve, 600))
+      expect(waitEvents.slice(since).filter(e => e.type === 'agent/notice')).toHaveLength(0)
+      expect(waitManager.pendingPermissionViews()).toHaveLength(1)
+      const responded = await dispatchRpc(waitManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
+      expect(responded.ok).toBe(true)
+      const { chunks } = await waitDrained
+      for (const chunk of chunks) {
+        if (chunk.type === 'reasoning-delta') parts.push(chunk.text)
+      }
+      // No deadline clause: nothing is going to happen on its own.
+      expect(parts.join('')).toContain('please approve in Settings')
+      expect(parts.join('')).not.toContain('within')
+    } finally {
+      await waitManager.shutdownAll()
+    }
   }, 30_000)
 })
 
@@ -3390,61 +3591,68 @@ describe('pre-chat pick persistence (isolated manager)', () => {
   it('edits an approval deadline live, persists it, and resets to the config file', async () => {
     const storage = `${tmpdir()}/acp-deadlines-${Date.now()}.json`
     const gm = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
-    // Nothing configured, nothing overridden: the built-in 5-minute window.
-    expect(gm.approvalDeadlines()).toEqual({ nativeApprovalTimeoutMs: 300_000, permissionFallbackTimeoutMs: 300_000 })
-    // A deployment that names only ONE window in `cordis.patch.yml` reports only
-    // that one: the other is a built-in default, not a configured value, and the
-    // settings card has to be able to tell the two apart.
-    gm.setConfiguredApprovalDeadlines({ nativeApprovalTimeoutMs: 600_000 })
+    // Nothing configured, nothing overridden: the built-in 5-minute window and
+    // the default mode.
+    expect(gm.approvalDeadlines()).toEqual({ permissionTimeoutMs: 300_000, mode: 'wait' })
+    // A deployment that names the window in `cordis.patch.yml` reports it as
+    // the reset target — "the file says 10 minutes" and "nothing was
+    // configured, 5 is the built-in default" are different facts, and the
+    // settings card has to be able to tell them apart.
+    gm.setConfiguredApprovalDeadlines({ permissionTimeoutMs: 600_000 }, 'wait')
     expect(gm.approvalDeadlines()).toMatchObject({
-      nativeApprovalTimeoutMs: 600_000,
-      permissionFallbackTimeoutMs: 300_000,
-      configured: { nativeApprovalTimeoutMs: 600_000 },
+      permissionTimeoutMs: 600_000,
+      mode: 'wait',
+      configured: { permissionTimeoutMs: 600_000 },
+      configuredMode: 'wait',
     })
 
     // The UI write outranks the config file and reaches the LIVE bridge without
     // restarting anything — the whole point over an `agent/save`-style reload,
     // which would cost the user every running session.
-    const tuningOf = (b: AgentBridge): { nativeApprovalTimeoutMs: number; permissionFallbackTimeoutMs: number } =>
-      b as unknown as { nativeApprovalTimeoutMs: number; permissionFallbackTimeoutMs: number }
+    const tuningOf = (b: AgentBridge): { permissionTimeoutMs: number } =>
+      b as unknown as { permissionTimeoutMs: number }
     const liveBridge = new AgentBridge({ ...def, id: 'live' }, pickHub, 500, () => { /* no manager behind it */ })
     ;(gm as unknown as { bridges: Map<string, AgentBridge> }).bridges.set('live', liveBridge)
-    await gm.setApprovalDeadlines({ nativeApprovalTimeoutMs: 30_000 })
+    await gm.setApprovalDeadlines({ permissionTimeoutMs: 30_000, mode: 'auto' })
     expect(gm.approvalDeadlines()).toMatchObject({
-      nativeApprovalTimeoutMs: 30_000,
-      permissionFallbackTimeoutMs: 300_000,
-      configured: { nativeApprovalTimeoutMs: 600_000 },
+      permissionTimeoutMs: 30_000,
+      mode: 'auto',
+      configured: { permissionTimeoutMs: 600_000 },
+      configuredMode: 'wait',
     })
-    expect(tuningOf(liveBridge).nativeApprovalTimeoutMs).toBe(30_000)
-    // The untouched window keeps the config-file value rather than being reset.
-    expect(tuningOf(liveBridge).permissionFallbackTimeoutMs).toBe(300_000)
+    expect(tuningOf(liveBridge).permissionTimeoutMs).toBe(30_000)
+    // The mode reaches the live bridge too — it decides what an expiry DOES.
+    expect((liveBridge as unknown as { permissionTimeoutMode: string }).permissionTimeoutMode).toBe('auto')
 
     // Persisted: a host restart comes back on the value the user picked, not the
     // deployment baseline. The host entry re-declares the patch file's baseline
     // on every boot, so the override has to keep outranking it after a restart.
     const reloaded = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
-    reloaded.setConfiguredApprovalDeadlines({ nativeApprovalTimeoutMs: 600_000 })
+    reloaded.setConfiguredApprovalDeadlines({ permissionTimeoutMs: 600_000 }, 'wait')
     expect(reloaded.approvalDeadlines()).toMatchObject({
-      nativeApprovalTimeoutMs: 30_000,
-      permissionFallbackTimeoutMs: 300_000,
-      configured: { nativeApprovalTimeoutMs: 600_000 },
+      permissionTimeoutMs: 30_000,
+      mode: 'auto',
+      configured: { permissionTimeoutMs: 600_000 },
     })
 
     // Reset drops the override: the config file decides again.
     await reloaded.setApprovalDeadlines({}, true)
     expect(reloaded.approvalDeadlines()).toMatchObject({
-      nativeApprovalTimeoutMs: 600_000,
-      permissionFallbackTimeoutMs: 300_000,
+      permissionTimeoutMs: 600_000,
+      mode: 'wait',
     })
     // A fresh manager over the same file sees the same thing (the reset persisted).
     const afterReset = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
-    afterReset.setConfiguredApprovalDeadlines({ nativeApprovalTimeoutMs: 600_000 })
-    expect(afterReset.approvalDeadlines()).toMatchObject({ nativeApprovalTimeoutMs: 600_000 })
+    afterReset.setConfiguredApprovalDeadlines({ permissionTimeoutMs: 600_000 }, 'wait')
+    expect(afterReset.approvalDeadlines()).toMatchObject({ permissionTimeoutMs: 600_000, mode: 'wait' })
 
     // An out-of-range write is refused before it can reach state, and the value
     // in force is untouched.
-    await expect(reloaded.setApprovalDeadlines({ permissionFallbackTimeoutMs: -1 })).rejects.toThrow(/permissionFallbackTimeoutMs/)
-    expect(reloaded.approvalDeadlines().permissionFallbackTimeoutMs).toBe(300_000)
+    await expect(reloaded.setApprovalDeadlines({ permissionTimeoutMs: -1 })).rejects.toThrow(/permissionTimeoutMs/)
+    expect(reloaded.approvalDeadlines().permissionTimeoutMs).toBe(600_000)
+    // A mode that is not one of the three is refused the same way.
+    await expect(reloaded.setApprovalDeadlines({ mode: 'maybe' as never })).rejects.toThrow(/permissionTimeoutMode/)
+    expect(reloaded.approvalDeadlines().mode).toBe('wait')
 
     await afterReset.shutdownAll()
     await reloaded.shutdownAll()

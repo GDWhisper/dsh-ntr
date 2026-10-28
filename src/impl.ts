@@ -8,7 +8,7 @@
 import { randomUUID } from './ids.ts'
 import type {
   AcpAgentCatalog, AcpAgentDef, AcpCatalogOption, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpMcpServerDef, AcpPluginConfig, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult,
-  AgentView, ApprovalDeadlineKey, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionOptionView, PermissionOutcome, RpcResult,
+  AgentView, ApprovalDeadlineKey, ApprovalDeadlinePatch, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionOptionView, PermissionOutcome, PermissionTimeoutMode, RpcResult,
 } from './protocol.ts'
 import { DEFAULT_TAG_HALO } from './protocol.ts'
 
@@ -104,6 +104,41 @@ export function validateTagHalo(value: unknown): AcpTagHalo {
 export const APPROVAL_DEADLINE_MAX_MS = 86_400_000
 
 /**
+ * The shortest REAL wait: the first rung of the card's ladder (30 seconds).
+ *
+ * The floor for a mode that must not wait zero — see
+ * {@link normalizeApprovalWindow}.
+ */
+export const APPROVAL_DEADLINE_MIN_WAIT_MS = 30_000
+
+/**
+ * Make a window legal for the mode it runs under.
+ *
+ * `0` means 不等待 — the ask is settled the moment it arrives instead of
+ * waiting. That is the **auto** mode's business: `auto` answers with the
+ * option the agent's own kinds imply, so the agent CONTINUES, and an
+ * unattended deployment gets a sane default instead of a hang.
+ *
+ * Under `abort` the same zero would refuse every ask the instant it arrived:
+ * the agent stops at every gate it meets, which is not a timeout, it is a
+ * brick wall. So `abort` never offers 不等待, and a window of `0` reaching it
+ * (a config file, a state file written by an older build, a mode switch that
+ * left the window behind) normalizes to the shortest real wait.
+ *
+ * `wait` ignores the window entirely — it never expires.
+ */
+export function normalizeApprovalWindow(mode: PermissionTimeoutMode, ms: number): number {
+  return mode === 'abort' && ms === 0 ? APPROVAL_DEADLINE_MIN_WAIT_MS : ms
+}
+
+/**
+ * The order `auto` mode picks an option in, by the kind the agent declared:
+ * the broadest grant first, then the narrow one, then the refusals, then
+ * whatever the agent offered instead. See {@link pickAutoOption}.
+ */
+export const AUTO_OPTION_KIND_PRIORITY = ['allow_always', 'allow_once', 'reject_once', 'reject_always'] as const
+
+/**
  * Validate ONE approval deadline, shared by every layer that accepts one.
  *
  * Three callers, one gate: `validateConfig` (the `cordis.patch.yml` baseline),
@@ -122,33 +157,60 @@ export function validateApprovalDeadlineMs(raw: unknown, label: string, code: 'b
 
 /**
  * Validate a settings-page deadline write. Omitted keys are simply absent from
- * the result — the manager merges, so a card that only touched one slider must
- * not reset the other. `reset` is not a deadline and is dropped here.
+ * the result — the manager merges, so a card that only moved the mode must not
+ * reset the number. `reset` is not a deadline and is dropped here.
  */
 export function validateApprovalDeadlines(value: unknown): Partial<Record<ApprovalDeadlineKey, number>> {
   if (value === null || typeof value !== 'object') throw new AcpError('bad_payload', 'acp: approval deadlines must be an object')
-  const { nativeApprovalTimeoutMs, permissionFallbackTimeoutMs } = value as {
-    nativeApprovalTimeoutMs?: unknown
-    permissionFallbackTimeoutMs?: unknown
-  }
+  const { permissionTimeoutMs } = value as { permissionTimeoutMs?: unknown }
   const out: Partial<Record<ApprovalDeadlineKey, number>> = {}
-  if (nativeApprovalTimeoutMs !== undefined) {
-    out.nativeApprovalTimeoutMs = validateApprovalDeadlineMs(
-      nativeApprovalTimeoutMs,
-      'nativeApprovalTimeoutMs',
+  if (permissionTimeoutMs !== undefined) {
+    out.permissionTimeoutMs = validateApprovalDeadlineMs(
+      permissionTimeoutMs,
+      'permissionTimeoutMs',
       'bad_payload',
-      '(0 = wait for the host approval chain forever)',
-    )
-  }
-  if (permissionFallbackTimeoutMs !== undefined) {
-    out.permissionFallbackTimeoutMs = validateApprovalDeadlineMs(
-      permissionFallbackTimeoutMs,
-      'permissionFallbackTimeoutMs',
-      'bad_payload',
-      '(0 = never answer a degraded ask on the human\'s behalf)',
+      '(0 = 不等待，仅自动推进档可用)',
     )
   }
   return out
+}
+
+/**
+ * Validate the mode a write asks for. Three values, and the list is the whole
+ * vocabulary: an unanswered ask is either answered for you, kept waiting, or
+ * refused. Anything else is a typo, not a new mode.
+ */
+export function validatePermissionTimeoutMode(raw: unknown, code: 'bad_config' | 'bad_payload'): PermissionTimeoutMode {
+  if (raw !== 'abort' && raw !== 'auto' && raw !== 'wait') {
+    throw new AcpError(code, 'acp: permissionTimeoutMode must be one of "abort", "auto", "wait"')
+  }
+  return raw
+}
+
+/**
+ * The option an expired deadline answers with in `auto` mode.
+ *
+ * The pick is by the option's KIND, because that is what the agent declared
+ * about the choice it is offering: `allow_always` first (one grant covers the
+ * rest of the run), then `allow_once` (the smaller grant), then the reject
+ * kinds (refuse but let the agent continue), and finally the first option
+ * whatever it is — an agent may offer only a custom kind, and refusing to
+ * answer at all would hang the turn.
+ *
+ * `undefined` means NO option could be read (no options, or none with a usable
+ * id). The caller then degrades to `abort`: guessing an option is worse than
+ * refusing, and hanging is worse than either. OmniTerm dev picks the same way
+ * (`pick_auto_option`, `src/acp/permission.rs`).
+ */
+export function pickAutoOption(options: readonly PermissionOptionView[]): PermissionOptionView | undefined {
+  const usable = (option: PermissionOptionView): PermissionOptionView | undefined =>
+    option.optionId === '' ? undefined : option
+  for (const kind of AUTO_OPTION_KIND_PRIORITY) {
+    const hit = options.find(option => option.kind === kind)
+    const picked = hit === undefined ? undefined : usable(hit)
+    if (picked !== undefined) return picked
+  }
+  return options.length === 0 ? undefined : usable(options[0] as PermissionOptionView)
 }
 
 /**
@@ -437,27 +499,30 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
   if (typeof startupTimeoutMs !== 'number' || !Number.isFinite(startupTimeoutMs) || startupTimeoutMs < 1_000 || startupTimeoutMs > 600_000) {
     throw new AcpError('bad_config', 'acp: startupTimeoutMs must be a number in [1000, 600000]')
   }
-  const permissionTimeoutMs = value.permissionTimeoutMs ?? 0
-  if (typeof permissionTimeoutMs !== 'number' || !Number.isInteger(permissionTimeoutMs) || permissionTimeoutMs < 0 || permissionTimeoutMs > APPROVAL_DEADLINE_MAX_MS) {
-    throw new AcpError('bad_config', `acp: permissionTimeoutMs must be an integer in [0, ${String(APPROVAL_DEADLINE_MAX_MS)}] (0 = wait forever)`)
-  }
-  // Both degraded-route deadlines share the `permissionTimeoutMs` range: `0` is
-  // the meaningful value (never withdraw / never auto-cancel), and anything up
-  // to a day is a legitimate "ask again later" window. Same validator as the
-  // settings-page write, so a baseline the panel can display is a baseline the
-  // panel can also produce.
-  const nativeApprovalTimeoutMs = validateApprovalDeadlineMs(
-    value.nativeApprovalTimeoutMs ?? 300_000,
-    'nativeApprovalTimeoutMs',
+  // ONE wait window for both routes. The two legacy keys are folded in when
+  // the new one is absent, so an existing `cordis.patch.yml` keeps meaning what
+  // it meant instead of silently falling back to the default.
+  const legacyWindow = value.nativeApprovalTimeoutMs ?? value.permissionFallbackTimeoutMs
+  // A legacy window of 0 meant "this window never fires". The only way to say
+  // that now is the `wait` MODE (0 is 不等待 today), so a legacy zero carries
+  // over as the mode — otherwise an unattended deployment would silently turn
+  // "wait forever" into "answer immediately".
+  const legacyNever = legacyWindow === 0
+  const permissionTimeoutMs = validateApprovalDeadlineMs(
+    legacyNever ? 300_000 : (value.permissionTimeoutMs ?? legacyWindow ?? 300_000),
+    'permissionTimeoutMs',
     'bad_config',
-    '(0 = wait for the host approval chain forever)',
+    '(0 = 不等待，仅自动推进档可用)',
   )
-  const permissionFallbackTimeoutMs = validateApprovalDeadlineMs(
-    value.permissionFallbackTimeoutMs ?? 300_000,
-    'permissionFallbackTimeoutMs',
-    'bad_config',
-    '(0 = never answer a degraded ask on the human\'s behalf)',
-  )
+  // What an expired deadline DOES. Same validator as the settings-page write,
+  // so a mode the panel can offer is a mode the next boot accepts.
+  const permissionTimeoutMode = legacyNever
+    ? 'wait'
+    : validatePermissionTimeoutMode(value.permissionTimeoutMode ?? 'wait', 'bad_config')
+  // 不等待 belongs to `auto` (it answers, so the agent continues). Under
+  // `abort` a zero window would refuse every ask on arrival — the agent stops
+  // at every gate — so it becomes the shortest real wait.
+  const effectivePermissionTimeoutMs = normalizeApprovalWindow(permissionTimeoutMode, permissionTimeoutMs)
   const cancelFallbackMs = value.cancelFallbackMs ?? 15_000
   if (typeof cancelFallbackMs !== 'number' || !Number.isInteger(cancelFallbackMs) || cancelFallbackMs < 0 || cancelFallbackMs > 600_000) {
     throw new AcpError('bad_config', 'acp: cancelFallbackMs must be an integer in [0, 600000] (0 = disable the fallback)')
@@ -475,9 +540,8 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
     transcriptMaxEntries: max,
     probeModelsOnBoot,
     startupTimeoutMs,
-    permissionTimeoutMs,
-    nativeApprovalTimeoutMs,
-    permissionFallbackTimeoutMs,
+    permissionTimeoutMs: effectivePermissionTimeoutMs,
+    permissionTimeoutMode,
     cancelFallbackMs,
     staleCancelRetryDelayMs,
     staleCancelMaxRetries,
@@ -1650,18 +1714,18 @@ export interface AcpManager {
   /** Write the halo preference (persisted with the agent registry). */
   setTagHalo?(halo: AcpTagHalo): Promise<void>
   /**
-   * The approval deadlines in force, with the facts that explain an override
-   * (the `cordis.patch.yml` baseline it outranks, and a `permissionTimeoutMs`
-   * that overrides both). `undefined` on a host half from before the card
-   * existed, which hides the settings card instead of guessing a value.
+   * The approval deadline in force, with the facts that explain an override
+   * (the `cordis.patch.yml` baseline it outranks). `undefined` on a host half
+   * from before the card existed, which hides the settings card instead of
+   * guessing a value.
    */
   approvalDeadlines?(): AcpApprovalDeadlines | undefined
   /**
-   * Write one or both approval deadlines (omitted keys keep their value), or
-   * drop the persisted override with `reset` so the config-file baseline
+   * Write the approval deadline, or the mode (omitted keys keep their value),
+   * or drop the persisted override with `reset` so the config-file baseline
    * applies again. Applies to the running bridges without a restart.
    */
-  setApprovalDeadlines?(patch: Partial<Record<ApprovalDeadlineKey, number>>, reset?: boolean): Promise<void>
+  setApprovalDeadlines?(patch: ApprovalDeadlinePatch, reset?: boolean): Promise<void>
   detectAgents?(): Promise<DetectedAgentInfo[]>
   saveAgent?(def: AcpAgentDef): Promise<void>
   deleteAgent?(agentId: string): Promise<void>
@@ -1985,10 +2049,10 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         // renders nothing rather than a number it cannot trust.
         return ok({ deadlines: manager.approvalDeadlines?.() })
       case 'ui/approval-deadlines-set': {
-        const patch = validateApprovalDeadlines({
-          nativeApprovalTimeoutMs: body.nativeApprovalTimeoutMs,
-          permissionFallbackTimeoutMs: body.permissionFallbackTimeoutMs,
-        })
+        const patch: ApprovalDeadlinePatch = {
+          ...validateApprovalDeadlines({ permissionTimeoutMs: body.permissionTimeoutMs }),
+          ...(body.mode === undefined ? {} : { mode: validatePermissionTimeoutMode(body.mode, 'bad_payload') }),
+        }
         await manager.setApprovalDeadlines?.(patch, body.reset === true)
         return ok({ deadlines: manager.approvalDeadlines?.() })
       }

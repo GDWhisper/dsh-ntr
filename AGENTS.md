@@ -105,8 +105,8 @@
 
 ### 权限（13–15）
 
-13. **审批优先走宿主 `ctx.approval`**：有 requester + 有 `dshSessionId` 时在对话 composer 里问；否则回落到 ledger（`no-requester` / `no-chat-session` 属设计内路径，`unavailable` 与 `native-timeout` 是降级并有 5 分钟倒计时）。路由本身另有 `nativeApprovalTimeoutMs`（默认 300s，**可配置且设置页可改**，`0` = 一直等）：宿主收了问题却不答，到点撤回（abort 交给它的 signal）并改走 ledger——撤回不是代答。成功路由不启动定时器，但广播 `permission/resolved`。两个降级时限（`nativeApprovalTimeoutMs` / `permissionFallbackTimeoutMs`）经 `ui/approval-deadlines` · `ui/approval-deadlines-set` 在设置页**热改**：覆盖值落 `agents.json` 的 `approvalDeadlines` 并压过 `cordis.patch.yml`，重置即回到配置文件的基线；`permissionTimeoutMs` 仍是唯一只读配置项且非 0 时一视同仁覆盖两者。`permission/request` 只广播一次，SSE 连接时按快照重放未决询问 + `permission/synced` 活集合收尾（刷新/新标签页否则永远看不到那张卡）；`session/cancel` 后必须 `settlePermissions`（ACP 规范：取消即答复未决审批 `cancelled`）。`approval` / `agents` 服务只能 `ctx.get` + `ctx.inject` 补注册。→ [permissions.md](./docs/agents/permissions.md)
-14. **审批 UI 归对话，设置页只做配置**：`ui.permissions` 非空就渲染可答复卡片，与 `approvalRouted` 无关（否则降级时藏掉唯一入口）。设置页没有权限策略开关：任何询问都必须交给人；唯一的时限卡片只调两个降级窗口，且必须同时显示「覆盖了配置文件」与「`permissionTimeoutMs` 正在覆盖本卡」两种事实。agent mode 控件在 `conversation.input.left`，不写可见标签、选项不依赖活会话、自带 ACP 闸门。agent 卡详情常挂载，工作区保存语义固定。→ [permissions.md](./docs/agents/permissions.md) / [ui.md](./docs/agents/ui.md)
+13. **审批优先走宿主 `ctx.approval`**：有 requester + 有 `dshSessionId` 时在对话 composer 里问；否则回落到 ledger（`no-requester` / `no-chat-session` 属设计内路径，`unavailable` 是降级）。**超时就地收场，严禁转移**：到点按 `permissionTimeoutMode`（**默认 `wait`**）结束这一问——`abort` 拒绝 / `auto` 按 option **kind 优先级**代答（挑不出合法选项则降级 `abort`）/ `wait` 不设期限——**不挪到「待处理权限请求」**（旧机制已退役：转移只买到一个第二机会，却把问题送到用户不在看的页面）。**只有 ONE 个等待窗口** `permissionTimeoutMs`（默认 300s）：对话里的询问与 ledger 里的询问问的是同一个问题（「有人在吗」），所以共用一个答案——两个窗口曾把设置卡变成两个看不出关联的旋钮。**永不到期只由 `wait` 模式表达**（时长轴不再有「一直等待」档，否则同一件事两处各说一遍）；**「不等待」（`0`）只属 `auto` 档**——它**代答**（agent 继续），所以请求到达即收场，native 不调 requester、ledger 不建卡也不广播 `permission/request`；`abort` 档**没有**这一档（会立刻拒绝每一问，agent 在每个门口都停住），落到最短真实等待 30 秒。窗口与模式经 `ui/approval-deadlines` · `ui/approval-deadlines-set` 在设置页**热改**：覆盖值落 `agents.json` 的 `approvalDeadlines` 并压过 `cordis.patch.yml`，重置即回到基线。模式与窗口都在**询问开始时读一次**，已持定时器的询问不改口径。到点必须留痕：广播 `agent/notice` + `permission/expired`，对话里要有一行说明，否则卡片凭空消失。`permission/request` 只广播一次，SSE 连接时按快照重放未决询问 + `permission/synced` 活集合收尾（刷新/新标签页否则永远看不到那张卡）；`session/cancel` 后必须 `settlePermissions`（ACP 规范：取消即答复未决审批 `cancelled`）。`approval` / `agents` 服务只能 `ctx.get` + `ctx.inject` 补注册。→ [permissions.md](./docs/agents/permissions.md)
+14. **审批 UI 归对话，设置页只做配置**：`ui.permissions` 非空就渲染可答复卡片，与 `approvalRouted` 无关（否则降级时藏掉唯一入口）。设置页没有权限策略开关：任何询问都必须交给人；唯一的时限卡片只有**两个控件**——「超时处理方式」（`wait` / `auto` / `abort` 三档互斥按钮，整宽排布，按钮文字不得折行）与「等待时长」（一根滑块，档位 不等待 / 30 秒 / 1 分 / 5 分 / 15 分 / 30 分 / 1 小时 / 6 小时，**「不等待」只在 `auto` 档出现**，`abort` 档从 30 秒起；`wait` 档下**不画滑块**，读数写「一直等待」）——并必须有一句话把两者说成一套（超过该时长仍未应答，将按上方所选的方式处理）。覆盖事实**挂被覆盖的那一行**，重置按钮**只有真的覆盖了才出现**。agent mode 控件在 `conversation.input.left`，不写可见标签、选项不依赖活会话、自带 ACP 闸门。agent 卡详情常挂载，工作区保存语义固定。→ [permissions.md](./docs/agents/permissions.md) / [ui.md](./docs/agents/ui.md)
 15. **【裁决部分已退役】工作区即侧栏路径**：聊天会话的 `session/new` / `session/load` cwd 与子进程 `spawnCwd` 都必须是 DSH 会话自己的工作区，并以 `extraRoots` 传入（create 与 resume 都要）。prompt 严格等于用户文本，不叙述任何边界。agent 的 mode 只经 `session/chat-list` / `chat-mode-set` 与 `agent/catalog` 上报。DSH Access mode 裁决整条已删除。→ [architecture.md](./docs/agents/architecture.md) / [retired.md](./docs/agents/retired.md)
 
 ### 转发与 preset（16–17）
@@ -118,11 +118,12 @@
 
 22. **【默认模型守卫已退役】插件只写自己的绑定与默认 agent**：`defaultAgentId` 是插件私有状态，删除 agent 必须清空。`session/chat-*` 只写插件映射，再由 guard 改写接到请求路径。插件完全不碰 DSH 模型层（不读目录、不写 `selectModel`、不广告模型）。旧默认模型守卫 / 路由强制 / 目录重试见 [retired.md](./docs/agents/retired.md)。→ [architecture.md](./docs/agents/architecture.md)
 
-### 界面（18、20、30）
+### 界面（18、20、30、33）
 
 18. **对话内的 NTR 面只借显示层**：模型 / 思考等级 / 额外 config options 读 `agent/catalog`；哪条会话由哪个 agent 服务读插件绑定（`routeAgentId`，无答案时**严禁**用 `agents[0]` 填名字）；写入只走 `bindChatAgent` / `setChatSessionModel` / `setChatSessionEffort` / `setChatSessionConfig`，严禁 `directory.select` / `selectModel`。cluster 顺序固定为 `高级 → model → thought → agent`：首轮前 agent 底座是右端锚点（不能被挤没），额外选项收进模型左侧的「高级」底座；首轮锁定、底座退场后，model / thought 成为右端锚点。模型 picker 一行一个模型值，勾中的行必须写模型名。NTR 视图只读 `session/chat-transcript`。空状态要区分「没服务过」与「ACP 会话没了」。空 roster（宿主已答 `agents/list`）下底座**不消失**，菜单给「打开 NTR 设置」动作；`agentsLoaded` 之前不得把「未读取」当「未配置」。→ [ui.md](./docs/agents/ui.md)
 20. **【竞争式遮蔽已退役】座位靠 claim 接管，失败一律放开**：`createModelSeatClaim` 用 `entriesOfSlot` 核实 head，不中就有界重注册（`MAX_SEAT_CLAIMS`），注册经 `ctx.slots.inject`。只读舞台会话 `agentPreset === ACP_PRESET_ID`，切走即撤；`stagedSessionOf` / `rowAgentPreset` 兼容两代快照；服务 / 槽位 / 注册 / 渲染任何不确定都回到原生座位。`ACP_PRESET_ID` 三处同步。旧竞争式遮蔽见 [retired.md](./docs/agents/retired.md)。→ [ui.md](./docs/agents/ui.md)
 30. **NTR 会话的 `/` 属于 agent**：只列 agent 经 `available_commands_update` 声明的命令，Enter 不被宿主认领，选中只插回草稿。实现只能运行时包装活的 `/` 来源（`slash-isolation.ts`），严禁注册第二个来源或替换 composer；命令清单只由一个来源承载；没有证据时 fail-open。命令声明还要按 agent 缓存进 `model-catalog.json`，供首条消息前使用。→ [ui.md](./docs/agents/ui.md) / [state.md](./docs/agents/state.md)
+33. **设置页文案有预算上限**：一个控件的说明**一行讲完**，机制解释进代码注释与 `docs/agents/`，不进 UI。同页参照是「呼吸频率 10 字 / 挂牌光晕 14 字 / 对话外观导语 15 字」；审批时限卡从 211 字压到 86 字是基准线，现为**两个控件**（默认档 55 字）。覆盖事实**必须看得见**——`configured[key]` 挂**被覆盖的那一行**，用警告色，不与其它灰色小字同层；重置按钮**只有真的覆盖了才出现**。文案里**点名控件名**必须与可见标题一致（改名要同步）。→ [ui.md](./docs/agents/ui.md) / [permissions.md](./docs/agents/permissions.md)
 
 ### 路径（24）
 
@@ -161,7 +162,7 @@
 - `register.spec.ts`：Cordis 上下文注册，用 `fakeCtx()` 模拟宿主。
 - `store.spec.ts`：前端状态机与消息块折叠。
 - `bridge.spec.ts`：集成测试，用真实子进程跑 `tests/mock-agent.mjs` 验证 stdio ACP 全链路。
-- `acp-view.spec.ts`：浏览器半区纯函数（diff / 空状态 / codec / 路径等价）。会 import 客户端模块，浏览器侧纯逻辑放这里，不要塞进 impl.spec。
+- `acp-view.spec.ts`：浏览器半区纯函数（diff / 空状态 / codec / 路径等价 / 审批期限事实）。会 import 客户端模块，浏览器侧纯逻辑放这里，不要塞进 impl.spec。
 - `session-controls.spec.ts`：composer 芯片与菜单**说了什么**（`agentBaseChip` / `describeRoute` / `menuFor`）。
 - `model-seat.spec.ts`：座位 claim 的装 / 撤 / 重取。
 - `slash-isolation.spec.ts`：斜杠来源包装与 fail-open。

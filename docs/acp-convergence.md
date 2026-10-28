@@ -372,6 +372,9 @@ selection，而 driver 每轮解析的路由（`selectionFor(agent).current`：p
   路由因此自带 `nativeApprovalTimeoutMs`（默认 300_000，与 `permissionFallbackTimeoutMs` 同一个窗口）：到点**撤回**——abort 交给宿主的
   signal（宿主 waterfall 用同一 signal 赛跑答案，遂以 `cancelled` 收尾、composer 面板消失），
   再把同一问题改走 ledger。撤回不是代答：人照样能在设置页回答同一个问题。填 `0` 关闭。
+  > **已退役（2026-10-28）**：上面的「撤回 + 改走 ledger」不再是现行机制——超时**就地收场**，
+  > 不转移（`abort` 拒绝 / `auto` 代答 / `wait` 不设期限），`native-timeout` 这个原因码已从代码里删除。
+  > 现行模型见 [permissions.md §2.1](./agents/permissions.md)。
 
 原因在广播前记进 `ledgerFallbacks`，`streamPrompt` 据此写聊天里那行提示：
 设计内路径照旧「please approve in Settings」，降级路径要说清为什么对话没展示这个问题
@@ -390,19 +393,49 @@ selection，而 driver 每轮解析的路由（`selectionFor(agent).current`：p
 `PermissionManager::pending_events()` + WS 连接时的 `PermissionsSynced` 标记帧。
 
 OmniTerm 的 reaper 另有一套三档策略（`abort` 取消并回收 / `auto` 代答 / `wait` 一直等，
-默认 30 分钟），本插件**只取其中两档**：`abort` ≈ 现行撤回 + 倒计时，`wait` ≈ 两个期限都填
+默认 30 分钟）。本插件**当时只取其中两档**：`abort` ≈ 现行撤回 + 倒计时，`wait` ≈ 两个期限都填
 `0`。`auto`（代替用户选 allow）与「宿主不替 agent 回答、每一问都必须交给人」的硬约束冲突，
 不移植。
+> **已更新（2026-10-28）**：三档**全部取用**，与 OmniTerm dev 的 `acp_perm_timeout_mode`
+> 同名同义（`wait` 默认 = 不自动拒绝 / `abort` 拒绝 / `auto` 按 option kind 优先级代答）。
+> 此前不移植 `auto`，是因为当时唯一的到点行为是「撤回 + 转移」，代答无处安放；现在超时
+> 就地收场，`auto` 是**用户显式选的档**，不是宿主替 agent 决定。
+> 插件自己的默认档是 `wait`（权限询问是问人的问题，默认就该等人）。
+> 见 [permissions.md §2.1](./agents/permissions.md)。
 
 **两个期限可在设置页热改（2026-10-27 补记）**：`cordis.patch.yml` 仍是部署基线，但
 `nativeApprovalTimeoutMs` / `permissionFallbackTimeoutMs` 也能在「NTR 设置 → 审批时限」里改
 （`ui/approval-deadlines` / `ui/approval-deadlines-set`），覆盖值落 `agents.json` 的
 `approvalDeadlines` 并压过配置文件，改完对**之后的询问**立即生效、不重启也不杀会话。这正是
 OmniTerm reaper 控件相对本插件原先形态多出来的那一部分：那边是模式下拉 + 30 秒步进滑块，
-经一个原子量热更新；这边只做两个窗口（`auto` 档不移植），预设 seg + 自由秒数两路输入，
+经一个原子量热更新；这边当时只做两个窗口（`auto` 档不移植），预设 seg + 自由秒数两路输入，
 热应用只改 `AgentBridge` 的两个字段（**已启动的定时器不重排**，正在决定中的人不该被移动球门）。
 `permissionTimeoutMs` 保持只能改配置文件——它是「一视同仁」的总闸，不该有两个入口。
-三层取值优先级与卡片必须显示的两个事实见 [permissions.md §2.3](./agents/permissions.md)。
+三层取值优先级与卡片必须显示的两个事实见 [permissions.md §2.4](./agents/permissions.md)。
+> **已更新（2026-10-28）**：卡片现在多一档「到点怎么处理」（`abort` / `auto` / `wait`），
+> 一起热改，见 [permissions.md §2.4](./agents/permissions.md)。
+>
+> **已更新（2026-10-28，第二个窗口退役）**：两个窗口合并成**一个**
+> `permissionTimeoutMs`（默认 300_000，`0` = 一直等），设置页卡片因此只剩两个控件
+> （一档到点行为 + 一根时长滑块）。对话 composer 里的询问与 ledger 里的询问问的是
+> 同一个问题，共用一个答案；两个窗口曾把卡变成三行看不出关联的旋钮。「一视同仁」的
+> `permissionTimeoutMs` 总闸随之消失——它让「卡片里那个数」和「真正生效的数」不是同一个数。
+> 旧的两个键仍被 `validateConfig` 接受并折叠进新键，老配置不会静默回到默认值。
+> 见 [permissions.md §2.4](./agents/permissions.md) 与 [retired.md](./agents/retired.md)。
+
+> **已更新（2026-10-28，「不等待」入轴）**：上一条里「`0` = 一直等」的说法**已作废**——
+> 新键 `permissionTimeoutMs: 0` 是**不等待**：请求到达即按「超时处理方式」那一档收场，
+> 根本不问人（native 不调 requester、ledger 不建条目也不广播 `permission/request`）。
+> 「永不到期」改由 `wait` 模式**唯一**表达，时长滑块上的「一直等待」档随之删除——
+> 同一件事不在两个控件里各说一遍。旧两个键里的 `0` 旧义是「这一窗永不触发」，
+> 因此迁移成 `wait` 模式 + 默认窗口，绝不迁成「不等待」（否则无人值守的部署会从
+> 「一直等」静默变成「立即自动放行」）。见 [permissions.md §2.1、§2.4](./agents/permissions.md)
+> 与 [retired.md](./agents/retired.md)。
+>
+> **再更新（同日）**：「不等待」**只属自动推进**——它代答，agent 继续，所以安全；
+> 配「超时中止」则是立刻拒绝每一问，agent 在每个门口都停住（那不是超时，是墙）。
+> 因此「超时中止」那一档的时长轴没有这一档，从 30 秒起；任何落到它的 0 一律抬到
+> 30 秒。见 [permissions.md §2.1、§2.4](./agents/permissions.md)。
 
 ### 2.4 原生模型座位：遮蔽是显示层要求，与路由无关
 

@@ -279,9 +279,11 @@ describe('host plugin contract', () => {
     })
     apply(ctx as never, {
       agents: [{ id: 'agent-1', command: 'run' }],
-      // One window named, one left to the default: the card must show only the
-      // named one as the reset target.
-      nativeApprovalTimeoutMs: 600_000,
+      // The ONE window named in the file. The mode is named too, for the same
+      // reason — "the file says `wait`" and "nothing was configured" are
+      // different facts.
+      permissionTimeoutMs: 600_000,
+      permissionTimeoutMode: 'wait',
     })
     const ask = async (endpoint: string, payload: unknown = {}): Promise<Record<string, unknown>> => {
       const answer = await rpcHandler!(endpoint, payload, new AbortController().signal)
@@ -289,20 +291,29 @@ describe('host plugin contract', () => {
     }
 
     expect((await ask('ui/approval-deadlines')).deadlines).toEqual({
-      nativeApprovalTimeoutMs: 600_000,
-      permissionFallbackTimeoutMs: 300_000,
-      configured: { nativeApprovalTimeoutMs: 600_000 },
+      permissionTimeoutMs: 600_000,
+      mode: 'wait',
+      configured: { permissionTimeoutMs: 600_000 },
+      configuredMode: 'wait',
     })
 
     // The settings write wins from here on, without a restart.
-    expect((await ask('ui/approval-deadlines-set', { nativeApprovalTimeoutMs: 30_000 })).deadlines)
-      .toMatchObject({ nativeApprovalTimeoutMs: 30_000 })
+    expect((await ask('ui/approval-deadlines-set', { permissionTimeoutMs: 30_000 })).deadlines)
+      .toMatchObject({ permissionTimeoutMs: 30_000 })
     expect((await ask('ui/approval-deadlines')).deadlines)
-      .toMatchObject({ nativeApprovalTimeoutMs: 30_000, configured: { nativeApprovalTimeoutMs: 600_000 } })
+      .toMatchObject({ permissionTimeoutMs: 30_000, configured: { permissionTimeoutMs: 600_000 } })
+
+    // The mode is writable through the same route, and outranks the file.
+    expect((await ask('ui/approval-deadlines-set', { mode: 'auto' })).deadlines)
+      .toMatchObject({ mode: 'auto', configuredMode: 'wait' })
+    // A mode outside the three is refused. (A protocol error comes back on the
+    // envelope itself, not inside `value` — same shape as `unknown_endpoint`.)
+    expect(await rpcHandler!('ui/approval-deadlines-set', { mode: 'maybe' }, new AbortController().signal))
+      .toMatchObject({ ok: false, error: { code: 'bad_payload' } })
 
     // Reset returns to the file's value.
     expect((await ask('ui/approval-deadlines-set', { reset: true })).deadlines)
-      .toMatchObject({ nativeApprovalTimeoutMs: 600_000 })
+      .toMatchObject({ permissionTimeoutMs: 600_000, mode: 'wait' })
   })
 
   it('never touches the host model layer at all — no route, no default, no guard', async () => {

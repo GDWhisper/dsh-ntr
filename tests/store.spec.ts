@@ -331,28 +331,33 @@ describe('AcpStore agent management', () => {
         if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
         if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
         if (endpoint === 'ui/approval-deadlines') {
-          return { ok: true, value: { deadlines: { nativeApprovalTimeoutMs: 600_000, permissionFallbackTimeoutMs: 300_000, configured: { nativeApprovalTimeoutMs: 600_000 } } } }
+          return { ok: true, value: { deadlines: { permissionTimeoutMs: 600_000, mode: 'abort', configured: { permissionTimeoutMs: 600_000 } } } }
         }
         if (endpoint === 'ui/approval-deadlines-set') {
           sent.push(payload as Record<string, unknown>)
           // The host answer is the authority: it echoes what is now in force.
-          return { ok: true, value: { deadlines: { nativeApprovalTimeoutMs: 30_000, permissionFallbackTimeoutMs: 300_000, configured: { nativeApprovalTimeoutMs: 600_000 } } } }
+          return { ok: true, value: { deadlines: { permissionTimeoutMs: 30_000, mode: 'auto', configured: { permissionTimeoutMs: 600_000 } } } }
         }
         return { ok: true, value: {} }
       },
       (zh) => zh,
     )
     await store.resync()
-    expect(store.getSnapshot().approvalDeadlines).toMatchObject({ nativeApprovalTimeoutMs: 600_000, permissionFallbackTimeoutMs: 300_000 })
+    expect(store.getSnapshot().approvalDeadlines).toMatchObject({ permissionTimeoutMs: 600_000, mode: 'abort' })
 
     // Only the touched key travels; the host answer replaces the optimistic value.
-    await store.setApprovalDeadline('nativeApprovalTimeoutMs', 30_000)
-    expect(sent).toEqual([{ nativeApprovalTimeoutMs: 30_000 }])
-    expect(store.getSnapshot().approvalDeadlines).toMatchObject({ nativeApprovalTimeoutMs: 30_000, permissionFallbackTimeoutMs: 300_000 })
+    await store.setApprovalDeadline(30_000)
+    expect(sent).toEqual([{ permissionTimeoutMs: 30_000 }])
+    expect(store.getSnapshot().approvalDeadlines).toMatchObject({ permissionTimeoutMs: 30_000, mode: 'auto' })
+
+    // The mode travels through the same write path.
+    await store.setApprovalTimeoutMode('auto')
+    expect(sent[1]).toEqual({ mode: 'auto' })
+    expect(store.getSnapshot().approvalDeadlines).toMatchObject({ mode: 'auto' })
 
     // `reset` is its own payload, not a deadline.
     await store.resetApprovalDeadlines()
-    expect(sent[1]).toEqual({ reset: true })
+    expect(sent[2]).toEqual({ reset: true })
 
     // A host half without the route leaves the card hidden rather than showing
     // a number this browser invented.

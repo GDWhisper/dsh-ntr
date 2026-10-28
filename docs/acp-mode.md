@@ -60,7 +60,7 @@ DSH 的"模式"就是 **agent preset**：一条 `@deepseek-ai/dsh-agent-preset` 
 
 **现行方向**：agent 侧 `session/request_permission` 原样映射到界面上。每个 agent 的权限形态不同（有的给选项列表、有的给 allow/deny、有的带 tool call 详情），接住它的载荷、渲染给人、把人的选择按 ACP 协议回包即可，宿主不预先判 allow/reject。
 
-**询问落在哪里，由它实际走的路决定**：`ask` 优先走宿主 `ctx.approval`（审批出现在对话 composer 里，不抢答）。走不到的三条原因见 [acp-convergence.md](acp-convergence.md) §2.3 的补记——设计内路径（没有审批服务、会话没有对话身份）落在设置页的 ledger 卡上等人答；**降级路径**（服务在、这次失败）落在同一张卡上，但带 5 分钟倒计时（`permissionFallbackTimeoutMs`），超时代答 `cancelled`。设置页那张卡**只要有待处理项就渲染可按钮**，不因 `approvalRouted` 而隐藏。
+**询问落在哪里，由它实际走的路决定**：`ask` 优先走宿主 `ctx.approval`（审批出现在对话 composer 里，不抢答）。走不到的三条原因见 [acp-convergence.md](acp-convergence.md) §2.3 的补记——设计内路径（没有审批服务、会话没有对话身份）落在设置页的 ledger 卡上等人答；**降级路径**（服务在、这次失败）落在同一张卡上，但带一个倒计时（`permissionTimeoutMs`，默认 5 分钟），到点按「超时处理方式」那一档收场。设置页那张卡**只要有待处理项就渲染可按钮**，不因 `approvalRouted` 而隐藏。
 
 **prompt 仍然严格等于用户文本**：这一条与权限怎么走无关，必须继续遵守。每轮转发给 ACP 的 prompt 严禁拼任何边界/策略句子（早期有 `policyNotice` 前缀叙述，已按用户要求彻底移除，不要以"agent 不知道边界"为由重加）。
 

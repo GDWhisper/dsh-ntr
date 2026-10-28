@@ -20,6 +20,22 @@
 - **退役**：`decidePermission` / `authorizeWrite` / `dshSessionPolicyOf` / `sandboxDenialMarker` / `wireAccessMode` / `setSessionPolicyResolver` / `DshSessionPolicy`。宿主不再坐在中间替 agent 判一遍，`approval === 'never'` 之类的全局 knob 不参与。
 - **仍然有效**：工作区即侧栏路径（session cwd + 进程 cwd，见 [architecture.md §4](./architecture.md)）；prompt 严格等于用户文本、不叙述边界；agent 自己的 mode 只经 `session/chat-list` / `session/chat-mode-set` 上报与切换。fs 只剩 `guardFsPath` 的 workspace containment。见 [permissions.md](./permissions.md)。
 
+### 超时把询问转移到设置页（撤回 → 改走 ledger）
+
+- **退役**：native 窗口到点后「撤回」并把同一问题改走 `PermissionLedger` 的那套机制；原因码 `native-timeout`；`LedgerFallback.waitedMs`；设置页卡片把两个窗口说成**一条链**（第一档撤出、第二档在设置页代答）。理由：转移只买到一个「第二机会」，却把问题送到用户**不在看的页面**，几分钟后照样被取消——那既不是挂起也不是取消，是没人要的混合态。更糟的是它对**每一问**都触发（定时器在 `requester(...)` 之前就 arm，一张正常渲染出来、你只是还没点的卡片同样会被撤走）。
+- **仍然有效**：超时就地收场，三档 `wait`（默认）/ `abort` / `auto`（`auto` 按 option kind 优先级代答，挑不出合法选项则降级 `abort`）；到点必须留痕（`agent/notice` + `permission/expired`，对话里有一行说明）。见 [permissions.md §2.1](./permissions.md) 与 [ui.md §8](./ui.md)。
+
+### 两个等待窗口（对话一处、ledger 一处）
+
+- **退役**：`nativeApprovalTimeoutMs` / `permissionFallbackTimeoutMs` 两个可设窗口，以及那个「一视同仁覆盖两者」的 `permissionTimeoutMs` 总闸；设置页卡片的三行版（到点怎么处理 + 对话里的询问 + 待处理权限请求里的询问）。理由：两处询问问的是同一个问题（「有人在吗」），分成两个数字只会让用户**看不出它们是不是一套**，还会配出互相矛盾的值（对话 5 分钟、ledger 1 小时）。总闸则让「卡片里那个数」和「真正生效的数」不是同一个数——卡片在骗人。
+- **仍然有效**：**一个**窗口 `permissionTimeoutMs`（默认 300_000，`0` = 不等待）+ 一档到点行为；卡片只剩两个控件并有一句话把两者说成一套。见 [permissions.md §2.4](./permissions.md) 与 [ui.md §8](./ui.md)。
+- **旧配置仍被接受**：`validateConfig` 把 `nativeApprovalTimeoutMs` / `permissionFallbackTimeoutMs` 折叠进新键（新键在场时忽略旧键），所以老的 `cordis.patch.yml` 不会静默回到默认值。
+
+### 时长轴上的「一直等待」档（以及 `0` = 一直等的旧义）
+
+- **退役**：滑块最右端的「一直等待」档，以及「窗口 `0` 表示这一窗永不触发」的旧义。理由：「永不到期」是**模式**（`wait`）的事，时长轴再放一档，同一件事两处各说一遍，用户只会怀疑自己漏配了什么。旧义更要命——`0` 一旦被重新解释成「不等待」，一个无人值守的部署会从「一直等」静默变成「立即自动放行」。
+- **仍然有效**：`wait` 模式是**唯一**能表达「永不到期」的档；新键 `permissionTimeoutMs: 0` 是**不等待**，且**只属 `auto`**（它代答，agent 继续）；`abort` 档**没有**这一档——同样的 0 在那里是立刻拒绝每一问，agent 在每个门口都停住，所以落到最短真实等待 30 秒（`normalizeApprovalWindow`，配置 / 状态文件 / 模式切换三条来路都走它）。滑块档位为 不等待 / 30 秒 / 1 分 / 5 分 / 15 分 / 30 分 / 1 小时 / 6 小时（`wait` 档下不画滑块），「不等待」只在自动推进档出现。旧键里的 `0` 迁移成 `wait` 模式 + 300_000 窗口（`validateConfig` 的 `legacyNever`、`BridgeManager.loadPersistedAgents` 同规则）。见 [permissions.md §2.1、§2.4](./permissions.md) 与 [ui.md §8](./ui.md)。
+
 ### agent 定义上的权限策略字段
 
 - **退役**：`AcpAgentDef.permission`（`ask` / `allow` / `reject`）、RPC `agent/set-permission`、`AgentBridge.permissionDecision`、设置页的「权限策略 / 要不要问人」下拉。它让插件替 agent 代答（`allow` / `reject`），与「agent 报什么就问什么」矛盾；要不要问由 agent 自己的 mode 决定。
@@ -57,6 +73,8 @@ selectAcpRoute  setDefaultModelGuard  wireDefaultModelGuard
 decidePermission  authorizeWrite  dshSessionPolicyOf  sandboxDenialMarker
 wireAccessMode  setSessionPolicyResolver  DshSessionPolicy
 PermissionMode  permissionDecision  agent/set-permission  def.permission
+native-timeout  LedgerFallback.waitedMs
+nativeApprovalTimeoutMs  permissionFallbackTimeoutMs  DeadlineModeRow  DeadlineRow
 answerBuffer  streamedAnswerLength  pendingToolAnswers  cardOutputs
 acpToolCallDetailsOf  acpToolActivityLine  acpToolActivityOutput  acpToolInputOf
 noteToolActivity

@@ -45,6 +45,7 @@ import {
   parseCatalogOptions,
   usableConfigOptions,
   permissionToolKind,
+  pickAutoOption,
   quoteCommandToken,
   randomUUID,
   resolveFsPath,
@@ -58,6 +59,8 @@ import {
   validateAgentDef,
   validateTagHalo,
   validateApprovalDeadlines,
+  validatePermissionTimeoutMode,
+  normalizeApprovalWindow,
 } from './impl.ts'
 import type {
   AcpToolCallSnapshot,
@@ -67,7 +70,7 @@ import type {
 import type {
   AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpMcpServerDef, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
   LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo,
-  ApprovalDeadlineKey, PermissionOutcome, PermissionOptionView, PreparedAdapterCall, SessionView, StreamChunk,
+  ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PreparedAdapterCall, SessionView, StreamChunk,
 } from './protocol.ts'
 import { DEFAULT_TAG_HALO } from './protocol.ts'
 
@@ -170,50 +173,45 @@ interface LiveSession {
 /** Reliability tuning, threaded from `AcpPluginConfig` through the manager. */
 export interface BridgeTuning {
   startupTimeoutMs?: number
+  /**
+   * How long a permission ask may sit unanswered before the deadline fires.
+   *
+   * ONE window for both routes. An ask can be asked in the conversation (the
+   * composer takeover) or in the settings panel's ledger (no approval service,
+   * or no chat identity to route into) — but both ask the same question, "is
+   * anyone there?", so both get the same answer. Two windows made the settings
+   * card look like two unrelated knobs.
+   *
+   * `0` means 一直等 — no deadline at all. What happens when it fires is
+   * {@link BridgeTuning.permissionTimeoutMode}'s business, never this knob's.
+   *
+   * The deadline is what keeps a turn from hanging on a question nobody can
+   * see: a routed ask shows no card and broadcasts no frame, so a host that
+   * takes the question and never renders it would otherwise leave the turn
+   * hanging forever. Past the deadline the ask is settled IN PLACE — it is not
+   * handed anywhere else. A human who was still deciding finds the ask REFUSED
+   * (or auto-answered, in `auto` mode), not relocated.
+   *
+   * Default 300000 ms. OmniTerm's equivalent is its reaper's permission-timeout
+   * threshold (30 min default, 30 s steps, hot-updatable).
+   */
   permissionTimeoutMs?: number
   /**
-   * Deadline for a permission ask whose native route DEGRADED to unavailable
-   * (see {@link LedgerFallbackReason}). Applies when `permissionTimeoutMs` is
-   * 0 — its "approvals belong to a person, wait forever" default — because a
-   * degraded ask has no visible answer entry in the conversation the user is
-   * looking at, and waiting forever would hang the turn on a question nobody
-   * can see there. The DESIGNED ledger paths (no approval service at all, a
-   * session with no chat identity) keep waiting: their answer entry is the
-   * settings panel, which is exactly where the chat line sends the user. `0`
-   * disables even this fallback.
+   * What an EXPIRED approval deadline does. `wait` (default) never expires
+   * the ask at all; `abort` refuses it; `auto` answers it with the option the
+   * agent's own kinds imply and lets the agent continue.
+   *
+   * Three values, and only three: an unanswered ask is either answered for
+   * you, kept waiting, or refused. Same vocabulary as OmniTerm dev's
+   * `acp_perm_timeout_mode`.
+   *
+   * The default is `wait`: a permission ask is a question FOR A HUMAN, and
+   * refusing it because the human looked away from the tab is worse than
+   * waiting — the ask stays visible the whole time, so nobody is left
+   * wondering what happened to it. `abort` and `auto` are opt-in for the
+   * deployments that would rather have a bounded turn.
    */
-  permissionFallbackTimeoutMs?: number
-  /**
-   * Deadline for the NATIVE approval route itself: how long
-   * {@link AgentBridge.askNativeApproval} waits for the host approval chain to
-   * answer before withdrawing the ask and handing it to the settings-panel
-   * ledger (`native-timeout`, see {@link LedgerFallbackReason}).
-   *
-   * A routed ask shows no card and broadcasts no frame — the composer takeover
-   * IS the answer entry — so a host that accepts the question and then never
-   * renders it (answerer absent from the browser scope, the conversation not
-   * mounted, a client that never received the remote event) leaves the turn
-   * hanging behind a question the user cannot see anywhere. The deadline is
-   * what makes that state bounded: past it the ask is withdrawn (the request
-   * signal is aborted, which settles the host ask `cancelled`) and re-asked on
-   * the ledger, where the chat line and the settings card are both visible.
-   *
-   * This is NOT an answer on the human's behalf: a human mid-decision simply
-   * finds the same question in the settings panel. `0` disables it (wait for
-   * the host forever).
-   *
-   * Default 300000 ms — the SAME window as
-   * {@link BridgeTuning.permissionFallbackTimeoutMs}, so "this route is not
-   * working" is one number instead of two arbitrary ones. A takeover that is
-   * going to render does so immediately, and the host replays a pending
-   * approval across reconnects (verified live on DSH web 0.2.1-rc.2), so the
-   * deadline only ever fires for a host that took the question and never showed
-   * it. OmniTerm's equivalent is its reaper's permission-timeout threshold
-   * (30 min default, 30 s steps, hot-updatable); this is the same knob without
-   * their `auto` tier, which this plugin does not have (every ask must reach a
-   * human).
-   */
-  nativeApprovalTimeoutMs?: number
+  permissionTimeoutMode?: PermissionTimeoutMode
   cancelFallbackMs?: number
   /**
    * How long to wait before resending a prompt the agent answered `cancelled`
@@ -270,28 +268,19 @@ export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unava
  * without the approval service, and an `/acp`-RPC session that has no chat
  * turn to route into. `unavailable` is a DEGRADATION — the service is wired
  * and this ask still failed, so the conversation the user is looking at will
- * never show the question. `native-timeout` is the other degradation: the host
- * TOOK the question and never answered it inside
- * {@link BridgeTuning.nativeApprovalTimeoutMs}, so it is withdrawn and re-asked
- * here. The last two decide both the chat line's wording (see
- * `BridgeManager.streamPrompt`) and whether a deadline is armed
- * ({@link AgentBridge.handlePermissionRequest}).
+ * never show the question. The reason decides the chat line's wording (see
+ * `BridgeManager.streamPrompt`); the deadline and the mode decide what
+ * happens if nobody answers ({@link AgentBridge.handlePermissionRequest}).
  */
-export type LedgerFallbackReason = 'no-requester' | 'no-chat-session' | 'unavailable' | 'native-timeout'
+export type LedgerFallbackReason = 'no-requester' | 'no-chat-session' | 'unavailable'
 
 /** One recorded ledger fallback: why the ask is here, and the deadline armed for it. */
 export interface LedgerFallback {
   reason: LedgerFallbackReason
   /** Effective deadline in ms; `0` = no timer (wait for the human). */
   timeoutMs: number
-  /**
-   * How long the NATIVE route waited before withdrawing this ask, on the
-   * `native-timeout` path only. The chat line reports it as an observed fact
-   * ("no answer in the conversation within Ns") rather than guessing a cause:
-   * a slow human and a host that never rendered the question look identical
-   * from here.
-   */
-  waitedMs?: number
+  /** What the deadline does when it fires. */
+  mode: PermissionTimeoutMode
 }
 
 /**
@@ -373,9 +362,8 @@ function toAcpMcpServers(defs: AcpMcpServerDef[] | undefined): McpServer[] {
 
 const DEFAULT_TUNING: Required<BridgeTuning> = {
   startupTimeoutMs: 60_000,
-  permissionTimeoutMs: 0,
-  permissionFallbackTimeoutMs: 300_000,
-  nativeApprovalTimeoutMs: 300_000,
+  permissionTimeoutMs: 300_000,
+  permissionTimeoutMode: 'wait',
   cancelFallbackMs: 15_000,
   staleCancelRetryDelayMs: 600,
   staleCancelMaxRetries: 2,
@@ -412,19 +400,17 @@ export class AgentBridge {
    */
   private readonly ledgerFallbacks = new Map<string, LedgerFallback>
   private readonly startupTimeoutMs: number
-  private readonly permissionTimeoutMs: number
   /**
-   * The two approval deadlines are NOT readonly, unlike their neighbors: the
-   * settings page rewrites them on a running bridge
-   * ({@link AgentBridge.applyApprovalDeadlines}), so a user editing the window
-   * does not have to kill every live session to see it take effect. Both are
-   * read per ask — `nativeApprovalTimeoutMs` when the native ask is armed,
-   * `permissionFallbackTimeoutMs` when the ledger ask's deadline is chosen — so
-   * a reassignment reaches every ask from that moment on. An ask already
-   * holding an armed timer keeps the window it was started with.
+   * The ONE approval deadline, and the mode it settles with. Neither is
+   * readonly, unlike their neighbors: the settings page rewrites them on a
+   * running bridge ({@link AgentBridge.applyApprovalDeadlines}), so a user
+   * editing the card does not have to kill every live session to see it take
+   * effect. Both are read per ask, so a reassignment reaches every ask from
+   * that moment on. An ask already holding an armed timer keeps the window it
+   * was started with.
    */
-  private permissionFallbackTimeoutMs: number
-  private nativeApprovalTimeoutMs: number
+  private permissionTimeoutMs: number
+  private permissionTimeoutMode: PermissionTimeoutMode
   private readonly cancelFallbackMs: number
   private readonly staleCancelRetryDelayMs: number
   private readonly staleCancelMaxRetries: number
@@ -489,9 +475,10 @@ export class AgentBridge {
   ) {
     const merged = { ...DEFAULT_TUNING, ...tuning }
     this.startupTimeoutMs = merged.startupTimeoutMs
-    this.permissionTimeoutMs = merged.permissionTimeoutMs
-    this.permissionFallbackTimeoutMs = merged.permissionFallbackTimeoutMs
-    this.nativeApprovalTimeoutMs = merged.nativeApprovalTimeoutMs
+    this.permissionTimeoutMode = merged.permissionTimeoutMode
+    // 不等待 (0) is the `auto` mode's business; under `abort` it would refuse
+    // every ask on arrival, so the window is floored to the shortest real wait.
+    this.permissionTimeoutMs = normalizeApprovalWindow(this.permissionTimeoutMode, merged.permissionTimeoutMs)
     this.cancelFallbackMs = merged.cancelFallbackMs
     this.staleCancelRetryDelayMs = merged.staleCancelRetryDelayMs
     this.staleCancelMaxRetries = merged.staleCancelMaxRetries
@@ -501,18 +488,22 @@ export class AgentBridge {
   }
 
   /**
-   * Adopt a rewritten approval deadline (the settings page's write). Only the
-   * two degraded-route windows live here; every other tuning value is fixed at
-   * construction, because a live bridge cannot meaningfully adopt a new startup
-   * or cancel window mid-flight.
+   * Adopt a rewritten approval deadline or mode (the settings page's write).
+   * Only the window and the mode live here; every other tuning value is
+   * fixed at construction, because a live bridge cannot meaningfully adopt a
+   * new startup or cancel window mid-flight.
    *
    * Deliberately does NOT re-arm anything: an ask that already holds a timer
    * keeps the window it was started with, and the next ask reads the new value.
    * Re-arming would move the goalposts under a human who is already deciding.
    */
-  applyApprovalDeadlines(patch: { nativeApprovalTimeoutMs?: number; permissionFallbackTimeoutMs?: number }): void {
-    if (patch.nativeApprovalTimeoutMs !== undefined) this.nativeApprovalTimeoutMs = patch.nativeApprovalTimeoutMs
-    if (patch.permissionFallbackTimeoutMs !== undefined) this.permissionFallbackTimeoutMs = patch.permissionFallbackTimeoutMs
+  applyApprovalDeadlines(patch: { permissionTimeoutMs?: number; mode?: PermissionTimeoutMode }): void {
+    if (patch.permissionTimeoutMs !== undefined) this.permissionTimeoutMs = patch.permissionTimeoutMs
+    if (patch.mode !== undefined) this.permissionTimeoutMode = patch.mode
+    // A mode switch can leave a window behind that the new mode cannot run
+    // (不等待 under `abort`): floor it, so the ask waits instead of refusing
+    // on arrival.
+    this.permissionTimeoutMs = normalizeApprovalWindow(this.permissionTimeoutMode, this.permissionTimeoutMs)
   }
 
   /**
@@ -1354,6 +1345,23 @@ export class AgentBridge {
       this.touch()
       return native.response
     }
+    // Deadline: how long this ask may sit unanswered. ONE window for every
+    // route — an ask that never reached the conversation included. They have
+    // no other answer entry, so exempting them would be the very invisible
+    // hang this mechanism exists to bound.
+    //
+    // What happens when it fires is the MODE's business: refused, answered
+    // with the option the agent's own kinds imply, or (in `wait`) never.
+    // The mode is read once, here, for the same reason the window is: an ask
+    // that started under one mode keeps it.
+    const mode = this.permissionTimeoutMode
+    const timeoutMs = this.permissionTimeoutMs
+    // 不等待（0）只属自动推进：请求到达即按那一档收场，不建 ledger 条目、不发卡
+    // ——问都来不及问。超时中止没有这一档（它会立刻拒绝每一问，agent 在每个门口
+    // 都停住），它的窗口最短是真实等待。
+    if (mode === 'auto' && timeoutMs === 0) {
+      return this.settleExpiredAsk(session, mode, toolCall, options, 0)
+    }
     return new Promise<RequestPermissionResponse>(resolve => {
       let timer: ReturnType<typeof setTimeout> | undefined
       const requestId = this.permissions.create(session.sessionId, (outcome: PermissionOutcome) => {
@@ -1375,41 +1383,31 @@ export class AgentBridge {
         toolCall,
         options: options.map((o): PermissionOptionView => ({ optionId: o.optionId, name: o.name, kind: o.kind })),
       })
-      // Deadline (`permissionTimeoutMs`): an approval left unanswered is
-      // answered `cancelled` on the human's behalf instead of hanging the turn
-      // forever. Off by default — approvals belong to a person. The one
-      // exception is a DEGRADED native route: the conversation just failed to
-      // show the question, so waiting forever would hang the turn behind an
-      // ask nobody can see there, and the fallback deadline applies instead
-      // (see `BridgeTuning.permissionFallbackTimeoutMs`). `native-timeout` is
-      // the same degradation reached from the other side: the host took the
-      // ask and never answered it.
-      const timeoutMs = this.permissionTimeoutMs > 0
-        ? this.permissionTimeoutMs
-        : native.reason === 'unavailable' || native.reason === 'native-timeout'
-          ? this.permissionFallbackTimeoutMs
-          : 0
       // Recorded before the broadcast: the hub is synchronous, and the chat
       // line `streamPrompt` folds from this frame words itself by the path
       // this ask actually took.
-      this.ledgerFallbacks.set(requestId, {
-        reason: native.reason,
-        timeoutMs,
-        ...(native.reason === 'native-timeout' ? { waitedMs: this.nativeApprovalTimeoutMs } : {}),
-      })
-      if (timeoutMs > 0) {
+      this.ledgerFallbacks.set(requestId, { reason: native.reason, timeoutMs, mode })
+      if (timeoutMs > 0 && mode !== 'wait') {
         timer = setTimeout(() => {
           if (!this.permissions.has(requestId)) return
+          const picked = mode === 'auto'
+            ? pickAutoOption(options.map(option => ({ optionId: option.optionId, name: option.name, kind: option.kind })))
+            : undefined
+          const tool = permissionToolName(toolCall)
           this.hub.broadcast({
             type: 'agent/notice',
             agentId: this.def.id,
             level: 'info',
-            // Name what was missed, the way a human needs it: which operation
-            // sat unanswered, and for how long (OmniTerm's reaper writes the
-            // same "you missed this" notice before it acts).
-            text: `acp: permission request for "${permissionToolName(toolCall)}" timed out after ${String(Math.round(timeoutMs / 1000))}s; answered "cancelled"`,
+            // Name what was missed and what was done about it, the way a human
+            // needs it: which operation sat unanswered, and what the plugin
+            // answered instead (OmniTerm's reaper writes the same notice).
+            text: picked === undefined
+              ? `acp: permission request for "${tool}" timed out after ${String(Math.round(timeoutMs / 1000))}s; refused`
+              : `acp: permission request for "${tool}" timed out after ${String(Math.round(timeoutMs / 1000))}s; answered "${picked.name}"`,
           })
-          this.permissions.respond(requestId, { outcome: 'cancelled' })
+          this.permissions.respond(requestId, picked === undefined
+            ? { outcome: 'cancelled' }
+            : { outcome: 'selected', optionId: picked.optionId })
         }, timeoutMs)
         timer.unref?.()
       }
@@ -1440,19 +1438,19 @@ export class AgentBridge {
    * open turn, so a session started over `/acp` (no chat turn) cannot be
    * routed and must stay on the ledger path.
    *
-   * The ask is raced against {@link BridgeTuning.nativeApprovalTimeoutMs}. A
+   * The ask is raced against {@link BridgeTuning.permissionTimeoutMs}. A
    * routed ask has exactly one answer entry — the composer takeover — and no
    * broadcast at all, so a host that takes the question and never renders it
    * would leave the turn hanging behind something invisible. Past the deadline
-   * the ask is WITHDRAWN (the signal handed to the host aborts, which settles
-   * its waterfall `cancelled` and drops the composer panel) and reported as
-   * `native-timeout`, sending the question to the ledger where the chat line
-   * and the settings card are both visible. Withdrawing is not answering: a
-   * human mid-decision finds the same question in the settings panel.
+   * the ask is settled RIGHT THERE, by
+   * {@link BridgeTuning.permissionTimeoutMode}: refused (`abort`), answered
+   * with the option the agent's own kinds imply (`auto`), or never expiring
+   * at all (`wait`).
    *
-   * No deadline is armed on the ledger paths (`no-requester`,
-   * `no-chat-session`): those never reach the host, and their answer entry is
-   * the settings panel the chat line already points at.
+   * It is NOT handed somewhere else. An earlier revision withdrew the ask and
+   * re-asked it on the settings ledger, which made the question travel to a
+   * page the user was not looking at — and then cancelled it there a few
+   * minutes later anyway. A deadline now ends the ask where it was asked.
    *
    * @returns the agent-facing response, or the reason the ask must fall back
    * to the ledger (see {@link LedgerFallbackReason}).
@@ -1466,6 +1464,16 @@ export class AgentBridge {
     const requester = this.approvalRequester?.()
     if (requester === undefined) return { reason: 'no-requester' }
     if (session.dshSessionId === undefined) return { reason: 'no-chat-session' }
+    // The mode is read ONCE, here: it decides both whether a deadline exists
+    // and what happens when it fires. An ask that started under one mode keeps
+    // it — the same rule the window follows (an ask already holding a timer
+    // keeps the one it started with).
+    const mode = this.permissionTimeoutMode
+    // 不等待（0）只属自动推进：没有问人的必要。直接按那一档收场，composer 接管
+    // 根本不必出现——它只会闪一下就没了，问了也来不及答。超时中止没有这一档。
+    if (mode === 'auto' && this.permissionTimeoutMs === 0) {
+      return { response: this.settleExpiredAsk(session, mode, toolCall, options, 0) }
+    }
     // One signal carries both withdrawals: the agent's own cancel (whatever
     // aborted the ACP request) and the deadline. The host's waterfall races its
     // answerers against this signal, so aborting is a clean withdrawal rather
@@ -1474,13 +1482,16 @@ export class AgentBridge {
     const askSignal = signal === undefined ? withdraw.signal : AbortSignal.any([signal, withdraw.signal])
     let timer: ReturnType<typeof setTimeout> | undefined
     let timedOut = false
-    const deadline = this.nativeApprovalTimeoutMs > 0
+    // `wait` never expires, so it never arms a timer at all. A window of `0`
+    // never reaches here: 不等待 was already settled above.
+    const windowMs = this.permissionTimeoutMs
+    const deadline = mode !== 'wait' && windowMs > 0
       ? new Promise<{ timedOut: true }>(resolve => {
         timer = setTimeout(() => {
           timedOut = true
           withdraw.abort()
           resolve({ timedOut: true })
-        }, this.nativeApprovalTimeoutMs)
+        }, windowMs)
         timer.unref?.()
       })
       : undefined
@@ -1494,13 +1505,15 @@ export class AgentBridge {
       })
       // A withdrawn ask settles on the host's own schedule; dropping it here
       // must not surface as an unhandled rejection later.
-      asked.catch(() => { /* withdrawn: the ledger owns this ask now */ })
+      asked.catch(() => { /* withdrawn: the deadline settles this ask now */ })
       const settled = deadline === undefined
         ? await asked.then(o => ({ outcome: o }))
         : await Promise.race([asked.then(o => ({ outcome: o })), deadline])
       // The flag, not the race winner, decides: the host may settle `cancelled`
       // from the very abort the deadline caused, and that is still a timeout.
-      if (timedOut || 'timedOut' in settled) return { reason: 'native-timeout' }
+      if (timedOut || 'timedOut' in settled) {
+        return { response: this.settleExpiredAsk(session, mode, toolCall, options, windowMs) }
+      }
       outcome = settled.outcome
     } catch {
       // Synchronous throw or rejection, either way: the ask falls back to the
@@ -1524,6 +1537,64 @@ export class AgentBridge {
         : { outcome: 'cancelled' },
     })
     return { response }
+  }
+
+  /**
+   * Settle an ask whose deadline fired, WHERE IT WAS ASKED.
+   *
+   * `abort` refuses it — the operation does not happen and the agent carries
+   * on with that answer. `auto` answers it with the option the agent's own
+   * kinds imply ({@link pickAutoOption}) so the agent CONTINUES; it says which
+   * option it picked, because an unattended approval nobody looked at has to
+   * be visible afterwards. A mode that cannot pick an option (no options, or
+   * none with a usable id) degrades to `abort`: refusing is safer than
+   * guessing, and hanging is worse than either.
+   *
+   * The `permission/resolved` frame keeps the event stream symmetric with the
+   * ledger path, so the browser drops any card it may hold for this session.
+   */
+  private settleExpiredAsk(
+    session: LiveSession,
+    mode: PermissionTimeoutMode,
+    toolCall: unknown,
+    options: PermissionOption[],
+    timeoutMs: number,
+  ): RequestPermissionResponse {
+    const picked = mode === 'auto'
+      ? pickAutoOption(options.map(option => ({ optionId: option.optionId, name: option.name, kind: option.kind })))
+      : undefined
+    const response: RequestPermissionResponse = picked === undefined
+      ? { outcome: { outcome: 'cancelled' } }
+      : { outcome: { outcome: 'selected', optionId: picked.optionId } }
+    const tool = permissionToolName(toolCall)
+    // 不等待（0）不是「等了 0 秒」，是没等：两种说法的区别就在这里。
+    const waited = timeoutMs > 0
+      ? `timed out after ${String(Math.round(timeoutMs / 1000))}s`
+      : 'was not waited for'
+    this.hub.broadcast({
+      type: 'agent/notice',
+      agentId: this.def.id,
+      level: 'info',
+      // Name what was missed and what was done about it — the way a human
+      // needs it: which operation sat unanswered, and what the plugin answered
+      // instead. OmniTerm's reaper writes the same "you missed this" notice.
+      text: picked === undefined
+        ? `acp: permission request for "${tool}" ${waited}; refused`
+        : `acp: permission request for "${tool}" ${waited}; answered "${picked.name}"`,
+    })
+    // The conversation's only trace of the expiry: the composer card is going
+    // away and nothing else says why.
+    this.hub.broadcast({
+      type: 'permission/expired',
+      sessionId: session.sessionId,
+      toolCall,
+      timeoutMs,
+      outcome: response.outcome.outcome === 'selected'
+        ? { outcome: 'selected', optionId: response.outcome.optionId }
+        : { outcome: 'cancelled' },
+      ...(picked === undefined ? {} : { optionName: picked.name }),
+    })
+    return response
   }
 
   private settlePermissions(session: LiveSession): void {
@@ -2706,21 +2777,34 @@ class TurnStreamController {
       if (this.foldInto(seg, update)) this.cursorSeq = typed.seq
     } else if (row.type === 'permission/request') {
       const typed = event as { toolCall: unknown; requestId: string }
-      const seg = this.segment
-      const line = this.permissionLine(typed)
-      if (seg === undefined || seg.finished) {
-        if (line !== '') this.pendingProse.push(line)
-        return
-      }
-      if (seg.hasCard) {
-        // The card must stay the segment's last block: park the line for the
-        // next segment instead of streaming it below the card.
-        this.pendingProse.push(line)
-        this.finishSegment(seg, { kind: 'stop' })
-        return
-      }
-      if (line !== '') this.emitProse(seg, 'reasoning', line)
+      this.pushProse(this.permissionLine(typed))
+    } else if (row.type === 'permission/expired') {
+      const typed = event as { toolCall: unknown; timeoutMs: number; outcome: PermissionOutcome; optionName?: string }
+      this.pushProse(this.expiredLine(typed))
     }
+  }
+
+  /**
+   * Put one narrative line into the turn's prose stream.
+   *
+   * A card-bearing segment must stay the segment's LAST block, so a line that
+   * arrives while a card is open is parked for the next segment instead of
+   * streaming below the card. A line that arrives between segments waits for
+   * the next one to open.
+   */
+  private pushProse(line: string): void {
+    if (line === '') return
+    const seg = this.segment
+    if (seg === undefined || seg.finished) {
+      this.pendingProse.push(line)
+      return
+    }
+    if (seg.hasCard) {
+      this.pendingProse.push(line)
+      this.finishSegment(seg, { kind: 'stop' })
+      return
+    }
+    this.emitProse(seg, 'reasoning', line)
   }
 
   /** Events that arrive between segments: recorded, replayed into the next one. */
@@ -2857,25 +2941,45 @@ class TurnStreamController {
       : 'permission'
     // The line must not point at a place with no answer entry, and the bridge
     // knows which path this ask took (`ledgerFallbackOf`, recorded before the
-    // frame was broadcast). On the DESIGNED ledger paths the settings panel's
-    // card is the answer entry. A DEGRADED native route carries a deadline and
-    // has to say why the conversation is not showing the question — as an
-    // OBSERVED FACT, not a guessed cause: "no answer within Ns" is true whether
-    // the human was slow or the host never rendered the question.
+    // frame was broadcast). On the ledger paths the settings panel's card is
+    // the answer entry. A DEGRADED native route has to say why the
+    // conversation is not showing the question — as an OBSERVED FACT, not a
+    // guessed cause.
+    //
+    // The last clause says what happens if nobody answers, and it follows the
+    // MODE: refused, answered automatically, or (in `wait`) nothing at all.
     const fallback = this.bridge.ledgerFallbackOf(event.requestId)
-    const why = fallback === undefined
-      ? undefined
-      : fallback.reason === 'unavailable'
-        ? 'the approval service is unavailable'
-        : fallback.reason === 'native-timeout'
-          ? `no answer in the conversation within ${String(Math.round((fallback.waitedMs ?? 0) / 1000))}s`
-          : undefined
-    if (fallback === undefined || why === undefined) {
-      return `\n> 🔐 [Permission Required: ${title}] - please approve in Settings\n`
+    const why = fallback?.reason === 'unavailable' ? 'the approval service is unavailable' : undefined
+    const lead = why === undefined ? 'please approve in Settings' : `${why}; approve in Settings`
+    if (fallback === undefined || fallback.timeoutMs <= 0 || fallback.mode === 'wait') {
+      return `\n> 🔐 [Permission Required: ${title}] - ${lead}\n`
     }
-    return fallback.timeoutMs > 0
-      ? `\n> 🔐 [Permission Required: ${title}] - ${why}; approve in Settings within ${String(Math.round(fallback.timeoutMs / 1000))}s or this request is cancelled\n`
-      : `\n> 🔐 [Permission Required: ${title}] - ${why}; please approve in Settings\n`
+    const otherwise = fallback.mode === 'auto'
+      ? 'this request is answered automatically'
+      : 'this request is cancelled'
+    return `\n> 🔐 [Permission Required: ${title}] - ${lead} within ${String(Math.round(fallback.timeoutMs / 1000))}s or ${otherwise}\n`
+  }
+
+  /**
+   * The line for an ask the plugin settled itself when its deadline fired.
+   *
+   * The composer card is disappearing, so the conversation has to say what
+   * happened to the question — otherwise the user is left with a vanished
+   * card and no explanation. The wording follows the outcome: refused, or
+   * answered with the option the agent's own kinds implied.
+   */
+  private expiredLine(event: { toolCall: unknown; timeoutMs: number; outcome: PermissionOutcome; optionName?: string }): string {
+    const title = typeof (event.toolCall as { title?: unknown } | undefined)?.title === 'string'
+      ? String((event.toolCall as { title: string }).title)
+      : 'permission'
+    const waited = event.timeoutMs > 0
+      ? `no answer within ${String(Math.round(event.timeoutMs / 1000))}s`
+      : 'not waited for'
+    if (event.outcome.outcome === 'selected') {
+      const picked = event.optionName === undefined ? event.outcome.optionId : event.optionName
+      return `\n> 🔐 [Permission Required: ${title}] - ${waited}; answered "${picked}" automatically, continuing\n`
+    }
+    return `\n> 🔐 [Permission Required: ${title}] - ${waited}; refused\n`
   }
 }
 
@@ -2911,17 +3015,23 @@ export class BridgeManager {
   /** The agent tag's halo preference (persisted; see `persistAgents`). */
   private tagHaloSetting: AcpTagHalo = { ...DEFAULT_TAG_HALO }
   /**
-   * What `cordis.patch.yml` asked for, by key — ONLY the keys it actually
-   * names. This is the deployment baseline, kept apart from
+   * What `cordis.patch.yml` asked for — ONLY if it actually named the key.
+   * This is the deployment baseline, kept apart from
    * {@link deadlineOverride} so the settings card can tell the user which of
-   * the two is winning. Empty when the file says nothing about either window,
-   * in which case {@link baselineDeadlines} (the built-in default) applies.
+   * the two is winning. Empty when the file says nothing about the window, in
+   * which case {@link baselineDeadline} (the built-in default) applies.
    */
   private configuredDeadlines: Partial<Record<ApprovalDeadlineKey, number>> = {}
   /**
-   * The value each deadline had before any override — the tuning this manager
-   * was constructed with, which already carries the validated config file (the
-   * host entry passes `validateConfig`'s output) or the built-in default.
+   * The mode the config file named, if it named one. Kept apart from the
+   * override for the same reason the window is: the card has to be able
+   * to say "the file asks for `abort`, the value set here wins".
+   */
+  private configuredMode?: PermissionTimeoutMode
+  /**
+   * The window before any override — the tuning this manager was constructed
+   * with, which already carries the validated config file (the host entry
+   * passes `validateConfig`'s output) or the built-in default.
    *
    * Held separately from {@link configuredDeadlines} because the two answer
    * different questions: this one is what RUNS when nothing is overridden, that
@@ -2929,17 +3039,23 @@ export class BridgeManager {
    * and a bare default does not deserve). A manager built without tuning at all
    * — a direct consumer, a test — gets `DEFAULT_TUNING` here and stays correct.
    */
-  private baselineDeadlines: { nativeApprovalTimeoutMs: number; permissionFallbackTimeoutMs: number }
+  private baselineDeadline: number
+  /**
+   * The mode before any override — the tuning this manager was constructed
+   * with, which already carries the validated config file (the host entry
+   * passes `validateConfig`'s output) or the built-in default.
+   */
+  private baselineMode: PermissionTimeoutMode
   /**
    * The settings page's own write, persisted with the agent registry. Merged
-   * OVER {@link baselineDeadlines}: once a user picks a window in the UI, that
+   * OVER {@link baselineDeadline}: once a user picks a window in the UI, that
    * pick is what runs, and the config file becomes the value the reset button
    * returns to. Without this split a hand-edited `cordis.patch.yml` and a UI
    * write would fight with no way to tell which one is live.
    */
-  private deadlineOverride: Partial<Record<ApprovalDeadlineKey, number>> = {}
+  private deadlineOverride: ApprovalDeadlinePatch = {}
   /**
-   * Tuning in force, defaults applied. The two approval deadlines are rewritten
+   * Tuning in force, defaults applied. The approval deadline is rewritten
    * IN PLACE by {@link applyDeadlineTuning}, which is why this is a live object
    * rather than the constructor's parameter: every bridge built afterwards
    * inherits the rewrite instead of the boot-time value.
@@ -3001,13 +3117,11 @@ export class BridgeManager {
     // `applyDeadlineTuning`), and every bridge built afterwards must inherit
     // the rewrite instead of the boot-time value.
     this.tuning = { ...DEFAULT_TUNING, ...tuning }
-    // The pre-override deadline values, snapshotted before anything can rewrite
-    // them. Everything else in `tuning` is fixed for the manager's lifetime, so
-    // only this pair needs a snapshot.
-    this.baselineDeadlines = {
-      nativeApprovalTimeoutMs: this.tuning.nativeApprovalTimeoutMs,
-      permissionFallbackTimeoutMs: this.tuning.permissionFallbackTimeoutMs,
-    }
+    // The pre-override deadline value, snapshotted before anything can rewrite
+    // it. Everything else in `tuning` is fixed for the manager's lifetime, so
+    // only this needs a snapshot.
+    this.baselineDeadline = this.tuning.permissionTimeoutMs
+    this.baselineMode = this.tuning.permissionTimeoutMode
     for (const def of defs) {
       this.defsMap.set(def.id, def)
     }
@@ -3834,7 +3948,31 @@ export class BridgeManager {
         // validator accepts must be the value that runs (a UI write that did
         // not survive a restart would read as a broken setting).
         try {
-          this.deadlineOverride = validateApprovalDeadlines((parsed as { approvalDeadlines?: unknown }).approvalDeadlines ?? {})
+          const raw = (parsed as { approvalDeadlines?: unknown }).approvalDeadlines ?? {}
+          // The OLD card wrote the two legacy windows, and its 「关」 preset
+          // wrote a zero — which then meant "this window never fires". The only
+          // way to say that now is the `wait` MODE (a zero means 不等待 today),
+          // so a legacy zero carries over as the mode instead of silently
+          // turning "wait forever" into "answer immediately".
+          const legacy = raw as { nativeApprovalTimeoutMs?: unknown; permissionFallbackTimeoutMs?: unknown }
+          const legacyWindow = legacy.nativeApprovalTimeoutMs ?? legacy.permissionFallbackTimeoutMs
+          const legacyNever = legacyWindow === 0
+          const window = legacyNever
+            ? undefined
+            : validateApprovalDeadlines(raw).permissionTimeoutMs
+          const mode = legacyNever
+            ? ('wait' as const)
+            : ((raw as { mode?: unknown }).mode === undefined
+              ? undefined
+              : validatePermissionTimeoutMode((raw as { mode?: unknown }).mode, 'bad_payload'))
+          // A stored window must be legal for the mode it runs under: 不等待
+          // (0) belongs to `auto`; under `abort` it would refuse every ask on
+          // arrival, so it floors to the shortest real wait.
+          const effectiveMode = mode ?? this.baselineMode
+          this.deadlineOverride = {
+            ...(window === undefined ? {} : { permissionTimeoutMs: normalizeApprovalWindow(effectiveMode, window) }),
+            ...(mode === undefined ? {} : { mode }),
+          }
         } catch {
           this.deadlineOverride = {}
         }
@@ -4880,7 +5018,7 @@ export class BridgeManager {
   }
 
   /**
-   * Declare the deployment baseline for the two approval deadlines — the values
+   * Declare the deployment baseline for the approval deadline — the values
    * `cordis.patch.yml` names, passed RAW (only the keys it actually contains).
    *
    * Kept separate from the validated tuning because "the file says 600000" and
@@ -4890,34 +5028,45 @@ export class BridgeManager {
    * also moves the baseline, so a manager built without tuning (a direct
    * consumer, a test) still runs what the deployment asked for.
    */
-  setConfiguredApprovalDeadlines(values: Partial<Record<ApprovalDeadlineKey, number>>): void {
-    this.configuredDeadlines = { ...values }
-    if (values.nativeApprovalTimeoutMs !== undefined) this.baselineDeadlines.nativeApprovalTimeoutMs = values.nativeApprovalTimeoutMs
-    if (values.permissionFallbackTimeoutMs !== undefined) this.baselineDeadlines.permissionFallbackTimeoutMs = values.permissionFallbackTimeoutMs
+  setConfiguredApprovalDeadlines(values: Partial<Record<ApprovalDeadlineKey, number>>, mode?: PermissionTimeoutMode): void {
+    // The baseline must be legal for the mode it runs under, or the card would
+    // advertise a number the deployment cannot actually run (不等待 under
+    // `abort`) and the reset button would restore it.
+    const effectiveMode = mode ?? this.configuredMode ?? this.baselineMode
+    const raw = values.permissionTimeoutMs
+    const window = raw === undefined ? undefined : normalizeApprovalWindow(effectiveMode, raw)
+    this.configuredDeadlines = window === undefined ? {} : { permissionTimeoutMs: window }
+    if (window !== undefined) this.baselineDeadline = window
+    if (mode !== undefined) {
+      this.configuredMode = mode
+      this.baselineMode = mode
+    }
     this.applyDeadlineTuning()
   }
 
   /**
-   * The approval deadlines in force, plus the two facts that explain a value the
-   * user did not pick: the config-file baseline an override is outranking, and a
-   * `permissionTimeoutMs` that overrides BOTH windows when non-zero. Both are
-   * reported only when they are actually in play, so the card can stay silent
-   * about a plain default.
+   * The approval deadline in force, plus the facts that explain a value the
+   * user did not pick: the config-file baseline an override is outranking. The
+   * mode rides along with its own baseline, for the same reason: the card has
+   * to be able to say "the file asks for `abort`, the value set here wins".
+   *
+   * Everything is reported only when it is actually in play, so the card can
+   * stay silent about a plain default.
    */
   approvalDeadlines(): AcpApprovalDeadlines {
     const deadlines: AcpApprovalDeadlines = {
-      nativeApprovalTimeoutMs: this.tuning.nativeApprovalTimeoutMs,
-      permissionFallbackTimeoutMs: this.tuning.permissionFallbackTimeoutMs,
+      permissionTimeoutMs: this.tuning.permissionTimeoutMs,
+      mode: this.tuning.permissionTimeoutMode,
     }
     if (Object.keys(this.configuredDeadlines).length > 0) deadlines.configured = { ...this.configuredDeadlines }
-    if (this.tuning.permissionTimeoutMs > 0) deadlines.permissionTimeoutMs = this.tuning.permissionTimeoutMs
+    if (this.configuredMode !== undefined) deadlines.configuredMode = this.configuredMode
     return deadlines
   }
 
   /**
-   * Write one or both approval deadlines (omitted keys keep their value), or
-   * drop the persisted override with `reset` so the config-file baseline — or
-   * the built-in default — applies again.
+   * Write the approval deadline, or the mode (omitted keys keep their value),
+   * or drop the persisted override with `reset` so the config-file baseline —
+   * or the built-in default — applies again.
    *
    * HOT: the rewrite reaches every live bridge, so a user changing the window
    * never has to kill a running session to see it take effect (the one thing an
@@ -4925,29 +5074,42 @@ export class BridgeManager {
    * write see the new window; an ask already holding a timer keeps the one it
    * started with.
    */
-  async setApprovalDeadlines(patch: Partial<Record<ApprovalDeadlineKey, number>>, reset = false): Promise<void> {
+  async setApprovalDeadlines(patch: ApprovalDeadlinePatch, reset = false): Promise<void> {
     // Merged BEFORE validating, so the whole resulting override passes the same
     // gate the config file does (an override written by an older build is
-    // re-gated here rather than trusted). `validateApprovalDeadlines` also drops
-    // unknown keys, which is what keeps a stale payload from poisoning state.
+    // re-gated here rather than trusted). The validators also drop unknown
+    // keys, which is what keeps a stale payload from poisoning state.
     const merged = reset ? {} : { ...this.deadlineOverride, ...patch }
-    this.deadlineOverride = validateApprovalDeadlines(merged)
+    const window = validateApprovalDeadlines(merged).permissionTimeoutMs
+    const mode = merged.mode === undefined
+      ? undefined
+      : validatePermissionTimeoutMode(merged.mode, 'bad_payload')
+    // The stored override must be legal for the mode it runs under, not just
+    // legal on its own: 不等待 (0) belongs to `auto`, and a mode switch can
+    // leave it behind. Flooring it HERE (not only in the running value) keeps
+    // the card's number and the running number the same number.
+    const effectiveMode = mode ?? this.baselineMode
+    this.deadlineOverride = {
+      ...(window === undefined ? {} : { permissionTimeoutMs: normalizeApprovalWindow(effectiveMode, window) }),
+      ...(mode === undefined ? {} : { mode }),
+    }
     this.applyDeadlineTuning()
     this.persistAgents()
   }
 
   /**
-   * Recompute the two deadlines from override → deployment baseline, and push
-   * the result to every live bridge.
+   * Recompute the deadline and the mode from override → deployment baseline,
+   * and push the result to every live bridge.
    */
   private applyDeadlineTuning(): void {
-    const nativeApprovalTimeoutMs = this.deadlineOverride.nativeApprovalTimeoutMs
-      ?? this.baselineDeadlines.nativeApprovalTimeoutMs
-    const permissionFallbackTimeoutMs = this.deadlineOverride.permissionFallbackTimeoutMs
-      ?? this.baselineDeadlines.permissionFallbackTimeoutMs
-    this.tuning.nativeApprovalTimeoutMs = nativeApprovalTimeoutMs
-    this.tuning.permissionFallbackTimeoutMs = permissionFallbackTimeoutMs
-    const patch = { nativeApprovalTimeoutMs, permissionFallbackTimeoutMs }
+    const permissionTimeoutMode = this.deadlineOverride.mode ?? this.baselineMode
+    const permissionTimeoutMs = normalizeApprovalWindow(
+      permissionTimeoutMode,
+      this.deadlineOverride.permissionTimeoutMs ?? this.baselineDeadline,
+    )
+    this.tuning.permissionTimeoutMs = permissionTimeoutMs
+    this.tuning.permissionTimeoutMode = permissionTimeoutMode
+    const patch = { permissionTimeoutMs, mode: permissionTimeoutMode }
     for (const bridge of this.bridges.values()) bridge.applyApprovalDeadlines(patch)
   }
 

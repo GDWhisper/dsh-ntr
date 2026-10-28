@@ -11,9 +11,10 @@ import { describe, expect, it, vi } from 'vitest'
 import { ACP_PRESET_ID, acpModeFromPresetEvent, formatCommandLine, isAbsolutePathLike, placeMenu, rowAgentPreset, splitAcpModelId, splitCommandLine, stagedIsAcpMode, stagedSessionOf, tokenizeCommandLine } from '../src/client/acp-ui.tsx'
 import { agentLockPhaseOf, FORM_MS, playAgentLockAnim, SHATTER_MS } from '../src/client/agent-lock-anim.ts'
 import { acpEmptyCopy, boundAgentOf, diffRows, isNewFileDiff } from '../src/client/acp-view.tsx'
+import { approvalDeadlineFacts, DEADLINE_MIN_WAIT_MS, deadlineSliderIndex, deadlineValueFor } from '../src/client/panel.tsx'
 import { describeRoute, menuFor, REFRESH_CATALOG_ITEM } from '../src/client/session-controls.tsx'
 import { AcpStore } from '../src/client/store.ts'
-import { isAbsolutePath, splitAdapterModelId, splitCommandLine as hostSplitCommandLine, tokenizeCommandLine as hostTokenizeCommandLine } from '../src/impl.ts'
+import { APPROVAL_DEADLINE_MIN_WAIT_MS, isAbsolutePath, splitAdapterModelId, splitCommandLine as hostSplitCommandLine, tokenizeCommandLine as hostTokenizeCommandLine } from '../src/impl.ts'
 import type { AgentCatalogResult, AgentView, ChatSessionView } from '../src/protocol.ts'
 
 /**
@@ -795,5 +796,91 @@ describe('the agent-lock hand-off clock', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+describe('approvalDeadlineFacts', () => {
+  // The card carries TWO controls — one window (how long) and one mode (what
+  // happens) — and an override can sit on either, so each is decided on its
+  // own. The reset button is honest only when something is ACTUALLY being
+  // outranked: offering it for a baseline that AGREES with the running value
+  // would put a button on the face of the settings that does nothing
+  // (observed live).
+  const base = { permissionTimeoutMs: 300_000, mode: 'abort' as const }
+  it('reports no override when the config file says nothing', () => {
+    const facts = approvalDeadlineFacts(base)
+    expect(facts.baseline).toBeUndefined()
+    expect(facts.modeBaseline).toBeUndefined()
+    expect(facts.overridden).toBe(false)
+  })
+  it('reports no override when the config file AGREES with the running value', () => {
+    const facts = approvalDeadlineFacts({ ...base, configured: { permissionTimeoutMs: 300_000 } })
+    expect(facts.overridden).toBe(false)
+    expect(facts.baseline).toBeUndefined()
+  })
+  it('reports the baseline of the window that is outranked', () => {
+    const facts = approvalDeadlineFacts({ ...base, configured: { permissionTimeoutMs: 600_000 } })
+    expect(facts.baseline).toBe(600_000)
+    expect(facts.overridden).toBe(true)
+  })
+  it('decides the mode on its own: an agreed mode is not an override', () => {
+    const facts = approvalDeadlineFacts({ ...base, configuredMode: 'abort' })
+    expect(facts.modeBaseline).toBeUndefined()
+    expect(facts.overridden).toBe(false)
+  })
+  it('reports the mode baseline when the card outranks it', () => {
+    const facts = approvalDeadlineFacts({ ...base, mode: 'auto', configuredMode: 'wait' })
+    expect(facts.modeBaseline).toBe('wait')
+    expect(facts.overridden).toBe(true)
+  })
+})
+
+describe('deadlineSliderIndex', () => {
+  it('keeps a rung where it is', () => {
+    expect(deadlineSliderIndex(300_000)).toBe(3)
+    expect(deadlineSliderIndex(30_000)).toBe(1)
+    // 不等待 is the FIRST rung: the slider reads left to right as "wait longer",
+    // and not waiting at all is the shortest wait there is.
+    expect(deadlineSliderIndex(0)).toBe(0)
+  })
+  it('parks an off-ladder window on the nearest rung', () => {
+    // 45 seconds sits exactly between 30 秒 and 1 分钟 — a tie goes to the
+    // SHORTER wait, so the thumb never promises more patience than it has.
+    expect(deadlineSliderIndex(45_000)).toBe(1)
+    expect(deadlineSliderIndex(200_000)).toBe(3)
+    expect(deadlineSliderIndex(400_000)).toBe(3)
+  })
+  it('parks a window longer than every rung on the longest one', () => {
+    expect(deadlineSliderIndex(86_400_000)).toBe(7)
+  })
+  it('offers 不等待 under 自动推进 only', () => {
+    // The auto ladder carries 不等待 as its first rung.
+    expect(deadlineSliderIndex(0, 'auto')).toBe(0)
+    // The abort ladder does not: refusing every ask the instant it arrives
+    // stops the agent at every gate, so the shortest wait it offers is the
+    // first REAL one. A zero parks on that rung instead of on a rung that
+    // does not exist.
+    expect(deadlineSliderIndex(30_000, 'abort')).toBe(0)
+    expect(deadlineSliderIndex(300_000, 'abort')).toBe(2)
+    expect(deadlineSliderIndex(0, 'abort')).toBe(0)
+    expect(deadlineSliderIndex(86_400_000, 'abort')).toBe(6)
+  })
+})
+
+describe('deadlineValueFor', () => {
+  it('drops 不等待 under 超时中止, keeping the shortest real wait', () => {
+    // 不等待 answers, so the agent continues — that is the auto mode's deal.
+    expect(deadlineValueFor('auto', 0)).toBe(0)
+    // 超时中止 refuses. A zero window there would refuse every ask on arrival
+    // (the agent stops at every gate), so it floors to the shortest real wait.
+    expect(deadlineValueFor('abort', 0)).toBe(30_000)
+    expect(deadlineValueFor('abort', 45_000)).toBe(45_000)
+    // 一直等待 has no window at all.
+    expect(deadlineValueFor('wait', undefined)).toBeUndefined()
+  })
+  it('keeps the browser floor in step with the host half', () => {
+    // The browser half hand-copies the floor (it may not import the host
+    // module), so the copy is pinned here instead of drifting.
+    expect(DEADLINE_MIN_WAIT_MS).toBe(APPROVAL_DEADLINE_MIN_WAIT_MS)
   })
 })

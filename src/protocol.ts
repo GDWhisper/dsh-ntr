@@ -163,48 +163,60 @@ export interface AcpPluginConfig {
    */
   startupTimeoutMs?: number
   /**
-   * How long a pending `session/request_permission` may sit unanswered before
-   * the host answers `cancelled` on the user's behalf.
-   * `0` (default) waits forever — the human decides, matching the ACP spec's
-   * stance that approvals belong to a person.
-   */
-  permissionTimeoutMs?: number
-  /**
-   * How long the NATIVE approval route may wait for the host approval chain to
-   * answer before the ask is withdrawn and handed to the settings-panel ledger
-   * (the `native-timeout` fallback). A routed ask has exactly one answer entry
-   * — the composer takeover — and broadcasts nothing, so a host that takes the
-   * question and never renders it would hang the turn behind something
-   * invisible; this deadline is what bounds that state. Withdrawing is NOT
-   * answering: the same question stays answerable in Settings.
+   * How long a permission ask may sit unanswered before the deadline fires.
    *
-   * Default 300000 ms (5 minutes) — the same window as
-   * `permissionFallbackTimeoutMs`, so "this route is not working" is one number
-   * instead of two arbitrary ones. A takeover that is going to render does so
-   * immediately, and the host replays a pending approval across reconnects, so
-   * the deadline only fires for a host that took the question and never showed
-   * it. `0` waits for the host forever (the pre-withdrawal behavior). OmniTerm's
-   * equivalent is the reaper's permission-timeout threshold (30 min default,
-   * 30 s steps, hot-updatable); this is the same knob without their `auto` tier,
-   * which this plugin does not have (every ask must reach a human).
+   * ONE window for both places an ask can live — the conversation's approval
+   * card and the settings panel's ledger. They ask the same question ("is
+   * anyone there?"), so they get the same answer; two windows only made the
+   * settings card look like two unrelated knobs.
+   *
+   * `0` means 不等待 — the ask is settled the moment it arrives, without asking
+   * anyone. That rung belongs to the `auto` MODE: it answers the ask, so the
+   * agent continues. Under `abort` the same zero would refuse every ask on
+   * arrival (the agent stops at every gate), so `abort` never runs it — the
+   * host normalizes it to the shortest real wait. Never expiring is the `wait`
+   * MODE's business, so the two never overlap. Anything else is the wait
+   * before the deadline fires. Default 300000 ms (5 minutes).
+   *
+   * When it fires, {@link AcpPluginConfig.permissionTimeoutMode} decides what
+   * happens.
    *
    * Editable from the settings page (`ui/approval-deadlines-set`), which
    * persists an override in the plugin's own state file and applies it to the
    * running bridges without restarting anything; the value here is the
    * deployment baseline that override falls back to. See {@link AcpApprovalDeadlines}.
    */
+  permissionTimeoutMs?: number
+  /**
+   * LEGACY: the old conversation-route window, kept so an existing
+   * `cordis.patch.yml` still says what it meant. Folded into
+   * {@link AcpPluginConfig.permissionTimeoutMs} when that key is absent, and
+   * ignored when it is present.
+   */
   nativeApprovalTimeoutMs?: number
   /**
-   * Deadline for a permission ask whose native route DEGRADED (`unavailable`, or
-   * `native-timeout` after the withdrawal above): the conversation is not
-   * showing the question, so waiting forever would hang the turn on something
-   * nobody can see there. Past it the ask is answered `cancelled`. Applies only
-   * while `permissionTimeoutMs` is `0`; that knob, when non-zero, governs every
-   * path alike. Default 300000 ms; `0` disables even this fallback.
+   * LEGACY: the old ledger-route window, kept for the same reason as
+   * {@link AcpPluginConfig.nativeApprovalTimeoutMs}.
+   */
+  permissionFallbackTimeoutMs?: number
+  /**
+   * What an expired approval deadline DOES. `wait` (default) never expires
+   * at all; `abort` answers `cancelled`; `auto` answers with the option the
+   * agent's own kinds imply and lets the agent continue.
+   *
+   * The default is `wait`: a permission ask is a question FOR A HUMAN, and
+   * refusing it because the human looked away is worse than waiting — the
+   * ask stays visible, so nobody is left wondering. `abort` and `auto` are
+   * opt-in for deployments that would rather have a bounded turn.
+   *
+   * `auto` is unattended operation — the plugin may approve something no human
+   * looked at — so it is opt-in and the outcome is announced. `wait` is the
+   * "hang visibly until I come back" mode: the ask stays pending and the turn
+   * stays open.
    *
    * Editable from the settings page, like {@link nativeApprovalTimeoutMs}.
    */
-  permissionFallbackTimeoutMs?: number
+  permissionTimeoutMode?: PermissionTimeoutMode
   /**
    * After `session/cancel`, how long to wait for the agent to settle the turn
    * before the host force-finalizes it. An agent that ignores the cancel
@@ -322,6 +334,28 @@ export type AcpEvent =
   | { type: 'agent/exposure'; agentId: string; exposedModels: string[]; autoDiscoverModels: boolean }
   | { type: 'permission/request'; requestId: string; sessionId: string; toolCall: unknown; options: PermissionOptionView[] }
   | { type: 'permission/resolved'; requestId: string; sessionId: string; outcome: PermissionOutcome }
+  /**
+   * An ask whose deadline fired and was settled by the plugin itself — refused
+   * (`abort`), or answered with the option the agent's own kinds imply
+   * (`auto`).
+   *
+   * A native ask (the composer takeover) never became a ledger entry, so this
+   * frame is the ONLY trace of the expiry in the conversation: without it the
+   * user would watch the composer card vanish with nothing said about it. The
+   * ledger path does not need it — its card sits on the settings panel and the
+   * chat line already pointed there.
+   */
+  | {
+      type: 'permission/expired'
+      sessionId: string
+      toolCall: unknown
+      /** How long the ask waited before the deadline fired. */
+      timeoutMs: number
+      /** What the plugin answered with. */
+      outcome: PermissionOutcome
+      /** The picked option's label, when one was picked (`auto` mode). */
+      optionName?: string
+    }
   /**
    * Terminator of the pending-permission REPLAY a freshly connected client
    * receives (see the `/api/acp/stream` route). A `permission/request` frame is
@@ -527,24 +561,54 @@ export type TagHaloResult = { halo: AcpTagHalo }
 /** `ui/tag-halo-set`: write the halo preference. */
 export interface TagHaloSetPayload { halo: AcpTagHalo }
 
-/** The two approval deadlines the settings page can edit, by field name. */
-export type ApprovalDeadlineKey = 'nativeApprovalTimeoutMs' | 'permissionFallbackTimeoutMs'
+/** The approval deadline the settings page can edit, by field name. ONE window. */
+export type ApprovalDeadlineKey = 'permissionTimeoutMs'
+
+/**
+ * What an EXPIRED approval deadline does. Three modes, and only three — an
+ * unanswered ask either gets answered for you, keeps waiting, or is refused.
+ *
+ * - `abort`: answer `cancelled`. The operation is refused and the agent
+ *   continues with that answer.
+ * - `auto`: answer the ask with the option the AGENT's own kinds imply
+ *   (`allow_always` → `allow_once` → `reject_once` → `reject_always` → the
+ *   first option), and the agent CONTINUES executing. This is unattended
+ *   operation: the plugin may end up approving something nobody looked at,
+ *   which is why it is opt-in and why the outcome is announced.
+ * - `wait` (default): never expire. The ask stays pending, visibly, until a
+ *   human answers it or the session is cancelled.
+ *
+ * Same three modes as OmniTerm dev's `acp_perm_timeout_mode`, under the same
+ * names. The plugin's own default is `wait`, not `abort` and not `auto`: a
+ * permission ask is a question for a human, so the safe default is to keep
+ * waiting rather than to refuse (or worse, approve) on their behalf.
+ */
+export type PermissionTimeoutMode = 'abort' | 'auto' | 'wait'
 
 /**
  * What the settings page's approval-deadline card shows: the values in force,
- * plus the two facts that explain why a value the user did not pick is winning.
+ * plus the facts that explain why a value the user did not pick is winning.
  *
  * `configured` is present only when `cordis.patch.yml` names a key — a settings
  * override outranks it, and the card must say so rather than silently showing
- * the override. `permissionTimeoutMs` is the config-file-only knob that
- * overrides BOTH deadlines when non-zero; it rides along so the card can warn
- * instead of letting a user tune a number that is not being read.
+ * the override. `configuredMode` is the same fact about the mode.
  */
 export interface AcpApprovalDeadlines {
-  nativeApprovalTimeoutMs: number
-  permissionFallbackTimeoutMs: number
+  /**
+   * The one wait window, in ms. `0` means 不等待 — the ask is settled on
+   * arrival, without asking anyone, and only the `auto` mode runs it.
+   * Never expiring is the `mode`'s business.
+   *
+   * It covers BOTH places an ask can live (the conversation's approval card
+   * and the settings panel's ledger): one question, one answer, one number.
+   */
+  permissionTimeoutMs: number
+  /** What an expired deadline does. Always present: `wait` is the default. */
+  mode: PermissionTimeoutMode
+  /** The config-file value for the window, when the file names one. */
   configured?: Partial<Record<ApprovalDeadlineKey, number>>
-  permissionTimeoutMs?: number
+  /** The config-file baseline for `mode`, when the file names one. */
+  configuredMode?: PermissionTimeoutMode
 }
 /**
  * `ui/approval-deadlines`: read the deadlines in force. `deadlines` is absent
@@ -553,13 +617,20 @@ export interface AcpApprovalDeadlines {
  */
 export type ApprovalDeadlinesResult = { deadlines?: AcpApprovalDeadlines }
 /**
- * `ui/approval-deadlines-set`: write one or both deadlines. Omitted keys keep
- * their current value; `reset: true` drops the persisted override so the
- * `cordis.patch.yml` baseline (or the built-in default) applies again.
+ * One write to the approval-deadline settings: the window, and the mode.
+ * Omitted keys keep their current value — a card that only moved the mode
+ * must not reset the number.
  */
-export interface ApprovalDeadlinesSetPayload {
-  nativeApprovalTimeoutMs?: number
-  permissionFallbackTimeoutMs?: number
+export interface ApprovalDeadlinePatch {
+  permissionTimeoutMs?: number
+  mode?: PermissionTimeoutMode
+}
+/**
+ * `ui/approval-deadlines-set`: write the deadline, or the mode.
+ * `reset: true` drops the persisted override so the `cordis.patch.yml`
+ * baseline (or the built-in default) applies again.
+ */
+export interface ApprovalDeadlinesSetPayload extends ApprovalDeadlinePatch {
   reset?: boolean
 }
 

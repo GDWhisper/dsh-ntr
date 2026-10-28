@@ -99,8 +99,7 @@ export function apply(ctx: Context, config?: unknown): void {
     {
       startupTimeoutMs: resolved.startupTimeoutMs,
       permissionTimeoutMs: resolved.permissionTimeoutMs,
-      nativeApprovalTimeoutMs: resolved.nativeApprovalTimeoutMs,
-      permissionFallbackTimeoutMs: resolved.permissionFallbackTimeoutMs,
+      permissionTimeoutMode: resolved.permissionTimeoutMode,
       cancelFallbackMs: resolved.cancelFallbackMs,
       staleCancelRetryDelayMs: resolved.staleCancelRetryDelayMs,
       staleCancelMaxRetries: resolved.staleCancelMaxRetries,
@@ -115,11 +114,20 @@ export function apply(ctx: Context, config?: unknown): void {
   // returns to). Only the keys the file actually names are declared.
   const rawConfig = (config ?? {}) as Record<string, unknown>
   const configuredDeadlines: Partial<Record<ApprovalDeadlineKey, number>> = {}
-  for (const key of ['nativeApprovalTimeoutMs', 'permissionFallbackTimeoutMs'] as const) {
-    const value = rawConfig[key]
-    if (typeof value === 'number' && Number.isFinite(value)) configuredDeadlines[key] = value
+  // The window the file actually named — the new key, or the legacy one it
+  // folded into (same order `validateConfig` resolves them in, so the card's
+  // baseline and the running value never disagree).
+  const rawWindow = rawConfig.permissionTimeoutMs
+    ?? rawConfig.nativeApprovalTimeoutMs
+    ?? rawConfig.permissionFallbackTimeoutMs
+  if (typeof rawWindow === 'number' && Number.isFinite(rawWindow)) {
+    configuredDeadlines.permissionTimeoutMs = rawWindow
   }
-  manager.setConfiguredApprovalDeadlines(configuredDeadlines)
+  // The mode is declared the same way: only when the file actually names it.
+  const configuredMode = rawConfig.permissionTimeoutMode === 'abort' || rawConfig.permissionTimeoutMode === 'auto' || rawConfig.permissionTimeoutMode === 'wait'
+    ? rawConfig.permissionTimeoutMode
+    : undefined
+  manager.setConfiguredApprovalDeadlines(configuredDeadlines, configuredMode)
   // Boot hook kept only so this entry point's shape does not change:
   // `bootstrapCatalogs` is intentionally empty — boot never spawns an agent,
   // in any environment and for any `probeModelsOnBoot` value. Catalogs fill

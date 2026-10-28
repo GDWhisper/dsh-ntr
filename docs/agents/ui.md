@@ -128,7 +128,13 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 - 模型区（`ModelCatalogBlock`）**常驻渲染**，严禁挂在探测结果上：右侧「已选模型」来自 agent 配置的 `exposedModels`，左侧「全部模型」来自宿主目录缓存（`agent/cached-models`，纯内存、不 spawn，见 [state.md §4](./state.md)），所以打开卡片就能看到已配置的东西。`检测可用模型` 只是**左侧列表的刷新**（新增的加进来、下架的去出去），与搜索框同放在模型区自己的工具栏里（不在区块顶部），点击后在标题行回报「新增 N · 移除 M / 目录无变化」。空目录时左侧给引导文案（未读取 / 该 Agent 未暴露 `category: model`），而不是隐藏整块。模型行**直接展示** `description`（如 agent 给出的积分消耗 `x0.29 credits`），严禁只放进 `title` 靠 hover 才能看到；分组兜底 description 与 `group` 相同时不重复展示。空间不足时名称与 credit 优先保留，模型 id 是唯一可收缩的格子：右缘渐隐（mask）而不是硬省略号，hover 时由 `armModelIdMarquee` 实测溢出量并滚动展示全文，`title` 仍保留完整值（reduced-motion 的兜底）。「全部模型」与「已选模型」两块列表**上下堆叠**，不再左右分栏——半宽面板会把名称 / id / credit 同时挤掉。两块面板各自带收纳按钮（`▾` / `▸`，`aria-expanded`）：只隐藏列表本体、保留标题与计数，列表继续挂载以保住滚动位置。
 - 每张 agent 卡保持「紧凑行 + 展开详情」两段，详情体**常挂载**、只用 `display: none` 折叠——条件渲染会重挂载表单 `useState`，丢掉用户编辑中的值。缓存读按 `active`（展开态）触发，折叠的卡片不发请求。
 - 页面按 `section` 分组：页头（标题 / 描述 / 流状态）→ 模式横幅 → 已接入的智能体 → 添加智能体 → **审批时限** → 对话外观。文案里点名的控件名必须与可见标题一致：store 的 `detectSummary` 与空态提示都指向「添加智能体」，改名要三处同步（`store.ts` / `panel.tsx` / `tests/store.spec.ts`）。审批时限卡的位置在「对话外观」之上：它改变的是回合会发生什么，那张卡只装饰挂牌。
-- **审批时限卡**（`ApprovalDeadlinesCard` / `DeadlineRow`）改两个降级窗口，热生效、不重启（取值三层与覆盖语义见 [permissions.md §2.3](./permissions.md)）。每行是「预设 seg + 自由秒数输入」两路：秒数字段是**草稿**，只有能解析成非负整数才提交，失焦时非法草稿回滚而不写入宿主会拒的值。卡片还必须显示宿主只在相关时才上报的两个事实：`configured[key]` 与生效值不同（配置文件被覆盖，给重置按钮）、`permissionTimeoutMs > 0`（它一视同仁，本卡调的两个数都没被读）。宿主没有这条 RPC 时整卡不渲染——不显示浏览器自己编的数。
+- **审批时限卡**（`ApprovalDeadlinesCard` / `DeadlineModeBlock` / `DeadlineSliderBlock`）只有**两个控件**：超时处理方式（三档互斥按钮）+ 等待时长（一根滑块），热生效、不重启（取值三层与覆盖语义见 [permissions.md §2.4](./permissions.md)）。**只有一个等待窗口**：对话 composer 里的询问与 ledger 里的询问问的是同一个问题，所以共用一个答案——两个窗口曾把卡变成三行看不出关联的旋钮，用户还得防着两处配出互相矛盾的值。模式按钮**整宽排布**（`.dwa-seg-wide`）：右对齐的 seg 会把「一直等待 / 自动推进 / 超时中止」挤成两行字（「中/止」「自动推/进」），读起来像坏了。滑块档位是刻度（不等待 / 30 秒 / 1 分钟 / 5 分钟 / 15 分钟 / 30 分钟 / 1 小时 / 6 小时，「不等待」只在自动推进档出现，超时中止档从 30 秒起）；「一直等待」**不是一档**，它由模式表达——同一件事不在两个控件里各说一遍。配置文件写的窗口若不在档位上，**照原值运行**，卡片显示精确数字并把滑块停在最近的档位上——滑块不许谎报正在生效的数。宿主没有这条 RPC 时整卡不渲染——不显示浏览器自己编的数。
+- **两个控件必须说成一套**：卡片有一句话把时长与模式接上（「超过该时长仍未应答，将按上方所选的方式处理。」）。三行版最大的失败不是难看，是用户**猜不出三个控件是不是有关系**；现在只剩两个，且它们的关系被写了出来。
+- **超时处理方式不能只写名字**：三个按钮（一直等待 / 自动推进 / 超时中止）下面必须有一行说明**当前档**的动作，且**两条说明不得说同一件事**——「自动推进」写「超过设定时间未应答，自动代替你选择一个选项让 agent 继续执行」，警告另起一条写「请确保你的 agent 值得信任，请谨慎选择」。否则「自动推进」会读成「界面自己往下滚」。这一行**只写动作**，不解释「为什么原来要转移」——那段历史写进文档，不写进 UI。
+- **`wait` 档下滑块不生效**：不设期限时不能留着「等待时长」配一个永不触发的数字，此时**不画滑块**、读数写「一直等待」、说明改成「选择「一直等待」时不设超时时长。」存着的窗口不被改写（模式写只带模式），切回来时原样回来。
+- **「不等待」只属自动推进**：滑块从左到右读作「等得越久越有耐心」，最左就是最不等——`0` 档的请求到达即代答，agent 继续。「超时中止」那一档**没有**这个刻度（从 30 秒起）：同样的 0 在那里是立刻拒绝每一问，agent 在每个门口都停住。「一直等待」属于模式轴（`wait`），时长轴不再重复它。
+- **覆盖事实挂在被覆盖的那一行**（`.dwa-deadline-flag`，警告色，紧贴它说的那个控件）；重置按钮**只有真的覆盖了才出现**。
+- **设置页文案有预算**：一个控件的说明**一行讲完**，机制解释进代码注释与 `docs/agents/`，不进 UI。同页参照是「呼吸频率 10 字 / 挂牌光晕 14 字 / 对话外观导语 15 字」——审批时限卡曾用 211 字铺满一张卡、两个旋钮埋在灰字里，压到 86 字后又回到 90 字（三行版），现在是**两个控件**：默认档 57 字，`auto` 档 95 字（多出的全是那句警告）；别把整页拉回长文。措辞取**正式陈述**（「超过设定时间未应答，自动代替你选择一个选项让 agent 继续执行」），不要口语化的拟人说法（「没人回答就替你选一个选项放行」）——后者两句话读起来像同一件事。
 - 工作区保存语义：单根模式（非空 `cwd`）把 `allowedCwdRoots` 收窄为 `[cwd]`；`cwd` 为空则两者都不发送（走宿主 `defaultAgentWorkspace()`）；多根模式发送编辑后的去重绝对路径。初始状态带 >1 个 root 的 agent 必须直接进多根模式，避免仅仅打开表单就收窄白名单。
 - 审批卡与权限路由见 [permissions.md](./permissions.md)。
 
@@ -149,5 +155,5 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 | 视图 | `src/client/acp-view.tsx` · `boundAgentOf` / `acpEmptyCopy` / `diffRows` / `isNewFileDiff` |
 | 斜杠 | `src/client/slash-isolation.ts` · `createSlashIsolation` / `slashAcpVerdict` / `commandCandidates` |
 | 文案 | `src/client/index.tsx` · `label` / `LocaleFace` / `browserPrefersZh`；`src/client/store.ts` · `refreshLocale` / `detectSummaryOf`；`locale/*.json` |
-| 设置页 | `src/client/panel.tsx` · `AcpSettingsSection` / `AgentRow` / `WorkspaceBlock` / `initialForm` / `buildPayload` / `ApprovalDeadlinesCard` |
+| 设置页 | `src/client/panel.tsx` · `AcpSettingsSection` / `AgentRow` / `WorkspaceBlock` / `initialForm` / `buildPayload` / `ApprovalDeadlinesCard` / `approvalDeadlineFacts` |
 | 设置对话框 | `src/client/settings-dialog.tsx` · `AcpSettingsDialog`；`src/client/acp-ui.tsx` · `openAcpSettingsDialog` / `closeAcpSettingsDialog` / `useAcpSettingsDialogOpen` |

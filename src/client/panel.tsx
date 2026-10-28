@@ -19,7 +19,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { formatCommandLine, isAbsolutePathLike, splitCommandLine } from './acp-ui.tsx'
 import { DEFAULT_KNOWN_PRESETS } from './store.ts'
 import type { AcpStore, UiState } from './store.ts'
-import type { AcpAgentDef, AcpCatalogChoice, AcpMcpServerDef, AgentSavePayload, AgentView, ApprovalDeadlineKey, DetectedAgentInfo } from '../protocol.ts'
+import type { AcpAgentDef, AcpApprovalDeadlines, AcpCatalogChoice, AcpMcpServerDef, AgentSavePayload, AgentView, DetectedAgentInfo, PermissionTimeoutMode } from '../protocol.ts'
 
 interface WithStore { acp: AcpStore }
 
@@ -197,12 +197,28 @@ const STYLE = `
 .dwa-seg > button.is-on { background: var(--ntr-accent); color: var(--dsw-alias-button-primary-invert, #fff); font-weight: 550; }
 .dwa-preference-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 0; }
 .dwa-preference-row + .dwa-preference-row { border-top: var(--ntr-line); }
+/* A control that needs the whole card: the label sits above it, not beside
+   it. A right-aligned segmented control squeezed its labels into two lines
+   each (中/止, 自动推/进), which read as broken rather than as choices. */
+.dwa-preference-block { padding: 12px 0; }
+.dwa-preference-block + .dwa-preference-block { border-top: var(--ntr-line); }
 .dwa-preference-label { font-size: var(--ntr-font-sm); font-weight: 600; }
 .dwa-preference-copy { margin-top: 2px; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
-.dwa-deadline-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.dwa-deadline-input { width: 76px; min-height: 30px; padding: 4px 8px; text-align: right; }
-.dwa-deadline-input[aria-invalid="true"] { border-color: var(--ntr-danger); }
-.dwa-deadline-unit { white-space: nowrap; }
+.dwa-seg-wide { display: flex; width: 100%; margin-top: 10px; }
+.dwa-seg-wide > button { flex: 1; }
+/* The wait window, as a slider: the number is the headline, the rungs are the
+   scale under the track. */
+.dwa-deadline-value { margin-top: 8px; font-size: 20px; font-weight: 600; }
+.dwa-deadline-range { width: 100%; margin-top: 6px; accent-color: var(--ntr-accent); }
+.dwa-deadline-range:disabled { opacity: 0.4; }
+.dwa-deadline-ticks { display: flex; justify-content: space-between; margin-top: 2px; color: var(--ntr-muted); font-size: 10px; }
+.dwa-deadline-ticks > span { white-space: nowrap; }
+/* The facts that make a number here meaningless, in warning ink rather than
+   the muted gray every other hint uses: the value the config file is
+   outranking, on the row it belongs to. */
+.dwa-deadline-flag { margin-top: 4px; font-size: var(--ntr-font-xs); font-weight: 550; color: var(--ntr-warn); }
+.dwa-deadline-warn { margin-top: 10px; padding: 9px 12px; border-left: 3px solid var(--dsw-alias-state-warn-primary, #d97706); background: var(--dsw-alias-state-warn-secondary, #fffbeb); border-radius: var(--ntr-radius-sm); font-size: var(--ntr-font-xs); line-height: 1.55; }
+.dwa-deadline-reset { display: flex; justify-content: flex-end; margin-top: 8px; }
 @media (max-width: 640px) {
   .dwa-root { padding: 14px; }
   .dwa-page-header { flex-direction: column; }
@@ -212,6 +228,11 @@ const STYLE = `
   .dwa-model-search { flex: 1 1 auto; width: auto; }
   .dwa-subsection-head, .dwa-preference-row { align-items: flex-start; flex-direction: column; }
   .dwa-default-hint { align-items: flex-start; flex-direction: column; }
+  /* The slider's scale: up to eight rungs with full unit words ("15 分钟")
+     need a smaller face before they can collide on a narrow panel. The rung
+     count follows the mode (自动推进 adds 不等待), and the row is a flex
+     space-between, so a shorter scale just spreads wider. */
+  .dwa-deadline-ticks { font-size: 9px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .dwa-root *, .dwa-root *::before, .dwa-root *::after { transition: none !important; }
@@ -458,126 +479,328 @@ export function permissionLedgerCard(ui: Pick<UiState, 'approvalRouted' | 'permi
 }
 
 /**
- * One-click windows for an approval deadline, in ms. `0` is spelled out rather
- * than hidden behind a big number because "never" is the value a cautious user
- * picks first, and a preset row that cannot express it would make them type.
+ * The ONE wait window, as the rungs the slider snaps to.
+ *
+ * Shortest wait first, and `0` (不等待) FIRST: the slider reads left to right
+ * as "wait longer", and "do not wait at all" is the shortest wait there is.
+ * Never expiring is NOT on this scale — that is the `wait` MODE's business,
+ * and having 「一直等待」 in both places made the card say the same thing twice
+ * in two ways.
+ *
+ * A window the config file names that is not on this ladder (45 seconds, say)
+ * still runs as configured: the card prints the exact number and parks the
+ * thumb on the nearest rung, so the slider never pretends a number the host
+ * is not using.
  */
-const DEADLINE_PRESETS = [0, 30_000, 60_000, 300_000, 900_000] as const
+const DEADLINE_LADDER: readonly number[] = [
+  0,
+  30_000,
+  60_000,
+  300_000,
+  900_000,
+  1_800_000,
+  3_600_000,
+  21_600_000,
+]
 
-/** Both editable windows, for the loops that treat them alike. */
-const DEADLINE_FIELDS: readonly ApprovalDeadlineKey[] = ['nativeApprovalTimeoutMs', 'permissionFallbackTimeoutMs']
+/**
+ * The shortest REAL wait — the first rung above 不等待.
+ *
+ * Hand-copied from the host half (`APPROVAL_DEADLINE_MIN_WAIT_MS` in
+ * `src/impl.ts`): the browser half may not import the host module, so the
+ * equivalence is pinned by a test instead (see `tests/acp-view.spec.ts`).
+ */
+export const DEADLINE_MIN_WAIT_MS = 30_000
 
-/** `5 分钟` / `30 秒` / `关` — the readout and the preset label, one formatter. */
-function deadlineText(ms: number, acp: AcpStore): string {
-  if (ms <= 0) return acp.label('关', 'Off')
-  const seconds = Math.round(ms / 1000)
-  if (seconds < 60) return acp.label(`${String(seconds)} 秒`, `${String(seconds)}s`)
-  const minutes = Math.round(seconds / 60)
-  return acp.label(`${String(minutes)} 分`, `${String(minutes)}m`)
+/**
+ * The window the card shows under a mode.
+ *
+ * 不等待 (`0`) is the **auto** mode's rung: it answers with the option the
+ * agent's own kinds imply, so the agent CONTINUES. `abort` has no such rung —
+ * refusing every ask the instant it arrives stops the agent at every gate it
+ * meets, which is not a timeout but a wall. So under `abort` the window floors
+ * to the shortest real wait, and the card never shows a zero it cannot run.
+ *
+ * `undefined` (the `wait` mode) stays undefined: there is no window at all.
+ */
+export function deadlineValueFor(mode: PermissionTimeoutMode, ms: number | undefined): number | undefined {
+  if (ms === undefined) return undefined
+  return mode === 'abort' ? Math.max(ms, DEADLINE_MIN_WAIT_MS) : ms
 }
 
 /**
- * One editable deadline: presets for the windows people actually pick, plus a
- * free-form seconds field for everything else.
+ * The rungs a mode offers.
  *
- * The field is a DRAFT, not the value: it only commits a parseable whole number
- * of seconds (0 allowed), and an unparseable draft reverts on blur instead of
- * writing garbage the host would refuse. The host answer is what the row then
- * shows, so a value the host trims never lingers in the UI.
+ * 不等待 (`0`) is the **auto** mode's rung: it answers with the option the
+ * agent's own kinds imply, so the agent CONTINUES. `abort` has no such rung —
+ * refusing every ask the instant it arrives stops the agent at every gate it
+ * meets, which is not a timeout but a wall. So `abort` starts at the shortest
+ * real wait.
  */
-function DeadlineRow(props: {
-  acp: AcpStore
-  field: ApprovalDeadlineKey
-  label: string
-  copy: string
-  value: number
-}) {
-  const { acp, field, label, copy, value } = props
-  const [draft, setDraft] = useState<string | undefined>(undefined)
-  const text = draft ?? String(Math.round(value / 1000))
-  const parsed = /^\d+$/.test(text.trim()) ? Number(text.trim()) * 1000 : undefined
-  const commit = (): void => {
-    const next = parsed
-    setDraft(undefined)
-    // A no-op write is still a write: it is what pins the value into the
-    // persisted override, which is what makes it survive a restart.
-    if (next !== undefined && next !== value) void acp.setApprovalDeadline(field, next)
+function deadlineLadder(mode: PermissionTimeoutMode): readonly number[] {
+  return mode === 'auto' ? DEADLINE_LADDER : DEADLINE_LADDER.filter(ms => ms > 0)
+}
+
+/**
+ * The rung the slider shows for a window. Exact hits keep their rung; anything
+ * else takes the nearest one. A tie goes to the SHORTER wait: the thumb must
+ * never promise more patience than the window has.
+ */
+export function deadlineSliderIndex(ms: number, mode: PermissionTimeoutMode = 'auto'): number {
+  const ladder = deadlineLadder(mode)
+  const exact = ladder.indexOf(ms)
+  if (exact >= 0) return exact
+  let best = 0
+  let bestDistance = Number.POSITIVE_INFINITY
+  for (let i = 0; i < ladder.length; i++) {
+    const distance = Math.abs(ms - ladder[i])
+    if (distance < bestDistance) {
+      bestDistance = distance
+      best = i
+    }
   }
+  return best
+}
+
+/** The three modes, in the order a user reads them: refuse, answer, wait. */
+const DEADLINE_MODES: readonly PermissionTimeoutMode[] = ['abort', 'auto', 'wait']
+
+/** `5 分钟` / `30 秒` / `不等待` — the readout and the tick label, one formatter. */
+function deadlineText(ms: number, acp: AcpStore): string {
+  if (ms <= 0) return acp.label('不等待', 'No wait')
+  const seconds = Math.round(ms / 1000)
+  if (seconds < 60) return acp.label(`${String(seconds)} 秒`, `${String(seconds)}s`)
+  const minutes = Math.round(seconds / 60)
+  if (minutes < 60) return acp.label(`${String(minutes)} 分钟`, `${String(minutes)}m`)
+  const hours = Math.round(minutes / 60)
+  return acp.label(`${String(hours)} 小时`, `${String(hours)}h`)
+}
+
+/** The mode's label — one formatter, so the picker and the override note agree. */
+function modeText(mode: PermissionTimeoutMode, acp: AcpStore): string {
+  if (mode === 'abort') return acp.label('超时中止', 'Abort')
+  if (mode === 'auto') return acp.label('自动推进', 'Auto')
+  return acp.label('一直等待', 'Wait')
+}
+
+/**
+ * The mode block: what happens when nobody answers.
+ *
+ * Three values and no more — refuse, answer, wait — so the picker is a
+ * segmented control, not a dropdown. The buttons stretch across the whole
+ * card: a right-aligned segmented control squeezed the labels into two lines
+ * each (中/止, 自动推/进), which read as broken rather than as choices.
+ *
+ * The copy under the buttons says what the SELECTED mode does, in one
+ * sentence — the labels alone ("超时中止") cannot. `auto` carries a warning of
+ * its own: it approves things nobody looked at.
+ */
+function DeadlineModeBlock(props: {
+  acp: AcpStore
+  mode: PermissionTimeoutMode
+  /** Set when the deployment baseline is outranked here. */
+  override?: string
+}) {
+  const { acp, mode, override } = props
+  const copy = mode === 'wait'
+    ? acp.label(
+      '一直等待应答，不设超时时间。',
+      'Wait until you answer — no deadline.',
+    )
+    : mode === 'auto'
+      ? acp.label(
+        '超过设定时间未应答，自动代替你选择一个选项让 agent 继续执行。',
+        'Past the deadline, an option is chosen for you and the agent continues.',
+      )
+      : acp.label(
+        '超过设定时间未应答，自动拒绝该操作，agent 继续执行。',
+        'Past the deadline, the operation is refused and the agent continues.',
+      )
   return (
-    <div className="dwa-preference-row">
-      <div>
-        <div className="dwa-preference-label">{label}</div>
-        <div className="dwa-preference-copy">{copy}</div>
+    <div className="dwa-preference-block">
+      <div className="dwa-preference-label">{acp.label('超时处理方式', 'When nobody answers')}</div>
+      <div className="dwa-seg dwa-seg-wide">
+        {DEADLINE_MODES.map(option => (
+          <button
+            key={option}
+            type="button"
+            className={mode === option ? 'is-on' : ''}
+            onClick={() => void acp.setApprovalTimeoutMode(option)}
+          >
+            {modeText(option, acp)}
+          </button>
+        ))}
       </div>
-      <div className="dwa-deadline-controls">
-        <div className="dwa-seg">
-          {DEADLINE_PRESETS.map(preset => (
-            <button
-              key={preset}
-              type="button"
-              className={value === preset ? 'is-on' : ''}
-              title={deadlineText(preset, acp)}
-              onClick={() => void acp.setApprovalDeadline(field, preset)}
-            >
-              {deadlineText(preset, acp)}
-            </button>
-          ))}
+      <div className="dwa-preference-copy">{copy}</div>
+      {mode === 'auto' && (
+        <div className="dwa-deadline-warn">
+          {acp.label(
+            '请确保你的 agent 值得信任，请谨慎选择。',
+            'Only pick this if you trust your agent — choose it carefully.',
+          )}
         </div>
-        <input
-          className="dwa-input dwa-deadline-input"
-          type="text"
-          inputMode="numeric"
-          aria-label={label}
-          aria-invalid={parsed === undefined}
-          value={text}
-          onChange={event => setDraft(event.target.value)}
-          onBlur={commit}
-          onKeyDown={event => { if (event.key === 'Enter') commit() }}
-        />
-        <span className="dwa-hint dwa-deadline-unit">{acp.label('秒', 'sec')}</span>
-      </div>
+      )}
+      {override !== undefined && (
+        <div className="dwa-deadline-flag">⚠ {override}</div>
+      )}
     </div>
   )
 }
 
 /**
+ * The duration block: how long to wait before the deadline fires.
+ *
+ * ONE slider, because there is ONE window: an ask in the conversation and an
+ * ask in the settings ledger are the same question, so they get the same
+ * answer. The slider's rungs are the windows people actually pick; a window
+ * the config file names outside them still runs as configured (the readout
+ * prints the exact number and the thumb parks on the nearest rung).
+ *
+ * `value === undefined` is the `wait` mode: there is no deadline at all, so
+ * the scale has nothing to say — the slider is not drawn, and the readout
+ * names the state that is actually in force. The stored window is NOT touched
+ * by that (the mode write carries only the mode), so switching back restores
+ * it.
+ */
+function DeadlineSliderBlock(props: {
+  acp: AcpStore
+  /** undefined in `wait` mode: no window, so no scale. */
+  value: number | undefined
+  /** The mode the window runs under — it decides which rungs exist. */
+  mode: PermissionTimeoutMode
+  /** Set when the deployment baseline is outranked here. */
+  override?: string
+}) {
+  const { acp, value, mode, override } = props
+  // 不等待 belongs to `auto`. Under `abort` the window floors to the shortest
+  // real wait, so the card never shows a zero it cannot run.
+  const effective = deadlineValueFor(mode, value)
+  const ladder = deadlineLadder(mode)
+  const index = effective === undefined ? 0 : deadlineSliderIndex(effective, mode)
+  const copy = effective === undefined
+    ? acp.label(
+      '选择「一直等待」时不设超时时长。',
+      '“Wait” sets no deadline.',
+    )
+    : effective <= 0
+      ? acp.label(
+        '不设等待时间，请求到达即按上方所选的方式处理。',
+        'No wait: the ask is settled on arrival, by whatever you picked above.',
+      )
+      : acp.label(
+        '超过该时长仍未应答，将按上方所选的方式处理。',
+        'Past this, whatever you picked above is what happens.',
+      )
+  return (
+    <div className="dwa-preference-block">
+      <div className="dwa-preference-label">{acp.label('等待时长', 'How long to wait')}</div>
+      <div className="dwa-deadline-value">
+        {effective === undefined ? acp.label('一直等待', 'Always') : deadlineText(effective, acp)}
+      </div>
+      {effective !== undefined && (
+        <>
+          <input
+            className="dwa-deadline-range"
+            type="range"
+            min={0}
+            max={ladder.length - 1}
+            step={1}
+            value={index}
+            aria-label={acp.label('等待时长', 'How long to wait')}
+            onChange={event => {
+              const next = ladder[Number(event.target.value)]
+              if (next !== undefined && next !== effective) void acp.setApprovalDeadline(next)
+            }}
+          />
+          <div className="dwa-deadline-ticks">
+            {ladder.map(rung => (
+              <span key={rung}>{deadlineText(rung, acp)}</span>
+            ))}
+          </div>
+        </>
+      )}
+      <div className="dwa-preference-copy">{copy}</div>
+      {override !== undefined && (
+        <div className="dwa-deadline-flag">⚠ {override}</div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * The facts the card has to show, decided from what the host reported.
+ *
+ * The card carries TWO controls, and they are orthogonal: one window (how
+ * long) and one mode (what happens). An override can sit on either of them,
+ * so each is decided on its own.
+ *
+ * `overridden` is what gates the reset button. A baseline that AGREES with the
+ * running value is not an override, and offering a reset for it would be a
+ * button that does nothing (observed live).
+ */
+export function approvalDeadlineFacts(deadlines: AcpApprovalDeadlines): {
+  /** The config-file window the card's window outranks — undefined when
+   *  nothing is being outranked. */
+  baseline: number | undefined
+  /** The config-file mode the card's mode outranks, when it differs. */
+  modeBaseline: PermissionTimeoutMode | undefined
+  /** A reset is only honest when something is actually being outranked. */
+  overridden: boolean
+} {
+  const configured = deadlines.configured?.permissionTimeoutMs
+  const baseline = configured === undefined || configured === deadlines.permissionTimeoutMs
+    ? undefined
+    : configured
+  const modeBaseline = deadlines.configuredMode !== undefined && deadlines.configuredMode !== deadlines.mode
+    ? deadlines.configuredMode
+    : undefined
+  return {
+    baseline,
+    modeBaseline,
+    overridden: baseline !== undefined || modeBaseline !== undefined,
+  }
+}
+
+/**
  * The approval-deadline card.
  *
- * Both windows are about the SAME failure — an ask nobody answered — reached
- * from two different routes, which is exactly why they need an explanation
- * rather than two bare sliders: the first bounds a host that took the question
- * into the composer and never rendered it, the second bounds an ask that never
- * reached the conversation at all. Neither is an answer on the user's behalf
- * being hidden from them: withdrawing re-asks on the ledger, and the fallback
- * says what it did in a notice.
+ * TWO controls, and they are orthogonal: one window (how long) and one mode
+ * (what happens). One window covers both places an ask can wait — the
+ * conversation's approval card and the settings panel's ledger — because they
+ * ask the same question and the answer should not differ by where the card
+ * happens to be drawn.
  *
- * `configured` and `permissionTimeoutMs` are reported by the host only when
- * they are actually in play, and both are shown here rather than swallowed:
- * a user tuning a number that something else is overriding deserves to be told.
+ * The two controls are ONE system, and the card says so in a sentence: the
+ * window says how long to wait, the mode says what happens when nobody
+ * answered. That sentence is the thing the previous three-row layout kept
+ * missing.
+ *
+ * The facts that make a number here meaningless are shown, not swallowed: the
+ * deployment baseline this card outranks. Each rides on the control it belongs
+ * to, and the reset button appears only when something is actually being
+ * outranked.
  */
 function ApprovalDeadlinesCard(props: { acp: AcpStore; ui: UiState }) {
   const { acp, ui } = props
   const deadlines = ui.approvalDeadlines
   // Older host half: no card rather than a number this browser invented.
   if (deadlines === undefined) return null
-  const configured = deadlines.configured ?? {}
-  const inForce: Record<ApprovalDeadlineKey, number> = {
-    nativeApprovalTimeoutMs: deadlines.nativeApprovalTimeoutMs,
-    permissionFallbackTimeoutMs: deadlines.permissionFallbackTimeoutMs,
-  }
-  const overrideNote = (field: ApprovalDeadlineKey): string | undefined => {
-    const baseline = configured[field]
-    // Equal (or unconfigured) means nothing is being outranked: stay silent.
-    if (baseline === undefined || baseline === inForce[field]) return undefined
-    return acp.label(
-      `cordis.patch.yml 里是 ${deadlineText(baseline, acp)}，设置页的值优先。`,
-      `cordis.patch.yml asks for ${deadlineText(baseline, acp)}; the value set here wins.`,
+  const facts = approvalDeadlineFacts(deadlines)
+  const baselineNote = facts.baseline === undefined
+    ? undefined
+    : acp.label(
+      `配置文件（cordis.patch.yml）设为 ${deadlineText(facts.baseline, acp)}，此处设置优先。`,
+      `The config file (cordis.patch.yml) asks for ${deadlineText(facts.baseline, acp)}; the value set here wins.`,
     )
-  }
-  // An override is in force exactly when a note says so — a configured baseline
-  // that AGREES with the running value is not an override, and offering a reset
-  // for it would be a button that does nothing (observed live).
-  const overridden = DEADLINE_FIELDS.some(field => overrideNote(field) !== undefined)
+  const modeNote = facts.modeBaseline === undefined
+    ? undefined
+    : acp.label(
+      `配置文件（cordis.patch.yml）设为「${modeText(facts.modeBaseline, acp)}」，此处设置优先。`,
+      `The config file (cordis.patch.yml) asks for "${modeText(facts.modeBaseline, acp)}"; the value set here wins.`,
+    )
+  // In `wait` mode there is no deadline at all, so the slider shows the one
+  // thing that is true: no deadline.
+  const waitMode = deadlines.mode === 'wait'
   return (
     <section className="dwa-section">
       <div className="dwa-section-heading">
@@ -585,58 +808,23 @@ function ApprovalDeadlinesCard(props: { acp: AcpStore; ui: UiState }) {
           <h3 className="dwa-section-title">{acp.label('审批时限', 'Approval deadlines')}</h3>
           <p className="dwa-section-copy">
             {acp.label(
-              '没人答复的权限询问多久后由插件接手。两者都不是替你批准：撤回后会改到设置页再问一次，代答前会先发一条说明。',
-              'How long an unanswered permission ask waits before the plugin takes over. Neither approves on your behalf: a withdrawal re-asks in Settings, and an auto-answer announces itself first.',
+              '权限请求的等待时长与超时处理方式。',
+              'How long to wait for a permission request, and what happens when nobody answers.',
             )}
           </p>
         </div>
       </div>
       <div className="dwa-card" style={{ paddingTop: 4, paddingBottom: 4 }}>
-        <DeadlineRow
+        <DeadlineModeBlock acp={acp} mode={deadlines.mode} override={modeNote} />
+        <DeadlineSliderBlock
           acp={acp}
-          field="nativeApprovalTimeoutMs"
-          label={acp.label('对话审批撤回窗口', 'Composer approval withdrawal')}
-          copy={acp.label(
-            '宿主把询问接进对话后，多久没出现就撤回并改到设置页问。会渲染的接管是立即出现的，所以这个期限只为「收了却不渲染」而响。',
-            'How long an ask the host took into the composer may stay invisible before it is withdrawn and re-asked in Settings. A takeover that renders does so immediately, so this only fires for one that never showed up.',
-          )}
-          value={deadlines.nativeApprovalTimeoutMs}
+          value={waitMode ? undefined : deadlines.permissionTimeoutMs}
+          mode={deadlines.mode}
+          override={baselineNote}
         />
-        {overrideNote('nativeApprovalTimeoutMs') !== undefined && (
-          <div className="dwa-hint" style={{ paddingBottom: 8 }}>{overrideNote('nativeApprovalTimeoutMs')}</div>
-        )}
-        <DeadlineRow
-          acp={acp}
-          field="permissionFallbackTimeoutMs"
-          label={acp.label('降级询问代答窗口', 'Degraded-ask auto-answer')}
-          copy={acp.label(
-            '询问没能进入对话时（审批服务不可用，或已被撤回），多久后答复 cancelled。',
-            'How long an ask that never reached the conversation (approval service unavailable, or withdrawn above) waits before it is answered cancelled.',
-          )}
-          value={deadlines.permissionFallbackTimeoutMs}
-        />
-        {overrideNote('permissionFallbackTimeoutMs') !== undefined && (
-          <div className="dwa-hint" style={{ paddingBottom: 8 }}>{overrideNote('permissionFallbackTimeoutMs')}</div>
-        )}
-        {deadlines.permissionTimeoutMs !== undefined && (
-          <div className="dwa-hint" style={{ paddingBottom: 8 }}>
-            {acp.label(
-              `注意：cordis.patch.yml 里 permissionTimeoutMs = ${deadlineText(deadlines.permissionTimeoutMs, acp)}，它一视同仁，覆盖上面两个窗口。`,
-              `Note: cordis.patch.yml sets permissionTimeoutMs = ${deadlineText(deadlines.permissionTimeoutMs, acp)}, which governs every path alike and overrides both windows above.`,
-            )}
-          </div>
-        )}
-        {overridden && (
-          <div className="dwa-preference-row">
-            <div>
-              <div className="dwa-preference-copy">
-                {acp.label(
-                  '设置页的值写在插件自己的状态文件里，重启后仍然有效；重置后回到 cordis.patch.yml 的配置。',
-                  'A value set here lives in the plugin\'s own state file and survives a restart; resetting returns to whatever cordis.patch.yml asks for.',
-                )}
-              </div>
-            </div>
-            <button type="button" className="dwa-btn" onClick={() => void acp.resetApprovalDeadlines()}>
+        {facts.overridden && (
+          <div className="dwa-deadline-reset">
+            <button type="button" className="dwa-btn dwa-btn-secondary" onClick={() => void acp.resetApprovalDeadlines()}>
               {acp.label('恢复配置文件的值', 'Use config file value')}
             </button>
           </div>
@@ -1528,9 +1716,23 @@ function AgentDetails({
                 '必须是 0（永不释放）或 [1000, 86400000] 之间的整数毫秒。',
                 'Must be 0 (never release) or an integer in [1000, 86400000] ms.',
               )
-              : acp.label(
-                '没有进行中的回合或待答审批时，空闲超过此时长就挂起进程（会话保留，下一条消息自动重启并恢复）；0 = 永不释放；有回合在跑、取消尚未结算或审批待答的进程不会被释放。此窗口只对承载过会话的进程生效：保存后拉起的模型探测进程（面板显示「已连接」的那个）固定 5 分钟释放，填 0 也拦不住。',
-                'With no turn in flight or approval awaiting an answer, the process is parked once it has been idle this long (sessions are kept and resume on the next message); 0 = never; a process with a running turn, an unsettled cancel, or a pending approval is never released. This window applies only to a process that has hosted a session: the model-probe process (the one the panel shows as "connected" after a save) is always released after 5 minutes, and 0 does not stop it.',
+              : (
+                <>
+                  {acp.label(
+                    '空闲超过此时长就挂起进程（会话保留，下一条消息自动恢复）。',
+                    'The process is parked once it has been idle this long (the session is kept and resumes on the next message).',
+                  )}
+                  <br />
+                  {acp.label(
+                    '0 = 永不释放；回合在跑、取消未结算或审批待答时不释放。',
+                    '0 = never; a process with a running turn, an unsettled cancel, or a pending approval is never released.',
+                  )}
+                  <br />
+                  {acp.label(
+                    '只对承载过会话的进程生效；探测进程固定 5 分钟释放，填 0 也拦不住。',
+                    'This window applies only to a process that has hosted a session; the model-probe process is always released after 5 minutes, and 0 does not stop it.',
+                  )}
+                </>
               )}
           </span>
         </div>

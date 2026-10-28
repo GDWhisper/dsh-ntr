@@ -29,34 +29,62 @@
         #                                after `saveAgent`.
         # Reliability tuning (defaults shown):
         # startupTimeoutMs: 60000    # budget for initialize / session/new / session/load
-        # permissionTimeoutMs: 0     # auto-cancel a pending approval after N ms. 0 waits
-        #                                for the human on the DESIGNED ledger path; on a
-        #                                DEGRADED native route the turn still ends, after
-        #                                `permissionFallbackTimeoutMs` (default 300000) —
-        #                                see `LedgerFallbackReason`.
-        # nativeApprovalTimeoutMs: 300000
-        #                              How long the native approval route (the composer
-        #                              takeover) may stay unanswered before the ask is
-        #                              WITHDRAWN and re-asked on the settings ledger. 0 waits
-        #                              for the host forever. Default matches
-        #                              `permissionFallbackTimeoutMs`: one window for "this
-        #                              route is not working", not two. Raise it if a
-        #                              deployment's users routinely deliberate for minutes
-        #                              before answering (withdrawing only relocates the
-        #                              question to Settings — it never answers for them).
-        # permissionFallbackTimeoutMs: 300000
-        #                              Deadline for a DEGRADED ask (`unavailable`, or
-        #                              `native-timeout` after the withdrawal above): past it
-        #                              the ask is answered `cancelled` instead of hanging the
-        #                              turn. 0 disables even this. `permissionTimeoutMs > 0`
-        #                              governs every path alike and overrides both.
-        #                              `nativeApprovalTimeoutMs` and
-        #                              `permissionFallbackTimeoutMs` are ALSO editable at
-        #                              runtime (NTR 设置 → 审批时限). The card's value is
-        #                              persisted in the plugin's own state file and OUTRANKS
-        #                              this file; the card shows what this file asked for and
-        #                              offers a reset back to it. Only `permissionTimeoutMs`
-        #                              stays config-file-only, as the override of both.
+        # permissionTimeoutMs: 300000
+        #                              How long a permission ask may sit unanswered
+        #                              before the deadline fires. ONE window for both
+        #                              places an ask can live — the conversation's
+        #                              approval card and the settings panel's ledger
+        #                              ("待处理权限请求"): they ask the same question,
+        #                              so they get the same answer.
+        #                              0 = 不等待: the ask is settled the moment it
+        #                              arrives, nobody is asked (no composer card, no
+        #                              ledger entry). That rung belongs to the
+        #                              `auto` mode ONLY — it ANSWERS the ask, so the
+        #                              agent continues. Under `abort` the same zero
+        #                              would refuse every ask on arrival (the agent
+        #                              stops at every gate), so `abort` starts at the
+        #                              shortest real wait. "Never expires" is NOT
+        #                              this key's business — that is `wait` mode
+        #                              below.
+        #                              When the deadline fires, the ask is
+        #                              settled WHERE IT WAS ASKED — it is not handed to
+        #                              the settings panel. What happens is
+        #                              `permissionTimeoutMode`'s business.
+        #                              LEGACY: `nativeApprovalTimeoutMs` and
+        #                              `permissionFallbackTimeoutMs` are still accepted
+        #                              and folded into this key (this key wins when it
+        #                              is present), so an older config keeps meaning
+        #                              what it meant. A LEGACY 0 meant "never
+        #                              expires", so it migrates to `wait` mode with
+        #                              the default window — never to 不等待, which
+        #                              would silently turn "wait forever" into
+        #                              "answer at once".
+        # permissionTimeoutMode: wait
+        #                              What an EXPIRED deadline does — three values, no
+        #                              more:
+        #                                wait   never expire; the ask stays pending,
+        #                                       visibly, until a human answers it or the
+        #                                       session is cancelled. DEFAULT: a
+        #                                       permission ask is a question FOR A HUMAN,
+        #                                       so the safe default is to keep waiting
+        #                                       rather than to refuse (or worse, approve)
+        #                                       on their behalf.
+        #                                abort  refuse the ask (`cancelled`); the agent
+        #                                       continues with that answer.
+        #                                auto   answer it with the option the AGENT's own
+        #                                       kinds imply (allow_always → allow_once →
+        #                                       reject_once → reject_always → the first
+        #                                       option) and let the agent CONTINUE.
+        #                                       Unattended operation: this may approve
+        #                                       something nobody looked at, which is why
+        #                                       it is opt-in and why the outcome is
+        #                                       announced. Same rule as OmniTerm dev's
+        #                                       `pick_auto_option`.
+        #                              The window and the mode are BOTH editable at
+        #                              runtime (NTR 设置 → 审批时限). The card's values
+        #                              are persisted in the plugin's own state file and
+        #                              OUTRANK this file; the card shows what this file
+        #                              asked for and offers a reset back to it.
         # cancelFallbackMs: 15000    # force-finalize a turn the agent ignores after session/cancel (0 = off)
         # staleCancelRetryDelayMs: 600  # resend a prompt answered cancelled with no cancel requested (0 = at once)
         # staleCancelMaxRetries: 2      # cap on those resends before the cancelled stop is reported as-is
