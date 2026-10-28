@@ -11,6 +11,9 @@
 - [待办清单](./todo.md)
   - 本仓唯一的待办清单：只留尚未落地的项，用户确认完结即删（结论并入 AGENTS.md 对应约束，不留「已落地」历史）
   - 当前为空
+- [发版手册](./release.md)
+  - 版本与 tag 规则、发布前检查，从提交到 npm 发布与 GitHub Release 的完整命令
+  - release note 的写法：面向用户、只写能感知到的变化，不写根因与内部机制
 - [ACP 会话的权限对齐调研（DSH Access mode ↔ ACP 权限）](./acp-permission-and-sandbox.md)
   - 两个权限旋钮的实体与证据（preset / projection / sandbox / approval）
   - 现状接线错误（`never` → ACP 请求被全拒、只读档可被审批放行、沙箱对 ACP 无作用力）

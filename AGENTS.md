@@ -18,6 +18,7 @@
 | [host.md](./docs/agents/host.md) | 改 `/acp` 通道、preset 声明、宿主服务探测、模型层 abstain |
 | [paths.md](./docs/agents/paths.md) | 改任何路径判定 / 比较 / 规范化 |
 | [retired.md](./docs/agents/retired.md) | 想知道「为什么不能回到 X」，或看到幽灵符号 |
+| [release.md](./docs/release.md) | 发版：bump 版本、打 tag、npm 发布、写 GitHub release note |
 
 历史推导与实测日志：[acp-convergence.md](./docs/acp-convergence.md)、[acp-mode.md](./docs/acp-mode.md)、[acp-permission-and-sandbox.md](./docs/acp-permission-and-sandbox.md)。待办：[todo.md](./docs/todo.md)（本仓唯一待办清单，当前为空）。
 
