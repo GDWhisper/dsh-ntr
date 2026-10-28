@@ -31,25 +31,25 @@
         # startupTimeoutMs: 60000    # budget for initialize / session/new / session/load
         # permissionTimeoutMs: 300000
         #                              How long a permission ask may sit unanswered
-        #                              before the deadline fires. ONE window for both
-        #                              places an ask can live — the conversation's
-        #                              approval card and the settings panel's ledger
-        #                              ("待处理权限请求"): they ask the same question,
-        #                              so they get the same answer.
+        #                              before the deadline fires. ONE window for every
+        #                              ask, wherever it is answered — the conversation
+        #                              card above the composer (`PermissionDock`) or
+        #                              the Settings page's cross-session mirror
+        #                              ("待处理权限请求"): one question, one answer.
         #                              0 = 不等待: the ask is settled the moment it
-        #                              arrives, nobody is asked (no composer card, no
-        #                              ledger entry). That rung belongs to the
-        #                              `auto` mode ONLY — it ANSWERS the ask, so the
-        #                              agent continues. Under `abort` the same zero
-        #                              would refuse every ask on arrival (the agent
-        #                              stops at every gate), so `abort` starts at the
-        #                              shortest real wait. "Never expires" is NOT
-        #                              this key's business — that is `wait` mode
-        #                              below.
-        #                              When the deadline fires, the ask is
-        #                              settled WHERE IT WAS ASKED — it is not handed to
-        #                              the settings panel. What happens is
-        #                              `permissionTimeoutMode`'s business.
+        #                              arrives, nobody is asked (no conversation card,
+        #                              no pending entry on the Settings page). That
+        #                              rung belongs to the `auto` mode ONLY — it
+        #                              ANSWERS the ask, so the agent continues. Under
+        #                              `abort` the same zero would refuse every ask on
+        #                              arrival (the agent stops at every gate), so
+        #                              `abort` starts at the shortest real wait. "Never
+        #                              expires" is NOT this key's business — that is
+        #                              `wait` mode below.
+        #                              When the deadline fires, the ask is settled IN
+        #                              PLACE: the card goes away and `permission/expired`
+        #                              records the outcome in the conversation. What
+        #                              happens is `permissionTimeoutMode`'s business.
         #                              LEGACY: `nativeApprovalTimeoutMs` and
         #                              `permissionFallbackTimeoutMs` are still accepted
         #                              and folded into this key (this key wins when it

@@ -942,6 +942,23 @@ const STYLE = `
 .ntr-acp-empty-hint { color: var(--dsw-alias-text-secondary, #6b7280); font-size: 12px; }
 .ntr-acp-seat-diag { font-family: var(--dsw-alias-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); opacity: 0.72; word-break: break-word; }
 .ntr-acp-empty-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+/* ---- Pending permission asks (conversation.input.dock) ---- */
+/* Full-width entries above the composer card. The list owns a bounded height
+   and scrolls so a burst of asks cannot push the composer off screen. */
+.ntr-permission-dock { display: flex; flex-direction: column; gap: 6px; width: 100%; max-height: min(38vh, 320px); overflow-y: auto; font-size: 12px; line-height: 1.5; }
+.ntr-permission-card { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); border-left: 3px solid var(--dsw-alias-state-warn-primary, #d97706); border-radius: 10px; background: var(--dsw-alias-bg-layer-1, #fff); }
+.ntr-permission-head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.ntr-permission-tool { flex: none; font-weight: 600; }
+.ntr-permission-reason { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dsw-alias-text-secondary, #6b7280); }
+.ntr-permission-deadline { flex: none; font-size: 11px; color: var(--dsw-alias-text-secondary, #6b7280); font-variant-numeric: tabular-nums; }
+.ntr-permission-deadline.is-expired { color: var(--dsw-alias-state-warn-primary, #b45309); font-weight: 600; }
+.ntr-permission-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.ntr-permission-option, .ntr-permission-cancel { font: inherit; font-size: 12px; line-height: 1.4; padding: 4px 10px; border-radius: 7px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: inherit; cursor: pointer; white-space: normal; text-align: left; }
+.ntr-permission-option:hover:not(:disabled), .ntr-permission-cancel:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-active, #0000000d); }
+.ntr-permission-option:disabled, .ntr-permission-cancel:disabled { opacity: 0.5; cursor: default; }
+.ntr-permission-option:focus-visible, .ntr-permission-cancel:focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary, #2563eb); outline-offset: 2px; }
+.ntr-permission-cancel { margin-left: auto; color: var(--dsw-alias-text-secondary, #6b7280); }
+.ntr-permission-error { padding: 4px 8px; border-radius: 6px; background: #fee2e2; color: #b91c1c; font-size: 11px; word-break: break-word; }
 /* ---- NTR settings dialog (shell.overlay) ---- */
 /* Frame-wide surface opened from the agent base's empty-roster menu. The
    overlay layer itself is click-through, so the layer opts back in and blocks

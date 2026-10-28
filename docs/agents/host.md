@@ -33,12 +33,13 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 
 `src/index.ts` 的 `export const inject` **只能**列插件真正依赖的服务。以下服务严禁写进去（缺服务会让插件整体加载失败），只能 `ctx.get` + `ctx.inject([...], …)` 后补注册：
 
-- `approval` / `agents` —— 原生审批链路（见 [permissions.md](./permissions.md)）
 - `sandboxPolicy` / `sessions` —— 工作区根解析（`wireWorkspace` 注入 `BridgeManager.setSessionWorkspaceResolver`，解析结果只有 `{ workspaceRoot }`，不含任何 mode / approval 语义）
 - `agentPresets` —— preset roster（`wirePresetRoster`）
 - 浏览器侧 `sessions` —— 经 `service<T>(name)` 在调用点惰性解析（见 [ui.md](./ui.md)）
 
-服务缺失必须是**可用性下降**，不是加载失败。能力上报（如 `approvalRouted`）只说明宿主有这条链，不构成单次询问的承诺。
+服务缺失必须是**可用性下降**，不是加载失败；可选服务迟到时由 `ctx.inject` 补挂，不得让插件整体不激活。
+
+**宿主审批服务不再是协作方**：权限询问全部走插件自己的 `PermissionLedger` 管线，`approval` / `agents` 不再被探测或调用；宿主的审批策略（`ask` / `never`）不再作用于 ACP 询问，`approval/asked|decided` 也不再为 ACP 询问写入（接受的取舍）。见 [permissions.md](./permissions.md)。
 
 ## 4. 不碰宿主的模型层
 
@@ -52,6 +53,6 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 | 主题 | 位置 |
 |---|---|
 | 通道 | `src/index.ts` · `/acp` 注册处 / `ChannelRegisteringConnection` |
-| 服务探测 | `src/index.ts` · `wireWorkspace` / `wirePresetRoster` / `wireApproval` |
+| 服务探测 | `src/index.ts` · `wireWorkspace` / `wirePresetRoster` |
 | preset | `presets/acp/acp.patch.yml`；`package.json` · `dsh.bundle.patch` / `exports`；`src/impl.ts` · `acpPresetStatusFromRoster` / `ACP_PRESET_SOURCE`；`src/bridge.ts` · `setPresetRosterReader` / `presetStatus` |
 | 模型层 abstain | `src/bridge.ts` · `AcpLlmAdapter.listModels` |

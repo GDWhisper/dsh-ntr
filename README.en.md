@@ -113,7 +113,7 @@ DSH's own `/model`, `/permission`, `/export`, etc. are **not** intercepted by th
 
 ### Approvals and the agent's own permission modes
 
-When the agent wants to touch something sensitive, it asks you. The approval card shows up right in the chat composer; you click Allow or Deny, and it obeys.
+When the agent wants to touch something sensitive, it asks you. The ask appears in the conversation on a card just above the composer (the plugin's own card); the options are exactly the agent's, and what you click is what it receives. The Settings page's "Pending Permission Requests" card is the cross-session mirror — answer there when the conversation isn't open.
 
 Every agent asks differently: some offer a set of options, some only allow/deny, some attach the exact command they are about to run. The plugin presents these as-is, and never pre-decides for you.
 

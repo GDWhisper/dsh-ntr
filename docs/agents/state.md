@@ -74,6 +74,14 @@
 - 浏览器 `AcpStore.chatSessionCommands` 的 `undefined` 同时覆盖「还没读」与「没有活声明」，此时按 `chatAgentFor`（活会话 → 锁定 → 宿主 / 乐观绑定 → pick → 插件默认）找到 agent，再读 `agentCommands`（必要时懒读一次纯内存的 `agent/catalog`）。**严禁**把「没有会话」当成「agent 没有命令」。
 - `loadChatSessions` 返回**在飞读取的 promise**（不是立即 resolve 的空壳），这样「我没有判定，去问」的调用才真能收到答案。
 
+## 7. 未决权限询问（仅内存）
+
+待答的权限询问是**运行时状态，不落盘**：`agents.json` 里与权限有关的只有 `approvalDeadlines`（设置页热改的期限与模式，见 [permissions.md §2.4](./permissions.md)）。宿主半区的 `PermissionLedger` 与浏览器 `UiState.permissions` 都随进程 / 页面消失，重连靠 `permissionReplayFrames` 重放未决项，并以 `permission/synced` 的活集合收尾。
+
+- **帧字段**（实时广播与重放共用 `permissionRequestFrame`，字段逐项一致）：`requestId`、`sessionId`（ACP 会话 id）、`dshSessionId?`（`/acp` RPC 会话没有）、`toolCall`（原样保留）、`toolName`（宿主经 `permissionToolName` 派生，含 `_meta` 里 `toolName` 的兜底）、`reason?`（`permissionAskReason` 的一行摘要）、`options`（原样，含顺序与 `kind`）、`timeoutMode`（`wait` / `abort` / `auto`）、`deadlineAt?`（epoch ms；`wait` 模式没有期限时缺席）。重放帧缺一项，靠它过滤 / 显示的对话卡就会在重连后静默丢询问。
+- `session/cancel`、`session/close`（先 settle 未决询问，再发 `session/close` 请求）、`releaseAll` 都会答复未决询问，卡片不会跨回合残留。
+- `approvalRouted` 已删除（`agents/list` 不再上报）：设置页镜像卡片只看 `ui.permissions` 是否非空，见 [ui.md §10](./ui.md)。
+
 ## 代码索引
 
 | 主题 | 位置 |
@@ -82,4 +90,5 @@
 | 校验 | `src/impl.ts` · `validateAgentDef` / `validateConfig` / `validateMcpServers`；`src/bridge.ts` · `saveAgent` |
 | 会话选择 | `src/bridge.ts` · `chatChoice` / `patchChatChoice` / `applyChatChoice` / `syncConversationRoute` / `loadPersistedChoices` / `persistAgents` |
 | 目录 | `src/bridge.ts` · `agentCatalog` / `resolveAdapterModel` / `absorbCatalog` / `absorbCatalogShape` / `setExposedModels` / `setAutoDiscoverModels` / `autoExposeNewModels` / `broadcastExposure`；`src/impl.ts` · `parseCatalogOptions` / `mergeCatalogShape` / `usableConfigOptions` |
+| 未决询问 | `src/bridge.ts` · `handlePermissionRequest`；`src/impl.ts` · `PermissionLedger` / `permissionRequestFrame` / `permissionReplayFrames`；`src/client/store.ts` · `permissionsForSession` |
 | 斜杠缓存 | `src/bridge.ts` · `chatSessions` / `absorbCommands`；`src/client/store.ts` · `chatSessionCommands` / `loadChatSessions` |

@@ -45,6 +45,7 @@ import {
   parseCatalogOptions,
   usableConfigOptions,
   permissionToolKind,
+  permissionRequestFrame,
   pickAutoOption,
   quoteCommandToken,
   randomUUID,
@@ -68,7 +69,7 @@ import type {
   RosterPresetRow,
 } from './impl.ts'
 import type {
-  AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpMcpServerDef, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
+  AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpMcpServerDef, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
   LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo,
   ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PreparedAdapterCall, SessionView, StreamChunk,
 } from './protocol.ts'
@@ -116,9 +117,9 @@ interface LiveSession {
   released: boolean
   /**
    * Owning DSH chat session id, when the session was opened through the LLM
-   * adapter (`AcpLlmAdapter`). `ctx.agents.get()` needs it to name the agent
-   * whose open turn carries the native approval question; sessions started
-   * over the `/acp` RPC have no chat session and stay on the ledger path.
+   * adapter (`AcpLlmAdapter`). It is what the conversation's permission card
+   * filters on (`permission/request.dshSessionId`); sessions started over the
+   * `/acp` RPC have no chat session, so their asks stay on the settings panel.
    */
   dshSessionId?: string
   /**
@@ -176,21 +177,24 @@ export interface BridgeTuning {
   /**
    * How long a permission ask may sit unanswered before the deadline fires.
    *
-   * ONE window for both routes. An ask can be asked in the conversation (the
-   * composer takeover) or in the settings panel's ledger (no approval service,
-   * or no chat identity to route into) — but both ask the same question, "is
-   * anyone there?", so both get the same answer. Two windows made the settings
-   * card look like two unrelated knobs.
+   * ONE window for every ask. Every ask is broadcast as `permission/request`
+   * and answered from the conversation's dock card; an `/acp`-RPC ask has no
+   * conversation, so the settings page mirrors the same ask as its answer
+   * entry. One question, one window: "is anyone there?" gets the same answer
+   * wherever the card is rendered, and two numbers made the settings card look
+   * like two unrelated knobs.
    *
-   * `0` means 一直等 — no deadline at all. What happens when it fires is
-   * {@link BridgeTuning.permissionTimeoutMode}'s business, never this knob's.
+   * `0` means 不等待, not "wait forever": `auto` settles the ask on arrival,
+   * `abort` floors the window to the shortest real wait (refusing every ask on
+   * arrival is a brick wall, not a timeout), and `wait` ignores the window
+   * entirely.
    *
-   * The deadline is what keeps a turn from hanging on a question nobody can
-   * see: a routed ask shows no card and broadcasts no frame, so a host that
-   * takes the question and never renders it would otherwise leave the turn
-   * hanging forever. Past the deadline the ask is settled IN PLACE — it is not
-   * handed anywhere else. A human who was still deciding finds the ask REFUSED
-   * (or auto-answered, in `auto` mode), not relocated.
+   * The deadline is what keeps a turn from hanging on a question nobody
+   * answers: the card stays visible, but an unattended session would otherwise
+   * wait indefinitely. Past the deadline the ask is settled IN PLACE — never
+   * relocated: `abort` refuses it, `auto` answers it with the option the
+   * agent's own kinds imply (broadest grant first), and `wait` never expires
+   * it at all.
    *
    * Default 300000 ms. OmniTerm's equivalent is its reaper's permission-timeout
    * threshold (30 min default, 30 s steps, hot-updatable).
@@ -245,52 +249,6 @@ export interface BridgeTuning {
    */
   probeIdleTimeoutMs?: number
 }
-
-/** One native approval question, as the host approval service defines it. */
-export interface ApprovalRequestContext {
-  /** DSH chat session that owns the open turn the question is asked in. */
-  dshSessionId?: string
-  agentId: string
-  /** Human-facing identity of the operation awaiting a decision. */
-  toolName: string
-  reason?: string
-  /** The ACP tool call this ask belongs to; the host card attaches its detail to it. */
-  callId?: string
-  signal?: AbortSignal
-}
-
-/** Outcome vocabulary of the host approval chain (`'unavailable'` = no answerer). */
-export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
-
-/**
- * Why one permission ask rides the settings-panel ledger instead of the native
- * approval chain, recorded when the ask is broadcast.
- *
- * `no-requester` and `no-chat-session` are the DESIGNED ledger paths: a host
- * without the approval service, and an `/acp`-RPC session that has no chat
- * turn to route into. `unavailable` is a DEGRADATION — the service is wired
- * and this ask still failed, so the conversation the user is looking at will
- * never show the question. The reason decides the chat line's wording (see
- * `BridgeManager.streamPrompt`); the deadline and the mode decide what
- * happens if nobody answers ({@link AgentBridge.handlePermissionRequest}).
- */
-export type LedgerFallbackReason = 'no-requester' | 'no-chat-session' | 'unavailable'
-
-/** One recorded ledger fallback: why the ask is here, and the deadline armed for it. */
-export interface LedgerFallback {
-  reason: LedgerFallbackReason
-  /** Effective deadline in ms; `0` = no timer (wait for the human). */
-  timeoutMs: number
-  /** What the deadline does when it fires. */
-  mode: PermissionTimeoutMode
-}
-
-/**
- * Asks the host approval service (`ctx.approval`) for one decision. Never
- * throws: any failure is reported as `'unavailable'` so the caller can fall
- * back to the settings-panel ledger.
- */
-export type ApprovalRequester = (request: ApprovalRequestContext) => Promise<ApprovalOutcome>
 
 /**
  * Resolves the workspace root of one chat session (`dshSessionId` = DSH session
@@ -392,15 +350,6 @@ export class AgentBridge {
   /** Inflight `session/load` resumes, shared so concurrent prompts don't double-resume. */
   private readonly resuming = new Map<string, Promise<LiveSession>>()
   readonly permissions = new PermissionLedger()
-  /**
-   * Why each outstanding ledger ask is on the ledger, keyed by request id and
-   * recorded before the `permission/request` broadcast (the hub is
-   * synchronous, so a subscriber can read it the moment the frame goes out).
-   * Entries live exactly as long as the ask: the ledger's resolve callback
-   * deletes them, and every terminal path (answer, timeout, session close,
-   * process death) resolves through it.
-   */
-  private readonly ledgerFallbacks = new Map<string, LedgerFallback>
   private readonly startupTimeoutMs: number
   /**
    * The ONE approval deadline, and the mode it settles with. Neither is
@@ -465,13 +414,8 @@ export class AgentBridge {
     private readonly onCommands?: (agentId: string, commands: NonNullable<SessionView['availableCommands']>) => void,
     tuning?: BridgeTuning,
     /**
-     * Resolved per ask (not captured) so a requester wired after this bridge
-     * was built still applies. Absent → every ask rides the ledger.
-     */
-    private readonly approvalRequester?: () => ApprovalRequester | undefined,
-    /**
-     * Resolved per turn, like {@link approvalRequester}: the host entry may
-     * wire the access-mode mapping after this bridge was built.
+     * Resolved per turn: the host entry may wire the workspace reader after
+     * this bridge was built.
      */
     private readonly sessionWorkspace?: () => SessionWorkspaceResolver | undefined,
   ) {
@@ -1263,12 +1207,15 @@ export class AgentBridge {
     // Closing a session is activity of its own: restart the idle window here
     // rather than at the prompt that opened it.
     this.touch()
+    // Answer every outstanding ask BEFORE `session/close` is awaited: an agent
+    // blocked on an unanswered `session/request_permission` would otherwise be
+    // able to hold the close open indefinitely.
+    this.settlePermissions(session)
     const conn = this.conn
     if (conn !== undefined && this.state === 'ready') {
       // `session/close` is an optional capability; the local teardown stands regardless.
       await conn.agent.request(methods.agent.session.close, { sessionId: session.acpSessionId }).catch(() => { /* unsupported */ })
     }
-    this.settlePermissions(session)
     this.sessions.delete(session.sessionId)
     this.acpIndex.delete(session.acpSessionId)
     this.hub.broadcast({ type: 'session/closed', sessionId: session.sessionId, reason })
@@ -1333,29 +1280,26 @@ export class AgentBridge {
   }
 
   /**
-   * Answer one ACP permission ask. Every ask reaches a human: the native
-   * approval chain first (answered in the chat composer), the settings-panel
-   * ledger otherwise.
+   * Answer one ACP permission ask.
+   *
+   * EVERY ask is answered by a human through the plugin's own ledger. The
+   * host's approval chain is deliberately not involved: it could accept an ask
+   * and render nothing, leaving the turn hanging behind something invisible
+   * with no deadline (issue #2). The ledger broadcasts `permission/request`,
+   * the browser renders the answerable card, and `permission/respond` settles
+   * it.
+   *
+   * The host answers on its own only when a deadline expires: `abort` refuses,
+   * `auto` picks the option the agent's own kinds imply, `wait` never expires.
+   * The ACP request's own `signal` (the agent withdrawing the ask, or the
+   * connection dying) settles the same entry cancelled, so a withdrawn ask can
+   * never leave a stale card behind.
    */
   private async handlePermissionRequest(acpSessionId: string, toolCall: unknown, options: PermissionOption[], signal?: AbortSignal): Promise<RequestPermissionResponse> {
     const session = this.acpIndex.get(acpSessionId)
     if (session === undefined || session.closed) return { outcome: { outcome: 'cancelled' } }
-    // Native approval first (answered in the chat composer); a `reason` means
-    // no route is available and the settings-panel ledger takes over.
-    const native = await this.askNativeApproval(session, toolCall, options, signal)
-    if ('response' in native) {
-      this.touch()
-      return native.response
-    }
-    // Deadline: how long this ask may sit unanswered. ONE window for every
-    // route — an ask that never reached the conversation included. They have
-    // no other answer entry, so exempting them would be the very invisible
-    // hang this mechanism exists to bound.
-    //
-    // What happens when it fires is the MODE's business: refused, answered
-    // with the option the agent's own kinds imply, or (in `wait`) never.
-    // The mode is read once, here, for the same reason the window is: an ask
-    // that started under one mode keeps it.
+    // The deadline and the mode are read ONCE, here: an ask that started under
+    // one pair keeps it, even if the settings page rewrites them mid-flight.
     const mode = this.permissionTimeoutMode
     const timeoutMs = this.permissionTimeoutMs
     // 不等待（0）只属自动推进：请求到达即按那一档收场，不建 ledger 条目、不发卡
@@ -1364,11 +1308,28 @@ export class AgentBridge {
     if (mode === 'auto' && timeoutMs === 0) {
       return this.settleExpiredAsk(session, mode, toolCall, options, 0)
     }
+    const optionViews = options.map((o): PermissionOptionView => ({ optionId: o.optionId, name: o.name, kind: o.kind }))
+    const reason = permissionAskReason(toolCall)
+    // Computed once, at ask creation: the frame, the chat line and the timer
+    // all describe the same instant, and a slow reader cannot stretch it.
+    const deadlineAt = timeoutMs > 0 && mode !== 'wait' ? Date.now() + timeoutMs : undefined
+    const view = {
+      ...(session.dshSessionId === undefined ? {} : { dshSessionId: session.dshSessionId }),
+      // Kept whole for the reconnect replay: a client that connects after the
+      // ask was broadcast must be re-shown the very card it has to answer.
+      toolCall,
+      toolName: permissionToolName(toolCall),
+      ...(reason === '' ? {} : { reason }),
+      options: optionViews,
+      timeoutMode: mode,
+      ...(deadlineAt === undefined ? {} : { deadlineAt }),
+    }
     return new Promise<RequestPermissionResponse>(resolve => {
       let timer: ReturnType<typeof setTimeout> | undefined
+      let detachSignal: (() => void) | undefined
       const requestId = this.permissions.create(session.sessionId, (outcome: PermissionOutcome) => {
         clearTimeout(timer)
-        this.ledgerFallbacks.delete(requestId)
+        detachSignal?.()
         this.touch()
         this.hub.broadcast({
           type: 'permission/resolved',
@@ -1379,202 +1340,57 @@ export class AgentBridge {
         resolve(outcome.outcome === 'selected'
           ? { outcome: { outcome: 'selected', optionId: outcome.optionId } }
           : { outcome: { outcome: 'cancelled' } })
-      }, {
-        // Kept for the reconnect replay: a client that connects after the ask
-        // was broadcast must be re-shown the very card it has to answer.
-        toolCall,
-        options: options.map((o): PermissionOptionView => ({ optionId: o.optionId, name: o.name, kind: o.kind })),
-      })
-      // Recorded before the broadcast: the hub is synchronous, and the chat
-      // line `streamPrompt` folds from this frame words itself by the path
-      // this ask actually took.
-      this.ledgerFallbacks.set(requestId, { reason: native.reason, timeoutMs, mode })
-      if (timeoutMs > 0 && mode !== 'wait') {
+      }, view)
+      // The live frame and the replay frame come from ONE builder, so a
+      // reconnecting client receives exactly what a live one did.
+      this.hub.broadcast(permissionRequestFrame({ requestId, sessionId: session.sessionId, ...view }))
+      if (deadlineAt !== undefined) {
         timer = setTimeout(() => {
           if (!this.permissions.has(requestId)) return
-          const picked = mode === 'auto'
-            ? pickAutoOption(options.map(option => ({ optionId: option.optionId, name: option.name, kind: option.kind })))
-            : undefined
-          const tool = permissionToolName(toolCall)
-          this.hub.broadcast({
-            type: 'agent/notice',
-            agentId: this.def.id,
-            level: 'info',
-            // Name what was missed and what was done about it, the way a human
-            // needs it: which operation sat unanswered, and what the plugin
-            // answered instead (OmniTerm's reaper writes the same notice).
-            text: picked === undefined
-              ? `acp: permission request for "${tool}" timed out after ${String(Math.round(timeoutMs / 1000))}s; refused`
-              : `acp: permission request for "${tool}" timed out after ${String(Math.round(timeoutMs / 1000))}s; answered "${picked.name}"`,
-          })
-          this.permissions.respond(requestId, picked === undefined
-            ? { outcome: 'cancelled' }
-            : { outcome: 'selected', optionId: picked.optionId })
-        }, timeoutMs)
+          // Settle IN PLACE: exactly one notice, one `permission/expired` (the
+          // conversation's trace of the expiry) and the ledger answer.
+          const outcome = this.announceExpiredAsk(session, mode, toolCall, options, timeoutMs)
+          this.permissions.respond(requestId, outcome)
+        }, Math.max(0, deadlineAt - Date.now()))
         timer.unref?.()
       }
-      this.hub.broadcast({
-        type: 'permission/request',
-        requestId,
-        sessionId: session.sessionId,
-        toolCall,
-        options: options.map((o): PermissionOptionView => ({ optionId: o.optionId, name: o.name, kind: o.kind })),
-      })
+      // The agent's own withdrawal settles the entry cancelled; the ledger's
+      // resolve callback broadcasts `permission/resolved`, and drops this
+      // listener, so nothing outlives the ask.
+      if (signal !== undefined) {
+        const onAbort = (): void => {
+          if (!this.permissions.has(requestId)) return
+          this.permissions.respond(requestId, { outcome: 'cancelled' })
+        }
+        if (signal.aborted) {
+          onAbort()
+          return
+        }
+        signal.addEventListener('abort', onAbort, { once: true })
+        detachSignal = () => { signal.removeEventListener('abort', onAbort) }
+      }
     })
   }
 
   /**
-   * Why one ledger ask is on the ledger, as recorded by
-   * {@link handlePermissionRequest}. The manager's `streamPrompt` reads it to
-   * word the chat line by the path the ask took; `undefined` once the ask is
-   * answered, timed out, or settled.
+   * Announce and compute one ask's expiry. Shared by the 不等待 arrival path
+   * and the ledger deadline, so an expiry can never broadcast two notices or
+   * skip the `permission/expired` line: once the card is gone that frame is
+   * the conversation's only trace of what happened to the question.
    */
-  ledgerFallbackOf(requestId: string): LedgerFallback | undefined {
-    return this.ledgerFallbacks.get(requestId)
-  }
-
-  /**
-   * Ask the host approval service for this permission (`ctx.approval` → the
-   * browser's composer takeover). Only sessions bound to a DSH chat session
-   * qualify: the service appends its audit pair to that session inside an
-   * open turn, so a session started over `/acp` (no chat turn) cannot be
-   * routed and must stay on the ledger path.
-   *
-   * The ask is raced against {@link BridgeTuning.permissionTimeoutMs}. A
-   * routed ask has exactly one answer entry — the composer takeover — and no
-   * broadcast at all, so a host that takes the question and never renders it
-   * would leave the turn hanging behind something invisible. Past the deadline
-   * the ask is settled RIGHT THERE, by
-   * {@link BridgeTuning.permissionTimeoutMode}: refused (`abort`), answered
-   * with the option the agent's own kinds imply (`auto`), or never expiring
-   * at all (`wait`).
-   *
-   * It is NOT handed somewhere else. An earlier revision withdrew the ask and
-   * re-asked it on the settings ledger, which made the question travel to a
-   * page the user was not looking at — and then cancelled it there a few
-   * minutes later anyway. A deadline now ends the ask where it was asked.
-   *
-   * @returns the agent-facing response, or the reason the ask must fall back
-   * to the ledger (see {@link LedgerFallbackReason}).
-   */
-  private async askNativeApproval(
-    session: LiveSession,
-    toolCall: unknown,
-    options: PermissionOption[],
-    signal?: AbortSignal,
-  ): Promise<{ response: RequestPermissionResponse } | { reason: LedgerFallbackReason }> {
-    const requester = this.approvalRequester?.()
-    if (requester === undefined) return { reason: 'no-requester' }
-    if (session.dshSessionId === undefined) return { reason: 'no-chat-session' }
-    // The mode is read ONCE, here: it decides both whether a deadline exists
-    // and what happens when it fires. An ask that started under one mode keeps
-    // it — the same rule the window follows (an ask already holding a timer
-    // keeps the one it started with).
-    const mode = this.permissionTimeoutMode
-    // 不等待（0）只属自动推进：没有问人的必要。直接按那一档收场，composer 接管
-    // 根本不必出现——它只会闪一下就没了，问了也来不及答。超时中止没有这一档。
-    if (mode === 'auto' && this.permissionTimeoutMs === 0) {
-      return { response: this.settleExpiredAsk(session, mode, toolCall, options, 0) }
-    }
-    // One signal carries both withdrawals: the agent's own cancel (whatever
-    // aborted the ACP request) and the deadline. The host's waterfall races its
-    // answerers against this signal, so aborting is a clean withdrawal rather
-    // than a leak.
-    const withdraw = new AbortController()
-    const askSignal = signal === undefined ? withdraw.signal : AbortSignal.any([signal, withdraw.signal])
-    let timer: ReturnType<typeof setTimeout> | undefined
-    let timedOut = false
-    // `wait` never expires, so it never arms a timer at all. A window of `0`
-    // never reaches here: 不等待 was already settled above.
-    const windowMs = this.permissionTimeoutMs
-    const deadline = mode !== 'wait' && windowMs > 0
-      ? new Promise<{ timedOut: true }>(resolve => {
-        timer = setTimeout(() => {
-          timedOut = true
-          withdraw.abort()
-          resolve({ timedOut: true })
-        }, windowMs)
-        timer.unref?.()
-      })
-      : undefined
-    let outcome: ApprovalOutcome
-    try {
-      const row = (typeof toolCall === 'object' && toolCall !== null ? toolCall : {}) as Record<string, unknown>
-      const asked = requester({
-        dshSessionId: session.dshSessionId,
-        agentId: this.def.id,
-        toolName: permissionToolName(toolCall),
-        reason: permissionAskReason(toolCall),
-        // The ACP call id is the id the adapter streamed on the host tool card
-        // (`TurnStreamController` fills `tool-call` blocks from
-        // `snapshot.callId`), so the host's approval detail slot can attach
-        // the operation's own card to this ask.
-        ...(typeof row.toolCallId === 'string' && row.toolCallId !== '' ? { callId: row.toolCallId } : {}),
-        signal: askSignal,
-      })
-      // A withdrawn ask settles on the host's own schedule; dropping it here
-      // must not surface as an unhandled rejection later.
-      asked.catch(() => { /* withdrawn: the deadline settles this ask now */ })
-      const settled = deadline === undefined
-        ? await asked.then(o => ({ outcome: o }))
-        : await Promise.race([asked.then(o => ({ outcome: o })), deadline])
-      // The flag, not the race winner, decides: the host may settle `cancelled`
-      // from the very abort the deadline caused, and that is still a timeout.
-      if (timedOut || 'timedOut' in settled) {
-        return { response: this.settleExpiredAsk(session, mode, toolCall, options, windowMs) }
-      }
-      outcome = settled.outcome
-    } catch {
-      // Synchronous throw or rejection, either way: the ask falls back to the
-      // ledger. An approval failure must never break the agent's turn.
-      outcome = 'unavailable'
-    } finally {
-      clearTimeout(timer)
-    }
-    if (outcome === 'unavailable') return { reason: 'unavailable' }
-    const response = nativeOutcomeResponse(outcome, options)
-    // Keep the event stream symmetric with the ledger path: a routed decision
-    // is still a resolution, and the browser uses it to drop any card it may
-    // hold for this session. No `permission/request` is broadcast — the
-    // settings panel must never show a card for a composer-routed ask.
-    this.hub.broadcast({
-      type: 'permission/resolved',
-      requestId: randomUUID(),
-      sessionId: session.sessionId,
-      outcome: response.outcome.outcome === 'selected'
-        ? { outcome: 'selected', optionId: response.outcome.optionId }
-        : { outcome: 'cancelled' },
-    })
-    return { response }
-  }
-
-  /**
-   * Settle an ask whose deadline fired, WHERE IT WAS ASKED.
-   *
-   * `abort` refuses it — the operation does not happen and the agent carries
-   * on with that answer. `auto` answers it with the option the agent's own
-   * kinds imply ({@link pickAutoOption}) so the agent CONTINUES; it says which
-   * option it picked, because an unattended approval nobody looked at has to
-   * be visible afterwards. A mode that cannot pick an option (no options, or
-   * none with a usable id) degrades to `abort`: refusing is safer than
-   * guessing, and hanging is worse than either.
-   *
-   * The `permission/resolved` frame keeps the event stream symmetric with the
-   * ledger path, so the browser drops any card it may hold for this session.
-   */
-  private settleExpiredAsk(
+  private announceExpiredAsk(
     session: LiveSession,
     mode: PermissionTimeoutMode,
     toolCall: unknown,
     options: PermissionOption[],
     timeoutMs: number,
-  ): RequestPermissionResponse {
+  ): PermissionOutcome {
     const picked = mode === 'auto'
       ? pickAutoOption(options.map(option => ({ optionId: option.optionId, name: option.name, kind: option.kind })))
       : undefined
-    const response: RequestPermissionResponse = picked === undefined
-      ? { outcome: { outcome: 'cancelled' } }
-      : { outcome: { outcome: 'selected', optionId: picked.optionId } }
+    const outcome: PermissionOutcome = picked === undefined
+      ? { outcome: 'cancelled' }
+      : { outcome: 'selected', optionId: picked.optionId }
     const tool = permissionToolName(toolCall)
     // 不等待（0）不是「等了 0 秒」，是没等：两种说法的区别就在这里。
     const waited = timeoutMs > 0
@@ -1591,19 +1407,36 @@ export class AgentBridge {
         ? `acp: permission request for "${tool}" ${waited}; refused`
         : `acp: permission request for "${tool}" ${waited}; answered "${picked.name}"`,
     })
-    // The conversation's only trace of the expiry: the composer card is going
-    // away and nothing else says why.
     this.hub.broadcast({
       type: 'permission/expired',
       sessionId: session.sessionId,
       toolCall,
       timeoutMs,
-      outcome: response.outcome.outcome === 'selected'
-        ? { outcome: 'selected', optionId: response.outcome.optionId }
-        : { outcome: 'cancelled' },
+      outcome,
       ...(picked === undefined ? {} : { optionName: picked.name }),
     })
-    return response
+    return outcome
+  }
+
+  /**
+   * Settle the 不等待 (`auto` + zero window) ask on arrival: no ledger entry
+   * and no card — nothing asks a human, so there is nothing to show. `auto`
+   * answers with the option the agent's own kinds imply ({@link pickAutoOption})
+   * and the agent CONTINUES. A mode that cannot pick an option (no options, or
+   * none with a usable id) degrades to refusing: safer than guessing, and
+   * hanging is worse than either.
+   */
+  private settleExpiredAsk(
+    session: LiveSession,
+    mode: PermissionTimeoutMode,
+    toolCall: unknown,
+    options: PermissionOption[],
+    timeoutMs: number,
+  ): RequestPermissionResponse {
+    const outcome = this.announceExpiredAsk(session, mode, toolCall, options, timeoutMs)
+    return outcome.outcome === 'selected'
+      ? { outcome: { outcome: 'selected', optionId: outcome.optionId } }
+      : { outcome: { outcome: 'cancelled' } }
   }
 
   private settlePermissions(session: LiveSession): void {
@@ -1643,7 +1476,7 @@ export class AgentBridge {
    * cannot reach into the agent's own process, so a second gate here would only
    * be a fiction in front of a tool that can write without asking us at all.
    * What the agent chooses to ask about goes to the human unchanged
-   * (`askNativeApproval`). See docs/acp-convergence.md §2.3.
+   * (`handlePermissionRequest`). See docs/acp-convergence.md §2.3.
    */
   private async handleFsWrite(params: { sessionId: string; path: string; content: string }): Promise<{ }> {
     const session = this.acpIndex.get(params.sessionId)
@@ -1760,12 +1593,11 @@ const APPROVAL_REASON_INPUT_KEYS = [
 ] as const
 
 /**
- * One line saying WHAT the native approval card is about.
+ * One line saying WHAT the permission ask is about.
  *
- * WHY: the host renders `reason ?? "工具 <name> 请求越权执行"`. Without a
- * reason the human only sees the tool's NAME ("Bash") and cannot judge the
- * request; the ACP tool call already declares the missing half — its title and
- * (for execute/edit tools) a short scalar in `rawInput`. Only ONE declared
+ * WHY: without it the human only sees the tool's NAME ("Bash") and cannot
+ * judge the request; the ACP tool call already declares the missing half — its
+ * title and (for execute/edit tools) a short scalar in `rawInput`. Only ONE declared
  * string is used, never a serialized object or a whole file, and the line is
  * capped so a pathological input cannot fill the card or the audit log.
  */
@@ -1796,22 +1628,6 @@ export function permissionAskReason(toolCall: unknown): string {
       .find((value): value is string => typeof value === 'string' && value !== '')
   const line = detail === undefined || detail === title ? title : `${title} · ${detail}`
   return line.length > APPROVAL_REASON_MAX ? `${line.slice(0, APPROVAL_REASON_MAX - 1)}…` : line
-}
-
-/**
- * Translate a native approval outcome into the ACP option the agent must see.
- * `'allowed-once'` is the chain's only grant; a rejection prefers the once-variant.
- */
-function nativeOutcomeResponse(outcome: ApprovalOutcome, options: PermissionOption[]): RequestPermissionResponse {
-  if (outcome === 'allowed-once') {
-    const allow = options.find(o => o.kind === 'allow_once') ?? options.find(o => o.kind === 'allow_always')
-    return allow === undefined ? { outcome: { outcome: 'cancelled' } } : { outcome: { outcome: 'selected', optionId: allow.optionId } }
-  }
-  if (outcome === 'rejected') {
-    const reject = options.find(o => o.kind === 'reject_once') ?? options.find(o => o.kind === 'reject_always')
-    return reject === undefined ? { outcome: { outcome: 'cancelled' } } : { outcome: { outcome: 'selected', optionId: reject.optionId } }
-  }
-  return { outcome: { outcome: 'cancelled' } }
 }
 
 function snapshot(session: LiveSession): SessionView {
@@ -2628,7 +2444,6 @@ class TurnStreamController {
   constructor(
     private readonly manager: BridgeManager,
     private readonly hub: EventHub,
-    private readonly bridge: AgentBridge,
     readonly session: LiveSession,
     readonly turnId: string,
     /** Releases the agent-side turn slot (the `beginTurn` settler; idempotent). */
@@ -2840,7 +2655,7 @@ class TurnStreamController {
       // segment; the event that CUTS the segment belongs to the next one.
       if (this.foldInto(seg, update)) this.cursorSeq = typed.seq
     } else if (row.type === 'permission/request') {
-      const typed = event as { toolCall: unknown; requestId: string }
+      const typed = event as Extract<AcpEvent, { type: 'permission/request' }>
       this.pushProse(this.permissionLine(typed))
     } else if (row.type === 'permission/expired') {
       const typed = event as { toolCall: unknown; timeoutMs: number; outcome: PermissionOutcome; optionName?: string }
@@ -2999,29 +2814,28 @@ class TurnStreamController {
     })
   }
 
-  private permissionLine(event: { toolCall: unknown; requestId: string }): string {
-    const title = typeof (event.toolCall as { title?: unknown } | undefined)?.title === 'string'
-      ? String((event.toolCall as { title: string }).title)
-      : 'permission'
-    // The line must not point at a place with no answer entry, and the bridge
-    // knows which path this ask took (`ledgerFallbackOf`, recorded before the
-    // frame was broadcast). On the ledger paths the settings panel's card is
-    // the answer entry. A DEGRADED native route has to say why the
-    // conversation is not showing the question — as an OBSERVED FACT, not a
-    // guessed cause.
-    //
+  private permissionLine(event: Extract<AcpEvent, { type: 'permission/request' }>): string {
+    // `toolName` is host-derived (`permissionToolName`) so agents that omit
+    // `title` and declare it in `_meta` still name the operation here.
+    const title = event.toolName
+    // The line must point at the place the answer entry actually is: a
+    // chat-bound ask renders its card in the conversation; an `/acp`-RPC ask
+    // has no conversation, so its card lives on the settings page.
+    const lead = event.dshSessionId !== undefined
+      ? 'please answer the permission card above the composer'
+      : 'please approve in Settings'
     // The last clause says what happens if nobody answers, and it follows the
     // MODE: refused, answered automatically, or (in `wait`) nothing at all.
-    const fallback = this.bridge.ledgerFallbackOf(event.requestId)
-    const why = fallback?.reason === 'unavailable' ? 'the approval service is unavailable' : undefined
-    const lead = why === undefined ? 'please approve in Settings' : `${why}; approve in Settings`
-    if (fallback === undefined || fallback.timeoutMs <= 0 || fallback.mode === 'wait') {
+    if (event.timeoutMode === 'wait' || event.deadlineAt === undefined) {
       return `\n> 🔐 [Permission Required: ${title}] - ${lead}\n`
     }
-    const otherwise = fallback.mode === 'auto'
+    const remainingMs = Math.max(0, event.deadlineAt - Date.now())
+    // Floor (+1 ms for the Date.now tick), min 1: rounding up would promise time already spent.
+    const remainingS = Math.max(1, Math.floor((remainingMs + 1) / 1000))
+    const otherwise = event.timeoutMode === 'auto'
       ? 'this request is answered automatically'
       : 'this request is cancelled'
-    return `\n> 🔐 [Permission Required: ${title}] - ${lead} within ${String(Math.round(fallback.timeoutMs / 1000))}s or ${otherwise}\n`
+    return `\n> 🔐 [Permission Required: ${title}] - ${lead} within ${String(remainingS)}s or ${otherwise}\n`
   }
 
   /**
@@ -3033,9 +2847,7 @@ class TurnStreamController {
    * answered with the option the agent's own kinds implied.
    */
   private expiredLine(event: { toolCall: unknown; timeoutMs: number; outcome: PermissionOutcome; optionName?: string }): string {
-    const title = typeof (event.toolCall as { title?: unknown } | undefined)?.title === 'string'
-      ? String((event.toolCall as { title: string }).title)
-      : 'permission'
+    const title = permissionToolName(event.toolCall)
     const waited = event.timeoutMs > 0
       ? `no answer within ${String(Math.round(event.timeoutMs / 1000))}s`
       : 'not waited for'
@@ -3212,30 +3024,14 @@ export class BridgeManager {
     onCatalog?: (agentId: string, configOptions: unknown, shapeOnly?: boolean) => void,
     onCommands?: (agentId: string, commands: NonNullable<SessionView['availableCommands']>) => void,
   ): AgentBridge {
-    return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, onCommands, this.tuning, () => this.approvalRequester, () => this.sessionWorkspaceResolver)
+    return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, onCommands, this.tuning, () => this.sessionWorkspaceResolver)
   }
 
   /**
-   * Route ACP permission asks through the host approval service (answered in
-   * the chat composer). Absent → every ask stays on the settings-panel ledger.
-   * Setting it also flips {@link approvalRouting}, which the browser reads to
-   * stop rendering the settings-panel permission card.
-   */
-  setApprovalRequester(requester?: ApprovalRequester): void {
-    this.approvalRequester = requester
-  }
-
-  /** True when permission asks go to native approval instead of the settings panel. */
-  approvalRouting(): boolean {
-    return this.approvalRequester !== undefined
-  }
-
-  /**
-   * Every outstanding ledger ask, across all agents, with the view the browser
-   * was shown it — the source of the reconnect replay (see
-   * `permissionReplayFrames`). Asks on the native route are deliberately
-   * absent: they broadcast nothing and their answer entry is the composer
-   * takeover the client already holds.
+   * Every outstanding ask, across all agents, with the view the browser was
+   * shown it — the source of the reconnect replay (see
+   * `permissionReplayFrames`). Every ACP ask is a ledger entry, so this is the
+   * whole live set.
    */
   pendingPermissionViews(): PendingPermissionView[] {
     const views: PendingPermissionView[] = []
@@ -5193,11 +4989,6 @@ export class BridgeManager {
       if (session.sessionId === sessionId) this.dshSessionMap.delete(key)
     }
   }
-  /**
-   * Latest native-approval requester. Held as a field (read through a thunk by
-   * each bridge) so a requester wired after bridges were built still applies.
-   */
-  private approvalRequester?: ApprovalRequester
   private sessionWorkspaceResolver?: SessionWorkspaceResolver
   private acpModeResolver?: AcpModeResolver
   /** Cached `chatSessionAcpMode` answers, keyed by DSH chat session id. */
@@ -5330,7 +5121,7 @@ export class BridgeManager {
     if (existing !== undefined && existing.released) {
       const resumed = await this.bridge(agentId).resumeSession(existing)
       // Rebind explicitly: a resume keeps the record's identity, but the chat
-      // session id is what native approval routing keys off.
+      // session id is what the conversation's permission card addresses.
       resumed.dshSessionId = dshSessionId
       // A resume without an explicit pick must keep serving the agent the
       // conversation was ON (its own model string when one was recorded). The
@@ -5369,7 +5160,7 @@ export class BridgeManager {
       workspaceRoot,
     )
     // Absent for `/acp`-RPC sessions and for adapter calls without a chat
-    // session; those deliberately keep the ledger path (see askNativeApproval).
+    // session; their permission cards are addressed by the ACP session only.
     session.dshSessionId = dshSessionId
     this.dshSessionMap.set(key, session)
     // Turn the displayed defaults into this conversation's pick, so the first
@@ -5651,7 +5442,6 @@ export class BridgeManager {
     const controller = new TurnStreamController(
       this,
       this.hub,
-      bridge,
       session,
       turnId,
       endTurn,

@@ -332,18 +332,44 @@ export type AcpEvent =
    * same as unset — no `agentId@choice` variants.
    */
   | { type: 'agent/exposure'; agentId: string; exposedModels: string[]; autoDiscoverModels: boolean }
-  | { type: 'permission/request'; requestId: string; sessionId: string; toolCall: unknown; options: PermissionOptionView[] }
+  /**
+   * One outstanding ask, broadcast ONCE when it is created and replayed as-is
+   * to every freshly connected client (see `permission/synced`).
+   *
+   * Every ACP permission ask carries everything the conversation card needs:
+   * who owns it (`dshSessionId`), what it is about (`toolCall` + the derived
+   * `toolName` / `reason`), the options to render verbatim, and the deadline in
+   * force. The host never answers on its own outside an expired `abort` /
+   * `auto` deadline, so this frame (and its replay) is the answer entry.
+   */
+  | {
+      type: 'permission/request'
+      requestId: string
+      /** ACP session id the ask belongs to. */
+      sessionId: string
+      /** DSH chat session id; absent for `/acp` RPC-only sessions. */
+      dshSessionId?: string
+      /** Raw ACP `ToolCallUpdate` the agent sent — never summarized away. */
+      toolCall: unknown
+      /** Host-derived human name (`permissionToolName`, `_meta` fallback included). */
+      toolName: string
+      /** One-line detail from the agent's declared input, when it has any. */
+      reason?: string
+      options: PermissionOptionView[]
+      /** What an unanswered ask does when its deadline fires. */
+      timeoutMode: PermissionTimeoutMode
+      /** Epoch ms of the deadline; absent in `wait` mode (no deadline). */
+      deadlineAt?: number
+    }
   | { type: 'permission/resolved'; requestId: string; sessionId: string; outcome: PermissionOutcome }
   /**
    * An ask whose deadline fired and was settled by the plugin itself — refused
    * (`abort`), or answered with the option the agent's own kinds imply
    * (`auto`).
    *
-   * A native ask (the composer takeover) never became a ledger entry, so this
-   * frame is the ONLY trace of the expiry in the conversation: without it the
-   * user would watch the composer card vanish with nothing said about it. The
-   * ledger path does not need it — its card sits on the settings panel and the
-   * chat line already pointed there.
+   * This is the conversation's record of the expiry: the card it was answering
+   * is gone, so without this frame the user would see it vanish with nothing
+   * said about it.
    */
   | {
       type: 'permission/expired'
@@ -429,12 +455,6 @@ export type RpcResult<T> = {
 
 export interface AgentsListResult {
   agents: AgentView[]
-  /**
-   * True when permission asks are routed to the host approval chain and the
-   * browser must stop rendering the settings-panel permission card. False (or
-   * absent on an older host) keeps the degraded ledger path visible.
-   */
-  approvalRouted?: boolean
 }
 export type SessionPromptResult = { accepted: true; turnId: string }
 export type TranscriptResult = { session: SessionView; entries: Array<{ seq: number; update: SessionUpdate }> }

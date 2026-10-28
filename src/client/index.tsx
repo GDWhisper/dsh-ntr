@@ -19,6 +19,7 @@ import { AcpComposerMode } from './composer-mode.tsx'
 import { AcpComposerAgentTag, AcpSessionControls, AcpSessionMenu } from './session-controls.tsx'
 import { AcpConversationView } from './acp-view.tsx'
 import { AcpSettingsDialog } from './settings-dialog.tsx'
+import { PermissionDock } from './permission-dock.tsx'
 import {
   createModelSeatClaim,
   createPermissionSeatClaim,
@@ -229,6 +230,21 @@ export function apply(ctx: Context): void {
     order: 5,
     inject: (sessionId: unknown) => chatFace(sessionId),
   }, AcpComposerAgentTag as unknown as SlotComponent<any>)), 'dsh-ntr: composer agent tag')
+
+  // Pending permission asks for the staged conversation, as full-width entries
+  // above the composer card (`conversation.input.dock` — a session-scoped list
+  // slot; the host's own queue/todo docks register the same way). Every ask is
+  // broadcast as `permission/request`; the dock renders only the ones carrying
+  // this conversation's id, so it needs no ACP-mode gate. Asks without a chat
+  // identity stay on the settings-panel ledger.
+  ctx.effect(() => ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
+    name: 'conversation.input.dock',
+    id: 'acp-permissions',
+    order: 10,
+    // The positional inject argument is the session binding key — the chat
+    // session id this dock belongs to (same contract as every other entry).
+    inject: (sessionId: unknown) => chatFace(sessionId),
+  }, PermissionDock as unknown as SlotComponent<any>)), 'dsh-ntr: conversation permission dock')
 
   /**
    * The client runtime's session list store, read structurally. Used to find

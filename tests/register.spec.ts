@@ -151,38 +151,12 @@ describe('host plugin contract', () => {
     }))
   })
 
-  it('reports approval routing only when the approval and agents services are both reachable', async () => {
-    async function listWith(get: (key: string) => unknown): Promise<unknown> {
-      const ctx = fakeCtx()
-      let rpcHandler: ((endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>) | undefined
-      ctx.connection.rpc.handle = vi.fn((_channel: string, handler: unknown) => {
-        rpcHandler = handler as typeof rpcHandler
-        return () => Promise.resolve()
-      })
-      ;(ctx as unknown as { get: unknown }).get = get
-      apply(ctx as never, { agents: [{ id: 'agent-1', command: 'run' }] })
-      return rpcHandler!('agents/list', {}, new AbortController().signal)
-    }
-
-    const routed = await listWith(key => {
-      if (key === 'approval') return { request: vi.fn() }
-      if (key === 'agents') return { get: vi.fn() }
-      return undefined
-    })
-    expect(routed).toMatchObject({ ok: true, value: { approvalRouted: true } })
-
-    // Either service missing → the settings-panel ledger stays authoritative.
-    const noApproval = await listWith(key => (key === 'agents' ? { get: vi.fn() } : undefined))
-    expect(noApproval).toMatchObject({ ok: true, value: { approvalRouted: false } })
-    const noAgents = await listWith(key => (key === 'approval' ? { request: vi.fn() } : undefined))
-    expect(noAgents).toMatchObject({ ok: true, value: { approvalRouted: false } })
-  })
-
-  it('reports nothing about access-mode routing — the axis is retired', async () => {
-    // `accessModeRouted` used to be part of `agents/list`. The whole mapping it
-    // reported on (DSH's access mode arbitrating an ACP agent's permissions) is
-    // retired: the agent decides its own approvals and the host maps the ask
-    // through unchanged. The field is gone; nothing may resurrect it.
+  it('reports nothing about approval or access-mode routing — both axes are retired', async () => {
+    // `agents/list` used to carry `approvalRouted` (the host took asks into its
+    // own approval chain) and, before that, `accessModeRouted` (the host
+    // arbitrated the agent's asks). Both are gone: EVERY ACP ask is answered
+    // through this plugin's own ledger, so the roster is all that is left —
+    // and nothing may resurrect a routing capability field.
     async function listWith(get: (key: string) => unknown): Promise<Record<string, unknown>> {
       const ctx = fakeCtx()
       let rpcHandler: ((endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>) | undefined
@@ -196,6 +170,8 @@ describe('host plugin contract', () => {
       return (answer as { value: Record<string, unknown> }).value
     }
 
+    // The host services the retired route needed are present here on purpose:
+    // their presence must not change the answer.
     const answer = await listWith(key => {
       if (key === 'approval') return { request: vi.fn(), config: { policy: 'ask' } }
       if (key === 'agents') return { get: vi.fn() }
@@ -203,10 +179,10 @@ describe('host plugin contract', () => {
       if (key === 'sessions') return { get: vi.fn(() => ({ events: [] })) }
       return undefined
     })
-    expect(answer).toMatchObject({ approvalRouted: true })
+    expect(answer).not.toHaveProperty('approvalRouted')
     expect(answer).not.toHaveProperty('accessModeRouted')
-    // Nothing else the retired axis reported may come back either.
-    expect(Object.keys(answer).sort()).toEqual(['agents', 'approvalRouted'])
+    // Nothing else the retired axes reported may come back either.
+    expect(Object.keys(answer).sort()).toEqual(['agents'])
   })
 
   it('answers the seat gate for a COLD session through the persistence store, without the access-mode knobs', async () => {

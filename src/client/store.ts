@@ -59,11 +59,65 @@ export type Block =
   | { kind: 'event'; event: string; text: string; raw?: string; status?: string }
   | { kind: 'notice'; tone: 'info' | 'error'; text: string }
 
+/**
+ * One permission ask waiting for a human. Every field is copied VERBATIM from
+ * the host's `permission/request` frame: the host owns what the ask is called
+ * (`toolName` / `reason`), which options the agent offered (order included),
+ * and whether the ask carries a deadline. The browser does not derive a title
+ * from `toolCall` and does not second-guess the agent's option labels.
+ */
 export interface PendingPermission {
   requestId: string
+  /** ACP session id. */
   sessionId: string
-  title: string
+  /** DSH chat session id; absent for `/acp` RPC-only sessions (settings-only ask). */
+  dshSessionId?: string
+  toolName: string
+  reason?: string
   options: Array<{ optionId: string; name: string; kind: string }>
+  timeoutMode: PermissionTimeoutMode
+  /** Epoch ms; absent in `wait` mode. */
+  deadlineAt?: number
+}
+
+/** Returned by {@link deadlineRemainingLabel} once the deadline has passed. */
+export const PERMISSION_DEADLINE_EXPIRED = 'expired'
+
+/**
+ * The asks that belong to one DSH chat conversation. An ask without a
+ * `dshSessionId` belongs to no conversation (an `/acp` RPC-only session), so it
+ * is deliberately absent from every conversation's dock and stays in the
+ * settings-panel ledger.
+ */
+export function permissionsForSession(
+  permissions: readonly PendingPermission[],
+  dshSessionId: string,
+): PendingPermission[] {
+  return permissions.filter(permission => permission.dshSessionId === dshSessionId)
+}
+
+/**
+ * Compact countdown for one ask, or `undefined` when there is nothing to count
+ * down (`wait` mode, or a frame without a deadline). Pure so the formatting is
+ * testable without a clock: the dock passes `Date.now()` on its tick.
+ *
+ * Past the deadline the answer is {@link PERMISSION_DEADLINE_EXPIRED} rather
+ * than a negative number — the host has already armed the expiry, and a card
+ * counting backwards would claim a deadline that no longer exists.
+ */
+export function deadlineRemainingLabel(
+  deadlineAt: number | undefined,
+  now: number,
+  mode: PermissionTimeoutMode,
+): string | undefined {
+  if (mode === 'wait' || deadlineAt === undefined) return undefined
+  const remainingMs = deadlineAt - now
+  if (remainingMs <= 0) return PERMISSION_DEADLINE_EXPIRED
+  const seconds = Math.ceil(remainingMs / 1000)
+  if (seconds < 60) return `${String(seconds)}s`
+  const minutes = Math.floor(seconds / 60)
+  const rest = seconds % 60
+  return rest === 0 ? `${String(minutes)}m` : `${String(minutes)}m ${String(rest)}s`
 }
 
 /**
@@ -137,17 +191,6 @@ export interface UiState {
    * that never answers, …) reads as a dead button.
    */
   probeErrors: Record<string, string>
-  /**
-   * Host reports that it HAS the native approval chain (permission asks are
-   * answered in the chat composer). This is a capability report, not a
-   * per-ask promise: an individual ask still falls back to the settings-panel
-   * ledger when the service is unavailable this time, or when the session has
-   * no chat identity behind it (`AgentBridge.askNativeApproval`). The panel
-   * therefore answers ANY pending ask, whatever this flag says — see
-   * `permissionLedgerCard` in panel.tsx. False on an older host or when the
-   * approval service is missing, in which case the ledger is the only path.
-   */
-  approvalRouted: boolean
   /**
    * ACP agent sessions backing the chat session the composer control sits in.
    * Only meaningful together with {@link chatSessionsFor}: the control reads it
@@ -539,7 +582,6 @@ export class AcpStore {
     seatCatalogs: {},
     probingModels: {},
     probeErrors: {},
-    approvalRouted: false,
     chatSessions: [],
     tagHalo: { ...DEFAULT_TAG_HALO },
     approvalDeadlines: undefined,
@@ -741,8 +783,8 @@ export class AcpStore {
   /** Snapshot refresh used on panel open and after a stream outage. */
   async resync(): Promise<void> {
     try {
-      const [{ agents, approvalRouted }, { sessions }, defaultAgentInfo, detectResult, presetResult, tagHaloResult, deadlinesResult] = await Promise.all([
-        this.call<{ agents: AgentView[]; approvalRouted?: boolean }>('agents/list'),
+      const [{ agents }, { sessions }, defaultAgentInfo, detectResult, presetResult, tagHaloResult, deadlinesResult] = await Promise.all([
+        this.call<{ agents: AgentView[] }>('agents/list'),
         this.call<{ sessions: SessionView[] }>('sessions/list'),
         // The plugin's OWN default ACP agent — a plugin-private id, not a DSH
         // model route (see `defaultAgent` on the host half).
@@ -766,7 +808,6 @@ export class AcpStore {
         sessions,
         defaultAgent: defaultAgentInfo?.agentId,
         detectedAgents,
-        approvalRouted: approvalRouted === true,
         preset: presetResult?.preset ?? undefined,
         tagHalo: tagHaloResult?.halo ?? { ...DEFAULT_TAG_HALO },
         approvalDeadlines: deadlinesResult.deadlines,
@@ -1483,11 +1524,20 @@ export class AcpStore {
     }
   }
 
+  /**
+   * Answer one ask (`optionId` absent = cancel it). A failure is reported
+   * through the store's notice — the settings panel renders that — AND
+   * rethrown, so the conversation dock can pin the message next to the card
+   * that failed instead of leaving it on a settings page the user may not
+   * have open. Callers that cannot show it (the settings panel) swallow it
+   * after the notice.
+   */
   async respondPermission(requestId: string, optionId?: string): Promise<void> {
     try {
       await this.call('permission/respond', { requestId, ...(optionId === undefined ? {} : { optionId }) })
     } catch (error) {
       this.flashError(error)
+      throw error
     }
   }
 
@@ -1851,16 +1901,22 @@ export class AcpStore {
         return this.loadAgentCatalog(event.agentId)
       }
       case 'permission/request': {
-        const title = typeof (event.toolCall as { title?: unknown } | undefined)?.title === 'string'
-          ? String((event.toolCall as { title: string }).title)
-          : this.locale('工具调用', 'tool call')
+        // Verbatim copy of the host's frame. The host decides what the ask is
+        // called (`toolName` / `reason`) and which options exist; deriving a
+        // title from `toolCall` here used to make the card say something the
+        // host never said.
+        const permission: PendingPermission = {
+          requestId: event.requestId,
+          sessionId: event.sessionId,
+          ...(event.dshSessionId === undefined ? {} : { dshSessionId: event.dshSessionId }),
+          toolName: event.toolName,
+          ...(event.reason === undefined ? {} : { reason: event.reason }),
+          options: event.options,
+          timeoutMode: event.timeoutMode,
+          ...(event.deadlineAt === undefined ? {} : { deadlineAt: event.deadlineAt }),
+        }
         this.mutate({
-          permissions: [...this.state.permissions.filter(p => p.requestId !== event.requestId), {
-            requestId: event.requestId,
-            sessionId: event.sessionId,
-            title,
-            options: event.options,
-          }],
+          permissions: [...this.state.permissions.filter(p => p.requestId !== event.requestId), permission],
         })
         return Promise.resolve()
       }

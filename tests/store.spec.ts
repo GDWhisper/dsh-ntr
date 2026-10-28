@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { AcpStore, foldUpdate, type Block } from '../src/client/store.ts'
+import { AcpStore, foldUpdate, permissionsForSession, type Block } from '../src/client/store.ts'
 import { acpModeFromPresetEvent, stagedIsAcpMode } from '../src/client/acp-ui.tsx'
 import type { AcpAgentDef, DetectedAgentInfo } from '../src/protocol.ts'
 
@@ -421,53 +421,24 @@ describe('AcpStore agent management', () => {
     expect(oldStore.getSnapshot().notice).toContain('重启 dsh web')
   })
 
-  it('resync records the host approval-routing capability (absent field = degraded)', async () => {
-    const store = new AcpStore(
-      async (_channel, endpoint) => {
-        if (endpoint === 'agents/list') return { ok: true, value: { agents: [], approvalRouted: true } }
-        if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
-        if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
-        return { ok: true, value: {} }
-      },
-      (zh) => zh,
-    )
-    expect(store.getSnapshot().approvalRouted).toBe(false)
-    await store.resync()
-    expect(store.getSnapshot().approvalRouted).toBe(true)
-
-    // An older host omits the field: the panel must keep its ledger card.
-    const legacy = new AcpStore(
-      async (_channel, endpoint) => {
-        if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
-        if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
-        if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
-        return { ok: true, value: {} }
-      },
-      (zh) => zh,
-    )
-    await legacy.resync()
-    expect(legacy.getSnapshot().approvalRouted).toBe(false)
-  })
-
-  it('answers a pending permission ask even when the host reports the native chain', async () => {
-    // `approvalRouted` says the host HAS the approval service; it does not
-    // promise THIS ask reached the conversation. An ask is in `ui.permissions`
-    // only because it fell back to the ledger (the service was unavailable
-    // this time, or the session has no chat identity), so the panel must still
-    // render the answerable card — the old rule showed a read-only count
-    // instead and left the ask with no button anywhere.
+  it('shows the settings ledger whenever any ask is pending', async () => {
+    // The conversation dock answers the asks belonging to the open
+    // conversation; the ledger is the cross-session mirror for everything it
+    // cannot show (another conversation, or no chat identity at all).
     const { permissionLedgerCard } = await import('../src/client/panel.tsx')
-    const pending = [{ requestId: 'r1', sessionId: 's1', title: 'mock dangerous operation', options: [{ optionId: 'allow1', name: 'Allow once', kind: 'allow_once' }] }]
+    const pending = [{
+      requestId: 'r1',
+      sessionId: 's1',
+      dshSessionId: 'chat-1',
+      toolName: 'Bash',
+      reason: 'Bash · echo hi',
+      options: [{ optionId: 'allow1', name: 'Allow once', kind: 'allow_once' }],
+      timeoutMode: 'abort' as const,
+      deadlineAt: 1_700_000_300_000,
+    }]
 
-    expect(permissionLedgerCard({ approvalRouted: true, permissions: pending }))
-      .toEqual({ visible: true, fellBackFromConversation: true })
-    expect(permissionLedgerCard({ approvalRouted: false, permissions: pending }))
-      .toEqual({ visible: true, fellBackFromConversation: false })
-    // Nothing pending: no card, whatever the capability report says.
-    expect(permissionLedgerCard({ approvalRouted: true, permissions: [] }))
-      .toEqual({ visible: false, fellBackFromConversation: false })
-    expect(permissionLedgerCard({ approvalRouted: false, permissions: [] }))
-      .toEqual({ visible: false, fellBackFromConversation: false })
+    expect(permissionLedgerCard({ permissions: pending })).toEqual({ visible: true })
+    expect(permissionLedgerCard({ permissions: [] })).toEqual({ visible: false })
   })
 
   it('round-trips the agent MCP server list through the settings form', async () => {
@@ -1361,7 +1332,16 @@ describe('AcpStore event application (released / reset / turn dedup)', () => {
   it('keeps a released session visible, marks it released, and clears its permissions', async () => {
     const { store, apply } = await makeStore()
     await apply({ type: 'session/created', sessionId: 's1', session: view() })
-    await apply({ type: 'permission/request', requestId: 'r1', sessionId: 's1', toolCall: { title: 't' }, options: [] })
+    await apply({
+      type: 'permission/request',
+      requestId: 'r1',
+      sessionId: 's1',
+      dshSessionId: 'chat-1',
+      toolCall: { title: 't' },
+      toolName: 'Bash',
+      options: [],
+      timeoutMode: 'wait',
+    })
     expect(store.getSnapshot().permissions).toHaveLength(1)
 
     await apply({ type: 'session/released', sessionId: 's1', session: view({ released: true }), reason: 'agent process exited' })
@@ -1372,6 +1352,41 @@ describe('AcpStore event application (released / reset / turn dedup)', () => {
     expect(state.notice).toMatch(/resume|恢复/)
   })
 
+  it('copies the permission frame fields verbatim', async () => {
+    const { store, apply } = await makeStore()
+    const options = [
+      { optionId: 'allow', name: 'Always Allow', kind: 'allow_always' },
+      { optionId: 'deny', name: 'Reject', kind: 'reject_once' },
+    ]
+    const deadlineAt = 1_700_000_300_000
+    await apply({
+      type: 'permission/request',
+      requestId: 'r1',
+      sessionId: 'acp-1',
+      dshSessionId: 'chat-1',
+      // The card must not depend on this raw payload; only the host-derived
+      // fields below are rendered.
+      toolCall: { title: 'NOT the card title' },
+      toolName: 'Bash',
+      reason: 'Bash · echo hi',
+      options,
+      timeoutMode: 'abort',
+      deadlineAt,
+    })
+    expect(store.getSnapshot().permissions).toEqual([{
+      requestId: 'r1',
+      sessionId: 'acp-1',
+      dshSessionId: 'chat-1',
+      toolName: 'Bash',
+      reason: 'Bash · echo hi',
+      options,
+      timeoutMode: 'abort',
+      deadlineAt,
+    }])
+    // The old local title derived from `toolCall.title` is gone.
+    expect(store.getSnapshot().permissions[0]).not.toHaveProperty('title')
+  })
+
   it('re-establishes the pending asks on reconnect and prunes the stale ones', async () => {
     // A `permission/request` is broadcast ONCE, so a client that connects later
     // never learns the ask exists. The stream replays every outstanding ask and
@@ -1379,19 +1394,114 @@ describe('AcpStore event application (released / reset / turn dedup)', () => {
     // resolved while it was disconnected, which must not survive as a card that
     // can only answer `unknown_request`.
     const { store, apply } = await makeStore()
-    await apply({ type: 'permission/request', requestId: 'stale', sessionId: 's1', toolCall: { title: 'old' }, options: [] })
-    await apply({ type: 'permission/request', requestId: 'live', sessionId: 's2', toolCall: { title: 'new' }, options: [] })
+    await apply({
+      type: 'permission/request',
+      requestId: 'stale',
+      sessionId: 's1',
+      dshSessionId: 'chat-1',
+      toolCall: { title: 'old' },
+      toolName: 'Bash',
+      options: [],
+      timeoutMode: 'wait',
+    })
+    await apply({
+      type: 'permission/request',
+      requestId: 'live',
+      sessionId: 's2',
+      dshSessionId: 'chat-1',
+      toolCall: { title: 'new' },
+      toolName: 'Write',
+      reason: 'Write · /w/a.ts',
+      options: [{ optionId: 'ok', name: 'Allow', kind: 'allow_once' }],
+      timeoutMode: 'auto',
+      deadlineAt: 1_700_000_300_000,
+    })
     expect(store.getSnapshot().permissions.map(p => p.requestId)).toEqual(['stale', 'live'])
 
     // The replay re-sends the outstanding ask (idempotent by request id — it may
-    // also have arrived live) and then names what is actually live.
-    await apply({ type: 'permission/request', requestId: 'live', sessionId: 's2', toolCall: { title: 'new' }, options: [] })
+    // also have arrived live) and then names what is actually live. The replay
+    // keeps every frame field, not just the id.
+    await apply({
+      type: 'permission/request',
+      requestId: 'live',
+      sessionId: 's2',
+      dshSessionId: 'chat-1',
+      toolCall: { title: 'new' },
+      toolName: 'Write',
+      reason: 'Write · /w/a.ts',
+      options: [{ optionId: 'ok', name: 'Allow', kind: 'allow_once' }],
+      timeoutMode: 'auto',
+      deadlineAt: 1_700_000_300_000,
+    })
     await apply({ type: 'permission/synced', requestIds: ['live'] })
     expect(store.getSnapshot().permissions.map(p => p.requestId)).toEqual(['live'])
+    expect(store.getSnapshot().permissions[0]).toMatchObject({
+      sessionId: 's2',
+      dshSessionId: 'chat-1',
+      toolName: 'Write',
+      reason: 'Write · /w/a.ts',
+      timeoutMode: 'auto',
+      deadlineAt: 1_700_000_300_000,
+    })
+
+    // An answered ask is pruned on its own frame, leaving the others alone.
+    await apply({ type: 'permission/resolved', requestId: 'live', sessionId: 's2', outcome: { outcome: 'cancelled' } })
+    expect(store.getSnapshot().permissions).toEqual([])
 
     // Nothing outstanding at all: the terminator alone must clear the list.
     await apply({ type: 'permission/synced', requestIds: [] })
     expect(store.getSnapshot().permissions).toEqual([])
+  })
+
+  it('filters pending asks by DSH chat session and never shows an ask with no chat identity', async () => {
+    const { store, apply } = await makeStore()
+    await apply({
+      type: 'permission/request',
+      requestId: 'mine',
+      sessionId: 'acp-1',
+      dshSessionId: 'chat-1',
+      toolCall: {},
+      toolName: 'Bash',
+      options: [],
+      timeoutMode: 'wait',
+    })
+    await apply({
+      type: 'permission/request',
+      requestId: 'other',
+      sessionId: 'acp-2',
+      dshSessionId: 'chat-2',
+      toolCall: {},
+      toolName: 'Write',
+      options: [],
+      timeoutMode: 'wait',
+    })
+    // An `/acp` RPC-only ask: pending, but belonging to no conversation.
+    await apply({
+      type: 'permission/request',
+      requestId: 'rpc-only',
+      sessionId: 'acp-3',
+      toolCall: {},
+      toolName: 'Bash',
+      options: [],
+      timeoutMode: 'wait',
+    })
+    const permissions = store.getSnapshot().permissions
+    expect(permissionsForSession(permissions, 'chat-1').map(p => p.requestId)).toEqual(['mine'])
+    expect(permissionsForSession(permissions, 'chat-2').map(p => p.requestId)).toEqual(['other'])
+    expect(permissionsForSession(permissions, 'chat-3')).toEqual([])
+  })
+
+  it('reports a failed permission answer and rethrows it to the caller', async () => {
+    // The dock pins the failure next to the card, so the error must not be
+    // swallowed behind the settings page's notice.
+    const store = new AcpStore(
+      async (_channel, endpoint) => (endpoint === 'permission/respond'
+        ? { ok: false, error: { code: 'unknown_request', message: 'ask is gone' } }
+        : { ok: true, value: {} }),
+      (zh) => zh,
+    )
+    await expect(store.respondPermission('r1', 'allow')).rejects.toThrow('ask is gone')
+    expect(store.getSnapshot().notice).toBe('ask is gone')
   })
 
   it('resets blocks and the seq watermark on session/reset so the replay folds fresh', async () => {

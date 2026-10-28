@@ -60,7 +60,9 @@ DSH 的"模式"就是 **agent preset**：一条 `@deepseek-ai/dsh-agent-preset` 
 
 **现行方向**：agent 侧 `session/request_permission` 原样映射到界面上。每个 agent 的权限形态不同（有的给选项列表、有的给 allow/deny、有的带 tool call 详情），接住它的载荷、渲染给人、把人的选择按 ACP 协议回包即可，宿主不预先判 allow/reject。
 
-**询问落在哪里，由它实际走的路决定**：`ask` 优先走宿主 `ctx.approval`（审批出现在对话 composer 里，不抢答）。走不到的三条原因见 [acp-convergence.md](acp-convergence.md) §2.3 的补记——设计内路径（没有审批服务、会话没有对话身份）落在设置页的 ledger 卡上等人答；**降级路径**（服务在、这次失败）落在同一张卡上，但带一个倒计时（`permissionTimeoutMs`，默认 5 分钟），到点按「超时处理方式」那一档收场。设置页那张卡**只要有待处理项就渲染可按钮**，不因 `approvalRouted` 而隐藏。
+> **【已退役，2026-10-28】下面这段「先走 `ctx.approval`、走不到再回落 ledger」的路由已整条删除。** 现行只有一条管线：每一问都由 `AgentBridge.handlePermissionRequest` 进 `PermissionLedger`、广播 `permission/request`，在对话 `PermissionDock`（`conversation.input.dock`，按 `dshSessionId` 过滤）或设置页镜像上等人回答，到点就地收场（`wait` 不设期限 / `abort` 拒绝 / `auto` 按 option kind 代答），`approvalRouted` 与 native 超时转移一并消失。详见 [agents/permissions.md](agents/permissions.md)。
+
+**【历史做法】询问落在哪里，由它实际走的路决定**：`ask` 优先走宿主 `ctx.approval`（审批出现在对话 composer 里，不抢答）。走不到的三条原因见 [acp-convergence.md](acp-convergence.md) §2.3 的补记——设计内路径（没有审批服务、会话没有对话身份）落在设置页的 ledger 卡上等人答；**降级路径**（服务在、这次失败）落在同一张卡上，但带一个倒计时（`permissionTimeoutMs`，默认 5 分钟），到点按「超时处理方式」那一档收场。设置页那张卡**只要有待处理项就渲染可按钮**，不因 `approvalRouted` 而隐藏。
 
 **prompt 仍然严格等于用户文本**：这一条与权限怎么走无关，必须继续遵守。每轮转发给 ACP 的 prompt 严禁拼任何边界/策略句子（早期有 `policyNotice` 前缀叙述，已按用户要求彻底移除，不要以"agent 不知道边界"为由重加）。
 
@@ -137,7 +139,7 @@ DSH 的"模式"就是 **agent preset**：一条 `@deepseek-ai/dsh-agent-preset` 
 
 ### 仍然有效的边界
 
-- **【已退役，2026-10-18】「不能替换原生 Access mode 下拉」**：这一条早年断定 `conversation.input.permission` 不是 slot（由 `ui-conversation` 的 InputBar 直接渲染 `PermissionSelect`），插件只能读 `permissions` 投影、只能用 `/permission <preset>` 切。现行实现里它是一个 `single` 槽位：`src/client/model-seat.tsx` 的 `createPermissionSeatClaim` 与模型底座同享 `syncAcpMode` 闸门，在 NTR 模式会话里注册一个渲染 `null` 的占主，**清掉原生 Access mode**——DSH 的 Access mode 规定的是宿主对自己工具的写策略，对外部 agent 进程毫无作用力，留着只会误导。读取路径（`joinPermissionSelect` / `boundarySection` / `usePermissionSelect`）随之删除。NTR 模式的权限面完全属于 agent，现行结论见 [acp-convergence.md](acp-convergence.md) §2.3 与 §3 批次 4。
+- **【已退役，2026-10-18】「不能替换原生 Access mode 下拉」**：这一条早年断定 `conversation.input.permission` 不是 slot（由 `ui-conversation` 的 InputBar 直接渲染 `PermissionSelect`），插件只能读 `permissions` 投影、只能用 `/permission <preset>` 切。现行实现里它是一个 `single` 槽位：`src/client/model-seat.tsx` 的 `createPermissionSeatClaim` 与模型底座同享 `syncAcpMode` 闸门，在 NTR 模式会话里注册一个渲染 `null` 的占主，**清掉原生 Access mode**——DSH 的 Access mode 规定的是宿主对自己工具的写策略，对外部 agent 进程毫无作用力，留着只会误导。读取路径（`joinPermissionSelect` / `boundarySection` / `usePermissionSelect`）随之删除。NTR 模式的权限面完全属于 agent，现行结论见 [agents/permissions.md](agents/permissions.md)（历史推导见 [acp-convergence.md](acp-convergence.md) §2.3 与 §3 批次 4）。
 - **原生聊天平面没有工具卡，这是换时间顺序付的代价**：批次 5 曾让 `streamPrompt` 发真的 `block-start('tool-call')` + `tool-call-delta` + `block-end`，宿主 `AssistantStreamAccumulator` 折成 `{ kind:'tool-call', callId, name, argsRaw }`，官方 chat 包的渲染器确实画出了卡片。但卡片不在消息体内渲染，而 `tool/call` 是 loop 在整条 assistant 消息**落定之后**才 append 的，所以它们永远堆在回合底部；而含 `tool-call` 块的消息被 `latestAnswer` 拒绝当答案。现行构建改发内联 `text`（思考 → 工具 → 答案），完整卡片回到 NTR tab。根因与利弊见 [acp-convergence.md](acp-convergence.md) §1.7。
 - **模式只能在空白会话选**：想中途切换到 NTR 模式（preset）需要新建会话。历史上下文不会追送（只转发人说的话），所以中途接管是"从这里开始由它接手"。
 - **芯片不出现于普通会话**：从没跑过 NTR agent 的会话不渲染任何 NTR 芯片（工具行保持干净）。

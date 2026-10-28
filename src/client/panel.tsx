@@ -2,11 +2,11 @@
  * React surface for ACP: the settings configuration section.
  *
  * Scope is deliberately narrow — this is a CONFIGURATION surface. Runtime
- * interaction lives in the conversation: permission asks are answered in the
- * chat composer through the host approval chain. The ledger card answers
- * whatever did NOT reach the conversation — a host without the chain, a
- * session with no chat identity behind it, or an ask whose native route
- * degraded to unavailable (see `permissionLedgerCard`).
+ * interaction lives in the conversation: every permission ask with a chat
+ * identity is answered on a card above that conversation's composer
+ * (`permission-dock.tsx`). The ledger card here is the cross-session mirror —
+ * asks whose conversation is not open, or which have no chat identity at all —
+ * and is where those are answered (see `permissionLedgerCard`).
  *
  * Each configured agent is one compact row (status + current model + badges)
  * that expands into the full connection form and model catalog. The row stays
@@ -460,22 +460,15 @@ export function payloadEquals(payload: AgentSavePayload, current: AcpAgentDef): 
 /**
  * The settings panel's permission-ledger rule.
  *
- * A pending ask ALWAYS gets an answerable card here, whatever `approvalRouted`
- * says. That flag reports that the host HAS an approval service — it does not
- * promise THIS ask reached the conversation. An ask lands in `ui.permissions`
- * only on the ledger path (`AgentBridge.handlePermissionRequest` broadcasts
- * `permission/request` there and nowhere else), so a pending entry is by
- * definition a question the conversation is not showing. The previous rule
- * (`approvalRouted` → a read-only count, no buttons) hid the only answer
- * entry exactly when the native route had degraded to unavailable, and the
- * ask then hung until its timeout.
- *
- * `fellBackFromConversation` is the case the card has to explain: the host
- * can route asks, and this one still did not make it.
+ * Pending asks are shown in the conversation card while that conversation is
+ * open; this card is the cross-session mirror for the ones it cannot show —
+ * asks belonging to another conversation, and `/acp` RPC-only asks with no
+ * chat identity at all. It therefore appears whenever ANY ask is pending: a
+ * pending entry with no conversation card would otherwise have no answer
+ * surface anywhere.
  */
-export function permissionLedgerCard(ui: Pick<UiState, 'approvalRouted' | 'permissions'>): { visible: boolean; fellBackFromConversation: boolean } {
-  const visible = ui.permissions.length > 0
-  return { visible, fellBackFromConversation: visible && ui.approvalRouted }
+export function permissionLedgerCard(ui: Pick<UiState, 'permissions'>): { visible: boolean } {
+  return { visible: ui.permissions.length > 0 }
 }
 
 /**
@@ -881,36 +874,37 @@ export function AcpSettingsSection(props: WithStore) {
         </div>
       </header>
 
-      {/* Any pending ask gets an answerable card here, whatever
-          `approvalRouted` says (see `permissionLedgerCard`): an ask is in
-          `ui.permissions` only because it fell back to the ledger, which
-          means the conversation is NOT showing it. */}
+      {/* The cross-session mirror: the conversation dock answers the asks
+          belonging to the open conversation; this card answers the rest. */}
       {ledger.visible && (
         <div className="dwa-card dwa-card-warn" style={{ marginBottom: 16 }}>
-          <div style={{ fontWeight: 600, marginBottom: 8 }}>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>
             {acp.label('待处理权限请求', 'Pending Permission Requests')}
           </div>
-          {ledger.fellBackFromConversation && (
-            <div className="dwa-hint" style={{ marginBottom: 8 }}>
-              {acp.label(
-                '这些询问没有进入对话（审批服务本次不可用、问题从未到达对话，或会话没有对话身份），请在此回答。',
-                'These asks did not reach the conversation (the approval service was unavailable, the question never reached the conversation, or the session has no chat identity) — answer them here.',
-              )}
-            </div>
-          )}
+          <div className="dwa-hint" style={{ marginBottom: 8 }}>
+            {acp.label(
+              '对话打开时在那边的卡片上回答；这里兜底显示其他会话的询问。',
+              'Answer in the conversation card while that conversation is open; this list covers the asks whose conversation is not.',
+            )}
+          </div>
           {ui.permissions.map(permission => (
             <div key={permission.requestId} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, flexWrap: 'wrap' }}>
-              <span style={{ flex: 1, minWidth: 160 }}>{permission.title}</span>
+              <span style={{ flex: 1, minWidth: 160 }}>
+                <span style={{ fontWeight: 600 }}>{permission.toolName}</span>
+                {permission.reason !== undefined && (
+                  <span style={{ color: 'var(--ntr-muted)' }}> · {permission.reason}</span>
+                )}
+              </span>
               {permission.options.map(option => (
                 <button
                   key={option.optionId}
                   className="dwa-btn dwa-btn-primary"
-                  onClick={() => void acp.respondPermission(permission.requestId, option.optionId)}
+                  onClick={() => { void acp.respondPermission(permission.requestId, option.optionId).catch(() => undefined) }}
                 >
                   {option.name}
                 </button>
               ))}
-              <button className="dwa-btn" onClick={() => void acp.respondPermission(permission.requestId)}>
+              <button className="dwa-btn" onClick={() => { void acp.respondPermission(permission.requestId).catch(() => undefined) }}>
                 {acp.label('拒绝', 'Dismiss')}
               </button>
             </div>

@@ -13,7 +13,8 @@ import { agentLockPhaseOf, FORM_MS, playAgentLockAnim, SHATTER_MS } from '../src
 import { acpEmptyCopy, boundAgentOf, diffRows, isNewFileDiff } from '../src/client/acp-view.tsx'
 import { approvalDeadlineFacts, DEADLINE_MIN_WAIT_MS, deadlineSliderIndex, deadlineValueFor } from '../src/client/panel.tsx'
 import { describeRoute, menuFor, REFRESH_CATALOG_ITEM } from '../src/client/session-controls.tsx'
-import { AcpStore } from '../src/client/store.ts'
+import { AcpStore, deadlineRemainingLabel, PERMISSION_DEADLINE_EXPIRED, permissionsForSession } from '../src/client/store.ts'
+import type { PendingPermission } from '../src/client/store.ts'
 import { APPROVAL_DEADLINE_MIN_WAIT_MS, isAbsolutePath, splitAdapterModelId, splitCommandLine as hostSplitCommandLine, tokenizeCommandLine as hostTokenizeCommandLine } from '../src/impl.ts'
 import type { AgentCatalogResult, AgentView, ChatSessionView } from '../src/protocol.ts'
 
@@ -882,5 +883,57 @@ describe('deadlineValueFor', () => {
     // The browser half hand-copies the floor (it may not import the host
     // module), so the copy is pinned here instead of drifting.
     expect(DEADLINE_MIN_WAIT_MS).toBe(APPROVAL_DEADLINE_MIN_WAIT_MS)
+  })
+})
+
+describe('permissionsForSession', () => {
+  const ask = (overrides: Partial<PendingPermission>): PendingPermission => ({
+    requestId: 'r1',
+    sessionId: 'acp-1',
+    dshSessionId: 'chat-1',
+    toolName: 'Bash',
+    options: [],
+    timeoutMode: 'wait',
+    ...overrides,
+  })
+
+  it('keeps only the asks addressed to the conversation', () => {
+    const permissions = [
+      ask({ requestId: 'mine', dshSessionId: 'chat-1' }),
+      ask({ requestId: 'other', dshSessionId: 'chat-2' }),
+      ask({ requestId: 'also-mine', dshSessionId: 'chat-1' }),
+    ]
+    expect(permissionsForSession(permissions, 'chat-1').map(p => p.requestId)).toEqual(['mine', 'also-mine'])
+    expect(permissionsForSession(permissions, 'chat-2').map(p => p.requestId)).toEqual(['other'])
+    expect(permissionsForSession(permissions, 'chat-3')).toEqual([])
+  })
+
+  it('never puts an ask without a chat identity into a conversation', () => {
+    // An `/acp` RPC-only ask is pending but has no conversation to render in;
+    // it stays on the settings-panel ledger.
+    const permissions = [ask({ requestId: 'rpc', dshSessionId: undefined })]
+    expect(permissionsForSession(permissions, 'chat-1')).toEqual([])
+  })
+})
+
+describe('deadlineRemainingLabel', () => {
+  const now = 1_700_000_000_000
+
+  it('has no countdown in wait mode, even if a deadline was supplied', () => {
+    expect(deadlineRemainingLabel(now + 10_000, now, 'wait')).toBeUndefined()
+    expect(deadlineRemainingLabel(undefined, now, 'abort')).toBeUndefined()
+    expect(deadlineRemainingLabel(undefined, now, 'auto')).toBeUndefined()
+  })
+
+  it('formats the remaining time in seconds (rounding up, so it never reads zero early)', () => {
+    expect(deadlineRemainingLabel(now + 12_000, now, 'abort')).toBe('12s')
+    expect(deadlineRemainingLabel(now + 1, now, 'auto')).toBe('1s')
+    expect(deadlineRemainingLabel(now + 90_000, now, 'abort')).toBe('1m 30s')
+    expect(deadlineRemainingLabel(now + 120_000, now, 'auto')).toBe('2m')
+  })
+
+  it('reports an expired deadline instead of counting backwards', () => {
+    expect(deadlineRemainingLabel(now, now, 'abort')).toBe(PERMISSION_DEADLINE_EXPIRED)
+    expect(deadlineRemainingLabel(now - 1, now, 'auto')).toBe(PERMISSION_DEADLINE_EXPIRED)
   })
 })

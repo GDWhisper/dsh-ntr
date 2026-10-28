@@ -1062,9 +1062,17 @@ describe('PermissionLedger', () => {
 
   it('replays only asks that carry a view, as their original request frame', () => {
     const ledger = new PermissionLedger()
+    // Every field the live frame carried must ride the replay too: the
+    // conversation card filters on `dshSessionId` and renders `toolName` /
+    // `deadlineAt`, so a replay missing one would silently drop the ask.
     const view = {
+      dshSessionId: 'chat-1',
       toolCall: { title: 'Bash' },
+      toolName: 'Bash',
+      reason: 'Bash · ls -la',
       options: [{ optionId: 'allow1', name: 'Allow once', kind: 'allow_once' }],
+      timeoutMode: 'abort' as const,
+      deadlineAt: 1_700_000_000_000,
     }
     const shown = ledger.create('s1', () => {}, view)
     // An entry without a view still answers — it just cannot be re-shown.
@@ -1150,18 +1158,13 @@ function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } {
 describe('dispatchRpc', () => {
   it('routes endpoints and normalizes errors into the Connection result shape', async () => {
     const manager = fakeManager()
-    // `approvalRouted` is reported for every host build; a manager without the
-    // probe (older/partial implementation) reports the degraded `false`.
+    // `agents/list` is the roster alone: the retired approval/access-mode axes
+    // have no reporting field left.
     await expect(dispatchRpc(manager, 'agents/list', {})).resolves.toEqual({
       ok: true,
-      value: { agents: [], approvalRouted: false },
+      value: { agents: [] },
     })
     expect(manager.calls).toContainEqual(['agents', undefined])
-    const routed = { ...manager, approvalRouting: () => true }
-    await expect(dispatchRpc(routed, 'agents/list', {})).resolves.toEqual({
-      ok: true,
-      value: { agents: [], approvalRouted: true },
-    })
     // Optional chat-session mode surface: a manager without it reports none.
     await expect(dispatchRpc(manager, 'session/chat-list', { dshSessionId: 'chat-1' })).resolves.toEqual({ ok: true, value: { sessions: [], acpMode: false } })
     // The seat gate's fallback fact source: read-only, memory-only, and false

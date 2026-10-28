@@ -12,10 +12,10 @@ import { afterAll, describe, expect, it } from 'vitest'
 import {
   AcpLlmAdapter, AgentBridge, BridgeManager, defaultAgentWorkspace,
   detectHostAgents, ensureAgentExecutable, findExecutable, killProcessTree, pluginStateDir, routeBindingRegistry, windowsShimLaunch,
-  type ApprovalOutcome, type ApprovalRequestContext, type BridgeTuning,
+  type BridgeTuning,
   permissionAskReason, permissionToolName,
 } from '../src/bridge.ts'
-import { EventHub, dispatchRpc } from '../src/impl.ts'
+import { EventHub, dispatchRpc, permissionReplayFrames } from '../src/impl.ts'
 import type { AcpAgentCatalog, AcpAgentDef, AcpEvent, AgentCatalogResult, ChatSessionView, StreamChunk } from '../src/protocol.ts'
 
 const MOCK = fileURLToPath(new URL('./mock-agent.mjs', import.meta.url))
@@ -1744,42 +1744,34 @@ describe('stale cancel and silent stops (isolated manager)', () => {
   }, 30_000)
 })
 
-describe('native approval routing (isolated manager)', () => {
-  const approvalHub = new EventHub()
-  const approvalEvents: AcpEvent[] = []
-  approvalHub.subscribe(event => { approvalEvents.push(event) })
-  const approvalManager = new BridgeManager([{ ...def, id: 'appr' }], approvalHub, 500)
-  const approvalAdapter = new AcpLlmAdapter(approvalManager)
-  const calls: ApprovalRequestContext[] = []
-  let scripted: ApprovalOutcome | 'throw' = 'unavailable'
-
-  approvalManager.setApprovalRequester(request => {
-    calls.push(request)
-    if (scripted === 'throw') throw new Error('approval service exploded')
-    return Promise.resolve(scripted)
-  })
+describe('every ACP permission ask reaches the human through the ledger (isolated manager)', () => {
+  const askHub = new EventHub()
+  const askEvents: AcpEvent[] = []
+  askHub.subscribe(event => { askEvents.push(event) })
+  const askManager = new BridgeManager([{ ...def, id: 'ask' }], askHub, 500)
+  const askAdapter = new AcpLlmAdapter(askManager)
 
   afterAll(async () => {
-    await approvalManager.shutdownAll()
+    await askManager.shutdownAll()
   })
 
   /**
    * Wait for a fresh event. `since` is mandatory: the hub keeps every event
    * from earlier cases, so an unscoped predicate would match a stale one.
    */
-  function apprWaitFor<T extends AcpEvent['type']>(type: T, since: number, predicate: (event: Extract<AcpEvent, { type: T }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: T }>> {
+  function askWaitFor<T extends AcpEvent['type']>(type: T, since: number, predicate: (event: Extract<AcpEvent, { type: T }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: T }>> {
     const matches = (event: AcpEvent): event is Extract<AcpEvent, { type: T }> =>
       event.type === type && predicate(event as Extract<AcpEvent, { type: T }>)
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`timeout waiting for ${type}`)), timeoutMs)
-      const unsub = approvalHub.subscribe(event => {
-        if (approvalEvents.indexOf(event) >= since && matches(event)) {
+      const unsub = askHub.subscribe(event => {
+        if (askEvents.indexOf(event) >= since && matches(event)) {
           clearTimeout(timer)
           unsub()
           resolve(event)
         }
       })
-      const existing = approvalEvents.find((event, index) => index >= since && matches(event))
+      const existing = askEvents.find((event, index) => index >= since && matches(event))
       if (existing !== undefined) {
         clearTimeout(timer)
         unsub()
@@ -1789,23 +1781,38 @@ describe('native approval routing (isolated manager)', () => {
   }
 
   /**
-   * Drain one adapter turn (the only path that binds a DSH chat session id) —
-   * the WHOLE turn, continuing through the staged-result steps the host loop
-   * would propose for its cards, so awaiting it means the turn really settled.
+   * Drive one adapter turn (the only path that binds a DSH chat session id),
+   * answering every ask it raises through `permission/respond` exactly as the
+   * browser's conversation card would. Collects the reasoning text the turn
+   * streamed (where the permission line lives).
    */
-  async function adapterTurn(sessionId: string, text: string): Promise<StreamChunk[]> {
-    const { chunks } = await hostLoopTurn(approvalAdapter, {
-      provider: 'acp',
-      model: 'appr',
-      sessionId,
-      messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+  async function askTurn(sessionKey: string | undefined, text: string, optionId = 'allow1'): Promise<{ reasoning: () => string; drained: Promise<void> }> {
+    const parts: string[] = []
+    const answers = askHub.subscribe(event => {
+      if (event.type !== 'permission/request') return
+      void dispatchRpc(askManager, 'permission/respond', { requestId: event.requestId, optionId })
     })
-    return chunks
+    const drained = (async () => {
+      try {
+        const { chunks } = await hostLoopTurn(askAdapter, {
+          provider: 'acp',
+          model: 'ask',
+          ...(sessionKey === undefined ? {} : { sessionId: sessionKey }),
+          messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+        })
+        for (const chunk of chunks) {
+          if (chunk.type === 'reasoning-delta') parts.push(chunk.text)
+        }
+      } finally {
+        answers()
+      }
+    })()
+    return { reasoning: () => parts.join(''), drained }
   }
 
-  async function echoOf(sessionId: string, text: string): Promise<string> {
-    await settleTranscript(approvalManager, sessionId)
-    const transcript = await dispatchRpc(approvalManager, 'transcript/get', { sessionId })
+  async function askEcho(sessionId: string): Promise<string> {
+    await settleTranscript(askManager, sessionId)
+    const transcript = await dispatchRpc(askManager, 'transcript/get', { sessionId })
     if (!transcript.ok) throw new Error('transcript failed')
     return (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
       .filter(e => e.update.sessionUpdate === 'agent_message_chunk')
@@ -1813,274 +1820,271 @@ describe('native approval routing (isolated manager)', () => {
       .join('')
   }
 
-  function hostSessionIdOf(sessionKey: string): string | undefined {
-    const turn = approvalEvents.find(e => e.type === 'turn/start' && e.text === sessionKey)
-    return turn?.sessionId
-  }
-
-  it('reports approvalRouting and answers an ask with the native outcome', async () => {
-    expect(approvalManager.approvalRouting()).toBe(true)
-    const before = approvalEvents.length
-
-    scripted = 'allowed-once'
-    await adapterTurn('dsh-approval-allow', 'PERM allow me')
-    const sessionId = hostSessionIdOf('PERM allow me')
-    expect(sessionId).toBeDefined()
-    expect(await echoOf(sessionId!, 'PERM allow me')).toContain('perm=allow1')
-
-    scripted = 'rejected'
-    await adapterTurn('dsh-approval-reject', 'PERM deny me')
-    const rejectSession = hostSessionIdOf('PERM deny me')
-    expect(rejectSession).toBeDefined()
-    expect(await echoOf(rejectSession!, 'PERM deny me')).toContain('perm=reject1')
-
-    // The question travelled with the chat session identity, the tool name,
-    // the card's headline reason, and the ACP call id the host card can attach
-    // its detail (the command) to.
-    expect(calls.at(-1)).toMatchObject({
-      dshSessionId: 'dsh-approval-reject',
-      agentId: 'appr',
+  it('broadcasts a complete request frame for a chat-bound ask, then follows the human answer', async () => {
+    const since = askEvents.length
+    const { drained } = await askTurn('dsh-ask-adapter', 'PERM adapter ask')
+    const request = await askWaitFor('permission/request', since, () => true)
+    expect(request).toMatchObject({
+      dshSessionId: 'dsh-ask-adapter',
       toolName: 'mock dangerous operation',
       reason: 'mock dangerous operation',
-      callId: 'call_1',
+      timeoutMode: 'wait',
+      options: [
+        { optionId: 'allow1', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'reject1', name: 'Reject once', kind: 'reject_once' },
+      ],
     })
-
-    // Routed asks never surface a settings-panel card: no `permission/request`
-    // for this epoch, but the resolution frame still rides the stream.
-    const fresh = approvalEvents.slice(before)
-    expect(fresh.filter(e => e.type === 'permission/request')).toHaveLength(0)
-    expect(fresh.filter(e => e.type === 'permission/resolved' && e.sessionId === rejectSession)).toHaveLength(1)
-  }, 30_000)
-
-  it('degrades to the panel ledger when the native answerer is unavailable', async () => {
-    scripted = 'unavailable'
-    // Drive through the adapter so the session IS chat-bound (a ledger fallback
-    // must still work for a session the router could have handled).
-    const since = approvalEvents.length
-    const drained = adapterTurn('dsh-approval-degrade', 'PERM degrade please')
-    const request = await apprWaitFor('permission/request', since, () => true)
-    await dispatchRpc(approvalManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
+    // The raw ACP payload stays on the frame (constraint 29)…
+    expect(request.toolCall).toMatchObject({ toolCallId: 'call_1', title: 'mock dangerous operation' })
+    // …and `wait` has no deadline at all.
+    expect(request).not.toHaveProperty('deadlineAt')
     await drained
-    expect(await echoOf(request.sessionId, 'PERM degrade please')).toContain('perm=allow1')
+    expect(await askEcho(request.sessionId)).toContain('perm=allow1')
+    expect(askManager.pendingPermissionViews()).toHaveLength(0)
   }, 30_000)
 
-  it('never calls the requester for a session without a DSH chat id', async () => {
-    const start = await dispatchRpc(approvalManager, 'session/start', { agentId: 'appr' })
+  it('omits dshSessionId for an /acp RPC-only ask', async () => {
+    const start = await dispatchRpc(askManager, 'session/start', { agentId: 'ask' })
     if (!start.ok) throw new Error('start failed')
     const id = (start.value as { sessionId: string }).sessionId
-    const callsBefore = calls.length
-    const since = approvalEvents.length
+    const since = askEvents.length
 
-    await dispatchRpc(approvalManager, 'session/prompt', { sessionId: id, text: 'PERM rpc path' })
-    const request = await apprWaitFor('permission/request', since, event => event.sessionId === id)
-    expect(calls).toHaveLength(callsBefore)
-    await dispatchRpc(approvalManager, 'permission/respond', { requestId: request.requestId, optionId: 'reject1' })
-    await apprWaitFor('permission/resolved', since, event => event.requestId === request.requestId)
-    await apprWaitFor('turn/end', since, event => event.sessionId === id && event.stopReason === 'end_turn')
-    expect(await echoOf(id, 'PERM rpc path')).toContain('perm=reject1')
+    const prompted = dispatchRpc(askManager, 'session/prompt', { sessionId: id, text: 'PERM rpc path' })
+    const request = await askWaitFor('permission/request', since, event => event.sessionId === id)
+    // No chat session behind it: the conversation card cannot address it, so
+    // the settings panel is its answer entry.
+    expect(request).not.toHaveProperty('dshSessionId')
+    expect(request.toolName).toBe('mock dangerous operation')
+    expect(request.timeoutMode).toBe('wait')
+    expect(request).not.toHaveProperty('deadlineAt')
+    await dispatchRpc(askManager, 'permission/respond', { requestId: request.requestId, optionId: 'reject1' })
+    await prompted
+    await askWaitFor('turn/end', since, event => event.sessionId === id && event.stopReason === 'end_turn')
+    expect(await askEcho(id)).toContain('perm=reject1')
   }, 30_000)
 
-  it('treats a throwing requester as unavailable instead of failing the turn', async () => {
-    scripted = 'throw'
-    const since = approvalEvents.length
-    const drained = adapterTurn('dsh-approval-throw', 'PERM throw please')
-    const request = await apprWaitFor('permission/request', since, () => true)
-    await dispatchRpc(approvalManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
-    await drained
-    expect(await echoOf(request.sessionId, 'PERM throw please')).toContain('perm=allow1')
-  }, 30_000)
-})
+  it('words the chat line for the answer entry the ask actually has', async () => {
+    // A chat-bound ask is answered on the card above the composer.
+    const sinceChat = askEvents.length
+    const chat = await askTurn('dsh-ask-line', 'PERM ask line')
+    await askWaitFor('permission/request', sinceChat, event => event.dshSessionId === 'dsh-ask-line')
+    await chat.drained
+    expect(chat.reasoning()).toContain('please answer the permission card above the composer')
+    expect(chat.reasoning()).not.toContain('within')
 
-/**
- * The ledger fallback when the native approval chain is wired but DEGRADES.
- *
- * `approvalRouted` reports that the host HAS the approval service; it does not
- * promise every ask reaches the conversation. When the service answers
- * `unavailable` for one ask, the ask falls back to the settings-panel ledger
- * and two things must hold: the turn must not hang forever behind a question
- * the conversation never showed, and the line folded into the chat must name
- * the path the ask actually took instead of pointing at a composer prompt that
- * failed. The DESIGNED ledger paths (no approval service at all, a session
- * with no chat identity) keep waiting for the human — their answer entry is
- * the settings panel, which is where the chat line sends the user.
- */
-describe('a degraded approval route still answers the turn (isolated manager)', () => {
-  const degradeHub = new EventHub()
-  const degradeEvents: AcpEvent[] = []
-  degradeHub.subscribe(event => { degradeEvents.push(event) })
-  // `permissionTimeoutMs` stays at its 0 default ("the two windows are in
-  // charge"); only the degraded-route fallback is shortened so the case runs
-  // in seconds instead of the production five minutes. The mode is `abort`
-  // because this case IS about the deadline firing — the plugin's own default
-  // is `wait` (never expire).
-  const degradeManager = new BridgeManager([{ ...def, id: 'degrade' }], degradeHub, 500, undefined, undefined, true, { permissionTimeoutMs: 2_000, permissionTimeoutMode: 'abort' })
-  const degradeAdapter = new AcpLlmAdapter(degradeManager)
-
-  degradeManager.setApprovalRequester(() => Promise.resolve('unavailable'))
-
-  afterAll(async () => {
-    await degradeManager.shutdownAll()
-  })
-
-  function degradeWaitFor<T extends AcpEvent['type']>(type: T, since: number, predicate: (event: Extract<AcpEvent, { type: T }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: T }>> {
-    const matches = (event: AcpEvent): event is Extract<AcpEvent, { type: T }> =>
-      event.type === type && predicate(event as Extract<AcpEvent, { type: T }>)
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${type}`)), timeoutMs)
-      const unsub = degradeHub.subscribe(event => {
-        if (degradeEvents.indexOf(event) >= since && matches(event)) {
-          clearTimeout(timer)
-          unsub()
-          resolve(event)
-        }
-      })
-      const existing = degradeEvents.find((event, index) => index >= since && matches(event))
-      if (existing !== undefined) {
-        clearTimeout(timer)
-        unsub()
-        resolve(existing)
-      }
+    // An adapter call with no DSH chat session has no conversation to show a
+    // card in; its answer entry is the settings page. The inline agent asks
+    // BEFORE announcing any tool call, so the line lands in the open segment
+    // (a sessionless turn cannot resume a card-bearing segment — there is no
+    // controller lookup key to find).
+    const plainScript = [
+      '(async () => {',
+      "  const { agent, methods, ndJsonStream, PROTOCOL_VERSION } = await import('@agentclientprotocol/sdk')",
+      "  const { Writable, Readable } = require('node:stream')",
+      "  agent({ name: 'plain-ask-fake' })",
+      '    .onRequest(methods.agent.initialize, () => ({',
+      '      protocolVersion: PROTOCOL_VERSION,',
+      "      agentCapabilities: { loadSession: false, promptCapabilities: { image: false, audio: false, embeddedContext: false } },",
+      '      authMethods: [],',
+      '    }))',
+      "    .onRequest(methods.agent.session.new, () => ({ sessionId: 'plain-ask-1' }))",
+      '    .onRequest(methods.agent.session.prompt, async ctx => {',
+      '      await ctx.client.request(methods.client.session.requestPermission, {',
+      '        sessionId: ctx.params.sessionId,',
+      "        toolCall: { toolCallId: 'c1', title: 'Bash' },",
+      "        options: [{ optionId: 'allow1', name: 'Allow once', kind: 'allow_once' }],",
+      '      })',
+      '      await ctx.client.notify(methods.client.session.update, {',
+      '        sessionId: ctx.params.sessionId,',
+      "        update: { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'PLAIN DONE' } },",
+      '      })',
+      "      return { stopReason: 'end_turn' }",
+      '    })',
+      '    .connect(ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin)))',
+      '})()',
+    ].join('\n')
+    const plainHub = new EventHub()
+    const plainEvents: AcpEvent[] = []
+    plainHub.subscribe(event => { plainEvents.push(event) })
+    const plainManager = new BridgeManager([{
+      ...def,
+      id: 'plain-ask',
+      args: ['-e', plainScript],
+      cwd: process.cwd(),
+      allowedCwdRoots: [process.cwd()],
+    }], plainHub, 500)
+    const answers = plainHub.subscribe(event => {
+      if (event.type !== 'permission/request') return
+      void dispatchRpc(plainManager, 'permission/respond', { requestId: event.requestId, optionId: 'allow1' })
     })
-  }
+    try {
+      const parts: string[] = []
+      for await (const chunk of new AcpLlmAdapter(plainManager).stream({
+        provider: 'acp',
+        model: 'plain-ask',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'PERM rpc line' }] }],
+      })) {
+        if (chunk.type === 'reasoning-delta') parts.push(chunk.text)
+      }
+      const frame = plainEvents.find((event): event is Extract<AcpEvent, { type: 'permission/request' }> => event.type === 'permission/request')
+      expect(frame).toBeDefined()
+      expect(frame).not.toHaveProperty('dshSessionId')
+      expect(parts.join('')).toContain('please approve in Settings')
+      expect(parts.join('')).not.toContain('above the composer')
+    } finally {
+      answers()
+      await plainManager.shutdownAll()
+    }
+  }, 30_000)
 
-  /** Drain one adapter turn, collecting the reasoning text it streamed. */
-  async function degradeTurn(sessionId: string, text: string): Promise<{ reasoning: () => string; drained: Promise<void> }> {
+  it('derives the tool name from _meta when the agent omits title', async () => {
+    // Real codebuddy sends the name in `_meta["codebuddy.ai/toolName"]` and
+    // omits the optional `title`; the frame (and therefore the card and the
+    // chat line) must still name the operation.
+    const metaScript = [
+      '(async () => {',
+      "  const { agent, methods, ndJsonStream, PROTOCOL_VERSION } = await import('@agentclientprotocol/sdk')",
+      "  const { Writable, Readable } = require('node:stream')",
+      "  agent({ name: 'meta-fake' })",
+      '    .onRequest(methods.agent.initialize, () => ({',
+      '      protocolVersion: PROTOCOL_VERSION,',
+      "      agentCapabilities: { loadSession: false, promptCapabilities: { image: false, audio: false, embeddedContext: false } },",
+      '      authMethods: [],',
+      '    }))',
+      "    .onRequest(methods.agent.session.new, () => ({ sessionId: 'meta-1' }))",
+      '    .onRequest(methods.agent.session.prompt, async ctx => {',
+      '      const response = await ctx.client.request(methods.client.session.requestPermission, {',
+      '        sessionId: ctx.params.sessionId,',
+      "        toolCall: { toolCallId: 'call_meta', _meta: { 'codebuddy.ai/toolName': 'Bash' } },",
+      "        options: [{ optionId: 'allow1', name: 'Allow once', kind: 'allow_once' }],",
+      '      })',
+      "      const answer = response.outcome.outcome === 'selected' ? response.outcome.optionId : 'cancelled'",
+      '      await ctx.client.notify(methods.client.session.update, {',
+      '        sessionId: ctx.params.sessionId,',
+      "        update: { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: `META:${answer}` } },",
+      '      })',
+      "      return { stopReason: 'end_turn' }",
+      '    })',
+      '    .connect(ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin)))',
+      '})()',
+    ].join('\n')
+    const metaHub = new EventHub()
+    const metaEvents: AcpEvent[] = []
+    metaHub.subscribe(event => { metaEvents.push(event) })
+    const metaManager = new BridgeManager([{
+      ...def,
+      id: 'meta',
+      args: ['-e', metaScript],
+      cwd: process.cwd(),
+      allowedCwdRoots: [process.cwd()],
+    }], metaHub, 500)
+    const metaAdapter = new AcpLlmAdapter(metaManager)
+    try {
+      const drained = (async () => {
+        for await (const chunk of metaAdapter.stream({
+          provider: 'acp',
+          model: 'meta',
+          sessionId: 'dsh-meta-name',
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'PERM meta name' }] }],
+        })) void chunk
+      })()
+      const request = await new Promise<Extract<AcpEvent, { type: 'permission/request' }>>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('timeout waiting for permission/request')), 15_000)
+        const unsub = metaHub.subscribe(event => {
+          if (event.type === 'permission/request') {
+            clearTimeout(timer)
+            unsub()
+            resolve(event)
+          }
+        })
+      })
+      expect(request.toolName).toBe('Bash')
+      expect(request.reason).toBe('Bash')
+      expect(request.toolCall).toMatchObject({ _meta: { 'codebuddy.ai/toolName': 'Bash' } })
+      await dispatchRpc(metaManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
+      await drained
+      await settleTranscript(metaManager, request.sessionId)
+      const transcript = await dispatchRpc(metaManager, 'transcript/get', { sessionId: request.sessionId })
+      if (!transcript.ok) throw new Error('transcript failed')
+      const echo = (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
+        .filter(e => e.update.sessionUpdate === 'agent_message_chunk')
+        .map(e => String((e.update.content as { text?: string }).text ?? ''))
+        .join('')
+      expect(echo).toContain('META:allow1')
+      void metaEvents
+    } finally {
+      await metaManager.shutdownAll()
+    }
+  }, 30_000)
+
+  it('replays a pending ask with exactly the live frame fields', async () => {
+    // The request frame is broadcast once. A client connecting later must get
+    // the SAME fields back, or its conversation card (which filters on
+    // `dshSessionId` and renders `toolName`/`deadlineAt`) drops the ask.
+    const since = askEvents.length
     const parts: string[] = []
     const drained = (async () => {
-      const { chunks } = await hostLoopTurn(degradeAdapter, {
+      const { chunks } = await hostLoopTurn(askAdapter, {
         provider: 'acp',
-        model: 'degrade',
-        sessionId,
-        messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+        model: 'ask',
+        sessionId: 'dsh-ask-replay',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'PERM ask replay' }] }],
       })
       for (const chunk of chunks) {
         if (chunk.type === 'reasoning-delta') parts.push(chunk.text)
       }
     })()
-    return { reasoning: () => parts.join(''), drained }
-  }
-
-  async function degradeEcho(sessionId: string): Promise<string> {
-    await settleTranscript(degradeManager, sessionId)
-    const transcript = await dispatchRpc(degradeManager, 'transcript/get', { sessionId })
-    if (!transcript.ok) throw new Error('transcript failed')
-    return (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
-      .filter(e => e.update.sessionUpdate === 'agent_message_chunk')
-      .map(e => String((e.update.content as { text?: string }).text ?? ''))
-      .join('')
-  }
-
-  it('ends the turn instead of hanging when nobody answers the degraded ask', async () => {
-    const since = degradeEvents.length
-    const { drained } = await degradeTurn('dsh-degrade-hang', 'PERM degrade hang')
-    const request = await degradeWaitFor('permission/request', since, () => true)
-
-    // Nobody answers. The deadline must answer `cancelled` on the human's
-    // behalf — with the default `permissionTimeoutMs: 0` this is the only
-    // thing keeping the turn from hanging forever.
-    const notice = await degradeWaitFor('agent/notice', since, event => event.text.includes('timed out after 2s'))
-    expect(notice.text).toContain('refused')
-    await drained
-    expect(await degradeEcho(request.sessionId)).toContain('perm=cancelled')
-  }, 30_000)
-
-  it('words the chat line by the path the ask took (degraded native route)', async () => {
-    const since = degradeEvents.length
-    const { reasoning, drained } = await degradeTurn('dsh-degrade-line', 'PERM degrade line')
-    const request = await degradeWaitFor('permission/request', since, () => true)
-
-    // A human CAN still answer in the settings panel; answering clears the
-    // deadline, and the turn completes on that answer.
-    await dispatchRpc(degradeManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
-    await drained
-    // The composer prompt the user is waiting for failed, and the ask now
-    // carries a deadline: the line has to say both.
-    expect(reasoning()).toContain('the approval service is unavailable')
-    expect(reasoning()).toContain('approve in Settings within 2s or this request is cancelled')
-    expect(reasoning()).not.toContain('please approve in Settings')
-    expect(await degradeEcho(request.sessionId)).toContain('perm=allow1')
-  }, 30_000)
-
-  it('lists the outstanding ledger asks for a reconnecting client', async () => {
-    // The `permission/request` frame is broadcast ONCE. A client that connects
-    // later — page reload, second tab, stream outage — would never learn this
-    // ask exists, and for a ledger ask the settings card is the only answer
-    // entry (OmniTerm closes the same hole by replaying
-    // `pending_events()` on every WS connect). The manager must therefore be
-    // able to name every outstanding ask with the view it was shown.
-    const since = degradeEvents.length
-    const { drained } = await degradeTurn('dsh-degrade-replay', 'PERM degrade replay')
-    const request = await degradeWaitFor('permission/request', since, () => true)
-
-    const views = degradeManager.pendingPermissionViews()
+    const request = await askWaitFor('permission/request', since, () => true)
+    const views = askManager.pendingPermissionViews()
     expect(views).toHaveLength(1)
-    expect(views[0]).toMatchObject({
-      requestId: request.requestId,
-      sessionId: request.sessionId,
-      toolCall: request.toolCall,
-      options: request.options,
-    })
-
-    await dispatchRpc(degradeManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
+    expect(permissionReplayFrames(views)).toEqual([
+      request,
+      { type: 'permission/synced', requestIds: [request.requestId] },
+    ])
+    await dispatchRpc(askManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
     await drained
-    expect(degradeManager.pendingPermissionViews()).toHaveLength(0)
+    expect(parts.join('')).toContain('please answer the permission card above the composer')
+    expect(askManager.pendingPermissionViews()).toHaveLength(0)
   }, 30_000)
 })
 
 /**
- * The native approval route TAKING a question and never answering it.
+ * The ONE deadline every ask carries.
  *
- * A routed ask has exactly one answer entry — the composer takeover — and no
- * broadcast at all, so a host that accepts the question and then never renders
- * it (the answerer sits outside the browser scope, the conversation is not
- * mounted, the client never received the remote event) hangs the turn behind
- * something invisible: no card, no chat line, no deadline. Reported as issue
- * #2: the ask is logged host-side and nothing ever answers it.
- *
- * The bridge bounds that state instead of trusting the host: past
- * `permissionTimeoutMs` the ask is settled WHERE IT WAS ASKED (the signal
- * handed to the host aborts, settling its waterfall `cancelled` and dropping
- * the composer panel). It is not moved to the ledger: that would send the
- * question to a page the user is not looking at, where a second deadline
- * would cancel it a few minutes later anyway.
+ * There is no second route any more: a chat-bound ask and an `/acp`-RPC ask
+ * are both ledger entries, and an ask nobody answers is settled HERE — with
+ * `abort` refusing it, `auto` picking the option the agent's own kinds imply,
+ * or `wait` never expiring. Each expiry must leave exactly one notice and one
+ * `permission/expired` frame: the card disappears, so the conversation would
+ * otherwise show nothing about what happened to the question.
  */
-describe('a native approval route that never answers still answers the turn (isolated manager)', () => {
-  const silentHub = new EventHub()
-  const silentEvents: AcpEvent[] = []
-  silentHub.subscribe(event => { silentEvents.push(event) })
-  const silentManager = new BridgeManager([{ ...def, id: 'silent' }], silentHub, 500, undefined, undefined, true, {
-    permissionTimeoutMs: 1_200,
-    // The case IS the deadline firing: the plugin's own default is `wait`
-    // (never expire), so the mode has to be picked explicitly here.
-    permissionTimeoutMode: 'abort',
-  })
-  const silentAdapter = new AcpLlmAdapter(silentManager)
-  /** Signals handed to the host approval chain, so a withdrawal is observable. */
-  const hostAsks: { signal: AbortSignal | undefined }[] = []
-
-  silentManager.setApprovalRequester(request => {
-    hostAsks.push({ signal: request.signal })
-    // A host that took the question and will never answer it.
-    return new Promise<ApprovalOutcome>(() => { /* never settles */ })
-  })
+describe('a ledger deadline settles an unanswered ask in place (isolated manager)', () => {
+  const deadlineHub = new EventHub()
+  const deadlineEvents: AcpEvent[] = []
+  deadlineHub.subscribe(event => { deadlineEvents.push(event) })
+  // A shortened window so the case runs in seconds instead of the production
+  // five minutes. The mode is `abort` because this case IS about the deadline
+  // firing — the plugin's own default is `wait` (never expire).
+  const deadlineManager = new BridgeManager([{ ...def, id: 'deadline' }], deadlineHub, 500, undefined, undefined, true, { permissionTimeoutMs: 2_000, permissionTimeoutMode: 'abort' })
+  const deadlineAdapter = new AcpLlmAdapter(deadlineManager)
 
   afterAll(async () => {
-    await silentManager.shutdownAll()
+    await deadlineManager.shutdownAll()
   })
 
-  function silentWaitFor<T extends AcpEvent['type']>(type: T, since: number, predicate: (event: Extract<AcpEvent, { type: T }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: T }>> {
+  function deadlineWaitFor<T extends AcpEvent['type']>(type: T, since: number, predicate: (event: Extract<AcpEvent, { type: T }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: T }>> {
     const matches = (event: AcpEvent): event is Extract<AcpEvent, { type: T }> =>
       event.type === type && predicate(event as Extract<AcpEvent, { type: T }>)
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`timeout waiting for ${type}`)), timeoutMs)
-      const unsub = silentHub.subscribe(event => {
-        if (silentEvents.indexOf(event) >= since && matches(event)) {
+      const unsub = deadlineHub.subscribe(event => {
+        if (deadlineEvents.indexOf(event) >= since && matches(event)) {
           clearTimeout(timer)
           unsub()
           resolve(event)
         }
       })
-      const existing = silentEvents.find((event, index) => index >= since && matches(event))
+      const existing = deadlineEvents.find((event, index) => index >= since && matches(event))
       if (existing !== undefined) {
         clearTimeout(timer)
         unsub()
@@ -2090,12 +2094,12 @@ describe('a native approval route that never answers still answers the turn (iso
   }
 
   /** Drain one adapter turn, collecting the reasoning text it streamed. */
-  async function silentTurn(sessionId: string, text: string): Promise<{ reasoning: () => string; drained: Promise<void> }> {
+  async function deadlineTurn(sessionId: string, text: string): Promise<{ reasoning: () => string; drained: Promise<void> }> {
     const parts: string[] = []
     const drained = (async () => {
-      const { chunks } = await hostLoopTurn(silentAdapter, {
+      const { chunks } = await hostLoopTurn(deadlineAdapter, {
         provider: 'acp',
-        model: 'silent',
+        model: 'deadline',
         sessionId,
         messages: [{ role: 'user', content: [{ type: 'text', text }] }],
       })
@@ -2106,9 +2110,9 @@ describe('a native approval route that never answers still answers the turn (iso
     return { reasoning: () => parts.join(''), drained }
   }
 
-  async function silentEcho(sessionId: string): Promise<string> {
-    await settleTranscript(silentManager, sessionId)
-    const transcript = await dispatchRpc(silentManager, 'transcript/get', { sessionId })
+  async function deadlineEcho(sessionId: string): Promise<string> {
+    await settleTranscript(deadlineManager, sessionId)
+    const transcript = await dispatchRpc(deadlineManager, 'transcript/get', { sessionId })
     if (!transcript.ok) throw new Error('transcript failed')
     return (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
       .filter(e => e.update.sessionUpdate === 'agent_message_chunk')
@@ -2116,87 +2120,138 @@ describe('a native approval route that never answers still answers the turn (iso
       .join('')
   }
 
-  it('refuses the ask where it was asked, without moving it to the ledger', async () => {
-    const since = silentEvents.length
-    const { reasoning, drained } = await silentTurn('dsh-silent-withdraw', 'PERM silent withdraw')
-    const expired = await silentWaitFor('permission/expired', since, () => true)
+  it('refuses once and leaves an expiry trace in the conversation', async () => {
+    const since = deadlineEvents.length
+    const { reasoning, drained } = await deadlineTurn('dsh-deadline-abort', 'PERM deadline abort')
+    const request = await deadlineWaitFor('permission/request', since, () => true)
 
-    // Exactly one host ask, and it was withdrawn: the signal the bridge handed
-    // over aborted, which is what settles the host waterfall `cancelled` in
-    // production and drops the composer panel.
-    expect(hostAsks).toHaveLength(1)
-    expect(hostAsks[0]?.signal?.aborted).toBe(true)
-
-    // The ask is NOT relocated. It never becomes a ledger entry, so there is no
-    // card to answer and no second chance in a page the user is not looking
-    // at — the deadline ends the question where it was asked.
-    expect(silentEvents.slice(since).filter(e => e.type === 'permission/request')).toHaveLength(0)
-    expect(silentManager.pendingPermissionViews()).toHaveLength(0)
-
-    await drained
-    // The conversation says what happened to the question; otherwise the
-    // composer card just vanishes with nothing said about it.
-    expect(reasoning()).toContain('no answer within 1s; refused')
-    expect(await silentEcho(expired.sessionId)).toContain('perm=cancelled')
-  }, 30_000)
-
-  it('ends the turn at its own deadline instead of hanging', async () => {
-    const since = silentEvents.length
-    const { drained } = await silentTurn('dsh-silent-hang', 'PERM silent hang')
-    const expired = await silentWaitFor('permission/expired', since, () => true)
-
-    // Nobody answered anywhere. The deadline settles the ask IN PLACE — the
-    // turn ends on that answer instead of hanging behind a question the
-    // conversation never showed.
-    const notice = await silentWaitFor('agent/notice', since, event => event.text.includes('timed out after 1s'))
-    expect(notice.text).toContain('refused')
-    await drained
-    expect(await silentEcho(expired.sessionId)).toContain('perm=cancelled')
-  }, 30_000)
-
-  it('leaves a promptly answered native ask alone', async () => {
-    // The deadline is a withdrawal, not an answer: a host that answers inside
-    // the window must never reach the ledger, and the ask must not be counted
-    // twice.
-    const before = hostAsks.length
-    const since = silentEvents.length
-    silentManager.setApprovalRequester(request => {
-      hostAsks.push({ signal: request.signal })
-      return new Promise<ApprovalOutcome>(resolve => { setTimeout(() => { resolve('allowed-once') }, 50) })
+    // Nobody answers. The deadline settles the SAME ledger entry: the
+    // conversation gets one expiry frame, and the ledger notice fires once.
+    const expired = await deadlineWaitFor('permission/expired', since, event => event.sessionId === request.sessionId)
+    expect(expired).toMatchObject({
+      sessionId: request.sessionId,
+      toolCall: { title: 'mock dangerous operation' },
+      timeoutMs: 2_000,
+      outcome: { outcome: 'cancelled' },
     })
-    const { drained } = await silentTurn('dsh-silent-prompt', 'PERM silent prompt')
+    expect(expired).not.toHaveProperty('optionName')
+    const notices = deadlineEvents.slice(since).filter((event): event is Extract<AcpEvent, { type: 'agent/notice' }> =>
+      event.type === 'agent/notice' && event.text.includes('timed out after 2s'))
+    expect(notices).toHaveLength(1)
+    expect(notices[0]?.text).toContain('refused')
+
     await drained
-    expect(hostAsks).toHaveLength(before + 1)
-    expect(silentEvents.slice(since).filter(e => e.type === 'permission/request')).toHaveLength(0)
-    const turn = silentEvents.find(e => e.type === 'turn/start' && e.text === 'PERM silent prompt')
-    expect(turn).toBeDefined()
-    expect(await silentEcho(turn!.sessionId)).toContain('perm=allow1')
-    // Restore the never-answering requester for any later case.
-    silentManager.setApprovalRequester(request => {
-      hostAsks.push({ signal: request.signal })
-      return new Promise<ApprovalOutcome>(() => { /* never settles */ })
-    })
+    expect(reasoning()).toContain('no answer within 2s; refused')
+    expect(await deadlineEcho(request.sessionId)).toContain('perm=cancelled')
+    // The entry is gone: answering now is an error, not a second chance.
+    const late = await dispatchRpc(deadlineManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
+    expect(late).toMatchObject({ ok: false, error: { code: 'unknown_request' } })
+    expect(deadlineManager.pendingPermissionViews()).toHaveLength(0)
   }, 30_000)
 
+  it('carries the deadline on the frame and words the chat line with it', async () => {
+    const since = deadlineEvents.length
+    const { reasoning, drained } = await deadlineTurn('dsh-deadline-line', 'PERM deadline line')
+    const request = await deadlineWaitFor('permission/request', since, () => true)
+    expect(request.timeoutMode).toBe('abort')
+    expect(typeof request.deadlineAt).toBe('number')
+    expect(request.deadlineAt).toBeGreaterThan(Date.now())
+
+    // A human answers on the card; the armed deadline is cleared with it.
+    await dispatchRpc(deadlineManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
+    await drained
+    expect(reasoning()).toContain('please answer the permission card above the composer within 2s or this request is cancelled')
+    expect(await deadlineEcho(request.sessionId)).toContain('perm=allow1')
+  }, 30_000)
+
+  it('answers automatically in auto mode and says which option it picked', async () => {
+    const autoHub = new EventHub()
+    const autoEvents: AcpEvent[] = []
+    autoHub.subscribe(event => { autoEvents.push(event) })
+    const autoManager = new BridgeManager([{ ...def, id: 'autodeadline' }], autoHub, 500, undefined, undefined, true, {
+      permissionTimeoutMs: 600,
+      permissionTimeoutMode: 'auto',
+    })
+    const autoAdapter = new AcpLlmAdapter(autoManager)
+    const autoWaitFor = <T extends AcpEvent['type']>(type: T, predicate: (event: Extract<AcpEvent, { type: T }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: T }>> => {
+      const matches = (event: AcpEvent): event is Extract<AcpEvent, { type: T }> =>
+        event.type === type && predicate(event as Extract<AcpEvent, { type: T }>)
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`timeout waiting for ${type}`)), timeoutMs)
+        const unsub = autoHub.subscribe(event => {
+          if (matches(event)) {
+            clearTimeout(timer)
+            unsub()
+            resolve(event)
+          }
+        })
+        const existing = autoEvents.find(matches)
+        if (existing !== undefined) {
+          clearTimeout(timer)
+          unsub()
+          resolve(existing)
+        }
+      })
+    }
+    try {
+      const parts: string[] = []
+      const drained = (async () => {
+        const { chunks } = await hostLoopTurn(autoAdapter, {
+          provider: 'acp',
+          model: 'autodeadline',
+          sessionId: 'dsh-deadline-auto',
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'PERM deadline auto' }] }],
+        })
+        for (const chunk of chunks) {
+          if (chunk.type === 'reasoning-delta') parts.push(chunk.text)
+        }
+      })()
+      const request = await autoWaitFor('permission/request', () => true)
+      expect(request.timeoutMode).toBe('auto')
+      // The agent's own kinds imply allow_once first; the plugin answers with
+      // it and says so, because nobody looked at the approval.
+      const expired = await autoWaitFor('permission/expired', event => event.sessionId === request.sessionId)
+      expect(expired).toMatchObject({
+        outcome: { outcome: 'selected', optionId: 'allow1' },
+        optionName: 'Allow once',
+      })
+      const notices = autoEvents.filter((event): event is Extract<AcpEvent, { type: 'agent/notice' }> =>
+        event.type === 'agent/notice' && event.text.includes('answered "Allow once"'))
+      expect(notices).toHaveLength(1)
+      await drained
+      expect(parts.join('')).toContain('no answer within 1s; answered "Allow once" automatically, continuing')
+      const transcript = await dispatchRpc(autoManager, 'transcript/get', { sessionId: request.sessionId })
+      if (!transcript.ok) throw new Error('transcript failed')
+      const echo = (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
+        .filter(e => e.update.sessionUpdate === 'agent_message_chunk')
+        .map(e => String((e.update.content as { text?: string }).text ?? ''))
+        .join('')
+      expect(echo).toContain('perm=allow1')
+    } finally {
+      await autoManager.shutdownAll()
+    }
+  }, 30_000)
+})
+
+/**
+ * A deadline adopted from the settings page.
+ *
+ * The whole point of the settings card over a config-file edit: the window
+ * changes WITHOUT restarting the bridge, which would cost the user every
+ * running session. Pass the new number to a live bridge, then run a turn — an
+ * ask raised after the write must follow it, and the frame / notice / chat
+ * line must all say the same thing.
+ */
+describe('a rewritten deadline reaches the next ask (isolated manager)', () => {
   it('adopts a deadline the settings page writes while a session is live', async () => {
-    // The whole point of the settings card over a config-file edit: the window
-    // changes WITHOUT restarting the bridge, which would cost the user every
-    // running session. Built with a window far too long to observe, then
-    // shortened through the settings route — the withdrawal must follow the new
-    // number, not the one the bridge was constructed with.
     const hotHub = new EventHub()
     const hotEvents: AcpEvent[] = []
     hotHub.subscribe(event => { hotEvents.push(event) })
     const hotManager = new BridgeManager([{ ...def, id: 'hot' }], hotHub, 500, undefined, undefined, true, {
       permissionTimeoutMs: 600_000,
-      // The write below shortens the windows; the MODE is what makes an
-      // expiry do something, and the plugin's default (`wait`) never expires.
+      // The write below shortens the window; the MODE is what makes an expiry
+      // do something, and the plugin's default (`wait`) never expires.
       permissionTimeoutMode: 'abort',
-    })
-    const hotAsks: { signal: AbortSignal | undefined }[] = []
-    hotManager.setApprovalRequester(request => {
-      hotAsks.push({ signal: request.signal })
-      return new Promise<ApprovalOutcome>(() => { /* never settles */ })
     })
     const hotWaitFor = <T extends AcpEvent['type']>(type: T, since: number, predicate: (event: Extract<AcpEvent, { type: T }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: T }>> => {
       const matches = (event: AcpEvent): event is Extract<AcpEvent, { type: T }> =>
@@ -2227,20 +2282,25 @@ describe('a native approval route that never answers still answers the turn (iso
         const { chunks } = await hostLoopTurn(new AcpLlmAdapter(hotManager), {
           provider: 'acp',
           model: 'hot',
-          sessionId: 'dsh-silent-hot',
-          messages: [{ role: 'user', content: [{ type: 'text', text: 'PERM silent hot' }] }],
+          sessionId: 'dsh-hot-deadline',
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'PERM hot deadline' }] }],
         })
         for (const chunk of chunks) {
           if (chunk.type === 'reasoning-delta') parts.push(chunk.text)
         }
       })()
-      // Settled on the NEW 600ms window, not the 600s one it was built with.
-      await hotWaitFor('permission/expired', since, () => true)
-      expect(hotAsks).toHaveLength(1)
-      expect(hotAsks[0]?.signal?.aborted).toBe(true)
+      const request = await hotWaitFor('permission/request', since, () => true)
+      // The frame describes the NEW 600ms window, not the 600s one the
+      // bridge was built with.
+      expect(request.timeoutMode).toBe('abort')
+      expect(request.deadlineAt! - Date.now()).toBeLessThan(2_000)
+      // Settled on that window, with one notice and one expiry frame.
+      const expired = await hotWaitFor('permission/expired', since, () => true)
+      expect(expired).toMatchObject({ timeoutMs: 600, outcome: { outcome: 'cancelled' } })
       const notice = await hotWaitFor('agent/notice', since, event => event.text.includes('timed out after 1s'), 5_000)
       expect(notice.text).toContain('refused')
       await drained
+      expect(parts.join('')).toContain('please answer the permission card above the composer within 1s or this request is cancelled')
       expect(parts.join('')).toContain('no answer within 1s; refused')
     } finally {
       await hotManager.shutdownAll()
@@ -2249,12 +2309,108 @@ describe('a native approval route that never answers still answers the turn (iso
 })
 
 /**
+ * Withdrawal and close ordering at the `AgentBridge` level.
+ *
+ * The ACP request's own `signal` is how an ask disappears without an answer:
+ * the agent withdrew it, or the connection died. A withdrawn ask must leave
+ * the ledger (and broadcast `permission/resolved`), or its card sits there
+ * forever and `hasActiveWork` never clears. The mock agent cannot cancel its
+ * own outgoing request, so these cases drive the bridge directly.
+ */
+describe('permission ask withdrawal and close ordering (AgentBridge)', () => {
+  type AskSeam = {
+    acpIndex: Map<string, unknown>
+    conn?: unknown
+    state: string
+    handlePermissionRequest(
+      acpSessionId: string,
+      toolCall: unknown,
+      options: Array<{ optionId: string; name: string; kind: string }>,
+      signal?: AbortSignal,
+    ): Promise<{ outcome: { outcome: string; optionId?: string } }>
+    closeSession(session: unknown, reason: string): Promise<void>
+  }
+
+  const askOptions = [{ optionId: 'allow1', name: 'Allow once', kind: 'allow_once' }]
+
+  it('settles a signal-aborted ask as cancelled and drops its card', async () => {
+    const hub = new EventHub()
+    const events: AcpEvent[] = []
+    hub.subscribe(event => { events.push(event) })
+    const bridge = new AgentBridge({ ...def, id: 'withdraw' }, hub, 500, () => {})
+    const seam = bridge as unknown as AskSeam
+    seam.acpIndex.set('acp-withdraw', { sessionId: 'host-withdraw', acpSessionId: 'acp-withdraw', closed: false })
+
+    const controller = new AbortController()
+    const answered = seam.handlePermissionRequest('acp-withdraw', { title: 'Bash' }, askOptions, controller.signal)
+    const request = events.find((event): event is Extract<AcpEvent, { type: 'permission/request' }> => event.type === 'permission/request')
+    expect(request).toBeDefined()
+    expect(bridge.permissions.has(request!.requestId)).toBe(true)
+
+    controller.abort()
+    await expect(answered).resolves.toEqual({ outcome: { outcome: 'cancelled' } })
+    expect(events.find(event => event.type === 'permission/resolved')).toMatchObject({
+      requestId: request!.requestId,
+      sessionId: 'host-withdraw',
+      outcome: { outcome: 'cancelled' },
+    })
+    expect(bridge.permissions.has(request!.requestId)).toBe(false)
+  })
+
+  it('removes the abort listener once the ask is answered', async () => {
+    const hub = new EventHub()
+    const events: AcpEvent[] = []
+    hub.subscribe(event => { events.push(event) })
+    const bridge = new AgentBridge({ ...def, id: 'detach' }, hub, 500, () => {})
+    const seam = bridge as unknown as AskSeam
+    seam.acpIndex.set('acp-detach', { sessionId: 'host-detach', acpSessionId: 'acp-detach', closed: false })
+
+    const controller = new AbortController()
+    const answered = seam.handlePermissionRequest('acp-detach', { title: 'Bash' }, askOptions, controller.signal)
+    const request = events.find((event): event is Extract<AcpEvent, { type: 'permission/request' }> => event.type === 'permission/request')
+    bridge.permissions.respond(request!.requestId, { outcome: 'selected', optionId: 'allow1' })
+    await expect(answered).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'allow1' } })
+    // Aborting after the answer must be a no-op, not a second resolution.
+    controller.abort()
+    expect(events.filter(event => event.type === 'permission/resolved')).toHaveLength(1)
+    expect(bridge.permissions.has(request!.requestId)).toBe(false)
+  })
+
+  it('settles outstanding asks before waiting for session/close', async () => {
+    const hub = new EventHub()
+    const bridge = new AgentBridge({ ...def, id: 'close-order' }, hub, 500, () => {})
+    const seam = bridge as unknown as AskSeam
+    const session = { sessionId: 'host-close', acpSessionId: 'acp-close', closed: false, running: true }
+    seam.acpIndex.set('acp-close', session)
+
+    const asked = seam.handlePermissionRequest('acp-close', { title: 'Bash' }, askOptions)
+    expect(bridge.permissions.sessionIds()).toHaveLength(1)
+
+    // A `session/close` the agent never answers (it is blocked on the ask).
+    let releaseClose: (() => void) | undefined
+    const closeGate = new Promise<void>(resolve => { releaseClose = resolve })
+    const closeCalls: unknown[] = []
+    seam.state = 'ready'
+    seam.conn = { agent: { request: (_method: string, params: unknown) => { closeCalls.push(params); return closeGate } } }
+
+    const closing = seam.closeSession(session, 'closed')
+    // The ask settles even though `session/close` is still in flight: settling
+    // first is what keeps a waiting agent from holding the close open.
+    await expect(Promise.race([asked, new Promise(resolve => setTimeout(() => resolve('still-pending'), 200))]))
+      .resolves.toEqual({ outcome: { outcome: 'cancelled' } })
+    expect(closeCalls).toHaveLength(1)
+    releaseClose!()
+    await closing
+    expect(bridge.permissions.sessionIds()).toHaveLength(0)
+  })
+})
+
+/**
  * The zero window: 不等待 — the ask is settled the moment it arrives.
  *
  * A window of `0` does not mean "waited for zero seconds"; it means nobody is
- * going to be asked at all. The native route therefore never reaches the host
- * (a composer card that appears and vanishes answers nothing), and the ledger
- * route never creates an entry (there would be no card to answer).
+ * going to be asked at all, so the ledger never creates an entry and never
+ * broadcasts a card (there would be nothing to answer).
  *
  * This rung belongs to the **auto** mode: it ANSWERS the ask with the option
  * the agent's own kinds imply, so the agent continues. Under `abort` the same
@@ -2266,8 +2422,8 @@ describe('a native approval route that never answers still answers the turn (iso
 describe('a zero window settles the ask without asking anyone (isolated manager)', () => {
   interface ZeroCase {
     events: AcpEvent[]
-    /** How many times the HOST was asked for an answer. */
-    hostAsks: number
+    /** How many `permission/request` frames were broadcast. */
+    requested: number
     /** Asks still waiting for an answer on the ledger. */
     pending: number
     /** The window actually in force. */
@@ -2277,13 +2433,11 @@ describe('a zero window settles the ask without asking anyone (isolated manager)
   }
 
   /**
-   * Run one PERM turn on a manager whose window is `0`.
-   *
-   * The adapter is the only path that binds a DSH chat session id, so it is
-   * also the only path that can reach the native route — the case that has to
-   * prove the host is NOT asked.
+   * Run one PERM turn on a manager whose window is `0`. Any ask that DOES
+   * reach the ledger is answered the way the browser's card would, so a
+   * floored window (abort / wait) cannot hang the turn.
    */
-  async function zeroCase(id: string, mode: 'auto' | 'abort' | 'wait', withRequester = true): Promise<ZeroCase> {
+  async function zeroCase(id: string, mode: 'auto' | 'abort' | 'wait'): Promise<ZeroCase> {
     const caseHub = new EventHub()
     const caseEvents: AcpEvent[] = []
     caseHub.subscribe(event => { caseEvents.push(event) })
@@ -2291,13 +2445,10 @@ describe('a zero window settles the ask without asking anyone (isolated manager)
       permissionTimeoutMs: 0,
       permissionTimeoutMode: mode,
     })
-    let hostAsks = 0
-    if (withRequester) {
-      caseManager.setApprovalRequester(() => {
-        hostAsks += 1
-        return Promise.resolve<ApprovalOutcome>('allowed-once')
-      })
-    }
+    const answers = caseHub.subscribe(event => {
+      if (event.type !== 'permission/request') return
+      void dispatchRpc(caseManager, 'permission/respond', { requestId: event.requestId, optionId: 'allow1' })
+    })
     const adapter = new AcpLlmAdapter(caseManager)
     const parts: string[] = []
     const sessionKey = `dsh-zero-${id}`
@@ -2325,25 +2476,24 @@ describe('a zero window settles the ask without asking anyone (isolated manager)
         .join('')
       return {
         events: caseEvents,
-        hostAsks,
+        requested: caseEvents.filter(e => e.type === 'permission/request').length,
         pending: caseManager.pendingPermissionViews().length,
         effectiveWindow: caseManager.approvalDeadlines().permissionTimeoutMs,
         reasoning: parts.join(''),
         echo,
       }
     } finally {
+      answers()
       await caseManager.shutdownAll()
     }
   }
 
-  it('auto: answers on the spot, without asking the host', async () => {
+  it('auto: answers on the spot, with no card at all', async () => {
     const result = await zeroCase('zeroauto', 'auto')
-    // The host was NEVER asked: a card that appears and vanishes answers
-    // nothing, and there is no second chance for it.
-    expect(result.hostAsks).toBe(0)
-    // Nor is there a ledger entry left waiting for later.
+    // No card was broadcast, and no ledger entry was left waiting: the ask was
+    // answered before it could reach a page.
+    expect(result.requested).toBe(0)
     expect(result.pending).toBe(0)
-    expect(result.events.filter(e => e.type === 'permission/request')).toHaveLength(0)
     // The window in force IS 不等待.
     expect(result.effectiveWindow).toBe(0)
     // The agent still got an answer — the option its own kinds imply.
@@ -2351,19 +2501,20 @@ describe('a zero window settles the ask without asking anyone (isolated manager)
     // And the conversation says so. "not waited for" is not "waited 0 seconds":
     // the two say different things to the human reading the transcript.
     expect(result.reasoning).toContain('not waited for; answered "Allow once" automatically, continuing')
-    const notice = result.events.find(e => e.type === 'agent/notice')
-    expect(notice?.text).toContain('was not waited for; answered "Allow once"')
+    const notices = result.events.filter((event): event is Extract<AcpEvent, { type: 'agent/notice' }> => event.type === 'agent/notice')
+    expect(notices).toHaveLength(1)
+    expect(notices[0]?.text).toContain('was not waited for; answered "Allow once"')
   }, 30_000)
 
-  it('abort: never settles on arrival — the ask still reaches the human', async () => {
+  it('abort: never settles on arrival — the floored window still asks the human', async () => {
     const result = await zeroCase('zeroabort', 'abort')
     // 不等待 is the auto mode's rung. Under 超时中止 a zero window would
     // refuse every ask the instant it arrived: the agent stops at every gate
     // it meets. So the window floors to the shortest REAL wait.
     expect(result.effectiveWindow).toBe(30_000)
-    // Which means the host IS asked — the question was not answered behind
-    // the human's back.
-    expect(result.hostAsks).toBe(1)
+    // Which means the ask DID reach the ledger — the question was not answered
+    // behind the human's back.
+    expect(result.requested).toBe(1)
     expect(result.echo).toContain('perm=allow1')
     // Nothing settled it on arrival: no expiry, no notice.
     expect(result.events.filter(e => e.type === 'permission/expired')).toHaveLength(0)
@@ -2374,96 +2525,23 @@ describe('a zero window settles the ask without asking anyone (isolated manager)
     const result = await zeroCase('zerowait', 'wait')
     // `wait` says the ask never expires. The window is the OTHER axis, and the
     // mode outranks it — a wait-mode ask still reaches the human.
-    expect(result.hostAsks).toBe(1)
+    expect(result.requested).toBe(1)
     expect(result.echo).toContain('perm=allow1')
     // Nothing settled it behind the human's back.
     expect(result.events.filter(e => e.type === 'permission/expired')).toHaveLength(0)
     expect(result.events.filter(e => e.type === 'agent/notice')).toHaveLength(0)
   }, 30_000)
-
-  it('the ledger route settles on the spot too, with no card to answer', async () => {
-    // No approval service at all → the ask would have ridden the ledger. It
-    // never does: nothing is pending, and no card is broadcast for a page the
-    // user is not looking at.
-    const result = await zeroCase('zeroledger', 'auto', false)
-    expect(result.hostAsks).toBe(0)
-    expect(result.pending).toBe(0)
-    expect(result.events.filter(e => e.type === 'permission/request')).toHaveLength(0)
-    expect(result.echo).toContain('perm=allow1')
-    expect(result.reasoning).toContain('not waited for; answered "Allow once" automatically, continuing')
-  }, 30_000)
 })
 
 /**
- * The DESIGNED ledger path: a host with no approval service at all.
+ * The `wait` mode keeps an ask pending.
  *
- * Every ask rides the ledger and the settings panel's card is the answer
- * entry, so the chat line names the panel plainly. The ledger's own window
- * applies here too — an ask nobody can see in the conversation is exactly the
- * one that must not hang the turn — and the `wait` mode is the way to say
- * "keep it pending until I come back".
+ * `wait` means "never expire": the ask stays on the ledger, visibly, until a
+ * human answers it or the session is cancelled — no notice, no automatic
+ * answer, and no deadline clause in the chat line.
  */
-describe('the designed ledger path answers in Settings (isolated manager)', () => {
-  const plainHub = new EventHub()
-  const plainEvents: AcpEvent[] = []
-  plainHub.subscribe(event => { plainEvents.push(event) })
-  // A shortened ledger deadline so the case runs in seconds instead of the
-  // production five minutes. The mode is `abort` because this case IS about
-  // the deadline firing — the plugin's own default is `wait` (never expire).
-  const plainManager = new BridgeManager([{ ...def, id: 'plain' }], plainHub, 500, undefined, undefined, true, { permissionTimeoutMs: 2_000, permissionTimeoutMode: 'abort' })
-  const plainAdapter = new AcpLlmAdapter(plainManager)
-
-  afterAll(async () => {
-    await plainManager.shutdownAll()
-  })
-
-  it('carries a deadline and says where to answer', async () => {
-    expect(plainManager.approvalRouting()).toBe(false)
-    const since = plainEvents.length
-    const parts: string[] = []
-    // The whole turn, continuation steps included: the permission ask cuts the
-    // first segment, so draining one stream() call is NOT draining the turn.
-    const plainDrained = hostLoopTurn(plainAdapter, {
-      provider: 'acp',
-      model: 'plain',
-      sessionId: 'dsh-plain-ledger',
-      messages: [{ role: 'user', content: [{ type: 'text', text: 'PERM plain ledger' }] }],
-    })
-    const request = await new Promise<Extract<AcpEvent, { type: 'permission/request' }>>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('timeout waiting for permission/request')), 15_000)
-      const unsub = plainHub.subscribe(event => {
-        if (plainEvents.indexOf(event) >= since && event.type === 'permission/request') {
-          clearTimeout(timer)
-          unsub()
-          resolve(event)
-        }
-      })
-    })
-
-    // Answering in Settings still works, and the line says where to answer and
-    // what happens if nobody does.
-    await dispatchRpc(plainManager, 'permission/respond', { requestId: request.requestId, optionId: 'allow1' })
-    const { chunks } = await plainDrained
-    for (const chunk of chunks) {
-      if (chunk.type === 'reasoning-delta') parts.push(chunk.text)
-    }
-
-    const reasoning = parts.join('')
-    expect(reasoning).toContain('approve in Settings within 2s or this request is cancelled')
-    expect(reasoning).not.toContain('unavailable')
-    const transcript = await dispatchRpc(plainManager, 'transcript/get', { sessionId: request.sessionId })
-    expect(transcript.ok).toBe(true)
-    if (!transcript.ok) return
-    const echo = (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
-      .filter(e => e.update.sessionUpdate === 'agent_message_chunk')
-      .map(e => String((e.update.content as { text?: string }).text ?? ''))
-      .join('')
-    expect(echo).toContain('perm=allow1')
-  }, 30_000)
-
-  it('keeps the ask pending in the wait mode', async () => {
-    // `wait` means "never expire": the ask stays on the ledger, visibly,
-    // until a human answers it or the session is cancelled.
+describe('the wait mode keeps an ask pending (isolated manager)', () => {
+  it('never settles on its own and carries no deadline clause', async () => {
     const waitHub = new EventHub()
     const waitEvents: AcpEvent[] = []
     waitHub.subscribe(event => { waitEvents.push(event) })
@@ -2492,8 +2570,8 @@ describe('the designed ledger path answers in Settings (isolated manager)', () =
         })
       })
 
-      // Well past the window: no notice, no auto-answer. The panel card is the
-      // answer entry and it waits for the human.
+      // Well past the window: no notice, no auto-answer, and the ledger entry
+      // is still there waiting for the human.
       await new Promise(resolve => setTimeout(resolve, 600))
       expect(waitEvents.slice(since).filter(e => e.type === 'agent/notice')).toHaveLength(0)
       expect(waitManager.pendingPermissionViews()).toHaveLength(1)
@@ -2504,7 +2582,7 @@ describe('the designed ledger path answers in Settings (isolated manager)', () =
         if (chunk.type === 'reasoning-delta') parts.push(chunk.text)
       }
       // No deadline clause: nothing is going to happen on its own.
-      expect(parts.join('')).toContain('please approve in Settings')
+      expect(parts.join('')).toContain('please answer the permission card above the composer')
       expect(parts.join('')).not.toContain('within')
     } finally {
       await waitManager.shutdownAll()
@@ -2659,11 +2737,11 @@ describe("a segmented turn interleaves like a native multi-step turn (isolated m
  *
  * The retired axis resolved a DSH access mode and pre-judged every ask against
  * it. It is gone: an ACP agent is fully autonomous, so the ask the agent raises
- * is what reaches the human, routed to the native composer when the host's
- * approval chain is available and otherwise to the settings-panel ledger. The
- * workspace resolver these cases used to fake as an access mode is now just
- * the workspace reader (`src/index.ts`'s `wireWorkspace`), so they still
- * exercise the production path without a live DSH host.
+ * is what reaches the human — unchanged — through this plugin's own permission
+ * ledger (the conversation card). The workspace resolver these cases used to
+ * fake as an access mode is now just the workspace reader (`src/index.ts`'s
+ * `wireWorkspace`), so they still exercise the production path without a live
+ * DSH host.
  */
 describe('permission mapping and the agent\'s own modes (isolated manager)', () => {
   const modeHub = new EventHub()
@@ -2671,13 +2749,6 @@ describe('permission mapping and the agent\'s own modes (isolated manager)', () 
   modeHub.subscribe(event => { modeEvents.push(event) })
   const modeManager = new BridgeManager([{ ...def, id: 'moded' }], modeHub, 500)
   const modeAdapter = new AcpLlmAdapter(modeManager)
-  const asks: ApprovalRequestContext[] = []
-  let answer: ApprovalOutcome = 'allowed-once'
-
-  modeManager.setApprovalRequester(request => {
-    asks.push(request)
-    return Promise.resolve(answer)
-  })
 
   afterAll(async () => {
     await modeManager.shutdownAll()
@@ -2740,20 +2811,28 @@ describe('permission mapping and the agent\'s own modes (isolated manager)', () 
   }
 
   /**
-   * Wait until the session's transcript stops growing, then read the mock
-   * agent's own echo of what it saw. See the module-level `settleTranscript`
-   * for why the wait is not optional.
+   * Run one PERM turn, answering the ask it raises the way the browser's
+   * conversation card would, then read the mock agent's own echo of what it
+   * saw. See the module-level `settleTranscript` for why the wait is not
+   * optional.
    */
-  async function modeTurn(sessionId: string, text: string): Promise<string> {
+  async function modeTurn(sessionId: string, text: string, optionId = 'allow1'): Promise<string> {
     const since = modeEvents.length
-    for await (const chunk of modeAdapter.stream({
-      provider: 'acp',
-      model: 'moded',
-      sessionId,
-      messages: [{ role: 'user', content: [{ type: 'text', text }] }],
-    })) {
-      void chunk
+    const drained = (async () => {
+      for await (const chunk of modeAdapter.stream({
+        provider: 'acp',
+        model: 'moded',
+        sessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+      })) {
+        void chunk
+      }
+    })()
+    if (text.includes('PERM')) {
+      const request = await modeWaitFor('permission/request', since, () => true)
+      await dispatchRpc(modeManager, 'permission/respond', { requestId: request.requestId, optionId })
     }
+    await drained
     const started = modeEvents.slice(since).find(event => event.type === 'turn/start' && event.text === text)
     if (started === undefined) throw new Error('the turn never started')
     await settleTranscript(modeManager, started.sessionId)
@@ -2769,19 +2848,20 @@ describe('permission mapping and the agent\'s own modes (isolated manager)', () 
     // The retired axis pre-judged every ask against a resolved DSH access mode
     // (and got it backwards: `never` denied everything `full access` meant to
     // allow). Now the ask the agent raises is what reaches the human —
-    // unchanged.
-    answer = 'allowed-once'
-    const before = asks.length
+    // unchanged — on the conversation card.
+    const since = modeEvents.length
     expect(await modeTurn('dsh-perm-1', 'PERM dangerous thing')).toContain('perm=allow1')
-    expect(asks).toHaveLength(before + 1)
-    expect(asks.at(-1)?.toolName).toBe('mock dangerous operation')
+    const request = modeEvents.slice(since).find((event): event is Extract<AcpEvent, { type: 'permission/request' }> => event.type === 'permission/request')
+    expect(request).toBeDefined()
+    expect(request!.toolName).toBe('mock dangerous operation')
+    expect(request!.dshSessionId).toBe('dsh-perm-1')
+    expect(request!.options.map(o => o.kind)).toEqual(['allow_once', 'reject_once'])
   }, 30_000)
 
   it('narrates nothing into the prompt, whatever the agent asks', async () => {
     // The mock echoes its whole input, so byte equality is the whole guard. A
-    // permission question is answered in the conversation; it is never narrated
-    // into the prompt the agent receives.
-    answer = 'allowed-once'
+    // permission question is answered on its card; it is never narrated into
+    // the prompt the agent receives.
     expect(await modeTurn('dsh-perm-quiet', 'PERM tell me nothing'))
       .toBe('MOCK: echo PERM tell me nothing perm=allow1')
   }, 30_000)

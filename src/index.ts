@@ -11,31 +11,14 @@ import type { ConnectionRpcHandler, HostConnectionHandle } from '@deepseek-ai/ds
 import { ACP_PRESET_ID, AcpLlmAdapter, BridgeManager } from './bridge.ts'
 import { EventHub, dispatchRpc, permissionReplayFrames, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
 import type { AcpEvent, ApprovalDeadlineKey } from './protocol.ts'
-import type { ApprovalOutcome } from './bridge.ts'
 import type { RosterPresetRow, SessionLogLike } from './impl.ts'
 
 export const name = 'dsh-ntr'
-// `approval` / `agents` are deliberately NOT listed here: they are optional
-// collaborators probed structurally below. A hard dependency would make the
-// whole plugin fail to load on a deployment without them (see the LLM service
-// probe, which follows the same shape).
+// Deliberately minimal: every other host service is probed structurally
+// (`ctx.get` + a late `ctx.inject`) so a deployment without one still loads
+// this plugin. ACP permission asks are answered through this plugin's own
+// ledger, so the host approval service is not a collaborator at all.
 export const inject = ['webServer', 'connection']
-
-/** Structural view of the host approval service (`@deepseek-ai/dsh-user-approval`). */
-interface ApprovalServiceLike {
-  request(req: { agent: unknown; toolName: string; reason?: string; callId?: string; signal?: AbortSignal }): Promise<ApprovalOutcome>
-  /**
-   * Present on the host service, but NEVER read by this plugin: the only call
-   * made here is `request` (see `wireApproval`). A deployment-wide default
-   * policy is the host's own business.
-   */
-  config?: { policy?: string }
-}
-
-/** Structural view of the host agent registry (`ctx.agents`), keyed by chat session id. */
-interface AgentsServiceLike {
-  get(sessionId: string): unknown | undefined
-}
 
 /** Structural view of the host sandbox policy service (`@deepseek-ai/dsh-sandbox-policy`). */
 interface SandboxPolicyLike {
@@ -167,40 +150,6 @@ export function apply(ctx: Context, config?: unknown): void {
   }
 
   /**
-   * Native approval routing: answer ACP `session/request_permission` through
-   * the host approval chain so the question takes over the chat composer
-   * (`ApprovalPanel`) instead of the settings panel.
-   *
-   * `approval.request` needs the live agent object (its session carries the
-   * audit pair, and the ask must land inside an open turn) and the chat
-   * session id our adapter already knows. Any missing piece — service absent,
-   * unknown session, a rejecting service — degrades to `'unavailable'`, which
-   * sends the ask back to the ledger/panel path rather than losing it.
-   */
-  const wireApproval = (): void => {
-    const approval = (typeof ctx.get === 'function' ? ctx.get('approval') : (ctx as unknown as { approval?: ApprovalServiceLike }).approval) as ApprovalServiceLike | undefined
-    const agents = (typeof ctx.get === 'function' ? ctx.get('agents') : (ctx as unknown as { agents?: AgentsServiceLike }).agents) as AgentsServiceLike | undefined
-    if (approval === undefined || agents === undefined) return
-    manager.setApprovalRequester(async ({ dshSessionId, toolName, reason, callId, signal }) => {
-      if (dshSessionId === undefined) return 'unavailable'
-      const agent = agents.get(dshSessionId)
-      if (agent === undefined) return 'unavailable'
-      try {
-        return await approval.request({
-          agent,
-          toolName,
-          ...(reason === undefined ? {} : { reason }),
-          ...(callId === undefined ? {} : { callId }),
-          ...(signal === undefined ? {} : { signal }),
-        })
-      } catch {
-        // Never propagate: a failed ask must fall back, not break the turn.
-        return 'unavailable'
-      }
-    })
-  }
-
-  /**
    * Workspace routing: the sidebar's selected workspace IS the chat session's
    * workspace, so the agent's session and its process both run there (see
    * `chatWorkspaceRoot` and `getOrCreateDshSession`).
@@ -288,11 +237,10 @@ export function apply(ctx: Context, config?: unknown): void {
     }
   }
 
-  wireApproval()
   wireWorkspace()
   if (typeof ctx.inject === 'function') {
-    // Late arrival for the workspace collaborators; kept separate from the
-    // approval probe so a deployment missing one service still wires the other.
+    // Late arrival for the workspace collaborators: a deployment missing one
+    // service must not fail this plugin's activation.
     ctx.inject(['sandboxPolicy', 'sessions'], () => {
       wireWorkspace()
     })
@@ -303,13 +251,6 @@ export function apply(ctx: Context, config?: unknown): void {
   if (typeof ctx.inject === 'function') {
     ctx.inject(['sessions'], () => {
       wireAcpMode()
-    })
-  }
-  if (typeof ctx.inject === 'function') {
-    // Late arrival: both services may still be loading when this plugin
-    // applies (profile order is not ours to control).
-    ctx.inject(['approval', 'agents'], () => {
-      wireApproval()
     })
   }
 

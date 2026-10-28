@@ -1579,6 +1579,22 @@ export class EventHub {
 
 // ---- Permission ledger ----
 
+/** Everything a `permission/request` frame carries besides the ids the ledger owns. */
+export interface PendingPermissionFields {
+  /** DSH chat session id; absent for `/acp` RPC-only sessions. */
+  dshSessionId?: string
+  toolCall: unknown
+  /** Host-derived human name (`permissionToolName`). */
+  toolName: string
+  /** One-line detail from the agent's declared input, when it has any. */
+  reason?: string
+  options: PermissionOptionView[]
+  /** What an unanswered ask does when its deadline fires. */
+  timeoutMode: PermissionTimeoutMode
+  /** Epoch ms of the deadline; absent in `wait` mode (no deadline). */
+  deadlineAt?: number
+}
+
 export interface PendingPermission {
   requestId: string
   sessionId: string
@@ -1588,15 +1604,13 @@ export interface PendingPermission {
    * client receives (see `permissionReplayFrames`). Absent on entries created
    * without a view — those still answer, they just cannot be re-shown.
    */
-  view?: { toolCall: unknown; options: PermissionOptionView[] }
+  view?: PendingPermissionFields
 }
 
 /** One outstanding ask as a reconnecting client must be re-shown it. */
-export interface PendingPermissionView {
+export interface PendingPermissionView extends PendingPermissionFields {
   requestId: string
   sessionId: string
-  toolCall: unknown
-  options: PermissionOptionView[]
 }
 
 export class PermissionLedger {
@@ -1648,11 +1662,34 @@ export class PermissionLedger {
       views.push({
         requestId: entry.requestId,
         sessionId: entry.sessionId,
-        toolCall: entry.view.toolCall,
-        options: entry.view.options,
+        ...entry.view,
       })
     }
     return views
+  }
+}
+
+/**
+ * The `permission/request` frame for one ask.
+ *
+ * ONE builder for both the live broadcast and the reconnect replay, so the two
+ * can never drift: a client that reconnects must receive exactly the frame the
+ * live one carried (its conversation card filters on `dshSessionId` and shows
+ * `toolName` / `deadlineAt`, so a replay missing them would silently drop the
+ * ask).
+ */
+export function permissionRequestFrame(view: PendingPermissionView): AcpEvent {
+  return {
+    type: 'permission/request',
+    requestId: view.requestId,
+    sessionId: view.sessionId,
+    ...(view.dshSessionId === undefined ? {} : { dshSessionId: view.dshSessionId }),
+    toolCall: view.toolCall,
+    toolName: view.toolName,
+    ...(view.reason === undefined ? {} : { reason: view.reason }),
+    options: view.options,
+    timeoutMode: view.timeoutMode,
+    ...(view.deadlineAt === undefined ? {} : { deadlineAt: view.deadlineAt }),
   }
 }
 
@@ -1663,10 +1700,10 @@ export class PermissionLedger {
  *
  * Why a replay at all: a `permission/request` is broadcast ONCE, when the ask is
  * created. A client that connects later — page reload, second tab, stream
- * outage — never receives it, and for a ledger ask (the `/acp` RPC path, or a
- * native route that degraded) that card is the ONLY answer entry, so the ask is
- * invisible to exactly the client that needs it. OmniTerm closes the same hole
- * with `PermissionManager::pending_events()` + a `PermissionsSynced` marker on
+ * outage — never receives it, and that card (conversation or settings ledger)
+ * is the ONLY answer entry for the ask, so the ask is invisible to exactly the
+ * client that needs it. OmniTerm closes the same hole with
+ * `PermissionManager::pending_events()` + a `PermissionsSynced` marker on
  * every WS connect.
  *
  * Why the terminator is mandatory: the replay is a snapshot, so an ask resolved
@@ -1675,13 +1712,7 @@ export class PermissionLedger {
  * `respond` would answer `unknown_request`.
  */
 export function permissionReplayFrames(pending: readonly PendingPermissionView[]): AcpEvent[] {
-  const requests: AcpEvent[] = pending.map(p => ({
-    type: 'permission/request' as const,
-    requestId: p.requestId,
-    sessionId: p.sessionId,
-    toolCall: p.toolCall,
-    options: p.options,
-  }))
+  const requests: AcpEvent[] = pending.map(permissionRequestFrame)
   return [...requests, { type: 'permission/synced', requestIds: pending.map(p => p.requestId) }]
 }
 
@@ -1761,12 +1792,6 @@ export interface AcpManager {
    * cache (newly published models appear, withdrawn ones drop out).
    */
   cachedAgentModels?(agentId: string): AgentProbeModelsResult | undefined
-  /**
-   * True when ACP permission asks are routed to the host's native approval
-   * service (answered in the chat composer) instead of the settings-panel
-   * ledger. Read-only capability report for `agents/list`.
-   */
-  approvalRouting?(): boolean
   /**
    * ACP agent sessions backing one DSH chat session (looked up by chat session
    * id), so the composer can offer the agent's OWN mode list. Empty when no
@@ -1881,12 +1906,7 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
   try {
     switch (endpoint) {
       case 'agents/list':
-        // `approvalRouted` is a capability report, not a command: the browser
-        // uses it to decide whether the settings panel still owns approvals.
-        return ok({
-          agents: manager.agentViews(),
-          approvalRouted: manager.approvalRouting?.() ?? false,
-        })
+        return ok({ agents: manager.agentViews() })
       case 'agents/detect':
         return ok({ agents: await (manager.detectAgents?.() ?? Promise.resolve([])) })
       case 'agent/save': {

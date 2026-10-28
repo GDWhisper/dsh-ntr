@@ -128,7 +128,7 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 - 模型区（`ModelCatalogBlock`）**常驻渲染**，严禁挂在探测结果上：右侧「已选模型」来自 agent 配置的 `exposedModels`，左侧「全部模型」来自宿主目录缓存（`agent/cached-models`，纯内存、不 spawn，见 [state.md §4](./state.md)），所以打开卡片就能看到已配置的东西。`检测可用模型` 只是**左侧列表的刷新**（新增的加进来、下架的去出去），与搜索框同放在模型区自己的工具栏里（不在区块顶部），点击后在标题行回报「新增 N · 移除 M / 目录无变化」。空目录时左侧给引导文案（未读取 / 该 Agent 未暴露 `category: model`），而不是隐藏整块。模型行**直接展示** `description`（如 agent 给出的积分消耗 `x0.29 credits`），严禁只放进 `title` 靠 hover 才能看到；分组兜底 description 与 `group` 相同时不重复展示。空间不足时名称与 credit 优先保留，模型 id 是唯一可收缩的格子：右缘渐隐（mask）而不是硬省略号，hover 时由 `armModelIdMarquee` 实测溢出量并滚动展示全文，`title` 仍保留完整值（reduced-motion 的兜底）。「全部模型」与「已选模型」两块列表**上下堆叠**，不再左右分栏——半宽面板会把名称 / id / credit 同时挤掉。两块面板各自带收纳按钮（`▾` / `▸`，`aria-expanded`）：只隐藏列表本体、保留标题与计数，列表继续挂载以保住滚动位置。
 - 每张 agent 卡保持「紧凑行 + 展开详情」两段，详情体**常挂载**、只用 `display: none` 折叠——条件渲染会重挂载表单 `useState`，丢掉用户编辑中的值。缓存读按 `active`（展开态）触发，折叠的卡片不发请求。
 - 页面按 `section` 分组：页头（标题 / 描述 / 流状态）→ 模式横幅 → 已接入的智能体 → 添加智能体 → **审批时限** → 对话外观。文案里点名的控件名必须与可见标题一致：store 的 `detectSummary` 与空态提示都指向「添加智能体」，改名要三处同步（`store.ts` / `panel.tsx` / `tests/store.spec.ts`）。审批时限卡的位置在「对话外观」之上：它改变的是回合会发生什么，那张卡只装饰挂牌。
-- **审批时限卡**（`ApprovalDeadlinesCard` / `DeadlineModeBlock` / `DeadlineSliderBlock`）只有**两个控件**：超时处理方式（三档互斥按钮）+ 等待时长（一根滑块），热生效、不重启（取值三层与覆盖语义见 [permissions.md §2.4](./permissions.md)）。**只有一个等待窗口**：对话 composer 里的询问与 ledger 里的询问问的是同一个问题，所以共用一个答案——两个窗口曾把卡变成三行看不出关联的旋钮，用户还得防着两处配出互相矛盾的值。模式按钮**整宽排布**（`.dwa-seg-wide`）：右对齐的 seg 会把「一直等待 / 自动推进 / 超时中止」挤成两行字（「中/止」「自动推/进」），读起来像坏了。滑块档位是刻度（不等待 / 30 秒 / 1 分钟 / 5 分钟 / 15 分钟 / 30 分钟 / 1 小时 / 6 小时，「不等待」只在自动推进档出现，超时中止档从 30 秒起）；「一直等待」**不是一档**，它由模式表达——同一件事不在两个控件里各说一遍。配置文件写的窗口若不在档位上，**照原值运行**，卡片显示精确数字并把滑块停在最近的档位上——滑块不许谎报正在生效的数。宿主没有这条 RPC 时整卡不渲染——不显示浏览器自己编的数。
+- **审批时限卡**（`ApprovalDeadlinesCard` / `DeadlineModeBlock` / `DeadlineSliderBlock`）只有**两个控件**：超时处理方式（三档互斥按钮）+ 等待时长（一根滑块），热生效、不重启（取值三层与覆盖语义见 [permissions.md §2.4](./permissions.md)）。**只有一个等待窗口**：对话卡片里的询问与设置页镜像里的询问问的是同一个问题，所以共用一个答案——两个窗口曾把卡变成三行看不出关联的旋钮，用户还得防着两处配出互相矛盾的值。模式按钮**整宽排布**（`.dwa-seg-wide`）：右对齐的 seg 会把「一直等待 / 自动推进 / 超时中止」挤成两行字（「中/止」「自动推/进」），读起来像坏了。滑块档位是刻度（不等待 / 30 秒 / 1 分钟 / 5 分钟 / 15 分钟 / 30 分钟 / 1 小时 / 6 小时，「不等待」只在自动推进档出现，超时中止档从 30 秒起）；「一直等待」**不是一档**，它由模式表达——同一件事不在两个控件里各说一遍。配置文件写的窗口若不在档位上，**照原值运行**，卡片显示精确数字并把滑块停在最近的档位上——滑块不许谎报正在生效的数。宿主没有这条 RPC 时整卡不渲染——不显示浏览器自己编的数。
 - **两个控件必须说成一套**：卡片有一句话把时长与模式接上（「超过该时长仍未应答，将按上方所选的方式处理。」）。三行版最大的失败不是难看，是用户**猜不出三个控件是不是有关系**；现在只剩两个，且它们的关系被写了出来。
 - **超时处理方式不能只写名字**：三个按钮（一直等待 / 自动推进 / 超时中止）下面必须有一行说明**当前档**的动作，且**两条说明不得说同一件事**——「自动推进」写「超过设定时间未应答，自动代替你选择一个选项让 agent 继续执行」，警告另起一条写「请确保你的 agent 值得信任，请谨慎选择」。否则「自动推进」会读成「界面自己往下滚」。这一行**只写动作**，不解释「为什么原来要转移」——那段历史写进文档，不写进 UI。
 - **`wait` 档下滑块不生效**：不设期限时不能留着「等待时长」配一个永不触发的数字，此时**不画滑块**、读数写「一直等待」、说明改成「选择「一直等待」时不设超时时长。」存着的窗口不被改写（模式写只带模式），切回来时原样回来。
@@ -136,7 +136,7 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 - **覆盖事实挂在被覆盖的那一行**（`.dwa-deadline-flag`，警告色，紧贴它说的那个控件）；重置按钮**只有真的覆盖了才出现**。
 - **设置页文案有预算**：一个控件的说明**一行讲完**，机制解释进代码注释与 `docs/agents/`，不进 UI。同页参照是「呼吸频率 10 字 / 挂牌光晕 14 字 / 对话外观导语 15 字」——审批时限卡曾用 211 字铺满一张卡、两个旋钮埋在灰字里，压到 86 字后又回到 90 字（三行版），现在是**两个控件**：默认档 57 字，`auto` 档 95 字（多出的全是那句警告）；别把整页拉回长文。措辞取**正式陈述**（「超过设定时间未应答，自动代替你选择一个选项让 agent 继续执行」），不要口语化的拟人说法（「没人回答就替你选一个选项放行」）——后者两句话读起来像同一件事。
 - 工作区保存语义：单根模式（非空 `cwd`）把 `allowedCwdRoots` 收窄为 `[cwd]`；`cwd` 为空则两者都不发送（走宿主 `defaultAgentWorkspace()`）；多根模式发送编辑后的去重绝对路径。初始状态带 >1 个 root 的 agent 必须直接进多根模式，避免仅仅打开表单就收窄白名单。
-- 审批卡与权限路由见 [permissions.md](./permissions.md)。
+- 审批卡：对话内的主答案面是 `PermissionDock`（见 §10），本页那张「待处理权限请求」是跨会话镜像。权限语义与期限见 [permissions.md](./permissions.md)。
 
 ## 9. 双语文案与语言切换
 
@@ -144,6 +144,19 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 - 热切换：`index.tsx` 订阅 locale 服务（`internal/service` 兜底晚到），回调 `store.refreshLocale()` **重新发布快照**（`localeRev` 自增）；`useSyncExternalStore` 因此重跑渲染期 `label()`。memo 化的 transcript 行（`BlockView`）props 不变就不会重渲染，所以它必须拿到 `localeRev`。切换不改数据，只改解析结果。
 - 已定型字符串不随切换回译：notice、权限标题兜底在事件发生时解析。唯一例外是 `detectSummary`——store 记住 `detectCounts`，在 `refreshLocale` 里重建，避免旧语言的成功行留在设置页。
 - 插件卡标题 / 描述不走这套：包内 `locale/en.json` / `locale/zh.json` 的 `meta.description` 由宿主 `readPluginMeta` 读取，经 `exports` 的 `./locale/*.json` 暴露。`en.json` 必须存在且与 `package.json.description` 一致（回退值），缺它整组本地化不生效。
+
+## 10. 对话内权限卡（`conversation.input.dock`）
+
+待答的 ACP 权限询问在对话里由 `PermissionDock`（`src/client/permission-dock.tsx`）回答，座位是 `conversation.input.dock`（宿主契约原文：composer 卡片上方的整宽条目；`kind: 'list'`、`scope: 'session'`）。**没有 ACP-mode 闸门**：帧集合本身就是闸门——这条会话没有询问就不渲染，普通会话不会凭空多一张卡。权限语义、期限与重放见 [permissions.md](./permissions.md)。
+
+- **注册**：`src/client/index.tsx` 经 `ctx.slots.inject` + `ctx.slots.register({ name: 'conversation.input.dock', id: 'acp-permissions', order: 10, inject })` 挂载；宿主的 queue / todo dock 用同一个座位。
+- **会话身份只来自注入位参**：`inject: (sessionId) => chatFace(sessionId)`。宿主渲染器的 `runInject(entry, binding, actions)` 把 slot binding key 作为**第一个位置参数**递进来（与 `conversation.input.left` 的 mode 控件同一契约），`chatFace` 再把它放进 props 的 `sessionId`。组件只声明 `acp` + `sessionId`，**不读** owner share 的 `session` / `input` 字段：`conversation.input.left` 曾因声明 `session.sessionId` 让整条 entry 崩掉并被 abdicate，而注入位参才是各版本都遵守的契约。
+- **过滤**：`permissionsForSession(ui.permissions, dshSessionId)` 只留 `dshSessionId` 相等的询问。没有对话身份的 `/acp` RPC 询问（帧里没有 `dshSessionId`）永远不进对话卡，只留在设置页镜像。
+- **选项原样**：每个 `option.name` 一个按钮，顺序就是 agent 给的顺序，`Always Allow` 这类名字照写；不渲染 `kind`、不翻译、不合并。**独立的取消按钮**不选任何选项，宿主按 `cancelled` 回给 agent。**没有全局 Enter / Esc**：composer 的键盘归 composer，卡片里只有普通可聚焦按钮。提交中按钮 `disabled`；失败就地显示在卡片里（`role="alert"`），同时 store 仍写一次 notice（设置页也看得到）。
+- **倒计时**：只有帧里带 `deadlineAt` 才显示（`wait` 模式没有期限）；`deadlineRemainingLabel` 每秒重算，过期显示「已超时」而不是负数——收场由宿主做，卡片不假装还剩时间。到点后卡片随 `permission/resolved` 消失，对话里的留痕来自 `permission/expired`。
+- **堆叠**：多问按**到达顺序**最旧在上，列表高度上限 `min(38vh, 320px)` 内滚动——连续询问不会把 composer 推出屏幕。
+- **设置页是镜像，不是替代**：`permissionLedgerCard` 只要 `ui.permissions` 非空就渲染可答复卡片（`approvalRouted` / `fellBackFromConversation` 已删除），文案是「对话打开时在那边的卡片上回答；这里兜底显示其他会话的询问。」每行写 `toolName`（有 `reason` 时附在后面），按钮同样原样。两个面回答的是同一份 `PendingPermission`，写入都走 `respondPermission`。
+- 聊天里那行提示（`TurnStreamController.permissionLine`）指向真正的答案面：有 `dshSessionId` 说「对话卡片」，`/acp` 询问说「设置页」。
 
 ## 代码索引
 
@@ -153,7 +166,8 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 | 座位 | `src/client/model-seat.tsx` · `createModelSeatClaim` / `createPermissionSeatClaim`；`src/client/index.tsx` · `syncAcpMode` |
 | 锁定 UI | `src/client/session-controls.tsx` · `lockedAgentOf` / `agentBaseHidden` / `agentTagVisible` / `agentTagAlive` / `agentTagHaloPresentation` / `AcpComposerAgentTag`；`src/client/agent-lock-anim.ts` |
 | 视图 | `src/client/acp-view.tsx` · `boundAgentOf` / `acpEmptyCopy` / `diffRows` / `isNewFileDiff` |
+| 权限卡 | `src/client/permission-dock.tsx` · `PermissionDock` / `PermissionAskCard`；`src/client/store.ts` · `permissionsForSession` / `deadlineRemainingLabel`；`src/client/index.tsx` · `acp-permissions` 注册处 |
 | 斜杠 | `src/client/slash-isolation.ts` · `createSlashIsolation` / `slashAcpVerdict` / `commandCandidates` |
 | 文案 | `src/client/index.tsx` · `label` / `LocaleFace` / `browserPrefersZh`；`src/client/store.ts` · `refreshLocale` / `detectSummaryOf`；`locale/*.json` |
-| 设置页 | `src/client/panel.tsx` · `AcpSettingsSection` / `AgentRow` / `WorkspaceBlock` / `initialForm` / `buildPayload` / `ApprovalDeadlinesCard` / `approvalDeadlineFacts` |
+| 设置页 | `src/client/panel.tsx` · `AcpSettingsSection` / `AgentRow` / `WorkspaceBlock` / `initialForm` / `buildPayload` / `ApprovalDeadlinesCard` / `approvalDeadlineFacts` / `permissionLedgerCard` |
 | 设置对话框 | `src/client/settings-dialog.tsx` · `AcpSettingsDialog`；`src/client/acp-ui.tsx` · `openAcpSettingsDialog` / `closeAcpSettingsDialog` / `useAcpSettingsDialogOpen` |

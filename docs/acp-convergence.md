@@ -354,7 +354,7 @@ selection，而 driver 每轮解析的路由（`selectionFor(agent).current`：p
 `options` / `toolCall` 详情 / allow-deny 原样送到界面，用户点什么就回什么给 agent。
 宿主不再有 `decidePermission` / `authorizeWrite` 这一层。
 
-**降级路径与兜底语义（2026-10-19 补记）**：`ask` 优先走宿主 `ctx.approval`
+**降级路径与兜底语义（2026-10-19 补记；已被 2026-10-28 的单一管线取代，见本节末）**：`ask` 优先走宿主 `ctx.approval`
 （审批出现在对话 composer 里，不抢答、不设定时器）。走不到的原因由
 `LedgerFallbackReason` 区分，全部回落到设置页的 `PermissionLedger`：
 
@@ -384,6 +384,20 @@ selection，而 driver 每轮解析的路由（`selectionFor(agent).current`：p
 可答复的卡片**，与 `approvalRouted` 无关——那个旗标只说宿主有审批链，不说这一条
 询问进了对话；有待处理项就等于对话没在展示它。
 
+> **已取代（2026-10-28，issue #2）**：上面整段「降级路径」不再存在——`ask` 不再优先走
+> 宿主 `ctx.approval`，`LedgerFallbackReason` / `native-timeout` / `ledgerFallbacks` /
+> 聊天行的降级措辞全部退役。原因是宿主可以**收下询问却什么都不渲染**，而默认 `wait`
+> 没有期限：turn 就挂在完全不可见的地方（实测 CodeBuddy 2.177.0 + 宿主审批提示关闭）。
+> 现行只有**一条** `PermissionLedger` 管线：除 `auto` + 0（到达即代答，不建条目、不发卡）
+> 外，每一问都广播 `permission/request`，对话内
+> `conversation.input.dock` 的 `PermissionDock` 是主答案面（按 `dshSessionId` 过滤、选项
+> 原样、独立取消按钮、有 `deadlineAt` 才倒计时），设置页的卡片是**跨会话镜像**；没有
+> 对话身份的 `/acp` 询问只在镜像里出现。到点仍然**就地收场**（`abort` / `auto` / `wait`），
+> 留痕是一次 `agent/notice` + 一条 `permission/expired`（对话里折成一行）。宿主审批策略
+> （`ask` / `never`）不再作用于 ACP 询问，`approval/asked|decided` 也不再为 ACP 询问写入
+> （接受的取舍）。现行形状见
+> [permissions.md](./agents/permissions.md)，座位与交互见 [ui.md §10](./agents/ui.md)。
+
 **重连重放（2026-10-27 补记，对齐 OmniTerm dev）**：`permission/request` 只广播一次，
 之后连上来的客户端（刷新 / 新标签页 / SSE 重连）永远收不到它，而 ledger 卡正是它唯一的
 答案入口。SSE 路由因此在 `stream/open` 之后重放全部未决询问（`permissionReplayFrames`，
@@ -391,6 +405,11 @@ selection，而 driver 每轮解析的路由（`selectionFor(agent).current`：p
 的活集合收尾——断线期间已解决的询问必须被客户端丢掉。原生路由上的询问不重放（不广播、
 答案入口是客户端已持有的 composer 接管）。OmniTerm 的对应机制是
 `PermissionManager::pending_events()` + WS 连接时的 `PermissionsSynced` 标记帧。
+
+> **已更新（2026-10-28）**：原生路由退役后不再有「不广播、不重放」的询问——除 `auto` + 0
+> 的到达即代答外，每一问都广播、都参与重放，且实时帧与重放帧由同一个
+> `permissionRequestFrame` 生成，`dshSessionId` / `toolName` / `deadlineAt` 等字段逐项一致；
+> 否则重连后的对话卡会因缺字段静默丢询问。
 
 OmniTerm 的 reaper 另有一套三档策略（`abort` 取消并回收 / `auto` 代答 / `wait` 一直等，
 默认 30 分钟）。本插件**当时只取其中两档**：`abort` ≈ 现行撤回 + 倒计时，`wait` ≈ 两个期限都填
@@ -584,6 +603,10 @@ outlet 读的就是它）核对这个 cell 的 head 是不是我们自己的组�
 
 **保留**：`ctx.approval` 原生审批链（约束 13 的 `askNativeApproval` 降级路径）——
 那正是「permission 原样映射」要用的通道。
+
+> **后续（2026-10-28）**：这条「保留」也退役了。宿主审批链不再参与 ACP 询问——它可以收下
+> 问题却不渲染任何东西，默认 `wait` 又没有期限，于是 turn 挂在不可见处（issue #2）。现行
+> 只有插件自己的 `PermissionLedger` 一条管线，见 §2.3 末的补记。
 
 **保留**：`resolveSessionCwd` / `chatWorkspaceRoot` / `ensureReady` 的 `spawnCwd`
 ——侧栏路径即 agent 工作区，这是用户明确要的。
