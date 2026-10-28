@@ -1,6 +1,8 @@
 /**
  * Pending ACP permission asks for the staged DSH conversation, rendered as
- * full-width entries above the composer card (`conversation.input.dock`).
+ * composer-width entries above the composer card (`conversation.input.dock`).
+ * The slot itself spans the conversation column; the dock mirrors the host's
+ * InputBar width formula so the cards line up with the input box.
  *
  * The host broadcasts every ask as `permission/request`, carrying the DSH chat
  * session id when the ask belongs to a conversation. This dock is the primary

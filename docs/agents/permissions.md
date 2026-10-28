@@ -137,7 +137,7 @@ to the config file"、"adopts a deadline the settings page writes while a sessio
 
 ## 3. 审批 UI
 
-**对话 dock 卡**（`src/client/permission-dock.tsx` · `PermissionDock`；注册在 `src/client/index.tsx` 的 `conversation.input.dock`）：主入口，session-scoped，全宽排在 composer 卡上方。
+**对话 dock 卡**（`src/client/permission-dock.tsx` · `PermissionDock`；注册在 `src/client/index.tsx` 的 `conversation.input.dock`）：主入口，session-scoped，排在 composer 卡上方。槽位本身是整列宽，卡片套宿主 InputBar 的宽度公式（`--dsh-composer-side-clearance` + `--dsh-composer-card-max-width`），与输入框同宽居中。
 
 - **过滤**：`permissionsForSession(ui.permissions, dshSessionId)` 只留 `dshSessionId` 等于当前会话的询问。它没有 ACP 模式闸门——帧集合本身就是闸门：普通对话只有在真的有待答询问时才出现这张卡。
 - **选项原样**：按钮按 agent 的 `name` 与顺序渲染，`kind` 不显示（「Always Allow」也照原名出现）。另有一个**取消**键，不带 `optionId`；宿主把它转成 `cancelled`。

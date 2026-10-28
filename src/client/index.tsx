@@ -231,9 +231,11 @@ export function apply(ctx: Context): void {
     inject: (sessionId: unknown) => chatFace(sessionId),
   }, AcpComposerAgentTag as unknown as SlotComponent<any>)), 'dsh-ntr: composer agent tag')
 
-  // Pending permission asks for the staged conversation, as full-width entries
-  // above the composer card (`conversation.input.dock` — a session-scoped list
-  // slot; the host's own queue/todo docks register the same way). Every ask is
+  // Pending permission asks for the staged conversation, above the composer
+  // card (`conversation.input.dock` — a session-scoped list slot; the host's
+  // own queue/todo docks register the same way). The slot spans the whole
+  // conversation column, so the dock component applies the composer's own
+  // width formula to line up with the input box. Every ask is dispatched as
   // broadcast as `permission/request`; the dock renders only the ones carrying
   // this conversation's id, so it needs no ACP-mode gate. Asks without a chat
   // identity stay on the settings-panel ledger.

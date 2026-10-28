@@ -147,7 +147,7 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 
 ## 10. 对话内权限卡（`conversation.input.dock`）
 
-待答的 ACP 权限询问在对话里由 `PermissionDock`（`src/client/permission-dock.tsx`）回答，座位是 `conversation.input.dock`（宿主契约原文：composer 卡片上方的整宽条目；`kind: 'list'`、`scope: 'session'`）。**没有 ACP-mode 闸门**：帧集合本身就是闸门——这条会话没有询问就不渲染，普通会话不会凭空多一张卡。权限语义、期限与重放见 [permissions.md](./permissions.md)。
+待答的 ACP 权限询问在对话里由 `PermissionDock`（`src/client/permission-dock.tsx`）回答，座位是 `conversation.input.dock`（宿主契约原文：composer 卡片上方的整宽条目；`kind: 'list'`、`scope: 'session'`）。槽位在 active 阶段是整列宽的 flex 容器，卡片自己套宿主 InputBar 的宽度公式——`width: calc(100% - 2 × --dsh-composer-side-clearance)`、`max-width: --dsh-composer-card-max-width`、`margin: 0 auto`——所以与输入框同宽居中对齐；宿主 queue dock 用同一套变量。**没有 ACP-mode 闸门**：帧集合本身就是闸门——这条会话没有询问就不渲染，普通会话不会凭空多一张卡。权限语义、期限与重放见 [permissions.md](./permissions.md)。
 
 - **注册**：`src/client/index.tsx` 经 `ctx.slots.inject` + `ctx.slots.register({ name: 'conversation.input.dock', id: 'acp-permissions', order: 10, inject })` 挂载；宿主的 queue / todo dock 用同一个座位。
 - **会话身份只来自注入位参**：`inject: (sessionId) => chatFace(sessionId)`。宿主渲染器的 `runInject(entry, binding, actions)` 把 slot binding key 作为**第一个位置参数**递进来（与 `conversation.input.left` 的 mode 控件同一契约），`chatFace` 再把它放进 props 的 `sessionId`。组件只声明 `acp` + `sessionId`，**不读** owner share 的 `session` / `input` 字段：`conversation.input.left` 曾因声明 `session.sessionId` 让整条 entry 崩掉并被 abdicate，而注入位参才是各版本都遵守的契约。

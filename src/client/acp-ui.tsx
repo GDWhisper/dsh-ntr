@@ -943,9 +943,20 @@ const STYLE = `
 .ntr-acp-seat-diag { font-family: var(--dsw-alias-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); opacity: 0.72; word-break: break-word; }
 .ntr-acp-empty-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
 /* ---- Pending permission asks (conversation.input.dock) ---- */
-/* Full-width entries above the composer card. The list owns a bounded height
-   and scrolls so a burst of asks cannot push the composer off screen. */
-.ntr-permission-dock { display: flex; flex-direction: column; gap: 6px; width: 100%; max-height: min(38vh, 320px); overflow-y: auto; font-size: 12px; line-height: 1.5; }
+/* The dock slot is the full conversation column, but the composer card inside
+   it is narrower (InputBar: side clearance + card max width). Mirror that
+   formula so each ask lines up with the input box instead of spanning the
+   column. The list owns a bounded height and scrolls so a burst of asks cannot
+   push the composer off screen. */
+.ntr-permission-dock {
+  box-sizing: border-box;
+  width: calc(100% - var(--dsh-composer-side-clearance, 16px) - var(--dsh-composer-side-clearance, 16px));
+  max-width: var(--dsh-composer-card-max-width, 920px);
+  margin: 0 auto;
+  display: flex; flex-direction: column; gap: 6px;
+  max-height: min(38vh, 320px); overflow-y: auto;
+  font-size: 12px; line-height: 1.5;
+}
 .ntr-permission-card { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); border-left: 3px solid var(--dsw-alias-state-warn-primary, #d97706); border-radius: 10px; background: var(--dsw-alias-bg-layer-1, #fff); }
 .ntr-permission-head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 .ntr-permission-tool { flex: none; font-weight: 600; }
