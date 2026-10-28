@@ -2,6 +2,26 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [0.2.1] - 2026-10-29
+
+设置页拆成了一次只看一件事的分区，聊天里的 token 数字也不再自相矛盾（[#6](https://github.com/GDWhisper/dsh-ntr/issues/6)）。
+
+### 新增
+
+- **设置页分区导航**：「智能体」「审批时限」「对话外观」分成三个分区，一次只展开一个；连接状态收成页面底部一行，细节要手动点「查看诊断」。([4def8c9](https://github.com/GDWhisper/dsh-ntr/commit/4def8c9))
+- **「添加智能体」改为按钮进入**：点按钮才展开填写页，保存成功后自动回到智能体列表。([4def8c9](https://github.com/GDWhisper/dsh-ntr/commit/4def8c9))
+
+### 改进
+
+- **切换分区不丢正在填的内容**：切分区、切「模型 / 连接 / 高级」都只是隐藏，填了一半的东西还在；模型列表只在当前可见时才去读取。([4def8c9](https://github.com/GDWhisper/dsh-ntr/commit/4def8c9))
+- **诊断收纳噪音，异常不收纳**：预设来源、「重新检测与刷新」和模式横幅移进「查看诊断」；模式一旦出现异常仍直接显示在页面上方。([4def8c9](https://github.com/GDWhisper/dsh-ntr/commit/4def8c9))
+- **「还没读取」和「确认没有」分开提示**：智能体空列表不再一律写成「未配置」。([4def8c9](https://github.com/GDWhisper/dsh-ntr/commit/4def8c9))
+- **审批时限分区按可用性出现**：宿主不提供该配置时，导航里不再留一个空分区。([4def8c9](https://github.com/GDWhisper/dsh-ntr/commit/4def8c9))
+
+### 修复
+
+- **聊天里的 token 用量不再离谱**（[#6](https://github.com/GDWhisper/dsh-ntr/issues/6)）：回答旁边的数字改为按输出长度估算，不再把上下文占用当成请求 token，也就不会出现自相矛盾的总量和速度；没有数据来源的缓存命中率直接不显示，而不是显示 0%。上下文占用仍在 NTR 视图里看。([3848188](https://github.com/GDWhisper/dsh-ntr/commit/3848188))
+
 ## [0.2.0] - 2026-10-28
 
 审批询问现在直接出现在对话里，每一条都会送到你面前，不会再隐形挂起（[#2](https://github.com/GDWhisper/dsh-ntr/issues/2)）。
