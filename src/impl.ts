@@ -8,7 +8,7 @@
 import { randomUUID } from './ids.ts'
 import type {
   AcpAgentCatalog, AcpAgentDef, AcpCatalogOption, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpMcpServerDef, AcpPluginConfig, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult,
-  AgentView, ApprovalDeadlineKey, ApprovalDeadlinePatch, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionOptionView, PermissionOutcome, PermissionTimeoutMode, RpcResult,
+  AgentView, ApprovalDeadlineKey, ApprovalDeadlinePatch, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionOptionView, PermissionOutcome, PermissionTimeoutMode, PluginUpdateState, RpcResult,
 } from './protocol.ts'
 import { DEFAULT_TAG_HALO } from './protocol.ts'
 
@@ -1912,6 +1912,18 @@ export interface AcpManager {
    * the badge rather than showing a number the browser invented.
    */
   pluginVersion?(): string | undefined
+  /**
+   * Ask the host's plugin manager what is published for this package. Read-only
+   * toward the installation: never downloads, never swaps files, never restarts
+   * the host. Absent on a host half from before the updater existed.
+   */
+  pluginUpdateCheck?(): Promise<PluginUpdateState>
+  /**
+   * Install one exact stable version THROUGH the host's plugin manager. The
+   * manager owns download/restart semantics; this plugin only relays. Absent on
+   * an older host half.
+   */
+  pluginUpdateApply?(version: string): Promise<PluginUpdateState>
 }
 
 function ok<T>(value: T): RpcResult<T> {
@@ -2080,6 +2092,17 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         // Absent on a host half from before the badge existed: the browser
         // hides it instead of naming a version it cannot know.
         return ok({ version: manager.pluginVersion?.() })
+      case 'plugin/update-check':
+        // An older host half answers `unsupported` rather than failing: the
+        // settings card then hides the update section.
+        return ok(await (manager.pluginUpdateCheck?.() ?? { status: 'unsupported' as const, current: '' }))
+      case 'plugin/update-apply': {
+        const version = str(body, 'version', 64)
+        if (!/^\d+\.\d+\.\d+$/.test(version)) {
+          throw new AcpError('bad_payload', 'acp: version must be a stable semver (x.y.z)')
+        }
+        return ok(await (manager.pluginUpdateApply?.(version) ?? { status: 'unsupported' as const, current: '' }))
+      }
       case 'agent/stop':
         await manager.stopAgent(str(body, 'agentId', 64)); return ok({ done: true })
       case 'default/agent':

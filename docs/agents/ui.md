@@ -138,6 +138,16 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 - 工作区保存语义：单根模式（非空 `cwd`）把 `allowedCwdRoots` 收窄为 `[cwd]`；`cwd` 为空则两者都不发送（走宿主 `defaultAgentWorkspace()`）；多根模式发送编辑后的去重绝对路径。初始状态带 >1 个 root 的 agent 必须直接进多根模式，避免仅仅打开表单就收窄白名单。
 - 审批卡：对话内的主答案面是 `PermissionDock`（见 §10），本页那张「待处理权限请求」是跨会话镜像。权限语义与期限见 [permissions.md](./permissions.md)。
 
+### 8.1 版本徽标与内置更新
+
+- **版本徽标是更新卡入口**（`.dwa-version`）：只读 `ui.pluginVersion`（`plugin/version`），宿主不答就整块不渲染——浏览器不编版本号。`ui.pluginUpdate` 存在且状态不属于 `unsupported` / `not-installed` 时，徽标渲染成 `<button>`（`versionOpensUpdate`），带 `aria-expanded` 与 `aria-controls="ntr-plugin-update-card"`，点击开合更新卡；含 `current` / `failed` / `busy` / `source-install` / `managed` 在内都能从这里打开。否则只是普通 `span`。`source-install` 额外挂 `title`「源码或本地安装，无法通过 registry 更新」。
+- **更新徽标**（`PluginUpdateBadge`，文案在 `updateBadgeText`）只在这些状态出现：`available`「可更新 vX」、`applying`「更新中…」、`applied`「已更新 vX」、`restart-required`「待重启 vX」——**最后一种只有 `installed` 存在时才挂**（apply 中断时磁盘状态未知，不编版本号）。**每个徽标都是可点按钮**（`applying` 也是），带同样的 `aria-expanded` / `aria-controls`：安装中的结果只能从卡片读。`current` / `busy` / `failed` / `unsupported` / `not-installed` / `managed` / `source-install` 不挂徽标——版本徽标本身就是入口。
+- **更新卡**（`PluginUpdateCard`）在页头下方**就地展开**，不用模态：设置页已经握着那一个动作，模态会盖住它正在说的版本。容器带 `id="ntr-plugin-update-card"`、`role="group"`、`aria-label`「插件更新」。`updateCardVisible` 只在 `open` 且状态不属于 `unsupported` / `not-installed` 时画（`source-install` / `managed` 也画，各自说明为什么不能在这里更新）。摘要行是「当前 vX → 最新 vY」；宿主没报 `latest` 时只有当前版本。磁盘版本与运行版本不同（装完没重启，可能更高也可能更低）时多一格「磁盘 vZ」，有合法 `publishedAt` 时在末尾附日期。
+- **动作**：仅 `available` 有「更新」，送的是 host 报的那个**精确版本**（`applyPluginUpdate(update.latest)`）；`applying` 时主按钮变成禁用的「正在更新…」；「关闭」收起卡片，但 `applying` 时不画；「重新检查」始终在（`applying` 时禁用），走 `checkPluginUpdate(true)` 跳过 store 的 10 分钟节流。安装**只能**由这一下点击发起——挂载只做检查。
+- **每个状态一行话**（约束 33）：`available`「更新会卸载并重装插件，之后可能需要重启 DSH。」/ `applied`「已应用，刷新页面即可使用新版本。」/ `restart-required` 分两种：`installed` 存在 → 「磁盘已是 vX，重启 DSH 后生效（桌面 App 退出重开；命令行重启 dsh web）。」；`installed` 缺失（apply 响应中断、磁盘状态未知）→ 「更新可能已完成，请刷新页面确认当前版本。」——**中性**，因为磁盘版本可能比运行版本高或低，绝不写「已更新」/ `busy`「有进行中的对话，结束后才能更新。」/ `failed`「更新失败。」/ `current`「已是最新版本。」/ `source-install`「源码或本地安装，无法通过 registry 更新。」/ `managed`「此安装由宿主管理，不能在这里更新。」。`applying` 无说明行，只有摘要与禁用按钮。宿主原始 `message` 是唯一的长文本，单独一行（`failed` / `busy` / `managed`），靠 CSS 折行，不改写、不截成半句。
+- 颜色只走宿主 alias token（约束 34）：徽标是 `state-business-tertiary` 底 / `state-business-primary` 前景；卡片就是普通 `dwa-card`，失败不另造一套红色。
+- 检查随设置页挂载自动触发（`AcpSettingsSection` 的 `useEffect`）；两个入口（宿主外壳 / 对话内对话框）挂同一个组件，store 的 10 分钟节流与 in-flight 去重因此只按一份算。双击「更新」被 store 的 `pluginUpdateApplying` 挡住；apply RPC 因插件被卸载而中断时，store 写 `restart-required` + notice「更新请求已中断；请刷新页面确认当前版本。」并清掉 `installed`，卡片只说「更新可能已完成，请刷新页面确认当前版本」，不编磁盘版本。`pluginUpdateGeneration` 让晚到的 check 结果无法覆盖 apply 的终态。旧宿主没有这个端点：`checkPluginUpdate` 静默吞掉 `unknown endpoint` 并回 `undefined`，面板把更新入口整块藏掉，不写 notice。
+
 ## 9. 双语文案与语言切换
 
 - 调用点一律写 `label(zh, en)` 对（`AcpStore.label`，实例绑定，可安全交给 memo 行）；运行时经宿主 `ctx.locale.resolveText({ zh, en })` 解析当前语言。`locale` 服务按 `ctx.get` 结构化读取（`LocaleFace`），缺失时回落到 `navigator.language`（`browserPrefersZh`）——不允许因此加载失败。
@@ -178,5 +188,5 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 | 权限卡 | `src/client/permission-dock.tsx` · `PermissionDock` / `PermissionAskCard`；`src/client/store.ts` · `permissionsForSession` / `deadlineRemainingLabel`；`src/client/index.tsx` · `acp-permissions` 注册处 |
 | 斜杠 | `src/client/slash-isolation.ts` · `createSlashIsolation` / `slashAcpVerdict` / `commandCandidates` |
 | 文案 | `src/client/index.tsx` · `label` / `LocaleFace` / `browserPrefersZh`；`src/client/store.ts` · `refreshLocale` / `detectSummaryOf`；`locale/*.json` |
-| 设置页 | `src/client/panel.tsx` · `AcpSettingsSection` / `AgentRow` / `WorkspaceBlock` / `initialForm` / `buildPayload` / `ApprovalDeadlinesCard` / `approvalDeadlineFacts` / `permissionLedgerCard` |
+| 设置页 | `src/client/panel.tsx` · `AcpSettingsSection` / `AgentRow` / `WorkspaceBlock` / `initialForm` / `buildPayload` / `ApprovalDeadlinesCard` / `approvalDeadlineFacts` / `permissionLedgerCard`；`PluginUpdateBadge` / `PluginUpdateCard` / `updateBadgeText` / `updateCardVisible` |
 | 设置对话框 | `src/client/settings-dialog.tsx` · `AcpSettingsDialog`；`src/client/acp-ui.tsx` · `openAcpSettingsDialog` / `closeAcpSettingsDialog` / `useAcpSettingsDialogOpen` |

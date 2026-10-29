@@ -612,6 +612,36 @@ export type DefaultAgentResult = { agentId?: string }
 export type PluginVersionResult = { version?: string }
 
 /**
+ * Where the plugin's own update check stands. The host half only ever reports
+ * facts it can read from the harness plugin manager and the npm registry — it
+ * never downloads, swaps files, or restarts itself.
+ */
+export type PluginUpdateStatus =
+  | 'unsupported' | 'not-installed' | 'source-install' | 'managed'
+  | 'current' | 'available' | 'applying' | 'busy'
+  | 'applied' | 'restart-required' | 'failed'
+
+/**
+ * One update-check answer, shared by `plugin/update-check` and
+ * `plugin/update-apply`.
+ */
+export interface PluginUpdateState {
+  status: PluginUpdateStatus
+  /** 运行中（内存里）的插件版本 */
+  current: string
+  /** 磁盘上装着的版本（listBundles().version），可读时才有 */
+  installed?: string
+  /** profile registry 链上最新的稳定版 */
+  latest?: string
+  /** latest 的 npm 发布时间 ISO */
+  publishedAt?: string
+  /** 实际按顺序问过的 registry */
+  registries?: string[]
+  /** 失败/额外说明（英文技术信息，UI 自己负责本地化） */
+  message?: string
+}
+
+/**
  * How the composer-edge agent tag shows liveness (the blue halo). `breath`
  * pulses the halo at the speed below; `steady` shows a constant glow.
  * Plugin-private display preference, persisted with the agent registry.

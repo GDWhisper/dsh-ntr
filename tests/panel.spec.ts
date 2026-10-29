@@ -82,6 +82,98 @@ describe('AcpSettingsSection navigation', () => {
     expect(document.querySelector('.dwa-version')).toBeNull()
   })
 
+  it('shows only the running version when the plugin is up to date', async () => {
+    const fixture = await mountPanel()
+    expect(screen.getByText('v0.2.1').className).toContain('dwa-version')
+    expect(screen.queryByText(/可更新/)).toBeNull()
+    expect(payloads(fixture, 'plugin/update-check')).toEqual([{}])
+  })
+
+  it('opens the update card from the version badge when up to date', async () => {
+    await mountPanel()
+    await click(await screen.findByRole('button', { name: 'v0.2.1' }))
+    expect(screen.getByText('已是最新版本。')).toBeDefined()
+    expect(screen.getByRole('button', { name: '重新检查' })).toBeDefined()
+  })
+
+  it('opens the update card from the version badge after a failed check', async () => {
+    await mountPanel({
+      pluginUpdate: { status: 'failed', current: '0.2.1', latest: '9.9.9', message: 'registry timeout' },
+    })
+    await click(await screen.findByRole('button', { name: 'v0.2.1' }))
+    expect(screen.getByText('更新失败。')).toBeDefined()
+    expect(screen.getByText('registry timeout')).toBeDefined()
+  })
+
+  it('offers an available update, opens the card, and installs the exact version', async () => {
+    const fixture = await mountPanel({
+      pluginUpdate: {
+        status: 'available', current: '0.2.1', installed: '0.2.1', latest: '9.9.9',
+        publishedAt: '2026-10-28T00:00:00.000Z',
+      },
+    })
+    const badge = await screen.findByRole('button', { name: '可更新 v9.9.9' })
+    expect(badge.className).toContain('dwa-update-badge')
+    await click(badge)
+    expect(screen.getByText('最新 v9.9.9')).toBeDefined()
+    expect(screen.getByText('当前 v0.2.1')).toBeDefined()
+    expect(screen.getByText(/更新会卸载并重装插件/)).toBeDefined()
+
+    await click(screen.getByRole('button', { name: '更新' }))
+    await waitFor(() => expect(payloads(fixture, 'plugin/update-apply')).toEqual([{ version: '9.9.9' }]))
+    await waitFor(() => expect(screen.getByText(/重启 DSH 后生效/)).toBeDefined())
+    expect(screen.getByText('待重启 v9.9.9')).toBeDefined()
+  })
+
+  it('lets the applying badge open the card mid-install', async () => {
+    await mountPanel({
+      pluginUpdate: { status: 'applying', current: '0.2.1', installed: '0.2.1', latest: '9.9.9' },
+    })
+    await click(await screen.findByRole('button', { name: '更新中…' }))
+    expect(screen.getByText('当前 v0.2.1')).toBeDefined()
+    expect(screen.getByRole('button', { name: '正在更新…' })).toBeDefined()
+  })
+
+  it('hides the update entry on a host without the update endpoints', async () => {
+    const fixture = await mountPanel({ pluginUpdate: null })
+    await waitFor(() => expect(payloads(fixture, 'plugin/update-check')).toEqual([{}]))
+    expect(screen.getByText('v0.2.1')).toBeDefined()
+    expect(document.querySelector('.dwa-update-badge')).toBeNull()
+    expect(fixture.store.getSnapshot().notice).toBeUndefined()
+    expect(screen.queryByText(/unknown endpoint/)).toBeNull()
+  })
+
+  it('marks a source install and explains it cannot be updated here', async () => {
+    await mountPanel({ pluginUpdate: { status: 'source-install', current: '0.2.1', installed: '0.2.1' } })
+    const version = await screen.findByTitle('源码或本地安装，无法通过 registry 更新。')
+    expect(screen.queryByText(/可更新/)).toBeNull()
+    expect(document.querySelector('.dwa-update-badge')).toBeNull()
+    await click(version)
+    expect(screen.getByText('源码或本地安装，无法通过 registry 更新。', { selector: '.dwa-update-copy' })).toBeDefined()
+  })
+
+  it('does not name a disk version when the install response was interrupted', async () => {
+    await mountPanel({
+      pluginUpdate: { status: 'available', current: '0.2.1', installed: '0.2.1', latest: '9.9.9' },
+      pluginUpdateApplyError: 'socket hang up',
+    })
+    await click(await screen.findByRole('button', { name: '可更新 v9.9.9' }))
+    await click(screen.getByRole('button', { name: '更新' }))
+    await waitFor(() => expect(screen.getByText('更新可能已完成，请刷新页面确认当前版本。')).toBeDefined())
+    expect(screen.queryByText(/磁盘已是/)).toBeNull()
+    // The disk version is unknown: no restart badge may invent one.
+    expect(screen.queryByText(/待重启/)).toBeNull()
+    expect(document.querySelector('.dwa-update-badge')).toBeNull()
+  })
+
+  it('keeps the version badge as the only update entry without a known disk version', async () => {
+    await mountPanel({ pluginUpdate: { status: 'restart-required', current: '0.2.1', latest: '9.9.9' } })
+    await waitFor(() => expect(document.querySelector('.dwa-update-badge')).toBeNull())
+    await click(await screen.findByRole('button', { name: 'v0.2.1' }))
+    expect(screen.getByText('更新可能已完成，请刷新页面确认当前版本。')).toBeDefined()
+    expect(screen.queryByText(/磁盘已是/)).toBeNull()
+  })
+
   it('shows only the chosen category and keeps the other pages mounted', async () => {
     const fixture = await mountPanel()
     const agents = screen.getByRole('region', { name: '已接入的智能体' })

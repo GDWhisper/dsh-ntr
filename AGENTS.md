@@ -14,7 +14,7 @@
 | [protocol.md](./docs/agents/protocol.md) | 改子进程、超时、取消、卡死收口（无活动看门狗）、崩溃恢复、空闲释放、启动命令、ACP 数据折叠 |
 | [ui.md](./docs/agents/ui.md) | 改 composer 座位、芯片、mode 控件、NTR 视图、斜杠菜单、设置页 |
 | [permissions.md](./docs/agents/permissions.md) | 改权限映射、审批卡片（对话 dock / 设置镜像）、审批时限、权限座位 |
-| [state.md](./docs/agents/state.md) | 改落盘、会话选择、模型目录 / 可见性、命令缓存 |
+| [state.md](./docs/agents/state.md) | 改落盘、会话选择、模型目录 / 可见性、命令缓存、内置更新 |
 | [host.md](./docs/agents/host.md) | 改 `/acp` 通道、preset 声明、宿主服务探测、模型层 abstain |
 | [paths.md](./docs/agents/paths.md) | 改任何路径判定 / 比较 / 规范化 |
 | [retired.md](./docs/agents/retired.md) | 想知道「为什么不能回到 X」，或看到幽灵符号 |
@@ -57,6 +57,7 @@
 - [`src/protocol.ts`](./src/protocol.ts)：前后端共享契约（纯类型），**严禁引入 Node 专属库或运行时代码**。
 - [`src/impl.ts`](./src/impl.ts)：纯宿主端逻辑（配置校验、环境组装、路径防越权、Transcript、EventHub），**严禁引入 Node 内置模块或 SDK**，必须由 `tests/impl.spec.ts` 覆盖。
 - [`src/bridge.ts`](./src/bridge.ts)：宿主与 ACP 子进程的 stdio 通信桥，依赖 `@agentclientprotocol/sdk`。
+- [`src/update.ts`](./src/update.ts)：内置更新（资格矩阵、registry 探测、把安装委托给宿主 `pluginManager`），**不下载、不替换文件、不重启**。
 - [`src/client/`](./src/client)：浏览器 React 扩展，**严禁引入 Node 内置模块或 ACP SDK**，通信只走 RPC / SSE。`acp-ui.tsx` 是座位共用结构 / 样式 / 菜单壳；`session-controls.tsx` 与 `acp-view.tsx` 分别实现 composer 底座与 NTR 视图；`permission-dock.tsx` 实现对话内的审批卡。
 - [`presets/acp/`](./presets/acp)：随包发布的 NTR agent preset（bundle patch 声明 + `acp-guard.mjs`），属于 DSH 的 agent 平面组装，不是本插件运行时模块。
 - **`~/.dsh/dsh-ntr/`**：运行时唯一落盘点：`agents.json`、`model-catalog.json`、`workspaces/`（见约束 28）。
@@ -147,6 +148,10 @@
 ### 用量统计（36）
 
 36. **`usage_update` 是上下文占用，不是请求 token**：`used` / `size` 只写 `session.usage`（ACP 视图的 `used/size`）；原生聊天流的 `usage` 块只能是按段估算的输出 token（正文 + 思考字符 ÷4，`inputTokens: 0`），**严禁**把 `size` / `used` 映射成 input/output。缓存命中率无数据源，`inputTokens: 0` 让宿主自然不显示。工具参数不计入估算（部分 agent 整块重发 `rawInput`）。→ [protocol.md](./docs/agents/protocol.md)
+
+### 内置更新（37）
+
+37. **内置更新只转述宿主的安装，绝不自己下载 / 替换 / 重启**：`plugin/update-check`（`{}`）与 `plugin/update-apply`（`{ version }`，只收精确且高于运行版本的 `x.y.z`）都回 `PluginUpdateState`（protocol.ts），实现是 `src/update.ts` 的 `UpdateService`。数据源只有 `ctx.get('pluginManager')` 的 `listBundles()` / `registries()` 与直接 GET packument（8s 超时、按 base 10 分钟缓存、只挑稳定且未 deprecated 的版本）；check 沿宿主 registry 链逐个询问，某个 base 只报运行版或更旧时**继续问下一个**（镜像滞后不掩盖更新），首个高于 `current` 的版本即 `available`。安装与回滚只调 `installBundle('dsh-ntr@<version>', { enabled: true, registry? })`；HMR 存在时宿主拒绝覆盖（`already-installed`），按宿主**原生更新语义** `removeBundle('dsh-ntr')` → 重试 install → 再失败**先 `removeBundle`（目标可能已落盘）再用同一 `installBundle` 回滚到运行版本**——**不是自替换**：文件操作全由 pluginManager 完成，删除只是卸载当前模块那一步，且必须由人点击触发。资格**正向判定 registry spec**：`x.y.z` / `vX.Y.Z` / `^`·`~`·`>=` 等范围、`*` / `x`、dist-tag（latest/next/beta/alpha/rc/stable）才可更新；含 `:` / `/` / `\` 或以 `.` 开头（link:/file:/git+/git@/github:/workspace:/https tarball/相对路径）一律 `source-install` 永不升级；无 pluginManager / 缺方法 / 旧宿主不报 `source` → `unsupported`；`readOnlyReason` 或 `removable === false` → `managed`；磁盘版本经 `compareVersions` ≠ 运行版本 → `restart-required`（可能更高也可能更低，**不冒充 latest**）。**check 不因对话在跑而 `busy`**（读 registry 不算 ACP 工作，安装中只回 `applying`）；`busy` 只由 apply 返回（`BridgeManager.hasActiveTurns`）。结果 `applied` / `restart-required` 为成功，`overridden` / `cancelled` / 带 error / 缺失或未知 `application` 一律 `failed`；错误正文优先 `error.diagnostic`，缺失才回落 `message`（RPC 信封的 `message` 只作兼容）。检查随设置页自动（store 10 分钟节流 + in-flight 去重），**安装必须人手点击**；apply RPC 可能因插件被卸载而中断，客户端按 `restart-required` + notice 收场。**严禁**自下载、自替换文件、自动重启，也严禁把 `pluginManager` 写进顶层 `inject`（旧宿主必须照常加载）。→ [state.md §8](./docs/agents/state.md) / [ui.md §8.1](./docs/agents/ui.md)
 
 ## 边界与禁区
 

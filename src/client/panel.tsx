@@ -19,7 +19,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { formatCommandLine, isAbsolutePathLike, splitCommandLine } from './acp-ui.tsx'
 import { DEFAULT_KNOWN_PRESETS } from './store.ts'
 import type { AcpStore, UiState } from './store.ts'
-import type { AcpAgentDef, AcpApprovalDeadlines, AcpCatalogChoice, AcpMcpServerDef, AgentSavePayload, AgentView, DetectedAgentInfo, PermissionTimeoutMode } from '../protocol.ts'
+import type { AcpAgentDef, AcpApprovalDeadlines, AcpCatalogChoice, AcpMcpServerDef, AgentSavePayload, AgentView, DetectedAgentInfo, PermissionTimeoutMode, PluginUpdateState } from '../protocol.ts'
 
 interface WithStore { acp: AcpStore }
 
@@ -115,7 +115,20 @@ const STYLE = `
 .dwa-badge-success { background: var(--dsw-alias-state-success-tertiary, #dcfce7); color: var(--ntr-success); }
 .dwa-badge-warn { background: var(--dsw-alias-state-warn-tertiary, #fef3c7); color: var(--ntr-warn); }
 .dwa-badge-info { background: var(--dsw-alias-state-business-tertiary, #dbeafe); color: var(--dsw-alias-state-business-primary, #2563eb); }
+/* The update badge is a button (it expands the update card): strip the
+   browser's default button chrome, keep the badge look. */
+.dwa-update-badge { border: 0; font-family: inherit; cursor: pointer; }
+.dwa-update-badge:hover { opacity: 0.85; }
+/* The version badge doubles as the update entry: same badge look, no chrome. */
+.dwa-version-btn { border: 0; font-family: inherit; cursor: pointer; }
+.dwa-version-btn:hover { opacity: 0.85; }
 .dwa-version { font-family: var(--ds-font-family-code, monospace); }
+/* The update card sits between the page header and the permission mirror. */
+.dwa-update-card { margin-bottom: 16px; }
+.dwa-update-summary { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; font-weight: 550; }
+.dwa-update-copy { margin: 6px 0 0; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
+.dwa-update-message { margin: 6px 0 0; color: var(--ntr-muted); font-size: var(--ntr-font-xs); white-space: pre-wrap; overflow-wrap: anywhere; }
+.dwa-update-actions { margin-top: 10px; }
 .dwa-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
 .dwa-agent-list { display: flex; flex-direction: column; border-top: var(--ntr-line); }
 .dwa-agent-card { border-bottom: var(--ntr-line); min-width: 0; }
@@ -855,6 +868,157 @@ function ApprovalDeadlinesCard(props: { acp: AcpStore; ui: UiState }) {
 
 type SettingsPage = 'agents' | 'add' | 'approvals' | 'appearance' | 'diagnostics'
 
+/** The states that carry an update badge next to the version badge. */
+function updateBadgeText(update: PluginUpdateState, acp: AcpStore): string | undefined {
+  if (update.status === 'available') {
+    return acp.label(`可更新 v${update.latest ?? update.current}`, `Update v${update.latest ?? update.current}`)
+  }
+  if (update.status === 'applying') return acp.label('更新中…', 'Updating…')
+  if (update.status === 'applied') {
+    const installed = update.installed ?? update.latest ?? update.current
+    return acp.label(`已更新 v${installed}`, `Updated v${installed}`)
+  }
+  if (update.status === 'restart-required') {
+    // Only a KNOWN disk version can be named. An interrupted install leaves
+    // `installed` unset, and a badge would have to invent a version.
+    if (update.installed === undefined) return undefined
+    // Neutral: the disk version can be newer OR older than the running one.
+    return acp.label(`待重启 v${update.installed}`, `Restart for v${update.installed}`)
+  }
+  return undefined
+}
+
+/**
+ * The version badge's update companion. Every badge is a button, `applying`
+ * included: the card is where the install's outcome is read, so the running
+ * install must be able to open it too. States without anything to act on get
+ * no badge at all — the version badge itself still opens the card.
+ */
+function PluginUpdateBadge(props: { acp: AcpStore; update: PluginUpdateState; open: boolean; onToggle: () => void }) {
+  const { acp, update, open, onToggle } = props
+  const text = updateBadgeText(update, acp)
+  if (text === undefined) return null
+  return (
+    <button
+      type="button"
+      className="dwa-badge dwa-badge-info dwa-update-badge"
+      aria-expanded={open}
+      aria-controls="ntr-plugin-update-card"
+      onClick={onToggle}
+    >
+      {text}
+    </button>
+  )
+}
+
+/**
+ * The update card. In-page, no dialog: the settings page already owns the one
+ * action (install the exact version the host reported), and a modal on top of
+ * a settings section would hide the version it is updating.
+ *
+ * The copy stays to one line per state (constraint 33); the host's raw error
+ * (`message`) is the only long text, and it wraps on its own line so a stack
+ * trace or a registry error is readable without stretching the card.
+ */
+function PluginUpdateCard(props: { acp: AcpStore; update: PluginUpdateState; onClose: () => void }) {
+  const { acp, update, onClose } = props
+  const applying = update.status === 'applying'
+  const latest = update.latest ?? update.current
+  const onDisk = update.installed !== undefined && update.installed !== update.current
+    ? update.installed
+    : undefined
+  const published = update.publishedAt !== undefined && !Number.isNaN(new Date(update.publishedAt).getTime())
+    ? new Date(update.publishedAt).toLocaleDateString()
+    : undefined
+  const copy = update.status === 'available'
+    ? acp.label('更新会卸载并重装插件，之后可能需要重启 DSH。', 'Updating uninstalls and reinstalls the plugin, and may require restarting DSH.')
+    : update.status === 'applied'
+      ? acp.label('已应用，刷新页面即可使用新版本。', 'Applied. Reload the page to use the new version.')
+      : update.status === 'restart-required'
+        ? update.installed !== undefined
+          ? acp.label(
+            `磁盘已是 v${update.installed}，重启 DSH 后生效（桌面 App 退出重开；命令行重启 dsh web）。`,
+            `On disk v${update.installed}. Restart DSH to apply (quit and reopen the app, or restart dsh web).`,
+          )
+          : acp.label(
+            '更新可能已完成，请刷新页面确认当前版本。',
+            'The update may already be complete. Refresh the page to confirm the current version.',
+          )
+        : update.status === 'busy'
+          ? acp.label('有进行中的对话，结束后才能更新。', 'Finish the running conversation before updating.')
+          : update.status === 'failed'
+            ? acp.label('更新失败。', 'Update failed.')
+            : update.status === 'current'
+              ? acp.label('已是最新版本。', 'Up to date.')
+              : update.status === 'source-install'
+                ? acp.label(
+                  '源码或本地安装，无法通过 registry 更新。',
+                  'Source or local install; update it through its own checkout.',
+                )
+                : update.status === 'managed'
+                  ? acp.label('此安装由宿主管理，不能在这里更新。', 'This install is managed by the host and cannot be updated here.')
+                  : undefined
+  const showMessage = (update.status === 'failed' || update.status === 'busy' || update.status === 'managed')
+    && update.message !== undefined
+  const apply = async (): Promise<void> => {
+    if (update.latest === undefined) return
+    try {
+      await acp.applyPluginUpdate(update.latest)
+    } catch {
+      // The store keeps the "disk may have changed" state and writes its own notice.
+    }
+  }
+  return (
+    <div
+      id="ntr-plugin-update-card"
+      className="dwa-card dwa-update-card"
+      role="group"
+      aria-label={acp.label('插件更新', 'Plugin update')}
+    >
+      <div className="dwa-update-summary">
+        <span>{acp.label(`当前 v${update.current}`, `Current v${update.current}`)}</span>
+        {onDisk !== undefined && <span className="dwa-hint">{acp.label(`磁盘 v${onDisk}`, `On disk v${onDisk}`)}</span>}
+        {update.latest !== undefined && (
+          <>
+            <span aria-hidden="true">→</span>
+            <span>{acp.label(`最新 v${latest}`, `Latest v${latest}`)}</span>
+            {published !== undefined && <span className="dwa-hint">{published}</span>}
+          </>
+        )}
+      </div>
+      {copy !== undefined && <p className="dwa-update-copy">{copy}</p>}
+      {showMessage && <div className="dwa-update-message">{update.message}</div>}
+      <div className="dwa-row-actions dwa-update-actions">
+        {update.status === 'available' && (
+          <button type="button" className="dwa-btn dwa-btn-primary" onClick={() => { void apply() }}>
+            {acp.label('更新', 'Update')}
+          </button>
+        )}
+        {applying && (
+          <button type="button" className="dwa-btn dwa-btn-primary" disabled>
+            {acp.label('正在更新…', 'Updating…')}
+          </button>
+        )}
+        {update.status !== 'applying' && (
+          <button type="button" className="dwa-btn" onClick={onClose}>{acp.label('关闭', 'Close')}</button>
+        )}
+        <button type="button" className="dwa-btn dwa-btn-quiet" disabled={applying} onClick={() => void acp.checkPluginUpdate(true)}>
+          {acp.label('重新检查', 'Check again')}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * The card is drawn for every state a host can report about this install,
+ * except the two where there is no install to talk about at all.
+ */
+function updateCardVisible(update: PluginUpdateState | undefined, open: boolean): boolean {
+  if (update === undefined || !open) return false
+  return update.status !== 'unsupported' && update.status !== 'not-installed'
+}
+
 export function AcpSettingsSection(props: WithStore) {
   const acp = props.acp
   ensureStyle()
@@ -863,6 +1027,12 @@ export function AcpSettingsSection(props: WithStore) {
   const [page, setPage] = useState<SettingsPage>('agents')
   const [addOpen, setAddOpen] = useState(false)
   const [addTarget, setAddTarget] = useState<DetectedAgentInfo | undefined>(undefined)
+  const [updateOpen, setUpdateOpen] = useState(false)
+  // The store throttles this to one registry read per ten minutes, so every
+  // remount (both settings entries mount this section) is cheap.
+  useEffect(() => {
+    void acp.checkPluginUpdate()
+  }, [acp])
   const { configured, available } = partitionAgents(ui.detectedAgents, ui.agents)
   const selected = addTarget ?? available[0] ?? NEW_AGENT_SEED
   const openAdd = (): void => {
@@ -870,14 +1040,48 @@ export function AcpSettingsSection(props: WithStore) {
     setPage('add')
   }
   const presetProblem = ui.preset !== undefined && (!ui.preset.installed || ui.preset.problem !== undefined)
+  const update = ui.pluginUpdate
+  // A source install cannot be replaced by this browser; the version badge
+  // says so on hover. Neutral wording: a checkout may be git or not.
+  const versionTitle = update?.status === 'source-install'
+    ? acp.label('源码或本地安装，无法通过 registry 更新。', 'Source or local install; update it through its own checkout.')
+    : undefined
+  // The running version is the update entry: every state with a real install
+  // report can open the card, including "up to date" (which offers a re-check).
+  const versionOpensUpdate = update !== undefined
+    && update.status !== 'unsupported'
+    && update.status !== 'not-installed'
 
   return (
     <div className="dwa-root">
       <header className="dwa-page-header">
         <div className="dwa-page-heading">
-          <h2 className="dwa-page-title">
+          <h2 className="dwa-page-title" aria-label={acp.label('NTR 设置', 'NTR settings')}>
             {acp.label('NTR 设置', 'NTR settings')}
-            {ui.pluginVersion !== undefined && <span className="dwa-badge dwa-version">{`v${ui.pluginVersion}`}</span>}
+            {ui.pluginVersion !== undefined && (
+              versionOpensUpdate
+                ? (
+                  <button
+                    type="button"
+                    className="dwa-badge dwa-version dwa-version-btn"
+                    title={versionTitle}
+                    aria-expanded={updateOpen}
+                    aria-controls="ntr-plugin-update-card"
+                    onClick={() => setUpdateOpen(open => !open)}
+                  >
+                    {`v${ui.pluginVersion}`}
+                  </button>
+                )
+                : <span className="dwa-badge dwa-version" title={versionTitle}>{`v${ui.pluginVersion}`}</span>
+            )}
+            {update !== undefined && (
+              <PluginUpdateBadge
+                acp={acp}
+                update={update}
+                open={updateOpen}
+                onToggle={() => setUpdateOpen(open => !open)}
+              />
+            )}
           </h2>
           <p className="dwa-page-description">
             {acp.label('连接智能体，设置你的对话偏好。', 'Connect agents and set your conversation preferences.')}
@@ -889,6 +1093,10 @@ export function AcpSettingsSection(props: WithStore) {
           </button>
         )}
       </header>
+
+      {update !== undefined && updateCardVisible(update, updateOpen) && (
+        <PluginUpdateCard acp={acp} update={update} onClose={() => setUpdateOpen(false)} />
+      )}
 
       {/* The cross-session mirror: the conversation dock answers the asks
           belonging to the open conversation; this card answers the rest. */}

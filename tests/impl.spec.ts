@@ -1271,6 +1271,32 @@ describe('dispatchRpc', () => {
       .resolves.toEqual({ ok: true, value: { version: '1.2.3' } })
     await expect(dispatchRpc({ ...manager, pluginVersion: undefined }, 'plugin/version', {}))
       .resolves.toEqual({ ok: true, value: { version: undefined } })
+    // Built-in update: check/apply delegate to the manager; an older host half
+    // answers `unsupported` instead of failing, and a malformed version never
+    // reaches the manager.
+    const withUpdate = {
+      ...manager,
+      pluginUpdateCheck: async () => {
+        manager.calls.push(['updateCheck', undefined])
+        return { status: 'current' as const, current: '1.2.3' }
+      },
+      pluginUpdateApply: async (version: string) => {
+        manager.calls.push(['updateApply', version])
+        return { status: 'applied' as const, current: '1.2.3', installed: version }
+      },
+    }
+    await expect(dispatchRpc(withUpdate, 'plugin/update-check', {}))
+      .resolves.toEqual({ ok: true, value: { status: 'current', current: '1.2.3' } })
+    expect(manager.calls).toContainEqual(['updateCheck', undefined])
+    await expect(dispatchRpc(withUpdate, 'plugin/update-apply', { version: '1.3.0' }))
+      .resolves.toEqual({ ok: true, value: { status: 'applied', current: '1.2.3', installed: '1.3.0' } })
+    expect(manager.calls).toContainEqual(['updateApply', '1.3.0'])
+    await expect(dispatchRpc(withUpdate, 'plugin/update-apply', { version: '1.3' }))
+      .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc(manager, 'plugin/update-check', {}))
+      .resolves.toEqual({ ok: true, value: { status: 'unsupported', current: '' } })
+    await expect(dispatchRpc(manager, 'plugin/update-apply', { version: '1.3.0' }))
+      .resolves.toEqual({ ok: true, value: { status: 'unsupported', current: '' } })
     await expect(dispatchRpc(manager, 'agent/save', { id: 'pi', command: 'pi-acp' })).resolves.toEqual({ ok: true, value: { done: true } })
     expect(manager.calls).toContainEqual(['save', expect.objectContaining({ id: 'pi', command: 'pi-acp' })])
     await expect(dispatchRpc(manager, 'agent/test', { id: 'pi', command: 'pi-acp', npmPackage: 'pi-acp' })).resolves.toEqual({ ok: true, value: { ok: true, durationMs: 5, stderr: [] } })

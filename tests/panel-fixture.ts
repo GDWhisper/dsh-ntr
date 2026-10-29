@@ -13,6 +13,7 @@ import type {
   ApprovalDeadlinesSetPayload,
   DetectedAgentInfo,
   PermissionOutcome,
+  PluginUpdateState,
   TagHaloSetPayload,
 } from '../src/protocol.ts'
 
@@ -35,6 +36,12 @@ export interface PanelFixtureOptions {
   preset?: AcpPresetStatus | null
   /** null simulates an older host without the version endpoint. */
   pluginVersion?: string | null
+  /** null simulates an older host without the plugin-update RPCs. */
+  pluginUpdate?: PluginUpdateState | null
+  /** What `plugin/update-apply` answers; defaults to an installed 9.9.9. */
+  pluginUpdateApplied?: PluginUpdateState
+  /** Reject `plugin/update-apply` with this message (a transport/RPC failure). */
+  pluginUpdateApplyError?: string
   tagHalo?: AcpTagHalo
   permissions?: PanelPermissionRequest[]
   /** Hold the first agents/list response to preview/test the loading state. */
@@ -54,6 +61,10 @@ export interface PanelFixture {
 
 const WORKSPACE = '/workspace/ntr-demo'
 const CATALOG_TIME = Date.UTC(2026, 9, 28, 10, 30)
+
+const DEFAULT_PLUGIN_UPDATE: PluginUpdateState = {
+  status: 'current', current: '0.2.1', installed: '0.2.1', latest: '0.2.1',
+}
 
 const EXAMPLE_AGENTS: AcpAgentDef[] = [
   {
@@ -112,6 +123,9 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
   const initialDeadlines = structuredClone<AcpApprovalDeadlines>(options.approvalDeadlines ?? { mode: 'wait', permissionTimeoutMs: 300_000 })
   let deadlineMode = initialDeadlines.mode
   let deadlineWindow = initialDeadlines.permissionTimeoutMs
+  let pluginUpdate = options.pluginUpdate === null
+    ? null
+    : structuredClone<PluginUpdateState>(options.pluginUpdate ?? DEFAULT_PLUGIN_UPDATE)
 
   function definition(agentId: string): AcpAgentDef {
     const def = definitions.get(agentId)
@@ -198,6 +212,18 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
         case 'preset/status': return ok({ preset })
         case 'plugin/version':
           return options.pluginVersion === null ? unsupported() : ok({ version: options.pluginVersion ?? '0.2.1' })
+        case 'plugin/update-check':
+          return pluginUpdate === null ? unsupported() : ok(pluginUpdate)
+        case 'plugin/update-apply': {
+          if (pluginUpdate === null) return unsupported()
+          if (options.pluginUpdateApplyError !== undefined) {
+            return { ok: false, error: { code: 'fixture_error', message: options.pluginUpdateApplyError } }
+          }
+          pluginUpdate = structuredClone<PluginUpdateState>(options.pluginUpdateApplied ?? {
+            status: 'restart-required', current: '0.2.1', installed: '9.9.9', latest: '9.9.9',
+          })
+          return ok(pluginUpdate)
+        }
         case 'default/agent':
           return ok({ agentId: defaultAgentId !== undefined && definitions.has(defaultAgentId) ? defaultAgentId : undefined })
         case 'default/agent-set': {

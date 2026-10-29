@@ -71,9 +71,10 @@ import type {
 import type {
   AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpMcpServerDef, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
   LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo,
-  ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PreparedAdapterCall, SessionView, StreamChunk,
+  ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PluginUpdateState, PreparedAdapterCall, SessionView, StreamChunk,
 } from './protocol.ts'
 import { DEFAULT_TAG_HALO } from './protocol.ts'
+import { UpdateService } from './update.ts'
 
 /**
  * Version of this installed package, read from the shipped `package.json` —
@@ -789,6 +790,19 @@ export class AgentBridge {
    */
   private isQuiet(): boolean {
     return this.sessions.size === 0 && !this.hasActiveWork()
+  }
+
+  /**
+   * A turn is in flight (or the agent has not settled its response yet) on any
+   * of this bridge's sessions. `settled` only stays non-undefined while the
+   * agent's answer is outstanding — the settler clears it on completion — so
+   * this is real work, not an idle session.
+   */
+  hasActiveTurn(): boolean {
+    for (const session of this.sessions.values()) {
+      if (session.running || session.settled !== undefined) return true
+    }
+    return false
   }
 
   /**
@@ -4117,6 +4131,37 @@ export class BridgeManager {
     return PLUGIN_VERSION
   }
 
+  /** Wire the built-in updater (host entry only; absent in pure tests). */
+  setUpdateService(service?: UpdateService): void {
+    this.updateService = service
+  }
+
+  /** Registry check for the settings card; `unsupported` when no updater is wired. */
+  async pluginUpdateCheck(): Promise<PluginUpdateState> {
+    return this.updateService?.check() ?? { status: 'unsupported', current: PLUGIN_VERSION }
+  }
+
+  /** Delegate one install to the host plugin manager; never touches files itself. */
+  async pluginUpdateApply(version: string): Promise<PluginUpdateState> {
+    return this.updateService?.apply(version) ?? { status: 'unsupported', current: PLUGIN_VERSION }
+  }
+
+  /**
+   * Whether any ACP work is in flight. An update install may restart the host,
+   * so check/apply describe the host as busy while a turn is running.
+   *
+   * Segmented turn streams count even between steps (the host is still
+   * continuing that turn); `running` / `settled` on a session covers `/acp`
+   * turns and the window between a prompt and the agent's acknowledgement.
+   */
+  hasActiveTurns(): boolean {
+    if (this.turnStreams.size > 0) return true
+    for (const bridge of this.bridges.values()) {
+      if (bridge.hasActiveTurn()) return true
+    }
+    return false
+  }
+
   private getStoragePath(): string | undefined {
     if (this.configStoragePath !== undefined) return this.configStoragePath
     if (process.env.DSH_ACP_CONFIG_FILE) return process.env.DSH_ACP_CONFIG_FILE
@@ -5291,6 +5336,12 @@ export class BridgeManager {
 
   /** Host-side reader of the harness preset roster (`ctx.agentPresets`), for `presetStatus`. */
   private presetRosterReader?: () => Promise<readonly RosterPresetRow[] | undefined>
+
+  /**
+   * The built-in updater, wired by the host entry. Absent in pure bridge tests —
+   * the update RPCs then answer `unsupported` instead of inventing a source.
+   */
+  private updateService?: UpdateService
 
   /**
    * The plugin's own default ACP agent (the panel's ★ gesture): which agent an

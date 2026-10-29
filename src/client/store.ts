@@ -6,7 +6,7 @@
  * Deliberately framework-free: React binds through `useSyncExternalStore`.
  */
 
-import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSavePayload, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, PermissionTimeoutMode, PluginVersionResult, SessionView } from '../protocol.ts'
+import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSavePayload, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, PermissionTimeoutMode, PluginUpdateState, PluginVersionResult, SessionView } from '../protocol.ts'
 import { DEFAULT_TAG_HALO } from '../protocol.ts'
 
 /** One slash command the ACP agent declared, whole row (the menu draws name, description and `input.hint`). */
@@ -304,6 +304,12 @@ export interface UiState {
    * hides the badge rather than naming a version this browser invented.
    */
   pluginVersion?: string
+  /**
+   * The running version and its update status (`plugin/update-check`). Absent
+   * on a host half without the endpoint, which hides the update entry instead
+   * of offering an install this browser cannot perform.
+   */
+  pluginUpdate?: PluginUpdateState
 }
 
 interface Listener { (): void }
@@ -314,6 +320,13 @@ const MAX_WATCHED = 6
 
 /** Raw JSON budget for one event block; the cut is marked. */
 const RAW_MAX = 256_000
+
+/**
+ * How long a fetched update state stays fresh. The settings panel asks on every
+ * mount; without this, every open would hit the registry. A forced check (the
+ * card's own button) always goes out.
+ */
+const PLUGIN_UPDATE_TTL_MS = 10 * 60 * 1000
 
 /** Pretty-printed JSON of an agent message (never throws, cuts only at {@link RAW_MAX} with a marker). */
 export function jsonText(value: unknown): string {
@@ -660,6 +673,22 @@ export class AcpStore {
   private readonly cachedModelReads = new Set<string>()
   /** Counts behind the last successful explicit re-detect, so a locale switch can re-render its summary. */
   private detectCounts: { total: number; installed: number } | undefined
+  /** When {@link UiState.pluginUpdate} was last read from the host (epoch ms). */
+  private pluginUpdateFetchedAt = 0
+  /**
+   * The shared in-flight `plugin/update-check`. The settings section mounts
+   * twice (both entries) and the update popover asks too; without this, two
+   * mounts in the same tick each fire their own registry read.
+   */
+  private pluginUpdateInflight?: Promise<PluginUpdateState | undefined>
+  /** Re-entry guard for `plugin/update-apply` (a double click is one install). */
+  private pluginUpdateApplying = false
+  /**
+   * Update read generation. An apply bumps it so a check that was already in
+   * flight (started before the install) cannot land afterwards and overwrite
+   * the install's verdict with the pre-install `available`.
+   */
+  private pluginUpdateGeneration = 0
 
   constructor(private readonly rpc: RpcCall, private readonly locale: (zh: string, en: string) => string) {}
 
@@ -834,6 +863,103 @@ export class AcpStore {
       if (active !== undefined) await this.loadTranscript(active)
     } catch (error) {
       this.mutate({ notice: String(error instanceof Error ? error.message : error) })
+    }
+  }
+
+  /**
+   * Read the plugin's update state (`plugin/update-check`). Throttled to ten
+   * minutes unless `force`: the settings panel asks on mount, and every
+   * remount must not hit the registry.
+   *
+   * An older host serves no such endpoint (`unknown endpoint`). That is a
+   * normal degradation, not an error worth a notice: the answer is `undefined`
+   * and the panel simply keeps its update entry hidden.
+   */
+  async checkPluginUpdate(force = false): Promise<PluginUpdateState | undefined> {
+    // One read for every caller while it is in flight, force included: the
+    // settings page and the popover mounting together must not hit the
+    // registry twice.
+    if (this.pluginUpdateInflight !== undefined) return this.pluginUpdateInflight
+    const current = this.state.pluginUpdate
+    if (!force && current !== undefined && Date.now() - this.pluginUpdateFetchedAt < PLUGIN_UPDATE_TTL_MS) {
+      return current
+    }
+    const generation = this.pluginUpdateGeneration
+    const inflight = this.readPluginUpdate(generation)
+    this.pluginUpdateInflight = inflight
+    try {
+      return await inflight
+    } finally {
+      this.pluginUpdateInflight = undefined
+    }
+  }
+
+  private async readPluginUpdate(generation: number): Promise<PluginUpdateState | undefined> {
+    try {
+      const pluginUpdate = await this.call<PluginUpdateState>('plugin/update-check')
+      // An install started while this read was in flight: its answer is
+      // already stale, and the install's verdict owns the state now.
+      if (generation !== this.pluginUpdateGeneration) return undefined
+      this.pluginUpdateFetchedAt = Date.now()
+      this.mutate({ pluginUpdate })
+      return pluginUpdate
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Install one exact version (`plugin/update-apply`). The status flips to
+   * `applying` first so the badge answers the click; the host's answer then
+   * becomes the state.
+   *
+   * A failed call does NOT prove the install did not happen: on an HMR host
+   * the update uninstalls the plugin before reinstalling it, which can cut the
+   * response. Whatever the error, the disk may already carry the new version,
+   * so the state becomes `restart-required` (the one neutral verdict for "the
+   * running code is not the disk's") with `installed` dropped (unknown, not a
+   * fact to display) and the notice asks for a reload rather than restoring
+   * `available` and pretending nothing changed.
+   */
+  async applyPluginUpdate(version: string): Promise<PluginUpdateState | undefined> {
+    if (this.pluginUpdateApplying) return undefined
+    this.pluginUpdateApplying = true
+    // Any check already in flight predates the install; its answer must not
+    // land on top of the install's verdict.
+    this.pluginUpdateGeneration += 1
+    const previous = this.state.pluginUpdate
+    if (previous !== undefined) {
+      this.mutate({ pluginUpdate: { ...previous, status: 'applying' } })
+    }
+    try {
+      const pluginUpdate = await this.call<PluginUpdateState>('plugin/update-apply', { version })
+      this.pluginUpdateFetchedAt = Date.now()
+      this.mutate({ pluginUpdate })
+      return pluginUpdate
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      // The disk state is UNKNOWN here: the install may have completed before
+      // the response was cut. Keep `latest` for display, drop `installed` so no
+      // surface can claim a disk version we never read, and reset the throttle
+      // so the next check actually asks the host instead of serving this
+      // unknown verdict for ten minutes.
+      const interrupted: PluginUpdateState = previous !== undefined
+        ? { ...previous, status: 'restart-required', installed: undefined, message }
+        : { status: 'restart-required', current: this.state.pluginVersion ?? '?', message }
+      this.pluginUpdateFetchedAt = 0
+      this.mutate({
+        pluginUpdate: interrupted,
+        notice: this.locale(
+          '更新请求已中断；请刷新页面确认当前版本。',
+          'The update request was interrupted. Reload the page to confirm the installed version.',
+        ),
+      })
+      return undefined
+    } finally {
+      // Invalidate reads that STARTED during the install: their "applying"
+      // answer would otherwise land on top of this call's final verdict.
+      this.pluginUpdateGeneration += 1
+      this.pluginUpdateApplying = false
     }
   }
 

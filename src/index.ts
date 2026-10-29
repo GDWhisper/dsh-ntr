@@ -8,10 +8,12 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { ConnectionRpcHandler, HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
-import { ACP_PRESET_ID, AcpLlmAdapter, BridgeManager } from './bridge.ts'
+import { ACP_PRESET_ID, AcpLlmAdapter, BridgeManager, PLUGIN_VERSION } from './bridge.ts'
 import { EventHub, dispatchRpc, permissionReplayFrames, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
 import type { AcpEvent, ApprovalDeadlineKey } from './protocol.ts'
 import type { RosterPresetRow, SessionLogLike } from './impl.ts'
+import { UpdateService } from './update.ts'
+import type { UpdateManagerLike } from './update.ts'
 
 export const name = 'dsh-ntr'
 // Deliberately minimal: every other host service is probed structurally
@@ -92,6 +94,16 @@ export function apply(ctx: Context, config?: unknown): void {
     },
   )
   const adapter = new AcpLlmAdapter(manager)
+  // Built-in update: the plugin never downloads or swaps files itself. The
+  // harness plugin manager owns the install; this only relays its facts.
+  // `resolveManager` re-probes on every call so a late-loading service is
+  // picked up without an `inject` dependency (a host without it must still
+  // load this plugin, and then reports `unsupported`).
+  manager.setUpdateService(new UpdateService({
+    resolveManager: () => (typeof ctx.get === 'function' ? ctx.get('pluginManager') : undefined) as UpdateManagerLike | undefined,
+    currentVersion: PLUGIN_VERSION,
+    isBusy: () => manager.hasActiveTurns(),
+  }))
   // The RAW patch-file deadlines, before validation filled the defaults in.
   // `validateConfig` returns a number for every knob, so the validated object
   // cannot tell "the deployment asked for 10 minutes" from "the deployment said

@@ -82,6 +82,40 @@
 - `session/cancel`、`session/close`（先 settle 未决询问，再发 `session/close` 请求）、`releaseAll` 都会答复未决询问，卡片不会跨回合残留。
 - `approvalRouted` 已删除（`agents/list` 不再上报）：设置页镜像卡片只看 `ui.permissions` 是否非空，见 [ui.md §10](./ui.md)。
 
+## 8. 内置更新
+
+更新是设置页版本徽标旁的一条链路，但**安装不是插件做的**：插件只问宿主「装的是什么」、问 registry「发布了什么」，再把安装**原样委托**给宿主 `pluginManager`。它从不下载包、不替换文件、不重启自己，也不拼 profile 路径（`src/update.ts` 的模块头就是这条边界）。HMR 下的「先卸再装」是宿主自己的更新语义（见下文 apply），不是自替换。
+
+- **端点**：`plugin/update-check`（`{}`）与 `plugin/update-apply`（`{ version }`，经 `str(body, 'version', 64)` 后必须匹配 `/^\d+\.\d+\.\d+$/`，否则 `bad_payload`）都回 `PluginUpdateState`（`src/protocol.ts`）。状态机固定为 `unsupported` / `not-installed` / `source-install` / `managed` / `current` / `available` / `applying` / `busy` / `applied` / `restart-required` / `failed`；`current` 是**运行中**（内存里）的版本，`installed` 是磁盘版本，`latest` 是 registry 报出的稳定版目标，`registries` 是实际按顺序问过的 base（见下文「registry 链」）。
+- **不抛异常**：服务侧把错误折成状态（`failed` + `message`；`message` 是英文技术信息，本地化归 UI）而不是 throw；唯一例外是格式不合法的版本——那是调用方 bug，抛 `bad_payload`。
+- **接线**：`src/index.ts` 在宿主入口 `manager.setUpdateService(new UpdateService({ … }))`；`resolveManager` 每次调用重探 `ctx.get('pluginManager')`，**不写进顶层 `inject`**——没有这个服务的旧宿主仍要能加载，此时 `BridgeManager.pluginUpdateCheck` 回 `unsupported`。纯 bridge 测试不接线，同样回 `unsupported`，不发明数据源。
+- **顺序**：check 是 `applying` 重入 → 资格矩阵 → registry 链，**不做忙判断**（读 registry 不花 ACP 工作，回合进行中也要能答「外面有什么版本」）；apply 是版本格式 → 拒绝不高于运行版本 → `applying` 重入 → 资格矩阵 → 忙判断 → `installBundle`。资格失败**优先于**忙：源码安装不会被说成「有对话在跑」。
+
+**资格矩阵**（`bundleEligibility`，check / apply 共用；bundle 不存在或 `installed !== true` 都算 `not-installed`）：
+
+| 条件 | 结果 |
+|---|---|
+| 无 `pluginManager`，或缺 `listBundles` / `registries` / `installBundle` 任一 | `unsupported` |
+| bundle 不存在或 `installed !== true` | `not-installed` |
+| bundle 不报 `source`（旧宿主） | `unsupported`（不猜渠道） |
+| `source` 不是 registry spec（`isRegistrySpec`） | `source-install` |
+| `readOnlyReason` 非空 | `managed`（`message` 用宿主原话） |
+| `removable === false` | `managed`（宿主标记不可移除，remove 必然失败） |
+| `bundle.error` 存在 | `failed`（code + `diagnostic`，缺失回落 `message`） |
+| 磁盘 `version` 与运行版本经 `compareVersions` 不等 | `restart-required`（装完没重启；更高或更低都算；只带 `installed`，**不冒充 `latest`**） |
+
+- **registry spec 是正向判定**：`isRegistrySpec` 先拒绝空串、`.` 开头、含 `:` / `/` / `\` 的来源，再只接受 `*` / `x`、dist-tag（latest / next / beta / alpha / rc / stable）与版本范围（可带 `v` 前缀、`^` / `~` / `>=` / `<=` / `>` / `<` / `=`；首段数字，最多三段，后两段可为 `x` / `*`；可选预发布 / build 后缀）。link: / file: / git+ / git@github.com: / github: / workspace: / https tarball / 相对路径都因形状被排除，**不维护黑名单**——将来出现新的 source scheme 默认不可更新。
+- **registry 链**：`registryPlan` 把 `registries()` 的 `registry` → `resolved` → `fallbackRegistries` 排成真正要问的列表，**只留 http(s)**（去尾斜杠、去空、去重），**跳过带 username/password 的 URL**（本模块不读 `.npmrc`，也不把凭据发给 fetch）。隐私规则：私有的 `resolved` 不会因为存在 fallback 链就被 widen（只有 npm 公网或本身就在 fallback 里才追加）。每个 base 直接 `GET <base>/dsh-ntr`（`accept: application/json`，8s `AbortSignal.timeout`），**不 spawn npm**。某个 base 连不上（非 2xx / 超时 / 解析失败）就换下一个；**某个 base 只报运行版或更旧时也换下一个**——镜像滞后不能掩盖后面的更新；首个报出高于 `current` 的版本即 `available`。返回的 `registries` 一律经 `displayRegistry` 脱敏（去 userinfo）；失败 message 同样脱敏。整条链都没有更新时报 `current`（`latest` 取链上最高稳定版）；一个 base 都没答上才 `failed`（无 registry 配置 / 全部不可达）。
+- **选版**：`pickUpdateTarget` 优先 `dist-tags.latest`（仅接受稳定且未被 `deprecated` 的版本、且高于 `current`）；否则取 `versions` 里最高且未 `deprecated` 的稳定版；都旧于 `current` 时仍回稳定且未弃用的 `latest`，供 UI 说「已是最新」。预发布版本永不提供安装；`publishedAt` 取 packument 的 `time[version]`。
+- **缓存**：每个 base 成功的 packument 答案缓存 10 分钟（`CACHE_TTL_MS`）——设置页每次挂载都会问一次，没有缓存就是每次开页面都打 registry。apply **成功**（`applied` / `restart-required`）清空缓存与 `lastTarget`，下一次 check 看到刚装上的版本；失败不清，缓存仍是最近一次成功的 packument，重试安装不必再打 registry。卡片「重新检查」绕过的是**浏览器侧**节流，宿主侧缓存仍按 base 生效。
+- **apply 委托与映射**：解包宿主的 `{ ok, value }` 信封后，`application === 'applied'` → `applied`，`'restart-required'` → `restart-required`（`installed` 取结果里的 `version`，缺失回落请求版本）；`overridden` / `cancelled` / 带 `error` / 缺失或未知 `application` → `failed`（如实说「manager 没给结果 / 给了不认识的状态」）。错误正文读 `error.diagnostic`，缺失才回落 `message`（RPC 信封的 `message` 只作兼容）。**失败绝不把目标版本写进 `installed`**：普通失败沿用资格阶段读到的磁盘版本（等于 `current`），回滚成功才显式写 `installed: current`，回滚失败则不带 `installed`。安装命中 registry 时经 `lastTarget` 透传给本次 `installBundle`（版本一致时）；**回滚不传 registry**，走宿主默认链（目标版本可能来自 fallback / 镜像）。check 在选版完成后会再查一次 `applying`：若安装已在 fetch 期间开始，晚到的结果返回 `applying`，不把 `available` 交给客户端。
+- **HMR 下的 apply**：宿主在 HMR 持有时拒绝覆盖已安装 bundle（`already-installed`）。apply 因此按宿主原生更新语义执行：先 `installBundle`；遇 `already-installed` 且宿主有 `removeBundle` → `removeBundle('dsh-ntr')`（会卸载当前插件）→ 重试 `installBundle`。卸载结果必须是 `error` 缺失且 `application` 为 `applied` / `restart-required` / undefined，`cancelled` / `overridden` / `failed` 一律 `failed`。重试再失败时**先再 `removeBundle`（目标可能已落盘）**，再 `installBundle('dsh-ntr@'+current, { enabled: true })` 回滚（不带 registry）；回滚失败时消息说明「rollback also failed」且不带 `installed`。这不是自替换：所有文件操作都由宿主 pluginManager 完成，用户手动点击触发，`removeBundle` 只是宿主更新流程里卸载活模块的那一步——apply 的 RPC 因此可能在安装中被打断，客户端按下一条处理。
+- **忙保护**：`isBusy` 接 `BridgeManager.hasActiveTurns`（有在飞的分段 turn 流，或任一 bridge 有活跃 turn）。**只有 apply 查忙**：安装可能要宿主重启，不能在别人回合中间做；有回合在跑时 check 照常查 registry。
+- **源码安装**：`link:` / `file:` / `git+` / `workspace:` / 相对路径等是本地挂载、git 检出或本地包，registry 里的版本对它没有意义。状态固定 `source-install`、**永不升级**；UI 的版本徽标 `title` 与卡片只说「源码或本地安装，无法通过 registry 更新」，不假定用户用的是 git（`file:` / tarball 同样成立）。这是 per-bundle 的 `source` 事实，不按渠道猜。
+- **客户端**：`checkPluginUpdate` 在 store 里做 10 分钟节流（`PLUGIN_UPDATE_TTL_MS`）与共享 in-flight promise（两个设置入口同 tick 挂载也只打一次）；`force` 只绕过 TTL，不绕过 in-flight。旧宿主没有端点时 `unknown endpoint` 被静默吞掉、返回 `undefined`，更新入口整块隐藏且不写 notice。`applyPluginUpdate` 用 `pluginUpdateApplying` 做重入保护（双击只装一次），先乐观写 `applying`；apply RPC 若因插件被卸载而中断，客户端把结果映射成 `restart-required`、**清掉 `installed`（磁盘状态未知）**、保留 `latest`、写一次 notice「更新请求已中断；请刷新页面确认当前版本。」，并重置节流时间戳让下一次 check 真正去问宿主。`pluginUpdateGeneration` 在 apply 开始时自增，晚到的 check 结果代次不符即丢弃——安装成功不会被旧 check 改回 `available`。
+- **已知限制**：check 直接 GET packument，**不读 profile 的 `.npmrc` 认证 / 代理**；带凭据的 registry URL 会被 `registryPlan` 跳过（不把 token 交给 fetch，也不发给浏览器），私有 registry 需要认证时可能表现为不可达，`failed.message` 列出问过的 base（URL 已脱敏）。将来 DSH 若提供 `updateBundle` / `listVersions`，优先改用宿主接口而不是继续自建 registry 读取。
+- **渠道与重启**：资格与安装都**按能力判断**，不按渠道：web 与桌面 DSH 的宿主半区同源，能不能更新只看 `ctx.get('pluginManager')`；插件不读渠道标记、不为 web / 桌面分支，装进哪个 profile 由 manager 决定，插件不拼路径、不认 profile 名。桌面 App 管理的 profile **不要**对它跑 `dsh plugin`（那份 profile 归 App 自己管）；两条渠道的安装都走这个进程内服务。重启**不能自动**：`applied` 让用户刷新页面，`restart-required` 让用户重启 DSH（桌面 App 退出重开 / 命令行重启 `dsh web`），插件既不重启宿主也不自替换。
+
 ## 代码索引
 
 | 主题 | 位置 |
@@ -92,3 +126,4 @@
 | 目录 | `src/bridge.ts` · `agentCatalog` / `resolveAdapterModel` / `absorbCatalog` / `absorbCatalogShape` / `setExposedModels` / `setAutoDiscoverModels` / `autoExposeNewModels` / `broadcastExposure`；`src/impl.ts` · `parseCatalogOptions` / `mergeCatalogShape` / `usableConfigOptions` |
 | 未决询问 | `src/bridge.ts` · `handlePermissionRequest`；`src/impl.ts` · `PermissionLedger` / `permissionRequestFrame` / `permissionReplayFrames`；`src/client/store.ts` · `permissionsForSession` |
 | 斜杠缓存 | `src/bridge.ts` · `chatSessions` / `absorbCommands`；`src/client/store.ts` · `chatSessionCommands` / `loadChatSessions` |
+| 内置更新 | `src/update.ts` · `UpdateService` / `check` / `apply` / `bundleEligibility` / `isRegistrySpec` / `registryPlan` / `pickUpdateTarget` / `compareVersions`；`src/index.ts` · `setUpdateService`；`src/bridge.ts` · `pluginUpdateCheck` / `pluginUpdateApply` / `hasActiveTurns` / `PLUGIN_VERSION`；`src/impl.ts` · `dispatchRpc`（`plugin/update-*` 分支）；`src/client/store.ts` · `checkPluginUpdate` / `applyPluginUpdate`；`src/client/panel.tsx` · `PluginUpdateBadge` / `PluginUpdateCard` / `updateBadgeText` / `updateCardVisible` |
