@@ -532,6 +532,14 @@ export const DEFAULT_KNOWN_PRESETS: DetectedAgentInfo[] = [
     defaultArgs: ['acp'],
   },
   {
+    id: 'cursor',
+    name: 'Cursor CLI',
+    description: 'Cursor CLI — run as `agent acp` over stdio (legacy alias `cursor-agent acp`)',
+    detected: false,
+    defaultCommand: 'agent',
+    defaultArgs: ['acp'],
+  },
+  {
     id: 'qwen',
     name: 'Qwen Code',
     description: 'Qwen Code — run as `qwen --experimental-acp` over stdio',
