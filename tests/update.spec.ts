@@ -101,6 +101,9 @@ describe('isRegistrySpec', () => {
     for (const source of [
       '1.0.0', 'v1.0.0', '^1.0.0', '~1.0.0', '>=1.0.0', '<=1.0.0', '>1.0.0', '<1.0.0', '=1.0.0',
       '*', 'x', 'latest', 'next', 'beta', 'alpha', 'rc', 'stable',
+      // The harness reports a registry dependency as `<package>@<spec>`.
+      'dsh-ntr@0.3.0', 'dsh-ntr@v0.3.0', 'dsh-ntr@^1.0.0', 'dsh-ntr@~1.0.0',
+      'dsh-ntr@>=1.0.0', 'dsh-ntr@*', 'dsh-ntr@x', 'dsh-ntr@latest',
     ]) {
       expect(isRegistrySpec(source), source).toBe(true)
     }
@@ -113,6 +116,9 @@ describe('isRegistrySpec', () => {
       'https://github.com/x/y/tarball/main',
       'https://registry.npmjs.org/dsh-ntr/-/dsh-ntr-1.0.0.tgz',
       './dsh-ntr', '../dsh-ntr', '.', '/opt/dsh-ntr', 'C:\\work\\dsh-ntr', 'npm',
+      'dsh-ntr@', '@1.0.0', 'dsh-ntr@file:../dsh-ntr', 'dsh-ntr@link:../dsh-ntr',
+      'dsh-ntr@git+https://github.com/x/y.git', 'dsh-ntr@workspace:*',
+      'dsh-ntr@npm:other@1.0.0', 'dsh-ntr@./local',
     ]) {
       expect(isRegistrySpec(source), source).toBe(false)
     }
@@ -278,7 +284,10 @@ describe('bundleEligibility', () => {
   })
 
   it('accepts registry version specs as updatable installs', () => {
-    for (const source of ['1.0.0', '^1.0.0', 'latest', '*', 'x']) {
+    for (const source of [
+      '1.0.0', '^1.0.0', 'latest', '*', 'x',
+      'dsh-ntr@0.3.0', 'dsh-ntr@^1.0.0', 'dsh-ntr@latest', 'dsh-ntr@*',
+    ]) {
       expect(bundleEligibility([bundle({ source })], '1.0.0')).toEqual({ ok: true, installed: '1.0.0' })
     }
   })
@@ -288,6 +297,7 @@ describe('bundleEligibility', () => {
       'link:../dsh-ntr', 'file:/opt/dsh-ntr', 'git+https://github.com/x/y.git', 'git@github.com:x/y.git',
       'github:x/y', 'https://github.com/x/y', 'https://github.com/x/y/tarball/main', 'workspace:*',
       './dsh-ntr', '../dsh-ntr', '/opt/dsh-ntr',
+      'dsh-ntr@file:../dsh-ntr', 'dsh-ntr@git+https://github.com/x/y.git', 'dsh-ntr@workspace:*',
     ]) {
       expect(bundleEligibility([bundle({ source })], '1.0.0'))
         .toEqual({ ok: false, state: { status: 'source-install', current: '1.0.0' } })

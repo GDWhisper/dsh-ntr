@@ -91,22 +91,35 @@ function describeFieldError(error: { code?: string; message?: string; diagnostic
   return parts.length > 0 ? parts.join(': ') : 'the host reported a bundle error'
 }
 
+/** The version-spec half of a registry source: a range, wildcard, or dist-tag. */
+function isRegistryRange(value: string): boolean {
+  if (value === '') return false
+  const lowered = value.toLowerCase()
+  if (lowered === '*' || lowered === 'x') return true
+  if (REGISTRY_TAGS.has(lowered)) return true
+  return REGISTRY_VERSION_SPEC.test(value)
+}
+
 /**
  * Whether a `listBundles().source` value names a registry-resolvable version
- * spec — the only install shape this updater may replace. The test is positive
- * on purpose: link/file/git/workspace/URL/tarball/relative forms all carry a
- * `:` / `/` / `\` or start with `.`, so they fall out without an ever-growing
- * blacklist (a new source scheme must not become silently updatable).
+ * spec — the only install shape this updater may replace. The harness records
+ * a registry dependency as `<package>@<spec>` (`dependencySpec` in the plugin
+ * manager), so the spec half after the last `@` is what gets judged. The test
+ * is positive on purpose: link/file/git/workspace/URL/tarball/relative forms
+ * all carry a `:` / `/` / `\` or start with `.`, so they fall out without an
+ * ever-growing blacklist (a new source scheme must not become silently
+ * updatable).
  */
 export function isRegistrySpec(source: string): boolean {
   const value = typeof source === 'string' ? source.trim() : ''
   if (value === '') return false
   if (value.startsWith('.')) return false
   if (value.includes(':') || value.includes('/') || value.includes('\\')) return false
-  const lowered = value.toLowerCase()
-  if (lowered === '*' || lowered === 'x') return true
-  if (REGISTRY_TAGS.has(lowered)) return true
-  return REGISTRY_VERSION_SPEC.test(value)
+  const at = value.lastIndexOf('@')
+  if (at === -1) return isRegistryRange(value)
+  const name = value.slice(0, at)
+  if (!/^[a-z0-9][a-z0-9._-]*$/i.test(name)) return false
+  return isRegistryRange(value.slice(at + 1))
 }
 
 /**
