@@ -332,6 +332,12 @@ export interface AgentView {
   idleTimeoutMs?: number
 }
 
+/**
+ * Why the host released a session's agent process. The browser turns this into
+ * one runtime-log line per cause; `idle` stays silent (expected lifecycle).
+ */
+export type AcpReleaseCause = 'idle' | 'workspace' | 'resume-failed' | 'stalled' | 'died'
+
 export type AcpEvent =
   | { type: 'agent/status'; agentId: string; state: AgentProcessState; error?: string; agent?: AgentView }
   | { type: 'agent/notice'; agentId: string; level: 'info' | 'error'; text: string }
@@ -344,6 +350,8 @@ export type AcpEvent =
     sessionId: string
     session: SessionView
     reason: string
+    /** Host's release-cause classification; absent on an older host half. */
+    cause?: AcpReleaseCause
   }
   | {
     /**

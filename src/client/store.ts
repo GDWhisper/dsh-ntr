@@ -135,6 +135,22 @@ export interface ChatTranscript {
   seq: number
 }
 
+/**
+ * One line of the settings page's ACP runtime log. Agent-side notices and
+ * session-release reasons land here (bounded, append order oldest→newest);
+ * failures of the settings page's OWN actions stay in {@link UiState.notice}.
+ */
+export interface AcpLogEntry {
+  id: number
+  at: number
+  level: 'info' | 'error'
+  text: string
+  agentId?: string
+}
+
+/** Cap on retained runtime-log lines; older entries fall off the front. */
+export const LOG_MAX_ENTRIES = 200
+
 export interface UiState {
   open: boolean
   /**
@@ -156,7 +172,15 @@ export interface UiState {
   blocks: Block[]
   permissions: PendingPermission[]
   busy: boolean
+  /**
+   * The settings page's one-line banner for its OWN action failures. Agent-side
+   * runtime messages do not land here; they append to {@link logs} instead.
+   */
   notice?: string
+  /** Agent-side runtime log, append order oldest→newest, capped at {@link LOG_MAX_ENTRIES}. */
+  logs: AcpLogEntry[]
+  /** Lines appended since the user last opened the log; reset by {@link AcpStore.markLogsRead}. */
+  logUnread: number
   /**
    * The plugin's OWN default ACP agent (the panel's ★ gesture) — which agent a
    * new ACP-mode conversation starts on. NOT the deployment default model: that
@@ -603,6 +627,8 @@ export class AcpStore {
     blocks: [],
     permissions: [],
     busy: false,
+    logs: [],
+    logUnread: 0,
     detectedAgents: [...DEFAULT_KNOWN_PRESETS],
     detecting: false,
     modelCatalogs: {},
@@ -625,6 +651,8 @@ export class AcpStore {
 
   private readonly listeners = new Set<Listener>()
   private source?: EventSource
+  /** Monotonic id source for {@link AcpLogEntry}s (never reset by `clearLogs`). */
+  private logSeq = 0
   private readonly lastSeq = new Map<string, number>()
   /** Sessions with a finalized turn (dedups the cancel-fallback + late real turn/end pair). */
   private readonly openTurns = new Set<string>()
@@ -710,6 +738,24 @@ export class AcpStore {
       blocks: blocksChanged ? [...this.state.blocks] : patch.blocks ?? this.state.blocks,
     }
     for (const listener of [...this.listeners]) listener()
+  }
+
+  /**
+   * Build the log patch for one line. Does NOT mutate: the caller merges it
+   * into the single `mutate` call it was already making for the same event.
+   */
+  private logPatch(level: 'info' | 'error', text: string, agentId?: string): Pick<UiState, 'logs' | 'logUnread'> {
+    const entry: AcpLogEntry = {
+      id: ++this.logSeq,
+      at: Date.now(),
+      level,
+      text,
+      ...(agentId === undefined ? {} : { agentId }),
+    }
+    return {
+      logs: [...this.state.logs, entry].slice(-LOG_MAX_ENTRIES),
+      logUnread: this.state.logUnread + 1,
+    }
   }
 
   // ---- Streaming update coalescing ----
@@ -1895,6 +1941,17 @@ export class AcpStore {
     this.mutate({ notice: undefined })
   }
 
+  /** Drop every retained runtime-log line (the unread counter restarts too). */
+  clearLogs(): void {
+    this.mutate({ logs: [], logUnread: 0 })
+  }
+
+  /** The user looked at the log: clear the unread badge. */
+  markLogsRead(): void {
+    if (this.state.logUnread === 0) return
+    this.mutate({ logUnread: 0 })
+  }
+
   private flashError(error: unknown): void {
     this.mutate({ notice: error instanceof Error ? error.message : String(error) })
   }
@@ -1904,7 +1961,7 @@ export class AcpStore {
   private applyEvent(event: AcpEvent): Promise<void> {
     switch (event.type) {
       case 'agent/notice': {
-        this.mutate({ notice: event.text })
+        this.mutate(this.logPatch(event.level, event.text, event.agentId))
         return Promise.resolve()
       }
       case 'agent/status': {
@@ -1934,6 +1991,7 @@ export class AcpStore {
         return Promise.resolve()
       }
       case 'session/closed': {
+        const closingSession = this.state.sessions.find(s => s.sessionId === event.sessionId)
         const sessions = this.state.sessions.filter(s => s.sessionId !== event.sessionId)
         const active = this.state.activeSessionId === event.sessionId ? sessions[0]?.sessionId : this.state.activeSessionId
         this.openTurns.delete(event.sessionId)
@@ -1949,7 +2007,9 @@ export class AcpStore {
           chatTranscripts: closedTranscripts,
           ...(chatSessions.length !== this.state.chatSessions.length ? { chatSessions } : {}),
           permissions: this.state.permissions.filter(p => p.sessionId !== event.sessionId),
-          ...(event.reason === 'agent-died' ? { notice: this.locale('会话因 agent 进程退出而终止', 'session ended: agent process died') } : {}),
+          ...(event.reason === 'agent-died'
+            ? this.logPatch('error', this.locale('会话因 agent 进程退出而终止', 'session ended: agent process died'), closingSession?.agentId)
+            : {}),
         })
         return Promise.resolve()
       }
@@ -1966,6 +2026,31 @@ export class AcpStore {
         const chatSessions = this.state.chatSessions.some(s => s.sessionId === event.sessionId)
           ? this.state.chatSessions.map(s => (s.sessionId === event.sessionId ? { ...s, released: true } : s))
           : this.state.chatSessions
+        // One runtime-log line per release cause; `idle` stays silent on
+        // purpose (an expected lifecycle transition, not a fault).
+        const cause = event.cause ?? 'died'
+        let log: Partial<Pick<UiState, 'logs' | 'logUnread'>> = {}
+        if (cause === 'workspace') {
+          log = this.logPatch('info', this.locale(
+            'agent 为切换工作区重启，会话已挂起；再次发送消息将自动恢复。',
+            'agent restarted for its workspace; the session is paused and will resume on your next message.',
+          ), event.session.agentId)
+        } else if (cause === 'resume-failed') {
+          log = this.logPatch('error', this.locale(
+            '会话恢复失败；再次发送消息将重试恢复。',
+            'session resume failed; your next message will retry it.',
+          ), event.session.agentId)
+        } else if (cause === 'stalled') {
+          log = this.logPatch('error', this.locale(
+            'agent 未响应卡死的回合，会话已挂起；再次发送消息将自动恢复。',
+            'agent did not acknowledge the stalled turn; the session is paused and will resume on your next message.',
+          ), event.session.agentId)
+        } else if (cause === 'died') {
+          log = this.logPatch('error', this.locale(
+            'agent 进程已退出，会话已挂起；再次发送消息将自动恢复。',
+            'agent process died; the session is paused and will resume on your next message.',
+          ), event.session.agentId)
+        }
         this.mutate({
           sessions,
           ...(chatSessions !== this.state.chatSessions ? { chatSessions } : {}),
@@ -1973,10 +2058,7 @@ export class AcpStore {
           // An observed transcript keeps its buffer but flips to released, so
           // the ACP view can say "会恢复" instead of silently looking dead.
           ...this.watchedSessionPatch(event.sessionId, event.session),
-          notice: this.locale(
-            'agent 进程已退出，会话已挂起；再次发送消息将自动恢复。',
-            'agent process died; the session is paused and will resume on your next message.',
-          ),
+          ...log,
         })
         return Promise.resolve()
       }

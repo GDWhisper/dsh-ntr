@@ -17,7 +17,7 @@
 
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { formatCommandLine, isAbsolutePathLike, splitCommandLine } from './acp-ui.tsx'
-import { DEFAULT_KNOWN_PRESETS } from './store.ts'
+import { DEFAULT_KNOWN_PRESETS, LOG_MAX_ENTRIES } from './store.ts'
 import type { AcpStore, UiState } from './store.ts'
 import type { AcpAgentDef, AcpApprovalDeadlines, AcpCatalogChoice, AcpMcpServerDef, AgentSavePayload, AgentView, DetectedAgentInfo, PermissionTimeoutMode, PluginUpdateState } from '../protocol.ts'
 
@@ -251,6 +251,17 @@ const STYLE = `
 .dwa-deadline-flag { margin-top: 4px; font-size: var(--ntr-font-xs); font-weight: 550; color: var(--ntr-warn); }
 .dwa-deadline-warn { margin-top: 10px; padding: 9px 12px; border-left: 3px solid var(--dsw-alias-state-warn-primary, #d97706); background: var(--dsw-alias-state-warn-secondary, #fffbeb); border-radius: var(--ntr-radius-sm); font-size: var(--ntr-font-xs); line-height: 1.55; }
 .dwa-deadline-reset { display: flex; justify-content: flex-end; margin-top: 8px; }
+/* Runtime log: one bounded list, newest first. The time column never wraps;
+   the message is the only cell that may break anywhere. */
+.dwa-log-list { list-style: none; margin: 0; padding: 0; border: var(--ntr-line); border-radius: var(--ntr-radius); overflow: hidden; }
+.dwa-log-row { display: flex; align-items: baseline; gap: 8px; padding: 6px 10px; font-size: var(--ntr-font-sm); border-top: var(--ntr-line); min-width: 0; }
+.dwa-log-row:first-child { border-top: 0; }
+.dwa-log-row.is-error { background: var(--dsw-alias-state-error-tertiary, #fef2f2); }
+.dwa-log-time { color: var(--ntr-muted); white-space: nowrap; }
+.dwa-log-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.dwa-log-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ntr-danger); display: inline-block; margin-left: 6px; }
+.dwa-log-level.is-info { background: var(--dsw-alias-state-business-tertiary, #dbeafe); color: var(--dsw-alias-state-business-primary, #2563eb); }
+.dwa-log-level.is-error { background: var(--dsw-alias-state-error-tertiary, #fef2f2); color: var(--ntr-danger); }
 @media (max-width: 640px) {
   .dwa-root { padding: 20px 16px; }
 }
@@ -866,7 +877,19 @@ function ApprovalDeadlinesCard(props: { acp: AcpStore; ui: UiState }) {
   )
 }
 
-type SettingsPage = 'agents' | 'add' | 'approvals' | 'appearance' | 'diagnostics'
+type SettingsPage = 'agents' | 'add' | 'approvals' | 'appearance' | 'logs' | 'diagnostics'
+
+/**
+ * Local wall-clock `HH:MM:SS` for one runtime-log line. Hand-built on purpose:
+ * `toLocaleTimeString` may drop seconds or pick a 12-hour clock depending on
+ * the browser locale, which makes the column ragged and ambiguous.
+ */
+function logClock(at: number): string {
+  const date = new Date(at)
+  return [date.getHours(), date.getMinutes(), date.getSeconds()]
+    .map(value => String(value).padStart(2, '0'))
+    .join(':')
+}
 
 /** The states that carry an update badge next to the version badge. */
 function updateBadgeText(update: PluginUpdateState, acp: AcpStore): string | undefined {
@@ -1033,6 +1056,11 @@ export function AcpSettingsSection(props: WithStore) {
   useEffect(() => {
     void acp.checkPluginUpdate()
   }, [acp])
+  // Opening the log is the read receipt. The store does not mutate at zero,
+  // so this cannot loop.
+  useEffect(() => {
+    if (page === 'logs' && ui.logUnread > 0) acp.markLogsRead()
+  }, [acp, page, ui.logUnread])
   const { configured, available } = partitionAgents(ui.detectedAgents, ui.agents)
   const selected = addTarget ?? available[0] ?? NEW_AGENT_SEED
   const openAdd = (): void => {
@@ -1154,6 +1182,10 @@ export function AcpSettingsSection(props: WithStore) {
         <button type="button" aria-pressed={page === 'agents'} onClick={() => setPage('agents')}>{acp.label('智能体', 'Agents')}</button>
         {ui.approvalDeadlines !== undefined && <button type="button" aria-pressed={page === 'approvals'} onClick={() => setPage('approvals')}>{acp.label('审批时限', 'Approval deadlines')}</button>}
         <button type="button" aria-pressed={page === 'appearance'} onClick={() => setPage('appearance')}>{acp.label('对话外观', 'Appearance')}</button>
+        <button type="button" aria-pressed={page === 'logs'} onClick={() => setPage('logs')}>
+          {acp.label('日志', 'Logs')}
+          {ui.logUnread > 0 && <span className="dwa-log-dot" aria-hidden="true" />}
+        </button>
       </nav>
       {page === 'diagnostics' && (
         <section className="dwa-section">
@@ -1334,6 +1366,45 @@ export function AcpSettingsSection(props: WithStore) {
           )}
         </div>
       </section>
+      {/* Conditional on purpose: this list can hold 200 rows, and keeping it
+          mounted through a `hidden` page would re-render every line on each
+          `session/update`. It carries no local state, so remounting is free. */}
+      {page === 'logs' && (
+        <section className="dwa-section" aria-label={acp.label('运行日志', 'Runtime log')}>
+          <div className="dwa-section-heading">
+            <div>
+              <h3 className="dwa-section-title">{acp.label('运行日志', 'Runtime log')}</h3>
+              <p className="dwa-section-copy">
+                {acp.label(
+                  `agent 运行消息，最多 ${String(LOG_MAX_ENTRIES)} 条。`,
+                  `Agent runtime messages, up to ${String(LOG_MAX_ENTRIES)}.`,
+                )}
+              </p>
+            </div>
+            {ui.logs.length > 0 && (
+              <button type="button" className="dwa-btn dwa-btn-quiet" onClick={() => acp.clearLogs()}>
+                {acp.label('清空', 'Clear')}
+              </button>
+            )}
+          </div>
+          {ui.logs.length === 0
+            ? <div className="dwa-empty" role="status">{acp.label('暂无运行日志。', 'No runtime messages yet.')}</div>
+            : (
+              <ul className="dwa-log-list">
+                {[...ui.logs].reverse().map(entry => (
+                  <li key={entry.id} className={entry.level === 'error' ? 'dwa-log-row is-error' : 'dwa-log-row'}>
+                    <span className="dwa-log-time dwa-mono">{logClock(entry.at)}</span>
+                    <span className={`dwa-badge dwa-log-level ${entry.level === 'error' ? 'is-error' : 'is-info'}`}>
+                      {entry.level === 'error' ? acp.label('错误', 'Error') : acp.label('信息', 'Info')}
+                    </span>
+                    {entry.agentId !== undefined && <span className="dwa-badge">{entry.agentId}</span>}
+                    <span className="dwa-log-text">{entry.text}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+        </section>
+      )}
       <footer className="dwa-health">
         <div className="dwa-health-status">
           <span className="dwa-dot" style={{ background: ui.stream === 'live' ? 'var(--ntr-success)' : ui.stream === 'down' ? 'var(--ntr-danger)' : 'var(--ntr-muted)' }} />

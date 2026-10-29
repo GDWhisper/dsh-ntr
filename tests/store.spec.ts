@@ -1146,6 +1146,9 @@ describe('AcpStore agent management', () => {
     expect(store.getSnapshot().probingModels.codebuddy).toBe(false)
     expect(store.getSnapshot().probeErrors.codebuddy).toContain('cwd does not exist')
     expect(store.getSnapshot().notice).toContain('cwd does not exist')
+    // A failed settings action stays on the notice banner; the agent runtime
+    // log is for agent-side messages only.
+    expect(store.getSnapshot().logs).toHaveLength(0)
 
     failing = false
     await store.probeModels('codebuddy')
@@ -1378,7 +1381,85 @@ describe('AcpStore event application (released / reset / turn dedup)', () => {
     expect(state.sessions).toHaveLength(1)
     expect(state.sessions[0]).toMatchObject({ sessionId: 's1', released: true })
     expect(state.permissions).toHaveLength(0)
-    expect(state.notice).toMatch(/resume|恢复/)
+    // No `cause` = an older host half: treated as `died`. It belongs in the
+    // runtime log, not the settings page's own action-failure banner.
+    expect(state.notice).toBeUndefined()
+    expect(state.logs.at(-1)).toMatchObject({ level: 'error' })
+    expect(state.logs.at(-1)?.text).toContain('恢复')
+  })
+
+  it('appends agent/notice to the runtime log instead of the notice banner', async () => {
+    const { store, apply } = await makeStore()
+    await apply({ type: 'agent/notice', agentId: 'pi', level: 'info', text: 'acp: catalog refreshed' })
+    const state = store.getSnapshot()
+    expect(state.notice).toBeUndefined()
+    expect(state.logs).toHaveLength(1)
+    expect(state.logs[0]).toMatchObject({ level: 'info', agentId: 'pi', text: 'acp: catalog refreshed' })
+    expect(state.logUnread).toBe(1)
+  })
+
+  it('bounds the runtime log to the newest entries, oldest first', async () => {
+    const { store, apply } = await makeStore()
+    for (let i = 0; i < 205; i++) {
+      await apply({ type: 'agent/notice', agentId: 'pi', level: 'info', text: `n${String(i)}` })
+    }
+    const logs = store.getSnapshot().logs
+    expect(logs).toHaveLength(200)
+    // Append order is oldest→newest; the first five fell off the front.
+    expect(logs[0]?.text).toBe('n5')
+    expect(logs.at(-1)?.text).toBe('n204')
+    expect(store.getSnapshot().logUnread).toBe(205)
+  })
+
+  it('marks the log read and clears it on demand', async () => {
+    const { store, apply } = await makeStore()
+    await apply({ type: 'agent/notice', agentId: 'pi', level: 'info', text: 'one' })
+    await apply({ type: 'agent/notice', agentId: 'pi', level: 'error', text: 'two' })
+    expect(store.getSnapshot().logUnread).toBe(2)
+
+    store.markLogsRead()
+    expect(store.getSnapshot().logUnread).toBe(0)
+    expect(store.getSnapshot().logs).toHaveLength(2)
+
+    store.clearLogs()
+    expect(store.getSnapshot().logs).toEqual([])
+    expect(store.getSnapshot().logUnread).toBe(0)
+  })
+
+  it('logs a session/closed agent-died termination as an error instead of a notice', async () => {
+    const { store, apply } = await makeStore()
+    await apply({ type: 'session/created', sessionId: 's1', session: view() })
+    await apply({ type: 'session/closed', sessionId: 's1', reason: 'agent-died' })
+    const state = store.getSnapshot()
+    expect(state.sessions).toHaveLength(0)
+    expect(state.notice).toBeUndefined()
+    expect(state.logs).toHaveLength(1)
+    expect(state.logs[0]).toMatchObject({ level: 'error' })
+    expect(state.logs[0]?.text).toContain('进程退出')
+  })
+
+  it('classifies every non-idle release cause into the runtime log', async () => {
+    const cases = [
+      { cause: 'workspace', level: 'info', text: '工作区' },
+      { cause: 'resume-failed', level: 'error', text: '恢复失败' },
+      { cause: 'stalled', level: 'error', text: '卡死' },
+      { cause: 'died', level: 'error', text: '进程已退出' },
+    ] as const
+    for (const expected of cases) {
+      const { store, apply } = await makeStore()
+      await apply({
+        type: 'session/released',
+        sessionId: 's1',
+        session: view({ released: true }),
+        reason: expected.cause,
+        cause: expected.cause,
+      })
+      const state = store.getSnapshot()
+      expect(state.notice).toBeUndefined()
+      expect(state.logs).toHaveLength(1)
+      expect(state.logs[0]).toMatchObject({ level: expected.level, agentId: 'pi' })
+      expect(state.logs[0]?.text).toContain(expected.text)
+    }
   })
 
   it('copies the permission frame fields verbatim', async () => {
@@ -1735,8 +1816,11 @@ describe('AcpStore observed ACP transcripts (the ACP view tab)', () => {
     expect(store.getSnapshot().chatSessions[0]).toMatchObject({ sessionId: 'acp-s1' })
     expect(store.getSnapshot().chatSessions[0]?.released).toBeUndefined()
 
-    await apply({ type: 'session/released', sessionId: 'acp-s1', session: view({ released: true }), reason: 'idle release' })
+    await apply({ type: 'session/released', sessionId: 'acp-s1', session: view({ released: true }), reason: 'idle release', cause: 'idle' })
     expect(store.getSnapshot().chatSessions[0]).toMatchObject({ sessionId: 'acp-s1', released: true })
+    // An idle release is expected lifecycle: no runtime-log line, no notice.
+    expect(store.getSnapshot().logs).toHaveLength(0)
+    expect(store.getSnapshot().notice).toBeUndefined()
 
     // Resuming on a fresh process un-releases via the next authoritative read.
     listed = { sessions: [{ agentId: 'pi', sessionId: 'acp-s1' }] }

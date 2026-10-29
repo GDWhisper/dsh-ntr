@@ -121,13 +121,14 @@
 
 22. **【默认模型守卫已退役】插件只写自己的绑定与默认 agent**：`defaultAgentId` 是插件私有状态，删除 agent 必须清空。`session/chat-*` 只写插件映射，再由 guard 改写接到请求路径。插件完全不碰 DSH 模型层（不读目录、不写 `selectModel`、不广告模型）。旧默认模型守卫 / 路由强制 / 目录重试见 [retired.md](./docs/agents/retired.md)。→ [architecture.md](./docs/agents/architecture.md)
 
-### 界面（18、20、30、33）
+### 界面（18、20、30、33、38）
 
 18. **对话内的 NTR 面只借显示层**：模型 / 思考等级 / 额外 config options 读 `agent/catalog`；哪条会话由哪个 agent 服务读插件绑定（`routeAgentId`，无答案时**严禁**用 `agents[0]` 填名字）；写入只走 `bindChatAgent` / `setChatSessionModel` / `setChatSessionEffort` / `setChatSessionConfig`，严禁 `directory.select` / `selectModel`。cluster 顺序固定为 `高级 → model → thought → agent`：首轮前 agent 底座是右端锚点（不能被挤没），额外选项收进模型左侧的「高级」底座；首轮锁定、底座退场后，model / thought 成为右端锚点。模型 picker 一行一个模型值，勾中的行必须写模型名。NTR 视图只读 `session/chat-transcript`。空状态要区分「没服务过」与「ACP 会话没了」。空 roster（宿主已答 `agents/list`）下底座**不消失**，菜单给「打开 NTR 设置」动作；`agentsLoaded` 之前不得把「未读取」当「未配置」。审批询问的 `PermissionDock` 卡也属于对话面（`conversation.input.dock`，按当前会话过滤），设置页只是跨会话镜像；`agents/list` 不再上报任何审批能力旗标。→ [ui.md](./docs/agents/ui.md) / [permissions.md](./docs/agents/permissions.md)
 20. **【竞争式遮蔽已退役】座位靠 claim 接管，失败一律放开**：`createModelSeatClaim` 用 `entriesOfSlot` 核实 head，不中就有界重注册（`MAX_SEAT_CLAIMS`），注册经 `ctx.slots.inject`。只读舞台会话 `agentPreset === ACP_PRESET_ID`，切走即撤；`stagedSessionOf` / `rowAgentPreset` 兼容两代快照；服务 / 槽位 / 注册 / 渲染任何不确定都回到原生座位。`ACP_PRESET_ID` 三处同步。旧竞争式遮蔽见 [retired.md](./docs/agents/retired.md)。→ [ui.md](./docs/agents/ui.md)
 30. **NTR 会话的 `/` 属于 agent**：只列 agent 经 `available_commands_update` 声明的命令，Enter 不被宿主认领，选中只插回草稿。实现只能运行时包装活的 `/` 来源（`slash-isolation.ts`），严禁注册第二个来源或替换 composer；命令清单只由一个来源承载；没有证据时 fail-open。命令声明还要按 agent 缓存进 `model-catalog.json`，供首条消息前使用。→ [ui.md](./docs/agents/ui.md) / [state.md](./docs/agents/state.md)
 33. **设置页文案有预算上限**：一个控件的说明**一行讲完**，机制解释进代码注释与 `docs/agents/`，不进 UI。同页参照是「呼吸频率 10 字 / 挂牌光晕 14 字 / 对话外观导语 15 字」；审批时限卡从 211 字压到 86 字是基准线，现为**两个控件**（默认档 55 字）。覆盖事实**必须看得见**——`configured[key]` 挂**被覆盖的那一行**，用警告色，不与其它灰色小字同层；重置按钮**只有真的覆盖了才出现**。文案里**点名控件名**必须与可见标题一致（改名要同步）。→ [ui.md](./docs/agents/ui.md) / [permissions.md](./docs/agents/permissions.md)
 34. **界面颜色只走宿主 alias token，写死颜色只能出现在 `var()` fallback**：主题归宿主（`body[data-ds-dark-theme]` + 根 `color-scheme` 继承），插件不维护 JS 主题状态，**严禁**自写 `color-scheme: light dark`（会跟系统偏好而非宿主）。状态色按宿主配对：`state-*-tertiary` 底 / `state-*-primary|*-label` 前景，diff 行 `file-diff-*-bg`，danger hover `interactive-bg-hover-danger`。宿主**不存在** `--dsw-alias-text-*` / `button-primary-invert` / `font-mono`，分别用 `label-*` / `label-primary-foreground` / `--ds-font-family-code`。→ [ui.md](./docs/agents/ui.md#11-主题与颜色)
+38. **运行消息进日志，动作失败进横幅**：agent 侧运行消息（`agent/notice`、会话释放）只进设置页「日志」分区——浏览器内存、追加序、最多 200 条、刷新清空、未读圆点、空闲释放不记；页顶横幅只承载用户动作（设置页动作与对话内 RPC）的失败，不再被运行消息覆盖。→ [ui.md §8](./docs/agents/ui.md)
 
 ### 路径（24）
 

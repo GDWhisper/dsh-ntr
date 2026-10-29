@@ -57,7 +57,7 @@ describe('AcpSettingsSection navigation', () => {
   it('starts with collapsed agents, no creation form, and no model cache read or probe', async () => {
     const fixture = await mountPanel()
     const nav = screen.getByRole('navigation', { name: 'NTR 设置分类' })
-    expect(within(nav).getAllByRole('button').map(button => button.textContent)).toEqual(['智能体', '审批时限', '对话外观'])
+    expect(within(nav).getAllByRole('button').map(button => button.textContent)).toEqual(['智能体', '审批时限', '对话外观', '日志'])
     expect(within(nav).getByRole('button', { name: '智能体', pressed: true })).toBeDefined()
     expect(screen.getByRole('region', { name: '已接入的智能体' })).toBeDefined()
     expect(screen.getByRole('button', { name: '管理 CodeBuddy', expanded: false })).toBeDefined()
@@ -174,6 +174,33 @@ describe('AcpSettingsSection navigation', () => {
     expect(screen.queryByText(/磁盘已是/)).toBeNull()
   })
 
+  it('moves agent notices into the runtime log and clears the unread dot', async () => {
+    const fixture = await mountPanel()
+    await act(async () => {
+      await fixture.applyEvent({ type: 'agent/notice', agentId: 'pi', level: 'info', text: 'one' })
+      await fixture.applyEvent({ type: 'agent/notice', agentId: 'pi', level: 'error', text: 'two' })
+    })
+    const nav = screen.getByRole('navigation', { name: 'NTR 设置分类' })
+    const logsButton = within(nav).getByRole('button', { name: '日志' })
+    // The dot is decoration only: the tab's name stays exactly 日志.
+    expect(logsButton.textContent).toBe('日志')
+    expect(logsButton.querySelector('.dwa-log-dot')?.getAttribute('aria-hidden')).toBe('true')
+
+    await click(logsButton)
+    const region = screen.getByRole('region', { name: '运行日志' })
+    expect(within(nav).getByRole('button', { name: '日志' }).querySelector('.dwa-log-dot')).toBeNull()
+    expect(within(region).queryByText('暂无运行日志。')).toBeNull()
+    const rows = within(region).getAllByRole('listitem')
+    expect(rows).toHaveLength(2)
+    expect(rows[0].textContent).toContain('two')
+    expect(rows[1].textContent).toContain('one')
+    expect(rows[0].querySelector('.dwa-log-level.is-error')?.textContent).toBe('错误')
+    expect(rows[1].querySelector('.dwa-log-level.is-info')?.textContent).toBe('信息')
+
+    await click(within(region).getByRole('button', { name: '清空' }))
+    expect(within(region).getByText('暂无运行日志。')).toBeDefined()
+  })
+
   it('shows only the chosen category and keeps the other pages mounted', async () => {
     const fixture = await mountPanel()
     const agents = screen.getByRole('region', { name: '已接入的智能体' })
@@ -236,7 +263,7 @@ describe('AcpSettingsSection navigation', () => {
   it('omits the approval category on a host without its RPC, without losing permission answers', async () => {
     await mountPanel({ approvalDeadlines: null, permissions: [permission()] })
     const nav = screen.getByRole('navigation', { name: 'NTR 设置分类' })
-    expect(within(nav).getAllByRole('button').map(button => button.textContent)).toEqual(['智能体', '对话外观'])
+    expect(within(nav).getAllByRole('button').map(button => button.textContent)).toEqual(['智能体', '对话外观', '日志'])
     expect(screen.queryByRole('slider', { hidden: true })).toBeNull()
     await category('对话外观')
     expect(screen.getByRole('button', { name: 'Always Allow' })).toBeDefined()

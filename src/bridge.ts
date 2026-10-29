@@ -69,7 +69,7 @@ import type {
   RosterPresetRow,
 } from './impl.ts'
 import type {
-  AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpMcpServerDef, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
+  AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpMcpServerDef, AcpPresetStatus, AcpReleaseCause, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
   LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo,
   ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PluginUpdateState, PreparedAdapterCall, SessionView, StreamChunk,
 } from './protocol.ts'
@@ -637,7 +637,7 @@ export class AgentBridge {
       this.touch()
       return
     }
-    this.releaseAll(`agent "${this.def.id}" was released after ${String(Math.round(this.currentIdleTimeoutMs / 1000))}s idle`)
+    this.releaseAll(`agent "${this.def.id}" was released after ${String(Math.round(this.currentIdleTimeoutMs / 1000))}s idle`, 'idle')
   }
 
   /**
@@ -835,7 +835,7 @@ export class AgentBridge {
       if (this.state === 'ready' && this.conn !== undefined && this.spawnCwd !== spawnCwd && this.isQuiet()) {
         const reason = `agent "${this.def.id}" restarts in ${spawnCwd} (the workspace of the session using it)`
         this.hub.broadcast({ type: 'agent/notice', agentId: this.def.id, level: 'info', text: `acp: ${reason}` })
-        this.releaseAll(reason)
+        this.releaseAll(reason, 'workspace')
       }
     }
     if (this.state === 'ready' && this.conn !== undefined) return Promise.resolve()
@@ -1291,13 +1291,13 @@ export class AgentBridge {
       this.sessions.delete(session.sessionId)
       session.released = true
       this.released.set(session.sessionId, session)
-      this.hub.broadcast({ type: 'session/released', sessionId: session.sessionId, session: snapshot(session), reason: 'resume failed' })
+      this.hub.broadcast({ type: 'session/released', sessionId: session.sessionId, session: snapshot(session), reason: 'resume failed', cause: 'resume-failed' })
       throw error
     }
   }
 
   /** Release all live sessions (process died or went idle): keep them resumable, settle permissions, drop the connection. */
-  releaseAll(reason: string): void {
+  releaseAll(reason: string, cause: AcpReleaseCause): void {
     this.clearIdleTimer()
     for (const session of [...this.sessions.values()]) {
       // A session already being closed is `closeSession`'s to delete. Marking
@@ -1317,7 +1317,7 @@ export class AgentBridge {
       session.released = true
       this.settlePermissions(session)
       this.released.set(session.sessionId, session)
-      this.hub.broadcast({ type: 'session/released', sessionId: session.sessionId, session: snapshot(session), reason })
+      this.hub.broadcast({ type: 'session/released', sessionId: session.sessionId, session: snapshot(session), reason, cause })
     }
     this.sessions.clear()
     this.acpIndex.clear()
@@ -5019,7 +5019,7 @@ export class BridgeManager {
     // here (their `runPrompt` promise also rejects into settle, but this also
     // covers a promise the connection teardown leaves pending).
     this.disposeTurnStreamsOf(controller => controller.session.agentId === bridge.def.id)
-    bridge.releaseAll(reason)
+    bridge.releaseAll(reason, 'died')
   }
 
   agentViews(): AgentView[] {
@@ -5737,7 +5737,7 @@ export class BridgeManager {
       // rejection does not broadcast a second `turn/end` for a turn already
       // finalized by the watchdog (`LiveSession.reclaimedTurnSeq`).
       session.reclaimedTurnSeq = session.turnSeq
-      bridge.releaseAll('agent did not acknowledge the stalled turn')
+      bridge.releaseAll('agent did not acknowledge the stalled turn', 'stalled')
       session.orphanPromptTurnSeq = undefined
       return { ok: true }
     }
