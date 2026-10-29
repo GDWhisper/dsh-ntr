@@ -2197,6 +2197,14 @@ export const AGENT_PRESETS: AgentPreset[] = [
     defaultArgs: ['acp'],
   },
   {
+    id: 'cursor',
+    name: 'Cursor CLI',
+    description: 'Cursor CLI — run as `agent acp` over stdio (legacy alias `cursor-agent acp`)',
+    executables: ['agent', 'cursor-agent'],
+    defaultCommand: 'agent',
+    defaultArgs: ['acp'],
+  },
+  {
     id: 'qwen',
     name: 'Qwen Code',
     description: 'Qwen Code — run as `qwen --experimental-acp` over stdio',
