@@ -2,6 +2,21 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [0.3.0] - 2026-10-29
+
+插件现在能在设置页里自己更新，卡死的回合会自动结束，还多了一个 Cursor CLI 预设。
+
+### 新增
+
+- **内置更新**：设置页的版本徽标会检查新版本并可直接安装，按提示重启 DSH 生效。([f9095d1](https://github.com/GDWhisper/dsh-ntr/commit/f9095d1))
+- **卡死的回合自动结束**：agent 长时间没有任何动静时，这一轮会自动结束并说明原因，不再让对话永远卡在「进行中」；下一条消息会自动恢复会话，agent 不支持会话恢复时会重置会话并说明上下文已丢失。([dd432c3](https://github.com/GDWhisper/dsh-ntr/commit/dd432c3))
+- **Cursor CLI 预设**：装了 Cursor CLI 就能在预设列表里直接选用，新旧两种启动命令都能识别。([b844ddb](https://github.com/GDWhisper/dsh-ntr/commit/b844ddb))
+
+### 改进
+
+- **设置页显示插件版本**：NTR 设置标题上显示当前安装的 dsh-ntr 版本号。([dd432c3](https://github.com/GDWhisper/dsh-ntr/commit/dd432c3))
+- **更新的边界说清楚**：源码或本地安装不提供升级，有对话进行中时不会安装，安装被中断时提示刷新确认版本而不是猜一个。([f9095d1](https://github.com/GDWhisper/dsh-ntr/commit/f9095d1))
+
 ## [0.2.1] - 2026-10-29
 
 设置页拆成了一次只看一件事的分区，聊天里的 token 数字也不再自相矛盾（[#6](https://github.com/GDWhisper/dsh-ntr/issues/6)）。
