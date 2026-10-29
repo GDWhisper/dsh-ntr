@@ -88,6 +88,18 @@
         # cancelFallbackMs: 15000    # force-finalize a turn the agent ignores after session/cancel (0 = off)
         # staleCancelRetryDelayMs: 600  # resend a prompt answered cancelled with no cancel requested (0 = at once)
         # staleCancelMaxRetries: 2      # cap on those resends before the cancelled stop is reported as-is
+        # turnStallMs: 600000        # inactivity watchdog: finalize a turn the agent
+        #                              went silent in for this long (0 = disable the
+        #                              WHOLE watchdog, tool window included). It
+        #                              finalizes the TURN only — the process is NOT
+        #                              killed; the next message reclaims the session
+        #                              (releaseAll + session/load, or a reset when
+        #                              the agent cannot load).
+        # turnStallToolMs: 1800000   # the same window while ANY ACP tool call is
+        #                              still active by id (parallel calls count as a
+        #                              set); 0 = fall back to turnStallMs
+        # turnStallTickMs: 30000     # how often the watchdog scans; tuning / tests
+        #                              only, there is no settings-page control
         # ACP 模式 (agent preset) is declared by this package's own bundle
         # patch list (package.json `dsh.bundle.patch` → presets/acp/acp.patch.yml),
         # so it needs no install step and has no config knob. The settings card

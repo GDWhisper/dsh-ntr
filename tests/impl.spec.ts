@@ -93,6 +93,29 @@ describe('validateConfig', () => {
     expect(validateConfig({ agents: [], permissionTimeoutMs: 60_000, cancelFallbackMs: 0 }).cancelFallbackMs).toBe(0)
     expect(validateConfig({ agents: [], staleCancelRetryDelayMs: 0, staleCancelMaxRetries: 0 }).staleCancelMaxRetries).toBe(0)
   })
+  it('defaults and bounds the inactivity watchdog windows', () => {
+    // Two silence windows (no tool in flight / tool in flight) plus the scan
+    // interval. All three are diagnostic knobs, not UI controls: `0` means
+    // "off" or "fall back", never "expire immediately".
+    const config = validateConfig({ agents: [] })
+    expect(config.turnStallMs).toBe(600_000)
+    expect(config.turnStallToolMs).toBe(1_800_000)
+    expect(config.turnStallTickMs).toBe(30_000)
+
+    expect(validateConfig({ agents: [], turnStallMs: 0, turnStallToolMs: 0, turnStallTickMs: 1 }))
+      .toMatchObject({ turnStallMs: 0, turnStallToolMs: 0, turnStallTickMs: 1 })
+
+    // Out of range / non-integers are refused loudly at boot.
+    expect(() => validateConfig({ agents: [], turnStallMs: -1 })).toThrow(/turnStallMs/)
+    expect(() => validateConfig({ agents: [], turnStallMs: 1.5 })).toThrow(/turnStallMs/)
+    expect(() => validateConfig({ agents: [], turnStallMs: 86_400_001 })).toThrow(/turnStallMs/)
+    expect(() => validateConfig({ agents: [], turnStallToolMs: -1 })).toThrow(/turnStallToolMs/)
+    expect(() => validateConfig({ agents: [], turnStallToolMs: 1.5 })).toThrow(/turnStallToolMs/)
+    expect(() => validateConfig({ agents: [], turnStallToolMs: 86_400_001 })).toThrow(/turnStallToolMs/)
+    expect(() => validateConfig({ agents: [], turnStallTickMs: 0 })).toThrow(/turnStallTickMs/)
+    expect(() => validateConfig({ agents: [], turnStallTickMs: 1.5 })).toThrow(/turnStallTickMs/)
+    expect(() => validateConfig({ agents: [], turnStallTickMs: 60_001 })).toThrow(/turnStallTickMs/)
+  })
   it('exposes ONE approval window and the expiry mode as config knobs', () => {
     // ONE window for both places an ask can wait (the conversation's approval
     // card and the settings panel's ledger): they ask the same question, so
@@ -1060,6 +1083,32 @@ describe('PermissionLedger', () => {
     void rb
   })
 
+  it('answers hasPendingFor per session and forgets an ask once it is settled', () => {
+    // The inactivity watchdog asks this question before firing: an ask waiting
+    // for the human is NOT the agent being stuck (`wait` has no deadline at
+    // all, so a stalled-looking turn can legitimately sit here forever).
+    const ledger = new PermissionLedger()
+    const answered: unknown[] = []
+    const first = ledger.create('s1', outcome => { answered.push(outcome) })
+    const other = ledger.create('s2', () => {})
+
+    expect(ledger.hasPendingFor('s1')).toBe(true)
+    expect(ledger.hasPendingFor('s2')).toBe(true)
+    expect(ledger.hasPendingFor('s3')).toBe(false)
+    // The key is the HOST session id (`LiveSession.sessionId`), not the ACP
+    // protocol session id, and it is matched exactly: no prefix matching.
+    expect(ledger.hasPendingFor('s')).toBe(false)
+
+    ledger.respond(first, { outcome: 'cancelled' })
+    expect(answered).toEqual([{ outcome: 'cancelled' }])
+    expect(ledger.hasPendingFor('s1')).toBe(false)
+    expect(ledger.hasPendingFor('s2')).toBe(true)
+
+    ledger.settleFor(entry => entry.sessionId === 's2')
+    expect(ledger.hasPendingFor('s2')).toBe(false)
+    void other
+  })
+
   it('replays only asks that carry a view, as their original request frame', () => {
     const ledger = new PermissionLedger()
     // Every field the live frame carried must ride the replay too: the
@@ -1216,6 +1265,12 @@ describe('dispatchRpc', () => {
     })
     await expect(dispatchRpc(manager, 'agents/detect', {})).resolves.toEqual({ ok: true, value: { agents: [] } })
     expect(manager.calls).toContainEqual(['detect', undefined])
+    // Version badge source: present on this half, silent (not failing) on a
+    // manager that predates the endpoint.
+    await expect(dispatchRpc({ ...manager, pluginVersion: () => '1.2.3' }, 'plugin/version', {}))
+      .resolves.toEqual({ ok: true, value: { version: '1.2.3' } })
+    await expect(dispatchRpc({ ...manager, pluginVersion: undefined }, 'plugin/version', {}))
+      .resolves.toEqual({ ok: true, value: { version: undefined } })
     await expect(dispatchRpc(manager, 'agent/save', { id: 'pi', command: 'pi-acp' })).resolves.toEqual({ ok: true, value: { done: true } })
     expect(manager.calls).toContainEqual(['save', expect.objectContaining({ id: 'pi', command: 'pi-acp' })])
     await expect(dispatchRpc(manager, 'agent/test', { id: 'pi', command: 'pi-acp', npmPackage: 'pi-acp' })).resolves.toEqual({ ok: true, value: { ok: true, durationMs: 5, stderr: [] } })

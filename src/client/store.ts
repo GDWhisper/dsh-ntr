@@ -6,7 +6,7 @@
  * Deliberately framework-free: React binds through `useSyncExternalStore`.
  */
 
-import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSavePayload, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, PermissionTimeoutMode, SessionView } from '../protocol.ts'
+import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSavePayload, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, PermissionTimeoutMode, PluginVersionResult, SessionView } from '../protocol.ts'
 import { DEFAULT_TAG_HALO } from '../protocol.ts'
 
 /** One slash command the ACP agent declared, whole row (the menu draws name, description and `input.hint`). */
@@ -298,6 +298,12 @@ export interface UiState {
    * (`preset/status` answering `null`), in which case the panel hides the block.
    */
   preset?: AcpPresetStatus
+  /**
+   * The installed host package's version (`plugin/version`), rendered as the
+   * settings page badge. Absent on a host half without the endpoint, which
+   * hides the badge rather than naming a version this browser invented.
+   */
+  pluginVersion?: string
 }
 
 interface Listener { (): void }
@@ -783,7 +789,7 @@ export class AcpStore {
   /** Snapshot refresh used on panel open and after a stream outage. */
   async resync(): Promise<void> {
     try {
-      const [{ agents }, { sessions }, defaultAgentInfo, detectResult, presetResult, tagHaloResult, deadlinesResult] = await Promise.all([
+      const [{ agents }, { sessions }, defaultAgentInfo, detectResult, presetResult, tagHaloResult, deadlinesResult, versionResult] = await Promise.all([
         this.call<{ agents: AgentView[] }>('agents/list'),
         this.call<{ sessions: SessionView[] }>('sessions/list'),
         // The plugin's OWN default ACP agent — a plugin-private id, not a DSH
@@ -797,6 +803,9 @@ export class AcpStore {
         // `undefined` (older half) hides the deadline card instead of showing a
         // number this browser made up.
         this.call<ApprovalDeadlinesResult>('ui/approval-deadlines').catch(() => ({ deadlines: undefined })),
+        // The settings badge's data source; older halves answer `unknown
+        // endpoint`, which hides the badge.
+        this.call<PluginVersionResult>('plugin/version').catch(() => null),
       ])
       const detectedAgents = (detectResult && detectResult.agents.length > 0)
         ? detectResult.agents
@@ -811,6 +820,7 @@ export class AcpStore {
         preset: presetResult?.preset ?? undefined,
         tagHalo: tagHaloResult?.halo ?? { ...DEFAULT_TAG_HALO },
         approvalDeadlines: deadlinesResult.deadlines,
+        pluginVersion: versionResult?.version !== undefined && versionResult.version !== '' ? versionResult.version : undefined,
       })
       const active = this.state.activeSessionId ?? sessions[0]?.sessionId
       if (active !== undefined) await this.loadTranscript(active)

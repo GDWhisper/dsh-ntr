@@ -284,6 +284,35 @@ describe('AcpStore agent management', () => {
     expect(older.getSnapshot().preset).toBeUndefined()
   })
 
+  it('reads the host version on resync and hides it on a host without the endpoint', async () => {
+    const store = new (await import('../src/client/store.ts')).AcpStore(
+      async (_channel, endpoint) => {
+        if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
+        if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'plugin/version') return { ok: true, value: { version: '1.2.3' } }
+        return { ok: true, value: {} }
+      },
+      (zh) => zh,
+    )
+    await store.resync()
+    expect(store.getSnapshot().pluginVersion).toBe('1.2.3')
+
+    // An older host half answers `unknown endpoint`; the badge stays hidden.
+    const older = new (await import('../src/client/store.ts')).AcpStore(
+      async (_channel, endpoint) => {
+        if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
+        if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'plugin/version') return { ok: false, error: { code: 'unknown_endpoint', message: 'acp: unknown endpoint' } }
+        return { ok: true, value: {} }
+      },
+      (zh) => zh,
+    )
+    await older.resync()
+    expect(older.getSnapshot().pluginVersion).toBeUndefined()
+  })
+
   it('reads the tag halo on resync and writes it back optimistically', async () => {
     const store = new (await import('../src/client/store.ts')).AcpStore(
       async (_channel, endpoint) => {

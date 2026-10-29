@@ -72,6 +72,16 @@ describe('AcpSettingsSection navigation', () => {
     expect(payloads(fixture, 'agent/probe-models')).toEqual([])
   })
 
+  it('shows the host version as a badge next to the page title', async () => {
+    await mountPanel({ pluginVersion: '9.9.9' })
+    expect(screen.getByText('v9.9.9').className).toContain('dwa-version')
+  })
+
+  it('hides the version badge on a host half without the endpoint', async () => {
+    await mountPanel({ pluginVersion: null })
+    expect(document.querySelector('.dwa-version')).toBeNull()
+  })
+
   it('shows only the chosen category and keeps the other pages mounted', async () => {
     const fixture = await mountPanel()
     const agents = screen.getByRole('region', { name: '已接入的智能体' })

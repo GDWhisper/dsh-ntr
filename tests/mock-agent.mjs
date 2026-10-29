@@ -11,6 +11,27 @@
  *              normal stop), zero visible output
  *  - "FAIL"  → the prompt request fails (JSON-RPC error), zero visible output
  *  - "IGNORE_CANCEL" → ignores session/cancel for ~1.2s, then finishes normally
+ *  - "HANG"  → the prompt request NEVER resolves and no update is ever sent
+ *              (the wedged agent the inactivity watchdog exists for); a
+ *              session/cancel is ignored on purpose
+ *  - "HANG_DELAY:<ms>" → sends nothing for <ms> (a slow but alive agent), then
+ *              runs the normal turn; session/cancel is ignored too
+ *  - "HANG_TOOL" → streams the usual opening (thought / plan / tool card), puts
+ *              the tool call `in_progress`, then NEVER finishes the turn: the
+ *              "working on a tool" shape the second stall window covers
+ *  - "HANG_TWO_TOOLS" → opens TWO tool calls, completes ONE, leaves the other
+ *              `in_progress`, then NEVER finishes: the parallel-call shape (a
+ *              finished call must not close the tool window while its sibling
+ *              is still running)
+ *  - "PIDTAG" → appends `PID:<process.pid>` to the echo, so a test can tell
+ *              whether the SAME agent process served two turns (a restart /
+ *              reclaim shows a different pid). Opt-in on purpose: every other
+ *              prompt keeps the byte-exact echo the existing tests assert.
+ *
+ * Environment knobs:
+ *  - MOCK_NO_LOAD=1 → `initialize` advertises no `loadSession` capability
+ *  - MOCK_IGNORE_CLOSE=1 → `session/close` is never answered (a wedged agent);
+ *              the host's stall reset must not wait for a graceful close
  *
  * Stale-cancel window: for 300ms after a `session/cancel` the NEXT prompt is
  * answered `cancelled` without generating a turn (the codebuddy 2.161.4
@@ -122,7 +143,10 @@ const app = agent({ name: 'mock-acp-agent' })
     authMethods: [],
   }))
   .onRequest(methods.agent.session.new, ctx => {
-    const sessionId = `mock-sess-${String(++counter)}`
+    // The PID prefix makes ids unique ACROSS PROCESSES too: a restart creates a
+    // new counter, and a test that proves "the host opened a NEW agent session"
+    // (a reset, not a `session/load`) compares ids from two different children.
+    const sessionId = `mock-sess-${String(process.pid)}-${String(++counter)}`
     sessions.set(sessionId, { cwd: ctx.params.cwd, modeId: 'default', temp: 'mid', model: DEFAULT_MODEL, effort: 'high', stream: false, mcpServers: ctx.params.mcpServers })
     return {
       sessionId,
@@ -141,7 +165,12 @@ const app = agent({ name: 'mock-acp-agent' })
     cancelCleanupUntil.set(ctx.params.sessionId, Date.now() + 300)
     fireCancel(ctx.params.sessionId)
   })
-  .onRequest(methods.agent.session.close, ctx => {
+  .onRequest(methods.agent.session.close, async ctx => {
+    // IGNORE_CLOSE: the wedged agent that never acknowledges a graceful close.
+    // A stall recovery must not depend on this request (it restarts the
+    // process instead), so a host that awaited it would hang here forever —
+    // which is exactly what the integration test pins.
+    if (process.env.MOCK_IGNORE_CLOSE === '1') await new Promise(() => {})
     sessions.delete(ctx.params.sessionId)
     return {}
   })
@@ -214,6 +243,21 @@ const app = agent({ name: 'mock-acp-agent' })
     const cleanupUntil = cancelCleanupUntil.get(sessionId)
     if (cleanupUntil !== undefined && Date.now() < cleanupUntil) {
       return { stopReason: 'cancelled' }
+    }
+
+    // Inactivity-watchdog modes, checked before any output. None of them
+    // acknowledges session/cancel: the watchdog exists for the agent that does
+    // not even acknowledge a cancel, so the reply must not arrive just because
+    // the host gave up on it. `HANG_TOOL` / `HANG_TWO_TOOLS` are excluded here —
+    // they hang LATER, with tool calls already in flight.
+    const delayed = /HANG_DELAY:(\d+)/.exec(text)
+    if (delayed !== null) {
+      await sleep(Number(delayed[1]))
+    } else if (text.includes('HANG') && !text.includes('HANG_TOOL') && !text.includes('HANG_TWO_TOOLS')) {
+      // A wedged agent: this request stays open forever. Nothing resolves it —
+      // not the cancel notification, not a timer. The process keeps serving
+      // other sessions, exactly like an agent stuck inside one turn.
+      await new Promise(() => {})
     }
 
     if (text.includes('FAIL')) {
@@ -297,6 +341,25 @@ const app = agent({ name: 'mock-acp-agent' })
       await send({ sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'completed', content: [{ type: 'content', content: { type: 'text', text: 'T1 OUTPUT LINE' } }] })
     }
 
+    if (text.includes('HANG_TWO_TOOLS')) {
+      // Parallel tool calls, the shape real agents produce: `ta` COMPLETES
+      // while `tb` is still `in_progress`. The turn is still the agent's to
+      // run — a sibling finishing is not the turn going quiet — so the host
+      // must keep applying the (longer) tool window. Then silence, like
+      // HANG_TOOL: session/cancel is ignored on purpose.
+      await send({ sessionUpdate: 'tool_call', toolCallId: 'ta', title: 'first parallel tool', kind: 'other', status: 'pending' })
+      await send({ sessionUpdate: 'tool_call', toolCallId: 'tb', title: 'second parallel tool', kind: 'other', status: 'pending' })
+      await send({ sessionUpdate: 'tool_call_update', toolCallId: 'ta', status: 'in_progress' })
+      await send({ sessionUpdate: 'tool_call_update', toolCallId: 'tb', status: 'in_progress' })
+      await send({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'ta',
+        status: 'completed',
+        content: [{ type: 'content', content: { type: 'text', text: 'first parallel result' } }],
+      })
+      await new Promise(() => {})
+    }
+
     await send({ sessionUpdate: 'tool_call', toolCallId: 'call_1', title: 'mock tool', kind: 'other', status: 'pending' })
 
     if (text.includes('PERM')) {
@@ -339,6 +402,12 @@ const app = agent({ name: 'mock-acp-agent' })
       await sleep(1200)
       fireCancel(sessionId)
     }
+    if (text.includes('HANG_TOOL')) {
+      // The tool call is open (status `in_progress` above) and never completes:
+      // a working agent whose tool half may legitimately take much longer than
+      // its prose half. session/cancel is ignored, like the other HANG modes.
+      await new Promise(() => {})
+    }
     await send({
       sessionUpdate: 'tool_call_update',
       toolCallId: 'call_1',
@@ -346,7 +415,10 @@ const app = agent({ name: 'mock-acp-agent' })
       content: [{ type: 'content', content: { type: 'text', text: 'tool result line' } }],
     })
     await send({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'MOCK:' } })
-    await send({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: ` echo ${text} perm=${permissionAnswer}` } })
+    // Opt-in process token: `REPLAYED` proves a `session/load`, but it is
+    // emitted by ANY child, so it cannot prove the process changed. The pid can.
+    const pidTag = text.includes('PIDTAG') ? ` PID:${String(process.pid)}` : ''
+    await send({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: ` echo ${text} perm=${permissionAnswer}${pidTag}` } })
     await send({ sessionUpdate: 'usage_update', used: 123, size: 1000 })
     return { stopReason: 'end_turn' }
   })

@@ -33,6 +33,8 @@ export interface PanelFixtureOptions {
   /** null simulates an older host without the approval RPC. */
   approvalDeadlines?: AcpApprovalDeadlines | null
   preset?: AcpPresetStatus | null
+  /** null simulates an older host without the version endpoint. */
+  pluginVersion?: string | null
   tagHalo?: AcpTagHalo
   permissions?: PanelPermissionRequest[]
   /** Hold the first agents/list response to preview/test the loading state. */
@@ -194,6 +196,8 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
         case 'agents/detect': return ok({ agents: detectedAgents() })
         case 'sessions/list': return ok({ sessions: [] })
         case 'preset/status': return ok({ preset })
+        case 'plugin/version':
+          return options.pluginVersion === null ? unsupported() : ok({ version: options.pluginVersion ?? '0.2.1' })
         case 'default/agent':
           return ok({ agentId: defaultAgentId !== undefined && definitions.has(defaultAgentId) ? defaultAgentId : undefined })
         case 'default/agent-set': {

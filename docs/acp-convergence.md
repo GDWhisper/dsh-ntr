@@ -250,7 +250,12 @@ callId 显式断块；同 callId 重发的 `tool_call` 按更新折叠。
    卡片因此夹在两个 assistant 节点之间，与原生多步回合一致。
 5. **guard**：第三职责的唯一例外（本行自己的续跑批次放行，callId 全部在
    `toolResults` 注册表里）与第四职责（`tools/execute` 虚拟工具）一并复活。
-6. **turn 级语义不变**：`turn/end` 仍只在 `session/prompt` 响应返回时发出；
+6. **turn 级语义不变**：`turn/end` 仍只在 `session/prompt` 响应返回时发出
+   （强制定稿另有 `session/cancel` 后的 cancel 兜底与后来的无活动看门狗两条
+   受控例外，判据见 [agents/protocol.md](./agents/protocol.md) §4 与 §6.1；
+   看门狗收口后，聊天路径的迟到答案被幂等的 `settle` 丢弃，`/acp` 在 reclaim
+   记下 `reclaimedTurnSeq` 之后同样丢弃——那之前迟到的真响应仍会自报一帧
+   `turn/end`）；
    以卡收尾的 turn 由**最后一个续跑段**收口（一条「工具已执行、无更多文字」
    的指针行，避免空气泡消息）；cancel 世代（`turnSeq`）与 prompt slot
    （agent 未确认取消前不解开 `settled` 闸门）跨段成立；段间事件只记账

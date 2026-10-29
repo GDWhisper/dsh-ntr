@@ -176,7 +176,7 @@ Every conversation has this tab. If the conversation has never been bound to an 
 
 **Agent stuck?**
 
-Click Stop without worry. The plugin cancels the turn, and force-finalizes it if the agent ignores the cancel — a conversation never hangs forever. If the agent process crashed, the next message automatically brings it back up and replays the context; history survives.
+Click Stop without worry. The plugin cancels the turn, and force-finalizes it if the agent ignores the cancel — a conversation never hangs forever. A turn the agent goes silent in is finalized too (see constraint 23 in AGENTS.md): with `session/load` the next send restarts the agent and resumes the session; without it the session is reset and its context is lost. If that was the conversation's first turn and it produced nothing, the agent lock rolls back and the next send starts a new session. A crashed agent process behaves the same way — one that supports resume comes back with its history on the next message.
 
 **Agent replied with an empty bubble?**
 
@@ -216,8 +216,8 @@ That's stale dependency state, not a missing plugin file: the failing path will 
 - **Inlined tool activity**: tool calls are inserted into the main chat in the order they happened, with thinking and replies on either side — no layering.
 - **Real permissions**: the agent's permission modes are listed verbatim, and every permission request is presented as-is. What you answer is what it receives.
 - **Slash commands belong to the agent**: in NTR conversations, `/` pops the agent's own declared commands; DSH's same-named commands don't hijack your input.
-- **Reconnect**: after a browser refresh or a network drop, history backfills in order. If the agent process crashed, the next message recovers it.
-- **Idle release**: agent processes with no activity exit automatically after an idle window, freeing memory. Processes with live conversations are never released.
+- **Reconnect**: after a browser refresh or a network drop, history backfills in order. If the agent process crashed, the next message recovers it when the agent declares `session/load`.
+- **Idle release**: agent processes with no activity exit automatically after an idle window, freeing memory; idle conversations are parked and resumed by the next message via `session/load` (agents that do not declare `session/load` still need no live conversation before their process is released).
 - **Windows works**: npm-globally-installed agents launch and get reaped correctly on Windows, leaving no stray background processes.
 
 ---
@@ -242,7 +242,7 @@ Mount it in your profile's `cordis.patch.yml`. When `cwd` / `allowedCwdRoots` ar
         allowedCwdRoots: [~/.dsh/dsh-ntr/workspaces]
 ```
 
-Optional agent fields: `npmPackage` (auto `npm install -g` when not found on PATH), `exposedModels` (which variants the NTR seat menu lists), `idleTimeoutMs` (idle-release window for chat processes; `0` = never release, default 30 minutes), `mcpServers` (extra MCP servers handed to the agent). Plugin-level there are also `transcriptMaxEntries` (per-conversation event buffer cap, default 600) and `probeModelsOnBoot` (kept for compatibility; boot-time per-agent probing no longer happens — see the comment on `bootstrapCatalogs`). Reliability timeouts and retries (`startupTimeoutMs`, `cancelFallbackMs`, `staleCancelRetryDelayMs`, `staleCancelMaxRetries`, `permissionTimeoutMs`, `permissionTimeoutMode`) are covered by [AGENTS.md](./AGENTS.md) constraints 12 and 13; anything editable in the Settings page should be edited there.
+Optional agent fields: `npmPackage` (auto `npm install -g` when not found on PATH), `exposedModels` (which variants the NTR seat menu lists), `idleTimeoutMs` (idle-release window for chat processes; `0` = never release, default 30 minutes), `mcpServers` (extra MCP servers handed to the agent). Plugin-level there are also `transcriptMaxEntries` (per-conversation event buffer cap, default 600) and `probeModelsOnBoot` (kept for compatibility; boot-time per-agent probing no longer happens — see the comment on `bootstrapCatalogs`). Reliability timeouts and retries (`startupTimeoutMs`, `cancelFallbackMs`, `staleCancelRetryDelayMs`, `staleCancelMaxRetries`, `permissionTimeoutMs`, `permissionTimeoutMode`, plus the stall watchdog's `turnStallMs` / `turnStallToolMs` / `turnStallTickMs`) are covered by [AGENTS.md](./AGENTS.md) constraints 12, 13 and 23; anything editable in the Settings page should be edited there — the three watchdog keys live in the config file only (`turnStallMs: 0` disables the whole watchdog).
 
 `mcpServers` uses the plugin's OWN shape (every entry carries a `name` and a `transport`), not the ACP wire shape — the wire's stdio entry has no `type`, and an entry written in the wire shape is silently dropped by the agent:
 

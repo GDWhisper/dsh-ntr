@@ -75,11 +75,33 @@ import type {
 } from './protocol.ts'
 import { DEFAULT_TAG_HALO } from './protocol.ts'
 
+/**
+ * Version of this installed package, read from the shipped `package.json` —
+ * one level above both `src/` at test time and `lib/` at runtime. The settings
+ * badge and the ACP handshake's `clientInfo` both report it; a copied literal
+ * would go stale on every release.
+ */
+export const PLUGIN_VERSION: string = (() => {
+  try {
+    const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8')) as { version?: unknown }
+    return typeof manifest.version === 'string' ? manifest.version : ''
+  } catch {
+    return ''
+  }
+})()
+
 const STDERR_TAIL_LINES = 40
 /** Single fs/read_text_file answer cap — agents reading huge files must page via `line`/`limit`. */
 const FS_MAX_READ_BYTES = 2 * 1024 * 1024
 /** Single fs/write_text_file payload cap. */
 const FS_MAX_WRITE_BYTES = 2 * 1024 * 1024
+/**
+ * How long a stop waits for the agent to answer `session/close` before killing
+ * the child anyway. The capability is optional and the LOCAL teardown is what
+ * actually frees the session, so a wedged agent must not be able to hang a
+ * stop — and with it the stall reclaim that calls it — forever.
+ */
+const SESSION_CLOSE_TIMEOUT_MS = 5_000
 
 /** What the composer showed for an agent before a conversation picked it. */
 interface DisplayedChatDefaults {
@@ -115,6 +137,20 @@ interface LiveSession {
   closed: boolean
   /** The agent process died; the session awaits a `session/load` resume. */
   released: boolean
+  /**
+   * When the agent last showed ANY sign of life on this session: an update, a
+   * permission ask (arrival or answer), or a turn start. The stall watchdog
+   * measures silence from here rather than from the prompt, which may
+   * legitimately be followed by a long tool run.
+   */
+  lastAgentActivityAt: number
+  /**
+   * Tool calls the agent announced and has not finished, by ACP `toolCallId`.
+   * A SET, not a flag: parallel calls finish independently, and one sibling's
+   * `completed` must not clear the long tool window while another is still
+   * running. Non-empty = the agent is working on its own clock.
+   */
+  activeToolCalls: Set<string>
   /**
    * Owning DSH chat session id, when the session was opened through the LLM
    * adapter (`AcpLlmAdapter`). It is what the conversation's permission card
@@ -168,6 +204,36 @@ interface LiveSession {
    * that answer means the message was silently dropped.
    */
   cancelRequestedAtTurn?: number
+  /**
+   * The {@link turnSeq} of a turn the stall watchdog force-finalized while the
+   * agent still held its `session/prompt`. The agent is presumed wedged, so the
+   * NEXT prompt reclaims the process (`BridgeManager.prepareStalledSession`)
+   * instead of queueing behind a turn that may never answer. Cleared when the
+   * late response lands or when the reclaim replaces the process.
+   */
+  orphanPromptTurnSeq?: number
+  /**
+   * The {@link turnSeq} of a turn a reclaim (`prepareStalledSession`) ended by
+   * closing the connection while the agent still held its `session/prompt`.
+   * The close rejects that request, and the caller's catch would broadcast a
+   * second `turn/end` for a turn already finalized: this marker tells the
+   * late `then`/`catch` to drop the answer instead. Set by the reclaim, cleared
+   * when that answer lands, at every new turn start, and by a resume.
+   */
+  reclaimedTurnSeq?: number
+  /**
+   * The controller of the turn currently streaming through this session.
+   *
+   * Chat turns are ALSO indexed by chat id ({@link BridgeManager}'s
+   * `turnStreams`) because their continuation steps arrive as fresh
+   * `streamPrompt` calls that look the turn up by chat id. An EPHEMERAL turn
+   * (`options.sessionId === undefined`) has no chat id to index under, so this
+   * attachment is the only way the stall watchdog can find its controller —
+   * without it a silent ephemeral turn falls into the `/acp` branch, which
+   * leaves the driver's segment queue open instead of finishing it. Cleared by
+   * the controller's own `retire` when it still points at it.
+   */
+  turnController?: TurnStreamController
   transcript: Transcript
 }
 
@@ -234,6 +300,23 @@ export interface BridgeTuning {
    * racing a concurrent `session/prompt` into the agent.
    */
   turnSettleMs?: number
+  /**
+   * How long a turn may stay SILENT — no update, no ask, no turn start — before
+   * the watchdog force-finalizes it as stalled. The turn is only watched while
+   * the agent is the one holding the floor (a segment on air, no pending ask),
+   * and the process survives: the next message reclaims it.
+   *
+   * `0` disables the watchdog.
+   */
+  turnStallMs?: number
+  /**
+   * The longer silence window used while an ACP tool call is in progress: the
+   * agent runs the tool on its own clock, so the plain turn window would call
+   * a healthy long-running tool stalled. `0` falls back to `turnStallMs`.
+   */
+  turnStallToolMs?: number
+  /** How often the watchdog scans for silent turns. */
+  turnStallTickMs?: number
   /**
    * Default idle-release window for agents without their own
    * `AcpAgentDef.idleTimeoutMs`: a READY process that holds no live session
@@ -328,6 +411,9 @@ const DEFAULT_TUNING: Required<BridgeTuning> = {
   staleCancelRetryDelayMs: 600,
   staleCancelMaxRetries: 2,
   turnSettleMs: 5_000,
+  turnStallMs: 600_000,
+  turnStallToolMs: 1_800_000,
+  turnStallTickMs: 30_000,
   idleTimeoutMs: 1_800_000,
   probeIdleTimeoutMs: 300_000,
 }
@@ -374,8 +460,19 @@ export class AgentBridge {
   private lastActivityAt = 0
   /** Throwaway catalog probes in flight — they hold no live session of their own. */
   private pendingProbes = 0
-  /** Host→agent session commands in flight (mode / config); not turns. */
-  private pendingCommands = 0
+  /**
+   * Host→agent session commands in flight (mode / config); not turns. Counted
+   * PER SESSION: a command the wedged agent never answers must not pin the
+   * bridge against reclaiming THAT session (it is exactly the state the
+   * watchdog is recovering from), while another session's command still does.
+   */
+  private readonly pendingCommands = new Map<string, number>()
+  /**
+   * `session/new` requests in flight. The session does not exist in `sessions`
+   * yet, so nothing else would tell a teardown (`releaseAll` / idle release)
+   * that a caller is waiting on the child it is about to kill.
+   */
+  private pendingCreates = 0
   /**
    * Whether a REAL session has ever been registered on this bridge. Probes
    * bypass session bookkeeping, so a bridge that has never hosted anything was
@@ -603,6 +700,18 @@ export class AgentBridge {
     }
   }
 
+  /**
+   * Open a session's settle gate without owning its turn stream: the turn's
+   * stream is gone (a resume, a release) but the next prompt still waits on
+   * this promise, and nothing is left that could ever resolve it.
+   */
+  private openSettleGate(session: LiveSession): void {
+    const settle = session.settledResolve
+    session.settled = undefined
+    session.settledResolve = undefined
+    settle?.()
+  }
+
   view(): AgentView {
     return {
       id: this.def.id,
@@ -633,12 +742,40 @@ export class AgentBridge {
    */
   private hasActiveWork(): boolean {
     if (this.pendingProbes > 0
-      || this.pendingCommands > 0
+      || this.pendingCreates > 0
+      || this.pendingCommands.size > 0
       || this.resuming.size > 0
       || this.permissions.sessionIds().length > 0
       || this.starting !== undefined) return true
     for (const session of this.sessions.values()) {
       if (session.running || session.settled !== undefined) return true
+    }
+    return false
+  }
+
+  /**
+   * Active work on this bridge EXCEPT `session`'s own — what a restart-carrying
+   * reclaim (the stall watchdog's follow-up) would destroy. Killing this child
+   * restarts every ACP session on the connection, so a live conversation that
+   * is mid-turn, mid-resume, or waiting on a human pins the process: its
+   * context is the one thing a restart cannot give back.
+   *
+   * `session`'s OWN mode/config command is deliberately not counted: an agent
+   * that ignores `session/set_mode` would otherwise make its own stall
+   * unrecoverable — the command's counter is exactly the evidence of the wedge.
+   */
+  hasOtherActiveWork(session: LiveSession): boolean {
+    if (this.pendingProbes > 0
+      || this.pendingCreates > 0
+      || this.resuming.size > 0
+      || this.starting !== undefined) return true
+    for (const sessionId of this.pendingCommands.keys()) {
+      if (sessionId !== session.sessionId) return true
+    }
+    if (this.permissions.sessionIds().some(entry => entry.sessionId !== session.sessionId)) return true
+    for (const other of this.sessions.values()) {
+      if (other === session) continue
+      if (other.running || other.settled !== undefined) return true
     }
     return false
   }
@@ -788,7 +925,7 @@ export class AgentBridge {
           terminal: false,
           session: { configOptions: { boolean: {} } },
         },
-        clientInfo: { name: 'dsh-ntr', title: 'DSH NTR', version: '0.1.0' },
+        clientInfo: { name: 'dsh-ntr', title: 'DSH NTR', version: PLUGIN_VERSION },
       }),
       'initialize',
     )
@@ -837,7 +974,26 @@ export class AgentBridge {
    * @param spawnCwd - where the agent PROCESS should run; see `ensureReady`.
    */
   async createSession(cwd: string | undefined, extraRoots: readonly string[] = [], spawnCwd?: string): Promise<LiveSession> {
+    // Readiness (and its possible restart into `spawnCwd`, see `ensureReady`)
+    // comes FIRST: `isQuiet` must not count THIS call's in-flight `session/new`
+    // against that move, or a fresh conversation could never bring a quiet
+    // process into its workspace. The counter is bumped in the same microtask
+    // that resumes here, so no idle-release timer can slip into the gap.
     await this.ensureReady(spawnCwd)
+    // Counted while the request is in flight: until `sessions.set` runs, the
+    // session is invisible to every teardown predicate, and a release that
+    // killed the child here would strand this promise on a dead connection.
+    this.pendingCreates += 1
+    try {
+      return await this.openSession(cwd, extraRoots)
+    } finally {
+      this.pendingCreates -= 1
+      this.touch()
+    }
+  }
+
+  /** The body of {@link createSession}; the caller keeps `pendingCreates` for it. */
+  private async openSession(cwd: string | undefined, extraRoots: readonly string[]): Promise<LiveSession> {
     const conn = this.conn
     if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
     const resolved = resolveSessionCwd(this.def, cwd, p => realpathSync(p), extraRoots)
@@ -858,6 +1014,8 @@ export class AgentBridge {
       turnSeq: 0,
       closed: false,
       released: false,
+      lastAgentActivityAt: Date.now(),
+      activeToolCalls: new Set(),
       transcript: new Transcript(this.transcriptMax),
       ...(result.modes !== undefined && result.modes !== null
         ? {
@@ -992,24 +1150,40 @@ export class AgentBridge {
     if (this.cancelFallbackMs <= 0) return
     const turnGen = session.turnSeq
     const timer = setTimeout(() => {
-      if (session.closed || session.turnSeq !== turnGen) return
-      // Nothing is in flight anymore (the turn settled on its own): nothing to
-      // finalize. A still-pending settle gate counts as in flight even though
-      // the stream is gone — that gate is what the next prompt waits on.
-      if (!session.running && session.settled === undefined) return
-      session.running = false
-      const settle = session.settledResolve
-      session.settled = undefined
-      session.settledResolve = undefined
-      settle?.()
-      this.hub.broadcast({
-        type: 'turn/end',
-        sessionId: session.sessionId,
-        turnId: '',
-        error: `agent "${this.def.id}" did not respond to the cancel request within ${String(Math.round(this.cancelFallbackMs / 1000))}s; the turn was force-finalized`,
-      })
+      this.finalizeTurn(
+        session,
+        turnGen,
+        `agent "${this.def.id}" did not respond to the cancel request within ${String(Math.round(this.cancelFallbackMs / 1000))}s; the turn was force-finalized`,
+      )
     }, this.cancelFallbackMs)
     timer.unref?.()
+  }
+
+  /**
+   * Force the local end of one turn whose agent never acknowledged it: clear
+   * `running`, open the settle gate, and broadcast the turn end with `turnId:
+   * ''` (there is no agent response to attribute it to). Shared by the cancel
+   * fallback and the stall watchdog.
+   *
+   * Generation-guarded: a turn that already ended — or that a later turn
+   * superseded — is not this call's to finalize. Returns whether it acted; a
+   * `false` means the caller was late and must leave the session alone.
+   */
+  finalizeTurn(session: LiveSession, turnGen: number, message: string): boolean {
+    if (session.closed || session.turnSeq !== turnGen) return false
+    // Nothing is in flight anymore (the turn settled on its own): nothing to
+    // finalize. A still-pending settle gate counts as in flight even though
+    // the stream is gone — that gate is what the next prompt waits on.
+    if (!session.running && session.settled === undefined) return false
+    session.running = false
+    this.openSettleGate(session)
+    this.hub.broadcast({
+      type: 'turn/end',
+      sessionId: session.sessionId,
+      turnId: '',
+      error: message,
+    })
+    return true
   }
 
   /**
@@ -1059,6 +1233,13 @@ export class AgentBridge {
       session.running = false
       session.closed = false
       session.released = false
+      // A resume is a fresh agent-side state: nothing from the dead process's
+      // turn survives it, including the settle gate and the stall markers.
+      session.orphanPromptTurnSeq = undefined
+      session.reclaimedTurnSeq = undefined
+      session.activeToolCalls.clear()
+      session.lastAgentActivityAt = Date.now()
+      this.openSettleGate(session)
       // Route replay updates into the fresh transcript while the load request
       // is in flight, and let the browser drop its blocks/watermark first.
       this.acpIndex.set(session.acpSessionId, session)
@@ -1105,10 +1286,20 @@ export class AgentBridge {
   releaseAll(reason: string): void {
     this.clearIdleTimer()
     for (const session of [...this.sessions.values()]) {
+      // A session already being closed is `closeSession`'s to delete. Marking
+      // it released would park it as resumable, and `doResumeSession` flips
+      // `closed` back to false — an idle release resurrecting a closed session.
+      if (session.closed) continue
       if (session.running) {
         session.running = false
         this.hub.broadcast({ type: 'turn/end', sessionId: session.sessionId, turnId: '', error: reason })
       }
+      // The process that owed the turn is gone: leaving its settle gate closed
+      // would make the next prompt wait for an answer that can no longer come.
+      this.openSettleGate(session)
+      // No call from the dead process can still be running: drop the tool set
+      // so a resumed turn starts on the plain window.
+      session.activeToolCalls.clear()
       session.released = true
       this.settlePermissions(session)
       this.released.set(session.sessionId, session)
@@ -1150,13 +1341,15 @@ export class AgentBridge {
   }
 
   /** Run one host→agent command as work, so an idle teardown cannot cut it. */
-  private async runCommand<T>(request: () => Promise<T>): Promise<T> {
-    this.pendingCommands += 1
+  private async runCommand<T>(session: LiveSession, request: () => Promise<T>): Promise<T> {
+    this.pendingCommands.set(session.sessionId, (this.pendingCommands.get(session.sessionId) ?? 0) + 1)
     this.touch()
     try {
       return await request()
     } finally {
-      this.pendingCommands -= 1
+      const remaining = (this.pendingCommands.get(session.sessionId) ?? 1) - 1
+      if (remaining > 0) this.pendingCommands.set(session.sessionId, remaining)
+      else this.pendingCommands.delete(session.sessionId)
       this.touch()
     }
   }
@@ -1164,7 +1357,7 @@ export class AgentBridge {
   async setMode(session: LiveSession, modeId: string): Promise<void> {
     const conn = this.conn
     if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
-    await this.runCommand(() => conn.agent.request(methods.agent.session.setMode, { sessionId: session.acpSessionId, modeId }))
+    await this.runCommand(session, () => conn.agent.request(methods.agent.session.setMode, { sessionId: session.acpSessionId, modeId }))
     // Well-behaved agents push `current_mode_update`, but the spec does not
     // require it — apply locally so the browser selector never goes stale.
     if (session.modes !== undefined) session.modes = { ...session.modes, currentModeId: modeId }
@@ -1179,7 +1372,7 @@ export class AgentBridge {
     const params = typeof value === 'boolean'
       ? { sessionId: session.acpSessionId, configId, value, type: 'boolean' as const }
       : { sessionId: session.acpSessionId, configId, value }
-    const result = await this.runCommand(() => conn.agent.request(methods.agent.session.setConfigOption, params)) as { configOptions?: unknown }
+    const result = await this.runCommand(session, () => conn.agent.request(methods.agent.session.setConfigOption, params)) as { configOptions?: unknown }
     // The response carries the full authoritative option set; some agents
     // (pi-acp observed) never re-notify after a client-driven set. It feeds the
     // SESSION snapshot first — `currentValue` in a per-session answer describes
@@ -1213,8 +1406,23 @@ export class AgentBridge {
     this.settlePermissions(session)
     const conn = this.conn
     if (conn !== undefined && this.state === 'ready') {
-      // `session/close` is an optional capability; the local teardown stands regardless.
-      await conn.agent.request(methods.agent.session.close, { sessionId: session.acpSessionId }).catch(() => { /* unsupported */ })
+      // `session/close` is an optional capability; the local teardown stands
+      // regardless. Bound the wait: a wedged agent that ignores the request
+      // must not hang the caller (the stall reclaim stops through here), so
+      // the request is raced against a timeout and left behind if it loses.
+      const close = conn.agent.request(methods.agent.session.close, { sessionId: session.acpSessionId }).catch(() => { /* unsupported */ })
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([
+          close,
+          new Promise<void>(resolve => {
+            timer = setTimeout(resolve, SESSION_CLOSE_TIMEOUT_MS)
+            timer.unref?.()
+          }),
+        ])
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+      }
     }
     this.sessions.delete(session.sessionId)
     this.acpIndex.delete(session.acpSessionId)
@@ -1237,6 +1445,36 @@ export class AgentBridge {
     }
     // A deliberate stop is not a crash: nothing stays resumable.
     this.released.clear()
+    this.conn?.close()
+    this.conn = undefined
+    this.killChild()
+    this.state = 'stopped'
+    this.initResult = undefined
+    this.publishStatus()
+  }
+
+  /**
+   * Drop every live session record and kill the child WITHOUT asking the agent
+   * to close them. `stop` sends `session/close` per session, and a wedged agent
+   * that ignores it would hang the caller (the stall reclaim) — the very agent
+   * this teardown exists to get rid of. The local teardown is what frees the
+   * sessions, so it runs unconditionally and immediately.
+   *
+   * Deliberately does NOT clear `released`: those records are constraint 10's
+   * — a released session survives a process death and is resumed by its next
+   * message. This is a stop, not a discard.
+   */
+  forceReset(reason: 'agent-stopped'): void {
+    this.clearIdleTimer()
+    for (const session of [...this.sessions.values()]) {
+      session.closed = true
+      this.settlePermissions(session)
+      this.openSettleGate(session)
+      session.activeToolCalls.clear()
+      this.sessions.delete(session.sessionId)
+      this.acpIndex.delete(session.acpSessionId)
+      this.hub.broadcast({ type: 'session/closed', sessionId: session.sessionId, reason })
+    }
     this.conn?.close()
     this.conn = undefined
     this.killChild()
@@ -1298,6 +1536,9 @@ export class AgentBridge {
   private async handlePermissionRequest(acpSessionId: string, toolCall: unknown, options: PermissionOption[], signal?: AbortSignal): Promise<RequestPermissionResponse> {
     const session = this.acpIndex.get(acpSessionId)
     if (session === undefined || session.closed) return { outcome: { outcome: 'cancelled' } }
+    // An ask is the agent speaking, not silence: the stall watchdog measures
+    // from here, and the pending ask exempts the session anyway.
+    session.lastAgentActivityAt = Date.now()
     // The deadline and the mode are read ONCE, here: an ask that started under
     // one pair keeps it, even if the settings page rewrites them mid-flight.
     const mode = this.permissionTimeoutMode
@@ -1331,6 +1572,9 @@ export class AgentBridge {
         clearTimeout(timer)
         detachSignal?.()
         this.touch()
+        // The answer releases the agent to continue; the turn's clock restarts
+        // here, not at the ask that may have waited on a human for minutes.
+        session.lastAgentActivityAt = Date.now()
         this.hub.broadcast({
           type: 'permission/resolved',
           requestId,
@@ -1433,6 +1677,7 @@ export class AgentBridge {
     options: PermissionOption[],
     timeoutMs: number,
   ): RequestPermissionResponse {
+    session.lastAgentActivityAt = Date.now()
     const outcome = this.announceExpiredAsk(session, mode, toolCall, options, timeoutMs)
     return outcome.outcome === 'selected'
       ? { outcome: { outcome: 'selected', optionId: outcome.optionId } }
@@ -1503,6 +1748,20 @@ export class AgentBridge {
   private handleSessionUpdate(params: SessionNotification): void {
     const session = this.acpIndex.get(params.sessionId)
     if (session === undefined) return // update for a session already closed locally
+    // Any update is the agent speaking: restart the stall clock here. A
+    // tool-call status also says whether the agent is inside a long-running
+    // tool, which earns the wider watchdog window.
+    session.lastAgentActivityAt = Date.now()
+    const kind = params.update.sessionUpdate
+    if (kind === 'tool_call' || kind === 'tool_call_update') {
+      const { toolCallId, status } = params.update as { toolCallId: string; status?: string | null }
+      if (status === 'completed' || status === 'failed') session.activeToolCalls.delete(toolCallId)
+      else if (status === 'pending' || status === 'in_progress') session.activeToolCalls.add(toolCallId)
+      // A `tool_call` without a status is a call the agent just announced and
+      // has not finished: count it as in flight. On an UPDATE the status is
+      // optional, and an absent one carries no news either way.
+      else if (kind === 'tool_call' && (status === undefined || status === null)) session.activeToolCalls.add(toolCallId)
+    }
     this.applyDerived(session, params.update)
     const seq = session.transcript.append(params.update)
     this.hub.broadcast({ type: 'session/update', sessionId: session.sessionId, seq, update: params.update })
@@ -2422,7 +2681,7 @@ type SegmentFinishReason =
 type TurnSettle =
   | { kind: 'stop'; stopReason: string }
   | { kind: 'cancelled' }
-  | { kind: 'error'; message: string }
+  | { kind: 'error'; message: string; code?: string }
 
 /**
  * The state of ONE ACP prompt, shared across every driver step of the turn.
@@ -2472,6 +2731,11 @@ class TurnStreamController {
     return this.settled
   }
 
+  /** Whether a segment is on air — the agent is expected to speak into a live driver step. */
+  get hasOpenSegment(): boolean {
+    return this.segment !== undefined && !this.segment.finished
+  }
+
   /** Generation guard: a controller whose turn has been superseded must not touch the session. */
   get stale(): boolean {
     return this.disposed || this.session.turnSeq !== this.turnSeqAtStart
@@ -2486,6 +2750,13 @@ class TurnStreamController {
    * consuming it, so the next segment replays it again.
    */
   startSegment(): SegmentState {
+    // A step opening is the HOST handing the turn back to the agent — this
+    // runs for the first step and for each continuation after the host
+    // executed a card. The watchdog measures the stretch the AGENT holds the
+    // floor, so the bounded gap a host step owns must not count as agent
+    // silence; resetting here cannot mask a later agent silence because the
+    // reset itself is bounded by one driver step.
+    this.session.lastAgentActivityAt = Date.now()
     const seg: SegmentState = {
       queue: new AsyncQueue<StreamChunk>(),
       index: -1,
@@ -2522,49 +2793,57 @@ class TurnStreamController {
   settle(outcome: TurnSettle): void {
     if (this.settled) return
     this.settled = true
-    const reason = outcome.kind === 'cancelled'
-      ? { kind: 'aborted' as const, failure: { message: 'Turn was cancelled', code: 'CANCELLED' } }
+    // A late answer to a SUPERSEDED turn still has to close this controller's
+    // queue (a continuation step may be parked on it) and its settle gate —
+    // but it must not touch the session the NEWER turn now owns, nor release
+    // process-wide waiters that belong to that turn.
+    const current = this.session.turnSeq === this.turnSeqAtStart
+    const reason: SegmentFinishReason = outcome.kind === 'cancelled'
+      ? { kind: 'aborted', failure: { message: 'Turn was cancelled', code: 'CANCELLED' } }
       : outcome.kind === 'error'
-        ? { kind: 'error' as const, failure: { message: outcome.message, code: 'INTERNAL' } }
-        : { kind: 'stop' as const }
-    if (outcome.kind === 'cancelled') {
-      this.hub.broadcast({ type: 'turn/end', sessionId: this.session.sessionId, turnId: this.turnId, stopReason: 'cancelled' })
-    } else if (outcome.kind === 'error') {
-      this.hub.broadcast({ type: 'turn/end', sessionId: this.session.sessionId, turnId: this.turnId, error: outcome.message })
-    } else {
-      this.hub.broadcast({ type: 'turn/end', sessionId: this.session.sessionId, turnId: this.turnId, stopReason: outcome.stopReason })
-    }
-    // The provisional lock settles BEFORE any synthesized warning below: the
-    // warning is our text, not evidence that the first turn delivered anything.
-    if (this.session.provisionalLock === true) {
-      this.session.provisionalLock = false
-      if (!this.sawVisibleBlock) this.rollbackFirstTurn(this.session)
+        ? { kind: 'error', failure: { message: outcome.message, code: outcome.code ?? 'INTERNAL' } }
+        : { kind: 'stop' }
+    if (current) {
+      if (outcome.kind === 'cancelled') {
+        this.hub.broadcast({ type: 'turn/end', sessionId: this.session.sessionId, turnId: this.turnId, stopReason: 'cancelled' })
+      } else if (outcome.kind === 'error') {
+        this.hub.broadcast({ type: 'turn/end', sessionId: this.session.sessionId, turnId: this.turnId, error: outcome.message })
+      } else {
+        this.hub.broadcast({ type: 'turn/end', sessionId: this.session.sessionId, turnId: this.turnId, stopReason: outcome.stopReason })
+      }
+      // The provisional lock settles BEFORE any synthesized warning below: the
+      // warning is our text, not evidence that the first turn delivered anything.
+      if (this.session.provisionalLock === true) {
+        this.session.provisionalLock = false
+        if (!this.sawVisibleBlock) this.rollbackFirstTurn(this.session)
+      }
     }
     const seg = this.segment
     if (seg !== undefined) {
-      if (outcome.kind !== 'stop') {
-        this.finishSegment(seg, reason)
-      } else {
-        if (!this.sawVisibleBlock) {
-          // The silent-failure report: a normal stop with nothing the chat
-          // plane renders. Aborted or failing turns need no extra hint; this
-          // is specifically "protocol says success, the bubble is empty".
-          const line = `\n[dsh-ntr] agent "${this.session.agentId}" ended the turn with no visible output (stop reason: ${outcome.stopReason}). Some agents fold upstream failures — auth, billing, rate limits — into a normal stop; try resending, and check the agent process logs if it repeats.\n`
-          this.emitProse(seg, 'text', line)
-        }
-        this.finishSegment(seg, reason)
+      if (current && outcome.kind === 'stop' && !this.sawVisibleBlock) {
+        // The silent-failure report: a normal stop with nothing the chat
+        // plane renders. Aborted or failing turns need no extra hint; this
+        // is specifically "protocol says success, the bubble is empty".
+        const line = `\n[dsh-ntr] agent "${this.session.agentId}" ended the turn with no visible output (stop reason: ${outcome.stopReason}). Some agents fold upstream failures — auth, billing, rate limits — into a normal stop; try resending, and check the agent process logs if it repeats.\n`
+        this.emitProse(seg, 'text', line)
       }
+      this.finishSegment(seg, reason)
     }
     // When no segment is on air (the turn ended on a card) the FINAL
     // continuation step collects the tail: `startSegment` sees `settled` and
     // finishes it with the appropriate closing line.
-    this.session.running = false
+    if (current) {
+      this.session.running = false
+      // The turn is over: no call from it can still earn the long tool window.
+      this.session.activeToolCalls.clear()
+      releaseAllToolOutputWaiters()
+    }
     this.endTurn()
-    releaseAllToolOutputWaiters()
     // The controller stays indexed only while a continuation step can still
     // come for its cards. A cancelled, failed, or card-less turn has none:
     // retire it now; the next turn's `rememberTurnStream` would anyway.
-    if (outcome.kind !== 'stop' || this.seenCalls.size === 0) this.dispose()
+    if (!current) this.retire()
+    else if (outcome.kind !== 'stop' || this.seenCalls.size === 0) this.dispose()
   }
 
   /** Cancelled by the user: finish the on-air segment and release the turn's slots. */
@@ -2588,10 +2867,25 @@ class TurnStreamController {
   /** Stop observing and release the manager's index. Idempotent. */
   dispose(): void {
     if (this.disposed) return
+    this.retire()
+    releaseAllToolOutputWaiters()
+  }
+
+  /**
+   * Stop observing and release the manager's index WITHOUT touching the
+   * process-wide tool-output waiters. A late settle of a superseded turn must
+   * use this: those waiters now belong to the turn on air, and waking them
+   * early would hand the guard a "no output" answer for a tool still running.
+   */
+  retire(): void {
+    if (this.disposed) return
     this.disposed = true
     this.unsubscribe()
+    // The session must not keep pointing at a retired turn: the stall watchdog
+    // reads this slot as "what is streaming now". A newer controller may have
+    // replaced it since, and that one is not ours to clear.
+    if (this.session.turnController === this) this.session.turnController = undefined
     this.manager.forgetTurnStream(this)
-    releaseAllToolOutputWaiters()
   }
 
   // ---- internals ----
@@ -2969,6 +3263,100 @@ export class BridgeManager {
         controller.dispose()
         this.turnStreams.delete(key)
       }
+    }
+  }
+
+  /**
+   * The stall watchdog's scan loop. Armed lazily at the first turn start and
+   * DROPPED once nothing anywhere is running: a manager that never runs a turn
+   * never holds a timer, and one that goes quiet does not keep the host awake.
+   */
+  private stallTimer?: ReturnType<typeof setInterval>
+
+  private armStallTimer(): void {
+    // `turnStallMs === 0` disables the WHOLE watchdog — the base window is the
+    // switch. `turnStallToolMs` cannot re-enable it: that number only widens
+    // the window for a turn that already has a tool in flight.
+    if (this.tuning.turnStallMs <= 0 || this.stallTimer !== undefined) return
+    const timer = setInterval(() => { this.reapStalledTurns() }, Math.max(1, this.tuning.turnStallTickMs))
+    timer.unref?.()
+    this.stallTimer = timer
+  }
+
+  /**
+   * Force-finalize turns the agent has gone silent in.
+   *
+   * "Silent" is scoped to the stretch where the AGENT owes the turn a word: a
+   * running session with a segment on air and no pending ask. A turn waiting on
+   * the host (tool cards executing between segments) or on a human (an
+   * unanswered permission) is not stuck and is skipped.
+   *
+   * Firing does NOT kill the process (see `LiveSession.orphanPromptTurnSeq`):
+   * the session, its transcript and its binding survive, and the next message
+   * reclaims the process. The turn's streaming face ends through its own
+   * controller when there is one, so the driver step on air closes with an
+   * error instead of being torn down mid-stream.
+   */
+  private reapStalledTurns(): void {
+    const now = Date.now()
+    let anyRunning = false
+    for (const bridge of this.bridges.values()) {
+      for (const session of bridge.sessionList) {
+        if (session.running) anyRunning = true
+        if (!session.running || session.closed || session.released) continue
+        // A question is on the table: the agent is waiting on a human, not
+        // stuck, and that wait is the permission deadline's business.
+        if (bridge.permissions.hasPendingFor(session.sessionId)) continue
+        // The controller this turn is streaming through. A chat turn is indexed
+        // by chat id (its continuation steps look it up that way) AND attached
+        // to the session; an EPHEMERAL turn has no chat id and therefore only
+        // the attachment — treating it as an `/acp` turn would finalize the
+        // session state without closing the driver's segment queue.
+        const indexed = session.dshSessionId === undefined ? undefined : this.turnStreams.get(session.dshSessionId)
+        // An index hit only speaks for THIS session: a concurrent first turn
+        // can have mapped another LiveSession under the same chat id.
+        const attached = session.turnController
+          ?? (indexed !== undefined && indexed.session === session ? indexed : undefined)
+        // A controller from an EARLIER turn is stale the moment any newer turn
+        // (e.g. an `/acp` prompt on the same chat) advances `turnSeq`: its
+        // segment is already closed, `onAir` would read false, and the
+        // watchdog would skip this turn forever. Treat it as absent.
+        const live = attached !== undefined && !attached.stale ? attached : undefined
+        // An `/acp`-RPC turn has no driver stream, so "on air" reads as true.
+        const onAir = live === undefined ? true : live.hasOpenSegment
+        if (!onAir) continue
+        const toolWindow = this.tuning.turnStallToolMs > 0 ? this.tuning.turnStallToolMs : this.tuning.turnStallMs
+        const threshold = session.activeToolCalls.size > 0 ? toolWindow : this.tuning.turnStallMs
+        if (now - session.lastAgentActivityAt < threshold) continue
+        void bridge.cancel(session)
+        session.orphanPromptTurnSeq = session.turnSeq
+        const turnGen = session.turnSeq
+        const message = `acp: agent "${session.agentId}" sent no activity for ${String(Math.round(threshold / 1000))}s; the stalled turn was force-finalized`
+        // A provisional first turn that showed nothing is about to be rolled
+        // back by `settle` (lock released, session closed), so the notice must
+        // not promise a resume that will not happen.
+        const willRollback = live !== undefined && live.session.provisionalLock === true && !live.sawVisibleBlock
+        if (live !== undefined) live.settle({ kind: 'error', message, code: 'INACTIVITY_TIMEOUT' })
+        else bridge.finalizeTurn(session, turnGen, message)
+        // What the next message can do depends on the capability the agent
+        // advertised at connect time, and on whether anyone else is using it.
+        const capabilities = bridge.view().agentCapabilities as { loadSession?: boolean } | undefined
+        const next = willRollback
+          ? 'This was the conversation\'s first turn and it delivered nothing, so it was discarded; the next message starts a new ACP session.'
+          : capabilities?.loadSession === true
+            ? 'The next message will restart the agent and resume the session.'
+            : 'The next message will reset the ACP session; this agent does not support session resume.'
+        this.hub.broadcast({
+          type: 'agent/notice',
+          agentId: session.agentId,
+          level: 'error',
+          text: `${message} ${next} If another conversation is still using the agent, the next send may be refused until that turn finishes.`,
+        })
+      }
+    }
+    if (!anyRunning && this.stallTimer !== undefined) {
+      clearInterval(this.stallTimer)
+      this.stallTimer = undefined
     }
   }
 
@@ -3714,6 +4102,11 @@ export class BridgeManager {
       return undefined
     }
     return acpPresetStatusFromRoster(rows, ACP_PRESET_ID)
+  }
+
+  /** The installed package's version (the settings page's badge). */
+  pluginVersion(): string {
+    return PLUGIN_VERSION
   }
 
   private getStoragePath(): string | undefined {
@@ -4731,18 +5124,64 @@ export class BridgeManager {
   }
 
   async prompt(sessionId: string, text: string): Promise<{ turnId: string }> {
-    const { bridge, session } = await this.locateOrResume(sessionId)
+    let located = await this.locateOrResume(sessionId)
+    // The watchdog abandoned a previous turn here and the agent may still be
+    // holding its prompt slot on the old process: reclaim BEFORE sending, or
+    // this message queues behind a turn that will never answer.
+    if (located.session.orphanPromptTurnSeq !== undefined) {
+      const prepared = await this.prepareStalledSession(located.session)
+      if (!prepared.ok) throw new AcpError('agent_unresponsive', prepared.message)
+      // Without `session/load` there is nothing to re-locate: the record was
+      // dropped on purpose, and "/acp" has no conversation to recreate it from.
+      // Re-locating anyway would surface a misleading `unknown_session`.
+      if (prepared.reset === true) {
+        throw new AcpError('session_reset', `acp: agent "${located.session.agentId}" does not support session resume; start a new session`)
+      }
+      // A resumable reclaim released the record: re-locate what is live now.
+      located = await this.locateOrResume(sessionId)
+    }
+    const { bridge, session } = located
     if (session.running) throw new AcpError('turn_in_flight', 'acp: this session already has a prompt in flight')
     session.running = true
     session.turnSeq += 1
+    const turnGen = session.turnSeq
+    session.lastAgentActivityAt = Date.now()
+    session.activeToolCalls.clear()
+    // A new turn owns the session from here: any reclaim marker named an
+    // earlier generation and must not suppress THIS turn's settle.
+    session.reclaimedTurnSeq = undefined
+    this.armStallTimer()
     const turnId = randomUUID()
     this.hub.broadcast({ type: 'turn/start', sessionId, turnId, text })
     void bridge.runPrompt(session, text, turnId)
       .then(stopReason => {
+        // The reclaim already ended this turn locally; the answer it caused is
+        // that same turn reporting back, not a second turn end for the caller.
+        if (session.reclaimedTurnSeq === turnGen) {
+          session.reclaimedTurnSeq = undefined
+          return
+        }
+        // A superseded turn's late answer must not end the turn now on air.
+        if (session.turnSeq !== turnGen) return
+        this.clearOrphanPrompt(session, turnGen)
         session.running = false
         this.hub.broadcast({ type: 'turn/end', sessionId, turnId, stopReason })
       })
       .catch((error: unknown) => {
+        if (session.reclaimedTurnSeq === turnGen) {
+          session.reclaimedTurnSeq = undefined
+          return
+        }
+        if (session.turnSeq !== turnGen) return
+        // The turn was ended by an EXTERNAL close (idle release, agent stop):
+        // that teardown already broadcast the turn's end, and the session is
+        // parked or closed. Reporting the close's rejection again would put a
+        // second terminal frame on a turn the browser already saw finish.
+        if (session.released || session.closed) {
+          this.clearOrphanPrompt(session, turnGen)
+          return
+        }
+        this.clearOrphanPrompt(session, turnGen)
         session.running = false
         this.hub.broadcast({
           type: 'turn/end',
@@ -4752,6 +5191,11 @@ export class BridgeManager {
         })
       })
     return { turnId }
+  }
+
+  /** The late answer landed (or failed): the turn is no longer an orphan. */
+  private clearOrphanPrompt(session: LiveSession, turnGen: number): void {
+    if (session.orphanPromptTurnSeq === turnGen) session.orphanPromptTurnSeq = undefined
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -4828,6 +5272,10 @@ export class BridgeManager {
   }
 
   async shutdownAll(): Promise<void> {
+    if (this.stallTimer !== undefined) {
+      clearInterval(this.stallTimer)
+      this.stallTimer = undefined
+    }
     this.dshSessionMap.clear()
     this.disposeTurnStreamsOf(() => true)
     await Promise.all([...this.bridges.values()].map(b => b.stop('agent-stopped')))
@@ -5183,6 +5631,76 @@ export class BridgeManager {
     return session
   }
 
+  /**
+   * Take the agent process back from a turn the stall watchdog abandoned.
+   *
+   * The wedged agent still holds its `session/prompt`, so the next message
+   * cannot simply be sent: it would queue behind a turn that may never answer.
+   * The process is restarted instead — unless another conversation on the same
+   * connection is doing real work, because killing the child destroys THEIR
+   * context too, and "retry after they finish" is the honest answer.
+   *
+   * A restart that can `session/load` costs the conversation nothing: the
+   * session is parked `released` and the normal acquisition path resumes it, so
+   * chat keeps its lock / `applyChatChoice` semantics and `/acp` keeps
+   * `locateOrResume`. An agent without resume support is reset instead, and the
+   * user is told the context is gone.
+   */
+  private async prepareStalledSession(session: LiveSession): Promise<{ ok: true; reset?: boolean } | { ok: false; message: string }> {
+    // A session whose `session/close` is still in flight must not be touched:
+    // releasing it would park it as resumable and `doResumeSession` flips
+    // `closed` back to false, resurrecting a closed session. Its owner deletes
+    // the record; the caller's own acquisition creates a new session (chat) or
+    // rejects `session_closed` (`/acp`).
+    if (session.closed) return { ok: true }
+    if (session.released) return { ok: true } // the acquisition resumes it
+    const bridge = this.bridge(session.agentId)
+    const blocked = `acp: agent "${session.agentId}" is unresponsive, but other conversations are still using it; retry after they finish`
+    if (bridge.hasOtherActiveWork(session)) return { ok: false, message: blocked }
+    // A sibling conversation the agent already settled is not "work" by
+    // `hasOtherActiveWork` — but its HOST may still owe the turn a
+    // continuation step (a card it is executing right now), and restarting the
+    // process would park and resume that live turn. Its indexed controller is
+    // the evidence. Scoped to THIS agent: the restart kills this agent's child
+    // only, so another agent's pending step is not this bridge's business.
+    // A closed or released session has no host behind it (a leftover
+    // controller), so it does not pin the child either.
+    for (const controller of this.turnStreams.values()) {
+      if (controller.session === session) continue
+      if (controller.session.agentId !== session.agentId) continue
+      if (controller.session.closed || controller.session.released) continue
+      if (!controller.stale) return { ok: false, message: blocked }
+    }
+    const capabilities = bridge.view().agentCapabilities as { loadSession?: boolean } | undefined
+    if (capabilities?.loadSession === true) {
+      // Whatever teardown runs, the agent's in-flight `session/prompt` is about
+      // to be rejected by the closing connection. Mark the generation so that
+      // rejection does not broadcast a second `turn/end` for a turn already
+      // finalized by the watchdog (`LiveSession.reclaimedTurnSeq`).
+      session.reclaimedTurnSeq = session.turnSeq
+      bridge.releaseAll('agent did not acknowledge the stalled turn')
+      session.orphanPromptTurnSeq = undefined
+      return { ok: true }
+    }
+    // No resume: the restart IS a reset, so only this session's context is at
+    // stake — and any other live session pins the process even while idle.
+    if (bridge.sessionList.some(other => other !== session)) return { ok: false, message: blocked }
+    const agentId = session.agentId
+    // `stop` would ask a wedged agent to close its sessions and wait for an
+    // answer that never comes; `forceReset` is the local half only.
+    session.reclaimedTurnSeq = session.turnSeq
+    bridge.forceReset('agent-stopped')
+    this.forgetDshSession(session.sessionId)
+    session.orphanPromptTurnSeq = undefined
+    this.hub.broadcast({
+      type: 'agent/notice',
+      agentId,
+      level: 'info',
+      text: `acp: agent "${agentId}" does not support session resume; the ACP session was reset (context could not be restored)`,
+    })
+    return { ok: true, reset: true }
+  }
+
   async *streamPrompt(options: GenerateOptions): AsyncIterable<StreamChunk> {
     // The plugin's own conversation↔agent mapping decides who serves the turn
     // (see `bindChatAgent`): the driver may arrive here with the previous
@@ -5293,6 +5811,20 @@ export class BridgeManager {
     }
 
     let session: LiveSession
+    // Same key `getOrCreateDshSession` looks up: a session the watchdog left
+    // orphaned must be reclaimed BEFORE the acquisition, so this message cannot
+    // queue behind a prompt the agent will never answer.
+    const stalled = this.dshSessionMap.get(`${options.sessionId ?? 'ephemeral'}:${agentId}`)
+    if (stalled !== undefined && stalled.orphanPromptTurnSeq !== undefined) {
+      const prepared = await this.prepareStalledSession(stalled)
+      if (!prepared.ok) {
+        yield {
+          type: 'finish',
+          reason: { kind: 'error', failure: { message: prepared.message, code: 'agent_unresponsive' } },
+        }
+        return
+      }
+    }
     try {
       session = await this.getOrCreateDshSession(options.sessionId, agentId)
     } catch (err) {
@@ -5424,6 +5956,13 @@ export class BridgeManager {
 
     session.running = true
     session.turnSeq += 1
+    const turnGen = session.turnSeq
+    session.lastAgentActivityAt = Date.now()
+    session.activeToolCalls.clear()
+    // A new turn owns the session from here: any reclaim marker named an
+    // earlier generation and must not suppress THIS turn's settle.
+    session.reclaimedTurnSeq = undefined
+    this.armStallTimer()
     const turnId = randomUUID()
     this.hub.broadcast({ type: 'turn/start', sessionId: session.sessionId, turnId, text: promptText })
 
@@ -5442,6 +5981,14 @@ export class BridgeManager {
       victim => this.rollbackFirstTurn(victim),
     )
     if (session.dshSessionId !== undefined) this.rememberTurnStream(session.dshSessionId, controller)
+    // The session itself carries the controller too: an EPHEMERAL turn
+    // (`options.sessionId === undefined`) has no chat id to index under, and
+    // the stall watchdog needs SOME route to the controller to close the
+    // driver's segment queue. For chat turns this also disambiguates a chat id
+    // two LiveSessions briefly share (a concurrent first turn). Assigned AFTER
+    // `rememberTurnStream` so the controller it just retired cannot clear this
+    // attachment.
+    session.turnController = controller
     const segment = controller.startSegment()
     const onAbort = (): void => {
       if (controller.stale) return
@@ -5460,12 +6007,29 @@ export class BridgeManager {
       // or a continuation one.
       bridge.runPrompt(session, promptText, turnId)
         .then(stopReason => {
+          // The reclaim already ended this turn locally, and the close it
+          // performed rejected this very request: the late answer is that same
+          // turn, not a second one to broadcast.
+          if (session.reclaimedTurnSeq === turnGen) {
+            session.reclaimedTurnSeq = undefined
+            return
+          }
           controller.settle(stopReason === 'cancelled'
             ? { kind: 'cancelled' }
             : { kind: 'stop', stopReason })
         })
         .catch((err: unknown) => {
+          if (session.reclaimedTurnSeq === turnGen) {
+            session.reclaimedTurnSeq = undefined
+            return
+          }
           controller.settle({ kind: 'error', message: describeError(err) })
+        })
+        // The agent's own answer closed the turn: whatever the watchdog marked
+        // orphaned has just reported back and no longer needs a reclaim.
+        .finally(() => {
+          if (session.reclaimedTurnSeq === turnGen) session.reclaimedTurnSeq = undefined
+          this.clearOrphanPrompt(session, turnGen)
         })
     }
 

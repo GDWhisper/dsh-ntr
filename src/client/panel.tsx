@@ -83,7 +83,7 @@ const STYLE = `
 }
 .dwa-page-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 28px; }
 .dwa-page-heading { min-width: 0; }
-.dwa-page-title { margin: 0; font-size: 20px; line-height: 1.35; font-weight: 550; letter-spacing: -0.02em; }
+.dwa-page-title { margin: 0; font-size: 20px; line-height: 1.35; font-weight: 550; letter-spacing: -0.02em; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .dwa-page-description { margin: 5px 0 0; color: var(--ntr-muted); font-size: var(--ntr-font-sm); }
 .dwa-btn {
   min-height: 32px; box-sizing: border-box; font: inherit; border-radius: var(--ntr-radius-sm);
@@ -115,6 +115,7 @@ const STYLE = `
 .dwa-badge-success { background: var(--dsw-alias-state-success-tertiary, #dcfce7); color: var(--ntr-success); }
 .dwa-badge-warn { background: var(--dsw-alias-state-warn-tertiary, #fef3c7); color: var(--ntr-warn); }
 .dwa-badge-info { background: var(--dsw-alias-state-business-tertiary, #dbeafe); color: var(--dsw-alias-state-business-primary, #2563eb); }
+.dwa-version { font-family: var(--ds-font-family-code, monospace); }
 .dwa-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
 .dwa-agent-list { display: flex; flex-direction: column; border-top: var(--ntr-line); }
 .dwa-agent-card { border-bottom: var(--ntr-line); min-width: 0; }
@@ -874,7 +875,10 @@ export function AcpSettingsSection(props: WithStore) {
     <div className="dwa-root">
       <header className="dwa-page-header">
         <div className="dwa-page-heading">
-          <h2 className="dwa-page-title">{acp.label('NTR 设置', 'NTR settings')}</h2>
+          <h2 className="dwa-page-title">
+            {acp.label('NTR 设置', 'NTR settings')}
+            {ui.pluginVersion !== undefined && <span className="dwa-badge dwa-version">{`v${ui.pluginVersion}`}</span>}
+          </h2>
           <p className="dwa-page-description">
             {acp.label('连接智能体，设置你的对话偏好。', 'Connect agents and set your conversation preferences.')}
           </p>

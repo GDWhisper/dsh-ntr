@@ -238,6 +238,50 @@ export interface AcpPluginConfig {
    * up and reports the `cancelled` stop as-is. Default 2.
    */
   staleCancelMaxRetries?: number
+  /**
+   * Inactivity watchdog for a turn the agent owes an answer: how long the turn
+   * may stay SILENT before the host finalizes it as stalled.
+   *
+   * The clock is `LiveSession.lastAgentActivityAt`, refreshed by ANY
+   * `session/update`, at every turn start, at each segment start (the host
+   * handing the turn back after a card), and when a permission ask arrives or
+   * is resolved. The watchdog only READS it while the turn is watched: an OPEN
+   * agent segment (always true on the `/acp`-RPC path, which has no driver
+   * stream) and no pending approval. The host-card execution phase and an
+   * unanswered ask are exempt by that gate, not because the clock is frozen —
+   * they legitimately move it too.
+   *
+   * Firing finalizes the TURN only (an `agent/notice` plus the usual turn
+   * end); it does NOT kill the agent process. The wedged `session/prompt` is
+   * abandoned, and the next message reclaims the session: parked with
+   * `releaseAll` and resumed with `session/load`, or reset outright when the
+   * agent declares no `loadSession` (the context is gone and the user is
+   * told).
+   *
+   * Default 600000 ms (10 minutes); `0` disables the WHOLE watchdog, the tool
+   * window included.
+   */
+  turnStallMs?: number
+  /**
+   * The longer silence window applied while ANY ACP tool call is still active
+   * by `toolCallId` — parallel calls are tracked as a set, so the window lasts
+   * until the LAST of them finishes. The agent is working on its own clock in
+   * there, so the plain turn window would call a healthy long-running tool
+   * stalled.
+   *
+   * Default 1800000 ms (30 minutes); `0` falls back to
+   * {@link AcpPluginConfig.turnStallMs}. It matches
+   * `TOOL_OUTPUT_WAIT_MS = 30 * 60 * 1000` in `presets/acp/acp-guard.mjs`, so
+   * the two halves of one turn agree on how long a tool may take.
+   */
+  turnStallToolMs?: number
+  /**
+   * How often the watchdog scans for silent turns, in milliseconds. A tuning /
+   * test knob only: NO settings-page control exists for it — and none for the
+   * two windows above either; the whole watchdog is configured in the patch
+   * file. Default 30000 ms.
+   */
+  turnStallTickMs?: number
 }
 
 // ---- Host → browser events (`/api/acp/stream`, SSE) ----
@@ -564,6 +608,8 @@ export interface AgentIdPayload { agentId: string }
 export interface DefaultAgentSetPayload { agentId?: string }
 /** `default/agent`: the plugin's own default agent id, or `undefined` when unset. */
 export type DefaultAgentResult = { agentId?: string }
+/** `plugin/version`: the installed host package's version, for the settings badge. */
+export type PluginVersionResult = { version?: string }
 
 /**
  * How the composer-edge agent tag shows liveness (the blue halo). `breath`

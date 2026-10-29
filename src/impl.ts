@@ -535,6 +535,22 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
   if (typeof staleCancelMaxRetries !== 'number' || !Number.isInteger(staleCancelMaxRetries) || staleCancelMaxRetries < 0 || staleCancelMaxRetries > 5) {
     throw new AcpError('bad_config', 'acp: staleCancelMaxRetries must be an integer in [0, 5]')
   }
+  // Stall-recovery windows (inactivity watchdog). Two lengths on purpose: a
+  // silent turn with the floor is a stuck agent, but a turn waiting on a TOOL
+  // call is a working agent, and the tool half may take as long as the guard's
+  // own tool-output wait. `0` means "off" / "fall back", never "expire now".
+  const turnStallMs = value.turnStallMs ?? 600_000
+  if (typeof turnStallMs !== 'number' || !Number.isInteger(turnStallMs) || turnStallMs < 0 || turnStallMs > 86_400_000) {
+    throw new AcpError('bad_config', 'acp: turnStallMs must be an integer in [0, 86400000] (0 = disable the watchdog)')
+  }
+  const turnStallToolMs = value.turnStallToolMs ?? 1_800_000
+  if (typeof turnStallToolMs !== 'number' || !Number.isInteger(turnStallToolMs) || turnStallToolMs < 0 || turnStallToolMs > 86_400_000) {
+    throw new AcpError('bad_config', 'acp: turnStallToolMs must be an integer in [0, 86400000] (0 = fall back to turnStallMs)')
+  }
+  const turnStallTickMs = value.turnStallTickMs ?? 30_000
+  if (typeof turnStallTickMs !== 'number' || !Number.isInteger(turnStallTickMs) || turnStallTickMs < 1 || turnStallTickMs > 60_000) {
+    throw new AcpError('bad_config', 'acp: turnStallTickMs must be an integer in [1, 60000]')
+  }
   return {
     agents,
     transcriptMaxEntries: max,
@@ -545,6 +561,9 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
     cancelFallbackMs,
     staleCancelRetryDelayMs,
     staleCancelMaxRetries,
+    turnStallMs,
+    turnStallToolMs,
+    turnStallTickMs,
   }
 }
 
@@ -1650,6 +1669,19 @@ export class PermissionLedger {
   }
 
   /**
+   * Whether ANY outstanding ask belongs to `sessionId`, a HOST session id
+   * (`LiveSession.sessionId`) — NOT the ACP protocol session id. Used by the
+   * stall watchdog: a turn blocked on a human is not a silent turn, so the
+   * session with a pending permission must not be finalized as stalled.
+   */
+  hasPendingFor(sessionId: string): boolean {
+    for (const entry of this.pending.values()) {
+      if (entry.sessionId === sessionId) return true
+    }
+    return false
+  }
+
+  /**
    * Outstanding asks WITH the view the browser was shown, for the reconnect
    * replay. Entries created without a view are skipped: replaying a frame the
    * client cannot render (no title, no options) would show an unanswerable
@@ -1874,6 +1906,12 @@ export interface AcpManager {
    * the registry service), which hides the panel block instead of guessing.
    */
   presetStatus?(): Promise<AcpPresetStatus | undefined>
+  /**
+   * The installed host package's version, reported for the settings page's
+   * badge. `undefined` on a host half that predates the endpoint, which hides
+   * the badge rather than showing a number the browser invented.
+   */
+  pluginVersion?(): string | undefined
 }
 
 function ok<T>(value: T): RpcResult<T> {
@@ -2038,6 +2076,10 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
       }
       case 'preset/status':
         return ok({ preset: await manager.presetStatus?.() ?? null })
+      case 'plugin/version':
+        // Absent on a host half from before the badge existed: the browser
+        // hides it instead of naming a version it cannot know.
+        return ok({ version: manager.pluginVersion?.() })
       case 'agent/stop':
         await manager.stopAgent(str(body, 'agentId', 64)); return ok({ done: true })
       case 'default/agent':

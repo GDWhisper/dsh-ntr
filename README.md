@@ -176,7 +176,7 @@ agent 要动敏感的东西时会问你。询问卡出现在对话里、聊天�
 
 **agent 卡住不动了？**
 
-可以放心点停止。插件会取消这一轮，并在 agent 不理会取消时强制收尾，会话不会永久卡住。如果 agent 进程崩了，下次发消息会自动把它拉起来并回放上下文，历史不丢。
+可以放心点停止。插件会取消这一轮，并在 agent 不理会取消时强制收尾，会话不会永久卡住。agent 自己长时间无动静时，卡住的那一轮也会被收口（见 AGENTS.md 约束 23）：声明了 `session/load` 的 agent，下一次发送会自动重启并恢复会话；没声明的会被重置，上下文丢失。卡的若是这条会话的首轮、且什么都没输出，锁定会回滚、该轮作废，下一条消息直接新建会话。agent 进程崩溃同理——支持恢复的会自动拉起并回放历史，不支持的要新建会话。
 
 **agent 只回了一个空气泡？**
 
@@ -216,8 +216,8 @@ agent 要动敏感的东西时会问你。询问卡出现在对话里、聊天�
 - **工具活动内联**：工具调用按发生顺序插进主聊天区，思考和回答分列它两侧，不分层。
 - **真实权限**：agent 的权限模式原样列出，它的每次权限询问也原样呈现，你答什么它收到什么。
 - **斜杠命令归 agent**：NTR 会话里 `/` 弹出的是 agent 自己声明的命令；DSH 的同名命令不会截走你的输入。
-- **断线重连**：浏览器刷新或断网后，历史按序补齐。agent 进程崩了，下次发消息自动恢复。
-- **空闲释放**：没有活动的 agent 进程会在空闲一段时候后自动退出，不占内存。有会话的进程不会被释放。
+- **断线重连**：浏览器刷新或断网后，历史按序补齐。agent 进程崩了，声明了 `session/load` 的会在下次发消息时自动恢复。
+- **空闲释放**：没有活动的 agent 进程会在空闲一段时候后自动退出，不占内存；空闲会话被挂起成可恢复状态，下一条消息经 `session/load` 恢复（只对声明了 `session/load` 的 agent 成立；没声明的仍要求没有活会话才释放进程）。
 - **Windows 可用**：npm 全局安装的 agent 在 Windows 上也能正常启动和回收，不会残留后台进程。
 
 ---
@@ -242,7 +242,7 @@ agent 要动敏感的东西时会问你。询问卡出现在对话里、聊天�
         allowedCwdRoots: [~/.dsh/dsh-ntr/workspaces]
 ```
 
-可选的 agent 字段：`npmPackage`（PATH 里找不到时自动 `npm install -g`）、`exposedModels`（NTR 座位菜单列哪些变体）、`idleTimeoutMs`（聊天进程的空闲释放窗口，`0` = 永不释放，默认 30 分钟）、`mcpServers`（额外交给 agent 连接的 MCP 服务器）。插件级还有 `transcriptMaxEntries`（会话事件缓冲上限，默认 600）与 `probeModelsOnBoot`（保留字段，启动时已不再为每个 agent 探测，见 `bootstrapCatalogs` 的注释）。可靠性超时与重试的默认值（`startupTimeoutMs`、`cancelFallbackMs`、`staleCancelRetryDelayMs`、`staleCancelMaxRetries`、`permissionTimeoutMs` 与 `permissionTimeoutMode`）见 [AGENTS.md](./AGENTS.md) 约束 12 与 13；设置页能改的都在设置页改。
+可选的 agent 字段：`npmPackage`（PATH 里找不到时自动 `npm install -g`）、`exposedModels`（NTR 座位菜单列哪些变体）、`idleTimeoutMs`（聊天进程的空闲释放窗口，`0` = 永不释放，默认 30 分钟）、`mcpServers`（额外交给 agent 连接的 MCP 服务器）。插件级还有 `transcriptMaxEntries`（会话事件缓冲上限，默认 600）与 `probeModelsOnBoot`（保留字段，启动时已不再为每个 agent 探测，见 `bootstrapCatalogs` 的注释）。可靠性超时与重试的默认值（`startupTimeoutMs`、`cancelFallbackMs`、`staleCancelRetryDelayMs`、`staleCancelMaxRetries`、`permissionTimeoutMs`、`permissionTimeoutMode`，以及卡死看门狗的 `turnStallMs` / `turnStallToolMs` / `turnStallTickMs`）见 [AGENTS.md](./AGENTS.md) 约束 12、13 与 23；设置页能改的都在设置页改，看门狗三个键只在配置文件里（`turnStallMs: 0` 关闭整个看门狗）。
 
 `mcpServers` 是**插件自己的形状**（每条必带 `name` 与 `transport`），不是 ACP 线格式——线格式里 stdio 那条不带 `type`，照线格式手写会被 agent 静默丢弃：
 

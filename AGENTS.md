@@ -11,7 +11,7 @@
 | 文档 | 什么时候读 |
 |---|---|
 | [architecture.md](./docs/agents/architecture.md) | 改消息走向、会话绑定、工作区、preset 外壳、agent 锁定 |
-| [protocol.md](./docs/agents/protocol.md) | 改子进程、超时、取消、崩溃恢复、空闲释放、启动命令、ACP 数据折叠 |
+| [protocol.md](./docs/agents/protocol.md) | 改子进程、超时、取消、卡死收口（无活动看门狗）、崩溃恢复、空闲释放、启动命令、ACP 数据折叠 |
 | [ui.md](./docs/agents/ui.md) | 改 composer 座位、芯片、mode 控件、NTR 视图、斜杠菜单、设置页 |
 | [permissions.md](./docs/agents/permissions.md) | 改权限映射、审批卡片（对话 dock / 设置镜像）、审批时限、权限座位 |
 | [state.md](./docs/agents/state.md) | 改落盘、会话选择、模型目录 / 可见性、命令缓存 |
@@ -97,11 +97,11 @@
 
 ### 进程与回合（10–12、19、23、26、29）
 
-10. **进程死亡 ≠ 会话销毁**：崩溃只走 `releaseAll`（标记 released、广播 `session/released`），严禁删记录或广播 `session/closed`。对 released 会话的 prompt / setMode / setConfigOption 自动 resume（respawn + `session/load`）；先重置 transcript 并广播 `session/reset`，再发 load。→ [protocol.md](./docs/agents/protocol.md)
+10. **进程死亡 ≠ 会话销毁**：崩溃只走 `releaseAll`（未 `closed` 的会话标记 released、广播 `session/released`；关闭在途的归 `closeSession` 删，标成 released 会被 resume 复活），严禁删记录或广播 `session/closed`。对 released 会话的 prompt / setMode / setConfigOption 自动 resume（respawn + `session/load`）；先重置 transcript 并广播 `session/reset`，再发 load。**唯一例外是刻意的无 resume 卡死重置**：`prepareStalledSession` 在 agent 未声明 `loadSession` 时走 `forceReset`，就地关闭记录并广播 `session/closed`（不发 `session/close`，也不清 `released`）——那是重置，不是崩溃。→ [protocol.md](./docs/agents/protocol.md)
 11. **生命周期事件必须带身份校验**：`child.exit` / `child.error` / `conn.closed` 三个触发器分别以 `this.child === child`、`this.conn === conn` 守卫。否则旧进程延迟的 exit 会杀掉刚 resume 的新进程。→ [protocol.md](./docs/agents/protocol.md)
 12. **启动有超时、取消有强制定稿且必须带世代守卫**：`initialize` / `session/new` / `session/load` 经 `withStartupTimeout`（60s）；cancel 后 `armCancelFallback`（15s）强制 `turn/end`，触发时 `turnSeq` 已前进则不得动手，并解开 `settled` 闸门。粘滞取消（agent 秒回 `cancelled`）按「本世代是否 cancel 过」判定并原样重发。fs 错误用 `new RequestError(code, message, { message })`。→ [protocol.md](./docs/agents/protocol.md)
-19. **空闲释放只针对没有活跃工作的进程**：只释放 `ready` 且无进行中 turn / 未结算取消 / 待答审批 / mode·config 命令在途 / 探测 / resume / 启动的 bridge。空闲 live 会话不阻止释放——走 `releaseAll` 挂起成 `released`，下一条消息经 `session/load` 恢复；未声明 `loadSession` 的 agent 例外，仍要求无 live 会话。释放静默、不广播 `agent/notice`。探测进程 5 分钟、聊天进程 30 分钟（`0` = 永不释放）。工作区就地搬迁仍要求无 live 会话。→ [protocol.md](./docs/agents/protocol.md)
-23. **轮次何时结束由 agent 决定**：`turn/end` 只在 `session/prompt` 响应返回时发出，严禁按空闲强制定稿（cancel 兜底除外）。正常结束但零可见产出必须发一条告警文本，不让上游失败静默成空气泡。→ [protocol.md](./docs/agents/protocol.md)
+19. **空闲释放只针对没有活跃工作的进程**：只释放 `ready` 且无进行中 turn / 未结算取消 / 待答审批 / mode·config 命令在途 / 探测 / `session/new` 在途 / resume / 启动的 bridge。空闲 live 会话不阻止释放——走 `releaseAll` 挂起成 `released`，下一条消息经 `session/load` 恢复；未声明 `loadSession` 的 agent 例外，仍要求无 live 会话。释放静默、不广播 `agent/notice`。探测进程 5 分钟、聊天进程 30 分钟（`0` = 永不释放）。工作区就地搬迁仍要求无 live 会话。→ [protocol.md](./docs/agents/protocol.md)
+23. **轮次何时结束由 agent 决定，强制定稿恰有两条**：`turn/end` 正常只在 `session/prompt` 响应返回时发出；受控例外只有 `session/cancel` 后的 `armCancelFallback`（约束 12）与无活动看门狗 `BridgeManager.reapStalledTurns`——后者只在会话 running 且未关闭 / 未释放、无待答审批、段开着（控制器须属于同一会话，stale 按不存在处理；`/acp` 无控制器按开着），且 agent 连续静默超过 `turnStallMs`（有在飞 `activeToolCalls` 时用更长的 `turnStallToolMs`；`turnStallMs: 0` 关掉整个看门狗）时开火，带世代守卫只收口一次并广播一条 notice（暂定首轮零可见产出则回滚锁并说明该轮已丢弃、下一条消息新建 ACP 会话；其余按 `loadSession` 分述）。**开火只收口 turn，绝不杀进程**：杀进程只发生在下一条消息的 `prepareStalledSession`——同 agent 上还有别的活跃工作（含另一条会话未 stale 的宿主续跑）则拒绝本轮，已 `closed` 的会话无物可收、直接放行；支持 `session/load` 走 `releaseAll` + resume，不支持则 `forceReset` 重置会话（`/acp` 报 `session_reset`，上下文已丢）。**严禁**再加第三种按空闲计时的强制定稿；正常结束但零可见产出必须发一条告警文本。→ [protocol.md §6.1](./docs/agents/protocol.md)
 26. **启动命令是一整条命令行；Windows 生成壳必须经 `cmd.exe`**：`codebuddy --acp` 整条粘贴是正确用法。`.cmd` 壳严禁直接 spawn（`EINVAL`），走 `windowsShimLaunch`（`cmd.exe /d /s /c` + `windowsVerbatimArguments` + 外层引号）；回收走 `killProcessTree`。→ [protocol.md](./docs/agents/protocol.md)
 29. **ACP 下发的数据不许静默丢弃**：每种 `session/update` kind 都要有去处；`content` / `rawInput` / `arguments` 的字符串、对象、数组都算有值；diff 同时保留结构与文本；超限只截断且留标记；无卡片的通知每种类一行、变了才重发。→ [protocol.md](./docs/agents/protocol.md)
 

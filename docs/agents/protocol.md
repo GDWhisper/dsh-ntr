@@ -1,6 +1,6 @@
 # ACP 桥：进程、回合与数据兜底
 
-本文是 [AGENTS.md](../../AGENTS.md) 的展开层，覆盖宿主 ↔ agent 的 stdio 通信、进程生命周期、超时/取消、恢复、空闲释放、启动命令与数据保真。
+本文是 [AGENTS.md](../../AGENTS.md) 的展开层，覆盖宿主 ↔ agent 的 stdio 通信、进程生命周期、超时/取消、卡死收口（无活动看门狗）、恢复、空闲释放、启动命令与数据保真。
 这些机制与 DSH 无关，是本插件真正的主体。
 
 ## 1. 配置与错误
@@ -22,7 +22,7 @@
 
 ## 2. 进程死亡 ≠ 会话销毁
 
-**崩溃路径**：`connectionLost` 只能走 `AgentBridge.releaseAll`——会话标记 `released`、settled 权限、广播 `session/released`。严禁在崩溃路径删除会话记录或广播 `session/closed`。
+**崩溃路径**：`connectionLost` 只能走 `AgentBridge.releaseAll`——会话标记 `released`、settled 权限、广播 `session/released`。**已 `closed` 的会话跳过**：它的记录归 `closeSession` 删，标成 `released` 会让 `doResumeSession` 把 `closed` 翻回 `false`，复活一条正在关闭的会话。严禁在崩溃路径删除会话记录或广播 `session/closed`。
 
 **恢复路径**：对 released 会话的 `prompt` / `setMode` / `setConfigOption`，经 `locateOrResume` 自动 resume（respawn + `session/load`），会话记录原地复活：
 
@@ -49,7 +49,7 @@
 
 ## 5. 空闲释放
 
-- **范围**：`AgentBridge.releaseIfIdle` 只释放 `state === 'ready'` 且 `hasActiveWork() === false` 的 bridge。活跃 = 有进行中的 turn（含已 abort、agent 尚未结算，`running || settled`）、待答审批、mode/config 命令在途（`pendingCommands`）、`pendingProbes` / `resuming` / `starting`。**空闲的 live 会话不算活跃**：释放把它们挂起为 `released`（不是关闭），下一条消息经 `session/load` 恢复，30 分钟窗口因此对聊天进程真正生效。
+- **范围**：`AgentBridge.releaseIfIdle` 只释放 `state === 'ready'` 且 `hasActiveWork() === false` 的 bridge。活跃 = 有进行中的 turn（含已 abort、agent 尚未结算，`running || settled`）、待答审批、mode/config 命令在途（`pendingCommands`）、`pendingProbes` / `pendingCreates` / `resuming` / `starting`。**空闲的 live 会话不算活跃**：释放把它们挂起为 `released`（不是关闭），下一条消息经 `session/load` 恢复，30 分钟窗口因此对聊天进程真正生效。
 - **可恢复性闸门**：agent 未声明 `loadSession` 时，有 live 会话的 bridge 不释放——无法 reload 的会话会在下一条消息时丢失上下文；这类 agent 仍等价于旧的「无 live 会话才释放」。
 - **工作区搬迁不共用这条放宽**：`ensureReady` 的就地重启仍要求 `isQuiet()`（无 live 会话且无活跃工作），避免多个工作区的会话互相把进程搬来搬去。两个谓词共享 `hasActiveWork()`，「无 live 会话」只属于搬迁。
 - **动作**：必须走 `releaseAll(reason)` 而不是 `stop()`——`stop` 会 `released.clear()`，毁掉尚未恢复的会话上下文。释放**静默进行，严禁广播 `agent/notice`**；`agent/notice` 只留给异常或伴随用户动作的事件（探测失败、权限超时、就地搬迁工作区）。
@@ -58,16 +58,42 @@
   - 从未登记过真实会话的 bridge（`everHostedSession === false`，探测拉起的进程，`probeConfigOptions` 刻意不登记会话）走 `DEFAULT_TUNING.probeIdleTimeoutMs`（默认 5 分钟）。`def.idleTimeoutMs`（含 `0` = 永不释放）是关于聊天进程的承诺，不管探测进程。
   - 第一个登记的会话（`createSession` / `doResumeSession`）把 bridge 翻转为 `def.idleTimeoutMs ?? DEFAULT_TUNING.idleTimeoutMs`（默认 30 分钟；`0` = 永不释放；`validateAgentDef` 只接受 0 或 [1000, 86400000] 的整数）。翻转时必须 `clearIdleTimer()` 再 `touch()` 重排。
 - **展示**：`AgentView.idleTimeoutMs` 必须报告**聊天窗口**语义（`idleTimeoutMs` getter），面板拿它预填与展示。浏览器 `DEFAULT_IDLE_RELEASE_MS` 是默认值的手拷贝，改常量必须同步。
+- **与卡死收口的关系**：无活动看门狗（§6.1）开火只收口 turn、不碰进程（下一条消息的善后可能重启或重置，那是另一条路径）；`running` / `settled` 清掉后 `hasActiveWork()` 自然转空，进程随后按本节窗口释放。两条路径互不替代——看门狗管「这一轮还能不能结束」，本节管「这个进程还要不要养着」。
 
 ## 6. 轮次收尾与分段
 
-- `turn/end` 只在 `session/prompt` 的**响应**返回时发出。**严禁**为「agent 不再吐字但仍在 running」新增按空闲计时的强制定稿——宿主分不清「正在想」与「在忙自己的事」，提前收尾会把答案切在流中间。
+- `turn/end` 的权威来源是 `session/prompt` 的**响应**。强制定稿**恰有两条**受控路径：`session/cancel` 后的 `armCancelFallback`（§4，人已经按过取消）与无活动看门狗（§6.1，agent 自己彻底沉默）。**严禁**再加第三种，尤其不要拿「宿主观察到的空闲」直接收尾——宿主分不清「正在想」与「在忙自己的事」，提前收尾会把答案切在流中间。
 - 一个 turn 由**多个段**组成（逐步切分，[architecture.md §2.2](./architecture.md)）：段的 `finish(stop)` 是步边界不是轮边界；`TurnStreamController`（`src/bridge.ts`）持有跨段的游标 / `seenCalls` / 记账。续跑批次（`isAcpToolContinuation`）**绝不新发 prompt**，用 `transcript.since(cursorSeq)` 补读段间事件；段间事件只记账（`recordAcpToolOutput` 唤醒等待者），游标不动。
 - **取消与世代跨段成立**：任何段的 `AbortSignal` → `bridge.cancel` + `abortActiveSegment`；`turnSeq` 世代守卫让旧段迟到的回调动不了新 turn；prompt slot（`settled` 闸门）在 agent 确认取消**之前不解开**——`abortActiveSegment` 不得调 `endTurn`，否则下一个 prompt 会在 ACP 协议禁止的窗口并发发出。
-- 唯一允许的强制定稿是 `session/cancel` 后的 `armCancelFallback`，两者语义不同，不得复用。
+- **两条强制定稿路径语义不同，不得互相复用**：`armCancelFallback` 是「已经要求取消、对方不回应」的兜底；看门狗是「没人要求取消、agent 自己不动了」的兜底。两者都必须按 `session.turnSeq` 做世代守卫（定时器武装时捕获；控制器用它创建时的 `turnSeqAtStart` 判定是否仍是本世代）、都只结束当前 turn 并解开 `settled` 闸门，且都不碰进程。
 - **正常结束却零可见产出必须显式报出**：结算时 stop 非 cancelled 且本轮没发过任何可见块（`sawVisibleBlock`：text / reasoning / tool-call 的 block-start，跨段累计；usage 等记账帧不算），必须把告警文本作为 text 块发出。部分 agent 把上游失败（403 / 认证 / 计费）折叠成合法 `end_turn`（实测 pi-acp），否则用户只看到一个空气泡。这是**报告**不是收尾：turn 照常以 stop 结束，不重试不判错。
 - **以卡收尾的 turn** 由最后一个续跑段收口：turn 已有可见产出时发一条指针行（「工具已执行、无文字回复」），绝不发空消息——空 assistant 消息不是宿主能诚实渲染的东西。
 - 记录在案的边界：codebuddy 首轮会先做内部标题生成（约 5s 无任何通知）才回应 prompt，首轮收尾因此推迟。这是 agent 行为，不是宿主 bug。
+
+### 6.1 无活动看门狗
+
+§6 开头那条「不要拿宿主观察到的空闲直接收尾」排除的是**宿主自己的**空闲计时——它分不清「agent 正在想」与「agent 已经挂了」。但 agent 真挂住时，会话会永远停在 `running`：`settled` 闸门不开，下一条消息发不出去，屏幕上也看不到任何原因。`BridgeManager.reapStalledTurns` 是这条规则的受控例外，判据是 **agent 活动**，不是宿主空闲。
+
+- **活动时钟**：`LiveSession.lastAgentActivityAt` 由每一条 `session/update` 刷新，turn 起点、每段起点、审批询问到达与结算也各刷一次。`LiveSession.activeToolCalls` 是**按 `toolCallId` 计的集合**（不是布尔标记）：`pending` / `in_progress` 加入，`completed` / `failed` 删除，没有 `status` 的新 `tool_call` 也算在飞；`tool_call_update` 不带 `status` 时集合不变。非空 = 长工具窗口，且并行调用各结各的，长窗口持续到**最后一个**在飞调用结束。
+- **开火条件**（全部成立）：
+  1. `session.running` 且未 `closed` / `released`；
+  2. 该会话没有待答审批（`bridge.permissions.hasPendingFor`，与 `permissionTimeoutMode` 无关：问人不是在卡住，`auto` / `abort` 的期限由审批自己的定时器管）；
+  3. 这一轮的段是**开着**的（`TurnStreamController.hasOpenSegment`）——宿主执行卡片时没有开着的段，agent 在这段时间不说话是合法的；
+  4. 最近一次 agent 活动距今超过窗口：`turnStallMs`（默认 600000 / 10 分钟）；`activeToolCalls` 非空时改用 `turnStallToolMs`（默认 1800000 / 30 分钟，与 guard 的 `TOOL_OUTPUT_WAIT_MS` 对齐——工具跑得久是 agent 还在干活）。
+- **控制器从哪来**：聊天轮按 chat id 索引（`BridgeManager.turnStreams`，续跑段靠它找回同一条 prompt），同时挂在 `LiveSession.turnController`；EPHEMERAL 轮（`GenerateOptions.sessionId` 未定义、没有聊天身份的适配器调用）没有 chat id，只有挂载点——只认索引会把它的段当成 `/acp` 轮，收口了会话状态却没关驱动的段队列（关队列的是 `TurnStreamController.settle`）。索引命中只在 `controller.session === session` 时才算数：并发的首轮可能把另一条 `LiveSession` 映射在同一个 chat id 下。
+- **stale 控制器按不存在处理**：控制器的 `stale`（已 dispose，或 `turnSeq` 已前进）为真时不得拿它的 `hasOpenSegment` 当判据——同一聊天上一条更新的 `/acp` prompt 推进了 `turnSeq` 后，旧控制器的段早已关闭，照它判断会让这一轮永远不被看见。没有活控制器（`/acp` RPC 轮次，或只有 stale 控制器）时「开着」按真处理，收口走 `AgentBridge.finalizeTurn`。
+- **扫描与开关**：`turnStallTickMs`（默认 30000）扫一次，没有 running 会话时定时器自动撤掉。三个键都是 `BridgeTuning` / `AcpPluginConfig` 字段，**只在配置文件里**（没有设置页控件）。`turnStallMs: 0` 关闭**整个**看门狗——工具窗口不能把它重新打开；`turnStallToolMs: 0` 回落 `turnStallMs`。
+- **开火动作**：尽力发一次 `session/cancel`（**不 await**：对方可能正是不响应任何请求才卡住）；记 `LiveSession.orphanPromptTurnSeq = session.turnSeq`；带世代守卫**只收口一次**——有活控制器走 `TurnStreamController.settle({ kind: 'error', code: 'INACTIVITY_TIMEOUT' })`（段队列关闭、`settled` 闸门解开，暂定首轮锁按既有语义结算），否则走 `AgentBridge.finalizeTurn`（`turnId: ''` + error，与 cancel 兜底同形）；广播一条 `agent/notice`，措辞按「下一轮还能不能续上」分三支：**暂定首轮且零可见块**（`provisionalLock` 为真、`sawVisibleBlock` 为假——`settle` 会因此回滚锁并关闭会话）说「这是会话的首轮、什么都没交付，已丢弃，下一条消息会新建 ACP 会话」，**不得**承诺 resume；其余按 `loadSession` 分述——**支持**时说「下一条消息会重启 agent 并恢复会话」，**不支持**时说「下一条消息会重置 ACP 会话，该 agent 不支持会话恢复」；三支都带一句「同一 agent 上还有别的会话在用，下一次发送可能被拒到那一轮结束」。**开火本身不杀进程**——同一进程里可能还挂着别的会话，收口只把宿主这一面从「永远 running」里救出来。
+- **强制收口帧只发一次，迟到的真答案按路径分述**：`settle` 幂等，`finalizeTurn` 对 `closed` 会话直接放弃、只在 `running` 或闸门仍挂着时动手。聊天路径迟到的**真**响应仍按 `settle` 的 `current`（`turnSeq === turnSeqAtStart`）判定：世代已前进就只关自己的段与 `endTurn`，不广播、不置 `running`、不放全局 waiter；仍是本世代则 `clearOrphanPrompt`，不再补第二帧，也不需要 reload。`/acp` 路径没有控制器：看门狗帧之后、reclaim 之前，迟到的真响应只要 `turnSeq` 未前进就照常广播它自己的 `turn/end`（带 `turnId` 与 stopReason）；一旦 reclaim 记下 `reclaimedTurnSeq`，该世代迟到的 then / catch 一律丢弃（见下一条）；被**外部拆除**（空闲释放 / `stop` / 关会话）抢先结束的会话同样不补帧——`prompt` 的迟到 catch 看到 `session.released || session.closed` 直接放手，因为那次拆除已经替这一轮收过场（释放发了 `turn/end`，关闭发 `session/closed`）。
+- **善后（`prepareStalledSession`）**：下一条消息发出前处理（聊天在 `getOrCreateDshSession` 之前，`/acp` 在 `locateOrResume` 之后）：
+  - 已 `closed` 的会话（`session/close` 在途）无物可收，直接放行——记录归 `closeSession` 删，标成 released 会被 resume 复活；已 `released` 的会话也放行，交给正常获取路径 resume。
+  - 同一 agent 上还有别的活跃工作（`AgentBridge.hasOtherActiveWork`：别的会话在跑 turn 或闸门未开、别的会话有待答审批、探测、`pendingCreates`、正在 resume / 启动，以及**别的会话**的在途命令）→ 拒绝本轮（"other conversations are still using it"）。命令按会话记在 `pendingCommands`（Map），所以卡在这条会话上的 mode / config 命令不挡它自己的 reclaim。
+  - 同 agent 另一条会话的控制器仍在 `turnStreams` 里且**未 stale** → 同样拒绝：那条会话已经 settle，`hasOtherActiveWork` 看不见它，但它的宿主可能正在执行卡片（续跑段即将到来），重启进程会把那条活轮次 park 再 resume。已 `closed` / `released` 的残留控制器不算，别的 agent 的也不算——重启只杀这个 agent 的子进程。
+  - 有 `loadSession` → `releaseAll` 把会话挂起成 `released`，正常获取路径（聊天 `getOrCreateDshSession` / `/acp` `locateOrResume`）经 `session/load` 恢复。
+  - 没有 `loadSession` → 还要求同 bridge 上没有别的 live 会话；`AgentBridge.forceReset('agent-stopped')` 杀掉子进程并就地关闭记录、广播 `session/closed`（**不发** `session/close`，也不清 `released`），随后 `forgetDshSession`。聊天下一条消息新建会话；`/acp` prompt 抛 `AcpError('session_reset', … start a new session)`，不是 `unknown_session`。
+  - `AgentBridge.closeSession` 的 `session/close` 有 `SESSION_CLOSE_TIMEOUT_MS`（5000ms）上限：卡死的 agent 不能挂住 stop / rollback。
+- **旧 turn 只以看门狗那一帧结束（reclaim 之后）**：reclaim 记 `LiveSession.reclaimedTurnSeq`；它关闭连接导致的旧 `session/prompt` 迟到 then / catch 对该世代被丢弃，所以看门狗的 `turn/end` 是唯一的旧轮次结束帧。cancel 兜底**不**记这个标记，它迟到的真 `end_turn` 照常广播（既有测试）。两个 turn 起点（`streamPrompt` / `/acp` `prompt`）与 resume 都会清掉这个标记，只有同一世代才抑制。
+- **防御性补丁**：`openSettleGate` 清掉 `settled` / `settledResolve` 并解开闸门，`releaseAll` / `doResumeSession` / `finalizeTurn` 都经它；`releaseAll` 跳过已 `closed` 的会话（§2）并清空 `activeToolCalls`，`doResumeSession` 同样清空 `activeToolCalls`、另清 `orphanPromptTurnSeq` / `reclaimedTurnSeq` 并重置 `lastAgentActivityAt`，避免孤儿标记跨进程存活。
 
 ## 7. 启动命令与 Windows
 
@@ -107,6 +133,7 @@
 | 桥与进程 | `src/bridge.ts` · `spawnAndConnect` / `killChild` / `killProcessTree` / `windowsShimLaunch` |
 | 恢复 | `src/bridge.ts` · `connectionLost` / `releaseAll` / `resumeSession` / `locateOrResume` |
 | 超时与取消 | `src/bridge.ts` · `withStartupTimeout` / `armCancelFallback` / `runPrompt` |
+| 卡死收口 | `src/bridge.ts` · `BridgeManager.reapStalledTurns` / `prepareStalledSession`；`LiveSession.turnController` / `activeToolCalls` / `orphanPromptTurnSeq` / `reclaimedTurnSeq`；`TurnStreamController.stale` / `hasOpenSegment` / `settle`（`INACTIVITY_TIMEOUT`）；`AgentBridge.finalizeTurn` / `forceReset`（§6.1） |
 | 空闲 | `src/bridge.ts` · `releaseIfIdle` / `armIdleRelease` / `touch` / `currentIdleTimeoutMs` / `everHostedSession` |
 | 收尾与分段 | `src/bridge.ts` · `streamPrompt` / `TurnStreamController` / `sawVisibleBlock` / `isAcpToolContinuation`（分段续读与收尾见 [architecture.md §2.2](./architecture.md)） |
 | 数据折叠 | `src/impl.ts` · `acpContentRows` / `formatAcpDiff` / `dumpJson` / `describeUnhandledUpdate` / `acpToolCallFromUpdate` / `acpToolCallDelta` |

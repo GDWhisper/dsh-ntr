@@ -87,7 +87,7 @@ ACP `session/request_permission` 原样映射：选项列表 / 名称 / 顺序 /
 
 - **`session/cancel` 必须答复未决审批**：ACP 规范要求 client 发 `session/cancel` 后以 `cancelled` 答复所有未决 `session/request_permission`。`AgentBridge.cancel` 因此在通知之后 `settlePermissions(session)`——否则 agent 的工具调用会一直阻塞在一个永远不会到来的答复上，ledger 还会留着一张属于已结束回合的卡（人再去点它只会得到 `unknown_request`）。这与 OmniTerm `AcpClient::cancel` → `PermissionManager::cancel_all` 是同一条规则。`releaseAll` / `closeSession` 本来就 settle，`cancel` 是漏的那一条。测试：`tests/bridge.spec.ts` 的 "answers a pending permission with cancelled when the turn is cancelled"。
 - **ACP 请求的 `signal` 撤回**：`handlePermissionRequest` 监听请求自带的 `signal`（agent 撤回询问，或连接断开）。abort 时 `permissions.respond(requestId, { outcome: 'cancelled' })`，走正常的 `permission/resolved` 广播并把 listener 摘掉；答复之后再 abort 是 no-op，不会二次结算。测试：`tests/bridge.spec.ts` 的 "settles a signal-aborted ask as cancelled and drops its card" 与 "removes the abort listener once the ask is answered"。
-- **关闭先 settle，再等 `session/close`**：`closeSession` 在 await `session/close` **之前**调用 `settlePermissions`——agent 可能正阻塞在一个未答询问上，先答复它，关闭才不会被它无限期拖住。测试：`tests/bridge.spec.ts` 的 "settles outstanding asks before waiting for session/close"。
+- **关闭先 settle，再等 `session/close`**：`closeSession` 在 await `session/close` **之前**调用 `settlePermissions`——agent 可能正阻塞在一个未答询问上，先答复它，关闭才不会被它无限期拖住。`session/close` 本身也不无限等：请求与 `SESSION_CLOSE_TIMEOUT_MS`（5s）race，输掉就把它留在原地，本地拆除照常完成——卡死的 agent 不能靠拖住关闭让 stop 或看门狗回收挂住。测试：`tests/bridge.spec.ts` 的 "settles outstanding asks before waiting for session/close"。
 
 ### 2.4 设置页热改一个窗口与一档到点行为
 
