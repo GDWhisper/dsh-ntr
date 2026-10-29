@@ -5,6 +5,7 @@
 ## 版本与 tag
 
 - 语义化版本：修复 / 小改动用 patch（`0.1.5 → 0.1.6`），成组的新能力用 minor。
+- **用户未主动声明版本号时，只升 patch（`Z`）**：默认在当前版本上 `X.Y.(Z+1)`，绝不替用户决定升 minor / major；确需升 `X` / `Y` 时先向用户确认，或等用户明确指定。
 - tag 必须是 annotated tag，名字**严格等于** `v` + `package.json` 的 `version`；CI 会校验，不匹配直接失败。
 - `package.json` 与 `package-lock.json` 必须同步（`npm version` 会一起改）。
 - `lib/` 是构建产物、被 gitignore；CI 自己 build，不要提交。
@@ -24,6 +25,8 @@
 Conventional Commits，英文；正文写动机与影响，不写「某年某月修过什么」。
 
 ### 2. bump 版本
+
+用户没给版本号时就按 patch 升（见上方「版本与 tag」），下面的 `0.1.6` 按实际 `Z+1` 替换：
 
 ```sh
 npm version 0.1.6 --no-git-tag-version
