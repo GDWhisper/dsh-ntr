@@ -295,9 +295,20 @@ export function describeRoute(
   // pick a conversation set up ahead of its first message could not show the
   // model and thought level it is about to use, which is the whole point of
   // choosing them early.
+  //
+  // A RELEASED row flips the precedence: it only describes what ran when the
+  // process was parked, while the pick is what the next resume applies
+  // (`applyChatChoice`) — a newer pick must outrank it, or a pre-switch on a
+  // parked session looks like a dead control (the chip snaps back to the
+  // parked value on every re-read). The parked row still beats nothing, so a
+  // conversation that never picked keeps naming what it ran.
   const pick = choice !== undefined && choice.agentId === agentId ? choice : undefined
-  const modelId = bound?.modelId ?? pick?.modelId
-  const effort = bound?.reasoningEffort ?? pick?.effort
+  const modelId = bound?.released === true
+    ? (pick?.modelId ?? bound?.modelId)
+    : (bound?.modelId ?? pick?.modelId)
+  const effort = bound?.released === true
+    ? (pick?.effort ?? bound?.reasoningEffort)
+    : (bound?.reasoningEffort ?? pick?.effort)
   const reasoning = catalog?.reasoning
   // The model the AGENT says it is on, for a conversation nobody has picked a
   // model for yet. Without it the chip has no label and does not render at all,

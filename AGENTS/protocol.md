@@ -24,12 +24,14 @@
 
 **崩溃路径**：`connectionLost` 只能走 `AgentBridge.releaseAll`——会话标记 `released`、settled 权限、广播 `session/released`。**已 `closed` 的会话跳过**：它的记录归 `closeSession` 删，标成 `released` 会让 `doResumeSession` 把 `closed` 翻回 `false`，复活一条正在关闭的会话。严禁在崩溃路径删除会话记录或广播 `session/closed`。
 
-**恢复路径**：对 released 会话的 `prompt` / `setMode` / `setConfigOption`，经 `locateOrResume` 自动 resume（respawn + `session/load`），会话记录原地复活：
+**恢复路径**：对 released 会话的 `prompt` / `setMode` / `setConfigOption`（`/acp` RPC 面），经 `locateOrResume` 自动 resume（respawn + `session/load`），会话记录原地复活：
 
 - replay 更新会在 load 响应前到达，所以必须**先**重置 transcript、把会话注册回 `acpIndex` 并广播 `session/reset`（浏览器清空 blocks 与 seq 水位），**再**发 load 请求。
 - resume 失败必须把记录 park 回 released map 并重新广播 `session/released`。
 - `resumeSession` 以 inflight promise 去重并发调用。
 - `loadSession` capability 检查必须在 `ensureReady` 之后：`releaseAll` 会清空旧 `initResult`，capability 只能来自新进程的 initialize。
+
+**聊天面的四轴写入不走这条恢复**：composer 的 `session/chat-mode-set` / `chat-model-set` / `chat-effort-set` / `chat-config-set` 对 released 会话**只记录选择、绝不唤醒进程**（用户决策 2026-10-30，与释放横幅「只在发消息或点按钮时回来」同一哲学），选择由 `applyChatChoice` 在下一次恢复（下一条消息或横幅按钮）时统一应用。`setChatSessionMode` 曾是四轴里唯一先 resume 的（「模式切换本身就是把 agent 拉回来的理由」），已收回——挂起就是挂起。显示侧 released 行必须让位给 pick（`describeRoute` / `modeInForce`），否则提前切换看起来像死控件。→ [ui.md §3](./ui.md)
 
 **显式恢复（用户手势）**：对话内「进程已释放」横幅的「恢复进程」按钮走 `session/chat-resume`（`BridgeManager.resumeChatSession`，按 DSH 聊天会话 id 寻址）——与下一条消息的惰性恢复同一套动作，但**绝不能走创建路径**（横幅按钮不得为没跑过 agent 的会话凭空 spawn 会话；查无绑定回 `unknown_session`）。会话已活时幂等返回（双击 / 与下一条消息竞速都不拉起第二个进程）。恢复后必须照 `getOrCreateDshSession` 的 released 分支重放 chat side effects（`lockChatAgent` / `syncConversationRoute` / `applyChatChoice` / 清 `provisionalLock`）——`session/load` 回来的会话跑在 agent 默认值上，不重放选择就是「芯片写 B、agent 跑 A」。UI 见 [ui.md §10.1](./ui.md)。
 

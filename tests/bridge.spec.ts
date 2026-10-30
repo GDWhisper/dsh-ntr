@@ -3283,6 +3283,33 @@ describe('idle release (isolated manager)', () => {
     }
   }, 30_000)
 
+  it('records a mode pick on a parked session without waking the process', async () => {
+    const { manager } = idleManager('idle-pick', { idleTimeoutMs: 200 })
+    try {
+      await manager.getOrCreateDshSession('dsh-idle-pick', 'idle-pick')
+      expect(await waitUntil(() => manager.agentViews()[0]?.state === 'stopped')).toBe(true)
+      const parked = manager.chatSessions('dsh-idle-pick')[0]
+      const available = parked?.modes?.availableModes ?? []
+      expect(available.length).toBeGreaterThan(1)
+      const target = available.find(mode => mode.id !== parked?.modes?.currentModeId)
+      expect(target).toBeDefined()
+
+      // The composer's axes on a parked session are "what the next turn should
+      // use" — recorded, never applied by force (user decision, 2026-10-30):
+      // the process stays parked until the user sends or hits 恢复进程.
+      await manager.setChatSessionMode('dsh-idle-pick', target!.id)
+      expect(manager.chatChoice('dsh-idle-pick')).toMatchObject({ agentId: 'idle-pick', mode: target!.id })
+      expect(manager.agentViews()[0]?.state).toBe('stopped')
+
+      // The next wake applies it (`applyChatChoice`), which is the whole point
+      // of a pre-switch.
+      await manager.resumeChatSession('dsh-idle-pick')
+      expect(manager.chatSessions('dsh-idle-pick')[0]?.modes?.currentModeId).toBe(target!.id)
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
   it('holds the process while a turn is running, then releases it once the turn settles', async () => {
     const { manager } = idleManager('idle-busy', { idleTimeoutMs: 200 })
     try {

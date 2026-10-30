@@ -42,9 +42,10 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 |---|---|---|
 | 这条会话由哪个 agent 服务 | 插件自己的绑定：`describeRoute` / `routeAgentId`（活会话 `bound` 优先 → `chatChoice` 的 pick，且只在 `choice.agentId === agentId` 时生效 → `chatBoundAgent` 乐观读 → 插件默认 agent） | `bindChatAgent`（传裸 `agentId`） |
 | 这个 agent 有哪些模型 / 思考等级 | `agent/catalog`（`AcpStore.loadAgentCatalog`，只对 `routeAgentId` 有答案的会话读，**含插件默认 agent**；宿主纯内存，不探测） | — |
-| 当前在哪个模型 / 思考等级 | `bound?.modelId ?? pick?.modelId`；`bound?.reasoningEffort ?? pick?.effort`；没选过时回落 `catalog.currentModel` 与 `catalog.reasoning.defaultEffort` | `setChatSessionModel` / `setChatSessionEffort` |
+| 当前在哪个模型 / 思考等级 | `bound?.modelId ?? pick?.modelId`；`bound?.reasoningEffort ?? pick?.effort`（released 行反过来：pick 优先，见下）；没选过时回落 `catalog.currentModel` 与 `catalog.reasoning.defaultEffort` | `setChatSessionModel` / `setChatSessionEffort` |
 | agent 的额外 config options | `agent/catalog` 的 `extras`（model / thought_level / mode 之外的 select 与 boolean，含未知 category） | `setChatSessionConfig`（`session/chat-config-set`），落 `AcpConversationChoice.extraConfigs`（select 存字符串，boolean 存真布尔） |
 
+- **released 会话上四轴只记录、不唤醒**（用户决策 2026-10-30）：mode / model / effort / config 对挂起的会话只写 `chatChoice`，由 `applyChatChoice` 在下一次恢复（下一条消息或横幅的「恢复进程」）时统一应用；进程只在「发消息」或「点恢复按钮」时回来。显示优先级因此分两态：**live 会话 > pick**（live 是正在跑的事实），**pick > released 行的旧值**（released 行只描述挂起前跑过什么，pick 才是恢复时会生效的东西；没有 pick 时 released 行仍兜底）——不对调，提前切换看起来就像死控件（芯片一重读就弹回旧值）。实现两处：`describeRoute`（model / effort）与 `modeInForce`（mode）。
 - **默认 agent 也算 routed**：新会话没有绑定 / pick 时，`routeAgentId` 回落到插件默认 agent；它和手动选中的 agent 一样展示 model / 思考 / 高级 chip，并读取该 agent 的 catalog（纯内存）。**严禁**要求用户先手动点一次 agent 才出现这些控件。
 - **显示什么就必须跑什么**：首轮前显示的 catalog 当前值在 `session/new` 前被捕获，并在新会话提供时写成这条会话的 pick（`displayedChatDefaults` / `seedChatChoiceFromCatalog`，见 [state.md §3](./state.md)）。否则就是「芯片写 B、agent 跑 A」——新会话的 agent 默认模型与缓存目录不同时必然发生。
 - **严禁**回到 `directory.select` / `selectModel`。
@@ -82,7 +83,7 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 - **选项不依赖活会话**：先取活会话的 `modes`，没有时回落 `agent/catalog` 的 `mode`（探测来的 `category: 'mode'` select，与 `session/new` 同源）。
 - **控件是否出现由「agent 发布了什么轴」决定，不能由「用户点过什么」决定**。`describeRoute` 让 `modelLabel` 只在有 pick 时才有值是真实回归：只点过思考等级的会话整块模型 chip 消失。配套：`agentCatalog` 必须同时回 `currentModel` 与 `mode`。
 - **自带 ACP 闸门**（`ui.acpMode[dshSessionId]` 或活会话存在）：它在 `conversation.input.left`，不在 `syncAcpMode` 的 claim 生命周期里，而 `agentId` 会回落到插件默认 `defaultAgent`，不闸就是普通会话凭空多一个 ACP 控件。
-- `setChatSessionMode` 对没有活会话的会话只记录 pick、不 spawn（与 `setChatSessionModel` 一致），`applyChatChoice` 在建 / 恢复会话时再应用。
+- `setChatSessionMode` 对没有活会话**或已释放**的会话只记录 pick、不 spawn（与 `setChatSessionModel` 一致；2026-10-30 起 released 不再先 resume，见 §3「只记录、不唤醒」），`applyChatChoice` 在建 / 恢复会话时再应用。
 - 该 series 的公开 `.d.ts` 里 slot 条目**不含 `owner` 字段**（`OwnerOf` 解析为 `object`），所以组件里声明结构类型（`ComposerModeProps`），注册处 `as unknown as SlotComponent<any>`；新增 client 模块依赖要加进 package.json 的 `dsh.client.inject`。
 
 ### 4.1 composer 上下文占用环（`conversation.composer.dock`）

@@ -18,7 +18,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { agentModeTitle } from '../src/client/composer-mode.tsx'
+import { agentModeTitle, modeInForce } from '../src/client/composer-mode.tsx'
 import {
   acpSettingsDialogIsOpen,
   closeAcpSettingsDialog,
@@ -40,7 +40,7 @@ import {
   REFRESH_CATALOG_ITEM,
 } from '../src/client/session-controls.tsx'
 import { AcpStore } from '../src/client/store.ts'
-import type { AgentCatalogResult, AgentView, ChatSessionView } from '../src/protocol.ts'
+import type { AcpConversationChoice, AgentCatalogResult, AgentView, ChatSessionView } from '../src/protocol.ts'
 
 describe('the agent base chip names only an agent that serves the conversation', () => {
   const acp = new AcpStore(async () => ({ ok: true, value: {} }), zh => zh)
@@ -329,6 +329,63 @@ describe('the model picker names both reasons a current model is not on offer', 
     // fetch one on demand.
     const cold = menuFor('model', { acp, agents: [agent], route: describeRoute([agent], bound, undefined) })
     expect(cold.sections[0]?.items.at(-1)?.id).toBe(REFRESH_CATALOG_ITEM)
+  })
+})
+
+describe('a parked session row yields to the conversation pick, so a pre-switch shows', () => {
+  const agent: AgentView = {
+    id: 'pi', title: 'Pi', command: 'pi-acp', args: [],
+    allowedCwdRoots: [], state: 'ready', liveSessions: [],
+  }
+  const catalog: AgentCatalogResult = {
+    agentId: 'pi',
+    title: 'Pi',
+    base: { id: 'pi', name: 'Pi' },
+    variants: [{ id: 'pi@sonnet', name: 'Sonnet' }, { id: 'pi@opus', name: 'Opus' }],
+    reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }], defaultEffort: 'low' },
+    probed: true,
+    updatedAt: 1,
+  }
+  const parked: ChatSessionView = {
+    agentId: 'pi', agentTitle: 'Pi', sessionId: 's1',
+    modelId: 'pi@sonnet', reasoningEffort: 'low', released: true,
+  }
+  const pick: AcpConversationChoice = { agentId: 'pi', modelId: 'pi@opus', effort: 'high' }
+
+  it('shows the picked model and effort over the parked session\'s last values', () => {
+    // The chip used to snap back to the parked value on every re-read, which
+    // made switching model/effort on a released session look like a dead
+    // control even though the pick had been recorded.
+    const route = describeRoute([agent], parked, undefined, catalog, 'pi', pick)
+    expect(route.modelId).toBe('pi@opus')
+    expect(route.effortLabel).toBe('High')
+  })
+
+  it('keeps naming what the parked session ran when nothing was picked', () => {
+    const route = describeRoute([agent], parked, undefined, catalog, 'pi', undefined)
+    expect(route.modelId).toBe('pi@sonnet')
+    expect(route.effortLabel).toBe('Low')
+  })
+
+  it('lets a LIVE session keep outranking the pick', () => {
+    const live: ChatSessionView = {
+      agentId: 'pi', agentTitle: 'Pi', sessionId: 's1',
+      modelId: 'pi@sonnet', reasoningEffort: 'low',
+    }
+    const route = describeRoute([agent], live, undefined, catalog, 'pi', pick)
+    expect(route.modelId).toBe('pi@sonnet')
+    expect(route.effortLabel).toBe('Low')
+  })
+
+  it('applies the same precedence to the mode select (modeInForce)', () => {
+    // A live session is the authority; a parked row yields to the pick (which
+    // the next resume applies) and only then names what it was parked on.
+    expect(modeInForce({ modes: { currentModeId: 'plan' } }, 'edits')).toBe('plan')
+    expect(modeInForce({ released: true, modes: { currentModeId: 'plan' } }, 'edits')).toBe('edits')
+    expect(modeInForce({ released: true, modes: { currentModeId: 'plan' } }, undefined)).toBe('plan')
+    expect(modeInForce(undefined, 'edits')).toBe('edits')
+    expect(modeInForce(undefined, undefined, 'first')).toBe('first')
+    expect(modeInForce(undefined, undefined)).toBe('')
   })
 })
 

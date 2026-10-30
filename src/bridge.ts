@@ -4052,9 +4052,15 @@ export class BridgeManager {
   }
 
   /**
-   * Switch one chat-bound session's ACP mode. A released session is resumed
-   * first (`session/load`), matching the "send to recover" promise — the mode
-   * switch is itself a reason to bring the agent back.
+   * Switch one chat-bound session's ACP mode.
+   *
+   * A released session is deliberately NOT resumed for it (user decision,
+   * 2026-10-30 — the composer's axes are "what the next turn should use", and
+   * the process comes back only when the user sends a message or hits the
+   * released banner's resume button). The pick is recorded and
+   * `applyChatChoice` applies it on resume, exactly like `setChatSessionModel`
+   * / `setChatSessionEffort` / `setChatSessionConfig`; only a LIVE session is
+   * told immediately (`session/set_mode`).
    */
   async setChatSessionMode(dshSessionId: string, modeId: string, agentId?: string): Promise<void> {
     if (agentId !== undefined) {
@@ -4084,9 +4090,16 @@ export class BridgeManager {
     if (target.closed) {
       throw new AcpError('unknown_session', `acp: the ACP session bound to chat session ${dshSessionId} is closed`)
     }
+    // A PARKED session gets the same record-only treatment (its agent is its
+    // own `agentId`, whatever the caller passed — the selection above already
+    // matched it). Resuming here was the one composer axis that broke ranks
+    // with the others, and it woke a process the user had explicitly parked.
+    if (target.released) {
+      this.patchChatChoice(dshSessionId, { agentId: target.agentId, mode: modeId })
+      return
+    }
     const bridge = this.bridge(target.agentId)
-    const session = target.released ? await bridge.resumeSession(target) : target
-    await bridge.setMode(session, modeId)
+    await bridge.setMode(target, modeId)
     // Persisted only AFTER the agent accepted it: a mode the agent rejected must
     // not come back on the next restore. This is the same contract the model and
     // thought level follow (user decision, 2026-10-18 — every control in the

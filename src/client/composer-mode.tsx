@@ -65,6 +65,25 @@ export function agentModeTitle(agentId: string | undefined, acp: AcpStore): stri
   )
 }
 
+/**
+ * The mode the select shows as in force.
+ *
+ * A LIVE session is the authority (it is what the agent runs right now). A
+ * RELEASED row only describes the mode the agent was parked ON, so a newer
+ * pick — which `applyChatChoice` will apply on the next resume — outranks it
+ * (and the parked row still beats the catalog default). Same precedence as
+ * the model and thought level in `describeRoute`: a pre-switch on a parked
+ * session must be visible or the control reads as dead.
+ */
+export function modeInForce(
+  target: { released?: boolean; modes?: { currentModeId?: string } } | undefined,
+  persisted: string | undefined,
+  fallback?: string,
+): string {
+  const live = target !== undefined && target.released !== true ? target.modes?.currentModeId : undefined
+  return live ?? persisted ?? target?.modes?.currentModeId ?? fallback ?? ''
+}
+
 export function AcpComposerMode({ acp, sessionId, useSession }: ComposerModeProps) {
   const ui = useUi(acp)
   const dshSessionId = String(sessionId)
@@ -125,18 +144,19 @@ export function AcpComposerMode({ acp, sessionId, useSession }: ComposerModeProp
     ? live
     : (isAcp ? catalog?.mode?.choices ?? [] : []).map(choice => ({ id: choice.id, name: choice.name, description: choice.description }))
   if (modes.length === 0) return null
-  // The mode IN FORCE comes from the live session; before one exists the only
-  // claims available are the agent's own reported current mode and the pick this
-  // conversation recorded (a pick outranks the agent's default, exactly like the
-  // model and thought level do in `describeRoute`).
+  // The mode IN FORCE: a live session is the authority, before one exists (or
+  // while one is parked) the claims available are the pick this conversation
+  // recorded and the agent's own reported current mode (a pick outranks the
+  // agent's default, exactly like the model and thought level do in
+  // `describeRoute`; the parked row yields to the pick — see `modeInForce`).
   const persisted = ui.chatChoice[dshSessionId]?.agentId === agentId
     ? ui.chatChoice[dshSessionId]?.mode
     : undefined
-  const current = target?.modes?.currentModeId
-    ?? persisted
-    ?? catalog?.mode?.currentValue
-    ?? modes[0]?.id
-    ?? ''
+  const current = modeInForce(
+    target,
+    persisted,
+    catalog?.mode?.currentValue ?? modes[0]?.id,
+  )
 
   return (
     <label
