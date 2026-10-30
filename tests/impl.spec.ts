@@ -1167,6 +1167,7 @@ function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } {
     bindChatAgent: (dshSessionId, agentId) => { calls.push(['bindChatAgent', dshSessionId, agentId]) },
     setChatSessionModel: async (dshSessionId, modelId) => { calls.push(['setChatSessionModel', dshSessionId, modelId]) },
     setChatSessionEffort: async (dshSessionId, effort) => { calls.push(['setChatSessionEffort', dshSessionId, effort]) },
+    resumeChatSession: async dshSessionId => { calls.push(['resumeChatSession', dshSessionId]) },
     detectAgents: async () => { calls.push(['detect', undefined]); return [] },
     saveAgent: async def => { calls.push(['save', def]) },
     deleteAgent: async id => { calls.push(['delete', id]) },
@@ -1229,6 +1230,11 @@ describe('dispatchRpc', () => {
     await expect(dispatchRpc(manager, 'session/chat-list', { dshSessionId: 'chat-1' }))
       .resolves.toEqual({ ok: true, value: { sessions: [], acpMode: false } })
     await expect(dispatchRpc(manager, 'session/chat-mode-set', { dshSessionId: 'chat-1', modeId: 'strict' })).resolves.toEqual({ ok: true, value: { done: true } })
+    // The released banner's explicit resume, addressed by the chat session id
+    // like every other conversation surface.
+    await expect(dispatchRpc(manager, 'session/chat-resume', { dshSessionId: 'chat-1' })).resolves.toEqual({ ok: true, value: { done: true } })
+    expect(manager.calls).toContainEqual(['resumeChatSession', 'chat-1'])
+    await expect(dispatchRpc(manager, 'session/chat-resume', {})).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     await expect(dispatchRpc(manager, 'session/chat-list', {})).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     // The ACP view's data source: addressed by the CHAT session id, because
     // the browser has no ACP session id before the first turn.

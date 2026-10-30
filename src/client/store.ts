@@ -1646,6 +1646,26 @@ export class AcpStore {
     await this.loadChatSessions(dshSessionId)
   }
 
+  /**
+   * Bring the conversation's released ACP session back on a fresh process —
+   * the released banner's explicit form of the "next message resumes it"
+   * promise (`session/chat-resume`). A failure is reported through the notice
+   * AND rethrown (the `respondPermission` contract), so the banner can pin
+   * the message beside the button the user just pressed; the binding is
+   * re-read either way so the row follows the host's real answer.
+   */
+  async resumeChatSession(dshSessionId: string): Promise<void> {
+    let failure: unknown
+    try {
+      await this.call('session/chat-resume', { dshSessionId })
+    } catch (error) {
+      this.flashError(error)
+      failure = error
+    }
+    await this.loadChatSessions(dshSessionId)
+    if (failure !== undefined) throw failure
+  }
+
   // ---- ACP transcript observation (the conversation's ACP view) ----
 
   /**
@@ -2053,9 +2073,7 @@ export class AcpStore {
         // The composer's own list (`session/chat-list` views) must flip too, or
         // the agent tag's live halo keeps breathing for a process that is gone:
         // nothing else re-reads this list until the next turn settles.
-        const chatSessions = this.state.chatSessions.some(s => s.sessionId === event.sessionId)
-          ? this.state.chatSessions.map(s => (s.sessionId === event.sessionId ? { ...s, released: true } : s))
-          : this.state.chatSessions
+        const chatSessions = withSessionReleased(this.state.chatSessions, event.sessionId, true)
         // One runtime-log line per release cause; `idle` stays silent on
         // purpose (an expected lifecycle transition, not a fault).
         const cause = event.cause ?? 'died'
@@ -2106,8 +2124,15 @@ export class AcpStore {
         // an observed transcript must drop both its blocks and its watermark
         // or the replay would be read as a gap and refetched forever.
         const watched = this.state.chatTranscripts[event.sessionId]
+        // ...and the composer's own list must flip back to live on the same
+        // event (mirror of the `session/released` flip): the released banner
+        // and the tag's halo read that row, and nothing else re-reads it until
+        // a turn settles — a resume would leave the banner claiming a parked
+        // process that is already back.
+        const chatSessions = withSessionReleased(this.state.chatSessions, event.sessionId, false)
         this.mutate({
           sessions,
+          ...(chatSessions === this.state.chatSessions ? {} : { chatSessions }),
           ...(isActive ? { blocks: [] } : {}),
           ...(watched === undefined ? {} : {
             chatTranscripts: {
@@ -2448,6 +2473,26 @@ function withSessionUsage<T extends { sessionId: string; usage?: SessionView['us
     if (row.sessionId !== sessionId || sameUsage(row.usage, usage)) return row
     changed = true
     return { ...row, usage }
+  })
+  return changed ? next : rows
+}
+
+/**
+ * Flip one chat row's `released` flag (release/resume bookkeeping). The
+ * composer's own list (`session/chat-list` rows) has no other live writer —
+ * `session/released` must mark it, `session/reset` must un-mark it, or the
+ * agent tag's halo and the released banner read yesterday's process state.
+ */
+function withSessionReleased<T extends { sessionId: string; released?: boolean }>(
+  rows: T[],
+  sessionId: string,
+  released: boolean,
+): T[] {
+  let changed = false
+  const next = rows.map(row => {
+    if (row.sessionId !== sessionId || (row.released === true) === released) return row
+    changed = true
+    return { ...row, released }
   })
   return changed ? next : rows
 }

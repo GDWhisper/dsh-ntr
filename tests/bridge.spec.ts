@@ -3245,6 +3245,44 @@ describe('idle release (isolated manager)', () => {
     }
   }, 30_000)
 
+  it('resumes a released chat session on the user\'s explicit gesture', async () => {
+    const { events, manager } = idleManager('idle-gesture', { idleTimeoutMs: 200 })
+    try {
+      const session = await manager.getOrCreateDshSession('dsh-gesture-1', 'idle-gesture')
+      const sessionId = session.sessionId
+      expect(await waitUntil(() => manager.agentViews()[0]?.state === 'stopped')).toBe(true)
+      expect(manager.chatSessions('dsh-gesture-1')).toMatchObject([{ sessionId, released: true }])
+
+      // The banner button: the same recovery the next prompt performs lazily,
+      // on the user's gesture instead.
+      await manager.resumeChatSession('dsh-gesture-1')
+      expect(manager.agentViews()[0]?.liveSessions).toEqual([sessionId])
+      expect(manager.chatSessions('dsh-gesture-1')[0]?.released).toBeFalsy()
+      // The browser learns of the resume from this frame, not a re-read.
+      expect(events.some(event => event.type === 'session/reset' && event.sessionId === sessionId)).toBe(true)
+      // The banner promises the context is kept: the load replay must land.
+      expect(await waitUntil(() => {
+        const entries = manager.chatTranscripts('dsh-gesture-1')[0]?.entries ?? []
+        const text = (entries as Array<{ update: Record<string, unknown> }>)
+          .filter(entry => entry.update.sessionUpdate === 'agent_message_chunk')
+          .map(entry => String((entry.update.content as { text?: string }).text ?? ''))
+          .join('')
+        return text.includes('REPLAYED: earlier conversation')
+      })).toBe(true)
+
+      // A second click while live spawns nothing (idempotent gesture).
+      await manager.resumeChatSession('dsh-gesture-1')
+      expect(manager.agentViews()[0]?.liveSessions).toEqual([sessionId])
+
+      // A conversation no ACP session ever served says so instead of
+      // pretending the button worked.
+      await expect(manager.resumeChatSession('dsh-gesture-never'))
+        .rejects.toMatchObject({ code: 'unknown_session' })
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
   it('holds the process while a turn is running, then releases it once the turn settles', async () => {
     const { manager } = idleManager('idle-busy', { idleTimeoutMs: 200 })
     try {

@@ -553,6 +553,39 @@ describe('AcpStore agent management', () => {
     expect(store.getSnapshot().notice).toBeUndefined()
   })
 
+  it('resumes a released chat session on request and reports failures to the caller', async () => {
+    const calls: Array<{ endpoint: string; payload: unknown }> = []
+    let failResume = false
+    const store = new AcpStore(async (_channel, endpoint, payload) => {
+      calls.push({ endpoint, payload })
+      if (endpoint === 'session/chat-resume') {
+        return failResume
+          ? { ok: false, error: { code: 'resume_unsupported', message: 'acp: agent cannot load sessions' } }
+          : { ok: true, value: { done: true } }
+      }
+      if (endpoint === 'session/chat-list') {
+        return { ok: true, value: { sessions: [{ agentId: 'pi', sessionId: 's1', released: true }] } }
+      }
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+
+    await store.resumeChatSession('chat-1')
+    expect(calls.filter(c => c.endpoint === 'session/chat-resume')).toEqual([
+      { endpoint: 'session/chat-resume', payload: { dshSessionId: 'chat-1' } },
+    ])
+    // The binding is re-read after the gesture so the row follows the host —
+    // the same contract the mode switch follows.
+    expect(calls.at(-1)?.endpoint).toBe('session/chat-list')
+    expect(store.getSnapshot().notice).toBeUndefined()
+
+    // A failure is flashed to the notice AND rethrown (the banner pins it
+    // beside the button the user just pressed).
+    failResume = true
+    await expect(store.resumeChatSession('chat-1')).rejects.toThrow('cannot load sessions')
+    expect(store.getSnapshot().notice).toContain('cannot load sessions')
+    expect(calls.at(-1)?.endpoint).toBe('session/chat-list')
+  })
+
   it('exposes the agent slash commands a chat-list answer carries', async () => {
     const store = new AcpStore(async (_channel, endpoint) => {
       if (endpoint === 'session/chat-list') {
@@ -1887,10 +1920,11 @@ describe('AcpStore observed ACP transcripts (the ACP view tab)', () => {
     expect(store.getSnapshot().logs).toHaveLength(0)
     expect(store.getSnapshot().notice).toBeUndefined()
 
-    // Resuming on a fresh process un-releases via the next authoritative read.
-    listed = { sessions: [{ agentId: 'pi', sessionId: 'acp-s1' }] }
-    await store.loadChatSessions('chat-1')
-    expect(store.getSnapshot().chatSessions[0]?.released).toBeUndefined()
+    // Resuming on a fresh process flips the row back live on `session/reset` —
+    // the same stream the banner and the halo read, with no re-read in
+    // between (a resume must not leave the banner claiming a parked process).
+    await apply({ type: 'session/reset', sessionId: 'acp-s1', session: view() })
+    expect(store.getSnapshot().chatSessions[0]?.released).toBe(false)
   })
 
   it('bounds how many transcripts stay resident', async () => {

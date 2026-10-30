@@ -31,6 +31,8 @@
 - `resumeSession` 以 inflight promise 去重并发调用。
 - `loadSession` capability 检查必须在 `ensureReady` 之后：`releaseAll` 会清空旧 `initResult`，capability 只能来自新进程的 initialize。
 
+**显式恢复（用户手势）**：对话内「进程已释放」横幅的「恢复进程」按钮走 `session/chat-resume`（`BridgeManager.resumeChatSession`，按 DSH 聊天会话 id 寻址）——与下一条消息的惰性恢复同一套动作，但**绝不能走创建路径**（横幅按钮不得为没跑过 agent 的会话凭空 spawn 会话；查无绑定回 `unknown_session`）。会话已活时幂等返回（双击 / 与下一条消息竞速都不拉起第二个进程）。恢复后必须照 `getOrCreateDshSession` 的 released 分支重放 chat side effects（`lockChatAgent` / `syncConversationRoute` / `applyChatChoice` / 清 `provisionalLock`）——`session/load` 回来的会话跑在 agent 默认值上，不重放选择就是「芯片写 B、agent 跑 A」。UI 见 [ui.md §10.1](./ui.md)。
+
 ## 3. 生命周期事件的身份校验
 
 `child.on('exit')` / `child.on('error')` / `conn.closed.then` 三个 connectionLost 触发器必须分别以 `this.child === child`、`this.conn === conn` 身份守卫，任何新触发器同理。

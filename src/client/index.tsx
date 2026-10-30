@@ -21,6 +21,7 @@ import { AcpComposerAgentTag, AcpSessionControls, AcpSessionMenu } from './sessi
 import { AcpConversationView } from './acp-view.tsx'
 import { AcpSettingsDialog } from './settings-dialog.tsx'
 import { PermissionDock } from './permission-dock.tsx'
+import { ReleasedBanner } from './released-banner.tsx'
 import {
   createModelSeatClaim,
   createPermissionSeatClaim,
@@ -262,6 +263,18 @@ export function apply(ctx: Context): void {
     // session id this dock belongs to (same contract as every other entry).
     inject: (sessionId: unknown) => chatFace(sessionId),
   }, PermissionDock as unknown as SlotComponent<any>)), 'dsh-ntr: conversation permission dock')
+
+  // The released-session banner in the same dock seat: when this
+  // conversation's agent process is parked (idle release or crash), one row
+  // says so and offers the explicit resume — the gesture form of the
+  // "next message resumes it" promise. Gated inside the component on the
+  // chat-list rows (released banner renders iff nothing live is left).
+  ctx.effect(() => ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
+    name: 'conversation.input.dock',
+    id: 'acp-released-banner',
+    order: 20,
+    inject: (sessionId: unknown) => chatFace(sessionId),
+  }, ReleasedBanner as unknown as SlotComponent<any>)), 'dsh-ntr: released-session banner')
 
   /**
    * The client runtime's session list store, read structurally. Used to find

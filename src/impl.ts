@@ -1862,6 +1862,13 @@ export interface AcpManager {
    */
   setChatSessionMode?(dshSessionId: string, modeId: string, agentId?: string): Promise<void>
   /**
+   * Bring one chat conversation's released session back on a fresh process on
+   * the user's explicit gesture (`session/chat-resume`, the released-session
+   * banner's button). Same recovery the next prompt performs lazily, minus
+   * the create path; no-op when the session is already live.
+   */
+  resumeChatSession?(dshSessionId: string): Promise<void>
+  /**
    * Point one DSH chat conversation at an ACP agent — the plugin's own
    * conversation↔agent mapping, never a DSH model route (see
    * `BridgeManager.bindChatAgent`).
@@ -2053,6 +2060,14 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         const dshSessionId = str(body, 'dshSessionId', 128)
         const modeId = str(body, 'modeId', 128)
         await manager.setChatSessionMode?.(dshSessionId, modeId, optionalStr(body, 'agentId', 64))
+        return ok({ done: true })
+      }
+      case 'session/chat-resume': {
+        // The released-session banner's explicit resume: the recovery the next
+        // prompt performs lazily, on the user's gesture instead. Addressed by
+        // DSH chat session id, like the rest of the conversation surfaces.
+        const dshSessionId = str(body, 'dshSessionId', 128)
+        await manager.resumeChatSession?.(dshSessionId)
         return ok({ done: true })
       }
       case 'session/chat-bind': {

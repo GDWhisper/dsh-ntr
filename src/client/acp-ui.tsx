@@ -979,6 +979,28 @@ const STYLE = `
 .ntr-permission-option:focus-visible, .ntr-permission-cancel:focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary, #2563eb); outline-offset: 2px; }
 .ntr-permission-cancel { margin-left: auto; color: var(--dsw-alias-label-secondary, #6b7280); }
 .ntr-permission-error { padding: 4px 8px; border-radius: 6px; background: color-mix(in srgb, var(--dsw-alias-state-error-primary, #b91c1c) 12%, transparent); color: var(--dsw-alias-state-error-primary, #b91c1c); font-size: 11px; word-break: break-word; }
+/* ---- Released-session banner (conversation.input.dock, released-banner.tsx) ---- */
+/* Same composer-width formula as the permission dock above: the slot spans
+   the column, the card lines up with the input box. One row of state + one
+   action; the error pins under it, beside the button that failed. */
+.ntr-released-banner {
+  box-sizing: border-box;
+  width: calc(100% - var(--dsh-composer-side-clearance, 16px) - var(--dsh-composer-side-clearance, 16px));
+  max-width: var(--dsh-composer-card-max-width, 920px);
+  margin: 0 auto;
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 8px 12px;
+  border: 1px solid var(--dsw-alias-border-l2, #d1d5db);
+  border-left: 3px solid var(--dsw-alias-state-warn-primary, #d97706);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1, #fff);
+  font-size: 12px; line-height: 1.5;
+}
+.ntr-released-banner-row { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.ntr-released-banner-text { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.ntr-released-banner-title { font-weight: 600; }
+.ntr-released-banner-body { color: var(--dsw-alias-label-secondary, #6b7280); }
+.ntr-released-banner .ntr-acp-more { flex: none; white-space: nowrap; }
 /* ---- NTR settings dialog (shell.overlay) ---- */
 /* Frame-wide surface opened from the agent base's empty-roster menu. The
    overlay layer itself is click-through, so the layer opts back in and blocks

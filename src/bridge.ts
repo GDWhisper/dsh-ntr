@@ -4095,6 +4095,42 @@ export class BridgeManager {
   }
 
   /**
+   * Bring one chat conversation's released session back on a fresh process on
+   * the USER's explicit gesture (the "恢复进程" banner) — the same work the
+   * next prompt performs lazily (`getOrCreateDshSession`'s released branch),
+   * minus the create path: a banner button must never materialize a session
+   * the conversation has not had yet. A live target passes through untouched,
+   * so a double click (or a click racing the next message) spawns nothing.
+   */
+  async resumeChatSession(dshSessionId: string): Promise<void> {
+    const candidates = [...this.dshSessionMap.values()].filter(
+      session => session.dshSessionId === dshSessionId && !session.closed,
+    )
+    // The session the NEXT message would use — the bound agent's — is the one
+    // to bring back; the first candidate is the fallback for a conversation
+    // whose binding has drifted (same selection `setChatSessionMode` makes
+    // without an explicit agentId).
+    const target = candidates.find(session => session.agentId === this.chatAgentFor(dshSessionId)) ?? candidates[0]
+    if (target === undefined) {
+      throw new AcpError('unknown_session', `acp: no ACP session is bound to chat session ${dshSessionId}`)
+    }
+    if (!target.released) return
+    const bridge = this.bridge(target.agentId)
+    const resumed = await bridge.resumeSession(target)
+    // Chat-side rebind + pick re-application, verbatim the lazy path's: the
+    // freshly loaded session comes back at the agent's defaults, so the
+    // conversation's model / thought level must be re-applied or the composer
+    // would show one thing and the process run another (see
+    // `getOrCreateDshSession`).
+    resumed.dshSessionId = dshSessionId
+    this.lockChatAgent(dshSessionId, target.agentId)
+    if (this.chatAgentIntent.has(dshSessionId)) this.syncConversationRoute(dshSessionId)
+    else routeBindingRegistry().conversations.set(dshSessionId, resumed.modelId ?? target.agentId)
+    await this.applyChatChoice(resumed)
+    resumed.provisionalLock = false
+  }
+
+  /**
    * Wire the harness's preset roster (`ctx.agentPresets`) into `presetStatus`.
    *
    * Optional on purpose: a deployment without the registry service has no

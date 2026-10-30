@@ -26,7 +26,7 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 - 退场后当前 agent 由 `conversation.input.overlay` 的挂牌 `AcpComposerAgentTag` 显示（`NTR · <agent>`，样式 `.ntr-acp-tag`）：骑在 composer 卡片上边缘，一半在卡片外、一半压在上边框（overlay anchor `top: 0` + `translateY(-50%)`）。
 - 挂牌**只读**（`AcpChip` 无 `onClick` 时渲染静态 `span`、无 caret），换 agent 只能新建会话。
 - 挂牌自带闸门 `agentTagVisible`：显式 `acpMode === false` 压过残留 `chatSessions`，`undefined` 才回落到锁本身。
-- **存活光晕**：挂牌判定 `agentTagAlive(bound, lockedTo)`——会话视图存在、未 released、且属于被挂牌的 agent——为真时按设置页「对话外观 → 挂牌光晕」的选择展示：`breath`（蓝色呼吸光晕，慢速 5.2s / 正常 3.2s / 快速 1.2s，经挂牌 span 上的 `--ntr-halo-period` 变量下发，映射在 `TAG_HALO_PERIODS` / `agentTagHaloPresentation`）或 `steady`（恒定光，无动画）。reduced-motion 下都退化为静态光。偏好持久化在 `agents.json` 的 `tagHalo` 键，经 `ui/tag-halo` / `ui/tag-halo-set` 读写；store 写入先行（乐观），失败回退。耦合不变量：`session/released` / `session/closed` 事件必须同步翻转 / 删除 store 的 `chatSessions` 行（composer 自己的清单），否则挂牌对着已释放进程一直呼吸；没有别的路径会替 composer 重读这份清单。
+- **存活光晕**：挂牌判定 `agentTagAlive(bound, lockedTo)`——会话视图存在、未 released、且属于被挂牌的 agent——为真时按设置页「对话外观 → 挂牌光晕」的选择展示：`breath`（蓝色呼吸光晕，慢速 5.2s / 正常 3.2s / 快速 1.2s，经挂牌 span 上的 `--ntr-halo-period` 变量下发，映射在 `TAG_HALO_PERIODS` / `agentTagHaloPresentation`）或 `steady`（恒定光，无动画）。reduced-motion 下都退化为静态光。偏好持久化在 `agents.json` 的 `tagHalo` 键，经 `ui/tag-halo` / `ui/tag-halo-set` 读写；store 写入先行（乐观），失败回退。耦合不变量：`session/released` / `session/closed` 事件必须同步翻转 / 删除 store 的 `chatSessions` 行（composer 自己的清单），`session/reset`（resume）必须把同一行翻回 live（`withSessionReleased`）——否则挂牌对着已释放进程一直呼吸、释放横幅对着已恢复的进程赖着不走；没有别的路径会替 composer 重读这份清单。
 - **动效**：底座立即播放 460ms 粉碎（`.ntr-acp-shatter` + `AcpShatterParts` 的 `out` 沙粒），随后挂牌以 540ms 凝聚（`.ntr-acp-tag.is-forming` + `in` 沙粒）。
   - 两半在**不同的 slot**（`conversation.input.model` / `conversation.input.overlay`），所以共读 `agent-lock-anim.ts` 的同一相位钟，**严禁**各自计时。
   - **不在轮次结束时播**：事件就是开始信号。首轮无输出被回滚（`chat/agent-unlocked`）时底座直接回来，不播反向动效。
@@ -176,6 +176,15 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 - **设置页是镜像，不是替代**：`permissionLedgerCard` 只要 `ui.permissions` 非空就渲染可答复卡片（`approvalRouted` / `fellBackFromConversation` 已删除），文案是「对话打开时在那边的卡片上回答；这里兜底显示其他会话的询问。」每行写 `toolName`（有 `reason` 时附在后面），按钮同样原样。两个面回答的是同一份 `PendingPermission`，写入都走 `respondPermission`。
 - 聊天里那行提示（`TurnStreamController.permissionLine`）指向真正的答案面：有 `dshSessionId` 说「对话卡片」，`/acp` 询问说「设置页」。
 
+### 10.1 释放横幅（`acp-released-banner`，同座）
+
+会话的 agent 进程被释放（空闲回收 / 崩溃）后，`conversation.input.dock` 的第二条目 `ReleasedBanner`（`src/client/released-banner.tsx`）在输入框上方显示一行「进程已释放」+「恢复进程」按钮。释放本身按约束 19 是静默的，而「下一条消息自动恢复」的承诺从聊天面本身无法验证——横幅把它说出来，按钮把它变成一个手势。
+
+- **闸门是纯函数** `releasedBannerVisible`（无 DOM 可测）：显式 `acpMode === false` 压过残留行（与挂牌同优先级）；`chatSessionsFor` 必须等于本会话；行集非空且**全部** `released`——有一行活着就说明下一条消息有人接，横幅让路；空集（没跑过 agent）不画。
+- **按钮**走 `session/chat-resume`（`AcpStore.resumeChatSession`），与下一条消息的惰性恢复同一套动作、绝不走创建路径（[protocol.md §2](./protocol.md)）。失败闪 notice **并** rethrow（`respondPermission` 契约），错误就地钉在按钮旁（`role="alert"`），不丢到用户可能没开的设置页。提交中按钮 `disabled`。
+- **挂载自读一次** `loadChatSessions`：打开一条已挂起的会话时，没有任何别的东西会替它读这份清单（挂牌、占用环的重读都挂在别的触发器上）。
+- 宽度复用权限卡的 InputBar 公式（`.ntr-released-banner`），样式与 `ntr-permission-card` 同族（warn 左边条）；行集的 released 翻转见 §2 耦合不变量。
+
 ## 11. 主题与颜色
 
 主题完全归宿主：暗色 token 由 `body[data-ds-dark-theme]` 选出，原生控件（select / checkbox / 滚动条）靠宿主写在 `documentElement` 上的 `color-scheme` 继承。插件**不维护 JS 侧主题状态**，也**严禁**自己写 `color-scheme: light dark`——那会跟随系统偏好而不是宿主偏好，两者不一致时面板会和宿主断层。
@@ -194,6 +203,7 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 | 锁定 UI | `src/client/session-controls.tsx` · `lockedAgentOf` / `agentBaseHidden` / `agentTagVisible` / `agentTagAlive` / `agentTagHaloPresentation` / `AcpComposerAgentTag`；`src/client/agent-lock-anim.ts` |
 | 视图 | `src/client/acp-view.tsx` · `boundAgentOf` / `acpEmptyCopy` / `diffRows` / `isNewFileDiff`；`src/client/context-meter.tsx` · `AcpContextMeter` / `acpMeterUsage` / `contextOccupancy` / `compactTokenCount`；`src/client/index.tsx` · `acp-context-meter` 注册处 |
 | 权限卡 | `src/client/permission-dock.tsx` · `PermissionDock` / `PermissionAskCard`；`src/client/store.ts` · `permissionsForSession` / `deadlineRemainingLabel`；`src/client/index.tsx` · `acp-permissions` 注册处 |
+| 释放横幅 | `src/client/released-banner.tsx` · `ReleasedBanner` / `releasedBannerVisible`；`src/client/store.ts` · `resumeChatSession` / `withSessionReleased`；`src/client/index.tsx` · `acp-released-banner` 注册处 |
 | 斜杠 | `src/client/slash-isolation.ts` · `createSlashIsolation` / `slashAcpVerdict` / `commandCandidates` |
 | 文案 | `src/client/index.tsx` · `label` / `LocaleFace` / `browserPrefersZh`；`src/client/store.ts` · `refreshLocale` / `detectSummaryOf`；`locale/*.json` |
 | 设置页 | `src/client/panel.tsx` · `AcpSettingsSection` / `AgentRow` / `WorkspaceBlock` / `initialForm` / `buildPayload` / `ApprovalDeadlinesCard` / `approvalDeadlineFacts` / `permissionLedgerCard`；`PluginUpdateBadge` / `PluginUpdateCard` / `updateBadgeText` / `updateCardVisible` |
