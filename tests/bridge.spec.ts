@@ -3299,12 +3299,83 @@ describe('idle release (isolated manager)', () => {
       // the process stays parked until the user sends or hits 恢复进程.
       await manager.setChatSessionMode('dsh-idle-pick', target!.id)
       expect(manager.chatChoice('dsh-idle-pick')).toMatchObject({ agentId: 'idle-pick', mode: target!.id })
+      expect(manager.chatSessions('dsh-idle-pick')[0]?.modes?.currentModeId).toBe(target!.id)
       expect(manager.agentViews()[0]?.state).toBe('stopped')
 
       // The next wake applies it (`applyChatChoice`), which is the whole point
       // of a pre-switch.
       await manager.resumeChatSession('dsh-idle-pick')
       expect(manager.chatSessions('dsh-idle-pick')[0]?.modes?.currentModeId).toBe(target!.id)
+
+      // When parked again, changing mode and resuming via prompt path (getOrCreateDshSession)
+      // also retains the new mode.
+      expect(await waitUntil(() => manager.agentViews()[0]?.state === 'stopped')).toBe(true)
+      expect(manager.chatSessions('dsh-idle-pick')[0]?.released).toBe(true)
+
+      const originalMode = parked!.modes!.currentModeId
+      await manager.setChatSessionMode('dsh-idle-pick', originalMode)
+      expect(manager.chatSessions('dsh-idle-pick')[0]?.modes?.currentModeId).toBe(originalMode)
+
+      const promptResumed = await manager.getOrCreateDshSession('dsh-idle-pick', 'idle-pick')
+      expect(promptResumed.modes?.currentModeId).toBe(originalMode)
+      expect(manager.chatSessions('dsh-idle-pick')[0]?.modes?.currentModeId).toBe(originalMode)
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
+  it('updates model and effort on a parked session without waking the process', async () => {
+    const { manager } = idleManager('idle-model-pick', { idleTimeoutMs: 200 })
+    try {
+      await manager.getOrCreateDshSession('dsh-idle-model-pick', 'idle-model-pick')
+      expect(await waitUntil(() => manager.agentViews()[0]?.state === 'stopped')).toBe(true)
+      const parked = manager.chatSessions('dsh-idle-model-pick')[0]
+      expect(parked?.released).toBe(true)
+
+      // Switching model and effort on a parked session immediately updates the
+      // in-memory session records and persists them without waking the stopped process.
+      await manager.setChatSessionModel('dsh-idle-model-pick', 'idle-model-pick@mock-model-b')
+      await manager.setChatSessionEffort('dsh-idle-model-pick', 'off')
+
+      expect(manager.agentViews()[0]?.state).toBe('stopped')
+      expect(manager.chatChoice('dsh-idle-model-pick')).toMatchObject({
+        agentId: 'idle-model-pick',
+        modelId: 'idle-model-pick@mock-model-b',
+        effort: 'off',
+      })
+      const updated = manager.chatSessions('dsh-idle-model-pick')[0]
+      expect(updated).toMatchObject({
+        modelId: 'idle-model-pick@mock-model-b',
+        reasoningEffort: 'off',
+        released: true,
+      })
+
+      // The next wake applies it and keeps the configuration.
+      await manager.resumeChatSession('dsh-idle-model-pick')
+      expect(manager.chatSessions('dsh-idle-model-pick')[0]).toMatchObject({
+        modelId: 'idle-model-pick@mock-model-b',
+        reasoningEffort: 'off',
+      })
+      expect(manager.chatSessions('dsh-idle-model-pick')[0]?.released).toBeFalsy()
+
+      // When parked again, changing configuration and resuming via the prompt path
+      // (getOrCreateDshSession) also retains the new configuration without jumping back.
+      expect(await waitUntil(() => manager.agentViews()[0]?.state === 'stopped')).toBe(true)
+      expect(manager.chatSessions('dsh-idle-model-pick')[0]?.released).toBe(true)
+
+      await manager.setChatSessionModel('dsh-idle-model-pick', 'idle-model-pick@mock-model-a')
+      await manager.setChatSessionEffort('dsh-idle-model-pick', 'high')
+
+      const promptResumed = await manager.getOrCreateDshSession('dsh-idle-model-pick', 'idle-model-pick')
+      expect(promptResumed).toMatchObject({
+        modelId: 'idle-model-pick@mock-model-a',
+        reasoningEffort: 'high',
+        released: false,
+      })
+      expect(manager.chatSessions('dsh-idle-model-pick')[0]).toMatchObject({
+        modelId: 'idle-model-pick@mock-model-a',
+        reasoningEffort: 'high',
+      })
     } finally {
       await manager.shutdownAll()
     }

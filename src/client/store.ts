@@ -1640,6 +1640,18 @@ export class AcpStore {
   async setChatSessionMode(dshSessionId: string, modeId: string, agentId?: string): Promise<void> {
     try {
       await this.call('session/chat-mode-set', { dshSessionId, modeId, ...(agentId === undefined ? {} : { agentId }) })
+      const safeAgent = (agentId && agentId.trim()) || undefined
+      this.writeChoice(dshSessionId, choice => ({ ...choice, mode: modeId }), safeAgent)
+      if (this.state.chatSessionsFor === dshSessionId) {
+        const owner = safeAgent ?? this.state.chatChoice[dshSessionId]?.agentId ?? this.state.chatBoundAgent[dshSessionId] ?? this.state.defaultAgent
+        let changed = false
+        const chatSessions = this.state.chatSessions.map(s => {
+          if (s.agentId !== owner || !s.modes || s.modes.currentModeId === modeId) return s
+          changed = true
+          return { ...s, modes: { ...s.modes, currentModeId: modeId } }
+        })
+        if (changed) this.mutate({ chatSessions })
+      }
     } catch (error) {
       this.flashError(error)
     }
@@ -1894,7 +1906,19 @@ export class AcpStore {
       // Optimistic for the same reason the binding is: the host recorded the
       // pick, and a conversation with no ACP session yet would otherwise show
       // the agent's default until its first turn created one.
-      this.writeChoice(dshSessionId, choice => ({ ...choice, modelId }), agentId)
+      const safeAgent = (agentId && agentId.trim()) || undefined
+      const targetAgent = safeAgent ?? (modelId ? splitModelAgentId(modelId) : undefined)
+      this.writeChoice(dshSessionId, choice => ({ ...choice, modelId }), targetAgent)
+      if (this.state.chatSessionsFor === dshSessionId) {
+        const owner = targetAgent ?? this.state.chatChoice[dshSessionId]?.agentId ?? this.state.chatBoundAgent[dshSessionId] ?? this.state.defaultAgent
+        let changed = false
+        const chatSessions = this.state.chatSessions.map(s => {
+          if (s.agentId !== owner || s.modelId === modelId) return s
+          changed = true
+          return { ...s, modelId }
+        })
+        if (changed) this.mutate({ chatSessions })
+      }
     } catch (error) {
       this.flashError(error)
       throw error
@@ -1909,10 +1933,21 @@ export class AcpStore {
         ...(effort === undefined ? {} : { effort }),
         ...(agentId === undefined ? {} : { agentId }),
       })
+      const targetAgent = (agentId && agentId.trim()) || undefined
       this.writeChoice(dshSessionId, choice => {
         const { effort: _dropped, ...rest } = choice
         return effort === undefined ? rest : { ...rest, effort }
-      }, agentId)
+      }, targetAgent)
+      if (this.state.chatSessionsFor === dshSessionId) {
+        const owner = targetAgent ?? this.state.chatChoice[dshSessionId]?.agentId ?? this.state.chatBoundAgent[dshSessionId] ?? this.state.defaultAgent
+        let changed = false
+        const chatSessions = this.state.chatSessions.map(s => {
+          if (s.agentId !== owner || s.reasoningEffort === effort) return s
+          changed = true
+          return { ...s, reasoningEffort: effort }
+        })
+        if (changed) this.mutate({ chatSessions })
+      }
     } catch (error) {
       this.flashError(error)
       throw error
@@ -2032,7 +2067,8 @@ export class AcpStore {
         const sessions = this.state.sessions.some(s => s.sessionId === event.sessionId)
           ? this.state.sessions.map(s => (s.sessionId === event.sessionId ? event.session : s))
           : this.state.sessions
-        const chatSessions = withSessionUsage(this.state.chatSessions, event.sessionId, event.session.usage)
+        let chatSessions = withSessionUsage(this.state.chatSessions, event.sessionId, event.session.usage)
+        chatSessions = withSessionModes(chatSessions, event.sessionId, event.session.modes)
         this.mutate({
           sessions,
           ...(chatSessions === this.state.chatSessions ? {} : { chatSessions }),
@@ -2495,6 +2531,40 @@ function withSessionReleased<T extends { sessionId: string; released?: boolean }
     return { ...row, released }
   })
   return changed ? next : rows
+}
+
+function sameModes(a?: SessionView['modes'], b?: SessionView['modes']): boolean {
+  if (a === b) return true
+  if (!a || !b) return false
+  if (a.currentModeId !== b.currentModeId) return false
+  const aModes = a.availableModes ?? []
+  const bModes = b.availableModes ?? []
+  if (aModes.length !== bModes.length) return false
+  return aModes.every((m, i) => {
+    const o = bModes[i]
+    return m != null && o != null && m.id === o.id && m.name === o.name && m.description === o.description
+  })
+}
+
+function withSessionModes<T extends { sessionId: string; modes?: SessionView['modes'] }>(
+  rows: T[],
+  sessionId: string,
+  modes?: SessionView['modes'],
+): T[] {
+  if (!modes) return rows
+  let changed = false
+  const next = rows.map(row => {
+    if (row.sessionId !== sessionId || sameModes(row.modes, modes)) return row
+    changed = true
+    return { ...row, modes }
+  })
+  return changed ? next : rows
+}
+
+function splitModelAgentId(modelId: string): string | undefined {
+  const at = modelId.indexOf('@')
+  const agent = at === -1 ? modelId.trim() : (at === 0 ? '' : modelId.slice(0, at).trim())
+  return agent || undefined
 }
 
 /** Last well-formed `usage_update` in one coalesced batch (later ticks win). */

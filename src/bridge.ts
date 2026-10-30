@@ -3917,11 +3917,12 @@ export class BridgeManager {
     this.patchChatChoice(dshSessionId, { agentId, modelId: choice === undefined ? undefined : modelId })
     for (const session of this.dshSessionMap.values()) {
       if (session.dshSessionId !== dshSessionId || session.agentId !== agentId) continue
-      if (session.released) continue
-      await this.alignSessionConfig(session, choice, session.reasoningEffort)
       session.choice = choice
       session.modelId = modelId
+      if (session.released) continue
+      await this.alignSessionConfig(session, choice, session.reasoningEffort)
     }
+    this.persistAgents()
   }
 
   /**
@@ -3947,12 +3948,15 @@ export class BridgeManager {
     // session is skipped here and re-aligned by `applyChatChoice` on resume.
     this.patchChatChoice(dshSessionId, { ...(agentId === undefined ? {} : { agentId }), effort })
     for (const session of this.dshSessionMap.values()) {
-      if (session.dshSessionId !== dshSessionId || session.released) continue
+      if (session.dshSessionId !== dshSessionId) continue
       if (agentId !== undefined && session.agentId !== agentId) continue
+      session.reasoningEffort = effort
+      if (session.released) continue
       const aligned = await this.alignSessionConfig(session, session.choice, effort)
       // Same rule as the model axis: a dropped level is no longer "in force".
       session.reasoningEffort = aligned.effortStale ? undefined : effort
     }
+    this.persistAgents()
   }
 
   /**
@@ -4185,6 +4189,10 @@ export class BridgeManager {
     // with the others, and it woke a process the user had explicitly parked.
     if (target.released) {
       this.patchChatChoice(dshSessionId, { agentId: target.agentId, mode: modeId })
+      if (target.modes !== undefined) {
+        target.modes = { ...target.modes, currentModeId: modeId }
+      }
+      this.persistAgents()
       return
     }
     const bridge = this.bridge(target.agentId)

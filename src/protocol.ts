@@ -683,6 +683,43 @@ export interface TagHaloSetPayload { halo: AcpTagHalo }
 export type ApprovalDeadlineKey = 'permissionTimeoutMs'
 
 /**
+ * The idle-release windows the settings page offers, in MINUTES.
+ *
+ * ONE ladder, shared by both halves: the browser snaps its slider to these
+ * values and the host accepts only these values, so a window the slider can
+ * produce is always a window the host runs. The first rung is 1 minute (an
+ * aggressive release), the rest are 5-minute steps up to an hour.
+ */
+export const IDLE_RELEASE_MINUTES: readonly number[] = [1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60]
+
+/**
+ * The idle-release window for chat processes, as the settings page edits it.
+ *
+ * The window is the HOST default: an agent that names its own
+ * {@link AcpAgentDef.idleTimeoutMs} keeps it, and a probe-only process (one
+ * that never hosted a session) still honors the short probe window — see
+ * `AGENTS/protocol.md` §5.
+ */
+export interface AcpIdleRelease {
+  /** The window in force, in ms. */
+  idleTimeoutMs: number
+  /** The built-in default (30 minutes) that a reset returns to, in ms. */
+  defaultIdleTimeoutMs: number
+}
+/** `ui/idle-release`: read the idle-release window in force. */
+export type IdleReleaseResult = { idleRelease?: AcpIdleRelease }
+/**
+ * `ui/idle-release-set`: write the idle-release window, or drop the persisted
+ * override with `reset` so the built-in default applies again.
+ */
+export interface IdleReleaseSetPayload {
+  /** The window to run, in ms; omitted when `reset` is true. */
+  idleTimeoutMs?: number
+  /** Drop the persisted override so the built-in default applies again. */
+  reset?: boolean
+}
+
+/**
  * What an EXPIRED approval deadline does. Three modes, and only three — an
  * unanswered ask either gets answered for you, keeps waiting, or is refused.
  *

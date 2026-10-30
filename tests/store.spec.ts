@@ -1990,6 +1990,180 @@ describe('the conversation↔agent binding (no DSH model route)', () => {
     })
   })
 
+  it('optimistically updates chatSessions when switching model, effort or mode', async () => {
+    let listed = {
+      sessions: [
+        {
+          agentId: 'codebuddy',
+          sessionId: 's1',
+          modelId: 'codebuddy@hy2',
+          reasoningEffort: 'low',
+          modes: { currentModeId: 'default', availableModes: [{ id: 'default', name: 'Default' }, { id: 'strict', name: 'Strict' }] },
+        },
+      ],
+      acpMode: true,
+    }
+    let holdChatList: Promise<void> | undefined
+    let releaseChatList: (() => void) | undefined
+    const store = new AcpStore(async (_channel, endpoint, payload) => {
+      if (endpoint === 'session/chat-model-set') {
+        const p = payload as { modelId: string }
+        listed = {
+          ...listed,
+          sessions: listed.sessions.map(s => ({ ...s, modelId: p.modelId })),
+        }
+        return { ok: true, value: {} }
+      }
+      if (endpoint === 'session/chat-effort-set') {
+        const p = payload as { effort?: string }
+        listed = {
+          ...listed,
+          sessions: listed.sessions.map(s => ({ ...s, reasoningEffort: p.effort })),
+        }
+        return { ok: true, value: {} }
+      }
+      if (endpoint === 'session/chat-mode-set') {
+        const p = payload as { modeId: string }
+        listed = {
+          ...listed,
+          sessions: listed.sessions.map(s => ({ ...s, modes: { ...s.modes, currentModeId: p.modeId } })),
+        }
+        return { ok: true, value: {} }
+      }
+      if (endpoint === 'session/chat-list') {
+        if (holdChatList) await holdChatList
+        return { ok: true, value: listed }
+      }
+      return { ok: true, value: {} }
+    }, zh => zh)
+
+    await store.loadChatSessions('chat-1')
+    expect(store.getSnapshot().chatSessions[0]).toMatchObject({
+      agentId: 'codebuddy',
+      modelId: 'codebuddy@hy2',
+      reasoningEffort: 'low',
+      modes: { currentModeId: 'default' },
+    })
+
+    // Switching model optimistically updates chatSessions without waiting for reload
+    await store.setChatSessionModel('chat-1', 'codebuddy@hy3', 'codebuddy')
+    expect(store.getSnapshot().chatSessions[0]?.modelId).toBe('codebuddy@hy3')
+
+    // Switching effort optimistically updates chatSessions
+    await store.setChatSessionEffort('chat-1', 'high', 'codebuddy')
+    expect(store.getSnapshot().chatSessions[0]?.reasoningEffort).toBe('high')
+
+    // Switching mode optimistically updates both chatChoice and chatSessions before reload settles
+    holdChatList = new Promise(resolve => { releaseChatList = resolve })
+    const modePromise = store.setChatSessionMode('chat-1', 'strict', 'codebuddy')
+    // Yield a microtask so chat-mode-set completes and optimistic write occurs
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(store.getSnapshot().chatChoice['chat-1']?.mode).toBe('strict')
+    expect(store.getSnapshot().chatSessions[0]?.modes?.currentModeId).toBe('strict')
+    releaseChatList!()
+    await modePromise
+    expect(store.getSnapshot().chatSessions[0]?.modes?.currentModeId).toBe('strict')
+
+    // Switching on an unrelated conversation does not mutate chatSessionsFor chat-1
+    const prevSessions = store.getSnapshot().chatSessions
+    await store.setChatSessionModel('chat-2', 'codebuddy@hy4', 'codebuddy')
+    expect(store.getSnapshot().chatSessions).toBe(prevSessions)
+
+    // Switching to the same value does not mutate chatSessions
+    await store.setChatSessionModel('chat-1', 'codebuddy@hy3', 'codebuddy')
+    expect(store.getSnapshot().chatSessions).toBe(prevSessions)
+
+    // session/meta event updates modes in chatSessions
+    const apply = (event: unknown): Promise<void> =>
+      (store as unknown as { applyEvent(event: unknown): Promise<void> }).applyEvent(event as never)
+    await apply({
+      type: 'session/meta',
+      sessionId: 's1',
+      session: {
+        sessionId: 's1',
+        agentId: 'codebuddy',
+        acpSessionId: 'acp-1',
+        cwd: '/w',
+        running: false,
+        closed: false,
+        seq: 0,
+        modes: { currentModeId: 'default', availableModes: [{ id: 'default', name: 'Default' }] },
+      },
+    })
+    expect(store.getSnapshot().chatSessions[0]?.modes?.currentModeId).toBe('default')
+
+    // session/meta with identical modes does not mutate chatSessions reference
+    const sameMetaSessions = store.getSnapshot().chatSessions
+    await apply({
+      type: 'session/meta',
+      sessionId: 's1',
+      session: {
+        sessionId: 's1',
+        agentId: 'codebuddy',
+        acpSessionId: 'acp-1',
+        cwd: '/w',
+        running: false,
+        closed: false,
+        seq: 0,
+        modes: { currentModeId: 'default', availableModes: [{ id: 'default', name: 'Default' }] },
+      },
+    })
+    expect(store.getSnapshot().chatSessions).toBe(sameMetaSessions)
+
+    // session/meta with null or undefined modes does not throw and leaves chatSessions unchanged
+    const metaNullSessions = store.getSnapshot().chatSessions
+    await apply({
+      type: 'session/meta',
+      sessionId: 's1',
+      session: {
+        sessionId: 's1',
+        agentId: 'codebuddy',
+        acpSessionId: 'acp-1',
+        cwd: '/w',
+        running: false,
+        closed: false,
+        seq: 0,
+        modes: null,
+      },
+    })
+    expect(store.getSnapshot().chatSessions).toBe(metaNullSessions)
+
+    await apply({
+      type: 'session/meta',
+      sessionId: 's1',
+      session: {
+        sessionId: 's1',
+        agentId: 'codebuddy',
+        acpSessionId: 'acp-1',
+        cwd: '/w',
+        running: false,
+        closed: false,
+        seq: 0,
+      },
+    })
+    expect(store.getSnapshot().chatSessions).toBe(metaNullSessions)
+
+    // Switching model without explicit agentId infers owner from modelId
+    await store.setChatSessionModel('chat-1', 'codebuddy@hy4')
+    expect(store.getSnapshot().chatSessions[0]?.modelId).toBe('codebuddy@hy4')
+    expect(store.getSnapshot().chatChoice['chat-1']?.modelId).toBe('codebuddy@hy4')
+
+    // Switching model with multiple '@' correctly extracts the leading agent id
+    await store.setChatSessionModel('chat-1', 'codebuddy@var@nested')
+    expect(store.getSnapshot().chatSessions[0]?.modelId).toBe('codebuddy@var@nested')
+    expect(store.getSnapshot().chatChoice['chat-1']?.agentId).toBe('codebuddy')
+
+    // Switching model with leading '@' (malformed) falls back to existing owner rather than setting ""
+    await store.setChatSessionModel('chat-1', '@only-choice')
+    expect(store.getSnapshot().chatChoice['chat-1']?.agentId).toBe('codebuddy')
+    expect(store.getSnapshot().chatSessions[0]?.modelId).toBe('@only-choice')
+
+    // Switching with whitespace agentId falls back rather than corrupting agentId into whitespace
+    await store.setChatSessionEffort('chat-1', 'low', '   ')
+    expect(store.getSnapshot().chatChoice['chat-1']?.agentId).toBe('codebuddy')
+    expect(store.getSnapshot().chatSessions[0]?.reasoningEffort).toBe('low')
+  })
+
   it('attributes a pick to the plugin default before anything was bound', async () => {
     // A fresh conversation served by the default agent has no binding and no
     // choice yet. The host records the pick for that agent; the optimistic

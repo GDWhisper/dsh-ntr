@@ -7,10 +7,10 @@
 
 import { randomUUID } from './ids.ts'
 import type {
-  AcpAgentCatalog, AcpAgentDef, AcpCatalogOption, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpMcpServerDef, AcpPluginConfig, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult,
-  AgentView, ApprovalDeadlineKey, ApprovalDeadlinePatch, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionOptionView, PermissionOutcome, PermissionTimeoutMode, PluginUpdateState, RpcResult,
+  AcpAgentCatalog, AcpAgentDef, AcpCatalogOption, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpMcpServerDef, AcpPluginConfig, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult,
+  AgentView, ApprovalDeadlineKey, ApprovalDeadlinePatch, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, IdleReleaseSetPayload, PermissionOptionView, PermissionOutcome, PermissionTimeoutMode, PluginUpdateState, RpcResult,
 } from './protocol.ts'
-import { DEFAULT_TAG_HALO } from './protocol.ts'
+import { DEFAULT_TAG_HALO, IDLE_RELEASE_MINUTES } from './protocol.ts'
 
 export { randomUUID }
 
@@ -173,6 +173,21 @@ export function validateApprovalDeadlines(value: unknown): Partial<Record<Approv
     )
   }
   return out
+}
+
+/**
+ * Validate the idle-release window the settings page writes.
+ *
+ * The window is expressed in MINUTES on the shared ladder
+ * ({@link IDLE_RELEASE_MINUTES}), so a value the slider can produce is
+ * always a value the host runs — the same one-ladder rule the approval
+ * deadline card follows.
+ */
+export function validateIdleReleaseMinutes(raw: unknown, code: 'bad_config' | 'bad_payload'): number {
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || !IDLE_RELEASE_MINUTES.includes(raw)) {
+    throw new AcpError(code, `acp: idle release minutes must be one of ${IDLE_RELEASE_MINUTES.join(', ')}`)
+  }
+  return raw
 }
 
 /**
@@ -1789,6 +1804,19 @@ export interface AcpManager {
    * applies again. Applies to the running bridges without a restart.
    */
   setApprovalDeadlines?(patch: ApprovalDeadlinePatch, reset?: boolean): Promise<void>
+  /**
+   * The idle-release window in force for chat processes, plus the built-in
+   * default a reset returns to. `undefined` on a host half from before the
+   * card existed, which hides the settings tab instead of showing a number
+   * this browser invented.
+   */
+  idleRelease?(): AcpIdleRelease | undefined
+  /**
+   * Write the idle-release window (in minutes), or drop the persisted
+   * override with `reset` so the built-in default applies again. Applies to
+   * the running bridges without a restart.
+   */
+  setIdleRelease?(minutes: number | undefined, reset?: boolean): Promise<void>
   detectAgents?(): Promise<DetectedAgentInfo[]>
   saveAgent?(def: AcpAgentDef): Promise<void>
   deleteAgent?(agentId: string): Promise<void>
