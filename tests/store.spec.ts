@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { AcpStore, foldUpdate, permissionsForSession, type Block } from '../src/client/store.ts'
 import { acpModeFromPresetEvent, stagedIsAcpMode } from '../src/client/acp-ui.tsx'
-import type { AcpAgentDef, DetectedAgentInfo } from '../src/protocol.ts'
+import type { AcpAgentDef, ChatSessionView, DetectedAgentInfo } from '../src/protocol.ts'
 
 function fold(...updates: Array<Record<string, unknown>>): Block[] {
   const blocks: Block[] = []
@@ -1346,6 +1346,71 @@ describe('AcpStore event application (released / reset / turn dedup)', () => {
     } finally {
       vi.unstubAllGlobals()
     }
+  })
+
+  it('live-patches usage into the session, chat row and watched transcript', async () => {
+    const listed = { sessions: [{ agentId: 'pi', sessionId: 's1', usage: { used: 1, size: 100 } }], acpMode: true }
+    const store = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint === 'session/chat-list') return { ok: true, value: listed }
+      if (endpoint === 'session/chat-transcript') {
+        return { ok: true, value: { views: [{ session: view({ usage: { used: 1, size: 100 } }), entries: [] }] } }
+      }
+      return { ok: true, value: {} }
+    }, zh => zh)
+    const apply = (event: unknown): Promise<void> =>
+      (store as unknown as { applyEvent(event: unknown): Promise<void> }).applyEvent(event)
+
+    await store.loadChatSessions('chat-1')
+    await store.loadChatTranscript('chat-1')
+    await apply({ type: 'session/created', sessionId: 's1', session: view({ usage: { used: 1, size: 100 } }) })
+    const blocksBefore = store.getSnapshot().chatTranscripts.s1?.blocks
+
+    await apply({ type: 'session/update', sessionId: 's1', seq: 1, update: { sessionUpdate: 'usage_update', used: 500, size: 1000 } })
+
+    // No animation frame in Node: the batch flushes synchronously, and every
+    // snapshot the occupancy surface reads moved — not just the transcript.
+    expect(store.getSnapshot().chatSessions[0]?.usage).toEqual({ used: 500, size: 1000 })
+    expect(store.getSnapshot().chatTranscripts.s1?.session.usage).toEqual({ used: 500, size: 1000 })
+    // A usage-only tick must not touch the folded blocks.
+    expect(store.getSnapshot().chatTranscripts.s1?.blocks).toBe(blocksBefore)
+  })
+
+  it('re-reads the chat row when a turn starts before the row list has seen the session', async () => {
+    // The first ACP session is materialized inside its first turn, after the
+    // composer's mount / running read; without this read its usage ticks would
+    // find no row and the occupancy ring would stay absent until the turn end.
+    let rows: ChatSessionView[] = []
+    const store = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint === 'session/chat-list') return { ok: true, value: { sessions: rows, acpMode: true } }
+      return { ok: true, value: {} }
+    }, zh => zh)
+    const apply = (event: unknown): Promise<void> =>
+      (store as unknown as { applyEvent(event: unknown): Promise<void> }).applyEvent(event)
+
+    await store.loadChatSessions('chat-1')
+    expect(store.getSnapshot().chatSessions).toEqual([])
+
+    rows = [{ agentId: 'pi', sessionId: 's1', usage: { used: 10, size: 100 } }]
+    await apply({ type: 'turn/start', sessionId: 's1', turnId: 't1', text: 'hi' })
+    await vi.waitFor(() => expect(store.getSnapshot().chatSessions).toEqual(rows))
+  })
+
+  it('takes a republished snapshot’s (possibly absent) usage onto the chat row', async () => {
+    const listed = { sessions: [{ agentId: 'pi', sessionId: 's1', usage: { used: 50, size: 100 } }], acpMode: true }
+    const store = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint === 'session/chat-list') return { ok: true, value: listed }
+      return { ok: true, value: {} }
+    }, zh => zh)
+    const apply = (event: unknown): Promise<void> =>
+      (store as unknown as { applyEvent(event: unknown): Promise<void> }).applyEvent(event)
+
+    await store.loadChatSessions('chat-1')
+    expect(store.getSnapshot().chatSessions[0]?.usage).toEqual({ used: 50, size: 100 })
+
+    // `session/meta` is the host's latest word on this session: when it carries
+    // no usage, an older reading must not outlive it on the composer's row.
+    await apply({ type: 'session/meta', sessionId: 's1', session: view() })
+    expect(store.getSnapshot().chatSessions[0]?.usage).toBeUndefined()
   })
 
   function view(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {

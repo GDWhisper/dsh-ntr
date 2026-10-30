@@ -11,9 +11,10 @@ import { describe, expect, it, vi } from 'vitest'
 import { ACP_PRESET_ID, acpModeFromPresetEvent, formatCommandLine, isAbsolutePathLike, placeMenu, rowAgentPreset, splitAcpModelId, splitCommandLine, stagedIsAcpMode, stagedSessionOf, tokenizeCommandLine } from '../src/client/acp-ui.tsx'
 import { agentLockPhaseOf, FORM_MS, playAgentLockAnim, SHATTER_MS } from '../src/client/agent-lock-anim.ts'
 import { acpEmptyCopy, boundAgentOf, diffRows, isNewFileDiff } from '../src/client/acp-view.tsx'
+import { acpMeterUsage, compactTokenCount, contextOccupancy } from '../src/client/context-meter.tsx'
 import { approvalDeadlineFacts, DEADLINE_MIN_WAIT_MS, deadlineSliderIndex, deadlineValueFor } from '../src/client/panel.tsx'
 import { describeRoute, menuFor, REFRESH_CATALOG_ITEM } from '../src/client/session-controls.tsx'
-import { AcpStore, deadlineRemainingLabel, PERMISSION_DEADLINE_EXPIRED, permissionsForSession } from '../src/client/store.ts'
+import { AcpStore, deadlineRemainingLabel, PERMISSION_DEADLINE_EXPIRED, permissionsForSession, usageFromUpdate } from '../src/client/store.ts'
 import type { PendingPermission } from '../src/client/store.ts'
 import { APPROVAL_DEADLINE_MIN_WAIT_MS, isAbsolutePath, splitAdapterModelId, splitCommandLine as hostSplitCommandLine, tokenizeCommandLine as hostTokenizeCommandLine } from '../src/impl.ts'
 import type { AgentCatalogResult, AgentView, ChatSessionView } from '../src/protocol.ts'
@@ -949,5 +950,80 @@ describe('deadlineRemainingLabel', () => {
   it('reports an expired deadline instead of counting backwards', () => {
     expect(deadlineRemainingLabel(now, now, 'abort')).toBe(PERMISSION_DEADLINE_EXPIRED)
     expect(deadlineRemainingLabel(now - 1, now, 'auto')).toBe(PERMISSION_DEADLINE_EXPIRED)
+  })
+})
+
+describe('contextOccupancy', () => {
+  it('rounds and clamps the agent sample to a bounded percentage', () => {
+    expect(contextOccupancy({ used: 280, size: 1000 })).toEqual({ percent: 28, used: 280, size: 1000 })
+    expect(contextOccupancy({ used: 0, size: 1000 })).toEqual({ percent: 0, used: 0, size: 1000 })
+    // Over-capacity samples (agents may report used > size) must not draw a
+    // ring past a full circle.
+    expect(contextOccupancy({ used: 2000, size: 1000 })).toEqual({ percent: 100, used: 2000, size: 1000 })
+  })
+
+  it('renders nothing for absent or unusable samples instead of a fake 0%', () => {
+    expect(contextOccupancy(undefined)).toBeUndefined()
+    expect(contextOccupancy({ used: 1, size: 0 })).toBeUndefined()
+    expect(contextOccupancy({ used: -1, size: 100 })).toBeUndefined()
+    expect(contextOccupancy({ used: Number.NaN, size: 100 })).toBeUndefined()
+    expect(contextOccupancy({ used: 1, size: Number.POSITIVE_INFINITY })).toBeUndefined()
+  })
+})
+
+describe('compactTokenCount', () => {
+  it('matches the host meter’s K/M shape', () => {
+    expect(compactTokenCount(0)).toBe('0')
+    expect(compactTokenCount(999)).toBe('999')
+    expect(compactTokenCount(1000)).toBe('1K')
+    expect(compactTokenCount(12_345)).toBe('12.3K')
+    expect(compactTokenCount(123_456)).toBe('123K')
+    expect(compactTokenCount(1_500_000)).toBe('1.5M')
+    expect(compactTokenCount(200_000_000)).toBe('200M')
+  })
+})
+
+describe('usageFromUpdate', () => {
+  it('carries a well-formed sample (with cost) and ignores malformed frames', () => {
+    expect(usageFromUpdate({ used: 123, size: 1000 })).toEqual({ used: 123, size: 1000 })
+    expect(usageFromUpdate({ used: 123, size: 1000, cost: { amount: 0.25, currency: 'USD' } }))
+      .toEqual({ used: 123, size: 1000, cost: { amount: 0.25, currency: 'USD' } })
+    // A malformed sample must leave the previous reading on screen, not zero it.
+    expect(usageFromUpdate({ used: '123', size: 1000 })).toBeUndefined()
+    expect(usageFromUpdate({ used: Number.NaN, size: 1000 })).toBeUndefined()
+    expect(usageFromUpdate({ used: 123, size: Number.POSITIVE_INFINITY })).toBeUndefined()
+    // A partial cost is dropped, the occupancy sample survives.
+    expect(usageFromUpdate({ used: 123, size: 1000, cost: { amount: 'x' } })).toEqual({ used: 123, size: 1000 })
+  })
+})
+
+describe('acpMeterUsage', () => {
+  const row = { agentId: 'pi', sessionId: 's1', usage: { used: 28, size: 100 } }
+
+  it('shows the row sample only for the conversation it belongs to', () => {
+    expect(acpMeterUsage({ acpMode: { c: true }, chatSessionsFor: 'c', chatSessions: [row] }, 'c'))
+      .toEqual({ used: 28, size: 100 })
+    expect(acpMeterUsage({ acpMode: {}, chatSessionsFor: 'c', chatSessions: [row] }, 'c'))
+      .toEqual({ used: 28, size: 100 })
+    // A list read for another conversation must never leak into this one.
+    expect(acpMeterUsage({ acpMode: { c: true }, chatSessionsFor: 'other', chatSessions: [row] }, 'c'))
+      .toBeUndefined()
+    expect(acpMeterUsage({ acpMode: { c: true }, chatSessionsFor: 'c', chatSessions: [] }, 'c'))
+      .toBeUndefined()
+  })
+
+  it('an explicit non-ACP verdict outranks a lingering session row', () => {
+    // Switching a conversation off the NTR preset does not close its ACP
+    // session; the ring must leave with the preset, like the agent tag does.
+    expect(acpMeterUsage({ acpMode: { c: false }, chatSessionsFor: 'c', chatSessions: [row] }, 'c'))
+      .toBeUndefined()
+  })
+
+  it('prefers the live row over a released one for the same conversation', () => {
+    const released = { agentId: 'pi', sessionId: 's0', usage: { used: 5, size: 100 }, released: true }
+    expect(acpMeterUsage({ acpMode: { c: true }, chatSessionsFor: 'c', chatSessions: [released, row] }, 'c'))
+      .toEqual({ used: 28, size: 100 })
+    expect(acpMeterUsage({ acpMode: { c: true }, chatSessionsFor: 'c', chatSessions: [released] }, 'c'))
+      .toEqual({ used: 5, size: 100 })
   })
 })

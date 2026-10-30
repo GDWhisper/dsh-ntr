@@ -16,6 +16,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { AcpStore, type RpcCall } from './store.ts'
 import { AcpSettingsSection } from './panel.tsx'
 import { AcpComposerMode } from './composer-mode.tsx'
+import { AcpContextMeter } from './context-meter.tsx'
 import { AcpComposerAgentTag, AcpSessionControls, AcpSessionMenu } from './session-controls.tsx'
 import { AcpConversationView } from './acp-view.tsx'
 import { AcpSettingsDialog } from './settings-dialog.tsx'
@@ -206,6 +207,20 @@ export function apply(ctx: Context): void {
     // composer-mode.tsx, so the composed-props constraint cannot be met by type
     // (see the note there). Runtime passes the real shares either way.
   }, AcpComposerMode as unknown as SlotComponent<any>)), 'dsh-ntr: composer agent-mode control')
+
+  // The agent's OWN context occupancy in the composer's bottom info row
+  // (`conversation.composer.dock` — the dock below the input card where the
+  // host renders its native ContextMeter). The native meter reads host
+  // projections an ACP request never feeds, so this ring reports the agent's
+  // `usage_update` used/size instead (see context-meter.tsx). Registered for
+  // every conversation; the component gates itself on an ACP conversation row
+  // carrying usage.
+  ctx.effect(() => ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
+    name: 'conversation.composer.dock',
+    id: 'acp-context-meter',
+    order: 10,
+    inject: (sessionId: unknown) => chatFace(sessionId),
+  }, AcpContextMeter as unknown as SlotComponent<any>)), 'dsh-ntr: composer context meter')
 
   // Its picker rides the composer's overlay seat — the platform's home for
   // menus, so the popup floats above the card instead of being clipped by it.

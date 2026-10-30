@@ -85,6 +85,11 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 - `setChatSessionMode` 对没有活会话的会话只记录 pick、不 spawn（与 `setChatSessionModel` 一致），`applyChatChoice` 在建 / 恢复会话时再应用。
 - 该 series 的公开 `.d.ts` 里 slot 条目**不含 `owner` 字段**（`OwnerOf` 解析为 `object`），所以组件里声明结构类型（`ComposerModeProps`），注册处 `as unknown as SlotComponent<any>`；新增 client 模块依赖要加进 package.json 的 `dsh.client.inject`。
 
+### 4.1 composer 上下文占用环（`conversation.composer.dock`）
+`src/client/context-meter.tsx` 在输入框下方的底部信息栏（宿主原生 ContextMeter 所在的同一行），只报 agent `usage_update` 的 `used/size`。
+- **不复用原生环**：宿主 `ContextMeter` 读 `contextPressure` / `contextBreakdown`，ACP 请求不产生这两类事件；**严禁**为点亮它把 `used` 塞进 `inputTokens`（约束 36 / issue #6）。
+- **数据源、闸门与重读**：`session/chat-list` 的 `ChatSessionView.usage`，SSE `usage_update` 实时补写 `chatSessions` 与被观察 transcript；`acpMeterUsage` 先判 `acpMode !== false`（显式 false 压过残留行，与挂牌一致），再判 `chatSessionsFor` 与行上的 `usage`，无样本 / `size <= 0` 不渲染（不画假 0%），百分比夹到 100；ACP 没有 system / tools / messages 拆分，**严禁**伪造明细，精确数字进 `title`，可见文字只有百分比；环按宿主 14px viewBox / 2px stroke 与 alias token 画。`useSession(s => s.running)` 翻转时 `loadChatSessions`；首轮 `turn/start` 无当前行则补读一次（每会话一次），`resync` 也刷新当前行。
+
 ## 5. NTR 视图 tab
 
 真工具卡只能在 `conversation.view` 的 NTR tab（`src/client/acp-view.tsx`）里画。
@@ -187,7 +192,7 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 | 底座 / 菜单 | `src/client/session-controls.tsx` · `AcpSessionControls` / `AcpSessionMenu` / `menuFor` / `describeRoute` / `routeAgentId` / `agentBaseChip` / `advancedOptions` |
 | 座位 | `src/client/model-seat.tsx` · `createModelSeatClaim` / `createPermissionSeatClaim`；`src/client/index.tsx` · `syncAcpMode` |
 | 锁定 UI | `src/client/session-controls.tsx` · `lockedAgentOf` / `agentBaseHidden` / `agentTagVisible` / `agentTagAlive` / `agentTagHaloPresentation` / `AcpComposerAgentTag`；`src/client/agent-lock-anim.ts` |
-| 视图 | `src/client/acp-view.tsx` · `boundAgentOf` / `acpEmptyCopy` / `diffRows` / `isNewFileDiff` |
+| 视图 | `src/client/acp-view.tsx` · `boundAgentOf` / `acpEmptyCopy` / `diffRows` / `isNewFileDiff`；`src/client/context-meter.tsx` · `AcpContextMeter` / `acpMeterUsage` / `contextOccupancy` / `compactTokenCount`；`src/client/index.tsx` · `acp-context-meter` 注册处 |
 | 权限卡 | `src/client/permission-dock.tsx` · `PermissionDock` / `PermissionAskCard`；`src/client/store.ts` · `permissionsForSession` / `deadlineRemainingLabel`；`src/client/index.tsx` · `acp-permissions` 注册处 |
 | 斜杠 | `src/client/slash-isolation.ts` · `createSlashIsolation` / `slashAcpVerdict` / `commandCandidates` |
 | 文案 | `src/client/index.tsx` · `label` / `LocaleFace` / `browserPrefersZh`；`src/client/store.ts` · `refreshLocale` / `detectSummaryOf`；`locale/*.json` |

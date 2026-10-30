@@ -659,6 +659,13 @@ export class AcpStore {
   /** In-flight `session/chat-list` reads, keyed by chat session id. */
   private readonly chatSessionReads = new Map<string, { dropped: boolean; done: Promise<void> }>()
   /**
+   * ACP session ids whose chat-list row was requested mid-turn (one read each).
+   * A conversation's first ACP session does not exist when the composer's
+   * mount/running read fires, so its first `usage_update` would find no row to
+   * patch; `turn/start` asks again once the host has materialized the session.
+   */
+  private readonly chatSessionRowReads = new Set<string>()
+  /**
    * Chat sessions whose list has answered at least once in this page. The
    * FIRST answer only seeds the lock; a lock appearing on a later answer is a
    * transition this page actually witnessed, and only that one is announced via
@@ -783,9 +790,16 @@ export class AcpStore {
       else list.push(item)
     }
     let chatTranscripts = this.state.chatTranscripts
+    let chatSessions = this.state.chatSessions
     let blocksChanged = false
     for (const [sessionId, items] of bySession) {
       const last = items[items.length - 1]
+      // `usage_update` is state, not stream content: it never becomes a block,
+      // but both observed snapshots that carry usage must move with it —
+      // otherwise the ACP view header and the composer's occupancy ring only
+      // refresh when some other RPC re-reads the session.
+      const usage = usageOfBatch(items)
+      if (usage !== undefined) chatSessions = withSessionUsage(chatSessions, sessionId, usage)
       // The observed transcript folds every frame (a watched session's cards
       // and prose); blocks are copied only when something actually changed, so
       // a usage-only tick costs one record object, not a re-render payload.
@@ -795,9 +809,12 @@ export class AcpStore {
         for (const item of items) {
           if (foldUpdate(record.blocks, item.update as Record<string, unknown>)) changed = true
         }
+        const session = usage !== undefined && !sameUsage(record.session.usage, usage)
+          ? { ...record.session, usage }
+          : record.session
         chatTranscripts = {
           ...chatTranscripts,
-          [sessionId]: { ...record, seq: last.seq, ...(changed ? { blocks: [...record.blocks] } : {}) },
+          [sessionId]: { ...record, session, seq: last.seq, ...(changed ? { blocks: [...record.blocks] } : {}) },
         }
       }
       if (sessionId !== this.state.activeSessionId) {
@@ -818,6 +835,7 @@ export class AcpStore {
     }
     const patch: Partial<UiState> = {}
     if (chatTranscripts !== this.state.chatTranscripts) patch.chatTranscripts = chatTranscripts
+    if (chatSessions !== this.state.chatSessions) patch.chatSessions = chatSessions
     if (blocksChanged) patch.blocks = [...this.state.blocks]
     if (Object.keys(patch).length > 0) this.mutate(patch)
   }
@@ -905,6 +923,10 @@ export class AcpStore {
         approvalDeadlines: deadlinesResult.deadlines,
         pluginVersion: versionResult?.version !== undefined && versionResult.version !== '' ? versionResult.version : undefined,
       })
+      // `sessions/list` is the `/acp` RPC face; the composer's chat rows
+      // (agent modes, occupancy) are a separate list. A reconnect must refresh
+      // that list too or the ring keeps a pre-outage sample until a turn ends.
+      if (this.state.chatSessionsFor !== undefined) void this.loadChatSessions(this.state.chatSessionsFor)
       const active = this.state.activeSessionId ?? sessions[0]?.sessionId
       if (active !== undefined) await this.loadTranscript(active)
     } catch (error) {
@@ -1365,9 +1387,9 @@ export class AcpStore {
    * the frame's authority.
    */
   loadChatSessions(dshSessionId: string, options?: { settleVerdict?: boolean }): Promise<void> {
-    // Two composer entries read this (the agent-mode control and the ACP
-    // cluster) and both re-read when a turn settles; one round-trip answers
-    // for both instead of two racing ones. A caller arriving mid-read waits
+    // The composer entries (agent-mode control, ACP cluster, occupancy ring)
+    // read this and re-read when a turn settles; one round-trip answers for
+    // all of them instead of racing reads. A caller arriving mid-read waits
     // for THAT read rather than returning immediately: the slash source's
     // one-shot "do I have a verdict yet?" ask is only useful if it can
     // receive the answer of a read already in flight.
@@ -1386,7 +1408,7 @@ export class AcpStore {
   ): Promise<void> {
     const settle = options?.settleVerdict === true || !this.acpModeLive.has(dshSessionId)
     try {
-      const { sessions, acpMode, boundAgentId, lockedAgentId, choice } = await this.call<{ sessions: ChatSessionView[]; acpMode?: boolean; boundAgentId?: string; lockedAgentId?: string; choice?: AcpConversationChoice }>('session/chat-list', { dshSessionId, refresh: true })
+      const { sessions = [], acpMode, boundAgentId, lockedAgentId, choice } = await this.call<{ sessions: ChatSessionView[]; acpMode?: boolean; boundAgentId?: string; lockedAgentId?: string; choice?: AcpConversationChoice }>('session/chat-list', { dshSessionId, refresh: true })
       // A committed `agent-preset/selected` frame may have settled this
       // session's verdict while the read was in flight; the host answer then
       // describes the log as of BEFORE that switch and must not overwrite it.
@@ -1983,11 +2005,19 @@ export class AcpStore {
         return Promise.resolve()
       }
       case 'session/meta': {
-        // Host re-published the session view after mode/config changes.
+        // Host re-published the session view after mode/config changes or a
+        // resume. The composer's occupancy ring reads the chat-list row, so
+        // that row must follow the snapshot's usage too — including an absent
+        // one, which must clear an older reading rather than outlive it.
         const sessions = this.state.sessions.some(s => s.sessionId === event.sessionId)
           ? this.state.sessions.map(s => (s.sessionId === event.sessionId ? event.session : s))
           : this.state.sessions
-        this.mutate({ sessions, ...this.watchedSessionPatch(event.sessionId, event.session) })
+        const chatSessions = withSessionUsage(this.state.chatSessions, event.sessionId, event.session.usage)
+        this.mutate({
+          sessions,
+          ...(chatSessions === this.state.chatSessions ? {} : { chatSessions }),
+          ...this.watchedSessionPatch(event.sessionId, event.session),
+        })
         return Promise.resolve()
       }
       case 'session/closed': {
@@ -2190,6 +2220,17 @@ export class AcpStore {
       case 'turn/start': {
         this.openTurns.add(event.sessionId)
         this.markWatchedRunning(event.sessionId, true)
+        // The session materializes inside this turn; if the composer's list
+        // has not seen its row yet (the mount/running read beat session/new),
+        // read once now so the occupancy ring has a row for the live usage
+        // ticks. The per-session set bounds this to one extra read.
+        const chatSessionId = this.state.chatSessionsFor
+        if (chatSessionId !== undefined
+          && !this.state.chatSessions.some(row => row.sessionId === event.sessionId)
+          && !this.chatSessionRowReads.has(event.sessionId)) {
+          this.chatSessionRowReads.add(event.sessionId)
+          void this.loadChatSessions(chatSessionId)
+        }
         if (event.sessionId === this.state.activeSessionId) {
           this.state.blocks.push({ kind: 'user', text: event.text })
           trimBlocks(this.state.blocks)
@@ -2364,6 +2405,64 @@ export const STATE_ONLY_UPDATES: ReadonlySet<string> = new Set([
   'usage_update',
   'session_info_update',
 ])
+
+/**
+ * Context occupancy carried by one raw `usage_update` frame, in the shape the
+ * session snapshots already use. A malformed frame is ignored (the last good
+ * sample stays on screen) instead of zeroing the meter.
+ */
+export function usageFromUpdate(update: Record<string, unknown>): SessionView['usage'] | undefined {
+  const used = update.used
+  const size = update.size
+  if (typeof used !== 'number' || !Number.isFinite(used)) return undefined
+  if (typeof size !== 'number' || !Number.isFinite(size)) return undefined
+  const cost = update.cost
+  if (cost !== null && typeof cost === 'object' && !Array.isArray(cost)) {
+    const row = cost as Record<string, unknown>
+    if (typeof row.amount === 'number' && Number.isFinite(row.amount)
+      && typeof row.currency === 'string' && row.currency !== '') {
+      return { used, size, cost: { amount: row.amount, currency: row.currency } }
+    }
+  }
+  return { used, size }
+}
+
+function sameUsage(left: SessionView['usage'], right: SessionView['usage']): boolean {
+  if (left === right) return true
+  if (left === undefined || right === undefined) return false
+  if (left.used !== right.used || left.size !== right.size) return false
+  const leftCost = left.cost
+  const rightCost = right.cost
+  if (leftCost === undefined || rightCost === undefined) return leftCost === rightCost
+  return leftCost.amount === rightCost.amount && leftCost.currency === rightCost.currency
+}
+
+/** Patch one session row's usage; other rows and an unchanged value keep their identities. */
+function withSessionUsage<T extends { sessionId: string; usage?: SessionView['usage'] }>(
+  rows: T[],
+  sessionId: string,
+  usage: SessionView['usage'],
+): T[] {
+  let changed = false
+  const next = rows.map(row => {
+    if (row.sessionId !== sessionId || sameUsage(row.usage, usage)) return row
+    changed = true
+    return { ...row, usage }
+  })
+  return changed ? next : rows
+}
+
+/** Last well-formed `usage_update` in one coalesced batch (later ticks win). */
+function usageOfBatch(items: ReadonlyArray<{ update: unknown }>): SessionView['usage'] | undefined {
+  let usage: SessionView['usage'] | undefined
+  for (const item of items) {
+    const update = item.update as Record<string, unknown>
+    if (update.sessionUpdate !== 'usage_update') continue
+    const parsed = usageFromUpdate(update)
+    if (parsed !== undefined) usage = parsed
+  }
+  return usage
+}
 
 function trimBlocks(blocks: Block[]): void {
   if (blocks.length > MAX_BLOCKS) blocks.splice(0, blocks.length - MAX_BLOCKS)

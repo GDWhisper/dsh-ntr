@@ -795,6 +795,15 @@ const STYLE = `
 .ntr-acp-chip.is-static:hover { background: var(--dsw-alias-bg-layer-2, #f3f4f6); }
 .ntr-acp-chip.is-active { border-color: var(--dsw-alias-state-business-primary, #2563eb); color: var(--dsw-alias-state-business-primary, #2563eb); background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 10%, transparent); }
 .ntr-acp-chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Composer context-occupancy ring (conversation.composer.dock,
+   context-meter.tsx): the agent's own prompt-side used/size in the host
+   ContextMeter's ring geometry, pill and tokens, so it reads as that meter's
+   sibling in the bottom info row. Gated inside the component; absent until the
+   agent reports a sample. */
+.ntr-acp-meter { display: inline-flex; align-items: center; gap: 6px; padding: 1px 8px; border-radius: 24px; color: var(--dsw-alias-label-tertiary, #9ca3af); font-family: inherit; font-size: var(--dsh-content-font-size-secondary, 13px); font-variant-numeric: tabular-nums; line-height: calc(20px + var(--dsh-content-font-delta-secondary, 0px)); white-space: nowrap; flex: none; }
+.ntr-acp-meter-track { fill: none; stroke: var(--dsw-alias-border-l3, #e5e7eb); stroke-width: 2px; }
+.ntr-acp-meter-fill { fill: none; stroke: var(--dsw-alias-label-tertiary, #9ca3af); stroke-width: 2px; stroke-linecap: round; }
+.ntr-acp-meter-percent { color: inherit; }
 /* The lock hand-off (src/client/agent-lock-anim.ts): the outgoing agent base
    breaks into debris for 460ms, then the edge tag condenses from the same
    particles. Both halves read one shared clock in that module; these durations

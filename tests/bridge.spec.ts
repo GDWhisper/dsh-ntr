@@ -4306,6 +4306,9 @@ describe('observed chat transcripts (isolated manager)', () => {
     const listed = await dispatchRpc(txManager, 'session/chat-list', { dshSessionId: 'dsh-tx-1' })
     if (!listed.ok) throw new Error('listing failed')
     expect((listed.value as { sessions: ChatSessionView[] }).sessions[0]?.agentTitle).toBe('Mock')
+    // The composer's occupancy ring reads the chat row, so the agent's own
+    // context sample must ride this answer — not only the transcript.
+    expect((listed.value as { sessions: ChatSessionView[] }).sessions[0]?.usage).toMatchObject({ used: 123, size: 1000 })
   }, 30_000)
 
   it('drops a closed session instead of serving a ghost transcript', async () => {

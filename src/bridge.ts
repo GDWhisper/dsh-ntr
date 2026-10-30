@@ -3567,6 +3567,7 @@ export class BridgeManager {
         ...(session.reasoningEffort === undefined ? {} : { reasoningEffort: session.reasoningEffort }),
         ...(session.modes === undefined ? {} : { modes: session.modes }),
         ...(session.availableCommands === undefined ? {} : { availableCommands: session.availableCommands }),
+        ...(session.usage === undefined ? {} : { usage: session.usage }),
         ...(session.released ? { released: true } : {}),
       })
     }

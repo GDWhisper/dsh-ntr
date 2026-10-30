@@ -543,6 +543,12 @@ export interface ChatSessionView {
    * agent can never see.
    */
   availableCommands?: SessionView['availableCommands']
+  /**
+   * Context occupancy the agent last reported (`usage_update`): prompt-side
+   * used/size, not request tokens. Absent until the agent reports one; the
+   * browser live-patches this row from the update frames (see AGENTS/ui.md).
+   */
+  usage?: SessionView['usage']
   /** The agent process died; the session awaits a `session/load` resume. */
   released?: boolean
 }
