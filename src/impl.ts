@@ -8,9 +8,9 @@
 import { randomUUID } from './ids.ts'
 import type {
   AcpAgentCatalog, AcpAgentDef, AcpCatalogOption, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpMcpServerDef, AcpPluginConfig, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult,
-  AgentView, ApprovalDeadlineKey, ApprovalDeadlinePatch, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, IdleReleaseSetPayload, PermissionOptionView, PermissionOutcome, PermissionTimeoutMode, PluginUpdateState, RpcResult,
+  AgentView, ApprovalDeadlineKey, ApprovalDeadlinePatch, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionOptionView, PermissionOutcome, PermissionTimeoutMode, PluginUpdateState, RpcResult,
 } from './protocol.ts'
-import { DEFAULT_TAG_HALO, IDLE_RELEASE_MINUTES } from './protocol.ts'
+import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_TAG_HALO, IDLE_RELEASE_MS } from './protocol.ts'
 
 export { randomUUID }
 
@@ -178,14 +178,14 @@ export function validateApprovalDeadlines(value: unknown): Partial<Record<Approv
 /**
  * Validate the idle-release window the settings page writes.
  *
- * The window is expressed in MINUTES on the shared ladder
- * ({@link IDLE_RELEASE_MINUTES}), so a value the slider can produce is
- * always a value the host runs — the same one-ladder rule the approval
- * deadline card follows.
+ * The window is expressed in MILLISECONDS on the shared ladder
+ * ({@link IDLE_RELEASE_MS}), so a value the slider can produce is always a
+ * value the host runs — the same one-ladder rule the approval deadline card
+ * follows.
  */
-export function validateIdleReleaseMinutes(raw: unknown, code: 'bad_config' | 'bad_payload'): number {
-  if (typeof raw !== 'number' || !Number.isInteger(raw) || !IDLE_RELEASE_MINUTES.includes(raw)) {
-    throw new AcpError(code, `acp: idle release minutes must be one of ${IDLE_RELEASE_MINUTES.join(', ')}`)
+export function validateIdleReleaseMs(raw: unknown, code: 'bad_config' | 'bad_payload'): number {
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || !IDLE_RELEASE_MS.includes(raw)) {
+    throw new AcpError(code, `acp: idleTimeoutMs must be one of ${IDLE_RELEASE_MS.join(', ')}`)
   }
   return raw
 }
@@ -538,6 +538,14 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
   // `abort` a zero window would refuse every ask on arrival — the agent stops
   // at every gate — so it becomes the shortest real wait.
   const effectivePermissionTimeoutMs = normalizeApprovalWindow(permissionTimeoutMode, permissionTimeoutMs)
+  // The chat-process idle-release window (the settings page edits it).
+  // Same shape as the per-agent field: 0 = never release, otherwise an
+  // integer number of milliseconds.
+  const idleTimeoutMs = value.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS
+  if (typeof idleTimeoutMs !== 'number' || !Number.isInteger(idleTimeoutMs)
+    || idleTimeoutMs > 86_400_000 || (idleTimeoutMs !== 0 && idleTimeoutMs < 1_000)) {
+    throw new AcpError('bad_config', 'acp: idleTimeoutMs must be 0 (never release) or an integer in [1000, 86400000]')
+  }
   const cancelFallbackMs = value.cancelFallbackMs ?? 15_000
   if (typeof cancelFallbackMs !== 'number' || !Number.isInteger(cancelFallbackMs) || cancelFallbackMs < 0 || cancelFallbackMs > 600_000) {
     throw new AcpError('bad_config', 'acp: cancelFallbackMs must be an integer in [0, 600000] (0 = disable the fallback)')
@@ -579,6 +587,7 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
     turnStallMs,
     turnStallToolMs,
     turnStallTickMs,
+    idleTimeoutMs,
   }
 }
 
@@ -1812,11 +1821,11 @@ export interface AcpManager {
    */
   idleRelease?(): AcpIdleRelease | undefined
   /**
-   * Write the idle-release window (in minutes), or drop the persisted
+   * Write the idle-release window (in ms), or drop the persisted
    * override with `reset` so the built-in default applies again. Applies to
    * the running bridges without a restart.
    */
-  setIdleRelease?(minutes: number | undefined, reset?: boolean): Promise<void>
+  setIdleRelease?(idleTimeoutMs: number | undefined, reset?: boolean): Promise<void>
   detectAgents?(): Promise<DetectedAgentInfo[]>
   saveAgent?(def: AcpAgentDef): Promise<void>
   deleteAgent?(agentId: string): Promise<void>
@@ -2183,6 +2192,16 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         }
         await manager.setApprovalDeadlines?.(patch, body.reset === true)
         return ok({ deadlines: manager.approvalDeadlines?.() })
+      }
+      case 'ui/idle-release':
+        // Absent on a host half from before the tab existed: the browser then
+        // renders nothing rather than a number it cannot trust.
+        return ok({ idleRelease: manager.idleRelease?.() })
+      case 'ui/idle-release-set': {
+        const reset = body.reset === true
+        const idleTimeoutMs = reset ? undefined : validateIdleReleaseMs(body.idleTimeoutMs, 'bad_payload')
+        await manager.setIdleRelease?.(idleTimeoutMs, reset)
+        return ok({ idleRelease: manager.idleRelease?.() })
       }
       case 'agent/set-exposed-models': {
         const agentId = str(body, 'agentId', 64)

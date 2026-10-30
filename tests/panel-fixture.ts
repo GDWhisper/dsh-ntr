@@ -11,7 +11,9 @@ import type {
   AgentSavePayload,
   AgentView,
   ApprovalDeadlinesSetPayload,
+  AcpIdleRelease,
   DetectedAgentInfo,
+  IdleReleaseResult,
   PermissionOutcome,
   PluginUpdateState,
   TagHaloSetPayload,
@@ -33,6 +35,8 @@ export interface PanelFixtureOptions {
   defaultAgentId?: string | null
   /** null simulates an older host without the approval RPC. */
   approvalDeadlines?: AcpApprovalDeadlines | null
+  /** null simulates an older host without the idle-release RPC. */
+  idleRelease?: AcpIdleRelease | null
   preset?: AcpPresetStatus | null
   /** null simulates an older host without the version endpoint. */
   pluginVersion?: string | null
@@ -122,6 +126,10 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
   })
   const initialDeadlines = structuredClone<AcpApprovalDeadlines>(options.approvalDeadlines ?? { mode: 'wait', permissionTimeoutMs: 300_000 })
   let deadlineMode = initialDeadlines.mode
+  const initialIdleRelease = options.idleRelease === null || options.idleRelease === undefined
+    ? { idleTimeoutMs: 1_800_000, defaultIdleTimeoutMs: 1_800_000 }
+    : structuredClone(options.idleRelease)
+  let idleRelease: AcpIdleRelease = structuredClone(initialIdleRelease)
   let deadlineWindow = initialDeadlines.permissionTimeoutMs
   let pluginUpdate = options.pluginUpdate === null
     ? null
@@ -293,6 +301,16 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
             deadlineWindow = patch.permissionTimeoutMs ?? deadlineWindow
           }
           return ok({ deadlines: approvalDeadlines() })
+        }
+        case 'ui/idle-release':
+          return options.idleRelease === null ? unsupported() : ok({ idleRelease })
+        case 'ui/idle-release-set': {
+          if (options.idleRelease === null) return unsupported()
+          const payload = payload as { idleTimeoutMs?: number; reset?: boolean }
+          idleRelease = payload.reset === true
+            ? { ...initialIdleRelease }
+            : { ...idleRelease, idleTimeoutMs: payload.idleTimeoutMs ?? idleRelease.idleTimeoutMs }
+          return ok({ idleRelease })
         }
         case 'permission/respond': {
           const { requestId, optionId } = payload as { requestId: string; optionId?: string }

@@ -91,6 +91,7 @@ export function apply(ctx: Context, config?: unknown): void {
       turnStallMs: resolved.turnStallMs,
       turnStallToolMs: resolved.turnStallToolMs,
       turnStallTickMs: resolved.turnStallTickMs,
+      idleTimeoutMs: resolved.idleTimeoutMs,
     },
   )
   const adapter = new AcpLlmAdapter(manager)
@@ -126,6 +127,13 @@ export function apply(ctx: Context, config?: unknown): void {
     ? rawConfig.permissionTimeoutMode
     : undefined
   manager.setConfiguredApprovalDeadlines(configuredDeadlines, configuredMode)
+
+  // The idle-release baseline the settings page's pick outranks. Only the
+  // raw value counts: `validateConfig` fills a default in, so the
+  // validated number cannot tell "the file says 10 minutes" from
+  // "the file says nothing, so 30 minutes applies".
+  const configuredIdleTimeoutMs = typeof rawConfig.idleTimeoutMs === 'number' ? rawConfig.idleTimeoutMs : undefined
+  manager.setConfiguredIdleRelease(configuredIdleTimeoutMs)
   // Boot hook kept only so this entry point's shape does not change:
   // `bootstrapCatalogs` is intentionally empty — boot never spawns an agent,
   // in any environment and for any `probeModelsOnBoot` value. Catalogs fill

@@ -6,7 +6,7 @@
  * Deliberately framework-free: React binds through `useSyncExternalStore`.
  */
 
-import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSavePayload, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, PermissionTimeoutMode, PluginUpdateState, PluginVersionResult, SessionView } from '../protocol.ts'
+import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSavePayload, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, IdleReleaseResult, IdleReleaseSetPayload, PermissionTimeoutMode, PluginUpdateState, PluginVersionResult, SessionView } from '../protocol.ts'
 import { DEFAULT_TAG_HALO } from '../protocol.ts'
 
 /** One slash command the ACP agent declared, whole row (the menu draws name, description and `input.hint`). */
@@ -236,6 +236,12 @@ export interface UiState {
    * host answer (returned by the same route) is the authority.
    */
   approvalDeadlines?: AcpApprovalDeadlines
+  /**
+   * The idle-release window in force, as the settings page edits it.
+   * Absent on a host half from before the tab existed, which hides the
+   * tab rather than showing a number this browser invented.
+   */
+  idleRelease?: AcpIdleRelease
   /**
    * Per-chat-session "does this conversation run the ACP preset" verdicts, as
    * reported by `session/chat-list` (host-read from the session log). The
@@ -638,6 +644,7 @@ export class AcpStore {
     chatSessions: [],
     tagHalo: { ...DEFAULT_TAG_HALO },
     approvalDeadlines: undefined,
+    idleRelease: undefined,
     chatTranscripts: {},
     acpMode: {},
     chatBoundAgent: {},
@@ -890,7 +897,7 @@ export class AcpStore {
   /** Snapshot refresh used on panel open and after a stream outage. */
   async resync(): Promise<void> {
     try {
-      const [{ agents }, { sessions }, defaultAgentInfo, detectResult, presetResult, tagHaloResult, deadlinesResult, versionResult] = await Promise.all([
+      const [{ agents }, { sessions }, defaultAgentInfo, detectResult, presetResult, tagHaloResult, deadlinesResult, idleReleaseResult, versionResult] = await Promise.all([
         this.call<{ agents: AgentView[] }>('agents/list'),
         this.call<{ sessions: SessionView[] }>('sessions/list'),
         // The plugin's OWN default ACP agent — a plugin-private id, not a DSH
@@ -904,6 +911,9 @@ export class AcpStore {
         // `undefined` (older half) hides the deadline card instead of showing a
         // number this browser made up.
         this.call<ApprovalDeadlinesResult>('ui/approval-deadlines').catch(() => ({ deadlines: undefined })),
+        // `undefined` (older half) hides the tab instead of showing a
+        // number this browser made up.
+        this.call<IdleReleaseResult>('ui/idle-release').catch(() => ({ idleRelease: undefined })),
         // The settings badge's data source; older halves answer `unknown
         // endpoint`, which hides the badge.
         this.call<PluginVersionResult>('plugin/version').catch(() => null),
@@ -921,6 +931,7 @@ export class AcpStore {
         preset: presetResult?.preset ?? undefined,
         tagHalo: tagHaloResult?.halo ?? { ...DEFAULT_TAG_HALO },
         approvalDeadlines: deadlinesResult.deadlines,
+        idleRelease: idleReleaseResult.idleRelease,
         pluginVersion: versionResult?.version !== undefined && versionResult.version !== '' ? versionResult.version : undefined,
       })
       // `sessions/list` is the `/acp` RPC face; the composer's chat rows
@@ -1851,6 +1862,36 @@ export class AcpStore {
   /** Drop the persisted override: the config file (or the built-in default) decides again. */
   async resetApprovalDeadlines(): Promise<void> {
     await this.writeApprovalDeadlines({ reset: true })
+  }
+
+  /**
+   * Write the idle-release window (in ms).
+   *
+   * The host answer — the same route returns the window now in force — is
+   * the authority, so an optimistic write that the host trims self-corrects
+   * instead of drifting from what runs.
+   */
+  async setIdleRelease(idleTimeoutMs: number): Promise<void> {
+    await this.writeIdleRelease({ idleTimeoutMs })
+  }
+
+  /**
+   * Drop the persisted override: the config file (or the built-in default)
+   * decides again.
+   */
+  async resetIdleRelease(): Promise<void> {
+    await this.writeIdleRelease({ reset: true })
+  }
+
+  private async writeIdleRelease(payload: IdleReleaseSetPayload): Promise<void> {
+    const previous = this.state.idleRelease
+    try {
+      const result = await this.call<IdleReleaseResult>('ui/idle-release-set', payload)
+      this.mutate({ idleRelease: result.idleRelease })
+    } catch (error) {
+      this.mutate({ idleRelease: previous })
+      this.flashError(error)
+    }
   }
 
   private async writeApprovalDeadlines(payload: ApprovalDeadlinesSetPayload): Promise<void> {

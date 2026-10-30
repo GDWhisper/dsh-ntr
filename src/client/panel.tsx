@@ -19,6 +19,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { formatCommandLine, isAbsolutePathLike, splitCommandLine } from './acp-ui.tsx'
 import { DEFAULT_KNOWN_PRESETS, LOG_MAX_ENTRIES } from './store.ts'
 import type { AcpStore, UiState } from './store.ts'
+import { IDLE_RELEASE_MS } from '../protocol.ts'
 import type { AcpAgentDef, AcpApprovalDeadlines, AcpCatalogChoice, AcpMcpServerDef, AgentSavePayload, AgentView, DetectedAgentInfo, PermissionTimeoutMode, PluginUpdateState } from '../protocol.ts'
 
 interface WithStore { acp: AcpStore }
@@ -456,20 +457,14 @@ function partitionAgents(
  * def (env / npmPackage / exposedModels included); the synthesized fallback
  * covers only the fields an `AgentView` carries, so anything else compares as
  * "changed" — the honest answer when the host never reported it.
+ *
+ * The idle-release field is compared AS STORED: an absent per-agent field
+ * means "follow the global window", and the host's resolved value must not be
+ * written back into it — that would freeze the global window into this agent's
+ * definition and the global slider would then never reach it.
  */
-/**
- * The idle-release window in effect for an agent: an unset per-agent field is
- * resolved by the HOST and reported back on `AgentView`, so filling it from
- * there keeps "unset" and "explicitly the host default" the same state —
- * merely opening the form must never read as an unsaved change.
- */
-function resolvedIdleTimeoutMs(def: AcpAgentDef, activeAgent: AgentView | undefined): AcpAgentDef {
-  if (def.idleTimeoutMs !== undefined || activeAgent?.idleTimeoutMs === undefined) return def
-  return { ...def, idleTimeoutMs: activeAgent.idleTimeoutMs }
-}
-
 function persistedDef(detected: DetectedAgentInfo, activeAgent: AgentView | undefined): AcpAgentDef | undefined {
-  if (detected.currentConfig !== undefined) return resolvedIdleTimeoutMs(detected.currentConfig, activeAgent)
+  if (detected.currentConfig !== undefined) return detected.currentConfig
   if (activeAgent === undefined) return undefined
   return {
     id: activeAgent.id,
@@ -479,7 +474,6 @@ function persistedDef(detected: DetectedAgentInfo, activeAgent: AgentView | unde
     ...(activeAgent.cwd === undefined ? {} : { cwd: activeAgent.cwd }),
     allowedCwdRoots: [...activeAgent.allowedCwdRoots],
     env: {},
-    ...(activeAgent.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: activeAgent.idleTimeoutMs }),
   }
 }
 
@@ -501,9 +495,10 @@ export function payloadEquals(payload: AgentSavePayload, current: AcpAgentDef): 
   if (exposureKey(payload.exposedModels) !== exposureKey(current.exposedModels)) return false
   if (mcpKey(payload.mcpServers) !== mcpKey(current.mcpServers)) return false
   if ((payload.autoDiscoverModels !== false) !== (current.autoDiscoverModels !== false)) return false
-  // An absent field means "use the host default" — which is what `current`
-  // already resolved to (see `resolvedIdleTimeoutMs`), so it is not a change.
-  if (payload.idleTimeoutMs !== undefined && payload.idleTimeoutMs !== current.idleTimeoutMs) return false
+  // The per-agent OVERRIDE, compared as stored: an absent field on both sides
+  // means "follow the global window" and is not a change; a field on one
+  // side only means the user is adding or dropping an override.
+  if (payload.idleTimeoutMs !== current.idleTimeoutMs) return false
   return true
 }
 
@@ -877,7 +872,132 @@ function ApprovalDeadlinesCard(props: { acp: AcpStore; ui: UiState }) {
   )
 }
 
-type SettingsPage = 'agents' | 'add' | 'approvals' | 'appearance' | 'logs' | 'diagnostics'
+/**
+ * The idle-release window, as the settings page edits it.
+ *
+ * ONE control, because there is ONE window: how long a chat process may sit
+ * idle before it is parked. The slider snaps to the shared ladder
+ * ({@link IDLE_RELEASE_MS}), so every rung it offers is a window the host can
+ * run.
+ *
+ * The card reports the deployment baseline as the fact being overridden, and
+ * offers a reset ONLY when something is really overridden — the same rule the
+ * approval deadline card follows.
+ */
+function IdleReleaseCard(props: { acp: AcpStore; ui: UiState }) {
+  const { acp, ui } = props
+  const release = ui.idleRelease
+  // Older host half: no card rather than a number this browser invented.
+  if (release === undefined) return null
+  // The value a RESET returns to: the window `cordis.patch.yml` names, else
+  // the built-in default. The same split the approval card keeps — the
+  // reset must restore what the deployment asked for, not a constant.
+  const baseline = release.defaultIdleTimeoutMs
+  // A reset is only honest when something is actually being overridden.
+  const overridden = release.idleTimeoutMs !== baseline
+  // A window the deployment named that is not on the ladder still runs as
+  // configured: the thumb parks on the nearest rung and the readout prints the
+  // exact number, so the card never lies about what is in force.
+  const index = IDLE_RELEASE_MS.indexOf(release.idleTimeoutMs)
+  const exact = index >= 0
+  const shown = exact ? release.idleTimeoutMs : nearestIdleRung(release.idleTimeoutMs)
+  // The config file's window is worth saying only when it is being
+  // outranked — otherwise it IS what runs, and saying "the value set here
+  // wins" would name a win nobody claimed.
+  const note = release.configuredIdleTimeoutMs === undefined
+    || release.configuredIdleTimeoutMs === release.idleTimeoutMs
+    ? undefined
+    : acp.label(
+      `配置文件（cordis.patch.yml）设为 ${idleWindowText(release.configuredIdleTimeoutMs, acp)}，此处设置优先。`,
+      `The config file (cordis.patch.yml) asks for ${idleWindowText(release.configuredIdleTimeoutMs, acp)}; the value set here wins.`,
+    )
+  const resetLabel = release.configuredIdleTimeoutMs === undefined
+    ? acp.label('恢复默认值', 'Restore default')
+    : acp.label('恢复配置文件的值', 'Use config file value')
+  return (
+    <section className="dwa-section">
+      <div className="dwa-section-heading">
+        <div>
+          <h3 className="dwa-section-title">{acp.label('空闲释放', 'Idle release')}</h3>
+          <p className="dwa-section-copy">
+            {acp.label('空闲多久后挂起聊天进程。', 'How long an idle chat process is kept before it is parked.')}
+          </p>
+        </div>
+      </div>
+      <div className="dwa-preferences">
+        <div className="dwa-preference-block">
+          <div className="dwa-preference-label">{acp.label('释放窗口', 'Release window')}</div>
+          <div className="dwa-deadline-value">{idleWindowText(release.idleTimeoutMs, acp)}</div>
+          <input
+            className="dwa-deadline-range"
+            type="range"
+            min={0}
+            max={IDLE_RELEASE_MS.length - 1}
+            step={1}
+            value={exact ? index : IDLE_RELEASE_MS.indexOf(shown)}
+            aria-label={acp.label('释放窗口', 'Release window')}
+            onChange={event => {
+              const next = IDLE_RELEASE_MS[Number(event.target.value)]
+              if (next !== undefined && next !== release.idleTimeoutMs) void acp.setIdleRelease(next)
+            }}
+          />
+          <div className="dwa-deadline-ticks">
+            {IDLE_RELEASE_MS.filter((_, i) => i % 2 === 0).map(ms => (
+              <span key={ms}>{idleWindowText(ms, acp)}</span>
+            ))}
+          </div>
+          <div className="dwa-preference-copy">
+            {acp.label(
+              '挂起后会话仍保留，下一条消息自动恢复。',
+              'A parked session is kept; the next message resumes it.',
+            )}
+          </div>
+          {note !== undefined && <div className="dwa-deadline-flag">⚠ {note}</div>}
+        </div>
+        {overridden && (
+          <div className="dwa-deadline-reset">
+            <button type="button" className="dwa-btn dwa-btn-secondary" onClick={() => void acp.resetIdleRelease()}>
+              {resetLabel}
+            </button>
+          </div>
+        )}
+      </div>
+    </section>
+  )
+}
+
+/**
+ * The rung nearest a window that is not on the ladder — used only to park the
+ * thumb; the readout always prints the exact value.
+ */
+function nearestIdleRung(ms: number): number {
+  let best = IDLE_RELEASE_MS[0]
+  let bestDistance = Number.POSITIVE_INFINITY
+  for (const rung of IDLE_RELEASE_MS) {
+    const distance = Math.abs(rung - ms)
+    if (distance < bestDistance) {
+      bestDistance = distance
+      best = rung
+    }
+  }
+  return best
+}
+
+/**
+ * `30 分钟` — the readout and the tick label, one formatter.
+ *
+ * ALWAYS minutes, even at the top of the ladder: a scale that runs "1 分钟"
+ * to "50 分钟" and then "1 小时" reads as two different scales.
+ */
+function idleWindowText(ms: number, acp: AcpStore): string {
+  // 0 is the deployment's way of saying "never release", and reading it as
+  // "0 分钟" would say the opposite.
+  if (ms <= 0) return acp.label('永不释放', 'Never')
+  const minutes = Math.round(ms / 60_000)
+  return acp.label(`${String(minutes)} 分钟`, `${String(minutes)}m`)
+}
+
+type SettingsPage = 'agents' | 'add' | 'approvals' | 'processes' | 'appearance' | 'logs' | 'diagnostics'
 
 /**
  * Local wall-clock `HH:MM:SS` for one runtime-log line. Hand-built on purpose:
@@ -1181,6 +1301,7 @@ export function AcpSettingsSection(props: WithStore) {
       <nav className="dwa-tabs" aria-label={acp.label('NTR 设置分类', 'NTR settings categories')}>
         <button type="button" aria-pressed={page === 'agents'} onClick={() => setPage('agents')}>{acp.label('智能体', 'Agents')}</button>
         {ui.approvalDeadlines !== undefined && <button type="button" aria-pressed={page === 'approvals'} onClick={() => setPage('approvals')}>{acp.label('审批时限', 'Approval deadlines')}</button>}
+        {ui.idleRelease !== undefined && <button type="button" aria-pressed={page === 'processes'} onClick={() => setPage('processes')}>{acp.label('进程管理', 'Processes')}</button>}
         <button type="button" aria-pressed={page === 'appearance'} onClick={() => setPage('appearance')}>{acp.label('对话外观', 'Appearance')}</button>
         <button type="button" aria-pressed={page === 'logs'} onClick={() => setPage('logs')}>
           {acp.label('日志', 'Logs')}
@@ -1317,6 +1438,7 @@ export function AcpSettingsSection(props: WithStore) {
       </section>
 
       <div hidden={page !== 'approvals'}><ApprovalDeadlinesCard acp={acp} ui={ui} /></div>
+      <div hidden={page !== 'processes'}><IdleReleaseCard acp={acp} ui={ui} /></div>
 
       <section className="dwa-section" hidden={page !== 'appearance'} aria-label={acp.label('对话外观', 'Appearance')}>
         <div className="dwa-section-heading">
@@ -1684,14 +1806,6 @@ interface AgentForm {
 }
 
 /**
- * Hand copy of `DEFAULT_TUNING.idleTimeoutMs` (src/bridge.ts): the browser
- * cannot import the host plane, and this number is only ever placeholder text
- * for a NOT-yet-configured agent (a configured one renders the host's resolved
- * value from `AgentView.idleTimeoutMs`). Keep the two in sync.
- */
-const DEFAULT_IDLE_RELEASE_MS = 1_800_000
-
-/**
  * Hand copy of `DEFAULT_TUNING.probeIdleTimeoutMs` (src/bridge.ts). A process
  * that has never hosted a session — the model probe / post-save probe — lives
  * by THIS window whatever the agent's own field says, so the placeholder has to
@@ -1719,8 +1833,11 @@ export function initialForm(detected: DetectedAgentInfo, activeAgent: AgentView 
     envRows: Object.entries(config?.env ?? {}).map(([key, value]) => ({ key, value })),
     exposed: config?.exposedModels === undefined ? undefined : [...config.exposedModels],
     autoDiscoverModels: config?.autoDiscoverModels !== false,
-    // Prefer the host's resolved value: it is the one actually in effect.
-    idleStr: idleText(activeAgent?.idleTimeoutMs ?? config?.idleTimeoutMs),
+    // The agent's OWN override only. The host's resolved value is NOT
+    // written back here: it would freeze the global window into this
+    // agent's definition, and the global slider would then never reach it.
+    // An empty field means "follow the global window".
+    idleStr: idleText(config?.idleTimeoutMs),
     // The MCP list comes back from the host in its NORMALIZED shape (defaults
     // filled in), so re-serializing it reproduces exactly what is stored —
     // that is what keeps the card from being permanently dirty.
@@ -1963,24 +2080,24 @@ function AgentDetails({
         </div>
       </div>
 
-      {/* Idle release: scoped to agents with NO live session (see
-          AgentBridge.releaseIfIdle), so it reclaims the processes that the
-          model probe / post-save probe leave behind without ever costing a
-          chat a cold start. TWO windows exist (AgentBridge.currentIdleTimeoutMs):
-          this field is the chat window of a process that HAS hosted a session;
-          a never-used process (a probe) always gets the short probe window and
-          ignores this field — which is why the copy below names both. */}
+      {/* Idle release: an OVERRIDE of the global window (「进程管理」). Empty
+          means "follow the global window", so the global slider reaches every
+          agent that does not pin its own. TWO windows exist
+          (AgentBridge.currentIdleTimeoutMs): this field is the chat window of
+          a process that HAS hosted a session; a never-used process (a probe)
+          always gets the short probe window and ignores this field — which is
+          why the copy below names both. */}
       <div className="dwa-form-row">
         <div className="dwa-form-col">
-          <label className="dwa-form-label">{acp.label('空闲释放（毫秒）', 'Idle Release (ms)')}</label>
+          <label className="dwa-form-label">{acp.label('空闲释放覆盖（毫秒）', 'Idle Release Override (ms)')}</label>
           <input
             className="dwa-input dwa-input-mono"
-            aria-label={acp.label('空闲释放（毫秒）', 'Idle Release (ms)')}
+            aria-label={acp.label('空闲释放覆盖（毫秒）', 'Idle Release Override (ms)')}
             value={form.idleStr}
             onChange={e => patch({ idleStr: e.target.value })}
             placeholder={acp.label(
-              `留空 = 宿主默认（承载会话 ${String(DEFAULT_IDLE_RELEASE_MS / 60_000)} 分钟 / 探测进程 ${String(DEFAULT_PROBE_RELEASE_MS / 60_000)} 分钟）`,
-              `Blank = host default (${String(DEFAULT_IDLE_RELEASE_MS / 60_000)} min for a chat process / ${String(DEFAULT_PROBE_RELEASE_MS / 60_000)} min for a probe)`,
+              `留空 = 跟随全局设置（探测进程固定 ${String(DEFAULT_PROBE_RELEASE_MS / 60_000)} 分钟）`,
+              `Blank = follow the global setting (probes always release after ${String(DEFAULT_PROBE_RELEASE_MS / 60_000)} min)`,
             )}
           />
           <span className={idleInvalid ? 'dwa-error' : 'dwa-hint'}>
@@ -1992,8 +2109,8 @@ function AgentDetails({
               : (
                 <>
                   {acp.label(
-                    '承载过会话的进程空闲后挂起；0 不释放，探测进程固定 5 分钟。',
-                    'Park idle chat processes; 0 keeps them alive. Probe processes always release after 5 minutes.',
+                    '仅覆盖此智能体；留空即跟随「进程管理」的全局设置。',
+                    'Overrides this agent only; leave blank to follow the global setting in “Processes”.',
                   )}
                 </>
               )}

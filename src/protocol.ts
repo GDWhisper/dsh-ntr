@@ -188,6 +188,18 @@ export interface AcpPluginConfig {
    */
   permissionTimeoutMs?: number
   /**
+   * How long a chat process may sit idle before it is released (parked, then
+   * resumed by the next message). In MILLISECONDS; default 1800000 (30 min).
+   *
+   * This is the HOST DEFAULT: an agent that names its own
+   * {@link AcpAgentDef.idleTimeoutMs} keeps its own. Editable from the
+   * settings page (「进程管理」 → `ui/idle-release-set`), which persists an
+   * override in the plugin's own state file and applies it to the running
+   * bridges without restarting anything; the value here is the deployment
+   * baseline that override falls back to. See {@link AcpIdleRelease}.
+   */
+  idleTimeoutMs?: number
+  /**
    * LEGACY: the old conversation-route window, kept so an existing
    * `cordis.patch.yml` still says what it meant. Folded into
    * {@link AcpPluginConfig.permissionTimeoutMs} when that key is absent, and
@@ -683,14 +695,25 @@ export interface TagHaloSetPayload { halo: AcpTagHalo }
 export type ApprovalDeadlineKey = 'permissionTimeoutMs'
 
 /**
- * The idle-release windows the settings page offers, in MINUTES.
+ * The idle-release windows the settings page offers, in MILLISECONDS.
  *
  * ONE ladder, shared by both halves: the browser snaps its slider to these
  * values and the host accepts only these values, so a window the slider can
  * produce is always a window the host runs. The first rung is 1 minute (an
  * aggressive release), the rest are 5-minute steps up to an hour.
  */
-export const IDLE_RELEASE_MINUTES: readonly number[] = [1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60]
+export const IDLE_RELEASE_MS: readonly number[] = [
+  60_000, 300_000, 600_000, 900_000, 1_200_000, 1_500_000, 1_800_000, 2_100_000, 2_400_000, 2_700_000, 3_000_000, 3_300_000, 3_600_000,
+]
+
+/**
+ * The built-in idle-release window for chat processes: 30 minutes.
+ *
+ * Lives beside the ladder it is a rung of, so the two cannot drift: a
+ * deployment that names no window of its own runs this, and the settings
+ * page's reset returns to it.
+ */
+export const DEFAULT_IDLE_TIMEOUT_MS = 1_800_000
 
 /**
  * The idle-release window for chat processes, as the settings page edits it.
@@ -703,8 +726,17 @@ export const IDLE_RELEASE_MINUTES: readonly number[] = [1, 5, 10, 15, 20, 25, 30
 export interface AcpIdleRelease {
   /** The window in force, in ms. */
   idleTimeoutMs: number
-  /** The built-in default (30 minutes) that a reset returns to, in ms. */
+  /**
+   * The window a RESET returns to: the deployment baseline when the config
+   * file names one, else the built-in default (30 minutes).
+   */
   defaultIdleTimeoutMs: number
+  /**
+   * The window `cordis.patch.yml` names, when it names one. Reported only
+   * when the file actually names one: the settings card must not say "the
+   * file asks for 30 minutes" about a file that says nothing.
+   */
+  configuredIdleTimeoutMs?: number
 }
 /** `ui/idle-release`: read the idle-release window in force. */
 export type IdleReleaseResult = { idleRelease?: AcpIdleRelease }

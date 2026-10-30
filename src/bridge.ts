@@ -71,9 +71,9 @@ import type {
 import type {
   AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpMcpServerDef, AcpPresetStatus, AcpReleaseCause, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
   LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo,
-  ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PluginUpdateState, PreparedAdapterCall, SessionView, StreamChunk,
+  AcpIdleRelease, ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PluginUpdateState, PreparedAdapterCall, SessionView, StreamChunk,
 } from './protocol.ts'
-import { DEFAULT_TAG_HALO } from './protocol.ts'
+import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_TAG_HALO, IDLE_RELEASE_MS } from './protocol.ts'
 import { UpdateService } from './update.ts'
 
 /**
@@ -424,7 +424,7 @@ const DEFAULT_TUNING: Required<BridgeTuning> = {
   turnStallMs: 600_000,
   turnStallToolMs: 1_800_000,
   turnStallTickMs: 30_000,
-  idleTimeoutMs: 1_800_000,
+  idleTimeoutMs: DEFAULT_IDLE_TIMEOUT_MS,
   probeIdleTimeoutMs: 300_000,
 }
 
@@ -462,7 +462,7 @@ export class AgentBridge {
   private readonly staleCancelRetryDelayMs: number
   private readonly staleCancelMaxRetries: number
   private readonly turnSettleMs: number
-  private readonly defaultIdleTimeoutMs: number
+  private defaultIdleTimeoutMs: number
   private readonly probeIdleTimeoutMs: number
   /** Armed while READY; fires the idle-release check. */
   private idleTimer?: ReturnType<typeof setTimeout>
@@ -564,6 +564,24 @@ export class AgentBridge {
     // (不等待 under `abort`): floor it, so the ask waits instead of refusing
     // on arrival.
     this.permissionTimeoutMs = normalizeApprovalWindow(this.permissionTimeoutMode, this.permissionTimeoutMs)
+  }
+
+  /**
+   * Adopt a rewritten host-default idle window (the settings page's write).
+   *
+   * Only the DEFAULT moves: an agent that names its own `idleTimeoutMs` keeps
+   * it (that promise is about the agent, not about the deployment), and a
+   * probe-only child keeps the short probe window.
+   *
+   * The timer is re-armed so the new window governs from NOW: an already
+   * armed timer still holds the old window, so a shortened window would not
+   * take effect until the old one elapsed.
+   */
+  applyIdleRelease(defaultIdleTimeoutMs: number): void {
+    if (this.defaultIdleTimeoutMs === defaultIdleTimeoutMs) return
+    this.defaultIdleTimeoutMs = defaultIdleTimeoutMs
+    this.clearIdleTimer()
+    this.touch()
   }
 
   /**
@@ -3329,6 +3347,29 @@ export class BridgeManager {
    */
   private deadlineOverride: ApprovalDeadlinePatch = {}
   /**
+   * The idle-release window the settings page picked, in ms, persisted
+   * with the agent registry. `undefined` means the deployment baseline runs.
+   *
+   * Merged OVER {@link baselineIdleTimeoutMs} exactly like
+   * {@link deadlineOverride} over {@link baselineDeadline}: a UI pick is what
+   * runs, and `cordis.patch.yml` becomes the value the reset button returns
+   * to. Without this split the two sources would fight with no way to tell
+   * which one is live.
+   */
+  private idleReleaseOverride?: number
+  /**
+   * The window `cordis.patch.yml` names, when it names one. Kept apart
+   * from the override for the same reason the deadline keeps its baseline
+   * apart: the settings card has to be able to say "the file asks for
+   * 10 minutes, the value set here wins".
+   */
+  private configuredIdleTimeoutMs?: number
+  /**
+   * The idle-release window before any override — the tuning this manager was
+   * constructed with (the deployment baseline, or the built-in 30 minutes).
+   */
+  private baselineIdleTimeoutMs: number
+  /**
    * Tuning in force, defaults applied. The approval deadline is rewritten
    * IN PLACE by {@link applyDeadlineTuning}, which is why this is a live object
    * rather than the constructor's parameter: every bridge built afterwards
@@ -3489,6 +3530,7 @@ export class BridgeManager {
     // it. Everything else in `tuning` is fixed for the manager's lifetime, so
     // only this needs a snapshot.
     this.baselineDeadline = this.tuning.permissionTimeoutMs
+    this.baselineIdleTimeoutMs = this.tuning.idleTimeoutMs
     this.baselineMode = this.tuning.permissionTimeoutMode
     for (const def of defs) {
       this.defsMap.set(def.id, def)
@@ -3505,6 +3547,10 @@ export class BridgeManager {
     // A persisted deadline override must reach the tuning the bridges are built
     // from, not just the settings card's readout.
     this.applyDeadlineTuning()
+    // The same for the idle-release window: a persisted override must
+    // reach the tuning the bridges are built from, not just the
+    // settings card's readout.
+    this.applyIdleReleaseTuning()
     // The request-path rewrite falls back to this default for a conversation
     // the user never bound explicitly — the same agent the composer chip shows.
     routeBindingRegistry().defaultModel = this.defaultAgent()
@@ -4423,6 +4469,19 @@ export class BridgeManager {
         } catch {
           this.deadlineOverride = {}
         }
+        // The settings page's idle-release pick. Re-validated on every boot
+        // because the state file is user- and version-editable: an
+        // unreadable value must not poison the window, and a value the
+        // validator accepts must be the value that runs.
+        try {
+          const raw = (parsed as { idleRelease?: unknown }).idleRelease
+          const value = (raw as { idleTimeoutMs?: unknown } | undefined)?.idleTimeoutMs
+          this.idleReleaseOverride = typeof value === 'number' && IDLE_RELEASE_MS.includes(value)
+            ? value
+            : undefined
+        } catch {
+          this.idleReleaseOverride = undefined
+        }
         this.loadPersistedChoices((parsed as { conversations?: unknown }).conversations)
         this.loadPersistedChatSessions((parsed as { chatSessions?: unknown }).chatSessions)
       }
@@ -4488,6 +4547,11 @@ export class BridgeManager {
         ...(Object.keys(this.deadlineOverride).length === 0
           ? {}
           : { approvalDeadlines: { ...this.deadlineOverride } }),
+        // The settings page's idle-release pick. Absent while none was
+        // ever written, so a fresh deployment's state file stays as it was.
+        ...(this.idleReleaseOverride === undefined
+          ? {}
+          : { idleRelease: { idleTimeoutMs: this.idleReleaseOverride } }),
         // The per-conversation picks: agent + model + thought level + mode +
         // extra config values chosen in the composer, including for
         // conversations with no live session yet.
@@ -5592,6 +5656,23 @@ export class BridgeManager {
   }
 
   /**
+   * Declare the deployment baseline for the idle-release window — the value
+   * `cordis.patch.yml` names, passed RAW (only when it names one).
+   *
+   * Kept separate from the validated tuning for the same reason the
+   * deadline keeps its baseline apart: "the file says 10 minutes" and
+   * "the file says nothing, so 30 minutes applies" are different facts.
+   * The first is the reset target and shows as the fact being overridden;
+   * the second is a built-in default. Called once by the host entry,
+   * before any bridge exists.
+   */
+  setConfiguredIdleRelease(idleTimeoutMs: number | undefined): void {
+    this.configuredIdleTimeoutMs = idleTimeoutMs
+    if (idleTimeoutMs !== undefined) this.baselineIdleTimeoutMs = idleTimeoutMs
+    this.applyIdleReleaseTuning()
+  }
+
+  /**
    * Declare the deployment baseline for the approval deadline — the values
    * `cordis.patch.yml` names, passed RAW (only the keys it actually contains).
    *
@@ -5635,6 +5716,58 @@ export class BridgeManager {
     if (Object.keys(this.configuredDeadlines).length > 0) deadlines.configured = { ...this.configuredDeadlines }
     if (this.configuredMode !== undefined) deadlines.configuredMode = this.configuredMode
     return deadlines
+  }
+
+  /**
+   * The idle-release window in force, plus the facts that explain a value the
+   * user did not pick: the deployment baseline an override is outranking.
+   *
+   * `defaultIdleTimeoutMs` is the window a RESET returns to — the deployment
+   * baseline when the config file names one, else the built-in default. It is
+   * NOT a hardcoded constant: a deployment that names 10 minutes must reset
+   * to 10 minutes, not to the built-in 30.
+   *
+   * The config file's own number is reported only when the file names one, so
+   * the settings card can stay silent about a plain default.
+   */
+  idleRelease(): AcpIdleRelease {
+    const release: AcpIdleRelease = {
+      idleTimeoutMs: this.idleTimeoutMs(),
+      defaultIdleTimeoutMs: this.baselineIdleTimeoutMs,
+    }
+    if (this.configuredIdleTimeoutMs !== undefined) release.configuredIdleTimeoutMs = this.configuredIdleTimeoutMs
+    return release
+  }
+
+  /**
+   * Write the idle-release window, or drop the persisted override with
+   * `reset` so the deployment baseline applies again.
+   *
+   * HOT: the rewrite reaches every live bridge, so a user changing the window
+   * never has to kill a running session to see it take effect.
+   */
+  async setIdleRelease(idleTimeoutMs: number | undefined, reset = false): Promise<void> {
+    this.idleReleaseOverride = reset ? undefined : idleTimeoutMs
+    this.applyIdleReleaseTuning()
+    this.persistAgents()
+  }
+
+  /**
+   * Recompute the idle-release window from override → deployment baseline, and
+   * push the result to every live bridge.
+   */
+  private applyIdleReleaseTuning(): void {
+    const window = this.idleTimeoutMs()
+    this.tuning.idleTimeoutMs = window
+    for (const bridge of this.bridges.values()) bridge.applyIdleRelease(window)
+  }
+
+  /**
+   * The idle-release window that runs, in ms: the settings page's pick, else
+   * the deployment baseline.
+   */
+  private idleTimeoutMs(): number {
+    return this.idleReleaseOverride ?? this.baselineIdleTimeoutMs
   }
 
   /**

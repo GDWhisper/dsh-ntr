@@ -1164,6 +1164,8 @@ function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } {
     setTagHalo: async halo => { calls.push(['setTagHalo', halo]) },
     approvalDeadlines: () => ({ permissionTimeoutMs: 300_000, mode: 'abort' as const }),
     setApprovalDeadlines: async (patch, reset) => { calls.push(['setApprovalDeadlines', patch, reset]) },
+    idleRelease: () => ({ idleTimeoutMs: 1_800_000, defaultIdleTimeoutMs: 1_800_000 }),
+    setIdleRelease: async (idleTimeoutMs, reset) => { calls.push(['setIdleRelease', idleTimeoutMs, reset]) },
     bindChatAgent: (dshSessionId, agentId) => { calls.push(['bindChatAgent', dshSessionId, agentId]) },
     setChatSessionModel: async (dshSessionId, modelId) => { calls.push(['setChatSessionModel', dshSessionId, modelId]) },
     setChatSessionEffort: async (dshSessionId, effort) => { calls.push(['setChatSessionEffort', dshSessionId, effort]) },
@@ -1382,6 +1384,25 @@ describe('dispatchRpc', () => {
     expect(manager.calls).toContainEqual(['setApprovalDeadlines', {}, false])
     await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { nativeApprovalTimeoutMs: 60_000 })).resolves.toMatchObject({ ok: true })
     expect(manager.calls).toContainEqual(['setApprovalDeadlines', {}, false])
+    // The idle-release window: read is `undefined` on an older host half (which
+    // hides the tab), and a write is validated against the shared ladder —
+    // only a rung the slider offers is a window the host runs.
+    await expect(dispatchRpc(manager, 'ui/idle-release', {})).resolves.toEqual({
+      ok: true,
+      value: { idleRelease: { idleTimeoutMs: 1_800_000, defaultIdleTimeoutMs: 1_800_000 } },
+    })
+    await expect(dispatchRpc({ ...manager, idleRelease: undefined }, 'ui/idle-release', {})).resolves.toEqual({
+      ok: true,
+      value: { idleRelease: undefined },
+    })
+    await expect(dispatchRpc(manager, 'ui/idle-release-set', { idleTimeoutMs: 300_000 })).resolves.toMatchObject({ ok: true })
+    expect(manager.calls).toContainEqual(['setIdleRelease', 300_000, false])
+    await expect(dispatchRpc(manager, 'ui/idle-release-set', { reset: true })).resolves.toMatchObject({ ok: true })
+    expect(manager.calls).toContainEqual(['setIdleRelease', undefined, true])
+    for (const bad of [0, -1, 1.5, 86_400_001, '60000', 90_000]) {
+      await expect(dispatchRpc(manager, 'ui/idle-release-set', { idleTimeoutMs: bad }))
+        .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    }
     // The conversation↔agent mapping: the plugin's own binding, never a model route.
     await expect(dispatchRpc(manager, 'session/chat-bind', { dshSessionId: 'chat-1', agentId: 'pi' })).resolves.toEqual({ ok: true, value: { done: true } })
     expect(manager.calls).toContainEqual(['bindChatAgent', 'chat-1', 'pi'])

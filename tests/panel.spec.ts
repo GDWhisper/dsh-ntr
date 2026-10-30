@@ -57,7 +57,7 @@ describe('AcpSettingsSection navigation', () => {
   it('starts with collapsed agents, no creation form, and no model cache read or probe', async () => {
     const fixture = await mountPanel()
     const nav = screen.getByRole('navigation', { name: 'NTR 设置分类' })
-    expect(within(nav).getAllByRole('button').map(button => button.textContent)).toEqual(['智能体', '审批时限', '对话外观', '日志'])
+    expect(within(nav).getAllByRole('button').map(button => button.textContent)).toEqual(['智能体', '审批时限', '进程管理', '对话外观', '日志'])
     expect(within(nav).getByRole('button', { name: '智能体', pressed: true })).toBeDefined()
     expect(screen.getByRole('region', { name: '已接入的智能体' })).toBeDefined()
     expect(screen.getByRole('button', { name: '管理 CodeBuddy', expanded: false })).toBeDefined()
@@ -221,6 +221,64 @@ describe('AcpSettingsSection navigation', () => {
     expect(payloads(fixture, 'agent/probe-models')).toEqual([])
   })
 
+  it('offers the idle-release window on the Processes tab and writes the picked rung', async () => {
+    const fixture = await mountPanel()
+    await category('进程管理')
+    expect(screen.getByRole('heading', { name: '空闲释放' })).toBeDefined()
+    // The readout names the window in force (30 minutes by default). The tick
+    // labels repeat it, so the readout is read from the value block.
+    expect(screen.getByText('30 分钟', { selector: '.dwa-deadline-value' })).toBeDefined()
+
+    const slider = screen.getByRole('slider', { name: '释放窗口' }) as HTMLInputElement
+    // The ladder is 1 minute, then 5-minute steps: index 3 is 15 minutes.
+    fireEvent.change(slider, { target: { value: '3' } })
+    await waitFor(() => { expect(payloads(fixture, 'ui/idle-release-set')).toHaveLength(1) })
+    expect(payloads(fixture, 'ui/idle-release-set')[0]).toEqual({ idleTimeoutMs: 900_000 })
+  })
+
+  it('offers no reset when nothing outranks the deployment baseline', async () => {
+    await mountPanel({
+      idleRelease: { idleTimeoutMs: 1_800_000, defaultIdleTimeoutMs: 1_800_000 },
+    })
+    await category('进程管理')
+    expect(screen.queryByRole('button', { name: '恢复默认值' })).toBeNull()
+    expect(screen.queryByRole('button', { name: '恢复配置文件的值' })).toBeNull()
+  })
+
+  it('names the config file window when the user outranks it', async () => {
+    // The user picked 15 minutes over the file's 30: the reset appears, and
+    // it says it returns to the FILE's value, because that is what it does.
+    await mountPanel({
+      idleRelease: {
+        idleTimeoutMs: 900_000,
+        defaultIdleTimeoutMs: 1_800_000,
+        configuredIdleTimeoutMs: 1_800_000,
+      },
+    })
+    await category('进程管理')
+    expect(screen.getByRole('button', { name: '恢复配置文件的值' })).toBeDefined()
+    // The fact being overridden is visible, in warning ink.
+    expect(screen.getByText(/配置文件（cordis.patch.yml）设为 30 分钟/)).toBeDefined()
+  })
+
+  it('hides the Processes tab on a host without the idle-release RPC', async () => {
+    const fixture = await mountPanel({ idleRelease: null })
+    expect(screen.queryByRole('button', { name: '进程管理' })).toBeNull()
+  })
+
+  it('lets a per-agent override pin one agent while the global window governs the rest', async () => {
+    const fixture = await mountPanel({
+      agents: [{
+        id: 'codebuddy', title: 'CodeBuddy', command: 'codebuddy', args: ['--acp'],
+        cwd: '/workspace/ntr-demo', allowedCwdRoots: ['/workspace/ntr-demo'], idleTimeoutMs: 900_000,
+      }],
+    })
+    await click(screen.getByRole('button', { name: '管理 CodeBuddy' }))
+    await detail('高级')
+    // The agent's OWN override is shown, not the host's resolved window.
+    expect((textbox('空闲释放覆盖（毫秒）') as HTMLInputElement).value).toBe('900000')
+  })
+
   it('reads the cache only for an expanded, active model page; navigation never probes', async () => {
     // An empty cache keeps duplicate reads observable.
     const fixture = await mountPanel({ catalogs: { codebuddy: null } })
@@ -263,8 +321,8 @@ describe('AcpSettingsSection navigation', () => {
   it('omits the approval category on a host without its RPC, without losing permission answers', async () => {
     await mountPanel({ approvalDeadlines: null, permissions: [permission()] })
     const nav = screen.getByRole('navigation', { name: 'NTR 设置分类' })
-    expect(within(nav).getAllByRole('button').map(button => button.textContent)).toEqual(['智能体', '对话外观', '日志'])
-    expect(screen.queryByRole('slider', { hidden: true })).toBeNull()
+    expect(within(nav).getAllByRole('button').map(button => button.textContent)).toEqual(['智能体', '进程管理', '对话外观', '日志'])
+    expect(screen.queryByRole('slider', { name: '等待时长', hidden: true })).toBeNull()
     await category('对话外观')
     expect(screen.getByRole('button', { name: 'Always Allow' })).toBeDefined()
   })
@@ -380,7 +438,7 @@ describe('AcpSettingsSection editing', () => {
     await detail('高级')
     const save = screen.getByRole('button', { name: '保存更改' }) as HTMLButtonElement
     expect(save.disabled).toBe(true)
-    fireEvent.change(textbox('空闲释放（毫秒）'), { target: { value: '' } })
+    fireEvent.change(textbox('空闲释放覆盖（毫秒）'), { target: { value: '' } })
     expect(save.disabled).toBe(false)
     await click(save)
     expect(payloads(fixture, 'agent/save')).toHaveLength(1)
@@ -490,7 +548,7 @@ describe('AcpSettingsSection permissions', () => {
     const fixture = await mountPanel()
     await category('审批时限')
     expect(screen.getByRole('button', { name: '一直等待' })).toBeDefined()
-    expect(screen.queryByRole('slider', { hidden: true })).toBeNull()
+    expect(screen.queryByRole('slider', { name: '等待时长', hidden: true })).toBeNull()
     expect(screen.queryByRole('button', { name: '恢复配置文件的值' })).toBeNull()
     expect(payloads(fixture, 'ui/approval-deadlines-set')).toEqual([])
 
@@ -513,7 +571,7 @@ describe('AcpSettingsSection permissions', () => {
       { mode: 'abort' }, { permissionTimeoutMs: 21_600_000 }, { permissionTimeoutMs: 30_000 },
     ])
     await click(screen.getByRole('button', { name: '一直等待' }))
-    expect(screen.queryByRole('slider', { hidden: true })).toBeNull()
+    expect(screen.queryByRole('slider', { name: '等待时长', hidden: true })).toBeNull()
     expect(payloads(fixture, 'ui/approval-deadlines-set').at(-1)).toEqual({ mode: 'wait' })
   })
 
@@ -525,7 +583,7 @@ describe('AcpSettingsSection permissions', () => {
     await click(screen.getByRole('button', { name: '恢复配置文件的值' }))
     expect(payloads(fixture, 'ui/approval-deadlines-set')).toEqual([{ reset: true }])
     expect(screen.queryByRole('button', { name: '恢复配置文件的值' })).toBeNull()
-    expect(screen.queryByRole('slider', { hidden: true })).toBeNull()
+    expect(screen.queryByRole('slider', { name: '等待时长', hidden: true })).toBeNull()
     await act(async () => { await fixture.store.resync() })
     expect(fixture.store.getSnapshot().approvalDeadlines).toMatchObject({ mode: 'wait', permissionTimeoutMs: 300_000 })
   })

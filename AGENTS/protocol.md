@@ -61,9 +61,10 @@
 - **动作**：必须走 `releaseAll(reason)` 而不是 `stop()`——`stop` 会 `released.clear()`，毁掉尚未恢复的会话上下文。释放**静默进行，严禁广播 `agent/notice`**；`agent/notice` 只留给异常或伴随用户动作的事件（探测失败、权限超时、就地搬迁工作区）。
 - **计时**：只有 `ready` 才武装定时器，窗口从 `lastActivityAt` 起算；`touch()` 会清掉已武装的定时器并按最新活动重排，因此窗口永远量到「最近一次活动」而不是更早的武装时刻。判定为「忙」时必须 `touch()` 重置窗口，否则会以 0ms 延迟自旋。
 - **两档窗口**（`currentIdleTimeoutMs`）：
-  - 从未登记过真实会话的 bridge（`everHostedSession === false`，探测拉起的进程，`probeConfigOptions` 刻意不登记会话）走 `DEFAULT_TUNING.probeIdleTimeoutMs`（默认 5 分钟）。`def.idleTimeoutMs`（含 `0` = 永不释放）是关于聊天进程的承诺，不管探测进程。
-  - 第一个登记的会话（`createSession` / `doResumeSession`）把 bridge 翻转为 `def.idleTimeoutMs ?? DEFAULT_TUNING.idleTimeoutMs`（默认 30 分钟；`0` = 永不释放；`validateAgentDef` 只接受 0 或 [1000, 86400000] 的整数）。翻转时必须 `clearIdleTimer()` 再 `touch()` 重排。
-- **展示**：`AgentView.idleTimeoutMs` 必须报告**聊天窗口**语义（`idleTimeoutMs` getter），面板拿它预填与展示。浏览器 `DEFAULT_IDLE_RELEASE_MS` 是默认值的手拷贝，改常量必须同步。
+  - 从未登记过真实会话的 bridge（`everHostedSession === false`，探测拉起的进程，`probeConfigOptions` 刻意不登记会话）走 `DEFAULT_TUNING.probeIdleTimeoutMs`（默认 5 分钟，**固定**、不随全局设置变）。`def.idleTimeoutMs`（含 `0` = 永不释放）是关于聊天进程的承诺，不管探测进程。
+  - 第一个登记的会话（`createSession` / `doResumeSession`）把 bridge 翻转为 `def.idleTimeoutMs ?? 全局窗口`（见下）。翻转时必须 `clearIdleTimer()` 再 `touch()` 重排。
+- **全局窗口 = 三层取值**（`def.idleTimeoutMs` → 设置页 → 部署基线 → 内置默认 30 分钟）：per-agent 的显式值最优先；没有它时用设置页「进程管理」的滑块值；再没有就用 `cordis.patch.yml` 的插件级 `idleTimeoutMs`；最后是 `DEFAULT_TUNING.idleTimeoutMs`（30 分钟）。**per-agent 那一层必须是「显式值或留空」，绝不能把宿主解析值回填进 agent 定义**——回填等于把全局窗口冻结进该 agent，全局滑块就再也到不了它。设置页的 pick 存在插件自己的状态文件里（与 agent 注册表同文件），**热生效**：`applyIdleRelease` 改写运行中 bridge 的默认窗口并重排定时器，用户不必杀会话。**重置目标是部署基线，不是内置常量**：`AcpIdleRelease.defaultIdleTimeoutMs` 报的是「重置回到哪个窗口」（部署写了就用部署的，否则用内置 30 分钟），`configuredIdleTimeoutMs` 只在配置文件真的写了那个键时才出现——设置卡绝不能对着一个什么都没说的文件宣称「文件要求 30 分钟」。滑动档位是共享阶梯 `IDLE_RELEASE_MS`（1 分钟，其后每 5 分钟一档到 1 小时），浏览器只出阶梯上的值，宿主只收阶梯上的值——滑块能出的值一定是宿主会跑的值。
+- **展示**：`AgentView.idleTimeoutMs` 必须报告**聊天窗口**语义（`idleTimeoutMs` getter）。设置页的 per-agent 输入框只显示**该 agent 自己的显式覆盖**（空 = 跟随全局），不显示解析值。
 - **与卡死收口的关系**：无活动看门狗（§6.1）开火只收口 turn、不碰进程（下一条消息的善后可能重启或重置，那是另一条路径）；`running` / `settled` 清掉后 `hasActiveWork()` 自然转空，进程随后按本节窗口释放。两条路径互不替代——看门狗管「这一轮还能不能结束」，本节管「这个进程还要不要养着」。
 
 ## 6. 轮次收尾与分段

@@ -3381,6 +3381,96 @@ describe('idle release (isolated manager)', () => {
     }
   }, 30_000)
 
+  it('applies a global idle-release pick to a running bridge, and keeps an agent\'s own override', async () => {
+    const { manager } = idleManager('idle-global', { idleTimeoutMs: 60_000 })
+    try {
+      await manager.startSession('idle-global', undefined)
+      expect(manager.agentViews()[0]?.idleTimeoutMs).toBe(60_000)
+
+      // The settings page's pick reaches the RUNNING process: the window is
+      // rewritten in place, so the user never has to kill a session to see it.
+      await manager.setIdleRelease(300_000)
+      expect(manager.agentViews()[0]?.idleTimeoutMs).toBe(300_000)
+      expect(manager.idleRelease()).toMatchObject({ idleTimeoutMs: 300_000 })
+
+      // An agent that names its OWN window keeps it — that promise is about
+      // the agent, not about the deployment.
+      const own = idleManager('idle-own', { idleTimeoutMs: 60_000 }, { idleTimeoutMs: 900_000 })
+      try {
+        await own.manager.startSession('idle-own', undefined)
+        await own.manager.setIdleRelease(300_000)
+        expect(own.manager.agentViews()[0]?.idleTimeoutMs).toBe(900_000)
+      } finally {
+        await own.manager.shutdownAll()
+      }
+
+      // A reset drops the pick: the deployment baseline runs again.
+      await manager.setIdleRelease(undefined, true)
+      expect(manager.idleRelease()).toMatchObject({ idleTimeoutMs: 60_000 })
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
+  it('resets to the deployment baseline, not to a built-in constant', async () => {
+    const { manager } = idleManager('idle-baseline', { idleTimeoutMs: 60_000 })
+    try {
+      // The deployment names 10 minutes. That is what a reset must return
+      // to — resetting to the built-in 30 would silently ignore the file.
+      manager.setConfiguredIdleRelease(600_000)
+      expect(manager.idleRelease()).toMatchObject({
+        idleTimeoutMs: 600_000,
+        defaultIdleTimeoutMs: 600_000,
+        configuredIdleTimeoutMs: 600_000,
+      })
+      await manager.setIdleRelease(300_000)
+      expect(manager.idleRelease()).toMatchObject({ idleTimeoutMs: 300_000 })
+      await manager.setIdleRelease(undefined, true)
+      expect(manager.idleRelease()).toMatchObject({ idleTimeoutMs: 600_000 })
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
+  it('lets the global window reach an agent that pins no window of its own', async () => {
+    const { manager } = idleManager('idle-follow', { idleTimeoutMs: 60_000 })
+    try {
+      await manager.startSession('idle-follow', undefined)
+      // The agent names no window, so the global pick governs it: this is the
+      // whole point of the setting — a window the user moved in the settings
+      // page must REACH the agents that did not pin one.
+      await manager.setIdleRelease(300_000)
+      expect(manager.agentViews()[0]?.idleTimeoutMs).toBe(300_000)
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
+  it('persists a global idle-release pick across a host restart', async () => {
+    const storage = `${tmpdir()}/acp-idle-global-${Date.now()}.json`
+    const hub = new EventHub()
+    {
+      const manager = new BridgeManager(
+        [{ ...def, id: 'idle-persist' }], hub, 500, storage, undefined, undefined, { idleTimeoutMs: 60_000 },
+      )
+      try {
+        await manager.setIdleRelease(900_000)
+        expect(manager.idleRelease()).toMatchObject({ idleTimeoutMs: 900_000 })
+      } finally {
+        await manager.shutdownAll()
+      }
+    }
+
+    // A fresh manager over the same state dir is a DSH restart: the pick is
+    // still in force, because it was persisted with the agent registry.
+    const second = new BridgeManager([{ ...def, id: 'idle-persist' }], hub, 500, storage, undefined, undefined, { idleTimeoutMs: 60_000 })
+    try {
+      expect(second.idleRelease()).toMatchObject({ idleTimeoutMs: 900_000 })
+    } finally {
+      await second.shutdownAll()
+    }
+  }, 30_000)
+
   it('keeps a parked chat session resumable across a host restart', async () => {
     // The session record is what "released ≠ destroyed" means at the process
     // boundary: without it, a DSH restart made the next message silently start

@@ -217,7 +217,7 @@ That's stale dependency state, not a missing plugin file: the failing path will 
 - **Real permissions**: the agent's permission modes are listed verbatim, and every permission request is presented as-is. What you answer is what it receives.
 - **Slash commands belong to the agent**: in NTR conversations, `/` pops the agent's own declared commands; DSH's same-named commands don't hijack your input.
 - **Reconnect**: after a browser refresh or a network drop, history backfills in order. If the agent process crashed, the next message recovers it when the agent declares `session/load`.
-- **Idle release**: agent processes with no activity exit automatically after an idle window, freeing memory; idle conversations are parked and resumed by the next message via `session/load` (agents that do not declare `session/load` still need no live conversation before their process is released).
+- **Idle release**: agent processes with no activity exit automatically after an idle window, freeing memory; idle conversations are parked and resumed by the next message via `session/load` (agents that do not declare `session/load` still need no live conversation before their process is released). The window is adjusted in the settings page under “Processes” (1-60 minutes, 30 by default); a single agent can override it in its own “Advanced” section.
 - **Windows works**: npm-globally-installed agents launch and get reaped correctly on Windows, leaving no stray background processes.
 
 ---

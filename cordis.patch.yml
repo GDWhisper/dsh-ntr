@@ -100,6 +100,21 @@
         #                              set); 0 = fall back to turnStallMs
         # turnStallTickMs: 30000     # how often the watchdog scans; tuning / tests
         #                              only, there is no settings-page control
+        # idleTimeoutMs: 1800000     # how long a chat process may sit idle before
+        #                              it is released (parked, then resumed by the
+        #                              next message). 0 = never release. The
+        #                              DEPLOYMENT baseline: the settings page's
+        #                              「进程管理」 tab (NTR 设置 → 进程管理) edits
+        #                              this window on a 1-60 minute slider and
+        #                              persists its pick in the plugin's own state
+        #                              file, which OUTRANKS the value here; the card
+        #                              shows what this file asks for and offers a
+        #                              reset back to it. A per-agent
+        #                              `agents[].idleTimeoutMs` still wins over both —
+        #                              that promise is about the agent. The PROBE
+        #                              window is a separate thing and stays fixed at 5
+        #                              minutes: a process that never hosted a session
+        #                              has no stake in a chat window.
         # ACP 模式 (agent preset) is declared by this package's own bundle
         # patch list (package.json `dsh.bundle.patch` → presets/acp/acp.patch.yml),
         # so it needs no install step and has no config knob. The settings card
@@ -125,7 +140,8 @@
         #     exposedModels: [model-a, model-b]   # opt-in `agent@choice` variants; unset/[] = base entry only
         #     idleTimeoutMs: 1800000     # release a chat process once it has been idle
         #                                #   this long (ms) with NO live session
-        #                                #   (0 = never; unset = 30 min). This window
+        #                                #   (0 = never; unset = follow the plugin-level
+        #                                #   `idleTimeoutMs` above). This window
         #                                #   applies ONLY to a process that has hosted a
         #                                #   session: a probe child (`everHostedSession`
         #                                #   false — what a model probe or a post-save
