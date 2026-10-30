@@ -1,7 +1,7 @@
 # DSH 插件开发文档
 
-- [实现约束细节（分层，入口：architecture.md）](./agents/architecture.md)
-  - 由 AGENTS.md 的 30 条硬约束索引、按主题拆开的展开文档：架构 / 协议 / 界面 / 权限 / 状态 / 宿主接线 / 路径 / 已退役方向
+- [实现约束细节（分层，入口：architecture.md）](../AGENTS/architecture.md)
+  - 由根 AGENTS.md 索引的 agent 操作手册（架构 / 协议 / 界面 / 权限 / 状态 / 宿主接线 / 路径 / 已退役方向）
 - [NTR 模式：把会话交给另一个 agent](./acp-mode.md)
   - 原生上下文确实被转发的证据（`agent/pre-step` 折入顺序 + 真实会话日志）与宿主侧修复（`selectForwardPrompt`、`purpose` 拒绝）
   - NTR 模式 = agent preset（`presets/acp`）：清空宿主对模型可见的一切；loop 不可替换的硬约束
@@ -11,8 +11,8 @@
 - [待办清单](./todo.md)
   - 本仓唯一的待办清单：只留尚未落地的项，用户确认完结即删（结论并入 AGENTS.md 对应约束，不留「已落地」历史）
   - 当前为空
-- [发版手册](./release.md)
-  - 版本与 tag 规则、发布前检查，从提交到 npm 发布与 GitHub Release 的完整命令
+- [发版手册](../AGENTS/release.md)
+  - agent 操作文档（由根 AGENTS.md 索引）：版本与 tag 规则、发布前检查，从提交到 npm 发布与 GitHub Release 的完整命令
   - release note 与 [`CHANGELOG.md`](../CHANGELOG.md) 的写法：面向用户、只写能感知到的变化与确定性净改动，不写根因与内部机制
 - [ACP 会话的权限对齐调研（DSH Access mode ↔ ACP 权限）](./acp-permission-and-sandbox.md)
   - 两个权限旋钮的实体与证据（preset / projection / sandbox / approval）

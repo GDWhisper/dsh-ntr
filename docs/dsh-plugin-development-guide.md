@@ -296,11 +296,11 @@ export function apply(ctx: Context) {
 }
 ```
 
-2. **前端打包配置（`tsdown.config.ts`）**：
+2. **前端打包配置（`tsdown.config.*`）**：
 前端产物必须输出到 `lib/client.js`，且必须保持 react 及 cordis 相关的依赖外部化（由 DSH SPA 的 `ModuleLoader` 供给）。
 **产物形状是 CJS 工厂函数，不是裸 ESM**：DSH 前端微内核的加载器是一张惰性 CJS 模块表，浏览器半区必须用 banner/footer 把整包裹成
 `window.__ModuleLoader__.load({ id, factory })`。输出裸 ESM（`format: 'esm'`）会在运行时解析失败，前端静默不加载。
-（dsh-ntr 自己的配置见 `tsdown.config.ts`，AGENTS.md 约束 1 是同一结论。）
+（dsh-ntr 自己的配置见 `tsdown.config.mjs`，AGENTS.md 约束 1 是同一结论。）
 ```ts
 import { defineConfig } from 'tsdown'
 

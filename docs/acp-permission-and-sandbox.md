@@ -40,10 +40,10 @@
    - 仅可查看（ask）：用户点「允许一次」就能写 ❌（违背只读语义）
    - 完全权限（**never**）：所有 ACP 权限请求被**确定性 reject** ❌（与标签完全相反）
 
-   > **【已退役，2026-10-28】上面这条宿主审批路由已删除，这几行按历史记载读。** 现行只有插件自己的 `PermissionLedger`：`AgentBridge.handlePermissionRequest` 把每一问广播成 `permission/request`，卡片在对话 `PermissionDock`（`conversation.input.dock`）与设置页镜像上等人回答，到点就地收场（`wait` 不设期限 / `abort` 拒绝 / `auto` 按 option kind 代答）；`askNativeApproval`、`approvalRouted`、`ctx.approval.request` 与 native 超时转移都已不存在，宿主 approval policy（`ask` / `never`）也不再作用于 ACP 询问。现行管线见 [agents/permissions.md](./agents/permissions.md)。
+   > **【已退役，2026-10-28】上面这条宿主审批路由已删除，这几行按历史记载读。** 现行只有插件自己的 `PermissionLedger`：`AgentBridge.handlePermissionRequest` 把每一问广播成 `permission/request`，卡片在对话 `PermissionDock`（`conversation.input.dock`）与设置页镜像上等人回答，到点就地收场（`wait` 不设期限 / `abort` 拒绝 / `auto` 按 option kind 代答）；`askNativeApproval`、`approvalRouted`、`ctx.approval.request` 与 native 超时转移都已不存在，宿主 approval policy（`ask` / `never`）也不再作用于 ACP 询问。现行管线见 [AGENTS/permissions.md](../AGENTS/permissions.md)。
 
 4. 真正对 ACP 有力的仍是我们自己的 `AcpAgentDef.permission`（`AgentBridge.handlePermissionRequest` 短路）与 `allowedCwdRoots`（`fs/read_text_file` / `fs/write_text_file` 白名单）。
-   > **【已退役，2026-10-28 复核】`AcpAgentDef.permission` 已不存在**（字段与 `AgentBridge.permissionDecision` 在 2026-10-24 逐步切分那次改动中一起删除，[retired.md](./agents/retired.md) 已收录），`handlePermissionRequest` 也不再按它短路——这一条按历史记载读。现行只有插件自己的 `PermissionLedger` 一条管线（见上一条注记与 [agents/permissions.md](./agents/permissions.md)）；**仍然有效的是 fs 围栏**：`AgentBridge.handleFsWrite` 的 `allowedCwdRoots` 白名单不变。
+   > **【已退役，2026-10-28 复核】`AcpAgentDef.permission` 已不存在**（字段与 `AgentBridge.permissionDecision` 在 2026-10-24 逐步切分那次改动中一起删除，[retired.md](../AGENTS/retired.md) 已收录），`handlePermissionRequest` 也不再按它短路——这一条按历史记载读。现行只有插件自己的 `PermissionLedger` 一条管线（见上一条注记与 [AGENTS/permissions.md](../AGENTS/permissions.md)）；**仍然有效的是 fs 围栏**：`AgentBridge.handleFsWrite` 的 `allowedCwdRoots` 白名单不变。
 
 ## 3. 方案 2（把 ACP 自己的权限塞进原生选择器）可行性裁定
 
@@ -57,7 +57,7 @@
 
 ## 4. 方案 1（原生 Access mode 驱动 ACP）设计
 
-> **【已退役，2026-10-14 / 约束 15】整节作废，按历史记载读，不要照着实现。** 按用户意图——**ACP agent 完全自治，DSH 的 Access mode / sandboxPolicy 不参与裁决**——宿主不再坐在中间替 agent 判一遍。当时的代码：`AgentBridge.permissionDecision` 只读 agent 自己的 `def.permission`（`ask` 走约束 13 的原生审批链，`allow` / `reject` 本地作答）；`AgentBridge.handleFsWrite` 只剩 `guardFsPath` 的 workspace containment（`resolveFsPath` 的 roots 校验**无条件**生效，`danger-full-access` 之类的 access mode 到不了这条路径，也放宽不了它）；`decidePermission` / `authorizeWrite` / `dshSessionPolicyOf` / `wireAccessMode` 全部已删。**【2026-10-28 补记】审批侧比这段记载更早退场**：`permissionDecision` / `def.permission` 与原生审批链一样不存在，每一问只经 `PermissionLedger` → `permission/request` → 对话 `PermissionDock`（现行模型见 [agents/permissions.md](./agents/permissions.md)）。本节唯一仍然有效的是下面「同一个 `workspaceRoot` 也是聊天会话的 ACP 工作目录」那一段（约束 15 的「工作目录」「进程 cwd」两条）。
+> **【已退役，2026-10-14 / 约束 15】整节作废，按历史记载读，不要照着实现。** 按用户意图——**ACP agent 完全自治，DSH 的 Access mode / sandboxPolicy 不参与裁决**——宿主不再坐在中间替 agent 判一遍。当时的代码：`AgentBridge.permissionDecision` 只读 agent 自己的 `def.permission`（`ask` 走约束 13 的原生审批链，`allow` / `reject` 本地作答）；`AgentBridge.handleFsWrite` 只剩 `guardFsPath` 的 workspace containment（`resolveFsPath` 的 roots 校验**无条件**生效，`danger-full-access` 之类的 access mode 到不了这条路径，也放宽不了它）；`decidePermission` / `authorizeWrite` / `dshSessionPolicyOf` / `wireAccessMode` 全部已删。**【2026-10-28 补记】审批侧比这段记载更早退场**：`permissionDecision` / `def.permission` 与原生审批链一样不存在，每一问只经 `PermissionLedger` → `permission/request` → 对话 `PermissionDock`（现行模型见 [AGENTS/permissions.md](../AGENTS/permissions.md)）。本节唯一仍然有效的是下面「同一个 `workspaceRoot` 也是聊天会话的 ACP 工作目录」那一段（约束 15 的「工作目录」「进程 cwd」两条）。
 >
 > 「二者互补」这个说法同样作废：让 ACP 模式控件出现的闸门会把原生 Access mode 整格占空，两个控件**从不同屏**。
 

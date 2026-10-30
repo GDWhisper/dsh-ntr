@@ -1,6 +1,6 @@
 # 已退役的轴与幽灵符号
 
-本文是 [AGENTS.md](../../AGENTS.md) 的冷存储层：记录**不要重新引入**的错误方向。完整推导、实测日志与分批退役清单见 [acp-convergence.md](../acp-convergence.md)、[acp-mode.md](../acp-mode.md)、[acp-permission-and-sandbox.md](../acp-permission-and-sandbox.md)。
+本文是 [AGENTS.md](../AGENTS.md) 的冷存储层：记录**不要重新引入**的错误方向。完整推导、实测日志与分批退役清单见 [acp-convergence.md](../docs/acp-convergence.md)、[acp-mode.md](../docs/acp-mode.md)、[acp-permission-and-sandbox.md](../docs/acp-permission-and-sandbox.md)。
 
 ## 错误轴：把 ACP 当成 DSH LLM provider
 
@@ -96,7 +96,7 @@ useDirectory  resolveDirectory  ModelDirectoryResolver  directoryFor
 > `toolResults` / `acpToolCallFromUpdate` / `acpToolCallDelta` /
 > `acpToolCallArgsOf` / `registryHasToolCall` / `toolOutputFor` / guard 的
 > 虚拟工具）**不在**幽灵清单里：它们在 2026-10-19 随 §1.7 的散文形态短暂
-> 退役，又随 [acp-convergence.md](../acp-convergence.md) §1.8 的逐步切分
+> 退役，又随 [acp-convergence.md](../docs/acp-convergence.md) §1.8 的逐步切分
 > 复活（升级了可等待的 `waitForToolOutput`）。仍退役的是**缓冲重放**那一套
 > （`answerBuffer` / `pendingToolAnswers` / `cardOutputs`）：切段后答案自然
 > 落在卡后的新消息里，缓冲没有存在理由；散文一族

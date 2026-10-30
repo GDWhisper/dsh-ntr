@@ -1,6 +1,6 @@
 # 状态与持久化
 
-本文是 [AGENTS.md](../../AGENTS.md) 的展开层。运行时唯一落盘点是 `~/.dsh/dsh-ntr/`。
+本文是 [AGENTS.md](../AGENTS.md) 的展开层。运行时唯一落盘点是 `~/.dsh/dsh-ntr/`。
 
 ## 1. 落盘位置
 

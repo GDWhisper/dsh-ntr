@@ -1,5 +1,7 @@
 # 发版
 
+本文是 [AGENTS.md](../AGENTS.md) 索引的发版手册。
+
 一条线：改代码 → 验证 → `git log vPREV..HEAD` 列出提交区间并逐笔判定 → 更新 `CHANGELOG.md` → 提交 → bump 版本 → `chore(release)` 提交 → push `main` → 打 `vX.Y.Z` tag → push tag（触发 npm 发布）→ 建 GitHub Release。
 
 ## 版本与 tag

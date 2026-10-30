@@ -1,6 +1,6 @@
 # 宿主接线
 
-本文是 [AGENTS.md](../../AGENTS.md) 的展开层，覆盖与 DSH 宿主平面的接线点：`/acp` 通道、agent preset 声明、可选服务探测。
+本文是 [AGENTS.md](../AGENTS.md) 的展开层，覆盖与 DSH 宿主平面的接线点：`/acp` 通道、agent preset 声明、可选服务探测。
 
 ## 1. `/acp` 通道注册
 
@@ -27,7 +27,7 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 - **解析基准**：`config.plugins` 的插件名按**声明者 Loader 的解析基准**（profile 目录）解析。相对路径（`./acp-guard.mjs`）会落到 profile 目录里不存在的文件上，导致整条声明激活失败、模式从选择器消失。随包的本地插件只能经**包名子路径**引用（`dsh-ntr/acp-guard` ← `package.json` `exports` 映射到 `presets/acp/acp-guard.mjs`）。`patch.insert` 顶层与 group 行才会被 app-boot 的 `anchorInsertedPluginNames` 改写成 patch 文件旁的绝对路径。
 - **状态**：面板读**宿主 roster**（`ctx.agentPresets.list()` 的 `preset-acp` 行，`acpPresetStatusFromRoster` 折叠，激活失败时原样显示 `broken`）；服务缺席时 `preset/status` 答 `null` 让面板整块隐藏。`preset/install` 已随旧机制删除——`preset/status` 只读，且**严禁**在插件自己的 `apply()` 里调 `list()`（registry 审计要等 Host 树 settle，会等在自己身上）。
 
-历史：0.1.7-rc.1 起 preset 改为 bundle patch 声明，旧的目录 roster 被移除。这次升级曾让 NTR 模式的 chip 直接消失，因为插件还在往旧目录复制文件、并按目录存在与否报告「已安装」。见 [acp-mode.md §2](../acp-mode.md)。
+历史：0.1.7-rc.1 起 preset 改为 bundle patch 声明，旧的目录 roster 被移除。这次升级曾让 NTR 模式的 chip 直接消失，因为插件还在往旧目录复制文件、并按目录存在与否报告「已安装」。见 [acp-mode.md §2](../docs/acp-mode.md)。
 
 ## 3. 可选宿主服务的探测
 

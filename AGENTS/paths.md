@@ -1,6 +1,6 @@
 # 跨平台路径
 
-本文是 [AGENTS.md](../../AGENTS.md) 的展开层。`src/impl.ts` 不能 import `node:path`，这些原语必须手写；realpath 语义靠注入。
+本文是 [AGENTS.md](../AGENTS.md) 的展开层。`src/impl.ts` 不能 import `node:path`，这些原语必须手写；realpath 语义靠注入。
 
 ## 规则
 

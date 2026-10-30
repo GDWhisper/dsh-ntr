@@ -1,7 +1,7 @@
 # 架构：只借显示层
 
-本文是 [AGENTS.md](../../AGENTS.md) 的展开层，回答「谁拥有什么、一轮消息怎么走、绑定与锁定怎么成立」。
-历史推导与实测日志见 [acp-convergence.md](../acp-convergence.md)、[acp-mode.md](../acp-mode.md)。
+本文是 [AGENTS.md](../AGENTS.md) 的展开层，回答「谁拥有什么、一轮消息怎么走、绑定与锁定怎么成立」。
+历史推导与实测日志见 [acp-convergence.md](../docs/acp-convergence.md)、[acp-mode.md](../docs/acp-mode.md)。
 
 ## 1. 归属模型
 
@@ -17,6 +17,17 @@
 
 反面轴（禁止照做）：把 ACP 当成 DSH LLM 层的一个 provider。那根轴要求 ACP 会话先写一条 `provider=acp` 的路由才能发消息，于是写路由污染全局默认模型、被 GUI 目录门禁拒、原生模型座位必须遮蔽。约束 8/15/17/20/22 的旧形态是为这条轴（以及同期的「宿主替 agent 裁决」）打的补丁，详见 [retired.md](./retired.md)。
 
+### 1.1 现行形态（速览）
+
+1. **NTR 底座在 `conversation.input.model`**：只作首轮前启动 / 切换 agent 的入口，下拉只有 agent 列表；模型、思考等级、agent 自己的 mode 各有控件。底座占原生模型底座那个 cell（composer bar 行尾、提交键左边）。座位与渲染见 [ui.md §1](./ui.md)。
+2. **会话绑定走插件自己的映射**（§3）：不写 DSH 模型路由，消息仍走宿主 driver，绑定由 guard 的 `agent/request` waterfall 接到请求路径上。
+3. **permission 原样映射**：agent 报什么就问什么，宿主不预先裁决，也没有本地代答开关（[permissions.md](./permissions.md)）。
+4. **消息展示在主聊天平面、逐步切分交错如原生**（§2.2）：完整参数 / diff 卡仍在 NTR 视图 tab（[ui.md §5](./ui.md)）；续跑段续读同一个仍在飞的 `session/prompt`，绝不新发 prompt。
+5. **NTR 会话跑 ACP preset 外壳**：不带工具、不带项目指令、不带 compaction；`agent/pre-step` 只放用户来源的内容（§5）。
+6. **首轮开始即锁定 agent**：底座粉碎成 composer 上边缘的只读挂牌 `NTR · <agent>`；首轮零可见输出则回滚解锁（§7）。
+7. **NTR 会话的 `/` 属于 agent**：菜单只列 agent 自己声明的命令，Enter 不被宿主认领（[ui.md §6](./ui.md)）。
+8. **MCP 服务器由 agent 自己拉起**：agent 自带的 MCP 照旧生效，`AcpAgentDef.mcpServers` 只是额外追加；MCP 工具不在宿主 `ctx.tools` 里，也不经 `tools/execute` 虚拟工具那条路——与「NTR preset 不挂工具行」不矛盾（§5 末段、[state.md §2](./state.md)）。
+
 ## 2. 一轮消息的路径
 
 ### 2.1 只转发人说的话
@@ -31,7 +42,7 @@
 
 - agent 的文字与思考由 `streamPrompt` 发真正的 `text` / `reasoning` block chunk，经宿主 driver 折成 `assistant/live-chunk` 与 `assistant/message`，由原生聊天平面渲染。
 - 工具活动发真正的 `tool-call` 块（`acpToolCallFromUpdate` / `acpToolCallDelta`：快照 + 前缀扩展 delta，每个 callId 一个 turn 内只开一张卡）。完整参数 / diff 卡仍在 NTR 视图 tab。
-- **逐步切分**（[acp-convergence.md §1.8](../acp-convergence.md)）：一个 ACP turn = 多个宿主 step。段内开过卡、且下一条非 tool 事件到达时切段（`block-end` + `finish(stop)`）；宿主 loop 落定消息 → 执行卡（guard 虚拟工具从共享注册表 `toolResults` 答真实输出，未到则 `waitForToolOutput` 挂起）→ 续跑。续跑批次（`isAcpToolContinuation`：最后 user 消息之后全是 tool 来源）由 `TurnStreamController.startSegment()` 用 transcript 游标补读段间事件再订阅，**绝不新发 `session/prompt`**。以卡收尾的 turn 由最后一个续跑段收口（指针行），避免空气泡。
+- **逐步切分**（[acp-convergence.md §1.8](../docs/acp-convergence.md)）：一个 ACP turn = 多个宿主 step。段内开过卡、且下一条非 tool 事件到达时切段（`block-end` + `finish(stop)`）；宿主 loop 落定消息 → 执行卡（guard 虚拟工具从共享注册表 `toolResults` 答真实输出，未到则 `waitForToolOutput` 挂起）→ 续跑。续跑批次（`isAcpToolContinuation`：最后 user 消息之后全是 tool 来源）由 `TurnStreamController.startSegment()` 用 transcript 游标补读段间事件再订阅，**绝不新发 `session/prompt`**。以卡收尾的 turn 由最后一个续跑段收口（指针行），避免空气泡。
 - **turn 级语义跨段成立**：`turnSeq` 世代守卫、prompt slot（agent 未确认取消前不解开 `settled` 闸门）、段间事件只记账不推进游标（下一段重放补齐），全部在 `TurnStreamController`；`session/cancel` 后的强制定稿由 `AgentBridge.armCancelFallback` 按同一 `turnSeq` 守卫。
 - **重述去重**：agent 会把整条 `tool_call` 重发多遍当进度（并行调用还会交错）。`seenCalls` 按 callId 一卡；重述只刷 `recordAcpToolOutput` 的输出记录（并唤醒等待中的虚拟工具）。无卡片的通知种类（plan / mode）同理，`announcedKinds` 每种类一行、文本变了才重发。
 
@@ -120,3 +131,28 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 | 工作区 | `src/index.ts` · `wireWorkspace`；`src/bridge.ts` · `chatWorkspaceRoot` / `getOrCreateDshSession` / `doResumeSession` |
 | 锁定 | `src/bridge.ts` · `lockedAgentFor` / `lockChatAgent` / `rollbackFirstTurn` / `provisionalLock` |
 | 默认 agent | `src/bridge.ts` · `defaultAgent` / `setDefaultAgent` |
+
+## 目录索引
+
+| 位置 | 是什么 |
+|---|---|
+| `src/index.ts` | Cordis 插件宿主入口：挂载 `/acp` RPC 通道与 `/api/acp/stream` SSE 路由，接线可选宿主服务 |
+| `src/protocol.ts` | 前后端共享契约（纯类型）；严禁 Node 专属库或运行时代码 |
+| `src/impl.ts` | 纯宿主端逻辑：配置校验、环境组装（`childEnv`）、路径防越权、Transcript、EventHub、目录解析 |
+| `src/bridge.ts` | 宿主 ↔ ACP 子进程的 stdio 桥：进程、回合、绑定、锁、数据折叠 |
+| `src/update.ts` | 内置更新：资格矩阵、registry 探测，把安装委托给宿主 `pluginManager`；不下载、不替换文件、不重启 |
+| `src/client/` | 浏览器 React 扩展：`acp-ui.tsx` 座位共用结构 / 样式 / 菜单壳，`session-controls.tsx` composer 底座，`acp-view.tsx` NTR 视图，`permission-dock.tsx` 对话审批卡，`panel.tsx` 设置页，`model-seat.tsx` 座位 claim，`slash-isolation.ts` 斜杠隔离，`store.ts` 前端状态 |
+| `presets/acp/` | 随包发布的 NTR agent preset（bundle patch 声明 + `acp-guard.mjs`），属于 DSH 的 agent 平面组装，不是本插件运行时模块 |
+| `~/.dsh/dsh-ntr/` | 运行时唯一落盘点：`agents.json` / `model-catalog.json` / `workspaces/`（[state.md §1](./state.md)） |
+| `acp-workspaces/` | 本仓开发 / 测试用的执行目录；运行时默认工作区是 `~/.dsh/dsh-ntr/workspaces` |
+| `lib/` | 构建产物，禁改（`npm run build` 全量覆盖，CI 自己 build） |
+| `docs/` | 历史推导与收敛记录（acp-convergence / acp-mode / acp-permission-and-sandbox）；现行文档在 `AGENTS/`，索引见 [AGENTS.md](../AGENTS.md) |
+| `CHANGELOG.md` | 面向用户的版本净改动记录，只记确定性改动（[release.md](./release.md)） |
+
+## 术语
+
+- **Host Half / Browser Half**：DSH 插件双端架构——Node 宿主服务与浏览器 UI 模块。本仓对应 `src/index.ts` + `src/bridge.ts` 与 `src/client/`。
+- **Transcript**：宿主为每个会话维护的有界环形缓冲（`transcriptMaxEntries`），用于重连后按 seq 补齐、续跑段补读段间事件。
+- **Model Catalog**：`agent/catalog` 下发的 agent 自己的 `model` / `thought_level` 面（`base` + `variants` + `reasoning`）。DSH 自己的模型目录里没有 ACP 条目。
+- **exposedModels**：per-agent 的座位可见性过滤。空 = 只留 `base`；只影响 `agentCatalog` 的变体展开，不影响 `resolveAdapterModel`。细节见 [state.md §5](./state.md)。
+
