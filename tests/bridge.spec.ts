@@ -3310,6 +3310,79 @@ describe('idle release (isolated manager)', () => {
     }
   }, 30_000)
 
+  it('keeps a parked chat session resumable across a host restart', async () => {
+    // The session record is what "released ≠ destroyed" means at the process
+    // boundary: without it, a DSH restart made the next message silently start
+    // a context-less new session and the released banner simply vanished.
+    const storage = `${tmpdir()}/acp-restart-resume-${Date.now()}.json`
+    const hub = new EventHub()
+    let hostSessionId = ''
+    {
+      const manager = new BridgeManager(
+        [{ ...def, id: 'restartable' }], hub, 500, storage, undefined, undefined, { idleTimeoutMs: 200 },
+      )
+      try {
+        // One real turn, so the session has history worth resuming.
+        for await (const _ of manager.streamPrompt({
+          model: 'restartable',
+          sessionId: 'dsh-restart-1',
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'remember me' }] }],
+        } as never)) { /* drain */ }
+        hostSessionId = manager.chatSessions('dsh-restart-1')[0]?.sessionId ?? ''
+        expect(hostSessionId).not.toBe('')
+        // Park it on the idle window; the release persists the record.
+        expect(await waitUntil(() => manager.agentViews()[0]?.state === 'stopped')).toBe(true)
+      } finally {
+        await manager.shutdownAll()
+      }
+    }
+
+    // A fresh manager over the same state dir is a DSH restart.
+    const second = new BridgeManager([{ ...def, id: 'restartable' }], hub, 500, storage)
+    try {
+      const restored = second.chatSessions('dsh-restart-1')
+      // The released banner's gate (all rows released) sees the conversation
+      // again — and the row says history exists on the agent side.
+      expect(restored).toMatchObject([{ sessionId: hostSessionId, released: true }])
+      expect(second.chatTranscripts('dsh-restart-1')[0]?.session)
+        .toMatchObject({ sessionId: hostSessionId, released: true, hasHistory: true })
+
+      // The banner button (or the next message) resumes instead of starting over.
+      await second.resumeChatSession('dsh-restart-1')
+      expect(second.chatSessions('dsh-restart-1')[0]?.released).toBeFalsy()
+      expect(await waitUntil(() => {
+        const entries = second.chatTranscripts('dsh-restart-1')[0]?.entries ?? []
+        const text = (entries as Array<{ update: Record<string, unknown> }>)
+          .filter(entry => entry.update.sessionUpdate === 'agent_message_chunk')
+          .map(entry => String((entry.update.content as { text?: string }).text ?? ''))
+          .join('')
+        return text.includes('REPLAYED: earlier conversation')
+      })).toBe(true)
+    } finally {
+      await second.shutdownAll()
+    }
+  }, 30_000)
+
+  it('does not resurrect a closed session across a host restart', async () => {
+    // Closed is destroyed, released is parked — the two must not blur at the
+    // persistence boundary (constraint 10).
+    const storage = `${tmpdir()}/acp-restart-closed-${Date.now()}.json`
+    const hub = new EventHub()
+    const manager = new BridgeManager([{ ...def, id: 'closer' }], hub, 500, storage)
+    try {
+      const session = await manager.getOrCreateDshSession('dsh-restart-2', 'closer')
+      await manager.closeSession(session.sessionId)
+    } finally {
+      await manager.shutdownAll()
+    }
+    const second = new BridgeManager([{ ...def, id: 'closer' }], hub, 500, storage)
+    try {
+      expect(second.chatSessions('dsh-restart-2')).toEqual([])
+    } finally {
+      await second.shutdownAll()
+    }
+  }, 30_000)
+
   it('holds the process while a turn is running, then releases it once the turn settles', async () => {
     const { manager } = idleManager('idle-busy', { idleTimeoutMs: 200 })
     try {
@@ -4567,9 +4640,9 @@ describe('agent lock at the start of the first turn (isolated manager)', () => {
     await first.shutdownAll()
 
     const second = new BridgeManager(lockAgents, lockHub, 500, storage)
-    // No live session exists on the fresh host; the persisted lock is the only
-    // thing keeping the conversation on its agent.
-    expect(second.chatSessions('dsh-lock-2')).toEqual([])
+    // The record is restored PARKED (a restart kills the process, not the
+    // conversation); the persisted lock is what keeps it on its agent.
+    expect(second.chatSessions('dsh-lock-2')).toMatchObject([{ agentId: 'lock-a', released: true }])
     expect(second.lockedAgentFor('dsh-lock-2')).toBe('lock-a')
     expect(second.chatChoice('dsh-lock-2')).toMatchObject({ agentId: 'lock-a', locked: true })
     // ...and the persisted record is back on the REQUEST path, not just in the
@@ -4853,9 +4926,11 @@ describe('pre-chat pick persistence (isolated manager)', () => {
       await first.shutdownAll()
 
       const second = new BridgeManager([{ ...def, id: 'cmd-cache' }], pickHub, 500, join(home, 'agents.json'))
-      // No live session for this conversation...
-      expect(second.chatSessions('dsh-cmd-1')).toEqual([])
-      // ...but the agent-level answer is there.
+      // The session record is restored PARKED (a restart kills the process,
+      // not the conversation)...
+      expect(second.chatSessions('dsh-cmd-1')).toMatchObject([{ agentId: 'cmd-cache', released: true }])
+      // ...and the agent-level answer — what `/` reads in a brand-new
+      // conversation — is there too.
       expect(second.agentCatalog('cmd-cache').commands).toEqual([{ name: 'greet', description: 'say hi' }])
       await second.shutdownAll()
     } finally {

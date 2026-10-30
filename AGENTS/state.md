@@ -6,7 +6,7 @@
 
 `pluginStateDir()`（`~/.dsh/dsh-ntr`）下只有三样东西：
 
-- `agents.json` —— agent 注册表 + 默认 agent + 每会话选择 + 插件私有偏好（`tagHalo`，经 `ui/tag-halo` RPC 读写；`approvalDeadlines`，经 `ui/approval-deadlines-set` 读写，见 [permissions.md §2.4](./permissions.md)）
+- `agents.json` —— agent 注册表 + 默认 agent + 每会话选择 + 每聊天会话的会话记录（`chatSessions`，见 §3.1）+ 插件私有偏好（`tagHalo`，经 `ui/tag-halo` RPC 读写；`approvalDeadlines`，经 `ui/approval-deadlines-set` 读写，见 [permissions.md §2.4](./permissions.md)）
 - `model-catalog.json` —— 模型目录 + agent 最近一次声明的斜杠命令
 - `workspaces/` —— 默认执行工作区
 
@@ -42,6 +42,16 @@
 - **读取面**：`session/chat-list` 回 `choice`，`AcpStore.chatChoice` 落状态；`describeRoute` 活会话优先、pick 兜底。composer 的 model / 思考 chip 不能以 `bound !== undefined` 为渲染条件（那是「对话前无法选择」的直接成因），改为 `routed`（活会话 **或** pick **或** `chatBoundAgent` **或** 插件默认 agent）再加各轴自己的条件。高级底座的当前值读 `advancedOptions(catalog, choice)`：`choice.extraConfigs` 覆盖 `catalog.extras[].currentValue`，且只在该 choice 属于 catalog 的 agent 时生效。
 - **显示的默认值就是首轮要跑的值**：没有 pick 的会话，composer 显示 `catalog.currentModel` / `reasoning.defaultEffort` / `extras[].currentValue`；`session/new` 回的是 agent 自己的默认值，两者可能不同。`getOrCreateDshSession` 的 create 路径必须在 `createSession` **之前**捕获显示值（`displayedChatDefaults`），在新会话提供这些值时写成该会话的 pick（`seedChatChoiceFromCatalog`：只补缺失字段，显式 pick 永远优先；新会话不再提供的值跳过，由 `absorbCatalog` 把显示纠正为实际值），再 `applyChatChoice`。`streamPrompt` 记录 `session.modelId` 时也要用 pick 的 variant / 会话自报的模型，**严禁**写回裸 agent id——裸 id 会让芯片回落到 agent 级 catalog，被同一 agent 的其他会话改掉。
 - **不移植 agent 级偏好层**：agent 级默认已由 `agent/catalog` 的 `reasoning.defaultEffort` 与自报 `currentValue` 表达，再加一层会造出「用户没选过却以为选过」的第三种事实源。
+
+### 3.1 会话记录持久化（`chatSessions`）
+
+聊天绑定的会话记录持久化在 `agents.json` 的 `chatSessions` 键（`persistedChatSession` / `loadPersistedChatSessions`，`src/bridge.ts`）。宿主重启把每条记录以 **released** 复原进 `dshSessionMap` 与对应 bridge 的 released map（`AgentBridge.parkReleased`）——进程死了但 agent 侧会话还在，`session/load` 照常恢复。这是「released ≠ 销毁」在进程边界上的落点（约束 10）：没有它，重启后释放横幅直接消失、下一条消息还会静默新开一条没有上下文的会话。
+
+- **只落身份与显示镜像**（`sessionId` / `acpSessionId` / `agentId` / `dshSessionId` / `cwd` + `title` / `modelId` / `reasoningEffort` / `modes` / `usage` / `hasHistory`）。**不落 transcript 与 `configOptions`**——两者都由 agent 在 `session/load` 时回放/带回；重启后到恢复前的空缓冲由 `hasHistory` 说明「历史待回放」（[ui.md §5](./ui.md)），不写「还没有消息」。
+- **写点**：`getOrCreateDshSession` 的建/恢复分支、`forgetDshSession`（closed 销毁即删盘）、以及 `AgentBridge` 的 `onSessionsDirty` 回调（`releaseAll` / `doResumeSession`——release 时 transcript 还在，`hasHistory` 正是在那里算的：`hasHistory || since(0).length > 0`）。
+- **closed 不落盘**：`forgetDshSession` 删内存记录并 `persistAgents`，重启不复活（约束 10）。**agent 已删除的记录丢弃**：restore 时 `defsMap` 查无此 agent 即跳过，下次写盘自然消失。
+- **容错**：逐行解析，单行损坏/字段缺失不影响其余记录。
+- **`/acp` RPC 面的会话（无 `dshSessionId`）不持久化**——那是面板的临时面，重启即清。
 
 ## 4. 模型目录（agent/catalog）
 

@@ -98,6 +98,7 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 - 数据必须走 `session/chat-transcript`（按 **DSH 聊天会话 id** 寻址：浏览器在看到返回前并不知道 ACP 会话 id）。
 - **严禁**让 LLM adapter 旁路转发工具事件；**严禁**在视图里做 prompt / cancel / spawn（它只读）。
 - 流式更新靠 store 把 SSE 的 `session/update` 折进被观察的 transcript（`chatTranscripts` + `MAX_WATCHED` 上限）；**严禁**视图自己轮询。
+- **空流文案分两态**（`historyAwaitsReplay`）：released 且 `hasHistory`（恢复自磁盘的记录，历史在 agent 侧等回放）说「历史将在恢复后回放显示」；否则才是「还没有消息」——对一条聊天面里还留着昨天对话的会话说「还没有消息」，正是本文件文案规则要防的自相矛盾。
 
 **空状态有两种含义**：`chatTranscriptOf` 回 `undefined` 同时覆盖「从没被 NTR agent 服务过」与「ACP 会话记录已经没了」（`closeSession` / `forgetDshSession` 销毁记录，进程停掉就丢 bridge），而绑定与 chip 仍指着那个 agent。用一句话描述两种状态会让视图与芯片互相矛盾。
 
@@ -184,6 +185,7 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 - **闸门是纯函数** `releasedBannerVisible`（无 DOM 可测）：显式 `acpMode === false` 压过残留行（与挂牌同优先级）；`chatSessionsFor` 必须等于本会话；行集非空且**全部** `released`——有一行活着就说明下一条消息有人接，横幅让路；空集（没跑过 agent）不画。
 - **按钮**走 `session/chat-resume`（`AcpStore.resumeChatSession`），与下一条消息的惰性恢复同一套动作、绝不走创建路径（[protocol.md §2](./protocol.md)）。失败闪 notice **并** rethrow（`respondPermission` 契约），错误就地钉在按钮旁（`role="alert"`），不丢到用户可能没开的设置页。提交中按钮 `disabled`。
 - **挂载自读一次** `loadChatSessions`：打开一条已挂起的会话时，没有任何别的东西会替它读这份清单（挂牌、占用环的重读都挂在别的触发器上）。
+- **横幅跨 DSH 重启存活**：会话记录持久化（[state.md §3.1](./state.md)），重启后记录以 released 复原，横幅与「恢复进程」照常——否则重启就等于把「released ≠ 销毁」丢掉。重启后到恢复前 NTR 视图的空流说「历史将在恢复后回放显示」（`historyAwaitsReplay`，见 §5），不说「还没有消息」。
 - 宽度复用权限卡的 InputBar 公式（`.ntr-released-banner`），样式与 `ntr-permission-card` 同族（warn 左边条）；行集的 released 翻转见 §2 耦合不变量。
 
 ## 11. 主题与颜色
@@ -202,7 +204,7 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 | 底座 / 菜单 | `src/client/session-controls.tsx` · `AcpSessionControls` / `AcpSessionMenu` / `menuFor` / `describeRoute` / `routeAgentId` / `agentBaseChip` / `advancedOptions` |
 | 座位 | `src/client/model-seat.tsx` · `createModelSeatClaim` / `createPermissionSeatClaim`；`src/client/index.tsx` · `syncAcpMode` |
 | 锁定 UI | `src/client/session-controls.tsx` · `lockedAgentOf` / `agentBaseHidden` / `agentTagVisible` / `agentTagAlive` / `agentTagHaloPresentation` / `AcpComposerAgentTag`；`src/client/agent-lock-anim.ts` |
-| 视图 | `src/client/acp-view.tsx` · `boundAgentOf` / `acpEmptyCopy` / `diffRows` / `isNewFileDiff`；`src/client/context-meter.tsx` · `AcpContextMeter` / `acpMeterUsage` / `contextOccupancy` / `compactTokenCount`；`src/client/index.tsx` · `acp-context-meter` 注册处 |
+| 视图 | `src/client/acp-view.tsx` · `boundAgentOf` / `acpEmptyCopy` / `diffRows` / `isNewFileDiff` / `historyAwaitsReplay`；`src/client/context-meter.tsx` · `AcpContextMeter` / `acpMeterUsage` / `contextOccupancy` / `compactTokenCount`；`src/client/index.tsx` · `acp-context-meter` 注册处 |
 | 权限卡 | `src/client/permission-dock.tsx` · `PermissionDock` / `PermissionAskCard`；`src/client/store.ts` · `permissionsForSession` / `deadlineRemainingLabel`；`src/client/index.tsx` · `acp-permissions` 注册处 |
 | 释放横幅 | `src/client/released-banner.tsx` · `ReleasedBanner` / `releasedBannerVisible`；`src/client/store.ts` · `resumeChatSession` / `withSessionReleased`；`src/client/index.tsx` · `acp-released-banner` 注册处 |
 | 斜杠 | `src/client/slash-isolation.ts` · `createSlashIsolation` / `slashAcpVerdict` / `commandCandidates` |

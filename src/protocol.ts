@@ -490,6 +490,14 @@ export interface SessionView {
    * recover") when the agent declares the `loadSession` capability.
    */
   released?: boolean
+  /**
+   * The agent-side session has history while the local buffer is empty: the
+   * record was restored from disk after a host restart (the `session/load`
+   * replay has not landed), or a resume cleared the buffer ahead of the
+   * replay. The ACP view then says history replays on restore instead of
+   * claiming "nothing yet".
+   */
+  hasHistory?: boolean
   /** Highest transcript seq included in this snapshot (for gap detection). */
   seq: number
 }

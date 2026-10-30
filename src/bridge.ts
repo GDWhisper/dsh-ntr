@@ -139,6 +139,15 @@ interface LiveSession {
   /** The agent process died; the session awaits a `session/load` resume. */
   released: boolean
   /**
+   * The agent-side session has history while the LOCAL buffer is empty: this
+   * record was restored from disk after a host restart (the replay has not
+   * landed yet), or a resume cleared the buffer ahead of the replay. The ACP
+   * view then says history replays on restore instead of "nothing yet". Set
+   * by `doResumeSession` (captured before the reset) and the restore path; the
+   * serializer ORs it with the live buffer length.
+   */
+  hasHistory?: boolean
+  /**
    * When the agent last showed ANY sign of life on this session: an update, a
    * permission ask (arrival or answer), or a turn start. The stall watchdog
    * measures silence from here rather than from the prompt, which may
@@ -516,6 +525,13 @@ export class AgentBridge {
      * this bridge was built.
      */
     private readonly sessionWorkspace?: () => SessionWorkspaceResolver | undefined,
+    /**
+     * Told whenever the SESSION RECORDS change shape (a release parks them, a
+     * resume revives them): the manager persists `chatSessions` through it, so
+     * a parked conversation stays resumable across a host restart (see
+     * `BridgeManager.loadPersistedChatSessions`).
+     */
+    private readonly onSessionsDirty?: () => void,
   ) {
     const merged = { ...DEFAULT_TUNING, ...tuning }
     this.startupTimeoutMs = merged.startupTimeoutMs
@@ -1241,7 +1257,11 @@ export class AgentBridge {
       if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
       const resolved = resolveSessionCwd(this.def, session.cwd, p => realpathSync(p), workspaceRoot === undefined ? [] : [workspaceRoot])
       // Replay arrives as brand-new updates, so the transcript restarts too;
-      // seq keeps meaning "position in the current epoch".
+      // seq keeps meaning "position in the current epoch". What the buffer held
+      // is now the agent's to replay — remember that there IS history before
+      // dropping it, or a failed resume parks an empty buffer back and the
+      // view claims the conversation never happened.
+      session.hasHistory = session.hasHistory === true || session.transcript.since(0).length > 0
       session.transcript = new Transcript(this.transcriptMax)
       session.cwd = resolved
       session.running = false
@@ -1285,6 +1305,7 @@ export class AgentBridge {
       this.touch()
       // Republish so configOptions/modes observed on load reach the browser.
       this.hub.broadcast({ type: 'session/meta', sessionId: session.sessionId, session: snapshot(session) })
+      this.onSessionsDirty?.()
       return session
     } catch (error) {
       this.acpIndex.delete(session.acpSessionId)
@@ -1292,6 +1313,7 @@ export class AgentBridge {
       session.released = true
       this.released.set(session.sessionId, session)
       this.hub.broadcast({ type: 'session/released', sessionId: session.sessionId, session: snapshot(session), reason: 'resume failed', cause: 'resume-failed' })
+      this.onSessionsDirty?.()
       throw error
     }
   }
@@ -1327,6 +1349,10 @@ export class AgentBridge {
     this.state = 'stopped'
     this.initResult = undefined
     this.publishStatus()
+    // The parked records are what keeps them resumable after a host restart —
+    // persist now, while their transcripts (the `hasHistory` evidence) are
+    // still the ones they were parked with.
+    this.onSessionsDirty?.()
   }
 
   /** Detach one released session record for a resume attempt. */
@@ -1340,6 +1366,15 @@ export class AgentBridge {
   /** Drop a released session record for good (user closed it or the agent was stopped). */
   dropReleased(sessionId: string): boolean {
     return this.released.delete(sessionId)
+  }
+
+  /**
+   * Register a session record restored from disk as already parked: a host
+   * restart killed every process, so it comes back exactly as `releaseAll`
+   * would have left it — resumable via `session/load`, never live.
+   */
+  parkReleased(session: LiveSession): void {
+    this.released.set(session.sessionId, session)
   }
 
   get releasedList(): LiveSession[] {
@@ -1918,8 +1953,61 @@ function snapshot(session: LiveSession): SessionView {
     running: session.running,
     closed: session.closed,
     ...(session.released ? { released: true } : {}),
+    ...(session.hasHistory === true ? { hasHistory: true } : {}),
     seq: session.transcript.head,
   }
+}
+
+/**
+ * One chat-bound session record, as persisted across host restarts (the
+ * `chatSessions` key of the agent registry). Deliberately identity + display
+ * mirrors ONLY — the transcript is the agent's to replay on `session/load`,
+ * and `configOptions` come back from the same load. `hasHistory` is what lets
+ * an empty restored view say "history replays on restore" instead of
+ * "nothing yet".
+ */
+interface PersistedChatSession {
+  sessionId: string
+  acpSessionId: string
+  agentId: string
+  dshSessionId: string
+  cwd: string
+  title?: string
+  modelId?: string
+  reasoningEffort?: string
+  modes?: SessionView['modes']
+  usage?: SessionView['usage']
+  hasHistory?: boolean
+}
+
+function persistedChatSession(session: LiveSession): PersistedChatSession {
+  return {
+    sessionId: session.sessionId,
+    acpSessionId: session.acpSessionId,
+    agentId: session.agentId,
+    dshSessionId: session.dshSessionId as string,
+    cwd: session.cwd,
+    ...(session.title === undefined ? {} : { title: session.title }),
+    ...(session.modelId === undefined ? {} : { modelId: session.modelId }),
+    ...(session.reasoningEffort === undefined ? {} : { reasoningEffort: session.reasoningEffort }),
+    ...(session.modes === undefined ? {} : { modes: session.modes }),
+    ...(session.usage === undefined ? {} : { usage: session.usage }),
+    ...(session.hasHistory === true || session.transcript.since(0).length > 0 ? { hasHistory: true } : {}),
+  }
+}
+
+/** Tolerant shape check for a `modes` value read back from disk. */
+function isPersistedModes(value: unknown): value is SessionView['modes'] {
+  if (value === null || typeof value !== 'object') return false
+  const modes = value as { currentModeId?: unknown; availableModes?: unknown }
+  return typeof modes.currentModeId === 'string' && Array.isArray(modes.availableModes)
+}
+
+/** Tolerant shape check for a `usage` value read back from disk. */
+function isPersistedUsage(value: unknown): value is SessionView['usage'] {
+  if (value === null || typeof value !== 'object') return false
+  const usage = value as { used?: unknown; size?: unknown }
+  return typeof usage.used === 'number' && typeof usage.size === 'number'
 }
 
 /**
@@ -3427,8 +3515,9 @@ export class BridgeManager {
     onConnectionLost: (bridge: AgentBridge, reason: string) => void,
     onCatalog?: (agentId: string, configOptions: unknown, shapeOnly?: boolean) => void,
     onCommands?: (agentId: string, commands: NonNullable<SessionView['availableCommands']>) => void,
+    onSessionsDirty?: () => void,
   ): AgentBridge {
-    return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, onCommands, this.tuning, () => this.sessionWorkspaceResolver)
+    return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, onCommands, this.tuning, () => this.sessionWorkspaceResolver, onSessionsDirty)
   }
 
   /**
@@ -4327,6 +4416,7 @@ export class BridgeManager {
           this.deadlineOverride = {}
         }
         this.loadPersistedChoices((parsed as { conversations?: unknown }).conversations)
+        this.loadPersistedChatSessions((parsed as { chatSessions?: unknown }).chatSessions)
       }
     } catch {
       // Storage load failure is non-fatal
@@ -4373,6 +4463,13 @@ export class BridgeManager {
     const filePath = this.getStoragePath()
     if (!filePath) return
     try {
+      // The chat-bound session records themselves: a host restart kills the
+      // processes but not the agent-side sessions, so restoring these as
+      // PARKED keeps a conversation resumable (`session/load`) instead of
+      // its next message silently starting a context-less new one.
+      const chatSessions = [...this.dshSessionMap.values()]
+        .filter(session => session.dshSessionId !== undefined && !session.closed)
+        .map(persistedChatSession)
       const payload = {
         version: 2,
         ...(this.defaultAgentId === undefined ? {} : { defaultAgentId: this.defaultAgentId }),
@@ -4389,10 +4486,66 @@ export class BridgeManager {
         ...(this.chatAgentIntent.size === 0
           ? {}
           : { conversations: Object.fromEntries(this.chatAgentIntent) }),
+        ...(chatSessions.length === 0 ? {} : { chatSessions }),
       }
       writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf-8')
     } catch {
       // Storage persist failure is non-fatal
+    }
+  }
+
+  /**
+   * Restore chat session records from disk as PARKED sessions.
+   *
+   * Every process died with the host, so nothing comes back live — but the
+   * agent-side sessions did not. Restoring each record as `released` is what
+   * makes the released banner, its resume button and the "next message
+   * resumes it" promise survive a restart (the alternative is the next
+   * message quietly starting a NEW, context-less session — constraint 10's
+   * "released ≠ destroyed" lost at the process boundary). Tolerant, one row
+   * at a time: a single corrupt entry must not cost every other conversation
+   * its context. Records whose agent is no longer configured are dropped —
+   * there is nothing to resume ON, and the next write omits them.
+   */
+  private loadPersistedChatSessions(raw: unknown): void {
+    if (!Array.isArray(raw)) return
+    for (const row of raw) {
+      if (row === null || typeof row !== 'object') continue
+      const record = row as Record<string, unknown>
+      const { sessionId, acpSessionId, agentId, dshSessionId, cwd } = record
+      if (typeof sessionId !== 'string' || sessionId === '') continue
+      if (typeof acpSessionId !== 'string' || acpSessionId === '') continue
+      if (typeof agentId !== 'string' || agentId === '') continue
+      if (typeof dshSessionId !== 'string' || dshSessionId === '') continue
+      if (typeof cwd !== 'string') continue
+      if (!this.defsMap.has(agentId)) continue
+      const { title, modelId, reasoningEffort, modes, usage, hasHistory } = record as {
+        title?: unknown; modelId?: unknown; reasoningEffort?: unknown; modes?: unknown; usage?: unknown; hasHistory?: unknown
+      }
+      const session: LiveSession = {
+        sessionId,
+        acpSessionId,
+        agentId,
+        dshSessionId,
+        cwd,
+        ...(typeof title === 'string' && title !== '' ? { title } : {}),
+        ...(typeof modelId === 'string' && modelId !== ''
+          ? { modelId, ...(splitAdapterModelId(modelId).choice === undefined ? {} : { choice: splitAdapterModelId(modelId).choice }) }
+          : {}),
+        ...(typeof reasoningEffort === 'string' && reasoningEffort !== '' ? { reasoningEffort } : {}),
+        ...(isPersistedModes(modes) ? { modes } : {}),
+        ...(isPersistedUsage(usage) ? { usage } : {}),
+        ...(hasHistory === true ? { hasHistory: true } : {}),
+        running: false,
+        turnSeq: 0,
+        closed: false,
+        released: true,
+        lastAgentActivityAt: Date.now(),
+        activeToolCalls: new Set<string>(),
+        transcript: new Transcript(this.transcriptMax),
+      }
+      this.dshSessionMap.set(`${dshSessionId}:${agentId}`, session)
+      this.bridge(agentId).parkReleased(session)
     }
   }
 
@@ -5016,6 +5169,8 @@ export class BridgeManager {
         else this.absorbCatalog(observedAgentId, configOptions)
       }, (observedAgentId, commands) => {
         this.absorbCommands(observedAgentId, commands)
+      }, () => {
+        this.persistAgents()
       })
       this.bridges.set(agentId, bridge)
     }
@@ -5536,9 +5691,16 @@ export class BridgeManager {
 
   /** Drop every chat-keyed record pointing at one host session (close/stop paths). */
   private forgetDshSession(sessionId: string): void {
+    let dropped = false
     for (const [key, session] of this.dshSessionMap) {
-      if (session.sessionId === sessionId) this.dshSessionMap.delete(key)
+      if (session.sessionId === sessionId) {
+        this.dshSessionMap.delete(key)
+        dropped = true
+      }
     }
+    // The disk record goes with it: a closed session is destroyed, not parked,
+    // and must not come back on the next boot (constraint 10).
+    if (dropped) this.persistAgents()
   }
   private sessionWorkspaceResolver?: SessionWorkspaceResolver
   private acpModeResolver?: AcpModeResolver
@@ -5688,6 +5850,9 @@ export class BridgeManager {
       // A RESUMED session had context before this call; a lock written here is
       // not provisional even if the conversation record was missing it.
       resumed.provisionalLock = false
+      // The load refreshed the record's mirrors (modes / usage / hasHistory);
+      // persist so a later restart restores what this resume saw.
+      this.persistAgents()
       return resumed
     }
     // A chat session runs where its DSH session lives, not in the plugin's
@@ -5737,6 +5902,9 @@ export class BridgeManager {
       // conversation back (a failed first attempt must not trap it).
       session.provisionalLock = this.lockChatAgent(dshSessionId, agentId)
     }
+    // The record is on disk from here: a host restart restores it as parked
+    // instead of the next message starting a context-less new session.
+    this.persistAgents()
     return session
   }
 

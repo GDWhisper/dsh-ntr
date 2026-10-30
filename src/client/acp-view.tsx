@@ -19,7 +19,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { ensureAcpStyle, useUi } from './acp-ui.tsx'
 import type { AcpChatInjected } from './acp-ui.tsx'
 import type { Block, ChatTranscript } from './store.ts'
-import type { AgentView, ChatSessionView } from '../protocol.ts'
+import type { AgentView, ChatSessionView, SessionView } from '../protocol.ts'
 
 /** Props of the ACP view entry (injected face + the frame's session id). */
 export interface AcpViewProps extends AcpChatInjected {
@@ -339,6 +339,20 @@ function boundSession(list: readonly ChatSessionView[]): ChatSessionView | undef
 }
 
 /**
+ * Whether an empty stream means "history exists but is not shown yet": the
+ * record was restored from disk after a host restart (the agent's replay has
+ * not landed), or a resume cleared the buffer ahead of the replay. The view
+ * then promises the replay instead of claiming the conversation never
+ * happened — "还没有消息" to someone whose chat plane still shows yesterday's
+ * turns is exactly the kind of contradiction this file's copy rules exist to
+ * prevent. In-memory released sessions keep their buffer, so this only fires
+ * when the buffer really is absent.
+ */
+export function historyAwaitsReplay(session: Pick<SessionView, 'released' | 'hasHistory'>): boolean {
+  return session.released === true && session.hasHistory === true
+}
+
+/**
  * Everything the view can read that says "this conversation is set up on an
  * agent": a live or parked ACP session, the host's binding (`session/chat-list`'s
  * `boundAgentId`, which outlives a closed session), and the persisted pick.
@@ -547,7 +561,13 @@ export function AcpConversationView(props: AcpViewProps) {
         }}
       >
         {transcript.blocks.length === 0
-          ? <div className="ntr-acp-empty-hint">{t('还没有消息：在下面的输入框里发给它。', 'Nothing yet — send it a message below.')}</div>
+          ? (
+            <div className="ntr-acp-empty-hint">
+              {historyAwaitsReplay(session)
+                ? t('进程已释放；历史将在恢复后回放显示。', 'The process is released — history replays once it is restored.')
+                : t('还没有消息：在下面的输入框里发给它。', 'Nothing yet — send it a message below.')}
+            </div>
+          )
           : transcript.blocks.map((block, index) => <BlockView key={index} block={block} label={acp.label} localeRev={ui.localeRev} />)}
       </div>
     </div>

@@ -10,7 +10,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { ACP_PRESET_ID, acpModeFromPresetEvent, formatCommandLine, isAbsolutePathLike, placeMenu, rowAgentPreset, splitAcpModelId, splitCommandLine, stagedIsAcpMode, stagedSessionOf, tokenizeCommandLine } from '../src/client/acp-ui.tsx'
 import { agentLockPhaseOf, FORM_MS, playAgentLockAnim, SHATTER_MS } from '../src/client/agent-lock-anim.ts'
-import { acpEmptyCopy, boundAgentOf, diffRows, isNewFileDiff } from '../src/client/acp-view.tsx'
+import { acpEmptyCopy, boundAgentOf, diffRows, historyAwaitsReplay, isNewFileDiff } from '../src/client/acp-view.tsx'
 import { acpMeterUsage, compactTokenCount, contextOccupancy } from '../src/client/context-meter.tsx'
 import { approvalDeadlineFacts, DEADLINE_MIN_WAIT_MS, deadlineSliderIndex, deadlineValueFor } from '../src/client/panel.tsx'
 import { describeRoute, menuFor, REFRESH_CATALOG_ITEM } from '../src/client/session-controls.tsx'
@@ -727,6 +727,20 @@ describe('the ACP view empty state (no transcript to show)', () => {
       .toBe('No agent configured · Settings → NTR')
     // No agents means no base to point at either way.
     expect(acpEmptyCopy({ hasAgents: false }, en).hint).toBe('No agent configured · Settings → NTR')
+  })
+
+  it('says history replays only when a parked record carries history', () => {
+    // A record restored from disk after a host restart: released, and the
+    // agent-side session has the turns the empty local buffer cannot show —
+    // "还没有消息" to someone whose chat plane shows yesterday's turns is the
+    // kind of contradiction this copy rule exists to prevent.
+    expect(historyAwaitsReplay({ released: true, hasHistory: true })).toBe(true)
+    // A parked session with nothing to show really has nothing.
+    expect(historyAwaitsReplay({ released: true })).toBe(false)
+    expect(historyAwaitsReplay({ released: true, hasHistory: false })).toBe(false)
+    // A live session (mid-replay or not) must not promise a restore.
+    expect(historyAwaitsReplay({ hasHistory: true })).toBe(false)
+    expect(historyAwaitsReplay({})).toBe(false)
   })
 })
 
