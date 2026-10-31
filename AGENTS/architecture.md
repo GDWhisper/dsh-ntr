@@ -44,7 +44,7 @@
 - 工具活动发真正的 `tool-call` 块（`acpToolCallFromUpdate` / `acpToolCallDelta`：快照 + 前缀扩展 delta，每个 callId 一个 turn 内只开一张卡）。完整参数 / diff 卡仍在 NTR 视图 tab。
 - **逐步切分**（[acp-convergence.md §1.8](../docs/acp-convergence.md)）：一个 ACP turn = 多个宿主 step。段内开过卡、且下一条非 tool 事件到达时切段（`block-end` + `finish(stop)`）；宿主 loop 落定消息 → 执行卡（guard 虚拟工具从共享注册表 `toolResults` 答真实输出，未到则 `waitForToolOutput` 挂起）→ 续跑。续跑批次（`isAcpToolContinuation`：最后 user 消息之后全是 tool 来源）由 `TurnStreamController.startSegment()` 用 transcript 游标补读段间事件再订阅，**绝不新发 `session/prompt`**。以卡收尾的 turn 由最后一个续跑段收口（指针行），避免空气泡。
 - **turn 级语义跨段成立**：`turnSeq` 世代守卫、prompt slot（agent 未确认取消前不解开 `settled` 闸门）、段间事件只记账不推进游标（下一段重放补齐），全部在 `TurnStreamController`；`session/cancel` 后的强制定稿由 `AgentBridge.armCancelFallback` 按同一 `turnSeq` 守卫。**聊天面与 `/acp` 共用一个 prompt slot**：`BridgeManager.prompt` 也经 `bridge.beginTurn` 占槽，聊天 `claimTurn` 与 `/acp` 的 `turn_in_flight` 检查互斥（/acp 还拒 `running` 与未 settle 的活聊天控制器），任一在飞时另一面不得发 `session/prompt`。
-- **后台 drain 的正文归属**：CodeBuddy 的 unsolicited turn 见 [protocol.md §6.2](./protocol.md)。主平面的唯一入口是 `adapter.stream`：等待中的用户回合把 drain 的正文折进自己的段（后台工具只进 transcript、不开卡），纯空闲 drain 只进 ACP 视图，**严禁**绕过 stream 凭空 append。
+- **后台 drain 的正文归属**：CodeBuddy 的 unsolicited turn 见 [protocol.md §6.2](./protocol.md)；派发 detached worker 的回合见 [protocol.md §6.3](./protocol.md)——worker 自己的 `session/update`（带 `codebuddy.ai/parentToolCallId`）只进 transcript / ACP 视图，主平面收的是父回合的正文与 drain 的最终答案。主平面的唯一入口是 `adapter.stream`：等待中的用户回合把 drain 的正文折进自己的段（后台工具只进 transcript、不开卡），纯空闲 drain 只进 ACP 视图，**严禁**绕过 stream 凭空 append。
 - **重述去重**：agent 会把整条 `tool_call` 重发多遍当进度（并行调用还会交错）。`seenCalls` 按 callId 一卡；重述只刷 `recordAcpToolOutput` 的输出记录（并唤醒等待中的虚拟工具）。无卡片的通知种类（plan / mode）同理，`announcedKinds` 每种类一行、文本变了才重发。
 
 ### 2.3 收尾
@@ -112,7 +112,7 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 
 - **首轮开始时**（ACP 会话 materialize、prompt 发出前）锁定并广播 `chat/agent-locked`。判定走 `lockedAgentOf`（宿主 `lockedAgentId` → 活/挂起会话的 agent），**不拿插件默认 agent 或首轮前的 pick 当判据**，**不查 roster**（agent 被删除也不解锁）。
 - 锁定发生在 `getOrCreateDshSession` 的 create 路径（`lockChatAgent` 并广播），不是点选时，但它是**临时的，直到首轮产生第一个可见块**。
-- 首轮无任何可见输出就结束（报错、静默失败、取消、看门狗以 `INACTIVITY_TIMEOUT` 收口）：`TurnStreamController.settle`（用户取消时还有 `abortActiveSegment`）在合成空回合告警**之前**用真实的 `sawVisibleBlock` 判定并调 `rollbackFirstTurn`——删除 `locked`、`forgetDshSession`、关闭失败会话（不关就没法解锁：活会话被当作锁）、广播 `chat/agent-unlocked`。看门狗在 `BridgeManager.reapStalledTurns` 里按同一判据换掉自己的 notice：不承诺「下一条消息恢复会话」，而是说明这一轮已丢弃、下一条消息新建 ACP 会话。**唯一例外**是被并入后台 drain 的回合：延后收口不是失败，drain 的产出仍在 transcript，锁转正、不滚（[protocol.md §6.2](./protocol.md)）。
+- 首轮无任何可见输出就结束（报错、静默失败、取消、看门狗以 `INACTIVITY_TIMEOUT` 收口）：`TurnStreamController.settle`（用户取消时还有 `abortActiveSegment`）在合成空回合告警**之前**用真实的 `sawVisibleBlock` 判定并调 `rollbackFirstTurn`——删除 `locked`、`forgetDshSession`、关闭失败会话（不关就没法解锁：活会话被当作锁）、广播 `chat/agent-unlocked`。看门狗在 `BridgeManager.reapStalledTurns` 里按同一判据换掉自己的 notice：不承诺「下一条消息恢复会话」，而是说明这一轮已丢弃、下一条消息新建 ACP 会话。**例外**是 ambient 家族的延后收口（被并入后台 drain 的回合 §6.2、派发 detached worker 的回合 §6.3）：延后收口不是失败，产出仍在 transcript，锁转正、不滚（[protocol.md §6.2 / §6.3](./protocol.md)）。
 - 一旦有可见输出，`chatChoice.locked` 随会话持久化。`bindChatAgent` / `setChatSessionModel` / `setChatSessionMode` 指向别的 agent、以及 `getOrCreateDshSession` 的 turn 路径一律以 `agent_locked` 拒绝。
 - 锁定在 ACP 会话关闭、进程停止、宿主重启后仍然保留。
 - 浏览器侧的表现与动效见 [ui.md](./ui.md) 的「底座退场与挂牌」。

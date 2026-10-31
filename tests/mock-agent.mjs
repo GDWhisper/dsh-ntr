@@ -88,6 +88,47 @@
  *              response has no conversation request id, so the prompt is
  *              folded into it (and the kept tail can be told from the evicted
  *              front)
+ *  - "DISPATCH" → the CodeBuddy 2.179.0 DETACHED-WORKER shape, with the
+ *              measured wire details: the coordinator opens an `Agent` tool
+ *              call (`codebuddy.ai/toolName` + the parent's request ids) and
+ *              re-sends that SAME call with `codebuddy.ai/isBackground` /
+ *              `isSubagent` once the worker runs detached; the ack update
+ *              names the tool again, says "已派", and the coordinator answers
+ *              its own prompt normally. The worker streams under its own
+ *              request id with `codebuddy.ai/parentToolCallId`, the Agent call
+ *              completes with **NO `_meta` at all** (the real wire sends it
+ *              bare), an `unsolicitedTurn` drain announces itself, and the
+ *              drain's TaskOutput + final text (the parent's answer) carry the
+ *              response's own request id — all after the prompt response.
+ *              Nothing may reach the main plane except the coordinator's own
+ *              ack and the drain's final answer.
+ *  - "DISPATCHNODRAIN" (with DISPATCH) → the worker never reports back: the
+ *              dispatch stays in progress and only the client's worker-phase
+ *              ceiling can end the turn (no parent text at all)
+ *  - "DISPATCHACKNODRAIN" (with DISPATCH) → the coordinator acks ("已派") and
+ *              answers, but the worker never reports: the deferral line must
+ *              still appear (the ack is not the drained run's answer)
+ *  - "DISPATCHSLOW" (with DISPATCH) → a slow worker phase, so a test can act
+ *              while the turn is holding
+ *  - "DISPATCHSILENT" (with DISPATCH) → the worker is silent for longer than
+ *              the test's ambient quiet window before it reports: the worker
+ *              phase has no quiet clock, so the turn must survive it
+ *  - "DISPATCHTWO" (with DISPATCH) → two dispatches; the drain announces
+ *              itself while BOTH are still running, the first reports early
+ *              (parent text follows) and the second later; the turn must not
+ *              close after the first report
+ *  - "DISPATCHALTFIRST" (with DISPATCH) → the drain announces itself BEFORE
+ *              the prompt response under a DIFFERENT id (`req-alt`); the
+ *              response names `req-dispatch`, and the drain's text arrives
+ *              under the announced id
+ *  - "DISPATCHFAST" (with DISPATCH) → the worker runs, reports and completes
+ *              BEFORE the prompt response; the drain still follows
+ *  - "DISPATCHLATEDRAIN" (with DISPATCH) → the dispatch completes WITHOUT
+ *              `_meta` and the drain's announcement is delayed past the test's
+ *              quiet window: the completion itself must start the drain phase
+ *  - "DISPATCHPARKED" (with DISPATCH) → the response lands between driver
+ *              steps (right after the ack) and the worker starts while the
+ *              host is away: a parked hold's step must adopt it later
  *
  * Environment knobs:
  *  - MOCK_NO_LOAD=1 → `initialize` advertises no `loadSession` capability
@@ -400,6 +441,243 @@ const app = agent({ name: 'mock-acp-agent' })
         })
       }, 10)
       return { stopReason: 'cancelled' }
+    }
+
+    if (text.includes('DISPATCH')) {
+      // The detached-worker shape CodeBuddy 2.179.0 produces with multitask
+      // on, with the measured wire details:
+      //  - the dispatch call names its tool (`codebuddy.ai/toolName: "Agent"`)
+      //    and the parent turn's ids on its FIRST send;
+      //  - the SAME call is re-sent with `codebuddy.ai/isBackground: true` /
+      //    `isSubagent` / `subagentType` once the worker runs detached — the
+      //    structural signal, no English text needed;
+      //  - the ack update names the tool again; the dispatch COMPLETION carries
+      //    no `_meta` at all (the real wire sends it bare);
+      //  - the worker's updates name their parent call (`parentToolCallId`) and
+      //    a request id of their own (`req-worker`);
+      //  - the drain's TaskOutput names `TaskOutput`, the final parent text
+      //    carries only `requestId`, and both use the RESPONSE's conversation
+      //    request id (`req-dispatch`) unless the drain announced another.
+      const dispatchId = 'agent_dispatch'
+      const secondId = 'agent_dispatch_two'
+      const drainId = 'req-dispatch'
+      const altId = 'req-alt'
+      const workerId = 'req-worker'
+      const secondWorkerId = 'req-worker-two'
+      const slow = text.includes('DISPATCHSLOW')
+      const silent = text.includes('DISPATCHSILENT')
+      const two = text.includes('DISPATCHTWO')
+      const fast = text.includes('DISPATCHFAST')
+      const parked = text.includes('DISPATCHPARKED')
+      const noDrain = text.includes('DISPATCHNODRAIN')
+      const ackNoDrain = text.includes('DISPATCHACKNODRAIN')
+      const lateDrain = text.includes('DISPATCHLATEDRAIN')
+      const altFirst = text.includes('DISPATCHALTFIRST')
+      // The run the PARENT's own steps carry. Normally the response's
+      // conversation request id; an early announcement can name another.
+      let parentRun = drainId
+      const notify = (update, meta) => ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: meta === undefined ? update : { ...update, _meta: meta },
+      })
+      const dispatchCall = callId => ({
+        sessionUpdate: 'tool_call',
+        toolCallId: callId,
+        title: 'Agent',
+        kind: 'other',
+        status: 'in_progress',
+        rawInput: {
+          description: 'audit the repo',
+          subagent_type: 'general-purpose',
+          name: 'explorer',
+          prompt: 'read the tree',
+        },
+      })
+      const firstMeta = {
+        'codebuddy.ai/toolName': 'Agent',
+        'codebuddy.ai/requestId': drainId,
+        'codebuddy.ai/conversationRequestId': drainId,
+      }
+      // No `toolName` here: the re-send is about the WORKER, not the call.
+      const resendMeta = {
+        'codebuddy.ai/isBackground': true,
+        'codebuddy.ai/isSubagent': true,
+        'codebuddy.ai/subagentType': 'general-purpose',
+        'codebuddy.ai/requestId': drainId,
+      }
+      const ackMeta = {
+        'codebuddy.ai/toolName': 'Agent',
+        'codebuddy.ai/requestId': drainId,
+        'codebuddy.ai/conversationRequestId': drainId,
+      }
+      const sendFirst = callId => notify(dispatchCall(callId), firstMeta)
+      const sendResend = callId => notify(dispatchCall(callId), resendMeta)
+      const sendAck = callId => notify({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: callId,
+        status: 'in_progress',
+        content: [{
+          type: 'content',
+          content: {
+            type: 'text',
+            text: 'Started general-purpose agent: explorer\nagent_id: agent-1\nThe worker is running detached (no team). Wait for <task-notification>, then call TaskOutput once for the full report.',
+          },
+        }],
+      }, ackMeta)
+      const sendWorker = (update, id = workerId, parent = dispatchId) => notify(update, {
+        'codebuddy.ai/requestId': id,
+        'codebuddy.ai/parentToolCallId': parent,
+      })
+      // The parent's own steps: requestId only (TaskOutput names its tool; the
+      // final prose names nothing).
+      const sendDrain = (update, toolName) => notify(update, {
+        'codebuddy.ai/requestId': parentRun,
+        ...(toolName === undefined ? {} : { 'codebuddy.ai/toolName': toolName }),
+      })
+      // The real completion frame: NO `_meta` at all.
+      const sendCompleted = callId => notify({ sessionUpdate: 'tool_call_update', toolCallId: callId, status: 'completed' })
+      const announce = id => notify({ sessionUpdate: 'session_info_update' }, {
+        'codebuddy.ai/unsolicitedTurn': { requestId: id, reason: 'background_drain' },
+        'codebuddy.ai/requestId': id,
+      })
+      // The coordinator's own message ("已派…"): this turn's parent prose, so
+      // it carries the parent run's request id and nothing else.
+      const sendParentText = text => notify(
+        { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
+        { 'codebuddy.ai/requestId': parentRun },
+      )
+      const workerTurn = async (id, parent, toolCallId) => {
+        // The worker's own turn: prose, a tool, its report. None of it is the
+        // session's answer; it belongs in the ACP transcript view.
+        await sendWorker({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'WORKER-THOUGHT ' } }, id, parent)
+        await sendWorker({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'WORKER-INTERNAL-TEXT ' } }, id, parent)
+        await sendWorker({
+          sessionUpdate: 'tool_call',
+          toolCallId,
+          title: 'Bash',
+          kind: 'execute',
+          status: 'in_progress',
+          rawInput: { command: 'rg TODO src' },
+        }, id, parent)
+        await sleep(slow ? 400 : 60)
+        await sendWorker({
+          sessionUpdate: 'tool_call_update',
+          toolCallId,
+          status: 'completed',
+          content: [{ type: 'content', content: { type: 'text', text: 'src/a.ts:3 TODO' } }],
+        }, id, parent)
+        await sendWorker({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'WORKER-REPORT-TEXT ' } }, id, parent)
+        if (slow) await sleep(400)
+      }
+      const drainTurn = async (finalText = 'DISPATCH-FINAL-ANSWER', announceRun = true) => {
+        if (announceRun && !altFirst) await announce(parentRun)
+        await sendDrain({
+          sessionUpdate: 'tool_call',
+          toolCallId: 'drain_task_output',
+          title: 'TaskOutput',
+          kind: 'read',
+          status: 'in_progress',
+        }, 'TaskOutput')
+        await sleep(slow ? 300 : 40)
+        await sendDrain({
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'drain_task_output',
+          status: 'completed',
+          content: [{ type: 'content', content: { type: 'text', text: 'WORKER REPORT BODY' } }],
+        })
+        // The parent's own answer — the text the main chat must receive.
+        await sendDrain({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: finalText } })
+      }
+
+      await sendFirst(dispatchId)
+      await sendResend(dispatchId)
+      if (two) {
+        await sendFirst(secondId)
+        await sendResend(secondId)
+      }
+      const response = {
+        stopReason: 'end_turn',
+        _meta: { 'codebuddy.ai/conversationRequestId': drainId, 'codebuddy.ai/requestId': drainId },
+      }
+      if (noDrain) {
+        // The worker never reports back and the coordinator says nothing: only
+        // the client's worker-phase ceiling can end this turn.
+        await sleep(30)
+        return response
+      }
+      // The coordinator's acknowledgement, then the prompt response: on the
+      // wire the parent turn is OVER while the worker runs on.
+      await sleep(20)
+      await sendAck(dispatchId)
+      if (two) await sendAck(secondId)
+      await sleep(20)
+      await sendParentText('DISPATCH-ACK ')
+      if (ackNoDrain) {
+        // Acked, then silence: the dispatch never reports.
+        await sleep(120)
+        return response
+      }
+      if (fast) {
+        // The worker is so fast it reports, streams and completes BEFORE the
+        // response; the drain still follows the parent's answer.
+        await workerTurn(workerId, dispatchId, 'worker_bash')
+        await sendCompleted(dispatchId)
+        setTimeout(() => { void drainTurn() }, 30)
+        return response
+      }
+      if (altFirst) {
+        // The drain announces itself BEFORE the response, under its own id.
+        await announce(altId)
+        parentRun = altId
+      }
+      if (parked) {
+        // The response lands BETWEEN driver steps: the ack was the cutting
+        // event and the host has not opened the next step yet. The worker
+        // starts while the host is away; the parked hold must adopt its step.
+        setTimeout(() => {
+          void (async () => {
+            await workerTurn(workerId, dispatchId, 'worker_bash')
+            await sendCompleted(dispatchId)
+            await drainTurn()
+          })()
+        }, 30)
+        return response
+      }
+      await sleep(slow ? 120 : 60)
+      setTimeout(() => {
+        void (async () => {
+          if (two) {
+            // The drain announced itself while BOTH dispatches were running:
+            // the first report must not arm its quiet clock, so the turn must
+            // still be holding after it.
+            await announce(parentRun)
+            await workerTurn(workerId, dispatchId, 'worker_bash')
+            await sendCompleted(dispatchId)
+            await sendDrain({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'DISPATCH-TWO-A-DONE ' } })
+            await sleep(120)
+            await workerTurn(secondWorkerId, secondId, 'worker_bash_two')
+            await sendCompleted(secondId)
+            await sendDrain({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'DISPATCH-TWO-B-DONE ' } })
+            await drainTurn('DISPATCH-TWO-FINAL ', false)
+            return
+          }
+          if (silent) await sleep(600)
+          if (lateDrain) {
+            // The dispatch completes WITHOUT meta and the drain is not
+            // announced for a while: the completion alone must start the drain
+            // phase (its quiet window then closes the turn).
+            await workerTurn(workerId, dispatchId, 'worker_bash')
+            await sendCompleted(dispatchId)
+            await sleep(400)
+            await drainTurn('DISPATCH-LATE-ANSWER')
+            return
+          }
+          await workerTurn(workerId, dispatchId, 'worker_bash')
+          await sendCompleted(dispatchId)
+          await drainTurn(altFirst ? 'DISPATCH-ALT-ANSWER' : 'DISPATCH-FINAL-ANSWER')
+        })()
+      }, 30)
+      return response
     }
 
     if (text.includes('GAP')) {

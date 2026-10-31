@@ -457,6 +457,32 @@ export interface BridgeTuning {
    */
   ambientMaxMs?: number
   /**
+   * The hard ceiling on the WORKER phase of a detached-worker hold (see
+   * `TurnStreamController.holdForBackgroundDispatch`): the turn dispatched one
+   * or more background workers through `Agent` tool calls, the agent answered
+   * the prompt, and at least one worker has not reported back yet. The worker
+   * phase has NO quiet window on purpose — measured against CodeBuddy 2.179.0,
+   * a detached worker's own updates are 13–24s apart while it is perfectly
+   * alive — so only EVERY known dispatch reporting (completed / failed) or
+   * this ceiling can end it; a drain announcement is recorded but arms no
+   * clock before then. Once they have all reported, the drain's own
+   * `ambientQuietMs` / `ambientMaxMs` windows take over.
+   *
+   * Default 600000 ms (10 minutes).
+   */
+  backgroundTaskMaxMs?: number
+  /**
+   * How long a PARKED detached-worker hold may wait for the host to open the
+   * driver step that carries the worker's report. The prompt response landed
+   * between two steps (the host is about to execute the `Agent` card), and a
+   * host that never opens the continuation step must not hang the turn. The
+   * host normally opens it at once, so this is a safety bound, not a cadence —
+   * deliberately far larger than one model hand-off.
+   *
+   * Default 30000 ms (30 seconds).
+   */
+  backgroundParkedGraceMs?: number
+  /**
    * How long an announced background drain may go without ANY update before a
    * later instant prompt stops treating itself as folded into it. A drain that
    * went silent for minutes is over even though nothing told us; keeping the
@@ -551,6 +577,8 @@ const DEFAULT_TUNING: Required<BridgeTuning> = {
   probeIdleTimeoutMs: 300_000,
   ambientQuietMs: 10_000,
   ambientMaxMs: 120_000,
+  backgroundTaskMaxMs: 600_000,
+  backgroundParkedGraceMs: 30_000,
   ambientStaleMs: 300_000,
 }
 
@@ -2272,6 +2300,15 @@ export class AgentBridge {
  * RESPONSE) had its message folded into the drain — the real answer streams
  * afterwards, under the drain's request id.
  *
+ * The same run also explains a DETACHED WORKER: `_meta["codebuddy.ai/toolName"]`
+ * names the `Agent` call that dispatched it, the call is re-sent with
+ * `_meta["codebuddy.ai/isBackground"] = true` once the worker runs off-turn, and
+ * every update the worker emits carries
+ * `_meta["codebuddy.ai/parentToolCallId"]` naming that call. Those updates are
+ * the worker's own turn — they belong in the transcript, not in the session's
+ * assistant message. The completion of the dispatch call itself carries NO
+ * `_meta` at all, so a known call's status is read from its id.
+ *
  * No other agent sends these keys: an object without them yields `undefined`,
  * so every existing path is untouched. Values are only read when they have the
  * declared shape (never guessed from a message body).
@@ -2285,6 +2322,27 @@ interface CodebuddyMeta {
   agentPhase?: { phase: string }
   /** Set on a `session/prompt` RESPONSE that really queued a conversation turn. */
   conversationRequestId?: string
+  /**
+   * The tool a `tool_call` names, when the agent omits `title`. `Agent` (or
+   * `Task`) means the call DISPATCHED a detached worker: the call stays in
+   * progress while the worker runs on its own.
+   */
+  toolName?: string
+  /**
+   * Set on every update a DETACHED WORKER emits (prose, tools, its report):
+   * it names the `Agent` tool call that dispatched the worker. Such an update
+   * belongs to the worker's own turn, never to this session's answer.
+   */
+  parentToolCallId?: string
+  /**
+   * Set on the dispatch call RE-SENT after the worker started
+   * (`codebuddy.ai/isBackground: true`): the call handed its work to a worker
+   * that keeps running off-turn, which is the structural "detached" signal.
+   * The first send of the same call does not carry it.
+   */
+  isBackground?: boolean
+  /** `codebuddy.ai/isSubagent` — the same re-send declares the worker a sub-agent. */
+  isSubagent?: boolean
 }
 
 /** Read the CodeBuddy `_meta` keys off an update or a `{ _meta }` wrapper. */
@@ -2301,6 +2359,14 @@ function codebuddyMetaOf(source: unknown): CodebuddyMeta | undefined {
   if (typeof conversationRequestId === 'string' && conversationRequestId !== '') {
     out.conversationRequestId = conversationRequestId
   }
+  const toolName = meta['codebuddy.ai/toolName']
+  if (typeof toolName === 'string' && toolName !== '') out.toolName = toolName
+  const parentToolCallId = meta['codebuddy.ai/parentToolCallId']
+  if (typeof parentToolCallId === 'string' && parentToolCallId !== '') out.parentToolCallId = parentToolCallId
+  // Booleans, read as booleans only: a string "true" is not the declared shape
+  // and guessing from it would make another agent's unrelated key look detached.
+  if (meta['codebuddy.ai/isBackground'] === true) out.isBackground = true
+  if (meta['codebuddy.ai/isSubagent'] === true) out.isSubagent = true
   const unsolicited = meta['codebuddy.ai/unsolicitedTurn']
   if (typeof unsolicited === 'object' && unsolicited !== null) {
     const run = unsolicited as Record<string, unknown>
@@ -2383,6 +2449,16 @@ function clearAmbientState(session: LiveSession): void {
   session.ambient = undefined
   session.ambientNotices?.clear()
   session.retiredAmbients = undefined
+}
+
+/**
+ * The closing line of a turn the agent deferred to its OWN background run: the
+ * answer exists, but in the ACP transcript view rather than in this bubble.
+ * Shared by the ambient wait and the detached-worker hold, so both say the
+ * same thing in the same words.
+ */
+function backgroundDeferralLine(agentId: string): string {
+  return `\n[dsh-ntr] agent "${agentId}" deferred this turn to a background task run; its output is in the ACP transcript view. Send again after the background run finishes.\n`
 }
 
 /** Human-facing identity of an ACP tool call (the approval headline). */
@@ -3414,6 +3490,90 @@ interface PendingAmbientUpdate {
 }
 
 /**
+ * The `Agent` tool call that handed work to a DETACHED worker.
+ *
+ * CodeBuddy 2.179.0 with multitask on: the coordinator opens an `Agent` call
+ * (`_meta["codebuddy.ai/toolName"] = "Agent"`), says "已派…", and ENDS ITS OWN
+ * PROMPT normally while the worker keeps running off-turn. The call itself
+ * stays `in_progress` until the worker reports, and only then does the agent
+ * start the background drain that carries the worker's report into the
+ * session. A turn that closed at its prompt response therefore lost the only
+ * answer it was ever going to produce; this record is what the controller
+ * holds the turn open for.
+ */
+interface BackgroundDispatch {
+  /** The `Agent` call's id — the card that stays on the plane. */
+  toolCallId: string
+  /** The last status the agent declared for the dispatch call itself. */
+  status: string
+  /** Whether the call already reported completed / failed. */
+  completed: boolean
+  /**
+   * Whether the work runs DETACHED, read from the wire's own structure: the
+   * call re-sent with `_meta["codebuddy.ai/isBackground"] = true`, or any
+   * update naming this call as its `parentToolCallId`. A synchronous
+   * `Agent` / `Task` call carries neither, so it can never make the turn wait
+   * after its own answer.
+   */
+  detached: boolean
+  /** Whether any update came FROM the worker (`codebuddy.ai/parentToolCallId`). */
+  sawWorkerUpdate: boolean
+}
+
+/**
+ * A turn held open for the detached worker its `Agent` call dispatched.
+ *
+ * Two phases, because their liveness signals differ:
+ * - `worker`: at least one worker runs off-turn and may be silent for tens of
+ *   seconds between model calls — NO quiet timer, only
+ *   {@link BridgeTuning.backgroundTaskMaxMs}. It ends when EVERY known dispatch
+ *   reported (completed / failed); a drain announcement is recorded meanwhile
+ *   but arms no clock.
+ * - `drain`: every dispatch reported and the background turn that carries
+ *   their report is (or is about to start) — the existing ambient windows
+ *   apply (`ambientQuietMs` quiet, reset by every update; `ambientMaxMs`
+ *   ceiling from the switch).
+ */
+interface BackgroundHold {
+  /** The stop reason the prompt RESPONSE carried (what the turn closes with). */
+  stopReason: string
+  /** The run this hold currently waits on: the response's id or the last announcement. */
+  requestId?: string
+  /**
+   * Every drain id this hold may fold text from: the response's
+   * `conversationRequestId` / `requestId` plus every announced id. A run
+   * announced before the response may name a different id than the response —
+   * both are this turn's answer, and anything else stays background noise.
+   */
+  acceptedIds: Set<string>
+  phase: 'worker' | 'drain'
+  /**
+   * Agent MESSAGE text folded into this hold. The parent's interim
+   * acknowledgement ("已派…") landed before the hold and is not the drained
+   * run's answer: a hold that never received that answer must still say where
+   * it will appear.
+   */
+  answerChars: number
+  /**
+   * The transcript head when the hold began. Text at or below it arrived
+   * before the hold — a parked hold replays the parent's ack from there — so
+   * it is not counted in {@link answerChars}; the drain updates withheld for
+   * the response are the exception and are counted explicitly when flushed.
+   */
+  floorSeq: number
+  quietTimer?: ReturnType<typeof setTimeout>
+  hardTimer?: ReturnType<typeof setTimeout>
+  /**
+   * The bounded wait for a driver step to speak into. Only while the hold is
+   * PARKED (`pendingBackgroundHold`): the response landed between steps, and
+   * the host is expected to open the continuation step for the Agent card.
+   */
+  graceTimer?: ReturnType<typeof setTimeout>
+  /** Whether the run's ids were already released (a close, cancel or teardown). */
+  retired: boolean
+}
+
+/**
  * The state of ONE ACP prompt, shared across every driver step of the turn.
  *
  * The controller owns the hub subscription (for the whole agent-side turn, not
@@ -3502,6 +3662,35 @@ class TurnStreamController {
    * measured CodeBuddy tick cadence these defaults come from).
    */
   private readonly ambientTuning: { quietMs: number; maxMs: number }
+  /**
+   * The detached workers this turn dispatched (see {@link BackgroundDispatch}),
+   * by `toolCallId`, recorded from the wire while the turn is still streaming —
+   * typically in the first step, before the prompt response lands. A turn may
+   * dispatch several, and the hold waits for ALL of them.
+   */
+  private readonly dispatches = new Map<string, BackgroundDispatch>()
+  /** The detached-worker hold in progress, once a segment carries it. */
+  private backgroundHold?: BackgroundHold
+  /**
+   * A hold parked because the prompt response landed while NO driver segment
+   * was open (the host is between steps, about to execute the Agent card). It
+   * begins when the next `startSegment` opens — or closes after a bounded
+   * grace so a host that never opens one does not hang the turn.
+   */
+  private pendingBackgroundHold?: BackgroundHold
+  /**
+   * The hold's own windows, read once at construction like the ambient pair:
+   * `taskMaxMs` is the worker phase's ceiling, `graceMs` the parked hold's
+   * bounded wait for a driver step (see {@link BridgeTuning.backgroundTaskMaxMs}
+   * and {@link BridgeTuning.backgroundParkedGraceMs}).
+   */
+  private readonly backgroundTuning: { taskMaxMs: number; graceMs: number }
+  /**
+   * When this controller was built. Only a drain announced AFTER this moment
+   * may be adopted by the hold: an `ambient` record that predates the turn is
+   * some earlier run's, and folding its text would mix two answers.
+   */
+  private readonly constructedAt: number
 
   constructor(
     private readonly manager: BridgeManager,
@@ -3515,7 +3704,9 @@ class TurnStreamController {
     this.turnSeqAtStart = session.turnSeq
     this.cursorSeq = session.transcript.head
     this.tpsSeq = session.transcript.head
+    this.constructedAt = Date.now()
     this.ambientTuning = manager.ambientTuning
+    this.backgroundTuning = manager.backgroundTuning
     this.unsubscribe = hub.subscribe(event => this.onEvent(event))
   }
 
@@ -3574,15 +3765,29 @@ class TurnStreamController {
       hasCard: false,
       // A segment opened DURING an ambient wait (never the steered first step,
       // which marks its own) inherits the suppression: the drain's tools still
-      // stay transcript-only until the turn closes.
-      ambient: this.awaitingAmbient !== undefined,
+      // stay transcript-only until the turn closes. A detached-worker hold
+      // suppresses its cards for the same reason, and a PARKED hold must
+      // suppress from the first replayed update on — the drain's TaskOutput
+      // arrives in exactly that step.
+      ambient: this.awaitingAmbient !== undefined
+        || this.backgroundHold !== undefined
+        || this.pendingBackgroundHold !== undefined,
       finished: false,
     }
     this.segment = seg
     const entries = this.session.transcript.since(this.cursorSeq)
     for (const entry of entries) {
       if (seg.finished) break
-      if (!this.foldInto(seg, entry.update as Record<string, unknown>)) break
+      const update = entry.update as Record<string, unknown>
+      // The same split the live path makes: a background drain's prose is not
+      // this turn's answer, even when it landed while no step was open. The
+      // record (tool outputs) still goes in; the cursor moves past it.
+      if (this.isForeignAmbientText(update)) {
+        this.recordWithoutSegment(update)
+        this.cursorSeq = entry.seq
+        continue
+      }
+      if (!this.foldInto(seg, update, entry.seq)) break
       this.cursorSeq = entry.seq
     }
     if (!seg.finished && this.pendingProse.length > 0) {
@@ -3590,6 +3795,12 @@ class TurnStreamController {
       // execution): it belongs to the turn's story, so it opens this segment.
       const lines = this.pendingProse.splice(0, this.pendingProse.length).join('')
       this.emitProse(seg, 'reasoning', lines)
+    }
+    const parkedHold = this.pendingBackgroundHold
+    if (parkedHold !== undefined && !seg.finished) {
+      // The host opened the continuation step for the Agent card: the hold
+      // finally has a driver step to speak the drain's answer into.
+      this.adoptBackgroundHold(seg, parkedHold)
     }
     if (this.settled) this.finishAfterSettle(seg)
     return seg
@@ -3667,6 +3878,459 @@ class TurnStreamController {
     this.recentRetiredDrain = true
   }
 
+  /**
+   * Whether this turn dispatched a detached worker whose answer is still
+   * outstanding. Read when the prompt response lands: such a turn is NOT over
+   * even though the agent answered it (see {@link holdForBackgroundDispatch}).
+   *
+   * Two ways a dispatch keeps the turn open:
+   * - it has not reported back yet (the worker is still running), or
+   * - it DID report — before the response, even — but it was structurally
+   *   detached and emitted worker updates: the drain that carries its report
+   *   is still coming.
+   * A synchronous `Agent` / `Task` call (completed, no `isBackground`, no
+   * worker updates) matches neither and closes normally.
+   */
+  get dispatchedDetachedWorker(): boolean {
+    for (const dispatch of this.dispatches.values()) {
+      if (!dispatch.completed) return true
+      if (dispatch.detached && dispatch.sawWorkerUpdate) return true
+    }
+    return false
+  }
+
+  /** The hold this turn is inside — adopted, or parked waiting for a step. */
+  private activeBackgroundHold(): BackgroundHold | undefined {
+    return this.backgroundHold ?? this.pendingBackgroundHold
+  }
+
+  /** Whether every KNOWN dispatch has reported (no dispatch at all counts as done). */
+  private allDispatchesCompleted(): boolean {
+    for (const dispatch of this.dispatches.values()) {
+      if (!dispatch.completed) return false
+    }
+    return true
+  }
+
+  /**
+   * Hold the turn open for the detached worker(s) its `Agent` tool calls
+   * dispatched — the second controlled ambient-family exception (constraint
+   * 23), not a new idle watchdog.
+   *
+   * THE SHAPE (measured against CodeBuddy 2.179.0, multitask on): the
+   * coordinator opens an `Agent` call that hands work to a background worker,
+   * says "已派…", and the `session/prompt` RESPONSE arrives normally while the
+   * worker keeps running. The worker's own updates (requestId B +
+   * `parentToolCallId`) never touch this session's message; when it finishes,
+   * the agent starts a background DRAIN (requestId A — the response's own
+   * `conversationRequestId`) whose steps carry the report and the final answer.
+   * Nothing tells the client the worker is running: no `session_end` (the SDK's
+   * schema rejects it) and an `agentPhase` idle tick even fires BETWEEN the
+   * worker and the drain. So the response cannot close the turn.
+   *
+   * The hold:
+   * - releases the agent-side prompt slot (`endTurn`: the response landed)
+   *   while keeping `running` and the driver step open;
+   * - marks the segment background, so EVERY tool call for the rest of the
+   *   hold — the workers', the drain's TaskOutput — stays transcript-only and
+   *   the final message carries text with no card in front of it;
+   * - waits in two phases: the worker phase only has the
+   *   {@link BridgeTuning.backgroundTaskMaxMs} ceiling (a detached worker goes
+   *   silent for tens of seconds while it works) and ends only when ALL known
+   *   dispatches reported, after which the drain phase uses the ambient
+   *   windows.
+   */
+  holdForBackgroundDispatch(stopReason: string, requestId?: string): void {
+    if (this.settled || this.disposed || this.closedTurn || this.stale) return
+    if (this.activeBackgroundHold() !== undefined) return
+    const hold: BackgroundHold = {
+      stopReason,
+      requestId,
+      acceptedIds: new Set<string>(),
+      phase: 'worker',
+      answerChars: 0,
+      floorSeq: this.session.transcript.head,
+      retired: false,
+    }
+    if (requestId !== undefined) hold.acceptedIds.add(requestId)
+    // A drain announced while this turn was ALREADY on air belongs to it (the
+    // announcement may have named a different id than the response). One that
+    // predates the turn is some earlier run's, and folding its text would mix
+    // two answers.
+    const announced = this.session.ambient
+    if (announced !== undefined && announced.startedAt >= this.constructedAt) {
+      hold.acceptedIds.add(announced.requestId)
+      if (hold.requestId === undefined) hold.requestId = announced.requestId
+    }
+    // The response landed: the agent no longer holds a prompt for this turn.
+    this.endTurn()
+    hold.hardTimer = setTimeout(() => { this.onBackgroundHard(hold) }, this.backgroundTuning.taskMaxMs)
+    hold.hardTimer.unref?.()
+    const seg = this.segment
+    if (seg !== undefined && !seg.finished) {
+      this.adoptBackgroundHold(seg, hold)
+    } else {
+      // The response landed BETWEEN driver steps: the host is about to execute
+      // the Agent card and open its continuation step. Park the hold for that
+      // step, with a bounded wait — a host that never opens one must not hang
+      // the turn forever.
+      hold.graceTimer = setTimeout(() => { this.onBackgroundGraceExpired(hold) }, this.backgroundTuning.graceMs)
+      hold.graceTimer.unref?.()
+      this.pendingBackgroundHold = hold
+    }
+    // A FAST detached worker may already have reported (even before the
+    // response): with every known dispatch complete there is no worker phase
+    // left to wait out, so the drain phase starts now.
+    if (this.allDispatchesCompleted()) this.startBackgroundDrain(hold)
+  }
+
+  /** Give a (possibly parked) hold a driver segment: cards off for the rest of it. */
+  private adoptBackgroundHold(seg: SegmentState, hold: BackgroundHold): void {
+    if (hold.graceTimer !== undefined) {
+      clearTimeout(hold.graceTimer)
+      hold.graceTimer = undefined
+    }
+    if (this.pendingBackgroundHold === hold) this.pendingBackgroundHold = undefined
+    seg.ambient = true
+    this.backgroundHold = hold
+    // The drain may have spoken BEFORE the response was judged. Those updates
+    // were withheld while this turn's own id was unknown
+    // (`pendingAmbientUpdates`); only the runs THIS hold owns are its answer —
+    // another run's withheld text is dropped (the transcript keeps it).
+    this.flushBackgroundHoldUpdates(seg, hold)
+    // The parked grace owns the wait while no step is on air; now that one is,
+    // a hold whose drain phase already began arms its quiet clock.
+    if (hold.phase === 'drain') this.armBackgroundQuiet(hold)
+  }
+
+  /**
+   * The worker phase is over once EVERY known dispatch reported: the drain
+   * that carries their reports is (about to be) running, so the existing
+   * ambient windows take over, measured from HERE.
+   *
+   * An announced run is accepted immediately, but while any dispatch is still
+   * incomplete it only records the id and switches the hold's primary run —
+   * arming the quiet clock there would let a drain that spoke early cut the
+   * turn off before its other worker ever reports.
+   */
+  private startBackgroundDrain(hold: BackgroundHold, requestId?: string): void {
+    if (hold !== this.backgroundHold && hold !== this.pendingBackgroundHold) return
+    if (requestId !== undefined) {
+      hold.acceptedIds.add(requestId)
+      hold.requestId = requestId
+    }
+    if (!this.allDispatchesCompleted()) return
+    if (hold.phase === 'drain') {
+      if (this.backgroundHold === hold) this.armBackgroundQuiet(hold)
+      return
+    }
+    hold.phase = 'drain'
+    if (hold.hardTimer !== undefined) clearTimeout(hold.hardTimer)
+    hold.hardTimer = setTimeout(() => { this.onBackgroundHard(hold) }, this.ambientTuning.maxMs)
+    hold.hardTimer.unref?.()
+    // A parked hold belongs to the grace until a driver step opens; a hold
+    // with a step arms its quiet clock now.
+    if (this.backgroundHold === hold) this.armBackgroundQuiet(hold)
+  }
+
+  /**
+   * A dispatch that lands while the drain phase already began means the
+   * coordinator handed out NEW work: the worker phase is back, and with it the
+   * absence of a quiet window.
+   */
+  private enterBackgroundWorkerPhase(hold: BackgroundHold): void {
+    if (hold.phase === 'worker') return
+    hold.phase = 'worker'
+    if (hold.quietTimer !== undefined) {
+      clearTimeout(hold.quietTimer)
+      hold.quietTimer = undefined
+    }
+    if (hold.hardTimer !== undefined) clearTimeout(hold.hardTimer)
+    hold.hardTimer = setTimeout(() => { this.onBackgroundHard(hold) }, this.backgroundTuning.taskMaxMs)
+    hold.hardTimer.unref?.()
+  }
+
+  /** Push the drain phase's quiet clock out: every update is evidence of work. */
+  private armBackgroundQuiet(hold: BackgroundHold): void {
+    if (hold.quietTimer !== undefined) clearTimeout(hold.quietTimer)
+    hold.quietTimer = setTimeout(() => { this.onBackgroundQuiet(hold) }, this.ambientTuning.quietMs)
+    hold.quietTimer.unref?.()
+  }
+
+  /**
+   * Any session update restarts the drain phase's quiet clock. Only an
+   * ADOPTED hold has one: a parked hold's wait belongs to its grace timer, and
+   * the worker phase never has a clock at all.
+   */
+  private noteBackgroundHoldActivity(): void {
+    const hold = this.backgroundHold
+    if (hold === undefined || hold.phase !== 'drain') return
+    this.armBackgroundQuiet(hold)
+  }
+
+  /** The drained run went quiet: the turn ends with the stop reason the response gave. */
+  private onBackgroundQuiet(hold: BackgroundHold): void {
+    if (this.backgroundHold !== hold || hold.phase !== 'drain') return
+    this.closeBackgroundHold(hold, { hard: false })
+  }
+
+  /** The hold outlived its ceiling (worker or drain): the run is still going. */
+  private onBackgroundHard(hold: BackgroundHold): void {
+    if (hold !== this.backgroundHold && hold !== this.pendingBackgroundHold) return
+    this.closeBackgroundHold(hold, { hard: true })
+  }
+
+  /**
+   * No driver step opened inside the grace: the host is not coming back for
+   * this turn's Agent card. Close it the way a quiet ambient ending does — the
+   * deferral line, never the zero-output blame — and keep ONE drain record:
+   * the worker may still report into a run no turn is waiting on.
+   *
+   * A parked hold has NO segment by definition, so the chat plane has nowhere
+   * to put the deferral line: it goes to the settings log (`agent/notice`)
+   * instead of being parked on prose nobody will read.
+   */
+  private onBackgroundGraceExpired(hold: BackgroundHold): void {
+    if (this.pendingBackgroundHold !== hold) return
+    this.pendingBackgroundHold = undefined
+    this.clearBackgroundHoldTimers(hold)
+    const line = hold.answerChars > 0 ? undefined : backgroundDeferralLine(this.session.agentId)
+    this.releaseBackgroundHoldIds(hold, { hard: true })
+    if (line !== undefined) this.broadcastBackgroundDeferral(line)
+    this.closeTurn({ kind: 'stop', stopReason: hold.stopReason }, { line, keepAmbient: true, requestId: hold.requestId })
+  }
+
+  /**
+   * Close a detached-worker hold exactly once. A turn that folded NO answer
+   * text from its held runs says where the rest of the output will land (the
+   * deferral wording, never the silent-failure blame); the parent's interim
+   * acknowledgement does not count as that answer.
+   *
+   * Ownership of the drain ids at close (`releaseBackgroundHoldIds`): a quiet
+   * close retires every accepted id and drops the session record; a hard or
+   * grace close keeps exactly ONE record, because the run is provably still
+   * going and a later update or re-announcement must revive it normally.
+   */
+  private closeBackgroundHold(hold: BackgroundHold, options: { hard: boolean }): void {
+    if (this.pendingBackgroundHold === hold) this.pendingBackgroundHold = undefined
+    else if (this.backgroundHold === hold) this.backgroundHold = undefined
+    else return
+    this.clearBackgroundHoldTimers(hold)
+    const line = hold.answerChars > 0 ? undefined : backgroundDeferralLine(this.session.agentId)
+    this.releaseBackgroundHoldIds(hold, { hard: options.hard })
+    const onAir = this.segment !== undefined && !this.segment.finished
+    // With no segment on air the closing line has no chat bubble to land in:
+    // log it, so the fact is recorded rather than silently dropped.
+    if (line !== undefined && !onAir) this.broadcastBackgroundDeferral(line)
+    this.closeTurn(
+      { kind: 'stop', stopReason: hold.stopReason },
+      { line, keepAmbient: options.hard, requestId: hold.requestId },
+    )
+  }
+
+  /** Write a hold's deferral line into the settings log (`agent/notice`). */
+  private broadcastBackgroundDeferral(line: string): void {
+    this.hub.broadcast({
+      type: 'agent/notice',
+      agentId: this.session.agentId,
+      level: 'info',
+      text: line.trim(),
+    })
+  }
+
+  /** Drop a hold's clocks. The hold object itself stays for its `retired` mark. */
+  private clearBackgroundHoldTimers(hold: BackgroundHold): void {
+    if (hold.quietTimer !== undefined) clearTimeout(hold.quietTimer)
+    if (hold.hardTimer !== undefined) clearTimeout(hold.hardTimer)
+    if (hold.graceTimer !== undefined) clearTimeout(hold.graceTimer)
+    hold.quietTimer = undefined
+    hold.hardTimer = undefined
+    hold.graceTimer = undefined
+  }
+
+  /**
+   * Drop every hold clock (teardown / a forced ending). `retire` also gives up
+   * every accepted run id — a SUCCESSOR turn must never fold the abandoned
+   * hold's drain or worker text into its own answer.
+   */
+  private clearBackgroundHold(options?: { retire?: boolean }): void {
+    const pending = this.pendingBackgroundHold
+    if (pending !== undefined) {
+      this.pendingBackgroundHold = undefined
+      this.clearBackgroundHoldTimers(pending)
+      if (options?.retire === true) this.releaseBackgroundHoldIds(pending, { hard: false })
+    }
+    const hold = this.backgroundHold
+    if (hold === undefined) return
+    this.backgroundHold = undefined
+    this.clearBackgroundHoldTimers(hold)
+    if (options?.retire === true) this.releaseBackgroundHoldIds(hold, { hard: false })
+  }
+
+  /**
+   * Settle what happens to the session's drain records when a hold closes.
+   *
+   * `hard: false` (quiet close, cancel, teardown): the run is no longer waited
+   * on, so EVERY accepted id is retired — its late text stays transcript-only
+   * for whatever turn runs next — and the session record is dropped if it
+   * names one of them.
+   *
+   * `hard: true` (ceiling / parked grace): the run is provably still going.
+   * Exactly ONE record survives — the session's current drain if it has one,
+   * else the hold's primary run — with its activity clock refreshed; the other
+   * accepted ids are retired. A hold whose primary id had no session record
+   * CREATES one, so a successor's `noteTurnRequestId` cannot adopt that id.
+   * Every accepted id therefore ends up either retired or owned by
+   * `session.ambient`; never both unowned and unretired.
+   */
+  private releaseBackgroundHoldIds(hold: BackgroundHold, options: { hard: boolean }): void {
+    if (hold.retired) return
+    hold.retired = true
+    if (!options.hard) {
+      for (const id of hold.acceptedIds) retireAmbientId(this.session, id)
+      if (this.session.ambient !== undefined && hold.acceptedIds.has(this.session.ambient.requestId)) {
+        this.session.ambient = undefined
+      }
+      return
+    }
+    const survivor = this.session.ambient?.requestId ?? hold.requestId
+    for (const id of hold.acceptedIds) {
+      if (id === survivor) continue
+      retireAmbientId(this.session, id)
+    }
+    if (survivor === undefined) return
+    const now = Date.now()
+    if (this.session.ambient?.requestId === survivor) {
+      this.session.ambient.lastActivityAt = now
+    } else {
+      this.session.ambient = {
+        requestId: survivor,
+        startedAt: now,
+        lastActivityAt: now,
+        sawOutput: hold.answerChars > 0,
+      }
+    }
+    // The surviving run is alive, not retired (an earlier wait of this turn
+    // may have retired it before it spoke again).
+    reviveAmbientId(this.session, survivor)
+  }
+
+  /**
+   * Fold the withheld drain updates that belong to this hold into its segment.
+   * The rest of the buffer was some OTHER run's text: it is dropped here (the
+   * transcript keeps it), never leaked into this turn's answer.
+   */
+  private flushBackgroundHoldUpdates(seg: SegmentState, hold: BackgroundHold): void {
+    if (this.pendingAmbientUpdates.length === 0) {
+      this.pendingAmbientTruncated = false
+      return
+    }
+    const pending = this.pendingAmbientUpdates.splice(0, this.pendingAmbientUpdates.length)
+    this.pendingAmbientChars = 0
+    const truncated = this.pendingAmbientTruncated
+    this.pendingAmbientTruncated = false
+    const accepted = pending.filter(entry => {
+      const requestId = codebuddyMetaOf(entry.update)?.requestId
+      return requestId !== undefined && hold.acceptedIds.has(requestId)
+    })
+    if (accepted.length === 0) return
+    if (truncated && !seg.finished) {
+      // The front of the drain's output was evicted from the bounded buffer:
+      // say so rather than letting the turn quietly start mid-story.
+      this.emitProse(seg, 'text', '\n[dsh-ntr] background output was truncated; the ACP transcript view still has every update.\n')
+    }
+    for (const entry of accepted) {
+      if (seg.finished) break
+      this.foldInto(seg, entry.update, entry.seq)
+      // The buffered drain text arrived BEFORE the hold, but it IS the held
+      // run's answer: below the hold's floor it was not counted by `foldInto`,
+      // so count it here (the floor exists to skip the parent's earlier ack,
+      // not the drain's own words).
+      if (entry.seq <= hold.floorSeq
+        && String(entry.update.sessionUpdate ?? '') === 'agent_message_chunk') {
+        hold.answerChars += chunkTextOf(entry.update.content).length
+      }
+    }
+  }
+
+  /**
+   * Follow the detached-worker signals of one live update.
+   *
+   * Only CodeBuddy sends them (`codebuddyMetaOf` answers `undefined` for every
+   * other agent, so nothing here can fire for them):
+   * - an `Agent` / `Task` `tool_call` records the dispatch — the FIRST send
+   *   needs that CodeBuddy shape;
+   * - the SAME call re-sent with `isBackground: true`, or any update naming it
+   *   as its `parentToolCallId`, marks the work DETACHED;
+   * - that call reporting completed / failed is read BY ID: the real
+   *   completion frame carries NO `_meta` at all, so requiring the CodeBuddy
+   *   shape here would miss every real completion;
+   * - any update carrying `parentToolCallId` is the worker's OWN turn — it
+   *   proves the worker alive but never belongs to this session's answer;
+   * - an `unsolicitedTurn` announcement is the drain that carries the report.
+   */
+  private trackBackgroundDispatch(update: Record<string, unknown>): void {
+    if (this.closedTurn) return
+    const meta = codebuddyMetaOf(update)
+    const kind = String(update.sessionUpdate ?? '')
+    const row = update as { toolCallId?: unknown; status?: unknown }
+    const toolCallId = typeof row.toolCallId === 'string' ? row.toolCallId.trim() : ''
+    const status = typeof row.status === 'string' ? row.status : ''
+    const completedStatus = status === 'completed' || status === 'failed'
+    if ((kind === 'tool_call' || kind === 'tool_call_update') && toolCallId !== '') {
+      const known = this.dispatches.get(toolCallId)
+      if (known !== undefined) {
+        // A known dispatch: the id is the whole evidence (see the doc above).
+        if (status !== '') known.status = status
+        if (meta?.isBackground === true) known.detached = true
+        if (completedStatus && !known.completed) {
+          known.completed = true
+          this.noteDispatchProgress()
+        }
+      } else if (meta !== undefined
+        && (meta.toolName === 'Agent' || meta.toolName === 'Task')
+        && (kind === 'tool_call' || meta.isBackground === true)) {
+        // A NEW dispatch needs the CodeBuddy shape. A turn may dispatch more
+        // than one worker; the hold waits for all of them.
+        const dispatch: BackgroundDispatch = {
+          toolCallId,
+          status,
+          completed: completedStatus,
+          detached: meta.isBackground === true,
+          sawWorkerUpdate: false,
+        }
+        this.dispatches.set(toolCallId, dispatch)
+        if (!dispatch.completed) {
+          const held = this.activeBackgroundHold()
+          // A dispatch registered after the drain phase began means new work:
+          // the worker phase (and its absence of a quiet clock) is back.
+          if (held !== undefined) this.enterBackgroundWorkerPhase(held)
+        }
+      }
+    }
+    if (meta?.parentToolCallId !== undefined) {
+      const parent = this.dispatches.get(meta.parentToolCallId)
+      if (parent !== undefined) {
+        parent.detached = true
+        parent.sawWorkerUpdate = true
+      }
+    }
+    if (meta?.unsolicitedTurn !== undefined) {
+      const held = this.activeBackgroundHold()
+      if (held !== undefined) this.startBackgroundDrain(held, meta.unsolicitedTurn.requestId)
+    }
+  }
+
+  /**
+   * A dispatch just reported: once the LAST one has, the drain phase starts.
+   * Until then the turn stays in its worker phase, with no quiet clock.
+   */
+  private noteDispatchProgress(): void {
+    if (!this.allDispatchesCompleted()) return
+    const held = this.activeBackgroundHold()
+    if (held !== undefined) this.startBackgroundDrain(held)
+  }
+
   /** Any session update is evidence the drain still works: push the quiet clock out. */
   private noteAmbientActivity(): void {
     const wait = this.awaitingAmbient
@@ -3707,7 +4371,7 @@ class TurnStreamController {
     if (this.awaitingAmbient !== wait) return
     const line = options?.announceDeferral === false || this.sawVisibleText
       ? undefined
-      : `\n[dsh-ntr] agent "${this.session.agentId}" deferred this turn to a background task run; its output is in the ACP transcript view. Send again after the background run finishes.\n`
+      : backgroundDeferralLine(this.session.agentId)
     this.closeTurn(
       { kind: 'stop', stopReason: wait.stopReason },
       { line, keepAmbient: wait.hard === true, requestId: wait.requestId },
@@ -3760,7 +4424,7 @@ class TurnStreamController {
     }
     for (const entry of pending) {
       if (seg.finished) break
-      this.foldInto(seg, entry.update)
+      this.foldInto(seg, entry.update, entry.seq)
     }
   }
 
@@ -3784,6 +4448,9 @@ class TurnStreamController {
     this.settled = true
     this.clearAmbientWait()
     this.clearPendingAmbient()
+    // An outside ending (watchdog, cancel) abandons a detached-worker hold: its
+    // run is no longer this turn's, so its id is retired before the close.
+    this.clearBackgroundHold({ retire: true })
     this.pendingOutcome = outcome
     this.closeScheduled = true
     setImmediate(() => { this.flushScheduledClose() })
@@ -3800,6 +4467,9 @@ class TurnStreamController {
   forceFinalize(outcome: TurnSettle): void {
     if (this.stale || this.closedTurn) return
     this.clearAmbientWait()
+    // A forced ending abandons a detached-worker hold: retire its run's id so
+    // its late words stay transcript-only for the next turn.
+    this.clearBackgroundHold({ retire: true })
     // A settle's deferred tail read is moot once this close runs: the turn is
     // over now, and the pending macrotask must not drain anything into it.
     this.pendingOutcome = undefined
@@ -3853,7 +4523,7 @@ class TurnStreamController {
         this.cursorSeq = entry.seq
         continue
       }
-      if (!this.foldInto(seg, update)) break
+      if (!this.foldInto(seg, update, entry.seq)) break
       this.cursorSeq = entry.seq
     }
   }
@@ -3876,6 +4546,10 @@ class TurnStreamController {
     this.settled = true
     this.clearAmbientWait()
     this.clearPendingAmbient()
+    // Whoever closed this turn already decided what happens to the held
+    // run's record (`closeBackgroundHold` retired or kept it); only the clocks
+    // are still ours to drop.
+    this.clearBackgroundHold()
     // A late answer to a SUPERSEDED turn still has to close this controller's
     // queue (a continuation step may be parked on it) and its settle gate —
     // but it must not touch the session the NEWER turn now owns, nor release
@@ -3996,6 +4670,15 @@ class TurnStreamController {
       this.settle({ kind: 'cancelled' })
       return
     }
+    if (this.backgroundHold !== undefined || this.pendingBackgroundHold !== undefined) {
+      // A detached-worker hold is a turn whose prompt response already landed
+      // (the slot is free) and whose segment is still open on purpose: the
+      // cancel ends OUR face of it now, once, and the held run's id is retired
+      // so its late text cannot join the next turn.
+      this.clearBackgroundHold({ retire: true })
+      this.settle({ kind: 'cancelled' })
+      return
+    }
     this.finishActive({ kind: 'aborted', failure: { message: 'aborted', code: 'ABORTED' } })
     // The agent may take its time acknowledging the cancel, but OUR face of
     // the turn ends now: the session stops running, the HOST's prompt slot is
@@ -4034,6 +4717,9 @@ class TurnStreamController {
     this.finishActive({ kind: 'aborted', failure: { message: 'turn stream retired', code: 'RETIRED' } })
     this.clearAmbientWait()
     this.clearPendingAmbient()
+    // A successor turn must never fold this hold's drain or worker text: the
+    // abandoned run's id is retired before the subscription goes away.
+    this.clearBackgroundHold({ retire: true })
     this.retire()
     releaseAllToolOutputWaiters()
   }
@@ -4122,15 +4808,26 @@ class TurnStreamController {
       // Any update — a `usage_update` / phase tick included — says the
       // background drain is still working, so the ambient quiet clock restarts.
       this.noteAmbientActivity()
-      if (typed.seq <= this.cursorSeq) return
+      // A detached-worker hold's drain phase has the same rule; its worker
+      // phase never does (see `BridgeTuning.backgroundTaskMaxMs`).
+      this.noteBackgroundHoldActivity()
       const update = typed.update as Record<string, unknown>
+      // The dispatch / worker / announcement bookkeeping runs BEFORE the cursor
+      // guard: those are turn-level facts, not segment content, and an update
+      // withheld by the ambient buffer must still keep them.
+      this.trackBackgroundDispatch(update)
+      if (typed.seq <= this.cursorSeq) return
       // A background drain's prose is not this turn's answer: keep it out of
       // the plane (the transcript still has it). Fail-open — nothing is split
       // until this turn has a request id of its own to compare against.
       this.noteTurnRequestId(update)
       if (this.isForeignAmbientText(update)) {
         this.recordWithoutSegment(update)
-        this.cursorSeq = typed.seq
+        // Advance past it only when nothing is left unconsumed behind it: the
+        // event that CUT the previous segment is parked for the next one, and
+        // jumping the cursor over it would lose its text for good. The replay
+        // applies the same foreign split, so leaving this one behind is safe.
+        if (typed.seq === this.cursorSeq + 1) this.cursorSeq = typed.seq
         return
       }
       // The turn's OWN request id is still unknown and this update belongs to
@@ -4162,7 +4859,7 @@ class TurnStreamController {
       }
       // The cursor advances only past events fully consumed into this
       // segment; the event that CUTS the segment belongs to the next one.
-      if (this.foldInto(seg, update)) this.cursorSeq = typed.seq
+      if (this.foldInto(seg, update, typed.seq)) this.cursorSeq = typed.seq
     } else if (row.type === 'permission/request') {
       this.tps.onBreak()
       const typed = event as Extract<AcpEvent, { type: 'permission/request' }>
@@ -4282,7 +4979,16 @@ class TurnStreamController {
   /** Learn this turn's own CodeBuddy request id from the first update naming one. */
   private noteTurnRequestId(update: Record<string, unknown>): void {
     if (this.turnRequestId !== undefined) return
-    const requestId = codebuddyMetaOf(update)?.requestId
+    const meta = codebuddyMetaOf(update)
+    // A detached worker's update names A WORKER, never this turn: adopting it
+    // would let the worker's own turn pass as the session's answer.
+    if (meta?.parentToolCallId !== undefined) return
+    // While a hold runs, the only ids this turn owns are the drain ids it
+    // accepted (see `BackgroundHold.acceptedIds`) — and those belong to the
+    // background run, never to a second "own turn id" that would outlive the
+    // hold. Nothing else may be adopted.
+    if (this.activeBackgroundHold() !== undefined) return
+    const requestId = meta?.requestId
     // A background drain's update names THE DRAIN, never this turn: adopting it
     // would make `isForeignAmbientText` pass the drain's own text through. A
     // RETIRED drain (its wait closed on silence, the run revived) is the same
@@ -4312,7 +5018,22 @@ class TurnStreamController {
    * was itself folded into the drain keeps its prose.
    */
   private isForeignAmbientText(update: Record<string, unknown>): boolean {
-    const requestId = codebuddyMetaOf(update)?.requestId
+    const meta = codebuddyMetaOf(update)
+    const requestId = meta?.requestId
+    // A detached worker's own turn is never this session's answer, whichever
+    // turn is on air (the fold-level guard lives in `foldInto` as well, for
+    // the replay paths that never ask this question). This includes a worker
+    // update that also names a drain id: its prose is the WORKER's.
+    if (meta?.parentToolCallId !== undefined) return true
+    // A detached-worker hold owns the drain phase: any run it accepted (the
+    // response's id, an announcement that named a different one) is this
+    // turn's answer, and every OTHER id is background noise — whatever the
+    // turn's own id says. Parked holds count: the response already owns them.
+    const hold = this.activeBackgroundHold()
+    if (hold !== undefined) {
+      if (requestId === undefined) return false
+      return !hold.acceptedIds.has(requestId)
+    }
     // The drain THIS turn is waiting on owns its text unconditionally: the
     // wait was opened for this id (a revived drain may still carry a retired
     // mark if the update raced the revival), so the whole steered answer must
@@ -4336,9 +5057,22 @@ class TurnStreamController {
    * the segmentation rule that puts each card between two assistant messages.
    * Returns whether the event was consumed into this segment: the cutting
    * event is left unconsumed (and thus behind the cursor) for the next one.
+   *
+   * `seq` is the update's transcript position when the caller has one: the
+   * detached-worker hold uses it to count only the answer text that arrived
+   * AFTER the hold began (a parked hold replays the parent's earlier ack).
    */
-  private foldInto(seg: SegmentState, update: Record<string, unknown>): boolean {
+  private foldInto(seg: SegmentState, update: Record<string, unknown>, seq?: number): boolean {
     const kind = String(update.sessionUpdate ?? '')
+    // A DETACHED WORKER's own turn: its words and tools are the worker's, not
+    // this session's answer. The transcript keeps them (the ACP view is where
+    // the user can read them) and the shared tool-output registry still sees
+    // the call, but nothing reaches this turn's message and no card opens for
+    // the host to execute. This applies to EVERY turn, not just a hold.
+    if (codebuddyMetaOf(update)?.parentToolCallId !== undefined) {
+      this.noteToolRecord(update)
+      return true
+    }
     if (kind === 'agent_thought_chunk' || kind === 'agent_message_chunk') {
       const text = chunkTextOf(update.content)
       if (text === '') return true
@@ -4350,7 +5084,18 @@ class TurnStreamController {
       // "The turn's own answer", as opposed to a background drain's prose that
       // happens to stream through the same session (see `isForeignAmbientText`).
       if (!this.isAmbientOwned(update)) this.sawAgentProse = true
-      if (kind === 'agent_message_chunk') this.sawVisibleText = true
+      if (kind === 'agent_message_chunk') {
+        this.sawVisibleText = true
+        // A hold's closing line asks whether ITS runs delivered answer text.
+        // The parent's interim acknowledgement arrived before the hold and
+        // already set `sawVisibleText`, so the hold keeps its own counter —
+        // and only text that arrived after the hold began counts (a parked
+        // hold replays that earlier ack from the transcript).
+        const hold = this.activeBackgroundHold()
+        if (hold !== undefined && (seq === undefined || seq > hold.floorSeq)) {
+          hold.answerChars += text.length
+        }
+      }
       this.emitProse(seg, kind === 'agent_thought_chunk' ? 'reasoning' : 'text', text)
       return true
     } else if (kind === 'tool_call' || kind === 'tool_call_update') {
@@ -4375,6 +5120,12 @@ class TurnStreamController {
         return true
       }
       if (this.seenCalls.has(snapshot.callId)) return true // a restatement of a card already settled
+      // A BARE status-only update for a call this turn never announced is not
+      // a card. The real wire sends the detached dispatch's completion exactly
+      // that way (no `_meta`, no title, no input); a turn that begins after the
+      // dispatch belongs to another turn's card, and opening one here would
+      // make the host execute a phantom tool.
+      if (kind === 'tool_call_update' && snapshot.name === '' && snapshot.argsRaw === '') return true
       this.seenCalls.add(snapshot.callId)
       this.openToolCallBlock(seg, snapshot)
       return true
@@ -4618,6 +5369,21 @@ export class BridgeManager {
     return {
       quietMs: this.tuning.ambientQuietMs,
       maxMs: this.tuning.ambientMaxMs,
+    }
+  }
+
+  /**
+   * The detached-worker hold's windows, read once at controller construction
+   * for the same reason as {@link ambientTuning}: `taskMaxMs` is the worker
+   * phase's only clock (see {@link BridgeTuning.backgroundTaskMaxMs}) and
+   * `graceMs` the bounded wait a PARKED hold gives the host to open its
+   * continuation step (see {@link BridgeTuning.backgroundParkedGraceMs}). The
+   * drain phase reuses {@link ambientTuning}.
+   */
+  get backgroundTuning(): { taskMaxMs: number; graceMs: number } {
+    return {
+      taskMaxMs: this.tuning.backgroundTaskMaxMs,
+      graceMs: this.tuning.backgroundParkedGraceMs,
     }
   }
 
@@ -7906,7 +8672,23 @@ export class BridgeManager {
             return
           }
           const responseMeta = codebuddyMetaOf({ _meta: result.meta })
-          if (responseMeta?.conversationRequestId !== undefined) {
+          // A DETACHED-WORKER HOLD: this turn's `Agent` call handed real work
+          // to a background worker that has not produced its answer yet, yet
+          // the agent answered the prompt normally (CodeBuddy says "已派…" and
+          // ends its own turn). Closing here loses the only answer the turn
+          // will ever produce — the worker's report streams into this same
+          // session later, as a background drain. Hold the turn open until
+          // every dispatch reports and the drain goes quiet (see
+          // `holdForBackgroundDispatch`); the prompt slot is released there.
+          //
+          // The decision comes BEFORE `adoptTurnRequestId`: adopting the id
+          // would clear the updates the drain streamed while this turn's own id
+          // was unknown, and those are exactly the ones the hold must fold.
+          const holdDispatch = controller.dispatchedDetachedWorker
+            && !session.released
+            && !session.closed
+            && result.stopReason !== 'cancelled'
+          if (!holdDispatch && responseMeta?.conversationRequestId !== undefined) {
             // The response names the conversation turn it queued: an instant
             // answer that still carries one is a real (if silent) turn, and its
             // prose can be told apart from a background drain's.
@@ -7925,6 +8707,15 @@ export class BridgeManager {
             retireAmbientId(session, session.ambient.requestId)
             session.ambient = undefined
             session.ambientNotices?.clear()
+          }
+          if (holdDispatch) {
+            // The response may name one run while an announcement named
+            // another; the hold accepts both (see `BackgroundHold.acceptedIds`).
+            controller.holdForBackgroundDispatch(
+              result.stopReason,
+              responseMeta?.conversationRequestId ?? responseMeta?.requestId,
+            )
+            return
           }
           // An instant answer with NO conversation request id, while the agent
           // announced a background drain this turn has not spoken into: the
