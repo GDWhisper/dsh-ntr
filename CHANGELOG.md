@@ -2,6 +2,28 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [0.3.2] - 2026-10-31
+
+NTR 会话现在自己接管消息动作与分支，挂起会话在界面上可见、可恢复，DSH 重启后也不丢。
+
+### 新增
+
+- **composer 显示上下文占用**：ACP 会话里也能看到 agent 报告的上下文占用环，不再只有原生会话有。([2f7e111](https://github.com/GDWhisper/dsh-ntr/commit/2f7e111))
+- **挂起会话横幅与恢复按钮**：进程被回收后输入框上方会说明会话已挂起，点「恢复」即可唤醒，不必先发一条消息。([d39adcb](https://github.com/GDWhisper/dsh-ntr/commit/d39adcb))
+- **空闲释放窗口可配置**：设置页「进程」分区用 1–60 分钟滑块决定空闲多久回收进程，保存后对运行中的进程立即生效；智能体里的同名设置改为「留空跟随全局」。([6663b84](https://github.com/GDWhisper/dsh-ntr/commit/6663b84))
+- **NTR 会话接管消息动作与分支**：点赞/点踩图标不再出现在 NTR 会话里；分支按钮改为带上 agent 上下文，子会话会记住父会话的内容，失败时就地说明原因。([97bc761](https://github.com/GDWhisper/dsh-ntr/commit/97bc761))
+
+### 改进
+
+- **挂起会话改偏好不再唤醒进程**：模型、思考等级、mode 改完立刻显示，进程只在你发消息或点「恢复」时回来。([61b5d77](https://github.com/GDWhisper/dsh-ntr/commit/61b5d77))
+- **重启 DSH 不丢挂起会话**：会话记录随插件落盘，重启后横幅、恢复按钮与下一条消息的自动恢复都还在。([bcbb9d7](https://github.com/GDWhisper/dsh-ntr/commit/bcbb9d7))
+
+### 修复
+
+- **恢复后模型芯片不再回跳**：在挂起会话上换过模型或思考等级，恢复生成时不会又显示成旧值。([7eefac4](https://github.com/GDWhisper/dsh-ntr/commit/7eefac4))
+- **分支按钮在旧宿主上不再消失**：宿主换了图标导出名时按钮照常显示可点。([f23cf3f](https://github.com/GDWhisper/dsh-ntr/commit/f23cf3f))
+- **NTR 界面不再串到普通会话**：NTR 页签与上下文占用环只在 NTR 会话里出现，普通会话回到原生界面。([7e113a8](https://github.com/GDWhisper/dsh-ntr/commit/7e113a8))
+
 ## [0.3.1] - 2026-10-29
 
 设置页现在有一份独立的运行日志，agent 的运行消息不再占用顶部通知横幅；内置更新也能识别通过 registry 安装的插件。
