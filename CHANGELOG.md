@@ -2,6 +2,25 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [Unreleased] - 2026-11-01
+
+CodeBuddy 的后台任务现在会把答案交回主对话，图片可以直接发给 agent，底部的生成速度也不再被工具等待拖慢。
+
+### 新增
+
+- **图片随消息发给 agent**：消息里带的图片会作为图片内容转发给 agent，文字与图片的顺序保持不变；agent 不支持图片输入时直接说明原因并拦下这一轮，不会把残缺的消息发出去，首轮也不会因此把会话锁死。([03a47ff](https://github.com/GDWhisper/dsh-ntr/commit/03a47ff))
+- **消息可以并进后台任务**：CodeBuddy 正在跑后台任务时发来的消息会被并进那次运行，回合等后台收尾再把正文补进当前对话，不再一发出就结束、答案只剩在 NTR 视图里。([3e236df](https://github.com/GDWhisper/dsh-ntr/commit/3e236df))
+
+### 改进
+
+- **底部生成速度按连续输出计**：`x tok/s` 只统计连续写字的段落，工具等待与审批停顿不再把速度拖到很低；这一轮的读数随后续打开会话保留，刷新页面回来还是同一个值。([733e14a](https://github.com/GDWhisper/dsh-ntr/commit/733e14a))
+
+### 修复
+
+- **分支按钮恢复可用**：点分支按钮不再报错，分叉照常带上 agent 上下文。([b846fa7](https://github.com/GDWhisper/dsh-ntr/commit/b846fa7))
+- **后台运行迟到的正文不再算成别的回答**：已经结束等待的后台运行如果又开口，它的话只留在 NTR 视图，不会被当成当前这一轮的回答；这一轮确实没有可见输出、又可能是被后台运行吞掉时，会说明去 NTR 视图看，而不是只说 agent 没有反应。([91704cc](https://github.com/GDWhisper/dsh-ntr/commit/91704cc))
+- **交给后台 worker 的活儿也等得到答案**：CodeBuddy 把任务派给后台 worker 时，回合会一直开着直到 worker 报回结果，最终答案出现在主对话里而不是只在 NTR 视图；并行派了多个 worker 会等齐，取消或下一轮不会收进迟到的答案，真没有答案时直接说明。([81b30e8](https://github.com/GDWhisper/dsh-ntr/commit/81b30e8))
+
 ## [0.3.2] - 2026-10-31
 
 NTR 会话现在自己接管消息动作与分支，挂起会话在界面上可见、可恢复，DSH 重启后也不丢。
