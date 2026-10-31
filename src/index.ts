@@ -277,6 +277,31 @@ export function apply(ctx: Context, config?: unknown): void {
     })
   }
 
+  const wireAttachments = (injectedCtx?: Context): void => {
+    const c = injectedCtx ?? ctx
+    let attachments: unknown
+    try {
+      if (typeof c.get === 'function') {
+        attachments = c.get('attachments') ?? c.get('attachmentService')
+      }
+    } catch {}
+    try {
+      if (attachments === undefined) {
+        attachments = (c as unknown as Record<string, unknown>).attachments ?? (c as unknown as Record<string, unknown>).attachmentService
+      }
+    } catch {}
+    if (attachments !== undefined) {
+      manager.setAttachmentResolver(attachments)
+    } else {
+      manager.setAttachmentResolver(c)
+    }
+  }
+  wireAttachments()
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['attachments'], injectedCtx => { wireAttachments(injectedCtx) })
+    ctx.inject(['attachmentService'], injectedCtx => { wireAttachments(injectedCtx) })
+  }
+
   /** Registration handle: callable disposer, plus `replace` to re-announce routes. */
   interface LlmAdapterHandle {
     (): void

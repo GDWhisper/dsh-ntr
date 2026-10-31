@@ -156,7 +156,7 @@ const app = agent({ name: 'mock-acp-agent' })
         // fork-naive host ask an agent that never implemented it.
         ...(process.env.MOCK_FORK === '1' ? { fork: {} } : {}),
       },
-      promptCapabilities: { image: false, audio: false, embeddedContext: false },
+      promptCapabilities: { image: process.env.MOCK_IMAGE === '1', audio: false, embeddedContext: false },
     },
     agentInfo: { name: 'mock-acp-agent', title: 'Mock ACP Agent', version: '0.0.1' },
     authMethods: [],
@@ -279,6 +279,7 @@ const app = agent({ name: 'mock-acp-agent' })
   })
   .onRequest(methods.agent.session.prompt, async ctx => {
     const { sessionId } = ctx.params
+    const imageBlocks = ctx.params.prompt.filter(part => part.type === 'image')
     const text = ctx.params.prompt
       .filter(part => part.type === 'text')
       .map(part => part.text)
@@ -469,7 +470,8 @@ const app = agent({ name: 'mock-acp-agent' })
     // Opt-in process token: `REPLAYED` proves a `session/load`, but it is
     // emitted by ANY child, so it cannot prove the process changed. The pid can.
     const pidTag = text.includes('PIDTAG') ? ` PID:${String(process.pid)}` : ''
-    await send({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: ` echo ${text} perm=${permissionAnswer}${pidTag}` } })
+    const imgTag = imageBlocks.length > 0 ? ` images=${String(imageBlocks.length)}` : ''
+    await send({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: ` echo ${text} perm=${permissionAnswer}${pidTag}${imgTag}` } })
     await send({ sessionUpdate: 'usage_update', used: 123, size: 1000 })
     return { stopReason: 'end_turn' }
   })

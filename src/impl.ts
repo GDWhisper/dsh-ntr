@@ -1387,8 +1387,1053 @@ export function describeUnhandledUpdate(kind: string, update: Record<string, unk
  * injected context too (goal/subagent/skill material), and that turn carries no
  * user intent to send anywhere.
  */
+export interface PromptImageContent {
+  type: 'image'
+  data: string
+  mimeType: string
+  uri?: string
+}
+
+export interface PromptTextContent {
+  type: 'text'
+  text: string
+}
+
+export type PromptContentBlock = PromptTextContent | PromptImageContent
+
+/** Helper: guess MIME type from file extension or URL */
+export function guessImageMimeType(pathOrUrl?: string): string | undefined {
+  if (!pathOrUrl) return undefined
+  const clean = pathOrUrl.split('?')[0].split('#')[0].toLowerCase()
+  if (clean.endsWith('.jpg') || clean.endsWith('.jpeg')) return 'image/jpeg'
+  if (clean.endsWith('.png')) return 'image/png'
+  if (clean.endsWith('.gif')) return 'image/gif'
+  if (clean.endsWith('.webp')) return 'image/webp'
+  if (clean.endsWith('.svg') || clean.endsWith('.svgz')) return 'image/svg+xml'
+  if (clean.endsWith('.bmp')) return 'image/bmp'
+  if (clean.endsWith('.ico')) return 'image/x-icon'
+  if (clean.endsWith('.tiff') || clean.endsWith('.tif')) return 'image/tiff'
+  if (clean.endsWith('.avif')) return 'image/avif'
+  if (clean.endsWith('.heic')) return 'image/heic'
+  if (clean.endsWith('.heif')) return 'image/heif'
+  if (clean.endsWith('.apng')) return 'image/apng'
+  return undefined
+}
+
+/** Helper: parse Data URI */
+export function parseImageDataUrl(url: string): { data: string; mimeType: string } | undefined {
+  if (!url.startsWith('data:')) return undefined
+  const commaIdx = url.indexOf(',')
+  if (commaIdx === -1) return undefined
+  const header = url.slice(5, commaIdx)
+  const raw = url.slice(commaIdx + 1).trim()
+  const parts = header.split(';')
+  const mimeType = parts[0] && parts[0].trim() !== '' ? parts[0].trim().toLowerCase() : 'image/png'
+  if (!mimeType.startsWith('image/')) return undefined
+  const isBase64 = parts.some(p => p.trim() === 'base64')
+  let data: string
+  if (isBase64) {
+    data = raw.replace(/\s+/g, '')
+  } else {
+    try {
+      const decoded = decodeURIComponent(raw)
+      data = typeof Buffer !== 'undefined' ? Buffer.from(decoded).toString('base64') : btoa(decoded)
+    } catch {
+      data = typeof Buffer !== 'undefined' ? Buffer.from(raw).toString('base64') : btoa(raw)
+    }
+  }
+  return { mimeType, data }
+}
+
+export function isLocalFilePath(str: string): boolean {
+  if (typeof str !== 'string' || str === '') return false
+  return isAbsolutePath(str) || str.startsWith('./') || str.startsWith('.\\') || str.startsWith('../') || str.startsWith('..\\')
+}
+
+export function normalizeFileUrlToPath(uri: string): string {
+  if (!uri.startsWith('file://')) return uri
+  let raw = uri.slice('file://'.length)
+  try {
+    raw = decodeURIComponent(raw)
+  } catch {}
+  if (raw.startsWith('localhost/')) {
+    raw = raw.slice('localhost'.length)
+  }
+  if (/^\/?[a-zA-Z]:/.test(raw)) {
+    return raw.startsWith('/') ? raw.slice(1) : raw
+  }
+  if (raw.startsWith('/')) {
+    return raw
+  }
+  return `//${raw}`
+}
+
+function expandHomePath(p: string): string {
+  if (p === '~' || p.startsWith('~/') || p.startsWith('~\\')) {
+    if (typeof process !== 'undefined' && process.env) {
+      const env = process.env
+      const home = env.HOME || env.USERPROFILE || (env.HOMEDRIVE && env.HOMEPATH ? `${env.HOMEDRIVE}${env.HOMEPATH}` : undefined)
+      if (home) {
+        const cleanHome = home.replaceAll('\\', '/').replace(/\/+$/, '')
+        return p === '~' ? cleanHome : `${cleanHome}/${p.slice(2).replaceAll('\\', '/')}`
+      }
+    }
+  }
+  return p
+}
+
+function readImageFileFromContext(filePath: string, context?: unknown): Buffer | Uint8Array | string | undefined {
+  const target = normalizeFileUrlToPath(filePath)
+  const expanded = expandHomePath(target)
+  const pathsToTry = target === expanded ? [target] : [target, expanded]
+
+  const builtinFs = typeof process !== 'undefined' && typeof (process as unknown as { getBuiltinModule?: (m: string) => unknown }).getBuiltinModule === 'function'
+    ? ((process as unknown as { getBuiltinModule: (m: string) => unknown }).getBuiltinModule('fs') as { existsSync?: (p: string) => boolean; readFileSync?: (p: string) => Buffer } | null)
+    : null
+
+  for (const p of pathsToTry) {
+    if (context && typeof (context as { readFile?: unknown }).readFile === 'function') {
+      try {
+        const res = (context as { readFile: (path: string) => unknown }).readFile(p)
+        if (res !== undefined) return res as Buffer | Uint8Array | string
+      } catch {}
+    }
+    if (context && typeof (context as { fs?: { readFileSync?: unknown } }).fs?.readFileSync === 'function') {
+      try {
+        const res = (context as { fs: { readFileSync: (path: string) => unknown } }).fs.readFileSync(p)
+        if (res !== undefined) return res as Buffer | Uint8Array | string
+      } catch {}
+    }
+    if (builtinFs && typeof builtinFs.existsSync === 'function' && typeof builtinFs.readFileSync === 'function') {
+      try {
+        if (builtinFs.existsSync(p)) return builtinFs.readFileSync(p)
+      } catch {}
+    }
+  }
+  return undefined
+}
+
+/**
+ * Detect image MIME type by examining binary magic numbers.
+ * Supports Buffer, Uint8Array, and base64 strings.
+ */
+export function detectImageMimeFromMagic(raw: Buffer | Uint8Array | string | undefined): string | undefined {
+  if (!raw) return undefined
+  let bytes: Uint8Array | undefined
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim()
+    if (trimmed.startsWith('<svg') || (trimmed.startsWith('<?xml') && trimmed.includes('<svg'))) {
+      return 'image/svg+xml'
+    }
+    try {
+      const prefix = trimmed.slice(0, 64).replace(/\s+/g, '')
+      if (typeof Buffer !== 'undefined') {
+        bytes = Buffer.from(prefix, 'base64')
+      } else if (typeof atob !== 'undefined') {
+        const bin = atob(prefix)
+        bytes = new Uint8Array(bin.length)
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+      }
+    } catch {
+      return undefined
+    }
+  } else if (raw instanceof Uint8Array || (typeof Buffer !== 'undefined' && Buffer.isBuffer(raw))) {
+    bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw)
+  }
+
+  if (!bytes || bytes.length < 3) return undefined
+
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
+  if (bytes.length >= 8 &&
+      bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 &&
+      bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) {
+    return 'image/png'
+  }
+
+  // JPEG: FF D8 FF
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return 'image/jpeg'
+  }
+
+  // GIF: GIF87a or GIF89a (47 49 46 38)
+  if (bytes.length >= 6 &&
+      bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38 &&
+      (bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61) {
+    return 'image/gif'
+  }
+
+  // WebP: RIFF....WEBP (52 49 46 46 .... 57 45 42 50)
+  if (bytes.length >= 12 &&
+      bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+      bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) {
+    return 'image/webp'
+  }
+
+  // BMP: 42 4D ("BM")
+  if (bytes.length >= 2 && bytes[0] === 0x42 && bytes[1] === 0x4d) {
+    return 'image/bmp'
+  }
+
+  // ICO: 00 00 01 00
+  if (bytes.length >= 4 && bytes[0] === 0x00 && bytes[1] === 0x00 && bytes[2] === 0x01 && bytes[3] === 0x00) {
+    return 'image/x-icon'
+  }
+
+  // TIFF: II*. (49 49 2A 00) or MM.* (4D 4D 00 2A)
+  if (bytes.length >= 4 &&
+      ((bytes[0] === 0x49 && bytes[1] === 0x49 && bytes[2] === 0x2a && bytes[3] === 0x00) ||
+       (bytes[0] === 0x4d && bytes[1] === 0x4d && bytes[2] === 0x00 && bytes[3] === 0x2a))) {
+    return 'image/tiff'
+  }
+
+  // AVIF / HEIC: ftyp box at offset 4 (bytes 4..7 === 'ftyp')
+  if (bytes.length >= 12 &&
+      bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70) {
+    const brand = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]).toLowerCase()
+    if (brand === 'avif' || brand === 'avis') return 'image/avif'
+    if (brand === 'heic' || brand === 'heix' || brand === 'hevc' || brand === 'mif1' || brand === 'msf1') return 'image/heic'
+  }
+
+  return undefined
+}
+
+function tryResolveFromAttachmentStore(
+  store: Record<string, unknown>,
+  id: string,
+  context?: unknown,
+  attachmentMeta?: unknown,
+): unknown {
+  const idWithoutPrefix = id.startsWith('sha256:') ? id.slice('sha256:'.length) : undefined
+  const idWithPrefix = id.startsWith('sha256:') ? id : `sha256:${id}`
+
+  const candidates: unknown[] = []
+  if (attachmentMeta && typeof attachmentMeta === 'object') {
+    candidates.push(attachmentMeta)
+  }
+  candidates.push({ attachmentId: idWithPrefix })
+  if (idWithoutPrefix !== undefined) {
+    candidates.push({ attachmentId: idWithoutPrefix })
+  }
+  candidates.push({ attachmentId: id })
+  candidates.push({ id: idWithPrefix })
+  candidates.push({ id })
+  if (idWithoutPrefix !== undefined) {
+    candidates.push({ id: idWithoutPrefix })
+  }
+  candidates.push(id)
+  if (idWithoutPrefix !== undefined) {
+    candidates.push(idWithoutPrefix)
+  }
+
+  // Cordis proxies wrap the underlying service instance; if a method call on the proxy fails
+  // or loses this context, fall back to the unwrapped instance (never the class prototype,
+  // which lacks instance state such as `this.root`).
+  const cordisOriginal = Reflect.get(store, Symbol.for('cordis.original')) as Record<string, unknown> | undefined
+
+  // A. LocalAttachmentStore.imageHostPath(ref) -> synchronous local absolute path
+  if (typeof store.imageHostPath === 'function') {
+    const fn = store.imageHostPath as (ref: unknown) => unknown
+    for (const cand of candidates) {
+      if (cand === undefined) continue
+      try {
+        let hostPath: unknown
+        try {
+          hostPath = fn.call(store, cand)
+        } catch {
+          if (cordisOriginal && typeof cordisOriginal.imageHostPath === 'function') {
+            hostPath = (cordisOriginal.imageHostPath as (ref: unknown) => unknown).call(cordisOriginal, cand)
+          }
+        }
+        if (hostPath && typeof (hostPath as Promise<unknown>).then === 'function') {
+          if (typeof (hostPath as Promise<unknown>).catch === 'function') {
+            (hostPath as Promise<unknown>).catch(() => {})
+          }
+        } else if (typeof hostPath === 'string' && hostPath.trim() !== '') {
+          const fileContent = readImageFileFromContext(hostPath, context)
+          return {
+            path: hostPath,
+            ...(fileContent !== undefined ? { data: fileContent } : {}),
+          }
+        }
+      } catch {}
+    }
+  }
+
+  // B. LocalAttachmentStore.fileHostPath(ref) -> fallback for file-type attachments
+  if (typeof store.fileHostPath === 'function') {
+    const fn = store.fileHostPath as (ref: unknown) => unknown
+    for (const cand of candidates) {
+      if (cand === undefined) continue
+      try {
+        let hostPath: unknown
+        try {
+          hostPath = fn.call(store, cand)
+        } catch {
+          if (cordisOriginal && typeof cordisOriginal.fileHostPath === 'function') {
+            hostPath = (cordisOriginal.fileHostPath as (ref: unknown) => unknown).call(cordisOriginal, cand)
+          }
+        }
+        if (hostPath && typeof (hostPath as Promise<unknown>).then === 'function') {
+          if (typeof (hostPath as Promise<unknown>).catch === 'function') {
+            (hostPath as Promise<unknown>).catch(() => {})
+          }
+        } else if (typeof hostPath === 'string' && hostPath.trim() !== '') {
+          const fileContent = readImageFileFromContext(hostPath, context)
+          return {
+            path: hostPath,
+            ...(fileContent !== undefined ? { data: fileContent } : {}),
+          }
+        }
+      } catch {}
+    }
+  }
+
+  // C. LocalAttachmentStore.readImage(ref) -> { ref, data: Uint8Array }
+  if (typeof store.readImage === 'function') {
+    const fn = store.readImage as (ref: unknown) => unknown
+    for (const cand of candidates) {
+      if (cand === undefined) continue
+      try {
+        let res: unknown
+        try {
+          res = fn.call(store, cand)
+        } catch {
+          if (cordisOriginal && typeof cordisOriginal.readImage === 'function') {
+            res = (cordisOriginal.readImage as (ref: unknown) => unknown).call(cordisOriginal, cand)
+          }
+        }
+        if (res && typeof res === 'object') {
+          // If it's a Promise (async), safely attach catch to avoid unhandledRejection crashes
+          if (typeof (res as Promise<unknown>).then === 'function') {
+            if (typeof (res as Promise<unknown>).catch === 'function') {
+              (res as Promise<unknown>).catch(() => {})
+            }
+          } else {
+            if (res instanceof Uint8Array || (typeof Buffer !== 'undefined' && Buffer.isBuffer(res))) {
+              return res
+            }
+            const data = (res as { data?: unknown }).data
+            if (data instanceof Uint8Array || (typeof Buffer !== 'undefined' && Buffer.isBuffer(data)) || typeof data === 'string') {
+              return { data }
+            }
+          }
+        }
+      } catch {}
+    }
+  }
+
+  // D. readAttachment
+  if (typeof store.readAttachment === 'function') {
+    try {
+      let res: unknown
+      try {
+        res = (store.readAttachment as (id: string) => unknown).call(store, id)
+      } catch {
+        if (cordisOriginal && typeof cordisOriginal.readAttachment === 'function') {
+          res = (cordisOriginal.readAttachment as (id: string) => unknown).call(cordisOriginal, id)
+        }
+      }
+      if (res && typeof (res as Promise<unknown>).then === 'function') {
+        if (typeof (res as Promise<unknown>).catch === 'function') {
+          (res as Promise<unknown>).catch(() => {})
+        }
+      } else if (res !== undefined) {
+        return res
+      }
+    } catch {}
+  }
+
+  // E. getAttachment
+  if (typeof store.getAttachment === 'function') {
+    try {
+      let res: unknown
+      try {
+        res = (store.getAttachment as (id: string) => unknown).call(store, id)
+      } catch {
+        if (cordisOriginal && typeof cordisOriginal.getAttachment === 'function') {
+          res = (cordisOriginal.getAttachment as (id: string) => unknown).call(cordisOriginal, id)
+        }
+      }
+      if (res && typeof (res as Promise<unknown>).then === 'function') {
+        if (typeof (res as Promise<unknown>).catch === 'function') {
+          (res as Promise<unknown>).catch(() => {})
+        }
+      } else if (res !== undefined) {
+        return res
+      }
+    } catch {}
+  }
+
+  return undefined
+}
+
+function tryStoreFreeDiskAttachment(id: string, context?: unknown): unknown {
+  if (typeof id !== 'string') return undefined
+  let hash: string | undefined
+  const trimmed = id.trim()
+  if (trimmed.startsWith('sha256:')) {
+    hash = trimmed.slice('sha256:'.length).toLowerCase()
+  } else if (/^[0-9a-f]{64}$/i.test(trimmed)) {
+    hash = trimmed.toLowerCase()
+  }
+  if (!hash || hash.length < 2) return undefined
+
+  const prefix = hash.slice(0, 2)
+  const relPaths = [
+    `attachments/v1/objects/${prefix}/${hash}`,
+    `attachments/v1/file-objects/${prefix}/${hash}`,
+  ]
+
+  const candidatePaths: string[] = []
+
+  if (typeof process !== 'undefined' && process.env) {
+    const env = process.env
+    if (env.DSH_NTR_STATE_DIR) {
+      const stateDir = env.DSH_NTR_STATE_DIR.replaceAll('\\', '/').replace(/\/+$/, '')
+      const hostDir = stateDir.endsWith('/dsh-ntr') ? stateDir.slice(0, -'/dsh-ntr'.length) : stateDir
+      for (const rel of relPaths) candidatePaths.push(`${hostDir}/${rel}`)
+    }
+    if (env.DSH_DIR) {
+      const dshDir = env.DSH_DIR.replaceAll('\\', '/').replace(/\/+$/, '')
+      for (const rel of relPaths) candidatePaths.push(`${dshDir}/${rel}`)
+    }
+    const home = env.HOME || env.USERPROFILE || (env.HOMEDRIVE && env.HOMEPATH ? `${env.HOMEDRIVE}${env.HOMEPATH}` : undefined)
+    if (home) {
+      const cleanHome = home.replaceAll('\\', '/').replace(/\/+$/, '')
+      for (const rel of relPaths) {
+        candidatePaths.push(`${cleanHome}/.dsh/${rel}`)
+        candidatePaths.push(`${cleanHome}\\.dsh\\${rel.replaceAll('/', '\\')}`)
+      }
+    }
+  }
+  for (const rel of relPaths) candidatePaths.push(`~/.dsh/${rel}`)
+
+  for (const p of candidatePaths) {
+    const fileContent = readImageFileFromContext(p, context)
+    if (fileContent !== undefined) {
+      return {
+        path: p,
+        data: fileContent,
+      }
+    }
+  }
+
+  return undefined
+}
+
+export function resolveImageAttachmentFromContext(
+  id: string,
+  context?: unknown,
+  attachmentMeta?: unknown,
+  rootContext?: unknown,
+): unknown {
+  const root = rootContext ?? context
+  if (context && typeof context === 'object') {
+    const ctx = context as Record<string, unknown>
+
+    const direct = tryResolveFromAttachmentStore(ctx, id, root, attachmentMeta)
+    if (direct !== undefined) return direct
+
+    if (typeof ctx.get === 'function') {
+      try {
+        const svc = (ctx.get as (name: string) => unknown)('attachments') ?? (ctx.get as (name: string) => unknown)('attachmentService')
+        if (svc && typeof svc === 'object') {
+          const res = resolveImageAttachmentFromContext(id, svc, attachmentMeta, root)
+          if (res !== undefined) return res
+        }
+      } catch {}
+    }
+
+    try {
+      if (ctx.attachmentService && typeof ctx.attachmentService === 'object') {
+        const res = resolveImageAttachmentFromContext(id, ctx.attachmentService, attachmentMeta, root)
+        if (res !== undefined) return res
+      }
+    } catch {}
+
+    try {
+      const attStore = ctx.attachments
+      if (attStore) {
+        if (typeof attStore === 'object') {
+          const fromStore = tryResolveFromAttachmentStore(attStore as Record<string, unknown>, id, root, attachmentMeta)
+          if (fromStore !== undefined) return fromStore
+        }
+        if (attStore instanceof Map || typeof (attStore as { get?: unknown }).get === 'function') {
+          try { return (attStore as Map<string, unknown>).get(id) } catch {}
+        }
+        if (typeof attStore === 'object' && Object.prototype.hasOwnProperty.call(attStore, id)) {
+          return (attStore as Record<string, unknown>)[id]
+        }
+      }
+    } catch {}
+  }
+
+  return tryStoreFreeDiskAttachment(id, root)
+}
+
+function toBase64(data: Buffer | Uint8Array | string): string {
+  if (typeof data === 'string') return data.replace(/\s+/g, '')
+  if (typeof Buffer !== 'undefined') return Buffer.from(data).toString('base64')
+  let binary = ''
+  const bytes = data instanceof Uint8Array ? data : new Uint8Array(data)
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i])
+  }
+  return btoa(binary)
+}
+
+/**
+ * Extract an image payload (Base64 data + MIME type) from an image block and optional context.
+ */
+export function resolveImageContent(block: unknown, context?: unknown): PromptImageContent | undefined {
+  if (!block || typeof block !== 'object') return undefined
+  const b = block as Record<string, unknown>
+  const attRecord = b.attachment && typeof b.attachment === 'object' ? (b.attachment as Record<string, unknown>) : undefined
+  const isExplicitImageBlock = b.type === 'image' || b.type === 'image_url' || b.type === 'attachment'
+  const explicitMime = (typeof attRecord?.mediaType === 'string' && attRecord.mediaType.trim().toLowerCase()) ||
+    (typeof attRecord?.mimeType === 'string' && attRecord.mimeType.trim().toLowerCase()) ||
+    (typeof b.mediaType === 'string' && b.mediaType.trim().toLowerCase()) ||
+    (typeof b.mimeType === 'string' && b.mimeType.trim().toLowerCase()) ||
+    (typeof b.contentType === 'string' && b.contentType.trim().toLowerCase()) ||
+    undefined
+
+  // 1. Direct base64 data: { data: string | Buffer | Uint8Array, mimeType?: string }
+  if (typeof b.data === 'string' && b.data.trim() !== '') {
+    if (b.data.startsWith('data:')) {
+      const parsed = parseImageDataUrl(b.data)
+      if (parsed) {
+        const mimeType = explicitMime || parsed.mimeType || detectImageMimeFromMagic(parsed.data) || 'image/png'
+        return { type: 'image', data: parsed.data, mimeType, ...(typeof b.uri === 'string' ? { uri: b.uri } : {}) }
+      }
+      return undefined
+    }
+    const mimeType = explicitMime || detectImageMimeFromMagic(b.data) || (isExplicitImageBlock ? 'image/png' : undefined)
+    if (mimeType && mimeType.startsWith('image/')) {
+      return {
+        type: 'image',
+        data: b.data.trim().replace(/\s+/g, ''),
+        mimeType,
+        ...(typeof b.uri === 'string' ? { uri: b.uri } : {}),
+      }
+    }
+  }
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(b.data)) {
+    const mimeType = explicitMime || detectImageMimeFromMagic(b.data) || (isExplicitImageBlock ? 'image/png' : undefined)
+    if (mimeType && mimeType.startsWith('image/')) {
+      return { type: 'image', data: b.data.toString('base64'), mimeType, ...(typeof b.uri === 'string' ? { uri: b.uri } : {}) }
+    }
+  }
+  if (b.data instanceof Uint8Array) {
+    const mimeType = explicitMime || detectImageMimeFromMagic(b.data) || (isExplicitImageBlock ? 'image/png' : undefined)
+    if (mimeType && mimeType.startsWith('image/')) {
+      return { type: 'image', data: toBase64(b.data), mimeType, ...(typeof b.uri === 'string' ? { uri: b.uri } : {}) }
+    }
+  }
+
+  // 2. Anthropic style: source: { type: 'base64', media_type: string, data: string }
+  if (b.source && typeof b.source === 'object') {
+    const src = b.source as Record<string, unknown>
+    const srcMime = (typeof src.media_type === 'string' && src.media_type.trim().toLowerCase()) ||
+      (typeof src.mimeType === 'string' && src.mimeType.trim().toLowerCase()) ||
+      explicitMime ||
+      (typeof src.data === 'string' || src.data instanceof Uint8Array || (typeof Buffer !== 'undefined' && Buffer.isBuffer(src.data)) ? detectImageMimeFromMagic(src.data as Buffer | Uint8Array | string) : undefined) ||
+      'image/png'
+    if (srcMime.startsWith('image/')) {
+      if (typeof src.data === 'string' && src.data.trim() !== '') {
+        return {
+          type: 'image',
+          data: src.data.trim().replace(/\s+/g, ''),
+          mimeType: srcMime,
+          ...(typeof b.uri === 'string' ? { uri: b.uri } : {}),
+        }
+      }
+      if (typeof Buffer !== 'undefined' && Buffer.isBuffer(src.data)) {
+        return { type: 'image', data: src.data.toString('base64'), mimeType: srcMime, ...(typeof b.uri === 'string' ? { uri: b.uri } : {}) }
+      }
+      if (src.data instanceof Uint8Array) {
+        return { type: 'image', data: toBase64(src.data), mimeType: srcMime, ...(typeof b.uri === 'string' ? { uri: b.uri } : {}) }
+      }
+    }
+  }
+
+  // 3. Image property: { image: string | Buffer | Uint8Array }
+  if (typeof b.image === 'string' && b.image.trim() !== '') {
+    if (b.image.startsWith('data:')) {
+      const parsed = parseImageDataUrl(b.image)
+      if (parsed) return { type: 'image', data: parsed.data, mimeType: explicitMime || parsed.mimeType || detectImageMimeFromMagic(parsed.data) || 'image/png' }
+      return undefined
+    }
+    const mimeType = explicitMime || detectImageMimeFromMagic(b.image) || (isExplicitImageBlock ? 'image/png' : undefined)
+    if (mimeType && mimeType.startsWith('image/')) {
+      return { type: 'image', data: b.image.trim().replace(/\s+/g, ''), mimeType }
+    }
+  }
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(b.image)) {
+    const mimeType = explicitMime || detectImageMimeFromMagic(b.image) || (isExplicitImageBlock ? 'image/png' : undefined)
+    if (mimeType && mimeType.startsWith('image/')) return { type: 'image', data: b.image.toString('base64'), mimeType }
+  }
+  if (b.image instanceof Uint8Array) {
+    const mimeType = explicitMime || detectImageMimeFromMagic(b.image) || (isExplicitImageBlock ? 'image/png' : undefined)
+    if (mimeType && mimeType.startsWith('image/')) return { type: 'image', data: toBase64(b.image), mimeType }
+  }
+
+  // 4. OpenAI style image_url: { image_url: string | { url: string } }
+  if (b.image_url) {
+    const urlStr = typeof b.image_url === 'string'
+      ? b.image_url
+      : (typeof b.image_url === 'object' && b.image_url !== null ? (b.image_url as Record<string, unknown>).url : undefined)
+    if (typeof urlStr === 'string' && urlStr.trim() !== '') {
+      if (urlStr.startsWith('data:')) {
+        const parsed = parseImageDataUrl(urlStr)
+        if (parsed) return { type: 'image', data: parsed.data, mimeType: explicitMime || parsed.mimeType || detectImageMimeFromMagic(parsed.data) || 'image/png', uri: urlStr }
+        return undefined
+      }
+      if (urlStr.startsWith('http://') || urlStr.startsWith('https://')) {
+        const mimeType = explicitMime || guessImageMimeType(urlStr) || 'image/png'
+        return { type: 'image', data: '', mimeType, uri: urlStr }
+      }
+      if (urlStr.startsWith('file://') || isLocalFilePath(urlStr)) {
+        const fileContent = readImageFileFromContext(urlStr, context)
+        if (fileContent !== undefined) {
+          let data: string
+          let resolvedMime: string | undefined
+          if (typeof fileContent === 'string') {
+            if (fileContent.startsWith('data:')) {
+              const parsed = parseImageDataUrl(fileContent)
+              if (parsed) {
+                data = parsed.data
+                resolvedMime = parsed.mimeType
+              } else {
+                return undefined
+              }
+            } else {
+              data = fileContent.trim().replace(/\s+/g, '')
+            }
+          } else {
+            data = toBase64(fileContent)
+          }
+          const mimeType = explicitMime || resolvedMime || guessImageMimeType(urlStr) || detectImageMimeFromMagic(fileContent) || (isExplicitImageBlock ? 'image/png' : undefined)
+          if (mimeType && mimeType.startsWith('image/')) {
+            return { type: 'image', data, mimeType, uri: urlStr }
+          }
+        }
+      }
+    }
+  }
+
+  // 5. Direct buffer / content on block: { buffer: Buffer } or { content: Buffer }
+  if (b.buffer && (typeof Buffer !== 'undefined' && Buffer.isBuffer(b.buffer) || b.buffer instanceof Uint8Array)) {
+    const data = typeof Buffer !== 'undefined' && Buffer.isBuffer(b.buffer) ? b.buffer.toString('base64') : toBase64(b.buffer as Uint8Array)
+    const mimeType = explicitMime || detectImageMimeFromMagic(b.buffer as Buffer | Uint8Array) || (isExplicitImageBlock ? 'image/png' : undefined)
+    if (mimeType && mimeType.startsWith('image/')) {
+      return { type: 'image', data, mimeType, ...(typeof b.uri === 'string' ? { uri: b.uri } : {}) }
+    }
+  }
+  if (b.content && (typeof Buffer !== 'undefined' && Buffer.isBuffer(b.content) || b.content instanceof Uint8Array)) {
+    const data = typeof Buffer !== 'undefined' && Buffer.isBuffer(b.content) ? b.content.toString('base64') : toBase64(b.content as Uint8Array)
+    const mimeType = explicitMime || detectImageMimeFromMagic(b.content as Buffer | Uint8Array) || (isExplicitImageBlock ? 'image/png' : undefined)
+    if (mimeType && mimeType.startsWith('image/')) {
+      return { type: 'image', data, mimeType, ...(typeof b.uri === 'string' ? { uri: b.uri } : {}) }
+    }
+  }
+
+  // 6. Data URL or Remote URL in `url`
+  if (typeof b.url === 'string') {
+    if (b.url.startsWith('data:')) {
+      const parsed = parseImageDataUrl(b.url)
+      if (parsed) return { type: 'image', data: parsed.data, mimeType: explicitMime || parsed.mimeType || detectImageMimeFromMagic(parsed.data) || 'image/png', uri: b.url }
+      return undefined
+    }
+    if (b.url.startsWith('http://') || b.url.startsWith('https://')) {
+      const mimeType = explicitMime || guessImageMimeType(b.url) || 'image/png'
+      return { type: 'image', data: '', mimeType, uri: b.url }
+    }
+  }
+
+  // 7. File path in `path`, `filePath`, or `url: file://...`
+  let filePath: string | undefined
+  if (typeof b.path === 'string' && b.path !== '') filePath = b.path
+  else if (typeof b.filePath === 'string' && b.filePath !== '') filePath = b.filePath
+  else if (typeof b.url === 'string' && (b.url.startsWith('file://') || isLocalFilePath(b.url))) filePath = b.url
+
+  if (filePath !== undefined) {
+    const fileContent = readImageFileFromContext(filePath, context)
+    if (fileContent !== undefined) {
+      let data: string
+      let resolvedMime: string | undefined
+      if (typeof fileContent === 'string') {
+        if (fileContent.startsWith('data:')) {
+          const parsed = parseImageDataUrl(fileContent)
+          if (parsed) {
+            data = parsed.data
+            resolvedMime = parsed.mimeType
+          } else {
+            return undefined
+          }
+        } else {
+          data = fileContent.trim().replace(/\s+/g, '')
+        }
+      } else {
+        data = toBase64(fileContent)
+      }
+      const mimeType = explicitMime ||
+        resolvedMime ||
+        guessImageMimeType(filePath) ||
+        detectImageMimeFromMagic(fileContent) ||
+        (isExplicitImageBlock ? 'image/png' : undefined)
+
+      if (mimeType && mimeType.startsWith('image/')) {
+        let uri = typeof b.url === 'string' ? b.url : undefined
+        if (!uri) {
+          if (filePath.startsWith('file://')) {
+            uri = filePath
+          } else if (isAbsolutePath(filePath)) {
+            if (filePath.startsWith('//') || filePath.startsWith('\\\\')) {
+              uri = `file://${filePath.replace(/^[\/\\]+/, '').replace(/\\/g, '/')}`
+            } else if (/^[a-zA-Z]:/.test(filePath)) {
+              uri = `file:///${filePath.replace(/\\/g, '/')}`
+            } else {
+              uri = `file://${filePath.startsWith('/') ? filePath : `/${filePath}`}`
+            }
+          } else {
+            uri = filePath
+          }
+        }
+        return {
+          type: 'image',
+          data,
+          mimeType,
+          uri,
+        }
+      }
+    }
+  }
+
+  // 8. Attachment resolution via context
+  let attachmentId: string | undefined
+  if (attRecord && typeof attRecord.attachmentId === 'string' && attRecord.attachmentId.trim() !== '') {
+    attachmentId = attRecord.attachmentId.trim()
+  } else if (typeof b.attachmentId === 'string' && b.attachmentId.trim() !== '') {
+    attachmentId = b.attachmentId.trim()
+  } else if (attRecord && typeof attRecord.id === 'string' && attRecord.id.trim() !== '') {
+    attachmentId = attRecord.id.trim()
+  } else if (typeof b.id === 'string' && b.id.trim() !== '') {
+    attachmentId = b.id.trim()
+  } else if (typeof b.attachment === 'string' && b.attachment.trim() !== '') {
+    attachmentId = b.attachment.trim()
+  } else if (typeof b.url === 'string' && b.url.startsWith('attachment:')) {
+    attachmentId = b.url.replace(/^attachment:\/\/|^attachment:/, '')
+  } else if (typeof b.image_url === 'string' && b.image_url.startsWith('attachment:')) {
+    attachmentId = b.image_url.replace(/^attachment:\/\/|^attachment:/, '')
+  } else if (b.image_url && typeof b.image_url === 'object' && typeof (b.image_url as Record<string, unknown>).url === 'string' && ((b.image_url as Record<string, unknown>).url as string).startsWith('attachment:')) {
+    attachmentId = ((b.image_url as Record<string, unknown>).url as string).replace(/^attachment:\/\/|^attachment:/, '')
+  }
+
+  if (attachmentId !== undefined) {
+    const rawAtt = resolveImageAttachmentFromContext(attachmentId, context, b.attachment)
+    if (rawAtt !== undefined) {
+      if (typeof rawAtt === 'string') {
+        if (rawAtt.startsWith('data:')) {
+          const parsed = parseImageDataUrl(rawAtt)
+          if (parsed) {
+            const mimeType = explicitMime || parsed.mimeType || detectImageMimeFromMagic(parsed.data) || 'image/png'
+            return {
+              type: 'image',
+              data: parsed.data,
+              mimeType,
+              uri: typeof b.uri === 'string' ? b.uri : `attachment://${attachmentId}`,
+            }
+          }
+          return undefined
+        } else if (rawAtt.startsWith('file://') || isLocalFilePath(rawAtt)) {
+          const fileContent = readImageFileFromContext(rawAtt, context)
+          if (fileContent !== undefined) {
+            let data: string
+            let resolvedMime: string | undefined
+            if (typeof fileContent === 'string') {
+              if (fileContent.startsWith('data:')) {
+                const parsed = parseImageDataUrl(fileContent)
+                if (parsed) {
+                  data = parsed.data
+                  resolvedMime = parsed.mimeType
+                } else {
+                  return undefined
+                }
+              } else {
+                data = fileContent.trim().replace(/\s+/g, '')
+              }
+            } else {
+              data = toBase64(fileContent)
+            }
+            const mimeType = explicitMime ||
+              resolvedMime ||
+              (typeof attRecord?.name === 'string' ? guessImageMimeType(attRecord.name) : undefined) ||
+              guessImageMimeType(rawAtt) ||
+              detectImageMimeFromMagic(fileContent) ||
+              (isExplicitImageBlock ? 'image/png' : undefined)
+            if (mimeType && mimeType.startsWith('image/')) {
+              return { type: 'image', data, mimeType, uri: typeof b.uri === 'string' ? b.uri : `attachment://${attachmentId}` }
+            }
+          }
+        }
+        const mimeType = explicitMime ||
+          (typeof attRecord?.name === 'string' ? guessImageMimeType(attRecord.name) : undefined) ||
+          guessImageMimeType(attachmentId) ||
+          detectImageMimeFromMagic(rawAtt) ||
+          (isExplicitImageBlock ? 'image/png' : undefined)
+        if (mimeType && mimeType.startsWith('image/')) {
+          return { type: 'image', data: rawAtt.trim().replace(/\s+/g, ''), mimeType, uri: typeof b.uri === 'string' ? b.uri : `attachment://${attachmentId}` }
+        }
+      }
+      if (typeof rawAtt === 'object' && rawAtt !== null) {
+        if (typeof Buffer !== 'undefined' && Buffer.isBuffer(rawAtt)) {
+          const mimeType = explicitMime ||
+            (typeof attRecord?.name === 'string' ? guessImageMimeType(attRecord.name) : undefined) ||
+            guessImageMimeType(attachmentId) ||
+            detectImageMimeFromMagic(rawAtt) ||
+            (isExplicitImageBlock ? 'image/png' : undefined)
+          if (mimeType && mimeType.startsWith('image/')) {
+            return {
+              type: 'image',
+              data: rawAtt.toString('base64'),
+              mimeType,
+              uri: typeof b.uri === 'string' ? b.uri : `attachment://${attachmentId}`,
+            }
+          }
+        }
+        if (rawAtt instanceof Uint8Array) {
+          const mimeType = explicitMime ||
+            (typeof attRecord?.name === 'string' ? guessImageMimeType(attRecord.name) : undefined) ||
+            guessImageMimeType(attachmentId) ||
+            detectImageMimeFromMagic(rawAtt) ||
+            (isExplicitImageBlock ? 'image/png' : undefined)
+          if (mimeType && mimeType.startsWith('image/')) {
+            return {
+              type: 'image',
+              data: toBase64(rawAtt),
+              mimeType,
+              uri: typeof b.uri === 'string' ? b.uri : `attachment://${attachmentId}`,
+            }
+          }
+        }
+        const attObj = rawAtt as Record<string, unknown>
+        let data: string | undefined
+        let resolvedMime: string | undefined
+
+        const attPath = typeof attObj.path === 'string' && attObj.path !== ''
+          ? attObj.path
+          : (typeof attObj.filePath === 'string' && attObj.filePath !== ''
+              ? attObj.filePath
+              : (typeof attObj.url === 'string' && (attObj.url.startsWith('file://') || isLocalFilePath(attObj.url)) ? attObj.url : undefined))
+
+        let fileContentForMagic: Buffer | Uint8Array | string | undefined
+
+        if (attPath !== undefined) {
+          const fileContent = readImageFileFromContext(attPath, context)
+          if (fileContent !== undefined) {
+            fileContentForMagic = fileContent
+            if (typeof fileContent === 'string') {
+              if (fileContent.startsWith('data:')) {
+                const parsed = parseImageDataUrl(fileContent)
+                if (parsed) {
+                  data = parsed.data
+                  resolvedMime = parsed.mimeType
+                }
+              } else {
+                data = fileContent.trim().replace(/\s+/g, '')
+              }
+            } else {
+              data = toBase64(fileContent)
+            }
+            if (!resolvedMime) resolvedMime = guessImageMimeType(attPath)
+          }
+        }
+
+        if (data === undefined) {
+          if (typeof attObj.data === 'string' && attObj.data.trim() !== '') {
+            if (attObj.data.startsWith('data:')) {
+              const parsed = parseImageDataUrl(attObj.data)
+              if (parsed) {
+                data = parsed.data
+                resolvedMime = parsed.mimeType
+              }
+            } else {
+              data = attObj.data.trim().replace(/\s+/g, '')
+              fileContentForMagic = attObj.data
+            }
+          }
+          else if (typeof Buffer !== 'undefined' && Buffer.isBuffer(attObj.data)) {
+            data = attObj.data.toString('base64')
+            fileContentForMagic = attObj.data
+          }
+          else if (attObj.data instanceof Uint8Array) {
+            data = toBase64(attObj.data)
+            fileContentForMagic = attObj.data
+          }
+          else if (typeof Buffer !== 'undefined' && Buffer.isBuffer(attObj.buffer)) {
+            data = attObj.buffer.toString('base64')
+            fileContentForMagic = attObj.buffer
+          }
+          else if (attObj.buffer instanceof Uint8Array) {
+            data = toBase64(attObj.buffer)
+            fileContentForMagic = attObj.buffer
+          }
+          else if (typeof Buffer !== 'undefined' && Buffer.isBuffer(attObj.content)) {
+            data = attObj.content.toString('base64')
+            fileContentForMagic = attObj.content
+          }
+          else if (attObj.content instanceof Uint8Array) {
+            data = toBase64(attObj.content)
+            fileContentForMagic = attObj.content
+          }
+          else if (typeof attObj.content === 'string') {
+            if (attObj.content.startsWith('data:')) {
+              const parsed = parseImageDataUrl(attObj.content)
+              if (parsed) {
+                data = parsed.data
+                resolvedMime = parsed.mimeType
+              }
+            } else {
+              data = attObj.content.trim().replace(/\s+/g, '')
+              fileContentForMagic = attObj.content
+            }
+          }
+        }
+
+        if (data !== undefined) {
+          const mimeType = explicitMime ||
+            (typeof attObj.mediaType === 'string' && attObj.mediaType.toLowerCase()) ||
+            (typeof attObj.mimeType === 'string' && attObj.mimeType.toLowerCase()) ||
+            resolvedMime ||
+            (typeof attRecord?.name === 'string' ? guessImageMimeType(attRecord.name) : undefined) ||
+            (typeof attObj.name === 'string' ? guessImageMimeType(attObj.name as string) : undefined) ||
+            guessImageMimeType(attachmentId) ||
+            detectImageMimeFromMagic(fileContentForMagic ?? data) ||
+            (isExplicitImageBlock ? 'image/png' : undefined)
+          if (mimeType && mimeType.startsWith('image/')) {
+            return {
+              type: 'image',
+              data,
+              mimeType,
+              uri: typeof b.uri === 'string' ? b.uri : `attachment://${attachmentId}`,
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 9. Direct b.attachment object
+  if (b.attachment && typeof b.attachment === 'object') {
+    const attObj = b.attachment as Record<string, unknown>
+    let data: string | undefined
+    let resolvedMime: string | undefined
+
+    const attPath = typeof attObj.path === 'string' && attObj.path !== ''
+      ? attObj.path
+      : (typeof attObj.filePath === 'string' && attObj.filePath !== ''
+          ? attObj.filePath
+          : (typeof attObj.url === 'string' && (attObj.url.startsWith('file://') || isLocalFilePath(attObj.url)) ? attObj.url : undefined))
+
+    let fileContentForMagic: Buffer | Uint8Array | string | undefined
+
+    if (attPath !== undefined) {
+      const fileContent = readImageFileFromContext(attPath, context)
+      if (fileContent !== undefined) {
+        fileContentForMagic = fileContent
+        if (typeof fileContent === 'string') {
+          if (fileContent.startsWith('data:')) {
+            const parsed = parseImageDataUrl(fileContent)
+            if (parsed) {
+              data = parsed.data
+              resolvedMime = parsed.mimeType
+            }
+          } else {
+            data = fileContent.trim().replace(/\s+/g, '')
+          }
+        } else {
+          data = toBase64(fileContent)
+        }
+        if (!resolvedMime) resolvedMime = guessImageMimeType(attPath)
+      }
+    }
+
+    if (data === undefined) {
+      if (typeof attObj.data === 'string' && attObj.data.trim() !== '') {
+        if (attObj.data.startsWith('data:')) {
+          const parsed = parseImageDataUrl(attObj.data)
+          if (parsed) {
+            data = parsed.data
+            resolvedMime = parsed.mimeType
+          }
+        } else {
+          data = attObj.data.trim().replace(/\s+/g, '')
+          fileContentForMagic = attObj.data
+        }
+      }
+      else if (typeof Buffer !== 'undefined' && Buffer.isBuffer(attObj.data)) {
+        data = attObj.data.toString('base64')
+        fileContentForMagic = attObj.data
+      }
+      else if (attObj.data instanceof Uint8Array) {
+        data = toBase64(attObj.data)
+        fileContentForMagic = attObj.data
+      }
+      else if (typeof Buffer !== 'undefined' && Buffer.isBuffer(attObj.buffer)) {
+        data = attObj.buffer.toString('base64')
+        fileContentForMagic = attObj.buffer
+      }
+      else if (attObj.buffer instanceof Uint8Array) {
+        data = toBase64(attObj.buffer)
+        fileContentForMagic = attObj.buffer
+      }
+      else if (typeof Buffer !== 'undefined' && Buffer.isBuffer(attObj.content)) {
+        data = attObj.content.toString('base64')
+        fileContentForMagic = attObj.content
+      }
+      else if (attObj.content instanceof Uint8Array) {
+        data = toBase64(attObj.content)
+        fileContentForMagic = attObj.content
+      }
+      else if (typeof attObj.content === 'string') {
+        if (attObj.content.startsWith('data:')) {
+          const parsed = parseImageDataUrl(attObj.content)
+          if (parsed) {
+            data = parsed.data
+            resolvedMime = parsed.mimeType
+          }
+        } else {
+          data = attObj.content.trim().replace(/\s+/g, '')
+          fileContentForMagic = attObj.content
+        }
+      }
+    }
+
+    if (data !== undefined) {
+      const mimeType = explicitMime ||
+        (typeof attObj.mediaType === 'string' && attObj.mediaType.toLowerCase()) ||
+        (typeof attObj.mimeType === 'string' && attObj.mimeType.toLowerCase()) ||
+        resolvedMime ||
+        (typeof attObj.name === 'string' ? guessImageMimeType(attObj.name as string) : undefined) ||
+        (attPath ? guessImageMimeType(attPath) : undefined) ||
+        detectImageMimeFromMagic(fileContentForMagic ?? data) ||
+        (isExplicitImageBlock ? 'image/png' : undefined)
+      if (mimeType && mimeType.startsWith('image/')) {
+        return { type: 'image', data, mimeType, ...(typeof b.uri === 'string' ? { uri: b.uri } : {}) }
+      }
+    }
+  }
+
+  return undefined
+}
 export type ForwardPromptSelection =
-  | { kind: 'prompt'; text: string; id?: string }
+  | {
+      kind: 'prompt'
+      text: string
+      id?: string
+      images?: PromptImageContent[]
+      content?: PromptContentBlock[]
+    }
   | { kind: 'no-user-input' }
   | { kind: 'empty' }
 
@@ -1405,28 +2450,72 @@ export type ForwardPromptSelection =
  * (tests, headless callers) and counts as user input.
  *
  * @param messages - the request's ordered messages, exactly as the host built them.
- * @returns the last real user message's text, or why there is none to forward.
+ * @param context - optional host context or attachment resolver for reading attachments.
+ * @returns the last real user message's text and any image content blocks, or why there is none to forward.
  */
 export function selectForwardPrompt(messages: readonly {
   role: string
-  content?: Array<{ type?: string; text?: string }>
+  content?: string | Array<{ type?: string; text?: string; [k: string]: unknown }> | { type?: string; text?: string; [k: string]: unknown }
   source?: { kind?: string }
   id?: string
-}[]): ForwardPromptSelection {
+}[], context?: unknown): ForwardPromptSelection {
   let sawUserRole = false
-  let last: { text: string; id?: string } | undefined
+  let last: {
+    text: string
+    id?: string
+    images?: PromptImageContent[]
+    content?: PromptContentBlock[]
+  } | undefined
   for (const message of messages) {
     if (message.role !== 'user') continue
     sawUserRole = true
     const kind = message.source?.kind
     if (kind !== undefined && kind !== 'user') continue
-    const text = (message.content ?? [])
+
+    const content = message.content ?? (message as { parts?: unknown }).parts
+    const rawBlocks: Array<Record<string, unknown>> = Array.isArray(content)
+      ? (content as Array<Record<string, unknown>>)
+      : (typeof content === 'string'
+          ? [{ type: 'text', text: content }]
+          : (typeof content === 'object' && content !== null ? [content as Record<string, unknown>] : []))
+
+    const text = rawBlocks
       .filter(block => block.type === 'text' && typeof block.text === 'string')
       .map(block => block.text as string)
       .join('\n')
       .trim()
-    if (text === '') continue
-    last = { text, ...(message.id === undefined ? {} : { id: message.id }) }
+
+    const images: PromptImageContent[] = []
+    const contentBlocks: PromptContentBlock[] = []
+
+    for (const block of rawBlocks) {
+      if (!block || typeof block !== 'object') continue
+      if (block.type === 'text' && typeof block.text === 'string') {
+        if (block.text.trim() !== '') {
+          contentBlocks.push({ type: 'text', text: block.text })
+        }
+      } else {
+        const resolved = resolveImageContent(block, context)
+        if (resolved !== undefined) {
+          images.push(resolved)
+          contentBlocks.push(resolved)
+        }
+      }
+    }
+
+    if (text === '' && images.length === 0) continue
+
+    const item: {
+      text: string
+      id?: string
+      images?: PromptImageContent[]
+      content?: PromptContentBlock[]
+    } = { text, ...(message.id === undefined ? {} : { id: message.id }) }
+    if (images.length > 0) {
+      item.images = images
+      item.content = contentBlocks
+    }
+    last = item
   }
   if (last !== undefined) return { kind: 'prompt', ...last }
   return sawUserRole ? { kind: 'no-user-input' } : { kind: 'empty' }
@@ -1778,7 +2867,7 @@ export function permissionReplayFrames(pending: readonly PendingPermissionView[]
 export interface AcpManager {
   agentViews(): AgentView[]
   startSession(agentId: string, cwd: string | undefined): Promise<{ sessionId: string }>
-  prompt(sessionId: string, text: string): Promise<{ turnId: string }>
+  prompt(sessionId: string, prompt: string | PromptContentBlock[]): Promise<{ turnId: string }>
   cancel(sessionId: string): Promise<void>
   closeSession(sessionId: string): Promise<void>
   setMode(sessionId: string, modeId: string): Promise<void>
@@ -2031,7 +3120,37 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
       case 'session/start':
         return ok(await manager.startSession(str(body, 'agentId', 64), optionalStr(body, 'cwd', 4096)))
       case 'session/prompt': {
-        const { turnId } = await manager.prompt(str(body, 'sessionId', 64), str(body, 'text', 1 << 20))
+        let promptInput: string | PromptContentBlock[]
+        if (Array.isArray(body.prompt)) {
+          if (body.prompt.length === 0) {
+            throw new AcpError('bad_payload', 'acp: prompt array cannot be empty')
+          }
+          for (const b of body.prompt) {
+            if (!b || typeof b !== 'object') throw new AcpError('bad_payload', 'acp: prompt blocks must be objects')
+            const block = b as Record<string, unknown>
+            if (block.type === 'text') {
+              if (typeof block.text !== 'string') throw new AcpError('bad_payload', 'acp: text block requires string text')
+              if (block.text.length > (1 << 20)) throw new AcpError('bad_payload', 'acp: text block exceeds max length')
+            } else if (block.type === 'image') {
+              if (typeof block.data !== 'string' || typeof block.mimeType !== 'string') {
+                throw new AcpError('bad_payload', 'acp: image block requires string data and mimeType')
+              }
+              if (!block.mimeType.toLowerCase().startsWith('image/')) {
+                throw new AcpError('bad_payload', 'acp: image block mimeType must start with image/')
+              }
+              if (block.uri !== undefined && typeof block.uri !== 'string') {
+                throw new AcpError('bad_payload', 'acp: image block uri must be string')
+              }
+              if (block.data.length > (20 << 20)) throw new AcpError('bad_payload', 'acp: image block exceeds max data length')
+            } else {
+              throw new AcpError('bad_payload', `acp: unsupported prompt block type: ${String(block.type)}`)
+            }
+          }
+          promptInput = body.prompt as PromptContentBlock[]
+        } else {
+          promptInput = str(body, 'text', 1 << 20)
+        }
+        const { turnId } = await manager.prompt(str(body, 'sessionId', 64), promptInput)
         return ok({ accepted: true as const, turnId })
       }
       case 'session/cancel':

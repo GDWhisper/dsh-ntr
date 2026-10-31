@@ -17,6 +17,8 @@ import {
   acpPresetStatusFromRoster,
   isAcpToolContinuation,
   isAbsolutePath,
+  isLocalFilePath,
+  normalizeFileUrlToPath,
   isUnderPath,
   MAX_CONFIG_OPTIONS_BYTES,
   mergeCatalogShape,
@@ -28,7 +30,9 @@ import {
   permissionToolPaths,
   resolveFsPath,
   resolveSessionCwd,
+  resolveImageAttachmentFromContext,
   selectForwardPrompt,
+  detectImageMimeFromMagic,
   sessionAgentPreset,
   sessionAgentPresetFromLog,
   splitAdapterModelId,
@@ -489,6 +493,1004 @@ describe('selectForwardPrompt (host request → forwarded ACP prompt)', () => {
       { role: 'user', content: [{ type: 'text', text: '  first  ' }, { type: 'image', url: 'x' }, { type: 'text', text: 'second' }] },
     ])).toEqual({ kind: 'prompt', text: 'first  \nsecond' })
     expect(selectForwardPrompt([{ role: 'user', content: [{ type: 'text', text: '   ' }] }])).toEqual({ kind: 'no-user-input' })
+  })
+
+  it('extracts direct base64 image blocks and populates images and content arrays', () => {
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        id: 'msg-img',
+        content: [
+          { type: 'text', text: 'look at this image' },
+          { type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' },
+        ],
+      },
+    ])
+    expect(picked).toEqual({
+      kind: 'prompt',
+      id: 'msg-img',
+      text: 'look at this image',
+      images: [{ type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' }],
+      content: [
+        { type: 'text', text: 'look at this image' },
+        { type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' },
+      ],
+    })
+  })
+
+  it('parses data URLs and anthropic source image blocks', () => {
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          { type: 'image', url: 'data:image/jpeg;base64,/9j/4AAQSkZJRg==' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/webp', data: 'UklGRiQAAABXRUJQVlA=' } },
+        ],
+      },
+    ])
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: '',
+      images: [
+        { type: 'image', data: '/9j/4AAQSkZJRg==', mimeType: 'image/jpeg', uri: 'data:image/jpeg;base64,/9j/4AAQSkZJRg==' },
+        { type: 'image', data: 'UklGRiQAAABXRUJQVlA=', mimeType: 'image/webp' },
+      ],
+      content: [
+        { type: 'image', data: '/9j/4AAQSkZJRg==', mimeType: 'image/jpeg', uri: 'data:image/jpeg;base64,/9j/4AAQSkZJRg==' },
+        { type: 'image', data: 'UklGRiQAAABXRUJQVlA=', mimeType: 'image/webp' },
+      ],
+    })
+  })
+
+  it('reads file paths via context readFile and resolves MIME types', () => {
+    const context = {
+      readFile: (path: string) => (path === '/workspace/test.png' ? Buffer.from('mock-png-binary') : undefined),
+    }
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'analyze diagram' },
+          { type: 'image', path: '/workspace/test.png' },
+        ],
+      },
+    ], context)
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: 'analyze diagram',
+      images: [
+        {
+          type: 'image',
+          data: Buffer.from('mock-png-binary').toString('base64'),
+          mimeType: 'image/png',
+          uri: 'file:///workspace/test.png',
+        },
+      ],
+      content: [
+        { type: 'text', text: 'analyze diagram' },
+        {
+          type: 'image',
+          data: Buffer.from('mock-png-binary').toString('base64'),
+          mimeType: 'image/png',
+          uri: 'file:///workspace/test.png',
+        },
+      ],
+    })
+  })
+
+  it('resolves attachments from context service or map', () => {
+    const context = {
+      attachments: {
+        'att-1': { data: 'YXR0MWJhc2U2NA==', mimeType: 'image/gif' },
+      },
+      getAttachment: (id: string) => (id === 'att-2' ? Buffer.from('att2-bytes') : undefined),
+    }
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          { type: 'image', attachmentId: 'att-1' },
+          { type: 'image', attachment: { id: 'att-2' } },
+        ],
+      },
+    ], context)
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: '',
+      images: [
+        { type: 'image', data: 'YXR0MWJhc2U2NA==', mimeType: 'image/gif', uri: 'attachment://att-1' },
+        { type: 'image', data: Buffer.from('att2-bytes').toString('base64'), mimeType: 'image/png', uri: 'attachment://att-2' },
+      ],
+      content: [
+        { type: 'image', data: 'YXR0MWJhc2U2NA==', mimeType: 'image/gif', uri: 'attachment://att-1' },
+        { type: 'image', data: Buffer.from('att2-bytes').toString('base64'), mimeType: 'image/png', uri: 'attachment://att-2' },
+      ],
+    })
+  })
+
+  it('preserves interleaved order of text and image content blocks', () => {
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'step 1' },
+          { type: 'image', data: 'aW1nMQ==', mimeType: 'image/png' },
+          { type: 'text', text: 'step 2' },
+          { type: 'image', data: 'aW1nMg==', mimeType: 'image/jpeg' },
+        ],
+      },
+    ])
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: 'step 1\nstep 2',
+      images: [
+        { type: 'image', data: 'aW1nMQ==', mimeType: 'image/png' },
+        { type: 'image', data: 'aW1nMg==', mimeType: 'image/jpeg' },
+      ],
+      content: [
+        { type: 'text', text: 'step 1' },
+        { type: 'image', data: 'aW1nMQ==', mimeType: 'image/png' },
+        { type: 'text', text: 'step 2' },
+        { type: 'image', data: 'aW1nMg==', mimeType: 'image/jpeg' },
+      ],
+    })
+  })
+
+  it('validates local file paths complying with Rule 24 and cross-platform paths', () => {
+    expect(isLocalFilePath('/absolute/posix/path.png')).toBe(true)
+    expect(isLocalFilePath('C:\\Windows\\test.png')).toBe(true)
+    expect(isLocalFilePath('D:/workspace/test.png')).toBe(true)
+    expect(isLocalFilePath('\\\\server\\share\\img.png')).toBe(true)
+    expect(isLocalFilePath('//server/share/img.png')).toBe(true)
+    expect(isLocalFilePath('./relative.png')).toBe(true)
+    expect(isLocalFilePath('../parent.png')).toBe(true)
+    expect(isLocalFilePath('..\\parent.png')).toBe(true)
+    expect(isLocalFilePath('\\\\?\\C:\\device')).toBe(false)
+    expect(isLocalFilePath('not-a-path')).toBe(false)
+    expect(isLocalFilePath('')).toBe(false)
+  })
+
+  it('normalizes file URLs to absolute paths on POSIX and Windows', () => {
+    expect(normalizeFileUrlToPath('file:///workspace/test.png')).toBe('/workspace/test.png')
+    expect(normalizeFileUrlToPath('file://localhost/workspace/test.png')).toBe('/workspace/test.png')
+    expect(normalizeFileUrlToPath('file:///C:/workspace/test.png')).toBe('C:/workspace/test.png')
+    expect(normalizeFileUrlToPath('file://localhost/C:/workspace/test.png')).toBe('C:/workspace/test.png')
+    expect(normalizeFileUrlToPath('file://C:/workspace/test.png')).toBe('C:/workspace/test.png')
+    expect(normalizeFileUrlToPath('file:///C:/My%20Documents/test%201.png')).toBe('C:/My Documents/test 1.png')
+    expect(normalizeFileUrlToPath('file:///workspace/%E6%B5%8B%E8%AF%95.png')).toBe('/workspace/测试.png')
+    expect(normalizeFileUrlToPath('file://server/share/test.png')).toBe('//server/share/test.png')
+    expect(normalizeFileUrlToPath('file://server/share/My%20Photo.png')).toBe('//server/share/My Photo.png')
+    expect(normalizeFileUrlToPath('/plain/path.png')).toBe('/plain/path.png')
+  })
+
+  it('parses OpenAI style image_url blocks and raw base64 image strings', () => {
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,b3BlbmFpaW1n' } },
+          { type: 'image', image: 'cmF3YmFzZTY0' },
+        ],
+      },
+    ])
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: '',
+      images: [
+        { type: 'image', data: 'b3BlbmFpaW1n', mimeType: 'image/png', uri: 'data:image/png;base64,b3BlbmFpaW1n' },
+        { type: 'image', data: 'cmF3YmFzZTY0', mimeType: 'image/png' },
+      ],
+      content: [
+        { type: 'image', data: 'b3BlbmFpaW1n', mimeType: 'image/png', uri: 'data:image/png;base64,b3BlbmFpaW1n' },
+        { type: 'image', data: 'cmF3YmFzZTY0', mimeType: 'image/png' },
+      ],
+    })
+  })
+
+  it('handles Buffer and Uint8Array image inputs', () => {
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          { type: 'image', data: Buffer.from('buffer-data'), mimeType: 'image/jpeg' },
+          { type: 'image', buffer: Buffer.from('buffer-prop'), mimeType: 'image/png' },
+          { type: 'image', content: new Uint8Array([1, 2, 3]) },
+        ],
+      },
+    ])
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: '',
+      images: [
+        { type: 'image', data: Buffer.from('buffer-data').toString('base64'), mimeType: 'image/jpeg' },
+        { type: 'image', data: Buffer.from('buffer-prop').toString('base64'), mimeType: 'image/png' },
+        { type: 'image', data: Buffer.from([1, 2, 3]).toString('base64'), mimeType: 'image/png' },
+      ],
+      content: [
+        { type: 'image', data: Buffer.from('buffer-data').toString('base64'), mimeType: 'image/jpeg' },
+        { type: 'image', data: Buffer.from('buffer-prop').toString('base64'), mimeType: 'image/png' },
+        { type: 'image', data: Buffer.from([1, 2, 3]).toString('base64'), mimeType: 'image/png' },
+      ],
+    })
+  })
+
+  it('converts non-base64 data URL to base64 encoding', () => {
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          { type: 'image', url: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg"/>' },
+        ],
+      },
+    ])
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: '',
+      images: [
+        {
+          type: 'image',
+          data: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString('base64'),
+          mimeType: 'image/svg+xml',
+          uri: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg"/>',
+        },
+      ],
+      content: [
+        {
+          type: 'image',
+          data: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString('base64'),
+          mimeType: 'image/svg+xml',
+          uri: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg"/>',
+        },
+      ],
+    })
+  })
+
+  it('strips Data URL header and parses MIME in attachment objects', () => {
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          { type: 'image', attachment: { data: 'data:image/webp;base64,d2VicGRhdGE=' } },
+        ],
+      },
+    ])
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: '',
+      images: [
+        { type: 'image', data: 'd2VicGRhdGE=', mimeType: 'image/webp' },
+      ],
+      content: [
+        { type: 'image', data: 'd2VicGRhdGE=', mimeType: 'image/webp' },
+      ],
+    })
+  })
+
+  it('resolves attachment pointing to a local file path', () => {
+    const context = {
+      readFile: (p: string) => (p === '/cache/att.png' ? Buffer.from('png-bytes') : undefined),
+      attachments: {
+        'att-path-1': '/cache/att.png',
+        'att-path-2': { path: '/cache/att.png' },
+      },
+    }
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          { type: 'image', attachmentId: 'att-path-1' },
+          { type: 'image', attachmentId: 'att-path-2' },
+        ],
+      },
+    ], context)
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: '',
+      images: [
+        { type: 'image', data: Buffer.from('png-bytes').toString('base64'), mimeType: 'image/png', uri: 'attachment://att-path-1' },
+        { type: 'image', data: Buffer.from('png-bytes').toString('base64'), mimeType: 'image/png', uri: 'attachment://att-path-2' },
+      ],
+      content: [
+        { type: 'image', data: Buffer.from('png-bytes').toString('base64'), mimeType: 'image/png', uri: 'attachment://att-path-1' },
+        { type: 'image', data: Buffer.from('png-bytes').toString('base64'), mimeType: 'image/png', uri: 'attachment://att-path-2' },
+      ],
+    })
+  })
+
+  it('preserves caller mimeType on attachment blocks over guessed fallback', () => {
+    const context = {
+      attachments: {
+        'uuid-123': 'YXR0Ynl0ZXM=',
+      },
+    }
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          { type: 'image', attachmentId: 'uuid-123', mimeType: 'image/webp' },
+        ],
+      },
+    ], context)
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: '',
+      images: [
+        { type: 'image', data: 'YXR0Ynl0ZXM=', mimeType: 'image/webp', uri: 'attachment://uuid-123' },
+      ],
+      content: [
+        { type: 'image', data: 'YXR0Ynl0ZXM=', mimeType: 'image/webp', uri: 'attachment://uuid-123' },
+      ],
+    })
+  })
+
+  it('supports message.parts structure and type attachment with image mimeType', () => {
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        parts: [
+          { type: 'text', text: 'question' },
+          { type: 'attachment', mimeType: 'image/png', data: 'aW1n' },
+        ],
+      } as never,
+    ])
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: 'question',
+      images: [
+        { type: 'image', data: 'aW1n', mimeType: 'image/png' },
+      ],
+      content: [
+        { type: 'text', text: 'question' },
+        { type: 'image', data: 'aW1n', mimeType: 'image/png' },
+      ],
+    })
+  })
+
+  it('handles string content safely without throwing TypeError', () => {
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: 'plain string content' as never,
+      },
+    ])
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: 'plain string content',
+    })
+  })
+
+  it('extracts image from type file with recognized image extension', () => {
+    const context = {
+      readFile: (p: string) => (p === '/work/screenshot.png' ? Buffer.from('img-bytes') : undefined),
+    }
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          { type: 'file', path: '/work/screenshot.png' },
+        ],
+      },
+    ], context)
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: '',
+      images: [
+        { type: 'image', data: Buffer.from('img-bytes').toString('base64'), mimeType: 'image/png', uri: 'file:///work/screenshot.png' },
+      ],
+      content: [
+        { type: 'image', data: Buffer.from('img-bytes').toString('base64'), mimeType: 'image/png', uri: 'file:///work/screenshot.png' },
+      ],
+    })
+  })
+
+  it('extracts image from type attachment with nested attachment object', () => {
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          { type: 'attachment', attachment: { id: 'a1', mimeType: 'image/png', data: 'dGVzdA==' } },
+        ],
+      },
+    ])
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: '',
+      images: [
+        { type: 'image', data: 'dGVzdA==', mimeType: 'image/png' },
+      ],
+      content: [
+        { type: 'image', data: 'dGVzdA==', mimeType: 'image/png' },
+      ],
+    })
+  })
+
+  it('extracts image from type attachment with attachmentId via context lookup', () => {
+    const context = {
+      attachments: {
+        'att-ctx': { data: 'YXR0Y29udGV4dA==', mimeType: 'image/webp' },
+      },
+    }
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          { type: 'attachment', attachmentId: 'att-ctx' },
+        ],
+      },
+    ], context)
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: '',
+      images: [
+        { type: 'image', data: 'YXR0Y29udGV4dA==', mimeType: 'image/webp', uri: 'attachment://att-ctx' },
+      ],
+      content: [
+        { type: 'image', data: 'YXR0Y29udGV4dA==', mimeType: 'image/webp', uri: 'attachment://att-ctx' },
+      ],
+    })
+  })
+
+  it('does not treat non-image files or non-image data URLs as images', () => {
+    const context = {
+      readFile: (p: string) => (p === '/work/notes.txt' ? 'hello plain text' : undefined),
+    }
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          { type: 'file', path: '/work/notes.txt' },
+          { type: 'image', data: 'data:application/pdf;base64,JVBERi0xLjQK' },
+        ],
+      },
+    ], context)
+    expect(picked).toEqual({ kind: 'no-user-input' })
+  })
+
+  it('supports remote HTTP/HTTPS image URLs by retaining uri', () => {
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          { type: 'image', url: 'https://example.com/cat.png' },
+          { type: 'image_url', image_url: { url: 'http://example.com/dog.jpg' } },
+        ],
+      },
+    ])
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: '',
+      images: [
+        { type: 'image', data: '', mimeType: 'image/png', uri: 'https://example.com/cat.png' },
+        { type: 'image', data: '', mimeType: 'image/jpeg', uri: 'http://example.com/dog.jpg' },
+      ],
+      content: [
+        { type: 'image', data: '', mimeType: 'image/png', uri: 'https://example.com/cat.png' },
+        { type: 'image', data: '', mimeType: 'image/jpeg', uri: 'http://example.com/dog.jpg' },
+      ],
+    })
+  })
+
+  it('supports single-object message content', () => {
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: { type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' },
+      },
+    ])
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: '',
+      images: [
+        { type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' },
+      ],
+      content: [
+        { type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' },
+      ],
+    })
+  })
+
+  it('resolves real DSH attachment structure using store imageHostPath and maps mediaType to mimeType', () => {
+    const rawImageBytes = Buffer.from('png-host-content')
+    const context = {
+      imageHostPath: (ref: unknown) => {
+        if (typeof ref === 'string' && ref.includes('1f4e8f2d9e96479ec762b46f8d6b946bed452bba976ca1092abd773bd0fb3796')) {
+          return '/dsh/cache/1f4e8f.png'
+        }
+        return undefined
+      },
+      readFile: (p: string) => (p === '/dsh/cache/1f4e8f.png' ? rawImageBytes : undefined),
+    }
+
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            attachment: {
+              attachmentId: 'sha256:1f4e8f2d9e96479ec762b46f8d6b946bed452bba976ca1092abd773bd0fb3796',
+              mediaType: 'image/png',
+              width: 128,
+              height: 92,
+              bytes: 2216,
+              name: 'image.png',
+            },
+          },
+        ],
+      },
+    ], context)
+
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: '',
+      images: [
+        {
+          type: 'image',
+          data: rawImageBytes.toString('base64'),
+          mimeType: 'image/png',
+          uri: 'attachment://sha256:1f4e8f2d9e96479ec762b46f8d6b946bed452bba976ca1092abd773bd0fb3796',
+        },
+      ],
+      content: [
+        {
+          type: 'image',
+          data: rawImageBytes.toString('base64'),
+          mimeType: 'image/png',
+          uri: 'attachment://sha256:1f4e8f2d9e96479ec762b46f8d6b946bed452bba976ca1092abd773bd0fb3796',
+        },
+      ],
+    })
+  })
+
+  it('resolves DSH attachment using store readImage returning Uint8Array synchronously', () => {
+    const rawBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    const context = {
+      readImage: (ref: unknown) => {
+        return { ref, data: rawBytes }
+      },
+    }
+
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            attachment: {
+              attachmentId: 'sha256:abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234',
+              mediaType: 'image/png',
+            },
+          },
+        ],
+      },
+    ], context)
+
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: '',
+      images: [
+        {
+          type: 'image',
+          data: Buffer.from(rawBytes).toString('base64'),
+          mimeType: 'image/png',
+          uri: 'attachment://sha256:abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234',
+        },
+      ],
+      content: [
+        {
+          type: 'image',
+          data: Buffer.from(rawBytes).toString('base64'),
+          mimeType: 'image/png',
+          uri: 'attachment://sha256:abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234',
+        },
+      ],
+    })
+  })
+
+  it('falls back to store-free disk lookup at ~/.dsh/attachments/v1/objects/<hash[0..1]>/<hash>', () => {
+    const hash = '1f4e8f2d9e96479ec762b46f8d6b946bed452bba976ca1092abd773bd0fb3796'
+    const diskBytes = Buffer.from('disk-attachment-bytes')
+    let queriedPath: string | undefined
+
+    const context = {
+      readFile: (p: string) => {
+        queriedPath = p
+        if (p.includes(`attachments/v1/objects/1f/${hash}`) || p.includes(`attachments\\v1\\objects\\1f\\${hash}`)) {
+          return diskBytes
+        }
+        return undefined
+      },
+    }
+
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            attachment: {
+              attachmentId: `sha256:${hash}`,
+              mediaType: 'image/webp',
+            },
+          },
+        ],
+      },
+    ], context)
+
+    expect(queriedPath).toBeDefined()
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: '',
+      images: [
+        {
+          type: 'image',
+          data: diskBytes.toString('base64'),
+          mimeType: 'image/webp',
+          uri: `attachment://sha256:${hash}`,
+        },
+      ],
+      content: [
+        {
+          type: 'image',
+          data: diskBytes.toString('base64'),
+          mimeType: 'image/webp',
+          uri: `attachment://sha256:${hash}`,
+        },
+      ],
+    })
+  })
+
+  it('detects MIME type from magic numbers when mediaType and mimeType are absent', () => {
+    const jpegBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46])
+    const context = {
+      attachments: {
+        'img-magic-jpeg': { data: jpegBytes },
+      },
+    }
+
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            attachment: {
+              attachmentId: 'img-magic-jpeg',
+            },
+          },
+        ],
+      },
+    ], context)
+
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: '',
+      images: [
+        {
+          type: 'image',
+          data: jpegBytes.toString('base64'),
+          mimeType: 'image/jpeg',
+          uri: 'attachment://img-magic-jpeg',
+        },
+      ],
+      content: [
+        {
+          type: 'image',
+          data: jpegBytes.toString('base64'),
+          mimeType: 'image/jpeg',
+          uri: 'attachment://img-magic-jpeg',
+        },
+      ],
+    })
+  })
+
+  it('respects attachmentId extraction precedence (b.attachment.attachmentId > b.attachmentId > b.attachment.id > b.id)', () => {
+    const context = {
+      attachments: {
+        'id-att-field': { data: 'YXR0MQ==', mimeType: 'image/png' },
+        'id-top-att': { data: 'YXR0Mg==', mimeType: 'image/png' },
+        'id-nested-id': { data: 'YXR0Mw==', mimeType: 'image/png' },
+        'id-top-id': { data: 'YXR0NA==', mimeType: 'image/png' },
+      },
+    }
+
+    // 1. b.attachment.attachmentId wins over b.attachmentId
+    const pick1 = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            attachmentId: 'id-top-att',
+            attachment: {
+              attachmentId: 'id-att-field',
+              id: 'id-nested-id',
+            },
+            id: 'id-top-id',
+          },
+        ],
+      },
+    ], context)
+    expect(pick1).toMatchObject({
+      images: [{ uri: 'attachment://id-att-field', data: 'YXR0MQ==' }],
+    })
+
+    // 2. b.attachmentId wins over b.attachment.id
+    const pick2 = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            attachmentId: 'id-top-att',
+            attachment: {
+              id: 'id-nested-id',
+            },
+            id: 'id-top-id',
+          },
+        ],
+      },
+    ], context)
+    expect(pick2).toMatchObject({
+      images: [{ uri: 'attachment://id-top-att', data: 'YXR0Mg==' }],
+    })
+
+    // 3. b.attachment.id wins over b.id
+    const pick3 = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            attachment: {
+              id: 'id-nested-id',
+            },
+            id: 'id-top-id',
+          },
+        ],
+      },
+    ], context)
+    expect(pick3).toMatchObject({
+      images: [{ uri: 'attachment://id-nested-id', data: 'YXR0Mw==' }],
+    })
+  })
+
+  it('extracts DSH image interleaved with text blocks in order', () => {
+    const context = {
+      attachments: {
+        'sha256:dsh-img': { data: 'aGVsbG8=', mimeType: 'image/png' },
+      },
+    }
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Step 1: Check this screenshot' },
+          {
+            type: 'image',
+            attachment: {
+              attachmentId: 'sha256:dsh-img',
+              mediaType: 'image/png',
+            },
+          },
+          { type: 'text', text: 'Step 2: Finish' },
+        ],
+      },
+    ], context)
+
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: 'Step 1: Check this screenshot\nStep 2: Finish',
+      images: [
+        { type: 'image', data: 'aGVsbG8=', mimeType: 'image/png', uri: 'attachment://sha256:dsh-img' },
+      ],
+      content: [
+        { type: 'text', text: 'Step 1: Check this screenshot' },
+        { type: 'image', data: 'aGVsbG8=', mimeType: 'image/png', uri: 'attachment://sha256:dsh-img' },
+        { type: 'text', text: 'Step 2: Finish' },
+      ],
+    })
+  })
+
+  it('detects multiple image formats using detectImageMimeFromMagic or falls back to image/png', () => {
+    // PNG
+    expect(detectImageMimeFromMagic(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))).toBe('image/png')
+    // JPEG
+    expect(detectImageMimeFromMagic(Buffer.from([0xff, 0xd8, 0xff, 0xe0]))).toBe('image/jpeg')
+    // GIF
+    expect(detectImageMimeFromMagic(Buffer.from('GIF89a'))).toBe('image/gif')
+    // WebP
+    expect(detectImageMimeFromMagic(Buffer.from([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50]))).toBe('image/webp')
+    // BMP
+    expect(detectImageMimeFromMagic(Buffer.from([0x42, 0x4d, 0, 0]))).toBe('image/bmp')
+    // SVG text
+    expect(detectImageMimeFromMagic('<svg xmlns="http://www.w3.org/2000/svg"/>')).toBe('image/svg+xml')
+    // Unknown bytes
+    expect(detectImageMimeFromMagic(Buffer.from([0x01, 0x02, 0x03]))).toBeUndefined()
+    expect(detectImageMimeFromMagic(undefined)).toBeUndefined()
+  })
+
+  it('safely extracts attachment through LocalAttachmentStore-like class preserving this.root', () => {
+    class MockLocalAttachmentStore {
+      root = 'M:/mock/dsh/attachments/v1'
+
+      imageHostPath(ref: { attachmentId?: string }) {
+        if (!this || this.root !== 'M:/mock/dsh/attachments/v1') {
+          throw new TypeError("Cannot read properties of undefined (reading 'root')")
+        }
+        const match = /^sha256:([a-f0-9]{64})$/.exec(String(ref?.attachmentId))
+        if (!match) throw new Error('INVALID_ATTACHMENT_REF')
+        return `${this.root}/objects/${match[1].slice(0, 2)}/${match[1]}`
+      }
+
+      async readImage(ref: { attachmentId?: string }) {
+        if (!this || this.root !== 'M:/mock/dsh/attachments/v1') {
+          throw new TypeError("Cannot read properties of undefined (reading 'root')")
+        }
+        throw new Error('ATTACHMENT_NOT_FOUND')
+      }
+    }
+
+    const pngHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3])
+    const hash = 'a'.repeat(64)
+    const store = new MockLocalAttachmentStore()
+    const childContext = Object.assign(Object.create(store), {
+      readFile: (p: string) => {
+        if (p === `M:/mock/dsh/attachments/v1/objects/aa/${hash}`) {
+          return pngHeader
+        }
+        return undefined
+      },
+    })
+
+    const picked = selectForwardPrompt([
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            attachment: {
+              attachmentId: `sha256:${hash}`,
+              mediaType: 'image/png',
+            },
+          },
+        ],
+      },
+    ], childContext)
+
+    expect(picked).toEqual({
+      kind: 'prompt',
+      text: '',
+      images: [
+        {
+          type: 'image',
+          data: pngHeader.toString('base64'),
+          mimeType: 'image/png',
+          uri: `attachment://sha256:${hash}`,
+        },
+      ],
+      content: [
+        {
+          type: 'image',
+          data: pngHeader.toString('base64'),
+          mimeType: 'image/png',
+          uri: `attachment://sha256:${hash}`,
+        },
+      ],
+    })
+  })
+
+  it('handles async readImage rejection gracefully without unhandledRejection crash', async () => {
+    let unhandledCaught = false
+    const onUnhandled = () => {
+      unhandledCaught = true
+    }
+    process.on('unhandledRejection', onUnhandled)
+
+    try {
+      class FailingStore {
+        root = '/root'
+        imageHostPath() {
+          throw new Error('no host path')
+        }
+        async readImage() {
+          throw new Error('async image load failed')
+        }
+      }
+
+      const store = new FailingStore()
+      const res = resolveImageAttachmentFromContext('sha256:' + 'b'.repeat(64), store)
+      expect(res).toBeUndefined()
+
+      await new Promise(r => setTimeout(r, 10))
+      expect(unhandledCaught).toBe(false)
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+
+  it('resolves attachments through ctx.get("attachments") service preserving rootContext for file reading', () => {
+    const pngHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    const hash = 'c'.repeat(64)
+    const expectedPath = `/dsh/attachments/v1/objects/cc/${hash}`
+
+    class StoreService {
+      root = '/dsh/attachments/v1'
+      imageHostPath(ref: { attachmentId?: string }) {
+        if (!this || this.root !== '/dsh/attachments/v1') {
+          throw new TypeError("Cannot read properties of undefined (reading 'root')")
+        }
+        return expectedPath
+      }
+    }
+
+    const serviceInstance = new StoreService()
+    const ctx = {
+      get(name: string) {
+        if (name === 'attachments') return serviceInstance
+        return undefined
+      },
+      readFile(p: string) {
+        if (p === expectedPath) return pngHeader
+        return undefined
+      },
+    }
+
+    const res = resolveImageAttachmentFromContext(`sha256:${hash}`, ctx) as { path?: string; data?: Buffer }
+    expect(res).toBeDefined()
+    expect(res.path).toBe(expectedPath)
+    expect(res.data).toEqual(pngHeader)
+  })
+
+  it('falls back to Symbol.for("cordis.original") when proxy method invocation throws', () => {
+    const pngHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    const hash = 'd'.repeat(64)
+    const expectedPath = `/dsh/attachments/v1/objects/dd/${hash}`
+
+    class RealStoreInstance {
+      root = '/dsh/attachments/v1'
+      imageHostPath(ref: { attachmentId?: string }) {
+        if (!this || this.root !== '/dsh/attachments/v1') {
+          throw new TypeError("Cannot read properties of undefined (reading 'root')")
+        }
+        return expectedPath
+      }
+    }
+
+    const realInstance = new RealStoreInstance()
+    // Simulated Cordis proxy where the outer proxy throws, but cordis.original works
+    const proxy = {
+      imageHostPath() {
+        throw new TypeError("Cannot read properties of undefined (reading 'root')")
+      },
+      [Symbol.for('cordis.original')]: realInstance,
+    }
+
+    const ctx = {
+      get: (name: string) => (name === 'attachments' ? proxy : undefined),
+      readFile: (p: string) => (p === expectedPath ? pngHeader : undefined),
+    }
+
+    const res = resolveImageAttachmentFromContext(`sha256:${hash}`, ctx) as { path?: string; data?: Buffer }
+    expect(res).toBeDefined()
+    expect(res.path).toBe(expectedPath)
+    expect(res.data).toEqual(pngHeader)
+  })
+
+  it('safely handles context whose property getters throw "without inject" errors', () => {
+    const cordisContextWithTraps = {
+      get: () => undefined,
+      get attachments(): never {
+        throw new Error('cannot get property "attachments" without inject')
+      },
+      get attachmentService(): never {
+        throw new Error('cannot get property "attachmentService" without inject')
+      },
+    }
+
+    // Must not throw, fails open gracefully
+    expect(() => resolveImageAttachmentFromContext('sha256:' + 'e'.repeat(64), cordisContextWithTraps)).not.toThrow()
+    expect(resolveImageAttachmentFromContext('sha256:' + 'e'.repeat(64), cordisContextWithTraps)).toBeUndefined()
   })
 })
 
@@ -1326,6 +2328,12 @@ describe('dispatchRpc', () => {
       error: { code: 'bad_payload', details: {} },
     })
     await expect(dispatchRpc(manager, 'session/prompt', { sessionId: 'S', text: 3 })).resolves.toMatchObject({ ok: false })
+    await expect(dispatchRpc(manager, 'session/prompt', { sessionId: 'S', prompt: [] })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc(manager, 'session/prompt', { sessionId: 'S', prompt: [{ type: 'unknown' }] })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc(manager, 'session/prompt', { sessionId: 'S', prompt: [{ type: 'image', data: 'abc' }] })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc(manager, 'session/prompt', { sessionId: 'S', prompt: [{ type: 'image', data: 'abc', mimeType: 'text/plain' }] })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc(manager, 'session/prompt', { sessionId: 'S', prompt: [{ type: 'image', data: 'abc', mimeType: 'image/png', uri: 123 }] })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc(manager, 'session/prompt', { sessionId: 'S', prompt: [{ type: 'text', text: 'hi' }, { type: 'image', data: 'abc', mimeType: 'image/png' }] })).resolves.toMatchObject({ ok: true, value: { accepted: true, turnId: 'T' } })
     await expect(dispatchRpc(manager, 'session/config-set', { sessionId: 'S', configId: 'm', value: 42 })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     // The plugin's OWN default ACP agent (the panel's ★ gesture) — a
     // plugin-private id, never a DSH model route.

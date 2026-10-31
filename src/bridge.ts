@@ -20,6 +20,7 @@ import {
   PROTOCOL_VERSION,
   RequestError,
   type ClientConnection,
+  type ContentBlock,
   type InitializeResponse,
   type McpServer,
   type McpServerHttp,
@@ -52,6 +53,7 @@ import {
   resolveFsPath,
   resolveSessionCwd,
   selectForwardPrompt,
+  isAbsolutePath,
   acpPresetStatusFromRoster,
   splitAdapterModelId,
   updateContentToText,
@@ -1267,16 +1269,30 @@ export class AgentBridge {
    * requested cancel (`cancelRequestedAtTurn` still names this generation)
    * returns as-is.
    */
-  async runPrompt(session: LiveSession, text: string, turnId: string): Promise<string> {
+  async runPrompt(session: LiveSession, prompt: string | ContentBlock[], turnId: string): Promise<string> {
     const conn = this.conn
     if (conn === undefined || session.closed || session.released) throw new AcpError('session_closed', 'acp: session is closed')
     this.touch()
+
+    const blocks: ContentBlock[] = typeof prompt === 'string'
+      ? [{ type: 'text', text: prompt }]
+      : prompt
+
+    if (blocks.length === 0) {
+      throw new AcpError('empty_prompt', 'acp: prompt cannot be empty')
+    }
+
+    const hasImages = blocks.some(b => b.type === 'image')
+    if (hasImages && this.initResult?.agentCapabilities?.promptCapabilities?.image !== true) {
+      throw new AcpError('image_unsupported', `acp: agent "${this.def.id}" does not support image input`)
+    }
+
     for (let attempt = 0; ; attempt += 1) {
       // The response is activity too: the idle window must start at the turn's
       // END, not at the prompt that may have started a long time ago.
       const result = await conn.agent.request(methods.agent.session.prompt, {
         sessionId: session.acpSessionId,
-        prompt: [{ type: 'text', text }],
+        prompt: blocks,
       }).finally(() => { this.touch() })
       if (result.stopReason !== 'cancelled' || session.cancelRequestedAtTurn === session.turnSeq) {
         return result.stopReason
@@ -3818,6 +3834,13 @@ export class BridgeManager {
   }
 
   /**
+   * Set the attachment service or context used to resolve image attachments in user prompts.
+   */
+  setAttachmentResolver(resolver?: unknown): void {
+    this.attachmentResolver = resolver
+  }
+
+  /**
    * Wire the ACP-mode probe: given a DSH session id, report whether that
    * session runs the ACP agent preset. The host half reads it back from the
    * session log (`sessionAgentPreset`); an absent resolver means the browser
@@ -5824,7 +5847,7 @@ export class BridgeManager {
     return { sessionId: session.sessionId }
   }
 
-  async prompt(sessionId: string, text: string): Promise<{ turnId: string }> {
+  async prompt(sessionId: string, prompt: string | ContentBlock[]): Promise<{ turnId: string }> {
     let located = await this.locateOrResume(sessionId)
     // The watchdog abandoned a previous turn here and the agent may still be
     // holding its prompt slot on the old process: reclaim BEFORE sending, or
@@ -5843,6 +5866,20 @@ export class BridgeManager {
     }
     const { bridge, session } = located
     if (session.running) throw new AcpError('turn_in_flight', 'acp: this session already has a prompt in flight')
+
+    const blocks: ContentBlock[] = typeof prompt === 'string'
+      ? [{ type: 'text', text: prompt }]
+      : prompt
+
+    if (blocks.length === 0) {
+      throw new AcpError('empty_prompt', 'acp: prompt cannot be empty')
+    }
+
+    const hasImages = blocks.some(b => b.type === 'image')
+    if (hasImages && bridge.initResult?.agentCapabilities?.promptCapabilities?.image !== true) {
+      throw new AcpError('image_unsupported', `acp: agent "${bridge.def.id}" does not support image input`)
+    }
+
     session.running = true
     session.turnSeq += 1
     const turnGen = session.turnSeq
@@ -5853,8 +5890,11 @@ export class BridgeManager {
     session.reclaimedTurnSeq = undefined
     this.armStallTimer()
     const turnId = randomUUID()
-    this.hub.broadcast({ type: 'turn/start', sessionId, turnId, text })
-    void bridge.runPrompt(session, text, turnId)
+    const promptText = typeof prompt === 'string'
+      ? prompt
+      : blocks.filter(b => b.type === 'text').map(b => (b as { text: string }).text).join('\n')
+    this.hub.broadcast({ type: 'turn/start', sessionId, turnId, text: promptText })
+    void bridge.runPrompt(session, blocks, turnId)
       .then(stopReason => {
         // The reclaim already ended this turn locally; the answer it caused is
         // that same turn reporting back, not a second turn end for the caller.
@@ -6216,6 +6256,7 @@ export class BridgeManager {
   }
   private sessionWorkspaceResolver?: SessionWorkspaceResolver
   private acpModeResolver?: AcpModeResolver
+  private attachmentResolver?: unknown
   /** Cached `chatSessionAcpMode` answers, keyed by DSH chat session id. */
   private readonly acpModeCache = new Map<string, boolean>()
   /** In-flight cold reads behind `chatSessionAcpModeAnswer`, keyed by session id. */
@@ -6581,8 +6622,36 @@ export class BridgeManager {
     // Forward the person's own words: the host folds its context sections
     // (AGENTS.md digest, skill catalog, runtime snapshot) after the claimed user
     // batch precisely so a consumer can tell them apart by `source` — see
-    // `selectForwardPrompt` and AGENTS.md rule 16.
-    const selection = selectForwardPrompt(options.messages ?? [])
+    const workspaceRoot = chatWorkspaceRoot(this.sessionWorkspaceResolver, options.sessionId)
+    const defaultReadFile = (p: string) => {
+      try {
+        if (existsSync(p)) return readFileSync(p)
+        if (workspaceRoot !== undefined && !isAbsolutePath(p)) {
+          const joined = join(workspaceRoot, p)
+          if (existsSync(joined)) return readFileSync(joined)
+        }
+      } catch {}
+      return undefined
+    }
+
+    const resolver = this.attachmentResolver
+    const attachmentContext = resolver !== undefined && typeof resolver === 'object' && resolver !== null
+      ? Object.assign(Object.create(resolver), {
+          readFile: (p: string) => {
+            if (typeof (resolver as { readFile?: unknown }).readFile === 'function') {
+              try {
+                const res = (resolver as { readFile: (p: string) => unknown }).readFile(p)
+                if (res !== undefined) return res
+              } catch {}
+            }
+            return defaultReadFile(p)
+          },
+        })
+      : {
+          readFile: defaultReadFile,
+        }
+
+    const selection = selectForwardPrompt(options.messages ?? [], attachmentContext)
     if (selection.kind === 'no-user-input') {
       // An injected-context wake: nothing the user said, nothing to send.
       yield { type: 'finish', reason: { kind: 'stop' } }
@@ -6643,6 +6712,22 @@ export class BridgeManager {
           failure: {
             message: `acp: the selected model "${blockedModel}" is not offered by agent "${agentId}" any more; choose another model and send again`,
             code: 'model_unavailable',
+          },
+        },
+      }
+      return
+    }
+
+    const hasImages = (selection.images?.length ?? 0) > 0 || (selection.content?.some(b => b.type === 'image') ?? false)
+    if (hasImages && bridge.initResult?.agentCapabilities?.promptCapabilities?.image !== true) {
+      if (session.provisionalLock === true) this.rollbackFirstTurn(session)
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            message: `acp: agent "${agentId}" does not support image input`,
+            code: 'image_unsupported',
           },
         },
       }
@@ -6794,7 +6879,11 @@ export class BridgeManager {
       // next turn has to respect. Settlement reaches the controller, which
       // releases the slot (`endTurn`) whether the segment on air is the first
       // or a continuation one.
-      bridge.runPrompt(session, promptText, turnId)
+      const promptBlocks: ContentBlock[] = selection.content && selection.content.length > 0
+        ? selection.content as ContentBlock[]
+        : [{ type: 'text', text: promptText }]
+
+      bridge.runPrompt(session, promptBlocks, turnId)
         .then(stopReason => {
           // The reclaim already ended this turn locally, and the close it
           // performed rejected this very request: the late answer is that same
