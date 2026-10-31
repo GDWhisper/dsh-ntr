@@ -8,6 +8,8 @@
 
 > 模型选择、思考等级、工作模式都是 **agent 自己的概念**，不是 DSH 的模型目录。插件不替你换模型，也不会把 agent 的选择写进 DSH 的全局设置。
 
+![dsh-ntr：在 DSH 里用 NTR 模式与 ACP agent 对话，模型、思考等级与工具活动都留在原生界面里](./docs/images/ntr-session.png)
+
 ---
 
 ## NTR 是什么

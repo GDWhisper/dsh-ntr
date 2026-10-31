@@ -8,6 +8,8 @@ Chat with any **ACP agent** (CodeBuddy, Pi, Oh My Pi, Claude Code, OpenCode, Qod
 
 > Model selection, thinking level, and work modes are **the agent's own concepts**, not DSH's model catalog. The plugin never swaps models for you, and never writes the agent's choices into DSH's global settings.
 
+![dsh-ntr: an NTR conversation with an ACP agent inside DSH, with models, thinking level, and tool activity in the native UI](./docs/images/ntr-session.png)
+
 ---
 
 ## What is NTR
