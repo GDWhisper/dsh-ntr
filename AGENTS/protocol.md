@@ -80,8 +80,9 @@
 
 ## 6. 轮次收尾与分段
 
-- `turn/end` 的权威来源是 `session/prompt` 的**响应**。强制定稿**恰有两条**受控路径：`session/cancel` 后的 `armCancelFallback`（§4，人已经按过取消）与无活动看门狗（§6.1，agent 自己彻底沉默）。**严禁**再加第三种，尤其不要拿「宿主观察到的空闲」直接收尾——宿主分不清「正在想」与「在忙自己的事」，提前收尾会把答案切在流中间。
+- `turn/end` 的权威来源是 `session/prompt` 的**响应**。`settle` 当场认领（幂等，与看门狗竞速），收口工作隔一个宏任务（`setImmediate` → `flushScheduledClose`）：`drainTail` 把**已进入 transcript** 却还没折进段的通知按序补读（停在切段事件之前；stale 回合不补读；只读已到达的通知，不无限等待），`finalizeTps` 的 final `turn/metrics` 先于 `turn/end`；续跑段若在这个窗口打开，先 flush 这次收口。**拆除当场作废这次收口**：`TurnStreamController.dispose`（关会话 / retire）清掉 `closeScheduled` / `pendingOutcome`，settle 之后紧接的拆除不会在宏任务里补发第二帧 `turn/end`；同一窗口里的用户 abort 则丢掉排队结果、就地按 cancelled 收口（`abortActiveSegment`）。强制定稿**恰有两条**受控路径：`session/cancel` 后的 `armCancelFallback`（§4，人已经按过取消）与无活动看门狗（§6.1，agent 自己彻底沉默）。**严禁**再加第三种，尤其不要拿「宿主观察到的空闲」直接收尾——宿主分不清「正在想」与「在忙自己的事」，提前收尾会把答案切在流中间。被并入后台 drain 的回合只**延后收口**（§6.2），不算第三条。
 - 一个 turn 由**多个段**组成（逐步切分，[architecture.md §2.2](./architecture.md)）：段的 `finish(stop)` 是步边界不是轮边界；`TurnStreamController`（`src/bridge.ts`）持有跨段的游标 / `seenCalls` / 记账。续跑批次（`isAcpToolContinuation`）**绝不新发 prompt**，用 `transcript.since(cursorSeq)` 补读段间事件；段间事件只记账（`recordAcpToolOutput` 唤醒等待者），游标不动。
+- **prompt slot 不等于 `running`，且 `/acp` 与聊天面共用同一个槽位**：`LiveSession.promptInFlight` 是 agent 侧并发闸（配 `settled` 闸门），`running` 只表示这一轮的显示 / 回合仍在进行；聊天面 `claimTurn` 只看前者与 `settled`，不看 `running`。`/acp` 的 `BridgeManager.prompt` 也必须经 `bridge.beginTurn` 占槽，**严禁**绕过槽位直接发 `session/prompt`：/acp 在飞时聊天 `claimTurn` 回 `busy`，聊天在飞时 `/acp` prompt 在 `running` / `promptInFlight` / 未 settle 的活 `session.turnController` 任一成立时回 `turn_in_flight`（已 settle 的控制器只是留给卡片续跑，放行；推进 `turnSeq` 会退休它）。ambient 等待**释放 prompt slot 但保持 `running`**（§6.2），下一条聊天消息照常可进（`/acp` 仍因 `running` 拒绝）；claim 失败（`busy` / `unsettled`）回 `turn_in_flight`，**不得**回滚首轮锁——锁归正在 stream 的那一轮。
 - **取消与世代跨段成立**：任何段的 `AbortSignal` → `bridge.cancel` + `abortActiveSegment`；`turnSeq` 世代守卫让旧段迟到的回调动不了新 turn；prompt slot（`settled` 闸门）在 agent 确认取消**之前不解开**——`abortActiveSegment` 不得调 `endTurn`，否则下一个 prompt 会在 ACP 协议禁止的窗口并发发出。
 - **两条强制定稿路径语义不同，不得互相复用**：`armCancelFallback` 是「已经要求取消、对方不回应」的兜底；看门狗是「没人要求取消、agent 自己不动了」的兜底。两者都必须按 `session.turnSeq` 做世代守卫（定时器武装时捕获；控制器用它创建时的 `turnSeqAtStart` 判定是否仍是本世代）、都只结束当前 turn 并解开 `settled` 闸门，且都不碰进程。
 - **正常结束却零可见产出必须显式报出**：结算时 stop 非 cancelled 且本轮没发过任何可见块（`sawVisibleBlock`：text / reasoning / tool-call 的 block-start，跨段累计；usage 等记账帧不算），必须把告警文本作为 text 块发出。部分 agent 把上游失败（403 / 认证 / 计费）折叠成合法 `end_turn`（实测 pi-acp），否则用户只看到一个空气泡。这是**报告**不是收尾：turn 照常以 stop 结束，不重试不判错。
@@ -90,7 +91,7 @@
 
 ### 6.1 无活动看门狗
 
-§6 开头那条「不要拿宿主观察到的空闲直接收尾」排除的是**宿主自己的**空闲计时——它分不清「agent 正在想」与「agent 已经挂了」。但 agent 真挂住时，会话会永远停在 `running`：`settled` 闸门不开，下一条消息发不出去，屏幕上也看不到任何原因。`BridgeManager.reapStalledTurns` 是这条规则的受控例外，判据是 **agent 活动**，不是宿主空闲。
+§6 开头那条「不要拿宿主观察到的空闲直接收尾」排除的是**宿主自己的**空闲计时——它分不清「agent 正在想」与「agent 已经挂了」。但 agent 真挂住时，会话会永远停在 `running`：`settled` 闸门不开，下一条消息发不出去，屏幕上也看不到任何原因。`BridgeManager.reapStalledTurns` 是这条规则的受控例外之一，判据是 **agent 活动**，不是宿主空闲（另一条例外是被并入后台 drain 的回合，§6.2）。
 
 - **活动时钟**：`LiveSession.lastAgentActivityAt` 由每一条 `session/update` 刷新，turn 起点、每段起点、审批询问到达与结算也各刷一次。`LiveSession.activeToolCalls` 是**按 `toolCallId` 计的集合**（不是布尔标记）：`pending` / `in_progress` 加入，`completed` / `failed` 删除，没有 `status` 的新 `tool_call` 也算在飞；`tool_call_update` 不带 `status` 时集合不变。非空 = 长工具窗口，且并行调用各结各的，长窗口持续到**最后一个**在飞调用结束。
 - **开火条件**（全部成立）：
@@ -112,6 +113,18 @@
   - `AgentBridge.closeSession` 的 `session/close` 有 `SESSION_CLOSE_TIMEOUT_MS`（5000ms）上限：卡死的 agent 不能挂住 stop / rollback。
 - **旧 turn 只以看门狗那一帧结束（reclaim 之后）**：reclaim 记 `LiveSession.reclaimedTurnSeq`；它关闭连接导致的旧 `session/prompt` 迟到 then / catch 对该世代被丢弃，所以看门狗的 `turn/end` 是唯一的旧轮次结束帧。cancel 兜底**不**记这个标记，它迟到的真 `end_turn` 照常广播（既有测试）。两个 turn 起点（`streamPrompt` / `/acp` `prompt`）与 resume 都会清掉这个标记，只有同一世代才抑制。
 - **防御性补丁**：`openSettleGate` 清掉 `settled` / `settledResolve` 并解开闸门，`releaseAll` / `doResumeSession` / `finalizeTurn` 都经它；`releaseAll` 跳过已 `closed` 的会话（§2）并清空 `activeToolCalls`，`doResumeSession` 同样清空 `activeToolCalls`、另清 `orphanPromptTurnSeq` / `reclaimedTurnSeq` 并重置 `lastAgentActivityAt`，避免孤儿标记跨进程存活。
+
+### 6.2 被并入后台 drain 的回合（CodeBuddy unsolicited turn）
+
+CodeBuddy 会自己起「后台 drain」：`session_info_update` 的 `_meta["codebuddy.ai/unsolicitedTurn"] = { requestId, reason: "background_drain" }` 宣告一次客户端从未 prompt 的回合，此后该运行的每条更新都带 `_meta["codebuddy.ai/requestId"]`（`codebuddyMetaOf` 只按形状读取，别的 agent 解析为 `undefined`，既有路径不受影响）。drain 运行期间用户发来的 prompt 会被并进去：`session/prompt` 约十几毫秒就回 `end_turn`，响应 `_meta` 里**没有** `codebuddy.ai/conversationRequestId`，真正的正文随后以 drain 的 requestId 到达。这不是静默空回合——按响应收口就会把答案切掉。
+
+- **识别与等待**：响应返回后，若会话有**未过期**的 `ambient`、stopReason 非 `cancelled`、响应无 `conversationRequestId`、且本轮自己还没产出正文或思考（`hasAgentProse`），走 `TurnStreamController.awaitAmbient`：`endTurn()` 释放 agent 侧 prompt slot，但**不 settle**——`running` 保持 true、段不关、不发 `turn/end`。`ambientStaleMs`（默认 300s）内没有活动的 `ambient` 在响应到达时惰性清掉（连同去重集），该响应按普通回合结算。
+- **drain 的结束是它的沉默**：任何 `session/update` 都重置 quiet 时钟（`ambientQuietMs` 默认 10s；实测 drain tick 间隔 1.0–1.4s，低于它会在答案存在前收口），另有 `ambientMaxMs`（默认 120s）硬上限；到点都只经 `closeTurn` 收口一次。硬上限只发一行「其余输出在 ACP transcript 视图」并直接收口（`announceDeferral: false`，不再叠发 deferred 行）；quiet 收口且本轮没有可见正文（text）才发 deferred 说明（`finishAmbient`），而不是零输出告警。首轮 ambient **不滚锁**（drain 的产出仍在 transcript，滚锁会连它一起关掉），锁就此转正。
+- **后台工具不开卡**：`SegmentState.ambient`（以及 drain-owned 的 `tool_call`）只 `recordAcpToolOutput` + 进 transcript，**不开 `tool-call` 块**——开了宿主 loop 就会为一个正文还没开始的回合执行工具、提议续跑；ambient 等待中打开的续跑段继承同样的抑制。
+- **主平面入口唯一**：等待中的用户回合把 drain 正文折进自己的段；**纯空闲 drain**（没有等待回合）只进 transcript / ACP 视图——主平面的唯一入口是 `adapter.stream`，插件不能凭空 append。
+- **request-id 分流**：本轮自己的 `turnRequestId` 与 drain 的 id 不同时，drain 正文不得混进用户回答（`isForeignAmbientText` → 只记录、游标前进、不折段）。响应到达前无从判定的 drain-owned 更新先缓冲（`pendingAmbientUpdates`，200 条 / 64 KiB 上限，超限丢最旧、transcript 仍有全量，但 flush 前先折一行截断标记，不让回合从半句话开始）；steered 时按序 flush 进 ambient 段，普通回合（响应带 `conversationRequestId` → `adoptTurnRequestId`）丢弃。id 未知前 fail-open，不切分。
+- **生命周期与通知**：`ambient` 随 close / release / resume / stop 与**本轮 ambient 收口**（`closeTurn` 的 ambient 分支，即 quiet / hard）清除；收口时连 `ambientNotices` 一起清掉，避免 drain 已结束却让后续普通静默回合被误判为 steered。**正常 settle 与用户 abort 不清**——drain 可以活过被并入的那一轮，提前清会让下一次 steered 等待落空。同一 requestId 只发一次 `agent/notice`（`ambientNotices` 去重）。
+- **与约束 23 的关系**：quiet / hard 只收口**已经 `awaitingAmbient`** 的那一轮，不杀进程、不新增通用看门狗；它和 cancel 兜底、无活动看门狗并列，但不是第三种「按宿主空闲计时」的强制定稿。外部收场走同一条 `closeTurn`：cancel 兜底 / 看门狗经 `finalizeTurn` → `forceFinalize`，ambient 等待中的用户 abort 走 `settle({ kind: 'cancelled' })`——都清掉 ambient 时钟与排队中的尾部补读，只发一帧；release / close 由各自的拆除路径收场，不在这一轮补帧。
 
 ## 7. 启动命令与 Windows
 
@@ -142,7 +155,7 @@
 - **形状层**：块的 `content` 可以是字符串、对象或数组；`rawInput` / `arguments` 可以是字符串、对象或**数组**。这些都算「有值」，空字符串 / `null` / 空数组才算「没有」。**严禁**用 `content?.type === 'text'` 一类窄判定把别的形状读成空。
 - **字段层**：ACP 视图的工具卡把 `kind` / `status` / `locations` / `terminalId` / `meta` 进 `details`，整个通知原文进 `raw`（`dumpJson`，只在 `ACP_TOOL_RAW_MAX` 截断且带标记）。`available_commands` 条目整条保留（`...c` 展开）。
 - **diff**：同时保留结构化 diff（ACP 视图 `DiffView`）与文本（路径 + `-`/`+` 行，`formatAcpDiff`）。**严禁**退回 `[diff path]` 占位；未知 content kind 保留整条 JSON（`acpContentRows` 的 `other`）。这份文本也是虚拟工具答给宿主执行记录的输出，不能是占位符。
-- **预算**：`ACP_TOOL_RAW_MAX` / `RAW_MAX`（256,000 字符）、`transcriptMaxEntries`（默认 600）、浏览器 `MAX_BLOCKS`（400）是有界容器，不是丢数据的理由；超限必须留截断标记。**严禁**给 stderr 行、npm 安装输出这类诊断文本加「取前 N 字符」——那正是激活失败时唯一有用的一行。
+- **预算**：`ACP_TOOL_RAW_MAX` / `RAW_MAX`（256,000 字符）、`transcriptMaxEntries`（默认 600）、浏览器 `MAX_BLOCKS`（400）是有界容器，不是丢数据的理由；超限必须留截断标记，回合内暂存的后台更新缓冲（`pendingAmbientUpdates`，§6.2）被顶掉时也同样先折一行截断标记再 flush。**Transcript 自身只合并连续同类纯状态 tick**（`usage_update`、无 title 的 `session_info_update`、`config_option_update`）：就地替换末条，seq 前进、数组不增长、保留最新值；内容类一条不丢，`since()` 的 seq 空洞是允许的，实时 SSE 仍逐帧广播。**严禁**给 stderr 行、npm 安装输出这类诊断文本加「取前 N 字符」——那正是激活失败时唯一有用的一行。
 - **通知身份**：没有卡片的种类（plan / mode / 未来新增）在原生流里每种类只发一行，文本变了才重发（`announcedKinds`）；ACP 视图按 kind 折叠（`store.ts` · `foldUpdate` 对 `plan` 就地更新）。
 
 ## 代码索引
@@ -153,9 +166,11 @@
 | 恢复 | `src/bridge.ts` · `connectionLost` / `releaseAll` / `resumeSession` / `locateOrResume` |
 | 超时与取消 | `src/bridge.ts` · `withStartupTimeout` / `armCancelFallback` / `runPrompt` |
 | 卡死收口 | `src/bridge.ts` · `BridgeManager.reapStalledTurns` / `prepareStalledSession`；`LiveSession.turnController` / `activeToolCalls` / `orphanPromptTurnSeq` / `reclaimedTurnSeq`；`TurnStreamController.stale` / `hasOpenSegment` / `settle`（`INACTIVITY_TIMEOUT`）；`AgentBridge.finalizeTurn` / `forceReset`（§6.1） |
+| 后台 drain | `src/bridge.ts` · `AgentBridge.handleSessionUpdate` / `codebuddyMetaOf` / `LiveSession.ambient` / `ambientNotices`；`TurnStreamController.awaitAmbient` / `finishAmbient` / `adoptTurnRequestId` / `isForeignAmbientText` / `pendingAmbientUpdates`；`BridgeManager.ambientTuning`（§6.2） |
+| 回合收口 | `src/bridge.ts` · `TurnStreamController.settle` / `flushScheduledClose` / `drainTail` / `closeTurn` / `finalizeTps` / `dispose` / `abortActiveSegment`（§6） |
 | 空闲 | `src/bridge.ts` · `releaseIfIdle` / `armIdleRelease` / `touch` / `currentIdleTimeoutMs` / `everHostedSession` |
 | 收尾与分段 | `src/bridge.ts` · `streamPrompt` / `TurnStreamController` / `sawVisibleBlock` / `isAcpToolContinuation`（分段续读与收尾见 [architecture.md §2.2](./architecture.md)） |
-| 数据折叠 | `src/impl.ts` · `acpContentRows` / `formatAcpDiff` / `dumpJson` / `describeUnhandledUpdate` / `acpToolCallFromUpdate` / `acpToolCallDelta` |
+| 数据折叠 | `src/impl.ts` · `acpContentRows` / `formatAcpDiff` / `dumpJson` / `describeUnhandledUpdate` / `acpToolCallFromUpdate` / `acpToolCallDelta` / `Transcript` / `coalescibleStateKind` |
 | tok/s 聚合 | `src/tps.ts` · `TurnTpsTracker`；`src/bridge.ts` · `TurnStreamController.trackTps` / `finalizeTps` / `BridgeManager.noteSessionBurst`；`src/protocol.ts` · `turn/metrics` / `SessionBurst`；`src/client/activity-pill.tsx` · `createActivityPillClaim` |
 | 启动命令 | `src/impl.ts` · `validateAgentDef` / `splitCommandLine`；`src/bridge.ts` · `quoteLegacyCommand` |
 | MCP 下发 | `src/bridge.ts` · `toAcpMcpServers`（线格式转换）；`src/impl.ts` · `validateMcpServers`（配置校验）；面板三处同步见 `src/client/panel.tsx` · `initialForm` / `buildPayload` / `payloadEquals` |

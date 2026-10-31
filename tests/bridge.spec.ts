@@ -1803,6 +1803,54 @@ describe('stale cancel and silent stops (isolated manager)', () => {
     expect(end2.stopReason).toBe('end_turn')
   }, 30_000)
 
+  it('does not resend a stale cancelled answer once a successor turn owns the session', async () => {
+    // The swallow retry is only safe while the generation that sent the prompt
+    // still owns the session. Here the cancelled answer arrives late, after a
+    // successor turn began (what the cancel fallback + the user's next message
+    // produce): resending would fire a second session/prompt into that turn.
+    const logPath = `${scWorkspace}/stale-late-prompts-${String(process.pid)}-${String(Date.now())}.log`
+    const lateHub = new EventHub()
+    const lateManager = new BridgeManager([
+      { ...def, id: 'late', cwd: scWorkspace, allowedCwdRoots: [scWorkspace], env: { ...def.env, MOCK_PROMPT_LOG: logPath } },
+    ], lateHub, 500, undefined, undefined, true, {
+      startupTimeoutMs: 3_000,
+      staleCancelRetryDelayMs: 250,
+      staleCancelMaxRetries: 2,
+    })
+    try {
+      const start = await dispatchRpc(lateManager, 'session/start', { agentId: 'late' })
+      if (!start.ok) throw new Error('start failed')
+      const id = (start.value as { sessionId: string }).sessionId
+      const located = await lateManager.locateOrResume(id)
+      const turnGen = located.session.turnSeq
+
+      const pending = located.bridge.runPrompt(located.session, 'STALE_LATE please', 'turn-stale-late', turnGen)
+      // Wait for the prompt to REACH the agent (the mock answers it 450ms
+      // later), then move the generation on: everything the old prompt says
+      // from here belongs to a superseded turn.
+      const deadline = Date.now() + 10_000
+      for (;;) {
+        const lines = existsSync(logPath)
+          ? readFileSync(logPath, 'utf8').split('\n').filter(line => line !== '')
+          : []
+        if (lines.length >= 1) break
+        if (Date.now() > deadline) throw new Error('the prompt never reached the agent')
+        await new Promise(resolve => setTimeout(resolve, 5))
+      }
+      located.session.turnSeq = turnGen + 1
+
+      // The late answer comes back as-is, not as a resent prompt.
+      await expect(pending).resolves.toMatchObject({ stopReason: 'cancelled' })
+      // Bounded negative wait past the retry delay: no second prompt went out.
+      await new Promise(resolve => setTimeout(resolve, 400))
+      const lines = readFileSync(logPath, 'utf8').split('\n').filter(line => line !== '')
+      expect(lines).toEqual(['STALE_LATE please'])
+    } finally {
+      await lateManager.shutdownAll()
+      rmSync(logPath, { force: true })
+    }
+  }, 30_000)
+
   it('reports a normal stop that produced no visible output', async () => {
     // The pi-acp shape: an upstream failure folded into a legal end_turn,
     // bookkeeping frames only — the user would see an empty bubble. The turn
@@ -6287,13 +6335,14 @@ describe('image input transmission and capability validation (isolated manager)'
             { type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' },
           ],
           'turn-direct-1',
+          located.session.turnSeq,
         ),
       ).rejects.toMatchObject({
         code: 'image_unsupported',
         message: expect.stringContaining('does not support image input'),
       })
       await expect(
-        located.bridge.runPrompt(located.session, [], 'turn-direct-empty'),
+        located.bridge.runPrompt(located.session, [], 'turn-direct-empty', located.session.turnSeq),
       ).rejects.toMatchObject({
         code: 'empty_prompt',
       })
@@ -6544,4 +6593,806 @@ describe('image input transmission and capability validation (isolated manager)'
       await gm.shutdownAll()
     }
   }, 45_000)
+})
+
+/**
+ * A prompt the agent folds into a background drain it is already running
+ * (CodeBuddy 2.179.0 multitask): `session/prompt` answers `end_turn` in
+ * milliseconds with no `codebuddy.ai/conversationRequestId`, and the real
+ * answer streams afterwards under the drain's request id. Closing the turn on
+ * that response cut every such answer — these cases pin the wait, its tools,
+ * its wording, and the tail a response races past.
+ */
+describe('a prompt steered into a background drain (isolated manager)', () => {
+  const drainWorkspace = `${tmpdir()}/dsh-ntr-drain-workspace`
+  mkdirSync(drainWorkspace, { recursive: true })
+  const drainHub = new EventHub()
+  const drainEvents: AcpEvent[] = []
+  drainHub.subscribe(event => { drainEvents.push(event) })
+  const drainManager = new BridgeManager(
+    [{ ...def, id: 'drain', cwd: drainWorkspace, allowedCwdRoots: [drainWorkspace] }],
+    drainHub,
+    500,
+    undefined,
+    undefined,
+    true,
+    // Tiny windows keep these cases fast. The quiet window must still exceed
+    // the GAP drain's 150ms tick spacing (proving ticks hold the turn open),
+    // while the cancel fallback must fire BEFORE the drain goes quiet so the
+    // fallback test proves the fallback — not silence — closed the turn.
+    { startupTimeoutMs: 3_000, cancelFallbackMs: 100, ambientQuietMs: 250 },
+  )
+  const drainAdapter = new AcpLlmAdapter(drainManager)
+
+  afterAll(async () => {
+    await drainManager.shutdownAll()
+  })
+
+  /** Drive one chat turn to completion, collecting every chunk of every step. */
+  async function drainTurn(dshSessionId: string, text: string): Promise<StreamChunk[]> {
+    const chunks: StreamChunk[] = []
+    for await (const chunk of drainAdapter.stream({
+      provider: 'acp',
+      model: 'drain',
+      sessionId: dshSessionId,
+      messages: [
+        { role: 'user', content: [{ type: 'text', text }] },
+      ],
+    })) {
+      chunks.push(chunk)
+    }
+    return chunks
+  }
+
+  function textOf(chunks: StreamChunk[]): string {
+    return chunks
+      .filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
+      .map(c => c.text)
+      .join('')
+  }
+
+  function finishOf(chunks: StreamChunk[]): Extract<StreamChunk, { type: 'finish' }> | undefined {
+    return chunks.find((c): c is Extract<StreamChunk, { type: 'finish' }> => c.type === 'finish')
+  }
+
+  /**
+   * Wait until a chat turn has entered its ambient wait: the prompt response
+   * already landed (the settle gate is open) while the drained segment is
+   * still on air. The state has no event of its own, so this polls the
+   * manager's controller index.
+   */
+  async function waitForAmbient(dshSessionId: string): Promise<NonNullable<ReturnType<BridgeManager['turnStreamFor']>>> {
+    const deadline = Date.now() + 10_000
+    for (;;) {
+      const live = drainManager.turnStreamFor(dshSessionId)
+      if (live !== undefined && !live.hasSettled && live.hasOpenSegment && live.session.settled === undefined) return live
+      if (Date.now() > deadline) throw new Error('the turn never entered an ambient wait')
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+  }
+
+  /** The ACP transcript's raw updates for one chat session, after quiescence. */
+  async function drainTranscript(dshSessionId: string): Promise<Array<Record<string, unknown>>> {
+    const acpSessionId = drainManager.chatSessions(dshSessionId)[0]?.sessionId
+    if (acpSessionId === undefined) throw new Error('no live ACP session for the chat session')
+    await settleTranscript(drainManager, acpSessionId)
+    const transcript = await dispatchRpc(drainManager, 'transcript/get', { sessionId: acpSessionId })
+    if (!transcript.ok) throw new Error('transcript failed')
+    return (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
+      .map(entry => entry.update)
+  }
+
+  const AMBIENT_REPORT = 'deferred this turn to a background task run'
+  const ZERO_OUTPUT_REPORT = 'ended the turn with no visible output'
+
+  it('keeps the turn open for the drain: its text arrives, its tools stay off the main plane', async () => {
+    const dshSessionId = 'dsh-drain-steer'
+    const since = drainEvents.length
+    const chunks = await drainTurn(dshSessionId, 'STEER please')
+    const text = textOf(chunks)
+
+    // The drain's answer reached the user's turn instead of being cut at the
+    // instant `end_turn` response (the 14ms codebuddy shape).
+    expect(text).toContain('AMBIENT-TEXT')
+    expect(text).toContain('TAIL-TEXT')
+    expect(finishOf(chunks)?.reason).toEqual({ kind: 'stop' })
+    // A deferred turn is not a silent-failure turn: neither report fired.
+    expect(text).not.toContain(ZERO_OUTPUT_REPORT)
+    expect(text).not.toContain(AMBIENT_REPORT)
+
+    // A background tool never opens a card on the main plane...
+    expect(chunks.filter(c => c.type === 'tool-call-delta')).toHaveLength(0)
+    // ...but it is in the ACP transcript the NTR view reads.
+    const acpSessionId = drainManager.chatSessions(dshSessionId)[0]?.sessionId
+    expect(acpSessionId).toBeDefined()
+    const transcript = await dispatchRpc(drainManager, 'transcript/get', { sessionId: acpSessionId! })
+    if (!transcript.ok) throw new Error('transcript failed')
+    const entries = (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
+    expect(entries.some(entry => entry.update.sessionUpdate === 'tool_call' && entry.update.toolCallId === 'amb_tool')).toBe(true)
+    expect(entries.some(entry => entry.update.sessionUpdate === 'tool_call_update'
+      && entry.update.toolCallId === 'amb_tool'
+      && entry.update.status === 'completed')).toBe(true)
+
+    // `turn/end` is the LAST thing the turn says: every drained text delta
+    // precedes it, and it fires exactly once.
+    const order = drainEvents
+      .slice(since)
+      .filter(event => event.sessionId === acpSessionId)
+      .map(event => event.type === 'turn/end'
+        ? 'end'
+        : event.type === 'session/update' && event.update.sessionUpdate === 'agent_message_chunk'
+          ? 'text'
+          : 'other')
+      .filter(mark => mark !== 'other')
+    expect(order.filter(mark => mark === 'text').length).toBeGreaterThan(0)
+    expect(order.at(-1)).toBe('end')
+    expect(order.filter(mark => mark === 'end')).toHaveLength(1)
+
+    // One notice per background run, not one per drain tick.
+    const notices = drainEvents
+      .slice(since)
+      .filter(event => event.type === 'agent/notice' && event.text.startsWith('acp: agent "drain" started a background task turn'))
+    expect(notices).toHaveLength(1)
+  }, 30_000)
+
+  it('closes a first-turn drain that only ran tools with a pointer, never rolling the lock back', async () => {
+    const dshSessionId = 'dsh-drain-steer-tool'
+    const since = drainEvents.length
+    const chunks = await drainTurn(dshSessionId, 'STEERTOOL please')
+    const text = textOf(chunks)
+
+    expect(finishOf(chunks)?.reason).toEqual({ kind: 'stop' })
+    expect(text.trim()).not.toBe('')
+    // Deferred, not failed: the pointer says where the output went.
+    expect(text).toContain(AMBIENT_REPORT)
+    expect(text).not.toContain(ZERO_OUTPUT_REPORT)
+
+    // This was the conversation's FIRST turn and it never showed a visible
+    // block (the drain ran only suppressed tools). Deferring is not a failed
+    // first turn: the lock and the live session stay, and no unlock is
+    // broadcast — the drain's output still lands in the transcript.
+    expect(drainManager.lockedAgentFor(dshSessionId)).toBe('drain')
+    expect(drainManager.chatSessions(dshSessionId)).toHaveLength(1)
+    expect(drainEvents.slice(since).some(event =>
+      event.type === 'chat/agent-unlocked' && event.dshSessionId === dshSessionId)).toBe(false)
+  }, 30_000)
+
+  it('keeps the turn open across sub-quiet model-call gaps in a drain', async () => {
+    const chunks = await drainTurn('dsh-drain-gap', 'GAP please')
+    const text = textOf(chunks)
+
+    // The drain ticks every 150ms for ~600ms before its text exists: longer
+    // than the 250ms quiet window, but no single GAP is. The turn must still
+    // be open when GAP-TEXT arrives instead of closing on the first silence.
+    expect(text).toContain('GAP-TEXT')
+    expect(text).not.toContain(AMBIENT_REPORT)
+    expect(finishOf(chunks)?.reason).toEqual({ kind: 'stop' })
+  }, 30_000)
+
+  it('withholds drain text from a normal turn and keeps drain tools off the plane', async () => {
+    const dshSessionId = 'dsh-drain-early'
+    const chunks = await drainTurn(dshSessionId, 'EARLY please')
+    const text = textOf(chunks)
+
+    // DRAIN-EARLY arrived while the turn's own request id was unknown and the
+    // response named a conversation turn: it was never this answer.
+    expect(text).toContain('REAL-ANSWER')
+    expect(text).toContain('REAL-TAIL')
+    expect(text).not.toContain('DRAIN-EARLY')
+    expect(text).not.toContain(AMBIENT_REPORT)
+    // A drain-owned tool call during a normal turn is transcript-only: opening
+    // a card would make the host execute it for the user's turn.
+    expect(chunks.filter(c => c.type === 'tool-call-delta')).toHaveLength(0)
+
+    const updates = await drainTranscript(dshSessionId)
+    expect(updates.some(update => update.sessionUpdate === 'agent_message_chunk'
+      && String((update.content as { text?: string }).text ?? '').includes('DRAIN-EARLY'))).toBe(true)
+    expect(updates.some(update => update.sessionUpdate === 'tool_call'
+      && update.toolCallId === 'drain_early_tool')).toBe(true)
+  }, 30_000)
+
+  it('flushes withheld drain text into a steered turn', async () => {
+    const chunks = await drainTurn('dsh-drain-early-steer', 'EARLY-STEER please')
+    const text = textOf(chunks)
+
+    // Same early drain text, but the response carries NO conversation id: the
+    // prompt was folded into the drain, so the withheld text is this answer.
+    expect(text).toContain('DRAIN-EARLY')
+    expect(text).toContain('AFTER-EARLY')
+    expect(text).not.toContain(AMBIENT_REPORT)
+    expect(chunks.filter(c => c.type === 'tool-call-delta')).toHaveLength(0)
+    expect(finishOf(chunks)?.reason).toEqual({ kind: 'stop' })
+  }, 30_000)
+
+  it('reports a truncated withhold buffer instead of dropping the drain front silently', async () => {
+    // FLOOD streams 220 indexed drain updates before the prompt response judges
+    // the turn. The bounded withhold buffer can only carry 200: the flush must
+    // say the front was dropped (the transcript still has every entry), never
+    // let the answer start mid-story without a word.
+    const chunks = await drainTurn('dsh-drain-flood', 'FLOOD please')
+    const text = textOf(chunks)
+
+    const marker = 'background output was truncated'
+    expect(text).toContain(marker)
+    // The buffer evicted the FRONT, not the tail: the marker precedes the
+    // retained content, and the first kept update is the one just past the
+    // 200-entry bound.
+    expect(text).toContain('FLOOD-020')
+    expect(text).toContain('FLOOD-219')
+    expect(text).not.toContain('FLOOD-000')
+    expect(text).not.toContain('FLOOD-019')
+    expect(text.indexOf(marker)).toBeLessThan(text.indexOf('FLOOD-020'))
+    expect(finishOf(chunks)?.reason).toEqual({ kind: 'stop' })
+  }, 30_000)
+
+  it('drains the tail the prompt response raced past before judging the turn empty', async () => {
+    const chunks = await drainTurn('dsh-drain-tail', 'TAIL please')
+    const text = textOf(chunks)
+
+    // The mock writes the chunks and answers without waiting for their
+    // dispatch: a settle that judges visibility before one macrotask loses them.
+    expect(text).toContain('TAIL-CHUNK')
+    expect(text).not.toContain(ZERO_OUTPUT_REPORT)
+    expect(finishOf(chunks)?.reason).toEqual({ kind: 'stop' })
+  }, 30_000)
+
+  it('still reports a normal stop with nothing to show, in the original wording', async () => {
+    const chunks = await drainTurn('dsh-drain-empty', 'EMPTY please')
+    const text = textOf(chunks)
+
+    expect(text).toContain(ZERO_OUTPUT_REPORT)
+    expect(text).toContain('(stop reason: end_turn)')
+    // A turn nobody steered must not borrow the deferred wording.
+    expect(text).not.toContain(AMBIENT_REPORT)
+    expect(finishOf(chunks)?.reason).toEqual({ kind: 'stop' })
+  }, 30_000)
+
+  it('does not treat a later normal turn as steered after an ambient wait closed', async () => {
+    const dshSessionId = 'dsh-drain-ambient-cleared'
+    const first = await drainTurn(dshSessionId, 'STEER please')
+    expect(textOf(first)).toContain('AMBIENT-TEXT')
+
+    // The drain is over and its wait closed. The NEXT prompt answers instantly
+    // with NO conversation request id — the "steered" shape — but there is no
+    // drain left to be steered into. A record that outlived its wait would
+    // hold this ordinary silent turn open for the quiet window and then report
+    // it as deferred; it must close on its own terms instead.
+    const second = await drainTurn(dshSessionId, 'EMPTY please')
+    const text = textOf(second)
+    expect(text).toContain(ZERO_OUTPUT_REPORT)
+    expect(text).not.toContain(AMBIENT_REPORT)
+    expect(finishOf(second)?.reason).toEqual({ kind: 'stop' })
+  }, 30_000)
+
+  it('retires a waiting turn when the conversation moves on, ending its driver step without touching the session', async () => {
+    const dshSessionId = 'dsh-drain-supersede'
+    const since = drainEvents.length
+    const chunks: StreamChunk[] = []
+    const drained = (async () => {
+      for await (const chunk of drainAdapter.stream({
+        provider: 'acp',
+        model: 'drain',
+        sessionId: dshSessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'STEER please' }] }],
+      })) {
+        chunks.push(chunk)
+      }
+    })()
+
+    // Entered the ambient wait: the response already released the prompt slot
+    // (`endTurn` cleared `session.settled`) while the segment is still open and
+    // the turn is NOT settled.
+    const deadline = Date.now() + 10_000
+    let live = drainManager.turnStreamFor(dshSessionId)
+    for (;;) {
+      if (live !== undefined && live.hasOpenSegment && live.session.settled === undefined) break
+      if (Date.now() > deadline) throw new Error('the turn never entered an ambient wait')
+      await new Promise(resolve => setTimeout(resolve, 5))
+      live = drainManager.turnStreamFor(dshSessionId)
+    }
+    if (live === undefined) throw new Error('no controller')
+    const turnId = live.turnId
+    const acpSessionId = live.session.sessionId
+    expect(live.hasSettled).toBe(false)
+
+    // The conversation's next turn replaces the controller before the drain
+    // goes quiet: the old driver step must not stay parked on its queue.
+    const replacement = {
+      session: live.session,
+      stale: false,
+      hasOpenSegment: true,
+      finishActive: () => {},
+      dispose: () => {},
+      settle: () => {},
+    } as unknown as never
+    try {
+      drainManager.rememberTurnStream(dshSessionId, replacement)
+      await Promise.race([
+        drained,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('the retired step is still parked on its queue')), 5_000)),
+      ])
+      // The retired turn closed ITS OWN stream...
+      expect(finishOf(chunks)?.reason).toMatchObject({ kind: 'aborted' })
+      // ...and never touched the session the newer turn now owns: no turn/end,
+      // and the session is still running for whoever is on air.
+      expect(live.session.running).toBe(true)
+      expect(drainEvents.slice(since).some(event =>
+        event.type === 'turn/end' && event.sessionId === acpSessionId && event.turnId === turnId)).toBe(false)
+    } finally {
+      drainManager.forgetTurnStream(replacement)
+    }
+  }, 30_000)
+
+  it('accepts the next prompt while the previous turn still waits on its drain', async () => {
+    const dshSessionId = 'dsh-drain-reenter'
+    const since = drainEvents.length
+    const firstChunks: StreamChunk[] = []
+    const first = (async () => {
+      for await (const chunk of drainAdapter.stream({
+        provider: 'acp',
+        model: 'drain',
+        sessionId: dshSessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'STEER please' }] }],
+      })) {
+        firstChunks.push(chunk)
+      }
+    })()
+
+    const waiting = await waitForAmbient(dshSessionId)
+    const session = waiting.session
+    // The waiting turn still holds the session's `running` flag on purpose
+    // (the drain is its work), and its first-turn lock is provisional.
+    expect(session.running).toBe(true)
+    expect(session.provisionalLock).toBe(true)
+
+    // The user sends again while the drain is still talking: the claim is
+    // gated on the HOST's prompt slot (already released with the response),
+    // never on `running` — and a failed claim must not roll the first-turn
+    // lock back while the drain is streaming.
+    const second = await hostLoopTurn(drainAdapter, {
+      provider: 'acp',
+      model: 'drain',
+      sessionId: dshSessionId,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'second please' }] }],
+    })
+    expect(finishOf(second.chunks)?.reason).toEqual({ kind: 'stop' })
+    expect(textOf(second.chunks)).toContain('MOCK: echo second please')
+
+    // The superseded waiting step ended when the new turn took the controller
+    // (rememberTurnStream disposes it, which closes its queue).
+    await Promise.race([
+      first,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('the waiting step is still parked on its queue')), 5_000)),
+    ])
+    expect(finishOf(firstChunks)?.reason).toMatchObject({ kind: 'aborted' })
+
+    // Nothing gave the conversation back: the session (and its ACP transcript)
+    // survived, and the lock was never rolled back.
+    expect(session.closed).toBe(false)
+    expect(drainManager.chatSessions(dshSessionId)).toHaveLength(1)
+    expect(drainEvents.slice(since).some(event =>
+      event.type === 'chat/agent-unlocked' && event.dshSessionId === dshSessionId)).toBe(false)
+  }, 30_000)
+
+  it('ends a waiting turn through its controller when the cancel fallback fires: one turn/end, promptly', async () => {
+    const dshSessionId = 'dsh-drain-fallback'
+    const since = drainEvents.length
+    const chunks: StreamChunk[] = []
+    const drained = (async () => {
+      for await (const chunk of drainAdapter.stream({
+        provider: 'acp',
+        model: 'drain',
+        sessionId: dshSessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'STEER please' }] }],
+      })) {
+        chunks.push(chunk)
+      }
+    })()
+
+    const waiting = await waitForAmbient(dshSessionId)
+    const sessionId = waiting.session.sessionId
+    const turnId = waiting.turnId
+
+    // Cancel WITHOUT the driver's own abort (the `/acp` cancel face): the
+    // ambient step stays on air until the fallback force-finalizes it.
+    await drainManager.cancel(sessionId)
+    const started = Date.now()
+    await Promise.race([
+      drained,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('the ambient step never closed')), 5_000)),
+    ])
+    // Closed by the 300ms fallback, not by the ambient ceiling (120s).
+    expect(Date.now() - started).toBeLessThan(5_000)
+
+    // Exactly one frame, and it names the turn's REAL id (the controller's),
+    // with the fallback's reason.
+    const frames = drainEvents.slice(since).filter(event => event.type === 'turn/end' && event.sessionId === sessionId)
+    expect(frames).toHaveLength(1)
+    expect(frames[0]).toMatchObject({ turnId, error: expect.stringContaining('did not respond to the cancel request') })
+    expect(finishOf(chunks)?.reason).toMatchObject({ kind: 'error' })
+    expect(waiting.session.running).toBe(false)
+  }, 30_000)
+
+  it('emits exactly one turn/end when a settle error lands during the ambient wait', async () => {
+    const dshSessionId = 'dsh-drain-watchdog'
+    const since = drainEvents.length
+    const chunks: StreamChunk[] = []
+    const drained = (async () => {
+      for await (const chunk of drainAdapter.stream({
+        provider: 'acp',
+        model: 'drain',
+        sessionId: dshSessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'STEER please' }] }],
+      })) {
+        chunks.push(chunk)
+      }
+    })()
+
+    const waiting = await waitForAmbient(dshSessionId)
+    const sessionId = waiting.session.sessionId
+    const turnId = waiting.turnId
+
+    // What the stall watchdog does when it decides the agent went silent
+    // while still holding the segment open.
+    waiting.settle({ kind: 'error', message: 'watchdog: synthetic silence', code: 'INACTIVITY_TIMEOUT' })
+    await Promise.race([
+      drained,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('the settled step never closed')), 5_000)),
+    ])
+
+    const frames = () => drainEvents.slice(since).filter(event => event.type === 'turn/end' && event.sessionId === sessionId)
+    expect(frames()).toHaveLength(1)
+    expect(frames()[0]).toMatchObject({ turnId, error: 'watchdog: synthetic silence' })
+    expect(finishOf(chunks)?.reason).toMatchObject({ kind: 'error', failure: { code: 'INACTIVITY_TIMEOUT' } })
+
+    // Longer than the ambient quiet window: a surviving quiet timer would have
+    // broadcast a second frame by now. (Bounded negative wait — there is no
+    // event for "the timer did not fire".)
+    await new Promise(resolve => setTimeout(resolve, 900))
+    expect(frames()).toHaveLength(1)
+  }, 30_000)
+
+  it('never broadcasts a second turn/end when the session closes inside the settle macrotask', async () => {
+    const dshSessionId = 'dsh-drain-close-race'
+    const chunks: StreamChunk[] = []
+    const drained = (async () => {
+      for await (const chunk of drainAdapter.stream({
+        provider: 'acp',
+        model: 'drain',
+        sessionId: dshSessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'STEER please' }] }],
+      })) {
+        chunks.push(chunk)
+      }
+    })()
+
+    const waiting = await waitForAmbient(dshSessionId)
+    const sessionId = waiting.session.sessionId
+    const turnId = waiting.turnId
+    const since = drainEvents.length
+
+    // The response landed: its closing work (tail drain + turn/end) is queued
+    // for the next macrotask. Closing the session in that window disposes the
+    // controller; the queued close must be retired with it, or the teardown's
+    // already-finished turn gets a SECOND turn/end carrying the real turn id.
+    waiting.settle({ kind: 'stop', stopReason: 'end_turn' })
+    await drainManager.closeSession(sessionId)
+    await Promise.race([
+      drained,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('the step never closed')), 5_000)),
+    ])
+
+    const frames = drainEvents.slice(since).filter(event => event.type === 'turn/end' && event.sessionId === sessionId)
+    expect(frames.filter(event => event.turnId === turnId)).toHaveLength(0)
+    expect(finishOf(chunks)?.reason).toMatchObject({ kind: 'aborted' })
+  }, 30_000)
+
+  it('never folds a successor turn\'s tail into a superseded waiting turn', async () => {
+    const dshSessionId = 'dsh-drain-stale-tail'
+    const since = drainEvents.length
+    const chunks: StreamChunk[] = []
+    const drained = (async () => {
+      for await (const chunk of drainAdapter.stream({
+        provider: 'acp',
+        model: 'drain',
+        sessionId: dshSessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'STEER please' }] }],
+      })) {
+        chunks.push(chunk)
+      }
+    })()
+
+    const waiting = await waitForAmbient(dshSessionId)
+    const session = waiting.session
+
+    // The turn settles, so its closing work (the deferred tail read) is queued
+    // for the next macrotask...
+    waiting.settle({ kind: 'cancelled' })
+    // ...and in that window the conversation's NEXT turn begins: `turnSeq`
+    // moves on, and an update that belongs to the new turn lands in the
+    // transcript without this (superseded) segment having folded it.
+    session.turnSeq += 1
+    session.transcript.append({
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: 'SUCCESSOR-TEXT' },
+    })
+    // A continuation step opening here runs the deferred close NOW.
+    waiting.startSegment()
+
+    await Promise.race([
+      drained,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('the superseded step never closed')), 5_000)),
+    ])
+    // The stale tail read folded nothing into the old step: that text belongs
+    // to the successor turn, not to this stream.
+    expect(textOf(chunks)).not.toContain('SUCCESSOR-TEXT')
+    expect(finishOf(chunks)?.reason).toMatchObject({ kind: 'aborted' })
+    // A superseded close never touches the session the newer turn owns.
+    expect(session.running).toBe(true)
+    expect(drainEvents.slice(since).some(event =>
+      event.type === 'turn/end' && event.sessionId === session.sessionId)).toBe(false)
+  }, 30_000)
+})
+
+/**
+ * The `/acp` RPC prompt and the chat adapter drive the SAME agent session: one
+ * `session/prompt` at a time is a protocol rule, whichever face sent it. The
+ * RPC path must therefore claim the chat path's slot (`promptInFlight` + the
+ * settle gate), and each face must refuse while the other is in flight.
+ */
+describe('the /acp prompt shares the chat prompt slot (isolated manager)', () => {
+  const gateLog = `${tmpdir()}/dsh-ntr-gate-prompts-${String(process.pid)}-${String(Date.now())}.log`
+  const gateHub = new EventHub()
+  const gateEvents: AcpEvent[] = []
+  gateHub.subscribe(event => { gateEvents.push(event) })
+  const gateManager = new BridgeManager(
+    [{ ...def, id: 'gate', env: { ...def.env, MOCK_PROMPT_LOG: gateLog } }],
+    gateHub,
+    500,
+    undefined,
+    undefined,
+    false,
+    { startupTimeoutMs: 5_000, cancelFallbackMs: 1_000 },
+  )
+  const gateAdapter = new AcpLlmAdapter(gateManager)
+
+  afterAll(async () => {
+    await gateManager.shutdownAll()
+    rmSync(gateLog, { force: true })
+  })
+
+  /** Every `session/prompt` text the agent actually received, in order. */
+  function promptLines(): string[] {
+    return existsSync(gateLog)
+      ? readFileSync(gateLog, 'utf8').split('\n').filter(line => line !== '')
+      : []
+  }
+
+  /** Fresh each time: an old event from an earlier case never satisfies a wait. */
+  function gateWaitFor<T extends AcpEvent['type']>(type: T, since: number, predicate: (event: Extract<AcpEvent, { type: T }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: T }>> {
+    const matches = (event: AcpEvent): event is Extract<AcpEvent, { type: T }> =>
+      event.type === type && predicate(event as Extract<AcpEvent, { type: T }>)
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${type}`)), timeoutMs)
+      const unsub = gateHub.subscribe(event => {
+        if (gateEvents.indexOf(event) >= since && matches(event)) {
+          clearTimeout(timer)
+          unsub()
+          resolve(event)
+        }
+      })
+      const existing = gateEvents.find((event, index) => index >= since && matches(event))
+      if (existing !== undefined) {
+        clearTimeout(timer)
+        unsub()
+        resolve(existing)
+      }
+    })
+  }
+
+  /** The mock's first tool tick proves `session/prompt` reached the agent. */
+  function promptReached(sessionId: string, since: number): Promise<void> {
+    return gateWaitFor('session/update', since, event => event.sessionId === sessionId
+      && (event.update as { toolCallId?: string }).toolCallId === 'call_1'
+      && (event.update as { status?: string }).status === 'in_progress')
+      .then(() => {})
+  }
+
+  async function collect(dshSessionId: string, text: string, signal?: AbortSignal): Promise<StreamChunk[]> {
+    const chunks: StreamChunk[] = []
+    for await (const chunk of gateAdapter.stream({
+      provider: 'acp',
+      model: 'gate',
+      sessionId: dshSessionId,
+      ...(signal === undefined ? {} : { signal }),
+      messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+    })) {
+      chunks.push(chunk)
+    }
+    return chunks
+  }
+
+  function gateFinish(chunks: StreamChunk[]): Extract<StreamChunk, { type: 'finish' }> | undefined {
+    return chunks.find((chunk): chunk is Extract<StreamChunk, { type: 'finish' }> => chunk.type === 'finish')
+  }
+
+  it('refuses a chat prompt while an /acp prompt is in flight', async () => {
+    const session = await gateManager.getOrCreateDshSession('dsh-gate-acp-first', 'gate')
+    const since = gateEvents.length
+    const before = promptLines().length
+    await gateManager.prompt(session.sessionId, 'SLOW ACP_FIRST please')
+    await promptReached(session.sessionId, since)
+
+    // The RPC answered `accepted`; the agent is still inside the turn. A chat
+    // prompt for the SAME ACP session must be refused before it is sent.
+    const chunks = await collect('dsh-gate-acp-first', 'chat while acp')
+    expect(gateFinish(chunks)?.reason).toMatchObject({ kind: 'error', failure: { code: 'turn_in_flight' } })
+    expect(promptLines().slice(before)).toEqual(['SLOW ACP_FIRST please'])
+    expect(gateEvents.slice(since).filter(event => event.type === 'turn/start' && event.sessionId === session.sessionId))
+      .toHaveLength(1)
+
+    // Release the /acp turn so shutdown is not left waiting on it.
+    await gateManager.cancel(session.sessionId)
+    await gateWaitFor('turn/end', since, event => event.sessionId === session.sessionId && event.stopReason === 'cancelled')
+  }, 30_000)
+
+  it('refuses an /acp prompt while a chat turn is in flight', async () => {
+    const session = await gateManager.getOrCreateDshSession('dsh-gate-chat-first', 'gate')
+    const since = gateEvents.length
+    const before = promptLines().length
+    const controller = new AbortController()
+    const running = collect('dsh-gate-chat-first', 'SLOW CHAT_FIRST please', controller.signal)
+    await promptReached(session.sessionId, since)
+
+    let code: string | undefined
+    try {
+      await gateManager.prompt(session.sessionId, 'acp while chat')
+    } catch (error) {
+      code = (error as { code?: string }).code
+    }
+    expect(code).toBe('turn_in_flight')
+    expect(promptLines().slice(before)).toEqual(['SLOW CHAT_FIRST please'])
+
+    controller.abort()
+    expect(gateFinish(await running)?.reason).toMatchObject({ kind: 'aborted' })
+    await gateWaitFor('turn/end', since, event => event.sessionId === session.sessionId)
+  }, 30_000)
+
+  it('accepts a chat prompt after an /acp turn completed normally', async () => {
+    // The other half of the two-way gate: an /acp turn that ENDS normally
+    // (not cancelled) must release the slot it claimed, so the same session's
+    // chat path can stream a full turn.
+    const dshSessionId = 'dsh-gate-acp-then-chat'
+    const session = await gateManager.getOrCreateDshSession(dshSessionId, 'gate')
+    const since = gateEvents.length
+    const accepted = await gateManager.prompt(session.sessionId, 'normal acp turn')
+    await gateWaitFor('turn/end', since, event => event.sessionId === session.sessionId
+      && event.turnId === accepted.turnId
+      && event.stopReason === 'end_turn')
+
+    const before = promptLines().length
+    // The mock's normal turn carries a tool card, so drive the real host loop:
+    // the first step opens the card, the continuation resumes the SAME ACP
+    // turn. What matters is that the chat path was admitted at all and
+    // completed normally after the /acp slot was released.
+    const { chunks } = await hostLoopTurn(gateAdapter, {
+      provider: 'acp',
+      model: 'gate',
+      sessionId: dshSessionId,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'chat after acp' }] }],
+    })
+    expect(gateFinish(chunks)?.reason).toEqual({ kind: 'stop' })
+    const text = chunks
+      .filter((chunk): chunk is Extract<StreamChunk, { type: 'text-delta' }> => chunk.type === 'text-delta')
+      .map(chunk => chunk.text)
+      .join('')
+    expect(text).toContain('MOCK: echo chat after acp perm=none')
+    expect(promptLines().slice(before)).toEqual(['chat after acp'])
+  }, 30_000)
+})
+
+/**
+ * The ambient ceiling is a DIFFERENT ending from a quiet drain: it announces
+ * that the rest of the output will land elsewhere. That notice must stand
+ * alone — the quiet ending's deferred report would only repeat it, and a
+ * no-text drain would otherwise receive both.
+ */
+describe('the ambient hard ceiling (isolated manager)', () => {
+  const hardWorkspace = `${tmpdir()}/dsh-ntr-drain-hard-workspace`
+  mkdirSync(hardWorkspace, { recursive: true })
+  const hardHub = new EventHub()
+  const hardEvents: AcpEvent[] = []
+  hardHub.subscribe(event => { hardEvents.push(event) })
+  const hardManager = new BridgeManager(
+    [{ ...def, id: 'drainhard', cwd: hardWorkspace, allowedCwdRoots: [hardWorkspace] }],
+    hardHub,
+    500,
+    undefined,
+    undefined,
+    false,
+    {
+      startupTimeoutMs: 3_000,
+      cancelFallbackMs: 300,
+      // The ceiling beats the quiet window: this case is about what the hard
+      // close SAYS, not about which timer normally closes a drain.
+      ambientQuietMs: 60_000,
+      ambientMaxMs: 150,
+    },
+  )
+  const hardAdapter = new AcpLlmAdapter(hardManager)
+
+  afterAll(async () => {
+    await hardManager.shutdownAll()
+  })
+
+  async function hardTurn(dshSessionId: string, text: string): Promise<StreamChunk[]> {
+    const chunks: StreamChunk[] = []
+    for await (const chunk of hardAdapter.stream({
+      provider: 'acp',
+      model: 'drainhard',
+      sessionId: dshSessionId,
+      messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+    })) {
+      chunks.push(chunk)
+    }
+    return chunks
+  }
+
+  function hardTextOf(chunks: StreamChunk[]): string {
+    return chunks
+      .filter((chunk): chunk is Extract<StreamChunk, { type: 'text-delta' }> => chunk.type === 'text-delta')
+      .map(chunk => chunk.text)
+      .join('')
+  }
+
+  it('closes with the hard notice only, never stacking the deferred line', async () => {
+    const chunks: StreamChunk[] = []
+    for await (const chunk of hardAdapter.stream({
+      provider: 'acp',
+      model: 'drainhard',
+      sessionId: 'dsh-drain-hard',
+      // Tool-only drain: no answer text, so the quiet ending's deferred line
+      // WOULD fire — the case that used to stack it under the hard notice.
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'STEERTOOL please' }] }],
+    })) {
+      chunks.push(chunk)
+    }
+    const text = hardTextOf(chunks)
+
+    expect(text.match(/is still running a background task/g)).toHaveLength(1)
+    expect(text).not.toContain('deferred this turn to a background task run')
+    expect(chunks.find((chunk): chunk is Extract<StreamChunk, { type: 'finish' }> => chunk.type === 'finish')?.reason)
+      .toEqual({ kind: 'stop' })
+  }, 30_000)
+
+  it('keeps the drain record after a hard close so the next folded prompt still gets the drain text', async () => {
+    const dshSessionId = 'dsh-drain-hard-retained'
+    const since = hardEvents.length
+
+    // Turn 1: a drain announces itself, the prompt is answered instantly and
+    // the drain then says NOTHING before the ceiling. The hard ending is
+    // evidence the drain is still running, so the session must keep its
+    // record — closing it here used to make the next folded prompt look like
+    // an ordinary silent turn.
+    const first = await hardTurn(dshSessionId, 'STEERHARD please')
+    expect(hardTextOf(first)).toContain('is still running a background task')
+
+    // Turn 2 is folded into the SAME drain: instant answer with no
+    // conversation id, and its text lands 60ms later (after the response
+    // would have closed the turn, before the next ceiling). With the record
+    // kept, the turn is treated as steered and the text reaches the user.
+    const second = await hardTurn(dshSessionId, 'HARDTAIL please')
+    const text = hardTextOf(second)
+    expect(text).toContain('HARD-TAIL-TEXT')
+    expect(text).not.toContain('ended the turn with no visible output')
+    expect(second.find((chunk): chunk is Extract<StreamChunk, { type: 'finish' }> => chunk.type === 'finish')?.reason)
+      .toEqual({ kind: 'stop' })
+
+    // One run, one notice: the de-dupe set survives the hard close, so the
+    // re-announcement during turn 2 does not log the same drain twice.
+    const notices = hardEvents
+      .slice(since)
+      .filter(event => event.type === 'agent/notice' && event.text.startsWith('acp: agent "drainhard" started a background task turn'))
+    expect(notices).toHaveLength(1)
+  }, 30_000)
 })

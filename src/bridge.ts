@@ -145,6 +145,22 @@ interface LiveSession {
    */
   burst?: SessionView['burst']
   running: boolean
+  /**
+   * The HOST's prompt slot for this session: true from the moment a turn
+   * starts until the agent answers it (or the host aborts the turn, or the
+   * turn is discarded). Together with the {@link settled} gate — which STAYS
+   * claimed after an abort until the agent acknowledges the cancel — this is
+   * what `claimTurn` arbitrates, NOT `running`.
+   *
+   * The three are deliberately different:
+   * - an ambient wait keeps `running` true (the background drain is still the
+   *   session's work, so nothing may release the process) while this slot is
+   *   already FREE (the agent answered; only the drain keeps talking);
+   * - an aborted turn drops THIS flag at once (our face of the turn ends) but
+   *   leaves `settled` in place, so the next prompt still waits out
+   *   `turnSettleMs` for the agent instead of racing a concurrent prompt.
+   */
+  promptInFlight?: boolean
   closed: boolean
   /** The agent process died; the session awaits a `session/load` resume. */
   released: boolean
@@ -254,7 +270,41 @@ interface LiveSession {
    * the controller's own `retire` when it still points at it.
    */
   turnController?: TurnStreamController
+  /**
+   * A background turn the agent started on its OWN initiative (CodeBuddy's
+   * multitask drains: a sub-agent completion notice starts a run the client
+   * never asked for). Its first `session_info_update` announces the request id
+   * every later update of that run carries in `_meta`; a `session/prompt`
+   * answered instantly with no conversation request id was folded into this
+   * drain and its real answer arrives as the drain's updates.
+   *
+   * Only lifetime events clear it (close / release / resume / stop): a drain
+   * may outlive the turn that was steered into it, and clearing on a normal
+   * settle would misclassify the NEXT steered prompt.
+   */
+  ambient?: AmbientTurn
+  /**
+   * Request ids whose `agent/notice` already went out, so a repeated
+   * announcement of the same background run is not logged twice.
+   */
+  ambientNotices?: Set<string>
   transcript: Transcript
+}
+
+/** One unsolicited (background) turn the agent is running, as announced in `_meta`. */
+interface AmbientTurn {
+  /** `codebuddy.ai/requestId` of the drain; every update of the run carries it. */
+  requestId: string
+  startedAt: number
+  /**
+   * When this drain last showed any sign of life (announcement or an update
+   * carrying its request id). {@link BridgeTuning.ambientStaleMs} expires the
+   * record from here, so a drain that died silently does not capture a later
+   * normal turn as steered.
+   */
+  lastActivityAt: number
+  /** Whether the drain already streamed prose (text or thought) into the transcript. */
+  sawOutput: boolean
 }
 
 /** Reliability tuning, threaded from `AcpPluginConfig` through the manager. */
@@ -351,6 +401,39 @@ export interface BridgeTuning {
    * probe-only process has no stake in. `0` disables it.
    */
   probeIdleTimeoutMs?: number
+  /**
+   * How long an ambient wait (see `TurnStreamController.awaitAmbient`) stays
+   * open after the LAST session update before the turn closes itself.
+   *
+   * A drain's end is its silence — the SDK's schema rejects the `session_end`
+   * CodeBuddy never sends anyway — but "silence" must be measured in the
+   * agent's own cadence, not in a chat-app-paced one. Measured against
+   * CodeBuddy 2.179.0: the gaps between drain ticks (the
+   * `model_requesting`→`model_streaming` hand-off of a real model call) run
+   * 1.0–1.4s, so any window below that closes the turn BEFORE the answer
+   * exists. 10s leaves room for two slow hand-offs without holding the turn
+   * open for a drain that actually finished.
+   *
+   * Deliberately NOT keyed on an `agentPhase` idle flag: a drain goes idle
+   * between queued messages too, so that signal closes the turn in the middle
+   * of its own work.
+   */
+  ambientQuietMs?: number
+  /**
+   * The hard ceiling on ONE ambient wait: a background run that keeps ticking
+   * for minutes without finishing must not hold the conversation's turn open
+   * forever. At the ceiling the turn says where the rest of the output will
+   * land and closes.
+   */
+  ambientMaxMs?: number
+  /**
+   * How long an announced background drain may go without ANY update before a
+   * later instant prompt stops treating itself as folded into it. A drain that
+   * went silent for minutes is over even though nothing told us; keeping the
+   * record would misclassify the next normal turn as steered. Checked lazily
+   * when a prompt response arrives (see `streamPrompt`), never on a timer.
+   */
+  ambientStaleMs?: number
 }
 
 /**
@@ -436,6 +519,9 @@ const DEFAULT_TUNING: Required<BridgeTuning> = {
   turnStallTickMs: 30_000,
   idleTimeoutMs: DEFAULT_IDLE_TIMEOUT_MS,
   probeIdleTimeoutMs: 300_000,
+  ambientQuietMs: 10_000,
+  ambientMaxMs: 120_000,
+  ambientStaleMs: 300_000,
 }
 
 type BridgeState = 'stopped' | 'starting' | 'ready' | 'error'
@@ -708,11 +794,16 @@ export class AgentBridge {
    * same session — forbidden by the protocol and rejected (or worse, mishandled)
    * by the agent. Waiting turns a protocol error into a short delay.
    *
+   * The gate is {@link LiveSession.promptInFlight} + the settle promise, NOT
+   * {@link LiveSession.running}: an ambient turn keeps `running` true for the
+   * whole drain while its prompt slot is already free, so `running` would
+   * refuse every message the user sends during a background task.
+   *
    * @param session - the session asking for the slot.
    * @returns whether the slot was claimed, and why not when it was not.
    */
   async claimTurn(session: LiveSession): Promise<{ ok: true } | { ok: false; reason: 'busy' | 'unsettled' }> {
-    if (session.running) return { ok: false, reason: 'busy' }
+    if (this.promptSlotHeld(session)) return { ok: false, reason: 'busy' }
     const pending = session.settled
     if (pending === undefined) return { ok: true }
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -730,13 +821,21 @@ export class AgentBridge {
     // The agent never acknowledged: sending now would start a concurrent turn,
     // so report it honestly instead of handing the agent two prompts at once.
     if (session.settled !== undefined) return { ok: false, reason: 'unsettled' }
-    if (session.running) return { ok: false, reason: 'busy' }
+    // Re-checked after the wait: another turn may have claimed the slot while
+    // this one was waiting on the gate.
+    if (this.promptSlotHeld(session)) return { ok: false, reason: 'busy' }
     return { ok: true }
   }
 
+  /** Whether a turn currently holds the agent prompt slot (see `promptInFlight`). */
+  private promptSlotHeld(session: LiveSession): boolean {
+    return session.promptInFlight === true
+  }
+
   /**
-   * Mark the agent-side turn as in flight and hand back the settler its stream
-   * owner must call once the agent is actually done with it.
+   * Mark the agent-side turn as in flight — claim the agent prompt slot and
+   * open the settle gate — and hand back the settler its stream owner must
+   * call once the agent is actually done with it.
    *
    * @param session - the session whose turn is starting.
    * @returns the settler (idempotent; also used by connection loss).
@@ -746,11 +845,16 @@ export class AgentBridge {
     const settled = new Promise<void>(resolve => { settle = resolve })
     session.settled = settled
     session.settledResolve = settle
+    session.promptInFlight = true
     this.touch()
     return () => {
+      // Identity-guarded: only THIS turn's settler may release the slot. A
+      // superseded turn's late settler must not clear the flag a NEWER turn
+      // has already claimed (its settle gate was replaced with a new promise).
       if (session.settled === settled) {
         session.settled = undefined
         session.settledResolve = undefined
+        session.promptInFlight = false
       }
       settle()
       // The turn is over: a fresh window starts here rather than at the prompt
@@ -762,12 +866,14 @@ export class AgentBridge {
   /**
    * Open a session's settle gate without owning its turn stream: the turn's
    * stream is gone (a resume, a release) but the next prompt still waits on
-   * this promise, and nothing is left that could ever resolve it.
+   * this promise, and nothing is left that could ever resolve it. The prompt
+   * slot itself goes with it: whatever held it is gone too.
    */
   private openSettleGate(session: LiveSession): void {
     const settle = session.settledResolve
     session.settled = undefined
     session.settledResolve = undefined
+    session.promptInFlight = false
     settle?.()
   }
 
@@ -1268,8 +1374,19 @@ export class AgentBridge {
    * window, bounded by {@link BridgeTuning.staleCancelMaxRetries}; a genuinely
    * requested cancel (`cancelRequestedAtTurn` still names this generation)
    * returns as-is.
+   *
+   * `turnGen` is the {@link LiveSession.turnSeq} this prompt was sent for. A
+   * stale-cancel resend is only allowed while that generation still owns the
+   * session: once a successor turn began (the cancel fallback finalized this
+   * one and the user moved on), resending would race a second `session/prompt`
+   * into the successor's turn. The late answer is returned as-is instead.
+   *
+   * The RESPONSE's `_meta` travels with the stop reason: it is the only place
+   * an agent says whether the prompt actually queued a conversation turn (see
+   * `CodebuddyMeta.conversationRequestId`), which decides whether an instant
+   * answer was the turn ending or a fold into a background drain.
    */
-  async runPrompt(session: LiveSession, prompt: string | ContentBlock[], turnId: string): Promise<string> {
+  async runPrompt(session: LiveSession, prompt: string | ContentBlock[], turnId: string, turnGen: number): Promise<{ stopReason: string; meta?: Record<string, unknown> }> {
     const conn = this.conn
     if (conn === undefined || session.closed || session.released) throw new AcpError('session_closed', 'acp: session is closed')
     this.touch()
@@ -1294,12 +1411,22 @@ export class AgentBridge {
         sessionId: session.acpSessionId,
         prompt: blocks,
       }).finally(() => { this.touch() })
+      const answered = () => ({
+        stopReason: result.stopReason,
+        ...(result._meta !== undefined && result._meta !== null ? { meta: result._meta } : {}),
+      })
       if (result.stopReason !== 'cancelled' || session.cancelRequestedAtTurn === session.turnSeq) {
-        return result.stopReason
+        return answered()
       }
-      if (attempt >= this.staleCancelMaxRetries) return result.stopReason
+      // The turn this answer belongs to no longer owns the session (a cancel
+      // fallback finalized it and a successor began): resending would fire a
+      // second `session/prompt` into the successor's turn.
+      if (session.turnSeq !== turnGen) return answered()
+      if (attempt >= this.staleCancelMaxRetries) return answered()
       await new Promise(resolve => setTimeout(resolve, this.staleCancelRetryDelayMs))
       if (session.closed || this.conn !== conn) throw new AcpError('session_closed', 'acp: session is closed')
+      // Re-check after the delay: the successor may have started while waiting.
+      if (session.turnSeq !== turnGen) return answered()
       this.touch()
     }
   }
@@ -1350,9 +1477,18 @@ export class AgentBridge {
 
   /**
    * Force the local end of one turn whose agent never acknowledged it: clear
-   * `running`, open the settle gate, and broadcast the turn end with `turnId:
-   * ''` (there is no agent response to attribute it to). Shared by the cancel
+   * `running`, open the settle gate, and end the turn. Shared by the cancel
    * fallback and the stall watchdog.
+   *
+   * A live controller owns the turn's streaming face — its segment queue, its
+   * ambient clocks and its `turn/end` id. Ending the turn behind its back
+   * would leave the driver step parked on an open queue, and the controller's
+   * own timers would later broadcast a SECOND `turn/end` for a turn already
+   * closed. So when the session still points at a current controller, the
+   * force goes THROUGH it (`forceFinalize`), which runs the same closing work
+   * as a normal settle exactly once. Only a turn with no live controller (an
+   * `/acp`-RPC turn, or one already retired) falls back to the local broadcast
+   * with `turnId: ''` — there is no stream whose id could be named.
    *
    * Generation-guarded: a turn that already ended — or that a later turn
    * superseded — is not this call's to finalize. Returns whether it acted; a
@@ -1360,6 +1496,11 @@ export class AgentBridge {
    */
   finalizeTurn(session: LiveSession, turnGen: number, message: string): boolean {
     if (session.closed || session.turnSeq !== turnGen) return false
+    const controller = session.turnController
+    if (controller !== undefined && !controller.stale) {
+      controller.forceFinalize({ kind: 'error', message })
+      return true
+    }
     // Nothing is in flight anymore (the turn settled on its own): nothing to
     // finalize. A still-pending settle gate counts as in flight even though
     // the stream is gone — that gate is what the next prompt waits on.
@@ -1427,10 +1568,13 @@ export class AgentBridge {
       session.closed = false
       session.released = false
       // A resume is a fresh agent-side state: nothing from the dead process's
-      // turn survives it, including the settle gate and the stall markers.
+      // turn survives it, including the settle gate and the stall markers. A
+      // background drain belonged to that process too.
       session.orphanPromptTurnSeq = undefined
       session.reclaimedTurnSeq = undefined
       session.activeToolCalls.clear()
+      session.ambient = undefined
+      session.ambientNotices?.clear()
       session.lastAgentActivityAt = Date.now()
       this.openSettleGate(session)
       // Route replay updates into the fresh transcript while the load request
@@ -1493,8 +1637,11 @@ export class AgentBridge {
       // would make the next prompt wait for an answer that can no longer come.
       this.openSettleGate(session)
       // No call from the dead process can still be running: drop the tool set
-      // so a resumed turn starts on the plain window.
+      // so a resumed turn starts on the plain window. A background drain died
+      // with it, and a stale ambient would misclassify the NEXT prompt.
       session.activeToolCalls.clear()
+      session.ambient = undefined
+      session.ambientNotices?.clear()
       session.released = true
       this.settlePermissions(session)
       this.released.set(session.sessionId, session)
@@ -1605,6 +1752,13 @@ export class AgentBridge {
   async closeSession(session: LiveSession, reason: 'closed' | 'agent-stopped' | 'agent-died'): Promise<void> {
     if (session.closed) return
     session.closed = true
+    // The session is going away: whatever background drain it announced ends
+    // with it (a re-created session must not inherit a stale ambient).
+    session.ambient = undefined
+    session.ambientNotices?.clear()
+    // ...and so does its prompt slot: nothing may keep rejecting a new prompt
+    // for a record that is being deleted.
+    session.promptInFlight = false
     // Closing a session is activity of its own: restart the idle window here
     // rather than at the prompt that opened it.
     this.touch()
@@ -1679,6 +1833,8 @@ export class AgentBridge {
       this.settlePermissions(session)
       this.openSettleGate(session)
       session.activeToolCalls.clear()
+      session.ambient = undefined
+      session.ambientNotices?.clear()
       this.sessions.delete(session.sessionId)
       this.acpIndex.delete(session.acpSessionId)
       this.hub.broadcast({ type: 'session/closed', sessionId: session.sessionId, reason })
@@ -1961,6 +2117,43 @@ export class AgentBridge {
     // tool, which earns the wider watchdog window.
     session.lastAgentActivityAt = Date.now()
     const kind = params.update.sessionUpdate
+    const meta = codebuddyMetaOf(params.update)
+    if (meta?.unsolicitedTurn !== undefined) {
+      // The agent started a background turn on its own: remember it so a
+      // prompt the agent folds into it (answered instantly, no conversation
+      // request id) can be kept open until the drain speaks. Announced once per
+      // request id — a repeated announcement is the same run, not news.
+      const run = meta.unsolicitedTurn
+      session.ambient = { requestId: run.requestId, startedAt: Date.now(), lastActivityAt: Date.now(), sawOutput: false }
+      const announced = session.ambientNotices ?? new Set<string>()
+      session.ambientNotices = announced
+      if (!announced.has(run.requestId)) {
+        announced.add(run.requestId)
+        // The de-dupe set outlives individual turns (a hard ceiling keeps the
+        // drain record), so it is bounded: evict the oldest ids first.
+        while (announced.size > AMBIENT_NOTICE_MAX) {
+          const oldest = announced.values().next().value
+          if (oldest === undefined) break
+          announced.delete(oldest)
+        }
+        this.hub.broadcast({
+          type: 'agent/notice',
+          agentId: session.agentId,
+          level: 'info',
+          text: `acp: agent "${this.def.id}" started a background task turn (${run.reason ?? 'unsolicited'}); its output will appear in the ACP transcript view, or in the turn that was waiting for it.`,
+        })
+      }
+    }
+    if (session.ambient !== undefined
+      && meta?.requestId === session.ambient.requestId) {
+      // The run is alive: refresh the staleness clock on ANY update it owns,
+      // not just prose (a tool-heavy stretch is still the drain working).
+      session.ambient.lastActivityAt = Date.now()
+      if ((kind === 'agent_message_chunk' || kind === 'agent_thought_chunk')
+        && chunkTextOf((params.update as { content?: unknown }).content) !== '') {
+        session.ambient.sawOutput = true
+      }
+    }
     if (kind === 'tool_call' || kind === 'tool_call_update') {
       const { toolCallId, status } = params.update as { toolCallId: string; status?: string | null }
       if (status === 'completed' || status === 'failed') session.activeToolCalls.delete(toolCallId)
@@ -2016,6 +2209,64 @@ export class AgentBridge {
         break
     }
   }
+}
+
+/**
+ * The CodeBuddy `_meta` facts this bridge reads, when the object carries them.
+ *
+ * CodeBuddy runs "background drains": a sub-agent completion notice starts a
+ * turn the client never prompted, announced by a `session_info_update` whose
+ * `_meta["codebuddy.ai/unsolicitedTurn"]` names the run. Every update of that
+ * run then carries `_meta["codebuddy.ai/requestId"]`, and a `session/prompt`
+ * answered instantly (with no `codebuddy.ai/conversationRequestId` on the
+ * RESPONSE) had its message folded into the drain — the real answer streams
+ * afterwards, under the drain's request id.
+ *
+ * No other agent sends these keys: an object without them yields `undefined`,
+ * so every existing path is untouched. Values are only read when they have the
+ * declared shape (never guessed from a message body).
+ */
+interface CodebuddyMeta {
+  /** The run this update belongs to. */
+  requestId?: string
+  /** Set on the `session_info_update` that STARTS a background turn. */
+  unsolicitedTurn?: { requestId: string; reason?: string }
+  /** The agent's own phase heartbeat (`{ phase }`), a liveness tick. */
+  agentPhase?: { phase: string }
+  /** Set on a `session/prompt` RESPONSE that really queued a conversation turn. */
+  conversationRequestId?: string
+}
+
+/** Read the CodeBuddy `_meta` keys off an update or a `{ _meta }` wrapper. */
+function codebuddyMetaOf(source: unknown): CodebuddyMeta | undefined {
+  if (typeof source !== 'object' || source === null) return undefined
+  const row = source as Record<string, unknown>
+  const rawMeta = row._meta
+  if (typeof rawMeta !== 'object' || rawMeta === null) return undefined
+  const meta = rawMeta as Record<string, unknown>
+  const out: CodebuddyMeta = {}
+  const requestId = meta['codebuddy.ai/requestId']
+  if (typeof requestId === 'string' && requestId !== '') out.requestId = requestId
+  const conversationRequestId = meta['codebuddy.ai/conversationRequestId']
+  if (typeof conversationRequestId === 'string' && conversationRequestId !== '') {
+    out.conversationRequestId = conversationRequestId
+  }
+  const unsolicited = meta['codebuddy.ai/unsolicitedTurn']
+  if (typeof unsolicited === 'object' && unsolicited !== null) {
+    const run = unsolicited as Record<string, unknown>
+    if (typeof run.requestId === 'string' && run.requestId !== '') {
+      out.unsolicitedTurn = {
+        requestId: run.requestId,
+        ...(typeof run.reason === 'string' && run.reason !== '' ? { reason: run.reason } : {}),
+      }
+    }
+  }
+  const phase = meta['codebuddy.ai/agentPhase']
+  if (typeof phase === 'object' && phase !== null) {
+    const tick = phase as Record<string, unknown>
+    if (typeof tick.phase === 'string' && tick.phase !== '') out.agentPhase = { phase: tick.phase }
+  }
+  return Object.keys(out).length === 0 ? undefined : out
 }
 
 /** Human-facing identity of an ACP tool call (the approval headline). */
@@ -2960,6 +3211,14 @@ interface SegmentState {
   activeToolCall: AcpToolCallSnapshot | undefined
   /** Whether this segment opened at least one tool-call block. */
   hasCard: boolean
+  /**
+   * The segment belongs to an ambient wait: the agent folded our prompt into a
+   * background drain it started itself. Tool traffic is recorded (so the
+   * transcript and any parked tool-output waiter get it) but opens NO card —
+   * a card would make the host loop execute a tool for a turn whose answer has
+   * not even started streaming yet.
+   */
+  ambient: boolean
   finished: boolean
 }
 
@@ -2979,6 +3238,49 @@ type TurnSettle =
 const TPS_PUSH_INTERVAL_MS = 1000
 
 /**
+ * Bounds on the updates withheld while a turn's own request id is still
+ * unknown (see `TurnStreamController.bufferAmbientUpdate`). The buffer exists
+ * only for the response window of one prompt, but a chatty drain could stream
+ * for a while inside it; over the bound the OLDEST entries are dropped — the
+ * transcript still has every one of them.
+ */
+const PENDING_AMBIENT_MAX_ENTRIES = 200
+const PENDING_AMBIENT_MAX_CHARS = 64 * 1024
+
+/**
+ * Bound on {@link LiveSession.ambientNotices}. The set now outlives the turn
+ * that announced a drain (a hard ceiling keeps the record, and a repeated
+ * announcement of the same run must stay silent), so it needs a ceiling of its
+ * own for a chatty agent. Oldest ids are evicted first; an id that far back is
+ * a run nobody is waiting on anymore.
+ */
+const AMBIENT_NOTICE_MAX = 64
+
+/** One ambient wait's clocks and the stop reason it will close the turn with. */
+interface AmbientWait {
+  /** The drain's request id: the turn is waiting on this run, not on its own. */
+  requestId: string
+  quietTimer: ReturnType<typeof setTimeout>
+  hardTimer: ReturnType<typeof setTimeout>
+  /** The stop reason the agent's `session/prompt` response carried. */
+  stopReason: string
+  /**
+   * Whether the CEILING closed this wait (the drain was still ticking) rather
+   * than silence. A hard ending must keep the session's drain record: the next
+   * prompt may be folded into the same run, and it is still alive.
+   */
+  hard?: boolean
+}
+
+/** An update withheld from the segment until the turn's own request id is known. */
+interface PendingAmbientUpdate {
+  seq: number
+  update: Record<string, unknown>
+  /** `JSON.stringify(update).length`, kept so eviction need not re-serialize. */
+  chars: number
+}
+
+/**
  * The state of ONE ACP prompt, shared across every driver step of the turn.
  *
  * The controller owns the hub subscription (for the whole agent-side turn, not
@@ -2991,12 +3293,58 @@ const TPS_PUSH_INTERVAL_MS = 1000
 class TurnStreamController {
   private segment: SegmentState | undefined
   private settled = false
+  /** Whether the turn's closing work already ran (see `closeTurn`). */
+  private closedTurn = false
   private disposed = false
   private readonly seenCalls = new Set<string>()
   private readonly announcedKinds = new Map<string, string>()
   /** Narrative lines (permission asks) that arrived while no segment was open. */
   private readonly pendingProse: string[] = []
   sawVisibleBlock = false
+  /**
+   * Whether THIS turn streamed its own prose (text or reasoning), i.e. an
+   * answer that is not the background drain's. Tool cards do not count — a
+   * drain that only ran tools delivered no words to the conversation.
+   */
+  private sawAgentProse = false
+  /**
+   * Whether any `agent_message_chunk` text reached the plane. Reasoning does
+   * not count: a steer whose drain only thought is still a turn with no answer
+   * text, and must say so when it closes.
+   */
+  private sawVisibleText = false
+  /**
+   * The CodeBuddy request id this turn has adopted as its own (from the
+   * prompt RESPONSE's `conversationRequestId`, or from the first update that
+   * named one). Used to keep a background drain's prose out of the user's
+   * answer; `undefined` means "unknown" and nothing is split (fail-open).
+   */
+  private turnRequestId?: string
+  /**
+   * Updates the session's background drain already streamed while this turn's
+   * OWN request id was still unknown. They are NOT folded on arrival: a drain
+   * tick that lands before the prompt response could otherwise teach the turn
+   * the drain's id (`noteTurnRequestId`) and mix the drain's text into the
+   * user's answer. Withheld here (cursor already advanced — the transcript
+   * keeps a copy) until the response decides what this turn is:
+   * - a normal turn (response carries a conversation id) discards them — they
+   *   were never this turn's answer;
+   * - a steered turn flushes them into the segment, in order, once
+   *   `awaitAmbient` marks the segment ambient (tool cards suppressed).
+   */
+  private readonly pendingAmbientUpdates: PendingAmbientUpdate[] = []
+  private pendingAmbientChars = 0
+  /**
+   * Whether the bounded buffer dropped at least one update. The flush then
+   * says so in the conversation instead of silently losing the front of the
+   * drain's output (constraint 29: ACP payloads are never dropped silently).
+   */
+  private pendingAmbientTruncated = false
+  /** The ambient wait in progress, if the agent folded this prompt into a drain. */
+  private awaitingAmbient?: AmbientWait
+  /** The outcome of a settle whose closing work is waiting one macrotask (see `settle`). */
+  private pendingOutcome?: TurnSettle
+  private closeScheduled = false
   private cursorSeq: number
   /**
    * Burst tracker for this turn, fed from the LIVE hub frames only. Segment
@@ -3006,6 +3354,13 @@ class TurnStreamController {
   private readonly tps = new TurnTpsTracker()
   private tpsSeq: number
   private lastTpsPushAt = 0
+  /**
+   * The ambient quiet/ceiling windows, read once from the manager: they are
+   * deployment tuning, not per-tick facts, and small test values must be stable
+   * for the whole turn (see {@link BridgeTuning.ambientQuietMs} for the
+   * measured CodeBuddy tick cadence these defaults come from).
+   */
+  private readonly ambientTuning: { quietMs: number; maxMs: number }
 
   constructor(
     private readonly manager: BridgeManager,
@@ -3019,6 +3374,7 @@ class TurnStreamController {
     this.turnSeqAtStart = session.turnSeq
     this.cursorSeq = session.transcript.head
     this.tpsSeq = session.transcript.head
+    this.ambientTuning = manager.ambientTuning
     this.unsubscribe = hub.subscribe(event => this.onEvent(event))
   }
 
@@ -3054,6 +3410,12 @@ class TurnStreamController {
    * consuming it, so the next segment replays it again.
    */
   startSegment(): SegmentState {
+    // A step opening on an already settled turn (the response landed a tick
+    // ago and the tail drain is still scheduled) closes that turn FIRST: the
+    // step must read a settled controller and the session must not stay
+    // `running` across the macrotask boundary — the host's next prompt would be
+    // refused as busy for no reason.
+    this.flushScheduledClose()
     // A step opening is the HOST handing the turn back to the agent — this
     // runs for the first step and for each continuation after the host
     // executed a card. The watchdog measures the stretch the AGENT holds the
@@ -3069,6 +3431,10 @@ class TurnStreamController {
       outputChars: 0,
       activeToolCall: undefined,
       hasCard: false,
+      // A segment opened DURING an ambient wait (never the steered first step,
+      // which marks its own) inherits the suppression: the drain's tools still
+      // stay transcript-only until the turn closes.
+      ambient: this.awaitingAmbient !== undefined,
       finished: false,
     }
     this.segment = seg
@@ -3093,10 +3459,272 @@ class TurnStreamController {
     if (this.segment !== undefined) this.finishSegment(this.segment, reason)
   }
 
+  /** Whether this turn already streamed prose of its own (not a drain's). */
+  get hasAgentProse(): boolean {
+    return this.sawAgentProse
+  }
+
+  /**
+   * Keep the turn open for a background drain the agent folded our prompt into.
+   *
+   * THE SHAPE: the agent answered `session/prompt` at once (CodeBuddy returns
+   * `end_turn` in ~14ms when it merges the message into a drain it is already
+   * running) and the real answer streams afterwards under the DRAIN's request
+   * id. Closing on the response would cut the turn before its text exists —
+   * which is exactly the bug this state exists for. So:
+   *
+   * - the agent-side prompt slot is released (`endTurn`: the response HAS
+   *   landed) but the turn is NOT settled: `settled` means "the turn is over",
+   *   and it is not — no `turn/end`, no `running = false`, no segment close;
+   * - the segment keeps folding the session's updates, with cards suppressed
+   *   (see `SegmentState.ambient`): the host must not execute a background
+   *   tool for a turn whose answer has not begun;
+   * - any update on the session resets the quiet clock, and the drain's end is
+   *   its silence (a `session_end` is rejected by the SDK's schema and never
+   *   reaches us — never wait for one); a hard ceiling closes what never ends.
+   */
+  awaitAmbient(requestId: string, stopReason: string): void {
+    if (this.settled || this.disposed || this.awaitingAmbient !== undefined) return
+    const seg = this.segment
+    if (seg === undefined || seg.finished) {
+      // No live driver step to speak into: nothing can be folded, so close the
+      // turn the ordinary way rather than holding state that renders nothing.
+      this.clearPendingAmbient()
+      this.settle({ kind: 'stop', stopReason })
+      return
+    }
+    seg.ambient = true
+    // The response landed: the agent no longer holds a prompt for this turn.
+    this.endTurn()
+    // The drain may have spoken BEFORE the response was judged. Those updates
+    // were withheld while this turn's own request id was unknowable (see
+    // `pendingAmbientUpdates`); the turn IS the drain, so they are its answer —
+    // folded in arrival order, now that `seg.ambient` suppresses their cards.
+    this.flushPendingAmbient(seg)
+    if (seg.finished) {
+      this.settle({ kind: 'stop', stopReason })
+      return
+    }
+    const wait: AmbientWait = {
+      requestId,
+      quietTimer: setTimeout(() => { this.onAmbientQuiet(wait) }, this.ambientTuning.quietMs),
+      hardTimer: setTimeout(() => { this.onAmbientHard(wait) }, this.ambientTuning.maxMs),
+      stopReason,
+    }
+    wait.quietTimer.unref?.()
+    wait.hardTimer.unref?.()
+    this.awaitingAmbient = wait
+  }
+
+  /** Any session update is evidence the drain still works: push the quiet clock out. */
+  private noteAmbientActivity(): void {
+    const wait = this.awaitingAmbient
+    if (wait === undefined) return
+    clearTimeout(wait.quietTimer)
+    wait.quietTimer = setTimeout(() => { this.onAmbientQuiet(wait) }, this.ambientTuning.quietMs)
+    wait.quietTimer.unref?.()
+  }
+
+  /** The drain went quiet: the turn ends with the stop reason the response gave. */
+  private onAmbientQuiet(wait: AmbientWait): void {
+    if (this.awaitingAmbient !== wait) return
+    this.finishAmbient(wait)
+  }
+
+  /** The drain outlived the ceiling: say where the rest will land, then close. */
+  private onAmbientHard(wait: AmbientWait): void {
+    if (this.awaitingAmbient !== wait) return
+    const seg = this.segment
+    if (seg !== undefined && !seg.finished) {
+      this.emitProse(seg, 'text', `\n[dsh-ntr] agent "${this.session.agentId}" is still running a background task; the rest of its output will appear in the ACP transcript view.\n`)
+    }
+    // The ceiling is evidence the drain is STILL RUNNING (unlike a quiet close),
+    // so the ending keeps the session's drain record; see `closeTurn`.
+    wait.hard = true
+    // The hard explanation already says the turn was cut short; the deferred
+    // line would only repeat it in different words.
+    this.finishAmbient(wait, { announceDeferral: false })
+  }
+
+  /**
+   * Close an ambient wait exactly once. A turn that produced no answer TEXT
+   * says so: the drain's output is in the ACP transcript view, and this
+   * bubble must not be empty (the zero-output report, reworded for a turn that
+   * was deferred rather than failed).
+   */
+  private finishAmbient(wait: AmbientWait, options?: { announceDeferral?: boolean }): void {
+    if (this.awaitingAmbient !== wait) return
+    const line = options?.announceDeferral === false || this.sawVisibleText
+      ? undefined
+      : `\n[dsh-ntr] agent "${this.session.agentId}" deferred this turn to a background task run; its output is in the ACP transcript view. Send again after the background run finishes.\n`
+    this.closeTurn(
+      { kind: 'stop', stopReason: wait.stopReason },
+      { line, keepAmbient: wait.hard === true },
+    )
+  }
+
+  /** Drop the ambient wait's clocks (the turn is being closed by someone else). */
+  private clearAmbientWait(): void {
+    const wait = this.awaitingAmbient
+    if (wait === undefined) return
+    this.awaitingAmbient = undefined
+    clearTimeout(wait.quietTimer)
+    clearTimeout(wait.hardTimer)
+  }
+
+  /**
+   * Withhold one background-drain update until the prompt response says what
+   * this turn is. The cursor advances past it anyway: it is already in the
+   * transcript, and replaying it into a later segment would emit it twice.
+   * Bounded (see `PENDING_AMBIENT_MAX_*`) — the transcript still keeps every
+   * entry the buffer drops.
+   */
+  private bufferAmbientUpdate(seq: number, update: Record<string, unknown>): void {
+    const chars = JSON.stringify(update).length
+    this.pendingAmbientUpdates.push({ seq, update, chars })
+    this.pendingAmbientChars += chars
+    while (this.pendingAmbientUpdates.length > PENDING_AMBIENT_MAX_ENTRIES
+      || (this.pendingAmbientChars > PENDING_AMBIENT_MAX_CHARS && this.pendingAmbientUpdates.length > 1)) {
+      const dropped = this.pendingAmbientUpdates.shift()
+      if (dropped === undefined) break
+      this.pendingAmbientChars -= dropped.chars
+      this.pendingAmbientTruncated = true
+    }
+  }
+
+  /** Fold the withheld drain updates into the now-ambient segment, once, in order. */
+  private flushPendingAmbient(seg: SegmentState): void {
+    if (this.pendingAmbientUpdates.length === 0) {
+      this.pendingAmbientTruncated = false
+      return
+    }
+    const truncated = this.pendingAmbientTruncated
+    this.pendingAmbientTruncated = false
+    const pending = this.pendingAmbientUpdates.splice(0, this.pendingAmbientUpdates.length)
+    this.pendingAmbientChars = 0
+    if (truncated && !seg.finished) {
+      // The front of the drain's output was evicted from the bounded buffer:
+      // say so rather than letting the turn quietly start mid-story.
+      this.emitProse(seg, 'text', '\n[dsh-ntr] background output was truncated; the ACP transcript view still has every update.\n')
+    }
+    for (const entry of pending) {
+      if (seg.finished) break
+      this.foldInto(seg, entry.update)
+    }
+  }
+
+  /** Drop withheld drain updates: this turn is not the drain, or it is closing. */
+  private clearPendingAmbient(): void {
+    this.pendingAmbientUpdates.length = 0
+    this.pendingAmbientChars = 0
+    this.pendingAmbientTruncated = false
+  }
+
   /** The agent settled its `session/prompt`. Ends the turn's streaming face. */
   settle(outcome: TurnSettle): void {
     if (this.settled) return
+    // `settled` is claimed NOW (a second settle, a cancel or a watchdog that
+    // races the tail drain must find the turn already spoken for), but the
+    // CLOSING work waits one macrotask: the SDK dispatches `session/update`
+    // notifications independently of the `session/prompt` RESPONSE, so the
+    // agent's last chunks can still be queued when this lands (see
+    // `settleTranscript`). Only what already reached the transcript is read —
+    // one macrotask, never an open-ended wait.
     this.settled = true
+    this.clearAmbientWait()
+    this.clearPendingAmbient()
+    this.pendingOutcome = outcome
+    this.closeScheduled = true
+    setImmediate(() => { this.flushScheduledClose() })
+  }
+
+  /**
+   * Force the local end of this turn — the cancel fallback and any watchdog
+   * that reached the controller. Runs the SAME closing work as a normal settle
+   * (`closeTurn`): the ambient clocks stop, the on-air segment closes (so the
+   * driver step parked on its queue ends), exactly one `turn/end` goes out
+   * with THIS turn's id, the session stops running and the prompt slot is
+   * released. Idempotent: a turn that already closed ignores the call.
+   */
+  forceFinalize(outcome: TurnSettle): void {
+    if (this.stale || this.closedTurn) return
+    this.clearAmbientWait()
+    // A settle's deferred tail read is moot once this close runs: the turn is
+    // over now, and the pending macrotask must not drain anything into it.
+    this.pendingOutcome = undefined
+    this.closeScheduled = false
+    this.closeTurn(outcome)
+  }
+
+  /**
+   * Run the deferred closing work now, when a driver step is about to open on
+   * an already settled turn: the continuation step must see the closed turn
+   * (and the session NOT left `running` across the macrotask boundary).
+   * Idempotent — the scheduled tick then finds nothing left to do.
+   */
+  private flushScheduledClose(): void {
+    if (!this.closeScheduled) return
+    this.closeScheduled = false
+    const outcome = this.pendingOutcome
+    this.pendingOutcome = undefined
+    if (outcome === undefined) return
+    // A DISPOSE that raced this queued close cleared it (see `dispose`), so a
+    // close still scheduled here belongs to a settle that landed AFTER the
+    // stream was retired (a crash rejects its prompt only after the teardown).
+    // That turn still ends through its own queue and real id — the teardown's
+    // releaseAll frame carried an empty id.
+    this.drainTail()
+    this.closeTurn(outcome)
+  }
+
+  /**
+   * Fold the notifications that reached the transcript but not the segment:
+   * the tail a response raced past. Stops AT a cutting event without consuming
+   * it (same rule as `startSegment`) — its next segment is not this turn's.
+   */
+  private drainTail(): void {
+    // The deferred read belongs to the turn that scheduled it. If the turn was
+    // retired or a NEWER turn already began (turnSeq moved on) in this one
+    // macrotask window, everything past the cursor is the successor's: folding
+    // it here would leak its text into this turn's driver step.
+    if (this.stale) return
+    const seg = this.segment
+    if (seg === undefined || seg.finished) return
+    for (const entry of this.session.transcript.since(this.cursorSeq)) {
+      if (seg.finished) break
+      const update = entry.update as Record<string, unknown>
+      // The same split the live path makes: a background drain's text in the
+      // tail is not this turn's answer. Record what the registry needs (tool
+      // outputs), move the cursor past it, and do NOT fold it — otherwise the
+      // deferred read smuggles the drain's prose into a normal turn.
+      if (this.isForeignAmbientText(update)) {
+        this.recordWithoutSegment(update)
+        this.cursorSeq = entry.seq
+        continue
+      }
+      if (!this.foldInto(seg, update)) break
+      this.cursorSeq = entry.seq
+    }
+  }
+
+  /**
+   * End the turn exactly once: burst metrics, ONE `turn/end`, the provisional
+   * lock, the closing text, the segment, the session flags, the prompt slot.
+   *
+   * `ambient.line` marks a controlled ambient ending: the given line closes
+   * the segment when the turn carried no answer text, instead of the generic
+   * zero-output warning (which would blame the agent for a turn the drain
+   * simply had not finished yet). `ambient.keepAmbient` says the ending was the
+   * CEILING, not silence: see the drain-record comment below.
+   */
+  private closeTurn(outcome: TurnSettle, ambient?: { line?: string; keepAmbient?: boolean }): void {
+    if (this.closedTurn) return
+    this.closedTurn = true
+    // A closed turn is a settled turn, whichever path got here first (an
+    // ambient ending does not go through `settle`).
+    this.settled = true
+    this.clearAmbientWait()
+    this.clearPendingAmbient()
     // A late answer to a SUPERSEDED turn still has to close this controller's
     // queue (a continuation step may be parked on it) and its settle gate —
     // but it must not touch the session the NEWER turn now owns, nor release
@@ -3108,6 +3736,24 @@ class TurnStreamController {
         ? { kind: 'error', failure: { message: outcome.message, code: outcome.code ?? 'INTERNAL' } }
         : { kind: 'stop' }
     if (current) {
+      // An ambient ending that came from SILENCE retires the drain record with
+      // its turn: a record that outlives the wait would make the NEXT instant
+      // answer with no conversation request id look steered (see
+      // `awaitAmbient`), holding a normal turn open for a drain this one
+      // already finished waiting on. A HARD ceiling ending is the opposite
+      // evidence — the drain was still ticking when the turn was cut — so the
+      // record SURVIVES (activity clock refreshed; `ambientStaleMs` expires it
+      // lazily) precisely so the next prompt folded into the same drain is
+      // still recognised as steered. `ambientNotices` is never cleared here:
+      // a repeated announcement of the same run must stay silent, and the set
+      // is bounded where entries are added.
+      if (ambient !== undefined) {
+        if (ambient.keepAmbient === true) {
+          if (this.session.ambient !== undefined) this.session.ambient.lastActivityAt = Date.now()
+        } else {
+          this.session.ambient = undefined
+        }
+      }
       // The turn's burst aggregate must be visible before the turn is marked
       // over: the final `turn/metrics` lands first, then `turn/end` flips the
       // session/pill state. Persisting and broadcasting share one value.
@@ -3121,14 +3767,24 @@ class TurnStreamController {
       }
       // The provisional lock settles BEFORE any synthesized warning below: the
       // warning is our text, not evidence that the first turn delivered anything.
+      //
+      // An AMBIENT ending ends the provisional phase WITHOUT a rollback: a
+      // deferral to a background drain is not a failed first turn, the drain's
+      // text still lands in the ACP transcript view, and rolling the lock back
+      // would close the session under it — dropping exactly the output the
+      // deferred turn promised. The lock therefore becomes permanent.
       if (this.session.provisionalLock === true) {
         this.session.provisionalLock = false
-        if (!this.sawVisibleBlock) this.rollbackFirstTurn(this.session)
+        if (!this.sawVisibleBlock && ambient === undefined) this.rollbackFirstTurn(this.session)
       }
     }
     const seg = this.segment
     if (seg !== undefined) {
-      if (current && outcome.kind === 'stop' && !this.sawVisibleBlock) {
+      if (ambient !== undefined) {
+        // The ambient line is OUR report, so it only appears when the drain
+        // delivered no answer text of its own; reasoning alone does not count.
+        if (ambient.line !== undefined && current) this.emitProse(seg, 'text', ambient.line)
+      } else if (current && outcome.kind === 'stop' && !this.sawVisibleBlock) {
         // The silent-failure report: a normal stop with nothing the chat
         // plane renders. Aborted or failing turns need no extra hint; this
         // is specifically "protocol says success, the bubble is empty".
@@ -3148,23 +3804,49 @@ class TurnStreamController {
     }
     this.endTurn()
     // The controller stays indexed only while a continuation step can still
-    // come for its cards. A cancelled, failed, or card-less turn has none:
-    // retire it now; the next turn's `rememberTurnStream` would anyway.
+    // come for its cards. A cancelled, failed, or card-less turn has none: retire
+    // it now; the next turn's `rememberTurnStream` would anyway. An ambient turn
+    // ALWAYS retires: its suppressed calls never open cards, so keeping the index
+    // would pin the controller (and its session id) to a turn nobody can continue.
     if (!current) this.retire()
-    else if (outcome.kind !== 'stop' || this.seenCalls.size === 0) this.dispose()
+    else if (ambient !== undefined || outcome.kind !== 'stop' || this.seenCalls.size === 0) this.dispose()
   }
 
-  /** Cancelled by the user: finish the on-air segment and release the turn's slots. */
+  /**
+   * Cancelled by the user: finish the on-air segment and release the turn's
+   * slots. An AMBIENT turn has already released the prompt slot (its response
+   * landed) and holds no segment the cancel fallback could close, so the
+   * cancel closes the turn itself with the cancelled stop.
+   */
   abortActiveSegment(): void {
     if (this.stale) return
+    this.clearPendingAmbient()
+    if (this.closeScheduled) {
+      // `settle` claimed the turn but queued its closing work for the next
+      // macrotask. An abort landing inside that window must not let the
+      // scheduled close broadcast the RESPONSE's stop reason while the segment
+      // already finished `aborted`: drop the queued outcome and close NOW with
+      // the cancelled one, so `turn/end` and the segment's finish agree.
+      this.closeScheduled = false
+      this.pendingOutcome = undefined
+      this.closeTurn({ kind: 'cancelled' })
+      return
+    }
+    if (this.awaitingAmbient !== undefined) {
+      this.settle({ kind: 'cancelled' })
+      return
+    }
     this.finishActive({ kind: 'aborted', failure: { message: 'aborted', code: 'ABORTED' } })
     // The agent may take its time acknowledging the cancel, but OUR face of
-    // the turn ends now: the session stops running and a provisional first
-    // lock settles against what was actually shown. The turn SLOT stays
-    // claimed, though: the agent-side prompt is still in flight, and a second
+    // the turn ends now: the session stops running, the HOST's prompt slot is
+    // released (so a new prompt may claim it), and a provisional first lock
+    // settles against what was actually shown. The AGENT-side gate (`settled`)
+    // stays claimed: the prompt is still in flight over there, and a second
     // prompt sent into that window would be a concurrent `session/prompt` the
-    // protocol forbids — `settle` (or the cancel fallback) releases the slot.
+    // protocol forbids — `claimTurn` waits it out, `settle` (or the cancel
+    // fallback) opens it.
     this.session.running = false
+    this.session.promptInFlight = false
     if (this.session.provisionalLock === true) {
       this.session.provisionalLock = false
       if (!this.sawVisibleBlock) this.rollbackFirstTurn(this.session)
@@ -3172,9 +3854,26 @@ class TurnStreamController {
     releaseAllToolOutputWaiters()
   }
 
-  /** Stop observing and release the manager's index. Idempotent. */
+  /**
+   * Stop observing and release the manager's index. Idempotent.
+   *
+   * The segment is CLOSED here (aborted) before unsubscribing: a driver step
+   * parked on its queue (`yield* segment.queue`) only ends when the queue
+   * closes, and a controller replaced by the conversation's next turn would
+   * otherwise leave that step hanging forever. An already finished segment is a
+   * no-op, and the session's flags are left alone — a superseded turn must not
+   * mark the newer turn's session idle.
+   */
   dispose(): void {
     if (this.disposed) return
+    // A settle may have queued its closing work for the next macrotask: this
+    // close owns the turn now, so that tick must not broadcast a second
+    // `turn/end` (with this turn's real id) over the teardown.
+    this.closeScheduled = false
+    this.pendingOutcome = undefined
+    this.finishActive({ kind: 'aborted', failure: { message: 'turn stream retired', code: 'RETIRED' } })
+    this.clearAmbientWait()
+    this.clearPendingAmbient()
     this.retire()
     releaseAllToolOutputWaiters()
   }
@@ -3247,12 +3946,37 @@ class TurnStreamController {
     if (row.sessionId !== undefined && row.sessionId !== this.session.sessionId) return
     if (row.type === 'session/update') {
       const typed = event as { sessionId: string; seq: number; update: unknown }
+      // Any update — a `usage_update` / phase tick included — says the
+      // background drain is still working, so the ambient quiet clock restarts.
+      this.noteAmbientActivity()
+      if (typed.seq <= this.cursorSeq) return
+      const update = typed.update as Record<string, unknown>
+      // A background drain's prose is not this turn's answer: keep it out of
+      // the plane (the transcript still has it). Fail-open — nothing is split
+      // until this turn has a request id of its own to compare against.
+      this.noteTurnRequestId(update)
+      if (this.isForeignAmbientText(update)) {
+        this.recordWithoutSegment(update)
+        this.cursorSeq = typed.seq
+        return
+      }
+      // The turn's OWN request id is still unknown and this update belongs to
+      // the background drain: folding it now could make the drain's tick teach
+      // `noteTurnRequestId` the drain's id, mixing the drain's text into the
+      // user's answer. Withhold it until the prompt response decides what this
+      // turn is (see `pendingAmbientUpdates`); the cursor moves on because the
+      // transcript already holds the entry.
+      if (this.turnRequestId === undefined
+        && this.awaitingAmbient === undefined
+        && this.isAmbientOwned(update)) {
+        this.bufferAmbientUpdate(typed.seq, update)
+        this.cursorSeq = typed.seq
+        return
+      }
       // Live-only burst accounting runs BEFORE the segment cursor: prose that
       // arrives between segments still belongs to this turn's output, and its
       // gaps are real. Replay never reaches this path.
       this.trackTps(typed)
-      if (typed.seq <= this.cursorSeq) return
-      const update = typed.update as Record<string, unknown>
       const seg = this.segment
       if (seg === undefined || seg.finished) {
         // Between segments: tool outputs still reach the shared registry (the
@@ -3370,6 +4094,47 @@ class TurnStreamController {
     recordAcpToolOutput(callId, updateContentToText(update.content))
   }
 
+  /** Whether this update belongs to the session's announced background drain. */
+  private isAmbientOwned(update: Record<string, unknown>): boolean {
+    const ambient = this.session.ambient
+    if (ambient === undefined) return false
+    const requestId = codebuddyMetaOf(update)?.requestId
+    return requestId !== undefined && requestId === ambient.requestId
+  }
+
+  /** Learn this turn's own CodeBuddy request id from the first update naming one. */
+  private noteTurnRequestId(update: Record<string, unknown>): void {
+    if (this.turnRequestId !== undefined) return
+    const requestId = codebuddyMetaOf(update)?.requestId
+    // A background drain's update names THE DRAIN, never this turn: adopting it
+    // would make `isForeignAmbientText` pass the drain's own text through.
+    if (requestId === undefined || requestId === this.session.ambient?.requestId) return
+    this.turnRequestId = requestId
+  }
+
+  /** Adopt the request id the prompt RESPONSE declared for this turn. */
+  adoptTurnRequestId(requestId: string): void {
+    this.turnRequestId = requestId
+    // A normal turn: whatever the drain streamed while the id was unknown was
+    // never this turn's answer. Drop it (the transcript keeps it) — it must not
+    // surface when a later segment replays or when the turn flushes anything.
+    this.clearPendingAmbient()
+  }
+
+  /**
+   * Prose of the session's background drain while this turn runs on its OWN
+   * request id: it belongs to the background run, not to the user's answer.
+   * Fail-open by design — an unknown turn id splits nothing, and a turn that
+   * was itself folded into the drain keeps its prose.
+   */
+  private isForeignAmbientText(update: Record<string, unknown>): boolean {
+    if (this.turnRequestId === undefined) return false
+    const requestId = codebuddyMetaOf(update)?.requestId
+    if (requestId === undefined || requestId === this.turnRequestId) return false
+    const ambient = this.session.ambient
+    return ambient !== undefined && requestId === ambient.requestId
+  }
+
   /**
    * The turn's whole fold, shared by live events and segment replay. Visible
    * non-tool events END a card-bearing segment instead of joining it — that is
@@ -3387,10 +4152,23 @@ class TurnStreamController {
         return false
       }
       seg.outputChars += text.length
+      // "The turn's own answer", as opposed to a background drain's prose that
+      // happens to stream through the same session (see `isForeignAmbientText`).
+      if (!this.isAmbientOwned(update)) this.sawAgentProse = true
+      if (kind === 'agent_message_chunk') this.sawVisibleText = true
       this.emitProse(seg, kind === 'agent_thought_chunk' ? 'reasoning' : 'text', text)
       return true
     } else if (kind === 'tool_call' || kind === 'tool_call_update') {
       this.noteToolRecord(update)
+      if (seg.ambient || this.isAmbientOwned(update)) {
+        // A background drain's tools stay in the transcript: opening a card
+        // would make the host execute a tool and propose a continuation step
+        // for a turn whose answer has not started yet. The ownership check
+        // covers a NORMAL turn too — its own segment is not ambient, but a
+        // drain can stream a tool call on the same session while it runs, and
+        // that call is not this turn's work.
+        return true
+      }
       const snapshot = acpToolCallFromUpdate(update)
       if (snapshot === undefined) return true
       if (seg.activeType === 'tool-call' && seg.activeToolCall?.callId === snapshot.callId) {
@@ -3633,6 +4411,19 @@ export class BridgeManager {
   /** The segmented turn a continuation step of one chat session must resume. */
   turnStreamFor(dshSessionId: string): TurnStreamController | undefined {
     return this.turnStreams.get(dshSessionId)
+  }
+
+  /**
+   * The ambient windows a turn's controller reads once at construction (see
+   * {@link BridgeTuning.ambientQuietMs}). Exposed as a plain snapshot so the
+   * controller never pokes at the manager's tuning object, and tests can tune
+   * the cadence through the constructor like every other window.
+   */
+  get ambientTuning(): { quietMs: number; maxMs: number } {
+    return {
+      quietMs: this.tuning.ambientQuietMs,
+      maxMs: this.tuning.ambientMaxMs,
+    }
   }
 
   /** Index a turn's controller, retiring whatever turn it supersedes. */
@@ -5865,7 +6656,20 @@ export class BridgeManager {
       located = await this.locateOrResume(sessionId)
     }
     const { bridge, session } = located
-    if (session.running) throw new AcpError('turn_in_flight', 'acp: this session already has a prompt in flight')
+    // The agent prompt slot is SHARED with chat turns: `running` alone misses
+    // a chat turn whose cancellation already released it (`running` false,
+    // `promptInFlight` still naming the agent-side turn), and a live chat
+    // controller means a continuation step may resume the SAME agent turn.
+    // A controller that already SETTLED (kept only so its card's continuation
+    // can still stream) has given the agent slot back: `/acp` may use it, and
+    // advancing `turnSeq` retires it — the behaviour the stale-controller
+    // watchdog case pins.
+    const chatController = session.turnController
+    if (session.running
+      || session.promptInFlight === true
+      || (chatController !== undefined && !chatController.stale && !chatController.hasSettled)) {
+      throw new AcpError('turn_in_flight', 'acp: this session already has a prompt in flight')
+    }
 
     const blocks: ContentBlock[] = typeof prompt === 'string'
       ? [{ type: 'text', text: prompt }]
@@ -5880,6 +6684,12 @@ export class BridgeManager {
       throw new AcpError('image_unsupported', `acp: agent "${bridge.def.id}" does not support image input`)
     }
 
+    // Claim the SAME slot the chat path claims (`claimTurn` + `beginTurn`): an
+    // `/acp` turn in flight must make the next chat prompt wait, and vice
+    // versa. The settler is idempotent and identity-guarded; the turn still
+    // ends through `turn/end` below, so chat and RPC turns share one gate
+    // without sharing a stream controller.
+    const endTurn = bridge.beginTurn(session)
     session.running = true
     session.turnSeq += 1
     const turnGen = session.turnSeq
@@ -5894,8 +6704,8 @@ export class BridgeManager {
       ? prompt
       : blocks.filter(b => b.type === 'text').map(b => (b as { text: string }).text).join('\n')
     this.hub.broadcast({ type: 'turn/start', sessionId, turnId, text: promptText })
-    void bridge.runPrompt(session, blocks, turnId)
-      .then(stopReason => {
+    void bridge.runPrompt(session, blocks, turnId, turnGen)
+      .then(result => {
         // The reclaim already ended this turn locally; the answer it caused is
         // that same turn reporting back, not a second turn end for the caller.
         if (session.reclaimedTurnSeq === turnGen) {
@@ -5905,8 +6715,11 @@ export class BridgeManager {
         // A superseded turn's late answer must not end the turn now on air.
         if (session.turnSeq !== turnGen) return
         this.clearOrphanPrompt(session, turnGen)
+        // Release the shared slot BEFORE the terminal frame: a listener that
+        // sends the next prompt on `turn/end` must not read a stale claim.
+        endTurn()
         session.running = false
-        this.hub.broadcast({ type: 'turn/end', sessionId, turnId, stopReason })
+        this.hub.broadcast({ type: 'turn/end', sessionId, turnId, stopReason: result.stopReason })
       })
       .catch((error: unknown) => {
         if (session.reclaimedTurnSeq === turnGen) {
@@ -5923,6 +6736,7 @@ export class BridgeManager {
           return
         }
         this.clearOrphanPrompt(session, turnGen)
+        endTurn()
         session.running = false
         this.hub.broadcast({
           type: 'turn/end',
@@ -5931,6 +6745,9 @@ export class BridgeManager {
           error: describeError(error),
         })
       })
+      // Every outcome — normal answer, failure, reclaim early-return, or a
+      // close's rejection — releases the shared prompt slot exactly once.
+      .finally(() => { endTurn() })
     return { turnId }
   }
 
@@ -6738,10 +7555,11 @@ export class BridgeManager {
     // the AGENT's slot until it acknowledges the cancel (see `claimTurn`).
     const claim = await bridge.claimTurn(session)
     if (!claim.ok) {
-      // A first turn that never got the prompt slot delivered nothing either:
-      // give the conversation back instead of leaving it locked to an agent
-      // that refused the only message it was asked to serve.
-      if (session.provisionalLock === true) this.rollbackFirstTurn(session)
+      // Never roll the provisional lock back here: a failed claim means ANOTHER
+      // prompt holds the slot (or the agent has not settled it), and that turn
+      // owns the conversation's lock. Closing the session would kill a turn
+      // that is actively streaming — the refusal already tells the user to
+      // retry.
       yield {
         type: 'finish',
         reason: {
@@ -6883,8 +7701,8 @@ export class BridgeManager {
         ? selection.content as ContentBlock[]
         : [{ type: 'text', text: promptText }]
 
-      bridge.runPrompt(session, promptBlocks, turnId)
-        .then(stopReason => {
+      bridge.runPrompt(session, promptBlocks, turnId, turnGen)
+        .then(result => {
           // The reclaim already ended this turn locally, and the close it
           // performed rejected this very request: the late answer is that same
           // turn, not a second one to broadcast.
@@ -6892,9 +7710,40 @@ export class BridgeManager {
             session.reclaimedTurnSeq = undefined
             return
           }
-          controller.settle(stopReason === 'cancelled'
+          const responseMeta = codebuddyMetaOf({ _meta: result.meta })
+          if (responseMeta?.conversationRequestId !== undefined) {
+            // The response names the conversation turn it queued: an instant
+            // answer that still carries one is a real (if silent) turn, and its
+            // prose can be told apart from a background drain's.
+            controller.adoptTurnRequestId(responseMeta.conversationRequestId)
+          }
+          // An announced drain that has shown NO sign of life for the staleness
+          // window is over, even though nothing said so (CodeBuddy never sends
+          // `session_end`). Keeping the record would make a later instant answer
+          // with no conversation request id look steered, and hold a normal turn
+          // open against a drain that is never coming back. Forget it (the
+          // notice de-dupe set with it) so this response settles normally.
+          if (session.ambient !== undefined
+            && Date.now() - session.ambient.lastActivityAt > this.tuning.ambientStaleMs) {
+            session.ambient = undefined
+            session.ambientNotices?.clear()
+          }
+          // An instant answer with NO conversation request id, while the agent
+          // announced a background drain this turn has not spoken into: the
+          // prompt was folded into that drain (CodeBuddy's multitask). The
+          // response is a formality — keep the turn open until the drain speaks.
+          if (session.ambient !== undefined
+            && !session.released
+            && !session.closed
+            && result.stopReason !== 'cancelled'
+            && responseMeta?.conversationRequestId === undefined
+            && !controller.hasAgentProse) {
+            controller.awaitAmbient(session.ambient.requestId, result.stopReason)
+            return
+          }
+          controller.settle(result.stopReason === 'cancelled'
             ? { kind: 'cancelled' }
-            : { kind: 'stop', stopReason })
+            : { kind: 'stop', stopReason: result.stopReason })
         })
         .catch((err: unknown) => {
           if (session.reclaimedTurnSeq === turnGen) {

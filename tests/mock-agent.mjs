@@ -30,6 +30,43 @@
  *              whether the SAME agent process served two turns (a restart /
  *              reclaim shows a different pid). Opt-in on purpose: every other
  *              prompt keeps the byte-exact echo the existing tests assert.
+ *  - "STEER" → the codebuddy 2.179.0 multitask shape: a background drain
+ *              announces itself with `_meta["codebuddy.ai/unsolicitedTurn"]`,
+ *              the prompt is answered at once (`end_turn`, NO
+ *              `codebuddy.ai/conversationRequestId` on the response) and the
+ *              actual answer streams afterwards under the drain's request id.
+ *              No `session_end` is ever sent (the client's schema rejects it),
+ *              so silence is the only "done" signal.
+ *  - "STEERTOOL" (with STEER) → the same shape, but the drain only runs a tool
+ *              (no thought, no answer text)
+ *  - "STEERHARD" → a drain that outlives the client's ambient ceiling: it
+ *              announces itself, the prompt is answered instantly, and NO
+ *              update follows before the ceiling fires
+ *  - "HARDTAIL" → the same drain (`amb-hard`) takes this prompt: instant
+ *              answer, then (after 60ms) a re-announcement and
+ *              `HARD-TAIL-TEXT`, proving the drain record survived the ceiling
+ *  - "STALE_LATE" → a stale-cancel `cancelled` answer that arrives late
+ *              (450ms), after the client may have moved on to a successor turn
+ *  - "TAIL" → sends the final chunks and returns `end_turn` without waiting
+ *              for their dispatch: the response/tail race the client's settle
+ *              has to drain before judging an empty turn
+ *  - "GAP" → the drain ticks (`usage_update` / `session_info_update`) every
+ *              150ms for ~600ms after the instant response, then sends its
+ *              text: proves the quiet window survives real model-call gaps
+ *  - "EARLY" → the drain announces itself and streams `DRAIN-EARLY` BEFORE the
+ *              prompt response (while the client cannot yet know which request
+ *              id belongs to the user's turn), then answers normally WITH
+ *              `_meta["codebuddy.ai/conversationRequestId"]` and streams
+ *              `REAL-ANSWER`; a drain-owned tool call follows the own-id text
+ *              so a normal turn must not open a card for it
+ *  - "EARLY-STEER" (with EARLY) → same early `DRAIN-EARLY`, but the response
+ *              carries NO conversation request id and the drain keeps talking
+ *  - "FLOOD" → a background drain that announces itself and streams more
+ *              indexed text updates than the client's bounded withhold buffer
+ *              holds before the prompt response decides what the turn is; the
+ *              response has no conversation request id, so the prompt is
+ *              folded into it (and the kept tail can be told from the evicted
+ *              front)
  *
  * Environment knobs:
  *  - MOCK_NO_LOAD=1 → `initialize` advertises no `loadSession` capability
@@ -45,6 +82,9 @@
  *  - MOCK_FORK_LOG=<path> → every `session/fork` request's params are appended
  *              there as one JSON line, so a test can count the requests the
  *              agent actually received and compare their wire shape
+ *  - MOCK_PROMPT_LOG=<path> → every `session/prompt`'s text is appended there
+ *              as one line, so a test can prove a rejected prompt never reached
+ *              the agent
  *
  * Stale-cancel window: for 300ms after a `session/cancel` the NEXT prompt is
  * answered `cancelled` without generating a turn (the codebuddy 2.161.4
@@ -284,6 +324,8 @@ const app = agent({ name: 'mock-acp-agent' })
       .filter(part => part.type === 'text')
       .map(part => part.text)
       .join(' ')
+    const promptLog = process.env.MOCK_PROMPT_LOG
+    if (promptLog !== undefined) appendFileSync(promptLog, `${text}\n`)
     const send = update => ctx.client.notify(methods.client.session.update, { sessionId, update })
     let permissionAnswer = 'none'
 
@@ -311,6 +353,231 @@ const app = agent({ name: 'mock-acp-agent' })
 
     if (text.includes('FAIL')) {
       throw new Error('mock prompt failure')
+    }
+
+    if (text.includes('STALE_LATE')) {
+      // The stale-cancel answer arrives LATE: a swallowed prompt's `cancelled`
+      // response lands after the client may already have moved on to a
+      // successor turn. The client must not resend it into that successor.
+      await sleep(450)
+      return { stopReason: 'cancelled' }
+    }
+
+    if (text.includes('GAP')) {
+      // A drain that spends ~600ms inside a real model hand-off, ticking every
+      // 150ms: the client's quiet window must be measured in the agent's own
+      // cadence, not in chat-app milliseconds.
+      const requestId = 'amb-gap'
+      const drainSend = update => ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: { ...update, _meta: { 'codebuddy.ai/requestId': requestId } },
+      })
+      await ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: {
+          sessionUpdate: 'session_info_update',
+          _meta: { 'codebuddy.ai/unsolicitedTurn': { requestId, reason: 'background_drain' } },
+        },
+      })
+      await sleep(25)
+      setTimeout(() => {
+        void (async () => {
+          for (let i = 0; i < 4; i += 1) {
+            await sleep(150)
+            await drainSend(i % 2 === 0
+              ? { sessionUpdate: 'usage_update', used: 10 + i, size: 1000 }
+              : { sessionUpdate: 'session_info_update' })
+          }
+          await drainSend({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'GAP-TEXT' } })
+        })()
+      }, 20)
+      return { stopReason: 'end_turn' }
+    }
+
+    if (text.includes('FLOOD')) {
+      // More drain updates than the client's bounded withhold buffer holds.
+      // They stream BEFORE the prompt response, while the client cannot know
+      // yet whether this prompt is its own turn or a steer; the response then
+      // says "steer" (no conversation request id), so the buffer is flushed —
+      // and its dropped front must be reported, never silently lost. Each
+      // update carries its index so a test can prove the buffer kept the TAIL.
+      const requestId = 'amb-flood'
+      const drainSend = update => ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: { ...update, _meta: { 'codebuddy.ai/requestId': requestId } },
+      })
+      await ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: {
+          sessionUpdate: 'session_info_update',
+          _meta: { 'codebuddy.ai/unsolicitedTurn': { requestId, reason: 'background_drain' } },
+        },
+      })
+      await sleep(25)
+      for (let i = 0; i < 220; i += 1) {
+        await drainSend({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `FLOOD-${String(i).padStart(3, '0')} ` },
+        })
+      }
+      // Dispatch time, not a timing bet: the notifications must be in the
+      // client's hands before the response is judged.
+      await sleep(50)
+      return { stopReason: 'end_turn' }
+    }
+
+    if (text.includes('EARLY')) {
+      // The drain speaks BEFORE the prompt response is judged. The client has
+      // no own request id yet, so the drain's text must be withheld until the
+      // response says whether this prompt was its own turn or a steer.
+      const drainId = 'amb-early'
+      const conversationId = 'conv-early'
+      const drainSend = update => ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: { ...update, _meta: { 'codebuddy.ai/requestId': drainId } },
+      })
+      const ownSend = update => ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: { ...update, _meta: { 'codebuddy.ai/requestId': conversationId } },
+      })
+      await ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: {
+          sessionUpdate: 'session_info_update',
+          _meta: { 'codebuddy.ai/unsolicitedTurn': { requestId: drainId, reason: 'background_drain' } },
+        },
+      })
+      await sleep(25)
+      await drainSend({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'DRAIN-EARLY ' } })
+      // Give the client time to fold it while the turn's own id is unknown.
+      await sleep(30)
+      if (text.includes('STEER')) {
+        // Steered: the response has NO conversation id, so the withheld drain
+        // text must be flushed into this turn; the drain keeps talking.
+        setTimeout(() => {
+          void (async () => {
+            await drainSend({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'AFTER-EARLY ' } })
+            await drainSend({ sessionUpdate: 'tool_call', toolCallId: 'amb_early_tool', title: 'early drain tool', kind: 'other', status: 'in_progress' })
+            await drainSend({
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'amb_early_tool',
+              status: 'completed',
+              content: [{ type: 'content', content: { type: 'text', text: 'EARLY TOOL OUTPUT' } }],
+            })
+          })()
+        }, 20)
+        return { stopReason: 'end_turn' }
+      }
+      // A normal turn: its own text names the conversation turn id first, then
+      // a drain-owned tool call arrives (which must stay transcript-only), and
+      // the response confirms the conversation id.
+      await ownSend({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'REAL-ANSWER ' } })
+      await drainSend({ sessionUpdate: 'tool_call', toolCallId: 'drain_early_tool', title: 'drain tool during a normal turn', kind: 'other', status: 'in_progress' })
+      await drainSend({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'drain_early_tool',
+        status: 'completed',
+        content: [{ type: 'content', content: { type: 'text', text: 'DRAIN EARLY TOOL OUTPUT' } }],
+      })
+      await ownSend({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'REAL-TAIL' } })
+      await sleep(20)
+      return { stopReason: 'end_turn', _meta: { 'codebuddy.ai/conversationRequestId': conversationId } }
+    }
+
+    if (text.includes('STEERHARD')) {
+      // A drain that OUTLIVES the client's ambient ceiling: it announces
+      // itself and the prompt is answered instantly, but no update follows
+      // before the ceiling fires. The client must keep the drain record — the
+      // HARDTAIL prompt below is folded into the SAME run.
+      const requestId = 'amb-hard'
+      await ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: {
+          sessionUpdate: 'session_info_update',
+          _meta: { 'codebuddy.ai/unsolicitedTurn': { requestId, reason: 'background_drain' } },
+        },
+      })
+      await sleep(25)
+      return { stopReason: 'end_turn' }
+    }
+
+    if (text.includes('HARDTAIL')) {
+      // The same drain (`amb-hard`) takes this prompt: instant answer, no
+      // conversation id, then its text lands a beat later — after the instant
+      // response, before the next ceiling. It re-announces itself first so a
+      // test can prove one run is announced once (the notice de-dupe set must
+      // survive the hard close).
+      const requestId = 'amb-hard'
+      const drainSend = update => ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: { ...update, _meta: { 'codebuddy.ai/requestId': requestId } },
+      })
+      setTimeout(() => {
+        void (async () => {
+          await ctx.client.notify(methods.client.session.update, {
+            sessionId,
+            update: {
+              sessionUpdate: 'session_info_update',
+              _meta: { 'codebuddy.ai/unsolicitedTurn': { requestId, reason: 'background_drain' } },
+            },
+          })
+          await drainSend({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'HARD-TAIL-TEXT ' } })
+        })()
+      }, 60)
+      return { stopReason: 'end_turn' }
+    }
+
+    if (text.includes('STEER')) {
+      // The background-drain shape: an unsolicited turn announces itself, the
+      // prompt is folded into it and answered at once, and the real content
+      // streams afterwards under the drain's request id.
+      const requestId = 'amb-1'
+      const drainSend = update => ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: { ...update, _meta: { 'codebuddy.ai/requestId': requestId } },
+      })
+      await ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: {
+          sessionUpdate: 'session_info_update',
+          _meta: { 'codebuddy.ai/unsolicitedTurn': { requestId, reason: 'background_drain' } },
+        },
+      })
+      // The announcement must be in the client's hands BEFORE its response is
+      // judged, or an instant `end_turn` reads as an ordinary silent turn.
+      // 25ms is dispatch time, not a timing bet: the response is next.
+      await sleep(25)
+      setTimeout(() => {
+        void (async () => {
+          if (!text.includes('STEERTOOL')) {
+            await drainSend({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'AMBIENT-THOUGHT ' } })
+            await drainSend({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'AMBIENT-' } })
+            await drainSend({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'TEXT ' } })
+          }
+          await drainSend({ sessionUpdate: 'tool_call', toolCallId: 'amb_tool', title: 'background tool', kind: 'other', status: 'in_progress' })
+          await drainSend({
+            sessionUpdate: 'tool_call_update',
+            toolCallId: 'amb_tool',
+            status: 'completed',
+            content: [{ type: 'content', content: { type: 'text', text: 'AMBIENT TOOL OUTPUT' } }],
+          })
+          if (!text.includes('STEERTOOL')) {
+            await drainSend({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'TAIL-TEXT' } })
+          }
+        })()
+      }, 20)
+      // No `codebuddy.ai/conversationRequestId`: the turn was merged into the
+      // running drain, which is exactly what the client has to detect.
+      return { stopReason: 'end_turn' }
+    }
+
+    if (text.includes('TAIL')) {
+      // The tail race: the chunks are written but NOT awaited, then the answer
+      // returns immediately — the client's notification dispatch may not have
+      // folded them yet when the response lands.
+      void send({ sessionUpdate: 'agent_message_chunk', messageId: 'tail', content: { type: 'text', text: 'TAIL-' } })
+      void send({ sessionUpdate: 'agent_message_chunk', messageId: 'tail', content: { type: 'text', text: 'CHUNK' } })
+      return { stopReason: 'end_turn' }
     }
 
     if (text.includes('EMPTY')) {
