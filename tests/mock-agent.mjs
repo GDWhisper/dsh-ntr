@@ -23,6 +23,9 @@
  *              `in_progress`, then NEVER finishes: the parallel-call shape (a
  *              finished call must not close the tool window while its sibling
  *              is still running)
+ *  - "PACED" → a 1.2s tool wait followed by two answer chunks 100ms apart, so a
+ *              test can prove the burst rate excludes tool waits but counts the
+ *              within-answer gap
  *  - "PIDTAG" → appends `PID:<process.pid>` to the echo, so a test can tell
  *              whether the SAME agent process served two turns (a restart /
  *              reclaim shows a different pid). Opt-in on purpose: every other
@@ -459,7 +462,10 @@ const app = agent({ name: 'mock-acp-agent' })
       status: 'completed',
       content: [{ type: 'content', content: { type: 'text', text: 'tool result line' } }],
     })
+    const paced = text.includes('PACED')
+    if (paced) await sleep(1200)
     await send({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'MOCK:' } })
+    if (paced) await sleep(100)
     // Opt-in process token: `REPLAYED` proves a `session/load`, but it is
     // emitted by ANY child, so it cannot prove the process changed. The pid can.
     const pidTag = text.includes('PIDTAG') ? ` PID:${String(process.pid)}` : ''

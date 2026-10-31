@@ -458,6 +458,18 @@ export type AcpEvent =
    */
   | { type: 'permission/synced'; requestIds: string[] }
   | { type: 'turn/start'; sessionId: string; turnId: string; text: string }
+  | {
+      type: 'turn/metrics'
+      /** ACP session id (the store keys live burst state by it). */
+      sessionId: string
+      /** DSH chat session id (routing/context only). */
+      dshSessionId: string
+      turnId: string
+      /** Session aggregate INCLUDING the current turn when measurable. */
+      outputTokens: number
+      burstMs: number
+      final: boolean
+    }
   | { type: 'turn/end'; sessionId: string; turnId: string; stopReason?: string; error?: string }
   /**
    * A DSH chat conversation was locked to its agent at the start of its first
@@ -481,6 +493,14 @@ export interface PermissionOptionView {
 
 export type PermissionOutcome = { outcome: 'selected'; optionId: string } | { outcome: 'cancelled' }
 
+/** Plugin-side measurable burst aggregate for one ACP session (not host turn timings). */
+export interface SessionBurst {
+  /** Sum of estimated output tokens over measurable turns. */
+  outputTokens: number
+  /** Sum of within-burst chunk gaps over those turns; tool/approval/long pauses excluded. */
+  burstMs: number
+}
+
 /** Derived session snapshot for replay/reconnect (source of truth stays in the transcript). */
 export interface SessionView {
   sessionId: string
@@ -494,6 +514,8 @@ export interface SessionView {
   availableCommands?: Array<{ name: string; description?: string; [key: string]: unknown }>
   plan?: unknown[]
   usage?: { used: number; size: number; cost?: { amount: number; currency: string } }
+  /** Measurable burst aggregate over this session's turns; absent until measured. */
+  burst?: SessionBurst
   running: boolean
   closed: boolean
   /**
@@ -569,6 +591,8 @@ export interface ChatSessionView {
    * browser live-patches this row from the update frames (see AGENTS/ui.md).
    */
   usage?: SessionView['usage']
+  /** Measurable burst aggregate over this session's turns; absent until measured. */
+  burst?: SessionView['burst']
   /** The agent process died; the session awaits a `session/load` resume. */
   released?: boolean
   /** The agent is running a turn on this session right now. */

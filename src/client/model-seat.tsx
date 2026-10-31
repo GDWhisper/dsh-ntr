@@ -128,7 +128,11 @@ export const MAX_SEAT_CLAIMS = 4
 /** One live entry in the cell, narrowed to what the claim reads. */
 export interface SeatEntry {
   component?: unknown
-  options?: { priority?: number; registrant?: string }
+  options?: { priority?: number; registrant?: string; id?: string; order?: number }
+  /** Entry-owned inject face; needed when the claim reuses a shipped occupant. */
+  inject?: (...args: unknown[]) => unknown
+  /** Locale namespace the occupant's `t` is bound to; needed for the same reuse. */
+  locale?: string
 }
 
 /** The slot-registry face this module uses (structural: the registry is not a dependency of this bundle). */
@@ -148,6 +152,12 @@ export interface SeatSlots {
  */
 export interface SeatRegisterOptions {
   name: string
+  /** List-slot cell to shadow; omitted for single/keyed registers. */
+  id?: string
+  /** Display position within the list; only meaningful with `id`. */
+  order?: number
+  /** Locale namespace the occupant's `t` is bound to. */
+  locale?: string
   priority?: number
   /**
    * The session-scoped face factory the renderer calls with the scope binding's
@@ -227,6 +237,15 @@ export interface PermissionSeatClaimOptions {
 export interface SeatClaimOptions {
   slots: SeatSlots
   slotKey: string
+  /**
+   * List-slot cell id to hold. Omitted for single/keyed seats; a list slot
+   * needs it because its winner view is one entry PER id, not one per slot.
+   */
+  entryId?: string
+  /** Display order for the installed list entry (same cell, so usually the shipped order). */
+  order?: number
+  /** Locale namespace the installed occupant resolves `t` against. */
+  locale?: string
   basePriority: number
   occupant(): unknown
   inject?(sessionId: unknown, actions?: unknown): unknown
@@ -265,7 +284,7 @@ interface CellView {
  * `entriesOfSlot` and performing bounded retakes if displaced by later registrations.
  */
 export function createSeatClaim(options: SeatClaimOptions): ModelSeatClaim {
-  const { slots, slotKey, basePriority, occupant, inject } = options
+  const { slots, slotKey, basePriority, occupant, inject, entryId } = options
   const label = options.label ?? slotKey
   const onDiag = options.onDiag
   const maxClaims = options.maxClaims ?? MAX_SEAT_CLAIMS
@@ -293,7 +312,10 @@ export function createSeatClaim(options: SeatClaimOptions): ModelSeatClaim {
     if (typeof slots.entriesOfSlot !== 'function') return { declared: isDeclared, verified: false }
     try {
       const heads = slots.entriesOfSlot(slotKey) ?? []
-      return { declared: isDeclared, verified: true, ...heads[0] === undefined ? {} : { entry: heads[0] } }
+      // A list slot projects one winner per id, so the cell this claim owns is
+      // the head WITH that id — not heads[0], which may be a sibling cell.
+      const entry = entryId === undefined ? heads[0] : heads.find(head => head.options?.id === entryId)
+      return { declared: isDeclared, verified: true, ...entry === undefined ? {} : { entry } }
     } catch {
       return { declared: isDeclared, verified: false }
     }
@@ -312,6 +334,9 @@ export function createSeatClaim(options: SeatClaimOptions): ModelSeatClaim {
     try {
       installed.push(slots.inject(slotKey, () => slots.register({
         name: slotKey,
+        ...(entryId === undefined ? {} : { id: entryId }),
+        ...(options.order === undefined ? {} : { order: options.order }),
+        ...(options.locale === undefined ? {} : { locale: options.locale }),
         priority: rank,
         ...(inject ? { inject } : {}),
       }, component)))

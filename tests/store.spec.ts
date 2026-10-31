@@ -1745,6 +1745,68 @@ describe('AcpStore event application (released / reset / turn dedup)', () => {
     expect(store.getSnapshot().blocks).toHaveLength(3)
   })
 
+  it('records a live turn/metrics frame in burstStats and notifies subscribers', async () => {
+    const { store, apply } = await makeStore()
+    let notified = 0
+    store.subscribe(() => { notified++ })
+
+    await apply({ type: 'turn/metrics', sessionId: 's1', dshSessionId: 'chat-1', turnId: 't1', outputTokens: 120, burstMs: 900, final: false })
+
+    expect(notified).toBe(1)
+    expect(store.getSnapshot().burstStats.s1).toEqual({ outputTokens: 120, burstMs: 900, turnId: 't1', final: false })
+  })
+
+  it('ignores a late live turn/metrics frame for a turn already finalized', async () => {
+    const { store, apply } = await makeStore()
+    await apply({ type: 'turn/metrics', sessionId: 's1', dshSessionId: 'chat-1', turnId: 't1', outputTokens: 200, burstMs: 1500, final: true })
+    let notified = 0
+    store.subscribe(() => { notified++ })
+
+    // A stream reconnect can deliver the earlier live frame after the final
+    // one; it must not regress the finalized aggregate.
+    await apply({ type: 'turn/metrics', sessionId: 's1', dshSessionId: 'chat-1', turnId: 't1', outputTokens: 150, burstMs: 1200, final: false })
+
+    expect(notified).toBe(0)
+    expect(store.getSnapshot().burstStats.s1).toEqual({ outputTokens: 200, burstMs: 1500, turnId: 't1', final: true })
+  })
+
+  it('accepts a live frame from a new turn after the previous one finalized', async () => {
+    const { store, apply } = await makeStore()
+    await apply({ type: 'turn/metrics', sessionId: 's1', dshSessionId: 'chat-1', turnId: 't1', outputTokens: 200, burstMs: 1500, final: true })
+
+    await apply({ type: 'turn/metrics', sessionId: 's1', dshSessionId: 'chat-1', turnId: 't2', outputTokens: 250, burstMs: 1800, final: false })
+
+    expect(store.getSnapshot().burstStats.s1).toEqual({ outputTokens: 250, burstMs: 1800, turnId: 't2', final: false })
+  })
+
+  it('drops only the closing session burstStats entry on session/closed', async () => {
+    const { store, apply } = await makeStore()
+    await apply({ type: 'session/created', sessionId: 's1', session: view() })
+    await apply({ type: 'turn/metrics', sessionId: 's1', dshSessionId: 'chat-1', turnId: 't1', outputTokens: 10, burstMs: 50, final: true })
+    await apply({ type: 'turn/metrics', sessionId: 's2', dshSessionId: 'chat-2', turnId: 't9', outputTokens: 20, burstMs: 60, final: true })
+
+    await apply({ type: 'session/closed', sessionId: 's1', reason: 'closed' })
+
+    const state = store.getSnapshot()
+    expect(state.burstStats.s1).toBeUndefined()
+    expect(state.burstStats.s2).toEqual({ outputTokens: 20, burstMs: 60, turnId: 't9', final: true })
+  })
+
+  it('leaves blocks and sessions untouched on turn/metrics', async () => {
+    const { store, apply } = await makeStore()
+    await apply({ type: 'session/created', sessionId: 's1', session: view() })
+    await apply({ type: 'turn/start', sessionId: 's1', turnId: 't1', text: 'hi' })
+    const blocksBefore = store.getSnapshot().blocks
+    const sessionsBefore = store.getSnapshot().sessions
+
+    await apply({ type: 'turn/metrics', sessionId: 's1', dshSessionId: 'chat-1', turnId: 't1', outputTokens: 5, burstMs: 40, final: false })
+
+    const state = store.getSnapshot()
+    expect(state.blocks).toBe(blocksBefore)
+    expect(state.sessions).toBe(sessionsBefore)
+    expect(state.burstStats.s1).toMatchObject({ turnId: 't1' })
+  })
+
   it('refuses a transcript answer that is behind what this page already folded', async () => {
     // The host fills its transcript from the notification pipeline, which the
     // SDK paces independently of the `session/prompt` response — so a read taken

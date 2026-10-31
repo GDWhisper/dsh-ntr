@@ -74,6 +74,7 @@ import type {
   AcpIdleRelease, ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PluginUpdateState, PreparedAdapterCall, SessionView, StreamChunk,
 } from './protocol.ts'
 import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_TAG_HALO, IDLE_RELEASE_MS } from './protocol.ts'
+import { OUTPUT_CHARS_PER_TOKEN, TurnTpsTracker } from './tps.ts'
 import { UpdateService } from './update.ts'
 
 /**
@@ -134,6 +135,13 @@ interface LiveSession {
   availableCommands?: SessionView['availableCommands']
   plan?: unknown[]
   usage?: SessionView['usage']
+  /**
+   * The plugin's own measurable burst aggregate over this ACP session's turns
+   * (see `src/tps.ts`). Persisted with the chat-session record so the dock's
+   * rate survives a host restart; absent until a turn contributes a measurable
+   * burst (>= 1 inter-chunk gap).
+   */
+  burst?: SessionView['burst']
   running: boolean
   closed: boolean
   /** The agent process died; the session awaits a `session/load` resume. */
@@ -2085,6 +2093,7 @@ function snapshot(session: LiveSession): SessionView {
     ...(session.availableCommands !== undefined ? { availableCommands: session.availableCommands } : {}),
     ...(session.plan !== undefined ? { plan: session.plan } : {}),
     ...(session.usage !== undefined ? { usage: session.usage } : {}),
+    ...(session.burst !== undefined ? { burst: session.burst } : {}),
     running: session.running,
     closed: session.closed,
     ...(session.released ? { released: true } : {}),
@@ -2127,6 +2136,7 @@ interface PersistedChatSession {
   reasoningEffort?: string
   modes?: SessionView['modes']
   usage?: SessionView['usage']
+  burst?: SessionView['burst']
   hasHistory?: boolean
 }
 
@@ -2142,6 +2152,7 @@ function persistedChatSession(session: LiveSession): PersistedChatSession {
     ...(session.reasoningEffort === undefined ? {} : { reasoningEffort: session.reasoningEffort }),
     ...(session.modes === undefined ? {} : { modes: session.modes }),
     ...(session.usage === undefined ? {} : { usage: session.usage }),
+    ...(session.burst === undefined ? {} : { burst: session.burst }),
     ...(session.hasHistory === true || session.transcript.since(0).length > 0 ? { hasHistory: true } : {}),
   }
 }
@@ -2158,6 +2169,14 @@ function isPersistedUsage(value: unknown): value is SessionView['usage'] {
   if (value === null || typeof value !== 'object') return false
   const usage = value as { used?: unknown; size?: unknown }
   return typeof usage.used === 'number' && typeof usage.size === 'number'
+}
+
+/** Tolerant shape check for a `burst` aggregate read back from disk. */
+function isPersistedBurst(value: unknown): value is NonNullable<SessionView['burst']> {
+  if (value === null || typeof value !== 'object') return false
+  const burst = value as { outputTokens?: unknown; burstMs?: unknown }
+  return typeof burst.outputTokens === 'number' && burst.outputTokens >= 0
+    && typeof burst.burstMs === 'number' && burst.burstMs >= 0
 }
 
 /**
@@ -2928,9 +2947,6 @@ interface SegmentState {
   finished: boolean
 }
 
-/** ACP `usage_update` is context occupancy, not request tokens; host usage is a 4-chars/token OUTPUT estimate (tool args excluded). */
-const OUTPUT_CHARS_PER_TOKEN = 4
-
 /** How one segment's stream ends, in `StreamChunk.finish` terms. */
 type SegmentFinishReason =
   | { kind: 'stop' }
@@ -2942,6 +2958,9 @@ type TurnSettle =
   | { kind: 'stop'; stopReason: string }
   | { kind: 'cancelled' }
   | { kind: 'error'; message: string; code?: string }
+
+/** How often a running turn's live burst aggregate is pushed to the browser. */
+const TPS_PUSH_INTERVAL_MS = 1000
 
 /**
  * The state of ONE ACP prompt, shared across every driver step of the turn.
@@ -2963,6 +2982,14 @@ class TurnStreamController {
   private readonly pendingProse: string[] = []
   sawVisibleBlock = false
   private cursorSeq: number
+  /**
+   * Burst tracker for this turn, fed from the LIVE hub frames only. Segment
+   * replay must not touch it: every event is already counted once when it
+   * arrived, and replay would double the numerator and the gaps.
+   */
+  private readonly tps = new TurnTpsTracker()
+  private tpsSeq: number
+  private lastTpsPushAt = 0
 
   constructor(
     private readonly manager: BridgeManager,
@@ -2975,6 +3002,7 @@ class TurnStreamController {
   ) {
     this.turnSeqAtStart = session.turnSeq
     this.cursorSeq = session.transcript.head
+    this.tpsSeq = session.transcript.head
     this.unsubscribe = hub.subscribe(event => this.onEvent(event))
   }
 
@@ -3064,6 +3092,10 @@ class TurnStreamController {
         ? { kind: 'error', failure: { message: outcome.message, code: outcome.code ?? 'INTERNAL' } }
         : { kind: 'stop' }
     if (current) {
+      // The turn's burst aggregate must be visible before the turn is marked
+      // over: the final `turn/metrics` lands first, then `turn/end` flips the
+      // session/pill state. Persisting and broadcasting share one value.
+      this.finalizeTps()
       if (outcome.kind === 'cancelled') {
         this.hub.broadcast({ type: 'turn/end', sessionId: this.session.sessionId, turnId: this.turnId, stopReason: 'cancelled' })
       } else if (outcome.kind === 'error') {
@@ -3199,6 +3231,10 @@ class TurnStreamController {
     if (row.sessionId !== undefined && row.sessionId !== this.session.sessionId) return
     if (row.type === 'session/update') {
       const typed = event as { sessionId: string; seq: number; update: unknown }
+      // Live-only burst accounting runs BEFORE the segment cursor: prose that
+      // arrives between segments still belongs to this turn's output, and its
+      // gaps are real. Replay never reaches this path.
+      this.trackTps(typed)
       if (typed.seq <= this.cursorSeq) return
       const update = typed.update as Record<string, unknown>
       const seg = this.segment
@@ -3215,12 +3251,71 @@ class TurnStreamController {
       // segment; the event that CUTS the segment belongs to the next one.
       if (this.foldInto(seg, update)) this.cursorSeq = typed.seq
     } else if (row.type === 'permission/request') {
+      this.tps.onBreak()
       const typed = event as Extract<AcpEvent, { type: 'permission/request' }>
       this.pushProse(this.permissionLine(typed))
     } else if (row.type === 'permission/expired') {
+      this.tps.onBreak()
       const typed = event as { toolCall: unknown; timeoutMs: number; outcome: PermissionOutcome; optionName?: string }
       this.pushProse(this.expiredLine(typed))
     }
+  }
+
+  /** Feed one live update into the turn's burst tracker. Never called by replay. */
+  private trackTps(typed: { seq: number; update: unknown }): void {
+    if (typed.seq <= this.tpsSeq) return
+    this.tpsSeq = typed.seq
+    const update = typed.update as Record<string, unknown>
+    const kind = String(update.sessionUpdate ?? '')
+    if (kind === 'agent_thought_chunk' || kind === 'agent_message_chunk') {
+      const text = chunkTextOf(update.content)
+      if (text === '') return
+      this.tps.onProse(text, Date.now())
+      this.pushLiveTps()
+    } else if (kind === 'tool_call' || kind === 'tool_call_update') {
+      this.tps.onBreak()
+    }
+  }
+
+  /** Throttled live aggregate so the dock's speed moves during a long turn. */
+  private pushLiveTps(): void {
+    const dshSessionId = this.session.dshSessionId
+    if (dshSessionId === undefined) return
+    const now = Date.now()
+    if (now - this.lastTpsPushAt < TPS_PUSH_INTERVAL_MS) return
+    const snap = this.tps.snapshot()
+    if (snap.outputTokens <= 0 || snap.burstMs <= 0) return
+    this.lastTpsPushAt = now
+    const base = this.session.burst ?? { outputTokens: 0, burstMs: 0 }
+    this.hub.broadcast({
+      type: 'turn/metrics',
+      sessionId: this.session.sessionId,
+      dshSessionId,
+      turnId: this.turnId,
+      outputTokens: base.outputTokens + snap.outputTokens,
+      burstMs: base.burstMs + snap.burstMs,
+      final: false,
+    })
+  }
+
+  /** Close the turn's metrics: persist the measurable part, then broadcast it. */
+  private finalizeTps(): void {
+    const dshSessionId = this.session.dshSessionId
+    if (dshSessionId === undefined) return
+    const snap = this.tps.snapshot()
+    if (snap.outputTokens > 0 && snap.burstMs > 0) {
+      this.manager.noteSessionBurst(this.session, snap.outputTokens, snap.burstMs)
+    }
+    const aggregate = this.session.burst ?? { outputTokens: 0, burstMs: 0 }
+    this.hub.broadcast({
+      type: 'turn/metrics',
+      sessionId: this.session.sessionId,
+      dshSessionId,
+      turnId: this.turnId,
+      outputTokens: aggregate.outputTokens,
+      burstMs: aggregate.burstMs,
+      final: true,
+    })
   }
 
   /**
@@ -3836,6 +3931,7 @@ export class BridgeManager {
         ...(session.modes === undefined ? {} : { modes: session.modes }),
         ...(session.availableCommands === undefined ? {} : { availableCommands: session.availableCommands }),
         ...(session.usage === undefined ? {} : { usage: session.usage }),
+        ...(session.burst === undefined ? {} : { burst: session.burst }),
         ...(session.released ? { released: true } : {}),
         ...(session.running ? { running: true } : {}),
         ...forkRowInfo(session, this.canForkNow(session.agentId)),
@@ -4733,6 +4829,21 @@ export class BridgeManager {
     for (const dshSessionId of this.chatAgentIntent.keys()) this.syncConversationRoute(dshSessionId)
   }
 
+  /**
+   * Fold one settled ACP turn's measurable burst into the session aggregate and
+   * persist it. A turn with no measured inter-chunk gap contributes neither
+   * side: adding its tokens with zero time would inflate the session rate.
+   */
+  noteSessionBurst(session: LiveSession, outputTokens: number, burstMs: number): void {
+    if (outputTokens <= 0 || burstMs <= 0) return
+    const base = session.burst ?? { outputTokens: 0, burstMs: 0 }
+    session.burst = {
+      outputTokens: base.outputTokens + outputTokens,
+      burstMs: base.burstMs + burstMs,
+    }
+    this.persistAgents()
+  }
+
   private persistAgents(): void {
     const filePath = this.getStoragePath()
     if (!filePath) return
@@ -4798,8 +4909,8 @@ export class BridgeManager {
       if (typeof dshSessionId !== 'string' || dshSessionId === '') continue
       if (typeof cwd !== 'string') continue
       if (!this.defsMap.has(agentId)) continue
-      const { title, modelId, reasoningEffort, modes, usage, hasHistory } = record as {
-        title?: unknown; modelId?: unknown; reasoningEffort?: unknown; modes?: unknown; usage?: unknown; hasHistory?: unknown
+      const { title, modelId, reasoningEffort, modes, usage, burst, hasHistory } = record as {
+        title?: unknown; modelId?: unknown; reasoningEffort?: unknown; modes?: unknown; usage?: unknown; burst?: unknown; hasHistory?: unknown
       }
       const session: LiveSession = {
         sessionId,
@@ -4814,6 +4925,7 @@ export class BridgeManager {
         ...(typeof reasoningEffort === 'string' && reasoningEffort !== '' ? { reasoningEffort } : {}),
         ...(isPersistedModes(modes) ? { modes } : {}),
         ...(isPersistedUsage(usage) ? { usage } : {}),
+        ...(isPersistedBurst(burst) ? { burst } : {}),
         ...(hasHistory === true ? { hasHistory: true } : {}),
         running: false,
         turnSeq: 0,

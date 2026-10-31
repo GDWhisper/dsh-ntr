@@ -17,6 +17,7 @@ import {
 } from '../src/bridge.ts'
 import { EventHub, dispatchRpc, permissionReplayFrames } from '../src/impl.ts'
 import type { AcpAgentCatalog, AcpAgentDef, AcpEvent, AgentCatalogResult, ChatSessionView, ChatTranscriptView, StreamChunk } from '../src/protocol.ts'
+import { OUTPUT_CHARS_PER_TOKEN } from '../src/tps.ts'
 
 const MOCK = fileURLToPath(new URL('./mock-agent.mjs', import.meta.url))
 
@@ -400,6 +401,84 @@ describe('ACP bridge over stdio (mock agent)', () => {
     expect(continued.some(c => c.type === 'text-delta')).toBe(true)
     expect(continued.find((c): c is Extract<StreamChunk, { type: 'finish' }> => c.type === 'finish')?.reason)
       .toEqual({ kind: 'stop' })
+  }, 30_000)
+
+  it('reports a burst rate that excludes the tool wait and serves it from chat-list', async () => {
+    const adapter = new AcpLlmAdapter(manager)
+    const dshSessionId = 'dsh-metrics-paced'
+    await hostLoopTurn(adapter, {
+      provider: 'acp',
+      model: 'mock',
+      sessionId: dshSessionId,
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'PACED metrics' }] },
+      ],
+    })
+    const final = await waitFor('turn/metrics', event =>
+      event.final && event.dshSessionId === dshSessionId && event.outputTokens > 0)
+    // The mock sleeps 1.2s after the tool completes and then emits two answer
+    // chunks 100ms apart. The tool wait is outside the burst (a tool update
+    // breaks it AND the gap is >1s); only the within-answer gap counts.
+    expect(final.burstMs).toBeGreaterThan(0)
+    expect(final.burstMs).toBeLessThan(1000)
+    // The running turn pushed live aggregates (final:false) on the same turn,
+    // so the dock moves before settle; the final frame is the same turn's.
+    const live = events.filter((event): event is Extract<AcpEvent, { type: 'turn/metrics' }> =>
+      event.type === 'turn/metrics' && event.dshSessionId === dshSessionId && !event.final)
+    expect(live.length).toBeGreaterThan(0)
+    expect(live.every(event => event.turnId === final.turnId)).toBe(true)
+    // Replay of the first segment into the continuation must not count its
+    // prose twice: the reported numerator is exactly the transcript's prose.
+    await settleTranscript(manager, final.sessionId)
+    const transcript = await dispatchRpc(manager, 'transcript/get', { sessionId: final.sessionId })
+    if (!transcript.ok) throw new Error('transcript/get failed')
+    const chars = (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
+      .filter(entry => entry.update.sessionUpdate === 'agent_message_chunk' || entry.update.sessionUpdate === 'agent_thought_chunk')
+      .map(entry => String((entry.update.content as { text?: string }).text ?? ''))
+      .join('').length
+    expect(final.outputTokens).toBe(Math.round(chars / OUTPUT_CHARS_PER_TOKEN))
+    const listed = await dispatchRpc(manager, 'session/chat-list', { dshSessionId })
+    if (!listed.ok) throw new Error('session/chat-list failed')
+    const row = (listed.value as { sessions: ChatSessionView[] }).sessions
+      .find(session => session.sessionId === final.sessionId)
+    expect(row?.burst).toEqual({ outputTokens: final.outputTokens, burstMs: final.burstMs })
+  }, 30_000)
+
+  it('persists the burst aggregate across a host restart', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-ntr-burst-'))
+    const storage = join(root, 'agents.json')
+    const dshSessionId = 'dsh-burst-restart'
+    const first = new BridgeManager([def], new EventHub(), 500, storage)
+    let expected: ChatSessionView['burst']
+    try {
+      await hostLoopTurn(new AcpLlmAdapter(first), {
+        provider: 'acp',
+        model: 'mock',
+        sessionId: dshSessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'PACED restart' }] }],
+      })
+      for (let attempt = 0; attempt < 200 && expected === undefined; attempt += 1) {
+        const listed = await dispatchRpc(first, 'session/chat-list', { dshSessionId })
+        if (!listed.ok) throw new Error('session/chat-list failed')
+        expected = (listed.value as { sessions: ChatSessionView[] }).sessions.find(session => session.burst !== undefined)?.burst
+        if (expected === undefined) await new Promise(resolve => setTimeout(resolve, 25))
+      }
+      expect(expected?.burstMs).toBeGreaterThan(0)
+      await first.shutdownAll()
+      const second = new BridgeManager([def], new EventHub(), 500, storage)
+      try {
+        const listed = await dispatchRpc(second, 'session/chat-list', { dshSessionId })
+        if (!listed.ok) throw new Error('session/chat-list after restart failed')
+        const restored = (listed.value as { sessions: ChatSessionView[] }).sessions.find(session => session.burst !== undefined)
+        expect(restored?.burst).toEqual(expected)
+        expect(restored?.released).toBe(true)
+      } finally {
+        await second.shutdownAll()
+      }
+    } finally {
+      await first.shutdownAll()
+      rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    }
   }, 30_000)
 
   it('gives every call exactly one card across restatements, interleaving and segments', async () => {

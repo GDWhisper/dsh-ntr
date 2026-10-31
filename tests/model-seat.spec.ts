@@ -812,8 +812,8 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
    * session-list rows that carry no `agentPreset`, so the row cannot answer and
    * only the verdict map can.
    */
-  function makeHost(options: { silentRow?: boolean; withList?: boolean; triggers?: unknown[] } = {}) {
-    interface Entry { component: unknown; options: { priority: number; registrant?: string; id?: string }; inject?: unknown }
+  function makeHost(options: { silentRow?: boolean; withList?: boolean; triggers?: unknown[]; activityHost?: boolean } = {}) {
+    interface Entry { component: unknown; options: { priority: number; registrant?: string; id?: string }; inject?: unknown; locale?: string }
     const cells = new Map<string, Entry[]>()
     const declared = new Set<string>([
       MODEL_SEAT_KEY,
@@ -826,16 +826,37 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
     const cellHandlers: Array<(...args: unknown[]) => void> = []
     const nativeModel = { native: 'ModelSelect' }
     const nativePermission = { native: 'PermissionSelect' }
+    const nativeActivity = { native: 'ActivityPill' }
     cells.set(MODEL_SEAT_KEY, [{ component: nativeModel, options: { priority: 0, registrant: 'client-ui-model-selection' } }])
     cells.set(PERMISSION_SEAT_KEY, [{ component: nativePermission, options: { priority: 0, registrant: 'client-ui-permission-presets' } }])
+    if (options.activityHost === true) {
+      cells.set('conversation.composer.dock', [{
+        component: nativeActivity,
+        options: { priority: 0, registrant: 'client-ui-chat', id: 'activity' },
+        inject: () => ({ hooks: { performanceUsage: { get: () => 'full' } } }),
+        locale: 'chat',
+      }])
+    }
     // The proven synchronous emission: our own registration and our own
     // unregistration both notify the gate from inside their own call stack.
     const emitChanged = (key: string): void => { for (const handler of [...cellHandlers]) handler(key) }
 
     const slots = {
-      spec: (key: string) => (declared.has(key) ? { kind: 'single' } : undefined),
-      entriesOfSlot: (key: string) => [...(cells.get(key) ?? [])].sort((a, b) => a.options.priority - b.options.priority),
-      register(options: { name: string; id?: string; order?: number; priority?: number; inject?: unknown }, component: unknown) {
+      spec: (key: string) => (declared.has(key) ? { kind: key === 'conversation.composer.dock' ? 'list' : 'single' } : undefined),
+      entriesOfSlot: (key: string) => {
+        const sorted = [...(cells.get(key) ?? [])].sort((a, b) => a.options.priority - b.options.priority)
+        if (key !== 'conversation.composer.dock') return sorted
+        // A list slot projects ONE winner per id; `activity` and the context
+        // meter are different cells and must both survive.
+        const seen = new Set<string | undefined>()
+        return sorted.filter(entry => {
+          const id = entry.options.id
+          if (seen.has(id)) return false
+          seen.add(id)
+          return true
+        })
+      },
+      register(options: { name: string; id?: string; order?: number; priority?: number; inject?: unknown; locale?: string }, component: unknown) {
         if (!declared.has(options.name)) throw new Error(`slot "${options.name}" is not declared`)
         // A bound the real registry does not have: one gate evaluation must
         // install one entry, so a registration past this line is the gate
@@ -852,6 +873,7 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
             ...(options.id === undefined ? {} : { id: options.id }),
           },
           ...(options.inject === undefined ? {} : { inject: options.inject }),
+          ...(options.locale === undefined ? {} : { locale: options.locale }),
         }
         const list = cells.get(options.name) ?? []
         list.push(entry)
@@ -948,8 +970,10 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
       head(key: string) { return slots.entriesOfSlot(key)[0] },
       count(key: string) { return (cells.get(key) ?? []).length },
       isNative(key: string, native: unknown) { return slots.entriesOfSlot(key)[0]?.component === native },
+      activityHead() { return slots.entriesOfSlot('conversation.composer.dock').find(entry => entry.options.id === 'activity') },
       nativeModel,
       nativePermission,
+      nativeActivity,
       stage(sessionId: string, row: { agentPreset?: string; subagent?: boolean } | undefined) {
         snapshot = row === undefined
           ? { byId: {}, ids: [] }
@@ -1024,6 +1048,22 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
     host.stage('s1', { agentPreset: 'standard' })
     expect(host.count('conversation.view')).toBe(0)
     expect(host.count('conversation.composer.dock')).toBe(0)
+  })
+
+  it('shadows the host activity pill only on an ACP conversation', () => {
+    // The dock's activity cell is a LIST id, not a whole slot: taking it must
+    // leave the host's context meter (a different id) untouched. The shadow
+    // renders the host component back, so the only observable difference is
+    // which entry wins the cell.
+    const host = makeHost({ activityHost: true })
+    apply(host.ctx as never)
+    host.stage('s1', { agentPreset: ACP_PRESET_ID })
+    expect(host.count('conversation.composer.dock')).toBe(3) // host + meter + shadow
+    expect(host.activityHead()?.component).not.toBe(host.nativeActivity)
+
+    host.stage('s1', { agentPreset: 'standard' })
+    expect(host.count('conversation.composer.dock')).toBe(1) // host only
+    expect(host.activityHead()?.component).toBe(host.nativeActivity)
   })
 
   it('follows the renderer current selection, not the first retained row', () => {

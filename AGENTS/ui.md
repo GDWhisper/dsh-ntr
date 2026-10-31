@@ -92,6 +92,13 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 - **不复用原生环**：宿主 `ContextMeter` 读 `contextPressure` / `contextBreakdown`，ACP 请求不产生这两类事件；**严禁**为点亮它把 `used` 塞进 `inputTokens`（约束 36 / issue #6）。
 - **数据源、闸门与重读**：`session/chat-list` 的 `ChatSessionView.usage`，SSE `usage_update` 实时补写 `chatSessions` 与被观察 transcript；`acpMeterUsage` 先判 `acpMode !== false`（显式 false 压过残留行，与挂牌一致），再判 `chatSessionsFor`；verdict `undefined` 时只有 live 行算证据，parked 行必须等明确 `true`（切走 preset 不会关闭 ACP 会话）。无样本 / `size <= 0` 不渲染（不画假 0%），百分比夹到 100；ACP 没有 system / tools / messages 拆分，**严禁**伪造明细，精确数字进 `title`，可见文字只有百分比；环按宿主 14px viewBox / 2px stroke 与 alias token 画。`useSession(s => s.running)` 翻转时 `loadChatSessions`；首轮 `turn/start` 无当前行则补读一次（每会话一次），`resync` 也刷新当前行。
 
+### 4.2 底部 activity pill（`conversation.composer.dock` id `activity`）
+`src/client/activity-pill.tsx` 在 ACP 会话里接管宿主底行的 `x轮x步 · xx tok/s`，**全页只保留这一个 tok/s**；不在 ACP 视图头部另加读数。
+- **同 id 影子，不画第二个 pill**：dock 是 `list` 槽，`entriesOfSlot` 每个 id 只取一个赢家；claim 用 `entryId: 'activity'` 注册更低 priority 的条目，渲染**宿主自己的 `ActivityPill` 组件**（从宿主条目的 `component`/`inject`/`locale` 运行时读取）。计数、图标、弹窗里的 LLM / tool / TTFT、aria 与语言全部是宿主的。
+- **只换速率**：wrapper 调一次 `useProjection('sessionStats')`，ACP 会话把 `decodeTokens` / `decodeMs` 换成插件 burst 聚合；宿主自己的 `formatTokensPerSecond` 与弹窗因而显示插件速率。无 measurable burst 时两个字段置 0（宿主隐藏速率、计数保留）；非 ACP 会话（`acpMode !== true`）原样传宿主 projection，视觉与原生条目一致。
+- **数据与口径**：`src/tps.ts` · `TurnTpsTracker` 只按连续 prose 的 ≤1s 间隔计时，`tool_call` / 审批 / turn 边界断开；分子是正文 + 思考字符 ÷4。`TurnStreamController` 在 live 路径按 seq 去重（segment replay 不重复计数），每 ≥1s 广播 `turn/metrics`，settle 时先落 `session.burst`（随 `chatSessions` 持久化）再广播 final，之后才是 `turn/end`。浏览器按 ACP session 读 live `burstStats`，页面重载由 `session/chat-list` 的 `row.burst` 种子恢复。
+- **生命周期与 fail-open**：claim 与两个座位同生命周期（`syncAcpMode` 确认 ACP 时建，`standDown` / 卸载释放），dock 的 `slots/changed` 也触发重试。宿主没有 `activity`（0.1.5 是 `stats`）、没有 `inject` / `locale` / `performanceUsage`，或条目类型不是 list → 不注册，原生 pill 照旧；宿主组件抛错时槽的 error boundary 让影子条目 abdicate，原生条目自动回来。多视图里只有舞台会话拿到 `acpMode === true`，其他 ACP 面板直通原生速率（与座位 claim 的全局性同一取舍）。宿主升级后必须重跑影子 spike。
+
 ## 5. NTR 视图 tab
 
 真工具卡只能在 `conversation.view` 的 NTR tab（`src/client/acp-view.tsx`）里画。
@@ -223,6 +230,7 @@ NTR 会话里，宿主的点赞 / 点踩 / 分支三图标是插件的业务：a
 | 座位 | `src/client/model-seat.tsx` · `createModelSeatClaim` / `createPermissionSeatClaim`；`src/client/index.tsx` · `syncAcpMode` |
 | 锁定 UI | `src/client/session-controls.tsx` · `lockedAgentOf` / `agentBaseHidden` / `agentTagVisible` / `agentTagAlive` / `agentTagHaloPresentation` / `AcpComposerAgentTag`；`src/client/agent-lock-anim.ts` |
 | 视图 | `src/client/acp-view.tsx` · `boundAgentOf` / `acpEmptyCopy` / `diffRows` / `isNewFileDiff` / `historyAwaitsReplay`；`src/client/context-meter.tsx` · `AcpContextMeter` / `acpMeterUsage` / `contextOccupancy` / `compactTokenCount`；`src/client/index.tsx` · `acp-context-meter` 注册处 |
+| tok/s | `src/tps.ts` · `TurnTpsTracker`；`src/bridge.ts` · `TurnStreamController.trackTps` / `finalizeTps` / `BridgeManager.noteSessionBurst`；`src/client/activity-pill.tsx` · `createActivityPillClaim` / `ActivityPillOccupant` / `patchedActivityStats` / `activityBurst`；`src/client/index.tsx` · `activityClaim` 注册处 |
 | 权限卡 | `src/client/permission-dock.tsx` · `PermissionDock` / `PermissionAskCard`；`src/client/store.ts` · `permissionsForSession` / `deadlineRemainingLabel`；`src/client/index.tsx` · `acp-permissions` 注册处 |
 | 释放横幅 | `src/client/released-banner.tsx` · `ReleasedBanner` / `releasedBannerVisible`；`src/client/store.ts` · `resumeChatSession` / `withSessionReleased`；`src/client/index.tsx` · `acp-released-banner` 注册处 |
 | 消息动作 | `src/client/branch-action.tsx` · `AcpBranchAction`；`src/client/store.ts` · `forkStateOf` / `forkChatSession`；`src/client/index.tsx` · `setScopeMarker` / `probeHostActionLabels` / `ntr-branch` 注册处；`src/client/acp-ui.tsx` · 隐藏规则与 `.ntr-branch-action` 样式（见 §12） |

@@ -269,6 +269,11 @@ export interface UiState {
   /** The DSH chat session id {@link chatSessions} was loaded for. */
   chatSessionsFor?: string
   /**
+   * Live burst aggregate per ACP session id, from `turn/metrics`. Absent means
+   * no measured burst yet; a row's persisted `burst` is the reload seed.
+   */
+  burstStats: Record<string, { outputTokens: number; burstMs: number; turnId: string; final: boolean }>
+  /**
    * The agent tag's halo preference (settings-editable display choice). The
    * tag reads it per render; the host answer in `resync` is the authority and
    * a write lands optimistically first.
@@ -687,6 +692,7 @@ export class AcpStore {
     probingModels: {},
     probeErrors: {},
     chatSessions: [],
+    burstStats: {},
     tagHalo: { ...DEFAULT_TAG_HALO },
     approvalDeadlines: undefined,
     idleRelease: undefined,
@@ -2234,11 +2240,20 @@ export class AcpStore {
         // entry would keep reading as a live session (the agent tag's halo
         // breathes on `!released`) until some future turn re-reads the list.
         const chatSessions = this.state.chatSessions.filter(s => s.sessionId !== event.sessionId)
+        // The burst aggregate belongs to this ACP session only; another
+        // session's entry must survive. Only patch when there was an entry.
+        const hadBurst = this.state.burstStats[event.sessionId] !== undefined
+        let burstStats = this.state.burstStats
+        if (hadBurst) {
+          burstStats = { ...burstStats }
+          delete burstStats[event.sessionId]
+        }
         this.mutate({
           sessions,
           activeSessionId: active,
           chatTranscripts: closedTranscripts,
           ...(chatSessions.length !== this.state.chatSessions.length ? { chatSessions } : {}),
+          ...(hadBurst ? { burstStats } : {}),
           permissions: this.state.permissions.filter(p => p.sessionId !== event.sessionId),
           ...(event.reason === 'agent-died'
             ? this.logPatch('error', this.locale('会话因 agent 进程退出而终止', 'session ended: agent process died'), closingSession?.agentId)
@@ -2422,6 +2437,28 @@ export class AcpStore {
         this.mutate({
           chatLockedAgent,
           ...(this.state.chatSessionsFor === event.dshSessionId ? { chatSessions: [] } : {}),
+        })
+        return Promise.resolve()
+      }
+      case 'turn/metrics': {
+        // Plugin-side burst aggregate for one ACP session. A late LIVE frame
+        // must not regress a turn this page already saw finalized (frames can
+        // land out of order across a stream reconnect); any other frame writes
+        // the entry. Blocks / sessions stay untouched — this is a metric.
+        const prior = this.state.burstStats[event.sessionId]
+        if (event.final === false && prior !== undefined && prior.final === true && prior.turnId === event.turnId) {
+          return Promise.resolve()
+        }
+        this.mutate({
+          burstStats: {
+            ...this.state.burstStats,
+            [event.sessionId]: {
+              outputTokens: event.outputTokens,
+              burstMs: event.burstMs,
+              turnId: event.turnId,
+              final: event.final,
+            },
+          },
         })
         return Promise.resolve()
       }

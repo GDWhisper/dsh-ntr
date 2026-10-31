@@ -27,6 +27,7 @@ import { AcpSettingsDialog } from './settings-dialog.tsx'
 import { PermissionDock } from './permission-dock.tsx'
 import { ReleasedBanner } from './released-banner.tsx'
 import { AcpBranchAction } from './branch-action.tsx'
+import { createActivityPillClaim, DOCK_SLOT } from './activity-pill.tsx'
 import {
   createModelSeatClaim,
   createPermissionSeatClaim,
@@ -483,6 +484,26 @@ export function apply(ctx: Context): void {
      */
     let permissionClaim: ModelSeatClaim | undefined
     /**
+     * Claim on the dock's `activity` cell (`conversation.composer.dock`, id
+     * `activity`), held for the same ACP-mode spell as the two seats. The
+     * occupant renders the HOST's ActivityPill with the plugin's burst speed
+     * patched into its `sessionStats`; it is a list cell, so the claim is
+     * identified by id rather than by the slot's heads[0]. If the host shape is
+     * not one this bundle knows, no claim is created and the native pill stays.
+     */
+    let activityClaim: ModelSeatClaim | undefined
+    let activityDiag = 'idle'
+    const noteActivityDiag = (line: string): void => {
+      if (line === activityDiag) return
+      activityDiag = line
+      // Success and the ordinary older-host "no activity entry" are silent; a
+      // shape mismatch or a lost registration must leave a breadcrumb. The ACP
+      // view has no line for this surface, and a missing speed fix is otherwise
+      // invisible.
+      if (!/failed|missing|taken|gave up|still held/.test(line)) return
+      console.warn(`[dsh-ntr] ${line}`)
+    }
+    /**
      * ACP-only auxiliary entries: the NTR view tab and the composer's context
      * ring. Unlike the two seats these are `list` slots with no visibility
      * predicate of their own, so "self-hide in the component" cannot remove a
@@ -567,6 +588,7 @@ export function apply(ctx: Context): void {
       releaseAuxEntries()
       if (claim !== undefined) { claim.release(); claim = undefined }
       if (permissionClaim !== undefined) { permissionClaim.release(); permissionClaim = undefined }
+      if (activityClaim !== undefined) { activityClaim.release(); activityClaim = undefined }
     }
     /**
      * Re-ask timer for the staged session, armed while the row is silent and a
@@ -706,6 +728,16 @@ export function apply(ctx: Context): void {
         onDiag: (line) => { permissionSeatDiag = `staged ${staged.sessionId} · ${line}` },
       })
       permissionClaim.sync()
+      // The dock's activity pill is a list CELL, not a whole slot: this claim
+      // shadows the shipped `activity` entry by id and renders it back with the
+      // plugin's burst speed. No host entry / inject / locale -> undefined and
+      // the native pill is untouched; the next evaluation retries.
+      activityClaim ??= createActivityPillClaim({
+        slots: ctx.slots as unknown as SeatSlots,
+        inject: (sessionId: unknown) => chatFace(sessionId),
+        onDiag: noteActivityDiag,
+      })
+      activityClaim?.sync()
       // The tab and the occupancy ring have the same lifetime as the claims:
       // they exist only while this staged conversation is an ACP one, and a
       // stand-down disposes them (a standard conversation must not see an NTR
@@ -826,7 +858,7 @@ export function apply(ctx: Context): void {
     // retakes the cell only when it is actually holding something that is not
     // ours — so this is evidence-driven, not a poll.
     const stopCell = ctx.on('slots/changed', (...args: unknown[]) => {
-      if (args[0] !== MODEL_SEAT_KEY && args[0] !== PERMISSION_SEAT_KEY) return
+      if (args[0] !== MODEL_SEAT_KEY && args[0] !== PERMISSION_SEAT_KEY && args[0] !== DOCK_SLOT) return
       runGate()
     })
     // Late services: the runtime's session list normally exists before this
@@ -847,6 +879,7 @@ export function apply(ctx: Context): void {
       releaseAuxEntries()
       if (claim !== undefined) { claim.release(); claim = undefined }
       if (permissionClaim !== undefined) { permissionClaim.release(); permissionClaim = undefined }
+      if (activityClaim !== undefined) { activityClaim.release(); activityClaim = undefined }
       store.noteSeatDiag('gate disposed')
       store.notePermissionSeatDiag('gate disposed')
     }
