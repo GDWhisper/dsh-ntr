@@ -47,6 +47,27 @@
  *              `HARD-TAIL-TEXT`, proving the drain record survived the ceiling
  *  - "STALE_LATE" → a stale-cancel `cancelled` answer that arrives late
  *              (450ms), after the client may have moved on to a successor turn
+ *  - "STALE_TICK" → a stale-cancel `cancelled` answer that is followed, 100ms
+ *              after the response, by a `usage_update` tick: the test uses the
+ *              tick as proof that the response landed, then cancels inside the
+ *              client's retry-delay window
+ *  - "QUIETDRAIN" → a background drain that announces itself and is answered
+ *              at once, then stays SILENT so the client's ambient quiet window
+ *              closes the turn; the next "REVIVE" prompt makes the same drain
+ *              speak again (the drain outlived its wait)
+ *  - "REVIVE" → the revived drain (`amb-quiet`) speaks at the START of this
+ *              prompt, before its own `conversationRequestId` text; the client
+ *              must keep it out of this turn
+ *  - "REVIVE-LATE" (with REVIVE) → same drain text, but AFTER the own-id text:
+ *              the stray-tail shape
+ *  - "DRAINAGAIN" → the QUIETDRAIN run re-announces itself in this prompt and
+ *              the response has no conversation request id: the revived id must
+ *              be un-retired so the drain's text is the steered answer
+ *  - "DRAINFIRST" → the revived drain speaks BEFORE the prompt response and
+ *              WITHOUT re-announcing itself: the update alone must revive it
+ *  - "CONVIDLE" → usage update only, then a normal answer that DOES name its
+ *              conversation request id (a normal silent turn next to a recently
+ *              retired drain)
  *  - "TAIL" → sends the final chunks and returns `end_turn` without waiting
  *              for their dispatch: the response/tail race the client's settle
  *              has to drain before judging an empty turn
@@ -113,6 +134,8 @@ const cancelled = new Set()
 const cancelWaiters = new Map()
 /** sessionId → epoch ms until which the next prompt is swallowed (stale cancel). */
 const cancelCleanupUntil = new Map()
+/** The drain announced by "QUIETDRAIN", revived by the next "REVIVE" prompt. */
+let quietDrainId = null
 let counter = 0
 
 // The model a fresh session starts on (tests may pin one via MOCK_MODEL).
@@ -363,6 +386,22 @@ const app = agent({ name: 'mock-acp-agent' })
       return { stopReason: 'cancelled' }
     }
 
+    if (text.includes('STALE_TICK')) {
+      // A stale-cancel answer followed by one tick AFTER the response. The test
+      // waits for the tick (proof the `cancelled` answer landed) and then
+      // cancels inside the client's retry delay: a second stop must suppress
+      // the resend. The tick is bookkeeping, so it opens nothing on the plane.
+      // It lands almost immediately so the cancel has the whole retry delay to
+      // arrive, not a fixed slice of it.
+      setTimeout(() => {
+        void ctx.client.notify(methods.client.session.update, {
+          sessionId,
+          update: { sessionUpdate: 'usage_update', used: 7, size: 1000 },
+        })
+      }, 10)
+      return { stopReason: 'cancelled' }
+    }
+
     if (text.includes('GAP')) {
       // A drain that spends ~600ms inside a real model hand-off, ticking every
       // 150ms: the client's quiet window must be measured in the agent's own
@@ -484,6 +523,101 @@ const app = agent({ name: 'mock-acp-agent' })
       return { stopReason: 'end_turn', _meta: { 'codebuddy.ai/conversationRequestId': conversationId } }
     }
 
+    if (text.includes('DRAINAGAIN')) {
+      // The drain from QUIETDRAIN is alive and RE-ANNOUNCES itself: the client
+      // must un-retire the id, rebuild the ambient record, and treat this
+      // prompt as steered — the text below is the answer, not transcript-only.
+      const requestId = quietDrainId ?? 'amb-quiet'
+      const drainSend = update => ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: { ...update, _meta: { 'codebuddy.ai/requestId': requestId } },
+      })
+      await ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: {
+          sessionUpdate: 'session_info_update',
+          _meta: { 'codebuddy.ai/unsolicitedTurn': { requestId, reason: 'background_drain' } },
+        },
+      })
+      await sleep(25)
+      setTimeout(() => {
+        void drainSend({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'REANNOUNCED-TEXT ' } })
+      }, 20)
+      return { stopReason: 'end_turn' }
+    }
+
+    if (text.includes('DRAINFIRST')) {
+      // The revived drain speaks BEFORE the prompt response is judged and does
+      // NOT re-announce itself: the update alone must un-retire the id and
+      // rebuild the ambient record, so the folded prompt is recognised as
+      // steered and the whole answer reaches the user.
+      const requestId = quietDrainId ?? 'amb-quiet'
+      const drainSend = update => ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: { ...update, _meta: { 'codebuddy.ai/requestId': requestId } },
+      })
+      await drainSend({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'DRAIN-FIRST-TEXT ' } })
+      await sleep(30)
+      setTimeout(() => {
+        void drainSend({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'DRAIN-FIRST-TAIL' } })
+      }, 20)
+      return { stopReason: 'end_turn' }
+    }
+
+    if (text.includes('QUIETDRAIN')) {
+      // A drain that announces itself and is answered at once, then stays
+      // SILENT: the client's ambient quiet window closes the turn. The run
+      // itself is NOT over — the next "REVIVE" prompt makes it speak again.
+      const requestId = 'amb-quiet'
+      await ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: {
+          sessionUpdate: 'session_info_update',
+          _meta: { 'codebuddy.ai/unsolicitedTurn': { requestId, reason: 'background_drain' } },
+        },
+      })
+      await sleep(25)
+      quietDrainId = requestId
+      return { stopReason: 'end_turn' }
+    }
+
+    if (text.includes('REVIVE')) {
+      // The drain from QUIETDRAIN outlived its ambient wait and speaks during
+      // THIS turn. REVIVE sends it BEFORE the own-id text (the id-adoption
+      // trap); REVIVE-LATE sends it after (the stray-tail shape). Either way it
+      // is a background run's output and must not join the user's answer.
+      const requestId = quietDrainId ?? 'amb-quiet'
+      const drainSend = update => ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: { ...update, _meta: { 'codebuddy.ai/requestId': requestId } },
+      })
+      const ownSend = update => ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: { ...update, _meta: { 'codebuddy.ai/requestId': 'conv-revive' } },
+      })
+      const revived = async () => {
+        await drainSend({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'REVIVED-DRAIN-TEXT ' } })
+        await drainSend({ sessionUpdate: 'tool_call', toolCallId: 'amb_quiet_tool', title: 'revived drain tool', kind: 'other', status: 'in_progress' })
+        await drainSend({
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'amb_quiet_tool',
+          status: 'completed',
+          content: [{ type: 'content', content: { type: 'text', text: 'REVIVED TOOL OUTPUT' } }],
+        })
+      }
+      if (text.includes('REVIVE-LATE')) {
+        await ownSend({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'REVIVE-NORMAL-TEXT ' } })
+        await revived()
+      } else {
+        await revived()
+        await ownSend({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'REVIVE-NORMAL-TEXT ' } })
+      }
+      // Dispatch time, not a timing bet: every notification is in the client's
+      // hands before the response is judged.
+      await sleep(30)
+      return { stopReason: 'end_turn', _meta: { 'codebuddy.ai/conversationRequestId': 'conv-revive' } }
+    }
+
     if (text.includes('STEERHARD')) {
       // A drain that OUTLIVES the client's ambient ceiling: it announces
       // itself and the prompt is answered instantly, but no update follows
@@ -578,6 +712,14 @@ const app = agent({ name: 'mock-acp-agent' })
       void send({ sessionUpdate: 'agent_message_chunk', messageId: 'tail', content: { type: 'text', text: 'TAIL-' } })
       void send({ sessionUpdate: 'agent_message_chunk', messageId: 'tail', content: { type: 'text', text: 'CHUNK' } })
       return { stopReason: 'end_turn' }
+    }
+
+    if (text.includes('CONVIDLE')) {
+      // A normal instant answer that names the conversation turn it queued:
+      // even with a recently retired drain id in the session, this turn is its
+      // own and must close with the ordinary zero-output warning.
+      await send({ sessionUpdate: 'usage_update', used: 5, size: 1000 })
+      return { stopReason: 'end_turn', _meta: { 'codebuddy.ai/conversationRequestId': 'conv-idle' } }
     }
 
     if (text.includes('EMPTY')) {

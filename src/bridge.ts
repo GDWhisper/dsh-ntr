@@ -288,6 +288,25 @@ interface LiveSession {
    * announcement of the same background run is not logged twice.
    */
   ambientNotices?: Set<string>
+  /**
+   * Background drains this session already STOPPED waiting on (an ambient wait
+   * that closed on silence, or a record that outlived `ambientStaleMs`). The
+   * record is gone from {@link ambient}, but the drain itself may still be
+   * running: a queued message or a long tool makes it speak again while the
+   * NEXT turn is on air. Without this list the late text would teach that turn
+   * the drain's id (`noteTurnRequestId` / `adoptTurnRequestId`) and fold the
+   * background run's answer into the user's answer (a double answer).
+   *
+   * An update or re-announcement carrying a listed id REVIVES it
+   * (`reviveAmbientId` + a rebuilt {@link ambient}): the run is alive, so its
+   * next steered prompt must receive the drain's text. Only while the record
+   * stays retired is its text transcript-only. Timestamps let the zero-output
+   * report recognise a prompt folded into a recently quieted drain
+   * (`hasRecentRetiredAmbient`). Bounded ({@link RETIRED_AMBIENT_MAX}), oldest
+   * evicted first; every lifecycle boundary clears the list
+   * (`clearAmbientState`).
+   */
+  retiredAmbients?: RetiredAmbient[]
   transcript: Transcript
 }
 
@@ -305,6 +324,17 @@ interface AmbientTurn {
   lastActivityAt: number
   /** Whether the drain already streamed prose (text or thought) into the transcript. */
   sawOutput: boolean
+}
+
+/** A drain id the session stopped waiting on, and when it was retired. */
+interface RetiredAmbient {
+  requestId: string
+  /**
+   * When the wait was retired. `hasRecentRetiredAmbient` uses it to tell a
+   * prompt folded into a just-quieted drain from one that ended on its own;
+   * `adoptTurnRequestId` / `noteTurnRequestId` ignore the id at any age.
+   */
+  retiredAt: number
 }
 
 /** Reliability tuning, threaded from `AcpPluginConfig` through the manager. */
@@ -1373,7 +1403,9 @@ export class AgentBridge {
    * {@link BridgeTuning.staleCancelRetryDelayMs}, out-waiting the cleanup
    * window, bounded by {@link BridgeTuning.staleCancelMaxRetries}; a genuinely
    * requested cancel (`cancelRequestedAtTurn` still names this generation)
-   * returns as-is.
+   * returns as-is — checked BOTH before the delay and after it, so a second
+   * stop click inside the retry window does not resend the prompt the user
+   * just stopped.
    *
    * `turnGen` is the {@link LiveSession.turnSeq} this prompt was sent for. A
    * stale-cancel resend is only allowed while that generation still owns the
@@ -1427,6 +1459,11 @@ export class AgentBridge {
       if (session.closed || this.conn !== conn) throw new AcpError('session_closed', 'acp: session is closed')
       // Re-check after the delay: the successor may have started while waiting.
       if (session.turnSeq !== turnGen) return answered()
+      // ...and a SECOND stop during the delay names this same generation. The
+      // user already said stop, so the stale-cancel answer is not a swallow to
+      // out-wait anymore: resending would make the agent run the prompt the
+      // user just stopped (the double-click case). Return as-is.
+      if (session.cancelRequestedAtTurn === session.turnSeq) return answered()
       this.touch()
     }
   }
@@ -1573,8 +1610,7 @@ export class AgentBridge {
       session.orphanPromptTurnSeq = undefined
       session.reclaimedTurnSeq = undefined
       session.activeToolCalls.clear()
-      session.ambient = undefined
-      session.ambientNotices?.clear()
+      clearAmbientState(session)
       session.lastAgentActivityAt = Date.now()
       this.openSettleGate(session)
       // Route replay updates into the fresh transcript while the load request
@@ -1640,8 +1676,7 @@ export class AgentBridge {
       // so a resumed turn starts on the plain window. A background drain died
       // with it, and a stale ambient would misclassify the NEXT prompt.
       session.activeToolCalls.clear()
-      session.ambient = undefined
-      session.ambientNotices?.clear()
+      clearAmbientState(session)
       session.released = true
       this.settlePermissions(session)
       this.released.set(session.sessionId, session)
@@ -1754,8 +1789,7 @@ export class AgentBridge {
     session.closed = true
     // The session is going away: whatever background drain it announced ends
     // with it (a re-created session must not inherit a stale ambient).
-    session.ambient = undefined
-    session.ambientNotices?.clear()
+    clearAmbientState(session)
     // ...and so does its prompt slot: nothing may keep rejecting a new prompt
     // for a record that is being deleted.
     session.promptInFlight = false
@@ -1833,8 +1867,7 @@ export class AgentBridge {
       this.settlePermissions(session)
       this.openSettleGate(session)
       session.activeToolCalls.clear()
-      session.ambient = undefined
-      session.ambientNotices?.clear()
+      clearAmbientState(session)
       this.sessions.delete(session.sessionId)
       this.acpIndex.delete(session.acpSessionId)
       this.hub.broadcast({ type: 'session/closed', sessionId: session.sessionId, reason })
@@ -2118,12 +2151,29 @@ export class AgentBridge {
     session.lastAgentActivityAt = Date.now()
     const kind = params.update.sessionUpdate
     const meta = codebuddyMetaOf(params.update)
+    // A RETIRED drain that speaks again is alive, not retired. Un-retire it
+    // BEFORE this update is classified and rebuild the ambient record: the run
+    // may never re-announce itself, yet the next prompt folded into it must
+    // still be recognised as steered and receive the drain's text. A
+    // re-announcement below does the same for its id.
+    if (meta?.requestId !== undefined && isRetiredAmbientId(session, meta.requestId)) {
+      reviveAmbientId(session, meta.requestId)
+      session.ambient = {
+        requestId: meta.requestId,
+        startedAt: session.ambient?.startedAt ?? Date.now(),
+        lastActivityAt: Date.now(),
+        sawOutput: session.ambient?.sawOutput ?? false,
+      }
+    }
     if (meta?.unsolicitedTurn !== undefined) {
       // The agent started a background turn on its own: remember it so a
       // prompt the agent folds into it (answered instantly, no conversation
       // request id) can be kept open until the drain speaks. Announced once per
       // request id — a repeated announcement is the same run, not news.
       const run = meta.unsolicitedTurn
+      // A re-announcement also revives a drain whose wait already closed: the
+      // same run is alive, and the notice de-dupe set keeps it silent.
+      reviveAmbientId(session, run.requestId)
       session.ambient = { requestId: run.requestId, startedAt: Date.now(), lastActivityAt: Date.now(), sawOutput: false }
       const announced = session.ambientNotices ?? new Set<string>()
       session.ambientNotices = announced
@@ -2267,6 +2317,72 @@ function codebuddyMetaOf(source: unknown): CodebuddyMeta | undefined {
     if (typeof tick.phase === 'string' && tick.phase !== '') out.agentPhase = { phase: tick.phase }
   }
   return Object.keys(out).length === 0 ? undefined : out
+}
+
+/**
+ * Remember a background drain this session stopped waiting on. A quiet close
+ * drops the drain record (so an ordinary next turn is not held open for it),
+ * but the run may revive afterwards; keeping its id lets every later update be
+ * recognized as the drain's (`isRetiredAmbientId`) instead of being adopted as
+ * the next turn's own. Bounded, oldest first — an id this far back names a run
+ * no late update can plausibly still carry. Re-retiring an id refreshes its
+ * timestamp and moves it to the end.
+ */
+function retireAmbientId(session: LiveSession, requestId: string): void {
+  const retired = session.retiredAmbients ?? []
+  const existing = retired.findIndex(entry => entry.requestId === requestId)
+  if (existing >= 0) retired.splice(existing, 1)
+  retired.push({ requestId, retiredAt: Date.now() })
+  while (retired.length > RETIRED_AMBIENT_MAX) retired.shift()
+  session.retiredAmbients = retired
+}
+
+/** Whether this request id names a drain the session already stopped waiting on. */
+function isRetiredAmbientId(session: LiveSession, requestId: string | undefined): boolean {
+  return requestId !== undefined
+    && session.retiredAmbients?.some(entry => entry.requestId === requestId) === true
+}
+
+/**
+ * Whether the session retired a drain recently enough that a prompt answered
+ * with no ambient record and no conversation id may have been folded into it.
+ * A quiet close is only evidence WE stopped waiting, so the next instant
+ * answer is ambiguous; past this horizon the drain is treated as gone and the
+ * ordinary zero-output warning applies.
+ */
+function hasRecentRetiredAmbient(session: LiveSession, withinMs: number): boolean {
+  const retired = session.retiredAmbients
+  if (retired === undefined || retired.length === 0) return false
+  const cutoff = Date.now() - withinMs
+  return retired.some(entry => entry.retiredAt >= cutoff)
+}
+
+/**
+ * The retired drain spoke again (an update or a re-announcement carried its
+ * id): it is alive, not retired. The caller rebuilds {@link LiveSession.ambient}
+ * so the next prompt folded into it is recognised as steered and its text can
+ * reach the user's turn; only while the id stays retired does its text remain
+ * transcript-only.
+ */
+function reviveAmbientId(session: LiveSession, requestId: string): void {
+  const retired = session.retiredAmbients
+  if (retired === undefined) return
+  const index = retired.findIndex(entry => entry.requestId === requestId)
+  if (index < 0) return
+  retired.splice(index, 1)
+  if (retired.length === 0) session.retiredAmbients = undefined
+}
+
+/**
+ * Forget every background-drain trace a session carried. Called at each
+ * lifecycle boundary (close / release / resume / force reset): a fresh
+ * agent-side state neither inherits a stale drain nor the ids of drains that
+ * belonged to the old one.
+ */
+function clearAmbientState(session: LiveSession): void {
+  session.ambient = undefined
+  session.ambientNotices?.clear()
+  session.retiredAmbients = undefined
 }
 
 /** Human-facing identity of an ACP tool call (the approval headline). */
@@ -3256,6 +3372,23 @@ const PENDING_AMBIENT_MAX_CHARS = 64 * 1024
  */
 const AMBIENT_NOTICE_MAX = 64
 
+/**
+ * Bound on {@link LiveSession.retiredAmbients}. The ids only exist to catch a
+ * drain that speaks again after its wait closed, and the timestamp lets the
+ * next silent close recognise a recent fold — a short-horizon concern, so a
+ * small ring is enough; the oldest is evicted first.
+ */
+const RETIRED_AMBIENT_MAX = 32
+
+/**
+ * Floor for the "recently retired" lookback the zero-output fallback uses
+ * (twice `ambientQuietMs`). Only test-sized quiet windows fall below it; a
+ * production window (10s) always wins. Without the floor a 250ms quiet window
+ * would leave a 500ms lookback, too tight to survive a loaded CI scheduler
+ * between one turn ending and the next prompt's response.
+ */
+const RETIRED_AMBIENT_RECENT_MIN_MS = 1_000
+
 /** One ambient wait's clocks and the stop reason it will close the turn with. */
 interface AmbientWait {
   /** The drain's request id: the turn is waiting on this run, not on its own. */
@@ -3342,6 +3475,14 @@ class TurnStreamController {
   private pendingAmbientTruncated = false
   /** The ambient wait in progress, if the agent folded this prompt into a drain. */
   private awaitingAmbient?: AmbientWait
+  /**
+   * The prompt response named no conversation turn while a drain this session
+   * retired RECENTLY may still be running without re-announcing. The turn still
+   * settles at once (a drain record that no update revived is not waited on),
+   * but its zero-output report says the turn may have been folded into that run
+   * instead of blaming the agent and suggesting a resend.
+   */
+  private recentRetiredDrain = false
   /** The outcome of a settle whose closing work is waiting one macrotask (see `settle`). */
   private pendingOutcome?: TurnSettle
   private closeScheduled = false
@@ -3516,6 +3657,16 @@ class TurnStreamController {
     this.awaitingAmbient = wait
   }
 
+  /**
+   * The prompt response named no conversation turn while a drain the session
+   * retired recently may still be running (and did not re-announce): the turn
+   * cannot be held open, but a zero-output report must not blame the agent.
+   * See `hasRecentRetiredAmbient` for the window.
+   */
+  noteRecentRetiredDrain(): void {
+    this.recentRetiredDrain = true
+  }
+
   /** Any session update is evidence the drain still works: push the quiet clock out. */
   private noteAmbientActivity(): void {
     const wait = this.awaitingAmbient
@@ -3559,7 +3710,7 @@ class TurnStreamController {
       : `\n[dsh-ntr] agent "${this.session.agentId}" deferred this turn to a background task run; its output is in the ACP transcript view. Send again after the background run finishes.\n`
     this.closeTurn(
       { kind: 'stop', stopReason: wait.stopReason },
-      { line, keepAmbient: wait.hard === true },
+      { line, keepAmbient: wait.hard === true, requestId: wait.requestId },
     )
   }
 
@@ -3717,7 +3868,7 @@ class TurnStreamController {
    * simply had not finished yet). `ambient.keepAmbient` says the ending was the
    * CEILING, not silence: see the drain-record comment below.
    */
-  private closeTurn(outcome: TurnSettle, ambient?: { line?: string; keepAmbient?: boolean }): void {
+  private closeTurn(outcome: TurnSettle, ambient?: { line?: string; keepAmbient?: boolean; requestId?: string }): void {
     if (this.closedTurn) return
     this.closedTurn = true
     // A closed turn is a settled turn, whichever path got here first (an
@@ -3751,6 +3902,16 @@ class TurnStreamController {
         if (ambient.keepAmbient === true) {
           if (this.session.ambient !== undefined) this.session.ambient.lastActivityAt = Date.now()
         } else {
+          // Silence closed this wait, but silence is not proof the run ended: a
+          // queued message or a long tool can make the drain speak again. So
+          // RETIRE its id before dropping the record — a revived run's late
+          // text must stay in the ACP transcript view instead of teaching the
+          // NEXT turn the drain's id and mixing the drain's answer into the
+          // user's (a double answer). The trade-off is deliberate: a next
+          // prompt the agent folds into that same revived drain may not receive
+          // the drain's text on the chat plane (transcript-only); a double
+          // answer is worse.
+          if (ambient.requestId !== undefined) retireAmbientId(this.session, ambient.requestId)
           this.session.ambient = undefined
         }
       }
@@ -3788,8 +3949,7 @@ class TurnStreamController {
         // The silent-failure report: a normal stop with nothing the chat
         // plane renders. Aborted or failing turns need no extra hint; this
         // is specifically "protocol says success, the bubble is empty".
-        const line = `\n[dsh-ntr] agent "${this.session.agentId}" ended the turn with no visible output (stop reason: ${outcome.stopReason}). Some agents fold upstream failures — auth, billing, rate limits — into a normal stop; try resending, and check the agent process logs if it repeats.\n`
-        this.emitProse(seg, 'text', line)
+        this.emitProse(seg, 'text', this.zeroOutputLine(outcome.stopReason))
       }
       this.finishSegment(seg, reason)
     }
@@ -3934,10 +4094,23 @@ class TurnStreamController {
     } else {
       // A settled turn that never showed anything: the zero-output warning the
       // plane would have gotten from a single-stream turn (constraint 23).
-      const line = `\n[dsh-ntr] agent "${this.session.agentId}" ended the turn with no visible output. Some agents fold upstream failures — auth, billing, rate limits — into a normal stop; try resending, and check the agent process logs if it repeats.\n`
+      const line = this.zeroOutputLine()
       if (seg.index < 0) this.emitProse(seg, 'text', line)
       this.finishSegment(seg, { kind: 'stop' })
     }
+  }
+
+  /**
+   * The "protocol says success, the bubble is empty" line. When a recently
+   * retired drain may have taken the prompt without re-announcing itself, say
+   * that instead of blaming the agent: the output exists in the transcript.
+   */
+  private zeroOutputLine(stopReason?: string): string {
+    if (this.recentRetiredDrain) {
+      return `\n[dsh-ntr] agent "${this.session.agentId}" produced no visible output this turn; it may have been folded into a background run; its output is in the ACP transcript view.\n`
+    }
+    const reason = stopReason === undefined ? '' : ` (stop reason: ${stopReason})`
+    return `\n[dsh-ntr] agent "${this.session.agentId}" ended the turn with no visible output${reason}. Some agents fold upstream failures — auth, billing, rate limits — into a normal stop; try resending, and check the agent process logs if it repeats.\n`
   }
 
   private onEvent(event: unknown): void {
@@ -4094,12 +4267,16 @@ class TurnStreamController {
     recordAcpToolOutput(callId, updateContentToText(update.content))
   }
 
-  /** Whether this update belongs to the session's announced background drain. */
+  /**
+   * Whether this update belongs to a background drain — the one the session is
+   * waiting on, or one whose wait already closed (retired) but whose run can
+   * still speak.
+   */
   private isAmbientOwned(update: Record<string, unknown>): boolean {
-    const ambient = this.session.ambient
-    if (ambient === undefined) return false
     const requestId = codebuddyMetaOf(update)?.requestId
-    return requestId !== undefined && requestId === ambient.requestId
+    if (requestId === undefined) return false
+    return requestId === this.session.ambient?.requestId
+      || isRetiredAmbientId(this.session, requestId)
   }
 
   /** Learn this turn's own CodeBuddy request id from the first update naming one. */
@@ -4107,14 +4284,21 @@ class TurnStreamController {
     if (this.turnRequestId !== undefined) return
     const requestId = codebuddyMetaOf(update)?.requestId
     // A background drain's update names THE DRAIN, never this turn: adopting it
-    // would make `isForeignAmbientText` pass the drain's own text through.
+    // would make `isForeignAmbientText` pass the drain's own text through. A
+    // RETIRED drain (its wait closed on silence, the run revived) is the same
+    // trap — that id belongs to the background run whichever turn is on air.
     if (requestId === undefined || requestId === this.session.ambient?.requestId) return
+    if (isRetiredAmbientId(this.session, requestId)) return
     this.turnRequestId = requestId
   }
 
   /** Adopt the request id the prompt RESPONSE declared for this turn. */
   adoptTurnRequestId(requestId: string): void {
-    this.turnRequestId = requestId
+    // A retired drain id is never this turn's own: adopting it would make the
+    // background run's prose pass `isForeignAmbientText` as the answer. The
+    // response still ends a normal turn, so the withheld drain buffer is
+    // dropped either way (the transcript keeps it).
+    if (!isRetiredAmbientId(this.session, requestId)) this.turnRequestId = requestId
     // A normal turn: whatever the drain streamed while the id was unknown was
     // never this turn's answer. Drop it (the transcript keeps it) — it must not
     // surface when a later segment replays or when the turn flushes anything.
@@ -4128,8 +4312,19 @@ class TurnStreamController {
    * was itself folded into the drain keeps its prose.
    */
   private isForeignAmbientText(update: Record<string, unknown>): boolean {
-    if (this.turnRequestId === undefined) return false
     const requestId = codebuddyMetaOf(update)?.requestId
+    // The drain THIS turn is waiting on owns its text unconditionally: the
+    // wait was opened for this id (a revived drain may still carry a retired
+    // mark if the update raced the revival), so the whole steered answer must
+    // reach the user instead of being filtered as background noise.
+    if (requestId !== undefined && this.awaitingAmbient?.requestId === requestId) return false
+    // A RETIRED drain is foreign even though its record is gone: the quiet
+    // close only means WE stopped waiting, not that the run ended. Its late
+    // text must never join the turn now on air — even before that turn has
+    // learned a request id of its own (the fail-open below does not apply to
+    // an id known to be a background run).
+    if (isRetiredAmbientId(this.session, requestId)) return true
+    if (this.turnRequestId === undefined) return false
     if (requestId === undefined || requestId === this.turnRequestId) return false
     const ambient = this.session.ambient
     return ambient !== undefined && requestId === ambient.requestId
@@ -7721,10 +7916,13 @@ export class BridgeManager {
           // window is over, even though nothing said so (CodeBuddy never sends
           // `session_end`). Keeping the record would make a later instant answer
           // with no conversation request id look steered, and hold a normal turn
-          // open against a drain that is never coming back. Forget it (the
-          // notice de-dupe set with it) so this response settles normally.
+          // open against a drain that is never coming back. RETIRE the id
+          // first, so a late update or a response naming it is never adopted as
+          // this session's own turn; then forget the record (the notice de-dupe
+          // set with it) so this response settles normally.
           if (session.ambient !== undefined
             && Date.now() - session.ambient.lastActivityAt > this.tuning.ambientStaleMs) {
+            retireAmbientId(session, session.ambient.requestId)
             session.ambient = undefined
             session.ambientNotices?.clear()
           }
@@ -7740,6 +7938,17 @@ export class BridgeManager {
             && !controller.hasAgentProse) {
             controller.awaitAmbient(session.ambient.requestId, result.stopReason)
             return
+          }
+          // No ambient record to wait on, but a drain this session stopped
+          // waiting on was retired moments ago: the run may have taken this
+          // prompt WITHOUT re-announcing itself. The turn cannot be held open
+          // (nothing names the drain), but a silent close must say the output
+          // may be in the transcript instead of blaming the agent.
+          if (session.ambient === undefined
+            && result.stopReason !== 'cancelled'
+            && responseMeta?.conversationRequestId === undefined
+            && hasRecentRetiredAmbient(session, Math.max(this.tuning.ambientQuietMs * 2, RETIRED_AMBIENT_RECENT_MIN_MS))) {
+            controller.noteRecentRetiredDrain()
           }
           controller.settle(result.stopReason === 'cancelled'
             ? { kind: 'cancelled' }

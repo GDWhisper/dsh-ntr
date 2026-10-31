@@ -1851,6 +1851,64 @@ describe('stale cancel and silent stops (isolated manager)', () => {
     }
   }, 30_000)
 
+  it('does not resend a stale cancelled prompt when a second stop lands during the retry delay', async () => {
+    // Two clicks on stop inside one turn's retry window: the second cancel
+    // names the SAME generation, so the generation guard alone would still
+    // resend a prompt the user has already stopped. The resend is only for the
+    // stale-cancel swallow — a requested cancel must win.
+    const logPath = `${scWorkspace}/double-cancel-prompts-${String(process.pid)}-${String(Date.now())}.log`
+    const hub = new EventHub()
+    const manager = new BridgeManager([
+      { ...def, id: 'double-cancel', cwd: scWorkspace, allowedCwdRoots: [scWorkspace], env: { ...def.env, MOCK_PROMPT_LOG: logPath } },
+    ], hub, 500, undefined, undefined, true, {
+      startupTimeoutMs: 3_000,
+      // The mock answers `cancelled` at once and ticks 10ms later, so the
+      // second cancel lands with nearly the whole (deliberately long) delay to
+      // spare. The assertions below do not depend on measuring that margin:
+      // the run only returns once the delay has elapsed.
+      staleCancelRetryDelayMs: 2_000,
+      staleCancelMaxRetries: 2,
+      cancelFallbackMs: 5_000,
+    })
+    try {
+      const start = await dispatchRpc(manager, 'session/start', { agentId: 'double-cancel' })
+      if (!start.ok) throw new Error('start failed')
+      const id = (start.value as { sessionId: string }).sessionId
+      const located = await manager.locateOrResume(id)
+      const turnGen = located.session.turnSeq
+
+      // The tick is bookkeeping (opens nothing), but it arrives AFTER the
+      // `cancelled` response: seeing it proves the client is already in its
+      // retry delay — no sleep-based guess about where the response is.
+      const answered = new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('the cancelled answer never landed')), 10_000)
+        const unsub = hub.subscribe(event => {
+          if (event.type !== 'session/update') return
+          if (event.sessionId !== located.session.sessionId) return
+          if (event.update.sessionUpdate !== 'usage_update') return
+          clearTimeout(timer)
+          unsub()
+          resolve()
+        })
+      })
+      const pending = located.bridge.runPrompt(located.session, 'STALE_TICK please', 'turn-double-cancel', turnGen)
+      await answered
+      await located.bridge.cancel(located.session)
+
+      await expect(pending).resolves.toMatchObject({ stopReason: 'cancelled' })
+      // `runPrompt` returns only after its retry delay elapsed (or the answer
+      // was not retryable), so a buggy resend would already have reached the
+      // agent and appended its line. No fixed sleep guesses at the delay.
+      const lines = existsSync(logPath)
+        ? readFileSync(logPath, 'utf8').split('\n').filter(line => line !== '')
+        : []
+      expect(lines).toEqual(['STALE_TICK please'])
+    } finally {
+      await manager.shutdownAll()
+      rmSync(logPath, { force: true })
+    }
+  }, 30_000)
+
   it('reports a normal stop that produced no visible output', async () => {
     // The pi-acp shape: an upstream failure folded into a legal end_turn,
     // bookkeeping frames only — the user would see an empty bubble. The turn
@@ -6684,6 +6742,7 @@ describe('a prompt steered into a background drain (isolated manager)', () => {
 
   const AMBIENT_REPORT = 'deferred this turn to a background task run'
   const ZERO_OUTPUT_REPORT = 'ended the turn with no visible output'
+  const RETIRED_FOLD_REPORT = 'may have been folded into a background run'
 
   it('keeps the turn open for the drain: its text arrives, its tools stay off the main plane', async () => {
     const dshSessionId = 'dsh-drain-steer'
@@ -6852,16 +6911,121 @@ describe('a prompt steered into a background drain (isolated manager)', () => {
     const first = await drainTurn(dshSessionId, 'STEER please')
     expect(textOf(first)).toContain('AMBIENT-TEXT')
 
-    // The drain is over and its wait closed. The NEXT prompt answers instantly
-    // with NO conversation request id — the "steered" shape — but there is no
-    // drain left to be steered into. A record that outlived its wait would
-    // hold this ordinary silent turn open for the quiet window and then report
-    // it as deferred; it must close on its own terms instead.
-    const second = await drainTurn(dshSessionId, 'EMPTY please')
+    // The drain is over and its wait closed. The NEXT prompt is a normal turn
+    // that names its conversation request id, so even with the drain's id
+    // still retired it must close on its own terms — not be held open, not be
+    // called a possible fold, and not borrow the deferred wording.
+    const second = await drainTurn(dshSessionId, 'CONVIDLE please')
     const text = textOf(second)
     expect(text).toContain(ZERO_OUTPUT_REPORT)
     expect(text).not.toContain(AMBIENT_REPORT)
+    expect(text).not.toContain(RETIRED_FOLD_REPORT)
     expect(finishOf(second)?.reason).toEqual({ kind: 'stop' })
+  }, 30_000)
+
+  it('revives a quiet-closed drain when it re-announces, so the steered text reaches the turn', async () => {
+    const dshSessionId = 'dsh-drain-reannounce'
+    // Turn 1 retires the drain's id: its wait closes on silence.
+    const first = await drainTurn(dshSessionId, 'QUIETDRAIN please')
+    expect(textOf(first)).toContain(AMBIENT_REPORT)
+
+    // The same run re-announces itself in turn 2 and the response names no
+    // conversation turn. The retired mark must not outlive the re-announcement:
+    // the drain's text IS this (steered) turn's answer, not transcript-only.
+    const second = await drainTurn(dshSessionId, 'DRAINAGAIN please')
+    const text = textOf(second)
+    expect(text).toContain('REANNOUNCED-TEXT')
+    expect(text).not.toContain(AMBIENT_REPORT)
+    expect(text).not.toContain(RETIRED_FOLD_REPORT)
+    expect(finishOf(second)?.reason).toEqual({ kind: 'stop' })
+  }, 30_000)
+
+  it('revives a quiet-closed drain from its late update alone, so a steered prompt receives the text', async () => {
+    const dshSessionId = 'dsh-drain-revive-steered'
+    const first = await drainTurn(dshSessionId, 'QUIETDRAIN please')
+    expect(textOf(first)).toContain(AMBIENT_REPORT)
+
+    // The revived drain speaks BEFORE the prompt response is judged and never
+    // re-announces itself. The update alone must un-retire the id and rebuild
+    // the ambient record; the fold into it is then detected as steered and its
+    // text (before and after the response) reaches the user.
+    const second = await drainTurn(dshSessionId, 'DRAINFIRST please')
+    const text = textOf(second)
+    expect(text).toContain('DRAIN-FIRST-TEXT')
+    expect(text).toContain('DRAIN-FIRST-TAIL')
+    expect(text).not.toContain(AMBIENT_REPORT)
+    expect(text).not.toContain(RETIRED_FOLD_REPORT)
+    expect(finishOf(second)?.reason).toEqual({ kind: 'stop' })
+  }, 30_000)
+
+  it('reports a possible fold, not agent silence, when a recently retired drain may have taken the prompt', async () => {
+    const dshSessionId = 'dsh-drain-retired-fold'
+    const first = await drainTurn(dshSessionId, 'QUIETDRAIN please')
+    expect(textOf(first)).toContain(AMBIENT_REPORT)
+
+    // No drain update and no re-announcement: the prompt answers instantly with
+    // no conversation request id. The drain may still be running, so the empty
+    // bubble must say the turn may have been folded into it (output is in the
+    // transcript) instead of blaming the agent and suggesting a resend. The
+    // turn is NOT held open — the report is immediate.
+    const started = Date.now()
+    const second = await drainTurn(dshSessionId, 'EMPTY please')
+    const text = textOf(second)
+    expect(text).toContain(RETIRED_FOLD_REPORT)
+    expect(text).not.toContain('try resending')
+    expect(text).not.toContain('check the agent process logs')
+    expect(text).not.toContain(ZERO_OUTPUT_REPORT)
+    expect(Date.now() - started).toBeLessThan(5_000)
+    expect(finishOf(second)?.reason).toEqual({ kind: 'stop' })
+  }, 30_000)
+
+  it('keeps a revived drain\'s late text out of the next turn that arrives first', async () => {
+    const dshSessionId = 'dsh-drain-revive-first'
+    // Turn 1: the drain announces itself and then stays silent, so the ambient
+    // quiet window closes the turn and drops the drain record — its id is
+    // RETIRED, not forgotten: the run itself is still alive.
+    const first = await drainTurn(dshSessionId, 'QUIETDRAIN please')
+    expect(textOf(first)).toContain(AMBIENT_REPORT)
+
+    // Turn 2 is an ordinary turn (its response names a conversation id). The
+    // revived drain speaks BEFORE this turn's own text: without the retired
+    // id, `noteTurnRequestId` would adopt the drain's id and the background
+    // text would be folded into the user's answer (a double answer).
+    const second = await drainTurn(dshSessionId, 'REVIVE please')
+    const text = textOf(second)
+    expect(text).toContain('REVIVE-NORMAL-TEXT')
+    expect(text).not.toContain('REVIVED-DRAIN-TEXT')
+    // The revived run's tool call is a background tool: transcript-only, no
+    // card for the host to execute as part of this turn.
+    expect(second.filter(chunk => chunk.type === 'tool-call-delta')).toHaveLength(0)
+    expect(finishOf(second)?.reason).toEqual({ kind: 'stop' })
+
+    // Nothing was lost: the late drain prose is in the ACP transcript view.
+    const updates = await drainTranscript(dshSessionId)
+    expect(updates.some(update => update.sessionUpdate === 'agent_message_chunk'
+      && String((update.content as { text?: string }).text ?? '').includes('REVIVED-DRAIN-TEXT'))).toBe(true)
+    expect(updates.some(update => update.sessionUpdate === 'tool_call'
+      && update.toolCallId === 'amb_quiet_tool')).toBe(true)
+  }, 30_000)
+
+  it('keeps a revived drain\'s late text out when it lands after the normal answer', async () => {
+    const dshSessionId = 'dsh-drain-revive-late'
+    const first = await drainTurn(dshSessionId, 'QUIETDRAIN please')
+    expect(textOf(first)).toContain(AMBIENT_REPORT)
+
+    // The stray-tail shape: this turn's own text (and its request id) came
+    // first, then the revived drain's text. The ambient record is gone, so
+    // only the retired id can tell this text apart from the answer.
+    const second = await drainTurn(dshSessionId, 'REVIVE-LATE please')
+    const text = textOf(second)
+    expect(text).toContain('REVIVE-NORMAL-TEXT')
+    expect(text).not.toContain('REVIVED-DRAIN-TEXT')
+    expect(second.filter(chunk => chunk.type === 'tool-call-delta')).toHaveLength(0)
+    expect(finishOf(second)?.reason).toEqual({ kind: 'stop' })
+
+    const updates = await drainTranscript(dshSessionId)
+    expect(updates.some(update => update.sessionUpdate === 'agent_message_chunk'
+      && String((update.content as { text?: string }).text ?? '').includes('REVIVED-DRAIN-TEXT'))).toBe(true)
   }, 30_000)
 
   it('retires a waiting turn when the conversation moves on, ending its driver step without touching the session', async () => {
