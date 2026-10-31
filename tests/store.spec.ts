@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { AcpStore, foldUpdate, forkStateOf, permissionsForSession, type Block } from '../src/client/store.ts'
 import { acpModeFromPresetEvent, stagedIsAcpMode } from '../src/client/acp-ui.tsx'
+import { resolveHostFork } from '../src/client/branch-action.tsx'
 import type { AcpAgentDef, ChatSessionView, DetectedAgentInfo } from '../src/protocol.ts'
 
 function fold(...updates: Array<Record<string, unknown>>): Block[] {
@@ -2579,4 +2580,44 @@ describe('forkChatSession (the NTR branch click)', () => {
     ])
     expect(store.getSnapshot().notice).toBeUndefined()
   })
+
+  it('preserves sessions instance context when called with resolveHostFork', async () => {
+    class HostSessionsService {
+      list = {
+        getSnapshot() {
+          return [{ id: 'parent-1' }]
+        },
+      }
+
+      async fork(options: { sessionId: string; increaseTitle?: boolean }) {
+        // Reproduces the exact host implementation pattern that failed with:
+        // Cannot read properties of undefined (reading 'getSnapshot')
+        const list = this.list.getSnapshot()
+        if (!list || list.length === 0) throw new Error('empty session list')
+        return `${options.sessionId}-child`
+      }
+    }
+
+    const hostService = new HostSessionsService()
+    const hostFace = resolveHostFork(hostService)
+    expect(hostFace).toBeDefined()
+
+    const calls: Array<{ endpoint: string; payload: unknown }> = []
+    const store = new AcpStore(async (_channel, endpoint, payload) => {
+      calls.push({ endpoint, payload })
+      if (endpoint === 'session/chat-fork-adopt') return { ok: true, value: { done: true } }
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+
+    const outcome = await store.forkChatSession('chat-1', sessionId => {
+      return hostFace!.fork({ sessionId, increaseTitle: true })
+    })
+
+    expect(outcome).toEqual({ childId: 'chat-1-child' })
+    expect(calls).toEqual([
+      { endpoint: 'session/chat-fork-adopt', payload: { dshSessionId: 'chat-1-child', parentDshSessionId: 'chat-1' } },
+    ])
+    expect(store.getSnapshot().notice).toBeUndefined()
+  })
 })
+

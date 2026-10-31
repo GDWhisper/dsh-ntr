@@ -11,7 +11,7 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
 import { ACP_PRESET_ID, acpModeFromPresetEvent, formatCommandLine, isAbsolutePathLike, placeMenu, rowAgentPreset, splitAcpModelId, splitCommandLine, stagedIsAcpMode, stagedSessionOf, tokenizeCommandLine } from '../src/client/acp-ui.tsx'
 import { agentLockPhaseOf, FORM_MS, playAgentLockAnim, SHATTER_MS } from '../src/client/agent-lock-anim.ts'
-import { branchIconOf } from '../src/client/branch-action.tsx'
+import { branchIconOf, resolveHostFork } from '../src/client/branch-action.tsx'
 import { acpEmptyCopy, boundAgentOf, diffRows, historyAwaitsReplay, isNewFileDiff } from '../src/client/acp-view.tsx'
 import { agentModeVisible } from '../src/client/composer-mode.tsx'
 import { acpMeterUsage, compactTokenCount, contextOccupancy } from '../src/client/context-meter.tsx'
@@ -1173,3 +1173,71 @@ describe('branchIconOf (branch-action.tsx)', () => {
     expect(branchIconOf({ IconBranchOutline16: null, IconBranchOutlineRegular: regular })).toBe(regular)
   })
 })
+
+describe('resolveHostFork (branch-action.tsx)', () => {
+  it('returns undefined when sessions service is null or undefined or lacks fork', () => {
+    expect(resolveHostFork(undefined)).toBeUndefined()
+    expect(resolveHostFork(null)).toBeUndefined()
+    expect(resolveHostFork({})).toBeUndefined()
+    expect(resolveHostFork({ fork: 'not-a-function' })).toBeUndefined()
+    expect(resolveHostFork(42)).toBeUndefined()
+    expect(resolveHostFork('service')).toBeUndefined()
+  })
+
+  it('safely catches throwing getters on sessions service', () => {
+    const throwingService = {
+      get fork(): never {
+        throw new Error('access denied')
+      },
+    }
+    expect(resolveHostFork(throwingService)).toBeUndefined()
+  })
+
+  it('binds the host sessions instance so that internal this references work', async () => {
+    class MockSessionsService {
+      list = {
+        getSnapshot() {
+          return [{ sessionId: 'parent-1', title: 'Parent' }]
+        },
+      }
+
+      async fork(options: { sessionId: string; increaseTitle?: boolean }) {
+        const snapshot = this.list.getSnapshot()
+        if (snapshot[0]?.sessionId !== options.sessionId) {
+          throw new Error('session not found in list')
+        }
+        return `${options.sessionId}-forked`
+      }
+    }
+
+    const service = new MockSessionsService()
+    const face = resolveHostFork(service)
+    expect(face).toBeDefined()
+
+    // Invoking face.fork(...) must not throw "Cannot read properties of undefined (reading 'getSnapshot')"
+    const childId = await face!.fork({ sessionId: 'parent-1', increaseTitle: true })
+    expect(childId).toBe('parent-1-forked')
+
+    // Calling detached fork must also preserve this context
+    const { fork } = face!
+    const childId2 = await fork({ sessionId: 'parent-1' })
+    expect(childId2).toBe('parent-1-forked')
+  })
+
+  it('forwards options faithfully to the underlying fork method', async () => {
+    const received: unknown[] = []
+    const service = {
+      async fork(options: { sessionId: string; increaseTitle?: boolean }) {
+        received.push(options)
+        return 'child-123'
+      },
+    }
+
+    const face = resolveHostFork(service)
+    expect(face).toBeDefined()
+    const result = await face!.fork({ sessionId: 'orig-sess', increaseTitle: true })
+    expect(result).toBe('child-123')
+    expect(received).toEqual([{ sessionId: 'orig-sess', increaseTitle: true }])
+  })
+})
+

@@ -26,7 +26,7 @@ import { AcpConversationView } from './acp-view.tsx'
 import { AcpSettingsDialog } from './settings-dialog.tsx'
 import { PermissionDock } from './permission-dock.tsx'
 import { ReleasedBanner } from './released-banner.tsx'
-import { AcpBranchAction } from './branch-action.tsx'
+import { AcpBranchAction, resolveHostFork } from './branch-action.tsx'
 import { createActivityPillClaim, DOCK_SLOT } from './activity-pill.tsx'
 import {
   createModelSeatClaim,
@@ -242,8 +242,7 @@ export function apply(ctx: Context): void {
    */
   const hostFork = (): AcpHostForkFace | undefined => {
     try {
-      const fork = service<StructuralServices['sessions']>('sessions')?.fork
-      return typeof fork === 'function' ? { fork } : undefined
+      return resolveHostFork(service<StructuralServices['sessions']>('sessions'))
     } catch {
       return undefined
     }

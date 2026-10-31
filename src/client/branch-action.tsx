@@ -26,9 +26,27 @@ import type { ComponentType } from 'react'
 import { Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import * as primitives from '@deepseek-ai/dsh-client-ui-primitives'
 import { useUi } from './acp-ui.tsx'
-import type { AcpChatInjected } from './acp-ui.tsx'
+import type { AcpChatInjected, AcpHostForkFace } from './acp-ui.tsx'
 import { forkStateOf } from './store.ts'
 import type { ChatForkState } from './store.ts'
+
+/**
+ * Resolves the runtime's `sessions.fork` primitive, binding it to the service
+ * instance so that internal `this` accesses (such as `this.list.getSnapshot()`)
+ * resolve correctly when called through `face.fork(...)`.
+ * Returns `undefined` if the service or `fork` method is absent or not a function.
+ */
+export function resolveHostFork(sessionsService: unknown): AcpHostForkFace | undefined {
+  try {
+    const sessions = sessionsService as {
+      fork?: (options: { sessionId: string; increaseTitle?: boolean }) => Promise<unknown>
+    } | null | undefined
+    const fork = sessions?.fork
+    return typeof fork === 'function' ? { fork: fork.bind(sessions) } : undefined
+  } catch {
+    return undefined
+  }
+}
 
 /**
  * The host's own branch-button icon, picked per host generation. The icon
