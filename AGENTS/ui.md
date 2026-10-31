@@ -9,7 +9,7 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 
 - **位置**：底座占的是原生模型底座那个 `single` cell——composer bar 行尾（`.trailing` 组，`margin-left: auto`）、提交键左边。原生 occupant 是宿主 `client-ui-model-selection` 的 `ModelSelect`（列 DSH 全量 provider，点一下写全局默认模型），所以 NTR 会话里必须由我们接管。
 - **一个 cell、一个 occupant**。cluster 内顺序固定 `高级 → model → thought → agent`：首轮前 agent 底座是右端锚点（它也是 `:last-child`，CSS `flex: none`，长模型名或额外 chip 只能挤压它左边的内容，**严禁**把 agent 底座排在前面——实测会被挤到看不见）；首轮锁定、底座退场后，`thought`（没有时 `model`）成为右端锚点。高级底座始终紧贴模型左侧。
-- **隔离靠闸门，不靠组件自隐**：`src/client/index.tsx` 的 `syncAcpMode` 只在舞台会话跑 ACP preset 时创建 claim，切走即 `release()`。非 NTR 会话里这条 entry 根本不存在。
+- **隔离靠闸门，不靠组件自隐**：`src/client/index.tsx` 的 `syncAcpMode` 只在舞台会话跑 ACP preset 时创建 claim，切走即 `release()`。非 NTR 会话里这条 entry 根本不存在。舞台会话取宿主当前选择（`uiSession.adapter.current` 的 key）优先，列表 `retainedBy.mainView` 只是没有 scope adapter 时的兜底——多视图残留两行时按第一个行会判错会话。
 - **claim 机制**（`src/client/model-seat.tsx` · `createModelSeatClaim`）：
   - cell 归属由客户端 runner 的页面级递减计数器决定（非 chain 槽位的声明优先级被改写，最后一个注册者赢）。`@hytime/dsh-thinking-effort` 也往这个 cell 注 slider，且排在我们之后注册。
   - claim 必须用 `entriesOfSlot` 核实 head 是不是自己，不是就再注册一次（有界 `MAX_SEAT_CLAIMS`、如实报「被谁占着 / 放弃」），触发来自 gate 评估与 `slots/changed`。
@@ -82,19 +82,21 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 - **不写可见标签**：agent 下发的 mode 名自解释（omp `Default`/`Plan`，codebuddy `Always Ask`/`Accept Edits`/…）。解释留在 `title` 与 `aria-label`（可访问性不能删）。
 - **选项不依赖活会话**：先取活会话的 `modes`，没有时回落 `agent/catalog` 的 `mode`（探测来的 `category: 'mode'` select，与 `session/new` 同源）。
 - **控件是否出现由「agent 发布了什么轴」决定，不能由「用户点过什么」决定**。`describeRoute` 让 `modelLabel` 只在有 pick 时才有值是真实回归：只点过思考等级的会话整块模型 chip 消失。配套：`agentCatalog` 必须同时回 `currentModel` 与 `mode`。
-- **自带 ACP 闸门**（`ui.acpMode[dshSessionId]` 或活会话存在）：它在 `conversation.input.left`，不在 `syncAcpMode` 的 claim 生命周期里，而 `agentId` 会回落到插件默认 `defaultAgent`，不闸就是普通会话凭空多一个 ACP 控件。
+- **自带 ACP 闸门**（`agentModeVisible`：显式 `ui.acpMode === false` 压过残留活会话行，`undefined` 时活会话才算证据；且 `!isAcp` 时整个控件 `return null`，残留活会话的 `availableModes` **不放行**）：它在 `conversation.input.left`，不在 `syncAcpMode` 的 claim 生命周期里，而 `agentId` 会回落到插件默认 `defaultAgent`，不闸就是普通会话凭空多一个 ACP 控件。
 - `setChatSessionMode` 对没有活会话**或已释放**的会话只记录 pick、不 spawn（与 `setChatSessionModel` 一致；2026-10-30 起 released 不再先 resume，见 §3「只记录、不唤醒」），`applyChatChoice` 在建 / 恢复会话时再应用。
 - 该 series 的公开 `.d.ts` 里 slot 条目**不含 `owner` 字段**（`OwnerOf` 解析为 `object`），所以组件里声明结构类型（`ComposerModeProps`），注册处 `as unknown as SlotComponent<any>`；新增 client 模块依赖要加进 package.json 的 `dsh.client.inject`。
 
 ### 4.1 composer 上下文占用环（`conversation.composer.dock`）
 `src/client/context-meter.tsx` 在输入框下方的底部信息栏（宿主原生 ContextMeter 所在的同一行），只报 agent `usage_update` 的 `used/size`。
+- **不由插件常驻注册**：该座位是 `list` 槽，宿主会把每个条目渲染进每条会话的底行；组件里 `return null` 挡不住条目本身。它和 NTR 视图 tab 一样由 `syncAcpMode` 的 `holdAuxEntries` 只在确认 ACP 时注册，`standDown` / 卸载即释放——非 NTR 会话里这条 entry 不存在，底行只留宿主原生 ContextMeter。
 - **不复用原生环**：宿主 `ContextMeter` 读 `contextPressure` / `contextBreakdown`，ACP 请求不产生这两类事件；**严禁**为点亮它把 `used` 塞进 `inputTokens`（约束 36 / issue #6）。
-- **数据源、闸门与重读**：`session/chat-list` 的 `ChatSessionView.usage`，SSE `usage_update` 实时补写 `chatSessions` 与被观察 transcript；`acpMeterUsage` 先判 `acpMode !== false`（显式 false 压过残留行，与挂牌一致），再判 `chatSessionsFor` 与行上的 `usage`，无样本 / `size <= 0` 不渲染（不画假 0%），百分比夹到 100；ACP 没有 system / tools / messages 拆分，**严禁**伪造明细，精确数字进 `title`，可见文字只有百分比；环按宿主 14px viewBox / 2px stroke 与 alias token 画。`useSession(s => s.running)` 翻转时 `loadChatSessions`；首轮 `turn/start` 无当前行则补读一次（每会话一次），`resync` 也刷新当前行。
+- **数据源、闸门与重读**：`session/chat-list` 的 `ChatSessionView.usage`，SSE `usage_update` 实时补写 `chatSessions` 与被观察 transcript；`acpMeterUsage` 先判 `acpMode !== false`（显式 false 压过残留行，与挂牌一致），再判 `chatSessionsFor`；verdict `undefined` 时只有 live 行算证据，parked 行必须等明确 `true`（切走 preset 不会关闭 ACP 会话）。无样本 / `size <= 0` 不渲染（不画假 0%），百分比夹到 100；ACP 没有 system / tools / messages 拆分，**严禁**伪造明细，精确数字进 `title`，可见文字只有百分比；环按宿主 14px viewBox / 2px stroke 与 alias token 画。`useSession(s => s.running)` 翻转时 `loadChatSessions`；首轮 `turn/start` 无当前行则补读一次（每会话一次），`resync` 也刷新当前行。
 
 ## 5. NTR 视图 tab
 
 真工具卡只能在 `conversation.view` 的 NTR tab（`src/client/acp-view.tsx`）里画。
 
+- **只存在于 NTR 会话**：`conversation.view` 是 `list` 槽，宿主把每个注册条目投进每条会话的页签栏，组件里 `return null` 只能清空内容、清不掉页签。所以该条目由 `syncAcpMode` 的 `holdAuxEntries` 在确认 ACP 时注册，`standDown` / 卸载即释放；非 NTR 会话里根本没有这个页签。组件仍保留显式 `acpMode === false` 的 `return null` 作为撤下前最后一帧的防守。
 - 数据必须走 `session/chat-transcript`（按 **DSH 聊天会话 id** 寻址：浏览器在看到返回前并不知道 ACP 会话 id）。
 - **严禁**让 LLM adapter 旁路转发工具事件；**严禁**在视图里做 prompt / cancel / spawn（它只读）。
 - 流式更新靠 store 把 SSE 的 `session/update` 折进被观察的 transcript（`chatTranscripts` + `MAX_WATCHED` 上限）；**严禁**视图自己轮询。
@@ -123,7 +125,8 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 ## 7. 快照读取与失败放开
 
 - **session list 快照两代形态**：DSH 0.1.7-rc.2 是 `{ ids, byId, phase, projectionsBySession }`——没有 `current` 也没有 `currentAddress`；舞台上会话 = `retainedBy.mainView > 0` 的行，preset 在 `byId[id].projectionValues.agentPreset`，subagent 行以 `origin === 'subagent'` 标记。旧运行时才是 `{ current, currentAddress, byId[id].agentPreset }`。
-- 读取一律经 `stagedSessionOf` / `rowAgentPreset`（`src/client/acp-ui.tsx`），不要再手写 `snapshot.current` / `byId[..].agentPreset`。
+- 读取一律经 `stagedSessionOf(snapshot, currentSessionId)` / `rowAgentPreset`（`src/client/acp-ui.tsx`），不要再手写 `snapshot.current` / `byId[..].agentPreset`；`currentSessionId` 来自 `uiSession.adapter.current` 的 key，缺失时才回退 mainView 扫描。宿主当前选择没有对应行时**必须** stand down（可能是 subagent 地址），不许拿别的行顶替。
+- **新增 ACP 槽位条目前的隔离检查**：非 NTR 会话里这个槽位必须仍由 DSH 原生条目占位；`single` / `keyed` 用 gate claim；会投影进每条会话的 `list` 槽（`conversation.view` / `conversation.composer.dock`）必须由 `syncAcpMode` 动态注册并在 standDown 释放；纯附加事务条目（权限卡 / 释放横幅 / 分支键）自门禁到本会话确有该事务且不得遮蔽原生条目；组件里的 `return null` 只作最后防线。新增这类条目时，`model-seat.spec.ts` 的 gate host 必须同时断言「ACP 时存在、标准时不存在」。
 - **失败放开**：服务未就位 / 槽位未声明 / 注册被拒 / 当前是 addressed subagent 路由 / 座位渲染崩溃（slot 错误边界会 abdicate 该条目），都必须回到原生座位并清掉「座位已接管」标志。claim 的 `sync()` 可重跑：下一次求值（store 变更、列表通知、preset 帧、cell 变化）会再试；诊断如实报告每次失败，不假装已安装。唯一允许的失败模式是「不接管」。
 - `ACP_PRESET_ID` 三处必须一致：浏览器半区、宿主 `src/bridge.ts`、声明里的 `config.id`（`presets/acp/acp.patch.yml`）。
 - **可选宿主服务严禁写进 `inject`**（缺服务会让插件整体加载失败；顶层 `inject` 只有 `slots` + `connection`）。只能经 `service<T>(name)` 在调用点 `ctx.get` 惰性解析（缺服务返 `undefined`、服务后到也能拿到），解析包 try/catch（见 `faceFor`）。

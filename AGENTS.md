@@ -67,8 +67,8 @@
 
 ### 界面（18、20、30、33、34、38、39）
 
-18. **对话内的 NTR 面只借显示层**：模型 / 思考等级 / 额外 config options 读 `agent/catalog`；会话由哪个 agent 服务读插件绑定 `routeAgentId`（无答案时**严禁**用 `agents[0]` 填名字）；写入只走 `bindChatAgent` / `setChatSessionModel` / `setChatSessionEffort` / `setChatSessionConfig`，**严禁** `directory.select` / `selectModel`。cluster 顺序固定 `高级 → model → thought → agent`（首轮前 agent 底座是右端锚点、不能被挤没）；picker 一行一个模型值、勾中的行必须写模型名；NTR 视图只读 `session/chat-transcript`，空状态区分「没服务过」与「ACP 会话没了」；空 roster 下底座不消失，`agentsLoaded` 之前不得把「未读取」当「未配置」。→ [ui.md](./AGENTS/ui.md)
-20. **【竞争式遮蔽已退役】座位靠 claim 接管，失败一律放开**：`createModelSeatClaim` 用 `entriesOfSlot` 核实 head，不中就有界重注册（`MAX_SEAT_CLAIMS`），注册经 `ctx.slots.inject`；只读舞台会话 `agentPreset === ACP_PRESET_ID`，切走即撤；`stagedSessionOf` / `rowAgentPreset` 兼容两代快照；任何不确定都回到原生座位；`ACP_PRESET_ID` 三处同步。→ [ui.md §1](./AGENTS/ui.md) / [retired.md](./AGENTS/retired.md)
+18. **对话内的 NTR 面只借显示层**：模型 / 思考等级 / 额外 config options 读 `agent/catalog`；会话由哪个 agent 服务读插件绑定 `routeAgentId`（无答案时**严禁**用 `agents[0]` 填名字）；写入只走 `bindChatAgent` / `setChatSessionModel` / `setChatSessionEffort` / `setChatSessionConfig`，**严禁** `directory.select` / `selectModel`。cluster 顺序固定 `高级 → model → thought → agent`（首轮前 agent 底座是右端锚点、不能被挤没）；picker 一行一个模型值、勾中的行必须写模型名；NTR 视图只读 `session/chat-transcript`，空状态区分「没服务过」与「ACP 会话没了」；**新增任何 ACP 专属槽位条目前的铁律**：先回答「非 NTR 会话里这个槽位归谁」——答案必须是 DSH 原生条目；**会替换或常驻改变原生面的条目**（`single` / `keyed` 座位，以及投影进每条会话的 `list` 槽如 `conversation.view` / `conversation.composer.dock`）只准走 gate claim / `syncAcpMode` 动态挂卸，**严禁**无条件注册；纯附加的事务条目（`conversation.input.dock` 的权限卡 / 释放横幅、`assistant-actions` 分支键）必须自门禁到「本会话确有该事务」，无数据不渲染，且不得遮蔽原生条目；组件里的 `return null` 只是最后防线，**不能当隔离**；非 NTR 会话的 NTR 页签 / 底部环必须不存在，原生模型、权限、上下文统计与 agent 控件必须原样可见；空 roster 下底座不消失，`agentsLoaded` 之前不得把「未读取」当「未配置」。→ [ui.md](./AGENTS/ui.md)
+20. **【竞争式遮蔽已退役】座位靠 claim 接管，失败一律放开**：`createModelSeatClaim` 用 `entriesOfSlot` 核实 head，不中就有界重注册（`MAX_SEAT_CLAIMS`），注册经 `ctx.slots.inject`；只读舞台会话 `agentPreset === ACP_PRESET_ID`，切走即撤；舞台会话优先取宿主当前选择（`uiSession.adapter.current`），列表 `retainedBy.mainView` 只作无 scope adapter 的兜底；`stagedSessionOf` / `rowAgentPreset` 兼容两代快照；任何不确定都回到原生座位；`ACP_PRESET_ID` 三处同步。→ [ui.md §1](./AGENTS/ui.md) / [retired.md](./AGENTS/retired.md)
 30. **NTR 会话的 `/` 属于 agent**：只列 agent 经 `available_commands_update` 声明的命令，Enter 不被宿主认领，选中只插回草稿；实现只能运行时包装活的 `/` 来源（`slash-isolation.ts`），**严禁**注册第二个来源或替换 composer；命令清单只由一个来源承载；没有证据时 fail-open；命令声明按 agent 缓存进 `model-catalog.json` 供首条消息前使用。→ [ui.md §6](./AGENTS/ui.md) / [state.md §6](./AGENTS/state.md)
 33. **设置页文案有预算上限**：一个控件的说明一行讲完，机制解释进代码注释与 `AGENTS/`，不进 UI；覆盖事实**必须看得见**——`configured[key]` 挂被覆盖的那一行、用警告色、不与其它灰色小字同层；重置按钮只有真的覆盖了才出现；文案里点名的控件名必须与可见标题一致。→ [ui.md §8](./AGENTS/ui.md) / [permissions.md §2.4](./AGENTS/permissions.md)
 34. **界面颜色只走宿主 alias token，写死颜色只能出现在 `var()` fallback**：主题归宿主，插件不维护 JS 主题状态，**严禁**自写 `color-scheme: light dark`；状态色按宿主配对（`state-*-tertiary` 底 / `state-*-primary` 前景、diff 行 `file-diff-*-bg`、danger hover `interactive-bg-hover-danger`）；宿主没有 `--dsw-alias-text-*` / `button-primary-invert` / `font-mono`，分别用 `label-*` / `label-primary-foreground` / `--ds-font-family-code`。→ [ui.md §11](./AGENTS/ui.md)
@@ -112,7 +112,7 @@
 - `bridge.spec.ts`：集成测试，用真实子进程跑 `tests/mock-agent.mjs` 验证 stdio ACP 全链路。
 - `acp-view.spec.ts`：浏览器半区纯函数（diff / 空状态 / codec / 路径等价 / 审批期限事实）。
 - `session-controls.spec.ts`：composer 芯片与菜单**说了什么**（`agentBaseChip` / `describeRoute` / `menuFor`）。
-- `model-seat.spec.ts`：座位 claim 的装 / 撤 / 重取。
+- `model-seat.spec.ts`：座位 claim 与 ACP gate 的装 / 撤 / 重取（含 `conversation.view` / `conversation.composer.dock` 的 ACP-only 动态注册）。
 - `slash-isolation.spec.ts`：斜杠来源包装与 fail-open。
 
 ## 环境前置条件

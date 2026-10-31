@@ -74,6 +74,21 @@ interface StructuralServices {
     fork?: (options: { sessionId: string; increaseTitle?: boolean }) => Promise<unknown>
   }
   /**
+   * The renderer's Session scope adapter (`uiSession.adapter`). Its `current`
+   * observable is the host's own selection — the session the composer is
+   * actually staged on — while the list can retain more than one row in a
+   * multi-view layout. Read structurally and used under try/catch: a host
+   * without it falls back to the list's main-view scan.
+   */
+  uiSession: {
+    adapter?: {
+      current?: {
+        getSnapshot(): { key?: unknown } | undefined
+        subscribe?(listener: () => void): () => void
+      }
+    }
+  }
+  /**
    * The shell workspace service (`ctx.get("uiWorkspace")`): `openSession`
    * focuses a session in the main view — the branch click's final step.
    */
@@ -294,17 +309,10 @@ export function apply(ctx: Context): void {
 
   // The agent's OWN context occupancy in the composer's bottom info row
   // (`conversation.composer.dock` — the dock below the input card where the
-  // host renders its native ContextMeter). The native meter reads host
-  // projections an ACP request never feeds, so this ring reports the agent's
-  // `usage_update` used/size instead (see context-meter.tsx). Registered for
-  // every conversation; the component gates itself on an ACP conversation row
-  // carrying usage.
-  ctx.effect(() => ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
-    name: 'conversation.composer.dock',
-    id: 'acp-context-meter',
-    order: 10,
-    inject: (sessionId: unknown) => chatFace(sessionId),
-  }, AcpContextMeter as unknown as SlotComponent<any>)), 'dsh-ntr: composer context meter')
+  // host renders its native ContextMeter) is installed by the ACP-mode gate
+  // below, with the same lifetime as the NTR view tab and the seats. It is
+  // NOT registered unconditionally: in an ordinary conversation this row must
+  // hold the host's native meter and nothing of ours (see `holdAuxEntries`).
 
   // Its picker rides the composer's overlay seat — the platform's home for
   // menus, so the popup floats above the card instead of being clipped by it.
@@ -387,6 +395,30 @@ export function apply(ctx: Context): void {
   }
 
   /**
+   * The renderer's current Session scope observable, when this host exposes it.
+   * This is the source the host's own main-view picker prefers; the list's
+   * retained rows are only the fallback for hosts without the adapter.
+   */
+  const currentScopeSource = (): NonNullable<StructuralServices['uiSession']['adapter']>['current'] => {
+    try {
+      const current = service<StructuralServices['uiSession']>('uiSession')?.adapter?.current
+      return current !== undefined && typeof current.getSnapshot === 'function' ? current : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /** The session the composer is actually staged on, if the runtime can say. */
+  const currentScopeSessionId = (): string | undefined => {
+    try {
+      const key = currentScopeSource()?.getSnapshot?.()?.key
+      return typeof key === 'string' && key !== '' ? key : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
    * Chat session ids the ACP-mode tracker has already asked the host about (the
    * `session/chat-list` fallback), mapped to WHEN the last ask went out. The
    * ask is once per id so a host whose answer carries no `acpMode` cannot turn
@@ -413,6 +445,8 @@ export function apply(ctx: Context): void {
 
   ctx.effect(() => {
     let stopWatch: (() => void) | undefined
+    /** Subscription to the renderer's current Session binding (see `currentScopeSource`). */
+    let stopCurrent: (() => void) | undefined
     /**
      * The claim on the host's model seat, held while the staged conversation
      * runs the ACP preset. That cell is where the host's own base sits (the
@@ -449,6 +483,52 @@ export function apply(ctx: Context): void {
      */
     let permissionClaim: ModelSeatClaim | undefined
     /**
+     * ACP-only auxiliary entries: the NTR view tab and the composer's context
+     * ring. Unlike the two seats these are `list` slots with no visibility
+     * predicate of their own, so "self-hide in the component" cannot remove a
+     * tab from the header or free the native bottom row. They are installed by
+     * this gate for exactly the same lifetime as the claims and disposed on
+     * every stand-down — a standard conversation then has no NTR tab at all,
+     * and the host's native context meter sits alone in its dock row.
+     */
+    let viewEntry: (() => void) | undefined
+    let meterEntry: (() => void) | undefined
+    const releaseAuxEntries = (): void => {
+      try { viewEntry?.() } catch {}
+      viewEntry = undefined
+      try { meterEntry?.() } catch {}
+      meterEntry = undefined
+    }
+    const holdAuxEntries = (): void => {
+      // A refused registration leaves the native surface in place (fail-open);
+      // the next evaluation retries when the slot is declared.
+      if (viewEntry === undefined) {
+        try {
+          viewEntry = ctx.slots.inject('conversation.view', () => ctx.slots.register({
+            name: 'conversation.view',
+            id: 'acp',
+            order: 20,
+            label: () => label('NTR', 'NTR'),
+            inject: (sessionId: unknown) => chatFace(sessionId),
+          }, AcpConversationView as unknown as SlotComponent<any>))
+        } catch {
+          viewEntry = undefined
+        }
+      }
+      if (meterEntry === undefined) {
+        try {
+          meterEntry = ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
+            name: 'conversation.composer.dock',
+            id: 'acp-context-meter',
+            order: 10,
+            inject: (sessionId: unknown) => chatFace(sessionId),
+          }, AcpContextMeter as unknown as SlotComponent<any>))
+        } catch {
+          meterEntry = undefined
+        }
+      }
+    }
+    /**
      * Last diagnostic line from {@link syncAcpMode}. Every way this gate can
      * end with the native seat still on screen used to be silent — an inner
      * `catch { return [] }` and an outer `catch { … }` between them swallowed
@@ -460,7 +540,8 @@ export function apply(ctx: Context): void {
     let seatDiag = 'idle'
     let permissionSeatDiag = 'idle'
     /**
-     * Hand BOTH cells back to their shipped occupants.
+     * Hand every ACP-only surface back: both composer cells, the NTR view tab
+     * and the context ring.
      *
      * Every path that is not "this staged conversation is CONFIRMED to run the
      * ACP preset" ends here — including the paths that carry no verdict at all
@@ -483,6 +564,7 @@ export function apply(ctx: Context): void {
       permissionSeatDiag = `${reason} (released)`
       disarmVerdictReask()
       setScopeMarker(false)
+      releaseAuxEntries()
       if (claim !== undefined) { claim.release(); claim = undefined }
       if (permissionClaim !== undefined) { permissionClaim.release(); permissionClaim = undefined }
     }
@@ -516,7 +598,13 @@ export function apply(ctx: Context): void {
         standDown('no session list service')
         return
       }
-      const staged = stagedSessionOf(snapshot)
+      // Prefer the renderer's own current selection; the list's retained rows
+      // are the fallback for hosts without the scope adapter. A multi-view
+      // layout can leave several rows retained, and judging the first one (or
+      // the one the previous switch left behind) would hold the ACP chrome
+      // while an ordinary conversation is on screen — the reported drift.
+      const current = currentScopeSessionId()
+      const staged = stagedSessionOf(snapshot, current)
       if (staged === undefined) {
         standDown('no staged session (nothing retains the main view)')
         return
@@ -572,7 +660,7 @@ export function apply(ctx: Context): void {
       // nothing. Both cells follow the same evidence — the staged
       // conversation's preset — through one {@link standDown}, so neither can
       // stay claimed after the evidence for it stops answering.
-      if (!stagedIsAcpMode(snapshot, acpModeVerdict)) {
+      if (!stagedIsAcpMode(snapshot, acpModeVerdict, current)) {
         // The row's own verdict is authoritative even when it says no: fold it
         // into the store so every per-conversation surface (the branch
         // button's ACP gate included) stops rendering without waiting for a
@@ -618,6 +706,11 @@ export function apply(ctx: Context): void {
         onDiag: (line) => { permissionSeatDiag = `staged ${staged.sessionId} · ${line}` },
       })
       permissionClaim.sync()
+      // The tab and the occupancy ring have the same lifetime as the claims:
+      // they exist only while this staged conversation is an ACP one, and a
+      // stand-down disposes them (a standard conversation must not see an NTR
+      // tab, and the host's native bottom row must stand alone there).
+      holdAuxEntries()
       // Confirmed ACP on a silent row: the verdict is all the evidence there
       // is, so it gets a re-ask deadline (see {@link ACP_MODE_VERDICT_TTL_MS}).
       if (rowAgentPreset(staged.row) === undefined) armVerdictReask()
@@ -671,6 +764,18 @@ export function apply(ctx: Context): void {
     const attach = (): void => {
       const list = sessionsList()
       if (list !== undefined && stopWatch === undefined) stopWatch = list.subscribe(runGate)
+      // The selection can move without the list changing (a tab or sidebar
+      // click), and `uiSession.current` is the host's own answer to "which
+      // conversation is on screen". Re-run the gate on that transition so the
+      // ACP chrome leaves before the newly staged ordinary conversation paints.
+      const current = currentScopeSource()
+      if (current?.subscribe !== undefined && stopCurrent === undefined) {
+        try {
+          stopCurrent = current.subscribe(runGate)
+        } catch {
+          stopCurrent = undefined
+        }
+      }
       attachPresetFrames()
       runGate()
     }
@@ -734,10 +839,12 @@ export function apply(ctx: Context): void {
       stopCell()
       stopPreset?.()
       stopWatch?.()
+      stopCurrent?.()
       disarmVerdictReask()
       // The scope marker dies with the gate: a reload (HMR) must not leave the
       // hiding CSS pointed at conversations nothing confirms anymore.
       setScopeMarker(false)
+      releaseAuxEntries()
       if (claim !== undefined) { claim.release(); claim = undefined }
       if (permissionClaim !== undefined) { permissionClaim.release(); permissionClaim = undefined }
       store.noteSeatDiag('gate disposed')
@@ -779,12 +886,14 @@ export function apply(ctx: Context): void {
         sessionsList()?.getSnapshot(),
         sessionId,
         id => store.getSnapshot().acpMode[id],
+        currentScopeSessionId(),
       ),
       ensureVerdict: async (sessionId) => {
         const held = (): boolean | undefined => slashAcpVerdict(
           sessionsList()?.getSnapshot(),
           sessionId,
           id => store.getSnapshot().acpMode[id],
+          currentScopeSessionId(),
         )
         const known = held()
         if (known !== undefined) return known
@@ -867,11 +976,10 @@ export function apply(ctx: Context): void {
   // diffs). Session-scope list entry; the view ring renders it one tab at a
   // time. Meanwhile the agent's prose and thinking ride the NATIVE chat plane
   // through the LLM adapter — see docs/acp-convergence.md §2.1.
-  ctx.effect(() => ctx.slots.inject('conversation.view', () => ctx.slots.register({
-    name: 'conversation.view',
-    id: 'acp',
-    order: 20,
-    label: () => 'NTR',
-    inject: (sessionId: unknown) => chatFace(sessionId),
-  }, AcpConversationView as unknown as SlotComponent<any>)), 'dsh-ntr: ACP view tab')
+  //
+  // It is installed by the ACP-mode gate above (`holdAuxEntries`) and NOT at
+  // plugin load: the host projects every registered `conversation.view` entry
+  // into EVERY session's tab strip, so an unconditional registration showed
+  // the NTR tab on ordinary conversations too. The gate's lifetime is the
+  // only per-session seam the host offers.
 }

@@ -44,7 +44,9 @@ export interface ContextOccupancy {
  * entry must render nothing. An explicit `acpMode === false` outranks a stale
  * `chatSessions` row: the conversation's preset left NTR while its ACP session
  * was still alive, and the ring must leave with it (same precedence as the
- * agent tag's `agentTagVisible`).
+ * agent tag's `agentTagVisible`). While the verdict is unknown, a LIVE row is
+ * proof; a PARKED one is not — it can outlive the preset switch, and the ring
+ * must not appear on an ordinary conversation during the answer window.
  */
 export function acpMeterUsage(
   ui: Pick<UiState, 'acpMode' | 'chatSessions' | 'chatSessionsFor'>,
@@ -52,8 +54,14 @@ export function acpMeterUsage(
 ): SessionView['usage'] | undefined {
   if (ui.acpMode[dshSessionId] === false) return undefined
   if (ui.chatSessionsFor !== dshSessionId) return undefined
-  const target = ui.chatSessions.find(row => !row.released) ?? ui.chatSessions[0]
-  return target?.usage
+  const live = ui.chatSessions.find(row => !row.released)
+  // A PARKED row alone is not proof this conversation is still in NTR mode:
+  // switching off the preset leaves the ACP session record alive, and while the
+  // host has not answered (`undefined`) the ring must not appear on an
+  // ordinary conversation. A live row is proof; a parked one needs the
+  // affirmative verdict.
+  if (live === undefined && ui.acpMode[dshSessionId] !== true) return undefined
+  return (live ?? ui.chatSessions[0])?.usage
 }
 
 /**

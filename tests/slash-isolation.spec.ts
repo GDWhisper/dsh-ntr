@@ -120,6 +120,18 @@ describe('slashAcpVerdict', () => {
     expect(slashAcpVerdict({ ...snapshot, byId: { 'chat-1': { agentPreset: 'standard' } } }, 'chat-1', () => true)).toBe(false)
   })
 
+  it('reads the renderer current selection, not the first retained row', () => {
+    const snapshot = {
+      ids: ['acp', 'standard'],
+      byId: {
+        acp: { id: 'acp', retainedBy: { mainView: 1 }, projectionValues: { agentPreset: 'acp' } },
+        standard: { id: 'standard', retainedBy: { mainView: 1 }, projectionValues: { agentPreset: 'standard' } },
+      },
+    }
+    expect(slashAcpVerdict(snapshot, 'standard', () => true, 'standard')).toBe(false)
+    expect(slashAcpVerdict(snapshot, 'acp', () => false, 'acp')).toBe(true)
+  })
+
   it('falls back to the host verdict while the row is silent, and answers undefined without one', () => {
     const snapshot = { current: 'chat-1', byId: { 'chat-1': {} } }
     expect(slashAcpVerdict(snapshot, 'chat-1', () => true)).toBe(true)

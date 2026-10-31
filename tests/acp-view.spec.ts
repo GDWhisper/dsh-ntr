@@ -13,6 +13,7 @@ import { ACP_PRESET_ID, acpModeFromPresetEvent, formatCommandLine, isAbsolutePat
 import { agentLockPhaseOf, FORM_MS, playAgentLockAnim, SHATTER_MS } from '../src/client/agent-lock-anim.ts'
 import { branchIconOf } from '../src/client/branch-action.tsx'
 import { acpEmptyCopy, boundAgentOf, diffRows, historyAwaitsReplay, isNewFileDiff } from '../src/client/acp-view.tsx'
+import { agentModeVisible } from '../src/client/composer-mode.tsx'
 import { acpMeterUsage, compactTokenCount, contextOccupancy } from '../src/client/context-meter.tsx'
 import { approvalDeadlineFacts, DEADLINE_MIN_WAIT_MS, deadlineSliderIndex, deadlineValueFor } from '../src/client/panel.tsx'
 import { describeRoute, menuFor, REFRESH_CATALOG_ITEM } from '../src/client/session-controls.tsx'
@@ -254,6 +255,29 @@ describe('stagedIsAcpMode (does the staged conversation run the ACP preset)', ()
     expect(rowAgentPreset({ agentPreset: 'standard' })).toBe('standard')
     expect(rowAgentPreset(undefined)).toBeUndefined()
     expect(rowAgentPreset({})).toBeUndefined()
+  })
+
+  it('prefers the renderer current selection over the list order', () => {
+    // The host's own main-view picker prefers its `current` binding; the list
+    // can retain more than one row. Without this key the first `ids` row used
+    // to win, which kept ACP chrome on screen while an ordinary conversation
+    // was selected.
+    const both = {
+      ids: ['acp', 'standard'],
+      byId: {
+        acp: { id: 'acp', retainedBy: { mainView: 1 }, projectionValues: { agentPreset: ACP_PRESET_ID } },
+        standard: { id: 'standard', retainedBy: { mainView: 1 }, projectionValues: { agentPreset: 'standard' } },
+      },
+    }
+    expect(stagedSessionOf(both, 'standard')?.sessionId).toBe('standard')
+    expect(stagedIsAcpMode(both, undefined, 'standard')).toBe(false)
+    expect(stagedSessionOf(both, 'acp')?.sessionId).toBe('acp')
+    expect(stagedIsAcpMode(both, undefined, 'acp')).toBe(true)
+    // The renderer answered, but the list has no row for it yet (or it is an
+    // unlisted subagent address): stand down instead of judging another row.
+    expect(stagedSessionOf(both, 'missing')).toBeUndefined()
+    // No current key (a host without the scope adapter) keeps the old fallback.
+    expect(stagedSessionOf(both)?.sessionId).toBe('acp')
   })
 })
 
@@ -712,9 +736,9 @@ describe('the ACP view empty state (no transcript to show)', () => {
 
   it('points at the composer base only inside an NTR-mode conversation', () => {
     // THE F7 case: the base is installed by the ACP-mode gate alone
-    // (`syncAcpMode`), and the NTR view tab is registered unconditionally — so
-    // in an ordinary conversation that cell still holds the host's own model
-    // selector and the hint sent the user to a control that is not there.
+    // (`syncAcpMode`), so in an ordinary conversation that cell still holds the
+    // host's own model selector and a hint naming the NTR base would send the
+    // user to a control that is not there.
     expect(acpEmptyCopy({ hasAgents: true, acpMode: true }, en).hint)
       .toBe('pick one from the NTR base in the composer')
     const ordinary = acpEmptyCopy({ hasAgents: true, acpMode: false }, en)
@@ -1033,6 +1057,19 @@ describe('acpMeterUsage', () => {
     // session; the ring must leave with the preset, like the agent tag does.
     expect(acpMeterUsage({ acpMode: { c: false }, chatSessionsFor: 'c', chatSessions: [row] }, 'c'))
       .toBeUndefined()
+  })
+
+  it('a parked row alone does not prove ACP mode while the verdict is unknown', () => {
+    // The row can outlive the preset switch; only a live row is proof on its
+    // own. Without the explicit verdict this must not paint an NTR ring on an
+    // ordinary conversation during the answer window.
+    const parked = { agentId: 'pi', sessionId: 's0', usage: { used: 5, size: 100 }, released: true }
+    expect(acpMeterUsage({ acpMode: {}, chatSessionsFor: 'c', chatSessions: [parked] }, 'c'))
+      .toBeUndefined()
+    // The affirmative verdict restores it (the ring reads the parked sample
+    // until a resume republishes the live one).
+    expect(acpMeterUsage({ acpMode: { c: true }, chatSessionsFor: 'c', chatSessions: [parked] }, 'c'))
+      .toEqual({ used: 5, size: 100 })
   })
 
   it('prefers the live row over a released one for the same conversation', () => {

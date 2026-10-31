@@ -131,8 +131,9 @@ export function slashAcpVerdict(
   snapshot: AcpSessionsSnapshot | undefined,
   sessionId: string,
   verdict: (sessionId: string) => boolean | undefined,
+  currentSessionId?: string,
 ): boolean | undefined {
-  const staged = stagedSessionOf(snapshot)
+  const staged = stagedSessionOf(snapshot, currentSessionId)
   if (staged !== undefined && staged.sessionId === sessionId) {
     const listed = rowAgentPreset(staged.row)
     if (listed !== undefined) return listed === ACP_PRESET_ID

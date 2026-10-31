@@ -66,6 +66,25 @@ export function agentModeTitle(agentId: string | undefined, acp: AcpStore): stri
 }
 
 /**
+ * Whether this conversation is one the agent-mode control may serve.
+ *
+ * An EXPLICIT non-ACP verdict outranks a lingering session row: switching a
+ * conversation off the NTR preset does not close its ACP session, so "a row
+ * exists" alone would keep this control on an ordinary conversation — the same
+ * precedence the agent tag, the context ring and the released banner already
+ * apply. Only while the host has not answered (`undefined`) does a bound
+ * session count as proof, which is what keeps the control available before the
+ * host's first `session/chat-list` answer lands.
+ */
+export function agentModeVisible(
+  acpMode: boolean | undefined,
+  hasBoundSession: boolean,
+): boolean {
+  if (acpMode === false) return false
+  return acpMode === true || hasBoundSession
+}
+
+/**
  * The mode the select shows as in force.
  *
  * A LIVE session is the authority (it is what the agent runs right now). A
@@ -104,9 +123,10 @@ export function AcpComposerMode({ acp, sessionId, useSession }: ComposerModeProp
   // unconditionally), so it must gate itself. The `defaultAgent` fallback below
   // would otherwise put an ACP mode select into ORDINARY conversations: the
   // agent id is plugin-global, so "an agent is configured" is not the same
-  // question as "this conversation is served by one". A live session is itself
-  // proof; otherwise it is the same host verdict the seat gate reads.
-  const isAcp = target !== undefined || ui.acpMode[dshSessionId] === true
+  // question as "this conversation is served by one". A live session is proof
+  // only while the host has not answered; an explicit `false` wins over the
+  // lingering row a preset switch leaves behind (see `agentModeVisible`).
+  const isAcp = agentModeVisible(ui.acpMode[dshSessionId], target !== undefined)
   // The agent this conversation is set up on, live session or not. Before the
   // first message there is no session to read a mode list from, yet the user is
   // already choosing the agent — and the mode is one of the things they may
@@ -135,6 +155,12 @@ export function AcpComposerMode({ acp, sessionId, useSession }: ComposerModeProp
     void acp.loadAgentCatalog(agentId)
   }, [acp, agentId, isAcp, target])
 
+  // The whole control is ACP-only: a lingering live session row survives a
+  // preset switch, so its `availableModes` are NOT a licence to render here.
+  // Without this guard an ordinary conversation kept an agent-mode select
+  // beside its native controls (reported as "the bottom bar lost its native
+  // capabilities").
+  if (!isAcp) return null
   const live = target?.modes?.availableModes ?? []
   // TWO sources, one list. A live session's `session/new` answer is the
   // authority on which modes exist and which is in force; the probed catalog
@@ -142,7 +168,7 @@ export function AcpComposerMode({ acp, sessionId, useSession }: ComposerModeProp
   // agent published on ITS throwaway session). A live session always wins.
   const modes = live.length > 0
     ? live
-    : (isAcp ? catalog?.mode?.choices ?? [] : []).map(choice => ({ id: choice.id, name: choice.name, description: choice.description }))
+    : (catalog?.mode?.choices ?? []).map(choice => ({ id: choice.id, name: choice.name, description: choice.description }))
   if (modes.length === 0) return null
   // The mode IN FORCE: a live session is the authority, before one exists (or
   // while one is parked) the claims available are the pick this conversation

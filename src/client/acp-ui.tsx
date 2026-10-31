@@ -323,6 +323,13 @@ export interface AcpStagedSession {
 /**
  * Which session the composer is currently staged on.
  *
+ * The renderer's own current scope binding is the first answer when the caller
+ * passes it (`currentSessionId`, read from `uiSession.adapter.current` in the
+ * browser entry): that is the exact session the host has selected, while the
+ * list can retain more than one row in a multi-view layout. Falling back to
+ * the list is still required — a host without that scope adapter, and the old
+ * snapshot shape below, have no better source.
+ *
  * Old runtimes answer from `snapshot.current` (with `currentAddress` as the
  * subagent marker). rc.2 has no `current`: the staged session is the row the
  * main view retains (`retainedBy.mainView > 0`) — the exact rule
@@ -330,8 +337,16 @@ export interface AcpStagedSession {
  * row with `origin === "subagent"` is an addressed subagent route. `undefined`
  * when nothing is staged yet (the list has not loaded, or no row holds the main
  * view): callers must stand down rather than guess.
+ *
+ * A current id the list has no row for is ALSO `undefined`: the selection may
+ * be a subagent address, and guessing "not a subagent" there would let the
+ * gate install ACP chrome on a route the plugin must not drive. The next list
+ * notification retries.
  */
-export function stagedSessionOf(snapshot: AcpSessionsSnapshot | undefined): AcpStagedSession | undefined {
+export function stagedSessionOf(
+  snapshot: AcpSessionsSnapshot | undefined,
+  currentSessionId?: string,
+): AcpStagedSession | undefined {
   if (snapshot === undefined) return undefined
   if (snapshot.current !== undefined) {
     return {
@@ -341,6 +356,11 @@ export function stagedSessionOf(snapshot: AcpSessionsSnapshot | undefined): AcpS
     }
   }
   const byId = snapshot.byId ?? {}
+  if (currentSessionId !== undefined) {
+    const row = byId[currentSessionId]
+    if (row === undefined) return undefined
+    return { sessionId: currentSessionId, row, subagent: row.origin === 'subagent' }
+  }
   // Candidate set is `byId`, NOT `ids`. In rc.2 the controller projects
   // `ids` from the host list only, then appends two fallback families to
   // `byId` without an `ids` entry: subagent-catalog children of a projected
@@ -367,8 +387,9 @@ export function stagedSessionOf(snapshot: AcpSessionsSnapshot | undefined): AcpS
 export function stagedIsAcpMode(
   snapshot: AcpSessionsSnapshot | undefined,
   acpMode?: (sessionId: string) => boolean | undefined,
+  currentSessionId?: string,
 ): boolean {
-  const staged = stagedSessionOf(snapshot)
+  const staged = stagedSessionOf(snapshot, currentSessionId)
   if (staged === undefined || staged.subagent) return false
   const listed = rowAgentPreset(staged.row)
   if (listed !== undefined) return listed === ACP_PRESET_ID

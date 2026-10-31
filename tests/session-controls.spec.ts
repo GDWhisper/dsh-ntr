@@ -18,7 +18,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { agentModeTitle, modeInForce } from '../src/client/composer-mode.tsx'
+import { agentModeTitle, agentModeVisible, modeInForce } from '../src/client/composer-mode.tsx'
 import {
   acpSettingsDialogIsOpen,
   closeAcpSettingsDialog,
@@ -534,5 +534,16 @@ describe('the agent-mode tooltip does not call the host access mode complementar
     expect(title).not.toContain('互补')
     // An agent id that never resolved still reads as a sentence.
     expect(agentModeTitle(undefined, acp)).toContain('agent')
+  })
+
+  it('renders only for an ACP conversation, and an explicit no outranks a lingering row', () => {
+    // Switching a conversation off the NTR preset leaves its ACP session row
+    // alive; "a row exists" is not proof of the mode. The host's explicit false
+    // wins, exactly like the agent tag, the context ring and the released
+    // banner. Before the first host answer, the row is the only proof.
+    expect(agentModeVisible(true, false)).toBe(true)
+    expect(agentModeVisible(undefined, true)).toBe(true)
+    expect(agentModeVisible(false, true)).toBe(false)
+    expect(agentModeVisible(undefined, false)).toBe(false)
   })
 })

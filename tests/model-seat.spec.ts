@@ -813,9 +813,14 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
    * only the verdict map can.
    */
   function makeHost(options: { silentRow?: boolean; withList?: boolean; triggers?: unknown[] } = {}) {
-    interface Entry { component: unknown; options: { priority: number; registrant?: string }; inject?: unknown }
+    interface Entry { component: unknown; options: { priority: number; registrant?: string; id?: string }; inject?: unknown }
     const cells = new Map<string, Entry[]>()
-    const declared = new Set<string>([MODEL_SEAT_KEY, PERMISSION_SEAT_KEY])
+    const declared = new Set<string>([
+      MODEL_SEAT_KEY,
+      PERMISSION_SEAT_KEY,
+      'conversation.view',
+      'conversation.composer.dock',
+    ])
     let counter = 0
     let registrations = 0
     const cellHandlers: Array<(...args: unknown[]) => void> = []
@@ -830,7 +835,7 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
     const slots = {
       spec: (key: string) => (declared.has(key) ? { kind: 'single' } : undefined),
       entriesOfSlot: (key: string) => [...(cells.get(key) ?? [])].sort((a, b) => a.options.priority - b.options.priority),
-      register(options: { name: string; priority?: number; inject?: unknown }, component: unknown) {
+      register(options: { name: string; id?: string; order?: number; priority?: number; inject?: unknown }, component: unknown) {
         if (!declared.has(options.name)) throw new Error(`slot "${options.name}" is not declared`)
         // A bound the real registry does not have: one gate evaluation must
         // install one entry, so a registration past this line is the gate
@@ -842,7 +847,10 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
         const rank = --counter
         const entry: Entry = {
           component,
-          options: { priority: rank },
+          options: {
+            priority: rank,
+            ...(options.id === undefined ? {} : { id: options.id }),
+          },
           ...(options.inject === undefined ? {} : { inject: options.inject }),
         }
         const list = cells.get(options.name) ?? []
@@ -876,6 +884,19 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
       subscribe(fn: () => void) { listListeners.add(fn); return () => { listListeners.delete(fn) } },
     }
     const notifyList = (): void => { for (const fn of [...listListeners]) fn() }
+    // The renderer's Session scope adapter (`uiSession.adapter.current`):
+    // `undefined` by default, which keeps every existing test on the list's
+    // main-view fallback; `select()` models a real selection change.
+    let currentKey: string | undefined
+    const currentListeners = new Set<() => void>()
+    const currentSource = {
+      getSnapshot: () => ({ key: currentKey }),
+      subscribe(fn: () => void) { currentListeners.add(fn); return () => { currentListeners.delete(fn) } },
+    }
+    const select = (sessionId: string | undefined): void => {
+      currentKey = sessionId
+      for (const fn of [...currentListeners]) fn()
+    }
 
     let hostAcpMode: boolean | undefined
     const rpcCalls: Array<{ endpoint: string; payload: unknown }> = []
@@ -898,6 +919,7 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
           if (options.withList === false) return undefined
           return { binding: () => undefined, list }
         }
+        if (key === 'uiSession') return { adapter: { current: currentSource } }
         if (key === 'inputTriggers') {
           return options.triggers === undefined ? undefined : { live: { sources: options.triggers } }
         }
@@ -944,6 +966,27 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
           }
         notifyList()
       },
+      /** Add one more main-view-retained row without replacing the current snapshot. */
+      retain(sessionId: string, row: { agentPreset?: string; subagent?: boolean }) {
+        const current = snapshot as { ids?: readonly string[]; byId?: Record<string, unknown> }
+        const ids = [...(current.ids ?? [])]
+        if (!ids.includes(sessionId)) ids.push(sessionId)
+        snapshot = {
+          ids,
+          byId: {
+            ...(current.byId ?? {}),
+            [sessionId]: {
+              id: sessionId,
+              retainedBy: { mainView: 1 },
+              ...(options.silentRow || row.agentPreset === undefined ? {} : { projectionValues: { agentPreset: row.agentPreset } }),
+              ...(row.subagent === true ? { origin: 'subagent' } : {}),
+            },
+          },
+        }
+        notifyList()
+      },
+      /** Move the renderer's current Session binding (the host's own selection). */
+      select(sessionId: string | undefined) { select(sessionId) },
       presetFrame(sessionId: string, agentPreset: string) {
         for (const handler of remoteHandlers.get('agent-preset/selected') ?? []) handler(sessionId, agentPreset)
       },
@@ -966,6 +1009,57 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
     // null-rendering blanking entry. Neither is the shipped occupant.
     expect(host.isNative(MODEL_SEAT_KEY, host.nativeModel)).toBe(false)
     expect(host.isNative(PERMISSION_SEAT_KEY, host.nativePermission)).toBe(false)
+  })
+
+  it('installs the NTR tab and context ring only on an ACP conversation', () => {
+    // Both are `list` entries the host projects into EVERY session's chrome:
+    // registering them at plugin load is exactly what left an NTR tab on
+    // ordinary conversations and an NTR ring in their bottom info row.
+    const host = makeHost()
+    apply(host.ctx as never)
+    host.stage('s1', { agentPreset: ACP_PRESET_ID })
+    expect(host.count('conversation.view')).toBe(1)
+    expect(host.count('conversation.composer.dock')).toBe(1)
+
+    host.stage('s1', { agentPreset: 'standard' })
+    expect(host.count('conversation.view')).toBe(0)
+    expect(host.count('conversation.composer.dock')).toBe(0)
+  })
+
+  it('follows the renderer current selection, not the first retained row', () => {
+    // A multi-view layout can leave two rows retaining the main view. The host
+    // picks the session the user selected (`uiSession.adapter.current`), so the
+    // gate must use that same answer — judging the first list row kept the ACP
+    // seats, tab and ring on screen while an ordinary conversation was open.
+    const host = makeHost()
+    apply(host.ctx as never)
+    host.stage('acp-1', { agentPreset: ACP_PRESET_ID })
+    host.retain('std-2', { agentPreset: 'standard' })
+    // Both rows retain the main view; without the current key the list-order
+    // fallback would judge acp-1.
+    host.select('std-2')
+    expect(host.isNative(MODEL_SEAT_KEY, host.nativeModel)).toBe(true)
+    expect(host.isNative(PERMISSION_SEAT_KEY, host.nativePermission)).toBe(true)
+    expect(host.count('conversation.view')).toBe(0)
+    expect(host.count('conversation.composer.dock')).toBe(0)
+
+    host.select('acp-1')
+    expect(host.isNative(MODEL_SEAT_KEY, host.nativeModel)).toBe(false)
+    expect(host.isNative(PERMISSION_SEAT_KEY, host.nativePermission)).toBe(false)
+    expect(host.count('conversation.view')).toBe(1)
+    expect(host.count('conversation.composer.dock')).toBe(1)
+  })
+
+  it('stands down when the current selection has no list row', () => {
+    // An addressed subagent route can be the current binding without a listed
+    // row. Guessing "not a subagent" there would install ACP chrome on a route
+    // this plugin must not drive.
+    const host = makeHost()
+    apply(host.ctx as never)
+    host.stage('s1', { agentPreset: ACP_PRESET_ID })
+    host.select('missing')
+    expect(host.isNative(MODEL_SEAT_KEY, host.nativeModel)).toBe(true)
+    expect(host.isNative(PERMISSION_SEAT_KEY, host.nativePermission)).toBe(true)
   })
 
   it('installs ONE entry per cell — the gate cannot re-enter itself through its own registration', () => {

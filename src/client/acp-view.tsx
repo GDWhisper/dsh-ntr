@@ -481,10 +481,15 @@ export function AcpConversationView(props: AcpViewProps) {
     node.scrollTop = node.scrollHeight
   }, [blockCount, tail])
 
+  // The gate installs the NTR tab only for a conversation it has confirmed as
+  // ACP; a stale release must not paint NTR content into an ordinary one for a
+  // frame, so anything but the affirmative verdict renders nothing.
+  if (ui.acpMode[sessionId] !== true) return null
+
   if (transcript === undefined) {
-    // `ui.acpMode[sessionId]` is `undefined` until the host has answered for
-    // this conversation; the copy builder reads that as "unknown" and says
-    // nothing rather than guessing.
+    // The guard above makes this a confirmed ACP conversation; the copy
+    // builder keeps its "unknown" branch for callers that only read facts
+    // (`docs` and tests), not for this rendered surface.
     const empty = acpEmptyCopy({
       bound: boundAgent,
       hasAgents: ui.agents.length > 0,

@@ -565,6 +565,16 @@ export function AcpSessionControls(props: AcpClusterProps) {
   useEffect(() => {
     if (served && agentListed && agentId !== undefined) void acp.loadAgentCatalog(agentId)
   }, [acp, served, agentListed, agentId])
+  // The picker could already be open when the first turn starts (clicking the
+  // send button is inside the composer card, which AcpMenu treats as its own
+  // furniture, so it does not close the menu). Once locked, that menu can only
+  // offer a switch the host will refuse — close it instead of leaving a live
+  // control over a locked conversation. Kept above every early return so the
+  // component never changes its hook order between renders.
+  useEffect(() => {
+    if (lockedTo === undefined || menu === null) return
+    if (menu.sessionId === sessionId && menu.kind === 'agent') closeAcpMenu()
+  }, [lockedTo, menu?.sessionId, menu?.kind, sessionId])
   const route = describeRoute(
     agents,
     bound,
@@ -590,15 +600,14 @@ export function AcpSessionControls(props: AcpClusterProps) {
   // base never comes back, and the tag is the only place the agent's name
   // lives.
   //
-  // The picker could already be open when the first turn starts (clicking the
-  // send button is inside the composer card, which AcpMenu treats as its own
-  // furniture, so it does not close the menu). Once locked, that menu can only
-  // offer a switch the host will refuse — close it instead of leaving a live
-  // control over a locked conversation.
-  useEffect(() => {
-    if (lockedTo === undefined || menu === null) return
-    if (menu.sessionId === sessionId && menu.kind === 'agent') closeAcpMenu()
-  }, [lockedTo, menu?.sessionId, menu?.kind, sessionId])
+  // The gate releases this cell when the conversation leaves ACP mode, and it
+  // only ever installs the claim for a session whose verdict it has already
+  // folded as TRUE — so the occupant requires that same affirmative fact. A
+  // claim held for one more evaluation (or a layout with more than one visible
+  // session) must never put NTR chips on an ordinary conversation's bar.
+  // Placed AFTER every hook: an early return above a hook would change the
+  // hook order between renders.
+  if (ui.acpMode[sessionId] !== true) return null
   // Keep the base mounted for the shatter half even though the lock already
   // retired it: unmounting on the same commit the lock arrives would skip the
   // transition entirely (the tag waits for the same phase to leave 'shatter').
@@ -1019,6 +1028,9 @@ export function AcpSessionMenu(props: AcpClusterProps) {
   }, [acp, menu, served, agentId])
 
   if (menu === null || menu.sessionId !== sessionId) return null
+  // A stale picker must not outlive the conversation's ACP mode (the gate
+  // releases the view/tab, but the overlay is unconditionally registered).
+  if (ui.acpMode[sessionId] !== true) return null
   const route = describeRoute(
     agents,
     bound,
