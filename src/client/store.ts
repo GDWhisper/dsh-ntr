@@ -96,6 +96,51 @@ export function permissionsForSession(
   return permissions.filter(permission => permission.dshSessionId === dshSessionId)
 }
 
+/** The branch button's six states (the NTR message-actions plan, §D4). */
+export type ChatForkState =
+  | 'ready'
+  | 'unsupported'
+  | 'released'
+  | 'busy'
+  | 'notTail'
+  | 'hostUnavailable'
+
+/**
+ * The branch click's outcome: the child DSH session id on success, or one
+ * actionable failure line (also flashed into the notice banner — the line is
+ * the conversation's local copy of the same failure).
+ */
+export type ChatForkOutcome = { childId: string } | { failure: string }
+
+/**
+ * The branch button's state for one conversation, in the precedence it renders:
+ * the host service missing beats everything (nothing can work), then the
+ * agent's fork capability, then the session's own state (a parked session
+ * before a running one), then the DOM's tail verdict, and only then ready.
+ *
+ * Every input is a fact someone else owns — the row's `fork` verdict is the
+ * host's, `hostFork` is the structural probe of the runtime's `sessions.fork`,
+ * `isTail` is read from the host's own `[data-turn-tail]` marker, and
+ * `liveRunning` is the SSE-driven running flag (the row's own `running` only
+ * refreshes on a chat-list read, so it would answer last turn). `undefined`
+ * facts degrade CLOSED: no row and no `fork` verdict both read as not-ready,
+ * never as a click-through.
+ */
+export function forkStateOf(
+  row: ChatSessionView | undefined,
+  hostFork: boolean,
+  isTail: boolean,
+  liveRunning?: boolean,
+): ChatForkState {
+  if (!hostFork) return 'hostUnavailable'
+  if (row === undefined) return 'released'
+  if (row.fork === undefined) return 'unsupported'
+  if (row.fork.supported !== true) return row.fork.reason ?? 'unsupported'
+  if (liveRunning === true) return 'busy'
+  if (!isTail) return 'notTail'
+  return 'ready'
+}
+
 /**
  * Compact countdown for one ask, or `undefined` when there is nothing to count
  * down (`wait` mode, or a frame without a deadline). Pure so the formatting is
@@ -1568,6 +1613,13 @@ export class AcpStore {
    * being the one authorized exception. Same no-op-when-unchanged discipline as
    * the other accessors, so a frame restating the held verdict costs no
    * listener churn.
+   *
+   * The seat gate (`syncAcpMode`) is the SECOND caller: it folds the runtime
+   * row's own `agentPreset` — the same session-log source the frames announce —
+   * through here, in both directions. That hands the row the frame's authority
+   * on purpose (one provenance, one rank): a stale projection is corrected by
+   * the gate's next evaluation with fresher row data, and only HOST READS are
+   * barred from regressing what the runtime itself already said.
    */
   noteAcpMode(dshSessionId: string, acpMode: boolean): void {
     this.acpModeLive.add(dshSessionId)
@@ -1687,6 +1739,60 @@ export class AcpStore {
     }
     await this.loadChatSessions(dshSessionId)
     if (failure !== undefined) throw failure
+  }
+
+  /**
+   * Branch one conversation (the NTR branch button's click): the fixed
+   * two-stage order — the HOST forks the DSH session tree first (copied
+   * history, `(1)` title, workspace), then the plugin adopts the ACP side via
+   * `session/chat-fork-adopt`, which runs the agent's own `session/fork` so
+   * the child actually remembers the parent context. Host first is structural:
+   * ACP fork has no cut-point parameter and nothing to return to if the host
+   * half failed second (see the plan's §D7).
+   *
+   * Resolves `{ childId }` on success, or `{ failure }` with one actionable
+   * line — the reason is ALSO flashed into the notice banner (a user-action
+   * failure, so the banner is its surface), and the local line is what the
+   * conversation renders beside the button (the user is not on the settings
+   * page). A failed adopt leaves the child an ordinary copied-history
+   * conversation (its first message starts a fresh `session/new` — today's
+   * behavior), never a half-bound one, and NOTHING is opened.
+   *
+   * `forkHost` is the runtime's `sessions.fork` face, resolved structurally by
+   * the entry and injected here: the store stays transport-free.
+   */
+  async forkChatSession(
+    dshSessionId: string,
+    forkHost: (sessionId: string) => Promise<unknown>,
+  ): Promise<ChatForkOutcome> {
+    let childId: unknown
+    try {
+      childId = await forkHost(dshSessionId)
+    } catch (error) {
+      const failure = error instanceof Error ? error.message : String(error)
+      this.flashError(failure)
+      return { failure }
+    }
+    if (typeof childId !== 'string' || childId === '') {
+      const failure = this.locale(
+        '宿主没有返回分支会话，分支未完成。',
+        'The host returned no branched session; the branch did not complete.',
+      )
+      this.flashError(new Error(failure))
+      return { failure }
+    }
+    try {
+      await this.call('session/chat-fork-adopt', { dshSessionId: childId, parentDshSessionId: dshSessionId })
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      const failure = this.locale(
+        `分支会话已创建，但没有接上 agent 的上下文（${reason}）；在子会话里发送的第一条消息会开启全新会话。`,
+        `The branched session was created but the agent context was not attached (${reason}); its first message will start a fresh session.`,
+      )
+      this.flashError(new Error(failure))
+      return { failure }
+    }
+    return { childId }
   }
 
   // ---- ACP transcript observation (the conversation's ACP view) ----

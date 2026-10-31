@@ -13,6 +13,10 @@ import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
+// The chat package's client types carry the SlotMap augmentation for
+// `conversation.chat.assistant-actions` (the branch entry's seat). Type-only:
+// erased at build, and the seat is owned by the host's chat module at runtime.
+import type {} from '@deepseek-ai/dsh-client-ui-chat/client'
 import { AcpStore, type RpcCall } from './store.ts'
 import { AcpSettingsSection } from './panel.tsx'
 import { AcpComposerMode } from './composer-mode.tsx'
@@ -22,6 +26,7 @@ import { AcpConversationView } from './acp-view.tsx'
 import { AcpSettingsDialog } from './settings-dialog.tsx'
 import { PermissionDock } from './permission-dock.tsx'
 import { ReleasedBanner } from './released-banner.tsx'
+import { AcpBranchAction } from './branch-action.tsx'
 import {
   createModelSeatClaim,
   createPermissionSeatClaim,
@@ -30,9 +35,9 @@ import {
 } from './model-seat.tsx'
 import type { ModelSeatClaim, SeatSlots } from './model-seat.tsx'
 import {
-  acpModeFromPresetEvent, rowAgentPreset, stagedIsAcpMode, stagedSessionOf,
+  acpModeFromPresetEvent, ACP_PRESET_ID, rowAgentPreset, stagedIsAcpMode, stagedSessionOf,
 } from './acp-ui.tsx'
-import type { AcpChatInjected, AcpSessionFace, AcpSessionsSnapshot, SessionListSource } from './acp-ui.tsx'
+import type { AcpChatInjected, AcpHostForkFace, AcpSessionFace, AcpSessionsSnapshot, SessionListSource } from './acp-ui.tsx'
 import { createSlashIsolation, slashAcpVerdict } from './slash-isolation.ts'
 import type { SlashSource } from './slash-isolation.ts'
 
@@ -60,10 +65,62 @@ interface StructuralServices {
     binding(sessionId: string): { session?: unknown } | undefined
     /** The client runtime's session list store (see `AcpSessionsSnapshot`). */
     list?: SessionListSource
+    /**
+     * The runtime's own branching primitive (`forkAt`'s engine): forks the DSH
+     * session tree at the latest completed turn and resolves the child id.
+     * Read structurally and used under try/catch — an absent `fork` is the
+     * branch button's `hostUnavailable` state, never a load failure.
+     */
+    fork?: (options: { sessionId: string; increaseTitle?: boolean }) => Promise<unknown>
+  }
+  /**
+   * The shell workspace service (`ctx.get("uiWorkspace")`): `openSession`
+   * focuses a session in the main view — the branch click's final step.
+   */
+  uiWorkspace: {
+    openSession?(sessionId: string): void
   }
 }
 
 const browserPrefersZh = typeof navigator !== 'undefined' && /^zh\b/i.test(navigator.language)
+
+/**
+ * The NTR scope marker (`html[data-ntr-acp]`): the ONLY hook the message-action
+ * hiding CSS keys on, so the host's like / dislike / branch icons disappear in
+ * exactly the conversations this gate has confirmed to run the ACP preset —
+ * and reappear the moment the evidence stops answering (every `standDown`
+ * clears it; non-ACP sessions never see it). Idempotent per call.
+ */
+const setScopeMarker = (active: boolean): void => {
+  if (typeof document === 'undefined') return
+  document.documentElement.toggleAttribute('data-ntr-acp', active)
+}
+
+/**
+ * One-shot sanity probe for the aria-label hiding: the host's action buttons
+ * carry LOCALIZED labels and no data-* hook, so a copy change (or a third
+ * language) silently un-hides them while everything else keeps working. Once
+ * the marker is on and a turn tail is actually on screen, check that at least
+ * one label the rules key on still exists and leave one console line for
+ * whoever debugs "the icons came back" — dev-visible, never user UI.
+ */
+let probedHostLabels = false
+const probeHostActionLabels = (): void => {
+  if (probedHostLabels || typeof document === 'undefined') return
+  // No turn tail rendered yet: the check would answer from nothing, so leave
+  // the probe armed for the next activation instead of burning it once.
+  if (document.querySelector('[data-turn-tail]') === null) return
+  probedHostLabels = true
+  const found = document.querySelector([
+    'button:not([data-ntr-branch])[aria-label="在新对话中分支"]',
+    'button:not([data-ntr-branch])[aria-label="Branch into a new conversation"]',
+    'button[aria-label="好的回答"]',
+    'button[aria-label="Good response"]',
+  ].join(', '))
+  if (found === null) {
+    console.warn('[dsh-ntr] none of the host message-action labels matched; the like/dislike/branch icons may not be hidden in NTR conversations')
+  }
+}
 
 /**
  * Structural view of the shell's locale service (`@deepseek-ai/dsh-client-locale`).
@@ -162,11 +219,37 @@ export function apply(ctx: Context): void {
     }
   }
 
+  /**
+   * The runtime's `sessions.fork`, resolved per call: `undefined` renders the
+   * branch button disabled (`hostUnavailable`) instead of hiding it, so a
+   * host that gains the primitive later is picked up on the next render.
+   */
+  const hostFork = (): AcpHostForkFace | undefined => {
+    try {
+      const fork = service<StructuralServices['sessions']>('sessions')?.fork
+      return typeof fork === 'function' ? { fork } : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /** Focus a session in the workspace (the branch click's last step). */
+  const openSession = (sessionId: string): void => {
+    try {
+      service<StructuralServices['uiWorkspace']>('uiWorkspace')?.openSession?.(sessionId)
+    } catch {
+      // Opening is presentation; a host without the workspace service leaves
+      // the branched session in the sidebar list, reachable by hand.
+    }
+  }
+
   /** The injected face every ACP conversation entry receives. */
   const chatFace = (sessionId: unknown): AcpChatInjected & { sessionId: string } => ({
     acp: store,
     sessionId: String(sessionId),
     faceFor,
+    hostFork,
+    openSession,
   })
 
   ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
@@ -276,6 +359,22 @@ export function apply(ctx: Context): void {
     inject: (sessionId: unknown) => chatFace(sessionId),
   }, ReleasedBanner as unknown as SlotComponent<any>)), 'dsh-ntr: released-session banner')
 
+  // The NTR branch entry riding the host's own assistant-actions row
+  // (`conversation.chat.assistant-actions` — list, session scope; the
+  // positional inject argument is the chat session id, like every other
+  // session slot). Registered for EVERY conversation; the component gates
+  // itself on the confirmed ACP verdict (non-ACP renders nothing), and the
+  // `data-ntr-branch` attribute it stamps is the CSS pass that keeps the
+  // hiding rules from swallowing the plugin's own button (same aria-label as
+  // the host's). Order 20 puts it after the (hidden) feedback entry's 10 —
+  // visually the spot the host's own branch button occupied.
+  ctx.effect(() => ctx.slots.inject('conversation.chat.assistant-actions', () => ctx.slots.register({
+    name: 'conversation.chat.assistant-actions',
+    id: 'ntr-branch',
+    order: 20,
+    inject: (sessionId: unknown) => chatFace(sessionId),
+  }, AcpBranchAction as unknown as SlotComponent<any>)), 'dsh-ntr: message branch action')
+
   /**
    * The client runtime's session list store, read structurally. Used to find
    * the session the composer is staged on and whether it runs the ACP preset —
@@ -383,6 +482,7 @@ export function apply(ctx: Context): void {
       // read identically in the one place either is observable.
       permissionSeatDiag = `${reason} (released)`
       disarmVerdictReask()
+      setScopeMarker(false)
       if (claim !== undefined) { claim.release(); claim = undefined }
       if (permissionClaim !== undefined) { permissionClaim.release(); permissionClaim = undefined }
     }
@@ -473,12 +573,22 @@ export function apply(ctx: Context): void {
       // conversation's preset — through one {@link standDown}, so neither can
       // stay claimed after the evidence for it stops answering.
       if (!stagedIsAcpMode(snapshot, acpModeVerdict)) {
+        // The row's own verdict is authoritative even when it says no: fold it
+        // into the store so every per-conversation surface (the branch
+        // button's ACP gate included) stops rendering without waiting for a
+        // host read. A silent row folds nothing — that case is the ask path's.
+        if (rowAgentPreset(staged.row) !== undefined) store.noteAcpMode(staged.sessionId, false)
         standDown(`staged ${staged.sessionId} is not in ACP mode`)
         return
       }
       // The row speaks, so the host verdict is not this gate's only fact
-      // source and no re-ask timer is needed.
-      if (rowAgentPreset(staged.row) !== undefined) disarmVerdictReask()
+      // source and no re-ask timer is needed. The same fold in the affirmative
+      // direction: the runtime row IS the preset truth, and the branch
+      // button's gate reads the folded map, not the snapshot.
+      if (rowAgentPreset(staged.row) !== undefined) {
+        store.noteAcpMode(staged.sessionId, rowAgentPreset(staged.row) === ACP_PRESET_ID)
+        disarmVerdictReask()
+      }
       // Stays re-runnable on purpose: the seat is not declared before the
       // composer bar mounts, a registration can be refused, and the cell can be
       // taken from us later. The claim reports each of those through the
@@ -486,6 +596,8 @@ export function apply(ctx: Context): void {
       // next evaluation (store mutation, list notification, preset frame, or a
       // change to the cell itself) simply tries again.
       seatDiag = `staged ${staged.sessionId} is ACP mode`
+      setScopeMarker(true)
+      probeHostActionLabels()
       claim ??= createModelSeatClaim({
         slots: ctx.slots as unknown as SeatSlots,
         occupant: () => AcpSessionControls,
@@ -623,6 +735,9 @@ export function apply(ctx: Context): void {
       stopPreset?.()
       stopWatch?.()
       disarmVerdictReask()
+      // The scope marker dies with the gate: a reload (HMR) must not leave the
+      // hiding CSS pointed at conversations nothing confirms anymore.
+      setScopeMarker(false)
       if (claim !== undefined) { claim.release(); claim = undefined }
       if (permissionClaim !== undefined) { permissionClaim.release(); permissionClaim = undefined }
       store.noteSeatDiag('gate disposed')

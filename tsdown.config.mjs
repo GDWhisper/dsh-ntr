@@ -17,6 +17,10 @@ const EXTERNAL = [
   'react/jsx-runtime',
   '@deepseek-ai/cordis',
   '@deepseek-ai/dsh-client-ui-slots',
+  // Host-provided primitives (the branch icon + Tooltip). Never bundled: the
+  // icon must come from the SAME module instance the host's own buttons use,
+  // or the two would render differently (two copies of one component).
+  '@deepseek-ai/dsh-client-ui-primitives',
 ]
 
 export default defineConfig({

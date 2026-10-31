@@ -8,6 +8,10 @@
   - 不替 agent 裁决（permission 原样映射给用户，宿主不再有 `decidePermission` / `authorizeWrite` 这一层）、转发内容严格等于用户文本、fs 写只剩 `guardFsPath` 的 workspace containment；做不到的边界（宿主侧无 per-session 目录过滤缝、Access mode 控件）
   - 对话内的 NTR 面：三块芯片（agent / 模型 / 思考等级）的权威来源各自是什么、模型面为什么另走 `agent/catalog`、权限档整格占空，以及 NTR 视图 tab 如何用 `session/chat-transcript` 渲染计划、完整工具输出与 unified diff
   - 双向模型隔离：宿主侧"什么都不广告"（ACP 模型不进 DSH 目录，`/model` 弹窗也不例外）+ 浏览器侧由 `createModelSeatClaim` 接管原生座位（occupant 是 NTR 底座本体，按当前会话 preset 动态注册；注册后用 `entriesOfSlot` 核实 cell 的 head 是不是自己，被抢走就再注册一次，上限 `MAX_SEAT_CLAIMS`，到顶如实报「被谁占着」；放弃时回到原生座位）
+- [方案：NTR 会话内的消息动作接管](./plan/ntr-message-actions.md)
+  - 为什么：NTR 会话里宿主的点赞 / 点踩 / 分支三图标要么无意义、要么分支出来 agent 记不住上文；本方案把它们在 NTR 会话内隐藏，换成插件自己的分支入口（同图标、同尺寸），可用性由插件按六态判定
+  - 怎么做：`html[data-ntr-acp]` 作用域 + `aria-label` 选择器隐藏（锚点 `[data-turn-tail]`）；`conversation.chat.assistant-actions` 注册自绘按钮；点击走「宿主 `sessions.fork` → 插件 `session/fork` adopt」两段式，子会话的 ACP 上下文来自 agent 自己的 fork
+  - 状态：已实现（含审核修正，见文内「实施修正」标注）；行为契约以 [AGENTS/ui.md §12](../AGENTS/ui.md) 与 [AGENTS/protocol.md §1](../AGENTS/protocol.md) 为准
 - [待办清单](./todo.md)
   - 本仓唯一的待办清单：只留尚未落地的项，用户确认完结即删（结论并入 AGENTS.md 对应约束，不留「已落地」历史）
   - 当前为空

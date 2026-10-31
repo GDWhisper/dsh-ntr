@@ -199,6 +199,19 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 - **宿主没有的 token**（引用它们只会永远落 fallback）：`--dsw-alias-text-primary` / `text-secondary` → `label-primary` / `label-secondary`；`--dsw-alias-button-primary-invert` → `label-primary-foreground`；`--dsw-alias-font-mono` → `--ds-font-family-code`。新增 token 引用前先在本机 DSH 的 `dsh-client-ui-theme/lib/client.js` 里核对定义。
 - `.ntr-acp-code` 的固定深色块（`#0f172a` / `#e2e8f0`）是有意的：两套主题下都可读，不参与 token 化。阴影 `rgba(0,0,0,α)` 同理可接受。
 
+## 12. 消息动作接管（分支按钮）
+
+NTR 会话里，宿主的点赞 / 点踩 / 分支三图标是插件的业务：agent 自己决定反馈面，而宿主的分支会分出一条 agent 不记得上文的会话。插件把三图标藏掉、在同一位置自绘分支入口（`src/client/branch-action.tsx` · `AcpBranchAction`）；分叉的两段链路见 [protocol.md §1](./protocol.md)。
+
+- **作用域标记归 `syncAcpMode` 维护**：`src/client/index.tsx` 的 `setScopeMarker` 幂等 `toggleAttribute('data-ntr-acp')`，每一条 `standDown` 与 gate 卸载清理都会摘掉——证据不再作答时宿主图标原样回来。行的 preset 判定经 `store.noteAcpMode` 折叠进 store（取代旧的「gate 只读不写」：舞台行的 `agentPreset` 与 `agent-preset/selected` 帧两个方向都折叠）；自绘按钮的闸门读折叠后的 `acpMode`，与 CSS 作用域是同一份事实，两个判定源不得分叉。
+- **隐藏是纯 CSS，锚点是 `[data-turn-tail]`**（宿主 `TurnTailNodeView` 根 div 的标记；当前宿主构建没有 `data-clock` 可依赖）。按本地化 `aria-label` 精确匹配，**只有 8 条 button 规则**：宿主 `Tooltip` 是 `cloneElement` 渲染、不加包装元素，藏掉 button 就是全部工作，行内不留空位；**严禁**加 `:has(> button…)` 规则——它会命中动作行本身（分支按钮）与 list 槽共用的 `display:contents` 锚点（反馈按钮），把整行藏掉（测试钉住了这条禁令）。`:not([data-ntr-branch])` 是自绘按钮的通行证——它与宿主分支按钮同 aria-label，否则会被自己的规则藏掉。复制键因精确匹配天然不受伤。**严禁**覆盖 `conversation.chat.node` 渲染来达成隐藏——那会连带失去 `turnTail` / `assistant-actions` 两个子槽。
+- **aria 选择器的脆点**：宿主改文案或加第三语言 → 规则不命中、图标复活（功能不坏，只是没藏住，用户仍能分叉）。缓解两道：`probeHostActionLabels` 在标记亮起且 turn tail 真的上屏后每页抽查一次（tail 未上屏不烧掉抽查），缺失 `console.warn` 一条（dev 可见，不进用户 UI）；测试断言注入的 CSS 字符串，宿主改文案时先红。
+- **自绘入口注册 `conversation.chat.assistant-actions`**（list、session scope、`order: 20`——排在 feedback 条目的 10 之后，即宿主原分支按钮的位置）；对每个会话注册、组件内部按折叠后的 acpMode 闸门（非 ACP 渲染 `null`，双保险）。图标 `IconBranchOutline16` 与 `Tooltip` 来自宿主前端模块表里的 `@deepseek-ai/dsh-client-ui-primitives`（`primitives.d.ts` 只结构化声明用到的成员）；该包是宿主提供的运行时模块，**严禁**打进 bundle——图标必须与宿主同源（约束 1 的 CJS 模块表纪律）。
+- **`.ntr-branch-action` 的数值逐值拷贝宿主 `.xzv4MW_action`**：`28px + font-delta` 方框、`padding: 6px`、`border-radius: 28px`、`label-tertiary`、hover `interactive-bg-hover` / `label-secondary`、`data-unavailable` 置灰（opacity 0.4）；自创数值就是第二套视觉。颜色只走 `var()` token（约束 34）。
+- **六态 `forkStateOf`（`store.ts` 纯函数），每个输入都是别人拥有的事实**：行 `fork` 字段（`session/chat-list` 下发，宿主判定、浏览器**不拼**；`supported: false` 带 `reason: 'unsupported' | 'released' | 'busy'`，无 reason 的旧行按不支持）；SSE 的实时 running（行数据的 `running` 只在 chat-list 重读时刷新，会答成上一轮）；宿主 `[data-turn-tail]` 的 `data-actions-reveal === "always"`（= 最新已完成轮次；`TurnTailNodeView` 用 `isLatestTurn` 决定）**且宿主分支按钮自己的 `data-unavailable` 不在场**（宿主还有更严的闸——尾节点不是 transcript 最后一项、或轮内有更晚节点时宿主自己置灰；读宿主按钮的这个属性保证插件的可点集合是宿主的子集，剩下的点击切点与宿主一致）。任一缺失按不可用——**fail-closed**：宁可少给一次分叉，不给一次切错点的分叉；`sessions.fork` 的结构探测（缺失 `hostUnavailable`，按钮可见但置灰）。优先级：宿主服务缺失 > 能力位 > 会话自身状态（released 先于 busy）> tail 判定 > ready。
+- **点击链路固定两段，全 or 无**：`store.forkChatSession` 先调宿主 `sessions.fork`（结构解析、每次点击重取 face——渲染与点击之间消失的服务在横幅里报错，不在组件里 throw），拿到 childId 再调 `session/chat-fork-adopt`；两段都成功才 `uiWorkspace.openSession(childId)`。任何一段失败：`store.forkChatSession` 返回 `{ failure }` 一行可操作的原因（同时 `flashError` 进设置页横幅，约束 38），组件把它钉在按钮旁的行内（`.ntr-branch-error`，`role="alert"`——用户在对话里，不能只留在设置页），**什么都不打开**——未接管的子会话是一条复制历史的普通会话，不是用户要去看的。`sessions.fork` 与 `uiWorkspace` 都是可选宿主服务，按 §7 的规矩经 `service<T>` 惰性解析，**严禁**写进 `inject`。
+- **作用域标记是页面级**：`html[data-ntr-acp]` 置位后，同屏所有 `[data-turn-tail]` 都应用隐藏规则——多视图布局里同屏的非 NTR 会话会一起丢三个图标。与模型座位 claim 的全局性同一取舍（座位 claim 也按「舞台会话」全页生效），已知且接受；宿主给出 per-session 钩子前没有更精确的作用域。
+
 ## 代码索引
 
 | 主题 | 位置 |
@@ -209,6 +222,7 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 | 视图 | `src/client/acp-view.tsx` · `boundAgentOf` / `acpEmptyCopy` / `diffRows` / `isNewFileDiff` / `historyAwaitsReplay`；`src/client/context-meter.tsx` · `AcpContextMeter` / `acpMeterUsage` / `contextOccupancy` / `compactTokenCount`；`src/client/index.tsx` · `acp-context-meter` 注册处 |
 | 权限卡 | `src/client/permission-dock.tsx` · `PermissionDock` / `PermissionAskCard`；`src/client/store.ts` · `permissionsForSession` / `deadlineRemainingLabel`；`src/client/index.tsx` · `acp-permissions` 注册处 |
 | 释放横幅 | `src/client/released-banner.tsx` · `ReleasedBanner` / `releasedBannerVisible`；`src/client/store.ts` · `resumeChatSession` / `withSessionReleased`；`src/client/index.tsx` · `acp-released-banner` 注册处 |
+| 消息动作 | `src/client/branch-action.tsx` · `AcpBranchAction`；`src/client/store.ts` · `forkStateOf` / `forkChatSession`；`src/client/index.tsx` · `setScopeMarker` / `probeHostActionLabels` / `ntr-branch` 注册处；`src/client/acp-ui.tsx` · 隐藏规则与 `.ntr-branch-action` 样式（见 §12） |
 | 斜杠 | `src/client/slash-isolation.ts` · `createSlashIsolation` / `slashAcpVerdict` / `commandCandidates` |
 | 文案 | `src/client/index.tsx` · `label` / `LocaleFace` / `browserPrefersZh`；`src/client/store.ts` · `refreshLocale` / `detectSummaryOf`；`locale/*.json` |
 | 设置页 | `src/client/panel.tsx` · `AcpSettingsSection` / `AgentRow` / `WorkspaceBlock` / `initialForm` / `buildPayload` / `ApprovalDeadlinesCard` / `approvalDeadlineFacts` / `permissionLedgerCard`；`PluginUpdateBadge` / `PluginUpdateCard` / `updateBadgeText` / `updateCardVisible` |

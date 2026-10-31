@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { AcpStore, foldUpdate, permissionsForSession, type Block } from '../src/client/store.ts'
+import { AcpStore, foldUpdate, forkStateOf, permissionsForSession, type Block } from '../src/client/store.ts'
 import { acpModeFromPresetEvent, stagedIsAcpMode } from '../src/client/acp-ui.tsx'
 import type { AcpAgentDef, ChatSessionView, DetectedAgentInfo } from '../src/protocol.ts'
 
@@ -2399,6 +2399,122 @@ describe('AcpStore plugin updates', () => {
     expect(await store.checkPluginUpdate()).toBeUndefined()
     expect(store.getSnapshot().pluginUpdate).toBeUndefined()
     // An older host is a normal deployment, not an error to flash.
+    expect(store.getSnapshot().notice).toBeUndefined()
+  })
+})
+
+/**
+ * The NTR branch button's state machine (the message-actions plan §D4). Every
+ * input is a fact someone else owns — the row's `fork` verdict is the host's,
+ * `hostFork` is the runtime probe, `isTail` is the host's own DOM marker — so
+ * the mapping is pure precedence, and `undefined` facts degrade CLOSED.
+ */
+describe('forkStateOf (the NTR branch button state machine)', () => {
+  const readyRow: ChatSessionView = { agentId: 'pi', sessionId: 's1', fork: { supported: true } }
+
+  it('maps the six states in the precedence they render', () => {
+    expect(forkStateOf(readyRow, true, true)).toBe('ready')
+    // The runtime has no `sessions.fork` face: nothing can work, ever.
+    expect(forkStateOf(readyRow, false, true)).toBe('hostUnavailable')
+    // No row: the conversation's ACP session is parked (or was never read) —
+    // degrade to released, never to a click-through.
+    expect(forkStateOf(undefined, true, true)).toBe('released')
+    // A row from a host half that predates the fork field: unsupported.
+    expect(forkStateOf({ agentId: 'pi', sessionId: 's1' }, true, true)).toBe('unsupported')
+    // The host's verdict is the authority; its reason rides through.
+    expect(forkStateOf({ agentId: 'pi', sessionId: 's1', fork: { supported: false, reason: 'unsupported' } }, true, true)).toBe('unsupported')
+    expect(forkStateOf({ agentId: 'pi', sessionId: 's1', fork: { supported: false, reason: 'released' } }, true, true)).toBe('released')
+    expect(forkStateOf({ agentId: 'pi', sessionId: 's1', fork: { supported: false, reason: 'busy' } }, true, true)).toBe('busy')
+    // `false` with no reason: a host half that predates reasons (treat as
+    // unsupported, never as a click-through).
+    expect(forkStateOf({ agentId: 'pi', sessionId: 's1', fork: { supported: false } }, true, true)).toBe('unsupported')
+    // History rows gray out even when everything else is fine.
+    expect(forkStateOf(readyRow, true, false)).toBe('notTail')
+  })
+
+  it('answers busy from the live running flag even when the row says ready', () => {
+    // The row's own `running` only refreshes on a chat-list read; the
+    // SSE-driven live flag is the fresher fact, and a running turn is not
+    // forkable (the adopt refuses mid-turn parents too).
+    expect(forkStateOf(readyRow, true, true, true)).toBe('busy')
+    expect(forkStateOf(readyRow, true, true, false)).toBe('ready')
+    // An absent live flag is no fact at all: the row's ready stands.
+    expect(forkStateOf(readyRow, true, true, undefined)).toBe('ready')
+  })
+})
+
+/**
+ * The branch click (the message-actions plan §D5): the HOST forks the DSH tree
+ * first (the injected `forkHost` face), then the plugin adopts the ACP side via
+ * `session/chat-fork-adopt`. A failure at either stage is flashed to the notice
+ * banner (a user-action failure) AND returned as `{ failure }` — the line the
+ * conversation renders beside the button; nothing opens.
+ */
+describe('forkChatSession (the NTR branch click)', () => {
+  it('reports a host-fork failure to the notice and never sends the adopt', async () => {
+    const calls: Array<{ endpoint: string; payload: unknown }> = []
+    const store = new AcpStore(async (_channel, endpoint, payload) => {
+      calls.push({ endpoint, payload })
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+
+    const outcome = await store.forkChatSession('chat-1', async () => {
+      throw new Error('host fork exploded')
+    })
+    expect(outcome).toEqual({ failure: 'host fork exploded' })
+    expect(store.getSnapshot().notice).toContain('host fork exploded')
+    // Host first is structural: with no child there is nothing to adopt.
+    expect(calls).toEqual([])
+  })
+
+  it('refuses a host answer that is not a session id', async () => {
+    const calls: Array<{ endpoint: string; payload: unknown }> = []
+    const store = new AcpStore(async (_channel, endpoint, payload) => {
+      calls.push({ endpoint, payload })
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+
+    expect(await store.forkChatSession('chat-1', async () => 42)).toEqual({ failure: '宿主没有返回分支会话，分支未完成。' })
+    expect(store.getSnapshot().notice).toContain('宿主没有返回分支会话')
+    expect(calls).toEqual([])
+  })
+
+  it('reports a failed adopt with the actionable line and leaves the child unbound', async () => {
+    const calls: Array<{ endpoint: string; payload: unknown }> = []
+    const store = new AcpStore(async (_channel, endpoint, payload) => {
+      calls.push({ endpoint, payload })
+      if (endpoint === 'session/chat-fork-adopt') {
+        return { ok: false, error: { code: 'parent_not_live', message: 'acp: the conversation to branch has no live ACP session' } }
+      }
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+
+    const outcome = await store.forkChatSession('chat-1', async () => 'child-1')
+    // The child EXISTS but nothing is attached to it: the failure line must say
+    // what happens next (its first message starts a fresh session), not just
+    // name the error.
+    expect(outcome).toEqual({
+      failure: '分支会话已创建，但没有接上 agent 的上下文（acp: the conversation to branch has no live ACP session）；在子会话里发送的第一条消息会开启全新会话。',
+    })
+    expect(store.getSnapshot().notice).toContain('分支会话已创建，但没有接上 agent 的上下文')
+    expect(calls).toEqual([
+      { endpoint: 'session/chat-fork-adopt', payload: { dshSessionId: 'child-1', parentDshSessionId: 'chat-1' } },
+    ])
+  })
+
+  it('adopts: sends the child the host returned and resolves it', async () => {
+    const calls: Array<{ endpoint: string; payload: unknown }> = []
+    const store = new AcpStore(async (_channel, endpoint, payload) => {
+      calls.push({ endpoint, payload })
+      if (endpoint === 'session/chat-fork-adopt') return { ok: true, value: { done: true } }
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+
+    const outcome = await store.forkChatSession('chat-1', async sessionId => `${sessionId}-copy`)
+    expect(outcome).toEqual({ childId: 'chat-1-copy' })
+    expect(calls).toEqual([
+      { endpoint: 'session/chat-fork-adopt', payload: { dshSessionId: 'chat-1-copy', parentDshSessionId: 'chat-1' } },
+    ])
     expect(store.getSnapshot().notice).toBeUndefined()
   })
 })

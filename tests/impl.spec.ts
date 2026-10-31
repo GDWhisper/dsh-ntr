@@ -1170,6 +1170,10 @@ function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } {
     setChatSessionModel: async (dshSessionId, modelId) => { calls.push(['setChatSessionModel', dshSessionId, modelId]) },
     setChatSessionEffort: async (dshSessionId, effort) => { calls.push(['setChatSessionEffort', dshSessionId, effort]) },
     resumeChatSession: async dshSessionId => { calls.push(['resumeChatSession', dshSessionId]) },
+    adoptForkedSession: async (childDshSessionId, parentDshSessionId) => {
+      calls.push(['adoptForkedSession', { childDshSessionId, parentDshSessionId }])
+      return { sessionId: 'S-child', acpSessionId: 'acp-child' }
+    },
     detectAgents: async () => { calls.push(['detect', undefined]); return [] },
     saveAgent: async def => { calls.push(['save', def]) },
     deleteAgent: async id => { calls.push(['delete', id]) },
@@ -1459,6 +1463,39 @@ describe('dispatchRpc', () => {
     await expect(dispatchRpc(manager, 'agent/set-auto-discover-models', { agentId: 'pi', autoDiscoverModels: 'yes' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     await expect(dispatchRpc(manager, 'agent/set-auto-discover-models', { agentId: 'pi' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     await expect(dispatchRpc(manager, 'agent/set-auto-discover-models', { autoDiscoverModels: true })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+  })
+
+  it('routes session/chat-fork-adopt to the manager and normalizes a bad payload', async () => {
+    // The second half of a branched conversation: the browser names the DSH
+    // child the host fork built and the parent to fork from — the manager owns
+    // everything past this shape check.
+    const manager = fakeManager()
+    await expect(dispatchRpc(manager, 'session/chat-fork-adopt', { dshSessionId: 'child-1', parentDshSessionId: 'parent-1' }))
+      .resolves.toEqual({ ok: true, value: { sessionId: 'S-child', acpSessionId: 'acp-child' } })
+    expect(manager.calls).toContainEqual(['adoptForkedSession', { childDshSessionId: 'child-1', parentDshSessionId: 'parent-1' }])
+
+    // Both ids are mandatory strings within the same bound every conversation
+    // endpoint carries: absent, non-string, or over-length is one shape
+    // failure, and none of them reaches the manager.
+    const badPayloads: Array<Record<string, unknown>> = [
+      {},
+      { dshSessionId: 'child-1' },
+      { parentDshSessionId: 'parent-1' },
+      { dshSessionId: 7, parentDshSessionId: 'parent-1' },
+      { dshSessionId: 'child-1', parentDshSessionId: null },
+      { dshSessionId: 'x'.repeat(129), parentDshSessionId: 'parent-1' },
+      { dshSessionId: 'child-1', parentDshSessionId: 'y'.repeat(129) },
+    ]
+    for (const payload of badPayloads) {
+      await expect(dispatchRpc(manager, 'session/chat-fork-adopt', payload))
+        .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    }
+    expect(manager.calls.filter(([kind]) => kind === 'adoptForkedSession')).toHaveLength(1)
+
+    // An older host half without the endpoint answers ok rather than failing —
+    // the adopt is an optional surface, like the other chat-session ones.
+    await expect(dispatchRpc({ ...manager, adoptForkedSession: undefined }, 'session/chat-fork-adopt', { dshSessionId: 'child-1', parentDshSessionId: 'parent-1' }))
+      .resolves.toEqual({ ok: true, value: { done: true } })
   })
 
   it('invokes agent/probe-models as a manager method so the receiver (`this`) survives', async () => {

@@ -5747,3 +5747,314 @@ describe('windows shim launch', () => {
     }
   }, 30_000)
 })
+
+/**
+ * The second half of a branched conversation (`session/chat-fork-adopt` →
+ * `adoptForkedSession` → `AgentBridge.forkSession`): the ACP side of the
+ * host-fork-then-adopt order. The host's `sessions.fork` is out of scope here —
+ * in these tests the DSH child conversation already exists; what is under test
+ * is the fourth session-creation point (the SAME `mcpServers` list as
+ * `session/new`, the startup timeout, the id de-dup) and the child binding
+ * (locked choice copy, `session/meta` republish, persistence).
+ */
+describe('conversation fork adoption (isolated manager)', () => {
+  const forkRoot = mkdtempSync(join(tmpdir(), 'dsh-ntr-fork-'))
+  afterAll(() => {
+    rmSync(forkRoot, { recursive: true, force: true })
+  })
+
+  /** The mock with the UNSTABLE fork knobs on (the base `def` advertises none). */
+  const forkDef = (env: Record<string, string>, id: string): AcpAgentDef => ({
+    ...def,
+    id,
+    env: { ...def.env, ...env },
+    // Non-empty on purpose: an empty list would make the "same list as
+    // session/new" assertion vacuous, and an adopt that sent an empty list
+    // would EVICT the live sessions' MCP scope (one list per process).
+    mcpServers: [
+      { name: 'local', transport: 'stdio', command: '/opt/servers/local', args: ['--mcp'], env: { TOKEN: 'x' } },
+      { name: 'remote', transport: 'http', url: 'https://example.test/mcp', headers: { Authorization: 'Bearer t' } },
+    ],
+  })
+
+  const forkHub = new EventHub()
+  const forkEvents: AcpEvent[] = []
+  forkHub.subscribe(event => { forkEvents.push(event) })
+
+  function forkWaitFor<T extends AcpEvent['type']>(type: T, predicate: (event: Extract<AcpEvent, { type: T }>) => boolean, timeoutMs = 15_000): Promise<Extract<AcpEvent, { type: T }>> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${type}`)), timeoutMs)
+      const unsub = forkHub.subscribe(event => {
+        if (event.type === type && predicate(event as Extract<AcpEvent, { type: T }>)) {
+          clearTimeout(timer)
+          unsub()
+          resolve(event as Extract<AcpEvent, { type: T }>)
+        }
+      })
+      const existing = forkEvents.find(event => event.type === type && predicate(event as Extract<AcpEvent, { type: T }>))
+      if (existing !== undefined) {
+        clearTimeout(timer)
+        unsub()
+        resolve(existing as Extract<AcpEvent, { type: T }>)
+      }
+    })
+  }
+
+  /** Drive one turn the way the host loop does, so the settled-turn claim is honest. */
+  const turn = async (gm: BridgeManager, dshSessionId: string, agentId: string, text = 'hi'): Promise<void> => {
+    const request = {
+      model: agentId,
+      sessionId: dshSessionId,
+      messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+    } as never
+    let messages = request.messages
+    for (let step = 0; step < 8; step += 1) {
+      const chunks: StreamChunk[] = []
+      for await (const chunk of gm.streamPrompt({ ...request, messages } as never)) chunks.push(chunk)
+      const finish = chunks.find((c): c is Extract<StreamChunk, { type: 'finish' }> => c.type === 'finish')
+      const callIds = [...new Set(chunks.filter(c => c.type === 'tool-call-delta').map(c => (c as { id: string }).id))]
+      if (finish === undefined || finish.reason.kind !== 'stop' || callIds.length === 0) return
+      messages = [...messages, ...callIds.map(id => ({
+        role: 'tool' as const,
+        source: { kind: 'tool' as const, callId: id },
+        content: [{ type: 'text' as const, text: 'staged result' }],
+      }))]
+    }
+  }
+
+  /** One entry per `session/fork` request the agent actually received. */
+  const forkRequests = (logPath: string): Array<{ sessionId?: string; cwd?: string; mcpServers?: Array<Record<string, unknown>> }> =>
+    existsSync(logPath)
+      ? (readFileSync(logPath, 'utf8').split('\n').filter(line => line.trim() !== '').map(line => JSON.parse(line)))
+      : []
+
+  /** The MCP wire list the session named by `sessionId` was created/forked with, echoed through "MCPS". */
+  async function echoedMcps(gm: BridgeManager, sessionId: string): Promise<Array<Record<string, unknown>>> {
+    await settleTranscript(gm, sessionId)
+    const transcript = await dispatchRpc(gm, 'transcript/get', { sessionId })
+    if (!transcript.ok) throw new Error('transcript failed')
+    const text = (transcript.value as { entries: Array<{ update: Record<string, unknown> }> })
+      .entries
+      .filter(entry => entry.update.sessionUpdate === 'agent_message_chunk')
+      .map(entry => String((entry.update.content as { text?: string }).text ?? ''))
+      .join('')
+    const begin = text.indexOf('MCPS_BEGIN')
+    const end = text.indexOf('MCPS_END')
+    if (begin < 0 || end <= begin) throw new Error('the agent never echoed the MCP servers')
+    return JSON.parse(text.slice(begin + 'MCPS_BEGIN'.length, end)) as Array<Record<string, unknown>>
+  }
+
+  it('adopts a forked child: the fork request carries the session/new mcpServers, the child is registered, the choice is locked, and session/meta is broadcast', async () => {
+    const logPath = join(forkRoot, 'adopt-fork.log')
+    const storage = join(forkRoot, 'adopt-agents.json')
+    const catalog = join(forkRoot, 'adopt-catalog.json')
+    const gm = new BridgeManager([forkDef({ MOCK_FORK: '1', MOCK_FORK_LOG: logPath }, 'forky')], forkHub, 500, storage, catalog)
+    try {
+      gm.bindChatAgent('dsh-fork-parent', 'forky')
+      // The FIRST turn doubles as the session/new wire witness: the mock echoes
+      // the MCP servers its session was created with.
+      await turn(gm, 'dsh-fork-parent', 'forky', 'MCPS please')
+      const parentRows = gm.chatSessions('dsh-fork-parent')
+      expect(parentRows).toHaveLength(1)
+      expect(parentRows[0]).toMatchObject({ agentId: 'forky', fork: { supported: true } })
+      const newWire = await echoedMcps(gm, parentRows[0].sessionId)
+      expect(newWire.map(entry => entry.name)).toEqual(['local', 'remote'])
+
+      const since = forkEvents.length
+      const adopt = await gm.adoptForkedSession('dsh-fork-child', 'dsh-fork-parent')
+      expect(adopt.acpSessionId).not.toBe('')
+
+      // The republish the composer's list and occupancy ring react to.
+      const meta = forkEvents.slice(since).find(event => event.type === 'session/meta' && event.sessionId === adopt.sessionId)
+      expect(meta).toBeDefined()
+
+      // The child is registered under ITS OWN conversation id, with a ready
+      // fork verdict of its own (a forked session can fork again).
+      const childRows = gm.chatSessions('dsh-fork-child')
+      expect(childRows).toHaveLength(1)
+      expect(childRows[0]).toMatchObject({ agentId: 'forky', sessionId: adopt.sessionId, fork: { supported: true } })
+
+      // The copied choice, LOCKED: a branched conversation belongs to its agent
+      // from birth — the same record the lock writes at a first turn.
+      expect(gm.chatChoice('dsh-fork-parent')).toMatchObject({ agentId: 'forky', locked: true })
+      expect(gm.chatChoice('dsh-fork-child')).toMatchObject({ agentId: 'forky', locked: true })
+
+      // ...and the write reached the registry file (a host restart keeps it).
+      const raw = JSON.parse(readFileSync(storage, 'utf8')) as {
+        conversations?: Record<string, { agentId?: string; locked?: boolean }>
+        chatSessions?: Array<{ dshSessionId: string; acpSessionId: string }>
+      }
+      expect(raw.conversations?.['dsh-fork-child']).toMatchObject({ agentId: 'forky', locked: true })
+      expect(raw.chatSessions).toContainEqual(expect.objectContaining({ dshSessionId: 'dsh-fork-child', acpSessionId: adopt.acpSessionId }))
+
+      // THE WIRE ASSERTION: exactly one session/fork arrived, it named the
+      // parent's ACP session, and it carried the SAME mcpServers list
+      // `session/new` received (one list per process — a second shape would
+      // evict the live sessions' MCP tools).
+      const requests = forkRequests(logPath)
+      expect(requests).toHaveLength(1)
+      const parentRecord = raw.chatSessions?.find(row => row.dshSessionId === 'dsh-fork-parent')
+      expect(parentRecord).toBeDefined()
+      expect(requests[0].sessionId).toBe(parentRecord?.acpSessionId)
+      expect(requests[0].mcpServers).toEqual(newWire)
+
+      // The child is servable end to end, and ITS session record carries the
+      // same list (the forked session is the real thing, not a stub).
+      await dispatchRpc(gm, 'session/prompt', { sessionId: adopt.sessionId, text: 'MCPS from the child' })
+      await forkWaitFor('turn/end', event => event.sessionId === adopt.sessionId)
+      expect(await echoedMcps(gm, adopt.sessionId)).toEqual(newWire)
+
+      // The capability bit landed in the last-known catalog file, so the
+      // browser's verdict outlives the agent process.
+      const rawCatalog = JSON.parse(readFileSync(catalog, 'utf8')) as { agents?: Record<string, { fork?: boolean }> }
+      expect(rawCatalog.agents?.forky?.fork).toBe(true)
+    } finally {
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
+  it('applies the copied choice to the forked session (mode and extra configs ride the adopt)', async () => {
+    const gm = new BridgeManager([forkDef({ MOCK_FORK: '1' }, 'forkchoice')], forkHub, 500, join(forkRoot, 'choice-agents.json'))
+    try {
+      gm.bindChatAgent('dsh-fork-choice-parent', 'forkchoice')
+      await turn(gm, 'dsh-fork-choice-parent', 'forkchoice')
+      // The parent's picks, recorded AND applied to the parent session. The
+      // fork copies agent-side state, but the RECORD is what a later resume
+      // re-applies — so the adopt must align the fresh session to it now (the
+      // fourth creation point follows create/resume), or the composer shows
+      // one thing and the agent runs another.
+      await gm.setChatSessionMode('dsh-fork-choice-parent', 'strict')
+      await gm.setChatSessionConfig('dsh-fork-choice-parent', 'temp', 'high')
+      const since = forkEvents.length
+      const adopt = await gm.adoptForkedSession('dsh-fork-choice-child', 'dsh-fork-choice-parent')
+      // The mode: the fork response starts the child on the agent's 'default';
+      // only applyChatChoice's `session/set_mode` makes the row say 'strict'.
+      const childRows = gm.chatSessions('dsh-fork-choice-child')
+      expect(childRows[0]?.modes?.currentModeId).toBe('strict')
+      // The extra config: the FINAL republish carries the session's options,
+      // and the temp option's current value must be the parent's pick, not the
+      // forked default ('mid'). Take the LAST meta — the mode alignment's own
+      // publishMeta fires before the config alignment runs.
+      const metas = forkEvents.slice(since).filter(event => event.type === 'session/meta' && event.sessionId === adopt.sessionId)
+      const options = ((metas.at(-1)?.session.configOptions ?? []) as Array<{ configId?: string; currentValue?: unknown }>)
+      expect(options.find(option => option.configId === 'temp')?.currentValue).toBe('high')
+    } finally {
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
+  it('refuses to adopt from a released parent with zero fork requests', async () => {
+    const logPath = join(forkRoot, 'released-fork.log')
+    const gm = new BridgeManager([forkDef({ MOCK_FORK: '1', MOCK_FORK_LOG: logPath }, 'forkrel')], forkHub, 500, join(forkRoot, 'released-agents.json'))
+    try {
+      gm.bindChatAgent('dsh-fork-released', 'forkrel')
+      await turn(gm, 'dsh-fork-released', 'forkrel')
+      // Kill the process under the live session: crash → releaseAll parks the
+      // record (released ≠ destroyed). A parked parent has no process to fork
+      // from — adopting it must refuse before any request goes out.
+      await turn(gm, 'dsh-fork-released', 'forkrel', 'DIE now')
+      const parentSessionId = gm.chatSessions('dsh-fork-released')[0]?.sessionId
+      await forkWaitFor('session/released', event => event.sessionId === parentSessionId)
+
+      await expect(gm.adoptForkedSession('dsh-fork-released-child', 'dsh-fork-released'))
+        .rejects.toMatchObject({ code: 'parent_not_live' })
+      // The refusal happened BEFORE the request: the agent saw no session/fork
+      // (the log file is written by the first request that ever arrives).
+      expect(existsSync(logPath)).toBe(false)
+      // And nothing was bound for the child either.
+      expect(gm.chatSessions('dsh-fork-released-child')).toEqual([])
+      expect(gm.chatChoice('dsh-fork-released-child')).toBeUndefined()
+    } finally {
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
+  it('refuses to adopt when the agent never advertised session/fork, with zero requests', async () => {
+    // The base mock advertises no fork capability: the capability gate must
+    // fire BEFORE the request (an unadvertised method would answer an
+    // unknown-method error at best).
+    const logPath = join(forkRoot, 'unsupported-fork.log')
+    const gm = new BridgeManager(
+      [{ ...def, id: 'forknofork', env: { ...def.env, MOCK_FORK_LOG: logPath } }],
+      forkHub, 500, join(forkRoot, 'unsupported-agents.json'),
+    )
+    try {
+      gm.bindChatAgent('dsh-fork-nofork', 'forknofork')
+      await turn(gm, 'dsh-fork-nofork', 'forknofork')
+      expect(gm.chatSessions('dsh-fork-nofork')[0]).toMatchObject({ fork: { supported: false, reason: 'unsupported' } })
+
+      await expect(gm.adoptForkedSession('dsh-fork-nofork-child', 'dsh-fork-nofork'))
+        .rejects.toMatchObject({ code: 'fork_unsupported' })
+      expect(existsSync(logPath)).toBe(false)
+      expect(gm.chatSessions('dsh-fork-nofork-child')).toEqual([])
+    } finally {
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
+  it('refuses a fork answer that names an already-routed session and registers nothing', async () => {
+    // The interleaving hazard: an answer naming the parent (or any session on
+    // this connection) would route the parent's updates, asks and permission
+    // cards into the child. The mock answers with the parent's own id.
+    const logPath = join(forkRoot, 'conflict-fork.log')
+    const gm = new BridgeManager(
+      [forkDef({ MOCK_FORK: '1', MOCK_FORK_MODE: 'conflict', MOCK_FORK_LOG: logPath }, 'forkconflict')],
+      forkHub, 500, join(forkRoot, 'conflict-agents.json'),
+    )
+    try {
+      gm.bindChatAgent('dsh-fork-conflict', 'forkconflict')
+      await turn(gm, 'dsh-fork-conflict', 'forkconflict')
+
+      await expect(gm.adoptForkedSession('dsh-fork-conflict-child', 'dsh-fork-conflict'))
+        .rejects.toMatchObject({ code: 'fork_id_conflict' })
+      // The request went out and was answered — but nothing was bound, not
+      // even a half record.
+      expect(forkRequests(logPath)).toHaveLength(1)
+      expect(gm.chatSessions('dsh-fork-conflict-child')).toEqual([])
+      expect(gm.chatChoice('dsh-fork-conflict-child')).toBeUndefined()
+    } finally {
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
+  it('times a wedged fork out within the startup window and keeps the bridge usable', async () => {
+    // The mock answers every request except session/fork, which never resolves.
+    // The adopt must come back bounded by the startup window (the same window
+    // every session-creation point carries) — and the in-flight fork counter
+    // must settle, so the bridge serves the conversation again afterwards.
+    const logPath = join(forkRoot, 'hang-fork.log')
+    const gm = new BridgeManager(
+      [forkDef({ MOCK_FORK: '1', MOCK_FORK_MODE: 'hang', MOCK_FORK_LOG: logPath }, 'forkhang')],
+      forkHub, 500, join(forkRoot, 'hang-agents.json'), undefined, true,
+      { startupTimeoutMs: 2_000 },
+    )
+    try {
+      gm.bindChatAgent('dsh-fork-hang', 'forkhang')
+      await turn(gm, 'dsh-fork-hang', 'forkhang')
+
+      const startedAt = Date.now()
+      let timeoutMessage = ''
+      await expect(gm.adoptForkedSession('dsh-fork-hang-child', 'dsh-fork-hang').catch((error: unknown) => {
+        timeoutMessage = error instanceof Error ? error.message : String(error)
+        throw error
+      })).rejects.toMatchObject({ code: 'agent_timeout' })
+      // Bounded by the startup window (plus process startup), not by forever;
+      // the detail names the request that stalled.
+      expect(Date.now() - startedAt).toBeLessThan(15_000)
+      expect(timeoutMessage).toContain('session/fork')
+      expect(forkRequests(logPath)).toHaveLength(1)
+      expect(gm.chatSessions('dsh-fork-hang-child')).toEqual([])
+
+      // The timeout tore the wedged process down (withStartupTimeout kills the
+      // child), so the conversation parks — and the NEXT message resumes it on
+      // a fresh process: the bridge is not wedged by the dead fork request.
+      const parentSessionId = gm.chatSessions('dsh-fork-hang')[0]?.sessionId
+      await forkWaitFor('session/released', event => event.sessionId === parentSessionId)
+      await turn(gm, 'dsh-fork-hang', 'forkhang', 'hello again')
+      expect(gm.chatSessions('dsh-fork-hang')[0]).toMatchObject({ agentId: 'forkhang' })
+      expect(gm.chatSessions('dsh-fork-hang')[0]?.released).toBeUndefined()
+    } finally {
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+})

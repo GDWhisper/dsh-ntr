@@ -32,6 +32,16 @@
  *  - MOCK_NO_LOAD=1 → `initialize` advertises no `loadSession` capability
  *  - MOCK_IGNORE_CLOSE=1 → `session/close` is never answered (a wedged agent);
  *              the host's stall reset must not wait for a graceful close
+ *  - MOCK_FORK=1 → `initialize` advertises the UNSTABLE `sessionCapabilities.fork`
+ *              bit, and `session/fork` is served: a NEW session id carrying the
+ *              same state shape a fresh `session/new` produces
+ *  - MOCK_FORK_MODE=conflict → `session/fork` answers with the PARENT's session
+ *              id (the "returned an id that already exists" shape)
+ *  - MOCK_FORK_MODE=hang → `session/fork` NEVER answers (the wedged fork the
+ *              startup timeout exists for)
+ *  - MOCK_FORK_LOG=<path> → every `session/fork` request's params are appended
+ *              there as one JSON line, so a test can count the requests the
+ *              agent actually received and compare their wire shape
  *
  * Stale-cancel window: for 300ms after a `session/cancel` the NEXT prompt is
  * answered `cancelled` without generating a turn (the codebuddy 2.161.4
@@ -52,6 +62,7 @@
  * replays a marker update before answering, simulating agent-side persistence.
  */
 import { Writable, Readable } from 'node:stream'
+import { appendFileSync } from 'node:fs'
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from '@agentclientprotocol/sdk'
 
 const sessions = new Map()
@@ -136,7 +147,12 @@ const app = agent({ name: 'mock-acp-agent' })
     protocolVersion: PROTOCOL_VERSION,
     agentCapabilities: {
       loadSession: process.env.MOCK_NO_LOAD !== '1',
-      sessionCapabilities: { close: {} },
+      sessionCapabilities: {
+        close: {},
+        // Opt-in: advertising the UNSTABLE fork bit unconditionally would let a
+        // fork-naive host ask an agent that never implemented it.
+        ...(process.env.MOCK_FORK === '1' ? { fork: {} } : {}),
+      },
       promptCapabilities: { image: false, audio: false, embeddedContext: false },
     },
     agentInfo: { name: 'mock-acp-agent', title: 'Mock ACP Agent', version: '0.0.1' },
@@ -183,6 +199,35 @@ const app = agent({ name: 'mock-acp-agent' })
     await send({ sessionUpdate: 'tool_call', toolCallId: 'replay_tool', title: 'replayed tool', kind: 'other', status: 'completed' })
     await send({ sessionUpdate: 'agent_message_chunk', messageId: 'replay-1', content: { type: 'text', text: 'REPLAYED: earlier conversation' } })
     return {
+      modes: {
+        currentModeId: 'default',
+        availableModes: [
+          { id: 'default', name: 'Default' },
+          { id: 'strict', name: 'Strict' },
+        ],
+      },
+      configOptions: mockConfigOptions(sessions.get(sessionId)),
+    }
+  })
+  .onRequest(methods.agent.session.fork, async ctx => {
+    // Recorded BEFORE any mode branch: the log is the record of what the agent
+    // actually received, so a "zero requests" assertion reads an absent file
+    // and a wire-shape assertion reads the request's own params.
+    const logPath = process.env.MOCK_FORK_LOG
+    if (logPath !== undefined) appendFileSync(logPath, `${JSON.stringify(ctx.params)}\n`)
+    if (process.env.MOCK_FORK_MODE === 'hang') {
+      // The wedged fork: this request stays open forever, like the HANG prompt.
+      await new Promise(() => {})
+    }
+    if (process.env.MOCK_FORK_MODE === 'conflict') {
+      // The interleaving hazard: an answer naming a session this connection
+      // already routes would let the parent's updates land in the child.
+      return { sessionId: ctx.params.sessionId }
+    }
+    const sessionId = `mock-sess-${String(process.pid)}-${String(++counter)}`
+    sessions.set(sessionId, { cwd: ctx.params.cwd, modeId: 'default', temp: 'mid', model: DEFAULT_MODEL, effort: 'high', stream: false, mcpServers: ctx.params.mcpServers })
+    return {
+      sessionId,
       modes: {
         currentModeId: 'default',
         availableModes: [

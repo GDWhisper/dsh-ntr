@@ -39,7 +39,7 @@
 21. **NTR preset 只能由 bundle patch 声明**：`package.json` 的 `dsh.bundle.patch` + `presets/acp/acp.patch.yml`。**严禁**再往 `~/.dsh/.agent-presets/` 复制文件，**严禁**新增「安装 / 修复 preset」入口；声明内插件名按 profile 基准解析，本地插件只能经包名子路径 `dsh-ntr/acp-guard` 引用；面板读宿主 roster。→ [host.md §2](./AGENTS/host.md)
 27. **底部栏的选择属于「会话」且必须持久化**：`agentId` / `modelId` / `effort` / `mode` / `extraConfigs` 记在 `AcpConversationChoice`，落 `agents.json` 的 `conversations`；`applyChatChoice` 必须在 create 与 resume 两条路径调用，`syncConversationRoute` 把 model 半接到请求路径且只增不减，切 agent（锁前）清空派生选择，所有写入只经 `patchChatChoice`。agent 不再提供的 model **必须拦截本轮**（`model_unavailable`、不发送 prompt、保留选择、首轮零输出照常回滚锁），**严禁**自动换模型；失效 effort 从记录删除并广播一次 notice。→ [state.md §3](./AGENTS/state.md)
 28. **一切运行时落盘只在 `~/.dsh/dsh-ntr/`**：`agents.json` / `model-catalog.json` / `workspaces/`；位置一律经 `pluginStateDir()`（`DSH_NTR_STATE_DIR` 可覆盖），派生的老路径从它反推；迁移必须同时改写 agent 里的绝对路径并回写磁盘。→ [state.md §1](./AGENTS/state.md)
-32. **`AcpAgentDef.mcpServers` 走插件自己的归一形状**：每条必带 `name` 与 `transport`（`stdio` / `http` / `sse`；`acp` 传输**不支持**，客户端没有 `mcp/message`）。**三个建会话点（`createSession` / `probeConfigOptions` / resume 的 `session/load`）必须传同一份列表**——agent 把它放进**进程级**作用域，一份空列表会顶掉同连接上活动会话的 MCP 工具。线格式只在 `toAcpMcpServers` 转一次（stdio **不带 `type`**，带了 agent 静默丢弃；`env` / `headers` 是 `[{name,value}]`）；宿主只校验不改形状；宿主侧 MCP（`ctx.tools`）**不经此路**转发。→ [state.md §2](./AGENTS/state.md) / [protocol.md §1](./AGENTS/protocol.md)
+32. **`AcpAgentDef.mcpServers` 走插件自己的归一形状**：每条必带 `name` 与 `transport`（`stdio` / `http` / `sse`；`acp` 传输**不支持**，客户端没有 `mcp/message`）。**四个建会话点（`createSession` / `probeConfigOptions` / resume 的 `session/load` / 分叉的 `session/fork`）必须传同一份列表**——agent 把它放进**进程级**作用域，一份空列表会顶掉同连接上活动会话的 MCP 工具。线格式只在 `toAcpMcpServers` 转一次（stdio **不带 `type`**，带了 agent 静默丢弃；`env` / `headers` 是 `[{name,value}]`）；宿主只校验不改形状；宿主侧 MCP（`ctx.tools`）**不经此路**转发。→ [state.md §2](./AGENTS/state.md) / [protocol.md §1](./AGENTS/protocol.md)
 
 ### 进程与回合（10–12、19、23、26、29）
 
@@ -65,7 +65,7 @@
 17. **【裁决部分已退役】NTR 模式 = agent preset，loop 不可替换**：`persona` 不挂工具 / 项目指令 / compaction；`agent/pre-step` 拒绝「strip 后仍有内容、却没有用户来源」的批次；`agent/request` 负责绑定改写。**严禁** `ctx.agents.setFactory` 替换 loop，**严禁**声称 preset 能屏蔽非 ACP 模型；「是否 NTR」读会话日志 preset，**严禁**自建标记位。→ [architecture.md §5](./AGENTS/architecture.md) / [retired.md](./AGENTS/retired.md)
 22. **【默认模型守卫已退役】插件只写自己的绑定与默认 agent**：`defaultAgentId` 是插件私有状态，删 agent 必须清空；`session/chat-*` 只写插件映射，再由 guard 改写接到请求路径；插件完全不碰 DSH 模型层（不读目录、不写 `selectModel`、不广告模型）。→ [architecture.md §3、§6](./AGENTS/architecture.md) / [retired.md](./AGENTS/retired.md)
 
-### 界面（18、20、30、33、34、38）
+### 界面（18、20、30、33、34、38、39）
 
 18. **对话内的 NTR 面只借显示层**：模型 / 思考等级 / 额外 config options 读 `agent/catalog`；会话由哪个 agent 服务读插件绑定 `routeAgentId`（无答案时**严禁**用 `agents[0]` 填名字）；写入只走 `bindChatAgent` / `setChatSessionModel` / `setChatSessionEffort` / `setChatSessionConfig`，**严禁** `directory.select` / `selectModel`。cluster 顺序固定 `高级 → model → thought → agent`（首轮前 agent 底座是右端锚点、不能被挤没）；picker 一行一个模型值、勾中的行必须写模型名；NTR 视图只读 `session/chat-transcript`，空状态区分「没服务过」与「ACP 会话没了」；空 roster 下底座不消失，`agentsLoaded` 之前不得把「未读取」当「未配置」。→ [ui.md](./AGENTS/ui.md)
 20. **【竞争式遮蔽已退役】座位靠 claim 接管，失败一律放开**：`createModelSeatClaim` 用 `entriesOfSlot` 核实 head，不中就有界重注册（`MAX_SEAT_CLAIMS`），注册经 `ctx.slots.inject`；只读舞台会话 `agentPreset === ACP_PRESET_ID`，切走即撤；`stagedSessionOf` / `rowAgentPreset` 兼容两代快照；任何不确定都回到原生座位；`ACP_PRESET_ID` 三处同步。→ [ui.md §1](./AGENTS/ui.md) / [retired.md](./AGENTS/retired.md)
@@ -73,6 +73,7 @@
 33. **设置页文案有预算上限**：一个控件的说明一行讲完，机制解释进代码注释与 `AGENTS/`，不进 UI；覆盖事实**必须看得见**——`configured[key]` 挂被覆盖的那一行、用警告色、不与其它灰色小字同层；重置按钮只有真的覆盖了才出现；文案里点名的控件名必须与可见标题一致。→ [ui.md §8](./AGENTS/ui.md) / [permissions.md §2.4](./AGENTS/permissions.md)
 34. **界面颜色只走宿主 alias token，写死颜色只能出现在 `var()` fallback**：主题归宿主，插件不维护 JS 主题状态，**严禁**自写 `color-scheme: light dark`；状态色按宿主配对（`state-*-tertiary` 底 / `state-*-primary` 前景、diff 行 `file-diff-*-bg`、danger hover `interactive-bg-hover-danger`）；宿主没有 `--dsw-alias-text-*` / `button-primary-invert` / `font-mono`，分别用 `label-*` / `label-primary-foreground` / `--ds-font-family-code`。→ [ui.md §11](./AGENTS/ui.md)
 38. **运行消息进日志，动作失败进横幅**：`agent/notice` 与会话释放只进设置页「日志」分区（浏览器内存、追加序、最多 200 条、刷新清空、未读圆点、空闲释放不记）；页顶横幅只承载用户动作（设置页动作与对话内 RPC）的失败。→ [ui.md §8](./AGENTS/ui.md)
+39. **NTR 会话的消息动作归插件**：宿主点赞/点踩/分支三图标只经 `html[data-ntr-acp]` 作用域 + `aria-label` 选择器隐藏（锚点 `[data-turn-tail]`，无 data-* 钩子可依赖），**严禁**覆盖 `conversation.chat.node` 渲染；自绘分支入口注册 `conversation.chat.assistant-actions`（`data-ntr-branch` 豁免、六态 `forkStateOf`、notTail 读宿主 `data-actions-reveal` fail-closed）；分叉固定「宿主 sessions.fork → 插件 session/chat-fork-adopt」两段、失败 all-or-nothing 进横幅；fork 能力位只读「活的 initialize 优先、model-catalog.json 最后已知兜底」。→ [ui.md §12](./AGENTS/ui.md) / [protocol.md §1](./AGENTS/protocol.md)
 
 ### 宿主接线、路径与依赖（24、25、31）
 
@@ -123,10 +124,10 @@
 | 文档 | 何时读取 | 何时维护 |
 |---|---|---|
 | [architecture.md](./AGENTS/architecture.md) | 改消息走向、会话绑定、工作区、preset 外壳、agent 锁定、默认 agent，或要目录 / 术语索引 | 动了 `src/bridge.ts` 的 `streamPrompt` / 绑定 / 锁定、`presets/acp/acp-guard.mjs`、或新增顶层源文件 |
-| [protocol.md](./AGENTS/protocol.md) | 改子进程、超时、取消、卡死收口（无活动看门狗）、崩溃恢复、空闲释放、启动命令、ACP 数据折叠 | 动 `AgentBridge` / `BridgeManager` / `TurnStreamController` 的生命周期、超时或 `session/update` 折叠逻辑 |
-| [ui.md](./AGENTS/ui.md) | 改 composer 座位 / 芯片 / 挂牌、mode 控件、NTR 视图、斜杠菜单、设置页、主题色 | 动 `src/client/` 的槽位注册、菜单内容、可见文案或 CSS token |
+| [protocol.md](./AGENTS/protocol.md) | 改子进程、超时、取消、卡死收口（无活动看门狗）、崩溃恢复、空闲释放、启动命令、会话分叉、ACP 数据折叠 | 动 `AgentBridge` / `BridgeManager` / `TurnStreamController` 的生命周期、超时或 `session/update` 折叠逻辑 |
+| [ui.md](./AGENTS/ui.md) | 改 composer 座位 / 芯片 / 挂牌、mode 控件、NTR 视图、斜杠菜单、消息动作 / 分支按钮、设置页、主题色 | 动 `src/client/` 的槽位注册、菜单内容、可见文案或 CSS token |
 | [permissions.md](./AGENTS/permissions.md) | 改权限映射、审批卡片（对话 dock / 设置镜像）、审批时限、权限座位、fs 围栏 | 动 `handlePermissionRequest` / `PermissionLedger` / 期限配置 / `PermissionDock` |
-| [state.md](./AGENTS/state.md) | 改落盘、会话选择持久化、模型目录 / 可见性、命令缓存、内置更新 | 动 `agents.json` 结构、`agent/catalog`、`absorbCommands` 或 `UpdateService` |
+| [state.md](./AGENTS/state.md) | 改落盘、会话选择持久化、模型目录 / 可见性、命令缓存、fork 能力位、内置更新 | 动 `agents.json` 结构、`agent/catalog`、`absorbCommands` 或 `UpdateService` |
 | [host.md](./AGENTS/host.md) | 改 `/acp` 通道注册、preset 声明、可选宿主服务探测、模型层 abstain | 动 `src/index.ts` 的注入 / `register`、`presets/acp/acp.patch.yml` 或 `package.json` 的 `dsh` 字段 |
 | [paths.md](./AGENTS/paths.md) | 改任何路径判定 / 比较 / 规范化，或 Windows 上遇到 `bad_cwd` / `cwd_denied` | 动 `isAbsolutePath` / `isUnderPath` / `canonicalizeFsPath` 或浏览器 `isAbsolutePathLike` |
 | [retired.md](./AGENTS/retired.md) | 想恢复某个旧机制、看到幽灵符号，或不确定某符号是否已删 | 又退役一条轴时，把旧符号追加进幽灵清单 |

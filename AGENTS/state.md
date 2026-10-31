@@ -7,7 +7,7 @@
 `pluginStateDir()`（`~/.dsh/dsh-ntr`）下只有三样东西：
 
 - `agents.json` —— agent 注册表 + 默认 agent + 每会话选择 + 每聊天会话的会话记录（`chatSessions`，见 §3.1）+ 插件私有偏好（`tagHalo`，经 `ui/tag-halo` RPC 读写；`approvalDeadlines`，经 `ui/approval-deadlines-set` 读写，见 [permissions.md §2.4](./permissions.md)；`idleRelease`，经 `ui/idle-release-set` 读写，是设置页「进程管理」挑的空闲释放窗口，见 [protocol.md §5](./protocol.md)）
-- `model-catalog.json` —— 模型目录 + agent 最近一次声明的斜杠命令
+- `model-catalog.json` —— 模型目录 + agent 最近一次声明的斜杠命令 + agent 的 fork 能力位（最后已知，见 §3.2）
 - `workspaces/` —— 默认执行工作区
 
 **严禁**再往 `~/.dsh` 根丢 `acp-*.json` 或 `acp-workspaces/`，也严禁把新文件塞在那个根上。`~/.dsh` 里是宿主的 `sessions/`、`storages/`、`skills/`、`profiles/`、凭据；插件文件混在里面会被用户和 AI 当成宿主配置去读、改、删。命名沿用宿主「按拥有者开子目录」的约定（`~/.dsh/skills/<owner>`、`~/.dsh/dsh-runtimes/<owner>`）。
@@ -52,6 +52,14 @@
 - **closed 不落盘**：`forgetDshSession` 删内存记录并 `persistAgents`，重启不复活（约束 10）。**agent 已删除的记录丢弃**：restore 时 `defsMap` 查无此 agent 即跳过，下次写盘自然消失。
 - **容错**：逐行解析，单行损坏/字段缺失不影响其余记录。
 - **`/acp` RPC 面的会话（无 `dshSessionId`）不持久化**——那是面板的临时面，重启即清。
+
+### 3.2 分叉的子会话与 fork 能力位
+
+「在新对话中分支」（[protocol.md §1](./protocol.md) 的第四个建会话点）在状态层的三个落点：
+
+- **`chatSessions.acpSessionId` 仍是唯一地址真相**：`adoptForkedSession` 给子会话建的持久化记录与任何聊天会话同形，resume 靠它 `session/load`；`AcpConversationChoice` 不存会话 id（见 §3），**严禁**为分叉再造第二个会话地址字段。
+- **子会话 choice = 父 choice 拷贝 + `locked: true`**，经 `patchChatChoice` 这一个入口写——分支出来的会话从出生就锁在它的 agent 上，模型 / 等级 / 模式 / 额外配置随父；**严禁**手抄字段清单（约束 27 的老坑）。
+- **fork 能力位落「最后已知」**：`initialize` 的 `sessionCapabilities.fork` 经 `noteForkCapability` 记进 `forkCaps`，随 `persistCatalogs` 写进 `model-catalog.json` 的 `agents[agentId].fork`，`loadPersistedCatalogs` 读回；`canForkNow` 活进程的 `initResult` 优先、这份最后已知兜底。**严禁**读 `view().agentCapabilities`——`releaseAll` 会清空它，分支按钮会无缘无故闪成禁用。能力位过期（agent 升级）只能等下次 `initialize` 更新，UI 文案用「最后已知」口径，不承诺实时。
 
 ## 4. 模型目录（agent/catalog）
 
@@ -134,6 +142,7 @@
 | 校验 | `src/impl.ts` · `validateAgentDef` / `validateConfig` / `validateMcpServers`；`src/bridge.ts` · `saveAgent` |
 | 会话选择 | `src/bridge.ts` · `chatChoice` / `patchChatChoice` / `applyChatChoice` / `syncConversationRoute` / `loadPersistedChoices` / `persistAgents` |
 | 目录 | `src/bridge.ts` · `agentCatalog` / `resolveAdapterModel` / `absorbCatalog` / `absorbCatalogShape` / `setExposedModels` / `setAutoDiscoverModels` / `autoExposeNewModels` / `broadcastExposure`；`src/impl.ts` · `parseCatalogOptions` / `mergeCatalogShape` / `usableConfigOptions` |
+| 分叉 | `src/bridge.ts` · `adoptForkedSession` / `forkSession` / `noteForkCapability` / `canForkNow` / `forkCaps`；`src/client/store.ts` · `forkChatSession` / `forkStateOf`（子会话绑定与能力位见 §3.2） |
 | 未决询问 | `src/bridge.ts` · `handlePermissionRequest`；`src/impl.ts` · `PermissionLedger` / `permissionRequestFrame` / `permissionReplayFrames`；`src/client/store.ts` · `permissionsForSession` |
 | 斜杠缓存 | `src/bridge.ts` · `chatSessions` / `absorbCommands`；`src/client/store.ts` · `chatSessionCommands` / `loadChatSessions` |
 | 内置更新 | `src/update.ts` · `UpdateService` / `check` / `apply` / `bundleEligibility` / `isRegistrySpec` / `registryPlan` / `pickUpdateTarget` / `compareVersions`；`src/index.ts` · `setUpdateService`；`src/bridge.ts` · `pluginUpdateCheck` / `pluginUpdateApply` / `hasActiveTurns` / `PLUGIN_VERSION`；`src/impl.ts` · `dispatchRpc`（`plugin/update-*` 分支）；`src/client/store.ts` · `checkPluginUpdate` / `applyPluginUpdate`；`src/client/panel.tsx` · `PluginUpdateBadge` / `PluginUpdateCard` / `updateBadgeText` / `updateCardVisible` |

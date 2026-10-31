@@ -571,6 +571,28 @@ export interface ChatSessionView {
   usage?: SessionView['usage']
   /** The agent process died; the session awaits a `session/load` resume. */
   released?: boolean
+  /** The agent is running a turn on this session right now. */
+  running?: boolean
+  /**
+   * Whether this session's ACP agent can be forked (`session/fork`) into a
+   * child conversation, as the host computed it. The browser does not derive
+   * this itself — the capability is host knowledge (the agent's
+   * `initialize`), and the row is the one place it is delivered.
+   * `supported: false` carries the reason; no reason on `false` means the
+   * host half predates the field (treat as unsupported).
+   */
+  fork?: ChatSessionForkInfo
+}
+/**
+ * The host's per-row verdict on forking one chat session's ACP session
+ * (`ChatSessionView.fork`). Computed from the agent's LAST KNOWN
+ * `sessionCapabilities.fork` (persisted with the model catalog) plus the
+ * session's own state — the browser never reads capability bits itself.
+ */
+export interface ChatSessionForkInfo {
+  supported: boolean
+  /** Why {@link supported} is false: the agent cannot fork, or the session cannot be forked right now. */
+  reason?: 'unsupported' | 'released' | 'busy'
 }
 export type ChatSessionsListResult = { sessions: ChatSessionView[] }
 
@@ -834,6 +856,22 @@ export interface ChatModelSetPayload { dshSessionId: string; modelId: string }
 export interface ChatEffortSetPayload { dshSessionId: string; effort?: string; agentId?: string }
 /** `session/chat-config-set`: set one of the agent's extra config options. */
 export interface ChatConfigSetPayload { dshSessionId: string; configId: string; value: string | boolean; agentId?: string }
+
+/**
+ * `session/chat-fork-adopt`: bind the DSH chat session a host `sessions.fork`
+ * just created to the SAME agent process, through the agent's own
+ * `session/fork` of the parent conversation's ACP session — the second half of
+ * the two-stage branch (host builds the DSH tree first, the plugin then adopts
+ * the ACP side; see the NTR message-actions plan, §D5/D7).
+ *
+ * On success the child conversation's next message reaches an agent that
+ * actually remembers the parent context. On failure NOTHING is bound: the
+ * child stays an ordinary copied-history conversation and its first message
+ * starts a fresh `session/new` (today's behavior).
+ */
+export interface ChatForkAdoptPayload { dshSessionId: string; parentDshSessionId: string }
+/** `session/chat-fork-adopt` success: the adopted ACP session's ids. */
+export type ChatForkAdoptResult = { sessionId: string; acpSessionId: string }
 
 /** Host-detected agent presence and tested defaults. */
 export interface DetectedAgentInfo {

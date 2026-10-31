@@ -7,6 +7,7 @@
  * payload into the only reviewable form the chat plane cannot show.
  */
 
+import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
 import { ACP_PRESET_ID, acpModeFromPresetEvent, formatCommandLine, isAbsolutePathLike, placeMenu, rowAgentPreset, splitAcpModelId, splitCommandLine, stagedIsAcpMode, stagedSessionOf, tokenizeCommandLine } from '../src/client/acp-ui.tsx'
 import { agentLockPhaseOf, FORM_MS, playAgentLockAnim, SHATTER_MS } from '../src/client/agent-lock-anim.ts'
@@ -1039,5 +1040,70 @@ describe('acpMeterUsage', () => {
       .toEqual({ used: 28, size: 100 })
     expect(acpMeterUsage({ acpMode: { c: true }, chatSessionsFor: 'c', chatSessions: [released] }, 'c'))
       .toEqual({ used: 5, size: 100 })
+  })
+})
+
+/**
+ * The NTR message-actions stylesheet (the message-actions plan §D2/D3). STYLE
+ * is a module-private constant mounted by `ensureAcpStyle`, so the assertions
+ * read the source file itself. These selectors are the feature's fragile half —
+ * the host's three icons are hidden by LOCALIZED aria-labels (its button
+ * classes are CSS-module hashes and there is no data-* hook), so a host copy
+ * change or a new language must fail HERE first, loudly, not silently un-hide
+ * the icons.
+ */
+describe('NTR message-actions stylesheet (acp-ui.tsx STYLE)', () => {
+  const acpUiSource = readFileSync(new URL('../src/client/acp-ui.tsx', import.meta.url), 'utf8')
+
+  /** The three host icons' localized labels (zh + en); the branch button is OUR own button's label too. */
+  const hiddenLabels: Array<{ label: string; own: boolean }> = [
+    { label: '在新对话中分支', own: true },
+    { label: 'Branch into a new conversation', own: true },
+    { label: '好的回答', own: false },
+    { label: '有问题的回答', own: false },
+    { label: '取消标记', own: false },
+    { label: 'Good response', own: false },
+    { label: 'Bad response', own: false },
+    { label: 'Remove rating', own: false },
+  ]
+
+  it('hides every host action button by its localized aria-label, and passes our own branch button through', () => {
+    for (const { label, own } of hiddenLabels) {
+      // `:not([data-ntr-branch])` is the pass OUR button carries — same label,
+      // same row; without it the hide rule would swallow our own entry.
+      const pass = own ? ':not([data-ntr-branch])' : ''
+      expect(acpUiSource).toContain(`html[data-ntr-acp] [data-turn-tail] button[aria-label="${label}"]${pass}`)
+    }
+    // NO :has(> button…) wrapper rules, ever: the host's Tooltip clones its
+    // child without a wrapper, so a :has rule matches the actions ROW (branch
+    // button) or the list slot's shared display:contents anchor (feedback
+    // buttons) — hiding the whole row. Verified against the real host package;
+    // this assertion keeps the SELECTOR from coming back (the STYLE comment
+    // naming the hazard is fine — match the selector prefix, not the prose).
+    expect(acpUiSource).not.toContain('[data-turn-tail] :has(> button')
+  })
+
+  it('the hide block actually hides, and the copy button is never named', () => {
+    // The hide declaration lives inside the one selector list above.
+    expect(acpUiSource.match(/display: none !important;/g) ?? []).toHaveLength(1)
+    // The label closest to ours in the DOM (复制 / Copy) must never be hidden:
+    // a rule keyed on it would break the one host action NTR keeps.
+    expect(acpUiSource).not.toContain('aria-label="复制"')
+    expect(acpUiSource).not.toContain('aria-label="Copy"')
+  })
+
+  it('styles the plugin branch button like the host icon it replaces', () => {
+    expect(acpUiSource).toContain('.ntr-branch-action {')
+    expect(acpUiSource).toContain('.ntr-branch-action svg')
+    expect(acpUiSource).toContain('.ntr-branch-action:hover')
+    // The unavailable state (the six-state machine's gray) and its hover reset.
+    expect(acpUiSource).toContain('.ntr-branch-action[data-unavailable]')
+    expect(acpUiSource).toContain('.ntr-branch-action[data-unavailable]:hover')
+    expect(acpUiSource).toContain('.ntr-branch-action:focus-visible')
+    // Colors come from the host's alias tokens (a var() fallback is the only
+    // place a literal may appear) — the same discipline the plan copied from
+    // the host's `.xzv4MW_action`.
+    expect(acpUiSource).toContain('var(--dsw-alias-label-tertiary')
+    expect(acpUiSource).toContain('var(--dsh-content-font-delta')
   })
 })

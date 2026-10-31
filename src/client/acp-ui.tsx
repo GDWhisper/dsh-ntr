@@ -78,6 +78,24 @@ export interface AcpChatInjected {
   acp: AcpStore
   /** Resolve the session's command/projection face; `undefined` before the session materializes. */
   faceFor(sessionId: string): AcpSessionFace | undefined
+  /**
+   * The runtime's `sessions.fork` face (the host's own branching primitive,
+   * resolved structurally per call); `undefined` when the host half lacks it —
+   * the branch button then renders disabled (`hostUnavailable`), never hidden.
+   */
+  hostFork?: () => AcpHostForkFace | undefined
+  /** The workspace's `openSession` face (the branch click's final step). */
+  openSession?: (sessionId: string) => void
+}
+
+/** The slice of the client runtime's session service the branch button needs. */
+export interface AcpHostForkFace {
+  /**
+   * Fork the DSH session tree at the latest completed turn. Resolves the CHILD
+   * session id; the host owns the cut-point snapping, history copy, `(1)`
+   * title and workspace attribution — the plugin rewrites none of it.
+   */
+  fork(options: { sessionId: string; increaseTitle?: boolean }): Promise<unknown>
 }
 
 // ---- The session standard kit (framework-provided, declared structurally) ----
@@ -1001,6 +1019,57 @@ const STYLE = `
 .ntr-released-banner-title { font-weight: 600; }
 .ntr-released-banner-body { color: var(--dsw-alias-label-secondary, #6b7280); }
 .ntr-released-banner .ntr-acp-more { flex: none; white-space: nowrap; }
+/* ---- NTR message actions (conversation.chat.assistant-actions) ---- */
+/* In an NTR conversation the host's like / dislike / branch icons are the
+   plugin's business (the agent decides its own feedback surface, and the
+   host's branch would fork a conversation the agent does not remember). The
+   three icons hide under the html[data-ntr-acp] scope marker, by their
+   LOCALIZED aria-labels — the only stable handles the host leaves (its button
+   classes are CSS-module hashes and there is no data-* hook). Hiding the
+   button is the WHOLE job: the host's Tooltip clones its child without a
+   wrapper element, so there is no container left behind to plug the row gap
+   — and any :has(> button…) rule would match the actions row itself (and the
+   list slot's shared display:contents anchor), hiding the entire row. The
+   :not([data-ntr-branch]) exemption is the pass our OWN button carries —
+   same label, same row. Known fragility: a host copy change or a third
+   language un-hides the icons; the entry probes the labels once per page and
+   warns in the console. */
+html[data-ntr-acp] [data-turn-tail] button[aria-label="在新对话中分支"]:not([data-ntr-branch]),
+html[data-ntr-acp] [data-turn-tail] button[aria-label="Branch into a new conversation"]:not([data-ntr-branch]),
+html[data-ntr-acp] [data-turn-tail] button[aria-label="好的回答"],
+html[data-ntr-acp] [data-turn-tail] button[aria-label="有问题的回答"],
+html[data-ntr-acp] [data-turn-tail] button[aria-label="取消标记"],
+html[data-ntr-acp] [data-turn-tail] button[aria-label="Good response"],
+html[data-ntr-acp] [data-turn-tail] button[aria-label="Bad response"],
+html[data-ntr-acp] [data-turn-tail] button[aria-label="Remove rating"] {
+  display: none !important;
+}
+/* The plugin's own branch button, dressed exactly like the host's .action
+   class (the values are copied from the host's compiled CSS, token colors
+   only). It rides the same actions row, so the host's row gap, font-delta
+   sizing and the [data-actions-reveal] hover rules already govern it. */
+.ntr-branch-action {
+  width: calc(28px + var(--dsh-content-font-delta, 0px));
+  height: calc(28px + var(--dsh-content-font-delta, 0px));
+  color: var(--dsw-alias-label-tertiary, #9ca3af);
+  cursor: pointer;
+  background: none;
+  border: none;
+  border-radius: 28px;
+  justify-content: center;
+  align-items: center;
+  padding: 6px;
+  display: inline-flex;
+}
+.ntr-branch-action svg { width: calc(15px + var(--dsh-content-font-delta, 0px)); height: calc(15px + var(--dsh-content-font-delta, 0px)); }
+.ntr-branch-action:hover { background: var(--dsw-alias-interactive-bg-hover, #0000000d); color: var(--dsw-alias-label-secondary, #6b7280); }
+.ntr-branch-action[data-unavailable] { cursor: default; opacity: 0.4; }
+.ntr-branch-action[data-unavailable]:hover { color: var(--dsw-alias-label-tertiary, #9ca3af); background: none; }
+.ntr-branch-action:focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary, #2563eb); outline-offset: 2px; }
+/* A failed branch click, pinned in the row beside the button (the conversation
+   surface of the settings banner the store also writes). One line, truncated;
+   the full text is the title tooltip and the banner. */
+.ntr-branch-error { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; line-height: calc(28px + var(--dsh-content-font-delta, 0px)); color: var(--dsw-alias-state-error-primary, #b91c1c); }
 /* ---- NTR settings dialog (shell.overlay) ---- */
 /* Frame-wide surface opened from the agent base's empty-roster menu. The
    overlay layer itself is click-through, so the layer opts back in and blocks

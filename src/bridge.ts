@@ -69,7 +69,7 @@ import type {
   RosterPresetRow,
 } from './impl.ts'
 import type {
-  AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpMcpServerDef, AcpPresetStatus, AcpReleaseCause, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
+  AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpMcpServerDef, AcpPresetStatus, AcpReleaseCause, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult, AgentView, ChatSessionForkInfo, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
   LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo,
   AcpIdleRelease, ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PluginUpdateState, PreparedAdapterCall, SessionView, StreamChunk,
 } from './protocol.ts'
@@ -484,6 +484,13 @@ export class AgentBridge {
    */
   private pendingCreates = 0
   /**
+   * `session/fork` requests in flight (the adopt path of a branched
+   * conversation). Same teardown hazard as {@link pendingCreates}: until the
+   * forked session is registered, nothing else would stop an idle release
+   * from killing the child out from under the caller.
+   */
+  private pendingForks = 0
+  /**
    * Whether a REAL session has ever been registered on this bridge. Probes
    * bypass session bookkeeping, so a bridge that has never hosted anything was
    * spawned by a probe and honors {@link probeIdleTimeoutMs}; the first
@@ -532,6 +539,13 @@ export class AgentBridge {
      * `BridgeManager.loadPersistedChatSessions`).
      */
     private readonly onSessionsDirty?: () => void,
+    /**
+     * Told whenever a fresh `initialize` reports the agent's
+     * `sessionCapabilities.fork` bit — the LAST KNOWN fork capability the
+     * manager persists and serves to the browser (the bridge's own
+     * `initResult` dies with the process; the manager's copy survives it).
+     */
+    private readonly onForkCapability?: (agentId: string, supported: boolean) => void,
   ) {
     const merged = { ...DEFAULT_TUNING, ...tuning }
     this.startupTimeoutMs = merged.startupTimeoutMs
@@ -778,6 +792,7 @@ export class AgentBridge {
   private hasActiveWork(): boolean {
     if (this.pendingProbes > 0
       || this.pendingCreates > 0
+      || this.pendingForks > 0
       || this.pendingCommands.size > 0
       || this.resuming.size > 0
       || this.permissions.sessionIds().length > 0
@@ -802,6 +817,7 @@ export class AgentBridge {
   hasOtherActiveWork(session: LiveSession): boolean {
     if (this.pendingProbes > 0
       || this.pendingCreates > 0
+      || this.pendingForks > 0
       || this.resuming.size > 0
       || this.starting !== undefined) return true
     for (const sessionId of this.pendingCommands.keys()) {
@@ -978,6 +994,10 @@ export class AgentBridge {
       'initialize',
     )
     this.initResult = init
+    // The fork capability is agent knowledge that must outlive the process:
+    // report it so the manager can persist a LAST KNOWN copy and serve the
+    // browser's branch button after a release (`initResult` itself dies here).
+    this.onForkCapability?.(this.def.id, this.initResult?.agentCapabilities?.sessionCapabilities?.fork != null)
   }
 
   /**
@@ -1124,6 +1144,103 @@ export class AgentBridge {
       return Array.isArray(result.configOptions) ? result.configOptions : []
     } finally {
       this.pendingProbes -= 1
+      this.touch()
+    }
+  }
+
+  /**
+   * Fork one live session through the agent's own `session/fork` (the
+   * UNSTABLE fourth session-creation point): the agent copies its internal
+   * state into a NEW ACP session that remembers the parent's context — the
+   * second half of a branched conversation, after the host's `sessions.fork`
+   * has already built the DSH session tree. The child is addressed by the
+   * CHILD DSH conversation id, so its first message reaches an agent that
+   * actually remembers the parent.
+   *
+   * The parent must be live on this connection — a released parent has no
+   * process to fork from (the browser blocks that click; this is the hard
+   * stop behind it). The ACP request carries the SAME `mcpServers` list as
+   * `session/new` / `session/load` (one list per process; an empty list would
+   * evict the live sessions' MCP scope) and is bounded by the startup timeout
+   * like every session-creation step. Counted in {@link pendingForks} while
+   * in flight so an idle release cannot kill the child out from under the
+   * caller.
+   */
+  async forkSession(parent: LiveSession, dshSessionId: string): Promise<LiveSession> {
+    if (this.initResult?.agentCapabilities?.sessionCapabilities?.fork == null) {
+      throw new AcpError('fork_unsupported', `acp: agent "${this.def.id}" does not advertise the session/fork capability`)
+    }
+    const conn = this.conn
+    if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
+    // The child runs where the parent runs: its cwd is the parent's already
+    // validated workspace, re-trusted as its own extra root (the same minimal
+    // trust `resolveSessionCwd` applied when the parent was created — never
+    // the agent's configured sandbox cwd, which is not where the conversation
+    // lives).
+    const resolved = resolveSessionCwd(this.def, parent.cwd, p => realpathSync(p), [parent.cwd])
+    this.pendingForks += 1
+    try {
+      const result = await this.withStartupTimeout(
+        conn.agent.request(methods.agent.session.fork, {
+          sessionId: parent.acpSessionId,
+          cwd: resolved,
+          mcpServers: toAcpMcpServers(this.def.mcpServers),
+        }),
+        'session/fork',
+      )
+      // A fork answer that names the parent (or any session already routed on
+      // this connection) would interleave the parent's updates, asks and
+      // permission cards into the child — refuse it rather than register it.
+      if (typeof result.sessionId !== 'string' || result.sessionId === '') {
+        throw new AcpError('fork_failed', 'acp: session/fork returned no session id')
+      }
+      if (result.sessionId === parent.acpSessionId || this.acpIndex.has(result.sessionId)) {
+        throw new AcpError('fork_id_conflict', 'acp: session/fork returned an id that already exists on this connection')
+      }
+      const session: LiveSession = {
+        sessionId: randomUUID(),
+        agentId: this.def.id,
+        acpSessionId: result.sessionId,
+        cwd: resolved,
+        running: false,
+        turnSeq: 0,
+        closed: false,
+        released: false,
+        lastAgentActivityAt: Date.now(),
+        activeToolCalls: new Set(),
+        transcript: new Transcript(this.transcriptMax),
+        dshSessionId,
+        ...(result.modes !== undefined && result.modes !== null
+          ? {
+            modes: {
+              currentModeId: result.modes.currentModeId,
+              availableModes: result.modes.availableModes.map(m => ({
+                id: m.id,
+                name: m.name,
+                ...(m.description !== null ? { description: m.description } : {}),
+              })),
+            },
+          }
+          : {}),
+        ...(usableConfigOptions(result.configOptions) ? { configOptions: result.configOptions } : {}),
+      }
+      // The fork answer's config options are the AGENT-LEVEL surface too (the
+      // same feed `session/new` provides): absorb them so the composer chips
+      // of the fresh conversation render without a probe.
+      if (this.onCatalog !== undefined && usableConfigOptions(result.configOptions)) {
+        this.onCatalog(this.def.id, result.configOptions)
+      }
+      this.sessions.set(session.sessionId, session)
+      this.acpIndex.set(session.acpSessionId, session)
+      // Same flip as `createSession`: a registered session makes this a chat
+      // process; re-arm the idle clock on the agent's own window.
+      this.clearIdleTimer()
+      this.everHostedSession = true
+      this.hub.broadcast({ type: 'session/created', sessionId: session.sessionId, session: snapshot(session) })
+      this.touch()
+      return session
+    } finally {
+      this.pendingForks -= 1
       this.touch()
     }
   }
@@ -1974,6 +2091,21 @@ function snapshot(session: LiveSession): SessionView {
     ...(session.hasHistory === true ? { hasHistory: true } : {}),
     seq: session.transcript.head,
   }
+}
+
+/**
+ * The `fork` half of one `session/chat-list` row: the host's verdict on
+ * forking this session's ACP agent. The capability half is the agent's LAST
+ * KNOWN bit (see `canForkNow`); the state half is the session's own, released
+ * checked before running (a parked record is never running). The browser
+ * renders its branch button from this verdict and never reads a capability
+ * bit itself.
+ */
+function forkRowInfo(session: LiveSession, capability: boolean): { fork: ChatSessionForkInfo } {
+  if (!capability) return { fork: { supported: false, reason: 'unsupported' } }
+  if (session.released) return { fork: { supported: false, reason: 'released' } }
+  if (session.running || session.settled !== undefined) return { fork: { supported: false, reason: 'busy' } }
+  return { fork: { supported: true } }
 }
 
 /**
@@ -3562,8 +3694,9 @@ export class BridgeManager {
     onCatalog?: (agentId: string, configOptions: unknown, shapeOnly?: boolean) => void,
     onCommands?: (agentId: string, commands: NonNullable<SessionView['availableCommands']>) => void,
     onSessionsDirty?: () => void,
+    onForkCapability?: (agentId: string, supported: boolean) => void,
   ): AgentBridge {
-    return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, onCommands, this.tuning, () => this.sessionWorkspaceResolver, onSessionsDirty)
+    return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, onCommands, this.tuning, () => this.sessionWorkspaceResolver, onSessionsDirty, onForkCapability)
   }
 
   /**
@@ -3704,9 +3837,83 @@ export class BridgeManager {
         ...(session.availableCommands === undefined ? {} : { availableCommands: session.availableCommands }),
         ...(session.usage === undefined ? {} : { usage: session.usage }),
         ...(session.released ? { released: true } : {}),
+        ...(session.running ? { running: true } : {}),
+        ...forkRowInfo(session, this.canForkNow(session.agentId)),
       })
     }
     return out
+  }
+
+  /**
+   * Adopt the ACP side of a branched conversation: the browser has already
+   * asked the HOST to fork the DSH session tree (`sessions.fork`), and this
+   * runs the agent's own `session/fork` of the parent conversation's live ACP
+   * session so the child actually remembers the parent context — then binds
+   * the child to it (the fourth session-creation point, with every discipline
+   * the other three carry).
+   *
+   * Failure is deliberately all-or-nothing: nothing is written for the child
+   * until the agent has answered, so a failed adopt leaves the child an
+   * ordinary copied-history conversation whose first message starts a fresh
+   * `session/new` (today's behavior) — never a half-bound record.
+   *
+   * @param childDshSessionId - the DSH session the host fork created.
+   * @param parentDshSessionId - the conversation being branched; its ACP
+   *   session must be LIVE on this connection (a released parent has no
+   *   process to fork from — the browser blocks the click, this is the hard
+   *   stop behind it).
+   */
+  async adoptForkedSession(childDshSessionId: string, parentDshSessionId: string): Promise<{ sessionId: string; acpSessionId: string }> {
+    // One conversation, one agent (the lock). The parent's LIVE session is
+    // the fork source; released or in-flight-settling parents are refused —
+    // forking a parked record would silently resume it, and forking mid-turn
+    // would fork an agent state the parent turn is still changing.
+    const parent = [...this.dshSessionMap.values()].find(session =>
+      session.dshSessionId === parentDshSessionId && !session.closed && !session.released)
+    if (parent === undefined) {
+      throw new AcpError('parent_not_live', 'acp: the conversation to branch has no live ACP session; send a message to resume it first')
+    }
+    if (parent.running || parent.settled !== undefined) {
+      throw new AcpError('turn_in_flight', 'acp: the conversation to branch is running a turn; wait for it to finish')
+    }
+    const agentId = parent.agentId
+    const childKey = `${childDshSessionId}:${agentId}`
+    if (this.dshSessionMap.has(childKey)) {
+      throw new AcpError('id_conflict', 'acp: the forked conversation is already bound to an ACP session')
+    }
+    // Capability gate BEFORE any request: an agent that never advertised
+    // `session/fork` must not be asked (it would answer an unknown-method
+    // error at best). Live init wins, last-known falls back — the same
+    // verdict the browser's row already showed.
+    if (!this.canForkNow(agentId)) {
+      throw new AcpError('fork_unsupported', `acp: agent "${agentId}" does not advertise the session/fork capability`)
+    }
+    const session = await this.bridge(agentId).forkSession(parent, childDshSessionId)
+    // The fork answered — the child is real on the agent side. From here the
+    // binding is written through the SAME paths as any chat session: one
+    // choice record (a copy of the parent's, locked — a branched conversation
+    // belongs to its agent from birth), the route pin, and persistence.
+    this.dshSessionMap.set(childKey, session)
+    const parentChoice = this.chatAgentIntent.get(parentDshSessionId)
+    this.patchChatChoice(childDshSessionId, {
+      agentId,
+      locked: true,
+      ...(parentChoice?.modelId === undefined ? {} : { modelId: parentChoice.modelId }),
+      ...(parentChoice?.effort === undefined ? {} : { effort: parentChoice.effort }),
+      ...(parentChoice?.mode === undefined ? {} : { mode: parentChoice.mode }),
+      ...(parentChoice?.extraConfigs === undefined ? {} : { extraConfigs: { ...parentChoice.extraConfigs } }),
+    })
+    // The fourth creation point follows the same discipline as `createSession`
+    // and `doResumeSession`: apply the recorded pick to the fresh session, so
+    // mode and extra configs (which only this path applies) cannot drift from
+    // what the composer shows — a forked session starts on the agent-side
+    // state the fork copied, and the record must match what runs.
+    await this.applyChatChoice(session)
+    // Re-publish so the browser's list and the composer's occupancy ring see
+    // the child immediately (with its just-bound choice mirrors).
+    this.hub.broadcast({ type: 'session/meta', sessionId: session.sessionId, session: snapshot(session) })
+    this.persistAgents()
+    return { sessionId: session.sessionId, acpSessionId: session.acpSessionId }
   }
 
   /**
@@ -4625,6 +4832,15 @@ export class BridgeManager {
 
   private readonly catalogs = new Map<string, { catalog: AcpAgentCatalog; updatedAt: number }>()
   /**
+   * Each agent's LAST KNOWN `sessionCapabilities.fork` bit, persisted with the
+   * model catalog. A live `initialize` result outranks it whenever one exists
+   * (see {@link canForkNow}) — this copy answers when the process is gone
+   * (a released session's branch button must not flash into "supported" just
+   * because `initResult` died with it, nor read `view().agentCapabilities`,
+   * which a release clears).
+   */
+  private readonly forkCaps = new Map<string, boolean>()
+  /**
    * The slash commands each agent declared in its most recent session, cached
    * per agent and persisted alongside the model catalog.
    *
@@ -4690,7 +4906,10 @@ export class BridgeManager {
       const stale = parsed.version !== BridgeManager.CATALOG_SCHEMA
       for (const [agentId, raw] of Object.entries(agents)) {
         if (typeof raw !== 'object' || raw === null) continue
-        const row = raw as { catalog?: unknown; updatedAt?: unknown; commands?: unknown; commandsUpdatedAt?: unknown }
+        const row = raw as { catalog?: unknown; updatedAt?: unknown; commands?: unknown; commandsUpdatedAt?: unknown; fork?: unknown }
+        // The persisted fork capability: a LAST KNOWN bit, loaded before any
+        // bridge can report a fresh one (a fresh `initialize` overwrites it).
+        if (typeof row.fork === 'boolean') this.forkCaps.set(agentId, row.fork)
         // Commands and the model catalog are learned independently (a session
         // may declare one before the other), so either half alone is a valid row.
         if (Array.isArray(row.commands)) {
@@ -4720,10 +4939,17 @@ export class BridgeManager {
         updatedAt?: number
         commands?: NonNullable<SessionView['availableCommands']>
         commandsUpdatedAt?: number
+        fork?: boolean
       }> = {}
       for (const [agentId, entry] of this.catalogs) agents[agentId] = { catalog: entry.catalog, updatedAt: entry.updatedAt }
       for (const [agentId, entry] of this.commandCache) {
         agents[agentId] = { ...(agents[agentId] ?? {}), commands: entry.commands, commandsUpdatedAt: entry.updatedAt }
+      }
+      // The LAST KNOWN fork capability rides the same file: it outlives the
+      // agent process, which is exactly when the browser needs it (see
+      // `canForkNow`).
+      for (const [agentId, supported] of this.forkCaps) {
+        agents[agentId] = { ...(agents[agentId] ?? {}), fork: supported }
       }
       writeFileSync(filePath, JSON.stringify({ version: BridgeManager.CATALOG_SCHEMA, agents }, null, 2), 'utf-8')
     } catch {
@@ -4814,6 +5040,33 @@ export class BridgeManager {
     // conversation opened before this session needs the new list for its very
     // first `/`, when there is still no live session to ask.
     this.hub.broadcast({ type: 'catalog/updated', agentId, updatedAt: entry.updatedAt })
+  }
+
+  /**
+   * Record a fresh `initialize`'s `sessionCapabilities.fork` verdict (the
+   * bridge reports it right after the handshake). Persisted with the model
+   * catalog; no broadcast — the browser learns it through `session/chat-list`
+   * rows, and its branch button deliberately runs on a last-known basis (the
+   * agent's own next `initialize` is the refresh).
+   */
+  private noteForkCapability(agentId: string, supported: boolean): void {
+    if (this.forkCaps.get(agentId) === supported) return
+    this.forkCaps.set(agentId, supported)
+    this.persistCatalogs()
+  }
+
+  /**
+   * Whether an agent's fork can be attempted RIGHT NOW: a live `initialize`
+   * answer wins (the process is up, its handshake is current); only when the
+   * process is gone does the LAST KNOWN persisted bit answer. `false` covers
+   * "never seen" — an unknown agent simply never gets a fork attempt.
+   */
+  private canForkNow(agentId: string): boolean {
+    const bridge = this.bridges.get(agentId)
+    if (bridge?.initResult !== undefined) {
+      return bridge.initResult.agentCapabilities?.sessionCapabilities?.fork != null
+    }
+    return this.forkCaps.get(agentId) === true
   }
 
   /**
@@ -5243,6 +5496,8 @@ export class BridgeManager {
         this.absorbCommands(observedAgentId, commands)
       }, () => {
         this.persistAgents()
+      }, (observedAgentId, supported) => {
+        this.noteForkCapability(observedAgentId, supported)
       })
       this.bridges.set(agentId, bridge)
     }
@@ -5402,11 +5657,15 @@ export class BridgeManager {
       if (splitAdapterModelId(model).agentId === agentId) routeBindingRegistry().conversations.delete(dshSessionId)
     }
     if (routeBindingRegistry().defaultModel === agentId) routeBindingRegistry().defaultModel = undefined
-    // Both maps are independent (either may be missing), so delete both before
-    // deciding whether the file needs rewriting.
+    // All three maps are independent (any may be missing), so delete all
+    // before deciding whether the file needs rewriting. The fork capability
+    // goes with the agent: a same-id rebuild must not inherit the OLD agent's
+    // "supported" and click into a `fork_unsupported` wall before its own
+    // first `initialize` answers.
     const droppedCatalog = this.catalogs.delete(agentId)
     const droppedCommands = this.commandCache.delete(agentId)
-    if (droppedCatalog || droppedCommands) this.persistCatalogs()
+    const droppedFork = this.forkCaps.delete(agentId)
+    if (droppedCatalog || droppedCommands || droppedFork) this.persistCatalogs()
     this.persistAgents()
     this.hub.broadcast({
       type: 'agent/status',

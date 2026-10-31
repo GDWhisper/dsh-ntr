@@ -10,15 +10,26 @@
 - **JSON-RPC `-32603 Internal error` 必须优先解析 `error.data`**：agent 的业务阻塞错误（`billing_error` / `rate_limit` / `auth_error`）放在 `data` 里，只读 `error.message` 会丢原因。见 `src/bridge.ts` · `describeError`。
 - **fs 请求错误必须用 `new RequestError(code, message, { message })`**：`RequestError.internalError(x)` 的第一个参数是 **data** 不是 message，传字符串会让 wire 上只剩 `Internal error`。
 
-**MCP 服务器随会话建立下发**：agent 级 `mcpServers`（见 [state.md §2](./state.md)）在三个建会话点**各发一次**，内容是同一份列表：
+**MCP 服务器随会话建立下发**：agent 级 `mcpServers`（见 [state.md §2](./state.md)）在四个建会话点**各发一次**，内容是同一份列表：
 
 - `createSession`（`session/new`）
 - `probeConfigOptions`（目录探测也走 `session/new`）
 - resume 路径的 `session/load`
+- 分叉路径的 `session/fork`（见下方「第四个建会话点」）
 
-**三处必须是同一份列表**：实测 codebuddy 把这些服务器放进 agent **进程级**的作用域，而不是会话级 —— 同进程里先建一个带注入的会话、再建一个 `mcpServers: []` 的会话，后者会把作用域换成空的，前者的 MCP 工具随之消失（agent 日志 `serverManager.delete("injected")`）。目录探测恰恰复用同一条连接建会话，所以探测若发空列表，用户在设置页点一次「检测可用模型」就会静默剥掉正在聊的会话的 MCP 工具。
+**四处必须是同一份列表**：实测 codebuddy 把这些服务器放进 agent **进程级**的作用域，而不是会话级 —— 同进程里先建一个带注入的会话、再建一个 `mcpServers: []` 的会话，后者会把作用域换成空的，前者的 MCP 工具随之消失（agent 日志 `serverManager.delete("injected")`）。目录探测恰恰复用同一条连接建会话，所以探测若发空列表，用户在设置页点一次「检测可用模型」就会静默剥掉正在聊的会话的 MCP 工具。
 
 线格式由 `toAcpMcpServers` 一次性转换：**stdio 那条不带 `type`**（带了 agent 会静默丢弃），http/sse 带 `type`；`env` / `headers` 是 `[{name,value}]` 数组。
+
+### session/fork（第四个建会话点）
+
+「在新对话中分支」的 ACP 半段：agent 把自己的内部状态拷进一条**新的** ACP 会话，子会话真的记得父会话的上文。分叉固定两段——**宿主先建 DSH 会话树**（`sessions.fork` 复制历史、标题 `(1)`、挂工作区），**插件再接管 ACP 侧**（`session/chat-fork-adopt` → `BridgeManager.adoptForkedSession` → `AgentBridge.forkSession`）；顺序不可对调，因为 ACP fork 没有切点参数，反过来先 ACP fork 再宿主 fork，第二步失败会留下无法归属的 ACP 会话。UI 侧见 [ui.md §12](./ui.md)。
+
+- **UNSTABLE 方法与能力位**：请求经 `methods.agent.session.fork`（SDK 的 `unstable_forkSession`，UNSTABLE / @experimental），能力位是 `initialize` 的 `agentCapabilities.sessionCapabilities.fork`。请求形状 `{ sessionId, cwd, mcpServers }` —— **没有切点参数**，只能从 agent 当前末端分叉。cwd 取父会话已验证的工作区并把它自己加进 extraRoots 重新信任（`resolveSessionCwd`），**严禁**回落 agent 配置的沙箱 cwd——那不是会话所在的地方。
+- **与其它三个建会话点共享的纪律**：同一份 `mcpServers`（进程级作用域，上方四处）；包 `withStartupTimeout`（与 `session/new` / `session/load` 同一超时）；在飞时计入 `pendingForks`（进 `hasActiveWork` / `hasOtherActiveWork`，空闲回收不能杀掉 fork 途中的进程）；响应的 `modes` / `configOptions` 过 `usableConfigOptions` 建 `LiveSession`，并经 `onCatalog` 反哺 agent 级目录——子会话的 composer 芯片不用等一次探测；返回 id 去重后才注册 `acpIndex` / `sessions`。
+- **`adoptForkedSession` 的前置校验（每一项不过都零请求即拒）**：父会话必须 live 且非 running——`parent_not_live`（fork 一个 released 记录等于悄悄 resume 它）与 `turn_in_flight`（分叉一个父 turn 还在改变的状态）；子 DSH 会话键未被占用——`id_conflict`（已绑定即拒）；`canForkNow` 不过——`fork_unsupported`（活的 initialize 优先、`forkCaps` 最后已知兜底，见 [state.md §3.2](./state.md)；agent 没宣告过**不许问**，问了至多换来 unknown-method）。`parent_not_live` / `turn_in_flight` 两档在浏览器点击前就按行 `fork` 字段置灰挡掉，这里是硬闸。
+- **返回校验**：id 非空（`fork_failed`）；id ≠ 父且不撞本连接已注册的会话（`fork_id_conflict`）——撞了拒绝注册，否则父会话的 `session/update`、审批询问会被路由进子会话。错误码全集：`parent_not_live` / `turn_in_flight` / `id_conflict` / `fork_unsupported` / `fork_failed` / `fork_id_conflict`，以及共享路径的 `agent_unreachable`（连接未开）、`agent_timeout`（`withStartupTimeout`）、`bad_cwd` / `cwd_denied` / `no_cwd`（`resolveSessionCwd`）与 `unknown_agent`（`bridge()` 查不到 agent）。
+- **all-or-nothing**：任何一步失败都不写子会话的任何绑定（choice / 锁 / 索引 / 记录全不写），子会话首条消息走原 `session/new`——等价于没有分叉功能时的行为，不留下半接管的会话；失败原因经 `flashError` 进设置页横幅（约束 38）。成功才写 choice = 父 choice 拷贝 + `locked: true`（经 `patchChatChoice`，[state.md §3.2](./state.md)）、广播 `session/meta`、浏览器 `openSession` 打开子会话。
 
 ## 2. 进程死亡 ≠ 会话销毁
 
@@ -55,7 +66,7 @@
 
 ## 5. 空闲释放
 
-- **范围**：`AgentBridge.releaseIfIdle` 只释放 `state === 'ready'` 且 `hasActiveWork() === false` 的 bridge。活跃 = 有进行中的 turn（含已 abort、agent 尚未结算，`running || settled`）、待答审批、mode/config 命令在途（`pendingCommands`）、`pendingProbes` / `pendingCreates` / `resuming` / `starting`。**空闲的 live 会话不算活跃**：释放把它们挂起为 `released`（不是关闭），下一条消息经 `session/load` 恢复，30 分钟窗口因此对聊天进程真正生效。
+- **范围**：`AgentBridge.releaseIfIdle` 只释放 `state === 'ready'` 且 `hasActiveWork() === false` 的 bridge。活跃 = 有进行中的 turn（含已 abort、agent 尚未结算，`running || settled`）、待答审批、mode/config 命令在途（`pendingCommands`）、`pendingProbes` / `pendingCreates` / `pendingForks`（分叉在途，§1）/ `resuming` / `starting`。**空闲的 live 会话不算活跃**：释放把它们挂起为 `released`（不是关闭），下一条消息经 `session/load` 恢复，30 分钟窗口因此对聊天进程真正生效。
 - **可恢复性闸门**：agent 未声明 `loadSession` 时，有 live 会话的 bridge 不释放——无法 reload 的会话会在下一条消息时丢失上下文；这类 agent 仍等价于旧的「无 live 会话才释放」。
 - **工作区搬迁不共用这条放宽**：`ensureReady` 的就地重启仍要求 `isQuiet()`（无 live 会话且无活跃工作），避免多个工作区的会话互相把进程搬来搬去。两个谓词共享 `hasActiveWork()`，「无 live 会话」只属于搬迁。
 - **动作**：必须走 `releaseAll(reason)` 而不是 `stop()`——`stop` 会 `released.clear()`，毁掉尚未恢复的会话上下文。释放**静默进行，严禁广播 `agent/notice`**；`agent/notice` 只留给异常或伴随用户动作的事件（探测失败、权限超时、就地搬迁工作区）。
@@ -146,3 +157,4 @@
 | 数据折叠 | `src/impl.ts` · `acpContentRows` / `formatAcpDiff` / `dumpJson` / `describeUnhandledUpdate` / `acpToolCallFromUpdate` / `acpToolCallDelta` |
 | 启动命令 | `src/impl.ts` · `validateAgentDef` / `splitCommandLine`；`src/bridge.ts` · `quoteLegacyCommand` |
 | MCP 下发 | `src/bridge.ts` · `toAcpMcpServers`（线格式转换）；`src/impl.ts` · `validateMcpServers`（配置校验）；面板三处同步见 `src/client/panel.tsx` · `initialForm` / `buildPayload` / `payloadEquals` |
+| 会话分叉 | `src/bridge.ts` · `AgentBridge.forkSession` / `BridgeManager.adoptForkedSession` / `pendingForks` / `noteForkCapability` / `canForkNow` / `forkCaps`；`src/impl.ts` · `dispatchRpc`（`session/chat-fork-adopt` 分支）；`src/client/store.ts` · `forkChatSession` / `forkStateOf` |

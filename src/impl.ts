@@ -1906,6 +1906,14 @@ export interface AcpManager {
    */
   resumeChatSession?(dshSessionId: string): Promise<void>
   /**
+   * Adopt the ACP side of a branched conversation (`session/chat-fork-adopt`):
+   * the browser has already asked the HOST to fork the DSH session tree, and
+   * this runs the agent's own `session/fork` of the parent's live ACP session,
+   * then binds the child to it. All-or-nothing — nothing is bound on failure,
+   * so the child stays an ordinary copied-history conversation.
+   */
+  adoptForkedSession?(childDshSessionId: string, parentDshSessionId: string): Promise<{ sessionId: string; acpSessionId: string }>
+  /**
    * Point one DSH chat conversation at an ACP agent — the plugin's own
    * conversation↔agent mapping, never a DSH model route (see
    * `BridgeManager.bindChatAgent`).
@@ -2106,6 +2114,18 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         const dshSessionId = str(body, 'dshSessionId', 128)
         await manager.resumeChatSession?.(dshSessionId)
         return ok({ done: true })
+      }
+      case 'session/chat-fork-adopt': {
+        // The second half of a branched conversation: bind the DSH session the
+        // host's `sessions.fork` just created to the agent's own `session/fork`
+        // of the parent's live ACP session. Both ids are validated before the
+        // optional call — the same shape rule as `session/chat-list` above.
+        // The adopted ids ride the answer (the protocol's ChatForkAdoptResult);
+        // a manager without the method keeps the plain `done` shape.
+        const dshSessionId = str(body, 'dshSessionId', 128)
+        const parentDshSessionId = str(body, 'parentDshSessionId', 128)
+        const adopted = await manager.adoptForkedSession?.(dshSessionId, parentDshSessionId)
+        return ok(adopted ?? { done: true })
       }
       case 'session/chat-bind': {
         // Point one chat conversation at an ACP agent. The plugin's own
