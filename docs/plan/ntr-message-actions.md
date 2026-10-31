@@ -56,7 +56,7 @@
 
 ### 2.4 图标组件可以直接拿
 
-宿主前端模块表里注册了 `@deepseek-ai/dsh-client-ui-primitives`，导出 `IconBranchOutline16`（**实施修正**：宿主自己的分支按钮用的就是这个，不是初稿写的 `IconBranchOutlineRegular`）与 `Tooltip`。插件当前 `package.json` 的 `dsh.client.inject` 已新增它；`tsdown.config.mjs` 的 `EXTERNAL` 也已加（图标与宿主同源）。
+宿主前端模块表里注册了 `@deepseek-ai/dsh-client-ui-primitives`，导出分支图标与 `Tooltip`。**实施修正（两次）**：分支按钮的图标导出名在宿主世代间移动——较新的 npm 包导出 `IconBranchOutline16`，用户实机的桌面 0.2.1-rc.2 只有 `IconBranchOutlineRegular` / `…Medium`（宿主自己的分支按钮在 rc.2 用的就是 `…Regular`）。所以实现不做硬 import，而是 `branchIconOf` 依 `…16 → …Regular → …Medium` 逐个回退，全部缺失时按钮照常渲染、只是没有 28px 图形——缺名时 `<undefined />` 会抛「Element type is invalid」、被槽位错误边界吞成整条目消失（实机踩过）。插件当前 `package.json` 的 `dsh.client.inject` 已新增它；`tsdown.config.mjs` 的 `EXTERNAL` 也已加（图标与宿主同源）。
 
 ### 2.5 宿主侧的分叉与打开会话
 
@@ -136,7 +136,7 @@ ctx.slots.inject('conversation.chat.assistant-actions', () => ctx.slots.register
 
 组件 `AcpBranchAction`（新文件 `src/client/branch-action.tsx`）：
 
-- 图标：bundle 顶部 `import { IconBranchOutline16, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'`（EXTERNAL，与宿主同源）；tooltip 用同包的 `Tooltip`，`side: 'bottom'`。
+- 图标：`import * as primitives` + 模块顶部 `branchIconOf(primitives)` 依 `…16 → …Regular → …Medium` 回退（EXTERNAL，与宿主同源；§2.4 的宿主世代差异）；tooltip 用同包的 `Tooltip`，`side: 'bottom'`。
 - 按钮必须带 `data-ntr-branch`（D2 的 CSS 靠它把自己那枚与宿主那枚区分开），`aria-label` 与宿主同文案（无障碍语义不变）。
 - 样式：class `.ntr-branch-action`，数值照 §2.3（28px 方框、`border-radius: 28px`、`var(--dsw-alias-label-tertiary)`、hover 用宿主 alias、`data-unavailable` 置灰），**颜色只走 token**（约束 34）。
 - 非 NTR 会话返回 `null`（同时 CSS 也不生效，双保险）。

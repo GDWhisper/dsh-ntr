@@ -11,6 +11,7 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
 import { ACP_PRESET_ID, acpModeFromPresetEvent, formatCommandLine, isAbsolutePathLike, placeMenu, rowAgentPreset, splitAcpModelId, splitCommandLine, stagedIsAcpMode, stagedSessionOf, tokenizeCommandLine } from '../src/client/acp-ui.tsx'
 import { agentLockPhaseOf, FORM_MS, playAgentLockAnim, SHATTER_MS } from '../src/client/agent-lock-anim.ts'
+import { branchIconOf } from '../src/client/branch-action.tsx'
 import { acpEmptyCopy, boundAgentOf, diffRows, historyAwaitsReplay, isNewFileDiff } from '../src/client/acp-view.tsx'
 import { acpMeterUsage, compactTokenCount, contextOccupancy } from '../src/client/context-meter.tsx'
 import { approvalDeadlineFacts, DEADLINE_MIN_WAIT_MS, deadlineSliderIndex, deadlineValueFor } from '../src/client/panel.tsx'
@@ -1105,5 +1106,33 @@ describe('NTR message-actions stylesheet (acp-ui.tsx STYLE)', () => {
     // the host's `.xzv4MW_action`.
     expect(acpUiSource).toContain('var(--dsw-alias-label-tertiary')
     expect(acpUiSource).toContain('var(--dsh-content-font-delta')
+  })
+})
+
+describe('branchIconOf (branch-action.tsx)', () => {
+  // The icon exports MOVED between shipped hosts: desktop 0.2.1-rc.2 has
+  // Regular/Medium but NOT 16, newer packages export 16. A hard import of one
+  // name compiles to a plain property read, so the missing export is
+  // `undefined` and the entry crashes at render — the slot error boundary
+  // abdicates it and the button silently disappears. The picker must prefer
+  // the newest name and always degrade, never throw.
+  const marker = (name: string) => () => name
+  const sixteen = marker('sixteen')
+  const regular = marker('regular')
+  const medium = marker('medium')
+
+  it('prefers IconBranchOutline16, then Regular, then Medium, and yields undefined when none exist', () => {
+    expect(branchIconOf({})).toBeUndefined()
+    expect(branchIconOf({ IconBranchOutlineMedium: medium })).toBe(medium)
+    expect(branchIconOf({ IconBranchOutlineRegular: regular, IconBranchOutlineMedium: medium })).toBe(regular)
+    expect(branchIconOf({
+      IconBranchOutline16: sixteen,
+      IconBranchOutlineRegular: regular,
+      IconBranchOutlineMedium: medium,
+    })).toBe(sixteen)
+    // The rc.2 shape — what the user's installed host actually exports.
+    expect(branchIconOf({ IconBranchOutlineRegular: regular })).toBe(regular)
+    // `null` exports (a host stubbing a name out) must not be picked either.
+    expect(branchIconOf({ IconBranchOutline16: null, IconBranchOutlineRegular: regular })).toBe(regular)
   })
 })

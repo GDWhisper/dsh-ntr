@@ -6,15 +6,19 @@
  *
  * Only the members this bundle uses are declared, structurally: the host
  * package is not part of a plugin's dependency closure, and the full surface
- * would be a second copy of types this plugin cannot import anyway. The icon
- * is the exact component the host's own branch button renders
- * (`MessageIconActions`), which is what keeps the self-drawn entry visually
- * identical to the icon it replaces.
+ * would be a second copy of types this plugin cannot import anyway. The
+ * branch icons are the candidates the host's own branch button renders
+ * (`MessageIconActions`) across shipped host generations — desktop 0.2.1-rc.2
+ * exports `IconBranchOutlineRegular` (and `…Medium`) but NOT `…16`, while
+ * newer packages export `…16` — which is why `branch-action.tsx` picks the
+ * first present one instead of hard-importing a single name.
  */
 declare module '@deepseek-ai/dsh-client-ui-primitives' {
   import type { ComponentType, ReactNode } from 'react'
 
-  export const IconBranchOutline16: ComponentType<Record<string, never>>
+  export const IconBranchOutline16: ComponentType<Record<string, never>> | undefined
+  export const IconBranchOutlineRegular: ComponentType<Record<string, never>> | undefined
+  export const IconBranchOutlineMedium: ComponentType<Record<string, never>> | undefined
   export const Tooltip: ComponentType<{
     label: ReactNode
     side?: 'top' | 'bottom' | 'left' | 'right'

@@ -22,11 +22,32 @@
  */
 
 import { useLayoutEffect, useRef, useState } from 'react'
-import { IconBranchOutline16, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { ComponentType } from 'react'
+import { Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
+import * as primitives from '@deepseek-ai/dsh-client-ui-primitives'
 import { useUi } from './acp-ui.tsx'
 import type { AcpChatInjected } from './acp-ui.tsx'
 import { forkStateOf } from './store.ts'
 import type { ChatForkState } from './store.ts'
+
+/**
+ * The host's own branch-button icon, picked per host generation. The icon
+ * exports MOVED between shipped hosts — desktop 0.2.1-rc.2 has
+ * `IconBranchOutlineRegular` / `…Medium` but NOT `…16`, newer packages export
+ * `…16` — and a hard import of one name compiles to a plain property read
+ * (`primitives.IconBranchOutline16`), so the missing export is `undefined`
+ * and `<undefined />` throws "Element type is invalid". The slot's error
+ * boundary then abdicates the whole entry: no button, no tooltip, nothing in
+ * any log — the exact silent disappearance this picker exists to prevent.
+ * Rendering the button never depends on the icon: with all three absent the
+ * click still works, only the 28px glyph is missing.
+ */
+export function branchIconOf(source: Record<string, unknown>): ComponentType<Record<string, never>> | undefined {
+  return (source.IconBranchOutline16 ?? source.IconBranchOutlineRegular ?? source.IconBranchOutlineMedium) as
+    | ComponentType<Record<string, never>>
+    | undefined
+}
+const BranchIcon = branchIconOf(primitives as unknown as Record<string, unknown>)
 /** What the label reads for each state (zh / en pairs, per the plan's §D4). */
 function tooltipFor(state: ChatForkState, label: (zh: string, en: string) => string): string {
   switch (state) {
@@ -128,7 +149,7 @@ export function AcpBranchAction(props: AcpChatInjected & { sessionId: string }) 
           data-unavailable={disabled || undefined}
           onClick={disabled ? undefined : onClick}
         >
-          <IconBranchOutline16 />
+          {BranchIcon === undefined ? null : <BranchIcon />}
         </button>
       </Tooltip>
       {failure !== undefined && (
