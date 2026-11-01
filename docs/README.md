@@ -12,9 +12,11 @@
   - 为什么：NTR 会话里宿主的点赞 / 点踩 / 分支三图标要么无意义、要么分支出来 agent 记不住上文；本方案把它们在 NTR 会话内隐藏，换成插件自己的分支入口（同图标、同尺寸），可用性由插件按六态判定
   - 怎么做：`html[data-ntr-acp]` 作用域 + `aria-label` 选择器隐藏（锚点 `[data-turn-tail]`）；`conversation.chat.assistant-actions` 注册自绘按钮；点击走「宿主 `sessions.fork` → 插件 `session/fork` adopt」两段式，子会话的 ACP 上下文来自 agent 自己的 fork
   - 状态：已实现（含审核修正，见文内「实施修正」标注）；行为契约以 [AGENTS/ui.md §12](../AGENTS/ui.md) 与 [AGENTS/protocol.md §1](../AGENTS/protocol.md) 为准
+- [方案：孤儿 agent 进程的回收（暂缓）](./plan/backlog/orphan-agent-reaping.md)
+  - 为什么 / 怎么做：宿主被 `SIGKILL` / `taskkill /F` 时插件拉起的 agent 会活下来；现状只覆盖优雅关闭、主动杀与 `exit` 钩子。三条候选路线（绕开 `.cmd` 壳 / supervisor 包装 / 重启接管）各带验收口径与风险，状态「未决策」，索引见 [backlog](./plan/backlog/README.md)
 - [待办清单](./todo.md)
   - 本仓唯一的待办清单：只留尚未落地的项，用户确认完结即删（结论并入 AGENTS.md 对应约束，不留「已落地」历史）
-  - 当前为空
+  - 当前一项：宿主被强杀后残留的 ACP agent 进程（方案见 [docs/plan/backlog](./plan/backlog/README.md)）
 - [发版手册](../AGENTS/release.md)
   - agent 操作文档（由根 AGENTS.md 索引）：版本与 tag 规则、发布前检查，从提交到 npm 发布与 GitHub Release 的完整命令
   - release note 与 [`CHANGELOG.md`](../CHANGELOG.md) 的写法：面向用户、只写能感知到的变化与确定性净改动，不写根因与内部机制
