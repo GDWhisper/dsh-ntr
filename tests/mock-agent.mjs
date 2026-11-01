@@ -192,6 +192,14 @@ const DEFAULT_MODEL = process.env.MOCK_MODEL ?? 'mock-model-a'
 // Test knob: reproduce Qoder CN's payload from issue #8, where the only
 // thought control is `reasoning_effort` tagged `category: 'model'`.
 const QODER_MODEL_CATEGORY = process.env.MOCK_QODER_MODEL_CATEGORY === '1'
+// Test knob: publish the mode as a `category: 'mode'` select too (codebuddy /
+// opencode shape), so the agent-level catalog can carry a mode value that a
+// NEW conversation's `session/new` does not start on.
+const MODE_OPTION = process.env.MOCK_MODE_OPTION === '1'
+// Test knob: the FIRST session this process opens starts in this mode; later
+// ones start on 'default'. That is the "catalog remembers another session's
+// mode" shape a fresh conversation must not silently lose.
+const FIRST_MODE = process.env.MOCK_FIRST_MODE
 
 function mockConfigOptions(state = { temp: 'mid', model: DEFAULT_MODEL, effort: 'high' }) {
   return [
@@ -243,6 +251,19 @@ function mockConfigOptions(state = { temp: 'mid', model: DEFAULT_MODEL, effort: 
         { value: 'high', name: 'high' },
       ],
     },
+    // Only when the knob is on: the mock otherwise mirrors an agent whose modes
+    // exist ONLY in `session/new`'s `modes` field.
+    ...(MODE_OPTION ? [{
+      configId: 'mode',
+      name: 'Mode',
+      type: 'select',
+      category: 'mode',
+      currentValue: state.modeId ?? 'default',
+      options: [
+        { value: 'default', name: 'Default' },
+        { value: 'strict', name: 'Strict' },
+      ],
+    }] : []),
     // A boolean toggle (ACP `type: 'boolean'`, no choices). The composer
     // renders it as a checkbox; the host must send it back as
     // `type: 'boolean'` with a real boolean value.
@@ -293,11 +314,12 @@ const app = agent({ name: 'mock-acp-agent' })
     // new counter, and a test that proves "the host opened a NEW agent session"
     // (a reset, not a `session/load`) compares ids from two different children.
     const sessionId = `mock-sess-${String(process.pid)}-${String(++counter)}`
-    sessions.set(sessionId, { cwd: ctx.params.cwd, modeId: 'default', temp: 'mid', model: DEFAULT_MODEL, effort: 'high', stream: false, mcpServers: ctx.params.mcpServers })
+    const modeId = FIRST_MODE !== undefined && counter === 1 ? FIRST_MODE : 'default'
+    sessions.set(sessionId, { cwd: ctx.params.cwd, modeId, temp: 'mid', model: DEFAULT_MODEL, effort: 'high', stream: false, mcpServers: ctx.params.mcpServers })
     return {
       sessionId,
       modes: {
-        currentModeId: 'default',
+        currentModeId: modeId,
         availableModes: [
           { id: 'default', name: 'Default' },
           { id: 'strict', name: 'Strict' },
@@ -383,6 +405,7 @@ const app = agent({ name: 'mock-acp-agent' })
     if (ctx.params.configId === 'temp') session.temp = String(ctx.params.value)
     else if (ctx.params.configId === 'model') session.model = String(ctx.params.value)
     else if (ctx.params.configId === 'thought') session.effort = String(ctx.params.value)
+    else if (ctx.params.configId === 'mode' && MODE_OPTION) session.modeId = String(ctx.params.value)
     else if (ctx.params.configId === 'stream') {
       // A boolean option must arrive discriminated: `type: 'boolean'` + a real
       // boolean. The request union keys on `type`, so a client that forgets it

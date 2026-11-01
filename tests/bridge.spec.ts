@@ -5437,6 +5437,51 @@ describe('pre-chat pick persistence (isolated manager)', () => {
     await nowhere.shutdownAll()
   }, 30_000)
 
+  it('runs the first turn on the mode the composer showed without an explicit pick', async () => {
+    // The mode select's value before the first message is the catalog's
+    // last-known mode (whatever another conversation left there), while
+    // `session/new` starts on the agent's own default. The composer's contract
+    // is "whatever it shows is what runs" — so the displayed mode is one of the
+    // pre-turn defaults the session must be seeded with, like model / effort.
+    const events: AcpEvent[] = []
+    const hub = new EventHub()
+    hub.subscribe(event => { events.push(event) })
+    const gm = new BridgeManager(
+      [{ ...def, id: 'modepick', env: { MOCK_MODE_OPTION: '1', MOCK_FIRST_MODE: 'strict' } }],
+      hub,
+      500,
+      `${tmpdir()}/acp-displayed-mode-${Date.now()}.json`,
+    )
+    try {
+      // A probe is the gesture that fills the composer's mode select before a
+      // session exists: the catalog says 'strict'. The chat session this test
+      // opens afterwards is the SECOND one on that process and starts on the
+      // agent's own 'default'.
+      await gm.probeAgentModels('modepick')
+      expect(gm.agentCatalog('modepick').mode?.currentValue).toBe('strict')
+
+      gm.bindChatAgent('dsh-displayed-mode', 'modepick')
+      expect(gm.chatChoice('dsh-displayed-mode')?.mode).toBeUndefined()
+      const since = events.length
+      for await (const _ of gm.streamPrompt({
+        model: 'modepick',
+        sessionId: 'dsh-displayed-mode',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      } as never)) { /* drain */ }
+
+      // Proof the agent did NOT start on the displayed mode: `session/created`
+      // carries the fresh session's own answer.
+      const created = events.slice(since).find((event): event is Extract<AcpEvent, { type: 'session/created' }> => event.type === 'session/created')
+      expect(created?.session.modes?.currentModeId).toBe('default')
+      // ...yet the first turn ran on what the composer showed, and the pick is
+      // the conversation's record from now on.
+      expect(gm.chatSessions('dsh-displayed-mode')[0]?.modes?.currentModeId).toBe('strict')
+      expect(gm.chatChoice('dsh-displayed-mode')).toMatchObject({ agentId: 'modepick', mode: 'strict' })
+    } finally {
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
   it('drops the previous agent\'s mode when the conversation switches agent', async () => {
     const gm = new BridgeManager(
       [{ ...def, id: 'alpha2' }, { ...def, id: 'beta2' }],

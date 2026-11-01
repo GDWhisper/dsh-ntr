@@ -81,6 +81,7 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 
 - **不写可见标签**：agent 下发的 mode 名自解释（omp `Default`/`Plan`，codebuddy `Always Ask`/`Accept Edits`/…）。解释留在 `title` 与 `aria-label`（可访问性不能删）。
 - **选项不依赖活会话**：先取活会话的 `modes`，没有时回落 `agent/catalog` 的 `mode`（探测来的 `category: 'mode'` select，与 `session/new` 同源）。
+- **显示的值就是首轮要跑的值**：没有 pick 时它显示 `catalog.mode.currentValue`，而那可能是同一 agent 别的会话抬上来的；`displayedChatDefaults` / `seedChatChoiceFromCatalog` 必须在 `session/new` 前捕获并把它写成会话的 pick（与 model / effort 同一契约，见 [state.md §3](./state.md)），否则就是「下拉写着 Bypass、首轮跑 Always Ask」。
 - **控件是否出现由「agent 发布了什么轴」决定，不能由「用户点过什么」决定**。`describeRoute` 让 `modelLabel` 只在有 pick 时才有值是真实回归：只点过思考等级的会话整块模型 chip 消失。配套：`agentCatalog` 必须同时回 `currentModel` 与 `mode`。
 - **自带 ACP 闸门**（`agentModeVisible`：显式 `ui.acpMode === false` 压过残留活会话行，`undefined` 时活会话才算证据；且 `!isAcp` 时整个控件 `return null`，残留活会话的 `availableModes` **不放行**）：它在 `conversation.input.left`，不在 `syncAcpMode` 的 claim 生命周期里，而 `agentId` 会回落到插件默认 `defaultAgent`，不闸就是普通会话凭空多一个 ACP 控件。
 - `setChatSessionMode` 对没有活会话**或已释放**的会话只记录 pick、不 spawn（与 `setChatSessionModel` 一致；2026-10-30 起 released 不再先 resume，见 §3「只记录、不唤醒」），`applyChatChoice` 在建 / 恢复会话时再应用。

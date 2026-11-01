@@ -112,6 +112,8 @@ const SESSION_CLOSE_TIMEOUT_MS = 5_000
 interface DisplayedChatDefaults {
   modelId?: string
   effort?: string
+  /** The agent's last-known mode (the composer's select without a pick). */
+  mode?: string
   extraConfigs?: Record<string, string | boolean>
 }
 
@@ -8052,8 +8054,8 @@ export class BridgeManager {
 
   /**
    * The agent values the composer is showing for a conversation that has not
-   * picked them — the catalog's current model, thought level and extra config
-   * values.
+   * picked them — the catalog's current model, thought level, mode and extra
+   * config values.
    *
    * Captured BEFORE `session/new`: materializing the session absorbs its own
    * defaults into the catalog (`absorbCatalog`), which would overwrite exactly
@@ -8072,6 +8074,14 @@ export class BridgeManager {
     // `defaultEffort` only when the current value is one of the agent's levels.
     const effort = this.reasoningMeta(agentId)?.defaultEffort
     if (effort !== undefined) out.effort = effort
+    // The mode select's pre-first-message value is the catalog's last-known
+    // mode (the agent's own answer from another session), and `session/new`
+    // starts on whatever the agent itself defaults to. Without capturing it,
+    // a conversation whose select reads "Bypass Permissions" would run its
+    // first turn on "Always Ask" — the same display/run split the model and
+    // thought level are seeded for.
+    const mode = catalog.mode?.currentValue
+    if (mode !== null && mode !== undefined && mode !== '') out.mode = mode
     const extraConfigs: Record<string, string | boolean> = {}
     for (const option of catalog.extras ?? []) {
       const value = option.currentValue
@@ -8092,14 +8102,15 @@ export class BridgeManager {
    * first prompt runs.
    *
    * A conversation with no explicit pick displays the agent catalog's current
-   * model / thought level / extras, while the ACP session `session/new` just
-   * created starts on whatever the agent itself defaults to. Without this the
-   * user is shown one model and the agent runs another — the defect reported
-   * as "the displayed model was not used". Values the fresh session does not
-   * offer are skipped (its `configOptions` are the authority, and the catalog
-   * update that rode `session/new` will correct the display), never turned
-   * into a failed first turn. Explicit picks always win: only missing fields
-   * are filled.
+   * model / thought level / mode / extras, while the ACP session `session/new`
+   * just created starts on whatever the agent itself defaults to. Without this
+   * the user is shown one model and the agent runs another — the defect
+   * reported as "the displayed model was not used", and the reported first
+   * turn that ignored the mode select's value. Values the fresh session does
+   * not offer are skipped (its `configOptions` are the authority, and the
+   * catalog update that rode `session/new` will correct the display), never
+   * turned into a failed first turn. Explicit picks always win: only missing
+   * fields are filled.
    */
   private seedChatChoiceFromCatalog(
     dshSessionId: string,
@@ -8127,6 +8138,18 @@ export class BridgeManager {
         patch.effort = displayed.effort
         changed = true
       }
+    }
+    // The mode is the third axis of the same contract. The select's value
+    // before the first message is the catalog's last-known mode; `session/new`
+    // answers with the agent's own default. Seed the displayed one when the
+    // fresh session still offers it — an agent that publishes no `modes`
+    // field is applied best-effort, exactly like `applyChatChoice`.
+    const displayedMode = displayed.mode
+    const offeredModes = session.modes?.availableModes ?? []
+    if (current?.mode === undefined && displayedMode !== undefined
+      && (offeredModes.length === 0 || offeredModes.some(entry => entry.id === displayedMode))) {
+      patch.mode = displayedMode
+      changed = true
     }
     if (displayed.extraConfigs !== undefined) {
       const extraConfigs = { ...(current?.agentId === agentId ? current.extraConfigs : undefined) }
