@@ -868,6 +868,48 @@ export function childEnv(parent: NodeJS.ProcessEnv, extra: Record<string, string
 // ---- Model catalog (pure parsing of ACP `configOptions`) ----
 
 /**
+ * ACP categories are free-form UX hints, not identity. Qoder CN tags
+ * `reasoning_effort` as `category: 'model'` (the spec means `thought_level`),
+ * and nothing stops an agent from reusing a category for several options.
+ * Slots are therefore assigned by `configId` first and category second, and a
+ * same-category option NEVER replaces another option's slot: whatever loses
+ * stays reachable through `extras` instead of silently becoming the model list.
+ */
+const EFFORT_OPTION_HINT = /effort|thinking|thought|reason/i
+
+function isModelSelector(configId: string, name: string): boolean {
+  return configId === 'model' || name.trim().toLowerCase() === 'model'
+}
+
+type CatalogSlot = 'model' | 'thought' | 'mode'
+
+interface CatalogSlotCandidate {
+  slot: CatalogSlot
+  rank: number
+  option: AcpCatalogOption
+}
+
+function catalogSlotFor(category: string | undefined, configId: string, name: string): Omit<CatalogSlotCandidate, 'option'> | undefined {
+  const effortish = EFFORT_OPTION_HINT.test(configId) || EFFORT_OPTION_HINT.test(name)
+  if (category === 'model') {
+    // The option explicitly named `model` is the selector even when other
+    // model-scoped options are present.
+    if (isModelSelector(configId, name)) return { slot: 'model', rank: 3 }
+    // A model-scoped effort is mislabelled, not a model: route it to the
+    // thought chip when no real `thought_level` option is published.
+    if (effortish) return { slot: 'thought', rank: 1 }
+    // An unknown model-scoped select: a last-resort selector only.
+    return { slot: 'model', rank: 1 }
+  }
+  if (category === 'thought_level') return { slot: 'thought', rank: 3 }
+  if (category === 'mode') return { slot: 'mode', rank: 2 }
+  // `model_config` is where the spec puts model-dependent knobs (effort,
+  // context size); only the effort-shaped ones have a dedicated control.
+  if (category === 'model_config' && effortish) return { slot: 'thought', rank: 1 }
+  return undefined
+}
+
+/**
  * Extract select options from a raw ACP `configOptions` payload.
  *
  * `model`, `thought_level` and `mode` get dedicated slots. Every OTHER select
@@ -880,24 +922,19 @@ export function childEnv(parent: NodeJS.ProcessEnv, extra: Record<string, string
 export function parseCatalogOptions(configOptions: unknown): AcpAgentCatalog {
   const out: AcpAgentCatalog = {}
   if (!Array.isArray(configOptions)) return out
-  const extras = new Map<string, AcpCatalogOption>()
+  const definitions: AcpCatalogOption[] = []
+  const candidates: CatalogSlotCandidate[] = []
   for (const raw of configOptions) {
     if (typeof raw !== 'object' || raw === null) continue
     const row = raw as Record<string, unknown>
     const category = typeof row.category === 'string' ? row.category : undefined
-    const slot = category === 'model'
-      ? 'model'
-      : category === 'thought_level'
-        ? 'thought'
-        : category === 'mode'
-          ? 'mode'
-          : undefined
     const configIdRaw = row.configId ?? row.id
     if (typeof configIdRaw !== 'string' && typeof configIdRaw !== 'number') continue
     const configId = String(configIdRaw)
     if (configId === '') continue
     const choices: NonNullable<AcpAgentCatalog['model']>['choices'] = []
     collectCatalogChoices(row.options, choices)
+    const name = typeof row.name === 'string' && row.name !== '' ? row.name : configId
     // A boolean toggle has no `options` at all; its current value is a JSON
     // boolean. It is encoded as 'true' / 'false' so the catalog stays
     // string-typed for every existing reader, and carries `kind` so the
@@ -906,7 +943,7 @@ export function parseCatalogOptions(configOptions: unknown): AcpAgentCatalog {
       || (typeof row.currentValue === 'boolean' && choices.length === 0)
     const option: AcpCatalogOption = {
       configId,
-      name: typeof row.name === 'string' && row.name !== '' ? row.name : configId,
+      name,
       ...(booleanKind ? { kind: 'boolean' as const } : {}),
       currentValue: booleanKind
         ? row.currentValue === true || row.currentValue === 'true'
@@ -915,19 +952,67 @@ export function parseCatalogOptions(configOptions: unknown): AcpAgentCatalog {
         : typeof row.currentValue === 'string' && row.currentValue !== '' ? row.currentValue : null,
       choices,
     }
+    definitions.push(option)
     // A toggle is never a model / thought / mode SELECT: those controls pick
     // among choices. It belongs to the advanced base, where it is a checkbox.
-    if (slot !== undefined && !booleanKind) {
-      out[slot] = option
-      continue
+    if (booleanKind) continue
+    const slot = catalogSlotFor(category, configId, name)
+    if (slot !== undefined) candidates.push({ ...slot, option })
+  }
+  const winnerIds = new Set<string>()
+  for (const slot of ['model', 'thought', 'mode'] as const) {
+    let winner: CatalogSlotCandidate | undefined
+    for (const candidate of candidates) {
+      if (candidate.slot !== slot) continue
+      if (winner === undefined || candidate.rank > winner.rank) {
+        winner = candidate
+      } else if (candidate.rank === winner.rank && candidate.option.configId === winner.option.configId) {
+        // The same option redefined later in one answer: the last definition
+        // is the current one.
+        winner = candidate
+      }
     }
-    // Choice-less options have nothing to pick; they would render an empty
-    // section in the advanced menu, so they stay out of the catalog entirely —
-    // except a boolean, whose whole point is that it has no choices.
-    if (choices.length > 0 || booleanKind) extras.set(configId, option)
+    if (winner === undefined) continue
+    out[slot] = winner.option
+    winnerIds.add(winner.option.configId)
+  }
+  // Choice-less options have nothing to pick; they would render an empty
+  // section in the advanced menu, so they stay out of the catalog entirely —
+  // except a boolean, whose whole point is that it has no choices. Anything
+  // that lost a slot race is still a real, settable option: keep it here.
+  const extras = new Map<string, AcpCatalogOption>()
+  for (const option of definitions) {
+    if (winnerIds.has(option.configId)) continue
+    if (option.choices.length > 0 || option.kind === 'boolean') extras.set(option.configId, option)
   }
   if (extras.size > 0) out.extras = [...extras.values()]
   return out
+}
+
+/**
+ * Whether a payload names ONE model selector without relying on category
+ * alone. When an agent publishes several `category: 'model'` options and none
+ * is explicitly the `model` id, the category is not trustworthy enough to
+ * reject the user's pick — callers must fail open instead of reporting
+ * `model_unavailable`.
+ */
+export function hasUnambiguousModelSelector(configOptions: unknown): boolean {
+  if (!Array.isArray(configOptions)) return true
+  let scoped = 0
+  let explicit = false
+  for (const raw of configOptions) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const row = raw as Record<string, unknown>
+    if (row.category !== 'model') continue
+    const configIdRaw = row.configId ?? row.id
+    if (typeof configIdRaw !== 'string' && typeof configIdRaw !== 'number') continue
+    const configId = String(configIdRaw)
+    if (configId === '') continue
+    scoped += 1
+    const name = typeof row.name === 'string' ? row.name : ''
+    if (isModelSelector(configId, name)) explicit = true
+  }
+  return explicit || scoped <= 1
 }
 
 /**

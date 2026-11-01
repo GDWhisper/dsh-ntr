@@ -21,6 +21,7 @@ import {
   normalizeFileUrlToPath,
   isUnderPath,
   MAX_CONFIG_OPTIONS_BYTES,
+  hasUnambiguousModelSelector,
   mergeCatalogShape,
   parseCatalogOptions,
   permissionReplayFrames,
@@ -355,6 +356,77 @@ describe('parseCatalogOptions', () => {
       }],
     })
   })
+
+  it('keeps the model selector when an agent mislabels an effort option as category:model', () => {
+    // Qoder CN 1.1.56 (issue #8): the `set_config_option(model, ...)` answer
+    // tags BOTH `model` and `reasoning_effort` as category:'model'. Last-wins
+    // used to replace the model list with the effort list, after which every
+    // send was refused as `model_unavailable` before reaching the agent.
+    const catalog = parseCatalogOptions([
+      { configId: 'mode', name: 'Mode', type: 'select', category: 'mode', currentValue: 'default', options: [
+        { value: 'default', name: 'Default' },
+        { value: 'yolo', name: 'Bypass Permissions' },
+      ] },
+      { configId: 'model', name: 'Model', type: 'select', category: 'model', currentValue: 'qfmodel', options: [
+        { value: 'auto', name: 'Auto (default)' },
+        { value: 'qfmodel', name: 'Qwen3.8-Flash' },
+        { value: 'dmodel', name: 'DeepSeek-V4-Pro' },
+      ] },
+      { configId: 'reasoning_effort', name: 'Reasoning Effort', type: 'select', category: 'model', currentValue: 'xhigh', options: [
+        { value: 'xhigh', name: 'Extra High' },
+        { value: 'low', name: 'Low' },
+        { value: 'medium', name: 'Medium' },
+        { value: 'none', name: 'None' },
+      ] },
+    ])
+    expect(catalog.model?.configId).toBe('model')
+    expect(catalog.model?.currentValue).toBe('qfmodel')
+    expect(catalog.model?.choices.map(choice => choice.value)).toEqual(['auto', 'qfmodel', 'dmodel'])
+    // The mislabelled effort is not a second model list: it is the thought
+    // control the agent should have published in the first place.
+    expect(catalog.thought?.configId).toBe('reasoning_effort')
+    expect(catalog.thought?.currentValue).toBe('xhigh')
+    expect(catalog.thought?.choices.map(choice => choice.value)).toEqual(['xhigh', 'low', 'medium', 'none'])
+    expect(catalog.mode?.configId).toBe('mode')
+    expect(catalog.extras).toBeUndefined()
+  })
+
+  it('never lets a same-category option replace a slot and keeps the loser settable', () => {
+    const catalog = parseCatalogOptions([
+      { configId: 'model', name: 'Model', category: 'model', currentValue: 'a', options: [
+        { value: 'a', name: 'A' },
+        { value: 'b', name: 'B' },
+      ] },
+      // Non-effort model-scoped option: a last-resort selector only.
+      { configId: 'variant', name: 'Variant', category: 'model', currentValue: 'x', options: [{ value: 'x', name: 'X' }] },
+      // A real thought_level outranks the mislabelled effort, which stays an
+      // extra instead of vanishing.
+      { configId: 'thought_level', name: 'Thinking', category: 'thought_level', currentValue: 'high', options: [{ value: 'high', name: 'High' }] },
+      { configId: 'reasoning_effort', name: 'Reasoning Effort', category: 'model', currentValue: 'low', options: [{ value: 'low', name: 'Low' }] },
+    ])
+    expect(catalog.model?.configId).toBe('model')
+    expect(catalog.thought?.configId).toBe('thought_level')
+    expect(catalog.extras?.map(option => option.configId)).toEqual(['variant', 'reasoning_effort'])
+  })
+})
+
+describe('hasUnambiguousModelSelector', () => {
+  it('trusts an explicit model id, or a single model-scoped option', () => {
+    expect(hasUnambiguousModelSelector([{ configId: 'model', category: 'model' }])).toBe(true)
+    expect(hasUnambiguousModelSelector([{ configId: 'reasoning_effort', category: 'model' }])).toBe(true)
+    expect(hasUnambiguousModelSelector([
+      { configId: 'model', category: 'model' },
+      { configId: 'reasoning_effort', category: 'model' },
+    ])).toBe(true)
+    expect(hasUnambiguousModelSelector([{ configId: 'modelId', name: 'Model', category: 'model' }, { configId: 'other', category: 'model' }])).toBe(true)
+  })
+
+  it('reports ambiguity when several model-scoped options exist and none is the selector', () => {
+    expect(hasUnambiguousModelSelector([
+      { configId: 'alpha', category: 'model' },
+      { configId: 'beta', category: 'model' },
+    ])).toBe(false)
+  })
 })
 
 describe('mergeCatalogShape', () => {
@@ -419,6 +491,30 @@ describe('mergeCatalogShape', () => {
     expect(merged.extras?.[0]).toEqual({ configId: 'stream', name: 'Stream', kind: 'boolean', currentValue: 'false', choices: [] })
     // New toggle: the answer's `true` is that session's pick, not the default.
     expect(merged.extras?.[1]).toEqual({ configId: 'verbose', name: 'Verbose', kind: 'boolean', currentValue: null, choices: [] })
+  })
+
+  it('heals a poisoned model slot on the next observation', () => {
+    // A catalog persisted by the broken parser holds `reasoning_effort` in the
+    // model slot. The corrected observation replaces the identity, and the old
+    // effort value is not carried over because the real model list cannot
+    // offer it.
+    const existing = {
+      model: { configId: 'reasoning_effort', name: 'Reasoning Effort', currentValue: 'xhigh', choices: choiceList(['xhigh', 'low']) },
+    }
+    const observed = parseCatalogOptions([
+      { configId: 'model', name: 'Model', category: 'model', currentValue: 'qfmodel', options: [
+        { value: 'auto', name: 'Auto' },
+        { value: 'qfmodel', name: 'Qwen3.8-Flash' },
+      ] },
+      { configId: 'reasoning_effort', name: 'Reasoning Effort', category: 'model', currentValue: 'xhigh', options: [
+        { value: 'xhigh', name: 'Extra High' },
+        { value: 'low', name: 'Low' },
+      ] },
+    ])
+    const merged = mergeCatalogShape(existing, observed)
+    expect(merged.model?.configId).toBe('model')
+    expect(merged.model?.currentValue).toBeNull()
+    expect(merged.thought?.configId).toBe('reasoning_effort')
   })
 })
 

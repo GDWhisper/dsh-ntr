@@ -181,6 +181,9 @@ let counter = 0
 
 // The model a fresh session starts on (tests may pin one via MOCK_MODEL).
 const DEFAULT_MODEL = process.env.MOCK_MODEL ?? 'mock-model-a'
+// Test knob: reproduce Qoder CN's payload from issue #8, where the only
+// thought control is `reasoning_effort` tagged `category: 'model'`.
+const QODER_MODEL_CATEGORY = process.env.MOCK_QODER_MODEL_CATEGORY === '1'
 
 function mockConfigOptions(state = { temp: 'mid', model: DEFAULT_MODEL, effort: 'high' }) {
   return [
@@ -198,7 +201,19 @@ function mockConfigOptions(state = { temp: 'mid', model: DEFAULT_MODEL, effort: 
     // `mock-model-plain` stands for a model with NO variants: like opencode's
     // `effort` option, a thought_level is published only for models that have
     // one — switching the model is what reveals it.
-    ...(state.model === 'mock-model-plain' ? [] : [{
+    ...(state.model === 'mock-model-plain' ? [] : QODER_MODEL_CATEGORY ? [{
+      configId: 'reasoning_effort',
+      name: 'Reasoning Effort',
+      type: 'select',
+      category: 'model',
+      currentValue: state.effort,
+      options: [
+        { value: 'xhigh', name: 'Extra High' },
+        { value: 'low', name: 'Low' },
+        { value: 'medium', name: 'Medium' },
+        { value: 'none', name: 'None' },
+      ],
+    }] : [{
       configId: 'thought',
       name: 'Thought Level',
       type: 'select',

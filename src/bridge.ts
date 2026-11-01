@@ -40,6 +40,7 @@ import {
   acpToolCallFromUpdate,
   buildAdapterModelId,
   childEnv,
+  hasUnambiguousModelSelector,
   isAcpToolContinuation,
   isUnderPath,
   mergeCatalogShape,
@@ -6970,6 +6971,10 @@ export class BridgeManager {
   private autoExposeNewModels(agentId: string, next: AcpAgentCatalog, before: AcpAgentCatalog | undefined): boolean {
     const def = this.defsMap.get(agentId)
     if (def === undefined || def.autoDiscoverModels === false || before === undefined) return false
+    // A different model-slot identity is a corrected reading, not newly added
+    // models. Diffing across it would expose an entire real catalog the first
+    // time a parser fix replaces a mislabelled slot (Qoder CN).
+    if (before.model !== undefined && next.model !== undefined && before.model.configId !== next.model.configId) return false
     const known = new Set((before.model?.choices ?? []).map(choice => choice.value))
     const exposed = new Set(def.exposedModels ?? [])
     const added = (next.model?.choices ?? [])
@@ -7360,6 +7365,11 @@ export class BridgeManager {
   private staleModelChoice(session: LiveSession, modelChoice: string | undefined): string | undefined {
     const wanted = modelChoice !== undefined && modelChoice !== '' ? modelChoice : undefined
     if (wanted === undefined) return undefined
+    // `category` is a UX hint, not identity: an agent may publish several
+    // `category: 'model'` options (Qoder CN ships `reasoning_effort` that way)
+    // and no explicit `model` id. In that case the selector is a guess, so a
+    // "not offered" verdict would refuse a perfectly valid pick — fail open.
+    if (!hasUnambiguousModelSelector(session.configOptions)) return undefined
     const model = parseCatalogOptions(session.configOptions).model
     if (model === undefined) return undefined
     if (model.currentValue === wanted) return undefined

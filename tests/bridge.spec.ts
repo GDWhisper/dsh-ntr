@@ -1472,6 +1472,48 @@ describe('model catalog (isolated manager)', () => {
     await auto.shutdownAll()
   }, 30_000)
 
+  it('does not auto-expose a corrected catalog after a poisoned model slot is healed', async () => {
+    // A catalog persisted by the pre-fix parser: the model slot IS the effort
+    // list, and auto-discovery had already exposed one of its values. The next
+    // real observation corrects the identity; diffing the two lists would call
+    // every real model "new" and flood the selection.
+    const healCatalogPath = `${tmpdir()}/acp-catalog-heal-${Date.now()}.json`
+    const healAgentsPath = `${tmpdir()}/acp-agents-heal-${Date.now()}.json`
+    writeFileSync(healCatalogPath, JSON.stringify({
+      version: 2,
+      agents: {
+        mock: {
+          catalog: {
+            model: {
+              configId: 'reasoning_effort',
+              name: 'Reasoning Effort',
+              currentValue: 'xhigh',
+              choices: [{ value: 'xhigh', name: 'Extra High' }, { value: 'low', name: 'Low' }],
+            },
+          },
+          updatedAt: 1,
+        },
+      },
+    }), 'utf-8')
+    const healHub = new EventHub()
+    const heal = new BridgeManager([{ ...def, exposedModels: ['xhigh'] }], healHub, 500, healAgentsPath, healCatalogPath)
+    try {
+      const start = await dispatchRpc(heal, 'session/start', { agentId: 'mock' })
+      expect(start.ok).toBe(true)
+      // The real selector replaces the poisoned identity...
+      expect(heal.catalogFor('mock')?.model?.configId).toBe('model')
+      expect(heal.catalogFor('mock')?.model?.choices.map(choice => choice.value))
+        .toEqual(['mock-model-a', 'mock-model-b'])
+      // ...without discovering both models: a changed slot identity is a
+      // corrected reading, not an incremental catalog.
+      expect(heal.agentCatalog('mock').variants).toEqual([])
+      const defs = (heal as unknown as { defsMap: Map<string, AcpAgentDef> }).defsMap
+      expect(defs.get('mock')?.exposedModels).toEqual(['xhigh'])
+    } finally {
+      await heal.shutdownAll()
+    }
+  }, 30_000)
+
   it('NEVER spawns an agent just because a catalog was read', async () => {
     // THE reported defect (user report, 2026-10-18): a conversation served by
     // `codebuddy` showed "Oh My Pi 已连接" in the agent picker — a second agent
@@ -5703,6 +5745,40 @@ describe('pre-chat pick persistence (isolated manager)', () => {
         .rejects.toMatchObject({ code: 'model_unavailable' })
       expect(gm.chatChoice('dsh-stale-1')).toMatchObject({ modelId: 'mock@mock-model-b' })
       expect(gm.chatSessions('dsh-stale-1')[0]?.modelId).toBe('mock@mock-model-b')
+    } finally {
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
+  it('runs the selected model when an agent mislabels an effort option as category:model', async () => {
+    // Issue #8 end-to-end: the agent's answer carries `model` plus a
+    // `reasoning_effort` also tagged category:'model'. The turn must reach the
+    // agent with the chosen model instead of failing `model_unavailable`
+    // before sending anything.
+    const qoderHub = new EventHub()
+    const qoderDef: AcpAgentDef = {
+      ...def,
+      env: { ...def.env, MOCK_QODER_MODEL_CATEGORY: '1' },
+    }
+    const gm = new BridgeManager([{ ...qoderDef, id: 'mock' }], qoderHub, 500, `${tmpdir()}/acp-qoder-category-${Date.now()}.json`)
+    try {
+      gm.bindChatAgent('dsh-qoder-category', 'mock')
+      await gm.setChatSessionModel('dsh-qoder-category', 'mock@mock-model-b')
+      const chunks: StreamChunk[] = []
+      for await (const chunk of gm.streamPrompt({
+        model: 'mock',
+        sessionId: 'dsh-qoder-category',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+      } as never)) chunks.push(chunk)
+      expect(chunks.at(-1)).toMatchObject({ type: 'finish' })
+      expect(chunks.at(-1)).not.toMatchObject({ reason: { kind: 'error' } })
+      expect(gm.chatSessions('dsh-qoder-category')[0]?.modelId).toBe('mock@mock-model-b')
+      // The model slot is the selector; the mislabelled effort is the thought
+      // control (this fixture publishes no real thought_level).
+      expect(gm.catalogFor('mock')?.model?.configId).toBe('model')
+      expect(gm.catalogFor('mock')?.model?.choices.map(choice => choice.value))
+        .toEqual(['mock-model-a', 'mock-model-b'])
+      expect(gm.catalogFor('mock')?.thought?.configId).toBe('reasoning_effort')
     } finally {
       await gm.shutdownAll()
     }
