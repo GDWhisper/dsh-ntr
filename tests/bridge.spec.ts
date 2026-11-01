@@ -7575,6 +7575,57 @@ describe('a turn that dispatched a detached worker (isolated manager)', () => {
     expect(entries.some(update => update.toolCallId === 'agent_dispatch' && update.status === 'completed')).toBe(true)
   }, 30_000)
 
+  it('reports the detached worker to the host subagent catalog once', async () => {
+    const dshSessionId = 'dsh-dispatch-catalog'
+    const calls: Array<{ dshSessionId: string; childId: string; label: string }> = []
+    dispatchManager.setSubagentCatalogReporter((reportedSessionId, childId, label) => {
+      calls.push({ dshSessionId: reportedSessionId, childId, label })
+    })
+    try {
+      await hostLoopTurn(dispatchAdapter, {
+        provider: 'acp',
+        model: 'dispatch',
+        sessionId: dshSessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'DISPATCH please' }] }],
+      })
+      // The caller's own name wins over the task description: it is the
+      // identity the coordinator used when it told the user what it sent.
+      expect(calls).toEqual([{
+        dshSessionId,
+        childId: 'acp:agent_dispatch',
+        label: 'general-purpose · explorer',
+      }])
+    } finally {
+      dispatchManager.setSubagentCatalogReporter(undefined)
+    }
+  }, 30_000)
+
+  it('waits for the dispatch identity meta before it reports the catalog row', async () => {
+    const dshSessionId = 'dsh-dispatch-catalog-meta'
+    const calls: Array<{ dshSessionId: string; childId: string; label: string }> = []
+    dispatchManager.setSubagentCatalogReporter((reportedSessionId, childId, label) => {
+      calls.push({ dshSessionId: reportedSessionId, childId, label })
+    })
+    try {
+      await hostLoopTurn(dispatchAdapter, {
+        provider: 'acp',
+        model: 'dispatch',
+        sessionId: dshSessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'DISPATCHMETA please' }] }],
+      })
+      // The worker was alive before the identity frame, but a bare
+      // "Agent · 外部任务" row would say nothing: exactly one report, carrying
+      // the role and task line from `_meta`, never the tool name.
+      expect(calls).toEqual([{
+        dshSessionId,
+        childId: 'acp:agent_dispatch',
+        label: 'general-purpose · audit the repo',
+      }])
+    } finally {
+      dispatchManager.setSubagentCatalogReporter(undefined)
+    }
+  }, 30_000)
+
   it('closes a worker that never reports at the worker-phase ceiling, with the deferral line', async () => {
     const dshSessionId = 'dsh-dispatch-nodrain'
     const since = dispatchEvents.length

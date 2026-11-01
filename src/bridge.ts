@@ -514,6 +514,12 @@ export type SessionWorkspaceResolver = (dshSessionId: string) => { workspaceRoot
 export type AcpModeResolver = (dshSessionId: string) => boolean | undefined | Promise<boolean | undefined>
 
 /**
+ * Report one detached ACP worker to the host's parent-owned subagent catalog.
+ * Display-only: the host records an EXTERNAL execution with no child session.
+ */
+export type SubagentCatalogReporter = (dshSessionId: string, childId: string, label: string) => void
+
+/**
  * The plugin's normalized MCP server shape → the ACP wire shape.
  *
  * THE WIRE SHAPE IS ASYMMETRIC, and getting it wrong is SILENT:
@@ -2346,6 +2352,15 @@ interface CodebuddyMeta {
   isBackground?: boolean
   /** `codebuddy.ai/isSubagent` — the same re-send declares the worker a sub-agent. */
   isSubagent?: boolean
+  /**
+   * `codebuddy.ai/subagentType` / `codebuddy.ai/description` /
+   * `codebuddy.ai/memberName` — the worker's identity. CodeBuddy omits the
+   * dispatch call's `rawInput` on its first send (repl display), so these meta
+   * keys are the ONLY place the assigned role and task line can be read.
+   */
+  subagentType?: string
+  subagentDescription?: string
+  subagentName?: string
 }
 
 /** Read the CodeBuddy `_meta` keys off an update or a `{ _meta }` wrapper. */
@@ -2370,6 +2385,14 @@ function codebuddyMetaOf(source: unknown): CodebuddyMeta | undefined {
   // and guessing from it would make another agent's unrelated key look detached.
   if (meta['codebuddy.ai/isBackground'] === true) out.isBackground = true
   if (meta['codebuddy.ai/isSubagent'] === true) out.isSubagent = true
+  const subagentType = meta['codebuddy.ai/subagentType']
+  if (typeof subagentType === 'string' && subagentType !== '') out.subagentType = subagentType
+  const subagentDescription = meta['codebuddy.ai/description']
+  if (typeof subagentDescription === 'string' && subagentDescription !== '') {
+    out.subagentDescription = subagentDescription
+  }
+  const subagentName = meta['codebuddy.ai/memberName']
+  if (typeof subagentName === 'string' && subagentName !== '') out.subagentName = subagentName
   const unsolicited = meta['codebuddy.ai/unsolicitedTurn']
   if (typeof unsolicited === 'object' && unsolicited !== null) {
     const run = unsolicited as Record<string, unknown>
@@ -2541,6 +2564,71 @@ export function permissionAskReason(toolCall: unknown): string {
       .find((value): value is string => typeof value === 'string' && value !== '')
   const line = detail === undefined || detail === title ? title : `${title} · ${detail}`
   return line.length > APPROVAL_REASON_MAX ? `${line.slice(0, APPROVAL_REASON_MAX - 1)}…` : line
+}
+
+/** Longest label the host's subagent catalog row carries for an ACP worker. */
+const SUBAGENT_CATALOG_LABEL_MAX = 160
+
+/** The structured input object an ACP tool call declared, if any. */
+function rawInputObjectOf(update: Record<string, unknown>): Record<string, unknown> | undefined {
+  const raw = update.rawInput ?? update.arguments
+  if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) return raw as Record<string, unknown>
+  if (typeof raw === 'string' && raw.length <= 16_384) {
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>
+    } catch {
+      return undefined
+    }
+  }
+  return undefined
+}
+
+/**
+ * One line naming a detached ACP worker in the host's subagent catalog.
+ *
+ * The identity is read from what CodeBuddy actually sends, in order: the
+ * `_meta` keys on the dispatch call's result frames (`subagentType` /
+ * `description` / `memberName` — the FIRST `tool_call` omits `rawInput`, so
+ * these are often the only source), then the structured `rawInput`, then the
+ * tool title. The prompt body is only used when nothing shorter exists. Capped
+ * so a pathological input cannot fill the catalog row.
+ */
+export function subagentDispatchLabel(update: Record<string, unknown>): string {
+  const meta = codebuddyMetaOf(update)
+  const input = rawInputObjectOf(update) ?? {}
+  const type = meta?.subagentType
+    ?? nonEmptyStringOf(input.subagent_type)
+    ?? nonEmptyStringOf(input.subagentType)
+    ?? permissionToolName(update)
+  const detail = meta?.subagentName
+    ?? nonEmptyStringOf(input.name)
+    ?? meta?.subagentDescription
+    ?? nonEmptyStringOf(input.description)
+    ?? nonEmptyStringOf(input.prompt)
+  const line = detail === undefined || detail === type ? type : `${type} · ${detail}`
+  return line.length > SUBAGENT_CATALOG_LABEL_MAX ? `${line.slice(0, SUBAGENT_CATALOG_LABEL_MAX - 1)}…` : line
+}
+
+/**
+ * Whether the update declared the worker's IDENTITY (role / task / name)
+ * rather than just restating the `Agent` tool. A bare dispatch names the tool
+ * as "Agent"; reporting that as the catalog label says nothing, so the report
+ * waits for one of these facts (or for the dispatch to complete).
+ */
+function subagentDispatchDeclaresIdentity(update: Record<string, unknown>): boolean {
+  const meta = codebuddyMetaOf(update)
+  if (meta?.subagentType !== undefined
+    || meta?.subagentDescription !== undefined
+    || meta?.subagentName !== undefined) return true
+  const input = rawInputObjectOf(update)
+  if (input === undefined) return false
+  return ['subagent_type', 'subagentType', 'name', 'description', 'prompt']
+    .some(key => nonEmptyStringOf(input[key]) !== undefined)
+}
+
+function nonEmptyStringOf(value: unknown): string | undefined {
+  return typeof value === 'string' && value !== '' ? value : undefined
 }
 
 function snapshot(session: LiveSession): SessionView {
@@ -3521,6 +3609,12 @@ interface BackgroundDispatch {
   detached: boolean
   /** Whether any update came FROM the worker (`codebuddy.ai/parentToolCallId`). */
   sawWorkerUpdate: boolean
+  /** One-line label for the host's subagent catalog, refreshed until reported. */
+  catalogLabel: string
+  /** Whether `catalogLabel` carries the worker's identity, not just the tool name. */
+  catalogLabelIdentified: boolean
+  /** Whether the host catalog already accepted this dispatch (one fact per call). */
+  catalogReported: boolean
 }
 
 /**
@@ -4285,7 +4379,11 @@ class TurnStreamController {
       if (known !== undefined) {
         // A known dispatch: the id is the whole evidence (see the doc above).
         if (status !== '') known.status = status
-        if (meta?.isBackground === true) known.detached = true
+        if (!known.catalogReported) this.refreshSubagentDispatchLabel(known, update)
+        if (meta?.isBackground === true) {
+          known.detached = true
+          this.reportSubagentDispatch(known)
+        }
         if (completedStatus && !known.completed) {
           known.completed = true
           this.noteDispatchProgress()
@@ -4301,8 +4399,12 @@ class TurnStreamController {
           completed: completedStatus,
           detached: meta.isBackground === true,
           sawWorkerUpdate: false,
+          catalogLabel: subagentDispatchLabel(update),
+          catalogLabelIdentified: subagentDispatchDeclaresIdentity(update),
+          catalogReported: false,
         }
         this.dispatches.set(toolCallId, dispatch)
+        if (dispatch.detached) this.reportSubagentDispatch(dispatch)
         if (!dispatch.completed) {
           const held = this.activeBackgroundHold()
           // A dispatch registered after the drain phase began means new work:
@@ -4316,6 +4418,7 @@ class TurnStreamController {
       if (parent !== undefined) {
         parent.detached = true
         parent.sawWorkerUpdate = true
+        this.reportSubagentDispatch(parent)
       }
     }
     if (meta?.unsolicitedTurn !== undefined) {
@@ -4325,11 +4428,48 @@ class TurnStreamController {
   }
 
   /**
+   * Hand one DETACHED dispatch to the host's subagent catalog. One fact per
+   * tool call, and only once the wire's structure proves the work runs
+   * off-turn — a synchronous `Agent` / `Task` call is a tool call, not a
+   * catalog child.
+   */
+  private reportSubagentDispatch(dispatch: BackgroundDispatch): void {
+    if (dispatch.catalogReported) return
+    // A bare "Agent" row says nothing; wait for the identity frame. A
+    // completed dispatch reports with whatever it has — a row must not be
+    // lost because the agent never declared more than the tool name.
+    if (!dispatch.catalogLabelIdentified && !dispatch.completed) return
+    if (this.manager.reportSubagentCatalog(this.session, `acp:${dispatch.toolCallId}`, dispatch.catalogLabel)) {
+      dispatch.catalogReported = true
+    }
+  }
+
+  /**
+   * Take a better label from a later frame of the SAME dispatch call.
+   *
+   * CodeBuddy omits `rawInput` (and often the title) on the dispatch call's
+   * first send, then restates the whole task identity in `_meta` on the result
+   * frame. A frame with no identity and no title is a bare status update and
+   * must not downgrade what is already known.
+   */
+  private refreshSubagentDispatchLabel(dispatch: BackgroundDispatch, update: Record<string, unknown>): void {
+    const identified = subagentDispatchDeclaresIdentity(update)
+    if (!identified && dispatch.catalogLabelIdentified) return
+    const title = update.title
+    if (!identified && !(typeof title === 'string' && title !== '')) return
+    dispatch.catalogLabel = subagentDispatchLabel(update)
+    dispatch.catalogLabelIdentified = identified
+  }
+
+  /**
    * A dispatch just reported: once the LAST one has, the drain phase starts.
    * Until then the turn stays in its worker phase, with no quiet clock.
    */
   private noteDispatchProgress(): void {
     if (!this.allDispatchesCompleted()) return
+    // Last chance for a row still waiting on identity: completion is a fact
+    // even when the agent never said more than the tool name.
+    for (const dispatch of this.dispatches.values()) this.reportSubagentDispatch(dispatch)
     const held = this.activeBackgroundHold()
     if (held !== undefined) this.startBackgroundDrain(held)
   }
@@ -5603,6 +5743,33 @@ export class BridgeManager {
    */
   setAcpModeResolver(resolver?: AcpModeResolver): void {
     this.acpModeResolver = resolver
+  }
+
+  /**
+   * Optional host integration: report a detached ACP worker as an EXTERNAL
+   * child in the parent chat session's subagent catalog. Display-only — the
+   * host renders it as a read-only "external task" row with no child session,
+   * activity or continuation. An absent reporter is a no-op.
+   */
+  setSubagentCatalogReporter(reporter?: SubagentCatalogReporter): void {
+    this.subagentCatalogReporter = reporter
+  }
+
+  /**
+   * Hand one detached worker to the host catalog. Returns whether a reporter
+   * handled it; a missing chat id or reporter leaves the dispatch unclaimed so
+   * a later wire update can retry.
+   */
+  reportSubagentCatalog(session: LiveSession, childId: string, label: string): boolean {
+    const dshSessionId = session.dshSessionId
+    const reporter = this.subagentCatalogReporter
+    if (dshSessionId === undefined || reporter === undefined) return false
+    try {
+      reporter(dshSessionId, childId, label)
+      return true
+    } catch {
+      return false
+    }
   }
 
   /**
@@ -8046,6 +8213,7 @@ export class BridgeManager {
   }
   private sessionWorkspaceResolver?: SessionWorkspaceResolver
   private acpModeResolver?: AcpModeResolver
+  private subagentCatalogReporter?: SubagentCatalogReporter
   private attachmentResolver?: unknown
   /** Cached `chatSessionAcpMode` answers, keyed by DSH chat session id. */
   private readonly acpModeCache = new Map<string, boolean>()

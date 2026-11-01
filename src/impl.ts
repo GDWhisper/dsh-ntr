@@ -2666,6 +2666,51 @@ export interface SessionLogLike {
 }
 
 /**
+ * Structural view of a LIVE host session that can take catalog appends. The
+ * host's `Session.append` validates the payload before committing; an older
+ * host without the `subagent/catalog` event accepts the method but throws,
+ * which the helper below treats as "not supported".
+ */
+export interface SessionCatalogLike extends SessionLogLike {
+  append?: (type: string, data: Record<string, unknown>) => unknown
+}
+
+/**
+ * Record one ACP-side worker in the host's parent-owned subagent catalog as an
+ * EXTERNAL execution. Display-only: external entries have no child session, no
+ * activity/timing and no continuation, and `list_agents` omits them. The
+ * catalog is append-only, so a replayed/resumed dispatch must never add the
+ * same `childId` twice. Returns whether a new fact was appended.
+ */
+export function appendExternalSubagentCatalog(
+  session: SessionCatalogLike | undefined,
+  childId: string,
+  label: string,
+  now = Date.now(),
+): boolean {
+  if (childId === '' || session?.append === undefined) return false
+  const events = session.events
+  if (Array.isArray(events)) {
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index] as { type?: unknown; data?: { childId?: unknown } } | undefined
+      if (event?.type === 'subagent/catalog' && event.data?.childId === childId) return false
+    }
+  }
+  try {
+    session.append('subagent/catalog', {
+      version: 2,
+      childId,
+      childCreatedAt: now,
+      mode: 'external',
+      label,
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
  * The agent preset a session actually runs.
  *
  * Mirrors `resolveSessionPreset` from `@deepseek-ai/dsh-agent-presets`

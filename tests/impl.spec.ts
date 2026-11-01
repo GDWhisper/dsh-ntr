@@ -7,6 +7,7 @@ import {
   acpToolCallArgsOf,
   acpToolCallDelta,
   acpToolCallFromUpdate,
+  appendExternalSubagentCatalog,
   buildAdapterModelId,
   describeUnhandledUpdate,
   updateContentToText,
@@ -2751,5 +2752,39 @@ describe('the retired permission axis (nothing here may arbitrate an agent ask)'
     expect(resolveFsPath('/srv/ws', ['/srv/ws'], 'a.txt', realpath)).toBe('/srv/ws/a.txt')
     expect(() => resolveFsPath('/srv/ws', ['/srv/ws'], '/etc/hosts', realpath)).toThrow(AcpError)
     expect(() => canonicalizeFsPath('/srv/ws', '', realpath)).toThrow(AcpError)
+  })
+})
+
+describe('appendExternalSubagentCatalog', () => {
+  it('appends one v2 external fact and skips a repeated childId', () => {
+    const events: Array<{ type: string; data: Record<string, unknown> }> = []
+    const session = {
+      events,
+      append(type: string, data: Record<string, unknown>): void {
+        events.push({ type, data })
+      },
+    }
+    expect(appendExternalSubagentCatalog(session, 'acp:call-1', 'general-purpose · audit', 123)).toBe(true)
+    expect(events).toEqual([{
+      type: 'subagent/catalog',
+      data: {
+        version: 2,
+        childId: 'acp:call-1',
+        childCreatedAt: 123,
+        mode: 'external',
+        label: 'general-purpose · audit',
+      },
+    }])
+    expect(appendExternalSubagentCatalog(session, 'acp:call-1', 'again', 456)).toBe(false)
+    expect(events).toHaveLength(1)
+  })
+
+  it('is silent when the session cannot append or the host rejects the event', () => {
+    expect(appendExternalSubagentCatalog(undefined, 'acp:call-1', 'x')).toBe(false)
+    const failing = {
+      events: [] as unknown[],
+      append(): void { throw new Error('host without subagent/catalog') },
+    }
+    expect(appendExternalSubagentCatalog(failing, 'acp:call-1', 'x')).toBe(false)
   })
 })

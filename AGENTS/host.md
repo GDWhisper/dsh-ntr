@@ -34,6 +34,7 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 `src/index.ts` 的 `export const inject` **只能**列插件真正依赖的服务。以下服务严禁写进去（缺服务会让插件整体加载失败），只能 `ctx.get` + `ctx.inject([...], …)` 后补注册：
 
 - `sandboxPolicy` / `sessions` —— 工作区根解析（`wireWorkspace` 注入 `BridgeManager.setSessionWorkspaceResolver`，解析结果只有 `{ workspaceRoot }`，不含任何 mode / approval 语义）
+- `sessions.append` / `subagent/catalog` —— detached ACP worker 的外部子代理目录事实（`wireSubagentCatalog` → `appendExternalSubagentCatalog`）：只写 `mode: 'external'`，无子会话 / activity / continuation；宿主没有该事件时 `append` 抛错即静默跳过。它写进宿主 session log，不落 `~/.dsh/dsh-ntr/`。
 - `agentPresets` —— preset roster（`wirePresetRoster`）
 - 浏览器侧 `sessions` —— 经 `service<T>(name)` 在调用点惰性解析（见 [ui.md](./ui.md)）
 

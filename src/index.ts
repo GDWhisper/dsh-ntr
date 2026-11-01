@@ -9,9 +9,9 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { ConnectionRpcHandler, HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
 import { ACP_PRESET_ID, AcpLlmAdapter, BridgeManager, PLUGIN_VERSION } from './bridge.ts'
-import { EventHub, dispatchRpc, permissionReplayFrames, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
+import { appendExternalSubagentCatalog, EventHub, dispatchRpc, permissionReplayFrames, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
 import type { AcpEvent, ApprovalDeadlineKey } from './protocol.ts'
-import type { RosterPresetRow, SessionLogLike } from './impl.ts'
+import type { RosterPresetRow, SessionCatalogLike } from './impl.ts'
 import { UpdateService } from './update.ts'
 import type { UpdateManagerLike } from './update.ts'
 
@@ -39,7 +39,7 @@ interface ChannelRegisteringConnection extends HostConnectionHandle {
 
 /** Structural view of the host session store (`@deepseek-ai/dsh-session`'s `ctx.sessions`). */
 interface SessionsLike {
-  get(sessionId: string): SessionLogLike | undefined
+  get(sessionId: string): SessionCatalogLike | undefined
 }
 
 /**
@@ -260,6 +260,27 @@ export function apply(ctx: Context, config?: unknown): void {
     }
   }
 
+  /**
+   * Optional host integration: record detached ACP workers as EXTERNAL
+   * children in the parent chat session's subagent catalog. Display-only — the
+   * host renders them as read-only "external task" rows with no child
+   * session, activity or continuation — and is skipped silently on hosts
+   * without the catalog event.
+   */
+  const wireSubagentCatalog = (): void => {
+    const sessions = (typeof ctx.get === 'function' ? ctx.get('sessions') : undefined) as SessionsLike | undefined
+    if (sessions === undefined) return
+    manager.setSubagentCatalogReporter((dshSessionId, childId, label) => {
+      let session: SessionCatalogLike | undefined
+      try {
+        session = sessions.get(dshSessionId)
+      } catch {
+        return
+      }
+      appendExternalSubagentCatalog(session, childId, label)
+    })
+  }
+
   wireWorkspace()
   if (typeof ctx.inject === 'function') {
     // Late arrival for the workspace collaborators: a deployment missing one
@@ -271,9 +292,11 @@ export function apply(ctx: Context, config?: unknown): void {
   // The ACP-preset verdict only needs the session store (live) and the
   // persistence store (cold); the sandbox knobs are NOT its dependencies.
   wireAcpMode()
+  wireSubagentCatalog()
   if (typeof ctx.inject === 'function') {
     ctx.inject(['sessions'], () => {
       wireAcpMode()
+      wireSubagentCatalog()
     })
   }
 

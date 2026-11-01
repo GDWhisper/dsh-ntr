@@ -519,6 +519,10 @@ const app = agent({ name: 'mock-acp-agent' })
       const ackNoDrain = text.includes('DISPATCHACKNODRAIN')
       const lateDrain = text.includes('DISPATCHLATEDRAIN')
       const altFirst = text.includes('DISPATCHALTFIRST')
+      // The real first send omits `rawInput` (repl display) AND the title, so
+      // its only label source is `_meta.toolName`. The identity arrives later,
+      // on the result frame's `_meta` — the shape this variant pins.
+      const identityOnly = text.includes('DISPATCHMETA')
       // The run the PARENT's own steps carry. Normally the response's
       // conversation request id; an early announcement can name another.
       let parentRun = drainId
@@ -532,12 +536,14 @@ const app = agent({ name: 'mock-acp-agent' })
         title: 'Agent',
         kind: 'other',
         status: 'in_progress',
-        rawInput: {
-          description: 'audit the repo',
-          subagent_type: 'general-purpose',
-          name: 'explorer',
-          prompt: 'read the tree',
-        },
+        ...(identityOnly ? {} : {
+          rawInput: {
+            description: 'audit the repo',
+            subagent_type: 'general-purpose',
+            name: 'explorer',
+            prompt: 'read the tree',
+          },
+        }),
       })
       const firstMeta = {
         'codebuddy.ai/toolName': 'Agent',
@@ -558,6 +564,16 @@ const app = agent({ name: 'mock-acp-agent' })
       }
       const sendFirst = callId => notify(dispatchCall(callId), firstMeta)
       const sendResend = callId => notify(dispatchCall(callId), resendMeta)
+      // The result frame's identity meta: the first place the role and task
+      // line can be read when the first send omitted `rawInput`.
+      const sendIdentity = callId => notify({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: callId,
+        status: 'in_progress',
+      }, {
+        ...resendMeta,
+        'codebuddy.ai/description': 'audit the repo',
+      })
       const sendAck = callId => notify({
         sessionUpdate: 'tool_call_update',
         toolCallId: callId,
@@ -636,7 +652,15 @@ const app = agent({ name: 'mock-acp-agent' })
       }
 
       await sendFirst(dispatchId)
-      await sendResend(dispatchId)
+      if (identityOnly) {
+        // The worker is already alive before the parent's result frame, so the
+        // detached evidence arrives WITHOUT a usable label: the client must
+        // not report a bare "Agent" row, only wait for the identity below.
+        await sendWorker({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'WORKER-THOUGHT ' } })
+        await sendIdentity(dispatchId)
+      } else {
+        await sendResend(dispatchId)
+      }
       if (two) {
         await sendFirst(secondId)
         await sendResend(secondId)
