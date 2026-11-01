@@ -5,6 +5,14 @@
  * Scenario markers read from the prompt text:
  *  - "PERM"  → mid-turn session/request_permission (allow_once / reject_once)
  *  - "SLOW"  → a 5s pause that session/cancel interrupts (cancelled stopReason)
+ *  - "STEERABLE" → an ordinary turn cut at a card boundary: the standard
+ *              opening streams, then `PRE-STEER CUT TEXT` lands after the
+ *              tool card (the client closes that segment while the prompt is
+ *              still on air), and the handler waits up to 5s for a
+ *              `session/cancel`, answering `cancelled` when one arrives. The
+ *              follow-up prompt carrying "STEER WORDS" is a plain steer —
+ *              NOT the background-drain "STEER" shape below; both markers
+ *              share the prefix, so the drain branch excludes them.
  *  - "DIE"   → emits one update then exits the process (crash → release → resume)
  *  - "EMPTY" → only a usage_update, then a legal end_turn: the silent-failure
  *              shape wild agents produce (pi-acp folds a provider 403 into a
@@ -954,7 +962,11 @@ const app = agent({ name: 'mock-acp-agent' })
       return { stopReason: 'end_turn' }
     }
 
-    if (text.includes('STEER')) {
+    // The chat-steer scenario ("STEERABLE" and the follow-up "STEER WORDS")
+    // shares this prefix but is NOT the drain shape: its first turn is an
+    // ordinary prompt waiting on a cancel, and its steer words must reach the
+    // agent as a plain prompt. Every existing drain marker still matches.
+    if (text.includes('STEER') && !text.includes('STEERABLE') && !text.includes('STEER WORDS')) {
       // The background-drain shape: an unsolicited turn announces itself, the
       // prompt is folded into it and answered at once, and the real content
       // streams afterwards under the drain's request id.
@@ -1137,6 +1149,18 @@ const app = agent({ name: 'mock-acp-agent' })
     }
 
     await send({ sessionUpdate: 'tool_call_update', toolCallId: 'call_1', status: 'in_progress' })
+    if (text.includes('STEERABLE')) {
+      // 卡片之后再发一条正文：插件会在卡片边界切段、把宿主 step 结束，
+      // 但本 prompt 仍然在飞 —— 宿主插话正好落在这个窗口。session/cancel
+      // 立刻以 cancelled 结束，用来验证「取消当前回合后再发新 prompt」。
+      await send({ sessionUpdate: 'agent_message_chunk', messageId: 'm-steer-cut', content: { type: 'text', text: 'PRE-STEER CUT TEXT ' } })
+      const wasCancelled = await Promise.race([
+        sleep(5000).then(() => false),
+        cancelPromise(sessionId).then(() => true),
+      ])
+      cancelled.delete(sessionId)
+      if (wasCancelled) return { stopReason: 'cancelled' }
+    }
     if (text.includes('SLOW')) {
       const wasCancelled = await Promise.race([
         sleep(5000).then(() => false),

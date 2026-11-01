@@ -8319,6 +8319,47 @@ export class BridgeManager {
     return { ok: true, reset: true }
   }
 
+  /**
+   * 聊天插话的槽位回收：宿主把插话作为同一会话在飞回合的下一步送达，
+   * 拒绝会让整条 host turn 失败。ACP 不能向运行中的 prompt 注入消息，
+   * 所以按插话语义中止当前回合，等 agent 真正结算后再让调用方重发。
+   *
+   * 只处理 `claimTurn` 的 `busy`（agent 仍持有本会话 prompt）；`unsettled`
+   * 说明我们这一侧已经释放过槽位（用户按过停止），保持原样拒绝。
+   *
+   * - 控制器已 settle（响应已到，延后收口还没释放闸门）：什么都不取消，只等闸门；
+   * - agent 真在跑：走用户取消同一条管线（session/cancel + 结算权限 + cancel fallback），
+   *   并立即关闭宿主这一侧的 segment，让闸门在 agent 应答/兜底后打开。
+   */
+  private async reclaimChatPrompt(
+    session: LiveSession,
+    controller: TurnStreamController,
+    signal?: AbortSignal,
+  ): Promise<'ok' | 'aborted'> {
+    if (session.closed || session.released) return 'ok'
+    if (!controller.hasSettled && session.promptInFlight === true) {
+      await this.bridge(session.agentId).cancel(session)
+      controller.abortActiveSegment()
+    }
+    return this.waitForSettleGate(session, signal)
+  }
+
+  /** 等 agent 侧 prompt slot 真正释放；步骤被取消时立即返回 aborted。 */
+  private waitForSettleGate(session: LiveSession, signal?: AbortSignal): Promise<'ok' | 'aborted'> {
+    const pending = session.settled
+    if (pending === undefined) return Promise.resolve('ok')
+    if (signal?.aborted) return Promise.resolve('aborted')
+    return new Promise(resolve => {
+      const done = (value: 'ok' | 'aborted'): void => {
+        signal?.removeEventListener('abort', onAbort)
+        resolve(value)
+      }
+      const onAbort = (): void => { done('aborted') }
+      signal?.addEventListener('abort', onAbort, { once: true })
+      void pending.then(() => { done('ok') })
+    })
+  }
+
   async *streamPrompt(options: GenerateOptions): AsyncIterable<StreamChunk> {
     // The plugin's own conversation↔agent mapping decides who serves the turn
     // (see `bindChatAgent`): the driver may arrive here with the previous
@@ -8524,26 +8565,81 @@ export class BridgeManager {
 
     // One prompt slot per session, and a turn the user aborted still occupies
     // the AGENT's slot until it acknowledges the cancel (see `claimTurn`).
-    const claim = await bridge.claimTurn(session)
+    let claim = await bridge.claimTurn(session)
     if (!claim.ok) {
-      // Never roll the provisional lock back here: a failed claim means ANOTHER
-      // prompt holds the slot (or the agent has not settled it), and that turn
-      // owns the conversation's lock. Closing the session would kill a turn
-      // that is actively streaming — the refusal already tells the user to
-      // retry.
-      yield {
-        type: 'finish',
-        reason: {
-          kind: 'error',
-          failure: {
-            message: claim.reason === 'busy'
-              ? 'acp: this session already has a prompt in flight'
-              : 'acp: the agent is still finishing the previous (cancelled) turn; send again in a moment',
-            code: 'turn_in_flight',
-          },
-        },
+      // A STEER ("插话"): the host delivers the user's mid-turn message as the
+      // NEXT step of the SAME host turn, so the conversation's own ACP prompt
+      // is still on air. Refusing would fail the whole host turn. ACP forbids
+      // injecting into a running prompt, so the steer's real semantic — abort
+      // the current turn, then send this one — is spelled cancel + wait +
+      // re-claim here.
+      //
+      // Only `busy` can be a steer: it means the AGENT still holds OUR prompt
+      // (`promptInFlight`). `unsettled` means our side already released the
+      // slot (the person pressed stop, or an earlier steer cancelled): the
+      // agent has not acknowledged yet, and quietly queueing the next message
+      // behind a turn the user stopped is not this path's business — that
+      // stays the honest `turn_in_flight` refusal below.
+      //
+      // Only the conversation's OWN in-flight turn qualifies (its live stream
+      // controller, on this very session). A `/acp` RPC turn has no chat
+      // controller, and another conversation never reaches this session, so
+      // both keep the plain refusal: nothing may be cancelled behind a
+      // caller's back.
+      const chatController = claim.reason === 'busy' && options.sessionId !== undefined
+        ? this.turnStreamFor(options.sessionId)
+        : undefined
+      if (options.sessionId !== undefined
+        && chatController !== undefined
+        && !chatController.stale
+        && chatController.session === session) {
+        const reclaimed = await this.reclaimChatPrompt(session, chatController, options.signal)
+        if (reclaimed === 'aborted') {
+          // The person pressed stop while the previous turn was winding down:
+          // the steer is theirs to re-send, nothing goes to the agent.
+          yield {
+            type: 'finish',
+            reason: { kind: 'aborted', failure: { message: 'aborted', code: 'ABORTED' } },
+          }
+          return
+        }
+        // A first turn that produced nothing rolled its provisional lock back
+        // and CLOSED (and forgot) this session: the steer needs a fresh one.
+        if (session.closed || session.released) {
+          try {
+            session = await this.getOrCreateDshSession(options.sessionId, agentId)
+          } catch (err) {
+            yield {
+              type: 'finish',
+              reason: { kind: 'error', failure: { message: describeError(err), code: 'session_init_failed' } },
+            }
+            return
+          }
+        }
+        // Same bridge: the session may have been re-created, but the
+        // conversation is still served by this agent's process.
+        claim = await bridge.claimTurn(session)
       }
-      return
+      if (!claim.ok) {
+        // Never roll the provisional lock back here: a failed claim means
+        // ANOTHER prompt holds the slot (or the agent has not settled it), and
+        // that turn owns the conversation's lock. Closing the session would
+        // kill a turn that is actively streaming — the refusal already tells
+        // the user to retry.
+        yield {
+          type: 'finish',
+          reason: {
+            kind: 'error',
+            failure: {
+              message: claim.reason === 'busy'
+                ? 'acp: this session already has a prompt in flight'
+                : 'acp: the agent is still finishing the previous (cancelled) turn; send again in a moment',
+              code: 'turn_in_flight',
+            },
+          },
+        }
+        return
+      }
     }
 
     // Same-agent model/effort switches ride the SAME ACP session (context

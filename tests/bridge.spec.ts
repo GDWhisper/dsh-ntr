@@ -16,7 +16,7 @@ import {
   permissionAskReason, permissionToolName,
 } from '../src/bridge.ts'
 import { EventHub, dispatchRpc, permissionReplayFrames } from '../src/impl.ts'
-import type { AcpAgentCatalog, AcpAgentDef, AcpEvent, AgentCatalogResult, ChatSessionView, ChatTranscriptView, StreamChunk } from '../src/protocol.ts'
+import type { AcpAgentCatalog, AcpAgentDef, AcpEvent, AgentCatalogResult, ChatSessionView, ChatTranscriptView, GenerateMessage, StreamChunk } from '../src/protocol.ts'
 import { OUTPUT_CHARS_PER_TOKEN } from '../src/tps.ts'
 
 const MOCK = fileURLToPath(new URL('./mock-agent.mjs', import.meta.url))
@@ -7925,18 +7925,20 @@ describe('the /acp prompt shares the chat prompt slot (isolated manager)', () =>
       .then(() => {})
   }
 
-  async function collect(dshSessionId: string, text: string, signal?: AbortSignal): Promise<StreamChunk[]> {
+  async function collectWith(dshSessionId: string, messages: GenerateMessage[], signal?: AbortSignal): Promise<StreamChunk[]> {
     const chunks: StreamChunk[] = []
     for await (const chunk of gateAdapter.stream({
       provider: 'acp',
       model: 'gate',
       sessionId: dshSessionId,
       ...(signal === undefined ? {} : { signal }),
-      messages: [{ role: 'user', content: [{ type: 'text', text }] }],
-    })) {
-      chunks.push(chunk)
-    }
+      messages,
+    })) chunks.push(chunk)
     return chunks
+  }
+
+  function collect(dshSessionId: string, text: string, signal?: AbortSignal): Promise<StreamChunk[]> {
+    return collectWith(dshSessionId, [{ role: 'user', content: [{ type: 'text', text }] }], signal)
   }
 
   function gateFinish(chunks: StreamChunk[]): Extract<StreamChunk, { type: 'finish' }> | undefined {
@@ -8015,6 +8017,79 @@ describe('the /acp prompt shares the chat prompt slot (isolated manager)', () =>
       .join('')
     expect(text).toContain('MOCK: echo chat after acp perm=none')
     expect(promptLines().slice(before)).toEqual(['chat after acp'])
+  }, 30_000)
+
+  /**
+   * The host's steer shape: the task's history (its first user turn, the
+   * settled assistant card, that card's staged tool result) followed by the
+   * person's mid-turn words. `isAcpToolContinuation` must not read it as a
+   * continuation step (a user-sourced message follows the tool result), and
+   * `selectForwardPrompt` must pick the last user-sourced message.
+   */
+  function steerMessages(firstWords: string, words: string): GenerateMessage[] {
+    return [
+      { role: 'user', content: [{ type: 'text', text: firstWords }], source: { kind: 'user' } },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'call_1', name: 'mock tool', arguments: '{}' }], source: { kind: 'model' } },
+      { role: 'tool', content: [{ type: 'tool-result', text: 'tool result line' }], source: { kind: 'tool', callId: 'call_1' } },
+      { role: 'user', content: [{ type: 'text', text: words }], source: { kind: 'user' } },
+    ]
+  }
+
+  it('a chat steer cancels the running ACP turn and resends the words', async () => {
+    const dshSessionId = 'dsh-steer-live'
+    const session = await gateManager.getOrCreateDshSession(dshSessionId, 'gate')
+    const since = gateEvents.length
+
+    // Turn 1 stops at the mock's card boundary: the prose after the card ends
+    // the driver's segment while the ACP prompt is still on air — the exact
+    // window a host steer lands in.
+    const first = await collectWith(dshSessionId, [
+      { role: 'user', content: [{ type: 'text', text: 'STEERABLE first turn' }], source: { kind: 'user' } },
+    ])
+    expect(gateFinish(first)?.reason).toEqual({ kind: 'stop' })
+    expect(promptLines()).toContain('STEERABLE first turn')
+
+    // Turn 2 is the steer. The old prompt is still running, so the adapter
+    // must cancel it, wait for the agent to settle, re-claim the slot and send
+    // the words as the next prompt (not refuse with `turn_in_flight`).
+    const second = await collectWith(dshSessionId, steerMessages('STEERABLE first turn', 'STEER WORDS'))
+    expect(gateFinish(second)?.reason.kind).not.toBe('error')
+    // The mock's stale-cancel window may answer the first send with
+    // `cancelled` and the adapter resends it, so the log may name the words
+    // twice — only that it reached the agent matters.
+    expect(promptLines()).toContain('STEER WORDS')
+    // The OLD turn was cancelled, not waited out or silently lost.
+    await gateWaitFor('turn/end', since, event => event.sessionId === session.sessionId
+      && event.stopReason === 'cancelled', 30_000)
+    // ...and the resent prompt reached its own ending, so the next case starts
+    // on a settled session.
+    await gateWaitFor('turn/end', since, event => event.sessionId === session.sessionId
+      && event.stopReason !== 'cancelled', 30_000)
+  }, 30_000)
+
+  it('a steer stopped while the old turn is winding down sends nothing', async () => {
+    const dshSessionId = 'dsh-steer-aborted'
+    const session = await gateManager.getOrCreateDshSession(dshSessionId, 'gate')
+    const since = gateEvents.length
+
+    const first = await collectWith(dshSessionId, [
+      { role: 'user', content: [{ type: 'text', text: 'STEERABLE first turn' }], source: { kind: 'user' } },
+    ])
+    expect(gateFinish(first)?.reason).toEqual({ kind: 'stop' })
+    const before = promptLines().length
+
+    // A steer whose signal is already aborted: the reclaim still cancels the
+    // old turn (the person said stop), but the new words must never be sent.
+    const controller = new AbortController()
+    controller.abort()
+    const chunks = await collectWith(dshSessionId, steerMessages('STEERABLE first turn', 'STEER WORDS'), controller.signal)
+
+    expect(gateFinish(chunks)?.reason.kind).toBe('aborted')
+    await new Promise(resolve => setTimeout(resolve, 100))
+    expect(promptLines().slice(before)).toEqual([])
+    // The interrupt's cancel DID go out: the old turn still ends cancelled.
+    await gateWaitFor('turn/end', since, event => event.sessionId === session.sessionId
+      && event.stopReason === 'cancelled', 30_000)
   }, 30_000)
 })
 
