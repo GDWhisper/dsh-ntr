@@ -460,20 +460,33 @@ export interface BridgeTuning {
    */
   ambientMaxMs?: number
   /**
-   * The hard ceiling on the WORKER phase of a detached-worker hold (see
-   * `TurnStreamController.holdForBackgroundDispatch`): the turn dispatched one
-   * or more background workers through `Agent` tool calls, the agent answered
-   * the prompt, and at least one worker has not reported back yet. The worker
-   * phase has NO quiet window on purpose — measured against CodeBuddy 2.179.0,
-   * a detached worker's own updates are 13–24s apart while it is perfectly
-   * alive — so only EVERY known dispatch reporting (completed / failed) or
-   * this ceiling can end it; a drain announcement is recorded but arms no
-   * clock before then. Once they have all reported, the drain's own
+   * How long the WORKER phase of a detached-worker hold may go WITHOUT any
+   * evidence from the worker (see `TurnStreamController.holdForBackgroundDispatch`):
+   * the turn dispatched one or more background workers through `Agent` tool
+   * calls, the agent answered the prompt, and at least one worker has not
+   * reported back yet. There is still no quiet clock in the ambient sense —
+   * measured against CodeBuddy 2.179.0, a detached worker's own updates are
+   * 13–24s apart while it is perfectly alive — so every update naming the
+   * dispatch or carrying its `parentToolCallId` PUSHES THIS WINDOW OUT. Only a
+   * genuinely silent worker, or every known dispatch reporting (completed /
+   * failed), ends the phase; a drain announcement is recorded but arms no
+   * quiet clock before then. Once they have all reported, the drain's own
    * `ambientQuietMs` / `ambientMaxMs` windows take over.
    *
-   * Default 600000 ms (10 minutes).
+   * Default 600000 ms (10 minutes of silence, not of total runtime).
    */
   backgroundTaskMaxMs?: number
+  /**
+   * Optional ABSOLUTE ceiling on a detached-worker hold, both phases included.
+   * `backgroundTaskMaxMs` keeps an ACTIVE worker alive indefinitely; this is
+   * the emergency bound for a zombie that keeps emitting updates forever.
+   * `0` disables it — the turn can then stay open as long as the worker keeps
+   * proving it is alive, and the person can still steer/cancel the hold by
+   * sending a message.
+   *
+   * Default 0 (no ceiling).
+   */
+  backgroundTaskCeilingMs?: number
   /**
    * How long a PARKED detached-worker hold may wait for the host to open the
    * driver step that carries the worker's report. The prompt response landed
@@ -587,6 +600,7 @@ const DEFAULT_TUNING: Required<BridgeTuning> = {
   ambientQuietMs: 10_000,
   ambientMaxMs: 120_000,
   backgroundTaskMaxMs: 600_000,
+  backgroundTaskCeilingMs: 0,
   backgroundParkedGraceMs: 30_000,
   ambientStaleMs: 300_000,
 }
@@ -3622,10 +3636,12 @@ interface BackgroundDispatch {
  *
  * Two phases, because their liveness signals differ:
  * - `worker`: at least one worker runs off-turn and may be silent for tens of
- *   seconds between model calls — NO quiet timer, only
- *   {@link BridgeTuning.backgroundTaskMaxMs}. It ends when EVERY known dispatch
- *   reported (completed / failed); a drain announcement is recorded meanwhile
- *   but arms no clock.
+ *   seconds between model calls — its clock is a SILENCE window
+ *   ({@link BridgeTuning.backgroundTaskMaxMs}) pushed out by every dispatch /
+ *   worker update, plus an optional whole-hold ceiling
+ *   ({@link BridgeTuning.backgroundTaskCeilingMs}). It ends when EVERY known
+ *   dispatch reported (completed / failed); a drain announcement is recorded
+ *   meanwhile but arms no clock.
  * - `drain`: every dispatch reported and the background turn that carries
  *   their report is (or is about to start) — the existing ambient windows
  *   apply (`ambientQuietMs` quiet, reset by every update; `ambientMaxMs`
@@ -3660,7 +3676,8 @@ interface BackgroundHold {
   floorSeq: number
   quietTimer?: ReturnType<typeof setTimeout>
   hardTimer?: ReturnType<typeof setTimeout>
-  /**
+  /** Absolute whole-hold ceiling; absent when the tuning disables it (0). */
+  ceilingTimer?: ReturnType<typeof setTimeout>  /**
    * The bounded wait for a driver step to speak into. Only while the hold is
    * PARKED (`pendingBackgroundHold`): the response landed between steps, and
    * the host is expected to open the continuation step for the Agent card.
@@ -3777,11 +3794,13 @@ class TurnStreamController {
   private pendingBackgroundHold?: BackgroundHold
   /**
    * The hold's own windows, read once at construction like the ambient pair:
-   * `taskMaxMs` is the worker phase's ceiling, `graceMs` the parked hold's
-   * bounded wait for a driver step (see {@link BridgeTuning.backgroundTaskMaxMs}
-   * and {@link BridgeTuning.backgroundParkedGraceMs}).
+   * `taskMaxMs` is the worker phase's silence window, `ceilingMs` the optional
+   * whole-hold absolute bound (0 = none), `graceMs` the parked hold's bounded
+   * wait for a driver step (see {@link BridgeTuning.backgroundTaskMaxMs} /
+   * {@link BridgeTuning.backgroundTaskCeilingMs} /
+   * {@link BridgeTuning.backgroundParkedGraceMs}).
    */
-  private readonly backgroundTuning: { taskMaxMs: number; graceMs: number }
+  private readonly backgroundTuning: { taskMaxMs: number; ceilingMs: number; graceMs: number }
   /**
    * When this controller was built. Only a drain announced AFTER this moment
    * may be adopted by the hold: an `ambient` record that predates the turn is
@@ -4031,11 +4050,13 @@ class TurnStreamController {
    * - marks the segment background, so EVERY tool call for the rest of the
    *   hold — the workers', the drain's TaskOutput — stays transcript-only and
    *   the final message carries text with no card in front of it;
-   * - waits in two phases: the worker phase only has the
-   *   {@link BridgeTuning.backgroundTaskMaxMs} ceiling (a detached worker goes
-   *   silent for tens of seconds while it works) and ends only when ALL known
-   *   dispatches reported, after which the drain phase uses the ambient
-   *   windows.
+   * - waits in two phases: the worker phase's clock is a SILENCE window
+   *   ({@link BridgeTuning.backgroundTaskMaxMs}) that every dispatch / worker
+   *   update pushes out, so a long task that keeps reporting is never cut at a
+   *   fixed total runtime. It ends when ALL known dispatches reported, after
+   *   which the drain phase uses the ambient windows. An optional absolute
+   *   ceiling ({@link BridgeTuning.backgroundTaskCeilingMs}, default none)
+   *   bounds a zombie that keeps talking forever.
    */
   holdForBackgroundDispatch(stopReason: string, requestId?: string): void {
     if (this.settled || this.disposed || this.closedTurn || this.stale) return
@@ -4063,6 +4084,7 @@ class TurnStreamController {
     this.endTurn()
     hold.hardTimer = setTimeout(() => { this.onBackgroundHard(hold) }, this.backgroundTuning.taskMaxMs)
     hold.hardTimer.unref?.()
+    this.armBackgroundCeiling(hold)
     const seg = this.segment
     if (seg !== undefined && !seg.finished) {
       this.adoptBackgroundHold(seg, hold)
@@ -4155,9 +4177,30 @@ class TurnStreamController {
   }
 
   /**
+   * Evidence from a live dispatch / worker: the worker phase is SILENCE-based,
+   * so each update pushes its deadline out. A long task that keeps reporting is
+   * never cut at a fixed total runtime; only a genuinely quiet worker is.
+   */
+  private noteBackgroundWorkerActivity(): void {
+    const hold = this.activeBackgroundHold()
+    if (hold === undefined || hold.phase !== 'worker' || hold.retired) return
+    if (hold.hardTimer !== undefined) clearTimeout(hold.hardTimer)
+    hold.hardTimer = setTimeout(() => { this.onBackgroundHard(hold) }, this.backgroundTuning.taskMaxMs)
+    hold.hardTimer.unref?.()
+  }
+
+  /** Arm the hold's optional absolute ceiling (0 = unlimited). */
+  private armBackgroundCeiling(hold: BackgroundHold): void {
+    if (this.backgroundTuning.ceilingMs <= 0) return
+    hold.ceilingTimer = setTimeout(() => { this.onBackgroundHard(hold) }, this.backgroundTuning.ceilingMs)
+    hold.ceilingTimer.unref?.()
+  }
+
+  /**
    * Any session update restarts the drain phase's quiet clock. Only an
-   * ADOPTED hold has one: a parked hold's wait belongs to its grace timer, and
-   * the worker phase never has a clock at all.
+   * ADOPTED hold has a quiet clock: a parked hold's wait belongs to its grace
+   * timer, and the worker phase is pushed forward only by dispatch / worker
+   * evidence (see `noteBackgroundWorkerActivity`).
    */
   private noteBackgroundHoldActivity(): void {
     const hold = this.backgroundHold
@@ -4171,7 +4214,7 @@ class TurnStreamController {
     this.closeBackgroundHold(hold, { hard: false })
   }
 
-  /** The hold outlived its ceiling (worker or drain): the run is still going. */
+  /** The hold went silent past its window, or outlived the absolute ceiling. */
   private onBackgroundHard(hold: BackgroundHold): void {
     if (hold !== this.backgroundHold && hold !== this.pendingBackgroundHold) return
     this.closeBackgroundHold(hold, { hard: true })
@@ -4239,9 +4282,11 @@ class TurnStreamController {
   private clearBackgroundHoldTimers(hold: BackgroundHold): void {
     if (hold.quietTimer !== undefined) clearTimeout(hold.quietTimer)
     if (hold.hardTimer !== undefined) clearTimeout(hold.hardTimer)
+    if (hold.ceilingTimer !== undefined) clearTimeout(hold.ceilingTimer)
     if (hold.graceTimer !== undefined) clearTimeout(hold.graceTimer)
     hold.quietTimer = undefined
     hold.hardTimer = undefined
+    hold.ceilingTimer = undefined
     hold.graceTimer = undefined
   }
 
@@ -4378,6 +4423,7 @@ class TurnStreamController {
       const known = this.dispatches.get(toolCallId)
       if (known !== undefined) {
         // A known dispatch: the id is the whole evidence (see the doc above).
+        this.noteBackgroundWorkerActivity()
         if (status !== '') known.status = status
         if (!known.catalogReported) this.refreshSubagentDispatchLabel(known, update)
         if (meta?.isBackground === true) {
@@ -4404,6 +4450,7 @@ class TurnStreamController {
           catalogReported: false,
         }
         this.dispatches.set(toolCallId, dispatch)
+        this.noteBackgroundWorkerActivity()
         if (dispatch.detached) this.reportSubagentDispatch(dispatch)
         if (!dispatch.completed) {
           const held = this.activeBackgroundHold()
@@ -4416,6 +4463,7 @@ class TurnStreamController {
     if (meta?.parentToolCallId !== undefined) {
       const parent = this.dispatches.get(meta.parentToolCallId)
       if (parent !== undefined) {
+        this.noteBackgroundWorkerActivity()
         parent.detached = true
         parent.sawWorkerUpdate = true
         this.reportSubagentDispatch(parent)
@@ -4423,7 +4471,10 @@ class TurnStreamController {
     }
     if (meta?.unsolicitedTurn !== undefined) {
       const held = this.activeBackgroundHold()
-      if (held !== undefined) this.startBackgroundDrain(held, meta.unsolicitedTurn.requestId)
+      if (held !== undefined) {
+        this.noteBackgroundWorkerActivity()
+        this.startBackgroundDrain(held, meta.unsolicitedTurn.requestId)
+      }
     }
   }
 
@@ -4952,7 +5003,8 @@ class TurnStreamController {
       // background drain is still working, so the ambient quiet clock restarts.
       this.noteAmbientActivity()
       // A detached-worker hold's drain phase has the same rule; its worker
-      // phase never does (see `BridgeTuning.backgroundTaskMaxMs`).
+      // phase is pushed out only by dispatch / worker evidence (see
+      // `BridgeTuning.backgroundTaskMaxMs`).
       this.noteBackgroundHoldActivity()
       const update = typed.update as Record<string, unknown>
       // The dispatch / worker / announcement bookkeeping runs BEFORE the cursor
@@ -5518,14 +5570,17 @@ export class BridgeManager {
   /**
    * The detached-worker hold's windows, read once at controller construction
    * for the same reason as {@link ambientTuning}: `taskMaxMs` is the worker
-   * phase's only clock (see {@link BridgeTuning.backgroundTaskMaxMs}) and
-   * `graceMs` the bounded wait a PARKED hold gives the host to open its
-   * continuation step (see {@link BridgeTuning.backgroundParkedGraceMs}). The
-   * drain phase reuses {@link ambientTuning}.
+   * phase's SILENCE window, pushed out by every dispatch / worker update (see
+   * {@link BridgeTuning.backgroundTaskMaxMs}), `ceilingMs` its optional
+   * absolute bound (0 = none) and `graceMs` the bounded wait a PARKED hold
+   * gives the host to open its continuation step (see
+   * {@link BridgeTuning.backgroundParkedGraceMs}). The drain phase reuses
+   * {@link ambientTuning}.
    */
-  get backgroundTuning(): { taskMaxMs: number; graceMs: number } {
+  get backgroundTuning(): { taskMaxMs: number; ceilingMs: number; graceMs: number } {
     return {
       taskMaxMs: this.tuning.backgroundTaskMaxMs,
+      ceilingMs: this.tuning.backgroundTaskCeilingMs,
       graceMs: this.tuning.backgroundParkedGraceMs,
     }
   }

@@ -7626,7 +7626,27 @@ describe('a turn that dispatched a detached worker (isolated manager)', () => {
     }
   }, 30_000)
 
-  it('closes a worker that never reports at the worker-phase ceiling, with the deferral line', async () => {
+  it('keeps holding while the worker keeps reporting, past the silence window', async () => {
+    const dshSessionId = 'dsh-dispatch-keepalive'
+    const started = Date.now()
+    const { chunks } = await hostLoopTurn(dispatchAdapter, {
+      provider: 'acp',
+      model: 'dispatch',
+      sessionId: dshSessionId,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'DISPATCHKEEPALIVE please' }] }],
+    })
+    const text = dispatchText(chunks)
+
+    // The worker phase outlived `backgroundTaskMaxMs` (1.5s here) purely on
+    // worker updates. A fixed total-runtime cap would have closed the turn with
+    // the deferral line and lost the drain's answer.
+    expect(Date.now() - started).toBeGreaterThan(1_600)
+    expect(text).toContain('DISPATCH-FINAL-ANSWER')
+    expect(text).not.toContain(DEFERRAL_REPORT)
+    expect(text).not.toContain(ZERO_OUTPUT_REPORT)
+  }, 30_000)
+
+  it('closes a worker that never reports after the worker-phase silence window', async () => {
     const dshSessionId = 'dsh-dispatch-nodrain'
     const since = dispatchEvents.length
     const { chunks } = await hostLoopTurn(dispatchAdapter, {
@@ -7637,9 +7657,9 @@ describe('a turn that dispatched a detached worker (isolated manager)', () => {
     })
     const text = dispatchText(chunks)
 
-    // The worker phase armed NO quiet timer (it would have fired long before
-    // the short ceiling here), so the ceiling is what ended the turn — and it
-    // says where the rest of the output will land instead of blaming silence.
+    // Nothing pushed the worker-phase silence window out, so it ended the
+    // turn — and it says where the rest of the output will land instead of
+    // blaming silence.
     expect(text).toContain(DEFERRAL_REPORT)
     expect(text).not.toContain(ZERO_OUTPUT_REPORT)
     expect(dispatchFinish(chunks)?.reason).toEqual({ kind: 'stop' })

@@ -519,6 +519,10 @@ const app = agent({ name: 'mock-acp-agent' })
       const ackNoDrain = text.includes('DISPATCHACKNODRAIN')
       const lateDrain = text.includes('DISPATCHLATEDRAIN')
       const altFirst = text.includes('DISPATCHALTFIRST')
+      // A long but healthy worker: it keeps emitting updates well past the
+      // client's worker-phase SILENCE window. Those updates must push that
+      // window out instead of letting a fixed total runtime cut the turn.
+      const keepAlive = text.includes('DISPATCHKEEPALIVE')
       // The real first send omits `rawInput` (repl display) AND the title, so
       // its only label source is `_meta.toolName`. The identity arrives later,
       // on the result frame's `_meta` — the shape this variant pins.
@@ -629,6 +633,13 @@ const app = agent({ name: 'mock-acp-agent' })
           content: [{ type: 'content', content: { type: 'text', text: 'src/a.ts:3 TODO' } }],
         }, id, parent)
         await sendWorker({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'WORKER-REPORT-TEXT ' } }, id, parent)
+        if (keepAlive) {
+          // Live evidence far beyond the client's 1.5s worker-phase window.
+          for (let tick = 0; tick < 7; tick += 1) {
+            await sleep(300)
+            await sendWorker({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: `WORKER-KEEPALIVE-${String(tick)} ` } }, id, parent)
+          }
+        }
         if (slow) await sleep(400)
       }
       const drainTurn = async (finalText = 'DISPATCH-FINAL-ANSWER', announceRun = true) => {
