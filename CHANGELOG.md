@@ -8,16 +8,37 @@
 
 ### 新增
 
-- **后台任务出现在子智能体清单**：条目上标出它在做什么。([459bc73](https://github.com/GDWhisper/dsh-ntr/commit/459bc73))
+- **catalog**：后台派出的 agent 进入子智能体清单，条目只读。([459bc73](https://github.com/GDWhisper/dsh-ntr/commit/459bc73))
 
 ### 改进
 
-- **后台任务还在更新就一直等**：答案能落回当前这条回复，不再满十分钟就收口。([a8a6d32](https://github.com/GDWhisper/dsh-ntr/commit/a8a6d32))
+- **chat**：后台任务持续汇报时，回合不再提前收口。([a8a6d32](https://github.com/GDWhisper/dsh-ntr/commit/a8a6d32))
 
 ### 修复
 
-- **新会话首轮按显示的模式执行**：底部选中什么，第一条消息就按什么跑。([680953e](https://github.com/GDWhisper/dsh-ntr/commit/680953e))
-- **关闭 DSH 不丢会话**：会话挂起、重启后可恢复，退出也不再拖长。([f4abd8e](https://github.com/GDWhisper/dsh-ntr/commit/f4abd8e))
+- **chat**：新会话首轮按当前显示的模式执行。([680953e](https://github.com/GDWhisper/dsh-ntr/commit/680953e))
+- **acp**：关闭 DSH 后会话可恢复，退出不再拖长。([f4abd8e](https://github.com/GDWhisper/dsh-ntr/commit/f4abd8e))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.3.4...v0.3.5
+
+---
+
+Background workers are visible and get to finish their answer; restarting DSH no longer drops conversations; a new conversation starts in the mode already displayed.
+
+### Added
+
+- **catalog**: detached workers show up in the subagent catalog as read-only entries. ([459bc73](https://github.com/GDWhisper/dsh-ntr/commit/459bc73))
+
+### Improved
+
+- **chat**: turns stay open while a background worker keeps reporting. ([a8a6d32](https://github.com/GDWhisper/dsh-ntr/commit/a8a6d32))
+
+### Fixed
+
+- **chat**: the first turn of a new conversation runs in the displayed mode. ([680953e](https://github.com/GDWhisper/dsh-ntr/commit/680953e))
+- **acp**: conversations stay recoverable after the host exits, and shutdown is prompt. ([f4abd8e](https://github.com/GDWhisper/dsh-ntr/commit/f4abd8e))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.3.4...v0.3.5
 
 ## [0.3.4] - 2026-11-01
 
