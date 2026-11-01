@@ -7,7 +7,7 @@
  * only object allowed to spawn a configured command.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { homedir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -107,6 +107,41 @@ const FS_MAX_WRITE_BYTES = 2 * 1024 * 1024
  * stop — and with it the stall reclaim that calls it — forever.
  */
 const SESSION_CLOSE_TIMEOUT_MS = 5_000
+
+/**
+ * The second — and last — slice after the escalation kill (`SIGKILL` on POSIX,
+ * a second `taskkill /T /F` on Windows). Deliberately short: past this point
+ * the child is the OS's problem (plus the exit reaper, see `reapLiveChildren`).
+ *
+ * `disposeChild` RESERVES this inside the budget it is handed, so every caller's
+ * number means the WHOLE disposal — graceful wait plus escalation wait — and
+ * never just the first one.
+ */
+const KILL_ESCALATION_GRACE_MS = 500
+
+/**
+ * Fire-and-forget kill: the whole disposal budget for the non-teardown paths
+ * (see `KILL_ESCALATION_GRACE_MS` for how it splits). Same 3s the old inline
+ * SIGKILL timer used before escalating.
+ */
+const KILL_ESCALATION_DELAY_MS = 3_000
+
+/**
+ * Budget for disposing a child whose start was invalidated by a teardown (see
+ * `AgentBridge.spawnAndConnect`). Short: that child was spawned moments ago and
+ * never served anything, so there is nothing to drain.
+ */
+const STALE_START_KILL_BUDGET_MS = 2_000
+
+/**
+ * The WHOLE host-shutdown budget for killing children, shared by every bridge
+ * (bridges run concurrently, so this is the worst case for all of them, not
+ * per bridge). One number, one deadline: `AgentBridge.shutdown` hands what is
+ * LEFT of it to `killChildAndWait`, and `disposeChild` reserves the escalation
+ * grace inside that — so the graceful wait gets at most 4s − 500ms and the
+ * whole disposal, escalation included, never exceeds 4s.
+ */
+const SHUTDOWN_BUDGET_MS = 4_000
 
 /** What the composer showed for an agent before a conversation picked it. */
 interface DisplayedChatDefaults {
@@ -615,6 +650,24 @@ export class AgentBridge {
 
   private child?: ChildProcess
   private conn?: ClientConnection
+  /**
+   * Teardown generation, bumped ONLY by a deliberate teardown (`stop` /
+   * `shutdown` / `forceReset`), so a start that was already in flight can tell
+   * that nobody owns its outcome any more: `spawnAndConnect` re-checks this
+   * after each await and disposes the child it would otherwise have published
+   * as `ready`. Without it, a teardown landing during `ensureAgentExecutable`
+   * (a global npm install can take minutes) left a freshly spawned agent
+   * running with no owner.
+   *
+   * `releaseAll` and `killChild` deliberately do NOT bump it: both are also the
+   * failure path of a start's own handshake — a child dying during startup goes
+   * `exit` → `connectionLost` → `releaseAll('died')` — and that start must
+   * still publish `error` with its stderr tail rather than be mistaken for a
+   * teardown (see `ensureReady`). It cannot leak a process either way: a crash
+   * release only happens once the child exists, and `spawnAndConnect` has no
+   * spawn point left after that.
+   */
+  private teardownEpoch = 0
   private starting?: Promise<void>
   private readonly sessions = new Map<string, LiveSession>()
   private readonly acpIndex = new Map<string, LiveSession>()
@@ -1087,10 +1140,19 @@ export class AgentBridge {
     }
     if (this.state === 'ready' && this.conn !== undefined) return Promise.resolve()
     if (this.starting !== undefined) return this.starting
+    const epoch = this.teardownEpoch
     this.state = 'starting'
     this.publishStatus()
-    this.starting = this.spawnAndConnect()
+    const started = this.spawnAndConnect(epoch)
       .then(() => {
+        // A teardown landed while the handshake was in flight: it owns the
+        // bridge now, and `spawnAndConnect` has already disposed whatever it
+        // spawned. Publishing `ready` here would paint a live status back over
+        // the stopped bridge. `state` catches the one teardown that does NOT
+        // bump the epoch — a crash release (`releaseAll`): without it, a
+        // handshake that resolved just as the child died would paint `ready`
+        // over the `stopped` that the crash left behind.
+        if (this.teardownEpoch !== epoch || this.state !== 'starting') return
         this.state = 'ready'
         this.lastError = undefined
         this.publishStatus()
@@ -1099,6 +1161,16 @@ export class AgentBridge {
         this.touch()
       })
       .catch((error: unknown) => {
+        // Same guard: a start nobody owns any more must not publish its
+        // outcome. A start's OWN failure — `withStartupTimeout`, or the child
+        // dying mid-handshake (which runs through `releaseAll`) — still reaches
+        // the lines below and publishes `error` with its stderr tail; neither
+        // of those paths bumps the epoch.
+        if (this.teardownEpoch !== epoch) {
+          // Publish nothing, but keep the caller's error contract: every
+          // interrupted start has always surfaced as `agent_unreachable`.
+          throw new AcpError('agent_unreachable', `acp: agent "${this.def.id}" failed to start: ${error instanceof Error ? error.message : String(error)}`)
+        }
         this.state = 'error'
         this.lastError = error instanceof Error ? error.message : String(error)
         this.clearIdleTimer()
@@ -1106,16 +1178,30 @@ export class AgentBridge {
         this.publishStatus()
         throw new AcpError('agent_unreachable', `acp: agent "${this.def.id}" failed to start: ${this.lastError}`)
       })
-      .finally(() => { this.starting = undefined })
-    return this.starting
+      .finally(() => {
+        // Only clear a slot that is still OURS: a teardown may have cleared it
+        // (and a fresh `ensureReady` may already hold it).
+        if (this.starting === started) this.starting = undefined
+      })
+    this.starting = started
+    return started
   }
 
-  private async spawnAndConnect(): Promise<void> {
+  /**
+   * @param epoch - `teardownEpoch` captured when this start claimed the bridge.
+   *   Every await below is a window in which a teardown can land; a stale start
+   *   owns nothing and must leave no process behind (see `teardownEpoch`).
+   */
+  private async spawnAndConnect(epoch: number): Promise<void> {
     this.stderrTail = []
     // Resolve (and, with npmPackage, auto-install) the executable before the
     // spawn; the resolved absolute path also pins the lookup to the host PATH
     // plus the well-known extra dirs, not the child env the agent may override.
     const { command } = await ensureAgentExecutable(this.def, undefined, line => this.noteStderr(line))
+    // A teardown landed while the executable was being resolved — a global
+    // install can hold this await for minutes. Nothing has been spawned yet, so
+    // there is nothing to reap; just refuse to create the process.
+    if (this.teardownEpoch !== epoch) return
     const cwd = safeSpawnCwd(this.def, this.wantedSpawnCwd)
     this.spawnCwd = cwd
     const launch = windowsShimLaunch(command, this.def.args ?? [])
@@ -1131,6 +1217,7 @@ export class AgentBridge {
       ...(launch.verbatim ? { windowsVerbatimArguments: true } : {}),
     })
     this.child = child
+    trackAgentChild(child)
     child.on('error', (error) => {
       // Identity guard: a stale event from a PREVIOUS child must not tear down
       // a connection that replaced it (an `exit` can land after the respawn
@@ -1190,6 +1277,25 @@ export class AgentBridge {
       }),
       'initialize',
     )
+    // The second — and widest — window: `initialize` waits up to the startup
+    // budget, and a shutdown / stop during it already dropped the connection and
+    // killed the child we spawned. That child is OURS even though the bridge no
+    // longer points at it, so dispose it with the awaitable kill instead of
+    // leaving a process nobody can reach.
+    if (this.teardownEpoch !== epoch) {
+      // Only when it is still the CURRENT connection: a newer one belongs to a
+      // fresh start and must not be closed from here.
+      if (this.conn === conn) {
+        this.conn = undefined
+        conn.close()
+      }
+      if (this.child === child) {
+        this.child = undefined
+        this.spawnCwd = undefined
+      }
+      await disposeChild(child, STALE_START_KILL_BUDGET_MS)
+      return
+    }
     this.initResult = init
     // The fork capability is agent knowledge that must outlive the process:
     // report it so the manager can persist a LAST KNOWN copy and serve the
@@ -1636,13 +1742,17 @@ export class AgentBridge {
       // workspace from its own cwd would come back in the plugin's sandbox.
       const workspaceRoot = chatWorkspaceRoot(this.sessionWorkspace?.(), session.dshSessionId)
       await this.ensureReady(workspaceRoot)
+      // The CONNECTION first: a teardown that landed during the start leaves no
+      // `initResult` either, and reporting that as `resume_unsupported` would
+      // blame the agent for a capability it may well have. "The bridge is not
+      // up" is the honest answer.
+      const conn = this.conn
+      if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
       // The capability comes from the FRESH initialize: after a crash the
       // bridge restarts the process, so check the (new) initResult here.
       if (this.initResult?.agentCapabilities?.loadSession !== true) {
         throw new AcpError('resume_unsupported', `acp: agent "${this.def.id}" does not advertise the loadSession capability; start a new session`)
       }
-      const conn = this.conn
-      if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
       const resolved = resolveSessionCwd(this.def, session.cwd, p => realpathSync(p), workspaceRoot === undefined ? [] : [workspaceRoot])
       // Replay arrives as brand-new updates, so the transcript restarts too;
       // seq keeps meaning "position in the current epoch". What the buffer held
@@ -1708,9 +1818,42 @@ export class AgentBridge {
     }
   }
 
-  /** Release all live sessions (process died or went idle): keep them resumable, settle permissions, drop the connection. */
+  /**
+   * Release all live sessions (process died or went idle): keep them resumable,
+   * settle permissions, drop the connection.
+   *
+   * Deliberately does NOT bump `teardownEpoch`: a child's death during startup
+   * runs through `connectionLost` into this method, and that start must still
+   * publish `error` with its stderr tail — the settings card expands on exactly
+   * that pair (see `view` / `teardownEpoch`).
+   */
   releaseAll(reason: string, cause: AcpReleaseCause): void {
     this.clearIdleTimer()
+    this.parkSessions(reason, cause)
+    this.conn?.close()
+    this.conn = undefined
+    this.killChild()
+    this.state = 'stopped'
+    this.initResult = undefined
+    this.publishStatus()
+  }
+
+  /**
+   * Park every live session as RELEASED — resumable through `session/load`,
+   * never destroyed — and persist the records.
+   *
+   * This is the local half shared by `releaseAll` (crash / idle / workspace) and
+   * `shutdown` (host exit): those paths differ only in what happens to the child
+   * afterwards. A `closed` session is skipped — its record belongs to
+   * `closeSession`, and flipping it to released would let a resume resurrect a
+   * conversation that is being destroyed (constraint 10).
+   *
+   * Returns how many sessions were parked, so a shutdown with nothing to park
+   * does not rewrite the state file (a second `shutdownAll` must not erase the
+   * records the first one persisted).
+   */
+  private parkSessions(reason: string, cause: AcpReleaseCause): number {
+    let parked = 0
     for (const session of [...this.sessions.values()]) {
       // A session already being closed is `closeSession`'s to delete. Marking
       // it released would park it as resumable, and `doResumeSession` flips
@@ -1732,19 +1875,15 @@ export class AgentBridge {
       this.settlePermissions(session)
       this.released.set(session.sessionId, session)
       this.hub.broadcast({ type: 'session/released', sessionId: session.sessionId, session: snapshot(session), reason, cause })
+      parked += 1
     }
     this.sessions.clear()
     this.acpIndex.clear()
-    this.conn?.close()
-    this.conn = undefined
-    this.killChild()
-    this.state = 'stopped'
-    this.initResult = undefined
-    this.publishStatus()
     // The parked records are what keeps them resumable after a host restart —
     // persist now, while their transcripts (the `hasHistory` evidence) are
     // still the ones they were parked with.
-    this.onSessionsDirty?.()
+    if (parked > 0) this.onSessionsDirty?.()
+    return parked
   }
 
   /** Detach one released session record for a resume attempt. */
@@ -1886,6 +2025,13 @@ export class AgentBridge {
 
   /** Kill the child and drop every local session bound to this connection. */
   async stop(reason: 'closed' | 'agent-stopped' | 'agent-died' = 'agent-stopped'): Promise<void> {
+    // Deliberate teardown: an in-flight start owns nothing any more, and must
+    // not be able to publish `ready` over the stopped state that follows.
+    this.teardownEpoch += 1
+    // Drop the memoized start: a later `ensureReady` must not adopt a promise
+    // whose result was already discarded. That promise's own `finally`
+    // re-checks identity, so it cannot clear a NEWER start's slot.
+    this.starting = undefined
     this.clearIdleTimer()
     for (const session of [...this.sessions.values()]) {
       await this.closeSession(session, reason)
@@ -1912,6 +2058,8 @@ export class AgentBridge {
    * message. This is a stop, not a discard.
    */
   forceReset(reason: 'agent-stopped'): void {
+    this.teardownEpoch += 1
+    this.starting = undefined
     this.clearIdleTimer()
     for (const session of [...this.sessions.values()]) {
       session.closed = true
@@ -1931,6 +2079,13 @@ export class AgentBridge {
     this.publishStatus()
   }
 
+  /**
+   * Fire-and-forget kill for the NON-teardown paths: idle release, workspace
+   * move, crash handling, `forceReset`, and a start's own failure. None of them
+   * may block on a dying process, and CRASH ≠ DESTROY (constraint 10): the
+   * sessions were already parked by the caller, this only takes the process
+   * away. The awaitable variant is `killChildAndWait`, used by host shutdown.
+   */
   private killChild(): void {
     const child = this.child
     this.child = undefined
@@ -1938,31 +2093,59 @@ export class AgentBridge {
     // `spawnAndConnect`). Leaving it behind would make `ensureReady` believe a
     // process is still running in that directory.
     this.spawnCwd = undefined
-    if (child === undefined || child.pid === undefined) return
-    try {
-      child.stdin?.end()
-    } catch { /* already gone */ }
-    const pid = child.pid
-    if (process.platform === 'win32') {
-      // Parity with the POSIX branch below, which kills the whole process
-      // GROUP: on Windows "the group" is the process tree, and it has to be
-      // killed while the tree is intact — killing the direct child first (a
-      // `cmd.exe` shim wrapper, see `windowsShimLaunch`) re-parents the agent
-      // out of `taskkill /T`'s reach. `stdin.end()` above is the graceful half.
-      killProcessTree(pid)
-      return
-    }
-    try {
-      process.kill(-pid, 'SIGTERM')
-    } catch {
-      child.kill('SIGTERM')
-    }
-    setTimeout(() => {
-      if (child.exitCode !== null || child.signalCode !== null) return
-      try {
-        process.kill(-pid, 'SIGKILL')
-      } catch { /* already gone */ }
-    }, 3000).unref()
+    if (child === undefined) return
+    void disposeChild(child, KILL_ESCALATION_DELAY_MS)
+  }
+
+  /**
+   * Take the current child away and WAIT until it is gone (bounded). Only the
+   * host shutdown path uses this — every other teardown must stay
+   * fire-and-forget.
+   *
+   * Always resolves: a teardown that could hang on an agent ignoring SIGTERM
+   * would be worse than a leaked process, and the process-exit reaper
+   * (`reapLiveChildren`) still holds the pid if even the escalation loses.
+   */
+  private async killChildAndWait(budgetMs: number): Promise<void> {
+    const child = this.child
+    this.child = undefined
+    this.spawnCwd = undefined
+    if (child === undefined) return
+    await disposeChild(child, budgetMs)
+  }
+
+  /**
+   * Host shutdown: park every live session as RELEASED (resumable, exactly as a
+   * crash would leave it), then WAIT for the child to die.
+   *
+   * Deliberately not `stop`: `stop` asks every session's agent to
+   * `session/close` and then clears the released records — i.e. it DESTROYS the
+   * conversations. A host shutdown is not the user's "stop this agent" gesture:
+   * the host is coming back, and the conversations must come back with it
+   * (constraint 10, plus the `chatSessions` records that outlive the restart).
+   * Skipping the per-session RPC is also what keeps teardown bounded: N sessions
+   * would otherwise spend up to N × SESSION_CLOSE_TIMEOUT_MS before the child
+   * was even signalled, and the process is about to die anyway — "the agent
+   * forgot this session" costs nothing a `session/load` cannot rebuild.
+   *
+   * Always resolves: `budgetMs` bounds the WHOLE kill — parking is synchronous,
+   * the graceful wait and the escalation both come out of the same deadline,
+   * and whatever still lives after it is the exit reaper's.
+   */
+  async shutdown(budgetMs: number = SHUTDOWN_BUDGET_MS): Promise<void> {
+    const deadline = Date.now() + Math.max(0, budgetMs)
+    // A deliberate teardown: an in-flight start must not publish `ready` (or
+    // leave its process running) over the stopped state this leaves behind.
+    this.teardownEpoch += 1
+    this.starting = undefined
+    this.clearIdleTimer()
+    this.parkSessions('the host is shutting down', 'shutdown')
+    this.conn?.close()
+    this.conn = undefined
+    this.state = 'stopped'
+    this.initResult = undefined
+    this.publishStatus()
+    await this.killChildAndWait(Math.max(0, deadline - Date.now()))
   }
 
   /**
@@ -3179,11 +3362,135 @@ export function windowsShimLaunch(
  * Best effort — `taskkill` is absent from no Windows this runs on, and a
  * failure here only means the OS reclaims the process later.
  */
-export function killProcessTree(pid: number): void {
+export function killProcessTree(pid: number): ChildProcess | undefined {
   try {
     const killer = spawn('taskkill', ['/pid', String(pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true })
     killer.on('error', () => { /* nothing else to try; the OS reaps it eventually */ })
-  } catch { /* spawn itself refused */ }
+    // Handed back so a caller that wants to wait can; the existing
+    // fire-and-forget callers simply ignore it.
+    return killer
+  } catch {
+    return undefined
+  }
+}
+
+/** Every agent child this host started and has not seen exit yet, by pid. */
+const liveChildPids = new Set<number>()
+/** Whether the process-exit reaper is already installed (installed once). */
+let exitReaperArmed = false
+
+/** Remember a freshly spawned agent child for the last-resort reaper. */
+function trackAgentChild(child: ChildProcess): void {
+  const pid = child.pid
+  if (pid === undefined) return
+  liveChildPids.add(pid)
+  // Both events: `exit` is the process fact, `close` is it plus its stdio being
+  // closed. Whichever comes first forgets the pid.
+  const forget = (): void => { liveChildPids.delete(pid) }
+  child.once('exit', forget)
+  child.once('close', forget)
+  if (exitReaperArmed) return
+  exitReaperArmed = true
+  process.once('exit', reapLiveChildren)
+}
+
+/**
+ * Last resort for a host that leaves without a graceful teardown: an unhandled
+ * crash that still runs `exit`, an explicit `process.exit()`, or a disposer the
+ * host never awaited. Only SYNC calls are legal here — the `exit` event cannot
+ * wait for a promise — hence `spawnSync` and a bare `process.kill`.
+ *
+ * Deliberately NOT a `SIGINT` / `SIGTERM` handler: registering one flips the
+ * host's own default disposition (killing the default "exit on Ctrl-C", or
+ * double-handling the host's shutdown and hanging it). A host that handles the
+ * signal itself still reaches `exit`; one that is SIGKILLed can run nothing at
+ * all (see AGENTS/protocol.md §7 for that limit).
+ */
+function reapLiveChildren(): void {
+  for (const pid of liveChildPids) {
+    try {
+      if (process.platform === 'win32') {
+        spawnSync('taskkill', ['/pid', String(pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true })
+      } else {
+        // The child was spawned `detached`, so it leads its own process group:
+        // -pid reaches everything it started (same reasoning as the graceful
+        // POSIX kill).
+        process.kill(-pid, 'SIGKILL')
+      }
+    } catch { /* already gone, or no permission left to try */ }
+  }
+  liveChildPids.clear()
+}
+
+/**
+ * End the child's stdin, dispatch the platform kill, and wait until the process
+ * is gone — bounded, and never rejecting.
+ *
+ * The escalation is deliberately platform-shaped: POSIX gets a process-GROUP
+ * `SIGKILL` (an agent that ignores SIGTERM is exactly what a second signal is
+ * for), Windows a second `taskkill /T /F` (the first may never have run at all:
+ * a failed spawn of `taskkill` is swallowed by `killProcessTree`).
+ */
+async function disposeChild(child: ChildProcess, budgetMs: number): Promise<void> {
+  // ONE deadline for the whole disposal: the escalation wait comes out of the
+  // same budget, so `budgetMs` can never turn into "grace period + grace
+  // period" (see `KILL_ESCALATION_GRACE_MS`).
+  const deadline = Date.now() + Math.max(0, budgetMs)
+  try {
+    child.stdin?.end()
+  } catch { /* already gone */ }
+  const pid = child.pid
+  if (pid === undefined) return
+  // A child that already exited may have had its pid reused: signalling it
+  // would reach an unrelated process (group). Nothing left to kill.
+  if (child.exitCode !== null || child.signalCode !== null) return
+  const windows = process.platform === 'win32'
+  if (windows) {
+    // Parity with the POSIX branch, which kills the whole process GROUP: on
+    // Windows "the group" is the process tree, and it has to be killed while
+    // the tree is intact — killing the direct child first (a `cmd.exe` shim
+    // wrapper, see `windowsShimLaunch`) re-parents the agent out of
+    // `taskkill /T`'s reach. `stdin.end()` above is the graceful half.
+    killProcessTree(pid)
+  } else {
+    try {
+      process.kill(-pid, 'SIGTERM')
+    } catch {
+      child.kill('SIGTERM')
+    }
+  }
+  // Everything except the escalation slice: the second wait is only there to
+  // confirm a SIGKILL / taskkill landed, and it must fit inside the same budget.
+  if (await waitForChildExit(child, Math.max(0, budgetMs - KILL_ESCALATION_GRACE_MS))) return
+  if (windows) {
+    killProcessTree(pid)
+  } else {
+    try {
+      process.kill(-pid, 'SIGKILL')
+    } catch { /* already gone */ }
+  }
+  // Whatever is left of the deadline, never a fresh grace period.
+  await waitForChildExit(child, Math.max(0, deadline - Date.now()))
+}
+
+/** Resolve true once the child is gone, false when the budget runs out first. */
+function waitForChildExit(child: ChildProcess, budgetMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true)
+  return new Promise<boolean>((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const settle = (gone: boolean): void => {
+      if (timer !== undefined) clearTimeout(timer)
+      child.off('exit', onGone)
+      child.off('close', onGone)
+      resolve(gone)
+    }
+    const onGone = (): void => { settle(true) }
+    timer = setTimeout(() => { settle(false) }, budgetMs)
+    // The host may exit while this waits; an armed timer must not hold it open.
+    timer.unref?.()
+    child.once('exit', onGone)
+    child.once('close', onGone)
+  })
 }
 
 /**
@@ -8024,14 +8331,31 @@ export class BridgeManager {
     await this.bridges.get(agentId)?.stop('agent-stopped')
   }
 
+  /**
+   * Host shutdown: park every conversation, then make sure no agent child
+   * outlives the host. Bridges run CONCURRENTLY against one bounded budget, so a
+   * single wedged agent cannot spend every other bridge's slice too.
+   *
+   * `/acp`'s "stop this agent" gesture is `stopAgent` → `stop`, which is a
+   * different promise: it closes the sessions on purpose. See
+   * `AgentBridge.shutdown` for why host exit must not.
+   */
   async shutdownAll(): Promise<void> {
     if (this.stallTimer !== undefined) {
       clearInterval(this.stallTimer)
       this.stallTimer = undefined
     }
-    this.dshSessionMap.clear()
     this.disposeTurnStreamsOf(() => true)
-    await Promise.all([...this.bridges.values()].map(b => b.stop('agent-stopped')))
+    // NOT cleared before the shutdown: `persistAgents` (called from
+    // `parkSessions`) writes the parked records out of `dshSessionMap`, and
+    // that write is what keeps the conversations resumable across the restart.
+    //
+    // `allSettled`, not `all`: one bridge's failure must neither skip the
+    // others nor reject a disposer that never asked for an answer. And NOT
+    // cleared afterwards either: a late `persistAgents` would then write
+    // `chatSessions: []` and erase exactly what the shutdown just saved. These
+    // records are terminal — nothing reads them again after disposal.
+    await Promise.allSettled([...this.bridges.values()].map(b => b.shutdown(SHUTDOWN_BUDGET_MS)))
   }
 
   /** Host-side reader of the harness preset roster (`ctx.agentPresets`), for `presetStatus`. */

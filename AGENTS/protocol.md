@@ -44,7 +44,7 @@
 
 **聊天面的四轴写入不走这条恢复**：composer 的 `session/chat-mode-set` / `chat-model-set` / `chat-effort-set` / `chat-config-set` 对 released 会话**只记录选择、绝不唤醒进程**（用户决策 2026-10-30，与释放横幅「只在发消息或点按钮时回来」同一哲学），选择由 `applyChatChoice` 在下一次恢复（下一条消息或横幅按钮）时统一应用。`setChatSessionMode` 曾是四轴里唯一先 resume 的（「模式切换本身就是把 agent 拉回来的理由」），已收回——挂起就是挂起。显示侧 released 行必须让位给 pick（`describeRoute` / `modeInForce`），否则提前切换看起来像死控件。→ [ui.md §3](./ui.md)
 
-**记录跨宿主重启存活**：聊天会话记录持久化在 `agents.json` 的 `chatSessions`（[state.md §3.1](./state.md)），宿主重启后以 released 复原——`session/chat-resume` 与下一条消息照常走 `session/load`，释放横幅照常显示。没有这层，重启后的下一条消息会静默新开一条没有上下文的会话，「released ≠ 销毁」就断在进程边界上。
+**记录跨宿主重启存活**：聊天会话记录持久化在 `agents.json` 的 `chatSessions`（[state.md §3.1](./state.md)），宿主退出本身也走释放语义（`AgentBridge.shutdown`，见 §7）而不是 `stop`；宿主重启后以 released 复原——`session/chat-resume` 与下一条消息照常走 `session/load`，释放横幅照常显示。没有这层，重启后的下一条消息会静默新开一条没有上下文的会话，「released ≠ 销毁」就断在进程边界上。
 
 **显式恢复（用户手势）**：对话内「进程已释放」横幅的「恢复进程」按钮走 `session/chat-resume`（`BridgeManager.resumeChatSession`，按 DSH 聊天会话 id 寻址）——与下一条消息的惰性恢复同一套动作，但**绝不能走创建路径**（横幅按钮不得为没跑过 agent 的会话凭空 spawn 会话；查无绑定回 `unknown_session`）。会话已活时幂等返回（双击 / 与下一条消息竞速都不拉起第二个进程）。恢复后必须照 `getOrCreateDshSession` 的 released 分支重放 chat side effects（`lockChatAgent` / `syncConversationRoute` / `applyChatChoice` / 清 `provisionalLock`）——`session/load` 回来的会话跑在 agent 默认值上，不重放选择就是「芯片写 B、agent 跑 A」。UI 见 [ui.md §10.1](./ui.md)。
 
@@ -71,7 +71,7 @@
 - **范围**：`AgentBridge.releaseIfIdle` 只释放 `state === 'ready'` 且 `hasActiveWork() === false` 的 bridge。活跃 = 有进行中的 turn（含已 abort、agent 尚未结算，`running || settled`）、待答审批、mode/config 命令在途（`pendingCommands`）、`pendingProbes` / `pendingCreates` / `pendingForks`（分叉在途，§1）/ `resuming` / `starting`。**空闲的 live 会话不算活跃**：释放把它们挂起为 `released`（不是关闭），下一条消息经 `session/load` 恢复，30 分钟窗口因此对聊天进程真正生效。
 - **可恢复性闸门**：agent 未声明 `loadSession` 时，有 live 会话的 bridge 不释放——无法 reload 的会话会在下一条消息时丢失上下文；这类 agent 仍等价于旧的「无 live 会话才释放」。
 - **工作区搬迁不共用这条放宽**：`ensureReady` 的就地重启仍要求 `isQuiet()`（无 live 会话且无活跃工作），避免多个工作区的会话互相把进程搬来搬去。两个谓词共享 `hasActiveWork()`，「无 live 会话」只属于搬迁。
-- **动作**：必须走 `releaseAll(reason)` 而不是 `stop()`——`stop` 会 `released.clear()`，毁掉尚未恢复的会话上下文。释放**静默进行，严禁广播 `agent/notice`**；`agent/notice` 只留给异常或伴随用户动作的事件（探测失败、权限超时、就地搬迁工作区）。
+- **动作**：必须走 `releaseAll(reason)` 而不是 `stop()`——`stop` 会 `released.clear()`，毁掉尚未恢复的会话上下文（宿主退出同理，走 `AgentBridge.shutdown`，见 §7）。释放**静默进行，严禁广播 `agent/notice`**；`agent/notice` 只留给异常或伴随用户动作的事件（探测失败、权限超时、就地搬迁工作区）。
 - **计时**：只有 `ready` 才武装定时器，窗口从 `lastActivityAt` 起算；`touch()` 会清掉已武装的定时器并按最新活动重排，因此窗口永远量到「最近一次活动」而不是更早的武装时刻。判定为「忙」时必须 `touch()` 重置窗口，否则会以 0ms 延迟自旋。
 - **两档窗口**（`currentIdleTimeoutMs`）：
   - 从未登记过真实会话的 bridge（`everHostedSession === false`，探测拉起的进程，`probeConfigOptions` 刻意不登记会话）走 `DEFAULT_TUNING.probeIdleTimeoutMs`（默认 5 分钟，**固定**、不随全局设置变）。`def.idleTimeoutMs`（含 `0` = 永不释放）是关于聊天进程的承诺，不管探测进程。
@@ -158,6 +158,12 @@ coordinator 用 `Agent` 工具派发 detached worker、说「已派…」，随�
 - spawn 一律 `windowsHide: true`。
 - 回收走 `killProcessTree(pid)`（`taskkill /t /f`，与 POSIX 杀进程组对齐），且必须在进程树完整时执行。
 
+**宿主退出**（`BridgeManager.shutdownAll` → `AgentBridge.shutdown`）走**释放**语义，与「用户停这个 agent」（`stopAgent` → `stop`：逐会话 `session/close` 后 `released.clear()`，即销毁）不是一回事：`parkSessions` 把 live 会话标成 released（保留记录、广播 `session/released` + `cause: 'shutdown'`、**不**发 `session/closed`），落盘后子进程才死，重启后照常 `session/load`（约束 10）。跳过 per-session RPC 也是预算的第一层收敛：N 个会话不再串行 N × `SESSION_CLOSE_TIMEOUT_MS`；bridge 并发，`shutdown(SHUTDOWN_BUDGET_MS = 4s)` 是**整条预算**（含升级尾巴）：首个等待最多 `4s − 500ms`，升级后只等剩余时间，`killChildAndWait` 到点必 resolve。`shutdownAll` 用 `Promise.allSettled`（一个 bridge 失败不影响其余、不向 disposer 抛），且**不**在结束后清 `dshSessionMap`——迟到的 `persistAgents` 会把它写成 `chatSessions: []`，正好抹掉刚存下的记录。
+
+- **杀是真等到的**：`disposeChild` 先 `stdin.end()` + 平台 kill（win32 `taskkill /t /f`、POSIX 组 `SIGTERM`），等 `exit` / `close` 到「预算 − `KILL_ESCALATION_GRACE_MS`」；POSIX 再发组 `SIGKILL`、win32 再发一次 `taskkill`，只再等到同一个 deadline（那 500ms 是被**预留**的一段，不是额外加时）。非停机路径（空闲释放 / 崩溃 / `forceReset` / 启动失败）仍走 fire-and-forget 的 `killChild()`，其整条预算为 `KILL_ESCALATION_DELAY_MS = 3s`——CRASH ≠ DESTROY（约束 10）。
+- **启动竞速**：`AgentBridge.teardownEpoch` 只由**主动** teardown（`stop` / `shutdown` / `forceReset`）递增；`spawnAndConnect` 在每次 await 后（`ensureAgentExecutable` 之后、`initialize` 之后）校验，过期就把刚 spawn 的子进程用可等待的 kill 收掉、清掉 `conn`，不翻 `ready`。`killChild` / `releaseAll` **不**递增——它们也是启动自身失败的路径（`withStartupTimeout`、子进程在握手期间死掉会经 `connectionLost` → `releaseAll('died')`），那次失败必须照常发 `state: error` + `stderrTail`（设置页失败卡片靠这对字段展开）；`ensureReady` 的成功分支另行校验 `state === 'starting'`，因此崩溃释放之后迟到的握手结果也翻不回 `ready`。
+- **进程级兜底**：模块级 `process.once('exit')` + live pid 集合（spawn 加入，`exit` / `close` 移除），处理器里同步 `SIGKILL` / `spawnSync taskkill`。只覆盖「宿主还能跑 `exit` 的退出」；**不注册 `SIGINT` / `SIGTERM`**（会改宿主自身的信号处置、可能重复处理宿主停机），也不做 job object / PID 文件——**宿主被 SIGKILL 或断电仍可能留下孤儿进程，这是明确的非目标**。
+
 ## 8. 数据保真
 
 用户要求：ACP agent 发什么就兜住什么。截断与占位的损失不是「少看几行」，而是 agent 说了、我们当作它没说。
@@ -178,7 +184,7 @@ coordinator 用 `Agent` 工具派发 detached worker、说「已派…」，随�
 
 | 主题 | 位置 |
 |---|---|
-| 桥与进程 | `src/bridge.ts` · `spawnAndConnect` / `killChild` / `killProcessTree` / `windowsShimLaunch` |
+| 桥与进程 | `src/bridge.ts` · `spawnAndConnect` / `teardownEpoch` / `killChild` / `killChildAndWait` / `disposeChild` / `killProcessTree` / `reapLiveChildren` / `windowsShimLaunch`；宿主退出 `BridgeManager.shutdownAll` / `AgentBridge.shutdown` / `parkSessions` |
 | 恢复 | `src/bridge.ts` · `connectionLost` / `releaseAll` / `resumeSession` / `locateOrResume` |
 | 超时与取消 | `src/bridge.ts` · `withStartupTimeout` / `armCancelFallback` / `runPrompt` |
 | 卡死收口 | `src/bridge.ts` · `BridgeManager.reapStalledTurns` / `prepareStalledSession`；`LiveSession.turnController` / `activeToolCalls` / `orphanPromptTurnSeq` / `reclaimedTurnSeq`；`TurnStreamController.stale` / `hasOpenSegment` / `settle`（`INACTIVITY_TIMEOUT`）；`AgentBridge.finalizeTurn` / `forceReset`（§6.1） |

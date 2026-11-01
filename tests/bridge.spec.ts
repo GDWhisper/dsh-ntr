@@ -4,7 +4,7 @@
  */
 
 import { fileURLToPath } from 'node:url'
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
@@ -89,6 +89,25 @@ async function settleTranscript(manager: BridgeManager, sessionId: string, attem
     if (head === previous && head > 0) return
     previous = head
     await new Promise(resolve => setTimeout(resolve, 10))
+  }
+}
+
+/** Poll a condition with a deadline: process death has no event we can await. */
+async function until(condition: () => boolean, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error('condition never became true')
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+}
+
+/** `kill(pid, 0)` is the portable liveness probe (EPERM would also mean alive). */
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
   }
 }
 
@@ -1635,6 +1654,51 @@ describe('reliability (isolated manager, short timeouts)', () => {
       await hung.shutdownAll()
     }
   }, 15_000)
+
+  it('keeps the error state when the child dies during the handshake', async () => {
+    // A CRASH is not a teardown: the settings card auto-expands on
+    // `state=error` + `stderrTail`, which is the only place the user can see why
+    // the agent will not start. Regression for `releaseAll` bumping
+    // `teardownEpoch`: the crash release then looked like a deliberate teardown
+    // to the start's own catch, which published nothing and left the failed card
+    // collapsed and unexplained.
+    //
+    // The child hands its stdout to a GRANDCHILD on purpose: that keeps the pipe
+    // open after it dies, so its own `exit` (→ `connectionLost` →
+    // `releaseAll('died')`) is guaranteed to land before the connection teardown
+    // rejects the pending `initialize`. The other order never reaches
+    // `releaseAll` and passed even with the bug.
+    const crash = new BridgeManager(
+      [{
+        ...def,
+        id: 'crash',
+        command: process.execPath,
+        args: ['-e', [
+          'const { spawn } = require("node:child_process")',
+          'spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: ["ignore", "inherit", "inherit"] })',
+          'console.error("boom: died during initialize")',
+          'setTimeout(() => process.exit(3), 100)',
+        ].join('; ')],
+      }],
+      relHub,
+      100,
+      undefined,
+      undefined,
+      true,
+      { startupTimeoutMs: 5_000 },
+    )
+    try {
+      const result = await dispatchRpc(crash, 'session/start', { agentId: 'crash' })
+      // Caller-visible contract is unchanged: every failed start is
+      // `agent_unreachable`.
+      expect(result).toMatchObject({ ok: false, error: { code: 'agent_unreachable' } })
+      const view = crash.agentViews().find(agent => agent.id === 'crash')
+      expect(view?.state).toBe('error')
+      expect(view?.stderrTail?.join('\n')).toContain('boom: died during initialize')
+    } finally {
+      await crash.shutdownAll()
+    }
+  }, 20_000)
 
   it('serves fs read/write requests inside the sandbox and refuses escapes', async () => {
     const start = await dispatchRpc(relManager, 'session/start', { agentId: 'rel' })
@@ -5969,25 +6033,6 @@ describe('request-path binding (isolated manager)', () => {
  * guessed: without either one cmd.exe reports the line as "not recognized".
  */
 describe('windows shim launch', () => {
-  /** Poll a condition with a deadline: process death has no event we can await. */
-  async function until(condition: () => boolean, timeoutMs = 10_000): Promise<void> {
-    const deadline = Date.now() + timeoutMs
-    while (!condition()) {
-      if (Date.now() > deadline) throw new Error('condition never became true')
-      await new Promise(resolve => setTimeout(resolve, 50))
-    }
-  }
-
-  /** `kill(pid, 0)` is the portable liveness probe (EPERM would also mean alive). */
-  function isAlive(pid: number): boolean {
-    try {
-      process.kill(pid, 0)
-      return true
-    } catch (error) {
-      return (error as NodeJS.ErrnoException).code === 'EPERM'
-    }
-  }
-
   /** The shim writes its (grand)child's pid there once node is up. */
   async function waitForPid(marker: string): Promise<number> {
     await until(() => existsSync(marker))
@@ -6060,6 +6105,165 @@ describe('windows shim launch', () => {
       rmSync(dir, { recursive: true, force: true })
     }
   }, 30_000)
+})
+
+/**
+ * Host shutdown must leave no agent CHILD alive, and must not destroy the
+ * conversations it parks: both are one path now (`BridgeManager.shutdownAll` →
+ * `AgentBridge.shutdown`). The old path called `stop` per bridge, which asked
+ * every session's agent to `session/close` (up to 5s EACH, before the child was
+ * even signalled) and then cleared the released records — a host restart
+ * destroyed every live conversation and could take N × 5s to exit.
+ */
+describe('host shutdown (isolated managers)', () => {
+  /** The manager's bridge for one agent. `bridges` is private; the test needs it. */
+  function bridgeOf(mgr: BridgeManager, agentId: string): AgentBridge {
+    return (mgr as unknown as { bridges: Map<string, AgentBridge> }).bridges.get(agentId) as AgentBridge
+  }
+
+  /** The spawned child. `child` is private; the test needs its identity. */
+  function childPidOf(bridge: AgentBridge): number | undefined {
+    return (bridge as unknown as { child?: { pid?: number } }).child?.pid
+  }
+
+  /**
+   * The child HANDLE, whose `exitCode` / `signalCode` can only be set by the OS
+   * taking the process away. That is a stronger death fact than
+   * `kill(pid, 0)`: a pid can be reused, and a terminated process can still
+   * answer a query while a handle to it is open.
+   */
+  function childHandleOf(bridge: AgentBridge): ChildProcess | undefined {
+    return (bridge as unknown as { child?: ChildProcess }).child
+  }
+
+  /** A process that never speaks ACP: the startup handshake stays pending. */
+  const silentDef: AcpAgentDef = {
+    ...def,
+    id: 'silent',
+    args: ['-e', 'setInterval(() => { /* keep alive */ }, 1000)'],
+  }
+
+  it('reaps the agent child and keeps the conversation resumable', async () => {
+    const shutdownHub = new EventHub()
+    const shutdownEvents: AcpEvent[] = []
+    shutdownHub.subscribe(event => { shutdownEvents.push(event) })
+    // A REAL state file: "still resumable after the host comes back" is a claim
+    // about disk, so the restarted manager below has to read what this one wrote
+    // (`VITEST` would otherwise make `persistAgents` a no-op).
+    const stateDir = mkdtempSync(join(tmpdir(), 'acp-shutdown-'))
+    const storage = join(stateDir, 'agents.json')
+    const mgr = new BridgeManager([{ ...def, id: 'shutdown' }], shutdownHub, 500, storage)
+    let pid = 0
+    let sessionId = ''
+    try {
+      const session = await mgr.getOrCreateDshSession('dsh-shutdown-1', 'shutdown')
+      sessionId = session.sessionId
+      // PIDTAG: the mock appends the pid of the process that served the turn.
+      await mgr.prompt(session.sessionId, 'hello PIDTAG')
+      await until(() => {
+        const { entries } = mgr.transcript(session.sessionId, undefined)
+        const text = (entries as Array<{ update: Record<string, unknown> }>)
+          .map(entry => String((entry.update.content as { text?: string } | undefined)?.text ?? ''))
+          .join('')
+        const found = /PID:(\d+)/.exec(text)
+        if (found !== null) pid = Number(found[1])
+        return pid > 0
+      })
+      expect(isAlive(pid)).toBe(true)
+      const handle = childHandleOf(bridgeOf(mgr, 'shutdown')) as ChildProcess
+      expect(handle.pid).toBe(pid)
+
+      await mgr.shutdownAll()
+
+      // The kill is AWAITED, and this is asserted WITHOUT a poll: the process is
+      // gone the instant shutdown resolves. A poll would also pass for the old
+      // fire-and-forget `killChild()` (the mock dies on SIGTERM anyway), which is
+      // the regression this guards. The handle's `exitCode` / `signalCode` only
+      // change when the OS took the process away; `kill(pid, 0)` is the same
+      // fact through the pid.
+      expect(handle.exitCode !== null || handle.signalCode !== null).toBe(true)
+      expect(isAlive(pid)).toBe(false)
+      // ...and the conversation was RELEASED, not closed: the record survives
+      // and the next message (or a restarted host) can `session/load` it.
+      expect(mgr.sessions()).toEqual([expect.objectContaining({ sessionId, released: true })])
+      expect(shutdownEvents.some(event => event.type === 'session/closed' && event.sessionId === sessionId)).toBe(false)
+      expect(shutdownEvents.some(event => event.type === 'session/released'
+        && event.sessionId === sessionId && event.cause === 'shutdown')).toBe(true)
+    } finally {
+      await mgr.shutdownAll()
+    }
+
+    // A persist AFTER the shutdown must not erase what the shutdown saved:
+    // `persistAgents` writes `dshSessionMap`, so clearing that map on the way
+    // out is exactly how the parked records would vanish from disk. A late call
+    // is normal traffic — any RPC that records a composer choice writes again.
+    mgr.bindChatAgent('dsh-shutdown-late', 'shutdown')
+    const onDisk = JSON.parse(readFileSync(storage, 'utf-8')) as { chatSessions?: Array<{ dshSessionId?: string }> }
+    expect(onDisk.chatSessions?.map(row => row.dshSessionId)).toEqual(['dsh-shutdown-1'])
+
+    // A fresh manager over the same file IS the restarted host: the record must
+    // come back parked (released → the next message resumes it), never closed.
+    const restarted = new BridgeManager([{ ...def, id: 'shutdown' }], shutdownHub, 500, storage)
+    try {
+      expect(restarted.chatSessions('dsh-shutdown-1')).toMatchObject([
+        { sessionId, agentId: 'shutdown', released: true },
+      ])
+    } finally {
+      await restarted.shutdownAll()
+      rmSync(stateDir, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it('leaves no live child when the host shuts down during startup', async () => {
+    const silentHub = new EventHub()
+    const bridge = new AgentBridge(silentDef, silentHub, 200, () => { /* no session to settle */ })
+    // Never awaited yet: `initialize` is still outstanding, so the child is
+    // alive and `state` is `starting` when the shutdown lands.
+    const started = bridge.ensureReady()
+    // Attach the rejection handler NOW: the killed handshake rejects long
+    // before this test is done with the pid, and a late handler reads as an
+    // unhandled rejection to the runner.
+    const settled = started.catch(() => { /* the teardown owns the outcome */ })
+    await until(() => childHandleOf(bridge) !== undefined)
+    const child = childHandleOf(bridge) as ChildProcess
+    const pid = child.pid as number
+    expect(isAlive(pid)).toBe(true)
+
+    await bridge.shutdown(1_000)
+
+    // The awaited kill must have reported the process gone BEFORE shutdown
+    // resolved (the handle's exit is the OS fact; see `childHandleOf`), and this
+    // is asserted without a poll on purpose: a poll would also pass for the old
+    // fire-and-forget `killChild()`.
+    expect(child.exitCode !== null || child.signalCode !== null).toBe(true)
+    expect(isAlive(pid)).toBe(false)
+    // The abandoned start must not paint a live status over the stopped bridge.
+    expect(bridge.state).toBe('stopped')
+    expect(bridge.initResult).toBeUndefined()
+    // The handshake fails when its child dies; a stale start must not surface
+    // as an unhandled rejection or flip the state.
+    await settled
+    expect(bridge.state).toBe('stopped')
+    // The SIGKILL / `taskkill` escalation itself is NOT covered anywhere in this
+    // block: the mock exits on the first signal, and a signal-ignoring child
+    // would mean a new fixture shared with tests that must not change.
+  }, 30_000)
+
+  it('never spawns after a stop that lands while the executable is resolving', async () => {
+    const racedHub = new EventHub()
+    const bridge = new AgentBridge({ ...silentDef, id: 'raced' }, racedHub, 200, () => { /* no session */ })
+    // `ensureReady` yields at `ensureAgentExecutable` before it spawns, so this
+    // stop lands inside that window — the one a global npm install can hold for
+    // minutes.
+    const started = bridge.ensureReady()
+    await bridge.stop()
+
+    // The start resolves without a child and without flipping state: the
+    // teardown epoch refuses to create the process at all.
+    await expect(started).resolves.toBeUndefined()
+    expect(childPidOf(bridge)).toBeUndefined()
+    expect(bridge.state).toBe('stopped')
+  }, 15_000)
 })
 
 /**
