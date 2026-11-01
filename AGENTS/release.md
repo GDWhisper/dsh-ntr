@@ -35,7 +35,7 @@ git log --format='%h %s' "${PREV}"..HEAD
 - [ ] 工作区干净（`git status --short` 无输出）
 - [ ] `npm run prepack` 通过（typecheck + 全部测试 + build）
 - [ ] 已用 `git log vPREV..HEAD` 逐笔核对：区间内每个用户可见提交都有条目
-- [ ] `CHANGELOG.md` 已加本版一节，与 release note 同一套话、带提交号；同一分区按提交顺序排列
+- [ ] `CHANGELOG.md` 已加本版一节，与 release note 同一套话、带提交号；中英双版、同一分区按提交顺序排列、两版末尾都有 compare 链接
 - [ ] 每条条目链接的 commit 都在本版区间内；内部文档 / 测试 / 重构提交没有记成用户改动
 - [ ] release note 按下方「Release note 规则」写好
 - [ ] 要在本机 DSH 里自测：`npm run build` 后重启 DSH（宿主半区是进程内加载的）
@@ -104,41 +104,50 @@ workflow 的权限是 `contents: read`，**不会**自动建 Release，需要手
 
 ```sh
 gh release create v0.1.6 --title "v0.1.6" --notes "$(cat <<'EOF'
-<一句话总结这一版的主线>
-
-## 新增
-
-- ...
-
-## 修复
-
-- ...
+<正文骨架见下方「Release note 规则」：中文版 → --- → 英文版>
 EOF
 )"
 ```
 
 ## Release note 规则（面向用户）
 
-- 标题只写 `vX.Y.Z`，**不加主题后缀**；正文第一行放一句话总结这一版的主线。
+- 标题只写 `vX.Y.Z`，**不加主题后缀**；正文先中文版（第一行一句话总结这一版的主线），`---` 分隔后接同结构的英文版。
 - 清单来自 `git log vPREV..HEAD`（见上方「从提交区间生成记录」）；**严禁**只按本次功能范围或凭记忆写，区间内每一笔用户可见改动都必须有条目。
-- 只写用户能感知到的变化和怎么用；**不写根因、不写内部符号 / 文件名 / 实现机制**。
-- 一条一句话，末尾挂**引入它的**提交链接 `([abc1234](https://github.com/GDWhisper/dsh-ntr/commit/abc1234))`；有 issue 就再挂 issue 链接。同一 commit 对应多条条目时可以重复挂同一个链接。
+- 只写用户能感知到的净改动；**不写根因、不写内部符号 / 文件名 / 实现机制**，也**不写「之前……现在……」的旧行为对照**——一句话讲清改成什么样就够，解释越多越读不出重点。
+- 一条一行，格式 `- **scope**：净改动。([abc1234](https://github.com/GDWhisper/dsh-ntr/commit/abc1234))`；`scope` 用引入它的 commit 的 conventional scope，有 issue 就再挂 issue 链接。同一 commit 对应多条条目时可以重复挂同一个链接。
 - 同一分区按提交时间顺序排列，旧的在前。
-- 分区只留用得上的：`## 新增` / `## 改进` / `## 修复`。
+- 分区只留用得上的：中文 `## 新增` / `## 改进` / `## 修复`，英文对应 `## Added` / `## Improved` / `## Fixed`。
+- 两版末尾各一行 `**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/vPREV...vX.Y.Z`。
 - **只记确定性的改动**：写这一版留下的最终行为；被推翻、回退或只在开发过程中存在过的中间形态不写。`CHANGELOG.md` 与 release note 使用同一套话。
-- `CHANGELOG.md` 每节标题用 `## [X.Y.Z] - YYYY-MM-DD`，新版本加在最上方。
-- 示例（0.2.0）：
+- `CHANGELOG.md` 每节标题用 `## [X.Y.Z] - YYYY-MM-DD`，节内同样中英双版（`### 新增` … / `---` / `### Added` …），新版本加在最上方。
+- 骨架（分区、条目、compare 链接两版各一份）：
 
 ```markdown
-审批询问现在直接出现在对话里，每一条都会送到你面前，不会再隐形挂起（[#2](https://github.com/GDWhisper/dsh-ntr/issues/2)）。
+<中文一句话总结>
 
 ## 新增
 
-- **审批卡直接出现在对话里**：agent 要动敏感东西时，询问卡出现在聊天输入框上方，和输入框同宽居中；选项就是 agent 给的那些（包括「始终允许」），点哪个它就收到哪个。([78545b6](https://github.com/GDWhisper/dsh-ntr/commit/78545b6))
+- **catalog**：后台派出的 agent 进入子智能体清单，条目只读。([459bc73](https://github.com/GDWhisper/dsh-ntr/commit/459bc73))
 
 ## 修复
 
-- **审批卡与输入框对齐**：不再比输入框宽出一截。([fccd95b](https://github.com/GDWhisper/dsh-ntr/commit/fccd95b))
+- **acp**：关闭 DSH 后会话可恢复，退出不再拖长。([f4abd8e](https://github.com/GDWhisper/dsh-ntr/commit/f4abd8e))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.3.4...v0.3.5
+
+---
+
+<English one-line summary>
+
+## Added
+
+- **catalog**: detached workers show up in the subagent catalog as read-only entries. ([459bc73](https://github.com/GDWhisper/dsh-ntr/commit/459bc73))
+
+## Fixed
+
+- **acp**: conversations stay recoverable after the host exits, and shutdown is prompt. ([f4abd8e](https://github.com/GDWhisper/dsh-ntr/commit/f4abd8e))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.3.4...v0.3.5
 ```
 
 ## Workflow 做了什么
