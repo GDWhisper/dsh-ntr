@@ -301,6 +301,13 @@ export interface UiState {
    */
   acpMode: Record<string, boolean>
   /**
+   * External ACP subagent catalog ids (`acp:<toolCallId>`) currently running,
+   * per DSH chat session. Feeds the host's own subagent status map in the
+   * header catalog shadow; entries are removed the moment the worker reports
+   * completed / failed or its turn ends.
+   */
+  activeSubagents: Record<string, string[]>
+  /**
    * Per-chat-session ACP agent binding, as reported by `session/chat-list`'s
    * `boundAgentId` (the host's intent map plus its live-session fallback): who
    * serves this conversation's NEXT message. `session/chat-bind` writes the
@@ -698,6 +705,7 @@ export class AcpStore {
     idleRelease: undefined,
     chatTranscripts: {},
     acpMode: {},
+    activeSubagents: {},
     chatBoundAgent: {},
     chatLockedAgent: {},
     agentLockReveal: {},
@@ -753,6 +761,14 @@ export class AcpStore {
    * could never be corrected.
    */
   private readonly acpModeLive = new Set<string>()
+  /**
+   * Monotonic order for applied `subagents/update` frames, plus a short log of
+   * the recent ones. A `session/chat-list` response can describe the host as of
+   * BEFORE a frame that landed while the read was in flight; the response
+   * replays the later frames over its snapshot instead of replacing them.
+   */
+  private subagentFrameSeq = 0
+  private readonly subagentFrames: Array<{ seq: number; dshSessionId: string; childId: string; running: boolean }> = []
   /**
    * Chat sessions whose host read came back WITHOUT a verdict (no `acpMode`
    * field, or the read failed). The seat gate consults this to retract its
@@ -1469,6 +1485,9 @@ export class AcpStore {
     read: { dropped: boolean },
   ): Promise<void> {
     const settle = options?.settleVerdict === true || !this.acpModeLive.has(dshSessionId)
+    // Captured BEFORE the request: every frame applied after this point is
+    // newer than whatever state the host will answer with.
+    const subagentFramesAtRead = this.subagentFrameSeq
     try {
       const { sessions = [], acpMode, boundAgentId, lockedAgentId, choice } = await this.call<{ sessions: ChatSessionView[]; acpMode?: boolean; boundAgentId?: string; lockedAgentId?: string; choice?: AcpConversationChoice }>('session/chat-list', { dshSessionId, refresh: true })
       // A committed `agent-preset/selected` frame may have settled this
@@ -1499,11 +1518,27 @@ export class AcpStore {
       const agentLockReveal = witnessedLock
         ? { ...this.state.agentLockReveal, [dshSessionId]: (this.state.agentLockReveal[dshSessionId] ?? 0) + 1 }
         : this.state.agentLockReveal
+      // External subagent rows still running, as the host snapshot knows them.
+      // REPLACED, not merged: a reconnect / reload may have missed the
+      // `running: false` frames of ids that stopped while the page was away,
+      // and live frames keep the set fresh from here. Frames that landed
+      // WHILE this read was in flight are newer than the snapshot, though:
+      // replay them over it, or a fresh `running: true` would be erased (grey
+      // until a reload — its frame is never re-sent) and a `running: false`
+      // would resurrect an id the snapshot still lists.
+      const activeSubagents = [...new Set(sessions.flatMap(row => row.activeSubagents ?? []))]
+      for (const frame of this.subagentFrames) {
+        if (frame.seq <= subagentFramesAtRead || frame.dshSessionId !== dshSessionId) continue
+        const at = activeSubagents.indexOf(frame.childId)
+        if (frame.running && at < 0) activeSubagents.push(frame.childId)
+        else if (!frame.running && at >= 0) activeSubagents.splice(at, 1)
+      }
       this.mutate({
         chatSessions: sessions,
         chatSessionsFor: dshSessionId,
         chatLockedAgent,
         agentLockReveal,
+        activeSubagents: { ...this.state.activeSubagents, [dshSessionId]: activeSubagents },
         // The host's binding (intent + live-session fallback) outranks the
         // optimistic entry this store wrote on the click; a host without the
         // field (older half) simply leaves the optimistic value standing.
@@ -2499,6 +2534,33 @@ export class AcpStore {
           trimBlocks(this.state.blocks)
           this.mutate({ sessions: this.state.sessions.map(s => (s.sessionId === event.sessionId ? { ...s, running: false } : s)) })
         }
+        return Promise.resolve()
+      }
+      case 'subagents/update': {
+        // One external catalog row's live status. Only the ONGOING state
+        // exists for these rows (the host excludes them from `completed`), so
+        // this set is what the catalog shadow merges into the host's own
+        // status map — an id absent here reads as the shipped grey idle dot.
+        //
+        // Recorded even when idempotent: a chat-list read in flight answers
+        // with an older snapshot and replays the frames it missed. The log is
+        // bounded; a read captures the sequence before its request, so older
+        // entries are never replayed twice.
+        this.subagentFrameSeq += 1
+        this.subagentFrames.push({
+          seq: this.subagentFrameSeq,
+          dshSessionId: event.dshSessionId,
+          childId: event.childId,
+          running: event.running,
+        })
+        if (this.subagentFrames.length > 256) this.subagentFrames.shift()
+        const current = this.state.activeSubagents[event.dshSessionId] ?? []
+        const present = current.includes(event.childId)
+        if (event.running === present) return Promise.resolve()
+        const next = event.running
+          ? [...current, event.childId]
+          : current.filter(id => id !== event.childId)
+        this.mutate({ activeSubagents: { ...this.state.activeSubagents, [event.dshSessionId]: next } })
         return Promise.resolve()
       }
       default:

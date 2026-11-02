@@ -35,6 +35,7 @@ import {
 } from '../src/client/model-seat.tsx'
 import type { SeatEntry, SeatSlots } from '../src/client/model-seat.tsx'
 import { ACP_PRESET_ID, stagedIsAcpMode, stagedSessionOf } from '../src/client/acp-ui.tsx'
+import { SUBAGENT_CATALOG_ENTRY_ID, SUBAGENT_CATALOG_SLOT } from '../src/client/subagent-activity.tsx'
 import { apply } from '../src/client/index.tsx'
 
 describe('the native model seat is occupied by the ACP base on an ACP conversation', () => {
@@ -812,7 +813,7 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
    * session-list rows that carry no `agentPreset`, so the row cannot answer and
    * only the verdict map can.
    */
-  function makeHost(options: { silentRow?: boolean; withList?: boolean; triggers?: unknown[]; activityHost?: boolean } = {}) {
+  function makeHost(options: { silentRow?: boolean; withList?: boolean; triggers?: unknown[]; activityHost?: boolean; catalogHost?: boolean } = {}) {
     interface Entry { component: unknown; options: { priority: number; registrant?: string; id?: string }; inject?: unknown; locale?: string }
     const cells = new Map<string, Entry[]>()
     const declared = new Set<string>([
@@ -820,6 +821,7 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
       PERMISSION_SEAT_KEY,
       'conversation.view',
       'conversation.composer.dock',
+      SUBAGENT_CATALOG_SLOT,
     ])
     let counter = 0
     let registrations = 0
@@ -827,6 +829,7 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
     const nativeModel = { native: 'ModelSelect' }
     const nativePermission = { native: 'PermissionSelect' }
     const nativeActivity = { native: 'ActivityPill' }
+    const nativeCatalog = { native: 'SubagentCatalogAction' }
     cells.set(MODEL_SEAT_KEY, [{ component: nativeModel, options: { priority: 0, registrant: 'client-ui-model-selection' } }])
     cells.set(PERMISSION_SEAT_KEY, [{ component: nativePermission, options: { priority: 0, registrant: 'client-ui-permission-presets' } }])
     if (options.activityHost === true) {
@@ -837,12 +840,22 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
         locale: 'chat',
       }])
     }
+    if (options.catalogHost === true) {
+      cells.set(SUBAGENT_CATALOG_SLOT, [{
+        component: nativeCatalog,
+        options: { priority: 0, registrant: 'client-ui-subagent', id: SUBAGENT_CATALOG_ENTRY_ID, order: 10 },
+        inject: () => ({ openChild() {}, openChildAside() {}, refreshProjection() {} }),
+        locale: 'subagent',
+      }])
+    }
     // The proven synchronous emission: our own registration and our own
     // unregistration both notify the gate from inside their own call stack.
     const emitChanged = (key: string): void => { for (const handler of [...cellHandlers]) handler(key) }
 
     const slots = {
-      spec: (key: string) => (declared.has(key) ? { kind: key === 'conversation.composer.dock' ? 'list' : 'single' } : undefined),
+      spec: (key: string) => (declared.has(key)
+        ? { kind: key === 'conversation.composer.dock' || key === SUBAGENT_CATALOG_SLOT ? 'list' : 'single' }
+        : undefined),
       entriesOfSlot: (key: string) => {
         const sorted = [...(cells.get(key) ?? [])].sort((a, b) => a.options.priority - b.options.priority)
         if (key !== 'conversation.composer.dock') return sorted
@@ -971,9 +984,11 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
       count(key: string) { return (cells.get(key) ?? []).length },
       isNative(key: string, native: unknown) { return slots.entriesOfSlot(key)[0]?.component === native },
       activityHead() { return slots.entriesOfSlot('conversation.composer.dock').find(entry => entry.options.id === 'activity') },
+      catalogHead() { return slots.entriesOfSlot(SUBAGENT_CATALOG_SLOT).find(entry => entry.options.id === SUBAGENT_CATALOG_ENTRY_ID) },
       nativeModel,
       nativePermission,
       nativeActivity,
+      nativeCatalog,
       stage(sessionId: string, row: { agentPreset?: string; subagent?: boolean } | undefined) {
         snapshot = row === undefined
           ? { byId: {}, ids: [] }
@@ -1064,6 +1079,21 @@ describe('the ACP-mode gate hands the permission seat back when the conversation
     host.stage('s1', { agentPreset: 'standard' })
     expect(host.count('conversation.composer.dock')).toBe(1) // host only
     expect(host.activityHead()?.component).toBe(host.nativeActivity)
+  })
+
+  it('shadows the host subagent catalog trigger only on an ACP conversation', () => {
+    // Same discipline as the activity pill: a LIST id shadowed by a
+    // lower-ranked entry of the same id, in ACP mode only — an ordinary
+    // conversation keeps the shipped trigger exactly as it was.
+    const host = makeHost({ catalogHost: true })
+    apply(host.ctx as never)
+    host.stage('s1', { agentPreset: ACP_PRESET_ID })
+    expect(host.count(SUBAGENT_CATALOG_SLOT)).toBe(2) // host + shadow
+    expect(host.catalogHead()?.component).not.toBe(host.nativeCatalog)
+
+    host.stage('s1', { agentPreset: 'standard' })
+    expect(host.count(SUBAGENT_CATALOG_SLOT)).toBe(1) // host only
+    expect(host.catalogHead()?.component).toBe(host.nativeCatalog)
   })
 
   it('follows the renderer current selection, not the first retained row', () => {

@@ -473,6 +473,19 @@ export type AcpEvent =
     }
   | { type: 'turn/end'; sessionId: string; turnId: string; stopReason?: string; error?: string }
   /**
+   * One ACP-dispatched worker became active/inactive in the host's
+   * EXTERNAL subagent catalog. `childId` is the catalog id
+   * (`acp:<toolCallId>`); the browser merges it into the host's own
+   * status map so the host's dot can read it.
+   */
+  | {
+      type: 'subagents/update'
+      /** DSH chat session id that owns the catalog row. */
+      dshSessionId: string
+      childId: string
+      running: boolean
+    }
+  /**
    * A DSH chat conversation was locked to its agent at the start of its first
    * ACP turn. Addressed by the CHAT session id (the browser may not know the
    * ACP session yet). The composer plays its base→tag hand-off on this frame;
@@ -598,6 +611,12 @@ export interface ChatSessionView {
   released?: boolean
   /** The agent is running a turn on this session right now. */
   running?: boolean
+  /**
+   * External (ACP-dispatched) subagent catalog ids still running for this
+   * session. Seeds the browser's active set after a reload / reconnect;
+   * live updates arrive as `subagents/update` frames.
+   */
+  activeSubagents?: string[]
   /**
    * Whether this session's ACP agent can be forked (`session/fork`) into a
    * child conversation, as the host computed it. The browser does not derive

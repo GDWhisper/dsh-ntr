@@ -137,6 +137,9 @@
  *  - "DISPATCHPARKED" (with DISPATCH) → the response lands between driver
  *              steps (right after the ack) and the worker starts while the
  *              host is away: a parked hold's step must adopt it later
+ *  - "DISPATCHCOMPLETEMETA" (with DISPATCH) → the detached signal and the
+ *              completion arrive in ONE frame (isBackground + status completed),
+ *              before anyone reported the row: it must never light
  *
  * Environment knobs:
  *  - MOCK_NO_LOAD=1 → `initialize` advertises no `loadSession` capability
@@ -519,6 +522,7 @@ const app = agent({ name: 'mock-acp-agent' })
       const ackNoDrain = text.includes('DISPATCHACKNODRAIN')
       const lateDrain = text.includes('DISPATCHLATEDRAIN')
       const altFirst = text.includes('DISPATCHALTFIRST')
+      const completedMeta = text.includes('DISPATCHCOMPLETEMETA')
       // A long but healthy worker: it keeps emitting updates well past the
       // client's worker-phase SILENCE window. Those updates must push that
       // window out instead of letting a fixed total runtime cut the turn.
@@ -663,6 +667,14 @@ const app = agent({ name: 'mock-acp-agent' })
       }
 
       await sendFirst(dispatchId)
+      if (completedMeta) {
+        // One frame that is simultaneously the detached re-send and the
+        // completion, on a dispatch nobody has reported yet. The row must not
+        // light: its work is already over.
+        await notify({ sessionUpdate: 'tool_call_update', toolCallId: dispatchId, status: 'completed' }, resendMeta)
+        await sleep(20)
+        return { stopReason: 'end_turn', _meta: { 'codebuddy.ai/conversationRequestId': drainId, 'codebuddy.ai/requestId': drainId } }
+      }
       if (identityOnly) {
         // The worker is already alive before the parent's result frame, so the
         // detached evidence arrives WITHOUT a usable label: the client must

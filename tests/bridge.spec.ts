@@ -7781,6 +7781,7 @@ describe('a turn that dispatched a detached worker (isolated manager)', () => {
 
   it('reports the detached worker to the host subagent catalog once', async () => {
     const dshSessionId = 'dsh-dispatch-catalog'
+    const since = dispatchEvents.length
     const calls: Array<{ dshSessionId: string; childId: string; label: string }> = []
     dispatchManager.setSubagentCatalogReporter((reportedSessionId, childId, label) => {
       calls.push({ dshSessionId: reportedSessionId, childId, label })
@@ -7799,6 +7800,48 @@ describe('a turn that dispatched a detached worker (isolated manager)', () => {
         childId: 'acp:agent_dispatch',
         label: 'general-purpose · explorer',
       }])
+
+      // The row's live status rides its own frames: the host's external rows
+      // have no Session, so nothing else can tell the browser the worker runs.
+      // Exactly one `running: true` when the row is reported, then exactly one
+      // `running: false` once the call completed / the turn closed.
+      const activity = dispatchEvents
+        .slice(since)
+        .filter((event): event is Extract<AcpEvent, { type: 'subagents/update' }> =>
+          event.type === 'subagents/update' && event.childId === 'acp:agent_dispatch')
+      expect(activity.map(event => event.running)).toEqual([true, false])
+      expect(activity.every(event => event.dshSessionId === dshSessionId)).toBe(true)
+    } finally {
+      dispatchManager.setSubagentCatalogReporter(undefined)
+    }
+  }, 30_000)
+
+  it('never lights a row whose detached signal and completion share one frame', async () => {
+    const dshSessionId = 'dsh-dispatch-completed-meta'
+    const since = dispatchEvents.length
+    const calls: Array<{ dshSessionId: string; childId: string; label: string }> = []
+    dispatchManager.setSubagentCatalogReporter((reportedSessionId, childId, label) => {
+      calls.push({ dshSessionId: reportedSessionId, childId, label })
+    })
+    try {
+      await hostLoopTurn(dispatchAdapter, {
+        provider: 'acp',
+        model: 'dispatch',
+        sessionId: dshSessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'DISPATCH DISPATCHCOMPLETEMETA' }] }],
+      })
+      // The catalog fact is still recorded (the row exists), but its work is
+      // over: no `running: true` may ever be sent for it, so there is no
+      // `[true, false]` flicker in the host's dot either. (The label itself is
+      // not the subject here: this synthetic frame carries no rawInput, so the
+      // refresh may only know the role.)
+      expect(calls).toHaveLength(1)
+      expect(calls[0]).toMatchObject({ dshSessionId, childId: 'acp:agent_dispatch' })
+      const activity = dispatchEvents
+        .slice(since)
+        .filter((event): event is Extract<AcpEvent, { type: 'subagents/update' }> =>
+          event.type === 'subagents/update' && event.childId === 'acp:agent_dispatch')
+      expect(activity).toEqual([])
     } finally {
       dispatchManager.setSubagentCatalogReporter(undefined)
     }

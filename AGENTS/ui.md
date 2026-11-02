@@ -100,6 +100,13 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 - **数据与口径**：`src/tps.ts` · `TurnTpsTracker` 只按连续 prose 的 ≤1s 间隔计时，`tool_call` / 审批 / turn 边界断开；分子是正文 + 思考字符 ÷4。`TurnStreamController` 在 live 路径按 seq 去重（segment replay 不重复计数），每 ≥1s 广播 `turn/metrics`，settle 时先落 `session.burst`（随 `chatSessions` 持久化）再广播 final，之后才是 `turn/end`。浏览器按 ACP session 读 live `burstStats`，页面重载由 `session/chat-list` 的 `row.burst` 种子恢复。
 - **生命周期与 fail-open**：claim 与两个座位同生命周期（`syncAcpMode` 确认 ACP 时建，`standDown` / 卸载释放），dock 的 `slots/changed` 也触发重试。宿主没有 `activity`（0.1.5 是 `stats`）、没有 `inject` / `locale` / `performanceUsage`，或条目类型不是 list → 不注册，原生 pill 照旧；宿主组件抛错时槽的 error boundary 让影子条目 abdicate，原生条目自动回来。多视图里只有舞台会话拿到 `acpMode === true`，其他 ACP 面板直通原生速率（与座位 claim 的全局性同一取舍）。宿主升级后必须重跑影子 spike。
 
+### 4.3 头部子代理目录 trigger（`conversation.session.header.actions` id `subagent-catalog`）
+`src/client/subagent-activity.tsx` 接管宿主头部那个子代理目录触发器，让 ACP 派出的 detached worker 点亮宿主自己的 ongoing 圆点。
+
+- **为什么只能是影子**：external 目录行（`acp:<toolCallId>`）没有真正的宿主 Session，宿主只从自己的 status map / summaries 取行活跃度，取不到就画灰点；线上事实在插件这侧（`subagents/update` → `store.activeSubagents`）。做法照 §4.2：同 id、更低 priority 的 list cell claim，渲染**宿主自己的组件**，只把 `useSessionStatus` 换成「活跃 id 标 `running: true`」的投影——trigger 圆点、每行圆点、aria 与下拉全是宿主的。
+- **只有 ongoing 可达**：宿主写死 `completed = !external && …`，external 行永远拿不到「已完成」绿点，**严禁**自绘 done 点或「正在运行」副文案。
+- **闸门与 fail-open**：claim 与其它座位同生命周期（`syncAcpMode` 确认 ACP 时建，`standDown` / 卸载释放），`slots/changed` 也触发重试；非 ACP 或无活跃 id 时原样直通宿主 hook（视觉与原生条目一致）。有活跃 id 时替换后的 hook **仍调用宿主 hook 本身**——宿主的 hook 序列不能随活跃集合切换（否则 React 在同一挂载上报 hook 数量变化，错误边界会让影子条目 abdicate）。宿主没有该条目 / 不是 `list` / 缺 component·inject·locale → 不注册，原生 trigger 照旧。宿主条目的 `inject`（`openChild` / `openChildAside` / `refreshProjection`）必须一并调用，否则目录行不可导航。
+
 ## 5. NTR 视图 tab
 
 真工具卡只能在 `conversation.view` 的 NTR tab（`src/client/acp-view.tsx`）里画。
@@ -232,6 +239,7 @@ NTR 会话里，宿主的点赞 / 点踩 / 分支三图标是插件的业务：a
 | 锁定 UI | `src/client/session-controls.tsx` · `lockedAgentOf` / `agentBaseHidden` / `agentTagVisible` / `agentTagAlive` / `agentTagHaloPresentation` / `AcpComposerAgentTag`；`src/client/agent-lock-anim.ts` |
 | 视图 | `src/client/acp-view.tsx` · `boundAgentOf` / `acpEmptyCopy` / `diffRows` / `isNewFileDiff` / `historyAwaitsReplay`；`src/client/context-meter.tsx` · `AcpContextMeter` / `acpMeterUsage` / `contextOccupancy` / `compactTokenCount`；`src/client/index.tsx` · `acp-context-meter` 注册处 |
 | tok/s | `src/tps.ts` · `TurnTpsTracker`；`src/bridge.ts` · `TurnStreamController.trackTps` / `finalizeTps` / `BridgeManager.noteSessionBurst`；`src/client/activity-pill.tsx` · `createActivityPillClaim` / `ActivityPillOccupant` / `patchedActivityStats` / `activityBurst`；`src/client/index.tsx` · `activityClaim` 注册处 |
+| 子代理圆点 | `src/client/subagent-activity.tsx` · `createSubagentCatalogClaim` / `SubagentCatalogOccupant` / `mergeSubagentStatuses`；`src/client/index.tsx` · `subagentCatalogClaim` 注册处；`src/bridge.ts` · `TurnStreamController.openDispatchActivity` / `closeDispatchActivity` / `activeCatalogChildIds` / `BridgeManager.chatSessions` |
 | 权限卡 | `src/client/permission-dock.tsx` · `PermissionDock` / `PermissionAskCard`；`src/client/store.ts` · `permissionsForSession` / `deadlineRemainingLabel`；`src/client/index.tsx` · `acp-permissions` 注册处 |
 | 释放横幅 | `src/client/released-banner.tsx` · `ReleasedBanner` / `releasedBannerVisible`；`src/client/store.ts` · `resumeChatSession` / `withSessionReleased`；`src/client/index.tsx` · `acp-released-banner` 注册处 |
 | 消息动作 | `src/client/branch-action.tsx` · `AcpBranchAction`；`src/client/store.ts` · `forkStateOf` / `forkChatSession`；`src/client/index.tsx` · `setScopeMarker` / `probeHostActionLabels` / `ntr-branch` 注册处；`src/client/acp-ui.tsx` · 隐藏规则与 `.ntr-branch-action` 样式（见 §12） |

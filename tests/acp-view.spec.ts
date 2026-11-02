@@ -18,6 +18,7 @@ import { acpMeterUsage, compactTokenCount, contextOccupancy } from '../src/clien
 import { approvalDeadlineFacts, DEADLINE_MIN_WAIT_MS, deadlineSliderIndex, deadlineValueFor } from '../src/client/panel.tsx'
 import { describeRoute, menuFor, REFRESH_CATALOG_ITEM } from '../src/client/session-controls.tsx'
 import { AcpStore, deadlineRemainingLabel, PERMISSION_DEADLINE_EXPIRED, permissionsForSession, usageFromUpdate } from '../src/client/store.ts'
+import { mergeSubagentStatuses } from '../src/client/subagent-activity.tsx'
 import type { PendingPermission } from '../src/client/store.ts'
 import { APPROVAL_DEADLINE_MIN_WAIT_MS, isAbsolutePath, splitAdapterModelId, splitCommandLine as hostSplitCommandLine, tokenizeCommandLine as hostTokenizeCommandLine } from '../src/impl.ts'
 import type { AgentCatalogResult, AgentView, ChatSessionView } from '../src/protocol.ts'
@@ -1241,3 +1242,39 @@ describe('resolveHostFork (branch-action.tsx)', () => {
   })
 })
 
+describe('mergeSubagentStatuses', () => {
+  const existing = new Map<string, unknown>([
+    ['acp:other', { running: false, pendingInteraction: undefined, completionUnread: true }],
+    ['session-1', { running: true, pendingInteraction: undefined, completionUnread: false }],
+  ])
+
+  it('returns the original map when there is nothing to light', () => {
+    expect(mergeSubagentStatuses(existing, undefined)).toBe(existing)
+    expect(mergeSubagentStatuses(existing, [])).toBe(existing)
+  })
+
+  it('marks each active external id running without touching the rest', () => {
+    const merged = mergeSubagentStatuses(existing, ['acp:call-1'])
+    expect(merged).not.toBe(existing)
+    // The host reads exactly `running` from this value; the other two members
+    // exist so a newer host does not see an undefined field.
+    expect(merged.get('acp:call-1')).toEqual({
+      running: true,
+      pendingInteraction: undefined,
+      completionUnread: false,
+    })
+    // Existing entries survive byte-identical, including one that is already
+    // in the map (an id both sides know is overridden by the live fact).
+    expect(merged.get('session-1')).toEqual(existing.get('session-1'))
+    expect(merged.get('acp:other')).toBe(existing.get('acp:other'))
+    expect(existing.get('acp:call-1')).toBeUndefined()
+  })
+
+  it('lights every active id and keeps unrelated entries', () => {
+    const merged = mergeSubagentStatuses(existing, ['acp:a', 'acp:b'])
+    expect(merged.size).toBe(4)
+    expect((merged.get('acp:a') as { running: boolean }).running).toBe(true)
+    expect((merged.get('acp:b') as { running: boolean }).running).toBe(true)
+    expect(merged.get('session-1')).toBe(existing.get('session-1'))
+  })
+})

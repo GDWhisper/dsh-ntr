@@ -28,6 +28,7 @@ import { PermissionDock } from './permission-dock.tsx'
 import { ReleasedBanner } from './released-banner.tsx'
 import { AcpBranchAction, resolveHostFork } from './branch-action.tsx'
 import { createActivityPillClaim, DOCK_SLOT } from './activity-pill.tsx'
+import { createSubagentCatalogClaim, SUBAGENT_CATALOG_SLOT } from './subagent-activity.tsx'
 import {
   createModelSeatClaim,
   createPermissionSeatClaim,
@@ -503,6 +504,23 @@ export function apply(ctx: Context): void {
       console.warn(`[dsh-ntr] ${line}`)
     }
     /**
+     * Claim on the header's `subagent-catalog` cell
+     * (`conversation.session.header.actions`, id `subagent-catalog`), held for
+     * the same ACP-mode spell. The occupant renders the HOST's catalog trigger
+     * with its `useSessionStatus` substituted so the live `acp:<toolCallId>`
+     * workers light the host's own ongoing dot; outside ACP mode, or with no
+     * live id, the occupant passes the host hook straight through. No host
+     * entry / inject / locale -> no claim and the native trigger stays.
+     */
+    let subagentCatalogClaim: ModelSeatClaim | undefined
+    let subagentCatalogDiag = 'idle'
+    const noteSubagentCatalogDiag = (line: string): void => {
+      if (line === subagentCatalogDiag) return
+      subagentCatalogDiag = line
+      if (!/failed|missing|taken|gave up|still held/.test(line)) return
+      console.warn(`[dsh-ntr] ${line}`)
+    }
+    /**
      * ACP-only auxiliary entries: the NTR view tab and the composer's context
      * ring. Unlike the two seats these are `list` slots with no visibility
      * predicate of their own, so "self-hide in the component" cannot remove a
@@ -588,6 +606,7 @@ export function apply(ctx: Context): void {
       if (claim !== undefined) { claim.release(); claim = undefined }
       if (permissionClaim !== undefined) { permissionClaim.release(); permissionClaim = undefined }
       if (activityClaim !== undefined) { activityClaim.release(); activityClaim = undefined }
+      if (subagentCatalogClaim !== undefined) { subagentCatalogClaim.release(); subagentCatalogClaim = undefined }
     }
     /**
      * Re-ask timer for the staged session, armed while the row is silent and a
@@ -737,6 +756,17 @@ export function apply(ctx: Context): void {
         onDiag: noteActivityDiag,
       })
       activityClaim?.sync()
+      // The header's subagent catalog trigger is the same kind of cell: same
+      // id, lower priority, the HOST component rendered back with the live
+      // external worker ids merged into its status map (so its own ongoing dot
+      // lights). Missing host entry / inject / locale -> no claim, native
+      // trigger stays; a later evaluation retries.
+      subagentCatalogClaim ??= createSubagentCatalogClaim({
+        slots: ctx.slots as unknown as SeatSlots,
+        inject: (sessionId: unknown) => chatFace(sessionId),
+        onDiag: noteSubagentCatalogDiag,
+      })
+      subagentCatalogClaim?.sync()
       // The tab and the occupancy ring have the same lifetime as the claims:
       // they exist only while this staged conversation is an ACP one, and a
       // stand-down disposes them (a standard conversation must not see an NTR
@@ -857,7 +887,10 @@ export function apply(ctx: Context): void {
     // retakes the cell only when it is actually holding something that is not
     // ours — so this is evidence-driven, not a poll.
     const stopCell = ctx.on('slots/changed', (...args: unknown[]) => {
-      if (args[0] !== MODEL_SEAT_KEY && args[0] !== PERMISSION_SEAT_KEY && args[0] !== DOCK_SLOT) return
+      if (args[0] !== MODEL_SEAT_KEY
+        && args[0] !== PERMISSION_SEAT_KEY
+        && args[0] !== DOCK_SLOT
+        && args[0] !== SUBAGENT_CATALOG_SLOT) return
       runGate()
     })
     // Late services: the runtime's session list normally exists before this
@@ -879,6 +912,7 @@ export function apply(ctx: Context): void {
       if (claim !== undefined) { claim.release(); claim = undefined }
       if (permissionClaim !== undefined) { permissionClaim.release(); permissionClaim = undefined }
       if (activityClaim !== undefined) { activityClaim.release(); activityClaim = undefined }
+      if (subagentCatalogClaim !== undefined) { subagentCatalogClaim.release(); subagentCatalogClaim = undefined }
       store.noteSeatDiag('gate disposed')
       store.notePermissionSeatDiag('gate disposed')
     }

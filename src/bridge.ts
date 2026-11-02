@@ -1859,6 +1859,9 @@ export class AgentBridge {
       // it released would park it as resumable, and `doResumeSession` flips
       // `closed` back to false — an idle release resurrecting a closed session.
       if (session.closed) continue
+      // The process that owed the turn is gone, so no worker is still running:
+      // every catalog dot this turn lit goes out before the turn/end below.
+      session.turnController?.releaseDispatchActivity()
       if (session.running) {
         session.running = false
         this.hub.broadcast({ type: 'turn/end', sessionId: session.sessionId, turnId: '', error: reason })
@@ -1980,6 +1983,8 @@ export class AgentBridge {
     // The session is going away: whatever background drain it announced ends
     // with it (a re-created session must not inherit a stale ambient).
     clearAmbientState(session)
+    // ...and so does every catalog dot its turn lit.
+    session.turnController?.releaseDispatchActivity()
     // ...and so does its prompt slot: nothing may keep rejecting a new prompt
     // for a record that is being deleted.
     session.promptInFlight = false
@@ -2066,6 +2071,8 @@ export class AgentBridge {
       this.settlePermissions(session)
       this.openSettleGate(session)
       session.activeToolCalls.clear()
+      // A forced teardown never closes its turn: the dots go out here.
+      session.turnController?.releaseDispatchActivity()
       clearAmbientState(session)
       this.sessions.delete(session.sessionId)
       this.acpIndex.delete(session.acpSessionId)
@@ -2379,6 +2386,10 @@ export class AgentBridge {
   private handleSessionUpdate(params: SessionNotification): void {
     const session = this.acpIndex.get(params.sessionId)
     if (session === undefined) return // update for a session already closed locally
+    // `closeSession` marks the record synchronously and then awaits the
+    // agent's `session/close`; an update racing that wait must not revive
+    // activity (e.g. report a new dispatch) on a record already going away.
+    if (session.closed) return
     // Any update is the agent speaking: restart the stall clock here. A
     // tool-call status also says whether the agent is inside a long-running
     // tool, which earns the wider watchdog window.
@@ -3936,6 +3947,12 @@ interface BackgroundDispatch {
   catalogLabelIdentified: boolean
   /** Whether the host catalog already accepted this dispatch (one fact per call). */
   catalogReported: boolean
+  /**
+   * Whether this dispatch's catalog row is currently reported active in the
+   * browser. Only meaningful once {@link catalogReported} is true: an id that
+   * never reached the catalog has no row to light, so it is never closed.
+   */
+  activity?: 'active' | 'idle'
 }
 
 /**
@@ -4732,15 +4749,23 @@ class TurnStreamController {
         // A known dispatch: the id is the whole evidence (see the doc above).
         this.noteBackgroundWorkerActivity()
         if (status !== '') known.status = status
+        const justCompleted = completedStatus && !known.completed
+        if (justCompleted) {
+          known.completed = true
+          // The catalog row stops being live here, whatever the turn does
+          // next — and BEFORE the report below, whose identity fallback may
+          // report the row for the first time, and before
+          // `noteDispatchProgress`. A frame that is BOTH completed and
+          // `isBackground` must close an already-lit row, never re-open it (a
+          // completed row never lights).
+          this.closeDispatchActivity(known)
+        }
         if (!known.catalogReported) this.refreshSubagentDispatchLabel(known, update)
         if (meta?.isBackground === true) {
           known.detached = true
           this.reportSubagentDispatch(known)
         }
-        if (completedStatus && !known.completed) {
-          known.completed = true
-          this.noteDispatchProgress()
-        }
+        if (justCompleted) this.noteDispatchProgress()
       } else if (meta !== undefined
         && (meta.toolName === 'Agent' || meta.toolName === 'Task')
         && (kind === 'tool_call' || meta.isBackground === true)) {
@@ -4799,6 +4824,7 @@ class TurnStreamController {
     if (!dispatch.catalogLabelIdentified && !dispatch.completed) return
     if (this.manager.reportSubagentCatalog(this.session, `acp:${dispatch.toolCallId}`, dispatch.catalogLabel)) {
       dispatch.catalogReported = true
+      this.openDispatchActivity(dispatch)
     }
   }
 
@@ -4817,6 +4843,77 @@ class TurnStreamController {
     if (!identified && !(typeof title === 'string' && title !== '')) return
     dispatch.catalogLabel = subagentDispatchLabel(update)
     dispatch.catalogLabelIdentified = identified
+  }
+
+  /**
+   * Announce one dispatch's catalog row as running / no longer running in the
+   * browser. The host's external rows have no real Session, so its own status
+   * map can never describe them; this frame is what lets the browser's shadow
+   * of the host catalog light the host's own ongoing dot. A turn with no chat
+   * identity (`/acp` RPC) has no catalog row and nothing to report to.
+   */
+  private broadcastDispatchActivity(dispatch: BackgroundDispatch, running: boolean): void {
+    if (this.session.dshSessionId === undefined) return
+    this.hub.broadcast({
+      type: 'subagents/update',
+      dshSessionId: this.session.dshSessionId,
+      childId: `acp:${dispatch.toolCallId}`,
+      running,
+    })
+  }
+
+  /**
+   * The dispatch is now a reported, still-running catalog row: light it.
+   *
+   * Only a row the catalog ACCEPTED can be lit (`catalogReported`) — an id the
+   * host never stored has nothing to read the status. A dispatch that already
+   * completed before it was reported (the identity-less fallback at completion)
+   * never lights at all: its work is over by definition.
+   */
+  private openDispatchActivity(dispatch: BackgroundDispatch): void {
+    if (dispatch.completed || !dispatch.catalogReported || dispatch.activity === 'active') return
+    dispatch.activity = 'active'
+    this.broadcastDispatchActivity(dispatch, true)
+  }
+
+  /**
+   * The dispatch's work ended: close its row. Guarded on `activity`, so a
+   * dispatch that was never lit never broadcasts a `running: false` for a row
+   * the browser does not hold.
+   */
+  private closeDispatchActivity(dispatch: BackgroundDispatch): void {
+    if (dispatch.activity !== 'active') return
+    dispatch.activity = 'idle'
+    this.broadcastDispatchActivity(dispatch, false)
+  }
+
+  /** Every dispatch this turn still reports as running: turn close / dispose. */
+  private closeAllDispatchActivity(): void {
+    for (const dispatch of this.dispatches.values()) this.closeDispatchActivity(dispatch)
+  }
+
+  /**
+   * The catalog ids this turn is still reporting as running, for the
+   * `session/chat-list` snapshot that seeds a reloaded browser (the live path
+   * is `subagents/update`). Read by `AgentBridge.chatSessions`.
+   */
+  activeCatalogChildIds(): string[] {
+    const out: string[] = []
+    for (const dispatch of this.dispatches.values()) {
+      if (dispatch.activity !== 'active' || !dispatch.catalogReported || dispatch.completed) continue
+      out.push(`acp:${dispatch.toolCallId}`)
+    }
+    return out
+  }
+
+  /**
+   * Drop every dot this turn owns. The bridge teardown paths call this before
+   * they detach the controller: those paths never reach `closeTurn`, and a
+   * status the browser keeps after the process is gone would show a worker
+   * running forever.
+   */
+  releaseDispatchActivity(): void {
+    this.closeAllDispatchActivity()
   }
 
   /**
@@ -5051,6 +5148,10 @@ class TurnStreamController {
     // run's record (`closeBackgroundHold` retired or kept it); only the clocks
     // are still ours to drop.
     this.clearBackgroundHold()
+    // Every catalog row this turn reported is no longer live: the browser must
+    // never keep a dot for a turn that already ended (an idle turn whose
+    // worker reports later says so in the ACP transcript view).
+    this.closeAllDispatchActivity()
     // A late answer to a SUPERSEDED turn still has to close this controller's
     // queue (a continuation step may be parked on it) and its settle gate —
     // but it must not touch the session the NEWER turn now owns, nor release
@@ -5221,6 +5322,9 @@ class TurnStreamController {
     // A successor turn must never fold this hold's drain or worker text: the
     // abandoned run's id is retired before the subscription goes away.
     this.clearBackgroundHold({ retire: true })
+    // The teardown ends the turn without `closeTurn`: the browser's dots go
+    // with it.
+    this.closeAllDispatchActivity()
     this.retire()
     releaseAllToolOutputWaiters()
   }
@@ -6228,6 +6332,10 @@ export class BridgeManager {
     for (const session of this.dshSessionMap.values()) {
       if (session.dshSessionId !== dshSessionId || session.closed) continue
       const title = this.defsMap.get(session.agentId)?.title
+      // External subagent rows still running on this session's turn: the
+      // browser seeds its active set from here after a reload (the live path
+      // is the `subagents/update` frames).
+      const activeSubagents = session.turnController?.activeCatalogChildIds() ?? []
       out.push({
         agentId: session.agentId,
         ...(title === undefined ? {} : { agentTitle: title }),
@@ -6241,6 +6349,7 @@ export class BridgeManager {
         ...(session.burst === undefined ? {} : { burst: session.burst }),
         ...(session.released ? { released: true } : {}),
         ...(session.running ? { running: true } : {}),
+        ...(activeSubagents.length === 0 ? {} : { activeSubagents }),
         ...forkRowInfo(session, this.canForkNow(session.agentId)),
       })
     }
