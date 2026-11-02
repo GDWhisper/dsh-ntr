@@ -2,6 +2,26 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [0.3.6] - 2026-11-02
+
+子智能体清单能看出后台任务还在不在跑。
+
+### 改进
+
+- **acp**：子智能体清单里还在跑的后台任务会亮起运行中的圆点，任务结束或本轮收口后回到空闲；刷新页面后仍在跑的任务也照样亮着。([669aa91](https://github.com/GDWhisper/dsh-ntr/commit/669aa91))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.3.5...v0.3.6
+
+---
+
+The subagent catalog shows whether a background worker is still running.
+
+### Improved
+
+- **acp**: background workers that are still running show the running dot in the subagent catalog, and go back to idle when they finish or the turn closes; a page reload keeps showing the live state. ([669aa91](https://github.com/GDWhisper/dsh-ntr/commit/669aa91))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.3.5...v0.3.6
+
 ## [0.3.5] - 2026-11-01
 
 后台任务可见、等得到结果；重启 DSH 不丢会话；新会话首轮按当前显示的模式执行。
