@@ -5876,6 +5876,95 @@ describe('pre-chat pick persistence (isolated manager)', () => {
     await gm.shutdownAll()
   })
 
+  interface PersistedDeadlines {
+    approvalDeadlines?: { permissionTimeoutMs?: number; mode?: string }
+  }
+
+  const readDeadlines = (storage: string): PersistedDeadlines['approvalDeadlines'] =>
+    (JSON.parse(readFileSync(storage, 'utf-8')) as PersistedDeadlines).approvalDeadlines
+
+  it('keeps a user-picked zero through a mode switch and a restart', async () => {
+    const storage = `${tmpdir()}/acp-deadline-zero-${Date.now()}.json`
+    const gm = new BridgeManager([{ ...def, id: 'zero' }], pickHub, 500, storage)
+    // 不等待 is the user's pick: it runs as zero under `auto`.
+    await gm.setApprovalDeadlines({ permissionTimeoutMs: 0, mode: 'auto' })
+    expect(gm.approvalDeadlines()).toMatchObject({ permissionTimeoutMs: 0, mode: 'auto' })
+    // A mode-only write carries no window: the stored zero survives, while the
+    // RUNTIME value floors to the shortest real wait under `abort`.
+    await gm.setApprovalDeadlines({ mode: 'abort' })
+    expect(gm.approvalDeadlines()).toMatchObject({ permissionTimeoutMs: 30_000, mode: 'abort' })
+    expect(readDeadlines(storage)).toEqual({ permissionTimeoutMs: 0, mode: 'abort' })
+    // Switching back restores the zero — because the write never rewrote it.
+    await gm.setApprovalDeadlines({ mode: 'auto' })
+    expect(gm.approvalDeadlines()).toMatchObject({ permissionTimeoutMs: 0, mode: 'auto' })
+    expect(readDeadlines(storage)).toEqual({ permissionTimeoutMs: 0, mode: 'auto' })
+    // A restart reads the same raw zero back, and the runtime agrees.
+    const reloaded = new BridgeManager([{ ...def, id: 'zero' }], pickHub, 500, storage)
+    expect(reloaded.approvalDeadlines()).toMatchObject({ permissionTimeoutMs: 0, mode: 'auto' })
+    expect(readDeadlines(storage)).toEqual({ permissionTimeoutMs: 0, mode: 'auto' })
+    await reloaded.shutdownAll()
+    await gm.shutdownAll()
+  })
+
+  it('keeps a real window unchanged through every mode switch', async () => {
+    const storage = `${tmpdir()}/acp-deadline-real-${Date.now()}.json`
+    const gm = new BridgeManager([{ ...def, id: 'real' }], pickHub, 500, storage)
+    await gm.setApprovalDeadlines({ permissionTimeoutMs: 300_000, mode: 'auto' })
+    expect(readDeadlines(storage)).toEqual({ permissionTimeoutMs: 300_000, mode: 'auto' })
+    await gm.setApprovalDeadlines({ mode: 'abort' })
+    expect(gm.approvalDeadlines()).toMatchObject({ permissionTimeoutMs: 300_000, mode: 'abort' })
+    expect(readDeadlines(storage)).toEqual({ permissionTimeoutMs: 300_000, mode: 'abort' })
+    await gm.setApprovalDeadlines({ mode: 'auto' })
+    expect(gm.approvalDeadlines()).toMatchObject({ permissionTimeoutMs: 300_000, mode: 'auto' })
+    expect(readDeadlines(storage)).toEqual({ permissionTimeoutMs: 300_000, mode: 'auto' })
+    const reloaded = new BridgeManager([{ ...def, id: 'real' }], pickHub, 500, storage)
+    expect(reloaded.approvalDeadlines()).toMatchObject({ permissionTimeoutMs: 300_000, mode: 'auto' })
+    await reloaded.shutdownAll()
+    await gm.shutdownAll()
+  })
+
+  it('floors a persisted zero under abort at runtime only', async () => {
+    // A state file can hold any pair the user or an older build wrote. The
+    // zero must NOT become 「不等待并立即拒绝」: under `abort` it runs as the
+    // 30 s minimum, and the file stays what the user chose.
+    const storage = `${tmpdir()}/acp-deadline-legacy-zero-${Date.now()}.json`
+    writeFileSync(storage, JSON.stringify({
+      version: 2,
+      approvalDeadlines: { permissionTimeoutMs: 0, mode: 'abort' },
+    }), 'utf-8')
+    const gm = new BridgeManager([{ ...def, id: 'legacy-zero' }], pickHub, 500, storage)
+    expect(gm.approvalDeadlines()).toMatchObject({ permissionTimeoutMs: 30_000, mode: 'abort' })
+    expect(readDeadlines(storage)).toEqual({ permissionTimeoutMs: 0, mode: 'abort' })
+    await gm.shutdownAll()
+  })
+
+  it('reads the persisted zero back raw at boot, so a mode switch can restore it', async () => {
+    // Startup must not rewrite the stored pick with the abort floor. If the
+    // load path normalized it, the runtime would read the same 30 s as the
+    // fixed logic and nothing below could fail — so this case asserts BOTH
+    // halves: the runtime floor at boot, and the raw zero still being the
+    // value a later switch back to `auto` runs on (the file included).
+    const storage = `${tmpdir()}/acp-deadline-boot-zero-${Date.now()}.json`
+    writeFileSync(storage, JSON.stringify({
+      version: 2,
+      approvalDeadlines: { permissionTimeoutMs: 0, mode: 'abort' },
+    }), 'utf-8')
+    const gm = new BridgeManager([{ ...def, id: 'boot-zero' }], pickHub, 500, storage)
+    // Boot applies the abort floor to the RUNTIME value only.
+    expect(gm.approvalDeadlines()).toMatchObject({ permissionTimeoutMs: 30_000, mode: 'abort' })
+    // Switching back to `auto` recovers 不等待 from the stored value, not from
+    // a boot-time rewrite of it.
+    await gm.setApprovalDeadlines({ mode: 'auto' })
+    expect(gm.approvalDeadlines()).toMatchObject({ permissionTimeoutMs: 0, mode: 'auto' })
+    expect(readDeadlines(storage)).toEqual({ permissionTimeoutMs: 0, mode: 'auto' })
+    await gm.shutdownAll()
+    // A second boot over the same file agrees, so the guard also covers
+    // reading a value the restart itself wrote.
+    const reloaded = new BridgeManager([{ ...def, id: 'boot-zero' }], pickHub, 500, storage)
+    expect(reloaded.approvalDeadlines()).toMatchObject({ permissionTimeoutMs: 0, mode: 'auto' })
+    await reloaded.shutdownAll()
+  })
+
   it('records an extra config option and applies it when the first session materializes', async () => {
     const storage = `${tmpdir()}/acp-pick-config-${Date.now()}.json`
     const gm = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)

@@ -993,10 +993,22 @@ describe('AcpSettingsSection permissions', () => {
     slider = screen.getByRole('slider', { name: '等待时长' }) as HTMLInputElement
     expect(slider.value).toBe(slider.min)
     expect(fixture.store.getSnapshot().approvalDeadlines).toMatchObject({ mode: 'abort', permissionTimeoutMs: 30_000 })
+    // Switching back must restore the ZERO, not keep the abort floor: a mode
+    // write carries no window, and the host keeps the user's raw pick.
+    await click(screen.getByRole('button', { name: '自动推进' }))
+    expect(screen.getAllByText('不等待').length).toBeGreaterThan(0)
+    expect(fixture.store.getSnapshot().approvalDeadlines).toMatchObject({ mode: 'auto', permissionTimeoutMs: 0 })
+    // The first four writes are plain actions: the two mode switches carry no
+    // duration, and the slider write carries no mode.
+    expect(payloads(fixture, 'ui/approval-deadlines-set').slice(0, 4)).toEqual([
+      { mode: 'auto' }, { permissionTimeoutMs: 0 }, { mode: 'abort' }, { mode: 'auto' },
+    ])
     // Move away and back to exercise the abort ladder's first selectable value.
+    await click(screen.getByRole('button', { name: '超时中止' }))
+    slider = screen.getByRole('slider', { name: '等待时长' }) as HTMLInputElement
     await act(async () => { fireEvent.change(slider, { target: { value: slider.max } }) })
     await act(async () => { fireEvent.change(slider, { target: { value: slider.min } }) })
-    expect(payloads(fixture, 'ui/approval-deadlines-set').slice(2)).toEqual([
+    expect(payloads(fixture, 'ui/approval-deadlines-set').slice(4)).toEqual([
       { mode: 'abort' }, { permissionTimeoutMs: 21_600_000 }, { permissionTimeoutMs: 30_000 },
     ])
     await click(screen.getByRole('button', { name: '一直等待' }))

@@ -27,6 +27,10 @@
 - **acp**：取消暂存与重试保存只在收到明确结果时算成功；被新保存取代的取消不再显示成用户取消。
 - **acp**：删除或停止 agent 后，迟到的模型探测结果不再写回目录。
 
+### 修复
+
+- **acp**：切换超时处理方式不再改写已保存的等待时长；「不等待」在切到「超时中止」时只在运行时按 30 秒生效，切回「自动推进」或重启后仍是「不等待」。已被旧版本写成 30 秒的记录需要重新选择一次「不等待」。
+
 ---
 
 A save no longer interrupts a running conversation; held saves, failures and retries are all visible.
@@ -50,6 +54,10 @@ A save no longer interrupts a running conversation; held saves, failures and ret
 - **acp**: closed failure and expiry banners stay closed after a reload; a new save of the same agent clears its old failure line and its "staging cancelled" line.
 - **acp**: cancelling a held save and retrying a save count as successful only on an explicit result; a cancellation superseded by a newer save is no longer shown as a user cancellation.
 - **acp**: after an agent is deleted or stopped, late model probe results are no longer written back to the catalog.
+
+### Fixed
+
+- **acp**: switching the timeout action no longer rewrites the saved wait window; "no wait" runs as a 30-second floor only while "time out and abort" is active, and "auto-advance" or a restart still reports "no wait". Records an older build already rewrote to 30 seconds must be set back to "no wait" once.
 
 ## [0.3.6] - 2026-11-02
 

@@ -65,7 +65,7 @@ ACP `session/request_permission` 原样映射：选项列表 / 名称 / 顺序 /
 - **模式与窗口都在询问开始时读一次**：已持定时器的询问不改口径，正在决定中的人不该被移动球门。`deadlineAt` 也在同一时刻算出并进入帧、聊天行与定时器——慢读者不能把期限读长。
 - **`wait` 不 arm 任何定时器**：「一直等」就是一直等，窗口配多少都一样；`wait` 下 `deadlineAt` 也不进帧。`wait` 是**唯一**能表达「永不到期」的档。
 - **`permissionTimeoutMs: 0` = 不等待，且只属 `auto`**：请求到达即收场，**根本不问人**——不建 ledger 条目、不广播 `permission/request`，直接走 `settleExpiredAsk`，只留下 `agent/notice` + `permission/expired` 的痕迹。它之所以安全，正是因为 `auto` 是**代答**（按 option kind 优先级挑一个），agent 拿到答案继续走。
-  **`abort` 档没有这一档**：同样的 0 在那里是**立刻拒绝**每一问，agent 在每个门口都停住——那不是超时，是墙。所以 `abort` 的时长轴从 30 秒起，任何落到 `abort` 的 0 一律抬到最短真实等待 30 秒（`normalizeApprovalWindow`：配置、状态文件、模式切换三条来路都走它）。`wait` 忽略窗口本身（0 也照等）。「永不到期」由 `wait` 模式表达，不再是时长轴上的一档：同一件事两处各说一遍，用户只会怀疑自己漏配了什么。
+  **`abort` 档没有这一档**：同样的 0 在那里是**立刻拒绝**每一问，agent 在每个门口都停住——那不是超时，是墙。所以 `abort` 的时长轴从 30 秒起，任何落到 `abort` 的 0 在**运行时**一律抬到最短真实等待 30 秒（`applyDeadlineTuning` 是唯一读取持久化覆盖值并归一的入口；`validateConfig` 在配置解析期自行归一；`normalizeApprovalWindow` 不改写持久化的用户原值）。`wait` 忽略窗口本身（0 也照等）。「永不到期」由 `wait` 模式表达，不再是时长轴上的一档：同一件事两处各说一遍，用户只会怀疑自己漏配了什么。
 - **旧配置里的 0 不是不等待**：旧的两个键（`nativeApprovalTimeoutMs` / `permissionFallbackTimeoutMs`）里 `0` 的旧义是「这一窗永不触发」，新义是「不等待」。旧 0 因此**迁移成 `wait` 模式 + 300_000 窗口**（`validateConfig` 的 `legacyNever`、`BridgeManager.loadPersistedAgents` 同规则）——否则一个无人值守的部署会从「一直等」静默变成「立即自动放行」。新键 `permissionTimeoutMs: 0` 则按新义执行（且只在 `auto` 档成立）。
 - **到点必须留痕**：卡片消失后，对话里不能什么都不说。`announceExpiredAsk` 广播**恰一条** `agent/notice` + **恰一条** `permission/expired`；定时器路径的 `permissions.respond` 再广播 `permission/resolved`（`auto` + `0` 没有 ledger 条目，也就没有最后这一帧，但两条留痕照发）。`TurnStreamController` 把 `permission/expired` 折成对话里的一行说明（`no answer within Ns; refused` / `… answered "X" automatically, continuing`）。不等待时写 `not waited for` / `was not waited for`——「等了 0 秒」与「没等」不是一回事。
 - **窗口与模式都是可设项**（`AcpPluginConfig`，`cordis.patch.yml` 里注释了默认值）：`permissionTimeoutMs`（等待时长，默认 300_000，`0` = 不等待）、`permissionTimeoutMode`（默认 `wait`）。旧的两个键**仍然被接受**，由 `validateConfig` 折叠进新键（新键在场时忽略旧键），所以老配置文件不会静默回到默认值。
@@ -106,6 +106,10 @@ ACP `session/request_permission` 原样映射：选项列表 / 名称 / 顺序 /
   改写对之后的询问立即生效。**已启动的定时器不重排**：正在决定中的人不该被移动球门。
 - **持久化**：写进 `agents.json`（与 `tagHalo` / `conversations` 同一个文件），每次启动重新过
   `validateApprovalDeadlines` / `validatePermissionTimeoutMode`——该文件用户可改，放一个越界值进去不能毒化期限与模式。
+  **持久化保存用户原值，运行时可能被动作抬高**：状态文件里的 `permissionTimeoutMs` 就是用户选的那个数，
+  切模式不重写它；`0` 只在运行时按当前动作归一（`abort` 抬到 30 秒，`auto` 保持 0）。改模式后切回
+  `auto` 能恢复「不等待」，重启也一样。已被旧逻辑写成 `30000` 的记录无法与用户真的选 30 秒区分，
+  **不做自动迁移**——受影响用户需要重选一次「不等待」。
 - **卡片必须说清两件事**，否则用户会在调一个不生效的数字：
   `configured[key]` 与生效值不同时提示「配置文件（cordis.patch.yml）里是 X，这里的值优先」并给重置按钮；
   模式的基线（`configuredMode`）同理，**挂在模式那一行**。
@@ -130,7 +134,11 @@ ACP `session/request_permission` 原样映射：选项列表 / 名称 / 顺序 /
 config file" 与 "carries a legacy zero over as the wait mode, never as 不等待"、
 `tests/register.spec.ts` 的 "carries the config file's approval deadlines into the
 settings card"、`tests/bridge.spec.ts` 的 "edits an approval deadline live, persists it, and resets
-to the config file"、"adopts a deadline the settings page writes while a session is live" 与
+to the config file"、"adopts a deadline the settings page writes while a session is live"、
+"keeps a user-picked zero through a mode switch and a restart"、
+"keeps a real window unchanged through every mode switch"、
+"floors a persisted zero under abort at runtime only"、
+"reads the persisted zero back raw at boot, so a mode switch can restore it" 与
 "a zero window settles the ask without asking anyone"、
 `tests/acp-view.spec.ts` 的 `deadlineSliderIndex`（不等待是最左一档）、
 `tests/store.spec.ts` 的 "reads the approval deadlines on resync and writes one back optimistically"。

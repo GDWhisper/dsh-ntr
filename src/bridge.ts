@@ -7286,12 +7286,13 @@ export class BridgeManager {
             : ((raw as { mode?: unknown }).mode === undefined
               ? undefined
               : validatePermissionTimeoutMode((raw as { mode?: unknown }).mode, 'bad_payload'))
-          // A stored window must be legal for the mode it runs under: 不等待
-          // (0) belongs to `auto`; under `abort` it would refuse every ask on
-          // arrival, so it floors to the shortest real wait.
-          const effectiveMode = mode ?? this.baselineMode
+          // The stored window is the user's RAW pick and is read back as-is:
+          // 不等待 (0) belongs to `auto`, and the floor under `abort` is applied
+          // at RUNTIME only (`applyDeadlineTuning`). Rewriting it here would
+          // make a restart itself change what the user chose, and a later
+          // switch back to `auto` could never recover the zero.
           this.deadlineOverride = {
-            ...(window === undefined ? {} : { permissionTimeoutMs: normalizeApprovalWindow(effectiveMode, window) }),
+            ...(window === undefined ? {} : { permissionTimeoutMs: window }),
             ...(mode === undefined ? {} : { mode }),
           }
         } catch {
@@ -8886,6 +8887,16 @@ export class BridgeManager {
     // The baseline must be legal for the mode it runs under, or the card would
     // advertise a number the deployment cannot actually run (不等待 under
     // `abort`) and the reset button would restore it.
+    //
+    // This normalization applies to the CONFIG BASELINE only (the value the
+    // card shows as the reset target and against which the override is
+    // compared): `applyDeadlineTuning` owns the persisted override, while
+    // `validateConfig` and the `AgentBridge` constructor normalize their own
+    // inputs. Keeping the file's raw 0 here would make the card report the
+    // floored runtime value as a user override and offer a reset that restores
+    // a value it cannot run. Separating "what the file says" from "what runs"
+    // needs a second protocol field; until that exists the config baseline
+    // stays normalized.
     const effectiveMode = mode ?? this.configuredMode ?? this.baselineMode
     const raw = values.permissionTimeoutMs
     const window = raw === undefined ? undefined : normalizeApprovalWindow(effectiveMode, raw)
@@ -8990,13 +9001,13 @@ export class BridgeManager {
     const mode = merged.mode === undefined
       ? undefined
       : validatePermissionTimeoutMode(merged.mode, 'bad_payload')
-    // The stored override must be legal for the mode it runs under, not just
-    // legal on its own: 不等待 (0) belongs to `auto`, and a mode switch can
-    // leave it behind. Flooring it HERE (not only in the running value) keeps
-    // the card's number and the running number the same number.
-    const effectiveMode = mode ?? this.baselineMode
+    // Persist the user's RAW window, never a mode-specific rewrite: 不等待 (0)
+    // belongs to `auto`, and the floor under `abort` is a RUNTIME fact applied
+    // by `applyDeadlineTuning`. Flooring it here would turn a mode switch into
+    // a silent edit of the stored value, so switching back to `auto` could
+    // never restore the zero the user actually picked.
     this.deadlineOverride = {
-      ...(window === undefined ? {} : { permissionTimeoutMs: normalizeApprovalWindow(effectiveMode, window) }),
+      ...(window === undefined ? {} : { permissionTimeoutMs: window }),
       ...(mode === undefined ? {} : { mode }),
     }
     this.applyDeadlineTuning()
@@ -9006,6 +9017,13 @@ export class BridgeManager {
   /**
    * Recompute the deadline and the mode from override → deployment baseline,
    * and push the result to every live bridge.
+   *
+   * This is the ONLY place the PERSISTED OVERRIDE is read and normalized into
+   * a runtime value. Persisted state keeps the user's RAW pick (0 = 不等待
+   * under `auto`), and the mode's floor is applied here on every recompute —
+   * so a state file holding a zero while the mode is `abort` still runs the
+   * 30 s minimum instead of refusing every ask on arrival. Nothing else may
+   * read `deadlineOverride` for a runtime value.
    */
   private applyDeadlineTuning(): void {
     const permissionTimeoutMode = this.deadlineOverride.mode ?? this.baselineMode
