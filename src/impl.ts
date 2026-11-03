@@ -9,8 +9,9 @@ import { randomUUID } from './ids.ts'
 import type {
   AcpAgentCatalog, AcpAgentDef, AcpCatalogOption, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpMcpServerDef, AcpPluginConfig, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult,
   AgentView, ApprovalDeadlineKey, ApprovalDeadlinePatch, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionOptionView, PermissionOutcome, PermissionTimeoutMode, PluginUpdateState, RpcResult,
+  ActiveTurnView, AgentSaveMode, AgentSaveResult, SaveGateFlushResult, SaveGateStatus,
 } from './protocol.ts'
-import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_TAG_HALO, IDLE_RELEASE_MS } from './protocol.ts'
+import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_TAG_HALO, IDLE_RELEASE_MS } from './protocol.ts'
 
 export { randomUUID }
 
@@ -3083,7 +3084,7 @@ export interface AcpManager {
    */
   setIdleRelease?(idleTimeoutMs: number | undefined, reset?: boolean): Promise<void>
   detectAgents?(): Promise<DetectedAgentInfo[]>
-  saveAgent?(def: AcpAgentDef): Promise<void>
+  saveAgent?(def: AcpAgentDef, mode?: AgentSaveMode): Promise<AgentSaveResult>
   deleteAgent?(agentId: string): Promise<void>
   /**
    * Spawn a throwaway process from raw form values (never persisted, never
@@ -3232,6 +3233,15 @@ export interface AcpManager {
    * an older host half.
    */
   pluginUpdateApply?(version: string): Promise<PluginUpdateState>
+  /**
+   * The ACP-turn save gate. Optional on older host halves: the RPCs then
+   * answer "always save now" so a browser from this bundle keeps working.
+   */
+  saveGateStatus?(): SaveGateStatus
+  saveGateFlush?(): Promise<SaveGateFlushResult>
+  saveGateCancel?(label: string): number
+  saveGateRetry?(label: string): boolean
+  saveGateWaitIdle?(timeoutMs?: number): Promise<boolean>
 }
 
 function ok<T>(value: T): RpcResult<T> {
@@ -3240,6 +3250,40 @@ function ok<T>(value: T): RpcResult<T> {
 
 function fail(code: string, message: string): RpcResult<never> {
   return { ok: false, error: { code, message, details: {} } }
+}
+
+/**
+ * The idle gate answer for a host half without the save-gate service.
+ *
+ * `gateAvailable: false` is what tells the browser this snapshot is a
+ * placeholder: it must not offer queue / force affordances the host cannot
+ * honour.
+ */
+export function emptySaveGateStatus(): SaveGateStatus {
+  return {
+    gateAvailable: false,
+    canSave: true,
+    activeTurns: 0,
+    activeSessions: [],
+    pending: [],
+    timeoutMs: DEFAULT_SAVE_GATE_TIMEOUT_MS,
+  }
+}
+
+/**
+ * The host-side decision for one explicit agent save. `force` and an idle
+ * target save now; `defer` queues; an omitted/`direct` mode with live target
+ * turns asks first. This is pure so both the RPC and the panel's fallback
+ * cannot drift.
+ */
+export function agentSaveAction(
+  activeSessions: readonly ActiveTurnView[],
+  mode: AgentSaveMode,
+): 'save' | 'defer' | 'confirm' {
+  if (activeSessions.length === 0) return 'save'
+  if (mode === 'force') return 'save'
+  if (mode === 'defer') return 'defer'
+  return 'confirm'
 }
 
 /** String payload field with a length bound (defensive against oversized bodies). */
@@ -3268,9 +3312,23 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
       case 'agents/detect':
         return ok({ agents: await (manager.detectAgents?.() ?? Promise.resolve([])) })
       case 'agent/save': {
+        const mode = body.saveMode
+        if (mode !== undefined && mode !== 'direct' && mode !== 'defer' && mode !== 'force') {
+          throw new AcpError('bad_payload', 'acp: saveMode must be direct, defer, or force')
+        }
+        if (manager.saveAgent === undefined) {
+          return fail('unsupported', 'acp: agent/save is not available')
+        }
         const def = validateAgentDef(body)
-        await manager.saveAgent?.(def)
-        return ok({ done: true })
+        const result = (await manager.saveAgent(def, mode as AgentSaveMode | undefined)) ?? { done: true }
+        // An older caller that sends no gesture gets `done: false` when turns
+        // are live. Returning `ok` there made a refused save look successful
+        // to any caller that only checks the RPC envelope; the new panel always
+        // sends `saveMode`, so this explicit failure signal is for legacy callers.
+        if (mode === undefined && result.confirmationRequired === true) {
+          return fail('confirmation_required', 'acp: the agent has running turns; send an explicit saveMode')
+        }
+        return ok(result)
       }
       case 'agent/delete': {
         const agentId = str(body, 'agentId', 64)
@@ -3450,6 +3508,40 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         // Absent on a host half from before the badge existed: the browser
         // hides it instead of naming a version it cannot know.
         return ok({ version: manager.pluginVersion?.() })
+      case 'save/status':
+        // A host half without the gate answers the idle state, so the browser
+        // never renders a pending toast it cannot resolve. `gateAvailable`
+        // stays false there: the snapshot is a placeholder, not a gate.
+        return ok({ status: manager.saveGateStatus?.() ?? emptySaveGateStatus() })
+      case 'save/flush':
+        if (manager.saveGateFlush === undefined) {
+          return fail('unsupported', 'acp: save/flush is not available')
+        }
+        return ok(await manager.saveGateFlush())
+      case 'save/cancel': {
+        if (manager.saveGateCancel === undefined) {
+          return fail('unsupported', 'acp: save/cancel is not available')
+        }
+        const label = str(body, 'label', 256)
+        return ok({ cancelled: manager.saveGateCancel(label) })
+      }
+      case 'save/retry': {
+        if (manager.saveGateRetry === undefined) {
+          return fail('unsupported', 'acp: save/retry is not available')
+        }
+        const label = str(body, 'label', 256)
+        return ok({ retried: manager.saveGateRetry(label) })
+      }
+      case 'save/wait-idle': {
+        if (manager.saveGateWaitIdle === undefined) {
+          return fail('unsupported', 'acp: save/wait-idle is not available')
+        }
+        const timeoutMs = body.timeoutMs
+        if (timeoutMs !== undefined && (typeof timeoutMs !== 'number' || !Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > DEFAULT_SAVE_GATE_TIMEOUT_MS)) {
+          throw new AcpError('bad_payload', `acp: timeoutMs must be an integer between 0 and ${String(DEFAULT_SAVE_GATE_TIMEOUT_MS)}`)
+        }
+        return ok({ idle: await manager.saveGateWaitIdle(timeoutMs as number | undefined) })
+      }
       case 'plugin/update-check':
         // An older host half answers `unsupported` rather than failing: the
         // settings card then hides the update section.

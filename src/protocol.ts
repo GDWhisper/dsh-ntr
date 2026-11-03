@@ -351,6 +351,122 @@ export interface AgentView {
  */
 export type AcpReleaseCause = 'idle' | 'workspace' | 'resume-failed' | 'stalled' | 'died' | 'shutdown'
 
+/** One ACP turn currently owed by an agent; the save gate reports these while deciding a profile write. */
+export interface ActiveTurnView {
+  /** ACP session id (the plugin's own identity). */
+  sessionId: string
+  /** DSH chat session id; absent for `/acp` RPC-only turns. */
+  dshSessionId?: string
+  agentId: string
+}
+
+/** One save waiting for every ACP turn to finish. */
+export interface SaveGatePendingView {
+  id: string
+  /** Human label of the write being held (`settings:llm-pi-ai`, ...). */
+  label: string
+  queuedAt: number
+  /** Epoch ms when the bounded wait expires; absent when the wait is unbounded. */
+  deadlineAt?: number
+}
+
+/** Terminal result of one deferred save, for the toast and for host callers. */
+export interface SaveGateOutcomeView {
+  at: number
+  status: 'saved' | 'expired' | 'failed' | 'cancelled'
+  label: string
+  /** Failure detail, present for `failed`. */
+  message?: string
+  /**
+   * Present on `cancelled` when a NEWER save of the same label displaced this
+   * queued entry (rather than the user cancelling it explicitly). The toast
+   * can then say "superseded by a newer save" instead of a bare cancellation.
+   */
+  superseded?: boolean
+}
+
+/**
+ * The plugin's answer to "may a profile write happen now?".
+ *
+ * This is deliberately a state snapshot, not a command: the host settings
+ * service asks before writing, the browser renders the pending queue, and the
+ * ACP conversation keeps running without a profile reload. `canSave` is true
+ * exactly when no ACP turn is owed by an agent.
+ */
+export interface SaveGateStatus {
+  /**
+   * Whether a real {@link AcpSaveGate} produced this snapshot. `false` on an
+   * older host half, where the status is only a synthetic idle state: the
+   * settings form must not offer queue / force affordances it cannot honour.
+   */
+  gateAvailable: boolean
+  canSave: boolean
+  activeTurns: number
+  activeSessions: ActiveTurnView[]
+  pending: SaveGatePendingView[]
+  /** Bounded wait for one queued save, in ms; 0 means "no expiry". */
+  timeoutMs: number
+  lastOutcome?: SaveGateOutcomeView
+  /**
+   * Most recent terminal result PER LABEL. Two agents can hold saves at the
+   * same time; the settings form reads its own label here so one agent's
+   * settlement never clears another agent's held state.
+   */
+  lastOutcomes?: Record<string, SaveGateOutcomeView>
+}
+
+/** What one deferred save settled to. */
+export type SaveGateOutcome =
+  | { status: 'saved'; value: unknown }
+  | { status: 'expired' }
+  /**
+   * `superseded` is set only when a newer save of the same label cancelled
+   * this queued entry. An explicit `save/cancel` settles a bare `cancelled`.
+   */
+  | { status: 'cancelled'; superseded?: boolean }
+  | {
+      status: 'failed'
+      message: string
+      /**
+       * The original refusal (for example a settings revision conflict). Host
+       * callers rethrow it so the API controller's error classification is
+       * unchanged; the browser only ever sees `message` via the status view.
+       */
+      error?: unknown
+    }
+
+/** Counts returned by an explicit "save now" gesture. */
+export interface SaveGateFlushResult {
+  saved: number
+  expired: number
+  failed: number
+  /** Entries dropped because a newer save / delete cancelled them. */
+  cancelled?: number
+}
+
+/** Payload of `save/cancel`: drop the held write carrying this label. */
+export interface SaveGateCancelPayload {
+  label: string
+}
+
+/** Count of queued writes the cancel gesture dropped. */
+export interface SaveGateCancelResult {
+  cancelled: number
+}
+
+/** Payload of `save/retry`: re-run the last failed/expired write of a label. */
+export interface SaveGateRetryPayload {
+  label: string
+}
+
+/** Whether the gate still retained an operation to re-run. */
+export interface SaveGateRetryResult {
+  retried: boolean
+}
+
+/** One save gate's bounded wait before it gives up and asks the user to retry. */
+export const DEFAULT_SAVE_GATE_TIMEOUT_MS = 600_000
+
 export type AcpEvent =
   | { type: 'agent/status'; agentId: string; state: AgentProcessState; error?: string; agent?: AgentView }
   | { type: 'agent/notice'; agentId: string; level: 'info' | 'error'; text: string }
@@ -473,6 +589,13 @@ export type AcpEvent =
     }
   | { type: 'turn/end'; sessionId: string; turnId: string; stopReason?: string; error?: string }
   /**
+   * The save gate's state changed: an ACP turn started/ended, a profile write
+   * was queued, flushed, expired or failed. The browser renders the pending
+   * toast from this frame; the settings page's own save promise is the host
+   * half's business.
+   */
+  | { type: 'save/status'; status: SaveGateStatus }
+  /**
    * One ACP-dispatched worker became active/inactive in the host's
    * EXTERNAL subagent catalog. `childId` is the catalog id
    * (`acp:<toolCallId>`); the browser merges it into the host's own
@@ -532,6 +655,12 @@ export interface SessionView {
   burst?: SessionBurst
   running: boolean
   closed: boolean
+  /**
+   * The agent has not yet settled its `session/prompt` after the visible turn
+   * ended. The save gate treats this as busy; an older host half never sends
+   * the field, so a browser-side fallback under-reports this window.
+   */
+  settled?: boolean
   /**
    * The owning agent process died and the session awaits a `session/load`
    * resume. Resuming happens implicitly on the next prompt ("send to
@@ -947,6 +1076,32 @@ export interface AgentSavePayload {
   idleTimeoutMs?: number
   /** MCP servers to connect to, in the normalized shape. See {@link AcpAgentDef.mcpServers}. */
   mcpServers?: AcpMcpServerDef[]
+  /**
+   * How `agent/save` treats live turns. The host is the authority: a caller
+   * that omits this gets `confirmationRequired` when the target agent is busy,
+   * never an implicit interruption.
+   */
+  saveMode?: AgentSaveMode
+}
+
+/** The three explicit save gestures the NTR settings form can send. */
+export type AgentSaveMode = 'direct' | 'defer' | 'force'
+
+/** What `agent/save` did; `confirmationRequired` means nothing was written. */
+export interface AgentSaveResult {
+  done: boolean
+  /** `defer` queued the save behind active turns; the form shows the saved-later state. */
+  deferred?: boolean
+  /**
+   * The save aborted because the agent was deleted or a NEWER save superseded
+   * it while it ran. That competing gesture won: this is not a failure, and
+   * the caller must not draw a failure banner.
+   */
+  cancelled?: boolean
+  /** Live turns exist and no explicit mode was supplied; the caller must ask. */
+  confirmationRequired?: boolean
+  /** The live turns that would be interrupted (target agent only). */
+  activeSessions?: ActiveTurnView[]
 }
 
 /** Result of `agent/test`: spawn + initialize a throwaway process from form values, then tear it down. */

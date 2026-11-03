@@ -6,8 +6,8 @@
  * Deliberately framework-free: React binds through `useSyncExternalStore`.
  */
 
-import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSavePayload, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, IdleReleaseResult, IdleReleaseSetPayload, PermissionTimeoutMode, PluginUpdateState, PluginVersionResult, SessionView } from '../protocol.ts'
-import { DEFAULT_TAG_HALO } from '../protocol.ts'
+import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, IdleReleaseResult, IdleReleaseSetPayload, PermissionTimeoutMode, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView } from '../protocol.ts'
+import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_TAG_HALO } from '../protocol.ts'
 
 /** One slash command the ACP agent declared, whole row (the menu draws name, description and `input.hint`). */
 export type AgentCommand = NonNullable<ChatSessionView['availableCommands']>[number]
@@ -196,6 +196,219 @@ export interface AcpLogEntry {
 /** Cap on retained runtime-log lines; older entries fall off the front. */
 export const LOG_MAX_ENTRIES = 200
 
+/**
+ * One page-top save banner. Save failures, expiry, rejection, partial force
+ * flushes and the HMR reload delay all share this shape so the overlay renders
+ * (and screen readers announce) them the same way.
+ */
+export type SaveBannerSource =
+  | 'save-failed'
+  | 'save-expired'
+  | 'save-rejected'
+  | 'save-partial'
+  | 'save-cancel-failed'
+  | 'save-cancelled'
+  | 'save-retry-none'
+  | 'save-retry-failed'
+  | 'hmr-delay'
+  | 'save-succeeded'
+export type SaveBannerAction = 'retry' | 'force' | 'dismiss'
+
+export interface SaveBanner {
+  /** Stable identity for dedupe: the same reason replaces, never stacks. */
+  key: string
+  source: SaveBannerSource
+  level: 'error' | 'success'
+  title: string
+  body: string
+  at: number
+  actions: SaveBannerAction[]
+  /** Which gate label the retry/force gesture targets, when applicable. */
+  label?: string
+  /** Success banners disappear on their own; failures persist until closed. */
+  autoDismissMs?: number
+  /**
+   * Gate-sourced failure rows are rebuilt by a page refresh's resync; a row the
+   * user explicitly closed must stay closed. Rows without this flag (direct save
+   * failures, rejection/partial/HMR notices) never cross a refresh at all.
+   */
+  persistAcrossReload?: boolean
+}
+
+/**
+ * Add or replace one banner. Failure rows are never dropped by count; only one
+ * transient success row is kept among successes. A NEW failure does not evict
+ * an existing success receipt: that row owns its own 2.5-second timer, and an
+ * error arriving beside it must not cut that timer short.
+ */
+export function composeSaveBanners(existing: SaveBanner[], incoming: SaveBanner): SaveBanner[] {
+  const withoutSame = existing.filter(banner => banner.key !== incoming.key)
+  const base = incoming.level === 'success'
+    ? withoutSame.filter(banner => banner.level !== 'success')
+    : withoutSame
+  return [...base, incoming]
+}
+
+/** sessionStorage record of persistent banners the user closed, keyed by row key. */
+const SAVE_BANNER_DISMISSALS_KEY = 'dsh-ntr.save-banner-dismissals'
+
+function readBannerDismissals(): Record<string, number> {
+  try {
+    const raw = globalThis.sessionStorage?.getItem(SAVE_BANNER_DISMISSALS_KEY)
+    if (raw === undefined || raw === null || raw === '') return {}
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null) return {}
+    const out: Record<string, number> = {}
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof value === 'number') out[key] = value
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function rememberBannerDismissal(banner: SaveBanner): void {
+  if (banner.persistAcrossReload !== true || banner.level !== 'error') return
+  try {
+    const dismissed = readBannerDismissals()
+    dismissed[banner.key] = banner.at
+    globalThis.sessionStorage?.setItem(SAVE_BANNER_DISMISSALS_KEY, JSON.stringify(dismissed))
+  } catch {
+    // Storage can be unavailable (private mode); the in-memory row is still closed.
+  }
+}
+
+function wasClosedAcrossReload(banner: SaveBanner): boolean {
+  if (banner.persistAcrossReload !== true) return false
+  return readBannerDismissals()[banner.key] === banner.at
+}
+
+/**
+ * Whether the host actually runs the save gate. A snapshot without the field
+ * (an older host, or a backend that never wired the gate) is NOT an idle
+ * authority: its empty `activeSessions` must never be read as "no turn".
+ */
+export function saveGateIsAvailable(status: SaveGateStatus): boolean {
+  return status.gateAvailable === true
+}
+
+function normalizeSaveGateStatus(status: SaveGateStatus): SaveGateStatus {
+  return { ...status, gateAvailable: saveGateIsAvailable(status) }
+}
+
+/** `agent-save:<id>` → the agent id; a host-settings label (`settings:…`) → undefined. */
+export function saveGateAgentId(label: string): string | undefined {
+  const prefix = 'agent-save:'
+  if (!label.startsWith(prefix)) return undefined
+  const id = label.slice(prefix.length)
+  return id === '' ? undefined : id
+}
+
+/** One agent a forced flush would interrupt, with the number of its live turns. */
+export interface SaveGateInterruptTarget {
+  agentId: string
+  name: string
+  sessions: number
+}
+
+/**
+ * Which agents the "save everything now" gesture would interrupt, and how many
+ * turns each owes. Reads the gate snapshot first; when it carries no session row
+ * for an agent (an older host half, or a not-yet-hydrated window), the browser's
+ * own session list supplies the same count — the fallback the settings form
+ * already uses (`activeSessionsForSave`). This never assumes host fields beyond
+ * `pending` / `activeSessions`; those are the snapshot's public shape.
+ */
+export function saveGateInterruptTargets(
+  status: SaveGateStatus,
+  agents: readonly AgentView[],
+  detected: readonly DetectedAgentInfo[],
+  sessions: readonly SessionView[],
+): SaveGateInterruptTarget[] {
+  const ids: string[] = []
+  const add = (id: string): void => {
+    if (!ids.includes(id)) ids.push(id)
+  }
+  for (const entry of status.pending) {
+    const id = saveGateAgentId(entry.label)
+    if (id !== undefined) add(id)
+  }
+  // A host-settings save still interrupts whoever is running: fall back to the
+  // gate's own active-turn rows when no pending label names an agent.
+  if (ids.length === 0) {
+    for (const view of status.activeSessions ?? []) add(view.agentId)
+  }
+  const trustGate = saveGateIsAvailable(status)
+  return ids.map(agentId => {
+    let count = trustGate
+      ? (status.activeSessions ?? []).filter(view => view.agentId === agentId).length
+      : 0
+    if (count === 0) {
+      count = sessions.filter(session =>
+        session.agentId === agentId && session.released !== true && (session.running || session.settled === true),
+      ).length
+    }
+    return {
+      agentId,
+      name: agents.find(agent => agent.id === agentId)?.title
+        ?? detected.find(info => info.id === agentId)?.name
+        ?? agentId,
+      sessions: count,
+    }
+  })
+}
+
+/** The terminal result naming one label, whichever snapshot shape carries it. */
+export function saveGateOutcomeForLabel(
+  status: SaveGateStatus,
+  label: string,
+): SaveGateOutcomeView | undefined {
+  return status.lastOutcomes?.[label]
+    ?? (status.lastOutcome?.label === label ? status.lastOutcome : undefined)
+}
+
+/** A `cancelled` row the host replaced with a newer queued snapshot. */
+export function saveGateOutcomeSuperseded(outcome: SaveGateOutcomeView): boolean {
+  return outcome.superseded === true
+}
+
+/** One terminal label transition, as seen between two gate snapshots. */
+export interface SaveGateOutcomeTransition {
+  label: string
+  outcome: SaveGateOutcomeView
+  /** The label was still queued in the previous snapshot. */
+  wasPending: boolean
+  /** The label is still queued in the new snapshot. */
+  isPending: boolean
+}
+
+/**
+ * Compare two gate snapshots. Pure: the SSE path and `resync` both feed this
+ * so a page refresh rebuilds the terminal rows it missed. A terminal entry is
+ * "new" when its timestamp or status changed; pending additions are reported
+ * apart because only the caller knows whether that deserves a log line.
+ */
+export function saveGateTransitions(
+  previous: SaveGateStatus | undefined,
+  next: SaveGateStatus,
+): { addedPending: SaveGatePendingView[]; outcomes: SaveGateOutcomeTransition[] } {
+  const previousOutcomes: Record<string, SaveGateOutcomeView> = previous?.lastOutcomes
+    ?? (previous?.lastOutcome === undefined ? {} : { [previous.lastOutcome.label]: previous.lastOutcome })
+  const nextOutcomes: Record<string, SaveGateOutcomeView> = next.lastOutcomes
+    ?? (next.lastOutcome === undefined ? {} : { [next.lastOutcome.label]: next.lastOutcome })
+  const wasPending = new Set((previous?.pending ?? []).map(entry => entry.label))
+  const isPending = new Set(next.pending.map(entry => entry.label))
+  const addedPending = next.pending.filter(entry => !wasPending.has(entry.label))
+  const outcomes: SaveGateOutcomeTransition[] = []
+  for (const [label, outcome] of Object.entries(nextOutcomes)) {
+    const before = previousOutcomes[label]
+    if (before !== undefined && before.at === outcome.at && before.status === outcome.status) continue
+    outcomes.push({ label, outcome, wasPending: wasPending.has(label), isPending: isPending.has(label) })
+  }
+  return { addedPending, outcomes }
+}
+
 export interface UiState {
   open: boolean
   /**
@@ -212,6 +425,12 @@ export interface UiState {
    * a surface that offers a setup entry on an empty roster must wait for this.
    */
   agentsLoaded: boolean
+  /**
+   * Agent ids deleted during THIS page's lifetime. The host keeps a tombstone
+   * for the same run, but a client-side copy lets the creation form warn before
+   * a doomed save. Cleared only by a host restart, never by `resync`.
+   */
+  deletedAgentIds: string[]
   sessions: SessionView[]
   activeSessionId?: string
   blocks: Block[]
@@ -222,6 +441,8 @@ export interface UiState {
    * runtime messages do not land here; they append to {@link logs} instead.
    */
   notice?: string
+  /** Page-top save banners; failures stay until dismissed, success auto-hides. */
+  saveBanners: SaveBanner[]
   /** Agent-side runtime log, append order oldest→newest, capped at {@link LOG_MAX_ENTRIES}. */
   logs: AcpLogEntry[]
   /** Lines appended since the user last opened the log; reset by {@link AcpStore.markLogsRead}. */
@@ -292,6 +513,12 @@ export interface UiState {
    * tab rather than showing a number this browser invented.
    */
   idleRelease?: AcpIdleRelease
+  /**
+   * The host's ACP-turn save gate. A pending entry means a profile write is
+   * held until the turn finishes; the toast renders it and offers the explicit
+   * force gesture. Absent from older hosts: the local default reads "idle".
+   */
+  saveGate: SaveGateStatus
   /**
    * Per-chat-session "does this conversation run the ACP preset" verdicts, as
    * reported by `session/chat-list` (host-read from the session log). The
@@ -686,10 +913,12 @@ export class AcpStore {
     stream: 'init',
     agents: [],
     agentsLoaded: false,
+    deletedAgentIds: [],
     sessions: [],
     blocks: [],
     permissions: [],
     busy: false,
+    saveBanners: [],
     logs: [],
     logUnread: 0,
     detectedAgents: [...DEFAULT_KNOWN_PRESETS],
@@ -703,6 +932,14 @@ export class AcpStore {
     tagHalo: { ...DEFAULT_TAG_HALO },
     approvalDeadlines: undefined,
     idleRelease: undefined,
+    saveGate: {
+      canSave: true,
+      gateAvailable: false,
+      activeTurns: 0,
+      activeSessions: [],
+      pending: [],
+      timeoutMs: DEFAULT_SAVE_GATE_TIMEOUT_MS,
+    },
     chatTranscripts: {},
     acpMode: {},
     activeSubagents: {},
@@ -719,6 +956,17 @@ export class AcpStore {
   private source?: EventSource
   /** Monotonic id source for {@link AcpLogEntry}s (never reset by `clearLogs`). */
   private logSeq = 0
+  /**
+   * What a banner's retry/force button can actually do. Kept out of UiState so
+   * the snapshot stays plain data; a dismissed banner drops its entry, which is
+   * why the same failure can show again next time.
+   */
+  private readonly bannerRetries = new Map<string,
+    | { kind: 'gate'; label: string }
+    | { kind: 'cancel'; label: string }
+    | { kind: 'flush' }
+    | { kind: 'payload'; payload: AgentSavePayload }
+  >()
   private readonly lastSeq = new Map<string, number>()
   /** Sessions with a finalized turn (dedups the cancel-fallback + late real turn/end pair). */
   private readonly openTurns = new Set<string>()
@@ -957,14 +1205,20 @@ export class AcpStore {
 
   private async call<T>(endpoint: string, payload: unknown = {}): Promise<T> {
     const result = await this.rpc('/acp', endpoint, payload)
-    if (!result.ok) throw new Error(result.error.message)
+    if (!result.ok) {
+      const error = new Error(result.error.message) as Error & { code?: string }
+      // Keep the protocol code so a save refusal can be told apart from a
+      // transport failure when the banner decides its next-step actions.
+      error.code = result.error.code
+      throw error
+    }
     return result.value as T
   }
 
   /** Snapshot refresh used on panel open and after a stream outage. */
   async resync(): Promise<void> {
     try {
-      const [{ agents }, { sessions }, defaultAgentInfo, detectResult, presetResult, tagHaloResult, deadlinesResult, idleReleaseResult, versionResult] = await Promise.all([
+      const [{ agents }, { sessions }, defaultAgentInfo, detectResult, presetResult, tagHaloResult, deadlinesResult, idleReleaseResult, saveGateResult, versionResult] = await Promise.all([
         this.call<{ agents: AgentView[] }>('agents/list'),
         this.call<{ sessions: SessionView[] }>('sessions/list'),
         // The plugin's OWN default ACP agent — a plugin-private id, not a DSH
@@ -981,6 +1235,9 @@ export class AcpStore {
         // `undefined` (older half) hides the tab instead of showing a
         // number this browser made up.
         this.call<IdleReleaseResult>('ui/idle-release').catch(() => ({ idleRelease: undefined })),
+        // The save gate is optional: an older host answers an unknown endpoint
+        // and the local idle default stays in force.
+        this.call<{ status: SaveGateStatus }>('save/status').catch(() => null),
         // The settings badge's data source; older halves answer `unknown
         // endpoint`, which hides the badge.
         this.call<PluginVersionResult>('plugin/version').catch(() => null),
@@ -988,6 +1245,11 @@ export class AcpStore {
       const detectedAgents = (detectResult && detectResult.agents.length > 0)
         ? detectResult.agents
         : (this.state.detectedAgents.length > 0 ? this.state.detectedAgents : [...DEFAULT_KNOWN_PRESETS])
+      // A snapshot without `gateAvailable` is an older/non-wired host, not an
+      // idle authority. Normalising here keeps every surface honest.
+      const nextSaveGate = saveGateResult?.status === undefined
+        ? undefined
+        : normalizeSaveGateStatus(saveGateResult.status)
       // Absent on an older host: keep the settings-panel card (degraded path).
       this.mutate({
         agents,
@@ -999,6 +1261,12 @@ export class AcpStore {
         tagHalo: tagHaloResult?.halo ?? { ...DEFAULT_TAG_HALO },
         approvalDeadlines: deadlinesResult.deadlines,
         idleRelease: idleReleaseResult.idleRelease,
+        ...(nextSaveGate === undefined ? {} : { saveGate: nextSaveGate }),
+        // A refresh must rebuild the terminal rows it missed, not only the
+        // gate snapshot: the SSE frame that produced them is gone.
+        ...(nextSaveGate === undefined
+          ? {}
+          : this.saveGatePatch(this.state.saveGate, nextSaveGate, false, true)),
         pluginVersion: versionResult?.version !== undefined && versionResult.version !== '' ? versionResult.version : undefined,
       })
       // `sessions/list` is the `/acp` RPC face; the composer's chat rows
@@ -1144,14 +1412,90 @@ export class AcpStore {
     )
   }
 
-  async saveAgent(payload: AgentSavePayload): Promise<void> {
+  /**
+   * Read the host's save gate before a settings save. The host remains the
+   * authority (`agent/save` re-checks), but this lets the form show its
+   * confirmation without racing a turn.
+   */
+  async readSaveGate(): Promise<SaveGateStatus> {
+    const result = await this.call<{ status: SaveGateStatus }>('save/status')
+    const status = normalizeSaveGateStatus(result.status)
+    this.mutate({ saveGate: status })
+    return status
+  }
+
+  /**
+   * Save one agent definition. `mode` is the user's explicit gesture:
+   * `direct` is the no-turn path, `defer` queues behind turns, `force` flushes
+   * the gate and interrupts. The host returns `confirmationRequired` when a
+   * turn exists and no explicit mode was supplied; the caller must ask.
+   */
+  async saveAgent(payload: AgentSavePayload, mode: AgentSaveMode = 'direct'): Promise<AgentSaveResult> {
     try {
-      await this.call('agent/save', payload)
+      const result = await this.call<AgentSaveResult>('agent/save', { ...payload, saveMode: mode })
+      // A delete won the race: the host aborted silently and wrote nothing.
+      // Re-reading the roster or probing the id would chase an agent that no
+      // longer exists (and a probe could resurrect its model surface).
+      if (result.cancelled === true) return result
+      if (result.confirmationRequired || result.deferred) return result
+      // This write landed: earlier "not written" receipts for the same agent
+      // would now contradict the fresh success. Other agents' rows stay.
+      this.clearAgentSaveFailures(payload.id)
       await this.resync()
       // The host probes the catalog right after a save; pull the fresh result
       // so the agent card fills in without a second click.
       void this.probeModels(payload.id)
+      return result
     } catch (error) {
+      const code = (error as { code?: string }).code
+      if (code === 'agent_deleted') {
+        // The id is gone for this host run. Offer no retry/force gesture: both
+        // would recreate exactly what the user removed, and the host will keep
+        // refusing it until a restart.
+        this.rememberDeletedAgent(payload.id)
+        const key = `save-failed:${payload.id}`
+        this.bannerRetries.delete(key)
+        const text = this.label(
+          '该 Agent 已被删除，本次保存已取消。',
+          'This agent was deleted, so this save was cancelled.',
+        )
+        this.pushSaveBanner({
+          key,
+          source: 'save-failed',
+          level: 'error',
+          title: this.label('保存已取消', 'Save cancelled'),
+          body: text,
+          at: Date.now(),
+          actions: ['dismiss'],
+          label: `agent-save:${payload.id}`,
+        })
+        this.mutate({ notice: text })
+        throw error
+      }
+      const key = code === 'confirmation_required' ? `save-rejected:${payload.id}` : `save-failed:${payload.id}`
+      const label = `agent-save:${payload.id}`
+      const body = code === 'confirmation_required'
+        ? this.label(
+            '目标 Agent 还有进行中的会话，本轮保存被拒绝。请选择「回合结束后保存」或「立即保存（中断该 Agent）」。',
+            'The target agent still has running turns, so the save was refused. Choose "save after turns" or "save now (interrupt this agent)".',
+          )
+        : this.label(
+            `配置未写入：${error instanceof Error ? error.message : String(error)}`,
+            `The setting was not written: ${error instanceof Error ? error.message : String(error)}`,
+          )
+      this.bannerRetries.set(key, { kind: 'payload', payload })
+      this.pushSaveBanner({
+        key,
+        source: code === 'confirmation_required' ? 'save-rejected' : 'save-failed',
+        level: 'error',
+        title: code === 'confirmation_required'
+          ? this.label('保存被拒绝', 'Save refused')
+          : this.label('保存失败', 'Save failed'),
+        body,
+        at: Date.now(),
+        actions: ['retry', 'force', 'dismiss'],
+        label,
+      })
       this.flashError(error)
       throw error
     }
@@ -1311,7 +1655,12 @@ export class AcpStore {
   async deleteAgent(agentId: string): Promise<void> {
     try {
       await this.call('agent/delete', { agentId })
+      this.rememberDeletedAgent(agentId)
       await this.resync()
+      // A retained retry payload would rebuild the agent just deleted. Drop the
+      // rows (and their retry entries) after the resync too, so a late status
+      // snapshot cannot put them back.
+      this.clearAgentSaveBanners(agentId)
       // Nothing should keep offering a deleted agent's models (a conversation
       // that was routed to it falls back to its roster entry).
       this.invalidateSeatCatalog(agentId)
@@ -1953,6 +2302,551 @@ export class AcpStore {
   }
 
   /**
+   * Explicit "强制保存": flush the host's held profile writes now, even while
+   * an ACP turn is running. The gate broadcasts its new state; the extra
+   * `save/status` read is the fallback for a host that resolves the flush
+   * before its own frame lands. A transport failure gets its own visible row —
+   * the caller's `.finally` must never be the only thing that runs.
+   */
+  async forceSaveGate(): Promise<SaveGateFlushResult> {
+    try {
+      return await this.flushHeldSaves()
+    } catch (error) {
+      this.pushSaveRetryFailedBanner(undefined, this.errorText(error))
+      throw error
+    }
+  }
+
+  /** Run `save/flush`, then fold its answer into banners and the gate snapshot. */
+  private async flushHeldSaves(): Promise<SaveGateFlushResult> {
+    // Capture what this flush was asked to write BEFORE the call: only the
+    // gate's terminal rows afterwards can tell which of those labels failed.
+    const heldLabels = this.state.saveGate.pending.map(entry => entry.label)
+    const result = await this.call<SaveGateFlushResult>('save/flush')
+    const status = await this.call<{ status: SaveGateStatus }>('save/status').catch(() => null)
+    const next = status?.status === undefined ? undefined : normalizeSaveGateStatus(status.status)
+    if (next !== undefined) this.mutate({ saveGate: next })
+    this.reportFlushResult(result, heldLabels, next)
+    return result
+  }
+
+  /**
+   * Drop one held profile write by label. The settings form uses this when the
+   * user edits the form after choosing "save after turns": flushing that old
+   * snapshot later would silently overwrite the newer values.
+   *
+   * Only a numeric, positive cancellation count is success. A missing or
+   * non-numeric answer leaves the held state in place and warns: the host
+   * clearly answered, but it did not prove the write was dropped.
+   */
+  async cancelSaveGate(label: string): Promise<boolean> {
+    let result: { cancelled?: number } | undefined
+    try {
+      result = await this.call<{ cancelled?: number }>('save/cancel', { label })
+    } catch (error) {
+      this.flashError(error)
+      this.pushSaveCancelFailedBanner(label)
+      return false
+    }
+    const cancelled = result?.cancelled
+    if (typeof cancelled !== 'number') {
+      this.pushSaveCancelFailedBanner(label)
+      return false
+    }
+    if (cancelled > 0) {
+      this.dropPendingLocally(label)
+      return true
+    }
+    // `0` can also mean "the frame raced ahead of the status snapshot". Re-read
+    // before warning; only a label still queued (or no matching terminal row)
+    // is a real failure.
+    try {
+      const status = await this.readSaveGate()
+      const stillPending = status.pending.some(entry => entry.label === label)
+      const outcome = saveGateOutcomeForLabel(status, label)
+      if (!stillPending && outcome?.status === 'cancelled') {
+        this.dropPendingLocally(label)
+        return true
+      }
+    } catch (error) {
+      this.flashError(error)
+    }
+    this.pushSaveCancelFailedBanner(label)
+    return false
+  }
+
+  /** Re-run a failed/expired held write through the host gate. */
+  async retrySaveGate(label: string): Promise<'retried' | 'none' | 'error'> {
+    try {
+      const result = await this.call<{ retried?: unknown }>('save/retry', { label })
+      if (result.retried === true) {
+        // A status frame is already on its way; this read closes the gap when
+        // the host resolves the retry before broadcasting.
+        await this.readSaveGate().catch(() => { /* the status frame remains authoritative */ })
+        return 'retried'
+      }
+      if (result.retried === false) return 'none'
+      // A malformed answer is not "nothing to retry": reporting that would
+      // hide a real host problem behind a success receipt.
+      throw new Error(this.label(
+        '宿主返回了无法识别的重试结果。',
+        'The host returned an unrecognised retry result.',
+      ))
+    } catch (error) {
+      this.pushSaveRetryFailedBanner(label, this.errorText(error))
+      return 'error'
+    }
+  }
+
+  private dropPendingLocally(label: string): void {
+    const next = this.state.saveGate.pending.filter(entry => entry.label !== label)
+    if (next.length === this.state.saveGate.pending.length) {
+      // Still clear a stale "cancel did not take effect" row on a success.
+      this.dismissBanner(`save-cancel-failed:${label}`)
+      return
+    }
+    this.mutate({
+      saveGate: {
+        ...this.state.saveGate,
+        pending: next,
+      },
+      saveBanners: this.state.saveBanners.filter(banner => banner.key !== `save-cancel-failed:${label}`),
+    })
+    this.bannerRetries.delete(`save-cancel-failed:${label}`)
+  }
+
+  /**
+   * The banner's "知道了": remove it, and let the same failure reappear later.
+   * `at` names the row that owns the gesture. An auto-dismiss timer passes the
+   * timestamp it was registered with, so a NEWER row sharing the key survives.
+   */
+  dismissBanner(key: string, at?: number): void {
+    const current = this.state.saveBanners.find(banner => banner.key === key)
+    if (current === undefined) {
+      this.bannerRetries.delete(key)
+      return
+    }
+    if (at !== undefined && current.at !== at) return
+    rememberBannerDismissal(current)
+    this.bannerRetries.delete(key)
+    this.mutate({ saveBanners: this.state.saveBanners.filter(banner => banner.key !== key) })
+  }
+
+  /** The banner's "重试": re-run the retained host write or the rejected save. */
+  async retryBanner(key: string): Promise<void> {
+    const action = this.bannerRetries.get(key)
+    if (action === undefined) {
+      this.dismissBanner(key)
+      return
+    }
+    if (action.kind === 'cancel') {
+      this.dismissBanner(key)
+      const cancelled = await this.cancelSaveGate(action.label)
+      // A failed retry re-adds its own "cancel did not take effect" row.
+      if (cancelled) this.pushSaveCancelledBanner(action.label)
+      return
+    }
+    if (action.kind === 'gate') {
+      const outcome = await this.retrySaveGate(action.label)
+      if (outcome === 'error') {
+        // Keep the original failure row AND the new error receipt: an RPC
+        // failure is not evidence that nothing was left to retry.
+        return
+      }
+      this.dismissBanner(key)
+      // "重试" never silently escalates to a force flush: a force can interrupt
+      // a running turn, and that is a separate, explicit gesture.
+      if (outcome === 'none') this.pushSaveRetryNoneBanner(action.label)
+      return
+    }
+    if (action.kind === 'flush') {
+      await this.retryFlushBanner(key)
+      return
+    }
+    this.dismissBanner(key)
+    try {
+      await this.saveAgent(action.payload, 'defer')
+    } catch { /* the failure banner has already been replaced */ }
+  }
+
+  /** The banner's "强制保存": flush the gate or force the rejected payload. */
+  async forceBanner(key: string): Promise<void> {
+    const action = this.bannerRetries.get(key)
+    if (action?.kind === 'payload') {
+      this.dismissBanner(key)
+      try {
+        await this.saveAgent(action.payload, 'force')
+      } catch { /* the failure banner has already been replaced */ }
+      return
+    }
+    // A gate failure/expiry row is settled by the flush itself; a transport
+    // error becomes a fresh visible receipt. The partial row is different: it
+    // must survive until a flush actually clears every held write.
+    if (action?.kind === 'gate') {
+      this.dismissBanner(key)
+      try {
+        await this.flushHeldSaves()
+      } catch (error) {
+        this.pushSaveRetryFailedBanner(undefined, this.errorText(error))
+      }
+      return
+    }
+    await this.retryFlushBanner(key)
+  }
+
+  /**
+   * Retry/force one `save-partial` row. The original partial row survives a
+   * transport failure; only an all-saved flush clears it. A partially completed
+   * retry replaces the row through {@link reportFlushResult} instead.
+   */
+  private async retryFlushBanner(key: string): Promise<void> {
+    const beforeAt = this.state.saveBanners.find(banner => banner.key === key)?.at
+    try {
+      const result = await this.flushHeldSaves()
+      const remaining = (result.expired ?? 0) + (result.failed ?? 0)
+      if (remaining === 0) this.dismissBanner(key, beforeAt)
+    } catch (error) {
+      this.pushSaveRetryFailedBanner(undefined, this.errorText(error))
+    }
+  }
+
+  /** Translate one force-flush result into a success or partial-failure banner. */
+  private reportFlushResult(
+    result: SaveGateFlushResult,
+    heldLabels: readonly string[] = [],
+    status?: SaveGateStatus,
+  ): void {
+    const expired = result.expired ?? 0
+    const failed = result.failed ?? 0
+    const failedLabels = status === undefined
+      ? []
+      : heldLabels.filter(label => {
+        const outcome = saveGateOutcomeForLabel(status, label)
+        return outcome?.status === 'failed' || outcome?.status === 'expired'
+      })
+    if (expired > 0 || failed > 0) {
+      const key = 'save-partial'
+      this.bannerRetries.set(key, { kind: 'flush' })
+      const named = failedLabels.length === 0
+        ? ''
+        : this.label(` 未写入：${failedLabels.join('、')}。`, ` Not written: ${failedLabels.join(', ')}.`)
+      this.pushSaveBanner({
+        key,
+        source: 'save-partial',
+        level: 'error',
+        title: this.label('强制保存只完成一部分', 'Forced save only partly completed'),
+        body: this.label(
+          `已保存 ${String(result.saved)} 项，失败 ${String(failed)} 项，过期 ${String(expired)} 项${result.cancelled ? `，取消 ${String(result.cancelled)} 项` : ''}。请重试。${named}`,
+          `${String(result.saved)} saved, ${String(failed)} failed, ${String(expired)} expired${result.cancelled ? `, ${String(result.cancelled)} cancelled` : ''}. Please retry.${named}`,
+        ),
+        at: Date.now(),
+        actions: ['retry', 'dismiss'],
+      })
+      return
+    }
+    if (result.saved > 0) {
+      const savedLabels = status === undefined
+        ? []
+        : heldLabels.filter(label => saveGateOutcomeForLabel(status, label)?.status === 'saved')
+      this.pushSaveSuccessBanner(result.saved, savedLabels)
+    }
+  }
+
+  /**
+   * A success receipt names the agent (or the non-agent label) it belongs to.
+   * Several agents settling in one frame share ONE row whose body lists every
+   * one of them, so the last settlement cannot erase the others' identity.
+   */
+  private saveSuccessBanner(saved: number, labels: string[] = []): SaveBanner {
+    const subjects = labels.map(label => this.saveSubjectOf(label))
+    const count = saved > 1
+      ? this.label(`已保存 ${String(saved)} 项配置`, `${String(saved)} settings were saved`)
+      : undefined
+    const body = subjects.length === 0
+      ? (count === undefined ? this.label('已保存。', 'Saved.') : `${count}。`)
+      : subjects.length > 3
+        ? this.label(
+          `已保存：${subjects.slice(0, 3).join('、')} 等 ${String(subjects.length)} 个。`,
+          `Saved: ${subjects.slice(0, 3).join(', ')}, ${String(subjects.length)} total.`,
+        )
+        : this.label(`已保存：${subjects.join('、')}。`, `Saved: ${subjects.join(', ')}.`)
+    return {
+      key: 'save-succeeded',
+      source: 'save-succeeded',
+      level: 'success',
+      title: this.label('保存成功', 'Saved'),
+      body,
+      at: Date.now(),
+      actions: ['dismiss'],
+      autoDismissMs: 2500,
+    }
+  }
+
+  private saveSubjectOf(label: string): string {
+    const prefix = 'agent-save:'
+    if (!label.startsWith(prefix)) return label
+    const agentId = label.slice(prefix.length)
+    const configured = this.state.agents.find(agent => agent.id === agentId)
+    const detected = this.state.detectedAgents.find(agent => agent.id === agentId)
+    return configured?.title ?? detected?.name ?? agentId
+  }
+
+  private pushSaveSuccessBanner(saved: number, labels: string[] = []): void {
+    this.pushSaveBanner(this.saveSuccessBanner(saved, labels))
+  }
+
+  private errorText(error: unknown): string {
+    return error instanceof Error ? error.message : String(error)
+  }
+
+  /** One visible receipt for a retry/force that failed before any settlement. */
+  private pushSaveRetryFailedBanner(label: string | undefined, message: string): void {
+    this.pushSaveBanner({
+      key: `save-retry-failed:${label ?? 'flush'}`,
+      source: 'save-retry-failed',
+      level: 'error',
+      title: this.label('重试失败', 'Retry failed'),
+      body: this.label(`重试没有完成：${message}`, `The retry did not complete: ${message}`),
+      at: Date.now(),
+      actions: ['dismiss'],
+      ...(label === undefined ? {} : { label }),
+    })
+  }
+
+  private pushSaveCancelledBanner(label: string): void {
+    this.pushSaveBanner({
+      key: `save-cancelled:${label}`,
+      source: 'save-cancelled',
+      level: 'success',
+      title: this.label('已取消暂存', 'Held save cancelled'),
+      body: this.label(
+        '回合结束后不会写入点击时的版本。',
+        'The values from the moment you clicked will not be written when the turn ends.',
+      ),
+      at: Date.now(),
+      actions: ['dismiss'],
+      autoDismissMs: 2500,
+    })
+  }
+
+  private pushSaveCancelFailedBanner(label: string): void {
+    const key = `save-cancel-failed:${label}`
+    this.bannerRetries.set(key, { kind: 'cancel', label })
+    this.pushSaveBanner({
+      key,
+      source: 'save-cancel-failed',
+      level: 'error',
+      title: this.label('取消未生效', 'Cancel did not take effect'),
+      body: this.label(
+        '取消未生效，回合结束会写入点击时版本。',
+        'The cancel did not take effect. The values from the moment you clicked will be written when the turn ends.',
+      ),
+      at: Date.now(),
+      actions: ['retry', 'dismiss'],
+      label,
+    })
+  }
+
+  private pushSaveRetryNoneBanner(label: string): void {
+    this.pushSaveBanner({
+      key: `save-retry-none:${label}`,
+      source: 'save-retry-none',
+      level: 'success',
+      title: this.label('已无待重试项', 'Nothing left to retry'),
+      body: this.label('该配置已不在待重试的队列中。', 'That setting is no longer waiting to be retried.'),
+      at: Date.now(),
+      actions: ['dismiss'],
+      autoDismissMs: 2500,
+    })
+  }
+
+  /** Record an id the host deleted during this run (session-only tombstone). */
+  private rememberDeletedAgent(agentId: string): void {
+    if (agentId === '' || this.state.deletedAgentIds.includes(agentId)) return
+    this.mutate({ deletedAgentIds: [...this.state.deletedAgentIds, agentId] })
+  }
+
+  /**
+   * The failure/expiry rows that a successful save of `label` retires. Scoped to
+   * the same agent (or the same non-agent setting) so another agent's failure
+   * receipts survive.
+   */
+  private saveFailureKeysFor(label: string): Set<string> {
+    const keys = new Set([`save-failed:${label}`, `save-expired:${label}`])
+    const prefix = 'agent-save:'
+    if (label.startsWith(prefix)) {
+      const agentId = label.slice(prefix.length)
+      keys.add(`save-failed:${agentId}`)
+      keys.add(`save-rejected:${agentId}`)
+    }
+    return keys
+  }
+
+  /**
+   * A successful save retires that agent's older failure receipts: leaving
+   * "the setting was not written" beside a fresh success would contradict it.
+   * Only failure/expiry rows go; another agent's rows and receipts stay.
+   */
+  private clearAgentSaveFailures(agentId: string): void {
+    const keys = this.saveFailureKeysFor(`agent-save:${agentId}`)
+    for (const key of keys) this.bannerRetries.delete(key)
+    const next = this.state.saveBanners.filter(banner => !keys.has(banner.key))
+    if (next.length !== this.state.saveBanners.length) this.mutate({ saveBanners: next })
+  }
+
+  /**
+   * A deleted agent must not leave a retry gesture behind: its payload would
+   * recreate exactly what the user removed. Clear the id-keyed rows and the
+   * label-keyed gate rows in one place.
+   */
+  private clearAgentSaveBanners(agentId: string): void {
+    const label = `agent-save:${agentId}`
+    const keys = new Set([
+      `save-failed:${agentId}`,
+      `save-rejected:${agentId}`,
+      `save-failed:${label}`,
+      `save-expired:${label}`,
+      `save-cancel-failed:${label}`,
+      `save-cancelled:${label}`,
+      `save-retry-none:${label}`,
+      `save-retry-failed:${label}`,
+    ])
+    for (const key of keys) this.bannerRetries.delete(key)
+    const next = this.state.saveBanners.filter(banner => !keys.has(banner.key))
+    if (next.length !== this.state.saveBanners.length) this.mutate({ saveBanners: next })
+  }
+
+  /**
+   * Fold one gate snapshot into banners and log lines. The SSE frame and
+   * `resync` share this, so a page refresh rebuilds the terminal rows it missed
+   * instead of only replacing `saveGate`.
+   *
+   * `logPending = false` on a resync: the held entry did not APPEAR at refresh
+   * time, and logging it on every panel open would be noise. Terminal rows are
+   * still synthesized.
+   *
+   * A terminal row is a SEED (rebuilt from a snapshot rather than witnessed live)
+   * when a resync asks for it or when the previous snapshot has no terminal
+   * entry for that label — the first SSE frame after a refresh lands before
+   * `resync` and carries the whole host roster. Seeded rows obey the closed-row
+   * records in sessionStorage; live settlements carry a new `at`, so closing an
+   * old row never suppresses a later failure of the same label.
+   */
+  private saveGatePatch(
+    previous: SaveGateStatus,
+    next: SaveGateStatus,
+    logPending = true,
+    rebuildRows = false,
+  ): Partial<UiState> {
+    const { addedPending, outcomes } = saveGateTransitions(previous, next)
+    const logged: AcpLogEntry[] = []
+    const log = (level: 'info' | 'error', text: string): void => {
+      logged.push({ id: ++this.logSeq, at: Date.now(), level, text })
+    }
+    let banners = this.state.saveBanners
+    for (const entry of addedPending) {
+      // The queue is authoritative again: drop a just-shown "cancelled"
+      // success row for the same label so the two prompts are not shown side
+      // by side. A resync can re-enter the queue too, so this is not tied to
+      // whether the arrival is worth a log line.
+      banners = banners.filter(banner => banner.key !== `save-cancelled:${entry.label}`)
+      if (logPending) {
+        log('info', this.label(
+          '本轮对话还在进行，配置已暂存，回合结束后自动保存。',
+          'A turn is still running. The setting is held and will be saved when the turn ends.',
+        ))
+      }
+    }
+    const savedLabels: string[] = []
+    for (const { label, outcome, wasPending, isPending } of outcomes) {
+      if (outcome.status === 'saved') {
+        // Only a previously HELD write earns the global receipt; a direct save
+        // from the form reports success on its own.
+        if (!wasPending) continue
+        // A success retires this agent's earlier failure/expiry receipts.
+        const cleared = this.saveFailureKeysFor(label)
+        for (const key of cleared) this.bannerRetries.delete(key)
+        banners = banners.filter(banner => !cleared.has(banner.key))
+        log('info', this.label(
+          `配置已保存：${label}。`,
+          `The setting was saved: ${label}.`,
+        ))
+        savedLabels.push(label)
+      } else if (outcome.status === 'expired') {
+        const key = `save-expired:${label}`
+        const row: SaveBanner = {
+          key,
+          source: 'save-expired',
+          level: 'error',
+          title: this.label('暂存已过期', 'Held save expired'),
+          body: this.label('等待超时，配置尚未写入。请重试。', 'The wait expired before the setting was written. Please retry.'),
+          at: outcome.at,
+          actions: isPending ? ['retry', 'force', 'dismiss'] : ['retry', 'dismiss'],
+          label,
+          persistAcrossReload: true,
+        }
+        if ((rebuildRows || saveGateOutcomeForLabel(previous, label) === undefined) && wasClosedAcrossReload(row)) continue
+        log('error', this.label(
+          '配置保存等待超时，尚未写入；请重新保存。',
+          'The setting was not saved before its wait expired. Please save it again.',
+        ))
+        this.bannerRetries.set(key, { kind: 'gate', label })
+        banners = composeSaveBanners(banners, row)
+      } else if (outcome.status === 'failed') {
+        const key = `save-failed:${label}`
+        const row: SaveBanner = {
+          key,
+          source: 'save-failed',
+          level: 'error',
+          title: this.label('保存失败', 'Save failed'),
+          body: this.label(
+            `配置未写入：${outcome.message ?? '未知错误'}`,
+            `The setting was not written: ${outcome.message ?? 'unknown error'}`,
+          ),
+          at: outcome.at,
+          actions: ['retry', 'dismiss'],
+          label,
+          persistAcrossReload: true,
+        }
+        if ((rebuildRows || saveGateOutcomeForLabel(previous, label) === undefined) && wasClosedAcrossReload(row)) continue
+        log('error', this.label(
+          `配置保存失败：${outcome.message ?? '未知错误'}`,
+          `The setting could not be saved: ${outcome.message ?? 'unknown error'}`,
+        ))
+        this.bannerRetries.set(key, { kind: 'gate', label })
+        banners = composeSaveBanners(banners, row)
+      } else if (outcome.status === 'cancelled') {
+        // A superseded row belongs to a newer save; a label still queued has
+        // not settled either. Neither is this attempt's cancellation.
+        if (saveGateOutcomeSuperseded(outcome) || isPending) continue
+        // Cancellation is a silent terminal result: no banner, one log line.
+        if (wasPending) log('info', this.label('配置暂存已取消。', 'The held setting was cancelled.'))
+      }
+    }
+    // One frame can settle several agents together. Show a single success row
+    // that names every one of them instead of letting the last overwrite the
+    // rest, and keep one log line per label above.
+    if (savedLabels.length > 0) {
+      banners = composeSaveBanners(banners, this.saveSuccessBanner(savedLabels.length, savedLabels))
+    }
+    return {
+      ...(logged.length === 0 ? {} : {
+        logs: [...this.state.logs, ...logged].slice(-LOG_MAX_ENTRIES),
+        logUnread: this.state.logUnread + logged.length,
+      }),
+      ...(banners === this.state.saveBanners ? {} : { saveBanners: banners }),
+    }
+  }
+
+  /**
+   * Add or replace one banner. The key IS the dedupe rule; failure rows are
+   * never dropped by count, and only one transient success row is kept.
+   */
+  private pushSaveBanner(banner: SaveBanner): void {
+    this.mutate({ saveBanners: composeSaveBanners(this.state.saveBanners, banner) })
+  }
+
+  /**
    * Set the plugin's OWN default ACP agent (the panel's ★ gesture): which agent
    * an ACP-mode conversation starts on. Plugin-private state — the host keeps it
    * in its own agent registry file, and nothing here touches DSH's model
@@ -2226,6 +3120,23 @@ export class AcpStore {
   private applyEvent(event: AcpEvent): Promise<void> {
     switch (event.type) {
       case 'agent/notice': {
+        if (event.agentId === 'hmr') {
+          // The hot-reload guard speaks through `agent/notice`; a log line is
+          // invisible unless the user opens the log, so the same fact also
+          // becomes a persistent page-top banner.
+          const retryFailure = event.text.includes('retry failed') || event.text.includes('did not start')
+          this.pushSaveBanner({
+            key: 'hmr-delay',
+            source: 'hmr-delay',
+            level: 'error',
+            title: this.label('热重载被延迟', 'Hot reload delayed'),
+            body: retryFailure
+              ? this.label('热重载重试失败，配置会在本轮对话结束后重新加载。', 'The hot-reload retry failed. The configuration will reload when this turn ends.')
+              : this.label('对话仍在进行，配置热重载已延迟；回合结束后会自动重新加载。', 'A turn is still running, so the configuration reload is delayed. It will reload when the turn ends.'),
+            at: Date.now(),
+            actions: ['dismiss'],
+          })
+        }
         this.mutate(this.logPatch(event.level, event.text, event.agentId))
         return Promise.resolve()
       }
@@ -2534,6 +3445,14 @@ export class AcpStore {
           trimBlocks(this.state.blocks)
           this.mutate({ sessions: this.state.sessions.map(s => (s.sessionId === event.sessionId ? { ...s, running: false } : s)) })
         }
+        return Promise.resolve()
+      }
+      case 'save/status': {
+        const status = normalizeSaveGateStatus(event.status)
+        this.mutate({
+          saveGate: status,
+          ...this.saveGatePatch(this.state.saveGate, status),
+        })
         return Promise.resolve()
       }
       case 'subagents/update': {

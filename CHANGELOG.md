@@ -2,6 +2,55 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [Unreleased]
+
+回合进行中保存配置不再打断对话；暂存、失败与重试都能看见。
+> *发布前补提交链接与 compare 链接（本次未提交）。 / Add commit and compare links before release (not committed yet).*
+
+### 新增
+
+- **acp**：保存 NTR agent 配置时若目标 agent 正在跑回合，可以选「回合结束后保存」或「立即保存并中断」；选择回合后保存会冻结点击时的配置，继续编辑则取消暂存并提示重新保存。
+- **acp**：保存结果在页顶提示：失败、等待过期、被拒绝、强制保存只完成一部分都常驻并给出重试或强制保存；成功短暂显示后自动消失。
+- **acp**：删除或停止 agent 前显示将影响的会话数。
+- **acp**：多个 agent 有暂存时可「全部立即保存」；确认卡列出会被中断的 Agent 与各自会话数，部分失败会列出未写入的 agent。
+- **acp**：同一帧多个 agent 保存成功只显示一条成功行，正文列出保存的 agent 名；超过 3 个时列前 3 个并注明总数。
+- **acp**：删除 agent 后，它的暂存保存显示单独的「该 Agent 已被删除」行，只给关闭。
+
+### 改进
+
+- **acp**：活动回合期间 HMR 替换被延迟，回合结束后自动重试，连续失败或回合长时间不结束会提示一次；插件设置保存可选择延后。DSH 设置写入本身不经本仓拦截，宿主补丁到位前不会自动排队。
+- **acp**：同一 agent 连续保存时，旧的暂存不会在回合结束后覆盖新值；删除 agent 会先取消它的暂存，避免配置被写回。
+- **acp**：单个 agent 的「立即保存」只处理该 agent，不再顺带写入其它 agent 的暂存；全局冲刷仍走「全部立即保存」。
+- **acp**：保存与删除在无法写盘时明确失败，不再静默成功；写盘失败时内存保持旧配置。
+- **acp**：只有门禁明确报告可用时才按门禁活动会话判断空闲，否则改用本地会话，避免把不完整快照当成空闲证据。
+- **acp**：关闭的失败 / 过期提示刷新后不再出现；同一 agent 的新保存会清掉它旧的失败提示与「已取消暂存」行。
+- **acp**：取消暂存与重试保存只在收到明确结果时算成功；被新保存取代的取消不再显示成用户取消。
+- **acp**：删除或停止 agent 后，迟到的模型探测结果不再写回目录。
+
+---
+
+A save no longer interrupts a running conversation; held saves, failures and retries are all visible.
+
+### Added
+
+- **acp**: when the target agent has a running turn, saving its settings offers "save after turns" or "save now and interrupt"; the deferred save freezes the values at click time, and editing the form cancels it and asks for a new save.
+- **acp**: save results appear at the page top: failure, expiry, refusal and a partly completed forced save stay until dismissed with a retry or force action; success hides itself shortly.
+- **acp**: removing or stopping an agent now shows how many sessions it will affect.
+- **acp**: when several agents have held saves, "save all now" offers one confirmation that lists the agents to interrupt and their session counts; a partial failure lists the agents that were not written.
+- **acp**: successful saves for several agents in the same frame collapse into one success line that lists the saved agent names; beyond three it shows the first three plus the total.
+- **acp**: after an agent is deleted, its held save shows a dedicated "this agent was deleted" line with a close action only.
+
+### Improved
+
+- **acp**: HMR replacement is delayed while a turn is active and retries after it ends, with one notice when retries fail or the turn never ends; plugin setting saves can be deferred. DSH setting writes themselves are not intercepted by this plugin, so the host must patch its write chain before they queue automatically.
+- **acp**: a newer save of the same agent invalidates the older held snapshot, and deleting an agent cancels its held save first, so the removed settings are not written back.
+- **acp**: "save now" for a single agent only handles that agent and no longer flushes other agents' held saves; a global flush still happens through "save all now".
+- **acp**: saving and deleting now fail explicitly when nothing can be written, instead of reporting success; a failed write keeps the old definition in memory.
+- **acp**: idle checks trust the gate's active sessions only when the gate reports itself available; otherwise the UI falls back to local sessions and no longer treats an incomplete snapshot as evidence of idleness.
+- **acp**: closed failure and expiry banners stay closed after a reload; a new save of the same agent clears its old failure line and its "staging cancelled" line.
+- **acp**: cancelling a held save and retrying a save count as successful only on an explicit result; a cancellation superseded by a newer save is no longer shown as a user cancellation.
+- **acp**: after an agent is deleted or stopped, late model probe results are no longer written back to the catalog.
+
 ## [0.3.6] - 2026-11-02
 
 子智能体清单能看出后台任务还在不在跑。

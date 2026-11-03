@@ -24,6 +24,7 @@ import { AcpContextMeter } from './context-meter.tsx'
 import { AcpComposerAgentTag, AcpSessionControls, AcpSessionMenu } from './session-controls.tsx'
 import { AcpConversationView } from './acp-view.tsx'
 import { AcpSettingsDialog } from './settings-dialog.tsx'
+import { SaveGuardToast } from './save-guard-toast.tsx'
 import { PermissionDock } from './permission-dock.tsx'
 import { ReleasedBanner } from './released-banner.tsx'
 import { AcpBranchAction, resolveHostFork } from './branch-action.tsx'
@@ -288,6 +289,17 @@ export function apply(ctx: Context): void {
     order: 30,
     inject: () => ({ acp: store }),
   }, AcpSettingsDialog as unknown as SlotComponent<any>)), 'dsh-ntr: NTR settings dialog')
+
+  // A profile write held by the save gate is visible wherever the user is:
+  // the host settings page keeps its own save request pending, and this global
+  // overlay states why and offers the explicit force gesture. It renders null
+  // when no write is pending, so ordinary saves never see it.
+  ctx.effect(() => ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+    name: 'shell.overlay',
+    id: 'acp-save-guard-toast',
+    order: 40,
+    inject: () => ({ acp: store }),
+  }, SaveGuardToast as unknown as SlotComponent<any>)), 'dsh-ntr: save guard toast')
 
   // The agent's OWN modes sit in the composer tool row — the seat the slot
   // contract reserves for exactly this ("entries sit beside that chrome, never

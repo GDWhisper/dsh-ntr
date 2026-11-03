@@ -10,6 +10,8 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { ConnectionRpcHandler, HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
 import { ACP_PRESET_ID, AcpLlmAdapter, BridgeManager, PLUGIN_VERSION } from './bridge.ts'
 import { appendExternalSubagentCatalog, EventHub, dispatchRpc, permissionReplayFrames, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
+import { AcpSaveGate } from './save-gate.ts'
+import { installHmrReconcileGuard } from './hmr-guard.ts'
 import type { AcpEvent, ApprovalDeadlineKey } from './protocol.ts'
 import type { RosterPresetRow, SessionCatalogLike } from './impl.ts'
 import { UpdateService } from './update.ts'
@@ -95,6 +97,76 @@ export function apply(ctx: Context, config?: unknown): void {
     },
   )
   const adapter = new AcpLlmAdapter(manager)
+  /**
+   * Profile-save gate: the host settings service and profile HMR ask this
+   * before they write / replace plugins. The plugin exposes it as the
+   * `acpSaveGate` Cordis service; turn boundaries drive its queue.
+   */
+  const saveGate = new AcpSaveGate(
+    {
+      hasActiveTurns: () => manager.hasActiveTurns(),
+      activeTurnViews: () => manager.activeTurnViews(),
+    },
+    status => hub.broadcast({ type: 'save/status', status }),
+  )
+  manager.setSaveGate(saveGate)
+  // A host half without `ctx.provide` (older Cordis or a structural test
+  // double) keeps the RPC/SSE face; only the host-service seam is absent.
+  if (typeof ctx.provide === 'function') ctx.provide('acpSaveGate', saveGate)
+  ctx.effect(() => {
+    const unsubscribe = hub.subscribe(event => {
+      if (event.type === 'turn/start'
+        || event.type === 'turn/end'
+        || event.type === 'session/released'
+        || event.type === 'session/closed') {
+        saveGate.sync()
+      }
+    })
+    return () => { unsubscribe() }
+  }, 'dsh-ntr: save gate turn tracking')
+  ctx.effect(() => () => {
+    saveGate.dispose()
+    manager.setSaveGate(undefined)
+  }, 'dsh-ntr: save gate teardown')
+
+  /**
+   * Hot-reload guard (Q): wrap the HMR service's public `reconcileProfile`.
+   * `refresh` calls that instance method from its `runExclusive` transaction;
+   * while a turn is active we return a valid empty reconciliation immediately,
+   * then retry the original method after idle. No host file is changed, and a
+   * missing / reshaped service simply leaves HMR alone.
+   */
+  let restoreHmrGuard: (() => void) | undefined
+  const installHmrGuard = (): void => {
+    if (restoreHmrGuard !== undefined) return
+    const hmr = typeof ctx.get === 'function' ? ctx.get('hmr') : undefined
+    if (hmr === undefined) return
+    const handle = installHmrReconcileGuard(hmr, saveGate, {
+      logger: ctx.logger,
+      // A failed retry must not sit on the idle listener alone: back off and
+      // try again, and say so once the bound is reached. Both the exhaustion
+      // report and the never-idle deadline land in the runtime log.
+      retryDelayMs: 1_000,
+      notify: message => {
+        hub.broadcast({ type: 'agent/notice', agentId: 'hmr', level: 'info', text: `acp: ${message}` })
+      },
+    })
+    // A degraded attempt (missing reconcileProfile / runExclusive, a frozen
+    // service, a read-only property) leaves the HMR service untouched. Not
+    // recording it is what lets a later `ctx.inject(['hmr'])` retry once the
+    // service recovers.
+    if (!handle.installed) return
+    restoreHmrGuard = handle
+  }
+  installHmrGuard()
+  if (typeof ctx.inject === 'function') {
+    // HMR may load after this plugin; late arrival must still install.
+    ctx.inject(['hmr'], () => { installHmrGuard() })
+  }
+  ctx.effect(() => () => {
+    restoreHmrGuard?.()
+    restoreHmrGuard = undefined
+  }, 'dsh-ntr: hmr hot-reload guard')
   // Built-in update: the plugin never downloads or swaps files itself. The
   // harness plugin manager owns the install; this only relays its facts.
   // `resolveManager` re-probes on every call so a late-loading service is

@@ -10,6 +10,7 @@ import type {
   AgentProbeModelsResult,
   AgentSavePayload,
   AgentView,
+  SaveGateStatus,
   ApprovalDeadlinesSetPayload,
   AcpIdleRelease,
   DetectedAgentInfo,
@@ -50,6 +51,18 @@ export interface PanelFixtureOptions {
   permissions?: PanelPermissionRequest[]
   /** Hold the first agents/list response to preview/test the loading state. */
   initialResyncGate?: Promise<void>
+  /** null simulates an older host without the save gate; `undefined` means idle. */
+  saveGate?: SaveGateStatus | null
+  /** Independent `save/status` response; null simulates an older host endpoint. */
+  saveStatus?: SaveGateStatus | null
+  /** Reject `save/status` with this message (a transient read failure). */
+  saveStatusError?: string
+  /** What `save/cancel` answers; 0 = the host cancelled nothing. Default 1. */
+  saveCancel?: number
+  /** Hold every `save/cancel` answer until this promise resolves. */
+  saveCancelGate?: Promise<void>
+  /** Make `agent/save` answer `cancelled` (the agent was deleted mid-save). */
+  agentSaveCancelled?: boolean
   locale?: (zh: string, en: string) => string
 }
 
@@ -134,6 +147,11 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
   let pluginUpdate = options.pluginUpdate === null
     ? null
     : structuredClone<PluginUpdateState>(options.pluginUpdate ?? DEFAULT_PLUGIN_UPDATE)
+  const saveGate = options.saveGate === null
+    ? null
+    : structuredClone<SaveGateStatus>(options.saveGate ?? {
+      canSave: true, gateAvailable: true, activeTurns: 0, activeSessions: [], pending: [], timeoutMs: 600_000,
+    })
 
   function definition(agentId: string): AcpAgentDef {
     const def = definitions.get(agentId)
@@ -240,8 +258,39 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
           defaultAgentId = agentId
           return ok({ done: true })
         }
+        case 'save/status':
+          if (options.saveStatus === null) return unsupported()
+          if (options.saveStatusError !== undefined) {
+            return { ok: false, error: { code: 'fixture_error', message: options.saveStatusError } }
+          }
+          return ok({ status: options.saveStatus ?? saveGate ?? {
+            canSave: true, gateAvailable: true, activeTurns: 0, activeSessions: [], pending: [], timeoutMs: 600_000,
+          } })
+        case 'save/cancel': {
+          if (options.saveStatus === null) return unsupported()
+          if (options.saveCancelGate !== undefined) await options.saveCancelGate
+          const { label } = payload as { label?: string }
+          const cancelled = options.saveCancel ?? 1
+          // A real host drops the entry; mirror that so a follow-up status read
+          // does not resurrect the held state.
+          if (cancelled > 0 && label !== undefined && saveGate !== null) {
+            saveGate.pending = saveGate.pending.filter(entry => entry.label !== label)
+          }
+          return ok({ cancelled })
+        }
         case 'agent/save': {
+          if (options.agentSaveCancelled === true) return ok({ done: false, cancelled: true })
           const def = structuredClone(payload as AgentSavePayload)
+          const mode = def.saveMode
+          delete def.saveMode
+          if (mode === 'defer') return ok({ done: true, deferred: true })
+          if (saveGate !== null && saveGate.canSave === false && mode !== 'force') {
+            return ok({
+              done: false,
+              confirmationRequired: true,
+              activeSessions: saveGate.activeSessions,
+            })
+          }
           definitions.set(def.id, { ...def, cwd: def.cwd ?? WORKSPACE, allowedCwdRoots: def.allowedCwdRoots ?? [def.cwd ?? WORKSPACE] })
           states.set(def.id, 'stopped')
           return ok({ done: true })

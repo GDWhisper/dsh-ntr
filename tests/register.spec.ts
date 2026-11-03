@@ -62,6 +62,22 @@ describe('host plugin contract', () => {
     expect(ctx.connection.rpc.handle).toHaveBeenCalledWith('/acp', expect.any(Function))
   })
 
+  it('provides the acpSaveGate service on a runtime that supports ctx.provide', () => {
+    // The host settings service and profile HMR resolve this optional service
+    // with `ctx.get('acpSaveGate')`; an older runtime without `provide` keeps
+    // working through the RPC/SSE face instead.
+    const ctx = fakeCtx() as unknown as { provide: ReturnType<typeof vi.fn> }
+    ctx.provide = vi.fn()
+    apply(ctx as never, { agents: [{ id: 'a', command: 'x' }] })
+    expect(ctx.provide).toHaveBeenCalledWith('acpSaveGate', expect.objectContaining({
+      canSaveNow: expect.any(Function),
+      defer: expect.any(Function),
+      waitForIdle: expect.any(Function),
+      forceFlush: expect.any(Function),
+      status: expect.any(Function),
+    }))
+  })
+
   it('keeps the channel registered when register returns no disposer, without registering twice', () => {
     // An unexpected return shape means "this runtime's register is not the one we
     // know": keep the working channel and hand the effect a no-op disposer rather
@@ -79,6 +95,32 @@ describe('host plugin contract', () => {
     // hand one over instead of letting activation/disposal fail.
     expect(channel).toBeDefined()
     expect(typeof channel![0]()).toBe('function')
+  })
+
+  it('retries the HMR guard after a degraded first attempt', () => {
+    // A present-but-unusable `hmr` service (no `runExclusive`) must not be
+    // recorded as installed: otherwise the late `ctx.inject(['hmr'])` callback
+    // skips forever, and the guard never recovers when the service does.
+    const ctx = fakeCtx() as unknown as {
+      get: (key: string) => unknown
+      inject: ReturnType<typeof vi.fn>
+    }
+    const original = vi.fn(async () => ({ warnings: [], pending: [] }))
+    const hmr: Record<string, unknown> = { reconcileProfile: original }
+    const callbacks: Record<string, Array<() => void>> = {}
+    ctx.get = (key: string) => (key === 'hmr' ? hmr : undefined)
+    ctx.inject = vi.fn((deps: string[], callback: () => void) => {
+      for (const dep of deps) (callbacks[dep] ??= []).push(callback)
+    })
+
+    apply(ctx as never, { agents: [{ id: 'a', command: 'x' }] })
+    // Degraded: the method is untouched, so nothing was recorded.
+    expect(hmr.reconcileProfile).toBe(original)
+
+    // The service recovers and the late injection fires: the guard installs.
+    hmr.runExclusive = vi.fn(async (operation: () => Promise<unknown>) => operation())
+    callbacks.hmr?.[0]?.()
+    expect(hmr.reconcileProfile).not.toBe(original)
   })
 
   it('fails the boot loudly on invalid agent config', () => {

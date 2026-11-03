@@ -44,6 +44,7 @@ import {
   validateAgentDef,
   validateApprovalDeadlines,
   validateConfig,
+  agentSaveAction,
 } from '../src/impl.ts'
 import type { AcpManager } from '../src/impl.ts'
 import type { AcpAgentDef, AgentProbeModelsResult, PermissionOptionView } from '../src/protocol.ts'
@@ -2474,6 +2475,66 @@ describe('dispatchRpc', () => {
       .resolves.toEqual({ ok: true, value: { version: '1.2.3' } })
     await expect(dispatchRpc({ ...manager, pluginVersion: undefined }, 'plugin/version', {}))
       .resolves.toEqual({ ok: true, value: { version: undefined } })
+    // Save gate: status/flush/wait-idle route to the manager; an older half
+    // answers the idle status (or `unsupported` for the gestures) instead of
+    // failing the browser.
+    const gateStatus = {
+      gateAvailable: true,
+      canSave: false,
+      activeTurns: 1,
+      activeSessions: [{ sessionId: 'S', agentId: 'demo' }],
+      pending: [{ id: 'save-1', label: 'settings:llm-pi-ai', queuedAt: 1, deadlineAt: 2 }],
+      timeoutMs: 600_000,
+    }
+    const withGate = {
+      ...manager,
+      saveGateStatus: () => gateStatus,
+      saveGateFlush: async () => ({ saved: 1, expired: 0, failed: 0 }),
+      saveGateWaitIdle: async (timeoutMs?: number) => {
+        manager.calls.push(['waitIdle', timeoutMs])
+        return true
+      },
+    }
+    await expect(dispatchRpc(withGate, 'save/status', {})).resolves.toEqual({ ok: true, value: { status: gateStatus } })
+    await expect(dispatchRpc(manager, 'save/status', {})).resolves.toMatchObject({
+      ok: true,
+      // The fallback snapshot is NOT gate-backed: the browser must be able to
+      // tell it cannot queue / force anything on this host half.
+      value: { status: { gateAvailable: false, canSave: true, activeTurns: 0, pending: [] } },
+    })
+    await expect(dispatchRpc(withGate, 'save/flush', {})).resolves.toEqual({
+      ok: true,
+      value: { saved: 1, expired: 0, failed: 0 },
+    })
+    await expect(dispatchRpc(manager, 'save/flush', {})).resolves.toMatchObject({ ok: false, error: { code: 'unsupported' } })
+    const withCancel = {
+      ...manager,
+      saveGateCancel: (label: string) => {
+        manager.calls.push(['saveCancel', label])
+        return 2
+      },
+    }
+    await expect(dispatchRpc(withCancel, 'save/cancel', { label: 'agent-save:pi' }))
+      .resolves.toEqual({ ok: true, value: { cancelled: 2 } })
+    expect(manager.calls).toContainEqual(['saveCancel', 'agent-save:pi'])
+    await expect(dispatchRpc(manager, 'save/cancel', { label: 'agent-save:pi' }))
+      .resolves.toMatchObject({ ok: false, error: { code: 'unsupported' } })
+    const withRetry = {
+      ...manager,
+      saveGateRetry: (label: string) => {
+        manager.calls.push(['saveRetry', label])
+        return true
+      },
+    }
+    await expect(dispatchRpc(withRetry, 'save/retry', { label: 'agent-save:pi' }))
+      .resolves.toEqual({ ok: true, value: { retried: true } })
+    expect(manager.calls).toContainEqual(['saveRetry', 'agent-save:pi'])
+    await expect(dispatchRpc(manager, 'save/retry', { label: 'agent-save:pi' }))
+      .resolves.toMatchObject({ ok: false, error: { code: 'unsupported' } })
+    await expect(dispatchRpc(withGate, 'save/wait-idle', { timeoutMs: 50 })).resolves.toEqual({ ok: true, value: { idle: true } })
+    expect(manager.calls).toContainEqual(['waitIdle', 50])
+    await expect(dispatchRpc(withGate, 'save/wait-idle', { timeoutMs: -1 })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc(manager, 'save/wait-idle', {})).resolves.toMatchObject({ ok: false, error: { code: 'unsupported' } })
     // Built-in update: check/apply delegate to the manager; an older host half
     // answers `unsupported` instead of failing, and a malformed version never
     // reaches the manager.
@@ -2501,6 +2562,52 @@ describe('dispatchRpc', () => {
     await expect(dispatchRpc(manager, 'plugin/update-apply', { version: '1.3.0' }))
       .resolves.toEqual({ ok: true, value: { status: 'unsupported', current: '' } })
     await expect(dispatchRpc(manager, 'agent/save', { id: 'pi', command: 'pi-acp' })).resolves.toEqual({ ok: true, value: { done: true } })
+    expect(manager.calls).toContainEqual(['save', expect.objectContaining({ id: 'pi', command: 'pi-acp' })])
+    const withSaveMode = {
+      ...manager,
+      saveAgent: async (def: AcpAgentDef, mode?: 'direct' | 'defer' | 'force') => {
+        manager.calls.push(['saveMode', def.id, mode])
+        return mode === 'defer' ? { done: true, deferred: true } : { done: true }
+      },
+    }
+    await expect(dispatchRpc(withSaveMode, 'agent/save', { id: 'pi', command: 'pi-acp', saveMode: 'defer' }))
+      .resolves.toEqual({ ok: true, value: { done: true, deferred: true } })
+    expect(manager.calls).toContainEqual(['saveMode', 'pi', 'defer'])
+    await expect(dispatchRpc(manager, 'agent/save', { id: 'pi', command: 'pi-acp', saveMode: 'bogus' }))
+      .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    // A legacy caller that sends no gesture must NOT receive `ok` when the host
+    // refused the save: the explicit failure signal is the whole point.
+    const busyManager = {
+      ...manager,
+      saveAgent: async (busyDef: AcpAgentDef, mode?: 'direct' | 'defer' | 'force') => {
+        manager.calls.push(['busySave', busyDef.id, mode])
+        return {
+          done: false,
+          confirmationRequired: true,
+          activeSessions: [{ sessionId: 'S', agentId: busyDef.id }],
+        }
+      },
+    }
+    await expect(dispatchRpc(busyManager, 'agent/save', { id: 'pi', command: 'pi-acp' }))
+      .resolves.toMatchObject({ ok: false, error: { code: 'confirmation_required' } })
+    expect(manager.calls).toContainEqual(['busySave', 'pi', undefined])
+    // The new panel always sends a mode, so its answer shape is unchanged.
+    await expect(dispatchRpc(busyManager, 'agent/save', { id: 'pi', command: 'pi-acp', saveMode: 'direct' }))
+      .resolves.toEqual({
+        ok: true,
+        value: {
+          done: false,
+          confirmationRequired: true,
+          activeSessions: [{ sessionId: 'S', agentId: 'pi' }],
+        },
+      })
+    const noSave = { ...manager, saveAgent: undefined }
+    await expect(dispatchRpc(noSave, 'agent/save', { id: 'pi', command: 'pi-acp' }))
+      .resolves.toMatchObject({ ok: false, error: { code: 'unsupported' } })
+    expect(agentSaveAction([], 'direct')).toBe('save')
+    expect(agentSaveAction([{ sessionId: 'S', agentId: 'pi' }], 'direct')).toBe('confirm')
+    expect(agentSaveAction([{ sessionId: 'S', agentId: 'pi' }], 'defer')).toBe('defer')
+    expect(agentSaveAction([{ sessionId: 'S', agentId: 'pi' }], 'force')).toBe('save')
     expect(manager.calls).toContainEqual(['save', expect.objectContaining({ id: 'pi', command: 'pi-acp' })])
     await expect(dispatchRpc(manager, 'agent/test', { id: 'pi', command: 'pi-acp', npmPackage: 'pi-acp' })).resolves.toEqual({ ok: true, value: { ok: true, durationMs: 5, stderr: [] } })
     expect(manager.calls).toContainEqual(['test', expect.objectContaining({ id: 'pi', command: 'pi-acp', npmPackage: 'pi-acp' })])

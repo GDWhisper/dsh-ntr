@@ -17,10 +17,16 @@
 
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { formatCommandLine, isAbsolutePathLike, splitCommandLine } from './acp-ui.tsx'
-import { DEFAULT_KNOWN_PRESETS, LOG_MAX_ENTRIES } from './store.ts'
+import {
+  DEFAULT_KNOWN_PRESETS,
+  LOG_MAX_ENTRIES,
+  saveGateIsAvailable,
+  saveGateOutcomeForLabel,
+  saveGateOutcomeSuperseded,
+} from './store.ts'
 import type { AcpStore, UiState } from './store.ts'
 import { IDLE_RELEASE_MS } from '../protocol.ts'
-import type { AcpAgentDef, AcpApprovalDeadlines, AcpCatalogChoice, AcpMcpServerDef, AgentSavePayload, AgentView, DetectedAgentInfo, PermissionTimeoutMode, PluginUpdateState } from '../protocol.ts'
+import type { AcpAgentDef, AcpApprovalDeadlines, AcpCatalogChoice, AcpMcpServerDef, ActiveTurnView, AgentSaveMode, AgentSavePayload, AgentView, DetectedAgentInfo, PermissionTimeoutMode, PluginUpdateState } from '../protocol.ts'
 
 interface WithStore { acp: AcpStore }
 
@@ -159,6 +165,9 @@ const STYLE = `
 .dwa-default-hint { background: var(--dsw-alias-bg-layer-2, #f9fafb); border: var(--ntr-line); border-radius: var(--ntr-radius-sm); padding: 10px 12px; font-size: var(--ntr-font-sm); display: flex; align-items: center; justify-content: space-between; margin: 12px 0 14px; gap: 12px; }
 .dwa-form-actions { display: flex; align-items: center; gap: 8px; margin-top: 16px; padding-top: 14px; border-top: var(--ntr-line); flex-wrap: wrap; }
 .dwa-form-actions .dwa-btn-primary { min-width: 88px; }
+.dwa-save-confirm { margin-top: 12px; }
+.dwa-save-confirm-actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.dwa-save-confirm-sessions { word-break: break-all; }
 .dwa-form-actions > .dwa-hint:first-child { margin-right: auto; }
 .dwa-form-actions > .dwa-hint:last-child:not(:first-child) { width: 100%; }
 .dwa-menu-wrap { position: relative; }
@@ -1570,6 +1579,31 @@ function AgentRow({
   const [form, setForm] = useState<AgentForm>(() => initialForm(detected, activeAgent))
   const [saving, setSaving] = useState(false)
   const [savedSuccess, setSavedSuccess] = useState(false)
+  /**
+   * Whether THIS visit asked for "save after turns". The visible held state is
+   * derived from the gate's pending queue (`agent-save:<id>`), so remounting the
+   * panel or refreshing the page still shows it. This flag only bridges the
+   * short gap between the host's `deferred` answer and its first status frame.
+   */
+  const [deferRequested, setDeferRequested] = useState(false)
+  /**
+   * The payload signature held when the save was queued. On a remount the exact
+   * payload is gone, but the queue still knows a save is waiting: this baseline
+   * is re-captured from the form so any later edit cancels it.
+   */
+  const [heldSignature, setHeldSignature] = useState<string>()
+  /** True once the queue listed this label during the current held attempt. */
+  const [sawPending, setSawPending] = useState(false)
+  /** Terminal outcome that already existed when this defer was queued. */
+  const [deferOutcomeAt, setDeferOutcomeAt] = useState<number>()
+  /** One line of edit/cancel feedback; a failed cancel is a page banner. */
+  const [saveNotice, setSaveNotice] = useState<string>()
+  // Every save re-reads the gate before it shows the dialog, so this starting
+  // value only bridges a transient status-read failure: it keeps the queue
+  // gesture available until a snapshot positively says the gate is absent.
+  // A snapshot without `gateAvailable` flips this to `false` in `handleSave`.
+  const [saveGateAvailable, setSaveGateAvailable] = useState(true)
+  const [saveConfirm, setSaveConfirm] = useState<ActiveTurnView[] | undefined>(undefined)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | undefined>(undefined)
   const patch = (next: Partial<AgentForm>): void => setForm(prev => ({ ...prev, ...next }))
@@ -1592,12 +1626,15 @@ function AgentRow({
   const trimmedId = form.agentId.trim()
   const idValid = !newCustom || AGENT_ID_PATTERN.test(trimmedId)
   const idTaken = newCustom && trimmedId !== '' && ui.agents.some(a => a.id === trimmedId)
+  // A tombstone is per host run: the deleted id cannot come back until a
+  // restart, so warn before a doomed save is attempted.
+  const idDeleted = newCustom && trimmedId !== '' && ui.deletedAgentIds.includes(trimmedId)
   const cwdInvalid = form.cwd.trim() !== '' && !isAbsolutePathLike(form.cwd.trim())
   const rootValues = form.roots.map(root => root.trim()).filter(root => root !== '')
   const rootsInvalid = form.rootsOpen && (rootValues.length === 0 || rootValues.some(root => !isAbsolutePathLike(root)))
   const idleInvalid = !idleValid(form.idleStr)
   const mcpInvalid = !mcpTextValid(form.mcpText)
-  const formIncomplete = splitCommandLine(form.commandLine).command === '' || !idValid || idTaken || cwdInvalid || rootsInvalid || idleInvalid || mcpInvalid
+  const formIncomplete = splitCommandLine(form.commandLine).command === '' || !idValid || idTaken || idDeleted || cwdInvalid || rootsInvalid || idleInvalid || mcpInvalid
 
   const payload = buildPayload(form, detected, newCustom)
   const current = persistedDef(detected, activeAgent)
@@ -1606,13 +1643,141 @@ function AgentRow({
   // A save stops the child and kills every live session (see BridgeManager.saveAgent).
   const showSaveWarning = dirty && activeAgent !== undefined && activeAgent.state !== 'stopped'
 
+  /**
+   * Active turns for THIS agent. A trusted gate is the authority; an older host
+   * has no gate, so only the browser's own session rows can answer. Never read
+   * an untrusted snapshot's empty `activeSessions` as proof of idle.
+   */
+  const activeSessionsForSave = (trustGate = true): ActiveTurnView[] => {
+    if (trustGate) {
+      const fromGate = ui.saveGate.activeSessions.filter(view => view.agentId === payload.id)
+      if (fromGate.length > 0) return fromGate
+    }
+    // The host also counts a session whose agent has not settled its prompt
+    // (`settled`). An older host half never sends that field, so this fallback
+    // can still under-report that brief window — it is the known limitation.
+    return ui.sessions
+      .filter(session => session.agentId === payload.id && session.released !== true && (session.running || session.settled === true))
+      .map(session => ({ sessionId: session.sessionId, agentId: session.agentId }))
+  }
+
+  const saveLabel = `agent-save:${payload.id}`
+  const labelOutcome = saveGateOutcomeForLabel(ui.saveGate, saveLabel)
+  const savePending = ui.saveGate.pending.some(entry => entry.label === saveLabel)
+  // Held while this label is queued, or while the local defer answer is still
+  // waiting for its first queue frame. No browser clock is compared with the
+  // host's: the queue plus a terminal outcome for this label decide settlement.
+  const saveDeferred = deferRequested || savePending
+  const payloadSignature = JSON.stringify(payload)
+  const cancelInFlight = useRef(false)
+  const latestPayloadSignature = useRef(payloadSignature)
+  latestPayloadSignature.current = payloadSignature
+
+  useEffect(() => {
+    if (!saveDeferred || heldSignature !== undefined) return
+    setHeldSignature(payloadSignature)
+  }, [saveDeferred, heldSignature, payloadSignature])
+
+  useEffect(() => {
+    if (savePending) {
+      if (!sawPending) setSawPending(true)
+      // The queue is back: a "cancelled, save again" line would now contradict
+      // the held state shown in the same composer.
+      if (saveNotice !== undefined) setSaveNotice(undefined)
+      return
+    }
+    if (!deferRequested && !sawPending) return
+    if (labelOutcome === undefined) return
+    // A superseded row belongs to a newer save, not to this held attempt.
+    if (saveGateOutcomeSuperseded(labelOutcome)) return
+    // A terminal outcome that predates this defer cannot settle it. Identity
+    // (not ordering) is enough: the outcome's `at` names the host's settlement,
+    // and it is only "new" when it differs from the one captured at defer time.
+    const outcomeIsNew = deferOutcomeAt === undefined || labelOutcome.at !== deferOutcomeAt
+    if (!sawPending && !outcomeIsNew) return
+    setDeferRequested(false)
+    setSawPending(false)
+    setHeldSignature(undefined)
+    setDeferOutcomeAt(undefined)
+    if (labelOutcome.status === 'cancelled') {
+      setSaveNotice(acp.label('已取消暂存，请重新保存。', 'The held setting was cancelled. Please save again.'))
+    }
+  }, [savePending, sawPending, deferRequested, labelOutcome, deferOutcomeAt, saveNotice, acp])
+
+  useEffect(() => {
+    if (!saveDeferred || heldSignature === undefined) return
+    // The user kept editing: the held snapshot would write stale values, so
+    // drop it explicitly and tell the user to save again. Checking the queue
+    // keeps this working after a remount, where the exact payload is gone.
+    if (payloadSignature === heldSignature) return
+    if (cancelInFlight.current) return
+    cancelInFlight.current = true
+    const signatureAtStart = payloadSignature
+    void (async () => {
+      try {
+        let cancelled = await acp.cancelSaveGate(saveLabel)
+        // An edit can land while the cancel request is in flight. The effect
+        // above skipped it, so compare the LATEST signature here and send one
+        // follow-up cancellation; otherwise the last edit would never be
+        // applied to the queue.
+        if (latestPayloadSignature.current !== signatureAtStart) {
+          cancelled = await acp.cancelSaveGate(saveLabel)
+        }
+        // A failed cancel keeps the held state; the store already raised the
+        // "cancel did not take effect" banner with its retry gesture.
+        if (!cancelled) return
+        setDeferRequested(false)
+        setSawPending(false)
+        setHeldSignature(undefined)
+        setDeferOutcomeAt(undefined)
+        setSaveNotice(acp.label('已取消暂存，请重新保存。', 'The held setting was cancelled. Please save again.'))
+        void acp.readSaveGate().catch(() => { /* the status frame remains authoritative */ })
+      } finally {
+        cancelInFlight.current = false
+      }
+    })()
+  }, [payloadSignature, saveDeferred, heldSignature, saveLabel, acp])
+
   const handleUseDefault = (): void => patch({ commandLine: formatCommandLine(detected.defaultCommand, detected.defaultArgs) })
 
-  const handleSave = async (): Promise<void> => {
+  /**
+   * The actual save, after the user's gesture is known. The host re-checks the
+   * gate, so a turn that started between the pre-check and this call still
+   * returns `confirmationRequired` instead of interrupting.
+   */
+  const performSave = async (mode: AgentSaveMode): Promise<void> => {
+    // An older host has no gate to queue behind: offering "save after turns"
+    // there would silently interrupt them when it ignores `saveMode`.
+    if (mode === 'defer' && !saveGateAvailable) return
     setSaving(true)
     setSavedSuccess(false)
+    setDeferRequested(false)
+    setSawPending(false)
+    setHeldSignature(undefined)
+    setDeferOutcomeAt(undefined)
+    setSaveNotice(undefined)
+    setSaveConfirm(undefined)
     try {
-      await acp.saveAgent(payload)
+      const result = await acp.saveAgent(payload, mode)
+      // The agent was deleted while this save ran; the host aborted without
+      // writing. That is not a success and not a staged settlement.
+      if (result.cancelled === true) return
+      if (result.confirmationRequired) {
+        const fromHost = result.activeSessions ?? []
+        const active = fromHost.length > 0 ? fromHost : activeSessionsForSave(saveGateAvailable)
+        setSaveConfirm(active)
+        return
+      }
+      if (result.deferred) {
+        // Freeze the signature this deferred save will write. Editing the form
+        // afterwards cancels it (see the effect above). The gate read brings the
+        // queue in immediately; the pending state itself survives a remount.
+        setDeferRequested(true)
+        setHeldSignature(payloadSignature)
+        setDeferOutcomeAt(labelOutcome?.at)
+        void acp.readSaveGate().catch(() => { /* the status frame remains authoritative */ })
+        return
+      }
       // A save from the creation card resets the list's selection: the agent
       // now lives in the configured list, and keeping the same card mounted
       // would render it twice. Configured rows pass no `onCreated`, so this is
@@ -1626,6 +1791,51 @@ function AgentRow({
     } finally {
       setSaving(false)
     }
+  }
+
+  const handleSave = async (): Promise<void> => {
+    if (saving) return
+    // Ask the host before opening the form's own confirmation. If the status
+    // endpoint is unavailable (older host), the host's `agent/save` guard is
+    // still the authority and will answer `confirmationRequired`.
+    try {
+      const status = await acp.readSaveGate()
+      const available = saveGateIsAvailable(status)
+      setSaveGateAvailable(available)
+      // Only a live gate snapshot is an authority. On an older/non-wired host
+      // its empty `activeSessions` proves nothing: use the browser's own live
+      // session rows, and if those are empty still send the direct save — the
+      // host's `agent/save` guard answers `confirmationRequired` and the dialog
+      // opens from that answer.
+      const active = available
+        ? status.activeSessions.filter(view => view.agentId === payload.id)
+        : activeSessionsForSave(false)
+      if (active.length > 0) {
+        setSaveConfirm(active)
+        return
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      const code = (error as { code?: string }).code
+      // Only a host without the endpoint loses the queue gesture. A transient
+      // read failure keeps it: the next attempt may succeed, and the host's
+      // agent/save guard is still the final authority.
+      const unsupported = code === 'unsupported' || message.includes('unknown endpoint save/status')
+      if (unsupported) setSaveGateAvailable(false)
+      if (!unsupported) {
+        setSaveNotice(acp.label(
+          '读取保存状态失败，请稍后重试。',
+          'Could not read the save status. Please try again later.',
+        ))
+      }
+      const active = activeSessionsForSave(!unsupported && saveGateAvailable)
+      if (active.length > 0) {
+        setSaveConfirm(active)
+        return
+      }
+      if (!unsupported) return
+    }
+    await performSave('direct')
   }
 
   const handleTest = async (): Promise<void> => {
@@ -1649,6 +1859,21 @@ function AgentRow({
   }
 
   const state = activeAgent !== undefined ? stateVisual(activeAgent.state, acp) : undefined
+  // Sessions a delete or stop would interrupt. The gate's active-turn views
+  // cover turns the session list may not have hydrated yet; the list covers
+  // live sessions between turns.
+  const affectedSessionIds = new Set<string>()
+  for (const view of ui.saveGate.activeSessions) {
+    if (view.agentId === detected.id) affectedSessionIds.add(view.sessionId)
+  }
+  for (const session of ui.sessions) {
+    // A released session waits for `session/load`; it has no live turn to
+    // interrupt, so it must not inflate the destructive-action count.
+    if (session.agentId === detected.id && !session.closed && session.released !== true) {
+      affectedSessionIds.add(session.sessionId)
+    }
+  }
+  const affectedSessions = affectedSessionIds.size
   const displayName = newCustom
     ? acp.label('新建自定义 Agent', 'New Custom Agent')
     : (activeAgent?.title ?? detected.currentConfig?.title ?? detected.name)
@@ -1707,6 +1932,7 @@ function AgentRow({
             <RowMenu
               acp={acp}
               canStop={activeAgent !== undefined && activeAgent.state !== 'stopped'}
+              sessionCount={affectedSessions}
               onStop={() => void acp.stopAgent(detected.id)}
               // The store already surfaced the failure as a notice; swallowing it
               // here only prevents an unhandled rejection.
@@ -1753,12 +1979,20 @@ function AgentRow({
             formIncomplete={formIncomplete}
             idValid={idValid}
             idTaken={idTaken}
+            idDeleted={idDeleted}
             cwdInvalid={cwdInvalid}
             rootsInvalid={rootsInvalid}
             idleInvalid={idleInvalid}
             mcpInvalid={mcpInvalid}
             saving={saving}
             savedSuccess={savedSuccess}
+            saveDeferred={saveDeferred}
+            saveNotice={saveNotice}
+            saveConfirm={saveConfirm}
+            canDefer={saveGateAvailable}
+            onSaveCancel={() => setSaveConfirm(undefined)}
+            onSaveDefer={() => void performSave('defer')}
+            onSaveForce={() => void performSave('force')}
             testing={testing}
             testResult={testResult}
             showSaveWarning={showSaveWarning}
@@ -1932,12 +2166,20 @@ function AgentDetails({
   formIncomplete,
   idValid,
   idTaken,
+  idDeleted,
   cwdInvalid,
   rootsInvalid,
   idleInvalid,
   mcpInvalid,
   saving,
   savedSuccess,
+  saveDeferred,
+  saveNotice,
+  saveConfirm,
+  canDefer,
+  onSaveCancel,
+  onSaveDefer,
+  onSaveForce,
   testing,
   testResult,
   showSaveWarning,
@@ -1956,12 +2198,22 @@ function AgentDetails({
   formIncomplete: boolean
   idValid: boolean
   idTaken: boolean
+  /** The id was deleted during this host run; the tombstone refuses reuse. */
+  idDeleted: boolean
   cwdInvalid: boolean
   rootsInvalid: boolean
   idleInvalid: boolean
   mcpInvalid: boolean
   saving: boolean
   savedSuccess: boolean
+  saveDeferred: boolean
+  /** Feedback for a held save that was cancelled because the form changed. */
+  saveNotice?: string
+  saveConfirm?: ActiveTurnView[]
+  canDefer: boolean
+  onSaveCancel: () => void
+  onSaveDefer: () => void
+  onSaveForce: () => void
   testing: boolean
   testResult?: { ok: boolean; text: string }
   showSaveWarning: boolean
@@ -1991,12 +2243,17 @@ function AgentDetails({
               onChange={e => patch({ agentId: e.target.value })}
               placeholder="e.g. my-agent"
             />
-            <span className={idValid && !idTaken ? 'dwa-hint' : 'dwa-error'}>
-              {idTaken
-                ? acp.label('该 ID 已被现有 Agent 占用。', 'This id is already taken by a configured agent.')
-                : idValid
-                  ? acp.label('小写字母或数字开头，可用 a-z 0-9 . _ -，最长 64 字符。', 'Starts with a lowercase letter or digit; a-z 0-9 . _ - allowed; max 64 chars.')
-                  : acp.label('ID 格式不合法：小写字母或数字开头，可用 a-z 0-9 . _ -。', 'Invalid id: start with a lowercase letter or digit; only a-z 0-9 . _ - allowed.')}
+            <span className={idValid && !idTaken && !idDeleted ? 'dwa-hint' : 'dwa-error'}>
+              {idDeleted
+                ? acp.label(
+                    '该 id 在本次运行中不可复用，需重启宿主或换一个 id。',
+                    'This id cannot be reused during this run. Restart the host or choose another id.',
+                  )
+                : idTaken
+                  ? acp.label('该 ID 已被现有 Agent 占用。', 'This id is already taken by a configured agent.')
+                  : idValid
+                    ? acp.label('小写字母或数字开头，可用 a-z 0-9 . _ -，最长 64 字符。', 'Starts with a lowercase letter or digit; a-z 0-9 . _ - allowed; max 64 chars.')
+                    : acp.label('ID 格式不合法：小写字母或数字开头，可用 a-z 0-9 . _ -。', 'Invalid id: start with a lowercase letter or digit; only a-z 0-9 . _ - allowed.')}
             </span>
           </div>
         </div>
@@ -2189,8 +2446,54 @@ function AgentDetails({
 
       {!advancedOpen && (mcpInvalid || idleInvalid) && <p className="dwa-error" role="alert">{acp.label('请检查「高级」中的无效配置。', 'Check the invalid settings in Advanced.')}</p>}
       {advancedOpen && (!idValid || idTaken || cwdInvalid || rootsInvalid || parsedCommand.command === '') && <p className="dwa-error" role="alert">{acp.label('请检查「连接」中的未完成或无效配置。', 'Check the incomplete or invalid settings in Connection.')}</p>}
+      {saveConfirm !== undefined && (
+        <div className="dwa-card dwa-card-warn dwa-save-confirm" role="alertdialog" aria-label={acp.label('保存确认', 'Save confirmation')}>
+          <div>
+            {acp.label(
+              `有 ${String(saveConfirm.length)} 个会话正在运行。现在保存会中断这些会话。`,
+              `${String(saveConfirm.length)} session(s) are running. Saving now interrupts them.`,
+            )}
+          </div>
+          {saveConfirm.length > 0 && (
+            <div className="dwa-hint dwa-mono dwa-save-confirm-sessions">
+              {saveConfirm.slice(0, 6).map(view => view.dshSessionId ?? view.sessionId).join('、')}
+              {saveConfirm.length > 6 ? '…' : ''}
+            </div>
+          )}
+          <div className="dwa-save-confirm-actions">
+            <button type="button" className="dwa-btn dwa-btn-quiet" onClick={onSaveCancel}>
+              {acp.label('取消', 'Cancel')}
+            </button>
+            {canDefer && (
+              <button type="button" className="dwa-btn" onClick={onSaveDefer}>
+                {acp.label('回合结束后保存', 'Save after turns')}
+              </button>
+            )}
+            <button type="button" className="dwa-btn dwa-btn-danger" onClick={onSaveForce}>
+              {acp.label('立即保存（中断该 Agent）', 'Save now (interrupt this agent)')}
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="dwa-form-actions">
         <span className="dwa-hint">{isConfigured ? dirty ? acp.label('有未保存的更改', 'Unsaved changes') : acp.label('配置已保存', 'Settings saved') : ''}</span>
+        {saveDeferred && (
+          <>
+            <span className="dwa-hint" style={{ color: 'var(--ntr-warn)' }}>
+              {acp.label('配置已暂存，回合结束后自动保存。', 'Settings held; they will be saved when the turns end.')}
+            </span>
+            <span className="dwa-hint" style={{ color: 'var(--ntr-warn)' }}>
+              {acp.label(
+                '本次保存使用点击时的版本；继续修改表单会取消这次暂存。',
+                'This save uses the values from the moment you clicked. Editing the form cancels it.',
+              )}
+            </span>
+          </>
+        )}
+        {saveNotice !== undefined && (
+          <span className="dwa-hint" role="status" style={{ color: 'var(--ntr-warn)' }}>{saveNotice}</span>
+        )}
         <button
           className="dwa-btn"
           onClick={onTest}
@@ -2349,33 +2652,41 @@ function WorkspaceBlock({
   )
 }
 
-/** Row overflow menu: the dangerous actions, plus the inline remove confirm. */
+/** Row overflow menu: the dangerous actions, plus an inline confirm for each. */
 function RowMenu({
   acp,
   canStop,
+  sessionCount,
   onStop,
   onRemove,
 }: {
   acp: AcpStore
   canStop: boolean
+  /** Sessions a stop or delete would interrupt; shown before confirming. */
+  sessionCount: number
   onStop: () => void
   onRemove: () => Promise<void>
 }) {
   const [open, setOpen] = useState(false)
-  const [confirming, setConfirming] = useState(false)
+  const [confirming, setConfirming] = useState<'stop' | 'remove' | undefined>(undefined)
   const wrap = useRef<HTMLDivElement | null>(null)
+
+  const affected = (): string => acp.label(
+    `将影响 ${String(sessionCount)} 个会话。`,
+    `${String(sessionCount)} session(s) will be affected.`,
+  )
 
   useEffect(() => {
     if (!open) return
     const onDown = (event: MouseEvent): void => {
       if (wrap.current !== null && event.target instanceof Node && wrap.current.contains(event.target)) return
       setOpen(false)
-      setConfirming(false)
+      setConfirming(undefined)
     }
     const onKey = (event: KeyboardEvent): void => {
       if (event.key !== 'Escape') return
       setOpen(false)
-      setConfirming(false)
+      setConfirming(undefined)
     }
     document.addEventListener('mousedown', onDown)
     document.addEventListener('keydown', onKey)
@@ -2387,7 +2698,7 @@ function RowMenu({
 
   const close = (): void => {
     setOpen(false)
-    setConfirming(false)
+    setConfirming(undefined)
   }
 
   return (
@@ -2400,51 +2711,63 @@ function RowMenu({
         title={acp.label('更多操作', 'More actions')}
         onClick={() => {
           setOpen(value => !value)
-          setConfirming(false)
+          setConfirming(undefined)
         }}
       >
         ⋯
       </button>
       {open && (
         <div className="dwa-menu" role="menu">
-          {canStop && (
-            <button
-              type="button"
-              role="menuitem"
-              className="dwa-menu-item"
-              onClick={() => {
-                close()
-                onStop()
-              }}
-            >
-              {acp.label('停止当前运行实例', 'Stop Running Process')}
-            </button>
-          )}
-          {confirming ? (
+          {confirming !== undefined ? (
             <div className="dwa-menu-confirm">
+              <span className="dwa-hint" style={{ color: 'var(--ntr-warn)' }}>{affected()}</span>
               <button
                 type="button"
                 className="dwa-btn dwa-btn-danger"
                 onClick={() => {
                   close()
-                  void onRemove()
+                  if (confirming === 'stop') onStop()
+                  else void onRemove()
                 }}
               >
-                {acp.label('确认移除？', 'Confirm remove?')}
+                {confirming === 'stop'
+                  ? acp.label('确认停止？', 'Confirm stop?')
+                  : acp.label('确认移除？', 'Confirm remove?')}
               </button>
-              <button type="button" className="dwa-btn" onClick={() => setConfirming(false)}>
+              <button type="button" className="dwa-btn" onClick={() => setConfirming(undefined)}>
                 {acp.label('取消', 'Cancel')}
               </button>
             </div>
           ) : (
-            <button
-              type="button"
-              role="menuitem"
-              className="dwa-btn dwa-menu-item dwa-menu-item-danger"
-              onClick={() => setConfirming(true)}
-            >
-              {acp.label('移除配置', 'Remove')}
-            </button>
+            <>
+              {canStop && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="dwa-menu-item"
+                  onClick={() => {
+                    // Stopping closes live sessions, so a busy agent asks first.
+                    // A silent process stops in one click.
+                    if (sessionCount > 0) {
+                      setConfirming('stop')
+                      return
+                    }
+                    close()
+                    onStop()
+                  }}
+                >
+                  {acp.label('停止当前运行实例', 'Stop Running Process')}
+                </button>
+              )}
+              <button
+                type="button"
+                role="menuitem"
+                className="dwa-btn dwa-menu-item dwa-menu-item-danger"
+                onClick={() => setConfirming('remove')}
+              >
+                {acp.label('移除配置', 'Remove')}
+              </button>
+            </>
           )}
         </div>
       )}

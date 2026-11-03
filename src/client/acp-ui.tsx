@@ -1040,6 +1040,61 @@ const STYLE = `
 .ntr-released-banner-title { font-weight: 600; }
 .ntr-released-banner-body { color: var(--dsw-alias-label-secondary, #6b7280); }
 .ntr-released-banner .ntr-acp-more { flex: none; white-space: nowrap; }
+/* ---- Save gate toast (shell.overlay, save-guard-toast.tsx) ---- */
+/* A profile write is held while an ACP turn runs. The host settings page keeps
+   its own save promise pending; this toast is the visible reason and the
+   explicit force gesture. The stack pins itself to the TOP of the viewport,
+   centered, so it does not depend on any settings/composer slot being mounted
+   and never covers the composer at the bottom. */
+.ntr-save-guard-stack {
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.ntr-save-guard-toast {
+  box-sizing: border-box;
+  max-width: min(420px, calc(100vw - 40px));
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--dsw-alias-border-l2, #d1d5db);
+  border-left: 3px solid var(--dsw-alias-state-warn-primary, #d97706);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1, #fff);
+  color: var(--dsw-alias-label-primary, #111827);
+  font-size: 12px;
+  line-height: 1.5;
+  pointer-events: auto;
+}
+.ntr-save-guard-toast.is-error { border-left-color: var(--dsw-alias-state-error-primary, #b91c1c); }
+/* Fold control for the failure rows beyond the six shown by default. */
+.ntr-save-guard-fold {
+  align-self: center;
+  pointer-events: auto;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 4px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--dsw-alias-border-l2, #d1d5db);
+  background: var(--dsw-alias-bg-layer-1, #fff);
+  color: var(--dsw-alias-label-secondary, #6b7280);
+  cursor: pointer;
+}
+.ntr-save-guard-fold:hover { background: var(--dsw-alias-interactive-bg-active, #0000000d); }
+.ntr-save-guard-title { font-weight: 600; }
+.ntr-save-guard-body { color: var(--dsw-alias-label-secondary, #6b7280); word-break: break-word; }
+.ntr-save-guard-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.ntr-save-guard-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--dsw-alias-border-l2, #d1d5db);
+}
+.ntr-save-guard-confirm-agents { color: var(--dsw-alias-label-secondary, #6b7280); word-break: break-word; }
+.ntr-save-guard-error { color: var(--dsw-alias-state-error-primary, #b91c1c); word-break: break-word; }
 /* ---- NTR message actions (conversation.chat.assistant-actions) ---- */
 /* In an NTR conversation the host's like / dislike / branch icons are the
    plugin's business (the agent decides its own feedback surface, and the

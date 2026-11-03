@@ -10,6 +10,8 @@ import { defineConfig } from 'vitest/config'
  * the browser build keeps the real require (tsdown EXTERNAL).
  */
 export default defineConfig({
+  // Keep Vitest's 5s default: the heaviest panel render finishes in about 1.5s.
+  // Subprocess bridge cases that need longer carry their own per-test bound.
   resolve: {
     alias: {
       '@deepseek-ai/dsh-client-ui-primitives': fileURLToPath(new URL('./tests/primitives-stub.ts', import.meta.url)),
