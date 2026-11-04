@@ -113,6 +113,36 @@ function isAlive(pid: number): boolean {
 }
 
 /**
+ * End a child from a test, on every CI platform.
+ *
+ * The product's `killProcessTree` is deliberately Windows-only: its only
+ * production callers are the `.cmd` shim teardown, where `taskkill /T /F` is
+ * the point. On Linux / macOS that helper spawns a command that does not
+ * exist, so a test that reuses it never kills anything. This local twin keeps
+ * the Windows tree kill and uses SIGKILL elsewhere: first the process GROUP
+ * (for a detached child), then the single pid when it is not a group leader.
+ * Callers still confirm death with `until(() => !isAlive(pid))`.
+ */
+function killTestProcessTree(pid: number): void {
+  if (process.platform === 'win32') {
+    const killer = spawn('taskkill', ['/pid', String(pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true })
+    killer.on('error', () => { /* the liveness probe reports the failure */ })
+    return
+  }
+  try {
+    process.kill(-pid, 'SIGKILL')
+    return
+  } catch {
+    /* not a process-group leader: fall through to the single pid */
+  }
+  try {
+    process.kill(pid, 'SIGKILL')
+  } catch {
+    /* already gone */
+  }
+}
+
+/**
  * Drive the adapter the way the host agent-loop does (docs/acp-convergence.md
  * §1.5/§1.7): stream one step; while its chunks carried `tool-call` blocks and
  * it finished with `stop`, stage those calls' results as tool-sourced messages
@@ -9668,7 +9698,7 @@ describe('A1: codebuddy runs one agent process per conversation', () => {
       detached.sessions.delete(sessionId as string)
       expect(record?.acpSessionId).toBeDefined()
       detached.acpIndex.delete(record?.acpSessionId as string)
-      killProcessTree(pid)
+      killTestProcessTree(pid)
       await until(() => !isAlive(pid))
       // The OS probe answers before the child's `exit` handler runs: wait for the
       // holder to record the death, otherwise the state assertion below races the
