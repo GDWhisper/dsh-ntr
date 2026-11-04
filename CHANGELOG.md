@@ -5,14 +5,13 @@
 ## [Unreleased]
 
 CodeBuddy 的每个聊天会话使用独立子进程，多会话并行互不影响；回合进行中保存配置不再打断对话，暂存、失败与重试都能看见。
-> *发布前补提交链接与 compare 链接（本次未提交）。 / Add commit and compare links before release (not committed yet).*
 
 ### 新增
 
-- **acp**：CodeBuddy 的每条聊天会话使用独立 ACP 子进程，多会话各自独立运行；目录探测使用一次性进程，探测结束立即回收。
-- **acp**：首轮失败并回滚的会话立即回收自己的子进程，不在后台常驻；会话关闭但 `session/prompt` 尚未结算时，回收与工作区搬迁保留进程，直到请求落地。空闲释放只等 live 或 released 会话上的待答请求，已关闭会话的残留请求不阻止进程回收。
-- **acp**：单个子进程启动失败、同一 agent 还有健康进程时，仍然写一条含 `failed to start` 的错误日志，同一条失败不重复提示。
-- **acp**：测试新增 A1 集成用例，覆盖每会话一进程、停止窗口、首轮回收、未结算 prompt 保护、空闲释放越过已关闭会话的待答请求、恢复在途归属、聚合状态、启动失败通知与 fork 禁用。
+- **acp**：CodeBuddy 的每条聊天会话使用独立 ACP 子进程，多会话各自独立运行；目录探测使用一次性进程，探测结束立即回收。([ee78ac2](https://github.com/GDWhisper/dsh-ntr/commit/ee78ac2))
+- **acp**：首轮失败并回滚的会话立即回收自己的子进程，不在后台常驻；会话关闭但 `session/prompt` 尚未结算时，回收与工作区搬迁保留进程，直到请求落地。空闲释放只等 live 或 released 会话上的待答请求，已关闭会话的残留请求不阻止进程回收。([ee78ac2](https://github.com/GDWhisper/dsh-ntr/commit/ee78ac2))
+- **acp**：单个子进程启动失败、同一 agent 还有健康进程时，仍然写一条含 `failed to start` 的错误日志，同一条失败不重复提示。([ee78ac2](https://github.com/GDWhisper/dsh-ntr/commit/ee78ac2))
+- **acp**：测试新增 A1 集成用例，覆盖每会话一进程、停止窗口、首轮回收、未结算 prompt 保护、空闲释放越过已关闭会话的待答请求、恢复在途归属、聚合状态、启动失败通知与 fork 禁用。([ee78ac2](https://github.com/GDWhisper/dsh-ntr/commit/ee78ac2))
 - **acp**：保存 NTR agent 配置时若目标 agent 正在跑回合，可以选「回合结束后保存」或「立即保存并中断」；选择回合后保存会冻结点击时的配置，继续编辑则取消暂存并提示重新保存。
 - **acp**：保存结果在页顶提示：失败、等待过期、被拒绝、强制保存只完成一部分都常驻并给出重试或强制保存；成功短暂显示后自动消失。
 - **acp**：删除或停止 agent 前显示将影响的会话数。
@@ -22,10 +21,10 @@ CodeBuddy 的每个聊天会话使用独立子进程，多会话并行互不影�
 
 ### 改进
 
-- **acp**：停止、保存或删除 agent 时进入停止窗口；窗口内到达的消息直接失败，不排队，停止完成后下一条消息新建进程。
-- **acp**：恢复在途时复用同一个 ACP 会话，不新建第二个；会话归属丢失时返回 `session_orphaned`，下一条消息重新创建，不落到其他会话的进程。
-- **acp**：同一 agent 的多进程状态聚合成一条：任一进程可用即为可用，全部崩溃或释放为已停止；单条启动失败不会拖累健康 agent 的聚合状态。
-- **acp**：CodeBuddy 的 fork 能力关闭，分支入口禁用；即使对端声明支持，请求也返回 `fork_unsupported`。
+- **acp**：停止、保存或删除 agent 时进入停止窗口；窗口内到达的消息直接失败，不排队，停止完成后下一条消息新建进程。([ee78ac2](https://github.com/GDWhisper/dsh-ntr/commit/ee78ac2))
+- **acp**：恢复在途时复用同一个 ACP 会话，不新建第二个；会话归属丢失时返回 `session_orphaned`，下一条消息重新创建，不落到其他会话的进程。([ee78ac2](https://github.com/GDWhisper/dsh-ntr/commit/ee78ac2))
+- **acp**：同一 agent 的多进程状态聚合成一条：任一进程可用即为可用，全部崩溃或释放为已停止；单条启动失败不会拖累健康 agent 的聚合状态。([ee78ac2](https://github.com/GDWhisper/dsh-ntr/commit/ee78ac2))
+- **acp**：CodeBuddy 的 fork 能力关闭，分支入口禁用；即使对端声明支持，请求也返回 `fork_unsupported`。([ee78ac2](https://github.com/GDWhisper/dsh-ntr/commit/ee78ac2))
 - **acp**：活动回合期间 HMR 替换被延迟，回合结束后自动重试，连续失败或回合长时间不结束会提示一次；插件设置保存可选择延后。DSH 设置写入本身不经本仓拦截，宿主补丁到位前不会自动排队。
 - **acp**：同一 agent 连续保存时，旧的暂存不会在回合结束后覆盖新值；删除 agent 会先取消它的暂存，避免配置被写回。
 - **acp**：单个 agent 的「立即保存」只处理该 agent，不再顺带写入其它 agent 的暂存；全局冲刷仍走「全部立即保存」。
@@ -45,10 +44,10 @@ Each CodeBuddy chat session runs in its own process, so sessions run in parallel
 
 ### Added
 
-- **acp**: each CodeBuddy chat session runs in its own ACP child process, and catalog probes use a one-shot process that is reclaimed as soon as the probe ends.
-- **acp**: a session that fails its first turn and rolls back reclaims its child immediately instead of leaving it resident; while `session/prompt` is still unanswered, pruning and workspace moves keep the process alive until the request settles. Idle release counts only prompts on live or released sessions, so a leftover request on a closed session does not block reclaiming the process.
-- **acp**: when one child fails to start while a sibling is healthy, the plugin still logs one error line containing `failed to start`, and the same failure is not reported again.
-- **acp**: new A1 integration tests cover one process per session, the stopping window, first-turn rollback, unanswered prompt protection, idle release past a closed session's unanswered prompt, in-flight resume ownership, aggregate status, start-failure notices and disabled fork.
+- **acp**: each CodeBuddy chat session runs in its own ACP child process, and catalog probes use a one-shot process that is reclaimed as soon as the probe ends. ([ee78ac2](https://github.com/GDWhisper/dsh-ntr/commit/ee78ac2))
+- **acp**: a session that fails its first turn and rolls back reclaims its child immediately instead of leaving it resident; while `session/prompt` is still unanswered, pruning and workspace moves keep the process alive until the request settles. Idle release counts only prompts on live or released sessions, so a leftover request on a closed session does not block reclaiming the process. ([ee78ac2](https://github.com/GDWhisper/dsh-ntr/commit/ee78ac2))
+- **acp**: when one child fails to start while a sibling is healthy, the plugin still logs one error line containing `failed to start`, and the same failure is not reported again. ([ee78ac2](https://github.com/GDWhisper/dsh-ntr/commit/ee78ac2))
+- **acp**: new A1 integration tests cover one process per session, the stopping window, first-turn rollback, unanswered prompt protection, idle release past a closed session's unanswered prompt, in-flight resume ownership, aggregate status, start-failure notices and disabled fork. ([ee78ac2](https://github.com/GDWhisper/dsh-ntr/commit/ee78ac2))
 - **acp**: when the target agent has a running turn, saving its settings offers "save after turns" or "save now and interrupt"; the deferred save freezes the values at click time, and editing the form cancels it and asks for a new save.
 - **acp**: save results appear at the page top: failure, expiry, refusal and a partly completed forced save stay until dismissed with a retry or force action; success hides itself shortly.
 - **acp**: removing or stopping an agent now shows how many sessions it will affect.
@@ -58,10 +57,10 @@ Each CodeBuddy chat session runs in its own process, so sessions run in parallel
 
 ### Improved
 
-- **acp**: stopping, saving or deleting an agent opens a stopping window; messages arriving in that window fail immediately and are not queued, and the next message starts a new process after the stop completes.
-- **acp**: an in-flight resume reuses the same ACP session and creates no second one; a lost session ownership returns `session_orphaned`, and the next message creates a new session and does not fall back to another session's process.
-- **acp**: the status of several processes for one agent is aggregated into one view: any usable process makes the agent usable, and a fully crashed or released set reports stopped; a single start failure keeps a healthy agent's aggregate status usable.
-- **acp**: fork is disabled for CodeBuddy, the branch entry is disabled, and a request returns `fork_unsupported` even if the peer advertises support.
+- **acp**: stopping, saving or deleting an agent opens a stopping window; messages arriving in that window fail immediately and are not queued, and the next message starts a new process after the stop completes. ([ee78ac2](https://github.com/GDWhisper/dsh-ntr/commit/ee78ac2))
+- **acp**: an in-flight resume reuses the same ACP session and creates no second one; a lost session ownership returns `session_orphaned`, and the next message creates a new session and does not fall back to another session's process. ([ee78ac2](https://github.com/GDWhisper/dsh-ntr/commit/ee78ac2))
+- **acp**: the status of several processes for one agent is aggregated into one view: any usable process makes the agent usable, and a fully crashed or released set reports stopped; a single start failure keeps a healthy agent's aggregate status usable. ([ee78ac2](https://github.com/GDWhisper/dsh-ntr/commit/ee78ac2))
+- **acp**: fork is disabled for CodeBuddy, the branch entry is disabled, and a request returns `fork_unsupported` even if the peer advertises support. ([ee78ac2](https://github.com/GDWhisper/dsh-ntr/commit/ee78ac2))
 - **acp**: HMR replacement is delayed while a turn is active and retries after it ends, with one notice when retries fail or the turn never ends; plugin setting saves can be deferred. DSH setting writes themselves are not intercepted by this plugin, so the host must patch its write chain before they queue automatically.
 - **acp**: a newer save of the same agent invalidates the older held snapshot, and deleting an agent cancels its held save first, so the removed settings are not written back.
 - **acp**: "save now" for a single agent only handles that agent and no longer flushes other agents' held saves; a global flush still happens through "save all now".
@@ -74,6 +73,8 @@ Each CodeBuddy chat session runs in its own process, so sessions run in parallel
 ### Fixed
 
 - **acp**: switching the timeout action no longer rewrites the saved wait window; "no wait" runs as a 30-second floor only while "time out and abort" is active, and "auto-advance" or a restart still reports "no wait". Records an older build already rewrote to 30 seconds must be set back to "no wait" once.
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.3.6...ee78ac2
 
 ## [0.3.6] - 2026-11-02
 

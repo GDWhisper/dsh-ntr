@@ -1,6 +1,6 @@
 # 方案 A1：CodeBuddy 每 DSH 会话一个 ACP 子进程
 
-**状态**：**已实现，尚未提交；待真机验证与独立复核结论**（代码与测试已落盘，文档以此为准）。**适用范围**：只对 agent id `codebuddy` 生效；其他 agent 保持「每 agent 一进程」。
+**状态**：**已提交 `ee78ac2`；待真机验证**（代码与测试已落盘，文档以此为准）。**适用范围**：只对 agent id `codebuddy` 生效；其他 agent 保持「每 agent 一进程」。
 **一句话**：把 CodeBuddy 的进程粒度从 agent 下沉到 DSH 会话：每条 DSH 会话独占一个 `AgentBridge`（子进程 + stdio 连接），进程内只开一个 ACP 会话；用复合键与 scope 路由替换 `bridges.get(agentId)` 的单例假设。
 
 > 写作约定：代码位置只用「文件 + 符号名」，不写行号。本文不是 `AGENTS/` 文档，但索引登记进 [docs/README.md](../README.md)。根 [AGENTS.md](../../AGENTS.md) 当前 150 行，已在硬上限；实施时只能改写既有约束，不能净增行。
@@ -356,4 +356,4 @@ private readonly bridgeScopes = new Map<string, BridgeScope>() // bridgeKey -> s
 - **`streamPrompt` 不缓存 bridge**：`initResult` / `claimTurn` / `beginTurn` / `runPrompt` 每处 `bridgeForSession(session)` 重解析；`onAbort` 只 `bridgeOwning`。`pendingPrompts` 按 ACP 会话 id 计数、包住 `session/prompt` 的整个 await，防止 prune 在请求未答时误删。它有两套读数：`hasActiveWork()` 默认严格计数（`pruneBridge` 与工作区搬迁用），`pendingPromptsOnServableSessions()` 只数 live / released 会话（空闲释放用）。已从 `sessions` 删除的会话上永不答复的请求因此不钉住进程；关闭在途（记录仍留在 `sessions`）仍算可服务，最多拖住 5 秒；代价是进程死后迟到的结算变成连接错误（见 [AGENTS/state.md §2.1](../../AGENTS/state.md)）。新增用例 `A1: a silent first turn that never answers still lets the idle clock release its child` 覆盖这条放宽。
 - **`bridgeScopes` 只写不读**：它是 `bridges` 键集合的伴生状态，仅供测试与诊断（生产代码 1 处声明、1 处写入、4 处删除，无消费者；唯一读取方是 `tests/bridge.spec.ts` 的 3 处断言）。运行时判定作用域的唯一权威是 `bridges` 的复合键与 `bridgeKey`。清理时删字段并把断言改为只看 `bridges` 键，不为消除死代码在业务逻辑里接读取。
 - **新增 `session_orphaned`**：`dshSessionMap` 还有 live 绑定、但 holder 三态都未命中时，先 `forgetDshSession` 再失败；不为孤儿记录 spawn。
-- **测试规模**（设计稿列 14 条 A1 用例）：A1 分组覆盖停止门禁、首轮失败回收、恢复在途归属、持久化恢复、启动失败通知、聚合 stopped、一次性探测、启动参数 / 环境清洗、空闲释放越过已关闭会话的待答请求等；全部在 `tests/bridge.spec.ts` 的 `A1: codebuddy runs one agent process per conversation` 分组，用 `tests/mock-agent.mjs` 的 `MOCK_SINGLE_SESSION` 占位模拟上游串话。具体条数以实现方最终统计为准。
+- **测试规模**（设计稿列 14 条 A1 用例）：A1 分组覆盖停止门禁、首轮失败回收、恢复在途归属、持久化恢复、启动失败通知、聚合 stopped、一次性探测、启动参数 / 环境清洗、空闲释放越过已关闭会话的待答请求等；全部在 `tests/bridge.spec.ts` 的 `A1: codebuddy runs one agent process per conversation` 分组，用 `tests/mock-agent.mjs` 的 `MOCK_SINGLE_SESSION` 占位模拟上游串话。最终规模：`tests/bridge.spec.ts` 257 条；bridge、impl、save-gate、panel、store 五个文件合计 617 条；全量 18 个文件 958 条。

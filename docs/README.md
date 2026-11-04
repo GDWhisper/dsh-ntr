@@ -14,10 +14,10 @@
   - 状态：已实现（含审核修正，见文内「实施修正」标注）；行为契约以 [AGENTS/ui.md §12](../AGENTS/ui.md) 与 [AGENTS/protocol.md §1](../AGENTS/protocol.md) 为准
 - [方案：孤儿 agent 进程的回收（暂缓）](./plan/backlog/orphan-agent-reaping.md)
   - 为什么 / 怎么做：宿主被 `SIGKILL` / `taskkill /F` 时插件拉起的 agent 会活下来；现状只覆盖优雅关闭、主动杀与 `exit` 钩子。三条候选路线（绕开 `.cmd` 壳 / supervisor 包装 / 重启接管）各带验收口径与风险，状态「未决策」，索引见 [backlog](./plan/backlog/README.md)
-- [方案：CodeBuddy 每 DSH 会话一个 ACP 子进程（A1，已实现，未提交）](./plan/codebuddy-per-session-process.md)
+- [方案：CodeBuddy 每 DSH 会话一个 ACP 子进程（A1，已提交 `ee78ac2`，待真机验证）](./plan/codebuddy-per-session-process.md)
   - 为什么：CodeBuddy 一条连接只有一个 `currentSession`，并发会话会互相顶掉、串话；stdio 下唯一可行的隔离拓扑是每会话一个进程
   - 怎么做：单 `bridges` Map 改复合键 + `BridgeScope`（chat / ephemeral / probe；`bridgeScopes` 只写不读，仅供测试与诊断）；聊天会话与 `/acp` 临时会话按会话归属，probe 结束即回收；`agentViews` 聚合成一条 agent 状态；父会话 fork 硬禁用；CodeBuddy 启动时清 `SERVER__PORT` / `SERVER__HOST` 且不传 `--port`
-  - 状态：**已实现，尚未提交；待真机验证与独立复核结论**。与 [A2](./plan/backlog/codebuddy-single-process-http-acp.md) 是同一问题下的省内存后续路线
+  - 状态：**已提交 `ee78ac2`；待真机验证**。与 [A2](./plan/backlog/codebuddy-single-process-http-acp.md) 是同一问题下的省内存后续路线
 - [方案：CodeBuddy 单进程 + 多条 HTTP ACP 连接（A2，暂缓）](./plan/backlog/codebuddy-single-process-http-acp.md)
   - 为什么 / 怎么做：A2 是一个 CodeBuddy 进程用 streamable-http 承载 N 条 ACP 连接、每条连接一个会话；省掉每会话约 300 MB 进程内存，代价是传输层重写、连接池、token、端口生命周期，且隔离仍依赖上游连接语义。含跨连接指针、writer 独占、端口、token 过期等未知项的验证方法
   - 状态：未决策、当前不启动；触发条件见文内，索引见 [backlog](./plan/backlog/README.md)
