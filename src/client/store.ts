@@ -12,6 +12,20 @@ import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_TAG_HALO } from '../protocol.ts'
 /** One slash command the ACP agent declared, whole row (the menu draws name, description and `input.hint`). */
 export type AgentCommand = NonNullable<ChatSessionView['availableCommands']>[number]
 
+/**
+ * One chat-row lifecycle frame the browser applied. A `session/chat-list`
+ * answer describes the host as of BEFORE frames that landed while its read was
+ * in flight, so the answer replays them over the row list. Only rows the
+ * answer already carries are patched: a `session/created` row the answer
+ * never saw belongs to the next read, and appending it here would put another
+ * conversation's row into this one's list.
+ */
+export interface ChatRowFrame {
+  seq: number
+  sessionId: string
+  kind: 'released' | 'reset' | 'created' | 'closed'
+}
+
 /** The unary RPC face (narrowed `ctx.connection.rpc.call`). */
 export type RpcCall = (channel: string, endpoint: string, payload: unknown) => Promise<
   | { ok: true; value: unknown }
@@ -973,12 +987,14 @@ export class AcpStore {
   /** In-flight `session/chat-list` reads, keyed by chat session id. */
   private readonly chatSessionReads = new Map<string, { dropped: boolean; done: Promise<void> }>()
   /**
-   * ACP session ids whose chat-list row was requested mid-turn (one read each).
-   * A conversation's first ACP session does not exist when the composer's
-   * mount/running read fires, so its first `usage_update` would find no row to
-   * patch; `turn/start` asks again once the host has materialized the session.
+   * Monotonic order plus a short log of chat-row lifecycle frames. Read
+   * starts capture the sequence; the answer replays every later frame over
+   * its row list. Bounded like {@link subagentFrames} — a read only needs the
+   * frames since it started, and a page that never reconnects cannot grow this
+   * without bound.
    */
-  private readonly chatSessionRowReads = new Set<string>()
+  private chatRowFrameSeq = 0
+  private readonly chatRowFrames: ChatRowFrame[] = []
   /**
    * Chat sessions whose list has answered at least once in this page. The
    * FIRST answer only seeds the lock; a lock appearing on a later answer is a
@@ -1272,7 +1288,9 @@ export class AcpStore {
       // `sessions/list` is the `/acp` RPC face; the composer's chat rows
       // (agent modes, occupancy) are a separate list. A reconnect must refresh
       // that list too or the ring keeps a pre-outage sample until a turn ends.
-      if (this.state.chatSessionsFor !== undefined) void this.loadChatSessions(this.state.chatSessionsFor)
+      // `force`: a read that began before the outage missed every frame the
+      // stream dropped, so its answer must not be reused here.
+      if (this.state.chatSessionsFor !== undefined) void this.loadChatSessions(this.state.chatSessionsFor, { force: true })
       const active = this.state.activeSessionId ?? sessions[0]?.sessionId
       if (active !== undefined) await this.loadTranscript(active)
     } catch (error) {
@@ -1813,13 +1831,21 @@ export class AcpStore {
    * framed can still be learned from. Composer readers pass nothing and keep
    * the frame's authority.
    */
-  loadChatSessions(dshSessionId: string, options?: { settleVerdict?: boolean }): Promise<void> {
+  loadChatSessions(dshSessionId: string, options?: { settleVerdict?: boolean; force?: boolean }): Promise<void> {
     // The composer entries (agent-mode control, ACP cluster, occupancy ring)
     // read this and re-read when a turn settles; one round-trip answers for
     // all of them instead of racing reads. A caller arriving mid-read waits
     // for THAT read rather than returning immediately: the slash source's
     // one-shot "do I have a verdict yet?" ask is only useful if it can
     // receive the answer of a read already in flight.
+    //
+    // `force` belongs to a caller that knows the host state JUST changed (a
+    // turn started, an explicit resume finished, the stream reconnected). A
+    // read that began before that change still names the old released row,
+    // and the dedup above would otherwise hand this caller that stale answer.
+    // Dropping it first makes this call ask the host again. The dropped read
+    // still resolves for its own caller; `read.dropped` makes it write nothing.
+    if (options?.force === true) this.abandonChatSessionRead(dshSessionId)
     const inFlight = this.chatSessionReads.get(dshSessionId)
     if (inFlight !== undefined) return inFlight.done
     const read: { dropped: boolean; done: Promise<void> } = { dropped: false, done: Promise.resolve() }
@@ -1830,15 +1856,23 @@ export class AcpStore {
 
   private async readChatSessionList(
     dshSessionId: string,
-    options: { settleVerdict?: boolean } | undefined,
+    options: { settleVerdict?: boolean; force?: boolean } | undefined,
     read: { dropped: boolean },
   ): Promise<void> {
     const settle = options?.settleVerdict === true || !this.acpModeLive.has(dshSessionId)
     // Captured BEFORE the request: every frame applied after this point is
     // newer than whatever state the host will answer with.
     const subagentFramesAtRead = this.subagentFrameSeq
+    const chatRowFramesAtRead = this.chatRowFrameSeq
     try {
-      const { sessions = [], acpMode, boundAgentId, lockedAgentId, choice } = await this.call<{ sessions: ChatSessionView[]; acpMode?: boolean; boundAgentId?: string; lockedAgentId?: string; choice?: AcpConversationChoice }>('session/chat-list', { dshSessionId, refresh: true })
+      const { sessions: listed = [], acpMode, boundAgentId, lockedAgentId, choice } = await this.call<{ sessions: ChatSessionView[]; acpMode?: boolean; boundAgentId?: string; lockedAgentId?: string; choice?: AcpConversationChoice }>('session/chat-list', { dshSessionId, refresh: true })
+      // The host answer can still describe the released row it had when this
+      // read started. Replay the lifecycle frames that landed in the meantime:
+      // a resume's `session/reset` flips the row back to live, a crash's
+      // `session/released` parks it, a close drops it. Without this the late
+      // answer overwrites the frame and the released banner survives a turn
+      // that is already running on a live process.
+      const sessions = replayChatRowFrames(listed, this.chatRowFrames, chatRowFramesAtRead)
       // A committed `agent-preset/selected` frame may have settled this
       // session's verdict while the read was in flight; the host answer then
       // describes the log as of BEFORE that switch and must not overwrite it.
@@ -2127,7 +2161,10 @@ export class AcpStore {
       this.flashError(error)
       failure = error
     }
-    await this.loadChatSessions(dshSessionId)
+    // `force`: the host answer this call needs is the one AFTER the resume.
+    // The host's no-op branch (already live) broadcasts no frame at all, so
+    // reusing a read that started before the click would keep the released row.
+    await this.loadChatSessions(dshSessionId, { force: true })
     if (failure !== undefined) throw failure
   }
 
@@ -3117,7 +3154,31 @@ export class AcpStore {
 
   // ---- Event application ----
 
+  /**
+   * One chat-row lifecycle frame, recorded in arrival order. A bounded log is
+   * enough: a `session/chat-list` read only needs the frames since it started.
+   */
+  private pushChatRowFrame(sessionId: string, kind: ChatRowFrame['kind']): void {
+    this.chatRowFrameSeq += 1
+    this.chatRowFrames.push({ seq: this.chatRowFrameSeq, sessionId, kind })
+    if (this.chatRowFrames.length > 256) this.chatRowFrames.shift()
+  }
+
+  /**
+   * Feed the replay log BEFORE the switch folds the frame into the snapshot.
+   * Live SSE frames and directly injected test frames then take the same path.
+   */
+  private noteChatRowFrame(event: AcpEvent): void {
+    switch (event.type) {
+      case 'session/released': this.pushChatRowFrame(event.sessionId, 'released'); break
+      case 'session/reset': this.pushChatRowFrame(event.sessionId, 'reset'); break
+      case 'session/created': this.pushChatRowFrame(event.sessionId, 'created'); break
+      case 'session/closed': this.pushChatRowFrame(event.sessionId, 'closed'); break
+    }
+  }
+
   private applyEvent(event: AcpEvent): Promise<void> {
+    this.noteChatRowFrame(event)
     switch (event.type) {
       case 'agent/notice': {
         if (event.agentId === 'hmr') {
@@ -3411,16 +3472,16 @@ export class AcpStore {
       case 'turn/start': {
         this.openTurns.add(event.sessionId)
         this.markWatchedRunning(event.sessionId, true)
-        // The session materializes inside this turn; if the composer's list
-        // has not seen its row yet (the mount/running read beat session/new),
-        // read once now so the occupancy ring has a row for the live usage
-        // ticks. The per-session set bounds this to one extra read.
+        // Every turn starts AFTER the host (re)materialized the session: a
+        // resume keeps its id, a `session/new` changes it. The composer's row
+        // list is a cached snapshot, so re-read it once per turn. `force`
+        // drops a read that began before this turn — its answer still names
+        // the released row, and the released banner would then hang over a
+        // turn that is already running on a live process. Concurrent readers
+        // share this one read through the in-flight dedup.
         const chatSessionId = this.state.chatSessionsFor
-        if (chatSessionId !== undefined
-          && !this.state.chatSessions.some(row => row.sessionId === event.sessionId)
-          && !this.chatSessionRowReads.has(event.sessionId)) {
-          this.chatSessionRowReads.add(event.sessionId)
-          void this.loadChatSessions(chatSessionId)
+        if (chatSessionId !== undefined) {
+          void this.loadChatSessions(chatSessionId, { force: true })
         }
         if (event.sessionId === this.state.activeSessionId) {
           this.state.blocks.push({ kind: 'user', text: event.text })
@@ -3696,6 +3757,38 @@ function withSessionReleased<T extends { sessionId: string; released?: boolean }
     return { ...row, released }
   })
   return changed ? next : rows
+}
+
+/**
+ * Re-apply the chat-row lifecycle frames that landed AFTER a
+ * `session/chat-list` read started. The host answer describes an earlier
+ * moment; without this replay a late answer overwrites the `session/reset`
+ * flip and the released banner keeps claiming a process that is already back.
+ * Only rows the answer carries are patched — a row from another conversation
+ * must never enter this conversation's list.
+ */
+export function replayChatRowFrames(
+  rows: readonly ChatSessionView[],
+  frames: readonly ChatRowFrame[],
+  afterSeq: number,
+): ChatSessionView[] {
+  let next: ChatSessionView[] = [...rows]
+  for (const frame of frames) {
+    if (frame.seq <= afterSeq) continue
+    switch (frame.kind) {
+      case 'closed':
+        next = next.filter(row => row.sessionId !== frame.sessionId)
+        break
+      case 'released':
+        next = withSessionReleased(next, frame.sessionId, true)
+        break
+      case 'reset':
+      case 'created':
+        next = withSessionReleased(next, frame.sessionId, false)
+        break
+    }
+  }
+  return next
 }
 
 function sameModes(a?: SessionView['modes'], b?: SessionView['modes']): boolean {

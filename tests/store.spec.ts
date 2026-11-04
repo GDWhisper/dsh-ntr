@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
-import { AcpStore, composeSaveBanners, foldUpdate, forkStateOf, permissionsForSession, saveGateTransitions, type Block, type RpcCall, type SaveBanner } from '../src/client/store.ts'
+import { AcpStore, composeSaveBanners, foldUpdate, forkStateOf, permissionsForSession, replayChatRowFrames, saveGateTransitions, type Block, type RpcCall, type SaveBanner } from '../src/client/store.ts'
 import { acpModeFromPresetEvent, stagedIsAcpMode } from '../src/client/acp-ui.tsx'
 import { resolveHostFork } from '../src/client/branch-action.tsx'
+import { releasedBannerVisible } from '../src/client/released-banner.tsx'
 import type { AcpAgentDef, ChatSessionView, DetectedAgentInfo } from '../src/protocol.ts'
 
 function fold(...updates: Array<Record<string, unknown>>): Block[] {
@@ -3730,6 +3731,145 @@ describe('save banners', () => {
     expect(entry).toMatchObject({ level: 'error', agentId: 'dsh-ntr', text })
     // It is a log line, not an HMR/save banner.
     expect(store.getSnapshot().saveBanners).toEqual([])
+  })
+})
+
+/**
+ * The released banner reads a CACHED row list. A `session/chat-list` read that
+ * started before a resume / release / close must not overwrite the frame that
+ * landed while it was in flight, and a turn start must ask the host again.
+ */
+describe('AcpStore chat-row freshness (the released banner follows the host)', () => {
+  type Answer = { ok: true; value: unknown }
+
+  function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+    let resolve: (value: T) => void = () => {}
+    const promise = new Promise<T>(done => { resolve = done })
+    return { promise, resolve }
+  }
+
+  function row(released?: boolean): ChatSessionView {
+    return { agentId: 'pi', sessionId: 's1', ...(released === true ? { released: true } : {}) }
+  }
+
+  function view(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      sessionId: 's1', agentId: 'pi', acpSessionId: 'acp-1', cwd: '/w',
+      running: false, closed: false, seq: 0, ...overrides,
+    }
+  }
+
+  function apply(store: AcpStore, event: unknown): Promise<void> {
+    return (store as unknown as { applyEvent(event: unknown): Promise<void> }).applyEvent(event)
+  }
+
+  /** Answers by read order; the last one repeats if a test reads more. */
+  function makeStore(
+    answers: Array<Answer | Promise<Answer>>,
+  ): { store: AcpStore; reads: () => number } {
+    let reads = 0
+    const store = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint !== 'session/chat-list') return { ok: true, value: { done: true } }
+      const answer = answers[Math.min(reads, answers.length - 1)]
+      reads += 1
+      return answer
+    }, zh => zh)
+    return { store, reads: () => reads }
+  }
+
+  function answered(rows: ChatSessionView[]): Answer {
+    return { ok: true, value: { sessions: rows } }
+  }
+
+  it('replays a resume frame over a chat-list answer that started before the resume', async () => {
+    const held = deferred<Answer>()
+    const { store } = makeStore([held.promise])
+    const pending = store.loadChatSessions('chat-1')
+
+    await apply(store, { type: 'session/reset', sessionId: 's1', session: view() })
+    held.resolve({ ok: true, value: { sessions: [row(true)] } })
+    await pending
+
+    expect(store.getSnapshot().chatSessions[0]?.released).not.toBe(true)
+    expect(releasedBannerVisible(store.getSnapshot(), 'chat-1')).toBe(false)
+  })
+
+  it('replays a release frame over a live chat-list answer', async () => {
+    const held = deferred<Answer>()
+    const { store } = makeStore([held.promise])
+    const pending = store.loadChatSessions('chat-1')
+
+    await apply(store, {
+      type: 'session/released', sessionId: 's1', session: view({ released: true }), reason: 'agent process exited',
+    })
+    held.resolve({ ok: true, value: { sessions: [row()] } })
+    await pending
+
+    expect(store.getSnapshot().chatSessions[0]?.released).toBe(true)
+    expect(releasedBannerVisible(store.getSnapshot(), 'chat-1')).toBe(true)
+  })
+
+  it('replays a close frame so a late answer cannot resurrect a closed row', async () => {
+    const held = deferred<Answer>()
+    const { store } = makeStore([held.promise])
+    const pending = store.loadChatSessions('chat-1')
+
+    await apply(store, { type: 'session/closed', sessionId: 's1', reason: 'closed' })
+    held.resolve({ ok: true, value: { sessions: [row(true)] } })
+    await pending
+
+    expect(store.getSnapshot().chatSessions).toEqual([])
+    expect(releasedBannerVisible(store.getSnapshot(), 'chat-1')).toBe(false)
+  })
+
+  it('re-reads the row list on every turn start and drops the stale in-flight read', async () => {
+    const held = deferred<Answer>()
+    // Read #1 seeds `chatSessionsFor` (the banner cannot show without it).
+    // Read #2 hangs so the turn start has a stale read to drop. Read #3 is
+    // the forced read and carries the host's live row.
+    const { store, reads } = makeStore([answered([row(true)]), held.promise, answered([row()])])
+    await store.loadChatSessions('chat-1')
+    expect(releasedBannerVisible(store.getSnapshot(), 'chat-1')).toBe(true)
+    const stale = store.loadChatSessions('chat-1')
+
+    await apply(store, { type: 'turn/start', sessionId: 's1', turnId: 't1', text: 'hi' })
+    held.resolve(answered([row(true)]))
+    await stale
+    await vi.waitFor(() => expect(store.getSnapshot().chatSessions[0]?.released).not.toBe(true))
+
+    expect(reads()).toBe(3)
+    expect(releasedBannerVisible(store.getSnapshot(), 'chat-1')).toBe(false)
+  })
+
+  it('forces a fresh answer after the explicit resume button', async () => {
+    const held = deferred<Answer>()
+    const { store, reads } = makeStore([answered([row(true)]), held.promise, answered([row()])])
+    await store.loadChatSessions('chat-1')
+    expect(releasedBannerVisible(store.getSnapshot(), 'chat-1')).toBe(true)
+    const stale = store.loadChatSessions('chat-1')
+
+    // The host's "already live" branch broadcasts no frame at all: only a
+    // forced read can clear a row the browser still holds as released.
+    await store.resumeChatSession('chat-1')
+    held.resolve(answered([row(true)]))
+    await stale
+
+    expect(reads()).toBe(3)
+    expect(store.getSnapshot().chatSessions[0]?.released).not.toBe(true)
+    expect(releasedBannerVisible(store.getSnapshot(), 'chat-1')).toBe(false)
+  })
+
+  it('replays only later frames and only rows the answer already carries', () => {
+    const rows = [row(true)]
+    // A frame the read had already seen is not applied twice.
+    expect(replayChatRowFrames(rows, [{ seq: 1, sessionId: 's1', kind: 'reset' }], 1)).toEqual(rows)
+    // Another conversation's session must never enter this conversation's list.
+    expect(replayChatRowFrames(rows, [{ seq: 1, sessionId: 'other', kind: 'reset' }], 0)).toEqual(rows)
+    // Later frames apply in arrival order, so the last state wins.
+    expect(replayChatRowFrames(rows, [
+      { seq: 1, sessionId: 's1', kind: 'released' },
+      { seq: 2, sessionId: 's1', kind: 'reset' },
+    ], 0)).toEqual([{ agentId: 'pi', sessionId: 's1', released: false }])
   })
 })
 

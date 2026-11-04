@@ -166,6 +166,7 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 会话的 agent 进程被释放（空闲回收 / 崩溃）后，`conversation.input.dock` 的第二条目 `ReleasedBanner`（`src/client/released-banner.tsx`）在输入框上方显示一行「进程已释放」+「恢复进程」按钮。释放本身按约束 19 是静默的，而「下一条消息自动恢复」的承诺从聊天面本身无法验证——横幅把它说出来，按钮把它变成一个手势。
 
 - **闸门是纯函数** `releasedBannerVisible`（无 DOM 可测）：显式 `acpMode === false` 压过残留行（与挂牌同优先级）；`chatSessionsFor` 必须等于本会话；行集非空且**全部** `released`——有一行活着就说明下一条消息有人接，横幅让路；空集（没跑过 agent）不画。
+- **行集不许倒退**：`src/client/store.ts` 的 `readChatSessionList` 在读发出前记下 `chatRowFrameSeq`，读回后用 `replayChatRowFrames` 重放在途期间到达的 `session/released` / `session/reset` / `session/created` / `session/closed` 帧。一份恢复前的旧快照否则会盖掉 `session/reset` 的翻转，横幅就挂在一个已经有 live 进程的回合上。重放只改读回行集里已有的行，不追加别的会话的行（新建行由下一次读带回）。`turn/start`、`session/chat-resume`、`resync` 走 `loadChatSessions(..., { force: true })`：复用 `abandonChatSessionRead` 丢掉在途旧读，每轮向宿主拿一次真实行集；并发读者仍由 in-flight 去重合成一次读。
 - **按钮**走 `session/chat-resume`（`AcpStore.resumeChatSession`），与下一条消息的惰性恢复同一套动作、绝不走创建路径（[protocol.md §2](./protocol.md)）。失败闪 notice **并** rethrow（`respondPermission` 契约），错误就地钉在按钮旁（`role="alert"`），不丢到用户可能没开的设置页。提交中按钮 `disabled`。
 - **挂载自读一次** `loadChatSessions`：打开一条已挂起的会话时，没有任何别的东西会替它读这份清单（挂牌、占用环的重读都挂在别的触发器上）。
 - **横幅跨 DSH 重启存活**：会话记录持久化（[state.md §3.1](./state.md)），重启后记录以 released 复原，横幅与「恢复进程」照常——否则重启就等于把「released ≠ 销毁」丢掉。重启后到恢复前 NTR 视图的空流说「历史将在恢复后回放显示」（`historyAwaitsReplay`，见 §5），不说「还没有消息」。
