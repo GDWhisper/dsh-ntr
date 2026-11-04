@@ -28,6 +28,35 @@
 7. **NTR 会话的 `/` 属于 agent**：菜单只列 agent 自己声明的命令，Enter 不被宿主认领（[ui.md §6](./ui.md)）。
 8. **MCP 服务器由 agent 自己拉起**：agent 自带的 MCP 照旧生效，`AcpAgentDef.mcpServers` 只是额外追加；MCP 工具不在宿主 `ctx.tools` 里，也不经 `tools/execute` 虚拟工具那条路——与「NTR preset 不挂工具行」不矛盾（§5 末段、[state.md §2](./state.md)）。
 
+### 1.2 CodeBuddy 的 A1 进程模型（现行实现）
+
+`PER_SESSION_AGENT_IDS` 目前只含 `codebuddy`（`isPerSessionAgent(agentId)`）。其余 agent 仍是**一条连接、一个进程**：每个 scope 都折叠到裸 `agentId`，语义与 A1 之前一致。
+
+**复合键**：`BridgeManager.bridges` 的键由 `bridgeKey(agentId, scope)` 生成——非 A1 返回裸 `agentId`；A1 返回 `agentId + '\u0000' + <kind>[:<token>]`。`BridgeScope` 四态：
+
+| scope | 何时创建 | 谁回收 |
+|---|---|---|
+| `agent` | 非 A1 的唯一进程 | `stopAgent` |
+| `chat` | 每条 DSH 聊天会话（`getOrCreateDshSession`，键含 `dshSessionId`） | `closeSession` / 首轮失败回滚 / `prepareStalledSession` 的善后 |
+| `ephemeral` | `/acp` 的 `startSession`（键含 `randomUUID()` token）与匿名回合（token 固定 `anonymous`） | `closeSession`；`streamPrompt` 结算后的 `.finally` |
+| `probe` | `probeAgentModels` 的目录探测 | 探测 `try/finally` 立即回收 |
+
+`bridgeScopes` 是 `bridges` 键集合的伴生状态，**仅供测试与诊断**：生产代码 1 处声明、1 处写入、4 处删除，没有任何消费者；唯一读取方是 `tests/bridge.spec.ts` 的 3 处断言（`agent/delete` 与 `stopAgent` 用例比对 `bridgeScopes.size` 与 `bridges.size`）。运行时判定作用域的唯一权威是 `bridges` 的复合键与 `bridgeKey`。清理时应删字段并把那 3 处断言改为只看 `bridges` 键（或提供测试可见的派生 getter），**不要**为消除死代码在业务逻辑里接读取。
+
+**启动清洗（只对 A1）**：`perSessionLaunchArgs` 删除 `--port <值>` 与 `--port=<值>`；`perSessionLaunchEnv` 按大写键名删除 `SERVER__PORT` / `SERVER__HOST`。原因是 CodeBuddy 的 ACP 模式会去绑 `127.0.0.1:6156`，每会话一个进程时必然 `EADDRINUSE`；stdio 传输不需要监听端口。
+
+**生命周期**
+- **创建**：chat 走 `bridgeForSession(session)`；同一 DSH 会话第一次发消息时创建自己的子进程。resume 路径复用同一 holder，绝不新建第二个 ACP 会话。
+- **复用**：`streamPrompt` **不缓存** bridge；`initResult`、`claimTurn`、`beginTurn`、`runPrompt` 每处重新 `bridgeForSession(session)`，`onAbort` 只用 `bridgeOwning(...)` 查归属、**绝不创建进程**。
+- **归属三态**：`bridgeOwning` 查 `hasSession` / `hasReleased` / `inflightResume`。恢复在途时 `getOrCreateDshSession` **await 同一个 `inflightResume`** 并复用同一 `LiveSession`；三态都未命中且 `dshSessionMap` 仍有 live 绑定，才 `forgetDshSession` 并抛 `session_orphaned`。
+- **回收**：`pruneBridge` 先用 `isDiscardable()` 判定（holder 没有任何 live / released 会话且无活跃工作），再删 `bridges` / `bridgeScopes`，最后 fire-and-forget `bridge.stop('agent-stopped')`。调用点只有 `closeSession`、`rollbackFirstTurn`、`streamPrompt` 的 `.finally`、`probeAgentModels` 的 `try/finally`；非 A1 直接返回，不删 agent 槽。
+- **首轮失败回滚**：`rollbackFirstTurn` 在 `closeSession(session, 'closed')` 落定后按 `keyOfBridge` 回收。若严格口径仍有待答请求（`hasActiveWork()`，按会话 id 计数），`pruneBridge` 拒绝删除，由 `streamPrompt` 的 `.finally` 补一次回收；空闲释放另用放宽口径 `hasActiveWork(false)`（见 [protocol.md §2](./protocol.md)）。
+- **停止门禁**：`stopAgent` / `saveAgentNow` / `deleteAgent` 先把 `stoppingAgents` 对该 agent 加一；期间 `bridgeFor` 新建与已存在 holder 的外借全部以 `agent_stopping` 拒绝，**消息不排队**。停止只按停止前的快照键删 `bridges` / `bridgeScopes`，删除前做 `this.bridges.get(key) === bridge` 恒等校验；最后递减计数，下一条消息正常新建进程。
+- **持久化恢复**：`loadPersistedChatSessions` 把每条 released 记录 `parkReleased` 到**它自己的** chat holder；进程重启后各会话仍各自独立。
+- **探测即用即回收**：`probeAgentModels` 用 `probe` scope 拉起一次性子进程，`try/finally` 结束就 `pruneBridge`；5 分钟探测窗口只是未被显式回收时的兜底。
+
+**隔离口径**：turn stream 清理与兄弟会话阻塞判定不再按 `agentId`，改为按 `sessionIdsOf(bridge)`——本 holder 的 live + released 会话 id 集合。A1 下别的 CodeBuddy 会话在跑不阻塞本会话，本会话的停止也不误删别的会话的流。会话 id 查找（`find` / `tryLocate` / `locateOrResume`）仍只按 `sessionId` 遍历全部 bridge、不按 agent 过滤，这是**已知取舍**，理由与启动条件见 [agent-scoped-session-lookup.md](../docs/plan/backlog/agent-scoped-session-lookup.md)。
+
 ## 2. 一轮消息的路径
 
 ### 2.1 只转发人说的话

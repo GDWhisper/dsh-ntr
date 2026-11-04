@@ -182,6 +182,30 @@ import { appendFileSync } from 'node:fs'
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from '@agentclientprotocol/sdk'
 
 const sessions = new Map()
+/**
+ * MOCK_SINGLE_SESSION=1: the CodeBuddy connection shape — one live session per
+ * connection. Every `session/new` / `session/load` on this connection evicts
+ * whatever it was serving before, and a prompt on an evicted session is refused
+ * (never executed). Existing markers are untouched: the knob is opt-in.
+ */
+const SINGLE_SESSION = process.env.MOCK_SINGLE_SESSION === '1'
+/**
+ * MOCK_LOAD_DELAY_MS=<ms>: `session/load` answers only after this pause (the
+ * replay updates still go out first). A test uses it to hold the recovery
+ * open and inject a second caller while the record is owned by nobody but the
+ * request itself. Default 0 keeps every other test byte-identical.
+ */
+const LOAD_DELAY_MS = Number(process.env.MOCK_LOAD_DELAY_MS ?? '0')
+/**
+ * MOCK_CANCEL_ANSWER_DELAY_MS=<ms>: "SLOW" acknowledges `session/cancel` and
+ * answers `cancelled` only after this pause. A test uses it to keep the prompt
+ * RESPONSE outstanding while the client closes and tries to prune the holder:
+ * the delay is deterministic, so "the request is still in flight when the
+ * prune runs" is a fact, not a race won by luck. Default 0 keeps every other
+ * test byte-identical.
+ */
+const CANCEL_ANSWER_DELAY_MS = Number(process.env.MOCK_CANCEL_ANSWER_DELAY_MS ?? '0')
+const evicted = new Set()
 const cancelled = new Set()
 const cancelWaiters = new Map()
 /** sessionId → epoch ms until which the next prompt is swallowed (stale cancel). */
@@ -296,6 +320,19 @@ function fireCancel(sessionId) {
   cancelWaiters.set(sessionId, [])
 }
 
+/**
+ * Connection-level single-session eviction: keep the record (so close / config
+ * calls stay coherent) but mark it superseded. Returning here instead of
+ * deleting the record also keeps the "REPLAYED" replay path of a later
+ * `session/load` byte-identical.
+ */
+function evictForNewSession(sessionId) {
+  if (!SINGLE_SESSION) return
+  for (const id of sessions.keys()) {
+    if (id !== sessionId) evicted.add(id)
+  }
+}
+
 const app = agent({ name: 'mock-acp-agent' })
   .onRequest(methods.agent.initialize, () => ({
     protocolVersion: PROTOCOL_VERSION,
@@ -317,6 +354,7 @@ const app = agent({ name: 'mock-acp-agent' })
     // new counter, and a test that proves "the host opened a NEW agent session"
     // (a reset, not a `session/load`) compares ids from two different children.
     const sessionId = `mock-sess-${String(process.pid)}-${String(++counter)}`
+    evictForNewSession(sessionId)
     const modeId = FIRST_MODE !== undefined && counter === 1 ? FIRST_MODE : 'default'
     sessions.set(sessionId, { cwd: ctx.params.cwd, modeId, temp: 'mid', model: DEFAULT_MODEL, effort: 'high', stream: false, mcpServers: ctx.params.mcpServers })
     return {
@@ -347,12 +385,18 @@ const app = agent({ name: 'mock-acp-agent' })
   })
   .onRequest(methods.agent.session.load, async ctx => {
     const { sessionId, cwd } = ctx.params
+    evictForNewSession(sessionId)
     // Stand-in for agent-side persistence: recreate the record, replay a
     // marker update, then answer with the session state.
     sessions.set(sessionId, { cwd, modeId: 'default', temp: 'mid', model: DEFAULT_MODEL, effort: 'high', stream: false, mcpServers: ctx.params.mcpServers })
     const send = update => ctx.client.notify(methods.client.session.update, { sessionId, update })
     await send({ sessionUpdate: 'tool_call', toolCallId: 'replay_tool', title: 'replayed tool', kind: 'other', status: 'completed' })
     await send({ sessionUpdate: 'agent_message_chunk', messageId: 'replay-1', content: { type: 'text', text: 'REPLAYED: earlier conversation' } })
+    // MOCK_LOAD_DELAY_MS: hold the RESPONSE open so a test can act while the
+    // session is mid-recovery (released cleared, not yet in `sessions`). The
+    // replay above already landed, so the pause is deterministic: the test sees
+    // the inflight request, not a sleep-based guess.
+    if (LOAD_DELAY_MS > 0) await new Promise(resolve => setTimeout(resolve, LOAD_DELAY_MS))
     return {
       modes: {
         currentModeId: 'default',
@@ -439,6 +483,15 @@ const app = agent({ name: 'mock-acp-agent' })
       .join(' ')
     const promptLog = process.env.MOCK_PROMPT_LOG
     if (promptLog !== undefined) appendFileSync(promptLog, `${text}\n`)
+
+    // Single-session connection (MOCK_SINGLE_SESSION=1): a session superseded
+    // by a later `session/new` / `session/load` executes NOTHING — no markers,
+    // no updates, no cancel acknowledgment. This is the CodeBuddy wire shape
+    // the per-session-process design exists for.
+    if (SINGLE_SESSION && evicted.has(sessionId)) {
+      throw new Error('session_superseded: this connection switched to another session')
+    }
+
     const send = update => ctx.client.notify(methods.client.session.update, { sessionId, update })
     let permissionAnswer = 'none'
 
@@ -1144,6 +1197,22 @@ const app = agent({ name: 'mock-acp-agent' })
       await send({ sessionUpdate: 'agent_message_chunk', messageId: 'mcps', content: { type: 'text', text: `MCPS_BEGIN${JSON.stringify(session?.mcpServers ?? [])}MCPS_END` } })
     }
 
+    if (text.includes('SILENTSLOW')) {
+      // NO opening update at all: a provisional first turn only rolls back when
+      // it has shown nothing, so the abort path under test needs the silent
+      // shape. The cancel is acknowledged at once; MOCK_CANCEL_ANSWER_DELAY_MS
+      // is what holds the RESPONSE open after it.
+      const wasCancelled = await Promise.race([
+        sleep(5000).then(() => false),
+        cancelPromise(sessionId).then(() => true),
+      ])
+      if (wasCancelled) {
+        cancelled.delete(sessionId)
+        if (CANCEL_ANSWER_DELAY_MS > 0) await sleep(CANCEL_ANSWER_DELAY_MS)
+        return { stopReason: 'cancelled' }
+      }
+    }
+
     await send({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thinking…' } })
     await send({
       sessionUpdate: 'plan',
@@ -1238,6 +1307,9 @@ const app = agent({ name: 'mock-acp-agent' })
       ])
       if (wasCancelled) {
         cancelled.delete(sessionId)
+        // MOCK_CANCEL_ANSWER_DELAY_MS: acknowledge the cancel at once, but hold
+        // the RESPONSE so the client's close / prune window lands inside it.
+        if (CANCEL_ANSWER_DELAY_MS > 0) await sleep(CANCEL_ANSWER_DELAY_MS)
         return { stopReason: 'cancelled' }
       }
     }

@@ -21,6 +21,14 @@
 
 线格式由 `toAcpMcpServers` 一次性转换：**stdio 那条不带 `type`**（带了 agent 会静默丢弃），http/sse 带 `type`；`env` / `headers` 是 `[{name,value}]` 数组。
 
+### 进程归属与错误码（A1）
+
+`BridgeManager.bridges` 以 `bridgeKey(agentId, scope)` 为键，`scope` 有 `agent` / `chat` / `ephemeral` / `probe` 四态（见 [architecture.md §1.2](./architecture.md)）。只有 `codebuddy` 走 A1 每会话一进程；其余 agent 仍是一条连接、一个进程，所有 scope 折叠到裸 `agentId`。归属判定产生三个错误码：
+
+- **`agent_stopping`**：`stopAgent` / `saveAgentNow` / `deleteAgent` 正在停止该 agent（`stoppingAgents > 0`）。`bridgeFor` 拒绝新建，已存在的 holder 也拒绝外借；消息**不排队**，这一轮直接失败，停止完成后下一条消息照常新建进程。设置页保存 / 删除的确认窗口里发消息会命中它。
+- **`session_orphaned`**：`getOrCreateDshSession` 看到 `dshSessionMap` 里的 live 绑定，但 `bridgeOwning` 的三态（`hasSession` / `hasReleased` / 正在 `inflightResume`）都未命中——该 ACP 会话已不在任何 holder 里。先 `forgetDshSession`，再失败；**不**为孤儿记录凭空 spawn，也不回落到别的会话的进程。下一条消息重新走创建路径。
+- **`fork_unsupported`**：A1 下分叉能力被强制关闭。`noteForkCapability` 对 CodeBuddy 直接写 `false`，`canForkNow` 直接返回 `false`；即使 `initialize` 宣告了 `sessionCapabilities.fork`，`adoptForkedSession` 与 `AgentBridge.forkSession` 也拒。浏览器侧分支按钮按行 `fork` 字段置灰（[ui.md §12](./ui.md)），绕过 UI 的请求零会话创建即失败。
+
 ### session/fork（第四个建会话点）
 
 「在新对话中分支」的 ACP 半段：agent 把自己的内部状态拷进一条**新的** ACP 会话，子会话真的记得父会话的上文。分叉固定两段——**宿主先建 DSH 会话树**（`sessions.fork` 复制历史、标题 `(1)`、挂工作区），**插件再接管 ACP 侧**（`session/chat-fork-adopt` → `BridgeManager.adoptForkedSession` → `AgentBridge.forkSession`）；顺序不可对调，因为 ACP fork 没有切点参数，反过来先 ACP fork 再宿主 fork，第二步失败会留下无法归属的 ACP 会话。UI 侧见 [ui.md §12](./ui.md)。
@@ -34,6 +42,10 @@
 ## 2. 进程死亡 ≠ 会话销毁
 
 **崩溃路径**：`connectionLost` 只能走 `AgentBridge.releaseAll`——会话标记 `released`、settled 权限、广播 `session/released`。**已 `closed` 的会话跳过**：它的记录归 `closeSession` 删，标成 `released` 会让 `doResumeSession` 把 `closed` 翻回 `false`，复活一条正在关闭的会话。严禁在崩溃路径删除会话记录或广播 `session/closed`。
+
+**未结算 prompt 保护**：`AgentBridge.pendingPrompts` 是「会话 id → 计数」的 Map，在 `session/prompt` 请求发出前加一、在响应或错误落地时减一，包住整个 await。两套读数刻意不同：`hasActiveWork()` 的严格计数（含已 `closed` 会话）进入 `isQuiet()`，所以 `pruneBridge` 与工作区搬迁必须等残留请求落地；空闲释放用 `hasActiveWork(false)` 的 `pendingPromptsOnServableSessions()`，只数 live / released 会话上的请求——已 `closed` 会话的永不答复不能钉死进程（约束 19）。`streamPrompt` 结算后的 `.finally` 再补一次 `pruneBridge`。没有这层，「会话关了、请求还在跑」会把唯一能答的进程杀掉，pending request 永远悬挂；没有放宽，一个坏 agent 会让进程永久常驻。
+
+**归属三态**：`bridgeOwning` 只认 `hasSession` / `hasReleased` / `inflightResume`。恢复在途时 `getOrCreateDshSession` `await` 同一个 inflight promise 并复用同一 `LiveSession`，**不再新建第二个 ACP 会话**。三态都未命中且 `dshSessionMap` 仍有 live 绑定，才 `forgetDshSession` 并抛 `session_orphaned`（§1）。
 
 **恢复路径**：对 released 会话的 `prompt` / `setMode` / `setConfigOption`（`/acp` RPC 面），经 `locateOrResume` 自动 resume（respawn + `session/load`），会话记录原地复活：
 
@@ -68,17 +80,19 @@
 
 ## 5. 空闲释放
 
-- **范围**：`AgentBridge.releaseIfIdle` 只释放 `state === 'ready'` 且 `hasActiveWork() === false` 的 bridge。活跃 = 有进行中的 turn（含已 abort、agent 尚未结算，`running || settled`）、待答审批、mode/config 命令在途（`pendingCommands`）、`pendingProbes` / `pendingCreates` / `pendingForks`（分叉在途，§1）/ `resuming` / `starting`。**空闲的 live 会话不算活跃**：释放把它们挂起为 `released`（不是关闭），下一条消息经 `session/load` 恢复，30 分钟窗口因此对聊天进程真正生效。
+- **范围**：`AgentBridge.releaseIfIdle` 只释放 `state === 'ready'` 且 `hasActiveWork(false) === false` 的 bridge。活跃 = 有进行中的 turn（含已 abort、agent 尚未结算，`running || settled`）、待答审批、mode/config 命令在途（`pendingCommands`）、`pendingProbes` / `pendingCreates` / `pendingForks`（分叉在途，§1）/ `pendingPromptsOnServableSessions()`（live 或 released 会话上未结算的 `session/prompt`，见 §2）/ `resuming` / `starting`。**空闲的 live 会话不算活跃**：释放把它们挂起为 `released`（不是关闭），下一条消息经 `session/load` 恢复，30 分钟窗口因此对聊天进程真正生效。**已从 `sessions` 删除的会话，其残留请求只在严格计数里算**——它们阻止 `pruneBridge` 与工作区搬迁，但不阻止空闲释放，否则一个永不答的 agent 会让进程永久常驻；关闭在途的记录仍留在 `sessions`，按可服务计，最多多等一个 `SESSION_CLOSE_TIMEOUT_MS`（5 秒）。
 - **可恢复性闸门**：agent 未声明 `loadSession` 时，有 live 会话的 bridge 不释放——无法 reload 的会话会在下一条消息时丢失上下文；这类 agent 仍等价于旧的「无 live 会话才释放」。
 - **工作区搬迁不共用这条放宽**：`ensureReady` 的就地重启仍要求 `isQuiet()`（无 live 会话且无活跃工作），避免多个工作区的会话互相把进程搬来搬去。两个谓词共享 `hasActiveWork()`，「无 live 会话」只属于搬迁。
 - **动作**：必须走 `releaseAll(reason)` 而不是 `stop()`——`stop` 会 `released.clear()`，毁掉尚未恢复的会话上下文（宿主退出同理，走 `AgentBridge.shutdown`，见 §7）。释放**静默进行，严禁广播 `agent/notice`**；`agent/notice` 只留给异常或伴随用户动作的事件（探测失败、权限超时、就地搬迁工作区）。
+- **子进程启动失败的通知**：单个 holder 启动失败时 `AgentView.state` 是 `error`；若同一 agent 还有健康的兄弟 holder，聚合状态仍为 `ready`，但必须补一条 `agent/notice`（`level: 'error'`，文本含 `failed to start`），否则用户只能看到一个看似正常的 agent。`noticedBridgeFailures` 按 holder + 文本去重，同一失败不重复刷屏；通知进设置页「日志」，不浮在对话上（[ui-panel.md §8](./ui-panel.md)）。
+- **多进程状态聚合**：`agentViews` 对同一 agent 的全部 holder 聚合。空集返回 `makeBridge(def).view()`，不从别处借状态；state 优先级 `ready > starting > error > stopped`；`base` 取第一条与结果同 state 的 holder；`liveSessions` 取并集；`stderrTail` 只随 `error` 带出。`publishAgentStatus` 只取与聚合 state 相同且 `errorText` 有值的子进程——stopped 兄弟的旧错误不得污染 `ready` 聚合。
 - **计时**：只有 `ready` 才武装定时器，窗口从 `lastActivityAt` 起算；`touch()` 会清掉已武装的定时器并按最新活动重排，因此窗口永远量到「最近一次活动」而不是更早的武装时刻。判定为「忙」时必须 `touch()` 重置窗口，否则会以 0ms 延迟自旋。
 - **两档窗口**（`currentIdleTimeoutMs`）：
-  - 从未登记过真实会话的 bridge（`everHostedSession === false`，探测拉起的进程，`probeConfigOptions` 刻意不登记会话）走 `DEFAULT_TUNING.probeIdleTimeoutMs`（默认 5 分钟，**固定**、不随全局设置变）。`def.idleTimeoutMs`（含 `0` = 永不释放）是关于聊天进程的承诺，不管探测进程。
+  - 从未登记过真实会话的 bridge（`everHostedSession === false`，探测拉起的进程，`probeConfigOptions` 刻意不登记会话）走 `DEFAULT_TUNING.probeIdleTimeoutMs`（默认 5 分钟，**固定**、不随全局设置变）。`def.idleTimeoutMs`（含 `0` = 永不释放）是关于聊天进程的承诺，不管探测进程。**A1 例外**：`probeAgentModels` 的 `probe` scope holder 在探针结束时就 `pruneBridge`（[architecture.md §1.2](./architecture.md)），5 分钟窗口只兜底未被显式回收的空 holder。
   - 第一个登记的会话（`createSession` / `doResumeSession`）把 bridge 翻转为 `def.idleTimeoutMs ?? 全局窗口`（见下）。翻转时必须 `clearIdleTimer()` 再 `touch()` 重排。
 - **全局窗口 = 三层取值**（`def.idleTimeoutMs` → 设置页 → 部署基线 → 内置默认 30 分钟）：per-agent 的显式值最优先；没有它时用设置页「进程管理」的滑块值；再没有就用 `cordis.patch.yml` 的插件级 `idleTimeoutMs`；最后是 `DEFAULT_TUNING.idleTimeoutMs`（30 分钟）。**per-agent 那一层必须是「显式值或留空」，绝不能把宿主解析值回填进 agent 定义**——回填等于把全局窗口冻结进该 agent，全局滑块就再也到不了它。设置页的 pick 存在插件自己的状态文件里（与 agent 注册表同文件），**热生效**：`applyIdleRelease` 改写运行中 bridge 的默认窗口并重排定时器，用户不必杀会话。**重置目标是部署基线，不是内置常量**：`AcpIdleRelease.defaultIdleTimeoutMs` 报的是「重置回到哪个窗口」（部署写了就用部署的，否则用内置 30 分钟），`configuredIdleTimeoutMs` 只在配置文件真的写了那个键时才出现——设置卡绝不能对着一个什么都没说的文件宣称「文件要求 30 分钟」。滑动档位是共享阶梯 `IDLE_RELEASE_MS`（1 分钟，其后每 5 分钟一档到 1 小时），浏览器只出阶梯上的值，宿主只收阶梯上的值——滑块能出的值一定是宿主会跑的值。
 - **展示**：`AgentView.idleTimeoutMs` 必须报告**聊天窗口**语义（`idleTimeoutMs` getter）。设置页的 per-agent 输入框只显示**该 agent 自己的显式覆盖**（空 = 跟随全局），不显示解析值。
-- **与卡死收口的关系**：无活动看门狗（§6.1）开火只收口 turn、不碰进程（下一条消息的善后可能重启或重置，那是另一条路径）；`running` / `settled` 清掉后 `hasActiveWork()` 自然转空，进程随后按本节窗口释放。两条路径互不替代——看门狗管「这一轮还能不能结束」，本节管「这个进程还要不要养着」。
+- **与卡死收口的关系**：无活动看门狗（§6.1）开火只收口 turn、不碰进程（下一条消息的善后可能重启或重置，那是另一条路径）；`running` / `settled` 清掉后**还要等 `pendingPrompts` 归零**，`hasActiveWork()` 才会转空。空闲释放看的是放宽口径 `hasActiveWork(false)`：只等 live / released 会话上的待答请求归零，**已 `closed` 会话的残留请求不钉住进程**（§2 双口径）。两条路径互不替代——看门狗管「这一轮还能不能结束」，本节管「这个进程还要不要养着」。
 
 ## 6. 轮次收尾与分段
 
@@ -109,8 +123,8 @@
 - **强制收口帧只发一次，迟到的真答案按路径分述**：`settle` 幂等，`finalizeTurn` 对 `closed` 会话直接放弃、只在 `running` 或闸门仍挂着时动手。聊天路径迟到的**真**响应仍按 `settle` 的 `current`（`turnSeq === turnSeqAtStart`）判定：世代已前进就只关自己的段与 `endTurn`，不广播、不置 `running`、不放全局 waiter；仍是本世代则 `clearOrphanPrompt`，不再补第二帧，也不需要 reload。`/acp` 路径没有控制器：看门狗帧之后、reclaim 之前，迟到的真响应只要 `turnSeq` 未前进就照常广播它自己的 `turn/end`（带 `turnId` 与 stopReason）；一旦 reclaim 记下 `reclaimedTurnSeq`，该世代迟到的 then / catch 一律丢弃（见下一条）；被**外部拆除**（空闲释放 / `stop` / 关会话）抢先结束的会话同样不补帧——`prompt` 的迟到 catch 看到 `session.released || session.closed` 直接放手，因为那次拆除已经替这一轮收过场（释放发了 `turn/end`，关闭发 `session/closed`）。
 - **善后（`prepareStalledSession`）**：下一条消息发出前处理（聊天在 `getOrCreateDshSession` 之前，`/acp` 在 `locateOrResume` 之后）：
   - 已 `closed` 的会话（`session/close` 在途）无物可收，直接放行——记录归 `closeSession` 删，标成 released 会被 resume 复活；已 `released` 的会话也放行，交给正常获取路径 resume。
-  - 同一 agent 上还有别的活跃工作（`AgentBridge.hasOtherActiveWork`：别的会话在跑 turn 或闸门未开、别的会话有待答审批、探测、`pendingCreates`、正在 resume / 启动，以及**别的会话**的在途命令）→ 拒绝本轮（"other conversations are still using it"）。命令按会话记在 `pendingCommands`（Map），所以卡在这条会话上的 mode / config 命令不挡它自己的 reclaim。
-  - 同 agent 另一条会话的控制器仍在 `turnStreams` 里且**未 stale** → 同样拒绝：那条会话已经 settle，`hasOtherActiveWork` 看不见它，但它的宿主可能正在执行卡片（续跑段即将到来），重启进程会把那条活轮次 park 再 resume。已 `closed` / `released` 的残留控制器不算，别的 agent 的也不算——重启只杀这个 agent 的子进程。
+  - 同一 bridge 上还有别的活跃工作（`AgentBridge.hasOtherActiveWork`：别的会话在跑 turn 或闸门未开、别的会话有待答审批、探测、`pendingCreates`、正在 resume / 启动，以及**别的会话**的在途命令）→ 拒绝本轮（"other conversations are still using it"）。A1 下「同一 bridge」就是**同一 CodeBuddy 会话自己的进程**，别的 CodeBuddy 会话进程不算；非 A1 则是该 agent 的唯一进程。命令按会话记在 `pendingCommands`（Map），所以卡在这条会话上的 mode / config 命令不挡它自己的 reclaim。
+  - 同 bridge 另一条会话的控制器仍在 `turnStreams` 里且**未 stale** → 同样拒绝：那条会话已经 settle，`hasOtherActiveWork` 看不见它，但它的宿主可能正在执行卡片（续跑段即将到来），重启进程会把那条活轮次 park 再 resume。已 `closed` / `released` 的残留控制器不算，**别的 bridge（别的 CodeBuddy 会话进程）的也不算**——重启只杀这个 holder 的 `sessionIdsOf` 覆盖的会话。
   - 有 `loadSession` → `releaseAll` 把会话挂起成 `released`，正常获取路径（聊天 `getOrCreateDshSession` / `/acp` `locateOrResume`）经 `session/load` 恢复。
   - 没有 `loadSession` → 还要求同 bridge 上没有别的 live 会话；`AgentBridge.forceReset('agent-stopped')` 杀掉子进程并就地关闭记录、广播 `session/closed`（**不发** `session/close`，也不清 `released`），随后 `forgetDshSession`。聊天下一条消息新建会话；`/acp` prompt 抛 `AcpError('session_reset', … start a new session)`，不是 `unknown_session`。
   - `AgentBridge.closeSession` 的 `session/close` 有 `SESSION_CLOSE_TIMEOUT_MS`（5000ms）上限：卡死的 agent 不能挂住 stop / rollback。

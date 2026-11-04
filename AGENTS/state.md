@@ -29,6 +29,25 @@
 - **`mcpServers` 只校验、不改形状**（`validateMcpServers` 原样返回用户写的条目）。设置页把它当 JSON 文本持有，并拿「将要送出的」与「已存的」比：宿主若替它补默认值（`args: []` / `env: {}`）或重排字段，那张卡就会永远判脏、每次保存都重启 agent。同理，条目里的 `name` 不得重名（它决定 agent 侧工具命名空间 `mcp__<name>__<tool>`）。
 - **宿主侧 MCP 不经这条路**。宿主自己的 MCP 桥（`@deepseek-ai/dsh-mcp-client`）把工具注册进 `ctx.tools`，那是宿主模型面的工具，与 agent 进程内的 MCP 无关；插件既读不到那批服务器的配置（宿主不暴露可读服务），也无法把宿主 MCP 暴露给 agent（见 [architecture.md §5](./architecture.md)）。`mcpServers` 只是**额外**追加：agent 自己配置的 MCP 服务器照旧由 agent 读自己的配置文件。
 
+### 2.1 运行时进程归属（A1）
+
+| 结构 | 键 | 归属 | 不变量 |
+|---|---|---|---|
+| `BridgeManager.bridges` | `bridgeKey(agentId, scope)` | 进程 | 非 A1 = 裸 `agentId`（一个 agent 一个进程）；A1 = `agentId\0<kind>[:token]`（一个 DSH 会话 / 一个 `/acp` token / 一次探测一个进程）。同一个键只有一个 `AgentBridge`。 |
+| `BridgeManager.bridgeScopes` | 同一个复合键 | 进程 | 键 → `BridgeScope` 的伴生状态，**只用测试与诊断**：生产代码 1 处声明、1 处写入、4 处删除，没有消费者；唯一读取方是 `tests/bridge.spec.ts` 的 3 处断言（`agent/delete` 与 `stopAgent` 比对 `bridgeScopes.size` 与 `bridges.size`）。判定作用域的唯一权威是 `bridges` 的复合键与 `bridgeKey`。 |
+| `BridgeManager.stoppingAgents` | `agentId` | agent | 停止中的重入计数。>0 时 `bridgeFor` 拒绝新建、已存在 holder 拒绝外借（`agent_stopping`）；归零后才允许下一条消息新建进程。**消息不排队**。 |
+| `BridgeManager.noticedBridgeFailures` | `AgentBridge` 对象 | 进程 | 启动失败通知的去重表（值为文本）。同一 holder 同一失败文本只发一次 `agent/notice`；holder 被回收后条目随 WeakMap 消失。 |
+| `AgentBridge.pendingPrompts` | ACP 会话 id | 进程 | 未结算的 `session/prompt`，**按会话 id 计数**（同一会话可重入）。请求发出前加一、响应或失败 `.finally` 减一，归零删键。两套读数：`hasActiveWork()` 默认严格计数含已 `closed` 会话，`pendingPromptsOnServableSessions()` 只数仍存在于 `sessions` / `released` 的 id，供空闲释放。 |
+| `BridgeManager.dshSessionMap` | `${dshSessionId ?? 'ephemeral'}:${agentId}` | 会话 | DSH 会话 → `LiveSession` 的插件地址。键含 agent（同一 DSH 会话换 agent 时不让旧记录冒充新绑定）；匿名 `/acp` 回合用 `ephemeral` 前缀。 |
+| `BridgeManager.turnStreams` | `dshSessionId` | 会话 | 在飞分段流的控制器。清理按会话 id / `sessionIdsOf` 选中的集合，不做 agent 级连带清除。 |
+
+- 模型目录、命令缓存、fork 能力位、`exposedModels` 仍是 **per-agent** 状态（`agentCatalog` / `forkCaps`）：会话换了进程不换这些事实源。
+- 权限询问与 transcript 是 **per-session**：`PermissionLedger` 按 ACP 会话 id、transcript 按 DSH 会话 id。
+- `AgentBridge.sessions` / `AgentBridge.released` 是 **per-process**：一个 holder 只装它自己的会话。`sessionIdsOf` 把这两个集合合成该 holder 的会话 id 集合，用于 turn stream 清理与兄弟会话阻塞判定（[protocol.md §6.1](./protocol.md)）。
+- 空闲释放按 holder 计时（`releaseIfIdle`）；A1 下一个 CodeBuddy 会话的进程释放不影响其他会话进程，`dshSessionMap` 也不删——下一条消息按 binding 恢复。
+- **已知残余风险（空闲释放 × 已关闭会话的待答请求）**：空闲释放用放宽口径（`hasActiveWork(false)`），已从 `sessions` 删除的会话上未结算的 `session/prompt` 不钉住进程。计时到点后 `releaseAll` 杀掉子进程，该请求以拒绝收场，`streamPrompt` 的 `.finally` 再 prune。若 agent 在进程死后才回应这条已被停止的 prompt，迟到的结算变成连接错误。取消结算途中的请求仍阻止释放，所以「按停止得到 `cancelled` 而不是 `error`」不变。窗口默认 30 分钟，`idleTimeoutMs: 0` 表示永不释放。这条代价是为满足 [AGENTS.md 约束 19](../AGENTS.md)（坏 agent 不得让进程永久常驻）接受的。
+- **已决策取舍（不排除关闭在途的会话）**：`closeSession` 先置 `session.closed = true`，等 `session/close` 返回后才从 `sessions` 删除。这段窗口里该会话仍被 `pendingPromptsOnServableSessions` 算作可服务，其待答请求仍阻止空闲释放。最坏只把释放推迟一个 `SESSION_CLOSE_TIMEOUT_MS`（5 秒），不影响语义与正确性。**决定不改**：排除 `closed` 会让空闲释放在关闭在途时提前杀进程，可能重新破坏「按停止得到 `cancelled` 而不是 `error`」；代价与收益不对等。
+
 ## 3. 会话选择持久化
 
 一个 DSH 聊天会话对它的 ACP agent 做的全部选择（`agentId` + `modelId` + `effort` + `mode` + `extraConfigs`）记在 `AcpConversationChoice`（`src/protocol.ts`），由 `BridgeManager.chatAgentIntent` 持有并持久化到 `agents.json` 的 `conversations` 键（`persistAgents` / `loadPersistedChoices`）。
@@ -45,7 +64,7 @@
 
 ### 3.1 会话记录持久化（`chatSessions`）
 
-聊天绑定的会话记录持久化在 `agents.json` 的 `chatSessions` 键（`persistedChatSession` / `loadPersistedChatSessions`，`src/bridge.ts`）。宿主重启把每条记录以 **released** 复原进 `dshSessionMap` 与对应 bridge 的 released map（`AgentBridge.parkReleased`）——进程死了但 agent 侧会话还在，`session/load` 照常恢复。这是「released ≠ 销毁」在进程边界上的落点（约束 10）：没有它，重启后释放横幅直接消失、下一条消息还会静默新开一条没有上下文的会话。
+聊天绑定的会话记录持久化在 `agents.json` 的 `chatSessions` 键（`persistedChatSession` / `loadPersistedChatSessions`，`src/bridge.ts`）。宿主重启把每条记录以 **released** 复原进 `dshSessionMap` 与**它自己的** chat holder 的 released map（`AgentBridge.parkReleased`）——A1 下每条记录一个 holder，不同会话不共享进程槽。进程死了但 agent 侧会话还在，`session/load` 照常恢复。这是「released ≠ 销毁」在进程边界上的落点（约束 10）：没有它，重启后释放横幅直接消失、下一条消息还会静默新开一条没有上下文的会话。
 
 - **只落身份与显示镜像**（`sessionId` / `acpSessionId` / `agentId` / `dshSessionId` / `cwd` + `title` / `modelId` / `reasoningEffort` / `modes` / `usage` / `hasHistory`）。**不落 transcript 与 `configOptions`**——两者都由 agent 在 `session/load` 时回放/带回；重启后到恢复前的空缓冲由 `hasHistory` 说明「历史待回放」（[ui.md §5](./ui.md)），不写「还没有消息」。
 - **写点**：`getOrCreateDshSession` 的建/恢复分支、`forgetDshSession`（closed 销毁即删盘）、以及 `AgentBridge` 的 `onSessionsDirty` 回调（`releaseAll` / `doResumeSession`——release 时 transcript 还在，`hasHistory` 正是在那里算的：`hasHistory || since(0).length > 0`）。
@@ -59,7 +78,7 @@
 
 - **`chatSessions.acpSessionId` 仍是唯一地址真相**：`adoptForkedSession` 给子会话建的持久化记录与任何聊天会话同形，resume 靠它 `session/load`；`AcpConversationChoice` 不存会话 id（见 §3），**严禁**为分叉再造第二个会话地址字段。
 - **子会话 choice = 父 choice 拷贝 + `locked: true`**，经 `patchChatChoice` 这一个入口写——分支出来的会话从出生就锁在它的 agent 上，模型 / 等级 / 模式 / 额外配置随父；**严禁**手抄字段清单（约束 27 的老坑）。
-- **fork 能力位落「最后已知」**：`initialize` 的 `sessionCapabilities.fork` 经 `noteForkCapability` 记进 `forkCaps`，随 `persistCatalogs` 写进 `model-catalog.json` 的 `agents[agentId].fork`，`loadPersistedCatalogs` 读回；`canForkNow` 活进程的 `initResult` 优先、这份最后已知兜底。**严禁**读 `view().agentCapabilities`——`releaseAll` 会清空它，分支按钮会无缘无故闪成禁用。能力位过期（agent 升级）只能等下次 `initialize` 更新，UI 文案用「最后已知」口径，不承诺实时。
+- **fork 能力位落「最后已知」**：`initialize` 的 `sessionCapabilities.fork` 经 `noteForkCapability` 记进 `forkCaps`，随 `persistCatalogs` 写进 `model-catalog.json` 的 `agents[agentId].fork`，`loadPersistedCatalogs` 读回；`canForkNow` 活进程的 `initResult` 优先、这份最后已知兜底。**严禁**读 `view().agentCapabilities`——`releaseAll` 会清空它，分支按钮会无缘无故闪成禁用。能力位过期（agent 升级）只能等下次 `initialize` 更新，UI 文案用「最后已知」口径，不承诺实时。**A1 例外**：CodeBuddy 的能力位被 `noteForkCapability` 强制写成 `false`，`canForkNow` 直接返回 `false`；即使 `initialize` 宣告了 fork，磁盘上的旧 `true` 也被覆盖，分支入口不可用（`fork_unsupported`，见 [protocol.md §1](./protocol.md)）。
 
 ## 4. 模型目录（agent/catalog）
 

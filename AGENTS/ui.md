@@ -171,10 +171,12 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 - **挂载自读一次** `loadChatSessions`：打开一条已挂起的会话时，没有任何别的东西会替它读这份清单（挂牌、占用环的重读都挂在别的触发器上）。
 - **横幅跨 DSH 重启存活**：会话记录持久化（[state.md §3.1](./state.md)），重启后记录以 released 复原，横幅与「恢复进程」照常——否则重启就等于把「released ≠ 销毁」丢掉。重启后到恢复前 NTR 视图的空流说「历史将在恢复后回放显示」（`historyAwaitsReplay`，见 §5），不说「还没有消息」。
 - 宽度复用权限卡的 InputBar 公式（`.ntr-released-banner`），样式与 `ntr-permission-card` 同族（warn 左边条）；行集的 released 翻转见 §2 耦合不变量。
+- **A1 下每条 CodeBuddy 会话独立进程**：崩溃或空闲释放只把这一条会话的行集变成 `released`，兄弟会话的进程照常活着，横幅不因兄弟会话而提前消失，也不因兄弟会话崩溃而误挂；「恢复进程」只重启本会话的进程。
+- **停止窗口内的消息直接失败**：设置页保存 / 删除 / 停止该 agent 期间到达的聊天消息以 `agent_stopping` 失败，不排队；停止完成后下一条消息正常新建进程（[protocol.md §1](./protocol.md)）。
 
 ## 12. 消息动作接管（分支按钮）
 
-NTR 会话里，宿主的点赞 / 点踩 / 分支三图标是插件的业务：agent 自己决定反馈面，而宿主的分支会分出一条 agent 不记得上文的会话。插件把三图标藏掉、在同一位置自绘分支入口（`src/client/branch-action.tsx` · `AcpBranchAction`）；分叉的两段链路见 [protocol.md §1](./protocol.md)。
+NTR 会话里，宿主的点赞 / 点踩 / 分支三图标是插件的业务：agent 自己决定反馈面，而宿主的分支会分出一条 agent 不记得上文的会话。插件把三图标藏掉、在同一位置自绘分支入口（`src/client/branch-action.tsx` · `AcpBranchAction`）；分叉的两段链路见 [protocol.md §1](./protocol.md)。**A1 例外**：CodeBuddy 的 fork 能力位被强制写成 `false`（[state.md §3.2](./state.md)），分支入口按行 `fork` 字段禁用，点击不发任何会话请求。
 
 - **作用域标记归 `syncAcpMode` 维护**：`src/client/index.tsx` 的 `setScopeMarker` 幂等 `toggleAttribute('data-ntr-acp')`，每一条 `standDown` 与 gate 卸载清理都会摘掉——证据不再作答时宿主图标原样回来。行的 preset 判定经 `store.noteAcpMode` 折叠进 store（取代旧的「gate 只读不写」：舞台行的 `agentPreset` 与 `agent-preset/selected` 帧两个方向都折叠）；自绘按钮的闸门读折叠后的 `acpMode`，与 CSS 作用域是同一份事实，两个判定源不得分叉。
 - **隐藏是纯 CSS，锚点是 `[data-turn-tail]`**（宿主 `TurnTailNodeView` 根 div 的标记；当前宿主构建没有 `data-clock` 可依赖）。按本地化 `aria-label` 精确匹配，**只有 8 条 button 规则**：宿主 `Tooltip` 是 `cloneElement` 渲染、不加包装元素，藏掉 button 就是全部工作，行内不留空位；**严禁**加 `:has(> button…)` 规则——它会命中动作行本身（分支按钮）与 list 槽共用的 `display:contents` 锚点（反馈按钮），把整行藏掉（测试钉住了这条禁令）。`:not([data-ntr-branch])` 是自绘按钮的通行证——它与宿主分支按钮同 aria-label，否则会被自己的规则藏掉。复制键因精确匹配天然不受伤。**严禁**覆盖 `conversation.chat.node` 渲染来达成隐藏——那会连带失去 `turnTail` / `assistant-actions` 两个子槽。

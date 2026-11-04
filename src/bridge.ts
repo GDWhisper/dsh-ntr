@@ -146,6 +146,89 @@ const STALE_START_KILL_BUDGET_MS = 2_000
  */
 const SHUTDOWN_BUDGET_MS = 4_000
 
+/**
+ * A1: agents whose ACP host keeps exactly ONE `currentSession` per stdio
+ * connection. CodeBuddy is the only one today — `session/new` / `session/load`
+ * replace its connection-wide session and stop the previous one, so every DSH
+ * conversation needs its own child process. Every other agent multiplexes any
+ * number of sessions over one process and stays on the agent-wide bridge.
+ */
+export const PER_SESSION_AGENT_IDS: ReadonlySet<string> = new Set(['codebuddy'])
+
+/** True when this agent gets one child process per DSH session (A1). */
+export function isPerSessionAgent(agentId: string): boolean {
+  return PER_SESSION_AGENT_IDS.has(agentId)
+}
+
+/** Which process one `AgentBridge` serves (per-session agents only; all others are `agent`). */
+export type BridgeScope =
+  /** Non-A1: the single process configured for the agent. */
+  | { kind: 'agent' }
+  /** A1: one DSH chat conversation. */
+  | { kind: 'chat'; dshSessionId: string }
+  /** A1: a `/acp` RPC session (its own token) or the anonymous turn bucket. */
+  | { kind: 'ephemeral'; token: string }
+  /** A1: the throwaway child a model / config probe opens. */
+  | { kind: 'probe' }
+
+/**
+ * The `bridges` key for one agent + scope. A non-per-session agent folds every
+ * scope onto the bare agent id, so its map keeps exactly one entry and every
+ * existing lookup stays byte-for-byte the same. A per-session agent keeps a
+ * distinct key per scope; the NUL separator cannot collide with an agent id or
+ * a DSH session id. `probe` carries no token — it is one fixed child per agent.
+ */
+export function bridgeKey(agentId: string, scope: BridgeScope): string {
+  if (!isPerSessionAgent(agentId)) return agentId
+  switch (scope.kind) {
+    case 'agent': return `${agentId}\u0000agent`
+    case 'chat': return `${agentId}\u0000chat:${scope.dshSessionId}`
+    case 'ephemeral': return `${agentId}\u0000ephemeral:${scope.token}`
+    case 'probe': return `${agentId}\u0000probe`
+  }
+}
+
+/**
+ * Drop the fixed `--port` CodeBuddy's ACP mode tries to bind: every per-session
+ * child would race for `127.0.0.1:6156` (`EADDRINUSE`), and stdio needs no
+ * listener at all. Both `--port <value>` and `--port=<value>` are removed; a
+ * non-per-session agent keeps its arguments byte-for-byte (new array, same
+ * entries — the caller's array is never mutated).
+ */
+export function perSessionLaunchArgs(args: readonly string[], agentId: string): string[] {
+  if (!isPerSessionAgent(agentId)) return [...args]
+  const kept: string[] = []
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]
+    if (arg === '--port') {
+      index += 1 // ...and the value that follows it
+      continue
+    }
+    if (arg.startsWith('--port=')) continue
+    kept.push(arg)
+  }
+  return kept
+}
+
+/**
+ * The same for the environment: a per-session child must not inherit an agent
+ * config that pins `SERVER__PORT` / `SERVER__HOST` (the EADDRINUSE above). The
+ * lookup is case-insensitive because Windows env names are, so a `server__port`
+ * written in lowercase is removed too. Non-per-session agents get the input
+ * object back untouched; a per-session agent gets a new object and never
+ * mutates the caller's.
+ */
+export function perSessionLaunchEnv(env: Record<string, string>, agentId: string): Record<string, string> {
+  if (!isPerSessionAgent(agentId)) return env
+  const kept: Record<string, string> = {}
+  for (const [key, value] of Object.entries(env)) {
+    const upper = key.toUpperCase()
+    if (upper === 'SERVER__PORT' || upper === 'SERVER__HOST') continue
+    kept[key] = value
+  }
+  return kept
+}
+
 /** What the composer showed for an agent before a conversation picked it. */
 interface DisplayedChatDefaults {
   modelId?: string
@@ -704,6 +787,17 @@ export class AgentBridge {
   /** Throwaway catalog probes in flight — they hold no live session of their own. */
   private pendingProbes = 0
   /**
+   * `session/prompt` requests still awaiting the agent's answer, keyed by the
+   * session that owns them. A rollback can close the session the moment the
+   * user aborts, which removes it from `sessions` — but the request is still on
+   * air, and killing the child now would turn a user's STOP into a
+   * connection-dropped ERROR. This map is the ownership proof `hasActiveWork`
+   * needs once the session is gone — and the KEY is what lets the idle clock
+   * tell a closed-and-abandoned request apart from a live one (see
+   * `pendingPromptsOnServableSessions`).
+   */
+  private pendingPrompts = new Map<string, number>()
+  /**
    * Host→agent session commands in flight (mode / config); not turns. Counted
    * PER SESSION: a command the wedged agent never answers must not pin the
    * bridge against reclaiming THAT session (it is exactly the state the
@@ -779,6 +873,13 @@ export class AgentBridge {
      * `initResult` dies with the process; the manager's copy survives it).
      */
     private readonly onForkCapability?: (agentId: string, supported: boolean) => void,
+    /**
+     * When present, a status transition is broadcast by the MANAGER from the
+     * AGGREGATE of every process serving the agent (A1 has several) instead of
+     * this child speaking for all of them. Absent on every legacy construction
+     * point, which keeps their frame byte-for-byte as it was.
+     */
+    private readonly onStatus?: (bridge: AgentBridge) => void,
   ) {
     const merged = { ...DEFAULT_TUNING, ...tuning }
     this.startupTimeoutMs = merged.startupTimeoutMs
@@ -1038,12 +1139,25 @@ export class AgentBridge {
   }
 
   /**
+   * The last startup / connection error. The manager folds it into the
+   * aggregated status frame (see `BridgeManager.publishAgentStatus`); the
+   * bridge itself only puts it on its own frame when it has no manager.
+   */
+  get errorText(): string | undefined {
+    return this.lastError
+  }
+
+  /**
    * Work a teardown would interrupt: a turn in flight (or one the agent is
    * still settling after an abort), a permission ask waiting for an answer, a
    * probe, a resume, or a start. A registered-but-idle session is NOT work.
    */
-  private hasActiveWork(): boolean {
+  private hasActiveWork(includeClosedPrompts = true): boolean {
+    const pendingPrompts = includeClosedPrompts
+      ? this.pendingPrompts.size
+      : this.pendingPromptsOnServableSessions()
     if (this.pendingProbes > 0
+      || pendingPrompts > 0
       || this.pendingCreates > 0
       || this.pendingForks > 0
       || this.pendingCommands.size > 0
@@ -1054,6 +1168,23 @@ export class AgentBridge {
       if (session.running || session.settled !== undefined) return true
     }
     return false
+  }
+
+  /**
+   * Outstanding prompts that belong to a session this bridge can still serve
+   * (live or parked). A request left behind by a CLOSED session is the abort /
+   * rollback case: it must keep the child alive until it settles, so `prune` and
+   * workspace moves use the strict count. But an agent that NEVER answers must
+   * not pin the process forever — constraint 19's idle clock needs an end point,
+   * and the agent will not give one. The idle release therefore ignores
+   * closed-session requests only.
+   */
+  private pendingPromptsOnServableSessions(): number {
+    let total = 0
+    for (const [sessionId, count] of this.pendingPrompts) {
+      if (this.sessions.has(sessionId) || this.released.has(sessionId)) total += count
+    }
+    return total
   }
 
   /**
@@ -1096,6 +1227,15 @@ export class AgentBridge {
   }
 
   /**
+   * Nothing is left here that a later turn could resume: no live session, no
+   * parked record, no work. A per-session holder (A1) is then safe to drop; an
+   * agent-wide holder is never dropped because it IS the agent's process slot.
+   */
+  isDiscardable(): boolean {
+    return this.isQuiet() && this.released.size === 0
+  }
+
+  /**
    * A turn is in flight (or the agent has not settled its response yet) on any
    * of this bridge's sessions. `settled` only stays non-undefined while the
    * agent's answer is outstanding — the settler clears it on completion — so
@@ -1116,7 +1256,7 @@ export class AgentBridge {
    * cannot reload, so there the old session-less rule stands.
    */
   private canIdleRelease(): boolean {
-    if (this.hasActiveWork()) return false
+    if (this.hasActiveWork(false)) return false
     return this.sessions.size === 0 || this.initResult?.agentCapabilities?.loadSession === true
   }
 
@@ -1207,10 +1347,10 @@ export class AgentBridge {
     if (this.teardownEpoch !== epoch) return
     const cwd = safeSpawnCwd(this.def, this.wantedSpawnCwd)
     this.spawnCwd = cwd
-    const launch = windowsShimLaunch(command, this.def.args ?? [])
+    const launch = windowsShimLaunch(command, perSessionLaunchArgs(this.def.args ?? [], this.def.id))
     const child = spawn(launch.command, launch.args, {
       cwd,
-      env: childEnv(process.env, this.def.env ?? {}),
+      env: perSessionLaunchEnv(childEnv(process.env, this.def.env ?? {}), this.def.id),
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: process.platform !== 'win32',
       shell: false,
@@ -1338,6 +1478,13 @@ export class AgentBridge {
   }
 
   private publishStatus(): void {
+    // A1: one child's transition must not speak for the whole agent — hand it
+    // to the manager, which folds every child into one frame. With a single
+    // child that frame is the identical one this method used to send.
+    if (this.onStatus !== undefined) {
+      this.onStatus(this)
+      return
+    }
     this.hub.broadcast({ type: 'agent/status', agentId: this.def.id, state: this.state, ...(this.lastError === undefined ? {} : { error: this.lastError }), agent: this.view() })
   }
 
@@ -1473,6 +1620,11 @@ export class AgentBridge {
    * caller.
    */
   async forkSession(parent: LiveSession, dshSessionId: string): Promise<LiveSession> {
+    // A1 (F2): the fourth session-creation point is hard-disabled per agent;
+    // a per-session child holds exactly the conversation it was spawned for.
+    if (isPerSessionAgent(this.def.id)) {
+      throw new AcpError('fork_unsupported', `acp: agent "${this.def.id}" runs one process per conversation and cannot fork`)
+    }
     if (this.initResult?.agentCapabilities?.sessionCapabilities?.fork == null) {
       throw new AcpError('fork_unsupported', `acp: agent "${this.def.id}" does not advertise the session/fork capability`)
     }
@@ -1597,12 +1749,21 @@ export class AgentBridge {
     }
 
     for (let attempt = 0; ; attempt += 1) {
+      const promptSessionId = session.sessionId
+      this.pendingPrompts.set(promptSessionId, (this.pendingPrompts.get(promptSessionId) ?? 0) + 1)
       // The response is activity too: the idle window must start at the turn's
       // END, not at the prompt that may have started a long time ago.
       const result = await conn.agent.request(methods.agent.session.prompt, {
         sessionId: session.acpSessionId,
         prompt: blocks,
-      }).finally(() => { this.touch() })
+      }).finally(() => {
+        // Decrement on the response OR the failure: a killed connection must
+        // not leave this bridge permanently "busy" and unprunable.
+        const remaining = (this.pendingPrompts.get(promptSessionId) ?? 1) - 1
+        if (remaining > 0) this.pendingPrompts.set(promptSessionId, remaining)
+        else this.pendingPrompts.delete(promptSessionId)
+        this.touch()
+      })
       const answered = () => ({
         stopReason: result.stopReason,
         ...(result._meta !== undefined && result._meta !== null ? { meta: result._meta } : {}),
@@ -5877,7 +6038,32 @@ function chunkTextOf(content: unknown): string {
 
 /** Routes host session ids to their owning bridge. */
 export class BridgeManager {
+  /**
+   * Process slots, keyed by `bridgeKey(agentId, scope)`. A non-per-session
+   * agent folds every scope onto the bare agent id (exactly one entry, as
+   * before); a per-session agent (A1) keeps one entry per chat / ephemeral /
+   * probe scope, so `bridges.values()` stays the complete set and every
+   * traversal keeps working unchanged.
+   */
   private readonly bridges = new Map<string, AgentBridge>()
+  /** The scope each `bridges` entry was created for; keys are opaque and never parsed. */
+  private readonly bridgeScopes = new Map<string, BridgeScope>()
+  /**
+   * Agents whose `stopAgent` is on the stack, with an overlapping-stop counter.
+   * `bridgeFor` refuses to mint a holder for them (see `stopAgent`): a message
+   * arriving during the teardown's `await` must not spawn a child the snapshot
+   * never saw, or that child would outlive the key sweep and leave a session
+   * record no process can serve. A counter rather than a flag so two
+   * overlapping stops cannot open the gate when the first one returns.
+   */
+  private readonly stoppingAgents = new Map<string, number>()
+  /**
+   * Child bridge → the startup error already written to the settings log. An
+   * `error` child under a `ready` aggregate has no status-frame voice, so the
+   * notice is its only surface; dedupe keeps repeated status publishes from
+   * repeating the line.
+   */
+  private readonly noticedBridgeFailures = new WeakMap<AgentBridge, string>()
   private readonly defsMap = new Map<string, AcpAgentDef>()
   /**
    * Process-lifetime delete tombstones. `deleteAgent` records the id BEFORE it
@@ -6198,7 +6384,10 @@ export class BridgeManager {
     onSessionsDirty?: () => void,
     onForkCapability?: (agentId: string, supported: boolean) => void,
   ): AgentBridge {
-    return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, onCommands, this.tuning, () => this.sessionWorkspaceResolver, onSessionsDirty, onForkCapability)
+    return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, onCommands, this.tuning, () => this.sessionWorkspaceResolver, onSessionsDirty, onForkCapability, bridge => {
+      this.publishAgentStatus(bridge.def.id)
+      this.noticeBridgeFailure(bridge)
+    })
   }
 
   /**
@@ -6419,6 +6608,12 @@ export class BridgeManager {
       throw new AcpError('turn_in_flight', 'acp: the conversation to branch is running a turn; wait for it to finish')
     }
     const agentId = parent.agentId
+    // A1 (F2): refuse before any request or record is written. `canForkNow`
+    // below also answers `false`, but failing here keeps the error the same
+    // shape even if the capability gate ever changes.
+    if (isPerSessionAgent(agentId)) {
+      throw new AcpError('fork_unsupported', `acp: agent "${agentId}" runs one process per conversation and cannot fork`)
+    }
     const childKey = `${childDshSessionId}:${agentId}`
     if (this.dshSessionMap.has(childKey)) {
       throw new AcpError('id_conflict', 'acp: the forked conversation is already bound to an ACP session')
@@ -6586,11 +6781,24 @@ export class BridgeManager {
     // Drop the chat-keyed record BEFORE the asynchronous agent-side close: the
     // browser's very next `session/chat-list` must not see this session.
     this.forgetDshSession(session.sessionId)
-    // Use the existing bridge, not `this.bridge(id)`: the agent may have been
-    // deleted while its first turn was failing, and a rollback must never throw.
-    const failed = this.bridges.get(session.agentId)
+    // Use the session's OWN bridge, not `this.bridge(id)` / a map lookup by
+    // agent: the agent may have been deleted while its first turn was failing,
+    // and a rollback must never throw — `bridgeOwning` never creates, never
+    // throws, and never routes a session to another process.
+    const failed = this.bridgeOwning(session.agentId, session.sessionId)
     if (failed !== undefined) {
-      void failed.closeSession(session, 'closed').catch(() => { /* already gone */ })
+      // Once the agent-side close has settled, drop the holder too: a failed
+      // first turn leaves nothing resumable behind it (the record was forgotten
+      // above), so a per-session holder would otherwise linger with a live
+      // child and no session — an orphan the next message could not use.
+      // `keyOfBridge` runs inside the callback so it names the holder only if
+      // this bridge is still registered.
+      void failed.closeSession(session, 'closed')
+        .catch(() => { /* already gone */ })
+        .finally(() => {
+          const key = this.keyOfBridge(failed)
+          if (key !== undefined) this.pruneBridge(key)
+        })
     }
   }
 
@@ -6807,7 +7015,7 @@ export class BridgeManager {
     for (const session of this.dshSessionMap.values()) {
       if (session.dshSessionId !== dshSessionId || session.agentId !== bound || session.released) continue
       try {
-        await this.bridge(bound).setConfigOption(session, configId, value)
+        await this.bridgeForSession(session).setConfigOption(session, configId, value)
       } catch (error) {
         this.hub.broadcast({
           type: 'agent/notice',
@@ -6858,7 +7066,7 @@ export class BridgeManager {
       const offered = session.modes?.availableModes ?? []
       if (offered.length === 0 || offered.some(mode => mode.id === choice.mode)) {
         try {
-          await this.bridge(session.agentId).setMode(session, choice.mode)
+          await this.bridgeForSession(session).setMode(session, choice.mode)
         } catch (error) {
           this.hub.broadcast({
             type: 'agent/notice',
@@ -6906,7 +7114,7 @@ export class BridgeManager {
           continue
         }
         try {
-          await this.bridge(session.agentId).setConfigOption(session, configId, value)
+          await this.bridgeForSession(session).setConfigOption(session, configId, value)
         } catch (error) {
           this.hub.broadcast({
             type: 'agent/notice',
@@ -6990,7 +7198,7 @@ export class BridgeManager {
       this.persistAgents()
       return
     }
-    const bridge = this.bridge(target.agentId)
+    const bridge = this.bridgeForSession(target)
     await bridge.setMode(target, modeId)
     // Persisted only AFTER the agent accepted it: a mode the agent rejected must
     // not come back on the next restore. This is the same contract the model and
@@ -7020,7 +7228,9 @@ export class BridgeManager {
       throw new AcpError('unknown_session', `acp: no ACP session is bound to chat session ${dshSessionId}`)
     }
     if (!target.released) return
-    const bridge = this.bridge(target.agentId)
+    // The parked record belongs to the holder it was parked on (A1); resuming
+    // on any other process would open the same session twice.
+    const bridge = this.bridgeForSession(target)
     const resumed = await bridge.resumeSession(target)
     // Chat-side rebind + pick re-application, verbatim the lazy path's: the
     // freshly loaded session comes back at the agent's defaults, so the
@@ -7494,7 +7704,11 @@ export class BridgeManager {
         transcript: new Transcript(this.transcriptMax),
       }
       this.dshSessionMap.set(`${dshSessionId}:${agentId}`, session)
-      this.bridge(agentId).parkReleased(session)
+      // A1: the record parks on the holder its own DSH conversation will
+      // resume through — the same scope the create branch would pick — so the
+      // first message after a restart reaches the process that can `session/load`
+      // it, not the agent-wide slot. Creating the holder is pure bookkeeping.
+      this.bridgeFor(agentId, { kind: 'chat', dshSessionId }).parkReleased(session)
     }
   }
 
@@ -7729,8 +7943,13 @@ export class BridgeManager {
    * agent's own next `initialize` is the refresh).
    */
   private noteForkCapability(agentId: string, supported: boolean): void {
-    if (this.forkCaps.get(agentId) === supported) return
-    this.forkCaps.set(agentId, supported)
+    // A1 (F2): one process per conversation means there is no shared
+    // connection to fork on, so the capability is permanently OFF whatever the
+    // agent's handshake says. Persisting `false` also overwrites a `true`
+    // cached by an earlier single-process generation.
+    const verdict = isPerSessionAgent(agentId) ? false : supported
+    if (this.forkCaps.get(agentId) === verdict) return
+    this.forkCaps.set(agentId, verdict)
     this.persistCatalogs()
   }
 
@@ -7741,6 +7960,9 @@ export class BridgeManager {
    * "never seen" — an unknown agent simply never gets a fork attempt.
    */
   private canForkNow(agentId: string): boolean {
+    // A1 (F2): hard-disabled. A per-session child serves ONE conversation, so
+    // there is no connection-scoped parent/child pair to fork.
+    if (isPerSessionAgent(agentId)) return false
     const bridge = this.bridges.get(agentId)
     if (bridge?.initResult !== undefined) {
       return bridge.initResult.agentCapabilities?.sessionCapabilities?.fork != null
@@ -7822,12 +8044,21 @@ export class BridgeManager {
     if (!this.defsMap.has(agentId) || this.isAgentDeleted(agentId)) {
       throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
     }
-    const bridge = this.bridge(agentId)
-    const configOptions = await bridge.probeConfigOptions()
-    const entry = this.absorbCatalog(agentId, configOptions)
-    // A fresh probe answers in the CURRENT schema by construction.
-    this.catalogStale.delete(agentId)
-    return { agentId, catalog: entry.catalog, updatedAt: entry.updatedAt }
+    const bridge = this.bridgeFor(agentId, { kind: 'probe' })
+    try {
+      const configOptions = await bridge.probeConfigOptions()
+      const entry = this.absorbCatalog(agentId, configOptions)
+      // A fresh probe answers in the CURRENT schema by construction.
+      this.catalogStale.delete(agentId)
+      return { agentId, catalog: entry.catalog, updatedAt: entry.updatedAt }
+    } finally {
+      // A probe child exists ONLY for this call: it must not linger (and must
+      // never be a chat session's process — the `probe` scope guarantees that
+      // for A1, while a non-per-session agent folds it onto its single slot and
+      // `pruneBridge` deliberately leaves that alone). Dropping the holder
+      // stops the child; see `pruneBridge`.
+      this.pruneBridge(bridgeKey(agentId, { kind: 'probe' }))
+    }
   }
 
   /**
@@ -8077,7 +8308,10 @@ export class BridgeManager {
     const result = { modelStale: false, effortStale: false }
     if (wantedModel === undefined && wantedEffort === undefined) return result
     const catalog = parseCatalogOptions(session.configOptions)
-    const bridge = this.bridge(session.agentId)
+    // The session's OWN process: A1 gives one agent several children, and a
+    // config write must reach the one holding this session, never the agent-wide
+    // slot (which may not even be running).
+    const bridge = this.bridgeForSession(session)
     const notice = (level: 'info' | 'error', text: string): void => {
       this.hub.broadcast({ type: 'agent/notice', agentId: session.agentId, level, text })
     }
@@ -8175,10 +8409,22 @@ export class BridgeManager {
     return model.choices.some(choice => choice.value === wanted) ? undefined : wanted
   }
 
-  private bridge(agentId: string): AgentBridge {
+  /**
+   * Resolve (or create) the bridge for one agent + scope. Creation is pure
+   * bookkeeping: `ensureReady` stays lazy, so a lookup that never runs a turn
+   * costs an object and nothing else.
+   */
+  private bridgeFor(agentId: string, scope: BridgeScope): AgentBridge {
     const def = this.defsMap.get(agentId)
     if (def === undefined) throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
-    let bridge = this.bridges.get(agentId)
+    // A teardown owns this agent right now (see `stopAgent`): refuse even an
+    // EXISTING holder — it is already in the stop snapshot and going down, so
+    // handing it out would act on a dying process — and never mint a new one.
+    if (this.stoppingAgents.has(agentId)) {
+      throw new AcpError('agent_stopping', `acp: agent "${agentId}" is stopping; send again once it has stopped`)
+    }
+    const key = bridgeKey(agentId, scope)
+    let bridge = this.bridges.get(key)
     if (bridge === undefined) {
       bridge = this.makeBridge(def, (b, reason) => {
         this.connectionLost(b, reason)
@@ -8192,9 +8438,95 @@ export class BridgeManager {
       }, (observedAgentId, supported) => {
         this.noteForkCapability(observedAgentId, supported)
       })
-      this.bridges.set(agentId, bridge)
+      this.bridges.set(key, bridge)
+      this.bridgeScopes.set(key, scope)
     }
     return bridge
+  }
+
+  /** Every bridge currently serving one configured agent (one entry unless A1). */
+  private bridgesOf(agentId: string): AgentBridge[] {
+    const result: AgentBridge[] = []
+    for (const bridge of this.bridges.values()) {
+      if (bridge.def?.id === agentId) result.push(bridge)
+    }
+    return result
+  }
+
+  /** The legacy single-slot lookup; non-per-session agents keep the exact old key. */
+  private bridge(agentId: string): AgentBridge {
+    return this.bridgeFor(agentId, { kind: 'agent' })
+  }
+
+  /** Every session id this bridge owns right now (live + parked), for isolation checks. */
+  private sessionIdsOf(bridge: AgentBridge): Set<string> {
+    const ids = new Set<string>()
+    for (const session of bridge.sessionList) ids.add(session.sessionId)
+    for (const session of bridge.releasedList) ids.add(session.sessionId)
+    return ids
+  }
+
+  /** The key a bridge is registered under, for pruning by key. */
+  private keyOfBridge(bridge: AgentBridge): string | undefined {
+    for (const [key, value] of this.bridges) {
+      if (value === bridge) return key
+    }
+    return undefined
+  }
+
+  /**
+   * The bridge that OWNS a session right now: live, parked, or resuming. Never
+   * throws and never creates, so a lookup for a session that is already gone
+   * cannot resurrect a process.
+   */
+  private bridgeOwning(agentId: string, sessionId: string): AgentBridge | undefined {
+    for (const bridge of this.bridges.values()) {
+      if (bridge.def.id !== agentId) continue
+      if (bridge.hasSession(sessionId) !== undefined) return bridge
+      if (bridge.hasReleased(sessionId) !== undefined) return bridge
+      // A resume is the third ownership state the comment above promises:
+      // `doResumeSession` clears `released` before `session/load` and only
+      // registers the session after its response, so for that whole request
+      // the record is in neither map. Reporting it owner-less here would let
+      // `getOrCreateDshSession` forget a healthy conversation mid-recovery.
+      if (bridge.inflightResume(sessionId) !== undefined) return bridge
+    }
+    return undefined
+  }
+
+  /**
+   * The bridge a session belongs to. Ownership by session id wins (live or
+   * parked); a chat session then falls back to the scope its DSH id names, and
+   * anything else is an error — a session must never be routed by `agentId`
+   * alone, which is the shared-`currentSession` bug A1 removes.
+   */
+  private bridgeForSession(session: LiveSession): AgentBridge {
+    const owning = this.bridgeOwning(session.agentId, session.sessionId)
+    if (owning !== undefined) return owning
+    if (session.dshSessionId !== undefined) return this.bridgeFor(session.agentId, { kind: 'chat', dshSessionId: session.dshSessionId })
+    throw new AcpError('unknown_session', `acp: no bridge owns session ${session.sessionId}`)
+  }
+
+  /**
+   * Drop a per-session holder once nothing a later turn could resume is left in
+   * it. A parked record keeps the holder alive; an agent-wide holder is never
+   * dropped because it IS the agent's process slot.
+   */
+  private pruneBridge(key: string): void {
+    const bridge = this.bridges.get(key)
+    if (bridge === undefined) return
+    if (!isPerSessionAgent(bridge.def.id)) return
+    if (!bridge.isDiscardable()) return
+    this.bridges.delete(key)
+    this.bridgeScopes.delete(key)
+    // Dropping the last reference must take the child with it: `isDiscardable`
+    // means this holder has no live / parked session and no work left, so
+    // nothing can use the process again — leaving it running would orphan it
+    // with no owner and no idle timer. `stop` is fire-and-forget here exactly
+    // like every non-shutdown teardown (see `killChild`).
+    if (bridge.state !== 'stopped') {
+      void bridge.stop('agent-stopped').catch(() => { /* already gone */ })
+    }
   }
 
   private find(sessionId: string): { bridge: AgentBridge; session: LiveSession } {
@@ -8243,12 +8575,98 @@ export class BridgeManager {
     // A dead process cannot settle its prompt: the turn streams riding it end
     // here (their `runPrompt` promise also rejects into settle, but this also
     // covers a promise the connection teardown leaves pending).
-    this.disposeTurnStreamsOf(controller => controller.session.agentId === bridge.def.id)
+    // Only THIS bridge's sessions: an A1 agent's other conversations ride their
+    // own processes, and matching by `agentId` would abort turns that are still
+    // running fine. `releaseAll` below is already per-bridge (`parkSessions`
+    // walks this instance's own `sessions`).
+    const owned = this.sessionIdsOf(bridge)
+    this.disposeTurnStreamsOf(controller => owned.has(controller.session.sessionId))
     bridge.releaseAll(reason, 'died')
   }
 
+  /**
+   * One agent's status as every process serving it adds up. A1 gives an agent
+   * several children (one per conversation, one per probe), so the browser
+   * needs a single answer: any live child means `ready`; only when none is
+   * live does `starting` / `error` surface; nothing at all means `stopped`.
+   * The BASE view (the first child in the winning state) carries the identity
+   * fields; `liveSessions` is the union across every child.
+   */
+  private aggregateView(def: AcpAgentDef): AgentView {
+    const bridges = this.bridgesOf(def.id)
+    if (bridges.length === 0) {
+      // Field-for-field the pre-spawn shape a non-A1 agent has always
+      // reported: "not started yet" must not become a different shape.
+      return this.makeBridge(def, () => { /* pre-spawn */ }).view()
+    }
+    const views = bridges.map(bridge => bridge.view())
+    const state: AgentView['state'] =
+      views.some(view => view.state === 'ready') ? 'ready'
+        : views.some(view => view.state === 'starting') ? 'starting'
+          : views.some(view => view.state === 'error') ? 'error'
+            : 'stopped'
+    const base = views.find(view => view.state === state) ?? views[0]
+    const liveSessions = new Set<string>()
+    for (const view of views) {
+      for (const sessionId of view.liveSessions) liveSessions.add(sessionId)
+    }
+    // `stderrTail` rides along only when the AGGREGATE is `error`, and then
+    // `base` is an error view — its tail is the right diagnostic. A ready
+    // aggregate must never inherit a stale tail from a failed sibling.
+    return { ...base, state, liveSessions: [...liveSessions] }
+  }
+
+  /**
+   * Broadcast ONE `agent/status` frame built from the aggregate of every
+   * process serving the agent. For a non-A1 agent there is exactly one child,
+   * so the frame is byte-for-byte the one the bridge used to publish itself:
+   * same `state`, same `error` (when it carries one), same `agent` view.
+   *
+   * A pruned child is already gone from `bridgesOf` when its `stop` reports —
+   * that is deliberate: a closing probe must not flash the whole agent
+   * `stopped` while its conversations are still live.
+   */
+  private publishAgentStatus(agentId: string): void {
+    const def = this.defsMap.get(agentId)
+    if (def === undefined) return
+    const view = this.aggregateView(def)
+    const bridges = this.bridgesOf(agentId)
+    // The error belongs to the child that produced the winning state; a
+    // lingering error on a stopped sibling must not colour a ready agent. No
+    // second fallback: a ready aggregate whose own children carry no error must
+    // publish NO `error` field, never another child's stale text.
+    const error = bridges.find(bridge => bridge.state === view.state && bridge.errorText !== undefined)?.errorText
+    this.hub.broadcast({
+      type: 'agent/status',
+      agentId,
+      state: view.state,
+      ...(error === undefined ? {} : { error }),
+      agent: view,
+    })
+  }
+
   agentViews(): AgentView[] {
-    return [...this.defsMap.values()].map(def => (this.bridges.get(def.id) ?? this.makeBridge(def, () => { /* pre-spawn */ })).view())
+    return [...this.defsMap.values()].map(def => this.aggregateView(def))
+  }
+
+  /**
+   * One log line per distinct startup failure of one child. The aggregate
+   * `agent/status` deliberately stays `ready` while ANY sibling serves, so a
+   * failed child's error is invisible there; without this notice the user only
+   * sees "one conversation does not work". Deduped per bridge instance + text:
+   * `publishStatus` fires on every transition and must not spam the log.
+   */
+  private noticeBridgeFailure(bridge: AgentBridge): void {
+    const error = bridge.errorText
+    if (bridge.state !== 'error' || error === undefined) return
+    if (this.noticedBridgeFailures.get(bridge) === error) return
+    this.noticedBridgeFailures.set(bridge, error)
+    this.hub.broadcast({
+      type: 'agent/notice',
+      agentId: bridge.def.id,
+      level: 'error',
+      text: `acp: agent "${bridge.def.id}" failed to start: ${error}`,
+    })
   }
 
   async detectAgents(): Promise<DetectedAgentInfo[]> {
@@ -8419,7 +8837,7 @@ export class BridgeManager {
       allowedCwdRoots: resolvedRoots,
     }
 
-    if (this.bridges.has(resolvedDef.id)) {
+    if (this.bridges.has(resolvedDef.id) || this.bridgesOf(resolvedDef.id).length > 0) {
       // The save performs its own strict registry write below, so the stop
       // must not race it with a second best-effort one.
       await this.stopAgent(resolvedDef.id, false)
@@ -8427,7 +8845,9 @@ export class BridgeManager {
       // save may have started, while the process was stopping. Abort before
       // touching the registry or the file.
       this.assertAgentSaveCurrent(resolvedDef.id, saveGeneration, deleteGeneration)
+      // `stopAgent` drops the per-scope keys; the bare slot goes here too.
       this.bridges.delete(resolvedDef.id)
+      this.bridgeScopes.delete(resolvedDef.id)
     }
 
     // Second gate immediately before the two writes that make the save
@@ -8470,12 +8890,14 @@ export class BridgeManager {
     if (exposedModels === undefined) delete def.exposedModels
     else def.exposedModels = [...exposedModels]
     this.persistAgents()
-    const bridge = this.bridges.get(agentId)
+    const view = this.aggregateView(def)
+    // The aggregate is the agent's state; the view rides along only when a
+    // holder exists, exactly as this frame always did (no `error` field here).
     this.hub.broadcast({
       type: 'agent/status',
       agentId,
-      state: bridge?.state ?? 'stopped',
-      ...(bridge === undefined ? {} : { agent: bridge.view() }),
+      state: view.state,
+      ...(this.bridgesOf(agentId).length === 0 ? {} : { agent: view }),
     })
     this.broadcastExposure(agentId)
   }
@@ -8505,10 +8927,13 @@ export class BridgeManager {
     // and a deferred snapshot flushing afterwards would write the definition
     // straight back into `agents.json` (the deleted agent would come back).
     this.saveGate?.cancel(`agent-save:${agentId}`)
-    if (this.bridges.has(agentId)) {
+    if (this.bridges.has(agentId) || this.bridgesOf(agentId).length > 0) {
       // This method performs its own strict registry write below.
       await this.stopAgent(agentId, false)
+      // `stopAgent` drops every per-scope key; the bare key is the non-A1 /
+      // pre-spawn slot and is removed here as well.
       this.bridges.delete(agentId)
+      this.bridgeScopes.delete(agentId)
     }
     this.defsMap.delete(agentId)
     // The default agent is a pointer INTO this registry: deleting its target
@@ -8576,7 +9001,12 @@ export class BridgeManager {
   }
 
   async startSession(agentId: string, cwd: string | undefined): Promise<{ sessionId: string }> {
-    const session = await this.bridge(agentId).createSession(cwd)
+    // A1: an `/acp` session gets its own process. The token is only the bridge
+    // key; later lookups find the session by the id it was registered with.
+    const scope: BridgeScope = isPerSessionAgent(agentId)
+      ? { kind: 'ephemeral', token: randomUUID() }
+      : { kind: 'agent' }
+    const session = await this.bridgeFor(agentId, scope).createSession(cwd)
     return { sessionId: session.sessionId }
   }
 
@@ -8712,12 +9142,15 @@ export class BridgeManager {
     if (live !== undefined) {
       await live.bridge.closeSession(live.session, 'closed')
       this.forgetDshSession(sessionId)
+      const key = this.keyOfBridge(live.bridge)
+      if (key !== undefined) this.pruneBridge(key)
       return
     }
     // A released session has no process left to close; just drop the record.
-    for (const bridge of this.bridges.values()) {
+    for (const [key, bridge] of this.bridges) {
       if (bridge.dropReleased(sessionId)) {
         this.hub.broadcast({ type: 'session/closed', sessionId, reason: 'closed' })
+        this.pruneBridge(key)
         return
       }
     }
@@ -8774,12 +9207,54 @@ export class BridgeManager {
    * definition it is about to replace.
    */
   async stopAgent(agentId: string, persist = true): Promise<void> {
-    for (const [key, session] of this.dshSessionMap) {
-      if (session.agentId === agentId) this.dshSessionMap.delete(key)
+    // Close the gate FIRST, synchronously and before the snapshot: from here
+    // until this call returns, `bridgeFor` refuses to mint or hand out a holder
+    // for this agent. Without it a message arriving during the `await` below
+    // could spawn a child the snapshot never saw, and the key sweep would then
+    // delete its holder — leaving an orphan process plus a live `dshSessionMap`
+    // record that no bridge serves (the next prompt would fail on a dead
+    // `acpSessionId`).
+    this.stoppingAgents.set(agentId, (this.stoppingAgents.get(agentId) ?? 0) + 1)
+    try {
+      // A1 gives one agent several processes; collect every one of them first so
+      // the teardown covers the whole set instead of the old single slot. The
+      // KEY travels with each snapshot entry: only those keys may be swept
+      // afterwards, never a key a later create re-registered.
+      const entries: { key: string; bridge: AgentBridge }[] = []
+      for (const [key, bridge] of this.bridges) {
+        if (bridge.def?.id === agentId) entries.push({ key, bridge })
+      }
+      const bridges = entries.map(entry => entry.bridge)
+      // The streams to kill are the sessions THIS agent owns — live, parked, or
+      // still chat-keyed. Matching on `agentId` would tear down a stream that a
+      // differently-scoped child of the same agent still serves.
+      const owned = new Set<string>()
+      for (const bridge of bridges) {
+        for (const sessionId of this.sessionIdsOf(bridge)) owned.add(sessionId)
+      }
+      for (const [key, session] of this.dshSessionMap) {
+        if (session.agentId !== agentId) continue
+        owned.add(session.sessionId)
+        this.dshSessionMap.delete(key)
+      }
+      this.disposeTurnStreamsOf(controller => owned.has(controller.session.sessionId))
+      if (persist) this.persistAgents()
+      // One stop per process, all at once: the children are independent, so the
+      // wall clock is the slowest single teardown rather than their sum.
+      await Promise.allSettled(bridges.map(bridge => bridge.stop('agent-stopped')))
+      // Delete exactly the snapshot keys. The identity check is defensive (the
+      // gate already makes a mid-stop registration impossible): a key now
+      // holding a DIFFERENT bridge is not ours to delete.
+      for (const { key, bridge } of entries) {
+        if (this.bridges.get(key) !== bridge) continue
+        this.bridges.delete(key)
+        this.bridgeScopes.delete(key)
+      }
+    } finally {
+      const remaining = (this.stoppingAgents.get(agentId) ?? 1) - 1
+      if (remaining <= 0) this.stoppingAgents.delete(agentId)
+      else this.stoppingAgents.set(agentId, remaining)
     }
-    this.disposeTurnStreamsOf(controller => controller.session.agentId === agentId)
-    if (persist) this.persistAgents()
-    await this.bridges.get(agentId)?.stop('agent-stopped')
   }
 
   /**
@@ -9204,16 +9679,46 @@ export class BridgeManager {
     const key = `${dshSessionId ?? 'ephemeral'}:${agentId}`
     const existing = this.dshSessionMap.get(key)
     if (existing !== undefined && !existing.closed && !existing.released) {
+      const owner = this.bridgeOwning(agentId, existing.sessionId)
+      // A LIVE record must have a holder. This state is not reachable today:
+      // every production deletion path parks the record first (`closeSession` /
+      // `forceReset` set `closed`, a failed resume sets `released`), so only the
+      // test suite synthesizes a live record without an owner to pin this
+      // fallback. Should it ever happen anyway, returning the record would route
+      // the next prompt to a process that no longer exists — the failure would
+      // surface later as a dead `acpSessionId`, far from its cause. Drop the
+      // unusable record and fail cleanly; the next attempt starts fresh.
+      if (owner === undefined) {
+        this.forgetDshSession(existing.sessionId)
+        throw new AcpError(
+          'session_orphaned',
+          `acp: the session for this conversation has no live agent process; send again to start a new one`,
+        )
+      }
+      // A resume may be in flight right now: `doResumeSession` clears `released`
+      // before `session/load` and only registers the session after it answers,
+      // so this record is momentarily owned by that request alone. Await it and
+      // reuse the SAME session — never forget the record, and never let a second
+      // ACP session be created on the same holder.
+      const inflight = owner.inflightResume(existing.sessionId)
+      const ready = inflight === undefined ? existing : await inflight
       // An existing session already carries context, so this is never a
       // provisional lock; it only repairs a record from before the flag (the
       // next turn's start writes/announces the lock).
       if (dshSessionId !== undefined) this.lockChatAgent(dshSessionId, agentId)
-      return existing
+      return ready
     }
     // The session's agent died earlier: resume in place so the conversation
     // context survives via `session/load`.
     if (existing !== undefined && existing.released) {
-      const resumed = await this.bridge(agentId).resumeSession(existing)
+      // The bridge that parked this record owns the resume; a chat conversation
+      // falls back to the scope its DSH id names, exactly like the `new`
+      // branch. Without a DSH id the old anonymous bucket stays as it was.
+      const resumeBridge = this.bridgeOwning(agentId, existing.sessionId)
+        ?? (dshSessionId === undefined
+          ? this.bridge(agentId)
+          : this.bridgeFor(agentId, { kind: 'chat', dshSessionId }))
+      const resumed = await resumeBridge.resumeSession(existing)
       // Rebind explicitly: a resume keeps the record's identity, but the chat
       // session id is what the conversation's permission card addresses.
       resumed.dshSessionId = dshSessionId
@@ -9249,7 +9754,12 @@ export class BridgeManager {
     // overwrite exactly the values the user saw and bring back "displayed one
     // model, ran another". See `displayedChatDefaults`.
     const displayed = dshSessionId === undefined ? undefined : this.displayedChatDefaults(agentId)
-    const session = await this.bridge(agentId).createSession(
+    // A1: each chat conversation gets its own process; a call without a DSH id
+    // shares the anonymous bucket, exactly like the old `ephemeral:<agent>` key.
+    const scope: BridgeScope = dshSessionId === undefined
+      ? { kind: 'ephemeral', token: 'anonymous' }
+      : { kind: 'chat', dshSessionId }
+    const session = await this.bridgeFor(agentId, scope).createSession(
       workspaceRoot ?? cwd,
       workspaceRoot === undefined ? [] : [workspaceRoot],
       // ...and the agent PROCESS runs there too, not just the session: see
@@ -9312,20 +9822,22 @@ export class BridgeManager {
     // rejects `session_closed` (`/acp`).
     if (session.closed) return { ok: true }
     if (session.released) return { ok: true } // the acquisition resumes it
-    const bridge = this.bridge(session.agentId)
+    const bridge = this.bridgeForSession(session)
     const blocked = `acp: agent "${session.agentId}" is unresponsive, but other conversations are still using it; retry after they finish`
     if (bridge.hasOtherActiveWork(session)) return { ok: false, message: blocked }
     // A sibling conversation the agent already settled is not "work" by
     // `hasOtherActiveWork` — but its HOST may still owe the turn a
     // continuation step (a card it is executing right now), and restarting the
     // process would park and resume that live turn. Its indexed controller is
-    // the evidence. Scoped to THIS agent: the restart kills this agent's child
-    // only, so another agent's pending step is not this bridge's business.
+    // the evidence. Scoped to THIS bridge: the restart kills this bridge's
+    // child only, so a sibling conversation on another process (A1) is not a
+    // reason to refuse, and a controller of another agent's session never was.
     // A closed or released session has no host behind it (a leftover
     // controller), so it does not pin the child either.
+    const owned = this.sessionIdsOf(bridge)
     for (const controller of this.turnStreams.values()) {
       if (controller.session === session) continue
-      if (controller.session.agentId !== session.agentId) continue
+      if (!owned.has(controller.session.sessionId)) continue
       if (controller.session.closed || controller.session.released) continue
       if (!controller.stale) return { ok: false, message: blocked }
     }
@@ -9378,7 +9890,7 @@ export class BridgeManager {
   ): Promise<'ok' | 'aborted'> {
     if (session.closed || session.released) return 'ok'
     if (!controller.hasSettled && session.promptInFlight === true) {
-      await this.bridge(session.agentId).cancel(session)
+      await this.bridgeForSession(session).cancel(session)
       controller.abortActiveSegment()
     }
     return this.waitForSettleGate(session, signal)
@@ -9472,7 +9984,7 @@ export class BridgeManager {
       }
       const segment = controller.startSegment()
       const onAbort = () => {
-        void this.bridge(controller.session.agentId).cancel(controller.session)
+        void this.bridgeForSession(controller.session).cancel(controller.session)
         controller.abortActiveSegment()
       }
       if (options.signal?.aborted) onAbort()
@@ -9562,7 +10074,12 @@ export class BridgeManager {
       return
     }
 
-    const bridge = this.bridge(agentId)
+    // The bridge that owns THIS session, not the agent's first slot: an A1
+    // agent keeps one process per conversation. Re-resolved through
+    // `bridgeForSession` at EVERY use below — a first-turn rollback can close
+    // this session and prune its holder (`rollbackFirstTurn` → `pruneBridge`),
+    // and a bridge captured once would then `claimTurn` / `beginTurn` /
+    // `runPrompt` on a dead object.
 
     // The model the conversation asks for is not one this agent offers any
     // more: refuse BEFORE sending anything. Falling back to "whatever the agent
@@ -9588,7 +10105,7 @@ export class BridgeManager {
     }
 
     const hasImages = (selection.images?.length ?? 0) > 0 || (selection.content?.some(b => b.type === 'image') ?? false)
-    if (hasImages && bridge.initResult?.agentCapabilities?.promptCapabilities?.image !== true) {
+    if (hasImages && this.bridgeForSession(session).initResult?.agentCapabilities?.promptCapabilities?.image !== true) {
       if (session.provisionalLock === true) this.rollbackFirstTurn(session)
       yield {
         type: 'finish',
@@ -9605,7 +10122,7 @@ export class BridgeManager {
 
     // One prompt slot per session, and a turn the user aborted still occupies
     // the AGENT's slot until it acknowledges the cancel (see `claimTurn`).
-    let claim = await bridge.claimTurn(session)
+    let claim = await this.bridgeForSession(session).claimTurn(session)
     if (!claim.ok) {
       // A STEER ("插话"): the host delivers the user's mid-turn message as the
       // NEXT step of the SAME host turn, so the conversation's own ACP prompt
@@ -9656,9 +10173,10 @@ export class BridgeManager {
             return
           }
         }
-        // Same bridge: the session may have been re-created, but the
-        // conversation is still served by this agent's process.
-        claim = await bridge.claimTurn(session)
+        // Re-resolve: the rollback above may have closed the old session AND
+        // pruned its holder, and `getOrCreateDshSession` may have built a fresh
+        // one under a new bridge.
+        claim = await this.bridgeForSession(session).claimTurn(session)
       }
       if (!claim.ok) {
         // Never roll the provisional lock back here: a failed claim means
@@ -9770,7 +10288,7 @@ export class BridgeManager {
     // stretch meets the next non-tool event (or the prompt settles); the host
     // loop then executes the card and proposes the continuation step, which
     // resumes the SAME prompt through the branch above.
-    const endTurn = bridge.beginTurn(session)
+    const endTurn = this.bridgeForSession(session).beginTurn(session)
     const controller = new TurnStreamController(
       this,
       this.hub,
@@ -9791,7 +10309,11 @@ export class BridgeManager {
     const segment = controller.startSegment()
     const onAbort = (): void => {
       if (controller.stale) return
-      void bridge.cancel(session)
+      // Re-resolve, but through `bridgeOwning`: an abort must never CREATE
+      // a process for a session whose holder was pruned (a rolled-back first
+      // turn), and a missing owner means there is nothing left to cancel.
+      const owner = this.bridgeOwning(session.agentId, session.sessionId)
+      if (owner !== undefined) void owner.cancel(session)
       controller.abortActiveSegment()
     }
 
@@ -9808,7 +10330,8 @@ export class BridgeManager {
         ? selection.content as ContentBlock[]
         : [{ type: 'text', text: promptText }]
 
-      bridge.runPrompt(session, promptBlocks, turnId, turnGen)
+      const promptBridge = this.bridgeForSession(session)
+      promptBridge.runPrompt(session, promptBlocks, turnId, turnGen)
         .then(result => {
           // The reclaim already ended this turn locally, and the close it
           // performed rejected this very request: the late answer is that same
@@ -9903,6 +10426,12 @@ export class BridgeManager {
         .finally(() => {
           if (session.reclaimedTurnSeq === turnGen) session.reclaimedTurnSeq = undefined
           this.clearOrphanPrompt(session, turnGen)
+          // A rollback during this turn could not prune the holder while the
+          // agent was still answering (`hasActiveWork` counts the outstanding
+          // prompt). Now that it settled, retry — this is the only second chance
+          // a closed-and-forgotten session gets.
+          const key = this.keyOfBridge(promptBridge)
+          if (key !== undefined) this.pruneBridge(key)
         })
     }
 
