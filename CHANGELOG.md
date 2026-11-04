@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-11-05
+
 CodeBuddy 的每个聊天会话使用独立子进程，多会话并行互不影响；回合进行中保存配置不再打断对话，暂存、失败与重试都能看见。
 
 ### 新增
@@ -74,7 +76,7 @@ Each CodeBuddy chat session runs in its own process, so sessions run in parallel
 
 - **acp**: switching the timeout action no longer rewrites the saved wait window; "no wait" runs as a 30-second floor only while "time out and abort" is active, and "auto-advance" or a restart still reports "no wait". Records an older build already rewrote to 30 seconds must be set back to "no wait" once.
 
-**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.3.6...ee78ac2
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.3.6...v0.3.7
 
 ## [0.3.6] - 2026-11-02
 
