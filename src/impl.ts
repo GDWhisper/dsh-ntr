@@ -1215,6 +1215,17 @@ export function acpToolCallFromUpdate(update: Record<string, unknown>): AcpToolC
 }
 
 /**
+ * Whether an ACP tool-call status means no further output will arrive for the
+ * call. `pending` and `in_progress` are the live ones; everything else
+ * (`completed`, `failed`, v2's `cancelled`, and any status a newer agent
+ * invents) is terminal. An absent or empty status is NOT terminal: the
+ * announcing `tool_call` routinely omits it, and its output follows later.
+ */
+export function isFinalToolCallStatus(status: unknown): boolean {
+  return typeof status === 'string' && status !== '' && status !== 'pending' && status !== 'in_progress'
+}
+
+/**
  * Fold one ACP `tool_call_update` into an open snapshot, in place.
  *
  * ACP updates carry FULL replacement snapshots (`rawInput` restated in whole on

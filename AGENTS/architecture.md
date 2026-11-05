@@ -122,7 +122,7 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 
 - `agent/pre-step` 步进闸门（`{ prepend: true }`，最外层：宿主 `installModelSelection` 在 `next()` 之后才追加 model-changed 通知，内层闸门剥不到）：**白名单保留** `user` / `tool` / 无 source 三类，其余一律按宿主注入剥掉（`agent-instructions` / `skill-catalog` / `runtime-context` / `plugin` / `model-selection` / `dsh-mnemon`，以及以后任何新种类）；显式给 `config.strippedSources` 时改为按该黑名单剥离（调试口，`[]` = 全保留），也只有这条路径还会 `reject`（剥完既无 user 也无 tool）。
 - **闸门绝不拒绝续跑步**：宿主的 `turn()` 把 `preStep` 的 `reject` 记成 `turn/end blocked`，且记在 `step/start` 之前（日志里没有第二个 `step/start` 就是这条路）。issue #10 两次事故都是「漏剥一个注入种类 → 续跑步批次留下残渣 → 拒绝」。续跑步批次里**本来就没有工具结果**：`dsh-agent-loop` 只把工具自己的 `additionalContexts` stage 进 next-step inbox，而 adapter 收到的 `GenerateOptions.messages` 来自 `session.deriveMessages()`（整份 transcript）。剥完通常为空——首步空批次走宿主原 completed 空转，续跑步照常进步，由 `isAcpToolContinuation` 决定是续读同一 prompt 还是收一行指针。另注：`step()` 会无条件追加自己那份 runtime-context 投影，剥不掉它，只能决定它的位置。
-- `tools/execute` 虚拟工具（§2.2）：解析不到的工具名即时注册 agent 作用域虚拟工具，工具体从 `toolResults` 取真实输出，未到则挂 `waitForToolOutput`（记录 / turn settle / 30 分钟兜底解除）。真实工具与缺席的 `tools` 服务原样放行。
+- `tools/execute` 虚拟工具（§2.2）：解析不到的工具名即时注册 agent 作用域虚拟工具，工具体从 `toolResults` 取真实输出，未到则挂 `waitForToolOutput`（真实输出落库 / agent 报终态 status（`isFinalToolCallStatus`）/ turn settle / 30 分钟兜底，四者任一解除）。**公告帧记下的空输出不算答案**，否则卡片永远只拿得到占位符（issue #10 的第 1 条观察）。真实工具与缺席的 `tools` 服务原样放行。
 - `agent/inbox/inserted` / `agent/inbox/claimed` 路由选择：见 §3，宿主有 `agent.model` 时把绑定写成会话选择。
 - `agent/request` 路由改写：见 §3，仅老宿主（无 `agent.model`）生效。
 
@@ -162,7 +162,7 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 | 主题 | 位置 |
 |---|---|
 | 消息选择 / 转发 | `src/impl.ts` · `selectForwardPrompt`；`src/bridge.ts` · `streamPrompt` |
-| 工具卡快照 / delta / 输出注册 | `src/impl.ts` · `acpToolCallFromUpdate` / `acpToolCallDelta` / `acpToolCallArgsOf`；`src/bridge.ts` · `recordAcpToolOutput` / `waitForToolOutput`；详见 [protocol.md](./protocol.md) |
+| 工具卡快照 / delta / 输出注册 | `src/impl.ts` · `acpToolCallFromUpdate` / `acpToolCallDelta` / `acpToolCallArgsOf` / `isFinalToolCallStatus`；`src/bridge.ts` · `recordAcpToolOutput` / `waitForToolOutput`；详见 [protocol.md](./protocol.md) |
 | 绑定 RPC | `src/impl.ts` · `dispatchRpc('session/chat-*')`；`src/bridge.ts` · `bindChatAgent` / `setChatSessionModel` / `setChatSessionEffort` / `setChatSessionMode` |
 | 路由选择 / 老宿主请求改写 | `presets/acp/acp-guard.mjs` · `selectBoundRoute` / `agent/request`；`src/bridge.ts` · `conversationRouteModel` |
 | 工作区 | `src/index.ts` · `wireWorkspace`；`src/bridge.ts` · `chatWorkspaceRoot` / `getOrCreateDshSession` / `doResumeSession` |

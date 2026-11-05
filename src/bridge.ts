@@ -42,6 +42,7 @@ import {
   childEnv,
   hasUnambiguousModelSelector,
   isAcpToolContinuation,
+  isFinalToolCallStatus,
   isUnderPath,
   mergeCatalogShape,
   parseCatalogOptions,
@@ -3950,6 +3951,14 @@ export interface AcpRouteBindingRegistry {
    */
   readonly toolResults: Map<string, string>
   /**
+   * Call ids whose output is COMPLETE — including a tool that produced none.
+   * An announcing `tool_call` records the call with an empty output, and that
+   * empty record must not read as an answer: membership here is what lets
+   * `waitForToolOutput` resolve with it instead of parking until the turn
+   * settles.
+   */
+  readonly toolOutputFinal: Set<string>
+  /**
    * Resolvers waiting for a call's output to land, keyed by call id. Under the
    * segmented turn shape the host loop executes a card the moment its segment
    * settles — often BEFORE the agent has reported the tool's output — so the
@@ -3977,14 +3986,16 @@ export function routeBindingRegistry(): AcpRouteBindingRegistry {
   const host = globalThis as unknown as { [ACP_ROUTE_BINDING_KEY]?: AcpRouteBindingRegistry }
   const existing = host[ACP_ROUTE_BINDING_KEY]
   if (existing !== undefined) {
-    // A registry from an older build may predate the waiter seam: re-attach
-    // the (upgraded) implementation so the guard can always use it.
+    // A registry from an older build may predate a seam: re-attach the
+    // (upgraded) implementation so the guard can always use it.
     if (existing.waitForToolOutput === undefined) existing.waitForToolOutput = (callId, timeoutMs) => waitForToolOutput(callId, timeoutMs)
+    if (existing.toolOutputFinal === undefined) (existing as { toolOutputFinal: Set<string> }).toolOutputFinal = new Set<string>()
     return existing
   }
   const registry: AcpRouteBindingRegistry = {
     conversations: new Map(),
     toolResults: new Map(),
+    toolOutputFinal: new Set(),
     toolOutputWaiters: new Map(),
     waitForToolOutput: (callId, timeoutMs) => waitForToolOutput(callId, timeoutMs),
   }
@@ -4003,20 +4014,30 @@ const TOOL_OUTPUT_MAX_CHARS = 16_000
  * would record `Error: unknown tool "<name>"`. The guard's `tools/execute`
  * listener instead registers a scoped virtual tool per name, and its body
  * answers with THIS record — the tool's real output, folded by the same helper
- * the ACP view uses. Every seen call id is recorded, even with empty output:
- * the guard's pre-step gate identifies its own continuation batches by exactly
- * this membership. Bounded: entries are transient, but an agent that inlines
- * whole files must not grow the process-wide map without limit.
+ * the ACP view uses.
+ *
+ * Every seen call id is recorded, even with empty output: an agent announces a
+ * call before it reports the result (CodeBuddy restates the whole `tool_call`
+ * once more with the output attached — see docs/acp-convergence.md §1.7), so
+ * the first record is routinely `''`. Such a record is a placeholder, not an
+ * answer: only a non-empty output, or a call the agent marked terminal,
+ * releases a parked waiter. Bounded: entries are transient, but an agent that
+ * inlines whole files must not grow the process-wide map without limit.
+ *
+ * @param final - whether the agent's status for this call is terminal.
  */
-export function recordAcpToolOutput(callId: string, text: string): void {
+export function recordAcpToolOutput(callId: string, text: string, final = false): void {
   if (callId === '') return
   const registry = routeBindingRegistry()
   registry.toolResults.set(callId, text.length > TOOL_OUTPUT_MAX_CHARS ? `${text.slice(0, TOOL_OUTPUT_MAX_CHARS)}…` : text)
+  if (final) registry.toolOutputFinal.add(callId)
   while (registry.toolResults.size > TOOL_OUTPUT_MAX_ENTRIES) {
     const oldest = registry.toolResults.keys().next().value
     if (oldest === undefined) break
     registry.toolResults.delete(oldest)
+    registry.toolOutputFinal.delete(oldest)
   }
+  if (text === '' && !final) return
   const waiters = registry.toolOutputWaiters.get(callId)
   if (waiters !== undefined) {
     registry.toolOutputWaiters.delete(callId)
@@ -4036,8 +4057,13 @@ export function recordAcpToolOutput(callId: string, text: string): void {
  */
 export function waitForToolOutput(callId: string, timeoutMs: number): Promise<string | undefined> {
   const registry = routeBindingRegistry()
+  if (callId === '') return Promise.resolve(undefined)
   const landed = registry.toolResults.get(callId)
-  if (landed !== undefined || callId === '') return Promise.resolve(landed)
+  // An EMPTY record is an answer only once the call is terminal — a tool that
+  // genuinely produced no output. Otherwise it is the announcement that the
+  // call started, and resolving with it is what made every display card answer
+  // with the transcript pointer while the agent was still running the tool.
+  if (landed !== undefined && (landed !== '' || registry.toolOutputFinal.has(callId))) return Promise.resolve(landed)
   return new Promise<string | undefined>(resolve => {
     let settled = false
     const done = (text: string | undefined): void => {
@@ -5887,7 +5913,7 @@ class TurnStreamController {
   private noteToolRecord(update: Record<string, unknown>): void {
     const callId = typeof update.toolCallId === 'string' ? update.toolCallId.trim() : ''
     if (callId === '') return
-    recordAcpToolOutput(callId, updateContentToText(update.content))
+    recordAcpToolOutput(callId, updateContentToText(update.content), isFinalToolCallStatus(update.status))
   }
 
   /**

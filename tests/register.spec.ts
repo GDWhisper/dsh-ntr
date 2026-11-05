@@ -552,6 +552,45 @@ describe('acp-guard preset row', () => {
     } finally {
       releaseAllToolOutputWaiters()
       routeBindingRegistry().toolResults.clear()
+      routeBindingRegistry().toolOutputFinal.clear()
+    }
+  })
+
+  it('keeps a card parked past the announcement, and releases it on the real output', async () => {
+    // Issue #10's placeholder: CodeBuddy announces a call, restates its title,
+    // and only then restates the call with the output attached. The
+    // announcement records the call with an EMPTY output, and answering a parked
+    // card with that record made every display card read "its output lives in
+    // the ACP transcript view" no matter what the tool printed.
+    const { routeBindingRegistry, recordAcpToolOutput, releaseAllToolOutputWaiters } = await import('../src/bridge.ts')
+    try {
+      const tools = toolsServiceOf()
+      const ctx = guardCtx({ tools })
+      await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+      const exec = ctx.listeners.get('tools/execute')
+      if (exec === undefined) throw new Error('no tools/execute listener')
+      await exec.listener({ name: 'Bash', agent: {}, exec: { callId: 'announce-1' } }, async () => ({ text: 'downstream' }))
+      const definition = tools.register.mock.calls[0][0] as { execute: (args: unknown, exec: { callId: string }) => Promise<{ text: string }> }
+
+      recordAcpToolOutput('announce-1', '')
+      const parked = definition.execute(undefined, { callId: 'announce-1' })
+      let settled = false
+      void parked.then(() => { settled = true })
+      await new Promise(resolve => setTimeout(resolve, 20))
+      expect(settled).toBe(false)
+      recordAcpToolOutput('announce-1', 'hello')
+      expect(await parked).toEqual({ text: 'hello' })
+
+      // A tool that printed nothing is terminal, not still running: the agent's
+      // own `completed` status releases the card at once instead of parking it
+      // until the turn settles (which would push the step boundary past the
+      // whole ACP turn and collapse the segmentation).
+      recordAcpToolOutput('empty-1', '', true)
+      expect(await definition.execute(undefined, { callId: 'empty-1' })).toMatchObject({ text: expect.stringContaining('ACP transcript view') })
+    } finally {
+      releaseAllToolOutputWaiters()
+      routeBindingRegistry().toolResults.clear()
+      routeBindingRegistry().toolOutputFinal.clear()
     }
   })
 

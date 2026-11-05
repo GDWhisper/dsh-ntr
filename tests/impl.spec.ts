@@ -18,6 +18,7 @@ import {
   acpPresetStatusFromRoster,
   isAcpToolContinuation,
   isAbsolutePath,
+  isFinalToolCallStatus,
   isLocalFilePath,
   normalizeFileUrlToPath,
   isUnderPath,
@@ -1601,6 +1602,21 @@ describe('ACP tool-call notifications → tool-call stream chunks', () => {
     // honest empty card, not a fabricated placeholder.
     expect(acpToolCallFromUpdate({ title: 'no id' })).toBeUndefined()
     expect(acpToolCallFromUpdate({ toolCallId: 'c2' })).toEqual({ callId: 'c2', name: '', argsRaw: '' })
+  })
+
+  it('reads only the two live statuses as "output may still arrive"', () => {
+    expect(isFinalToolCallStatus('pending')).toBe(false)
+    expect(isFinalToolCallStatus('in_progress')).toBe(false)
+    // The announcing `tool_call` routinely carries no status at all: treating
+    // that as terminal would answer a display card before the tool ran.
+    expect(isFinalToolCallStatus(undefined)).toBe(false)
+    expect(isFinalToolCallStatus('')).toBe(false)
+    expect(isFinalToolCallStatus(3)).toBe(false)
+    expect(isFinalToolCallStatus('completed')).toBe(true)
+    expect(isFinalToolCallStatus('failed')).toBe(true)
+    // ACP v2 adds `cancelled`, and an agent may invent its own: anything not
+    // live is terminal.
+    expect(isFinalToolCallStatus('cancelled')).toBe(true)
   })
 
   it('reads the input spellings agents use in the wild, and nothing when they send none', () => {

@@ -3605,8 +3605,11 @@ describe("a segmented turn interleaves like a native multi-step turn (isolated m
     expect(chunks.find(c => c.type === 'finish')?.reason).toEqual({ kind: 'stop' })
 
     // The tool's output reached the shared registry — the guard's virtual tool
-    // answers the host loop's execution of the card from it.
+    // answers the host loop's execution of the card from it. The agent's
+    // `completed` status marked the call terminal, which is what lets a tool
+    // that prints NOTHING release its card instead of parking it.
     expect(routeBindingRegistry().toolResults.get('c1')).toContain('FAKE TOOL OUTPUT')
+    expect(routeBindingRegistry().toolOutputFinal.has('c1')).toBe(true)
   }, 30_000)
 
   it('answers a foreign staged batch with a closing message, and a card-final turn with the tail pointer', async () => {

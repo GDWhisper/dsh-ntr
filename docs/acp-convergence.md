@@ -252,8 +252,9 @@ callId 显式断块；同 callId 重发的 `tool_call` 按更新折叠。
    ——段尾就是卡，宿主落定的消息因此以卡收尾。
 3. **宿主制造步**：loop 看见 settled 消息含 `tool-call` 块 → `executeToolCalls`
    → 卡片（guard 的虚拟工具从共享注册表 `toolResults` 取**真实输出**；输出未到
-   时工主体 `waitForToolOutput` 挂起，由 `recordAcpToolOutput`、turn settle 或
-   30 分钟兜底解除）→ 续跑下一步。
+   时工主体 `waitForToolOutput` 挂起，由带内容的 `recordAcpToolOutput`、agent 的
+   终态 status、turn settle 或 30 分钟兜底解除——**公告帧那条空记录不算答案**，
+   见 §1.9 修复二）→ 续跑下一步。
 4. **续跑 = 续读**：续跑批次被 `isAcpToolContinuation` 识别，**绝不新发
    `session/prompt`**——`TurnStreamController.startSegment()` 用 transcript
    游标（`cursorSeq`）补读段间事件再订阅，答案 / 后续卡落在后面的新消息里。
@@ -329,11 +330,20 @@ O(1)；浏览器端已由合帧 + memo 吸收。若实测仍有 agent（`usage_u
 `instructions` / `recall`，出现在他 step 1 的 transcript 里即是证据），不在名单
 里 → 剥完还剩两条 → 既无 user 又非全 tool → `reject` → blocked。
 
-**修复**：改成**白名单**——只保留 `user` / `tool` / 无 source 三类，其余
+**修复一（闸门）**：改成**白名单**——只保留 `user` / `tool` / 无 source 三类，其余
 全按宿主注入剥掉；并且**不再拒绝续跑步**。判定续跑的权威本来就是 adapter
 （`isAcpToolContinuation` 读 transcript）加 prompt 槽位（`claimTurn`），闸门用注册表
 callId 复刻这个判定既冗余又脆；`registryHasToolCall` 随之删除。唯一残留的 `reject`
 只在显式 `strippedSources` 调试口留下「既非 user 也非 tool」的批次时才可能触发。
+
+**修复二（占位符，即报告人的第 1 条观察）**：公告帧 `tool_call` 会先记一条**空**
+输出，而 `waitForToolOutput` 的短路条件是 `landed !== undefined`——空串立刻解除
+等待，卡片于是永远拿占位符，§1.8 第 3 点的「挂起等真实输出」从未生效。改为：空
+记录只有在 agent 报了终态 status（`isFinalToolCallStatus`：非 `pending` /
+`in_progress`）时才算答案，否则继续等；`recordAcpToolOutput` 也只在有真输出或终态
+时唤醒等待者。codebuddy 的第三遍重述带 content（§1.7 实测），真实输出会正常落库；
+真的没有输出的工具由终态 status 立刻解除，不会挂到 turn settle、把步边界拖到整轮
+之后（那会让切段塌回「所有卡片在结尾一起执行」）。
 
 ---
 

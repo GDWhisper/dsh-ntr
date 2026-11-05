@@ -83,6 +83,7 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 | 启动即报 adapter 无效 / NTR 完全没有服务 | `LlmAdapter` 注册期成员（`providerInfo`、`providerRetryPolicy`） | 注册期必调成员新增或改名 |
 | NTR 会话被宿主模型回答（没进 ACP） | `agent.model.select` 是否存在；`inbox/inserted` / `claimed` 是否仍早于路由读取 | 选择写入没生效，路由落到部署默认 |
 | 回合以 `blocked` 收尾 / 工具续跑断 | 宿主 `turn()` 里 `preStep` 的 `reject` 分支（`blocked` 记在 `step/start` **之前**：日志里没有第二个 `step/start` 就是这条路）；guard 闸门的保留白名单 | 闸门把宿主新增的注入种类当成「外来批次」拒了——0.3.8 之前是 `runtime-context`，0.3.9 之前是 `dsh-mnemon`；改成白名单后不再依赖种类清单 |
+| 工具卡输出永远是 `ran inside the ACP agent process` 占位符 | `recordAcpToolOutput` 的空记录、`waitForToolOutput` 的短路条件、ACP `tool_call_update.status` 词表 | 公告帧先落一条空记录，等待被空串立刻解除；agent 从不发终态 status 时会挂到 turn settle 才解除 |
 | NTR 对话里出现宿主注入（项目指令 / 记忆召回 / model changed） | `agent/pre-step` decision 形状、`message.source.kind` 常量 | 闸门 fail-open；runtime-context 那一条剥不掉（`step()` 自己会追加） |
 | 模型底座 / 座位 / 选择器消失或露出原生控件 | 槽位名（含 `conversation.input.overlay`）、`entriesOfSlot`、projection key | 客户端槽位或投影改名 |
 | 审批卡 / 释放横幅不出现 | `conversation.input.dock`、`session/update` 折叠 | dock 槽位或事件形状变化 |
