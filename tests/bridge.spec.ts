@@ -728,9 +728,13 @@ describe('ACP bridge over stdio (mock agent)', () => {
       .filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
       .map(c => c.text).join('')).toContain('no in-flight ACP turn to resume')
 
-    // A session-title call rides the same logged route; it must not become an
-    // ACP turn (it would spend a remote turn on a title, or fold a harness
-    // prompt into the agent's own context).
+    // A session-title call rides the same logged route. The host's
+    // `dsh-session-title-llm` prompt embeds the session's human messages as a
+    // JSON array, and the adapter answers it LOCALLY with a placeholder title
+    // (the first human message) — never an ACP turn, which would spend a
+    // remote turn on a title or fold a harness prompt into the agent's own
+    // context (issue #11: the sidebar also lost its title on hosts whose text
+    // fallback never fires).
     const titleChunks: StreamChunk[] = []
     for await (const chunk of adapter.stream({
       provider: 'acp',
@@ -740,14 +744,42 @@ describe('ACP bridge over stdio (mock agent)', () => {
       messages: [{
         role: 'user',
         source: { kind: 'plugin', plugin: 'dsh-session-title-llm' },
-        content: [{ type: 'text', text: 'Generate the session title from this JSON array of human messages: […]' }],
+        content: [{ type: 'text', text: 'Generate the session title from this JSON array of human messages: ["给这个仓库写一份测试指南","second human line"]' }],
       }],
     })) {
       titleChunks.push(chunk)
     }
+    expect(titleChunks.map(c => c.type)).toEqual(['block-start', 'text-delta', 'block-end', 'finish'])
+    const titleText = titleChunks.find((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')?.text
+    expect(titleText).toBe('给这个仓库写一份测试指南')
     const titleFinish = titleChunks.find((c): c is Extract<StreamChunk, { type: 'finish' }> => c.type === 'finish')
-    expect(titleFinish?.reason).toMatchObject({ kind: 'error', failure: { code: 'unsupported_purpose' } })
-    expect(titleChunks.some(c => c.type === 'text-delta' || c.type === 'block-start')).toBe(false)
+    expect(titleFinish?.reason).toMatchObject({ kind: 'stop' })
+
+    // A title prompt without a parseable human-message array keeps the old
+    // refusal, and compaction is refused outright: the adapter must never turn
+    // an auxiliary call into a remote turn.
+    for (const [purpose, prompt] of [
+      ['session-title', 'Generate the session title from this JSON array of human messages: not json'],
+      ['compaction', 'Fold this conversation for compaction: ["hello from the person"]'],
+    ] as const) {
+      const refused: StreamChunk[] = []
+      for await (const chunk of adapter.stream({
+        provider: 'acp',
+        model: 'mock',
+        sessionId,
+        purpose,
+        messages: [{
+          role: 'user',
+          source: { kind: 'plugin', plugin: purpose === 'session-title' ? 'dsh-session-title-llm' : 'dsh-compaction' },
+          content: [{ type: 'text', text: prompt }],
+        }],
+      })) {
+        refused.push(chunk)
+      }
+      const refusalFinish = refused.find((c): c is Extract<StreamChunk, { type: 'finish' }> => c.type === 'finish')
+      expect(refusalFinish?.reason).toMatchObject({ kind: 'error', failure: { code: 'unsupported_purpose' } })
+      expect(refused.some(c => c.type === 'text-delta' || c.type === 'block-start')).toBe(false)
+    }
 
     // An injected-context wake carries nothing the user said: no ACP turn at all.
     const wakeChunks: StreamChunk[] = []

@@ -35,6 +35,8 @@ import {
   resolveSessionCwd,
   resolveImageAttachmentFromContext,
   selectForwardPrompt,
+  extractSessionTitlePlaceholder,
+  SESSION_TITLE_PLACEHOLDER_MAX,
   detectImageMimeFromMagic,
   sessionAgentPreset,
   sessionAgentPresetFromLog,
@@ -1591,6 +1593,47 @@ describe('selectForwardPrompt (host request → forwarded ACP prompt)', () => {
     // Must not throw, fails open gracefully
     expect(() => resolveImageAttachmentFromContext('sha256:' + 'e'.repeat(64), cordisContextWithTraps)).not.toThrow()
     expect(resolveImageAttachmentFromContext('sha256:' + 'e'.repeat(64), cordisContextWithTraps)).toBeUndefined()
+  })
+})
+
+describe('extractSessionTitlePlaceholder (host title prompt → placeholder title)', () => {
+  const titlePrompt = (text: string) => [{ role: 'user', source: { kind: 'plugin', plugin: 'dsh-session-title-llm' }, content: [{ type: 'text', text }] }]
+
+  it('takes the first human message out of the prompt\'s JSON array', () => {
+    expect(extractSessionTitlePlaceholder(titlePrompt(
+      'Generate the session title from this JSON array of human messages: ["给这个仓库写一份测试指南","second human line"]',
+    ))).toBe('给这个仓库写一份测试指南')
+    // A bracket in prose before the real array must not block the scan.
+    expect(extractSessionTitlePlaceholder(titlePrompt(
+      '[optional] Generate the session title from this JSON array of human messages: ["你好"]',
+    ))).toBe('你好')
+  })
+
+  it('reads object elements via text / content / message and skips empties', () => {
+    expect(extractSessionTitlePlaceholder(titlePrompt('prompt: [{"text":"  "},{"content":"第一个问题"}]'))).toBe('第一个问题')
+    expect(extractSessionTitlePlaceholder(titlePrompt('prompt: [{"message":"first"}]'))).toBe('first')
+    // Objects without a usable string field fall through; a string element still wins.
+    expect(extractSessionTitlePlaceholder(titlePrompt('prompt: [{"other":1},"fallback title"]'))).toBe('fallback title')
+  })
+
+  it('collapses whitespace and truncates by code points with an ellipsis', () => {
+    expect(extractSessionTitlePlaceholder(titlePrompt('["a\\n  b\\t c"]'))).toBe('a b c')
+    const long = '啊'.repeat(SESSION_TITLE_PLACEHOLDER_MAX + 10)
+    expect(extractSessionTitlePlaceholder(titlePrompt(`["${long}"]`)))
+      .toBe('啊'.repeat(SESSION_TITLE_PLACEHOLDER_MAX) + '…')
+    // The cut falls mid-run of astral chars: the pair stays intact (a naive
+    // UTF-16 slice would emit a lone half surrogate here).
+    const mixed = 'a'.repeat(SESSION_TITLE_PLACEHOLDER_MAX - 1) + '🙂'.repeat(10)
+    expect(extractSessionTitlePlaceholder(titlePrompt(`["${mixed}"]`)))
+      .toBe('a'.repeat(SESSION_TITLE_PLACEHOLDER_MAX - 1) + '🙂' + '…')
+  })
+
+  it('returns undefined for prompts without a parseable human-message array', () => {
+    expect(extractSessionTitlePlaceholder(titlePrompt('Generate the session title from this JSON array of human messages: not json'))).toBeUndefined()
+    expect(extractSessionTitlePlaceholder(titlePrompt('Generate the session title: []'))).toBeUndefined()
+    expect(extractSessionTitlePlaceholder(titlePrompt('Generate the session title: ["   ",""]'))).toBeUndefined()
+    expect(extractSessionTitlePlaceholder(titlePrompt('Generate the session title: ["unclosed bracket'))).toBeUndefined()
+    expect(extractSessionTitlePlaceholder([])).toBeUndefined()
   })
 })
 

@@ -2618,6 +2618,102 @@ export function selectForwardPrompt(messages: readonly {
   return sawUserRole ? { kind: 'no-user-input' } : { kind: 'empty' }
 }
 
+/** Longest placeholder title the adapter answers a `session-title` call with. */
+export const SESSION_TITLE_PLACEHOLDER_MAX = 60
+
+/**
+ * Pulls the first human message out of the host's title-generation prompt, to
+ * serve as a session's placeholder title (AGENTS.md rule 16).
+ *
+ * The host's `dsh-session-title-llm` call arrives as one user message whose
+ * text embeds the session's human messages as a JSON array — observed format:
+ * "Generate the session title from this JSON array of human messages: […]".
+ * Scanning the raw text for a balanced array (string-aware, so `]` inside
+ * strings cannot truncate it) keeps this independent of the instruction
+ * wording, which may drift between host versions. Elements may be plain
+ * strings or objects; for objects the first string among `text` / `content` /
+ * `message` wins. Whitespace collapses to single spaces and long titles cut at
+ * {@link SESSION_TITLE_PLACEHOLDER_MAX} code points (surrogate-pair safe) with
+ * an ellipsis.
+ *
+ * Anything unparseable returns `undefined`, and the caller keeps the old
+ * `unsupported_purpose` refusal — the worst case stays exactly what shipped
+ * before the placeholder existed (issue #11: the host's own text fallback does
+ * not fire on every host version, so a parseable prompt must be answered).
+ */
+export function extractSessionTitlePlaceholder(messages: readonly {
+  role: string
+  content?: string | Array<{ type?: string; text?: string; [k: string]: unknown }> | { type?: string; text?: string; [k: string]: unknown }
+}[]): string | undefined {
+  const blocks: string[] = []
+  for (const message of messages) {
+    if (message.role !== 'user') continue
+    const content = message.content ?? (message as { parts?: unknown }).parts
+    const rawBlocks: Array<Record<string, unknown>> = Array.isArray(content)
+      ? (content as Array<Record<string, unknown>>)
+      : (typeof content === 'string'
+          ? [{ type: 'text', text: content }]
+          : (typeof content === 'object' && content !== null ? [content as Record<string, unknown>] : []))
+    for (const block of rawBlocks) {
+      if (typeof block.text === 'string') blocks.push(block.text)
+    }
+  }
+
+  const prompt = blocks.join('\n')
+  for (let start = prompt.indexOf('['); start !== -1; start = prompt.indexOf('[', start + 1)) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(sliceBalancedJsonArray(prompt, start))
+    } catch {
+      continue
+    }
+    if (!Array.isArray(parsed)) continue
+    for (const element of parsed) {
+      const value = typeof element === 'string'
+        ? element
+        : (element !== null && typeof element === 'object'
+            ? firstStringField(element as Record<string, unknown>, ['text', 'content', 'message'])
+            : undefined)
+      if (value === undefined) continue
+      const collapsed = value.replace(/\s+/gu, ' ').trim()
+      if (collapsed === '') continue
+      const chars = Array.from(collapsed)
+      if (chars.length <= SESSION_TITLE_PLACEHOLDER_MAX) return collapsed
+      return chars.slice(0, SESSION_TITLE_PLACEHOLDER_MAX).join('') + '…'
+    }
+  }
+  return undefined
+}
+
+/** Slices the balanced `[…]` region starting at `start`, or `''` when it never closes. */
+function sliceBalancedJsonArray(text: string, start: number): string {
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') inString = true
+    else if (ch === '[') depth++
+    else if (ch === ']' && --depth === 0) return text.slice(start, i + 1)
+  }
+  return ''
+}
+
+/** First string among `keys`, for title-array elements that arrive as objects. */
+function firstStringField(record: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === 'string') return value
+  }
+  return undefined
+}
+
 // ---- The agent's own permission vocabulary ----
 
 /** ACP `ToolCall.kind` values that are known to take a file effect. */

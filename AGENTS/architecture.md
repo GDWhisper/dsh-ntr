@@ -65,7 +65,7 @@
 
 - **严禁**用「最后一条 `role === 'user'` 的消息」：宿主把上下文段折在用户消息**之后**，最后一条 user 消息实测是 `skill-catalog` / `agent-instructions` / system-prompt 快照。
 - 只有注入消息的唤醒轮（goal / subagent / skill 注入）不发 NTR 轮次，直接以 `stop` 结束。
-- `purpose !== undefined`（`session-title` / `compaction`）必须在 `getOrCreateDshSession` **之前**以 `unsupported_purpose` 失败。标题生成复用同一会话 route，不看 `purpose` 会把「起个标题」当成一轮真实 prompt。
+- `purpose !== undefined` 必须在 `getOrCreateDshSession` **之前**就地处理，绝不把辅助调用送进 ACP 会话（标题生成复用同一会话 route，不看 `purpose` 会把「起个标题」当成一轮真实 prompt）。分流：`session-title` 的提示词自带人类消息 JSON 数组（宿主 `dsh-session-title-llm`），`extractSessionTitlePlaceholder`（`src/impl.ts`）取首条折回占位标题（不发轮次、不 spawn；截 `SESSION_TITLE_PLACEHOLDER_MAX` 码点；解析失败回落拒绝——宿主自己的文本兜底在部分版本如 2.0.22-next 不生效，issue #11 报备）；`compaction` 与未知 purpose 仍以 `unsupported_purpose` 失败。
 
 ### 2.2 展示：逐步切分，卡片夹在两个 assistant 节点之间
 

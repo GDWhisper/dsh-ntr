@@ -55,6 +55,7 @@ import {
   resolveFsPath,
   resolveSessionCwd,
   selectForwardPrompt,
+  extractSessionTitlePlaceholder,
   isAbsolutePath,
   acpPresetStatusFromRoster,
   splitAdapterModelId,
@@ -10158,10 +10159,26 @@ export class BridgeManager {
     // Auxiliary host calls (`session-title`, `compaction`) ride the session's
     // logged route, so they reach this adapter looking like a turn. They are not
     // conversation: forwarding one would spend a remote agent turn on a title
-    // prompt, or worse, fold it into the ACP agent's own context. Refuse before
-    // touching (or spawning) anything — the title service degrades to its text
-    // fallback and compaction is best-effort.
+    // prompt, or worse, fold it into the ACP agent's own context.
     if (options.purpose !== undefined) {
+      // A title call carries the session's human messages as a JSON array (the
+      // host's `dsh-session-title-llm` prompt). Answer it locally by folding
+      // the first one back as the placeholder title: no ACP turn, no bridge
+      // session, and the sidebar gets a title even on hosts whose own text
+      // fallback never fires (issue #11, DSH 2.0.22-next).
+      if (options.purpose === 'session-title') {
+        const title = extractSessionTitlePlaceholder(options.messages ?? [])
+        if (title !== undefined) {
+          yield { type: 'block-start', index: 0, blockType: 'text' }
+          yield { type: 'text-delta', index: 0, text: title }
+          yield { type: 'block-end', index: 0, block: { type: 'text', text: title } }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
+      }
+      // Compaction — and a title prompt we cannot parse — stays refused before
+      // touching (or spawning) anything: compaction is best-effort, and an
+      // unparseable title keeps the old refusal so the host can fall back.
       yield {
         type: 'finish',
         reason: {

@@ -30,7 +30,7 @@ DSH 组装一次请求时，消息顺序**不是**"历史 + 最后一条用户�
 
 - 只转发 `source.kind` 为 `'user'`（或没有 source 的手工请求）的消息，且取最后一条——注入的 `plugin` / `agent-instructions` / `skill-catalog` / `runtime-context` / `tool` 一律跳过；
 - 一个只有注入消息的"唤醒轮"（goal / subagent / skill 注入）不发任何 ACP 轮次，直接以 `stop` 结束；
-- `purpose !== undefined` 的辅助请求直接失败（`unsupported_purpose`），标题服务回落到文本兜底，compaction 本就是尽力而为。
+- `purpose !== undefined` 的辅助请求直接失败（`unsupported_purpose`），标题服务回落到文本兜底，compaction 本就是尽力而为。（现行做法已再进一步：`session-title` 提示词自带人类消息 JSON 数组，可解析时折回首条做占位标题——实测宿主的文本兜底并非在所有版本生效，issue #11 报备侧边栏无标题；仅 `compaction` 与解析失败仍拒绝，见 [AGENTS/architecture.md §2.1](../AGENTS/architecture.md)。）
 
 ## 2. NTR 模式 = 一个 agent preset（不是新控件）
 
