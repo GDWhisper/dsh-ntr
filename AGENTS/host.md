@@ -1,6 +1,6 @@
 # 宿主接线
 
-本文是 [AGENTS.md](../AGENTS.md) 的展开层，覆盖与 DSH 宿主平面的接线点：`/acp` 通道、agent preset 声明、可选服务探测。
+本文是 [AGENTS.md](../AGENTS.md) 的展开层，覆盖与 DSH 宿主平面的接线点：`/acp` 通道、agent preset 声明、可选服务探测、模型层 abstain、宿主升级排查（§5，**宿主升级后先读这一节**）。
 
 ## 1. `/acp` 通道注册
 
@@ -48,6 +48,63 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 
 - `AcpLlmAdapter.listModels('acp')` 必须返回空数组；ACP 模型面走 `agent/catalog`（见 [state.md §4](./state.md)）。
 - 已退役的默认模型守卫、路由强制、目录重试机制不要带回来，见 [retired.md](./retired.md)。
+
+## 5. 宿主升级排查
+
+**何时读**：DSH 升级后 NTR 报错或表现异常。只读这一节，按症状表定位后再翻对应文档；不要先通读 architecture。
+
+**冒烟顺序**：`npm run prepack` 排除自身回归 → 确认宿主版本（桌面版看 `resources/app.asar` 内 `dsh/package.json`，CLI 跑 `dsh --version`）→ 新建会话选 NTR（roster 有 `acp`、composer 出现 ACP 底座）→ 选 agent 发「只回复 ok」→ 确认 NTR 面有实时数据（transcript 增量 / 审批卡）→ 再切一次模型并触发一个工具调用。
+
+**版本分叉**：有 `agent.model.select` 的宿主（0.2.2+）在 step preparation 前固定路由，guard 用 `agent.model.select()` 写入；没有的宿主（0.2.1-）继续走 `agent/request` 改写。排查先看这一条属于哪边。
+
+### 5.1 植入点（宿主契约面）
+
+| # | 植入点 | 依赖的宿主契约 | 我们这一侧 |
+|---|---|---|---|
+| 1 | bundle patch / preset | `dsh.bundle.patch`；`@deepseek-ai/dsh-agent-preset` 的 `config.{id,name,description,order,plugins}`；`persona` 的 `complete` / `includeRuntimeContext`；插件名按 profile 基准解析 | `package.json`、`presets/acp/acp.patch.yml` |
+| 2 | Cordis 入口与服务 | 具名 `name` / `inject` / `apply`；`ctx.connection.register(owner, '/acp', …)`；`ctx.connection.fetch.register({ path, methods, fetch })`，path 必须是 `/api/…` 完整路径；可选服务 `ctx.get` / `ctx.inject` | `src/index.ts` |
+| 3 | LLM adapter | `ctx.llm.registerAdapter(['acp'], …)`；`LlmAdapter` 的 `providerInfo` / `providerRetryPolicy` / `imageRequestPricing` / `listModels` / `resolveModel` / `prepareCall` / `stream`（前三个在注册 / 计费路径被无条件调用）；`GenerateOptions`（`sessionId` / `messages` / `model` / `purpose` / `signal`）；`StreamChunk` 词表 | `src/bridge.ts` · `AcpLlmAdapter` / `streamPrompt` |
+| 4 | 路由与步进 seam | `agent.model.select/current`；`agent/inbox/inserted` / `claimed` 与 `preStep` 取路由的先后；`agent/request` waterfall（仅老宿主）；`agent/pre-step` 的 decision 形状与 waterfall 顺序 | `presets/acp/acp-guard.mjs` · `selectBoundRoute` / 闸门 / 改写 |
+| 5 | 工具卡执行 | `tools/execute` 的 `{ name, agent, callId }`；`ctx.tools.get(name, agent)` / `register(def)`；`message.source.kind === 'tool'` 与 `callId` | `presets/acp/acp-guard.mjs` |
+| 6 | 会话事实 | `agent-preset/selected` 事件；`sessions.get` 的 `events`；`sessionPersistence.open` 的 `header`（冷会话 preset）；`agentPresets.list` | `src/index.ts` · `wireAcpMode` / `wirePresetRoster`；`src/impl.ts` · `sessionAgentPreset` |
+| 7 | 浏览器槽位与宿主原语 | `conversation.input.model` / `left` / `overlay` / `dock`、`conversation.view`、`conversation.composer.dock`、`conversation.chat.assistant-actions`、`shell.overlay`；projection `agentPreset`；`ctx.slots.inject` / `entriesOfSlot` / `uiSession.adapter.current`；`sessions.fork` 与 `remote.$on('agent-preset/selected')` | `src/client/` |
+| 8 | 插件管理 / 更新 | `pluginManager.listBundles()` / `registries()` / `installBundle()`；packument | `src/update.ts` |
+
+非宿主面：ACP 协议与 `session/update` 词表在 `@agentclientprotocol/sdk`，升级依赖时看 SDK 类型，不走本表。
+
+### 5.2 症状 → 先查
+
+| 症状 | 先查 | 高发原因 |
+|---|---|---|
+| 首轮报 `agent/request proposed … after step preparation fixed …` | 宿主 `dsh-agent-loop` 的 `preStep` / `prepareRequest`；guard 的 `fixesRouteBeforeRequest` / `selectBoundRoute` | 路由固定得更早，或选择 API / 写入时点改名 |
+| NTR 模式从选择器消失 / roster 行带 `broken` 诊断 | preset 行 schema、`persona` 字段、插件名解析 | preset config 改名、包名子路径不再可解析 |
+| 所有 `POST /acp/*` 返 405 | `connection.register` 探测 | 入口 / 围栏变化，回落到 `rpc.handle` 也失败 |
+| 实时面全静默（transcript 不增量、审批卡 / 释放与限流横幅不出现，但 RPC 可用） | `ctx.connection.fetch.register` 的 `/api/…` 路径校验与 SSE 响应形态 | 路由表或流式响应契约变化 |
+| 启动即报 adapter 无效 / NTR 完全没有服务 | `LlmAdapter` 注册期成员（`providerInfo`、`providerRetryPolicy`） | 注册期必调成员新增或改名 |
+| NTR 会话被宿主模型回答（没进 ACP） | `agent.model.select` 是否存在；`inbox/inserted` / `claimed` 是否仍早于路由读取 | 选择写入没生效，路由落到部署默认 |
+| 回合以 `blocked` 收尾 / 工具续跑断 | `agent/pre-step` decision 形状、source kind 常量、`tools/execute` 载荷 | 闸门误拒或剥离清单过期 |
+| NTR 对话里出现宿主注入（项目指令 / runtime-context / model changed） | `agent/pre-step` decision 形状、`message.source.kind` 常量 | 闸门 fail-open 或剥离清单过期 |
+| 模型底座 / 座位 / 选择器消失或露出原生控件 | 槽位名（含 `conversation.input.overlay`）、`entriesOfSlot`、projection key | 客户端槽位或投影改名 |
+| 审批卡 / 释放横幅不出现 | `conversation.input.dock`、`session/update` 折叠 | dock 槽位或事件形状变化 |
+| 内置更新不可用 | `pluginManager` 方法面 | 服务或方法签名变化 |
+
+### 5.3 读宿主源码
+
+桌面版解包 `<安装目录>/resources/app.asar`（`npx @electron/asar extract <asar> <dir>`）后，先 `grep` 符号再读函数：
+
+| 文件 | 看什么 |
+|---|---|
+| `dsh/node_modules/@deepseek-ai/dsh-agent-loop/lib/index.js` | `preStep`、`prepareRequest`、inbox 事件的发出顺序 |
+| `dsh/node_modules/@deepseek-ai/dsh-agent/lib/index.js` | `AgentModel`、`modelSelectionProjectionDefinition`、`installModelSelection` |
+| `dsh/node_modules/@deepseek-ai/dsh-api-session-controller/lib/index.js` | `composeAgent`（安装顺序）、`prompt`、`selectModel` |
+| `dsh/node_modules/@deepseek-ai/dsh-llm/lib/index.js` | `LlmAdapter` 契约、`GenerateOptions` |
+| `dsh-client-ui-*` / `lib/client.js` | 槽位名与 projection face |
+
+常用 grep：`agent.model.select`、`agent/request proposed`、`agent/inbox/inserted`、`installModelSelection`、`registerAdapter(`、`conversation.input.model`。
+
+### 5.4 维护
+
+每次因宿主升级做兼容修复，在 §5.2 补一行「症状 → 先查 → 原因」，把新依赖的符号加进 §5.1；根因推导写 `docs/acp-convergence.md`，不进本文。
 
 ## 代码索引
 

@@ -129,7 +129,7 @@
 | [ui-panel.md](./AGENTS/ui-panel.md) | 改设置页布局、保存横幅、版本徽标 / 内置更新卡、文案或主题色 | 动 `panel.tsx`、`save-guard-toast.tsx`、`locale.*` 或 CSS token |
 | [permissions.md](./AGENTS/permissions.md) | 改权限映射、审批卡片（对话 dock / 设置镜像）、审批时限、权限座位、fs 围栏 | 动 `handlePermissionRequest` / `PermissionLedger` / 期限配置 / `PermissionDock` |
 | [state.md](./AGENTS/state.md) | 改落盘、会话选择持久化、模型目录 / 可见性、命令缓存、fork 能力位、内置更新、保存门禁 / HMR 防护 | 动 `agents.json` 结构、`agent/catalog`、`absorbCommands`、`AcpSaveGate`、`hmr-guard` 或 `UpdateService` |
-| [host.md](./AGENTS/host.md) | 改 `/acp` 通道注册、preset 声明、可选宿主服务探测、模型层 abstain | 动 `src/index.ts` 的注入 / `register`、`presets/acp/acp.patch.yml` 或 `package.json` 的 `dsh` 字段 |
+| [host.md](./AGENTS/host.md) | 改宿主接线（通道 / preset / 服务 / 模型 abstain），或**宿主升级后 NTR 报错 / 异常：先读 §5 排查** | 动 `src/index.ts`、`presets/acp/acp.patch.yml`、`package.json` 的 `dsh` 字段；每次因宿主升级做兼容修复后补 §5.2 症状行 |
 | [paths.md](./AGENTS/paths.md) | 改任何路径判定 / 比较 / 规范化，或 Windows 上遇到 `bad_cwd` / `cwd_denied` | 动 `isAbsolutePath` / `isUnderPath` / `canonicalizeFsPath` 或浏览器 `isAbsolutePathLike` |
 | [retired.md](./AGENTS/retired.md) | 想恢复某个旧机制、看到幽灵符号，或不确定某符号是否已删 | 又退役一条轴时，把旧符号追加进幽灵清单 |
 | [release.md](./AGENTS/release.md) | 发版：更新 CHANGELOG、bump 版本、打 tag、npm 发布、写 GitHub release note | 发布流程、版本规则或 CHANGELOG 口径变化 |
