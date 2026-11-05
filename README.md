@@ -283,12 +283,12 @@ dsh plugin --profile web add ./   # 挂载到 Web Profile
 
 代码位置：`src/index.ts`（插件入口）· `src/protocol.ts`（共享类型）· `src/impl.ts`（纯宿主逻辑）· `src/bridge.ts`（子进程通信桥）· `src/client/`（React 扩展）· `presets/acp/`（NTR 模式声明）· `~/.dsh/dsh-ntr/`（运行时落盘）。
 
-- **DSH 只出显示层**：插件不写 DSH 的模型路由，不接管宿主的模型目录，也不让 ACP 模型出现在 DSH 原生选择器里。
+- **DSH 只出显示层**：插件不写全局默认模型，不接管宿主的模型目录，也不让 ACP 模型出现在 DSH 原生选择器里；唯一的模型层写入是 guard 用 `agent.model.select()` 把会话绑定记成该会话的模型选择（宿主 0.2.2+ 在 step preparation 前固定路由）。
 - **工作区即侧栏路径**：侧栏点开的目录必须成为 `session/new` 的 cwd **和** agent 子进程自己的 cwd。有一条 agent（codebuddy）在进程启动那一刻就定死工作区。
 - **NTR 模式 = agent preset**：由 `presets/acp/acp.patch.yml` 随包声明，不挂工具、不注入项目指令、不做 compaction，让模型可见的表面完全属于对端 agent。
 - **转发严格等于用户文本**：按 `source.kind === 'user'` 挑消息，不转发标题生成、compaction 这类辅助调用，也不拼任何边界叙述。
 - **逐步切分 = 原生交错的工具卡**：一个 ACP turn 按工具活动切成多个宿主 step——段以 `tool-call` 卡收尾即结束本次 stream，宿主落定消息、执行卡（真实输出经 guard 虚拟工具应答）、续跑下一步；续跑段续读同一个仍在飞的 `session/prompt`，绝不新发 prompt。卡片因此夹在两个 assistant 节点之间，与原生多步对话一致。
-- **绑定必须接到请求路径上**：guard 的 `agent/request` waterfall（`prepend: true`）把请求改写成绑定指向的 `acp/<agent>`，adapter 再做一次复查。
+- **绑定必须接到请求路径上**：guard 在唤醒驱动前用 `agent.model.select()` 把绑定记成会话的模型选择（`acp/<agent>`），adapter 再做一次复查；老宿主（无 `agent.model`）才用 `agent/request` waterfall（`prepend: true`）改写请求。
 - **权限模式与审批是两层，都以 agent 为准**：`composer-mode.tsx` 的控件只渲染 agent 经 `session/set_mode` 下发的 `availableModes`，不写可见标签、不翻译选项名；`session/request_permission` 原样映射给用户。插件没有自己的权限开关：agent 问了就一定到人面前。早先那套由宿主替 agent 裁定的端口语义（`decidePermission`、fs 写栅栏）已删除，见 `docs/acp-convergence.md` §2.3。
 - **跨平台路径**：`impl.ts` 不能 import `node:path`，绝对路径判定与 containment 全部手写，Windows 与 UNC 有专门用例。
 

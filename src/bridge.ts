@@ -3901,21 +3901,25 @@ function quoteLegacyCommand(item: unknown): unknown {
  *
  * `session/chat-bind` records which ACP agent serves one DSH chat session — the
  * plugin's own mapping, deliberately not a DSH model route (see
- * `bindChatAgent`). But a route is exactly what the host driver reads per turn
+ * `bindChatAgent`). But a route is exactly what the host driver reads per step
  * (`selectionFor(agent).current`: pending selection → last request header →
  * deployment default), and a session that has never run an ACP turn resolves to
- * the DEPLOYMENT DEFAULT — so without a rewrite the driver never reaches this
- * adapter at all, and a session already on `acp/<old>` replays `<old>` forever.
+ * the DEPLOYMENT DEFAULT — so the driver would reach this adapter only if the
+ * binding is recorded as the session's model selection first.
  *
- * The rewrite lives in `presets/acp/acp-guard.mjs` (an `agent/request` waterfall
- * listener, registered with `prepend` so it lands OUTSIDE the harness's own
- * `installModelSelection` rewrite and wins). The guard is loaded by the
- * harness's Loader as its own module instance, so the two halves share state
- * through this registry on `globalThis` rather than through a module import —
- * same-package, cross-instance, like a service. The guard reads it defensively
- * and degrades to "no rewrite" (the harness default plays out) when it is
- * absent; `ACP_ROUTE_BINDING_KEY` is therefore a hand-copy discipline with the
- * guard's `BINDING_KEY` (see tests/register.spec.ts for the equivalence).
+ * The guard (`presets/acp/acp-guard.mjs`) does that on the wake seam: DSH
+ * 0.2.2+ fixes the step's route at preparation and reads `agent.model`, so the
+ * guard calls `agent.model.select({ provider: 'acp', model })` from the
+ * `agent/inbox/inserted` / `agent/inbox/claimed` listeners (before that read).
+ * Older hosts have no `agent.model`; there the guard keeps an `agent/request`
+ * waterfall rewrite registered with `prepend` so it lands OUTSIDE the harness's
+ * own rewrite and wins. The guard is loaded by the harness's Loader as its own
+ * module instance, so the two halves share state through this registry on
+ * `globalThis` rather than through a module import — same-package,
+ * cross-instance, like a service. The guard reads it defensively and degrades
+ * to "no rewrite" (the harness default plays out) when it is absent;
+ * `ACP_ROUTE_BINDING_KEY` is therefore a hand-copy discipline with the guard's
+ * `BINDING_KEY` (see tests/register.spec.ts for the equivalence).
  */
 export const ACP_ROUTE_BINDING_KEY = Symbol.for('dsh-ntr.acp-binding')
 
@@ -6758,12 +6762,13 @@ export class BridgeManager {
    * Bind one DSH chat session to an ACP agent.
    *
    * This is the plugin's OWN conversation↔agent mapping. It deliberately does
-   * NOT write a DSH model selection: the retired "express the agent as a
-   * `provider: 'acp'` route" axis forced `session.selectModel`, which both
-   * polluted the deployment default model and got refused by the GUI's catalog
-   * gate (`session/model-unavailable`) — even though the prompt admission path
-   * never checked catalog membership in the first place. See
-   * docs/acp-convergence.md §1.1 and §2.2.
+   * NOT call the host's `session.selectModel` RPC: the retired "express the
+   * agent as a `provider: 'acp'` route" axis used it, which both polluted the
+   * deployment default model and got refused by the GUI's catalog gate
+   * (`session/model-unavailable`) — even though prompt admission never checked
+   * catalog membership. The guard instead writes the session's selection
+   * directly (`agent.model.select`) at wake time, on hosts that fix the route
+   * before `agent/request`. See docs/acp-convergence.md §1.1 and §2.2.
    *
    * The host half records the intent; the actual ACP session is created on the
    * next turn (which is also what resumes a released one).
@@ -6919,7 +6924,8 @@ export class BridgeManager {
   /**
    * Publish one conversation's pick onto the request-path binding.
    *
-   * The guard's `agent/request` rewrite and this class's own turn admission read
+   * The guard's model selection (and its legacy `agent/request` rewrite) and
+   * this class's own turn admission read
    * `routeBindingRegistry().conversations`, whose values are adapter model ids.
    * The MODEL half of the pick therefore rides there, so a turn that starts
    * with `agentId` alone does not silently drop a variant chosen up front; with

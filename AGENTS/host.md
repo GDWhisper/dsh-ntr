@@ -44,7 +44,7 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 
 ## 4. 不碰宿主的模型层
 
-插件完全不读 `modelDirectories`、不写 `selectModel`、不广告 ACP 模型。`session/chat-bind` 等 RPC 只写插件自己的映射，再由 guard 的 `agent/request` waterfall 接到请求路径上（见 [architecture.md §3](./architecture.md)）。
+插件不读 `modelDirectories`、不走 `session/selectModel`、不写全局默认模型、不广告 ACP 模型。`session/chat-bind` 等 RPC 只写插件自己的映射；guard 在唤醒前用 `agent.model.select()` 把绑定记成该会话的模型选择（宿主 0.2.2+ 的 step preparation 会先固定路由），老宿主才用 `agent/request` waterfall 改写（见 [architecture.md §3](./architecture.md)）。
 
 - `AcpLlmAdapter.listModels('acp')` 必须返回空数组；ACP 模型面走 `agent/catalog`（见 [state.md §4](./state.md)）。
 - 已退役的默认模型守卫、路由强制、目录重试机制不要带回来，见 [retired.md](./retired.md)。

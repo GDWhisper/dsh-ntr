@@ -16,9 +16,11 @@
  * automatic reminders shipped presets add; `runtime-context` is the host's
  * own snapshot source (the constant is `runtime-context` in `dsh-agent-loop`,
  * NOT `plugin`); every `plugin`-sourced message (notices, relays, recalls) is
- * harness context by construction. `user` and `tool` sources are kept: the
- * first is the person, the second is loop-internal continuity this session
- * still needs.
+ * harness context by construction. `model-selection` is the host's "model
+ * changed" notice: it describes the harness route (`acp/<agent>@<choice>`),
+ * which this conversation does not expose and must not forward. `user` and
+ * `tool` sources are kept: the first is the person, the second is
+ * loop-internal continuity this session still needs.
  *
  * NO-USER-INPUT STEPS ARE REJECTED (third duty) — with ONE exception: the
  * continuation steps of this row's OWN display cards. A batch that carries no
@@ -60,23 +62,35 @@
  *                                 disables the filter, e.g. to debug what the
  *                                 harness is injecting).
  *
- * ROUTE REWRITE (second duty): the host driver resolves each turn's route as
- * "pending selection → last request header → deployment default", and a plugin
- * cannot append a selection. A session that has never run an ACP turn therefore
- * resolves to the deployment default (a provider this conversation cannot use),
- * and one that has replays its previous `acp/<agent>` header even after the
- * user switched agents in the composer. The driver exposes exactly one seam for
- * this: the `agent/request` waterfall. This row registers a listener that
- * rewrites the resolved config to the plugin's conversation→agent binding
- * (`dsh-ntr` records it on bind, on model switch, and when a session
- * materializes; the plugin's default agent answers conversations nobody bound).
+ * ROUTE (second duty): the host driver resolves each step's route as "pending
+ * selection → last request header → deployment default". A session that has
+ * never run an ACP turn therefore resolves to the deployment default (a
+ * provider this conversation cannot use), and one bound to a different agent
+ * replays the previous `acp/<agent>` header. The route must be the plugin's
+ * conversation→agent binding (`dsh-ntr` records it on bind, on model switch,
+ * and when a session materializes; the plugin's default agent answers
+ * conversations nobody bound).
  *
- * The listener is registered with `{ prepend: true }`: waterfall listeners run
- * outermost-first, and the harness's own `installModelSelection` rewrite (which
- * re-applies `selectionFor(agent).current` — the deployment default for a
- * session with no selection history) is registered BEFORE this row mounts, so
- * only the outermost slot lets the binding win. The rewrite drops the resolved
- * `reasoningEffort`: it belongs to whatever route the seed named, while the
+ * DSH 0.2.2+ FIXES THAT ROUTE AT STEP PREPARATION: `preStep` captures
+ * `agent.model.current()` synchronously right after the inbox splice that
+ * wakes the driver, and `agent/request` may then only adjust non-route
+ * controls — proposing a different provider/model (or effort) fails the step
+ * with "agent/request proposed … after step preparation fixed …; use
+ * agent.model.select() before step preparation". The hook that lands before
+ * that capture is the agent's OWN selection projection: `agent.model.select`
+ * appends a `model/selection` event, and the projection is folded
+ * synchronously, so a listener on `agent/inbox/inserted` (the splice that
+ * wakes the driver) and on `agent/inbox/claimed` (inside `preStep`, right
+ * before the capture — it also covers input queued in a previous process)
+ * runs in time. This row records the binding there. `agent/created` is
+ * deliberately NOT a seam: a preset switch away before the first turn would
+ * leave an `acp/...` selection on what is now an ordinary session.
+ *
+ * OLDER HOSTS (no `agent.model`) get the reverse: their `preStep` captures no
+ * route, and only the `agent/request` waterfall can name one. This row keeps
+ * that rewrite for exactly those hosts, registered with `{ prepend: true }` so
+ * it lands outside the harness's own selection rewrite. It drops the resolved
+ * `reasoningEffort`: that belongs to whatever route the seed named, while the
  * agent's thought level is the plugin's own per-session axis
  * (`session/chat-effort-set`), and a foreign effort would fail the adapter's
  * effort validation.
@@ -100,7 +114,7 @@
 export const name = 'acp-guard'
 
 /** Source kinds stripped from every proposed step unless configured otherwise. */
-const DEFAULT_STRIPPED_SOURCES = ['agent-instructions', 'skill-catalog', 'runtime-context', 'plugin']
+const DEFAULT_STRIPPED_SOURCES = ['agent-instructions', 'skill-catalog', 'runtime-context', 'plugin', 'model-selection']
 
 /** The shared binding registry's key — hand-copy of `ACP_ROUTE_BINDING_KEY` (src/bridge.ts). */
 const BINDING_KEY = Symbol.for('dsh-ntr.acp-binding')
@@ -129,6 +143,33 @@ function boundModelFor(dshSessionId) {
     return typeof fallback === 'string' && fallback !== '' ? fallback : undefined
   } catch {
     return undefined
+  }
+}
+
+/**
+ * Whether this host fixes the step's route before `agent/request` and rejects
+ * a rewrite there (DSH 0.2.2+). Such hosts expose the recorded selection as
+ * `agent.model`; older hosts expose neither member.
+ */
+function fixesRouteBeforeRequest(agent) {
+  return typeof agent?.model?.select === 'function'
+}
+
+/**
+ * Record the conversation's adapter route as the host's model selection, so
+ * `preStep` captures it (see the module header). No-op on hosts without
+ * `agent.model` — the `agent/request` rewrite carries those.
+ */
+function selectBoundRoute(agent) {
+  try {
+    if (!fixesRouteBeforeRequest(agent)) return
+    const sessionId = agent?.session?.id
+    const model = boundModelFor(typeof sessionId === 'string' ? sessionId : undefined)
+    if (model === undefined) return
+    agent.model.select({ provider: 'acp', model })
+  } catch {
+    // A selection bug must never break the step: the host's route check turns
+    // a missing selection into a loud, attributable failure instead.
   }
 }
 
@@ -216,14 +257,25 @@ function virtualToolDefinition(toolName) {
 const TOOL_OUTPUT_WAIT_MS = 30 * 60 * 1000
 
 /**
- * Register the step gate, the display-card executor, and the route rewrite for
- * this preset's agent scope.
+ * Register the step gate, the display-card executor, and the route selection
+ * for this preset's agent scope.
  * @param ctx - the preset-scoped context the row is mounted under.
  * @param config - optional `strippedSources` override.
  */
 export function apply(ctx, config) {
   const stripped = strippedSourcesOf(config)
   const virtualDefs = makeVirtualDefs()
+  // The route, before DSH 0.2.2's `preStep` captures it: `inbox/inserted` is
+  // the synchronous splice that wakes the driver, and `inbox/claimed` fires
+  // inside `preStep` just before the capture (the last-second seam, which also
+  // covers input queued in a previous process). Both are no-ops on hosts
+  // without `agent.model` (see the module header).
+  ctx.on('agent/inbox/inserted', ({ agent } = {}) => { selectBoundRoute(agent) })
+  ctx.on('agent/inbox/claimed', ({ agent } = {}) => { selectBoundRoute(agent) })
+  // Outermost: the harness's own `installModelSelection` appends its "model
+  // changed" notice AFTER calling `next()`, so only a prepended gate sees (and
+  // strips) it. Inner listeners that add messages run inside this gate too —
+  // which is exactly the contract: nothing but the person reaches the agent.
   ctx.on('agent/pre-step', async (_payload, next) => {
     // Downstream failures propagate untouched; only this gate's own logic is guarded.
     const decision = await next()
@@ -265,7 +317,7 @@ export function apply(ctx, config) {
       // A gate bug must never eat context: degrade to keeping every message.
       return decision
     }
-  })
+  }, { prepend: true })
 
   // The display-card executor: answer the loop's execution of an ACP tool card
   // with the call's real output (fourth duty — see the module header).
@@ -292,12 +344,34 @@ export function apply(ctx, config) {
     }
   })
 
-  // The route rewrite: outermost on purpose — see the module header for why
-  // `prepend` is load-bearing (the harness's own selection rewrite registers
-  // first, and outermost runs last, so its value is what the driver sees).
+  // The legacy route rewrite: DSH 0.2.2+ captures the route before this
+  // waterfall and fails the step when it changes, so only hosts without
+  // `agent.model` are served here (`selectBoundRoute` carries the others).
+  // Outermost on purpose: the harness's own selection rewrite registers
+  // before this row, and the outermost waterfall slot is the one whose
+  // return value the driver receives, so only it can override the binding.
   ctx.on('agent/request', async (payload, next) => {
     const resolved = await next()
     try {
+      if (fixesRouteBeforeRequest(payload?.agent)) {
+        // The route is already fixed from the selection; the host compares the
+        // proposed effort against that SAME captured selection, so make it
+        // agree there — a foreign `agent/request` listener (inner ones run
+        // before this outermost slot) may have replaced the seed's effort.
+        // The plugin's own selection never carries one (the agent's thought
+        // level is its own axis), while an unbound session keeps the
+        // deployment selection's effort; both are handled by reading current.
+        if (resolved === undefined || typeof resolved !== 'object') return resolved
+        let current
+        try { current = payload.agent.model.current?.() } catch { current = undefined }
+        const effort = current?.reasoningEffort
+        if (resolved.reasoningEffort === effort) return resolved
+        if (effort === undefined) {
+          const { reasoningEffort: _foreign, ...rest } = resolved
+          return rest
+        }
+        return { ...resolved, reasoningEffort: effort }
+      }
       const model = boundModelFor(payload?.agent?.session?.id === undefined
         ? undefined
         : String(payload.agent.session.id))

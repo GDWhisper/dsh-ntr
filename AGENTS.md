@@ -8,7 +8,7 @@
 ## 心智模型
 
 **本质是借 DSH 的界面壳跟 ACP agent 对话：DSH 只提供显示层，模型调用逻辑不归我们。** 推理 / 工具 / 文件读写 / 权限决策归对端 agent 进程（完全自治）；会话身份 / 消息列表 / 输入框 / 侧栏归 DSH；模型选择 / 思考等级 / 权限档是 agent 自己的概念，不是 DSH 的模型目录。
-**不要把 ACP 当成 DSH LLM 层的一个 provider**：那根轴要求先写 `provider=acp` 路由才能发消息，于是写路由污染全局默认模型、被目录门禁拒、原生座位必须遮蔽；现行做法是插件只写自己的绑定，由 guard 的 `agent/request` 改写接到请求路径上。
+**不要把 ACP 当成 DSH LLM 层的一个 provider**：那根轴要求经 `session/selectModel` 写 `provider=acp` 路由，于是污染全局默认模型、被目录门禁拒、原生座位必须遮蔽。现行做法是插件只写自己的绑定；guard 在唤醒驱动前用 `agent.model.select()` 把绑定记成该会话的模型选择（0.2.2+ 在 step preparation 前固定路由，`agent/request` 已不许改路由），只有老宿主才回落到 `agent/request` 改写。
 → 归属模型、消息走向、绑定、工作区、preset 外壳、agent 锁定：[AGENTS/architecture.md](./AGENTS/architecture.md)。
 
 ## 快速命令
@@ -62,8 +62,8 @@
 ### 转发、preset 与绑定（16–17、22）
 
 16. **只转发人说的话**：`selectForwardPrompt` 按 `message.source.kind === 'user'` 挑消息，**严禁**「最后一条 user 消息」（注入内容折在用户消息之后）；注入唤醒轮不发 NTR 轮次；`purpose !== undefined`（标题 / compaction）在 `getOrCreateDshSession` 之前以 `unsupported_purpose` 失败。→ [architecture.md §2.1](./AGENTS/architecture.md)
-17. **【裁决部分已退役】NTR 模式 = agent preset，loop 不可替换**：`persona` 不挂工具 / 项目指令 / compaction；`agent/pre-step` 拒绝「strip 后仍有内容、却没有用户来源」的批次；`agent/request` 负责绑定改写。**严禁** `ctx.agents.setFactory` 替换 loop，**严禁**声称 preset 能屏蔽非 ACP 模型；「是否 NTR」读会话日志 preset，**严禁**自建标记位。→ [architecture.md §5](./AGENTS/architecture.md) / [retired.md](./AGENTS/retired.md)
-22. **【默认模型守卫已退役】插件只写自己的绑定与默认 agent**：`defaultAgentId` 是插件私有状态，删 agent 必须清空；`session/chat-*` 只写插件映射，再由 guard 改写接到请求路径；插件完全不碰 DSH 模型层（不读目录、不写 `selectModel`、不广告模型）。→ [architecture.md §3、§6](./AGENTS/architecture.md) / [retired.md](./AGENTS/retired.md)
+17. **【裁决部分已退役】NTR 模式 = agent preset，loop 不可替换**：`persona` 不挂工具 / 项目指令 / compaction；`agent/pre-step` 拒绝「strip 后仍有内容、却没有用户来源」的批次；绑定由 guard 在 `agent/inbox/inserted` / `agent/inbox/claimed`（后者在 `preStep` 取选择之前，兼收上一次进程遗留的排队输入）里用 `agent.model.select()` 记成会话模型选择，老宿主（无 `agent.model`）才用 `agent/request` 改写。**严禁** `ctx.agents.setFactory` 替换 loop，**严禁**声称 preset 能屏蔽非 ACP 模型；「是否 NTR」读会话日志 preset，**严禁**自建标记位。→ [architecture.md §5](./AGENTS/architecture.md) / [retired.md](./AGENTS/retired.md)
+22. **【默认模型守卫已退役】插件只写自己的绑定、会话路由选择与默认 agent**：`defaultAgentId` 是插件私有状态，删 agent 必须清空；`session/chat-*` 只写插件映射；guard 经 `agent.model.select()` 把绑定记成该会话的模型选择（直写 agent 的 selection 投影，**不是** `session/selectModel` RPC，不读模型目录、不写全局默认模型、不广告模型）；老宿主才回落 `agent/request` 改写。→ [architecture.md §3、§6](./AGENTS/architecture.md) / [retired.md](./AGENTS/retired.md)
 
 ### 界面（18、20、30、33、34、38、39）
 

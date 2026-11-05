@@ -407,14 +407,21 @@ describe('acp-guard preset row', () => {
     }
   }
 
-  it('registers the route rewrite outermost so the binding outranks the harness selection', async () => {
+  it('registers the legacy route rewrite outermost, plus the model-selection seam', async () => {
     const ctx = guardCtx()
     await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
-    // `installModelSelection`'s own agent/request rewrite registers BEFORE the
-    // preset rows mount; waterfall listeners run outermost-first, so only the
-    // outermost slot lets the binding's rewrite land last (and win).
+    // DSH 0.2.2+ fixes the step's route before `agent/request`; the binding is
+    // recorded through `agent.model.select` on the splice/claim that starts
+    // the step. Older hosts keep the waterfall rewrite, registered outermost:
+    // `installModelSelection`'s own rewrite registers BEFORE the preset rows
+    // mount and waterfall listeners run outermost-first, so only that slot
+    // lets the binding's rewrite land last (and win).
     expect(ctx.on).toHaveBeenCalledWith('agent/request', expect.any(Function), { prepend: true })
-    expect(ctx.on).toHaveBeenCalledWith('agent/pre-step', expect.any(Function))
+    // The gate must be outermost too: `installModelSelection` appends its
+    // "model changed" notice after `next()`, so an inner gate cannot strip it.
+    expect(ctx.on).toHaveBeenCalledWith('agent/pre-step', expect.any(Function), { prepend: true })
+    expect(ctx.on).toHaveBeenCalledWith('agent/inbox/inserted', expect.any(Function))
+    expect(ctx.on).toHaveBeenCalledWith('agent/inbox/claimed', expect.any(Function))
   })
 
   it('rewrites the resolved request to the conversation binding, dropping the inherited effort', async () => {

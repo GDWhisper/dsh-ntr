@@ -20,7 +20,7 @@
 ### 1.1 现行形态（速览）
 
 1. **NTR 底座在 `conversation.input.model`**：只作首轮前启动 / 切换 agent 的入口，下拉只有 agent 列表；模型、思考等级、agent 自己的 mode 各有控件。底座占原生模型底座那个 cell（composer bar 行尾、提交键左边）。座位与渲染见 [ui.md §1](./ui.md)。
-2. **会话绑定走插件自己的映射**（§3）：不写 DSH 模型路由，消息仍走宿主 driver，绑定由 guard 的 `agent/request` waterfall 接到请求路径上。
+2. **会话绑定走插件自己的映射**（§3）：不写全局默认模型，消息仍走宿主 driver；guard 在唤醒前用 `agent.model.select()` 把绑定记成会话的模型选择（老宿主才用 `agent/request` waterfall）。
 3. **permission 原样映射**：agent 报什么就问什么，宿主不预先裁决，也没有本地代答开关（[permissions.md](./permissions.md)）。
 4. **消息展示在主聊天平面、逐步切分交错如原生**（§2.2）：完整参数 / diff 卡仍在 NTR 视图 tab（[ui.md §5](./ui.md)）；续跑段续读同一个仍在飞的 `session/prompt`，绝不新发 prompt。
 5. **NTR 会话跑 ACP preset 外壳**：不带工具、不带项目指令、不带 compaction；`agent/pre-step` 只放用户来源的内容（§5）。
@@ -82,22 +82,27 @@
 
 ## 3. 会话 ↔ agent 绑定
 
-`session/chat-bind` / `session/chat-model-set` / `session/chat-effort-set` / `session/chat-mode-set` 指向「这条 DSH 会话由哪个 agent 服务」，**不写任何 DSH 模型路由**。
+`session/chat-bind` / `session/chat-model-set` / `session/chat-effort-set` / `session/chat-mode-set` 指向「这条 DSH 会话由哪个 agent 服务」，**不写全局默认模型，也不经 `session/selectModel`**。
 
-发消息仍走宿主 driver（进日志的唯一路径）。driver 每轮按「pending selection → 上一条请求 header → 部署默认」解析路由，三者插件都不写，所以绑定必须自己接到请求路径上，否则：新会话发到部署默认 provider，跑过的会话永远回放旧 agent。
+发消息仍走宿主 driver（进日志的唯一路径）。driver 每个 step 按「pending selection → 上一条请求 header → 部署默认」解析路由，所以绑定必须自己接到请求路径上，否则：新会话发到部署默认 provider，跑过的会话永远回放旧 agent。
 
-两层机制：
+**0.2.2 起路由在 step preparation 前固定**：`preStep` 先取 `agent.model.current()`，之后 `agent/request` 只许改非路由控制项，改 provider/model/effort 直接判该轮失败。因此 guard 必须在那次读取之前把绑定写成会话的模型选择：
 
-1. **guard 的 `agent/request` waterfall 改写**（`presets/acp/acp-guard.mjs`）
-   - 把解析出的请求改写成绑定指向的 `acp/<agent>`。
-   - 注册必须 `{ prepend: true }`：waterfall 外层后执行，其返回值才是 driver 看到的；harness 自己的 `installModelSelection` 先注册，只有最外层能让绑定赢。
+1. **guard 的 `agent.model.select()`**（`presets/acp/acp-guard.mjs`）——现行宿主
+   - `selectBoundRoute` 在 `agent/inbox/inserted`（唤醒驱动的同步 splice）与 `agent/inbox/claimed`（`preStep` 内部、取选择之前最后一刻，兼收上一次进程遗留的排队输入）里执行 `agent.model.select({ provider: 'acp', model })`，model 来自注册表绑定，无绑定回落插件默认 agent。**不要**挂 `agent/created`：首轮前切走 preset 会把 `acp/...` 选择留在普通会话上。
+   - 直写 agent 的 selection 投影，不碰全局默认模型、不读模型目录、不做目录门禁；宿主随后把这次选择连同请求写进日志，重启后作为 `lastUsed` 继续生效。
+   - `model-selection` 来源的「model changed」通知属于宿主路由话术，在 `agent/pre-step` 里剥掉（若宿主把它接在本行外层之后追加，bridge 的两条过滤也会忽略它），不转发给 ACP agent。
+   - `agent/request` 在这些宿主上**不改 provider/model**，但把 `reasoningEffort` 对齐到 `agent.model.current()`（宿主正是拿它与捕获的选择比较）：插件自己的选择从不带 effort，内层监听器塞进来的会被剥掉；无绑定的部署默认选择若带 effort 则保留。
+2. **guard 的 `agent/request` 改写**——仅老宿主（无 `agent.model`）
+   - 老宿主不在 preStep 固定路由，才把解析出的请求改写成绑定指向的 `acp/<agent>`。
+   - 注册 `{ prepend: true }`：waterfall 外层后执行，其返回值才是 driver 看到的；harness 自己的 `installModelSelection` 先注册，只有最外层能让绑定赢。
    - 改写丢掉继承的 `reasoningEffort`：那是别的路由的 effort，agent 的思考等级走插件自己的轴，外来 effort 还会撞 adapter 校验。
    - 无绑定的会话回落插件默认 agent；连默认 agent 都没有就不改写（部署默认照旧）。
    - 绑定注册表经 `globalThis[Symbol.for('dsh-ntr.acp-binding')]` 跨模块实例共享（guard 由 Loader 独立加载，import 不共享）。`ACP_ROUTE_BINDING_KEY`（`src/bridge.ts`）与 guard 的 `BINDING_KEY` 是手拷贝，`tests/register.spec.ts` 断言两侧看到同一个注册表。
-2. **adapter 自己的复查**（`BridgeManager.streamPrompt`）
+3. **adapter 自己的复查**（`BridgeManager.streamPrompt`）
    - driver 仍带来旧 agent id（旧 header 回放、guard 未挂载）时，`conversationRouteModel` 的绑定 model 串优先。
    - 材料化的默认 effort（`reasoning.defaultEffort`、`modelDefaultEffort`）不算用户选择，不得回写覆盖：catalog 缓存不随 per-session `set_config_option` 刷新，覆盖会把座位刚选的思考等级静默改回去。
-3. **绑定显示**
+4. **绑定显示**
    - `session/chat-list` 回 `boundAgentId`（宿主 `chatAgentFor`：intent + 活会话回落）。
    - 浏览器 `chatBoundAgent` 在点击成功当下乐观写入：活会话列表要等下一轮才物化新 agent 的会话，不乐观写就表现为「点击无效」。
 
@@ -113,11 +118,12 @@
 
 NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 行）：`persona` 行 `complete: true` + `includeRuntimeContext: false`，**不挂**工具行 / `agent-instructions` / `tool-skill` / plan-mode / todo / compaction / 委派行。
 
-`acp-guard.mjs` 挂三个监听器：
+`acp-guard.mjs` 挂四类监听器：
 
-- `agent/pre-step` 步进闸门：过滤注入内容（`agent-instructions` / `skill-catalog` / `runtime-context` / `plugin`）；**拒绝「strip 后仍有内容、却没有用户来源」的批次**，`reject` 使 turn 以 blocked 收尾。空批次仍走原 completed 空转；无 source 的消息算用户输入。**唯一例外**：staged tool results 的每个 callId 都在共享注册表 `toolResults` 里（本行自己卡片的续跑步，§2.2 的逐步切分）——放行，adapter 会续读同一 prompt 而不是转发批次。
+- `agent/pre-step` 步进闸门（`{ prepend: true }`，最外层：宿主 `installModelSelection` 在 `next()` 之后才追加 model-changed 通知，内层闸门剥不到）：过滤注入内容（`agent-instructions` / `skill-catalog` / `runtime-context` / `plugin` / `model-selection`）；**拒绝「strip 后仍有内容、却没有用户来源」的批次**，`reject` 使 turn 以 blocked 收尾。空批次仍走原 completed 空转；无 source 的消息算用户输入。**唯一例外**：staged tool results 的每个 callId 都在共享注册表 `toolResults` 里（本行自己卡片的续跑步，§2.2 的逐步切分）——放行，adapter 会续读同一 prompt 而不是转发批次。
 - `tools/execute` 虚拟工具（§2.2）：解析不到的工具名即时注册 agent 作用域虚拟工具，工具体从 `toolResults` 取真实输出，未到则挂 `waitForToolOutput`（记录 / turn settle / 30 分钟兜底解除）。真实工具与缺席的 `tools` 服务原样放行。
-- `agent/request` 路由改写：见 §3。
+- `agent/inbox/inserted` / `agent/inbox/claimed` 路由选择：见 §3，宿主有 `agent.model` 时把绑定写成会话选择。
+- `agent/request` 路由改写：见 §3，仅老宿主（无 `agent.model`）生效。
 
 纪律：
 
@@ -132,7 +138,7 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 ## 6. 默认 agent
 
 - 插件自己的默认 agent 是**插件私有状态**：`defaultAgentId`，存在 `~/.dsh/dsh-ntr/agents.json`，RPC `default/agent` / `default/agent-set`，面板 ★。删除 agent 必须同时清空该指针。
-- 它只决定「新会话默认选哪个 agent」，与 DSH 的任何模型字段无关。插件**完全不碰**宿主的模型层：不读 `modelDirectories`、不写 `selectModel`、不广告 `listModels`。
+- 它只决定「新会话默认选哪个 agent」，与 DSH 的全局默认模型无关。插件**不碰**宿主的模型目录与默认模型：不读 `modelDirectories`、不走 `session/selectModel`、不写 `agentDefaultModel`、不广告 `listModels`；唯一的模型层写入是 guard 用 `agent.model.select()` 记会话路由。
 - 没有绑定、没有 pick、没有默认 agent 时，`routeAgentId` 返回 `undefined`。那是一个答案，不是待填的洞：芯片**严禁**借 `agents[0]?.id` 填一个名字，否则芯片上写着某个 agent 而没有任何消息会送到它那里。
 
 ## 7. agent 锁定
@@ -157,7 +163,7 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 | 消息选择 / 转发 | `src/impl.ts` · `selectForwardPrompt`；`src/bridge.ts` · `streamPrompt` |
 | 工具卡快照 / delta / 输出注册 | `src/impl.ts` · `acpToolCallFromUpdate` / `acpToolCallDelta` / `acpToolCallArgsOf`；`src/bridge.ts` · `recordAcpToolOutput` / `waitForToolOutput`；详见 [protocol.md](./protocol.md) |
 | 绑定 RPC | `src/impl.ts` · `dispatchRpc('session/chat-*')`；`src/bridge.ts` · `bindChatAgent` / `setChatSessionModel` / `setChatSessionEffort` / `setChatSessionMode` |
-| 请求改写 | `presets/acp/acp-guard.mjs`；`src/bridge.ts` · `conversationRouteModel` |
+| 路由选择 / 老宿主请求改写 | `presets/acp/acp-guard.mjs` · `selectBoundRoute` / `agent/request`；`src/bridge.ts` · `conversationRouteModel` |
 | 工作区 | `src/index.ts` · `wireWorkspace`；`src/bridge.ts` · `chatWorkspaceRoot` / `getOrCreateDshSession` / `doResumeSession` |
 | 锁定 | `src/bridge.ts` · `lockedAgentFor` / `lockChatAgent` / `rollbackFirstTurn` / `provisionalLock` |
 | 默认 agent | `src/bridge.ts` · `defaultAgent` / `setDefaultAgent` |
