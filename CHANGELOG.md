@@ -4,6 +4,26 @@
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-11-05
+
+修复 DSH 0.2.2 及更新版本上 NTR 会话无法发送消息的问题。
+
+### 修复
+
+- **acp**：DSH 0.2.2 及更新版本上的 NTR 会话恢复正常发送消息，不再在发送时以路由错误失败。([889cc20](https://github.com/GDWhisper/dsh-ntr/commit/889cc20))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.3.8...v0.3.9
+
+---
+
+NTR conversations send normally again on DSH 0.2.2 and newer.
+
+### Fixed
+
+- **acp**: NTR conversations on DSH 0.2.2 and newer send messages normally instead of failing with a route error. ([889cc20](https://github.com/GDWhisper/dsh-ntr/commit/889cc20))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.3.8...v0.3.9
+
 ## [0.3.8] - 2026-11-05
 
 ### 新增
