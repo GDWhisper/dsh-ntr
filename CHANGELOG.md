@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-11-05
+
 ### 新增
 
 - **acp**：agent 因频率限制拒绝本轮时，输入框上方显示一行「agent 已限流」，正文用 agent 自己写的说明（含重置时间）；没有按钮，切换模型走 composer 里的模型菜单。
@@ -11,7 +13,7 @@
 
 ### 修复
 
-- **acp**：guard 剥离 `runtime-context`、`agent-instructions`、`skill-catalog`、`plugin` 四类来源；只含 `runtime-context` 的唤醒轮以空批次进入，工具续跑步只把过滤后的工具消息交给 adapter，两者都不再以 `blocked` 收尾。
+- **acp**：guard 剥离 `runtime-context`、`agent-instructions`、`skill-catalog`、`plugin` 四类来源；只含 `runtime-context` 的唤醒轮以空批次进入，工具续跑步只把过滤后的工具消息交给 adapter，两者都不再以 `blocked` 收尾。([32b8081](https://github.com/GDWhisper/dsh-ntr/commit/32b8081))
 
 ---
 
@@ -22,7 +24,9 @@
 
 ### Fixed
 
-- **acp**: the guard strips `runtime-context`, `agent-instructions`, `skill-catalog`, and `plugin`; a `runtime-context`-only wake turn enters with an empty batch, and tool continuations pass only filtered tool messages to the adapter, so neither ends as `blocked`.
+- **acp**: the guard strips `runtime-context`, `agent-instructions`, `skill-catalog`, and `plugin`; a `runtime-context`-only wake turn enters with an empty batch, and tool continuations pass only filtered tool messages to the adapter, so neither ends as `blocked`. ([32b8081](https://github.com/GDWhisper/dsh-ntr/commit/32b8081))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.3.7...v0.3.8
 
 ## [0.3.7] - 2026-11-05
 
