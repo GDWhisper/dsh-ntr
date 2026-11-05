@@ -174,6 +174,10 @@ describe('a rate-limited prompt response (quota refusal wiring)', () => {
       expect(refusalsOf(h, mark).length).toBe(0)
 
       await chatTurn(h, 'dsh-quota-clear', 'hello again')
+      // The adapter stream ends at the first tool-card boundary, before the
+      // prompt response settles and the clear is broadcast; waiting for the
+      // ordinary turn/end puts the read after that frame, not on a sleep.
+      await waitFor(h, 'turn/end', event => event.stopReason === 'end_turn', 15_000, mark)
       // The clear is a BROADCAST, not just a field reset: without it the
       // browser keeps a row it was never told changed.
       const after = refusalsOf(h, mark)
