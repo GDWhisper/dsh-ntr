@@ -132,6 +132,9 @@
  *  - "DISPATCHSILENT" (with DISPATCH) → the worker is silent for longer than
  *              the test's ambient quiet window before it reports: the worker
  *              phase has no quiet clock, so the turn must survive it
+ *  - "DISPATCHLONGTOOL" (with DISPATCH) → the worker opens a tool call and then
+ *              emits nothing past the client's SHORT worker silence window: the
+ *              open call must hold on the long tier until the report arrives
  *  - "DISPATCHTWO" (with DISPATCH) → two dispatches; the drain announces
  *              itself while BOTH are still running, the first reports early
  *              (parent text follows) and the second later; the turn must not
@@ -591,6 +594,10 @@ const app = agent({ name: 'mock-acp-agent' })
       // client's worker-phase SILENCE window. Those updates must push that
       // window out instead of letting a fixed total runtime cut the turn.
       const keepAlive = text.includes('DISPATCHKEEPALIVE')
+      // A worker blocked inside ONE long tool call: it opens the call and then
+      // emits nothing for longer than the client's SHORT worker silence
+      // window. The open call alone must move the wait to the long tier.
+      const longTool = text.includes('DISPATCHLONGTOOL')
       // The real first send omits `rawInput` (repl display) AND the title, so
       // its only label source is `_meta.toolName`. The identity arrives later,
       // on the result frame's `_meta` — the shape this variant pins.
@@ -693,7 +700,7 @@ const app = agent({ name: 'mock-acp-agent' })
           status: 'in_progress',
           rawInput: { command: 'rg TODO src' },
         }, id, parent)
-        await sleep(slow ? 400 : 60)
+        await sleep(longTool ? 2_500 : slow ? 400 : 60)
         await sendWorker({
           sessionUpdate: 'tool_call_update',
           toolCallId,

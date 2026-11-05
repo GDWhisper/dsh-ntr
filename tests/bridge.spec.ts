@@ -8388,6 +8388,10 @@ describe('a turn that dispatched a detached worker (isolated manager)', () => {
       // remaining short enough for the no-drain cases.
       ambientQuietMs: 250,
       backgroundTaskMaxMs: 1_500,
+      // The long tier while the worker is inside an open tool call: well above
+      // the mock's 2.5s silent tool, still short enough for a failure to fail
+      // fast.
+      backgroundTaskToolMs: 8_000,
       // The parked case delays the host's next step by 100ms on purpose.
       backgroundParkedGraceMs: 1_000,
     },
@@ -8611,6 +8615,27 @@ describe('a turn that dispatched a detached worker (isolated manager)', () => {
     // worker updates. A fixed total-runtime cap would have closed the turn with
     // the deferral line and lost the drain's answer.
     expect(Date.now() - started).toBeGreaterThan(1_600)
+    expect(text).toContain('DISPATCH-FINAL-ANSWER')
+    expect(text).not.toContain(DEFERRAL_REPORT)
+    expect(text).not.toContain(ZERO_OUTPUT_REPORT)
+  }, 30_000)
+
+  it('keeps holding while the worker is inside one long, silent tool call', async () => {
+    const dshSessionId = 'dsh-dispatch-longtool'
+    const started = Date.now()
+    const { chunks } = await hostLoopTurn(dispatchAdapter, {
+      provider: 'acp',
+      model: 'dispatch',
+      sessionId: dshSessionId,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'DISPATCHLONGTOOL please' }] }],
+    })
+    const text = dispatchText(chunks)
+
+    // The worker opens its Bash call and then says nothing for 2.5s — longer
+    // than `backgroundTaskMaxMs` (1.5s). The open call is the evidence that
+    // keeps the worker phase on the long tier; without it the turn would close
+    // with the deferral line before the report ever arrived.
+    expect(Date.now() - started).toBeGreaterThan(2_000)
     expect(text).toContain('DISPATCH-FINAL-ANSWER')
     expect(text).not.toContain(DEFERRAL_REPORT)
     expect(text).not.toContain(ZERO_OUTPUT_REPORT)

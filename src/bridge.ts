@@ -620,9 +620,23 @@ export interface BridgeTuning {
    * quiet clock before then. Once they have all reported, the drain's own
    * `ambientQuietMs` / `ambientMaxMs` windows take over.
    *
-   * Default 600000 ms (10 minutes of silence, not of total runtime).
+   * Default 600000 ms (10 minutes of silence, not of total runtime). This is
+   * the SHORT tier: while the worker's last known state is an open tool call,
+   * `backgroundTaskToolMs` applies instead.
    */
   backgroundTaskMaxMs?: number
+  /**
+   * The worker phase's LONG tier: how long it may go silent when the worker's
+   * last known state is an OPEN tool call (`tool_call` / `tool_call_update`
+   * carrying `parentToolCallId` without completed / failed). Mirrors the main
+   * turn's {@link BridgeTuning.turnStallToolMs}: a worker blocked inside one
+   * Bash / generation command emits no updates for minutes while it is
+   * perfectly alive, and reading that as death closes the turn before the
+   * report arrives.
+   *
+   * `0` falls back to `backgroundTaskMaxMs`. Default 1800000 ms (30 minutes).
+   */
+  backgroundTaskToolMs?: number
   /**
    * Optional ABSOLUTE ceiling on a detached-worker hold, both phases included.
    * `backgroundTaskMaxMs` keeps an ACTIVE worker alive indefinitely; this is
@@ -747,6 +761,7 @@ const DEFAULT_TUNING: Required<BridgeTuning> = {
   ambientQuietMs: 10_000,
   ambientMaxMs: 120_000,
   backgroundTaskMaxMs: 600_000,
+  backgroundTaskToolMs: 1_800_000,
   backgroundTaskCeilingMs: 0,
   backgroundParkedGraceMs: 30_000,
   ambientStaleMs: 300_000,
@@ -4368,13 +4383,24 @@ class TurnStreamController {
   private pendingBackgroundHold?: BackgroundHold
   /**
    * The hold's own windows, read once at construction like the ambient pair:
-   * `taskMaxMs` is the worker phase's silence window, `ceilingMs` the optional
-   * whole-hold absolute bound (0 = none), `graceMs` the parked hold's bounded
-   * wait for a driver step (see {@link BridgeTuning.backgroundTaskMaxMs} /
+   * `taskMaxMs` is the worker phase's SHORT silence window, `toolMaxMs` its
+   * long tier while the worker's last known state is an open tool call,
+   * `ceilingMs` the optional whole-hold absolute bound (0 = none), `graceMs`
+   * the parked hold's bounded wait for a driver step (see
+   * {@link BridgeTuning.backgroundTaskMaxMs} /
+   * {@link BridgeTuning.backgroundTaskToolMs} /
    * {@link BridgeTuning.backgroundTaskCeilingMs} /
    * {@link BridgeTuning.backgroundParkedGraceMs}).
    */
-  private readonly backgroundTuning: { taskMaxMs: number; ceilingMs: number; graceMs: number }
+  private readonly backgroundTuning: { taskMaxMs: number; toolMaxMs: number; ceilingMs: number; graceMs: number }
+  /**
+   * Tool calls FROM the worker's own turn (updates carrying
+   * `parentToolCallId`) that have not reported completed / failed. They are
+   * the long-tier evidence for the worker phase's silence window: a worker
+   * blocked inside one command is alive, not gone (see
+   * {@link BridgeTuning.backgroundTaskToolMs}).
+   */
+  private readonly workerToolCalls = new Set<string>()
   /**
    * When this controller was built. Only a drain announced AFTER this moment
    * may be adopted by the hold: an `ambient` record that predates the turn is
@@ -4656,7 +4682,7 @@ class TurnStreamController {
     }
     // The response landed: the agent no longer holds a prompt for this turn.
     this.endTurn()
-    hold.hardTimer = setTimeout(() => { this.onBackgroundHard(hold) }, this.backgroundTuning.taskMaxMs)
+    hold.hardTimer = setTimeout(() => { this.onBackgroundHard(hold) }, this.backgroundSilenceMs())
     hold.hardTimer.unref?.()
     this.armBackgroundCeiling(hold)
     const seg = this.segment
@@ -4739,7 +4765,7 @@ class TurnStreamController {
       hold.quietTimer = undefined
     }
     if (hold.hardTimer !== undefined) clearTimeout(hold.hardTimer)
-    hold.hardTimer = setTimeout(() => { this.onBackgroundHard(hold) }, this.backgroundTuning.taskMaxMs)
+    hold.hardTimer = setTimeout(() => { this.onBackgroundHard(hold) }, this.backgroundSilenceMs())
     hold.hardTimer.unref?.()
   }
 
@@ -4759,8 +4785,18 @@ class TurnStreamController {
     const hold = this.activeBackgroundHold()
     if (hold === undefined || hold.phase !== 'worker' || hold.retired) return
     if (hold.hardTimer !== undefined) clearTimeout(hold.hardTimer)
-    hold.hardTimer = setTimeout(() => { this.onBackgroundHard(hold) }, this.backgroundTuning.taskMaxMs)
+    hold.hardTimer = setTimeout(() => { this.onBackgroundHard(hold) }, this.backgroundSilenceMs())
     hold.hardTimer.unref?.()
+  }
+
+  /**
+   * The worker phase's silence window, by the worker's LAST KNOWN state: an
+   * open worker tool call gets the long tier (`toolMaxMs`), an idle one the
+   * short tier (`taskMaxMs`). Same shape as the main turn's
+   * `turnStallMs` / `turnStallToolMs` pair.
+   */
+  private backgroundSilenceMs(): number {
+    return this.workerToolCalls.size > 0 ? this.backgroundTuning.toolMaxMs : this.backgroundTuning.taskMaxMs
   }
 
   /** Arm the hold's optional absolute ceiling (0 = unlimited). */
@@ -5045,6 +5081,7 @@ class TurnStreamController {
     if (meta?.parentToolCallId !== undefined) {
       const parent = this.dispatches.get(meta.parentToolCallId)
       if (parent !== undefined) {
+        this.trackWorkerToolCall(kind, toolCallId, status)
         this.noteBackgroundWorkerActivity()
         parent.detached = true
         parent.sawWorkerUpdate = true
@@ -5058,6 +5095,19 @@ class TurnStreamController {
         this.startBackgroundDrain(held, meta.unsolicitedTurn.requestId)
       }
     }
+  }
+
+  /**
+   * Mirror one tool call of the WORKER's own turn into the long-tier evidence
+   * set: a call announced (or still in progress) keeps the worker "busy";
+   * completed / failed clears it. An UPDATE without a status carries no news
+   * either way (same rule as the main turn's `activeToolCalls`).
+   */
+  private trackWorkerToolCall(kind: string, toolCallId: string, status: string): void {
+    if (toolCallId === '' || (kind !== 'tool_call' && kind !== 'tool_call_update')) return
+    if (status === 'completed' || status === 'failed') this.workerToolCalls.delete(toolCallId)
+    else if (status === 'pending' || status === 'in_progress') this.workerToolCalls.add(toolCallId)
+    else if (kind === 'tool_call' && status === '') this.workerToolCalls.add(toolCallId)
   }
 
   /**
@@ -6302,16 +6352,20 @@ export class BridgeManager {
   /**
    * The detached-worker hold's windows, read once at controller construction
    * for the same reason as {@link ambientTuning}: `taskMaxMs` is the worker
-   * phase's SILENCE window, pushed out by every dispatch / worker update (see
-   * {@link BridgeTuning.backgroundTaskMaxMs}), `ceilingMs` its optional
+   * phase's SHORT silence window, `toolMaxMs` its long tier while the worker's
+   * last known state is an open tool call (0 falls back to the short one), both
+   * pushed out by every dispatch / worker update (see
+   * {@link BridgeTuning.backgroundTaskMaxMs} /
+   * {@link BridgeTuning.backgroundTaskToolMs}); `ceilingMs` their optional
    * absolute bound (0 = none) and `graceMs` the bounded wait a PARKED hold
    * gives the host to open its continuation step (see
    * {@link BridgeTuning.backgroundParkedGraceMs}). The drain phase reuses
    * {@link ambientTuning}.
    */
-  get backgroundTuning(): { taskMaxMs: number; ceilingMs: number; graceMs: number } {
+  get backgroundTuning(): { taskMaxMs: number; toolMaxMs: number; ceilingMs: number; graceMs: number } {
     return {
       taskMaxMs: this.tuning.backgroundTaskMaxMs,
+      toolMaxMs: this.tuning.backgroundTaskToolMs > 0 ? this.tuning.backgroundTaskToolMs : this.tuning.backgroundTaskMaxMs,
       ceilingMs: this.tuning.backgroundTaskCeilingMs,
       graceMs: this.tuning.backgroundParkedGraceMs,
     }
