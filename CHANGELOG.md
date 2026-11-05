@@ -4,6 +4,24 @@
 
 ## [Unreleased]
 
+带工具调用的回合恢复正常：跑完、给出回答，工具卡显示真实输出（[#10](https://github.com/GDWhisper/dsh-ntr/issues/10)）。
+
+### 修复
+
+- **acp**：派了后台 worker 的回合，在 worker 卡着一个未完成的工具调用时改用更长的静默窗等它（`backgroundTaskToolMs`，默认 30 分钟），迟到的报告不再丢。([3151282](https://github.com/GDWhisper/dsh-ntr/commit/3151282))
+- **acp**：带工具调用的回合跑完并给出正文回答，不再在工具卡之后立刻结束、界面只显示「已完成」。([0aac54a](https://github.com/GDWhisper/dsh-ntr/commit/0aac54a)) ([#10](https://github.com/GDWhisper/dsh-ntr/issues/10))
+- **acp**：宿主的记忆召回一类上下文注入不再进入 NTR 会话的消息记录。([0aac54a](https://github.com/GDWhisper/dsh-ntr/commit/0aac54a)) ([#10](https://github.com/GDWhisper/dsh-ntr/issues/10))
+- **acp**：聊天里的工具卡显示该次调用的真实输出，不再是「ran inside the ACP agent process」占位文字。([864ccb3](https://github.com/GDWhisper/dsh-ntr/commit/864ccb3)) ([#10](https://github.com/GDWhisper/dsh-ntr/issues/10))
+
+---
+
+### Fixed
+
+- **acp**: a turn that dispatched a background worker waits on a longer silence window while the worker sits inside an unfinished tool call (`backgroundTaskToolMs`, 30 minutes by default), so a late report is no longer lost. ([3151282](https://github.com/GDWhisper/dsh-ntr/commit/3151282))
+- **acp**: a turn that calls a tool runs to completion and answers in prose instead of ending right after the tool card with only "已完成" in the UI. ([0aac54a](https://github.com/GDWhisper/dsh-ntr/commit/0aac54a)) ([#10](https://github.com/GDWhisper/dsh-ntr/issues/10))
+- **acp**: host context injections such as memory recalls no longer enter an NTR conversation's message record. ([0aac54a](https://github.com/GDWhisper/dsh-ntr/commit/0aac54a)) ([#10](https://github.com/GDWhisper/dsh-ntr/issues/10))
+- **acp**: a tool card in the chat shows that call's real output instead of the "ran inside the ACP agent process" pointer. ([864ccb3](https://github.com/GDWhisper/dsh-ntr/commit/864ccb3)) ([#10](https://github.com/GDWhisper/dsh-ntr/issues/10))
+
 ## [0.3.9] - 2026-11-05
 
 修复 DSH 0.2.2 及更新版本上 NTR 会话无法发送消息的问题。
