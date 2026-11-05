@@ -208,6 +208,16 @@ Normal. Mode lists are declared by each agent itself (sent via `session/set_mode
 
 That's stale dependency state, not a missing plugin file: the failing path will contain `node_modules/dsh-ntr/node_modules/.pnpm/...`. The source install uses `link:` to your checkout; pnpm's hoisted layout replaces the package directory with the registry files but leaves the link target's `node_modules` behind. That old tree (an older `@agentclientprotocol/sdk` plus its broken `zod` symlink) shadows the freshly installed dependency, so DSH's import hits the bad link and fails with `EPERM`. Fix: uninstall `dsh-ntr` in the plugin manager, remove `~/.dsh/profiles/<profile>/node_modules/dsh-ntr` (or just its nested `node_modules`), then reinstall and restart. For the desktop app's profile, uninstall/reinstall from the app's Plugins page instead of the CLI.
 
+**An NTR session shows `Error: unknown tool "xxx"` followed by a "Tool added: xxx" line. What is that?**
+
+Display-layer noise from the host's card execution record. It is not a failed tool call in the agent.
+
+In an NTR session the agent's tools run inside its own process, and the host only receives notifications. The host still executes each card once, because that execution record is what draws the card. The host has no definition for that name, so the guard registers a virtual tool at execution time and answers with the output the bridge recorded.
+
+But the step's executable tool set is fixed before the request goes out. A tool registered during execution cannot join that step. So the first call of that tool name records `unknown tool`, and the next request assembly sees one extra tool and writes the "Tool added" line.
+
+Impact: this happens once per tool name per session. The turn is not interrupted and the agent is unaffected. That card shows no mirrored output; the real output is in the NTR tab.
+
 ---
 
 ## What it can do (feature list)
