@@ -2,9 +2,9 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
-## [Unreleased]
+## [0.3.10] - 2026-11-06
 
-带工具调用的回合恢复正常：跑完、给出回答，工具卡显示真实输出（[#10](https://github.com/GDWhisper/dsh-ntr/issues/10)）。
+带工具调用的回合恢复正常：跑完、给出回答，工具卡显示真实输出（[#10](https://github.com/GDWhisper/dsh-ntr/issues/10)）；NTR 会话的侧边栏标题自动取首条用户消息（[#11](https://github.com/GDWhisper/dsh-ntr/issues/11)）。
 
 ### 修复
 
@@ -12,6 +12,9 @@
 - **acp**：带工具调用的回合跑完并给出正文回答，不再在工具卡之后立刻结束、界面只显示「已完成」。([0aac54a](https://github.com/GDWhisper/dsh-ntr/commit/0aac54a)) ([#10](https://github.com/GDWhisper/dsh-ntr/issues/10))
 - **acp**：宿主的记忆召回一类上下文注入不再进入 NTR 会话的消息记录。([0aac54a](https://github.com/GDWhisper/dsh-ntr/commit/0aac54a)) ([#10](https://github.com/GDWhisper/dsh-ntr/issues/10))
 - **acp**：聊天里的工具卡显示该次调用的真实输出，不再是「ran inside the ACP agent process」占位文字。([864ccb3](https://github.com/GDWhisper/dsh-ntr/commit/864ccb3)) ([#10](https://github.com/GDWhisper/dsh-ntr/issues/10))
+- **acp**：NTR 会话的侧边栏标题自动取首条用户消息。([713ec0f](https://github.com/GDWhisper/dsh-ntr/commit/713ec0f)) ([#11](https://github.com/GDWhisper/dsh-ntr/issues/11))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.3.9...v0.3.10
 
 ---
 
@@ -21,6 +24,9 @@
 - **acp**: a turn that calls a tool runs to completion and answers in prose instead of ending right after the tool card with only "已完成" in the UI. ([0aac54a](https://github.com/GDWhisper/dsh-ntr/commit/0aac54a)) ([#10](https://github.com/GDWhisper/dsh-ntr/issues/10))
 - **acp**: host context injections such as memory recalls no longer enter an NTR conversation's message record. ([0aac54a](https://github.com/GDWhisper/dsh-ntr/commit/0aac54a)) ([#10](https://github.com/GDWhisper/dsh-ntr/issues/10))
 - **acp**: a tool card in the chat shows that call's real output instead of the "ran inside the ACP agent process" pointer. ([864ccb3](https://github.com/GDWhisper/dsh-ntr/commit/864ccb3)) ([#10](https://github.com/GDWhisper/dsh-ntr/issues/10))
+- **acp**: an NTR session's sidebar title comes from its first user message. ([713ec0f](https://github.com/GDWhisper/dsh-ntr/commit/713ec0f)) ([#11](https://github.com/GDWhisper/dsh-ntr/issues/11))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.3.9...v0.3.10
 
 ## [0.3.9] - 2026-11-05
 
