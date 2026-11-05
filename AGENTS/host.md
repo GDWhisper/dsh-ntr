@@ -64,7 +64,7 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 | 1 | bundle patch / preset | `dsh.bundle.patch`；`@deepseek-ai/dsh-agent-preset` 的 `config.{id,name,description,order,plugins}`；`persona` 的 `complete` / `includeRuntimeContext`；插件名按 profile 基准解析 | `package.json`、`presets/acp/acp.patch.yml` |
 | 2 | Cordis 入口与服务 | 具名 `name` / `inject` / `apply`；`ctx.connection.register(owner, '/acp', …)`；`ctx.connection.fetch.register({ path, methods, fetch })`，path 必须是 `/api/…` 完整路径；可选服务 `ctx.get` / `ctx.inject` | `src/index.ts` |
 | 3 | LLM adapter | `ctx.llm.registerAdapter(['acp'], …)`；`LlmAdapter` 的 `providerInfo` / `providerRetryPolicy` / `imageRequestPricing` / `listModels` / `resolveModel` / `prepareCall` / `stream`（前三个在注册 / 计费路径被无条件调用）；`GenerateOptions`（`sessionId` / `messages` / `model` / `purpose` / `signal`）；`StreamChunk` 词表 | `src/bridge.ts` · `AcpLlmAdapter` / `streamPrompt` |
-| 4 | 路由与步进 seam | `agent.model.select/current`；`agent/inbox/inserted` / `claimed` 与 `preStep` 取路由的先后；`agent/request` waterfall（仅老宿主）；`agent/pre-step` 的 decision 形状与 waterfall 顺序 | `presets/acp/acp-guard.mjs` · `selectBoundRoute` / 闸门 / 改写 |
+| 4 | 路由与步进 seam | `agent.model.select/current`；`agent/inbox/inserted` / `claimed` 与 `preStep` 取路由的先后；`agent/request` waterfall（仅老宿主）；`agent/pre-step` 的 decision 形状与 waterfall 顺序；**`decision.messages` 只是本步 inbox 认领 + loop 自己的 runtime-context 投影，不是请求消息**（adapter 拿到的 `GenerateOptions.messages` 来自 `session.deriveMessages()`，即整份 transcript）；工具结果**不进** next-step inbox（loop 只 stage 工具自己的 `additionalContexts`）；`step()` 无条件追加自己那份 runtime-context 投影，闸门剥不掉它，只能决定它的位置 | `presets/acp/acp-guard.mjs` · `selectBoundRoute` / 闸门 / 改写 |
 | 5 | 工具卡执行 | `tools/execute` 的 `{ name, agent, callId }`；`ctx.tools.get(name, agent)` / `register(def)`；`message.source.kind === 'tool'` 与 `callId` | `presets/acp/acp-guard.mjs` |
 | 6 | 会话事实 | `agent-preset/selected` 事件；`sessions.get` 的 `events`；`sessionPersistence.open` 的 `header`（冷会话 preset）；`agentPresets.list` | `src/index.ts` · `wireAcpMode` / `wirePresetRoster`；`src/impl.ts` · `sessionAgentPreset` |
 | 7 | 浏览器槽位与宿主原语 | `conversation.input.model` / `left` / `overlay` / `dock`、`conversation.view`、`conversation.composer.dock`、`conversation.chat.assistant-actions`、`shell.overlay`；projection `agentPreset`；`ctx.slots.inject` / `entriesOfSlot` / `uiSession.adapter.current`；`sessions.fork` 与 `remote.$on('agent-preset/selected')` | `src/client/` |
@@ -82,8 +82,8 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 | 实时面全静默（transcript 不增量、审批卡 / 释放与限流横幅不出现，但 RPC 可用） | `ctx.connection.fetch.register` 的 `/api/…` 路径校验与 SSE 响应形态 | 路由表或流式响应契约变化 |
 | 启动即报 adapter 无效 / NTR 完全没有服务 | `LlmAdapter` 注册期成员（`providerInfo`、`providerRetryPolicy`） | 注册期必调成员新增或改名 |
 | NTR 会话被宿主模型回答（没进 ACP） | `agent.model.select` 是否存在；`inbox/inserted` / `claimed` 是否仍早于路由读取 | 选择写入没生效，路由落到部署默认 |
-| 回合以 `blocked` 收尾 / 工具续跑断 | `agent/pre-step` decision 形状、source kind 常量、`tools/execute` 载荷 | 闸门误拒或剥离清单过期 |
-| NTR 对话里出现宿主注入（项目指令 / runtime-context / model changed） | `agent/pre-step` decision 形状、`message.source.kind` 常量 | 闸门 fail-open 或剥离清单过期 |
+| 回合以 `blocked` 收尾 / 工具续跑断 | 宿主 `turn()` 里 `preStep` 的 `reject` 分支（`blocked` 记在 `step/start` **之前**：日志里没有第二个 `step/start` 就是这条路）；guard 闸门的保留白名单 | 闸门把宿主新增的注入种类当成「外来批次」拒了——0.3.8 之前是 `runtime-context`，0.3.9 之前是 `dsh-mnemon`；改成白名单后不再依赖种类清单 |
+| NTR 对话里出现宿主注入（项目指令 / 记忆召回 / model changed） | `agent/pre-step` decision 形状、`message.source.kind` 常量 | 闸门 fail-open；runtime-context 那一条剥不掉（`step()` 自己会追加） |
 | 模型底座 / 座位 / 选择器消失或露出原生控件 | 槽位名（含 `conversation.input.overlay`）、`entriesOfSlot`、projection key | 客户端槽位或投影改名 |
 | 审批卡 / 释放横幅不出现 | `conversation.input.dock`、`session/update` 折叠 | dock 槽位或事件形状变化 |
 | 内置更新不可用 | `pluginManager` 方法面 | 服务或方法签名变化 |

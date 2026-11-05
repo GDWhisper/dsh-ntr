@@ -555,60 +555,6 @@ describe('acp-guard preset row', () => {
     }
   })
 
-  it('lets its own continuation steps through, and still refuses a foreign staged batch', async () => {
-    // The third duty's exception is back with the fourth: a staged batch whose
-    // every call id the bridge recorded is the continuation of OUR cards (the
-    // adapter resumes the same in-flight prompt for it). One unknown id makes
-    // the batch foreign — forwarding it would re-send the person's last words.
-    const { routeBindingRegistry } = await import('../src/bridge.ts')
-    routeBindingRegistry().toolResults.set('own-1', 'output')
-    try {
-      const ctx = guardCtx()
-      await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
-      const step = ctx.listeners.get('agent/pre-step')
-      if (step === undefined) throw new Error('guard registered no pre-step listener')
-
-      const own = {
-        messages: [
-          { role: 'tool', source: { kind: 'tool', callId: 'own-1' }, content: [{ type: 'text', text: 'output' }] },
-        ],
-      }
-      expect(await step.listener(own, async () => ({ kind: 'enter', messages: own.messages })))
-        .toEqual({ kind: 'enter', messages: own.messages })
-
-      const foreign = {
-        messages: [
-          { role: 'tool', source: { kind: 'tool', callId: 'own-1' }, content: [{ type: 'text', text: 'output' }] },
-          { role: 'tool', source: { kind: 'tool', callId: 'never-seen' }, content: [{ type: 'text', text: '?' }] },
-        ],
-      }
-      expect(await step.listener(foreign, async () => ({ kind: 'enter', messages: foreign.messages })))
-        .toEqual({ kind: 'reject' })
-    } finally {
-      routeBindingRegistry().toolResults.clear()
-    }
-  })
-
-  it('rejects a continuation step fed with nothing the person said', async () => {
-    // The oml session bug: the host loop re-runs whenever the settled
-    // assistant message carries tool-call blocks — which is what the ACP
-    // agent's display-only tool cards are. The next step's batch is the
-    // staged tool results, and forwarding it re-sent the person's last words
-    // to the agent on every step. `reject` ends the turn instead.
-    const ctx = guardCtx()
-    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
-    const preStep = ctx.listeners.get('agent/pre-step')
-    if (preStep === undefined) throw new Error('guard registered no agent/pre-step listener')
-
-    const toolResult = { role: 'user', source: { kind: 'tool', callId: 'c1' }, content: [{ type: 'text', text: 'Error: unknown tool "Bash"' }] }
-    const context = { role: 'user', source: { kind: 'runtime-context', form: 'snapshot' }, content: [{ type: 'text', text: 'Current runtime context.' }] }
-    const decision = await preStep.listener({ messages: [toolResult, context], turn: 2, step: 2 }, async () => ({
-      kind: 'enter',
-      messages: [toolResult, context],
-    }))
-    expect(decision).toEqual({ kind: 'reject' })
-  })
-
   it('keeps a batch that carries the person\'s words and still strips the injections', async () => {
     const ctx = guardCtx()
     await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))

@@ -9,37 +9,50 @@
  * appended after them. A bridge that forwarded "the last user message" would
  * hand the ACP agent the harness's context instead of the question. dsh-ntr's
  * bridge filters by `message.source.kind`, and this row is the second line of
- * defence: it removes the injections before they are even committed, so the
- * session's durable transcript shows the conversation and nothing else.
+ * defence: it removes the injections before `step()` commits them, so the
+ * session's durable transcript — which is what `deriveMessages()` feeds the
+ * adapter — shows the conversation and nothing else. One exception is the
+ * host's own runtime-context projection: `step()` recomputes and appends it
+ * whether or not this gate let a copy through, so all stripping decides there
+ * is its position, not its presence.
  *
- * STRIPPED SOURCES: `agent-instructions` and `skill-catalog` are the two
- * automatic reminders shipped presets add; `runtime-context` is the host's
- * own snapshot source (the constant is `runtime-context` in `dsh-agent-loop`,
- * NOT `plugin`); every `plugin`-sourced message (notices, relays, recalls) is
- * harness context by construction. `model-selection` is the host's "model
- * changed" notice: it describes the harness route (`acp/<agent>@<choice>`),
- * which this conversation does not expose and must not forward. `user` and
- * `tool` sources are kept: the first is the person, the second is
- * loop-internal continuity this session still needs.
+ * KEPT SOURCES — AN ALLOW LIST, NOT A DENY LIST: only `user` (the person) and
+ * `tool` (the loop's own continuity) survive, plus a message with no `source`
+ * at all (the hand-built-request convention the bridge's forward picker uses).
+ * Everything else the harness contributes is context by construction: its
+ * identity, the AGENTS.md digest (`agent-instructions`), the skill catalog, the
+ * runtime snapshot (`runtime-context` — the host's own constant, NOT `plugin`),
+ * memory recalls (`dsh-mnemon`), plugin notices, and the "model changed"
+ * notice (`model-selection`), which describes a harness route this
+ * conversation does not expose.
  *
- * NO-USER-INPUT STEPS ARE REJECTED (third duty) — with ONE exception: the
- * continuation steps of this row's OWN display cards. A batch that carries no
- * user-sourced message is the fuel of a host-side CONTINUATION step — the
- * agent loop re-runs whenever the settled assistant message contains
- * `tool-call` blocks, which is exactly what the ACP agent's segmented stream
- * produces (one card-bearing message per tool activity; see
- * docs/acp-convergence.md §1.7). The host "executes" the cards and proposes
- * the next step fed with those results, and the adapter answers that step by
- * resuming the SAME in-flight `session/prompt` from the transcript cursor —
- * never by sending a new one. Forwarding an arbitrary such batch would
- * re-send the person's last words to the ACP agent — the agent runs its OWN
- * loop and must hear a prompt once — so anything whose staged tool results
- * the bridge never saw is refused (`reject` ends the turn). But a batch whose
- * every staged call id sits in the shared registry (`toolResults`) is one of
- * OUR continuation steps and passes. Batches that DO carry user input keep
- * flowing (stripped as configured), and a source-less message counts as user
- * input — the same convention the bridge's forward picker uses, so a
- * hand-assembled batch is never eaten.
+ * Naming the kinds to DROP instead was issue #10 twice over: every host release
+ * adds an injection, and a kind missing from the list left a residue in a
+ * continuation step's batch — which the refusal below turned into
+ * `turn/end {kind:"blocked"}`, killing the whole turn. `strippedSources` still
+ * names kinds to drop; supplying it REPLACES the allow list, so `[]` keeps
+ * everything (the debugging hatch it always was).
+ *
+ * A CONTINUATION STEP IS NEVER REFUSED (third duty). The driver proposes a next
+ * step whenever the settled assistant message carries `tool-call` blocks —
+ * exactly what the ACP agent's segmented stream produces (one card-bearing
+ * message per tool activity; see docs/acp-convergence.md §1.8). That step's
+ * batch holds NO tool result: `dsh-agent-loop` stages only a tool's own
+ * `additionalContexts` into the next-step inbox, and the request the adapter
+ * reads is `session.deriveMessages()` — the whole transcript, not this batch.
+ * So the batch is whatever the harness injected plus the loop's own
+ * runtime-context projection (which `step()` appends to the transcript whether
+ * or not it survived this gate), and after the allow list it is EMPTY.
+ *
+ * Refusing it would end the turn; entering it hands the decision to the adapter,
+ * which is already the authority (`isAcpToolContinuation` in src/impl.ts): it
+ * resumes the SAME in-flight `session/prompt` from the transcript cursor — never
+ * sending a new one, so the person's words reach the agent exactly once — and
+ * closes with one pointer line when no turn of ours is live. An empty batch on
+ * a FIRST step stays the plain enter: the loop ends it as a completed no-op
+ * (the injected-wake path). Only a batch left with neither the person nor a
+ * tool result is refused, which the allow list makes unreachable unless an
+ * explicit `strippedSources` override put foreign kinds back.
  *
  * DISPLAY CARDS EXECUTE AS REAL RESULTS (fourth duty): the card the Chat
  * plane draws IS the execution record, so the call must execute and record a
@@ -58,9 +71,9 @@
  * error-result behavior.
  *
  * Config:
- *   strippedSources?: string[]  — source kinds to strip (default below; `[]`
- *                                 disables the filter, e.g. to debug what the
- *                                 harness is injecting).
+ *   strippedSources?: string[]  — source kinds to drop, REPLACING the allow
+ *                                 list below (`[]` keeps everything, e.g. to
+ *                                 debug what the harness is injecting).
  *
  * ROUTE (second duty): the host driver resolves each step's route as "pending
  * selection → last request header → deployment default". A session that has
@@ -113,20 +126,33 @@
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'acp-guard'
 
-/** Source kinds stripped from every proposed step unless configured otherwise. */
-const DEFAULT_STRIPPED_SOURCES = ['agent-instructions', 'skill-catalog', 'runtime-context', 'plugin', 'model-selection']
+/** The source kinds a proposed step keeps (see the module header). */
+const KEPT_SOURCES = new Set(['user', 'tool'])
 
 /** The shared binding registry's key — hand-copy of `ACP_ROUTE_BINDING_KEY` (src/bridge.ts). */
 const BINDING_KEY = Symbol.for('dsh-ntr.acp-binding')
 
-/** Read and validate the `strippedSources` list. */
-function strippedSourcesOf(config) {
+/**
+ * The keep-predicate for one proposed step's messages: the allow list, or the
+ * configured deny list replacing it. A source-less message is always kept — a
+ * hand-built request (tests, headless callers) carries no provenance.
+ */
+function messageFilterOf(config) {
   const value = config?.strippedSources
-  if (value === undefined) return new Set(DEFAULT_STRIPPED_SOURCES)
+  if (value === undefined) {
+    return message => {
+      const kind = message?.source?.kind
+      return typeof kind !== 'string' || KEPT_SOURCES.has(kind)
+    }
+  }
   if (!Array.isArray(value) || value.some(item => typeof item !== 'string')) {
     throw new TypeError(`${name}: strippedSources must be an array of source-kind strings`)
   }
-  return new Set(value)
+  const stripped = new Set(value)
+  return message => {
+    const kind = message?.source?.kind
+    return typeof kind !== 'string' || !stripped.has(kind)
+  }
 }
 
 /**
@@ -185,21 +211,6 @@ function toolOutputFor(callId) {
     return typeof text === 'string' && text !== '' ? text : undefined
   } catch {
     return undefined
-  }
-}
-
-/**
- * Whether the bridge saw this call id in the ACP update stream — the marker
- * that a staged tool result belongs to this row's own continuation steps (and
- * not to some foreign continuation this gate must refuse).
- */
-function registryHasToolCall(callId) {
-  try {
-    if (typeof callId !== 'string' || callId === '') return false
-    const registry = globalThis[BINDING_KEY]
-    return registry?.toolResults?.has?.(callId) === true
-  } catch {
-    return false
   }
 }
 
@@ -263,7 +274,7 @@ const TOOL_OUTPUT_WAIT_MS = 30 * 60 * 1000
  * @param config - optional `strippedSources` override.
  */
 export function apply(ctx, config) {
-  const stripped = strippedSourcesOf(config)
+  const keep = messageFilterOf(config)
   const virtualDefs = makeVirtualDefs()
   // The route, before DSH 0.2.2's `preStep` captures it: `inbox/inserted` is
   // the synchronous splice that wakes the driver, and `inbox/claimed` fires
@@ -275,44 +286,28 @@ export function apply(ctx, config) {
   // Outermost: the harness's own `installModelSelection` appends its "model
   // changed" notice AFTER calling `next()`, so only a prepended gate sees (and
   // strips) it. Inner listeners that add messages run inside this gate too —
-  // which is exactly the contract: nothing but the person reaches the agent.
+  // which is exactly the contract, and exactly why the filter is an allow list:
+  // a host-plane row this package has never heard of (issue #10's `dsh-mnemon`)
+  // lands here as well. Nothing but the person and the loop's own tool
+  // continuity reaches the agent.
   ctx.on('agent/pre-step', async (_payload, next) => {
     // Downstream failures propagate untouched; only this gate's own logic is guarded.
     const decision = await next()
     if (decision.kind === 'reject') return decision
     try {
       if (!Array.isArray(decision.messages)) return decision
-      let kept = decision.messages
-      if (stripped.size > 0) {
-        const filtered = kept.filter(message => {
-          const kind = message?.source?.kind
-          return typeof kind !== 'string' || !stripped.has(kind)
-        })
-        if (filtered.length !== kept.length) kept = filtered
-      }
-      // The ONE legal no-user step: the continuation of this row's own display
-      // cards. Every message left after stripping is a staged tool result whose
-      // call id the bridge recorded; the adapter answers that step by resuming
-      // the same in-flight ACP prompt (see the module header). Anything else
-      // with no user input still rejects — forwarding it would re-send the
-      // person's last words to the agent. An EMPTY batch keeps the plain enter:
-      // the loop ends a first step with no messages as a completed no-op (the
-      // injected-wake path). The accepted batch is the FILTERED one: harness
-      // injections are stripped, so the adapter sees the tool results alone.
-      const isOwnToolContinuation = kept.length > 0 && kept.every(message => {
-        if (message?.source?.kind !== 'tool') return false
-        const callId = message?.source?.callId ?? message?.toolCallId
-        return registryHasToolCall(typeof callId === 'string' ? callId : '')
-      })
-      if (isOwnToolContinuation) {
-        return kept === decision.messages ? decision : { ...decision, messages: kept }
-      }
-      const hasUserInput = kept.some(message => {
+      const kept = decision.messages.filter(keep)
+      // The one refusal left: a batch carrying neither the person nor a tool
+      // result is nothing an ACP turn could be about, and entering it would let
+      // the adapter forward the transcript's last user message on a step that
+      // was never meant to speak. The allow list cannot produce such a batch —
+      // this is the explicit `strippedSources` override's safety net.
+      const foreign = kept.length > 0 && !kept.some(message => {
         const kind = message?.source?.kind
-        return kind === undefined || kind === 'user'
+        return kind === undefined || kind === 'user' || kind === 'tool'
       })
-      if (kept.length > 0 && !hasUserInput) return { kind: 'reject' }
-      return kept === decision.messages ? decision : { ...decision, messages: kept }
+      if (foreign) return { kind: 'reject' }
+      return kept.length === decision.messages.length ? decision : { ...decision, messages: kept }
     } catch {
       // A gate bug must never eat context: degrade to keeping every message.
       return decision
@@ -338,8 +333,9 @@ export function apply(ctx, config) {
       }
       return next()
     } catch {
-      // Registration is an upgrade, not a dependency: the old error-result
-      // behavior (and the pre-step gate) still bounds the damage.
+      // Registration is an upgrade, not a dependency: without it the host
+      // records `Error: unknown tool "<name>"` for the card, which is noise in
+      // the transcript and nothing more — the agent ran the tool itself.
       return next()
     }
   })

@@ -143,6 +143,14 @@ turn 2 跑了 4 个 step）给出完整链条：
 原 completed 空转；无 source 的消息算用户输入，与 bridge 取词约定一致）。
 `runtime-context` 是宿主 `dsh-agent-loop` 的快照来源常量，不是 `plugin`。
 
+> **订正（2026-11-05，见 §1.9）**：第 4 点的「下一步的批次只有 staged tool
+> results」不成立——宿主只把工具自己的 `result.additionalContexts` stage 进
+> next-step inbox，本行的虚拟工具不产出 context，所以续跑步批次里**没有**工具
+> 结果，只有宿主注入；adapter 读到的消息列表来自 `session.deriveMessages()`（整份
+> transcript），「原话重发」由 `isAcpToolContinuation`（§1.8 第 4 点）与 prompt
+> 槽位（`claimTurn`）挡住，不靠这条 `reject`。第三职责现已改为白名单剥离，且
+> **绝不拒绝续跑步**；下面这段 strip 名单只作历史记载。
+
 同一次事故还暴露了 delta 语义错位：ACP 的 `tool_call_update` **整包重述**
 `rawInput`，而宿主 accumulator 对 `argumentsDelta` 是**拼接**
 （`previous.args.push(...)`，组装时 `args.join("")`）——把快照当增量，
@@ -245,13 +253,14 @@ callId 显式断块；同 callId 重发的 `tool_call` 按更新折叠。
 3. **宿主制造步**：loop 看见 settled 消息含 `tool-call` 块 → `executeToolCalls`
    → 卡片（guard 的虚拟工具从共享注册表 `toolResults` 取**真实输出**；输出未到
    时工主体 `waitForToolOutput` 挂起，由 `recordAcpToolOutput`、turn settle 或
-   30 分钟兜底解除）→ 续跑下一步（staged tool results）。
+   30 分钟兜底解除）→ 续跑下一步。
 4. **续跑 = 续读**：续跑批次被 `isAcpToolContinuation` 识别，**绝不新发
    `session/prompt`**——`TurnStreamController.startSegment()` 用 transcript
    游标（`cursorSeq`）补读段间事件再订阅，答案 / 后续卡落在后面的新消息里。
    卡片因此夹在两个 assistant 节点之间，与原生多步回合一致。
-5. **guard**：第三职责的唯一例外（本行自己的续跑批次放行，callId 全部在
-   `toolResults` 注册表里）与第四职责（`tools/execute` 虚拟工具）一并复活。
+5. **guard**：第三职责改为**白名单剥离 + 绝不拒绝续跑步**（原「callId 全部在
+   `toolResults` 注册表里才放行」的例外在真实宿主上从未命中，见 §1.9），第四职责
+   （`tools/execute` 虚拟工具）一并复活。
 6. **turn 级语义不变**：`turn/end` 仍只在 `session/prompt` 响应返回时发出
    （强制定稿另有 `session/cancel` 后的 cancel 兜底与后来的无活动看门狗两条
    受控例外，判据见 [AGENTS/protocol.md](../AGENTS/protocol.md) §4 与 §6.1；
@@ -291,6 +300,40 @@ O(1)；浏览器端已由合帧 + memo 吸收。若实测仍有 agent（`usage_u
 （`SessionFormatError: assistant/message repeats advertised tool call`）。修复：
 每 id 保留**首个**块，删重复的 `tool/call` + `tool/result` 审计行，重排 seq。
 现行构建不再产出重复的 tool-call 块，这类旧日志不会再出现。
+
+### 1.9 续跑步被拒的真根因：闸门用黑名单认宿主注入（2026-11-05，issue #10）
+
+0.3.8 把 `runtime-context` 加进剥离名单后，报告人升到 0.3.9 仍然「一带工具就
+`turn/end {kind:"blocked"}`、没有正文回答」。这次直接读了宿主源码
+（`dsh-agent-loop` 0.2.1-rc.5：`AgentLoop.turn()` / `preStep()` / `step()` /
+`executeToolCalls()`），三条事实把之前所有基于日志形状的推断收窄或推翻：
+
+1. **`blocked` 只有一个来源**：`turn()` 里 `preStep` 返回 `{kind:"reject"}` →
+   `turnEnds = {kind:"blocked"}`，并且发生在 `step/start` 之前。报告人日志里
+   「没有第二个 `step/start`」因此就是本行闸门拒绝，不是别的插件。
+2. **续跑步的批次里根本没有工具结果**。`executeToolCalls` 只把工具自己的
+   `result.additionalContexts` stage 进 next-step inbox，而本行的虚拟工具不产出
+   context；adapter 拿到的 `GenerateOptions.messages` 是 `buildRequest` 里的
+   `session.deriveMessages()`——整份 transcript（`tool/result` 帧投影成
+   `role:"tool"` + `source:{kind:"tool",callId}`）。所以续跑步的
+   `decision.messages` = 内层监听器追加的注入 + loop 自己那份 runtime-context
+   投影，**从来不是「staged tool results」**：§1.8 第 5 点那个「callId 全部在
+   `toolResults` 注册表里」的例外，在真实宿主上从未命中过（本机能过是因为剥完
+   恰好为空，走的是空批次那条路）。
+3. **`step()` 自己会追加 runtime-context 投影**（`if (context !== undefined &&
+   !contextAdmitted)`），闸门剥不剥都照样落进 transcript。0.3.8 说的「剥掉
+   runtime-context」只对「让批次变空」有效，对「transcript 干净」无效。
+
+差异于是落在宿主版本上：0.2.1-rc.5 的续跑步批次剥完为空 → 放行 → 正常续读（所以
+本机复现不出来）；报告人的宿主多了一种记忆注入 `dsh-mnemon`（`form` 为
+`instructions` / `recall`，出现在他 step 1 的 transcript 里即是证据），不在名单
+里 → 剥完还剩两条 → 既无 user 又非全 tool → `reject` → blocked。
+
+**修复**：改成**白名单**——只保留 `user` / `tool` / 无 source 三类，其余
+全按宿主注入剥掉；并且**不再拒绝续跑步**。判定续跑的权威本来就是 adapter
+（`isAcpToolContinuation` 读 transcript）加 prompt 槽位（`claimTurn`），闸门用注册表
+callId 复刻这个判定既冗余又脆；`registryHasToolCall` 随之删除。唯一残留的 `reject`
+只在显式 `strippedSources` 调试口留下「既非 user 也非 tool」的批次时才可能触发。
 
 ---
 

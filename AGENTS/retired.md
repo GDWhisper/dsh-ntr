@@ -88,18 +88,25 @@ ApprovalRequestContext  LedgerFallbackReason  LedgerFallback  ApprovalServiceLik
 nativeApprovalTimeoutMs  permissionFallbackTimeoutMs  DeadlineModeRow  DeadlineRow
 answerBuffer  streamedAnswerLength  pendingToolAnswers  cardOutputs
 acpToolCallDetailsOf  acpToolActivityLine  acpToolActivityOutput  acpToolInputOf
-noteToolActivity
+noteToolActivity  registryHasToolCall  DEFAULT_STRIPPED_SOURCES  isOwnToolContinuation
 useDirectory  resolveDirectory  ModelDirectoryResolver  directoryFor
 ```
 
 > 工具卡路径的符号（`isAcpToolContinuation` / `recordAcpToolOutput` /
 > `toolResults` / `acpToolCallFromUpdate` / `acpToolCallDelta` /
-> `acpToolCallArgsOf` / `registryHasToolCall` / `toolOutputFor` / guard 的
+> `acpToolCallArgsOf` / `toolOutputFor` / guard 的
 > 虚拟工具）**不在**幽灵清单里：它们在 2026-10-19 随 §1.7 的散文形态短暂
 > 退役，又随 [acp-convergence.md](../docs/acp-convergence.md) §1.8 的逐步切分
 > 复活（升级了可等待的 `waitForToolOutput`）。仍退役的是**缓冲重放**那一套
 > （`answerBuffer` / `pendingToolAnswers` / `cardOutputs`）：切段后答案自然
 > 落在卡后的新消息里，缓冲没有存在理由；散文一族
 > （`acpToolActivityLine` / `noteToolActivity` …）同样不要再回来。
+>
+> `registryHasToolCall` / `DEFAULT_STRIPPED_SOURCES` / `isOwnToolContinuation`
+> 是 2026-11-05 退役的（§1.9）：闸门的第三职责改成**白名单剥离**（`KEPT_SOURCES`
+> = `user` / `tool`）且**不再拒绝续跑步**，「按注册表 callId 认出本行自己的续跑
+> 批次」这套判定随之删除——续跑的权威是 adapter 的 `isAcpToolContinuation`（读
+> transcript）加 prompt 槽位，闸门复刻它既冗余又会在宿主新增注入种类时把整轮拒成
+> `blocked`。**严禁**再按 source kind 列黑名单。
 
 `tests/impl.spec.ts` 的 "the retired permission axis" 套件断言其中一部分 helper 已不存在。

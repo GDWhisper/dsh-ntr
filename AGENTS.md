@@ -62,7 +62,7 @@
 ### 转发、preset 与绑定（16–17、22）
 
 16. **只转发人说的话**：`selectForwardPrompt` 按 `message.source.kind === 'user'` 挑消息，**严禁**「最后一条 user 消息」（注入内容折在用户消息之后）；注入唤醒轮不发 NTR 轮次；`purpose !== undefined`（标题 / compaction）在 `getOrCreateDshSession` 之前以 `unsupported_purpose` 失败。→ [architecture.md §2.1](./AGENTS/architecture.md)
-17. **【裁决部分已退役】NTR 模式 = agent preset，loop 不可替换**：`persona` 不挂工具 / 项目指令 / compaction；`agent/pre-step` 拒绝「strip 后仍有内容、却没有用户来源」的批次；绑定由 guard 在 `agent/inbox/inserted` / `agent/inbox/claimed`（后者在 `preStep` 取选择之前，兼收上一次进程遗留的排队输入）里用 `agent.model.select()` 记成会话模型选择，老宿主（无 `agent.model`）才用 `agent/request` 改写。**严禁** `ctx.agents.setFactory` 替换 loop，**严禁**声称 preset 能屏蔽非 ACP 模型；「是否 NTR」读会话日志 preset，**严禁**自建标记位。→ [architecture.md §5](./AGENTS/architecture.md) / [retired.md](./AGENTS/retired.md)
+17. **【裁决部分已退役】NTR 模式 = agent preset，loop 不可替换**：`persona` 不挂工具 / 项目指令 / compaction；`agent/pre-step` 只保留 `user` / `tool` / 无 source 三类消息（**白名单，严禁改回按种类列黑名单剥离**：宿主每版都新增注入种类，漏一个就在续跑步批次里留下残渣，被闸门拒成 `turn/end blocked`），续跑步一律放行、由 adapter 的 `isAcpToolContinuation` 决定续读还是收口；绑定由 guard 在 `agent/inbox/inserted` / `agent/inbox/claimed`（后者在 `preStep` 取选择之前，兼收上一次进程遗留的排队输入）里用 `agent.model.select()` 记成会话模型选择，老宿主（无 `agent.model`）才用 `agent/request` 改写。**严禁** `ctx.agents.setFactory` 替换 loop，**严禁**声称 preset 能屏蔽非 ACP 模型；「是否 NTR」读会话日志 preset，**严禁**自建标记位。→ [architecture.md §5](./AGENTS/architecture.md) / [retired.md](./AGENTS/retired.md)
 22. **【默认模型守卫已退役】插件只写自己的绑定、会话路由选择与默认 agent**：`defaultAgentId` 是插件私有状态，删 agent 必须清空；`session/chat-*` 只写插件映射；guard 经 `agent.model.select()` 把绑定记成该会话的模型选择（直写 agent 的 selection 投影，**不是** `session/selectModel` RPC，不读模型目录、不写全局默认模型、不广告模型）；老宿主才回落 `agent/request` 改写。→ [architecture.md §3、§6](./AGENTS/architecture.md) / [retired.md](./AGENTS/retired.md)
 
 ### 界面（18、20、30、33、34、38、39）
@@ -104,7 +104,7 @@
 
 ## 测试约定
 
-测试在 [`tests/`](./tests)，`.spec.ts` 命名；其余按模块就近（`panel.spec.ts` 设置页、`update.spec.ts` 更新服务），浏览器侧纯逻辑一律放 `acp-view.spec.ts`，不要塞进 `impl.spec.ts`。
+测试在 [`tests/`](./tests)，`.spec.ts` 命名；其余按模块就近（`panel.spec.ts` 设置页、`update.spec.ts` 更新服务、`acp-guard.spec.ts` preset guard 的步进闸门与路由选择），浏览器侧纯逻辑一律放 `acp-view.spec.ts`，不要塞进 `impl.spec.ts`。
 
 - `impl.spec.ts`：纯逻辑单测，无子进程，秒级返回。
 - `register.spec.ts`：Cordis 上下文注册，用 `fakeCtx()` 模拟宿主。

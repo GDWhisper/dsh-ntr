@@ -1,11 +1,16 @@
 /**
  * Regression tests for the ACP preset's step gate (`agent/pre-step`).
  *
- * Issue #10: a continuation step fed only with the host's runtime-context
- * snapshot was rejected, and the host turns every rejection into
- * `turn/end {kind:"blocked"}`. `runtime-context` is the real source constant
- * in `dsh-agent-loop` (not `plugin`), so the gate must strip it exactly like
- * the other harness injections.
+ * Issue #10: a tool-bearing turn ended as `turn/end {kind:"blocked"}` with no
+ * answer. `dsh-agent-loop` records a rejection from the `agent/pre-step`
+ * waterfall as `blocked`, before `step/start` — and the continuation step of a
+ * card-bearing message carries NO tool result in its batch (the loop stages only
+ * a tool's own `additionalContexts`; the adapter reads `deriveMessages()`), so
+ * the batch is whatever the harness injected. A deny list of source kinds missed
+ * one — `runtime-context` first, then the newer host's `dsh-mnemon` — and the
+ * residue tripped the no-user-input refusal. The gate now keeps only `user`,
+ * `tool` and source-less messages, so an injection it has never heard of cannot
+ * end a turn.
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -48,12 +53,19 @@ const runtimeContext = {
   content: [{ type: 'text', text: 'Current runtime context.' }],
 }
 
-describe('acp-guard pre-step source filtering', () => {
-  afterEach(async () => {
-    const { routeBindingRegistry } = await import('../src/bridge.ts')
-    routeBindingRegistry().toolResults.clear()
-  })
+/** The memory recalls a newer host folds into every step (issue #10's residue). */
+const mnemonInstructions = {
+  role: 'user',
+  source: { kind: 'dsh-mnemon', form: 'instructions' },
+  content: [{ type: 'text', text: 'Remembered instructions.' }],
+}
+const mnemonRecall = {
+  role: 'user',
+  source: { kind: 'dsh-mnemon', form: 'recall' },
+  content: [{ type: 'text', text: 'Recalled notes.' }],
+}
 
+describe('acp-guard pre-step source filtering', () => {
   it('enters an empty batch for a runtime-context-only continuation step', async () => {
     const preStep = await mountGuard()
     const decision = await preStep({ messages: [], turn: 4, step: 2 }, nextWith([], runtimeContext))
@@ -66,74 +78,56 @@ describe('acp-guard pre-step source filtering', () => {
     expect(decision).toEqual({ kind: 'enter', messages: [] })
   })
 
-  it('still rejects a foreign non-user, non-tool message', async () => {
+  it('enters the continuation step of a card-bearing message on a host with memory recalls', async () => {
+    // Issue #10 exactly: nothing was claimed for this step, two `dsh-mnemon`
+    // rows rode the waterfall, and the loop appended its own runtime-context
+    // projection. Refusing it ended the whole turn as `blocked`.
     const preStep = await mountGuard()
-    const foreign = { role: 'user', source: { kind: 'goal' }, content: [{ type: 'text', text: 'goal material' }] }
-    const decision = await preStep({ messages: [foreign], turn: 4, step: 2 }, nextWith([foreign]))
-    expect(decision).toEqual({ kind: 'reject' })
+    const batch = [mnemonInstructions, mnemonRecall, runtimeContext]
+    const decision = await preStep({ messages: [], turn: 1, step: 2 }, nextWith(batch))
+    expect(decision).toEqual({ kind: 'enter', messages: [] })
   })
 
-  it('still rejects a staged tool result whose call id is not registered', async () => {
+  it('drops an injection kind it has never heard of', async () => {
     const preStep = await mountGuard()
-    const foreignTool = { role: 'user', source: { kind: 'tool', callId: 'not-ours' }, content: [{ type: 'text', text: '?' }] }
-    const decision = await preStep({ messages: [foreignTool], turn: 4, step: 2 }, nextWith([foreignTool]))
-    expect(decision).toEqual({ kind: 'reject' })
+    const future = { role: 'user', source: { kind: 'some-future-host-section' }, content: [{ type: 'text', text: '?' }] }
+    const decision = await preStep({ messages: [], turn: 2, step: 1 }, nextWith([future]))
+    expect(decision).toEqual({ kind: 'enter', messages: [] })
   })
 
-  it('enters a staged tool continuation whose call id is registered', async () => {
-    const { routeBindingRegistry } = await import('../src/bridge.ts')
-    routeBindingRegistry().toolResults.set('own-1', 'grep output')
+  it('keeps a staged tool result and drops the injections around it', async () => {
     const preStep = await mountGuard()
-    const ownTool = { role: 'user', source: { kind: 'tool', callId: 'own-1' }, content: [{ type: 'text', text: 'grep output' }] }
-    const decision = await preStep({ messages: [ownTool], turn: 4, step: 2 }, nextWith([ownTool]))
-    expect(decision).toEqual({ kind: 'enter', messages: [ownTool] })
+    const staged = { role: 'tool', toolCallId: 'call-1', source: { kind: 'tool', callId: 'call-1' }, content: [{ type: 'text', text: 'grep output' }] }
+    const decision = await preStep({ messages: [], turn: 4, step: 2 }, nextWith([staged, mnemonRecall, runtimeContext]))
+    expect(decision).toEqual({ kind: 'enter', messages: [staged] })
   })
 
-  it('enters a registered tool continuation with runtime-context stripped', async () => {
-    const { routeBindingRegistry } = await import('../src/bridge.ts')
-    routeBindingRegistry().toolResults.set('own-2', 'grep output')
+  it('keeps a tool result whose call id the bridge never recorded', async () => {
+    // The gate is not the authority on whether a continuation is ours: the
+    // adapter decides from the transcript (`isAcpToolContinuation`) and closes
+    // with one pointer line when no turn of ours is live. Refusing here instead
+    // would end the turn.
     const preStep = await mountGuard()
-    const ownTool = { role: 'user', source: { kind: 'tool', callId: 'own-2' }, content: [{ type: 'text', text: 'grep output' }] }
-    const decision = await preStep({ messages: [ownTool, runtimeContext], turn: 4, step: 2 }, nextWith([ownTool, runtimeContext]))
-    expect(decision).toEqual({ kind: 'enter', messages: [ownTool] })
+    const unknown = { role: 'tool', toolCallId: 'not-ours', source: { kind: 'tool', callId: 'not-ours' }, content: [{ type: 'text', text: '?' }] }
+    const decision = await preStep({ messages: [], turn: 4, step: 2 }, nextWith([unknown]))
+    expect(decision).toEqual({ kind: 'enter', messages: [unknown] })
   })
 
-  it('rejects a runtime-context-only batch when strippedSources is empty', async () => {
-    const ctx = guardCtx()
-    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, { strippedSources: [] } as never))
-    const preStep = ctx.listeners.get('agent/pre-step')
-    if (preStep === undefined) throw new Error('guard registered no agent/pre-step listener')
-    const decision = await preStep.listener({ messages: [runtimeContext], turn: 4, step: 2 }, nextWith([runtimeContext]))
-    expect(decision).toEqual({ kind: 'reject' })
-  })
-
-  it('rejects a registered tool continuation carrying a foreign message', async () => {
-    const { routeBindingRegistry } = await import('../src/bridge.ts')
-    routeBindingRegistry().toolResults.set('own-3', 'grep output')
+  it('keeps a hand-built message that carries no source', async () => {
     const preStep = await mountGuard()
-    const ownTool = { role: 'user', source: { kind: 'tool', callId: 'own-3' }, content: [{ type: 'text', text: 'grep output' }] }
-    // `goal` is a real non-stripped source: dsh-goal-round-driver builds user
-    // messages with `source.kind: "goal"` for goal follow-up rounds.
-    const foreign = { role: 'user', source: { kind: 'goal' }, content: [{ type: 'text', text: 'goal round prompt' }] }
-    const decision = await preStep({ messages: [ownTool, foreign], turn: 4, step: 2 }, nextWith([ownTool, foreign]))
-    expect(decision).toEqual({ kind: 'reject' })
+    const bare = { role: 'user', content: [{ type: 'text', text: '你好' }] }
+    const decision = await preStep({ messages: [bare], turn: 1, step: 1 }, nextWith([bare]))
+    expect(decision).toEqual({ kind: 'enter', messages: [bare] })
   })
 
-  it('enters with only the person when the four harness sources accompany it', async () => {
+  it('enters with only the person when the harness sources accompany it', async () => {
     const preStep = await mountGuard()
     const user = { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '你好' }] }
     const agentInstructions = { role: 'user', source: { kind: 'agent-instructions' }, content: [{ type: 'text', text: 'AGENTS.md digest' }] }
     const skillCatalog = { role: 'user', source: { kind: 'skill-catalog' }, content: [{ type: 'text', text: '<available_skills>' }] }
     const pluginNotice = { role: 'user', source: { kind: 'plugin' }, content: [{ type: 'text', text: 'notice' }] }
-    const batch = [user, agentInstructions, skillCatalog, pluginNotice, runtimeContext]
+    const batch = [user, agentInstructions, skillCatalog, pluginNotice, mnemonInstructions, mnemonRecall, runtimeContext]
     const decision = await preStep({ messages: batch, turn: 1, step: 1 }, nextWith(batch))
-    expect(decision).toEqual({ kind: 'enter', messages: [user] })
-  })
-
-  it('keeps the person and strips runtime-context from a mixed batch', async () => {
-    const preStep = await mountGuard()
-    const user = { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '你好' }] }
-    const decision = await preStep({ messages: [user, runtimeContext], turn: 1, step: 1 }, nextWith([user, runtimeContext]))
     expect(decision).toEqual({ kind: 'enter', messages: [user] })
   })
 
@@ -147,6 +141,35 @@ describe('acp-guard pre-step source filtering', () => {
     }
     const decision = await preStep({ messages: [user, notice], turn: 2, step: 1 }, nextWith([user, notice]))
     expect(decision).toEqual({ kind: 'enter', messages: [user] })
+  })
+
+  it('rejects a runtime-context-only batch when strippedSources is empty', async () => {
+    // The debug hatch replaces the allow list, and with it comes the refusal
+    // for a batch left holding nothing an ACP turn could be about.
+    const ctx = guardCtx()
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, { strippedSources: [] } as never))
+    const preStep = ctx.listeners.get('agent/pre-step')
+    if (preStep === undefined) throw new Error('guard registered no agent/pre-step listener')
+    const decision = await preStep.listener({ messages: [runtimeContext], turn: 4, step: 2 }, nextWith([runtimeContext]))
+    expect(decision).toEqual({ kind: 'reject' })
+  })
+
+  it('rejects a foreign batch under an explicit deny list that keeps it', async () => {
+    const ctx = guardCtx()
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, { strippedSources: ['skill-catalog'] } as never))
+    const preStep = ctx.listeners.get('agent/pre-step')
+    if (preStep === undefined) throw new Error('guard registered no agent/pre-step listener')
+    // `goal` is a real non-stripped source: dsh-goal-round-driver builds user
+    // messages with `source.kind: "goal"` for goal follow-up rounds.
+    const foreign = { role: 'user', source: { kind: 'goal' }, content: [{ type: 'text', text: 'goal round prompt' }] }
+    const decision = await preStep.listener({ messages: [foreign], turn: 4, step: 2 }, nextWith([foreign]))
+    expect(decision).toEqual({ kind: 'reject' })
+  })
+
+  it('passes a downstream rejection through untouched', async () => {
+    const preStep = await mountGuard()
+    const decision = await preStep({ messages: [], turn: 1, step: 1 }, async () => ({ kind: 'reject' as const }))
+    expect(decision).toEqual({ kind: 'reject' })
   })
 })
 
