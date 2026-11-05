@@ -137,9 +137,11 @@ turn 2 跑了 4 个 step）给出完整链条：
 
 宿主仍会执行卡片并记录 `unknown tool` 错误 result（卡片渲染依赖宿主的
 `tool/call` 执行记录，插件没有 append 通道，§1.3），这个噪音掐不掉；但续跑必须掐断。
-修复是 guard 的第三职责（`agent/pre-step`）：**strip 之后仍有内容、却没有任何
+修复是 guard 的第三职责（`agent/pre-step`）：strip 名单为 `agent-instructions` /
+`skill-catalog` / `runtime-context` / `plugin`，**strip 之后仍有内容、却没有任何
 用户来源的批次一律 `reject`**（turn 以 blocked 收尾；strip 后为空的注入轮保持
 原 completed 空转；无 source 的消息算用户输入，与 bridge 取词约定一致）。
+`runtime-context` 是宿主 `dsh-agent-loop` 的快照来源常量，不是 `plugin`。
 
 同一次事故还暴露了 delta 语义错位：ACP 的 `tool_call_update` **整包重述**
 `rawInput`，而宿主 accumulator 对 `argumentsDelta` 是**拼接**

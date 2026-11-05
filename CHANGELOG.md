@@ -11,7 +11,7 @@
 
 ### 修复
 
-- **acp**：guard 剥离 `runtime-context` 注入，带工具的续跑步不再被误判为外来批次并以 `blocked` 收尾。
+- **acp**：guard 剥离 `runtime-context`、`agent-instructions`、`skill-catalog`、`plugin` 四类来源；只含 `runtime-context` 的唤醒轮以空批次进入，工具续跑步只把过滤后的工具消息交给 adapter，两者都不再以 `blocked` 收尾。
 
 ---
 
@@ -22,7 +22,7 @@
 
 ### Fixed
 
-- **acp**: the guard strips the `runtime-context` injection, so tool continuations are no longer mistaken for foreign batches and end as `blocked`.
+- **acp**: the guard strips `runtime-context`, `agent-instructions`, `skill-catalog`, and `plugin`; a `runtime-context`-only wake turn enters with an empty batch, and tool continuations pass only filtered tool messages to the adapter, so neither ends as `blocked`.
 
 ## [0.3.7] - 2026-11-05
 

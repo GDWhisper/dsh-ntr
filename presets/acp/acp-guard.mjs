@@ -13,10 +13,12 @@
  * session's durable transcript shows the conversation and nothing else.
  *
  * STRIPPED SOURCES: `agent-instructions` and `skill-catalog` are the two
- * automatic reminders shipped presets add; every `plugin`-sourced message
- * (runtime-context snapshots, notices, relays, recalls) is harness context by
- * construction. `user` and `tool` sources are kept: the first is the person,
- * the second is loop-internal continuity this session still needs.
+ * automatic reminders shipped presets add; `runtime-context` is the host's
+ * own snapshot source (the constant is `runtime-context` in `dsh-agent-loop`,
+ * NOT `plugin`); every `plugin`-sourced message (notices, relays, recalls) is
+ * harness context by construction. `user` and `tool` sources are kept: the
+ * first is the person, the second is loop-internal continuity this session
+ * still needs.
  *
  * NO-USER-INPUT STEPS ARE REJECTED (third duty) — with ONE exception: the
  * continuation steps of this row's OWN display cards. A batch that carries no
@@ -98,7 +100,7 @@
 export const name = 'acp-guard'
 
 /** Source kinds stripped from every proposed step unless configured otherwise. */
-const DEFAULT_STRIPPED_SOURCES = ['agent-instructions', 'skill-catalog', 'plugin']
+const DEFAULT_STRIPPED_SOURCES = ['agent-instructions', 'skill-catalog', 'runtime-context', 'plugin']
 
 /** The shared binding registry's key — hand-copy of `ACP_ROUTE_BINDING_KEY` (src/bridge.ts). */
 const BINDING_KEY = Symbol.for('dsh-ntr.acp-binding')
@@ -237,18 +239,22 @@ export function apply(ctx, config) {
         if (filtered.length !== kept.length) kept = filtered
       }
       // The ONE legal no-user step: the continuation of this row's own display
-      // cards. Every message is a staged tool result whose call id the bridge
-      // recorded; the adapter answers that step by resuming the same in-flight
-      // ACP prompt (see the module header). Anything else with no user input
-      // still rejects — forwarding it would re-send the person's last words to
-      // the agent. An EMPTY batch keeps the plain enter: the loop ends a first
-      // step with no messages as a completed no-op (the injected-wake path).
+      // cards. Every message left after stripping is a staged tool result whose
+      // call id the bridge recorded; the adapter answers that step by resuming
+      // the same in-flight ACP prompt (see the module header). Anything else
+      // with no user input still rejects — forwarding it would re-send the
+      // person's last words to the agent. An EMPTY batch keeps the plain enter:
+      // the loop ends a first step with no messages as a completed no-op (the
+      // injected-wake path). The accepted batch is the FILTERED one: harness
+      // injections are stripped, so the adapter sees the tool results alone.
       const isOwnToolContinuation = kept.length > 0 && kept.every(message => {
         if (message?.source?.kind !== 'tool') return false
         const callId = message?.source?.callId ?? message?.toolCallId
         return registryHasToolCall(typeof callId === 'string' ? callId : '')
       })
-      if (isOwnToolContinuation) return decision
+      if (isOwnToolContinuation) {
+        return kept === decision.messages ? decision : { ...decision, messages: kept }
+      }
       const hasUserInput = kept.some(message => {
         const kind = message?.source?.kind
         return kind === undefined || kind === 'user'

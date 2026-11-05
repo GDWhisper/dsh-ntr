@@ -115,7 +115,7 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 
 `acp-guard.mjs` 挂三个监听器：
 
-- `agent/pre-step` 步进闸门：过滤注入内容；**拒绝「strip 后仍有内容、却没有用户来源」的批次**，`reject` 使 turn 以 blocked 收尾。空批次仍走原 completed 空转；无 source 的消息算用户输入。**唯一例外**：staged tool results 的每个 callId 都在共享注册表 `toolResults` 里（本行自己卡片的续跑步，§2.2 的逐步切分）——放行，adapter 会续读同一 prompt 而不是转发批次。
+- `agent/pre-step` 步进闸门：过滤注入内容（`agent-instructions` / `skill-catalog` / `runtime-context` / `plugin`）；**拒绝「strip 后仍有内容、却没有用户来源」的批次**，`reject` 使 turn 以 blocked 收尾。空批次仍走原 completed 空转；无 source 的消息算用户输入。**唯一例外**：staged tool results 的每个 callId 都在共享注册表 `toolResults` 里（本行自己卡片的续跑步，§2.2 的逐步切分）——放行，adapter 会续读同一 prompt 而不是转发批次。
 - `tools/execute` 虚拟工具（§2.2）：解析不到的工具名即时注册 agent 作用域虚拟工具，工具体从 `toolResults` 取真实输出，未到则挂 `waitForToolOutput`（记录 / turn settle / 30 分钟兜底解除）。真实工具与缺席的 `tools` 服务原样放行。
 - `agent/request` 路由改写：见 §3。
 
