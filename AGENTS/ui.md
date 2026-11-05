@@ -1,6 +1,6 @@
 # 浏览器半区：座位、芯片与视图
 
-本文是 [AGENTS.md](../AGENTS.md) 的展开层，覆盖 `src/client/` 的会话面接线纪律（§1–§7、§10、§10.1、§12）。
+本文是 [AGENTS.md](../AGENTS.md) 的展开层，覆盖 `src/client/` 的会话面接线纪律（§1–§7、§10、§10.1、§10.2、§12）。
 设置页、保存横幅、更新卡、文案与主题见 [ui-panel.md](./ui-panel.md)（§8、§8.1、§8.2、§9、§11）。
 浏览器半区**严禁**引入 Node 内置模块或 `@agentclientprotocol/sdk`，通信只走 RPC / SSE。
 
@@ -142,7 +142,7 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 
 - **session list 快照两代形态**：DSH 0.1.7-rc.2 是 `{ ids, byId, phase, projectionsBySession }`——没有 `current` 也没有 `currentAddress`；舞台上会话 = `retainedBy.mainView > 0` 的行，preset 在 `byId[id].projectionValues.agentPreset`，subagent 行以 `origin === 'subagent'` 标记。旧运行时才是 `{ current, currentAddress, byId[id].agentPreset }`。
 - 读取一律经 `stagedSessionOf(snapshot, currentSessionId)` / `rowAgentPreset`（`src/client/acp-ui.tsx`），不要再手写 `snapshot.current` / `byId[..].agentPreset`；`currentSessionId` 来自 `uiSession.adapter.current` 的 key，缺失时才回退 mainView 扫描。宿主当前选择没有对应行时**必须** stand down（可能是 subagent 地址），不许拿别的行顶替。
-- **新增 ACP 槽位条目前的隔离检查**：非 NTR 会话里这个槽位必须仍由 DSH 原生条目占位；`single` / `keyed` 用 gate claim；会投影进每条会话的 `list` 槽（`conversation.view` / `conversation.composer.dock`）必须由 `syncAcpMode` 动态注册并在 standDown 释放；纯附加事务条目（权限卡 / 释放横幅 / 分支键）自门禁到本会话确有该事务且不得遮蔽原生条目；组件里的 `return null` 只作最后防线。新增这类条目时，`model-seat.spec.ts` 的 gate host 必须同时断言「ACP 时存在、标准时不存在」。
+- **新增 ACP 槽位条目前的隔离检查**：非 NTR 会话里这个槽位必须仍由 DSH 原生条目占位；`single` / `keyed` 用 gate claim；会投影进每条会话的 `list` 槽（`conversation.view` / `conversation.composer.dock`）必须由 `syncAcpMode` 动态注册并在 standDown 释放；纯附加事务条目（`conversation.input.dock` 的权限卡 / 释放横幅 / 限流横幅、`assistant-actions` 分支键）自门禁到本会话确有该事务且不得遮蔽原生条目；组件里的 `return null` 只作最后防线。新增这类条目时，`model-seat.spec.ts` 的 gate host 必须同时断言「ACP 时存在、标准时不存在」。
 - **失败放开**：服务未就位 / 槽位未声明 / 注册被拒 / 当前是 addressed subagent 路由 / 座位渲染崩溃（slot 错误边界会 abdicate 该条目），都必须回到原生座位并清掉「座位已接管」标志。claim 的 `sync()` 可重跑：下一次求值（store 变更、列表通知、preset 帧、cell 变化）会再试；诊断如实报告每次失败，不假装已安装。唯一允许的失败模式是「不接管」。
 - `ACP_PRESET_ID` 三处必须一致：浏览器半区、宿主 `src/bridge.ts`、声明里的 `config.id`（`presets/acp/acp.patch.yml`）。
 - **可选宿主服务严禁写进 `inject`**（缺服务会让插件整体加载失败；顶层 `inject` 只有 `slots` + `connection`）。只能经 `service<T>(name)` 在调用点 `ctx.get` 惰性解析（缺服务返 `undefined`、服务后到也能拿到），解析包 try/catch（见 `faceFor`）。
@@ -174,6 +174,16 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_command
 - **A1 下每条 CodeBuddy 会话独立进程**：崩溃或空闲释放只把这一条会话的行集变成 `released`，兄弟会话的进程照常活着，横幅不因兄弟会话而提前消失，也不因兄弟会话崩溃而误挂；「恢复进程」只重启本会话的进程。
 - **停止窗口内的消息直接失败**：设置页保存 / 删除 / 停止该 agent 期间到达的聊天消息以 `agent_stopping` 失败，不排队；停止完成后下一条消息正常新建进程（[protocol.md §1](./protocol.md)）。
 
+### 10.2 限流横幅（`acp-quota-banner`，同座）
+
+agent 因配额拒绝本轮时，`conversation.input.dock` 的第三条目 `QuotaBanner`（`src/client/quota-banner.tsx`）在输入框上方显示一行「agent 已限流」+ agent 自己的原文。
+
+- **为什么必须有这一行**：CodeBuddy 对超配额的 `session/prompt` 走 **resolve**（`stopReason: "refusal"`），原因只在响应 `_meta["codebuddy.ai/errorMessage"]` 里，错误路径与 `describeError` 都看不到它。于是回合干净结束、没有报错面、没有 notice——用户的消息看起来被接受了然后被无视。这一行把原因钉在用户正在看的地方。
+- **闸门是纯函数** `quotaRefusalMessage`（无 DOM 可测）：显式 `acpMode === false` 压过残留行；`chatSessionsFor` 必须等于本会话；然后**逐条扫过本会话所有活 `ChatSessionView` 行**（parked 行归释放横幅，且宿主在释放边界清掉 refusal），按该行的 `sessionId` 找**活且未关闭**的 `SessionView` 并读 `quotaRefusal.message`。`SessionView` 不带 DSH 会话 id，活 chat 行是唯一的桥——兄弟会话的 refusal 因此天然漏不进来。**严禁**只取第一条活行：宿主允许两条 LiveSession 短暂共用一个 chat id（并发首轮，见 `session.turnController` 处注释），落在第二条行上的限流必须也看得见。字段缺失（旧宿主半区）一律不渲染。
+- **正文是 agent 原文，逐字**：重置时间在里面，是用户唯一需要的事实；**严禁**改写、截断或总结。**没有按钮**：模型 picker 就在 composer 里，切不切模型是用户的决定，卡片不替他做。
+- **瞬态**：宿主在下一条非限流响应与每个生命周期边界（close / release / resume / forceReset）清掉它并广播 `session/meta`，横幅随之消失；它**绝不**落进 `agents.json` 的 `chatSessions`。注册 `order: 30`（权限卡 10、释放横幅 20 之后），**无条件注册 + 组件自门禁**，与权限卡同 pattern——**不要**改挂 `syncAcpMode` 的 `holdAuxEntries`（那是 `list` 投影槽的规矩，见 §7）。
+- 宽度复用 InputBar 公式（`.ntr-quota-banner`），配色走仓库既有的 `state-error-tertiary` 底 / `state-error-primary` 前景（与 `panel.tsx` 的日志错误行同一对，`var()` 里带 fallback）。`src/` 与 `node_modules/@deepseek-ai/` 里都 grep 不到 `state-danger-*`，宿主 bundle 本身也只引用 `state-error-primary`——所以「宿主有 danger 档」这一条我核实不了，写成约定而非事实；宿主真新增 danger 档 token 时再改（约束 34）。
+
 ## 12. 消息动作接管（分支按钮）
 
 NTR 会话里，宿主的点赞 / 点踩 / 分支三图标是插件的业务：agent 自己决定反馈面，而宿主的分支会分出一条 agent 不记得上文的会话。插件把三图标藏掉、在同一位置自绘分支入口（`src/client/branch-action.tsx` · `AcpBranchAction`）；分叉的两段链路见 [protocol.md §1](./protocol.md)。**A1 例外**：CodeBuddy 的 fork 能力位被强制写成 `false`（[state.md §3.2](./state.md)），分支入口按行 `fork` 字段禁用，点击不发任何会话请求。
@@ -199,5 +209,6 @@ NTR 会话里，宿主的点赞 / 点踩 / 分支三图标是插件的业务：a
 | 子代理圆点 | `src/client/subagent-activity.tsx` · `createSubagentCatalogClaim` / `SubagentCatalogOccupant` / `mergeSubagentStatuses`；`src/client/index.tsx` · `subagentCatalogClaim` 注册处；`src/bridge.ts` · `TurnStreamController.openDispatchActivity` / `closeDispatchActivity` / `activeCatalogChildIds` / `BridgeManager.chatSessions` |
 | 权限卡 | `src/client/permission-dock.tsx` · `PermissionDock` / `PermissionAskCard`；`src/client/store.ts` · `permissionsForSession` / `deadlineRemainingLabel`；`src/client/index.tsx` · `acp-permissions` 注册处 |
 | 释放横幅 | `src/client/released-banner.tsx` · `ReleasedBanner` / `releasedBannerVisible`；`src/client/store.ts` · `resumeChatSession` / `withSessionReleased`；`src/client/index.tsx` · `acp-released-banner` 注册处 |
+| 限流横幅 | `src/client/quota-banner.tsx` · `QuotaBanner` / `quotaRefusalMessage`；`src/client/index.tsx` · `acp-quota-banner` 注册处；`src/bridge.ts` · `agentRefusalDetail` / `snapshot` 的 `quotaRefusal` |
 | 消息动作 | `src/client/branch-action.tsx` · `AcpBranchAction`；`src/client/store.ts` · `forkStateOf` / `forkChatSession`；`src/client/index.tsx` · `setScopeMarker` / `probeHostActionLabels` / `ntr-branch` 注册处；`src/client/acp-ui.tsx` · 隐藏规则与 `.ntr-branch-action` 样式（见 §12） |
 | 斜杠 | `src/client/slash-isolation.ts` · `createSlashIsolation` / `slashAcpVerdict` / `commandCandidates` |

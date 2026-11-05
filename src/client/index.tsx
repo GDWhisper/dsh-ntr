@@ -27,6 +27,7 @@ import { AcpSettingsDialog } from './settings-dialog.tsx'
 import { SaveGuardToast } from './save-guard-toast.tsx'
 import { PermissionDock } from './permission-dock.tsx'
 import { ReleasedBanner } from './released-banner.tsx'
+import { QuotaBanner } from './quota-banner.tsx'
 import { AcpBranchAction, resolveHostFork } from './branch-action.tsx'
 import { createActivityPillClaim, DOCK_SLOT } from './activity-pill.tsx'
 import { createSubagentCatalogClaim, SUBAGENT_CATALOG_SLOT } from './subagent-activity.tsx'
@@ -379,6 +380,21 @@ export function apply(ctx: Context): void {
     order: 20,
     inject: (sessionId: unknown) => chatFace(sessionId),
   }, ReleasedBanner as unknown as SlotComponent<any>)), 'dsh-ntr: released-session banner')
+
+  // The rate-limit banner in the same dock seat: an agent that refuses a prompt
+  // for quota reasons answers with a RESOLVE and puts the reason in the response
+  // `_meta`, so the turn ends cleanly with no error surface at all — the message
+  // looks accepted and then ignored. One row names the cause and repeats the
+  // agent's own text (the reset time in it is the fact the user needs). Gated
+  // inside the component on the live SessionView's `quotaRefusal`, which only a
+  // conversation the agent actually refused carries; no action button, because
+  // the model picker is already in the composer.
+  ctx.effect(() => ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
+    name: 'conversation.input.dock',
+    id: 'acp-quota-banner',
+    order: 30,
+    inject: (sessionId: unknown) => chatFace(sessionId),
+  }, QuotaBanner as unknown as SlotComponent<any>)), 'dsh-ntr: rate-limit banner')
 
   // The NTR branch entry riding the host's own assistant-actions row
   // (`conversation.chat.assistant-actions` — list, session scope; the

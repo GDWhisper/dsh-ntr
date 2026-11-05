@@ -14,6 +14,17 @@
  *              NOT the background-drain "STEER" shape below; both markers
  *              share the prefix, so the drain branch excludes them.
  *  - "DIE"   → emits one update then exits the process (crash → release → resume)
+ *  - "QUOTA" → the CodeBuddy rate-limit shape: the prompt is ANSWERED (a
+ *              resolve, never a reject) with `stopReason: 'refusal'` and the
+ *              reason in the response `_meta["codebuddy.ai/errorMessage"]` as a
+ *              JSON string whose `data.category` is `quota`. Variants:
+ *              "QUOTA_DRAIN" also announces a background drain that never
+ *              speaks (the ambient wait must lose to the refusal), and
+ *              "QUOTA_WORKER" also dispatches a detached worker that never
+ *              reports (the background hold must lose to it too).
+ *  - "REFUSED" → the same resolve-with-`refusal` shape, but NOT a quota (a
+ *              content policy): the turn closes as an ordinary stop and the
+ *              agent's own reason must survive into the zero-output line.
  *  - "EMPTY" → only a usage_update, then a legal end_turn: the silent-failure
  *              shape wild agents produce (pi-acp folds a provider 403 into a
  *              normal stop), zero visible output
@@ -1148,6 +1159,82 @@ const app = agent({ name: 'mock-acp-agent' })
       // own and must close with the ordinary zero-output warning.
       await send({ sessionUpdate: 'usage_update', used: 5, size: 1000 })
       return { stopReason: 'end_turn', _meta: { 'codebuddy.ai/conversationRequestId': 'conv-idle' } }
+    }
+
+    if (text.includes('QUOTA')) {
+      // The CodeBuddy rate-limit wire shape, measured: the prompt RESOLVES
+      // (`stopReason: 'refusal'`, no JSON-RPC error anywhere) and the reason
+      // rides the response `_meta` as a JSON string. Nothing in the turn says
+      // the account is over quota, so a client that only reads the stop reason
+      // reports a clean, silent turn.
+      // Merge, never replace: the dispatch frames carry their own `_meta` keys
+      // (`toolName` / `isBackground`) and those are the whole signal.
+      const quotaMeta = update => ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: { ...update, _meta: { ...(update._meta ?? {}), 'codebuddy.ai/requestId': 'req-quota' } },
+      })
+      if (text.includes('QUOTA_DRAIN')) {
+        // A drain announced and then silent: an ambient wait on it would hold
+        // the turn open for the whole quiet window, so a client that ranks the
+        // refusal below the ambient branch never ends this turn on time.
+        await ctx.client.notify(methods.client.session.update, {
+          sessionId,
+          update: {
+            sessionUpdate: 'session_info_update',
+            _meta: { 'codebuddy.ai/unsolicitedTurn': { requestId: 'amb-quota', reason: 'background_drain' } },
+          },
+        })
+        await sleep(25)
+      }
+      if (text.includes('QUOTA_WORKER')) {
+        // A detached worker dispatched and never reporting: a background hold
+        // would keep the turn open for the worker window, which is the other
+        // branch the refusal must outrank.
+        await quotaMeta({
+          sessionUpdate: 'tool_call',
+          toolCallId: 'agent_quota',
+          title: 'Agent',
+          kind: 'other',
+          status: 'in_progress',
+          rawInput: { description: 'audit the repo', subagent_type: 'general-purpose', name: 'explorer' },
+          _meta: { 'codebuddy.ai/toolName': 'Agent' },
+        })
+        await quotaMeta({
+          sessionUpdate: 'tool_call',
+          toolCallId: 'agent_quota',
+          title: 'Agent',
+          kind: 'other',
+          status: 'in_progress',
+          _meta: { 'codebuddy.ai/isBackground': true, 'codebuddy.ai/isSubagent': true },
+        })
+        await sleep(25)
+      }
+      return {
+        stopReason: 'refusal',
+        _meta: {
+          'codebuddy.ai/errorMessage': JSON.stringify({
+            code: -32003,
+            message: '429 您使用量已超出频率限制，将在 2026-11-05 12:00 重置，您也可以切换其他模型继续使用。',
+            data: { statusCode: 429, code: 6004, category: 'quota' },
+          }),
+        },
+      }
+    }
+
+    if (text.includes('REFUSED')) {
+      // The same resolve-with-`refusal` shape, but the agent declined for a
+      // reason that is not a quota: the turn is an ordinary stop, and the
+      // agent's own reason must reach the user rather than be dropped.
+      return {
+        stopReason: 'refusal',
+        _meta: {
+          'codebuddy.ai/errorMessage': JSON.stringify({
+            code: -32003,
+            message: 'content policy: the requested action is not allowed',
+            data: { statusCode: 400, code: 6001, category: 'content_filter' },
+          }),
+        },
+      }
     }
 
     if (text.includes('EMPTY')) {

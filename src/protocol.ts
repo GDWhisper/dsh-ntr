@@ -587,7 +587,7 @@ export type AcpEvent =
       burstMs: number
       final: boolean
     }
-  | { type: 'turn/end'; sessionId: string; turnId: string; stopReason?: string; error?: string }
+  | { type: 'turn/end'; sessionId: string; turnId: string; stopReason?: string; error?: string; errorKind?: 'quota' }
   /**
    * The save gate's state changed: an ACP turn started/ended, a profile write
    * was queued, flushed, expired or failed. The browser renders the pending
@@ -638,6 +638,27 @@ export interface SessionBurst {
   burstMs: number
 }
 
+/**
+ * Why an agent REFUSED a `session/prompt` it answered (not rejected).
+ *
+ * CodeBuddy answers a rate-limited prompt with a resolved response:
+ * `stopReason: 'refusal'`, and the reason in the response `_meta` as a JSON
+ * string (`{ code, message, data: { statusCode, code, category } }`). The SDK's
+ * prompt-response schema strips a top-level `errorMessage` field but passes
+ * `_meta` through untouched, so the host half reads it there
+ * (`agentRefusalDetail` in `src/bridge.ts`) — the only place the reason still
+ * arrives.
+ */
+export interface AgentRefusalDetail {
+  /**
+   * `quota` for a rate limit the user can wait out or switch models for;
+   * `refusal` for any other agent-side refusal.
+   */
+  kind: 'quota' | 'refusal'
+  /** The agent's own words, unedited — they carry the reset time. */
+  message: string
+}
+
 /** Derived session snapshot for replay/reconnect (source of truth stays in the transcript). */
 export interface SessionView {
   sessionId: string
@@ -675,6 +696,16 @@ export interface SessionView {
    * claiming "nothing yet".
    */
   hasHistory?: boolean
+  /**
+   * The agent's last rate-limit refusal on this session, as the agent worded
+   * it (the reset time included). Set when a `session/prompt` answered
+   * `stopReason: 'refusal'` with a quota detail in its `_meta`, cleared by the
+   * next non-limited response and at every lifecycle boundary (close / release
+   * / resume / force reset). Deliberately TRANSIENT: it never rides along in
+   * the persisted chat-session record, and the record's timestamp stays on the
+   * host side. Absent for every session that was never refused.
+   */
+  quotaRefusal?: { message: string }
   /** Highest transcript seq included in this snapshot (for gap detection). */
   seq: number
 }

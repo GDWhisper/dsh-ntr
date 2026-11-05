@@ -73,7 +73,7 @@ import type {
   RosterPresetRow,
 } from './impl.ts'
 import type {
-  AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpMcpServerDef, AcpPresetStatus, AcpReleaseCause, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSaveResult, AgentTestResult, AgentView, ChatSessionForkInfo, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
+  AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpMcpServerDef, AcpPresetStatus, AcpReleaseCause, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentRefusalDetail, AgentSaveMode, AgentSaveResult, AgentTestResult, AgentView, ChatSessionForkInfo, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
   LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo,
   AcpIdleRelease, ActiveTurnView, ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PluginUpdateState, PreparedAdapterCall, SaveGateFlushResult, SaveGateStatus, SessionView, StreamChunk,
 } from './protocol.ts'
@@ -431,6 +431,32 @@ interface LiveSession {
    * (`clearAmbientState`).
    */
   retiredAmbients?: RetiredAmbient[]
+  /**
+   * The agent's last rate-limit refusal on this session, and when it landed.
+   *
+   * CodeBuddy answers a rate-limited prompt with a RESOLVED response
+   * (`stopReason: 'refusal'`, the reason in the response `_meta`), so nothing
+   * in the turn itself says the conversation stopped for a quota the user can
+   * wait out or switch models for. The composer's dock card reads this through
+   * `snapshot()`; the `at` timestamp stays here and never reaches the view.
+   *
+   * BOTH prompt planes write it — the chat adapter's `streamPrompt` and the
+   * `/acp` RPC's `prompt` — because one LiveSession can be driven from either,
+   * and a banner that survives the answer that disproved it is a lie.
+   *
+   * TRANSIENT by design: the next non-limited response clears it, and so does
+   * every lifecycle boundary (`clearAmbientState`: close / release / resume /
+   * force reset). It is deliberately NOT part of `PersistedChatSession` — a
+   * quota from a previous host run says nothing about this one.
+   *
+   * `at` stamps when the refusal landed and nothing expires the record from
+   * it: the reset time the agent reports is prose inside `message`, and
+   * guessing a timestamp out of that would invent a policy the agent never
+   * stated. The record clears on EVIDENCE instead (the next answer that is not
+   * rate-limited, or a lifecycle boundary), which is also why an idle release
+   * bounds how long a stale banner can sit on a live session.
+   */
+  quotaRefusal?: { message: string; at: number }
   transcript: Transcript
 }
 
@@ -2842,11 +2868,16 @@ function reviveAmbientId(session: LiveSession, requestId: string): void {
  * lifecycle boundary (close / release / resume / force reset): a fresh
  * agent-side state neither inherits a stale drain nor the ids of drains that
  * belonged to the old one.
+ *
+ * The transient rate-limit refusal goes the same way: the next process either
+ * answers normally (clearing it on its own) or refuses again with its own
+ * detail, and a quota recorded against the OLD process must not outlive it.
  */
 function clearAmbientState(session: LiveSession): void {
   session.ambient = undefined
   session.ambientNotices?.clear()
   session.retiredAmbients = undefined
+  session.quotaRefusal = undefined
 }
 
 /**
@@ -2882,6 +2913,53 @@ export function permissionToolName(toolCall: unknown): string {
   }
   if (typeof row.kind === 'string' && row.kind !== '') return row.kind
   return 'tool call'
+}
+
+/**
+ * Why the agent refused a `session/prompt` it ANSWERED, read off the
+ * response's `_meta`.
+ *
+ * CodeBuddy refuses a rate-limited prompt with a RESOLVED response, not a
+ * rejection: `stopReason: 'refusal'` and the reason in
+ * `_meta["codebuddy.ai/errorMessage"]`, a JSON string of the shape
+ * `{ code, message, data: { statusCode, code, category } }`. The SDK's
+ * prompt-response schema strips a top-level `errorMessage` field but passes
+ * `_meta` through untouched, so this key is the only place the reason still
+ * reaches the plugin — and `describeError` never sees it, because there is no
+ * error to describe.
+ *
+ * `meta` is the `_meta` object itself (a prompt response's `meta`), not a
+ * `{ _meta }` wrapper. `undefined` means "this response carries no refusal
+ * detail", which is the answer for every other agent and for every normal
+ * response — never a reason to invent one.
+ */
+export function agentRefusalDetail(meta: unknown): AgentRefusalDetail | undefined {
+  if (typeof meta !== 'object' || meta === null) return undefined
+  const raw = (meta as Record<string, unknown>)['codebuddy.ai/errorMessage']
+  if (typeof raw !== 'string' || raw === '') return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    // Not JSON: another agent's key, or a future shape. The text is still the
+    // agent's own reason, so report it as a refusal rather than dropping it.
+    return { kind: 'refusal', message: raw }
+  }
+  if (typeof parsed !== 'object' || parsed === null) return { kind: 'refusal', message: raw }
+  const row = parsed as Record<string, unknown>
+  const message = typeof row.message === 'string' && row.message !== '' ? row.message : raw
+  const data = typeof row.data === 'object' && row.data !== null ? row.data as Record<string, unknown> : {}
+  const quota = data.category === 'quota' || data.statusCode === 429
+  return { kind: quota ? 'quota' : 'refusal', message }
+}
+
+/**
+ * The one wording both prompt paths use for a rate-limited turn. The chat
+ * plane carries it in the turn's error, the `/acp` plane in its `turn/end`;
+ * two phrasings for one fact is how a user ends up googling the wrong one.
+ */
+function rateLimitedTurnError(agentId: string, detail: AgentRefusalDetail): string {
+  return `[dsh-ntr] agent "${agentId}" is rate limited: ${detail.message}`
 }
 
 /** Longest reason line the approval card headline carries. */
@@ -3021,6 +3099,9 @@ function snapshot(session: LiveSession): SessionView {
     ...(session.settled !== undefined ? { settled: true } : {}),
     ...(session.released ? { released: true } : {}),
     ...(session.hasHistory === true ? { hasHistory: true } : {}),
+    // The agent's own words only: the `at` timestamp is host-side bookkeeping
+    // and no browser surface has a use for it.
+    ...(session.quotaRefusal !== undefined ? { quotaRefusal: { message: session.quotaRefusal.message } } : {}),
     seq: session.transcript.head,
   }
 }
@@ -4010,9 +4091,9 @@ type SegmentFinishReason =
 
 /** Why a turn ended, as seen by {@link TurnStreamController.settle}. */
 type TurnSettle =
-  | { kind: 'stop'; stopReason: string }
+  | { kind: 'stop'; stopReason: string; refusal?: string }
   | { kind: 'cancelled' }
-  | { kind: 'error'; message: string; code?: string }
+  | { kind: 'error'; message: string; code?: string; errorKind?: 'quota' }
 
 /** How often a running turn's live burst aggregate is pushed to the browser. */
 const TPS_PUSH_INTERVAL_MS = 1000
@@ -5363,7 +5444,16 @@ class TurnStreamController {
       if (outcome.kind === 'cancelled') {
         this.hub.broadcast({ type: 'turn/end', sessionId: this.session.sessionId, turnId: this.turnId, stopReason: 'cancelled' })
       } else if (outcome.kind === 'error') {
-        this.hub.broadcast({ type: 'turn/end', sessionId: this.session.sessionId, turnId: this.turnId, error: outcome.message })
+        // `errorKind` rides along only when the host classified the failure:
+        // a quota refusal is the one error a browser surface acts on (the
+        // composer's dock card), so it must not have to re-read the message.
+        this.hub.broadcast({
+          type: 'turn/end',
+          sessionId: this.session.sessionId,
+          turnId: this.turnId,
+          error: outcome.message,
+          ...(outcome.errorKind !== undefined ? { errorKind: outcome.errorKind } : {}),
+        })
       } else {
         this.hub.broadcast({ type: 'turn/end', sessionId: this.session.sessionId, turnId: this.turnId, stopReason: outcome.stopReason })
       }
@@ -5390,7 +5480,7 @@ class TurnStreamController {
         // The silent-failure report: a normal stop with nothing the chat
         // plane renders. Aborted or failing turns need no extra hint; this
         // is specifically "protocol says success, the bubble is empty".
-        this.emitProse(seg, 'text', this.zeroOutputLine(outcome.stopReason))
+        this.emitProse(seg, 'text', this.zeroOutputLine(outcome.stopReason, outcome.refusal))
       }
       this.finishSegment(seg, reason)
     }
@@ -5560,8 +5650,19 @@ class TurnStreamController {
    * The "protocol says success, the bubble is empty" line. When a recently
    * retired drain may have taken the prompt without re-announcing itself, say
    * that instead of blaming the agent: the output exists in the transcript.
+   *
+   * A `refusal` stop reason is the agent's OWN verdict, not a silent failure:
+   * it answered the prompt and declined to do the work. Saying "no visible
+   * output" would read as a host-side gap and send the user looking for a bug
+   * that is not there — and `refusal` carries the agent's reason, which is the
+   * one stop reason that does (constraint 29: nothing the agent sent is
+   * dropped), so it is quoted when the agent gave one.
    */
-  private zeroOutputLine(stopReason?: string): string {
+  private zeroOutputLine(stopReason?: string, refusal?: string): string {
+    if (stopReason === 'refusal') {
+      const detail = refusal === undefined || refusal === '' ? '' : `: ${refusal}`
+      return `\n[dsh-ntr] agent "${this.session.agentId}" refused this turn${detail}.\n`
+    }
     if (this.recentRetiredDrain) {
       return `\n[dsh-ntr] agent "${this.session.agentId}" produced no visible output this turn; it may have been folded into a background run; its output is in the ACP transcript view.\n`
     }
@@ -9087,11 +9188,37 @@ export class BridgeManager {
         // A superseded turn's late answer must not end the turn now on air.
         if (session.turnSeq !== turnGen) return
         this.clearOrphanPrompt(session, turnGen)
+        // The SAME rate-limit refusal the chat plane settles on (see
+        // `streamPrompt`): a refused prompt RESOLVES, so without this the turn
+        // would end as a plain `refusal` stop and the reason — which lives only
+        // in the response `_meta` — would be dropped. The banner is a chat
+        // surface, but the record hangs off the SESSION, and one LiveSession
+        // can be driven from both planes: a chat conversation whose last
+        // `/acp` answer was normal must not keep showing a quota the agent has
+        // already stopped reporting.
+        const refusal = result.stopReason === 'refusal' ? agentRefusalDetail(result.meta) : undefined
+        if (refusal?.kind === 'quota') {
+          session.quotaRefusal = { message: refusal.message, at: Date.now() }
+          this.hub.broadcast({ type: 'session/meta', sessionId, session: snapshot(session) })
+        } else if (session.quotaRefusal !== undefined) {
+          session.quotaRefusal = undefined
+          this.hub.broadcast({ type: 'session/meta', sessionId, session: snapshot(session) })
+        }
         // Release the shared slot BEFORE the terminal frame: a listener that
         // sends the next prompt on `turn/end` must not read a stale claim.
         endTurn()
         session.running = false
-        this.hub.broadcast({ type: 'turn/end', sessionId, turnId, stopReason: result.stopReason })
+        if (refusal?.kind === 'quota') {
+          this.hub.broadcast({
+            type: 'turn/end',
+            sessionId,
+            turnId,
+            error: rateLimitedTurnError(session.agentId, refusal),
+            errorKind: 'quota',
+          })
+        } else {
+          this.hub.broadcast({ type: 'turn/end', sessionId, turnId, stopReason: result.stopReason })
+        }
       })
       .catch((error: unknown) => {
         if (session.reclaimedTurnSeq === turnGen) {
@@ -10341,6 +10468,36 @@ export class BridgeManager {
             return
           }
           const responseMeta = codebuddyMetaOf({ _meta: result.meta })
+          // A RATE-LIMIT REFUSAL: the agent answered the prompt and declined
+          // the work because the account is over its quota. CodeBuddy says so
+          // with `stopReason: 'refusal'` plus a quota detail in the response
+          // `_meta` — a RESOLVED response, so no error path and no
+          // `describeError` ever sees the reason. Ranked BEFORE the hold /
+          // ambient branches below: a refused turn has no answer coming, so
+          // holding it open for a background run would wait on work the agent
+          // just said it will not do.
+          const refusal = result.stopReason === 'refusal' ? agentRefusalDetail(result.meta) : undefined
+          if (refusal?.kind === 'quota') {
+            // The dock card reads this through `snapshot()`, so publish it
+            // BEFORE the turn ends: a browser that renders the card off
+            // `turn/end` must already know why the turn failed.
+            session.quotaRefusal = { message: refusal.message, at: Date.now() }
+            this.hub.broadcast({ type: 'session/meta', sessionId: session.sessionId, session: snapshot(session) })
+            controller.settle({
+              kind: 'error',
+              message: rateLimitedTurnError(agentId, refusal),
+              code: 'rate_limited',
+              errorKind: 'quota',
+            })
+            return
+          }
+          // Any other answer — a normal turn, a plain refusal, a hold, an
+          // ambient fold — means the quota is no longer what stopped this
+          // session: the banner must not outlive the evidence for it.
+          if (session.quotaRefusal !== undefined) {
+            session.quotaRefusal = undefined
+            this.hub.broadcast({ type: 'session/meta', sessionId: session.sessionId, session: snapshot(session) })
+          }
           // A DETACHED-WORKER HOLD: this turn's `Agent` call handed real work
           // to a background worker that has not produced its answer yet, yet
           // the agent answered the prompt normally (CodeBuddy says "已派…" and
@@ -10412,7 +10569,15 @@ export class BridgeManager {
           }
           controller.settle(result.stopReason === 'cancelled'
             ? { kind: 'cancelled' }
-            : { kind: 'stop', stopReason: result.stopReason })
+            // A refusal carries the agent's own reason (`agentRefusalDetail`),
+            // and the zero-output line quotes it: a quota was already settled
+            // above as an error, so what reaches here is the agent declining
+            // the work and saying why.
+            : {
+              kind: 'stop',
+              stopReason: result.stopReason,
+              ...(refusal !== undefined ? { refusal: refusal.message } : {}),
+            })
         })
         .catch((err: unknown) => {
           if (session.reclaimedTurnSeq === turnGen) {

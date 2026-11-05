@@ -1040,6 +1040,35 @@ const STYLE = `
 .ntr-released-banner-title { font-weight: 600; }
 .ntr-released-banner-body { color: var(--dsw-alias-label-secondary, #6b7280); }
 .ntr-released-banner .ntr-acp-more { flex: none; white-space: nowrap; }
+/* ---- Rate-limit banner (conversation.input.dock, quota-banner.tsx) ---- */
+/* Same composer-width formula as the released banner: the slot spans the
+   column, the card lines up with the input box. One row of state and the
+   agent's own message; no action, so the row is a single line pair. The
+   error pairing is the one this repo already uses everywhere else
+   (state-error-tertiary ground / state-error-primary foreground, the same
+   tokens the settings log rows use), so the banner follows the theme instead
+   of a fixed red. No state-danger-* token exists in the host bundles — only
+   state-error-* is referenced there. */
+.ntr-quota-banner {
+  box-sizing: border-box;
+  width: calc(100% - var(--dsh-composer-side-clearance, 16px) - var(--dsh-composer-side-clearance, 16px));
+  max-width: var(--dsh-composer-card-max-width, 920px);
+  margin: 0 auto;
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 8px 12px;
+  border: 1px solid var(--dsw-alias-border-l2, #d1d5db);
+  border-left: 3px solid var(--dsw-alias-state-error-primary, #dc2626);
+  border-radius: 10px;
+  background: var(--dsw-alias-state-error-tertiary, #fef2f2);
+  color: var(--dsw-alias-state-error-primary, #dc2626);
+  font-size: 12px; line-height: 1.5;
+}
+.ntr-quota-banner-row { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.ntr-quota-banner-text { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.ntr-quota-banner-title { font-weight: 600; }
+/* The agent's message is a full sentence with a reset time in it, so it wraps
+   rather than ellipsizing (an ellipsis here would hide the reset time). */
+.ntr-quota-banner-body { word-break: break-word; }
 /* ---- Save gate toast (shell.overlay, save-guard-toast.tsx) ---- */
 /* A profile write is held while an ACP turn runs. The host settings page keeps
    its own save promise pending; this toast is the visible reason and the

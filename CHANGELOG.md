@@ -4,6 +4,26 @@
 
 ## [Unreleased]
 
+### 新增
+
+- **acp**：agent 因频率限制拒绝本轮时，输入框上方显示一行「agent 已限流」，正文用 agent 自己写的说明（含重置时间）；没有按钮，切换模型走 composer 里的模型菜单。
+- **acp**：agent 以 `refusal` 拒绝本轮且没有正文时，说明里带上 agent 自己给出的理由，不再只说「没有可见输出」。
+
+### 修复
+
+- **acp**：guard 剥离 `runtime-context` 注入，带工具的续跑步不再被误判为外来批次并以 `blocked` 收尾。
+
+---
+
+### Added
+
+- **acp**: when the agent refuses a turn because it is rate limited, one row above the input box says "agent 已限流" and repeats the agent's own message (reset time included); there is no button — switching models stays in the composer's model menu.
+- **acp**: when the agent refuses a turn with no prose, the note quotes the agent's own reason instead of only saying "no visible output".
+
+### Fixed
+
+- **acp**: the guard strips the `runtime-context` injection, so tool continuations are no longer mistaken for foreign batches and end as `blocked`.
+
 ## [0.3.7] - 2026-11-05
 
 CodeBuddy 的每个聊天会话使用独立子进程，多会话并行互不影响；回合进行中保存配置不再打断对话，暂存、失败与重试都能看见。
