@@ -8853,6 +8853,20 @@ describe('a turn that dispatched a detached worker (isolated manager)', () => {
     expect(dispatchFinish(firstResult.steps.at(-1) ?? [])?.reason).toMatchObject({ kind: 'aborted' })
     expect(dispatchText(firstResult.chunks)).not.toContain('DISPATCH-FINAL-ANSWER')
 
+    // The superseded controller was disposed by the successor's
+    // `rememberTurnStream`, and that teardown owns the record half: its
+    // still-open dispatch must end terminal (`unknown` — a retired turn is no
+    // evidence the worker stopped) or the panel keeps a row running forever.
+    const records = dispatchEvents
+      .slice(since)
+      .filter((event): event is Extract<AcpEvent, { type: 'subagents/record' }> =>
+        event.type === 'subagents/record' && event.record.childId === 'acp:agent_dispatch')
+      .map(event => event.record)
+    expect(records.length).toBeGreaterThan(0)
+    expect(records.at(-1)?.status).toBe('unknown')
+    expect(records.at(-1)?.endedAt).toBeDefined()
+    expect(unexpectedSubagentFrames(dispatchEvents, since)).toEqual([])
+
     // Nothing gave the conversation back: the session and its transcript live.
     expect(holding.session.closed).toBe(false)
     expect(dispatchManager.chatSessions(dshSessionId)).toHaveLength(1)

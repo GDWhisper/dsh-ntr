@@ -2356,7 +2356,7 @@ export class AgentBridge {
     // The session is going away: whatever background drain it announced ends
     // with it (a re-created session must not inherit a stale ambient).
     clearAmbientState(session)
-    // ...and so does every still-open dispatch record its turn owned: a closed
+    // ...and so does every still-open dispatch record the turn owned; a closed
     // session is not a cancelled worker.
     session.turnController?.terminalizeDispatches('unknown')
     // ...and so does its prompt slot: nothing may keep rejecting a new prompt
