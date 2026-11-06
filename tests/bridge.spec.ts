@@ -10,9 +10,10 @@ import { join } from 'node:path'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { afterAll, describe, expect, it, vi } from 'vitest'
 import {
-  AcpLlmAdapter, AgentBridge, BridgeManager, bridgeKey, defaultAgentWorkspace,
+  AcpLlmAdapter, AgentBridge, BridgeManager, bridgeKey, classifyTestFailure, defaultAgentWorkspace,
   detectHostAgents, ensureAgentExecutable, findExecutable, isPerSessionAgent, killProcessTree, perSessionLaunchArgs, perSessionLaunchEnv, pluginStateDir, routeBindingRegistry, windowsShimLaunch,
   type BridgeTuning,
+  type StartAttempt,
   permissionAskReason, permissionToolName,
 } from '../src/bridge.ts'
 import { AcpError, EventHub, dispatchRpc, permissionReplayFrames } from '../src/impl.ts'
@@ -878,6 +879,50 @@ describe('ACP bridge over stdio (mock agent)', () => {
     )).rejects.toThrow(/npm down/)
   })
 
+  it('classifies a failed start from the attempt record, not from the SDK sentence', () => {
+    // The pure half of the connection test's verdict: every spawn failure
+    // rejects `initialize` with the same "ACP connection closed", so the cause
+    // can only come from these facts. The integration case above covers
+    // `not-found` / `start-failed` on real processes; the windows that need a
+    // dead or hung agent are pinned here.
+    const base: StartAttempt = { command: 'codebuddy', installTried: false, spawned: false, timedOut: false }
+    // Nothing was spawned and no spawn error: the resolution step threw, i.e.
+    // the npm auto-install.
+    expect(classifyTestFailure(undefined)).toBe('handshake-failed')
+    expect(classifyTestFailure(base)).toBe('not-found')
+    expect(classifyTestFailure({ ...base, installTried: true })).toBe('install-failed')
+    // `spawn` RETURNS a handle for a program that does not exist (the ENOENT is
+    // an async event), so `spawned` is true and the spawn error must win.
+    expect(classifyTestFailure({
+      ...base, spawned: true, spawnError: { code: 'ENOENT', message: 'spawn codebuddy ENOENT' },
+    })).toBe('not-found')
+    // …but ENOENT AFTER a path resolved is not "install it": the file was found
+    // and then failed to launch, which is a start failure.
+    expect(classifyTestFailure({
+      ...base, spawned: true, executablePath: '/usr/local/bin/codebuddy', spawnError: { code: 'ENOENT', message: 'spawn ENOENT' },
+    })).toBe('start-failed')
+    // A program that exists but cannot be launched is NOT a missing agent.
+    expect(classifyTestFailure({
+      ...base, spawned: true, spawnError: { code: 'EACCES', message: 'spawn EACCES' },
+    })).toBe('start-failed')
+    // `spawn` threw synchronously: nothing was spawned, yet the OS gave a reason.
+    expect(classifyTestFailure({
+      ...base, spawnError: { code: 'EINVAL', message: 'spawn EINVAL' },
+    })).toBe('start-failed')
+    // The timeout is definitive even if a stale spawn error lands afterwards.
+    expect(classifyTestFailure({
+      ...base, timedOut: true, spawnError: { code: 'EACCES', message: 'stale spawn error' },
+    })).toBe('timeout')
+    expect(classifyTestFailure({ ...base, spawned: true, timedOut: true })).toBe('timeout')
+    // A timeout also kills the child, so the exit fact is present — the timeout
+    // must still be reported as such.
+    expect(classifyTestFailure({
+      ...base, spawned: true, timedOut: true, exit: { code: null, signal: 'SIGKILL' },
+    })).toBe('timeout')
+    expect(classifyTestFailure({ ...base, spawned: true, exit: { code: 3, signal: null } })).toBe('start-failed')
+    expect(classifyTestFailure({ ...base, spawned: true })).toBe('handshake-failed')
+  })
+
   it('testAgent handshakes a throwaway process without touching the manager', async () => {
     const before = manager.agentViews().map(a => a.id)
     const result = await manager.testAgent({
@@ -903,6 +948,34 @@ describe('ACP bridge over stdio (mock agent)', () => {
     })
     expect(failed.ok).toBe(false)
     expect(failed.error).toBeDefined()
+    // The verdict NAMES the cause: a missing program is 'not-found', which is
+    // what lets the card say "install the agent" instead of echoing the SDK's
+    // one-size sentence ("ACP connection closed") for every spawn failure.
+    expect(failed.failure).toBe('not-found')
+    expect(failed.command).toBe('definitely-missing-dsh-ntr-cmd')
+    expect(failed.executablePath).toBeUndefined()
+    expect(failed.installTried).toBe(false)
+    // The OS reason travels with the verdict: ENOENT is what separates "there
+    // is nothing to run" from "the OS refused to run it" without reading prose.
+    expect(failed.spawnError?.code).toBe('ENOENT')
+
+    // A program that EXISTS but is not a usable ACP launch: it is found on
+    // PATH, starts, and dies at once — the other mistake the card must name
+    // differently (or the user reinstalls an agent that was never missing).
+    const died = await manager.testAgent({
+      id: 'test-died',
+      // `process.execPath` resolves, and `-e` makes it exit before speaking ACP.
+      command: process.execPath,
+      args: ['-e', 'process.exit(3)'],
+      cwd: tmpdir(),
+      allowedCwdRoots: [tmpdir()],
+    })
+    expect(died.ok).toBe(false)
+    expect(died.failure).toBe('start-failed')
+    expect(died.executablePath).toBeDefined()
+    expect(died.exit).toEqual({ code: 3, signal: null })
+    // It launched; the refusal was the ACP conversation, not the OS.
+    expect(died.spawnError).toBeUndefined()
   }, 30_000)
 
   it('supports saving and deleting agents dynamically with persistence', async () => {

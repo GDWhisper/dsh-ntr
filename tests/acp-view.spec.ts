@@ -15,13 +15,13 @@ import { branchIconOf, resolveHostFork } from '../src/client/branch-action.tsx'
 import { acpEmptyCopy, boundAgentOf, diffRows, historyAwaitsReplay, isNewFileDiff } from '../src/client/acp-view.tsx'
 import { agentModeVisible } from '../src/client/composer-mode.tsx'
 import { acpMeterUsage, compactTokenCount, contextOccupancy } from '../src/client/context-meter.tsx'
-import { approvalDeadlineFacts, DEADLINE_MIN_WAIT_MS, deadlineSliderIndex, deadlineValueFor } from '../src/client/panel.tsx'
+import { agentTestHint, approvalDeadlineFacts, DEADLINE_MIN_WAIT_MS, deadlineSliderIndex, deadlineValueFor } from '../src/client/panel.tsx'
 import { describeRoute, menuFor, REFRESH_CATALOG_ITEM } from '../src/client/session-controls.tsx'
 import { AcpStore, deadlineRemainingLabel, PERMISSION_DEADLINE_EXPIRED, permissionsForSession, usageFromUpdate } from '../src/client/store.ts'
 import { mergeSubagentStatuses } from '../src/client/subagent-activity.tsx'
 import type { PendingPermission } from '../src/client/store.ts'
 import { APPROVAL_DEADLINE_MIN_WAIT_MS, isAbsolutePath, splitAdapterModelId, splitCommandLine as hostSplitCommandLine, tokenizeCommandLine as hostTokenizeCommandLine } from '../src/impl.ts'
-import type { AgentCatalogResult, AgentView, ChatSessionView } from '../src/protocol.ts'
+import type { AgentCatalogResult, AgentTestResult, AgentView, ChatSessionView } from '../src/protocol.ts'
 
 /**
  * Model-row ids only. The picker's last row is the explicit refresh ACTION
@@ -889,6 +889,89 @@ describe('approvalDeadlineFacts', () => {
     const facts = approvalDeadlineFacts({ ...base, mode: 'auto', configuredMode: 'wait' })
     expect(facts.modeBaseline).toBe('wait')
     expect(facts.overridden).toBe(true)
+  })
+})
+
+describe('agentTestHint (the connection test names the mistake)', () => {
+  /** Read the English side, so the assertions name what a user would read. */
+  const en = (_zh: string, text: string): string => text
+  const zh = (text: string): string => text
+  const result = (patch: Partial<AgentTestResult>): AgentTestResult => ({
+    ok: false, durationMs: 12, stderr: [], ...patch,
+  })
+
+  it('says nothing without a cause from the host', () => {
+    // An older host half reports only the SDK sentence; inventing a fix for it
+    // would be worse than showing the raw text.
+    expect(agentTestHint(result({}), en)).toBeUndefined()
+  })
+
+  it('routes a missing program to "install it", never to "fix the command"', () => {
+    // THE case this copy exists for: the SDK answers "ACP connection closed"
+    // whether the program is absent or the arguments are wrong.
+    const hint = agentTestHint(result({ failure: 'not-found', command: 'codebuddy' }), en)
+    expect(hint).toMatch(/"codebuddy" is not on PATH/)
+    expect(hint).toMatch(/Install the agent/)
+    expect(hint).not.toMatch(/launch command/)
+    // The Chinese side names the same two fixes.
+    expect(agentTestHint(result({ failure: 'not-found', command: 'codebuddy' }), zh))
+      .toBe('PATH 中找不到「codebuddy」。安装该 agent，或在「高级」填 npm 包名自动安装。')
+  })
+
+  it('names the npm package when the auto-install already ran', () => {
+    const hint = agentTestHint(result({ failure: 'not-found', command: 'codebuddy', installTried: true }), en)
+    expect(hint).toMatch(/auto-install ran/)
+    expect(hint).toMatch(/package and bin names/)
+  })
+
+  it('reports a failed npm install as itself, not as a missing program', () => {
+    const hint = agentTestHint(result({ failure: 'install-failed', command: 'codebuddy', installTried: true }), en)
+    expect(hint).toMatch(/npm auto-install failed/)
+  })
+
+  it('routes a program that exists but dies to "check the arguments and the output"', () => {
+    const hint = agentTestHint(result({
+      failure: 'start-failed', command: 'codebuddy', executablePath: '/usr/local/bin/codebuddy', exit: { code: 3, signal: null },
+    }), en)
+    expect(hint).toMatch(/was found \(\/usr\/local\/bin\/codebuddy\)/)
+    expect(hint).toMatch(/exited at once \(code 3\)/)
+    expect(hint).toMatch(/Read the output below/)
+    // …and never tells the user to install an agent the host just found.
+    expect(hint).not.toMatch(/not on PATH/)
+    expect(agentTestHint(result({
+      failure: 'start-failed', command: 'codebuddy', executablePath: '/x/codebuddy', exit: { code: 3, signal: null },
+    }), zh)).toBe('「codebuddy」找到了（/x/codebuddy），但立刻退出（退出码 3）。先看下面的输出：可能是参数不全、鉴权失败或配置错误。')
+  })
+
+  it('routes a refused executable to permissions, not to arguments', () => {
+    const hint = agentTestHint(result({
+      failure: 'start-failed', command: 'codebuddy', spawnError: { code: 'EACCES', message: 'spawn EACCES' },
+    }), en)
+    expect(hint).toMatch(/not executable by this user/)
+    expect(hint).not.toMatch(/Read the output below/)
+  })
+
+  it('says the process never started when there is no exit fact', () => {
+    const hint = agentTestHint(result({ failure: 'start-failed', command: 'codebuddy' }), en)
+    expect(hint).toMatch(/did not start/)
+    expect(hint).not.toMatch(/exit code/)
+  })
+
+  it('routes a silent or dropped handshake to the ACP question', () => {
+    expect(agentTestHint(result({ failure: 'timeout', command: 'codebuddy' }), en))
+      .toMatch(/missed the ACP handshake deadline/)
+    expect(agentTestHint(result({ failure: 'handshake-failed', command: 'codebuddy' }), en))
+      .toMatch(/dropped before the ACP handshake/)
+  })
+
+  it('falls back to "this command" when the host sent no program name', () => {
+    expect(agentTestHint(result({ failure: 'not-found' }), en)).toMatch(/^this command is not on PATH/)
+  })
+
+  it('says nothing for a failure kind this bundle does not know', () => {
+    // A newer host can add a kind; inventing a fix for the wrong failure is
+    // worse than showing only the host's own text.
+    expect(agentTestHint(result({ failure: 'some-future-kind' as never }), en)).toBeUndefined()
   })
 })
 

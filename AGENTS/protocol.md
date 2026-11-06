@@ -169,6 +169,7 @@ coordinator 用 `Agent` 工具派发 detached worker、说「已派…」，随�
 - `validateAgentDef` 返回的 `command` 是**裸路径**（spawn 要的就是不带引号的它）。折叠的幂等只对**不含空白**的 command 成立；`C:\Program Files\a.exe` 被原样重校验时会在空格处再切一刀。
 - `loadPersistedAgents` 每次启动重校验，靠 `quoteLegacyCommand` 补差：先把 command token 重新引号化再重校验，且只在该路径盘上存在时这么做。**严禁**给持久化的 `command` 加引号来「修」它——会弄坏两条 spawn 路径。
 - **严禁**回到「命令 / 参数」两框语义：`command: 'codebuddy --acp'` 曾被当成文件名，spawn ENOENT → SDK 报 `ACP connection closed`，与真实原因毫不像。
+- **`agent/test` 的失败报事实，解释句由浏览器写**：spawn 的每一种失败都用同一句 `ACP connection closed` 拒掉在飞的 `initialize`，于是「没装 agent」与「启动命令写错」（两种错误、两种修法）长得一模一样。所以 `AgentBridge.startAttempt`（`StartAttempt`）记录 `executablePath` / `spawnError` / `exit` / `timedOut` / `installTried`，`classifyTestFailure` 折成 `AgentTestFailureKind`（`not-found` / `install-failed` / `start-failed` / `timeout` / `handshake-failed`）。宿主回 kind + 事实 + 原始 `error` 文本，**解释句由浏览器写**（`panel.tsx` · `agentTestHint`，locale 归浏览器），并显示 stderr 尾巴。三个坑：① `spawn` 在程序不存在时**也**返回子进程句柄（ENOENT 是异步 `error` 事件），所以 `spawnError` 必须在 `spawned` **之前**判；同步抛出的 `spawn` 错误同样要记（否则会被说成安装失败）。② 子进程在握手期间死亡时 stdio 先关、`initialize` 先被拒、`killChild` 先清 `this.child`，所以 exit 事实记在身份守卫**之前**（记进本次 attempt 自己的对象），且 `testAgent` 读之前先 `awaitStartChildExit`（250ms 上限，且只在本次真的 spawn 过时等）。③ `installTried` 只能由安装步骤自己置位（`ensureAgentExecutable` 的 `onInstallStart`），**严禁**用「def 配了 npmPackage」推断；`timedOut` 优先于迟到的 spawn 错误；ENOENT 只有在 `executablePath` 缺失时才算 `not-found`。
 - 浏览器半区手拷贝（`src/client/acp-ui.tsx`）必须同语义，由 `tests/acp-view.spec.ts` 样本集守等价。
 
 **Windows**：
@@ -214,6 +215,6 @@ coordinator 用 `Agent` 工具派发 detached worker、说「已派…」，随�
 | 收尾与分段 | `src/bridge.ts` · `streamPrompt` / `TurnStreamController` / `sawVisibleBlock` / `isAcpToolContinuation`（分段续读与收尾见 [architecture.md §2.2](./architecture.md)）；限流拒绝 `agentRefusalDetail` / `rateLimitedTurnError` / `LiveSession.quotaRefusal` / `zeroOutputLine`（§1） |
 | 数据折叠 | `src/impl.ts` · `acpContentRows` / `formatAcpDiff` / `dumpJson` / `describeUnhandledUpdate` / `acpToolCallFromUpdate` / `acpToolCallDelta` / `Transcript` / `coalescibleStateKind` |
 | tok/s 聚合 | `src/tps.ts` · `TurnTpsTracker`；`src/bridge.ts` · `TurnStreamController.trackTps` / `finalizeTps` / `BridgeManager.noteSessionBurst`；`src/protocol.ts` · `turn/metrics` / `SessionBurst`；`src/client/activity-pill.tsx` · `createActivityPillClaim` |
-| 启动命令 | `src/impl.ts` · `validateAgentDef` / `splitCommandLine`；`src/bridge.ts` · `quoteLegacyCommand` |
+| 启动命令 | `src/impl.ts` · `validateAgentDef` / `splitCommandLine`；`src/bridge.ts` · `quoteLegacyCommand` / `StartAttempt` / `classifyTestFailure` / `AgentBridge.awaitStartChildExit` / `BridgeManager.testAgent` |
 | MCP 下发 | `src/bridge.ts` · `toAcpMcpServers`（线格式转换）；`src/impl.ts` · `validateMcpServers`（配置校验）；面板三处同步见 `src/client/panel.tsx` · `initialForm` / `buildPayload` / `payloadEquals` |
 | 会话分叉 | `src/bridge.ts` · `AgentBridge.forkSession` / `BridgeManager.adoptForkedSession` / `pendingForks` / `noteForkCapability` / `canForkNow` / `forkCaps`；`src/impl.ts` · `dispatchRpc`（`session/chat-fork-adopt` 分支）；`src/client/store.ts` · `forkChatSession` / `forkStateOf` |

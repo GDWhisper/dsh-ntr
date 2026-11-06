@@ -9,6 +9,7 @@ import type {
   AgentExposedModelsPayload,
   AgentProbeModelsResult,
   AgentSavePayload,
+  AgentTestResult,
   AgentView,
   SaveGateStatus,
   ApprovalDeadlinesSetPayload,
@@ -63,6 +64,8 @@ export interface PanelFixtureOptions {
   saveCancelGate?: Promise<void>
   /** Make `agent/save` answer `cancelled` (the agent was deleted mid-save). */
   agentSaveCancelled?: boolean
+  /** What `agent/test` answers; defaults to a successful handshake. */
+  agentTest?: AgentTestResult
   locale?: (zh: string, en: string) => string
 }
 
@@ -308,7 +311,7 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
           return ok({ done: true })
         }
         case 'agent/test':
-          return ok({ ok: true, durationMs: 12, stderr: [], agentInfo: { name: (payload as AgentSavePayload).title ?? 'Preview agent' } })
+          return ok(options.agentTest ?? { ok: true, durationMs: 12, stderr: [], agentInfo: { name: (payload as AgentSavePayload).title ?? 'Preview agent' } })
         case 'agent/cached-models':
           return ok(catalogs[(payload as { agentId: string }).agentId] ?? null)
         case 'agent/probe-models': {

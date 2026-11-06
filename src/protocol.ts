@@ -1135,11 +1135,58 @@ export interface AgentSaveResult {
   activeSessions?: ActiveTurnView[]
 }
 
+/**
+ * Why a connection test failed, as a VALUE the settings page can name a fix
+ * for.
+ *
+ * Every spawn failure used to reach the browser as one sentence — the SDK
+ * rejects the pending `initialize` with "ACP connection closed" whatever went
+ * wrong — so "the agent is not installed" and "the launch command is wrong"
+ * (the two mistakes a user actually makes, with different fixes) looked
+ * identical. The host reports the cause as a fact; the panel writes the
+ * sentence (it owns the locale).
+ */
+export type AgentTestFailureKind =
+  /** Nothing on PATH matches the program token: the agent is not installed. */
+  | 'not-found'
+  /** The `npmPackage` auto-install ran and failed; nothing was ever spawned. */
+  | 'install-failed'
+  /** The program was spawned and died before the ACP handshake finished. */
+  | 'start-failed'
+  /** The program ran but never answered `initialize` inside the startup budget. */
+  | 'timeout'
+  /** The connection dropped before `initialize` answered, with no exit fact to explain it. */
+  | 'handshake-failed'
+
 /** Result of `agent/test`: spawn + initialize a throwaway process from form values, then tear it down. */
 export interface AgentTestResult {
   ok: boolean
   /** Failure reason when `ok` is false (spawn ENOENT, install failure, initialize timeout, …). */
   error?: string
+  /** Machine-readable cause of a failed test; absent when `ok` is true. */
+  failure?: AgentTestFailureKind
+  /** The program token the test launched (the first token of the form's command line). */
+  command?: string
+  /** Absolute path that token resolved to; absent means the host never found it on PATH. */
+  executablePath?: string
+  /**
+   * The spawn's own error, when the process could not be launched at all.
+   *
+   * `code` is the OS reason (`ENOENT` / `EACCES` / `EINVAL`…). It separates
+   * "nothing to run" from "the OS refused to run it" — two fixes the settings
+   * page must not blur into "check the arguments".
+   */
+  spawnError?: { code?: string; message: string }
+  /**
+   * How the child died, when it did.
+   *
+   * A launch command missing its argument (`codebuddy` without `--acp`) usually
+   * shows up as a fast non-zero exit, which is what tells that mistake apart
+   * from an agent that is simply not installed.
+   */
+  exit?: { code: number | null; signal: string | null }
+  /** Whether the `npmPackage` auto-install actually STARTED during this attempt. */
+  installTried?: boolean
   /** The agent's `initialize` identity, when the handshake completed. */
   agentInfo?: { name?: string; title?: string; version?: string }
   /** Wall-clock cost of the whole test, including a triggered npm install. */

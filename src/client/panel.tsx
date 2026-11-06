@@ -25,8 +25,9 @@ import {
   saveGateOutcomeSuperseded,
 } from './store.ts'
 import type { AcpStore, UiState } from './store.ts'
+import type { Translate } from './acp-view.tsx'
 import { IDLE_RELEASE_MS } from '../protocol.ts'
-import type { AcpAgentDef, AcpApprovalDeadlines, AcpCatalogChoice, AcpMcpServerDef, ActiveTurnView, AgentSaveMode, AgentSavePayload, AgentView, DetectedAgentInfo, PermissionTimeoutMode, PluginUpdateState } from '../protocol.ts'
+import type { AcpAgentDef, AcpApprovalDeadlines, AcpCatalogChoice, AcpMcpServerDef, ActiveTurnView, AgentSaveMode, AgentSavePayload, AgentTestResult, AgentView, DetectedAgentInfo, PermissionTimeoutMode, PluginUpdateState } from '../protocol.ts'
 
 interface WithStore { acp: AcpStore }
 
@@ -805,6 +806,100 @@ export function approvalDeadlineFacts(deadlines: AcpApprovalDeadlines): {
     baseline,
     modeBaseline,
     overridden: baseline !== undefined || modeBaseline !== undefined,
+  }
+}
+
+/**
+ * What the connection test's result block renders: the host's raw error, the
+ * sentence naming the user's actual mistake, and the evidence behind it.
+ */
+export interface AgentTestOutcome {
+  ok: boolean
+  /** The host's own failure text (or the success line). */
+  text: string
+  /** One line naming what to fix; absent when the host gave no cause. */
+  hint?: string
+  /** The child's stderr tail — the evidence the hint is drawn from. */
+  detail: string[]
+}
+
+/**
+ * Name the fix for a failed connection test.
+ *
+ * Every spawn failure used to arrive as ONE sentence — the SDK rejects the
+ * pending `initialize` with "ACP connection closed" whatever went wrong — so
+ * the two mistakes a user actually makes (the agent is not installed / the
+ * launch command is wrong) were indistinguishable. The host reports WHICH one
+ * happened (`AgentTestResult.failure`); this decides the sentence, because the
+ * copy belongs to the browser that owns the locale.
+ *
+ * A pure function on purpose: the settings bundle has no DOM test of its own,
+ * and this decision is exactly what the single sentence got wrong.
+ */
+export function agentTestHint(result: AgentTestResult, t: Translate): string | undefined {
+  const failure = result.failure
+  if (failure === undefined) return undefined
+  const name = result.command === undefined || result.command === ''
+    ? t('这个命令', 'this command')
+    : t(`「${result.command}」`, `"${result.command}"`)
+  switch (failure) {
+    case 'not-found':
+      return result.installTried === true
+        ? t(
+          `已自动安装，PATH 中仍找不到${name}。确认包名与 bin 名一致。`,
+          `The auto-install ran and ${name} is still not on PATH. Check the package and bin names.`,
+        )
+        : t(
+          `PATH 中找不到${name}。安装该 agent，或在「高级」填 npm 包名自动安装。`,
+          `${name} is not on PATH. Install the agent, or set its npm package under Advanced.`,
+        )
+    case 'install-failed':
+      return t(
+        `npm 自动安装失败，${name}未装上。错误在下面的输出里。`,
+        `The npm auto-install failed, so ${name} is missing. npm's error is below.`,
+      )
+    case 'timeout':
+      return t(
+        `${name}已启动，但未在时限内完成 ACP 握手。确认它是 ACP agent，且参数完整。`,
+        `${name} started but missed the ACP handshake deadline. Confirm it is an ACP agent and the arguments are complete.`,
+      )
+    case 'handshake-failed':
+      return t(
+        `与${name}的连接在 ACP 握手前断开。确认它是 ACP agent，且命令正确。`,
+        `The connection to ${name} dropped before the ACP handshake. Confirm it is an ACP agent and the command is right.`,
+      )
+    case 'start-failed': {
+      // The OS refused to run the file: a permission fix, not an argument fix.
+      const code = result.spawnError?.code
+      if (code === 'EACCES' || code === 'EPERM') {
+        return t(
+          `没有权限执行${name}。检查文件权限，或换一个可执行路径。`,
+          `${name} is not executable by this user. Check the file permissions or use another path.`,
+        )
+      }
+      const where = result.executablePath === undefined
+        ? ''
+        : t(`（${result.executablePath}）`, ` (${result.executablePath})`)
+      if (result.exit === undefined) {
+        return t(
+          `${name}找到了${where}，但进程没能起来。检查启动命令与运行环境。`,
+          `${name} was found${where}, but the process did not start. Check the command and the runtime.`,
+        )
+      }
+      const died = result.exit.code !== null
+        ? t(`但立刻退出（退出码 ${String(result.exit.code)}）`, `but exited at once (code ${String(result.exit.code)})`)
+        : t('但立刻退出了', 'but exited at once')
+      // An exit before the handshake can be a wrong argument list OR a refused
+      // login, so the sentence names BOTH instead of blaming the command alone.
+      return t(
+        `${name}找到了${where}，${died}。先看下面的输出：可能是参数不全、鉴权失败或配置错误。`,
+        `${name} was found${where} ${died}. Read the output below: the arguments may be incomplete, or auth/config failed.`,
+      )
+    }
+    default:
+      // A kind this bundle does not know (host newer than the browser half):
+      // say nothing rather than invent a fix for the wrong failure.
+      return undefined
   }
 }
 
@@ -1605,7 +1700,7 @@ function AgentRow({
   const [saveGateAvailable, setSaveGateAvailable] = useState(true)
   const [saveConfirm, setSaveConfirm] = useState<ActiveTurnView[] | undefined>(undefined)
   const [testing, setTesting] = useState(false)
-  const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | undefined>(undefined)
+  const [testResult, setTestResult] = useState<AgentTestOutcome | undefined>(undefined)
   const patch = (next: Partial<AgentForm>): void => setForm(prev => ({ ...prev, ...next }))
 
   const serverExposureKey = exposureKey(detected.currentConfig?.exposedModels)
@@ -1849,10 +1944,21 @@ function AgentRow({
           text: acp.label('连接成功', 'Connected') + (result.agentInfo?.name !== undefined ? ` · ${result.agentInfo.name}` : '')
             + (result.agentInfo?.version !== undefined ? ` v${result.agentInfo.version}` : '')
             + ` · ${String(result.durationMs)}ms`,
+          // A successful start can still write warnings to stderr; the host
+          // returns them, so show them instead of dropping half the evidence.
+          detail: result.stderr,
         }
-        : { ok: false, text: result.error ?? acp.label('未知错误', 'Unknown error') })
+        : {
+          ok: false,
+          text: result.error ?? acp.label('未知错误', 'Unknown error'),
+          // The hint is what turns the one SDK sentence into the user's actual
+          // mistake; `stderr` is the evidence behind it (constraint 29: output
+          // is truncated only with a marker, never silently).
+          hint: agentTestHint(result, acp.label),
+          detail: result.stderr,
+        })
     } catch (error) {
-      setTestResult({ ok: false, text: error instanceof Error ? error.message : String(error) })
+      setTestResult({ ok: false, text: error instanceof Error ? error.message : String(error), detail: [] })
     } finally {
       setTesting(false)
     }
@@ -2215,7 +2321,7 @@ function AgentDetails({
   onSaveDefer: () => void
   onSaveForce: () => void
   testing: boolean
-  testResult?: { ok: boolean; text: string }
+  testResult?: AgentTestOutcome
   showSaveWarning: boolean
   onUseDefault: () => void
   onSave: () => void
@@ -2525,17 +2631,40 @@ function AgentDetails({
       </div>
 
       {testResult !== undefined && (
-        <div
-          className="dwa-mono"
-          style={{
-            marginTop: 8,
-            fontSize: 12,
-            whiteSpace: 'pre-wrap',
-            wordBreak: 'break-all',
-            color: testResult.ok ? 'var(--ntr-success)' : 'var(--ntr-danger)',
-          }}
-        >
-          {testResult.ok ? '✓ ' : '✕ '}{testResult.text}
+        <div style={{ marginTop: 8 }}>
+          <div
+            className="dwa-mono"
+            style={{
+              fontSize: 12,
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-all',
+              color: testResult.ok ? 'var(--ntr-success)' : 'var(--ntr-danger)',
+            }}
+          >
+            {testResult.ok ? '✓ ' : '✕ '}{testResult.text}
+          </div>
+          {/* The sentence that names the mistake, above the raw evidence: the
+              host's error text alone reads "ACP connection closed" for every
+              kind of spawn failure. Two colours on purpose — the raw line is
+              the failure (danger), the hint is advice (warn). */}
+          {testResult.hint !== undefined && (
+            <div
+              className="dwa-hint"
+              role="status"
+              style={{ marginTop: 4, color: 'var(--ntr-warn)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}
+            >
+              {testResult.hint}
+            </div>
+          )}
+          {testResult.detail.length > 0 && (
+            <div style={{ marginTop: 6 }}>
+              {/* Named, because the row above already shows the live process
+                  tail: two unnamed stderr blocks in one card read as a
+                  duplicate rather than as two different processes. */}
+              <span className="dwa-hint">{acp.label('测试进程输出', 'Test process output')}</span>
+              <pre className="dwa-stderr" style={{ marginTop: 4 }}>{testResult.detail.join('\n')}</pre>
+            </div>
+          )}
         </div>
       )}
     </div>

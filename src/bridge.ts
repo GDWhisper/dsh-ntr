@@ -75,7 +75,7 @@ import type {
   RosterPresetRow,
 } from './impl.ts'
 import type {
-  AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpMcpServerDef, AcpPresetStatus, AcpReleaseCause, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentRefusalDetail, AgentSaveMode, AgentSaveResult, AgentTestResult, AgentView, ChatSessionForkInfo, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
+  AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpMcpServerDef, AcpPresetStatus, AcpReleaseCause, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentRefusalDetail, AgentSaveMode, AgentSaveResult, AgentTestFailureKind, AgentTestResult, AgentView, ChatSessionForkInfo, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
   LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo,
   AcpIdleRelease, ActiveTurnView, ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PluginUpdateState, PreparedAdapterCall, SaveGateFlushResult, SaveGateStatus, SessionView, StreamChunk,
 } from './protocol.ts'
@@ -137,6 +137,14 @@ const KILL_ESCALATION_DELAY_MS = 3_000
  * never served anything, so there is nothing to drain.
  */
 const STALE_START_KILL_BUDGET_MS = 2_000
+
+/**
+ * How long `BridgeManager.testAgent` waits for a failed start's child to report
+ * its `exit` before writing the verdict (see `AgentBridge.awaitStartChildExit`).
+ * A process that is already gone reports in microseconds; this only bounds the
+ * pathological case, and it delays a user-visible answer, so it stays small.
+ */
+const TEST_EXIT_GRACE_MS = 250
 
 /**
  * The WHOLE host-shutdown budget for killing children, shared by every bridge
@@ -771,11 +779,88 @@ const DEFAULT_TUNING: Required<BridgeTuning> = {
 
 type BridgeState = 'stopped' | 'starting' | 'ready' | 'error'
 
+/**
+ * Facts about one start attempt, recorded as it happens so a failure can be
+ * NAMED afterwards instead of being read back out of prose.
+ *
+ * WHY: whatever goes wrong, the SDK rejects the pending `initialize` with the
+ * same sentence (`ACP connection closed`), so the user's two actual mistakes —
+ * "the agent is not installed" and "the launch command is wrong" — used to
+ * arrive identical. The connection test reads this record (see
+ * `classifyTestFailure`) and the settings page writes the matching fix.
+ *
+ * Written once per {@link AgentBridge.spawnAndConnect}, after the teardown
+ * checks: a start that lost its epoch describes nothing anyone reads.
+ */
+export interface StartAttempt {
+  /** The program token the definition names, before PATH resolution. */
+  command: string
+  /** Absolute path the program token resolved to; absent = never found on PATH. */
+  executablePath?: string
+  /**
+   * The `npmPackage` auto-install was actually STARTED during this attempt.
+   *
+   * Set from the install step itself, never from the definition: a configured
+   * package name proves nothing (the program may already sit on PATH), and
+   * claiming the install ran would make the settings page name a fix that never
+   * happened.
+   */
+  installTried: boolean
+  /** `spawn` was called and returned a child (an async ENOENT still counts as spawned). */
+  spawned: boolean
+  /** The spawn itself failed (ENOENT, EACCES, EINVAL…). */
+  spawnError?: { code?: string; message: string }
+  /** The child exited while the handshake was still in flight. */
+  exit?: { code: number | null; signal: string | null }
+  /** The `initialize` request ran out of its startup budget. */
+  timedOut: boolean
+}
+
+/**
+ * Name one failed `agent/test` from the attempt's own facts.
+ *
+ * The timeout is read first: it is the only fact that proves the process RAN,
+ * and a spawn error arriving after the teardown is stale noise about a child
+ * nobody was waiting for any more. The rest follows the order of the events:
+ * spawn → resolution → exit → a connection that dropped with no fact at all.
+ */
+export function classifyTestFailure(attempt: StartAttempt | undefined): AgentTestFailureKind {
+  if (attempt === undefined) return 'handshake-failed'
+  if (attempt.timedOut) return 'timeout'
+  // The spawn's own error is the second-strongest fact: `spawn` RETURNS a
+  // handle even when the program does not exist (the ENOENT arrives as an
+  // event), so `spawned` can be true here and this must be read before it.
+  if (attempt.spawnError !== undefined) {
+    // ENOENT means "install it" only when nothing was ever resolved. A path WAS
+    // found and then failed to launch, so the fix is not a reinstall.
+    return attempt.spawnError.code === 'ENOENT' && attempt.executablePath === undefined
+      ? 'not-found'
+      : 'start-failed'
+  }
+  if (!attempt.spawned) {
+    // Nothing was spawned and there is no spawn error: the failure happened
+    // while RESOLVING the command, i.e. inside the npm auto-install.
+    return attempt.installTried ? 'install-failed' : 'not-found'
+  }
+  if (attempt.exit !== undefined) return 'start-failed'
+  return 'handshake-failed'
+}
+
 export class AgentBridge {
   state: BridgeState = 'stopped'
   initResult?: InitializeResponse
   lastError?: string
   stderrTail: string[] = []
+  /** Facts about the LAST start attempt — see {@link StartAttempt}. */
+  startAttempt?: StartAttempt
+  /**
+   * The child the current start attempt spawned.
+   *
+   * Held separately from {@link child} because `killChild` clears THAT one the
+   * moment a start fails, and the exit facts of the child are exactly what a
+   * failed connection test has to report (see `awaitStartChildExit`).
+   */
+  private startChild?: ChildProcess
 
   private child?: ChildProcess
   private conn?: ClientConnection
@@ -1380,10 +1465,31 @@ export class AgentBridge {
    */
   private async spawnAndConnect(epoch: number): Promise<void> {
     this.stderrTail = []
+    // The attempt record starts here and is filled in as the start progresses;
+    // a failure reads it back to name the cause (see `StartAttempt`).
+    const attempt: StartAttempt = {
+      command: this.def.command,
+      // Flipped by the install step itself, not by the definition: see
+      // `StartAttempt.installTried`.
+      installTried: false,
+      spawned: false,
+      timedOut: false,
+    }
+    this.startAttempt = attempt
     // Resolve (and, with npmPackage, auto-install) the executable before the
     // spawn; the resolved absolute path also pins the lookup to the host PATH
     // plus the well-known extra dirs, not the child env the agent may override.
-    const { command } = await ensureAgentExecutable(this.def, undefined, line => this.noteStderr(line))
+    const { command } = await ensureAgentExecutable(
+      this.def,
+      undefined,
+      line => this.noteStderr(line),
+      () => { attempt.installTried = true },
+    )
+    // Re-resolved (not taken from the answer above) because the install may have
+    // JUST made the program resolvable: this is exactly the question "did the
+    // host find a program to launch", which is what tells "not installed"
+    // apart from "the launch command is wrong".
+    attempt.executablePath = findExecutable(this.def.command)
     // A teardown landed while the executable was being resolved — a global
     // install can hold this await for minutes. Nothing has been spawned yet, so
     // there is nothing to reap; just refuse to create the process.
@@ -1391,20 +1497,40 @@ export class AgentBridge {
     const cwd = safeSpawnCwd(this.def, this.wantedSpawnCwd)
     this.spawnCwd = cwd
     const launch = windowsShimLaunch(command, perSessionLaunchArgs(this.def.args ?? [], this.def.id))
-    const child = spawn(launch.command, launch.args, {
-      cwd,
-      env: perSessionLaunchEnv(childEnv(process.env, this.def.env ?? {}), this.def.id),
-      stdio: ['pipe', 'pipe', 'pipe'],
-      detached: process.platform !== 'win32',
-      shell: false,
-      // A console child of a GUI host (the desktop app) would otherwise pop a
-      // console window on every spawn.
-      windowsHide: true,
-      ...(launch.verbatim ? { windowsVerbatimArguments: true } : {}),
-    })
+    let child: ChildProcess
+    try {
+      child = spawn(launch.command, launch.args, {
+        cwd,
+        env: perSessionLaunchEnv(childEnv(process.env, this.def.env ?? {}), this.def.id),
+        stdio: ['pipe', 'pipe', 'pipe'],
+        detached: process.platform !== 'win32',
+        shell: false,
+        // A console child of a GUI host (the desktop app) would otherwise pop a
+        // console window on every spawn.
+        windowsHide: true,
+        ...(launch.verbatim ? { windowsVerbatimArguments: true } : {}),
+      })
+    } catch (error) {
+      // `spawn` rejects an unusable option set SYNCHRONOUSLY (an invalid `env`
+      // value, a bad option type). Record that like the async `error` event
+      // below, or the verdict would blame the install / PATH for a launch the
+      // host refused to attempt at all.
+      attempt.spawnError = {
+        code: (error as NodeJS.ErrnoException).code,
+        message: error instanceof Error ? error.message : String(error),
+      }
+      throw error
+    }
     this.child = child
+    this.startChild = child
+    attempt.spawned = true
     trackAgentChild(child)
     child.on('error', (error) => {
+      // The FACT is recorded before the identity guard: this attempt's own
+      // record is not shared with a replacement child, and a start that was
+      // already torn down still has to report WHY it failed. Only the teardown
+      // below needs the guard — a stale event must not kill a fresh process.
+      attempt.spawnError = { code: (error as NodeJS.ErrnoException).code, message: error.message }
       // Identity guard: a stale event from a PREVIOUS child must not tear down
       // a connection that replaced it (an `exit` can land after the respawn
       // already started and would otherwise kill the fresh process).
@@ -1413,6 +1539,12 @@ export class AgentBridge {
       if (this.state !== 'stopped') this.onConnectionLost(this, `spawn error: ${error.message}`)
     })
     child.on('exit', (code, signal) => {
+      // Before the guard, for the same reason as the spawn error above: a child
+      // that dies during the handshake closes its stdio FIRST, so the pending
+      // `initialize` is already rejected (and `killChild` has already cleared
+      // `this.child`) by the time this lands — the guard would swallow the one
+      // fact that names a wrong launch command.
+      attempt.exit = { code, signal }
       if (this.child !== child) return // stale event from a replaced child
       this.noteStderr(`[process exited code=${String(code)} signal=${String(signal)}]`)
       if (this.state === 'ready' || this.state === 'starting') {
@@ -1462,6 +1594,7 @@ export class AgentBridge {
         clientInfo: { name: 'dsh-ntr', title: 'DSH NTR', version: PLUGIN_VERSION },
       }),
       'initialize',
+      attempt,
     )
     // The second — and widest — window: `initialize` waits up to the startup
     // budget, and a shutdown / stop during it already dropped the connection and
@@ -1496,10 +1629,14 @@ export class AgentBridge {
    * is a race, and the losing call tears the child down: a process that stops
    * answering protocol requests is dead for every session it owns.
    */
-  private withStartupTimeout<T>(request: Promise<T>, what: string): Promise<T> {
+  private withStartupTimeout<T>(request: Promise<T>, what: string, attempt?: StartAttempt): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
+        // Marks THE attempt this start owns, not whatever `this.startAttempt`
+        // points at when the timer fires: a late timer from an older start must
+        // not make a fresh attempt read as timed out.
+        if (attempt !== undefined) attempt.timedOut = true
         this.killChild()
         reject(new AcpError('agent_timeout', `acp: agent "${this.def.id}" did not answer ${what} within ${String(this.startupTimeoutMs)}ms${this.stderrTail.length > 0 ? `; stderr: ${this.stderrTail.slice(-5).join(' | ')}` : ''}`))
       }, this.startupTimeoutMs)
@@ -1510,6 +1647,31 @@ export class AgentBridge {
       // The losing request may still reject when the child is torn down below.
       void request.catch(() => { /* already surfaced through the timeout path */ })
     })
+  }
+
+  /**
+   * Wait — briefly — for the current start's child to report its `exit`, so a
+   * failure verdict can name the code the process died with.
+   *
+   * WHY a bounded WAIT instead of a read: a child that dies during the ACP
+   * handshake closes its stdio FIRST. The SDK therefore rejects the pending
+   * `initialize` (reporting "ACP connection closed") before Node delivers
+   * `exit`, and the start's own teardown clears the child in that same window.
+   * Reading the record at the rejection would miss the exit code — the single
+   * most useful fact about a launch command that is wrong.
+   *
+   * Never rejects, and never outlasts its budget: a process that is gone
+   * reports promptly, and a wedged one must not delay the verdict.
+   */
+  async awaitStartChildExit(budgetMs: number): Promise<void> {
+    // Only a start that actually reached `spawn` has a child whose exit is
+    // worth waiting for; a start that died while resolving (a failed install)
+    // must not sit on the previous child for the whole grace window.
+    if (this.startAttempt?.spawned !== true) return
+    const child = this.startChild
+    if (child === undefined) return
+    if (child.exitCode !== null || child.signalCode !== null) return
+    await waitForChildExit(child, budgetMs)
   }
 
   private noteStderr(line: string): void {
@@ -3837,10 +3999,18 @@ export async function ensureAgentExecutable(
   def: Pick<AcpAgentDef, 'command' | 'npmPackage'>,
   install: (pkg: string, onLog: (line: string) => void) => Promise<void> = (pkg, onLog) => npmInstallGlobal(pkg, onLog),
   onLog: (line: string) => void = () => {},
+  /**
+   * Called when the auto-install is about to run — the only point that proves
+   * an install was TRIED. A configured `npmPackage` alone does not (see
+   * `StartAttempt.installTried`), and a throw below would otherwise leave no
+   * trace of the attempt.
+   */
+  onInstallStart: () => void = () => {},
 ): Promise<ExecutableResolution> {
   const found = findExecutable(def.command)
   if (found !== undefined) return { command: found, installed: false }
   if (def.npmPackage === undefined || def.npmPackage === '') return { command: def.command, installed: false }
+  onInstallStart()
   await install(def.npmPackage, onLog)
   const retry = findExecutable(def.command)
   if (retry === undefined) {
@@ -9177,9 +9347,29 @@ export class BridgeManager {
         stderr: [...bridge.stderrTail],
       }
     } catch (error) {
+      // The child's exit may still be in flight when the handshake failure is
+      // reported (see `awaitStartChildExit`): give it a bounded moment so the
+      // verdict can carry the exit code.
+      await bridge.awaitStartChildExit(TEST_EXIT_GRACE_MS)
+      // The failure is reported as FACTS, not only as the SDK's sentence: every
+      // spawn failure rejects the pending `initialize` with the same
+      // "ACP connection closed", which cannot tell "the agent is not installed"
+      // from "the launch command is wrong". The browser writes the sentence from
+      // `failure`; `error` stays for the raw text.
+      const attempt = bridge.startAttempt
       return {
         ok: false,
         error: error instanceof Error ? error.message : String(error),
+        failure: classifyTestFailure(attempt),
+        ...(attempt === undefined
+          ? {}
+          : {
+            command: attempt.command,
+            ...(attempt.executablePath === undefined ? {} : { executablePath: attempt.executablePath }),
+            installTried: attempt.installTried,
+            ...(attempt.spawnError === undefined ? {} : { spawnError: attempt.spawnError }),
+            ...(attempt.exit === undefined ? {} : { exit: attempt.exit }),
+          }),
         durationMs: Date.now() - startedAt,
         stderr: [...bridge.stderrTail],
       }
