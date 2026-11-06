@@ -584,13 +584,6 @@ export interface UiState {
    */
   acpMode: Record<string, boolean>
   /**
-   * External ACP subagent catalog ids (`acp:<toolCallId>`) currently running,
-   * per DSH chat session. Feeds the host's own subagent status map in the
-   * header catalog shadow; entries are removed the moment the worker reports
-   * completed / failed or its turn ends.
-   */
-  activeSubagents: Record<string, string[]>
-  /**
    * The plugin's OWN lifecycle records for external workers, keyed by
    * {@link subagentKey} (`dshSessionId + childId`). Live transitions arrive as
    * `subagents/record` frames; a `session/chat-list` answer carries the
@@ -1015,7 +1008,6 @@ export class AcpStore {
     },
     chatTranscripts: {},
     acpMode: {},
-    activeSubagents: {},
     subagents: {},
     subagentDetails: {},
     chatBoundAgent: {},
@@ -1050,9 +1042,8 @@ export class AcpStore {
   /**
    * Monotonic order plus a short log of chat-row lifecycle frames. Read
    * starts capture the sequence; the answer replays every later frame over
-   * its row list. Bounded like {@link subagentFrames} — a read only needs the
-   * frames since it started, and a page that never reconnects cannot grow this
-   * without bound.
+   * its row list. Bounded — a read only needs the frames since it started, and
+   * a page that never reconnects cannot grow this without bound.
    */
   private chatRowFrameSeq = 0
   private readonly chatRowFrames: ChatRowFrame[] = []
@@ -1087,18 +1078,10 @@ export class AcpStore {
    */
   private readonly acpModeLive = new Set<string>()
   /**
-   * Monotonic order for applied `subagents/update` frames, plus a short log of
-   * the recent ones. A `session/chat-list` response can describe the host as of
-   * BEFORE a frame that landed while the read was in flight; the response
-   * replays the later frames over its snapshot instead of replacing them.
-   */
-  private subagentFrameSeq = 0
-  private readonly subagentFrames: Array<{ seq: number; dshSessionId: string; childId: string; running: boolean }> = []
-  /**
-   * Monotonic order plus a short log of applied `subagents/record` frames, for
-   * the same reason as {@link subagentFrames}: a `session/chat-list` answer can
-   * describe the host as of BEFORE a frame that landed while the read was in
-   * flight, and the answer replays the later frames over its snapshot.
+   * Monotonic order plus a short log of applied `subagents/record` frames: a
+   * `session/chat-list` answer can describe the host as of BEFORE a frame that
+   * landed while the read was in flight, and the answer replays the later
+   * frames over its snapshot.
    */
   private subagentRecordSeq = 0
   private readonly subagentRecordFrames: Array<{ seq: number; dshSessionId: string; record: SubagentRecord }> = []
@@ -1987,7 +1970,6 @@ export class AcpStore {
     const settle = options?.settleVerdict === true || !this.acpModeLive.has(dshSessionId)
     // Captured BEFORE the request: every frame applied after this point is
     // newer than whatever state the host will answer with.
-    const subagentFramesAtRead = this.subagentFrameSeq
     const subagentRecordFramesAtRead = this.subagentRecordSeq
     const chatRowFramesAtRead = this.chatRowFrameSeq
     try {
@@ -2027,21 +2009,6 @@ export class AcpStore {
       const agentLockReveal = witnessedLock
         ? { ...this.state.agentLockReveal, [dshSessionId]: (this.state.agentLockReveal[dshSessionId] ?? 0) + 1 }
         : this.state.agentLockReveal
-      // External subagent rows still running, as the host snapshot knows them.
-      // REPLACED, not merged: a reconnect / reload may have missed the
-      // `running: false` frames of ids that stopped while the page was away,
-      // and live frames keep the set fresh from here. Frames that landed
-      // WHILE this read was in flight are newer than the snapshot, though:
-      // replay them over it, or a fresh `running: true` would be erased (grey
-      // until a reload — its frame is never re-sent) and a `running: false`
-      // would resurrect an id the snapshot still lists.
-      const activeSubagents = [...new Set(sessions.flatMap(row => row.activeSubagents ?? []))]
-      for (const frame of this.subagentFrames) {
-        if (frame.seq <= subagentFramesAtRead || frame.dshSessionId !== dshSessionId) continue
-        const at = activeSubagents.indexOf(frame.childId)
-        if (frame.running && at < 0) activeSubagents.push(frame.childId)
-        else if (!frame.running && at >= 0) activeSubagents.splice(at, 1)
-      }
       // The plugin's own lifecycle records: REPLACED for this conversation and
       // refreshed for every other one, then replayed over by the
       // `subagents/record` frames that landed while this read was in flight
@@ -2061,7 +2028,6 @@ export class AcpStore {
         chatSessionsFor: dshSessionId,
         chatLockedAgent,
         agentLockReveal,
-        activeSubagents: { ...this.state.activeSubagents, [dshSessionId]: activeSubagents },
         subagents,
         // The host's binding (intent + live-session fallback) outranks the
         // optimistic entry this store wrote on the click; a host without the
@@ -3770,33 +3736,6 @@ export class AcpStore {
           saveGate: status,
           ...this.saveGatePatch(this.state.saveGate, status),
         })
-        return Promise.resolve()
-      }
-      case 'subagents/update': {
-        // One external catalog row's live status. Only the ONGOING state
-        // exists for these rows (the host excludes them from `completed`), so
-        // this set is what the catalog shadow merges into the host's own
-        // status map — an id absent here reads as the shipped grey idle dot.
-        //
-        // Recorded even when idempotent: a chat-list read in flight answers
-        // with an older snapshot and replays the frames it missed. The log is
-        // bounded; a read captures the sequence before its request, so older
-        // entries are never replayed twice.
-        this.subagentFrameSeq += 1
-        this.subagentFrames.push({
-          seq: this.subagentFrameSeq,
-          dshSessionId: event.dshSessionId,
-          childId: event.childId,
-          running: event.running,
-        })
-        if (this.subagentFrames.length > 256) this.subagentFrames.shift()
-        const current = this.state.activeSubagents[event.dshSessionId] ?? []
-        const present = current.includes(event.childId)
-        if (event.running === present) return Promise.resolve()
-        const next = event.running
-          ? [...current, event.childId]
-          : current.filter(id => id !== event.childId)
-        this.mutate({ activeSubagents: { ...this.state.activeSubagents, [event.dshSessionId]: next } })
         return Promise.resolve()
       }
       case 'subagents/record': {

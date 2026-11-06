@@ -28,6 +28,19 @@ function normPath(p: string): string {
   return p.replaceAll('\\', '/')
 }
 
+/**
+ * Any `subagents/*` frame other than the plugin's record stream, since
+ * `since`. The bridge used to emit a second, per-worker dot feed beside the
+ * records; that feed is retired and the record stream is the only lifecycle
+ * source, so any extra subagent frame kind is a regression.
+ */
+function unexpectedSubagentFrames(source: readonly AcpEvent[], since: number): AcpEvent[] {
+  return source.slice(since).filter(event => {
+    const type = (event as { type: string }).type
+    return type.startsWith('subagents/') && type !== 'subagents/record'
+  })
+}
+
 const def: AcpAgentDef = {
   id: 'mock',
   title: 'Mock',
@@ -8636,22 +8649,16 @@ describe('a turn that dispatched a detached worker (isolated manager)', () => {
         label: 'general-purpose · explorer',
       }])
 
-      // The row's live status rides its own frames: the host's external rows
-      // have no Session, so nothing else can tell the browser the worker runs.
-      // Exactly one `running: true` when the row is reported, then exactly one
-      // `running: false` once the call completed / the turn closed.
-      const activity = dispatchEvents
-        .slice(since)
-        .filter((event): event is Extract<AcpEvent, { type: 'subagents/update' }> =>
-          event.type === 'subagents/update' && event.childId === 'acp:agent_dispatch')
-      expect(activity.map(event => event.running)).toEqual([true, false])
-      expect(activity.every(event => event.dshSessionId === dshSessionId)).toBe(true)
+      // The record stream is the ONLY lifecycle source (the legacy per-worker
+      // dot feed is retired). The catalog report itself still happens once,
+      // and separately, above.
+      expect(unexpectedSubagentFrames(dispatchEvents, since)).toEqual([])
     } finally {
       dispatchManager.setSubagentCatalogReporter(undefined)
     }
   }, 30_000)
 
-  it('never lights a row whose detached signal and completion share one frame', async () => {
+  it('names a dispatch with a shared detachment-and-completion frame as completed in its record', async () => {
     const dshSessionId = 'dsh-dispatch-completed-meta'
     const since = dispatchEvents.length
     const calls: Array<{ dshSessionId: string; childId: string; label: string }> = []
@@ -8665,18 +8672,23 @@ describe('a turn that dispatched a detached worker (isolated manager)', () => {
         sessionId: dshSessionId,
         messages: [{ role: 'user', content: [{ type: 'text', text: 'DISPATCH DISPATCHCOMPLETEMETA' }] }],
       })
-      // The catalog fact is still recorded (the row exists), but its work is
-      // over: no `running: true` may ever be sent for it, so there is no
-      // `[true, false]` flicker in the host's dot either. (The label itself is
-      // not the subject here: this synthetic frame carries no rawInput, so the
-      // refresh may only know the role.)
+      // The catalog fact is still recorded (the row exists) even though its
+      // work was over when it arrived. (The label itself is not the subject
+      // here: this synthetic frame carries no rawInput, so the refresh may
+      // only know the role.)
       expect(calls).toHaveLength(1)
       expect(calls[0]).toMatchObject({ dshSessionId, childId: 'acp:agent_dispatch' })
-      const activity = dispatchEvents
+      // The record still tells the truth — creation, then the terminal
+      // `completed` the shared frame carried — and the retired dot feed stays
+      // silent.
+      const records = dispatchEvents
         .slice(since)
-        .filter((event): event is Extract<AcpEvent, { type: 'subagents/update' }> =>
-          event.type === 'subagents/update' && event.childId === 'acp:agent_dispatch')
-      expect(activity).toEqual([])
+        .filter((event): event is Extract<AcpEvent, { type: 'subagents/record' }> =>
+          event.type === 'subagents/record' && event.record.childId === 'acp:agent_dispatch')
+        .map(event => event.record)
+      expect(records.map(record => record.status)).toEqual(['running', 'completed'])
+      expect(records.at(-1)?.endedAt).toBeDefined()
+      expect(unexpectedSubagentFrames(dispatchEvents, since)).toEqual([])
     } finally {
       dispatchManager.setSubagentCatalogReporter(undefined)
     }
@@ -9084,8 +9096,8 @@ describe('a turn that dispatched a detached worker (isolated manager)', () => {
  * The plugin-owned lifecycle record for external workers: six states derived
  * from the wire, terminal rows persisted in `agents.json` on TRANSITIONS only,
  * and a snapshot carried on `session/chat-list` for live AND released sessions.
- * The host catalog (the OLD `subagents/update` feed) keeps running beside it
- * until the UI task retires it.
+ * This is the ONLY lifecycle source — the legacy per-worker dot feed is
+ * retired and must never appear again.
  */
 describe('external subagent lifecycle records (isolated manager)', () => {
   const recordWorkspace = `${tmpdir()}/dsh-ntr-subagent-records-workspace`
@@ -9157,7 +9169,7 @@ describe('external subagent lifecycle records (isolated manager)', () => {
     return parsed.subagents
   }
 
-  it('announces creation + completion, keeps the old catalog feed, and serves the detail read', async () => {
+  it('announces creation + completion, keeps the catalog report, and serves the detail read', async () => {
     const dshSessionId = 'dsh-dispatch-record-completed'
     const since = recordEvents.length
     const calls: string[] = []
@@ -9188,12 +9200,9 @@ describe('external subagent lifecycle records (isolated manager)', () => {
     expect(terminal.counts.toolCalls).toBeGreaterThanOrEqual(1)
     expect(terminal.counts.textChars).toBeGreaterThan(0)
 
-    // The OLD path is dual-run on purpose (Task 3 retires it).
-    const activity = recordEvents
-      .slice(since)
-      .filter((event): event is Extract<AcpEvent, { type: 'subagents/update' }> =>
-        event.type === 'subagents/update' && event.childId === 'acp:agent_dispatch')
-    expect(activity.map(event => event.running)).toEqual([true, false])
+    // The retired dot feed is gone; the record stream is the only lifecycle
+    // source, and the catalog row is still reported exactly once.
+    expect(unexpectedSubagentFrames(recordEvents, since)).toEqual([])
     expect(calls).toEqual(['acp:agent_dispatch'])
 
     // The snapshot carries the terminal record (live session).
@@ -9228,13 +9237,9 @@ describe('external subagent lifecycle records (isolated manager)', () => {
     const frames = recordFrames(since)
     expect(frames.map(frame => frame.status)).toEqual(['running', 'failed'])
     // No reporter is wired in this test: the host catalog never accepted the
-    // row, so the OLD activity feed stays silent — the record stream is
-    // deliberately NOT gated on that acceptance (the panel must see it).
-    const activity = recordEvents
-      .slice(since)
-      .filter((event): event is Extract<AcpEvent, { type: 'subagents/update' }> =>
-        event.type === 'subagents/update' && event.childId === 'acp:agent_dispatch')
-    expect(activity).toEqual([])
+    // row, and the record stream is deliberately NOT gated on that acceptance
+    // (the panel must see it). The retired dot feed never speaks either way.
+    expect(unexpectedSubagentFrames(recordEvents, since)).toEqual([])
     const terminal = frames.at(-1)!
     // The failure reason is the completion frame's `content`, verbatim.
     expect(terminal.error).toEqual([{
@@ -9271,6 +9276,7 @@ describe('external subagent lifecycle records (isolated manager)', () => {
     const afterCancel = recordFrames(since)
     expect(afterCancel.at(-1)?.status).toBe('cancelled')
     expect(afterCancel.at(-1)?.endedAt).toBeDefined()
+    expect(unexpectedSubagentFrames(recordEvents, since)).toEqual([])
     // No row is left running anywhere in the snapshot either.
     expect(recordManager.subagentsFor(dshSessionId).some(row => row.status === 'running' || row.status === 'pending')).toBe(false)
 
@@ -9315,6 +9321,7 @@ describe('external subagent lifecycle records (isolated manager)', () => {
     const frames = recordFrames(since)
     expect(frames.at(-1)?.status).toBe('unknown')
     expect(frames.at(-1)?.endedAt).toBeDefined()
+    expect(unexpectedSubagentFrames(recordEvents, since)).toEqual([])
     // Reconnect seed: the conversation is parked (released) and the terminal
     // record still rides its `session/chat-list` row.
     const rows = recordManager.chatSessions(dshSessionId)
@@ -9341,6 +9348,7 @@ describe('external subagent lifecycle records (isolated manager)', () => {
 
     const frames = recordFrames(since)
     expect(frames.at(-1)?.status).toBe('unknown')
+    expect(unexpectedSubagentFrames(recordEvents, since)).toEqual([])
     // The conversation is destroyed: its records go with it (the next write
     // must not keep the key).
     expect(recordManager.subagentsFor(dshSessionId)).toEqual([])
@@ -9361,6 +9369,7 @@ describe('external subagent lifecycle records (isolated manager)', () => {
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error('the holding step never closed')), 5_000)),
     ])
     expect(recordFrames(since).at(-1)?.status).toBe('unknown')
+    expect(unexpectedSubagentFrames(recordEvents, since)).toEqual([])
 
     // A forced RESET tears the session down without `closeTurn`; the record is
     // still terminalized before the controller is detached.
@@ -9375,6 +9384,7 @@ describe('external subagent lifecycle records (isolated manager)', () => {
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error('the reset turn never closed')), 5_000)),
     ])
     expect(recordFrames(resetSince).at(-1)?.status).toBe('unknown')
+    expect(unexpectedSubagentFrames(recordEvents, resetSince)).toEqual([])
   }, 30_000)
 
   it('closes a worker that never reports as unknown, not running', async () => {
@@ -9384,6 +9394,7 @@ describe('external subagent lifecycle records (isolated manager)', () => {
     // The worker-phase ceiling closed the turn with the deferral report.
     expect(recordText(chunks)).toContain('deferred this turn to a background task run')
     expect(recordFrames(since).map(frame => frame.status)).toEqual(['running', 'unknown'])
+    expect(unexpectedSubagentFrames(recordEvents, since)).toEqual([])
   }, 30_000)
 
   it('prunes orphan record keys at load and keeps owned ones', async () => {

@@ -33,9 +33,7 @@
  * READ-ONLY. Rows open a read-only detail overlay
  * ({@link SubagentDetailDialog}, a global `shell.overlay` entry); neither the
  * list nor the detail offers cancel / retry / spawn / stop or any other fake
- * control. The old `subagents/update` -> `activeSubagents` ->
- * `mergeSubagentStatuses` path keeps feeding the host component on the
- * fail-open branch (Task 3c retires it).
+ * control.
  */
 
 import { createElement, useEffect, useLayoutEffect, useRef, useState } from 'react'

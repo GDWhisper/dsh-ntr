@@ -20,11 +20,6 @@
  * - everything else -> the HOST component with its original props, visually
  *   indistinguishable from the shipped entry.
  *
- * The old live-dot path (`subagents/update` -> `activeSubagents` ->
- * {@link mergeSubagentStatuses}) is kept: were the self-drawn panel to fail
- * open (a host shape this bundle cannot serve), the host component is still
- * rendered with the live external ids marked running. Task 3c retires it.
- *
  * NON-ACP CONVERSATIONS PASS THROUGH. A list entry is projected into EVERY
  * session's header, so the occupant renders the host component whenever
  * `acpMode` is not affirmatively true — making it visually indistinguishable
@@ -35,7 +30,7 @@
  * the native entry keeps the cell exactly as shipped.
  */
 
-import { createElement, useMemo } from 'react'
+import { createElement } from 'react'
 import type { ComponentType } from 'react'
 // Type-only: pulls the conversation SlotMap merge into this program.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
@@ -50,27 +45,12 @@ export const SUBAGENT_CATALOG_SLOT = 'conversation.session.header.actions'
 export const SUBAGENT_CATALOG_ENTRY_ID = 'subagent-catalog'
 
 /**
- * The host's own status map with the live external ids marked running.
+ * The standard kit + injected face the shadow renders the host component with.
  *
- * The substituted value matches the host's `SessionStatus`: `running` is the
- * only field the catalog reads, and the other two are present so a newer host
- * reading them does not see an undefined member. Without active ids the
- * ORIGINAL map is returned unchanged (same reference), which is what lets the
- * wrapper hand the untouched hook back instead of a needless wrapper.
+ * `useSessionStatus` is part of the host's kit and is passed through untouched:
+ * the plugin no longer substitutes it (the host's status map never described
+ * an external row, and the self-drawn panel reads the plugin's own records).
  */
-export function mergeSubagentStatuses<T>(
-  statuses: ReadonlyMap<string, T>,
-  active: readonly string[] | undefined,
-): ReadonlyMap<string, T> {
-  if (active === undefined || active.length === 0) return statuses
-  const merged = new Map(statuses)
-  for (const id of active) {
-    merged.set(id, { running: true, pendingInteraction: undefined, completionUnread: false } as unknown as T)
-  }
-  return merged
-}
-
-/** The standard kit + injected face the shadow renders the host component with. */
 interface SubagentCatalogHostProps {
   sessionId: unknown
   useSessionStatus?: unknown
@@ -84,37 +64,17 @@ interface OccupantProps extends SubagentCatalogHostProps {
   onDiag?: (line: string) => void
 }
 
-type StatusHook = (selector?: (value: unknown) => unknown) => unknown
-
 function SubagentCatalogOccupant({ host: Host, onDiag, ...props }: OccupantProps) {
   const ui = useUi(props.acp)
   const dshSessionId = String(props.sessionId)
-  const hostStatus = props.useSessionStatus
   const acpMode = ui.acpMode[dshSessionId] === true
-  const active = acpMode ? ui.activeSubagents?.[dshSessionId] : undefined
-  const useSessionStatus = useMemo(() => {
-    if (typeof hostStatus !== 'function' || active === undefined || active.length === 0) return hostStatus
-    // The host calls this prop as a hook among its own. A zero-hook projector
-    // would change the host component's hook COUNT the moment the active set
-    // starts or stops being non-empty, and React rejects that on the same
-    // mount ("Rendered fewer/more hooks…"). So the substituted hook always
-    // calls the REAL hook itself: whether or not a worker is live, the host
-    // runs exactly the same hooks, in the same order.
-    const patched: StatusHook = selector => {
-      const statuses = (hostStatus as StatusHook)((value: unknown) => value) as ReadonlyMap<string, unknown>
-      const merged = mergeSubagentStatuses(statuses, active)
-      return selector === undefined ? merged : selector(merged)
-    }
-    return patched
-  }, [hostStatus, active])
-  const hostProps = useSessionStatus === hostStatus ? props : { ...props, useSessionStatus }
   // TWO COMPONENT TYPES: React unmounts one and mounts the other, so each
   // keeps a fixed hook count. A conditional hook inside one component would
   // flip the count on the ACP-mode verdict and the slot's error boundary would
   // abdicate the whole entry.
   return acpMode
-    ? createElement(OwnSubagentCatalog, { ...hostProps, host: Host, onDiag } as unknown as OwnSubagentCatalogProps)
-    : createElement(Host, hostProps)
+    ? createElement(OwnSubagentCatalog, { ...props, host: Host, onDiag } as unknown as OwnSubagentCatalogProps)
+    : createElement(Host, props)
 }
 
 function findHostCatalog(slots: SeatSlots): SeatEntry | undefined {

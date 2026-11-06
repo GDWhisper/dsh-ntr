@@ -2233,8 +2233,8 @@ export class AgentBridge {
       // `closed` back to false — an idle release resurrecting a closed session.
       if (session.closed) continue
       // The process that owed the turn is gone, so no worker is still running:
-      // every catalog dot this turn lit goes out before the turn/end below.
-      session.turnController?.releaseDispatchActivity()
+      // every still-open dispatch becomes `unknown` before the turn/end below.
+      session.turnController?.terminalizeDispatches('unknown')
       if (session.running) {
         session.running = false
         this.hub.broadcast({ type: 'turn/end', sessionId: session.sessionId, turnId: '', error: reason })
@@ -2356,8 +2356,9 @@ export class AgentBridge {
     // The session is going away: whatever background drain it announced ends
     // with it (a re-created session must not inherit a stale ambient).
     clearAmbientState(session)
-    // ...and so does every catalog dot its turn lit.
-    session.turnController?.releaseDispatchActivity()
+    // ...and so does every still-open dispatch record its turn owned: a closed
+    // session is not a cancelled worker.
+    session.turnController?.terminalizeDispatches('unknown')
     // ...and so does its prompt slot: nothing may keep rejecting a new prompt
     // for a record that is being deleted.
     session.promptInFlight = false
@@ -2444,8 +2445,9 @@ export class AgentBridge {
       this.settlePermissions(session)
       this.openSettleGate(session)
       session.activeToolCalls.clear()
-      // A forced teardown never closes its turn: the dots go out here.
-      session.turnController?.releaseDispatchActivity()
+      // A forced teardown never closes its turn: every still-open dispatch
+      // becomes `unknown` here.
+      session.turnController?.terminalizeDispatches('unknown')
       clearAmbientState(session)
       this.sessions.delete(session.sessionId)
       this.acpIndex.delete(session.acpSessionId)
@@ -4417,12 +4419,6 @@ interface BackgroundDispatch {
   catalogLabelIdentified: boolean
   /** Whether the host catalog already accepted this dispatch (one fact per call). */
   catalogReported: boolean
-  /**
-   * Whether this dispatch's catalog row is currently reported active in the
-   * browser. Only meaningful once {@link catalogReported} is true: an id that
-   * never reached the catalog has no row to light, so it is never closed.
-   */
-  activity?: 'active' | 'idle'
   /** When the dispatch call was first seen (the record's `startedAt`). */
   startedAt: number
   /** Last frame belonging to this dispatch. Memory-only: persisted with the next transition. */
@@ -5274,13 +5270,6 @@ class TurnStreamController {
           known.terminal = status === 'failed' ? 'failed' : 'completed'
           known.endedAt = now
           if (status === 'failed' && update.content !== undefined) known.error = update.content
-          // The catalog row stops being live here, whatever the turn does
-          // next — and BEFORE the report below, whose identity fallback may
-          // report the row for the first time, and before
-          // `noteDispatchProgress`. A frame that is BOTH completed and
-          // `isBackground` must close an already-lit row, never re-open it (a
-          // completed row never lights).
-          this.closeDispatchActivity(known)
         }
         if (!known.catalogReported) this.refreshSubagentDispatchLabel(known, update)
         if (meta?.isBackground === true) {
@@ -5410,8 +5399,13 @@ class TurnStreamController {
    * batch (one announcement per record, one state-file write). Already
    * terminal rows are left untouched: `cancelled` / `unknown` are not allowed
    * to overwrite what the agent actually said.
+   *
+   * This is the record half of every teardown path: a turn / session / process
+   * that goes away without a terminal frame must still leave the panel a
+   * terminal row (`cancelled` for a cancelled turn, `unknown` for everything
+   * else — those endings are not evidence the worker ended).
    */
-  private terminalizeDispatches(status: 'cancelled' | 'unknown'): void {
+  terminalizeDispatches(status: 'cancelled' | 'unknown'): void {
     const dshSessionId = this.session.dshSessionId
     const now = Date.now()
     const records: SubagentRecord[] = []
@@ -5453,7 +5447,6 @@ class TurnStreamController {
     if (!dispatch.catalogLabelIdentified && !dispatch.completed) return
     if (this.manager.reportSubagentCatalog(this.session, `acp:${dispatch.toolCallId}`, dispatch.catalogLabel)) {
       dispatch.catalogReported = true
-      this.openDispatchActivity(dispatch)
     }
   }
 
@@ -5472,84 +5465,6 @@ class TurnStreamController {
     if (!identified && !(typeof title === 'string' && title !== '')) return
     dispatch.catalogLabel = subagentDispatchLabel(update)
     dispatch.catalogLabelIdentified = identified
-  }
-
-  /**
-   * Announce one dispatch's catalog row as running / no longer running in the
-   * browser. The host's external rows have no real Session, so its own status
-   * map can never describe them; this frame is what lets the browser's shadow
-   * of the host catalog light the host's own ongoing dot. A turn with no chat
-   * identity (`/acp` RPC) has no catalog row and nothing to report to.
-   */
-  private broadcastDispatchActivity(dispatch: BackgroundDispatch, running: boolean): void {
-    if (this.session.dshSessionId === undefined) return
-    this.hub.broadcast({
-      type: 'subagents/update',
-      dshSessionId: this.session.dshSessionId,
-      childId: `acp:${dispatch.toolCallId}`,
-      running,
-    })
-  }
-
-  /**
-   * The dispatch is now a reported, still-running catalog row: light it.
-   *
-   * Only a row the catalog ACCEPTED can be lit (`catalogReported`) — an id the
-   * host never stored has nothing to read the status. A dispatch that already
-   * completed before it was reported (the identity-less fallback at completion)
-   * never lights at all: its work is over by definition.
-   */
-  private openDispatchActivity(dispatch: BackgroundDispatch): void {
-    if (dispatch.completed || !dispatch.catalogReported || dispatch.activity === 'active') return
-    dispatch.activity = 'active'
-    this.broadcastDispatchActivity(dispatch, true)
-  }
-
-  /**
-   * The dispatch's work ended: close its row. Guarded on `activity`, so a
-   * dispatch that was never lit never broadcasts a `running: false` for a row
-   * the browser does not hold.
-   */
-  private closeDispatchActivity(dispatch: BackgroundDispatch): void {
-    if (dispatch.activity !== 'active') return
-    dispatch.activity = 'idle'
-    this.broadcastDispatchActivity(dispatch, false)
-  }
-
-  /**
-   * Every dispatch this turn still reports as running goes out, and every
-   * dispatch that never reported a terminal state gets one: `cancelled` when
-   * the turn was cancelled, `unknown` for every other ending (a turn ending is
-   * not evidence the worker ended). Already terminal rows are not overwritten.
-   */
-  private closeAllDispatchActivity(terminal: 'cancelled' | 'unknown' = 'unknown'): void {
-    for (const dispatch of this.dispatches.values()) this.closeDispatchActivity(dispatch)
-    this.terminalizeDispatches(terminal)
-  }
-
-  /**
-   * The catalog ids this turn is still reporting as running, for the
-   * `session/chat-list` snapshot that seeds a reloaded browser (the live path
-   * is `subagents/update`). Read by `AgentBridge.chatSessions`.
-   */
-  activeCatalogChildIds(): string[] {
-    const out: string[] = []
-    for (const dispatch of this.dispatches.values()) {
-      if (dispatch.activity !== 'active' || !dispatch.catalogReported || dispatch.completed) continue
-      out.push(`acp:${dispatch.toolCallId}`)
-    }
-    return out
-  }
-
-  /**
-   * Drop every dot this turn owns and write the `unknown` terminal record for
-   * every dispatch that never reported. The bridge teardown paths
-   * (`parkSessions` / `closeSession` / `forceReset` / `dispose`) call this
-   * before they detach the controller: those paths never reach `closeTurn`,
-   * and a row the browser keeps as running would stay "running" forever.
-   */
-  releaseDispatchActivity(): void {
-    this.closeAllDispatchActivity('unknown')
   }
 
   /**
@@ -5784,12 +5699,13 @@ class TurnStreamController {
     // run's record (`closeBackgroundHold` retired or kept it); only the clocks
     // are still ours to drop.
     this.clearBackgroundHold()
-    // Every catalog row this turn reported is no longer live: the browser must
-    // never keep a dot for a turn that already ended (an idle turn whose
-    // worker reports later says so in the ACP transcript view). A cancelled
-    // turn also tells its still-open workers they were cancelled; any other
-    // ending leaves them `unknown` (the turn ending is not the worker ending).
-    this.closeAllDispatchActivity(outcome.kind === 'cancelled' ? 'cancelled' : 'unknown')
+    // Every still-open worker of this turn gets a terminal record now: the
+    // browser must never keep a running row for a turn that already ended (an
+    // idle turn whose worker reports later says so in the ACP transcript
+    // view). A cancelled turn also tells its still-open workers they were
+    // cancelled; any other ending leaves them `unknown` (the turn ending is
+    // not the worker ending).
+    this.terminalizeDispatches(outcome.kind === 'cancelled' ? 'cancelled' : 'unknown')
     // A late answer to a SUPERSEDED turn still has to close this controller's
     // queue (a continuation step may be parked on it) and its settle gate —
     // but it must not touch the session the NEWER turn now owns, nor release
@@ -5969,10 +5885,11 @@ class TurnStreamController {
     // A successor turn must never fold this hold's drain or worker text: the
     // abandoned run's id is retired before the subscription goes away.
     this.clearBackgroundHold({ retire: true })
-    // The teardown ends the turn without `closeTurn`: the browser's dots go
-    // with it, and every still-open dispatch becomes `unknown` — a retired
-    // turn is not evidence its worker stopped.
-    this.closeAllDispatchActivity('unknown')
+    // The teardown ends the turn without `closeTurn`: every still-open
+    // dispatch becomes `unknown` here — a retired turn is not evidence its
+    // worker stopped, and a missing terminal record would leave the panel's
+    // row permanently running.
+    this.terminalizeDispatches('unknown')
     this.retire()
     releaseAllToolOutputWaiters()
   }
@@ -7124,10 +7041,6 @@ export class BridgeManager {
     for (const session of this.dshSessionMap.values()) {
       if (session.dshSessionId !== dshSessionId || session.closed) continue
       const title = this.defsMap.get(session.agentId)?.title
-      // External subagent rows still running on this session's turn: the
-      // browser seeds its active set from here after a reload (the live path
-      // is the `subagents/update` frames).
-      const activeSubagents = session.turnController?.activeCatalogChildIds() ?? []
       out.push({
         agentId: session.agentId,
         ...(title === undefined ? {} : { agentTitle: title }),
@@ -7141,7 +7054,6 @@ export class BridgeManager {
         ...(session.burst === undefined ? {} : { burst: session.burst }),
         ...(session.released ? { released: true } : {}),
         ...(session.running ? { running: true } : {}),
-        ...(activeSubagents.length === 0 ? {} : { activeSubagents }),
         ...(subagents === undefined || subagents.length === 0 ? {} : { subagents: [...subagents] }),
         ...forkRowInfo(session, this.canForkNow(session.agentId)),
       })

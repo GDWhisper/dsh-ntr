@@ -686,19 +686,6 @@ export type AcpEvent =
    */
   | { type: 'save/status'; status: SaveGateStatus }
   /**
-   * One ACP-dispatched worker became active/inactive in the host's
-   * EXTERNAL subagent catalog. `childId` is the catalog id
-   * (`acp:<toolCallId>`); the browser merges it into the host's own
-   * status map so the host's dot can read it.
-   */
-  | {
-      type: 'subagents/update'
-      /** DSH chat session id that owns the catalog row. */
-      dshSessionId: string
-      childId: string
-      running: boolean
-    }
-  /**
    * One external worker's plugin-owned lifecycle record changed state.
    *
    * Broadcast on CREATION and on every status transition — never per worker
@@ -870,12 +857,6 @@ export interface ChatSessionView {
   released?: boolean
   /** The agent is running a turn on this session right now. */
   running?: boolean
-  /**
-   * External (ACP-dispatched) subagent catalog ids still running for this
-   * session. Seeds the browser's active set after a reload / reconnect;
-   * live updates arrive as `subagents/update` frames.
-   */
-  activeSubagents?: string[]
   /**
    * The plugin's own lifecycle records for this conversation's external
    * workers (status / failure reason / timings / counts). Terminal states are

@@ -7,8 +7,7 @@
  * - ACP conversation -> the plugin's self-drawn trigger + read-only list
  *   (projection rows joined with the plugin's six-state records);
  * - anything else, or any host shape the panel cannot serve -> the HOST
- *   component with its original props (the fail-open branch, which keeps the
- *   old `activeSubagents` dot path intact until Task 3c retires it).
+ *   component with its original props (the fail-open branch).
  */
 
 import { createElement, useState } from 'react'
@@ -32,8 +31,8 @@ afterEach(cleanup)
 
 /**
  * The status map the fake host hook answers with. The host component compares
- * the value it was handed against this reference, so a test can tell a
- * substituted hook (a copy) from the shipped one (the same map).
+ * the value it was handed against this reference: the plugin must pass the
+ * shipped hook and map through untouched on every non-ACP / fail-open branch.
  */
 let hostMap: ReadonlyMap<string, { running?: boolean }>
 
@@ -163,7 +162,6 @@ function makeSlots(withHost = true, withInject = true, withLocale = true): FakeS
 function acpState(overrides: Record<string, unknown> = {}): AcpStore {
   return fakeAcp({
     acpMode: { 'chat-1': true },
-    activeSubagents: { 'chat-1': ['acp:call-1'] },
     subagents: {},
     ...overrides,
   })
@@ -231,21 +229,19 @@ describe('the subagent catalog shadow', () => {
     expect(slots.winner()?.locale).toBe('subagent')
   })
 
-  it('keeps the old dot path alive on the fail-open branch (no catalog yet)', () => {
+  it('hands a host shape it cannot serve back to the host component untouched', () => {
     const slots = makeSlots()
     const claim = createSubagentCatalogClaim({ slots, inject: sessionId => ({ acp: acpState(), sessionId }) })
     claim?.sync()
     // No catalog projection -> the panel must hand the cell back to the host
-    // component, still with the live external ids merged into its status map
-    // (the pre-3a behaviour Task 3c retires).
+    // component with its shipped hook and props (the allowed failure mode).
     renderShadow(slots)
-    expect(screen.getByTestId('subagent-catalog').textContent).toBe('running · merged · nav')
+    expect(screen.getByTestId('subagent-catalog').textContent).toBe('idle · raw · nav')
   })
 
   it('draws the self-drawn trigger and read-only list in an ACP conversation', () => {
     const slots = makeSlots()
     const acp = acpState({
-      activeSubagents: {},
       subagents: {
         [subagentKey('chat-1', 'acp:a')]: record({
           childId: 'acp:a',
@@ -296,7 +292,6 @@ describe('the subagent catalog shadow', () => {
   it('shows an unknown history row and a catalog-pending dispatch honestly', () => {
     const slots = makeSlots()
     const acp = acpState({
-      activeSubagents: {},
       subagents: {
         [subagentKey('chat-1', 'acp:new')]: record({
           childId: 'acp:new',
@@ -349,56 +344,35 @@ describe('the subagent catalog shadow', () => {
     }
   })
 
-  it('passes the host hook straight through with no active ids', () => {
-    const slots = makeSlots()
-    for (const acp of [
-      acpState({ activeSubagents: {} }),
-      acpState({ activeSubagents: { 'chat-1': [] } }),
-      acpState({ activeSubagents: { 'chat-2': ['acp:call-1'] } }),
-    ]) {
-      const shadow = createSubagentCatalogClaim({ slots, inject: sessionId => ({ acp, sessionId }) })
-      shadow?.sync()
-      renderShadow(slots)
-      expect(screen.getByTestId('subagent-catalog').textContent).toBe('idle · raw · nav')
-      shadow?.release()
-      cleanup()
-    }
-  })
-
   it('passes the host hook straight through outside ACP mode', () => {
     const slots = makeSlots()
     const acp = acpState({ acpMode: { 'chat-1': false } })
     const claim = createSubagentCatalogClaim({ slots, inject: sessionId => ({ acp, sessionId }) })
     claim?.sync()
     renderShadow(slots)
-    // The active set still names this chat, but the gate's verdict says the
-    // conversation is not ACP: the host component must see the shipped map.
+    // The gate's verdict says the conversation is not ACP: the host component
+    // must see the shipped map, untouched.
     expect(screen.getByTestId('subagent-catalog').textContent).toBe('idle · raw · nav')
   })
 
-  it('keeps the host hook sequence stable when a worker starts and stops on one mount', async () => {
-    // The host stores this hook mid-list; a substitute that does not call the
-    // real hook would change its hook count on the active-set flip and throw
-    // (React: "Rendered fewer/more hooks…"). This mounts ONCE and toggles.
+  it('swaps the component type on an ACP-mode flip without a hook-count error', async () => {
+    // The host component stores its hook mid-list; the occupant must switch
+    // between TWO component types (never a conditional hook) when the
+    // ACP-mode verdict flips on one mount, or React rejects the render.
     const store = new AcpStore(async () => ({ ok: true, value: {} }), (zh) => zh)
-    store.noteAcpMode('chat-1', true)
-    const apply = (event: unknown): Promise<void> =>
-      (store as unknown as { applyEvent(event: unknown): Promise<void> }).applyEvent(event)
     const slots = makeSlots()
     const claim = createSubagentCatalogClaim({ slots, inject: sessionId => ({ acp: store, sessionId }) })
     claim?.sync()
-    renderShadow(slots)
+    renderShadow(slots, { projections: projection([{ id: 'acp:a', mode: 'external', createdAt: 1_000, label: 'worker' }]) })
     expect(screen.getByTestId('subagent-catalog').textContent).toBe('idle · raw · nav')
 
     await act(async () => {
-      await apply({ type: 'subagents/update', dshSessionId: 'chat-1', childId: 'acp:call-1', running: true })
+      store.noteAcpMode('chat-1', true)
     })
-    expect(screen.getByTestId('subagent-catalog').textContent).toBe('running · merged · nav')
-
-    await act(async () => {
-      await apply({ type: 'subagents/update', dshSessionId: 'chat-1', childId: 'acp:call-1', running: false })
-    })
-    expect(screen.getByTestId('subagent-catalog').textContent).toBe('idle · raw · nav')
+    // ACP mode: the self-drawn trigger takes the cell in place of the host
+    // component.
+    expect(screen.queryByTestId('subagent-catalog')).toBeNull()
+    expect(screen.getByText('累计 1 个')).toBeDefined()
   })
 
   it('restores the native entry when the claim is released', () => {
