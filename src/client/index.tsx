@@ -563,11 +563,11 @@ export function apply(ctx: Context): void {
     /**
      * Claim on the header's `subagent-catalog` cell
      * (`conversation.session.header.actions`, id `subagent-catalog`), held for
-     * the same ACP-mode spell. The occupant renders the HOST's catalog trigger
-     * with its `useSessionStatus` substituted so the live `acp:<toolCallId>`
-     * workers light the host's own ongoing dot; outside ACP mode, or with no
-     * live id, the occupant passes the host hook straight through. No host
-     * entry / inject / locale -> no claim and the native trigger stays.
+     * the same ACP-mode spell. The occupant hands ACP conversations to the
+     * plugin's self-drawn trigger + list (fed by the host's catalog projection
+     * and the plugin's own six-state records) and renders the HOST's component
+     * with its original props everywhere else. No host entry / inject / locale
+     * -> no claim and the native trigger stays.
      */
     let subagentCatalogClaim: ModelSeatClaim | undefined
     const noteSubagentCatalogDiag = createSubagentCatalogDiagSink()
