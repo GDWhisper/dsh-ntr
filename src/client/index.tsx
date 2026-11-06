@@ -785,10 +785,12 @@ export function apply(ctx: Context): void {
       })
       activityClaim?.sync()
       // The header's subagent catalog trigger is the same kind of cell: same
-      // id, lower priority, the HOST component rendered back with the live
-      // external worker ids merged into its status map (so its own ongoing dot
-      // lights). Missing host entry / inject / locale -> no claim, native
-      // trigger stays; a later evaluation retries.
+      // id, lower priority. In an ACP conversation the occupant swaps in the
+      // plugin's self-drawn trigger + read-only list (host projection joined
+      // with the plugin's six-state records); an ordinary conversation, or a
+      // host shape the panel cannot serve, renders the host component with its
+      // original props. Missing host entry / inject / locale -> no claim, the
+      // native trigger stays; a later evaluation retries.
       subagentCatalogClaim ??= createSubagentCatalogClaim({
         slots: ctx.slots as unknown as SeatSlots,
         inject: (sessionId: unknown) => chatFace(sessionId),

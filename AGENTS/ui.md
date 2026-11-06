@@ -102,11 +102,13 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 - **生命周期与 fail-open**：claim 与两个座位同生命周期（`syncAcpMode` 确认 ACP 时建，`standDown` / 卸载释放），dock 的 `slots/changed` 也触发重试。宿主没有 `activity`（0.1.5 是 `stats`）、没有 `inject` / `locale` / `performanceUsage`，或条目类型不是 list → 不注册，原生 pill 照旧；宿主组件抛错时槽的 error boundary 让影子条目 abdicate，原生条目自动回来。多视图里只有舞台会话拿到 `acpMode === true`，其他 ACP 面板直通原生速率（与座位 claim 的全局性同一取舍）。宿主升级后必须重跑影子 spike。
 
 ### 4.3 头部子代理目录 trigger（`conversation.session.header.actions` id `subagent-catalog`）
-`src/client/subagent-activity.tsx` 接管宿主头部那个子代理目录触发器，让 ACP 派出的 detached worker 点亮宿主自己的 ongoing 圆点。
+`src/client/subagent-activity.tsx` 的 `createSubagentCatalogClaim` 用同 id、更低 priority 的 list cell claim 接管宿主头部那个子代理目录触发器，并按 ACP 判定分给**两个不同的组件类型**（严禁在同一组件里按 `acpMode` 条件调 hook：hook 数量翻转会让槽的错误边界 abdicate 整条 entry）：
 
-- **为什么只能是影子**：external 目录行（`acp:<toolCallId>`）没有真正的宿主 Session，宿主只从自己的 status map / summaries 取行活跃度，取不到就画灰点；线上事实在插件这侧（`subagents/update` → `store.activeSubagents`）。做法照 §4.2：同 id、更低 priority 的 list cell claim，渲染**宿主自己的组件**，只把 `useSessionStatus` 换成「活跃 id 标 `running: true`」的投影——trigger 圆点、每行圆点、aria 与下拉全是宿主的。
-- **只有 ongoing 可达**：宿主写死 `completed = !external && …`，external 行永远拿不到「已完成」绿点，**严禁**自绘 done 点或「正在运行」副文案。
-- **闸门与 fail-open**：claim 与其它座位同生命周期（`syncAcpMode` 确认 ACP 时建，`standDown` / 卸载释放），`slots/changed` 也触发重试；非 ACP 或无活跃 id 时原样直通宿主 hook（视觉与原生条目一致）。有活跃 id 时替换后的 hook **仍调用宿主 hook 本身**——宿主的 hook 序列不能随活跃集合切换（否则 React 在同一挂载上报 hook 数量变化，错误边界会让影子条目 abdicate）。宿主没有该条目 / 不是 `list` / 缺 component·inject·locale → 不注册，原生 trigger 照旧。宿主条目的 `inject`（`openChild` / `openChildAside` / `refreshProjection`）必须一并调用，否则目录行不可导航。
+- **ACP 会话 → 插件自绘**（`src/client/subagent-panel.tsx` · `OwnSubagentCatalog`）：trigger 把「累计 N 个」与「M 运行中」分开写（`status === 'running'` 才算运行中，`pending` 不算；有运行中才点亮圆点）；下拉是只读列表，行骨架来自宿主持久投影 `useSessions(s => s.projectionsBySession)[sessionId].values.subagentCatalog`，状态 / 耗时 / 最后活动 / 工具调用数来自插件的六态 `SubagentRecord`（按 `childId` 左连接，最新派发在前）：宿主有、插件无 → `unknown`（**绝不画成成功**）；插件有、宿主无 → 仍列出并标「目录待同步」。耗时按 `endedAt ?? now - startedAt`，运行中的行按秒推进、终态冻结。列表**只读**：没有取消 / 重试 / spawn，也没有假按钮（详情浮层见后续任务）。
+- **非 ACP → 宿主组件原样**：`acpMode` 不是肯定为 true 时直通宿主组件与原始 props，视觉与原生条目一致。
+- **fail-open**：宿主投影形状不认识（`useSessions` 缺失 / 投影值不是数组 / 出现 `mode !== 'external'` 的原生行 / 行形状不认识 / 无 session id）时渲染宿主组件而不是空白面板，原因经 claim 的 `onDiag` 如实上报。自绘面板分支里 `useSessionStatus` 的替换仍**调用宿主 hook 本身**，宿主 hook 序列不随活跃集合切换。
+- **旧路径仍在**：`subagents/update` → `store.activeSubagents` → `mergeSubagentStatuses` 保留给 fail-open 分支的宿主动点，待退役。
+- **闸门与注册**：claim 与其它座位同生命周期（`syncAcpMode` 确认 ACP 时建，`standDown` / 卸载释放），`slots/changed` 也触发重试；宿主没有该条目 / 不是 `list` / 缺 component·inject·locale → 不注册，原生 trigger 照旧。宿主条目的 `inject`（`openChild` / `openChildAside` / `refreshProjection`）必须一并调用——fail-open 分支要靠它保住目录行导航。
 
 ## 5. NTR 视图 tab
 
@@ -206,7 +208,7 @@ NTR 会话里，宿主的点赞 / 点踩 / 分支三图标是插件的业务：a
 | 锁定 UI | `src/client/session-controls.tsx` · `lockedAgentOf` / `agentBaseHidden` / `agentTagVisible` / `agentTagAlive` / `agentTagHaloPresentation` / `AcpComposerAgentTag`；`src/client/agent-lock-anim.ts` |
 | 视图 | `src/client/acp-view.tsx` · `boundAgentOf` / `acpEmptyCopy` / `diffRows` / `isNewFileDiff` / `historyAwaitsReplay`；`src/client/context-meter.tsx` · `AcpContextMeter` / `acpMeterUsage` / `contextOccupancy` / `compactTokenCount`；`src/client/index.tsx` · `acp-context-meter` 注册处 |
 | tok/s | `src/tps.ts` · `TurnTpsTracker`；`src/bridge.ts` · `TurnStreamController.trackTps` / `finalizeTps` / `BridgeManager.noteSessionBurst`；`src/client/activity-pill.tsx` · `createActivityPillClaim` / `ActivityPillOccupant` / `patchedActivityStats` / `activityBurst`；`src/client/index.tsx` · `activityClaim` 注册处 |
-| 子代理圆点 | `src/client/subagent-activity.tsx` · `createSubagentCatalogClaim` / `SubagentCatalogOccupant` / `mergeSubagentStatuses`；`src/client/index.tsx` · `subagentCatalogClaim` 注册处；`src/bridge.ts` · `TurnStreamController.openDispatchActivity` / `closeDispatchActivity` / `activeCatalogChildIds` / `BridgeManager.chatSessions` |
+| 子代理面板 | `src/client/subagent-activity.tsx` · `createSubagentCatalogClaim` / `SubagentCatalogOccupant`（ACP 分流）/ `mergeSubagentStatuses`（fail-open 旧路径）；`src/client/subagent-panel.tsx` · `OwnSubagentCatalog` / `subagentPanelRows` / `readSubagentCatalogProjection` / `subagentTriggerLabel`；`src/client/index.tsx` · `subagentCatalogClaim` 注册处；`src/bridge.ts` · `TurnStreamController.openDispatchActivity` / `closeDispatchActivity` / `activeCatalogChildIds` / `BridgeManager.chatSessions` |
 | 权限卡 | `src/client/permission-dock.tsx` · `PermissionDock` / `PermissionAskCard`；`src/client/store.ts` · `permissionsForSession` / `deadlineRemainingLabel`；`src/client/index.tsx` · `acp-permissions` 注册处 |
 | 释放横幅 | `src/client/released-banner.tsx` · `ReleasedBanner` / `releasedBannerVisible`；`src/client/store.ts` · `resumeChatSession` / `withSessionReleased`；`src/client/index.tsx` · `acp-released-banner` 注册处 |
 | 限流横幅 | `src/client/quota-banner.tsx` · `QuotaBanner` / `quotaRefusalMessage`；`src/client/index.tsx` · `acp-quota-banner` 注册处；`src/bridge.ts` · `agentRefusalDetail` / `snapshot` 的 `quotaRefusal` |

@@ -1,28 +1,34 @@
 /**
- * The ACP conversation's shadow of the host's subagent catalog trigger
- * (`conversation.session.header.actions`, list cell id `subagent-catalog`).
+ * The ACP conversation's header cell for the host's subagent catalog trigger
+ * (`conversation.session.header.actions`, list cell id `subagent-catalog`):
+ * the claim that takes the cell, and the branch that keeps ordinary
+ * conversations on the host's own component.
  *
- * WHY A SHADOW AT ALL: detached CodeBuddy workers are reported to the host's
- * durable subagent catalog as `mode: 'external'` rows (`acp:<toolCallId>`), and
- * an external child has no real host Session — so the host's catalog derives
- * every row's activity from its own status map / summaries keyed by that child
- * id, finds nothing, and paints the grey idle dot even while the worker runs.
- * The wire facts DO exist on this side (`subagents/update` frames behind
- * `store.activeSubagents`); this module hands them to the host's own component
- * instead of building a second catalog.
+ * THE CELL. Detached CodeBuddy workers are reported to the host's durable
+ * subagent catalog as `mode: 'external'` rows (`acp:<toolCallId>`), and an
+ * external child has no real host Session. The host's own trigger therefore
+ * cannot paint them correctly. This module takes the cell with a
+ * lower-priority entry of the SAME id (the same list-cell claim as
+ * `activity-pill.tsx`) and decides who renders inside it — see the split
+ * below.
  *
- * HOW: same list-cell claim as `activity-pill.tsx` — take the cell with a
- * lower-priority entry of the SAME id, render the HOST's component, and give it
- * a substituted `useSessionStatus` that reports `running: true` for the live
- * ids. Trigger dot, per-row dot, aria labels and the dropdown are then all the
- * host's own; only the status the host reads changes. The host hard-codes
- * `completed = !external && …`, so only the ONGOING state is achievable for an
- * external row — no green "done" dot is attempted here.
+ * THE SPLIT (two component TYPES, never a conditional hook):
+ * - ACP conversation (`acpMode` affirmatively true) -> {@link OwnSubagentCatalog}
+ *   from `subagent-panel.tsx`, the plugin's self-drawn trigger + read-only list
+ *   fed by the host's `subagentCatalog` projection and the plugin's own
+ *   six-state records;
+ * - everything else -> the HOST component with its original props, visually
+ *   indistinguishable from the shipped entry.
+ *
+ * The old live-dot path (`subagents/update` -> `activeSubagents` ->
+ * {@link mergeSubagentStatuses}) is kept: were the self-drawn panel to fail
+ * open (a host shape this bundle cannot serve), the host component is still
+ * rendered with the live external ids marked running. Task 3c retires it.
  *
  * NON-ACP CONVERSATIONS PASS THROUGH. A list entry is projected into EVERY
- * session's header, so the wrapper renders the host component with the ORIGINAL
- * hook whenever `acpMode` is not affirmatively true or no id is active — making
- * it visually indistinguishable from the shipped entry there.
+ * session's header, so the occupant renders the host component whenever
+ * `acpMode` is not affirmatively true — making it visually indistinguishable
+ * from the shipped entry there.
  *
  * FAIL-OPEN IS STRUCTURAL: a host without the entry (older build), a slot kind
  * change, or a missing component / inject / locale yields no claim at all and
@@ -37,6 +43,8 @@ import { useUi } from './acp-ui.tsx'
 import type { AcpStore } from './store.ts'
 import { createSeatClaim } from './model-seat.tsx'
 import type { ModelSeatClaim, SeatEntry, SeatSlots } from './model-seat.tsx'
+import { OwnSubagentCatalog } from './subagent-panel.tsx'
+import type { OwnSubagentCatalogProps } from './subagent-panel.tsx'
 
 export const SUBAGENT_CATALOG_SLOT = 'conversation.session.header.actions'
 export const SUBAGENT_CATALOG_ENTRY_ID = 'subagent-catalog'
@@ -72,15 +80,18 @@ interface SubagentCatalogHostProps {
 
 interface OccupantProps extends SubagentCatalogHostProps {
   host: ComponentType<Record<string, unknown>>
+  /** The claim's diagnostic line: the self-drawn panel reports every fail-open reason here. */
+  onDiag?: (line: string) => void
 }
 
 type StatusHook = (selector?: (value: unknown) => unknown) => unknown
 
-function SubagentCatalogOccupant({ host: Host, ...props }: OccupantProps) {
+function SubagentCatalogOccupant({ host: Host, onDiag, ...props }: OccupantProps) {
   const ui = useUi(props.acp)
   const dshSessionId = String(props.sessionId)
   const hostStatus = props.useSessionStatus
-  const active = ui.acpMode[dshSessionId] === true ? ui.activeSubagents?.[dshSessionId] : undefined
+  const acpMode = ui.acpMode[dshSessionId] === true
+  const active = acpMode ? ui.activeSubagents?.[dshSessionId] : undefined
   const useSessionStatus = useMemo(() => {
     if (typeof hostStatus !== 'function' || active === undefined || active.length === 0) return hostStatus
     // The host calls this prop as a hook among its own. A zero-hook projector
@@ -96,7 +107,14 @@ function SubagentCatalogOccupant({ host: Host, ...props }: OccupantProps) {
     }
     return patched
   }, [hostStatus, active])
-  return createElement(Host, useSessionStatus === hostStatus ? props : { ...props, useSessionStatus })
+  const hostProps = useSessionStatus === hostStatus ? props : { ...props, useSessionStatus }
+  // TWO COMPONENT TYPES: React unmounts one and mounts the other, so each
+  // keeps a fixed hook count. A conditional hook inside one component would
+  // flip the count on the ACP-mode verdict and the slot's error boundary would
+  // abdicate the whole entry.
+  return acpMode
+    ? createElement(OwnSubagentCatalog, { ...hostProps, host: Host, onDiag } as unknown as OwnSubagentCatalogProps)
+    : createElement(Host, hostProps)
 }
 
 function findHostCatalog(slots: SeatSlots): SeatEntry | undefined {
@@ -145,6 +163,7 @@ export function createSubagentCatalogClaim(options: SubagentCatalogClaimOptions)
     occupant: () => (props: Record<string, unknown>) => createElement(SubagentCatalogOccupant, {
       ...props,
       host: Host,
+      ...(options.onDiag === undefined ? {} : { onDiag: options.onDiag }),
     } as unknown as OccupantProps),
     // The host entry's own face is `catalogActions(parentSessionId)`: it
     // supplies `openChild` / `openChildAside` / `refreshProjection`, and the

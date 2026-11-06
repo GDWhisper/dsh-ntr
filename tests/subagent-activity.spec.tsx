@@ -1,17 +1,19 @@
 // @vitest-environment jsdom
 /**
- * The header's subagent catalog trigger, as a fake list slot reproduces it:
- * the host entry is registered under id `subagent-catalog`, the claim shadows
- * it at a lower priority, and the shadow renders the HOST component with a
- * substituted `useSessionStatus` that marks the live `acp:<toolCallId>` rows
- * running. These tests prove the mechanism the real 0.2.1 host relies on
- * (one winner per id, entry inject/locale exposure) without pulling a private
- * host component into the test graph.
+ * The header's subagent catalog cell, as a fake list slot reproduces it: the
+ * host entry is registered under id `subagent-catalog`, the claim shadows it
+ * at a lower priority, and the occupant splits on the ACP-mode verdict —
+ *
+ * - ACP conversation -> the plugin's self-drawn trigger + read-only list
+ *   (projection rows joined with the plugin's six-state records);
+ * - anything else, or any host shape the panel cannot serve -> the HOST
+ *   component with its original props (the fail-open branch, which keeps the
+ *   old `activeSubagents` dot path intact until Task 3c retires it).
  */
 
 import { createElement, useState } from 'react'
 import type { ComponentType } from 'react'
-import { act, cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   createSubagentCatalogClaim,
@@ -19,8 +21,9 @@ import {
   SUBAGENT_CATALOG_SLOT,
 } from '../src/client/subagent-activity.tsx'
 import type { SeatEntry, SeatRegisterOptions, SeatSlots } from '../src/client/model-seat.tsx'
-import { AcpStore } from '../src/client/store.ts'
+import { AcpStore, subagentKey } from '../src/client/store.ts'
 import type { AcpStore as AcpStoreType } from '../src/client/store.ts'
+import type { SubagentRecord } from '../src/protocol.ts'
 
 afterEach(cleanup)
 
@@ -117,6 +120,8 @@ function fakeAcp(state: Record<string, unknown>): AcpStoreType {
   return {
     subscribe: () => () => {},
     getSnapshot: () => snapshot,
+    // The self-drawn panel resolves both language sides through the store.
+    label: (zh: string) => zh,
   } as unknown as AcpStoreType
 }
 
@@ -156,23 +161,57 @@ function acpState(overrides: Record<string, unknown> = {}): AcpStore {
   return fakeAcp({
     acpMode: { 'chat-1': true },
     activeSubagents: { 'chat-1': ['acp:call-1'] },
+    subagents: {},
     ...overrides,
   })
 }
 
+/** One plugin lifecycle record, with sane defaults. */
+function record(patch: Partial<SubagentRecord> = {}): SubagentRecord {
+  return {
+    childId: 'acp:a',
+    dshSessionId: 'chat-1',
+    toolCallId: 'a',
+    label: 'worker',
+    status: 'running',
+    startedAt: 1_000,
+    lastActivityAt: 2_000,
+    counts: { updates: 1, toolCalls: 0, textChars: 0 },
+    ...patch,
+  }
+}
+
+/** The host's `subagentCatalog` view value for one session. */
+function projection(rows: readonly Record<string, unknown>[]): Record<string, unknown> {
+  return { 'chat-1': { values: { subagentCatalog: rows } } }
+}
+
+interface ShadowOptions {
+  /** `projectionsBySession` the fake host hook answers with. */
+  projections?: Record<string, unknown>
+  /** Omit the `useSessions` prop entirely (an older host shape). */
+  withoutUseSessions?: boolean
+}
+
 /** Render the winning entry the way the renderer does: inject face + standard kit. */
-function renderShadow(slots: FakeSlots): void {
+function renderShadow(slots: FakeSlots, options: ShadowOptions = {}): void {
   const entry = slots.winner()
   expect(entry).toBeDefined()
   const face = entry?.inject === undefined ? {} : entry.inject('chat-1') as Record<string, unknown>
   hostMap = new Map([['session-1', { running: true }]])
-  render(createElement(entry?.component as ComponentType<Record<string, unknown>>, {
+  const props: Record<string, unknown> = {
     sessionId: 'chat-1',
-    useSessions: (selector: (value: unknown) => unknown) => selector({ byId: {}, projectionsBySession: {} }),
     useSessionStatus: useHostSessionStatus,
     t: (key: string) => key,
     ...face,
-  }))
+  }
+  if (options.withoutUseSessions !== true) {
+    props.useSessions = (selector: (value: unknown) => unknown) => selector({
+      byId: {},
+      projectionsBySession: options.projections ?? {},
+    })
+  }
+  render(createElement(entry?.component as ComponentType<Record<string, unknown>>, props))
 }
 
 describe('the subagent catalog shadow', () => {
@@ -189,14 +228,122 @@ describe('the subagent catalog shadow', () => {
     expect(slots.winner()?.locale).toBe('subagent')
   })
 
-  it('lights the live external worker through the host component', () => {
+  it('keeps the old dot path alive on the fail-open branch (no catalog yet)', () => {
     const slots = makeSlots()
     const claim = createSubagentCatalogClaim({ slots, inject: sessionId => ({ acp: acpState(), sessionId }) })
     claim?.sync()
+    // No catalog projection -> the panel must hand the cell back to the host
+    // component, still with the live external ids merged into its status map
+    // (the pre-3a behaviour Task 3c retires).
     renderShadow(slots)
-    // The host's own component read `running: true` for `acp:call-1` from a
-    // COPY of its status map, and its catalog actions still reach it.
     expect(screen.getByTestId('subagent-catalog').textContent).toBe('running · merged · nav')
+  })
+
+  it('draws the self-drawn trigger and read-only list in an ACP conversation', () => {
+    const slots = makeSlots()
+    const acp = acpState({
+      activeSubagents: {},
+      subagents: {
+        [subagentKey('chat-1', 'acp:a')]: record({
+          childId: 'acp:a',
+          type: 'explore',
+          status: 'running',
+          startedAt: 1_000,
+          lastActivityAt: 2_000,
+          counts: { updates: 2, toolCalls: 3, textChars: 5 },
+        }),
+        [subagentKey('chat-1', 'acp:b')]: record({
+          childId: 'acp:b',
+          toolCallId: 'b',
+          label: 'writer',
+          status: 'completed',
+          startedAt: 500,
+          endedAt: 5_500,
+          lastActivityAt: 5_500,
+        }),
+      },
+    })
+    const claim = createSubagentCatalogClaim({ slots, inject: sessionId => ({ acp, sessionId }) })
+    claim?.sync()
+    renderShadow(slots, {
+      projections: projection([
+        { id: 'acp:a', mode: 'external', createdAt: 1_000, label: 'scanner' },
+        { id: 'acp:b', mode: 'external', createdAt: 500, label: 'writer' },
+      ]),
+    })
+    // The host component is NOT rendered: the cell is the plugin's own trigger,
+    // with the cumulative count and the running count kept apart.
+    expect(screen.queryByTestId('subagent-catalog')).toBeNull()
+    expect(screen.getByText('累计 2 个 · 1 运行中')).toBeDefined()
+
+    fireEvent.click(screen.getByRole('button'))
+    expect(screen.getAllByRole('listitem')).toHaveLength(2)
+    // Newest dispatch first: the projection label wins over the record's
+    // fallback one, and the record's `type` prefixes it.
+    expect(screen.getByText('explore · scanner')).toBeDefined()
+    expect(screen.getByText('writer')).toBeDefined()
+    expect(screen.getByText('运行中')).toBeDefined()
+    expect(screen.getByText('已完成')).toBeDefined()
+    // The completed row froze at endedAt - startedAt; no fake controls exist.
+    expect(screen.getByText('5s')).toBeDefined()
+    expect(screen.queryAllByRole('link')).toHaveLength(0)
+    expect(screen.queryAllByRole('menuitem')).toHaveLength(0)
+  })
+
+  it('shows an unknown history row and a catalog-pending dispatch honestly', () => {
+    const slots = makeSlots()
+    const acp = acpState({
+      activeSubagents: {},
+      subagents: {
+        [subagentKey('chat-1', 'acp:new')]: record({
+          childId: 'acp:new',
+          status: 'pending',
+          startedAt: 9_000,
+          lastActivityAt: 9_100,
+        }),
+      },
+    })
+    const claim = createSubagentCatalogClaim({ slots, inject: sessionId => ({ acp, sessionId }) })
+    claim?.sync()
+    renderShadow(slots, {
+      projections: projection([{ id: 'acp:old', mode: 'external', createdAt: 1_000, label: 'history' }]),
+    })
+    // `pending` is dispatched but not running: no running segment in the
+    // trigger, while the row itself reads pending.
+    expect(screen.getByText('累计 2 个')).toBeDefined()
+    fireEvent.click(screen.getByRole('button'))
+    // A catalog row with no record predates state tracking: it must read
+    // unknown, never succeeded.
+    expect(screen.getByText('状态未知')).toBeDefined()
+    // A dispatch the host catalog has not appended yet is still listed.
+    expect(screen.getByText('等待开始')).toBeDefined()
+    expect(screen.getByText(/目录待同步/)).toBeDefined()
+  })
+
+  it('fails open to the host component on every host shape it cannot serve', () => {
+    const shapes: Array<{ name: string; options: ShadowOptions }> = [
+      { name: 'no useSessions hook', options: { withoutUseSessions: true } },
+      { name: 'projection not an array', options: { projections: { 'chat-1': { values: { subagentCatalog: 'nope' } } } } },
+      { name: 'native catalog row', options: { projections: projection([{ id: 'session-2', mode: 'one-shot', createdAt: 1 }]) } },
+      { name: 'row without an id', options: { projections: projection([{ mode: 'external' }]) } },
+      { name: 'row without a mode', options: { projections: projection([{ id: 'acp:x' }]) } },
+    ]
+    for (const shape of shapes) {
+      const diagnosed: string[] = []
+      const slots = makeSlots()
+      const claim = createSubagentCatalogClaim({
+        slots,
+        inject: sessionId => ({ acp: acpState({ subagents: {} }), sessionId }),
+        onDiag: line => diagnosed.push(line),
+      })
+      claim?.sync()
+      renderShadow(slots, shape.options)
+      expect(screen.getByTestId('subagent-catalog'), shape.name).toBeDefined()
+      expect(screen.queryByText(/累计 /), shape.name).toBeNull()
+      expect(diagnosed.some(line => line.startsWith('subagent catalog: ')), shape.name).toBe(true)
+      claim?.release()
+      cleanup()
+    }
   })
 
   it('passes the host hook straight through with no active ids', () => {

@@ -459,7 +459,7 @@ export function acpEmptyCopy(facts: AcpEmptyFacts, t: Translate): AcpEmptyCopy {
 // transcript.
 
 /** Tick of the in-flight rows' elapsed clocks (the label shows whole seconds). */
-const SUBAGENT_TICK_MS = 1000
+export const SUBAGENT_TICK_MS = 1000
 
 /** Badge wording per lifecycle state; six states must read differently. */
 const SUBAGENT_LABEL: Record<SubagentStatus, readonly [zh: string, en: string]> = {
@@ -496,7 +496,7 @@ export function subagentStatusTone(status: SubagentStatus): string {
  * Whether the row is still in flight: dispatched but not started, or running.
  * These are exactly the rows whose elapsed clock advances with `now`.
  */
-function isActiveSubagent(status: SubagentStatus): boolean {
+export function isActiveSubagent(status: SubagentStatus): boolean {
   return status === 'pending' || status === 'running'
 }
 

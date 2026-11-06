@@ -6,13 +6,19 @@
  * frozen. The interval is gated on "any row still in flight", so a strip of
  * only terminal rows schedules no timer at all.
  *
- * Everything else about the strip is pure logic and lives in
- * tests/acp-view.spec.ts; this file exists for the clock the store cannot drive.
+ * The header panel (`subagent-panel.tsx`) uses the same tick helper and the
+ * same gate; its own clock test lives below.
+ *
+ * Everything else about both surfaces is pure logic and lives in
+ * tests/acp-view.spec.ts; this file exists for the clocks the store cannot drive.
  */
 
-import { act, cleanup, render, screen } from '@testing-library/react'
+import type { ComponentType } from 'react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SubagentSection } from '../src/client/acp-view.tsx'
+import { OwnSubagentCatalog } from '../src/client/subagent-panel.tsx'
+import type { AcpStore } from '../src/client/store.ts'
 import type { SubagentRecord } from '../src/protocol.ts'
 
 afterEach(() => {
@@ -87,5 +93,67 @@ describe('the subagent strip clock', () => {
     expect(vi.getTimerCount()).toBe(0)
     act(() => { vi.advanceTimersByTime(5_000) })
     expect(screen.getByText('1s')).toBeDefined()
+  })
+})
+
+/** The host's own trigger, rendered only on the panel's fail-open branch. */
+const HostTrigger: ComponentType<Record<string, unknown>> = () => (
+  <span data-testid="host-trigger">host</span>
+)
+
+/** A fake injected store: the panel reads `subagents` and `label` only. */
+function panelStore(state: Record<string, unknown>): AcpStore {
+  return {
+    subscribe: () => () => {},
+    getSnapshot: () => state,
+    label: (zh: string) => zh,
+  } as unknown as AcpStore
+}
+
+function panelState(records: readonly SubagentRecord[]): Record<string, unknown> {
+  return { subagents: Object.fromEntries(records.map(item => [`${item.dshSessionId}\u0000${item.childId}`, item])) }
+}
+
+/** The host projection hook, answering as if it held one external row. */
+const useSessions = (selector: (value: unknown) => unknown): unknown => selector({
+  projectionsBySession: {
+    'chat-1': { values: { subagentCatalog: [{ id: 'acp:a', mode: 'external', createdAt: 1_000_000, label: 'worker' }] } },
+  },
+})
+
+describe('the header subagent panel clock', () => {
+  it('ticks a running row once per second and freezes it at its end stamp', () => {
+    startClock(1_000_000)
+    const running = panelState([record({ startedAt: 1_000_000, status: 'running', lastActivityAt: 1_000_000 })])
+    const view = render(
+      <OwnSubagentCatalog host={HostTrigger} acp={panelStore(running)} sessionId="chat-1" useSessions={useSessions} />,
+    )
+    expect(screen.getByText('累计 1 个 · 1 运行中')).toBeDefined()
+    fireEvent.click(screen.getByRole('button'))
+    expect(screen.getByText('0s')).toBeDefined()
+
+    act(() => { vi.advanceTimersByTime(1_000) })
+    expect(screen.getByText('1s')).toBeDefined()
+
+    // Terminal: the row freezes at endedAt - startedAt and the interval stops.
+    const done = panelState([record({ startedAt: 1_000_000, status: 'completed', endedAt: 1_003_000 })])
+    view.rerender(
+      <OwnSubagentCatalog host={HostTrigger} acp={panelStore(done)} sessionId="chat-1" useSessions={useSessions} />,
+    )
+    expect(screen.getByText('3s')).toBeDefined()
+    expect(vi.getTimerCount()).toBe(0)
+    act(() => { vi.advanceTimersByTime(60_000) })
+    expect(screen.getByText('3s')).toBeDefined()
+  })
+
+  it('keeps the panel shut and schedules no timer while nothing runs', () => {
+    startClock(0)
+    const done = panelState([record({ startedAt: 0, status: 'completed', endedAt: 1_000 })])
+    render(
+      <OwnSubagentCatalog host={HostTrigger} acp={panelStore(done)} sessionId="chat-1" useSessions={useSessions} />,
+    )
+    expect(screen.getByText('累计 1 个')).toBeDefined()
+    expect(screen.queryByRole('listitem')).toBeNull()
+    expect(vi.getTimerCount()).toBe(0)
   })
 })

@@ -19,6 +19,7 @@ import { agentTestHint, approvalDeadlineFacts, DEADLINE_MIN_WAIT_MS, deadlineSli
 import { describeRoute, menuFor, REFRESH_CATALOG_ITEM } from '../src/client/session-controls.tsx'
 import { AcpStore, deadlineRemainingLabel, PERMISSION_DEADLINE_EXPIRED, permissionsForSession, usageFromUpdate } from '../src/client/store.ts'
 import { mergeSubagentStatuses } from '../src/client/subagent-activity.tsx'
+import { placeSubagentMenu, readSubagentCatalogProjection, subagentLastActivityLabel, subagentPanelRows, subagentTriggerLabel } from '../src/client/subagent-panel.tsx'
 import type { PendingPermission } from '../src/client/store.ts'
 import { APPROVAL_DEADLINE_MIN_WAIT_MS, isAbsolutePath, splitAdapterModelId, splitCommandLine as hostSplitCommandLine, tokenizeCommandLine as hostTokenizeCommandLine } from '../src/impl.ts'
 import type { AgentCatalogResult, AgentTestResult, AgentView, ChatSessionView, SubagentRecord, SubagentStatus } from '../src/protocol.ts'
@@ -1478,5 +1479,137 @@ describe('the NTR view subagent section', () => {
     expect(history?.body).toMatch(/predate state tracking/)
     // One known row is enough: the rows speak for themselves, no banner.
     expect(subagentSectionCopy({ total: 3, known: 1, served: true }, en)).toBeUndefined()
+  })
+})
+
+/**
+ * The header panel's pure half (Task 3a of the subagent panel): the host
+ * projection validator, the projection-records join, the trigger sentence and
+ * the dropdown geometry. The panel draws only what these return, so the
+ * honesty rules (unknown is never success, plugin-only rows still show, a
+ * native row fails open) are decided — and tested — here.
+ */
+describe('the header subagent panel helpers', () => {
+  const en = (_zh: string, text: string): string => text
+  const zh = (text: string): string => text
+  const record = (patch: Partial<SubagentRecord> = {}): SubagentRecord => ({
+    childId: 'acp:a',
+    dshSessionId: 'chat-1',
+    toolCallId: 'a',
+    label: 'worker',
+    status: 'completed',
+    startedAt: 0,
+    lastActivityAt: 0,
+    counts: { updates: 0, toolCalls: 0, textChars: 0 },
+    ...patch,
+  })
+
+  it('serves only an array of external catalog rows', () => {
+    const read = readSubagentCatalogProjection([
+      { id: 'acp:a', mode: 'external', createdAt: 5, label: 'scanner' },
+      { id: 'acp:b', mode: 'external' },
+    ])
+    expect(read.ok).toBe(true)
+    if (read.ok) {
+      expect(read.rows).toEqual([
+        { id: 'acp:a', createdAt: 5, label: 'scanner' },
+        { id: 'acp:b' },
+      ])
+    }
+    // Every other shape is a host this bundle cannot draw: undefined (not
+    // loaded yet), a non-array, a native row (needs host navigation), a row
+    // with no id / no external mode / an unexpected field type.
+    for (const value of [
+      undefined,
+      null,
+      'nope',
+      {},
+      [null],
+      [{ mode: 'external' }],
+      [{ id: 'acp:a' }],
+      [{ id: 'session-2', mode: 'one-shot' }],
+      [{ id: 'acp:a', mode: 'external', createdAt: '5' }],
+      [{ id: 'acp:a', mode: 'external', label: 7 }],
+    ]) {
+      expect(readSubagentCatalogProjection(value).ok, JSON.stringify(value)).toBe(false)
+    }
+    // Append-only means a duplicate is a host bug; draw the worker once.
+    const once = readSubagentCatalogProjection([
+      { id: 'acp:a', mode: 'external', createdAt: 1 },
+      { id: 'acp:a', mode: 'external', createdAt: 2 },
+    ])
+    expect(once.ok).toBe(true)
+    if (once.ok) expect(once.rows).toHaveLength(1)
+  })
+
+  it('joins catalog rows with records newest-first, host dispatch time winning', () => {
+    const rows = subagentPanelRows([
+      { id: 'acp:old', createdAt: 1_000, label: 'scanner' },
+      { id: 'acp:new', createdAt: 5_000, label: 'writer' },
+    ], [
+      record({
+        childId: 'acp:old',
+        type: 'explore',
+        label: 'fallback-old',
+        // The host's `createdAt` is authoritative for dispatch time.
+        startedAt: 900,
+        status: 'completed',
+        endedAt: 4_000,
+        lastActivityAt: 3_500,
+        counts: { updates: 2, toolCalls: 4, textChars: 9 },
+      }),
+      // Plugin-only: dispatched, but the host catalog has not appended it yet.
+      record({ childId: 'acp:pending', label: 'p', status: 'running', startedAt: 9_000, lastActivityAt: 9_500 }),
+    ])
+    expect(rows.map(row => row.childId)).toEqual(['acp:pending', 'acp:new', 'acp:old'])
+    expect(rows[2]).toMatchObject({
+      title: 'explore · scanner',
+      status: 'completed',
+      startedAt: 1_000,
+      endedAt: 4_000,
+      lastActivityAt: 3_500,
+      toolCalls: 4,
+      pendingCatalog: false,
+    })
+    // Catalog row without a record: state unknown, no activity fact, zero tools.
+    expect(rows[1]).toMatchObject({ title: 'writer', status: 'unknown', pendingCatalog: false, toolCalls: 0 })
+    expect(rows[1]?.lastActivityAt).toBeUndefined()
+    expect(rows[0]).toMatchObject({ title: 'p', status: 'running', pendingCatalog: true })
+  })
+
+  it('de-duplicates both sides by child id, the fresher record winning', () => {
+    const stale = record({ childId: 'acp:a', status: 'running', startedAt: 1_000, lastActivityAt: 2_000 })
+    const fresh = record({ childId: 'acp:a', status: 'failed', startedAt: 1_000, lastActivityAt: 8_000 })
+    const rows = subagentPanelRows([
+      { id: 'acp:a', createdAt: 1_000 },
+      { id: 'acp:a', createdAt: 1_000 },
+    ], [stale, fresh])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.status).toBe('failed')
+  })
+
+  it('separates the cumulative count from the running count', () => {
+    expect(subagentTriggerLabel(3, 0, en)).toBe('3 total')
+    expect(subagentTriggerLabel(3, 2, en)).toBe('3 total · 2 running')
+    expect(subagentTriggerLabel(3, 0, zh)).toBe('累计 3 个')
+    expect(subagentTriggerLabel(3, 2, zh)).toBe('累计 3 个 · 2 运行中')
+  })
+
+  it('renders last activity relative to now, and nothing when unknown', () => {
+    expect(subagentLastActivityLabel(undefined, 5_000, en)).toBeUndefined()
+    expect(subagentLastActivityLabel(1_000, 4_000, en)).toBe('last activity 3s ago')
+    // Clock skew must read as "just now", never a negative age.
+    expect(subagentLastActivityLabel(9_000, 4_000, en)).toBe('last activity 0s ago')
+    expect(subagentLastActivityLabel(1_000, 65_000, zh)).toBe('最后活动 1m 04s 前')
+  })
+
+  it('places the dropdown under the trigger inside the viewport', () => {
+    expect(placeSubagentMenu({ left: 100, bottom: 40 }, { width: 1_200, height: 800 }))
+      .toEqual({ left: 100, top: 45, width: 336 })
+    // Flush left / right / narrow viewport all clamp inside the margin.
+    expect(placeSubagentMenu({ left: 0, bottom: 0 }, { width: 1_200, height: 800 }).left).toBe(16)
+    expect(placeSubagentMenu({ left: 1_100, bottom: 0 }, { width: 1_200, height: 800 }).left).toBe(848)
+    expect(placeSubagentMenu({ left: 0, bottom: 0 }, { width: 300, height: 800 }))
+      .toEqual({ left: 16, top: 5, width: 268 })
   })
 })

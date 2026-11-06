@@ -953,6 +953,24 @@ const STYLE = `
 .ntr-acp-badge.is-warn { color: var(--dsw-alias-state-warn-label, #b45309); background: var(--dsw-alias-state-warn-tertiary, #fef3c7); }
 .ntr-acp-badge.is-fail { color: var(--dsw-alias-state-error-primary, #b91c1c); background: color-mix(in srgb, var(--dsw-alias-state-error-primary, #b91c1c) 12%, transparent); }
 .ntr-acp-badge.is-idle { color: var(--dsw-alias-label-secondary, #6b7280); background: var(--dsw-alias-bg-layer-2, #f3f4f6); }
+/* ---- ACP header subagent panel (conversation.session.header.actions) ---- */
+/* The self-drawn trigger and its read-only dropdown (subagent-panel.tsx). The
+   list is a fixed-position layer measured from the trigger, so the header band
+   cannot clip it; colors are host alias tokens only (constraint 34). */
+.ntr-acp-subagent-panel { position: relative; display: inline-flex; }
+.ntr-acp-subagent-trigger { display: inline-flex; align-items: center; gap: 5px; max-width: 240px; font: inherit; font-size: 12px; line-height: 1.4; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: inherit; cursor: pointer; }
+.ntr-acp-subagent-trigger:hover { background: var(--dsw-alias-interactive-bg-active, #0000000d); }
+.ntr-acp-subagent-trigger:focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary, #2563eb); outline-offset: 2px; }
+.ntr-acp-subagent-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--dsw-alias-label-tertiary, #9ca3af); }
+.ntr-acp-subagent-trigger.is-running .ntr-acp-subagent-dot { background: var(--dsw-alias-state-business-primary, #2563eb); box-shadow: 0 0 0 3px color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 18%, transparent); }
+.ntr-acp-subagent-trigger.is-running { border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 40%, transparent); }
+.ntr-acp-subagent-count { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.ntr-acp-subagent-chevron { flex: none; font-size: 10px; color: var(--dsw-alias-label-tertiary, #9ca3af); }
+.ntr-acp-subagent-menu { position: fixed; z-index: 900; display: flex; flex-direction: column; gap: 2px; max-height: min(320px, 50vh); overflow: auto; padding: 6px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); border-radius: 10px; background: var(--dsw-alias-bg-layer-1, #fff); box-shadow: 0 12px 32px rgba(0, 0, 0, 0.16); font-size: 12px; line-height: 1.5; }
+.ntr-acp-subagent-row { display: flex; flex-direction: column; gap: 1px; min-width: 0; padding: 4px 6px; border-radius: 6px; }
+.ntr-acp-subagent-row-main { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.ntr-acp-subagent-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ntr-acp-subagent-row-meta { display: flex; flex-wrap: wrap; gap: 6px; color: var(--dsw-alias-label-tertiary, #9ca3af); font-variant-numeric: tabular-nums; }
 .ntr-acp-bubble { max-width: 88%; padding: 8px 12px; border-radius: 12px; white-space: pre-wrap; word-break: break-word; }
 .ntr-acp-bubble.is-user { align-self: flex-end; background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 12%, transparent); }
 .ntr-acp-bubble.is-agent { align-self: flex-start; background: var(--dsw-alias-bg-layer-2, #f3f4f6); }
