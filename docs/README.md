@@ -8,6 +8,13 @@
   - 不替 agent 裁决（permission 原样映射给用户，宿主不再有 `decidePermission` / `authorizeWrite` 这一层）、转发内容严格等于用户文本、fs 写只剩 `guardFsPath` 的 workspace containment；做不到的边界（宿主侧无 per-session 目录过滤缝、Access mode 控件）
   - 对话内的 NTR 面：三块芯片（agent / 模型 / 思考等级）的权威来源各自是什么、模型面为什么另走 `agent/catalog`、权限档整格占空，以及 NTR 视图 tab 如何用 `session/chat-transcript` 渲染计划、完整工具输出与 unified diff
   - 双向模型隔离：宿主侧"什么都不广告"（ACP 模型不进 DSH 目录，`/model` 弹窗也不例外）+ 浏览器侧由 `createModelSeatClaim` 接管原生座位（occupant 是 NTR 底座本体，按当前会话 preset 动态注册；注册后用 `entriesOfSlot` 核实 cell 的 head 是不是自己，被抢走就再注册一次，上限 `MAX_SEAT_CLAIMS`，到顶如实报「被谁占着」；放弃时回到原生座位）
+- [方案：自制子智能体展示（彻底替换宿主 trigger，已决策待实现）](./plan/subagent-panel.md)
+  - 为什么：宿主把 `mode: 'external'` 行写死为「外部任务」——`completed = !external && …`、无 activity 文案、不可点进详情；插件现在只塞一个 `running` 布尔圆点，成功 / 失败 / 耗时 / 明细全不可达。实测宿主持久的只有目录成员（日志事件 + `subagentCatalog` 检查点），运行态不持久，external 行连 `subagentTiming` 数据源都没有
+  - 怎么做：claim 的 occupant 在 ACP 会话分流到自绘面板（非 ACP 原样渲染宿主组件）；列表复用宿主 `subagentCatalog` projection，终态落 `agents.json` 新增的 `subagents` 键，明细按 worker 单独限 200 条且只在内存；六态 = 排队 / 运行 / 成功 / 失败 / 已取消 / 未知，详情挂 `shell.overlay`
+  - 状态：已决策（彻底替换 / 宿主持久性已调查 / 同意单独上限），待实现；证据、契约、变更清单与验收口径见文内
+- [上游实测：CodeBuddy 多会话串话](./upstream/codebuddy-acp-multi-session-prompt-cross-talk.md)
+  - 一条 ACP 连接只有一个 `currentSession` 的现场证据：新建会话的首条 prompt 被旧会话接走并以 `end_turn` 零输出返回，新建会话还会取消旧会话的后台任务
+  - 用途：A1（每 DSH 会话一个进程）与 A2（单进程多连接）的判定依据；证据原文与复现步骤见文内
 - [方案：NTR 会话内的消息动作接管](./plan/ntr-message-actions.md)
   - 为什么：NTR 会话里宿主的点赞 / 点踩 / 分支三图标要么无意义、要么分支出来 agent 记不住上文；本方案把它们在 NTR 会话内隐藏，换成插件自己的分支入口（同图标、同尺寸），可用性由插件按六态判定
   - 怎么做：`html[data-ntr-acp]` 作用域 + `aria-label` 选择器隐藏（锚点 `[data-turn-tail]`）；`conversation.chat.assistant-actions` 注册自绘按钮；点击走「宿主 `sessions.fork` → 插件 `session/fork` adopt」两段式，子会话的 ACP 上下文来自 agent 自己的 fork
@@ -29,7 +36,7 @@
   - 状态：未决策、当前不改；启动条件见文内，索引见 [backlog](./plan/backlog/README.md)
 - [待办清单](./todo.md)
   - 本仓唯一的待办清单：只留尚未落地的项，用户确认完结即删（结论并入 AGENTS.md 对应约束，不留「已落地」历史）
-  - 当前一项：宿主被强杀后残留的 ACP agent 进程（方案见 [docs/plan/backlog](./plan/backlog/README.md)）
+  - 当前两项：自制子智能体展示（方案见 [docs/plan/subagent-panel.md](./plan/subagent-panel.md)）；宿主被强杀后残留的 ACP agent 进程（方案见 [docs/plan/backlog](./plan/backlog/README.md)）
 - [发版手册](../AGENTS/release.md)
   - agent 操作文档（由根 AGENTS.md 索引）：版本与 tag 规则、发布前检查，从提交到 npm 发布与 GitHub Release 的完整命令
   - release note 与 [`CHANGELOG.md`](../CHANGELOG.md) 的写法：面向用户、只写能感知到的变化与确定性净改动，不写根因与内部机制
