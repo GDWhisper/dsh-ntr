@@ -30,7 +30,7 @@ import { ReleasedBanner } from './released-banner.tsx'
 import { QuotaBanner } from './quota-banner.tsx'
 import { AcpBranchAction, resolveHostFork } from './branch-action.tsx'
 import { createActivityPillClaim, DOCK_SLOT } from './activity-pill.tsx'
-import { createSubagentCatalogClaim, SUBAGENT_CATALOG_SLOT } from './subagent-activity.tsx'
+import { createSubagentCatalogClaim, subagentCatalogDiagIsWorthWarn, SUBAGENT_CATALOG_SLOT } from './subagent-activity.tsx'
 import {
   createModelSeatClaim,
   createPermissionSeatClaim,
@@ -151,6 +151,23 @@ const probeHostActionLabels = (): void => {
 interface LocaleFace {
   resolveText?(text: Record<string, string>): string
   subscribe?(listener: () => void): () => void
+}
+
+/**
+ * The production console sink for the `subagent-catalog` claim and its
+ * self-drawn panel: one line per verdict change, then only the lines
+ * {@link subagentCatalogDiagIsWorthWarn} calls worth a breadcrumb. Exported so
+ * the browser tests can push a real panel fail-open reason through the same
+ * sink the gate installs.
+ */
+export function createSubagentCatalogDiagSink(): (line: string) => void {
+  let previous = 'idle'
+  return (line: string): void => {
+    if (line === previous) return
+    previous = line
+    if (!subagentCatalogDiagIsWorthWarn(line)) return
+    console.warn(`[dsh-ntr] ${line}`)
+  }
 }
 
 /**
@@ -541,13 +558,7 @@ export function apply(ctx: Context): void {
      * entry / inject / locale -> no claim and the native trigger stays.
      */
     let subagentCatalogClaim: ModelSeatClaim | undefined
-    let subagentCatalogDiag = 'idle'
-    const noteSubagentCatalogDiag = (line: string): void => {
-      if (line === subagentCatalogDiag) return
-      subagentCatalogDiag = line
-      if (!/failed|missing|taken|gave up|still held/.test(line)) return
-      console.warn(`[dsh-ntr] ${line}`)
-    }
+    const noteSubagentCatalogDiag = createSubagentCatalogDiagSink()
     /**
      * ACP-only auxiliary entries: the NTR view tab and the composer's context
      * ring. Unlike the two seats these are `list` slots with no visibility

@@ -6,8 +6,9 @@
  * frozen. The interval is gated on "any row still in flight", so a strip of
  * only terminal rows schedules no timer at all.
  *
- * The header panel (`subagent-panel.tsx`) uses the same tick helper and the
- * same gate; its own clock test lives below.
+ * The header panel (`subagent-panel.tsx`) uses the same tick helper; its own
+ * clock test lives below, including the open-menu gate that keeps relative
+ * "last activity" labels fresh.
  *
  * Everything else about both surfaces is pure logic and lives in
  * tests/acp-view.spec.ts; this file exists for the clocks the store cannot drive.
@@ -135,15 +136,57 @@ describe('the header subagent panel clock', () => {
     act(() => { vi.advanceTimersByTime(1_000) })
     expect(screen.getByText('1s')).toBeDefined()
 
-    // Terminal: the row freezes at endedAt - startedAt and the interval stops.
+    // Terminal: the row freezes at endedAt - startedAt. The interval stays
+    // only because the menu is open (its "last activity" labels are relative),
+    // so the elapsed clock no longer moves.
     const done = panelState([record({ startedAt: 1_000_000, status: 'completed', endedAt: 1_003_000 })])
     view.rerender(
       <OwnSubagentCatalog host={HostTrigger} acp={panelStore(done)} sessionId="chat-1" useSessions={useSessions} />,
     )
     expect(screen.getByText('3s')).toBeDefined()
-    expect(vi.getTimerCount()).toBe(0)
+    expect(vi.getTimerCount()).toBe(1)
     act(() => { vi.advanceTimersByTime(60_000) })
     expect(screen.getByText('3s')).toBeDefined()
+
+    // Closing an all-terminal list releases the open-driven interval.
+    fireEvent.click(screen.getByRole('button'))
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('refreshes relative labels when the list opens long after the last worker finished', () => {
+    // A row whose last activity is newer than the last tick used to clamp to
+    // "0s" forever, and a menu opened long after mount showed mount-time ages.
+    startClock(1_000_000)
+    const done = panelState([record({
+      startedAt: 1_000_000,
+      status: 'completed',
+      endedAt: 1_010_000,
+      lastActivityAt: 1_010_000,
+    })])
+    render(
+      <OwnSubagentCatalog host={HostTrigger} acp={panelStore(done)} sessionId="chat-1" useSessions={useSessions} />,
+    )
+    // Nothing is in flight and the menu is shut: no timer, so `now` stands at
+    // the mount time while the page runs on.
+    expect(vi.getTimerCount()).toBe(0)
+    act(() => { vi.advanceTimersByTime(65_000) })
+
+    // Open: the label must be measured from the open (55s), not from the mount
+    // (where the activity stamp was still in the future and clamps to 0s).
+    fireEvent.click(screen.getByRole('button'))
+    expect(screen.getByText(/最后活动 55s 前/)).toBeDefined()
+    expect(screen.getByText('10s')).toBeDefined()
+    act(() => { vi.advanceTimersByTime(1_000) })
+    expect(screen.getByText(/最后活动 56s 前/)).toBeDefined()
+
+    // Shut: the open-driven interval is released again.
+    fireEvent.click(screen.getByRole('button'))
+    expect(vi.getTimerCount()).toBe(0)
+
+    // Reopened a minute later: measured from the new open, not the old tick.
+    act(() => { vi.advanceTimersByTime(60_000) })
+    fireEvent.click(screen.getByRole('button'))
+    expect(screen.getByText(/最后活动 1m 56s 前/)).toBeDefined()
   })
 
   it('keeps the panel shut and schedules no timer while nothing runs', () => {
@@ -155,5 +198,39 @@ describe('the header subagent panel clock', () => {
     expect(screen.getByText('累计 1 个')).toBeDefined()
     expect(screen.queryByRole('listitem')).toBeNull()
     expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('closes the menu and its listeners when the list empties while open', () => {
+    startClock(1_000_000)
+    const running = panelState([record({ startedAt: 1_000_000, lastActivityAt: 1_000_000 })])
+    const view = render(
+      <OwnSubagentCatalog host={HostTrigger} acp={panelStore(running)} sessionId="chat-1" useSessions={useSessions} />,
+    )
+    fireEvent.click(screen.getByRole('button'))
+    expect(screen.getAllByRole('listitem')).toHaveLength(1)
+    expect(vi.getTimerCount()).toBe(1)
+
+    // Page-level Escape listener: the open menu handles Escape in the CAPTURE
+    // phase and stops it there, so a listener that outlives the visible menu
+    // would keep swallowing the page's key.
+    const pageEscapes: string[] = []
+    const onPageEscape = (event: KeyboardEvent): void => { if (event.key === 'Escape') pageEscapes.push('page') }
+    window.addEventListener('keydown', onPageEscape)
+    try {
+      const emptySessions = (selector: (value: unknown) => unknown): unknown => selector({
+        projectionsBySession: { 'chat-1': { values: { subagentCatalog: [] } } },
+      })
+      view.rerender(
+        <OwnSubagentCatalog host={HostTrigger} acp={panelStore(panelState([]))} sessionId="chat-1" useSessions={emptySessions} />,
+      )
+      // No rows -> no menu, the open-driven interval is released, and Escape
+      // reaches the page again.
+      expect(screen.queryByRole('listitem')).toBeNull()
+      expect(vi.getTimerCount()).toBe(0)
+      fireEvent.keyDown(document.body, { key: 'Escape' })
+      expect(pageEscapes).toEqual(['page'])
+    } finally {
+      window.removeEventListener('keydown', onPageEscape)
+    }
   })
 })

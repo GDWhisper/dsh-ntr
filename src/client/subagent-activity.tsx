@@ -136,6 +136,24 @@ export interface SubagentCatalogClaimOptions {
 }
 
 /**
+ * Whether a `subagent catalog` diagnostic must reach the production console.
+ *
+ * The claim's own verdicts keep the shared failure-keyword filter, and the
+ * ordinary older-host "host entry not available" stays silent (no entry means
+ * the native trigger is simply still there). The self-drawn panel's fail-open
+ * reasons — a projection that is not an array, a missing `useSessions` hook, a
+ * native child it cannot navigate, no session id, an unexpected row shape —
+ * match none of those keywords, so the whole `subagent catalog:` prefix is
+ * accepted: a fail-open nobody can see in the console is exactly the silent
+ * failure this filter must not have.
+ */
+export function subagentCatalogDiagIsWorthWarn(line: string): boolean {
+  if (line === 'subagent catalog: host entry not available') return false
+  if (line.startsWith('subagent catalog: ')) return true
+  return /failed|missing|taken|gave up|still held/.test(line)
+}
+
+/**
  * Take the header's `subagent-catalog` cell for one ACP-mode spell.
  *
  * Returns `undefined` on any host shape this bundle cannot serve (no entry, a

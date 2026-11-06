@@ -14,12 +14,15 @@
 import { createElement, useState } from 'react'
 import type { ComponentType } from 'react'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   createSubagentCatalogClaim,
+  subagentCatalogDiagIsWorthWarn,
   SUBAGENT_CATALOG_ENTRY_ID,
   SUBAGENT_CATALOG_SLOT,
 } from '../src/client/subagent-activity.tsx'
+import { readSubagentCatalogProjection } from '../src/client/subagent-panel.tsx'
+import { createSubagentCatalogDiagSink } from '../src/client/index.tsx'
 import type { SeatEntry, SeatRegisterOptions, SeatSlots } from '../src/client/model-seat.tsx'
 import { AcpStore, subagentKey } from '../src/client/store.ts'
 import type { AcpStore as AcpStoreType } from '../src/client/store.ts'
@@ -422,5 +425,65 @@ describe('the subagent catalog shadow', () => {
       })).toBeUndefined()
     }
     expect(diagnosed).toEqual(Array.from({ length: 3 }, () => 'subagent catalog: host entry not available'))
+  })
+})
+
+/**
+ * The production console sink. The self-drawn panel's fail-open reasons
+ * ("not an array", "no useSessions hook", a native child it cannot navigate,
+ * no session id, an unexpected row shape) match none of the shared failure
+ * keywords, so a keyword-only filter made every one of them silent.
+ */
+describe('the subagent catalog diagnostic sink', () => {
+  it('prints a real panel fail-open reason, once per verdict change', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const sink = createSubagentCatalogDiagSink()
+      const read = readSubagentCatalogProjection('not an array')
+      expect(read.ok).toBe(false)
+      if (read.ok) return
+      const line = `subagent catalog: ${read.reason}`
+
+      sink(line)
+      expect(warn).toHaveBeenCalledWith(`[dsh-ntr] ${line}`)
+      sink(line)
+      expect(warn).toHaveBeenCalledTimes(1)
+      // The ordinary older-host case still says nothing: the native trigger is
+      // simply still there.
+      sink('subagent catalog: host entry not available')
+      expect(warn).toHaveBeenCalledTimes(1)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('accepts every reason the panel and projection reader can emit', () => {
+    const values: unknown[] = [
+      undefined,
+      'not an array',
+      [null],
+      [{ mode: 'external' }],
+      [{ id: 'acp:x' }],
+      [{ id: 'session-1', mode: 'one-shot' }],
+      [{ id: 'acp:x', mode: 'external', createdAt: 'soon' }],
+      [{ id: 'acp:x', mode: 'external', label: 7 }],
+    ]
+    for (const value of values) {
+      const read = readSubagentCatalogProjection(value)
+      expect(read.ok).toBe(false)
+      if (read.ok) continue
+      const line = `subagent catalog: ${read.reason}`
+      expect(subagentCatalogDiagIsWorthWarn(line), line).toBe(true)
+    }
+    // Reasons emitted by the component itself rather than the projection reader.
+    expect(subagentCatalogDiagIsWorthWarn('subagent catalog: the host entry has no useSessions hook')).toBe(true)
+    expect(subagentCatalogDiagIsWorthWarn('subagent catalog: the host handed the entry no session id')).toBe(true)
+  })
+
+  it('keeps the shared failure keywords and stays silent on success', () => {
+    expect(subagentCatalogDiagIsWorthWarn('conversation.session.header.actions: held by the ACP base')).toBe(false)
+    expect(subagentCatalogDiagIsWorthWarn('conversation.session.header.actions: taken by client-ui-subagent — gave up after 3 retakes')).toBe(true)
+    expect(subagentCatalogDiagIsWorthWarn('conversation.session.header.actions: still held by another entry after retake 3')).toBe(true)
+    expect(subagentCatalogDiagIsWorthWarn('subagent catalog: registration failed (boom)')).toBe(true)
   })
 })

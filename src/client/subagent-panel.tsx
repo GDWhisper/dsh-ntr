@@ -331,20 +331,34 @@ function OwnCatalogProjection(props: OwnSubagentCatalogProps) {
     : readSubagentCatalogProjection(snapshot?.values?.subagentCatalog)
   const records = subagentRowsFor(Object.values(ui.subagents), sessionId)
   const rows = read.ok ? subagentPanelRows(read.rows, records) : []
+  const reason = read.ok ? undefined : read.reason
+  // Whether this panel has anything of its own to draw: a fail-open branch and
+  // an empty list both render the host component / nothing. The menu must not
+  // stay open across that change — its capture-phase Escape listener would
+  // outlive the visible menu and keep swallowing the page's Escape.
+  const served = reason === undefined && rows.length > 0
 
-  // Tick the in-flight rows' clocks once a second (a silent running worker
-  // sends no record frame); terminal rows freeze at their end stamp. Gated on
-  // "any row still in flight", so an all-terminal list schedules no timer.
+  // Tick the clocks once a second while something needs a moving label: an
+  // in-flight row's elapsed clock (a silent running worker sends no record
+  // frame), or the open menu's relative "last activity" line. The open menu
+  // matters even after the last worker finished: a menu opened long after the
+  // mount must measure from the open, not from the mount, or every row shows
+  // mount-time ages and a row newer than the last tick reads "0s" forever.
+  // An all-terminal list with the menu shut schedules no timer at all.
   const ticking = rows.some(row => isActiveSubagent(row.status))
   const [now, setNow] = useState(() => Date.now())
+  const [open, setOpen] = useState(false)
   useEffect(() => {
-    if (!ticking) return
+    if (!ticking && !open) return
     setNow(Date.now())
     const timer = setInterval(() => { setNow(Date.now()) }, SUBAGENT_TICK_MS)
     return () => { clearInterval(timer) }
-  }, [ticking])
+  }, [ticking, open])
+  useEffect(() => {
+    if (served) return
+    setOpen(false)
+  }, [served])
 
-  const [open, setOpen] = useState(false)
   const rootRef = useRef<HTMLDivElement | null>(null)
   const triggerRef = useRef<HTMLButtonElement | null>(null)
   const [placement, setPlacement] = useState<SubagentMenuPlacement | undefined>(undefined)
@@ -387,7 +401,6 @@ function OwnCatalogProjection(props: OwnSubagentCatalogProps) {
     }
   }, [open])
 
-  const reason = read.ok ? undefined : read.reason
   const onDiag = props.onDiag
   useEffect(() => {
     if (reason !== undefined) onDiag?.(`subagent catalog: ${reason}`)

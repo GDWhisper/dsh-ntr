@@ -104,9 +104,9 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 ### 4.3 头部子代理目录 trigger（`conversation.session.header.actions` id `subagent-catalog`）
 `src/client/subagent-activity.tsx` 的 `createSubagentCatalogClaim` 用同 id、更低 priority 的 list cell claim 接管宿主头部那个子代理目录触发器，并按 ACP 判定分给**两个不同的组件类型**（严禁在同一组件里按 `acpMode` 条件调 hook：hook 数量翻转会让槽的错误边界 abdicate 整条 entry）：
 
-- **ACP 会话 → 插件自绘**（`src/client/subagent-panel.tsx` · `OwnSubagentCatalog`）：trigger 把「累计 N 个」与「M 运行中」分开写（`status === 'running'` 才算运行中，`pending` 不算；有运行中才点亮圆点）；下拉是只读列表，行骨架来自宿主持久投影 `useSessions(s => s.projectionsBySession)[sessionId].values.subagentCatalog`，状态 / 耗时 / 最后活动 / 工具调用数来自插件的六态 `SubagentRecord`（按 `childId` 左连接，最新派发在前）：宿主有、插件无 → `unknown`（**绝不画成成功**）；插件有、宿主无 → 仍列出并标「目录待同步」。耗时按 `endedAt ?? now - startedAt`，运行中的行按秒推进、终态冻结。列表**只读**：没有取消 / 重试 / spawn，也没有假按钮（详情浮层见后续任务）。
+- **ACP 会话 → 插件自绘**（`src/client/subagent-panel.tsx` · `OwnSubagentCatalog`）：trigger 把「累计 N 个」与「M 运行中」分开写（`status === 'running'` 才算运行中，`pending` 不算；有运行中才点亮圆点）；下拉是只读列表，行骨架来自宿主持久投影 `useSessions(s => s.projectionsBySession)[sessionId].values.subagentCatalog`，状态 / 耗时 / 最后活动 / 工具调用数来自插件的六态 `SubagentRecord`（按 `childId` 左连接，最新派发在前）：宿主有、插件无 → `unknown`（**绝不画成成功**）；插件有、宿主无 → 仍列出并标「目录待同步」。耗时按 `endedAt ?? now - startedAt`，运行中的行按秒推进、终态冻结；下拉打开期间「最后活动」等相对时间也按秒刷新（打开时先重取当前时间），关闭且无运行中行时不留计时器，列表变空即自动收起。列表**只读**：没有取消 / 重试 / spawn，也没有假按钮（详情浮层见后续任务）。
 - **非 ACP → 宿主组件原样**：`acpMode` 不是肯定为 true 时直通宿主组件与原始 props，视觉与原生条目一致。
-- **fail-open**：宿主投影形状不认识（`useSessions` 缺失 / 投影值不是数组 / 出现 `mode !== 'external'` 的原生行 / 行形状不认识 / 无 session id）时渲染宿主组件而不是空白面板，原因经 claim 的 `onDiag` 如实上报。自绘面板分支里 `useSessionStatus` 的替换仍**调用宿主 hook 本身**，宿主 hook 序列不随活跃集合切换。
+- **fail-open**：宿主投影形状不认识（`useSessions` 缺失 / 投影值不是数组 / 出现 `mode !== 'external'` 的原生行 / 行形状不认识 / 无 session id）时渲染宿主组件而不是空白面板，原因经 claim 的 `onDiag` 上报（控制台过滤接受 `subagent catalog:` 前缀，fail-open 不会静默）。fail-open 与非 ACP 分支渲染宿主组件时，`useSessionStatus` 的替换仍**调用宿主 hook 本身**，宿主组件的 hook 序列不随活跃集合切换（自绘分支不渲染宿主组件，替换的 hook 不会被调用）。
 - **旧路径仍在**：`subagents/update` → `store.activeSubagents` → `mergeSubagentStatuses` 保留给 fail-open 分支的宿主动点，待退役。
 - **闸门与注册**：claim 与其它座位同生命周期（`syncAcpMode` 确认 ACP 时建，`standDown` / 卸载释放），`slots/changed` 也触发重试；宿主没有该条目 / 不是 `list` / 缺 component·inject·locale → 不注册，原生 trigger 照旧。宿主条目的 `inject`（`openChild` / `openChildAside` / `refreshProjection`）必须一并调用——fail-open 分支要靠它保住目录行导航。
 
