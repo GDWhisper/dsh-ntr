@@ -69,6 +69,7 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 | 6 | 会话事实 | `agent-preset/selected` 事件；`sessions.get` 的 `events`；`sessionPersistence.open` 的 `header`（冷会话 preset）；`agentPresets.list` | `src/index.ts` · `wireAcpMode` / `wirePresetRoster`；`src/impl.ts` · `sessionAgentPreset` |
 | 7 | 浏览器槽位与宿主原语 | `conversation.input.model` / `left` / `overlay` / `dock`、`conversation.view`、`conversation.composer.dock`、`conversation.chat.assistant-actions`、`shell.overlay`；projection `agentPreset`；`ctx.slots.inject` / `entriesOfSlot` / `uiSession.adapter.current`；`sessions.fork` 与 `remote.$on('agent-preset/selected')` | `src/client/` |
 | 8 | 插件管理 / 更新 | `pluginManager.listBundles()` / `registries()` / `installBundle()`；packument | `src/update.ts` |
+| 9 | 子代理目录投影 | `conversation.session.header.actions` 的 list 条目 id `subagent-catalog`（宿主组件 + `inject` 的 `openChild` / `openChildAside` / `refreshProjection` + `locale` / `order`）；`useSessions(s => s.projectionsBySession)` → `[sessionId].values.subagentCatalog`（数组，每行 `{ id, createdAt?, label?, mode: 'external' }`）；`useSessionStatus` 原样透传 | `src/client/subagent-activity.tsx` · `createSubagentCatalogClaim` / `SubagentCatalogOccupant`；`src/client/subagent-panel.tsx` · `readSubagentCatalogProjection` / `OwnSubagentCatalog` / `SubagentDetailDialog` |
 
 非宿主面：ACP 协议与 `session/update` 词表在 `@agentclientprotocol/sdk`，升级依赖时看 SDK 类型，不走本表。
 
@@ -86,6 +87,7 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 | 工具卡输出永远是 `ran inside the ACP agent process` 占位符 | `recordAcpToolOutput` 的空记录、`waitForToolOutput` 的短路条件、ACP `tool_call_update.status` 词表 | 公告帧先落一条空记录，等待被空串立刻解除；agent 从不发终态 status 时会挂到 turn settle 才解除 |
 | NTR 对话里出现宿主注入（项目指令 / 记忆召回 / model changed） | `agent/pre-step` decision 形状、`message.source.kind` 常量 | 闸门 fail-open；runtime-context 那一条剥不掉（`step()` 自己会追加） |
 | 模型底座 / 座位 / 选择器消失或露出原生控件 | 槽位名（含 `conversation.input.overlay`）、`entriesOfSlot`、projection key | 客户端槽位或投影改名 |
+| 子代理面板退回宿主 trigger / 控制台出现 `subagent catalog:` fail-open 行 | `subagentCatalog` 投影与 `useSessions` 形状；`subagent-panel.tsx` 的 `readSubagentCatalogProjection` / `subagent-activity.tsx` 的 `SubagentCatalogOccupant` | 插槽条目 / id / projection key 改名，出现非 `external` 行或行形状变化 |
 | 审批卡 / 释放横幅不出现 | `conversation.input.dock`、`session/update` 折叠 | dock 槽位或事件形状变化 |
 | 内置更新不可用 | `pluginManager` 方法面 | 服务或方法签名变化 |
 

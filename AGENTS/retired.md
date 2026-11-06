@@ -60,6 +60,12 @@
 - 也不要把「渲染 `null` 就够了」或「组件里 `return null` 就是隔离」当结论——两次都是修过的真实缺陷。
 - **仍然有效**：`createModelSeatClaim` 装的是 NTR 底座本体；`entriesOfSlot` 核实 + 有界重取；动态注册、切走即撤；`stagedSessionOf` / `rowAgentPreset` 的两代快照读法；`ACP_PRESET_ID` 三处同步；失败一律不接管。见 [ui.md](./ui.md)。
 
+### 子代理活跃圆点流（`subagents/update`）
+
+- **退役**：`subagents/update` 活跃流、`ChatSessionView.activeSubagents`、浏览器 `UiState.activeSubagents` 与 `subagentFrames` / `subagentFrameSeq` 重放日志、`mergeSubagentStatuses`、`activeCatalogChildIds`，以及 `BackgroundDispatch.activity` 与 `broadcastDispatchActivity` / `openDispatchActivity` / `closeDispatchActivity` / `closeAllDispatchActivity` / `releaseDispatchActivity`；连同它对宿主 `useSessionStatus` 状态表的替换。
+- **为什么死**：宿主对 `mode: 'external'` 行写死「不可完成、不可导航」，这条流只能表达「正在跑」一个灰点——它是与插件六态记录并行的**第二个事实源**，成功 / 失败 / 取消 / 未知的终点从这条流永远到不了浏览器；在 fail-open 分支里它也只是给宿主组件多画一个假活跃点。插件自持的六态记录已经覆盖同一件事，且不依赖宿主的 external 行渲染。
+- **仍然有效**：`subagents/record` + `SubagentRecord`（`TurnStreamController.syncDispatchRecord` / `terminalizeDispatches`，落 `agents.json` 的 `subagents` 键）与自绘面板 `OwnSubagentCatalog` / 详情 `SubagentDetailDialog`；宿主 `subagentCatalog` projection 仍是列表骨架，fail-open 时原样渲染宿主组件、不再注入任何状态。见 [protocol.md §6.3](./protocol.md) 与 [ui.md §4.3](./ui.md)。
+
 ### 约束 22：默认模型守卫与路由强制
 
 - **退役**：`AcpDefaultModelGuard` / `reconcileDefaultModel` / `lastNativeRoute` / `settleAcpRoute` / `watchRoute` / `routeAttempts` / `routeNotices` / `acpRouteTarget` / `selectAcpRoute` / `setDefaultModelGuard` / `wireDefaultModelGuard`；RPC `model/get-default` / `model/set-default` / `model/reconcile-default`。
@@ -90,6 +96,10 @@ answerBuffer  streamedAnswerLength  pendingToolAnswers  cardOutputs
 acpToolCallDetailsOf  acpToolActivityLine  acpToolActivityOutput  acpToolInputOf
 noteToolActivity  registryHasToolCall  DEFAULT_STRIPPED_SOURCES  isOwnToolContinuation
 useDirectory  resolveDirectory  ModelDirectoryResolver  directoryFor
+subagents/update  activeSubagents  subagentFrames  subagentFrameSeq
+mergeSubagentStatuses  activeCatalogChildIds  BackgroundDispatch.activity
+broadcastDispatchActivity  openDispatchActivity  closeDispatchActivity
+closeAllDispatchActivity  releaseDispatchActivity
 ```
 
 > 工具卡路径的符号（`isAcpToolContinuation` / `recordAcpToolOutput` /
