@@ -12,7 +12,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { ACP_PRESET_ID, acpModeFromPresetEvent, formatCommandLine, isAbsolutePathLike, placeMenu, rowAgentPreset, splitAcpModelId, splitCommandLine, stagedIsAcpMode, stagedSessionOf, tokenizeCommandLine } from '../src/client/acp-ui.tsx'
 import { agentLockPhaseOf, FORM_MS, playAgentLockAnim, SHATTER_MS } from '../src/client/agent-lock-anim.ts'
 import { branchIconOf, resolveHostFork } from '../src/client/branch-action.tsx'
-import { acpEmptyCopy, boundAgentOf, diffRows, formatSubagentDuration, historyAwaitsReplay, isNewFileDiff, subagentActiveCount, subagentElapsedMs, subagentRowsFor, subagentSectionCopy, subagentStatusLabel, subagentStatusTone, subagentTitle } from '../src/client/acp-view.tsx'
+import { acpEmptyCopy, boundAgentOf, diffRows, formatSubagentDuration, historyAwaitsReplay, isNewFileDiff, subagentElapsedMs, subagentRowsFor, subagentRunningCount, subagentSectionCopy, subagentStatusLabel, subagentStatusTone, subagentTitle } from '../src/client/acp-view.tsx'
 import { agentModeVisible } from '../src/client/composer-mode.tsx'
 import { acpMeterUsage, compactTokenCount, contextOccupancy } from '../src/client/context-meter.tsx'
 import { agentTestHint, approvalDeadlineFacts, DEADLINE_MIN_WAIT_MS, deadlineSliderIndex, deadlineValueFor } from '../src/client/panel.tsx'
@@ -1436,14 +1436,17 @@ describe('the NTR view subagent section', () => {
     expect(rows[2]?.status).toBe('failed')
   })
 
-  it('counts pending and running rows as active', () => {
-    expect(subagentActiveCount([
+  it('counts only running rows for the header, never a pending row', () => {
+    // The row badge of a pending row says "pending" (等待开始); counting it as
+    // "running" in the header would make the two lines disagree. Its elapsed
+    // clock still ticks — that is the strip's separate `ticking` gate.
+    expect(subagentRunningCount([
       record({ status: 'pending' }),
       record({ status: 'running' }),
       record({ status: 'completed' }),
       record({ status: 'unknown' }),
-    ])).toBe(2)
-    expect(subagentActiveCount([])).toBe(0)
+    ])).toBe(1)
+    expect(subagentRunningCount([])).toBe(0)
   })
 
   it('names a row by type · label, falling back to label then child id', () => {

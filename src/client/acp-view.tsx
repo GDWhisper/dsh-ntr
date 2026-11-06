@@ -458,6 +458,9 @@ export function acpEmptyCopy(facts: AcpEmptyFacts, t: Translate): AcpEmptyCopy {
 // no `foldUpdate` / `blocks` reads: worker frames are not part of the parent
 // transcript.
 
+/** Tick of the in-flight rows' elapsed clocks (the label shows whole seconds). */
+const SUBAGENT_TICK_MS = 1000
+
 /** Badge wording per lifecycle state; six states must read differently. */
 const SUBAGENT_LABEL: Record<SubagentStatus, readonly [zh: string, en: string]> = {
   pending: ['等待开始', 'pending'],
@@ -489,21 +492,31 @@ export function subagentStatusTone(status: SubagentStatus): string {
   return SUBAGENT_TONE[status] ?? 'idle'
 }
 
-/** Whether the row is still moving: dispatched but not started, or running. */
+/**
+ * Whether the row is still in flight: dispatched but not started, or running.
+ * These are exactly the rows whose elapsed clock advances with `now`.
+ */
 function isActiveSubagent(status: SubagentStatus): boolean {
   return status === 'pending' || status === 'running'
 }
 
-/** Rows still moving (dispatched but not started, or running): the header's "running" count. */
-export function subagentActiveCount(records: readonly Pick<SubagentRecord, 'status'>[]): number {
-  return records.filter(record => isActiveSubagent(record.status)).length
+/**
+ * Rows the agent is running right now — the header's "M running" count.
+ *
+ * `pending` is deliberately NOT counted: the row's own badge says "pending"
+ * (等待开始), so calling the same state "running" in the header would make the
+ * two lines contradict each other. The pending row's elapsed clock still
+ * ticks (it counts from dispatch), it just is not billed as running.
+ */
+export function subagentRunningCount(records: readonly Pick<SubagentRecord, 'status'>[]): number {
+  return records.filter(record => record.status === 'running').length
 }
 
 /**
  * One row's elapsed wall time: from dispatch to the terminal stamp, or to
- * `now` while the row is still active. A stale end stamp on an active row is
- * ignored, and a terminal row without one (a teardown-written `unknown`) has
- * no better stamp to stop at.
+ * `now` while the row is still in flight. A stale end stamp on an in-flight
+ * row is ignored, and a terminal row without one (a teardown-written
+ * `unknown`) has no better stamp to stop at.
  */
 export function subagentElapsedMs(
   record: Pick<SubagentRecord, 'startedAt' | 'endedAt' | 'status'>,
@@ -633,24 +646,39 @@ function SubagentRow({ record, now, t }: { record: SubagentRecord; now: number; 
  * The compact, read-only subagent strip. It stays secondary to the transcript:
  * one header line, a capped row list, and copy instead of rows when nothing is
  * known.
+ *
+ * Exported for the strip's render test (the per-second clock); the section
+ * registers nothing and reads no store state of its own.
  */
-function SubagentSection({ rows, served, t }: { rows: readonly SubagentRecord[]; served: boolean; t: Translate }) {
-  const now = Date.now()
-  const active = subagentActiveCount(rows)
+export function SubagentSection({ rows, served, t }: { rows: readonly SubagentRecord[]; served: boolean; t: Translate }) {
+  // The elapsed clocks of in-flight rows must advance without a store frame
+  // (a silent running worker sends no `subagents/record`), so they tick once a
+  // second; terminal rows freeze at their end stamp. Same pattern as
+  // `PermissionDock`'s countdown: derive the boolean first, then gate a single
+  // interval on it, so an all-terminal strip schedules no timer at all.
+  const ticking = rows.some(record => isActiveSubagent(record.status))
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!ticking) return
+    setNow(Date.now())
+    const timer = setInterval(() => { setNow(Date.now()) }, SUBAGENT_TICK_MS)
+    return () => { clearInterval(timer) }
+  }, [ticking])
+  const running = subagentRunningCount(rows)
   const note = subagentSectionCopy({
     total: rows.length,
     known: rows.filter(record => record.status !== 'unknown').length,
     served,
   }, t)
   const totalText = t(`累计 ${rows.length} 个`, `${rows.length} total`)
-  const activeText = t(`${active} 运行中`, `${active} running`)
+  const runningText = t(`${running} 运行中`, `${running} running`)
   return (
     <div className="ntr-acp-subagents">
       <div className="ntr-acp-subagents-head">
         <span className="ntr-acp-subagents-title">{t('子智能体', 'subagents')}</span>
         {rows.length > 0 && (
           <span className="ntr-acp-subagents-count">
-            {active > 0 ? `${totalText} · ${activeText}` : totalText}
+            {running > 0 ? `${totalText} · ${runningText}` : totalText}
           </span>
         )}
       </div>
@@ -683,6 +711,12 @@ export function AcpConversationView(props: AcpViewProps) {
   const subagents = subagentRowsFor(Object.values(ui.subagents), sessionId)
   const bound = ui.chatSessionsFor === sessionId ? boundSession(ui.chatSessions) : undefined
   const transcript: ChatTranscript | undefined = acp.chatTranscriptOf(sessionId)
+  // "An ACP session has served this conversation" is a fact of its own: the
+  // chat-list row proves it just as well as the transcript does, and the two
+  // reads land independently. Taking only the transcript would paint the
+  // "history unknown" copy for a served conversation while the transcript
+  // read is in flight; with neither answer the fact is genuinely unknown.
+  const served = transcript !== undefined || bound !== undefined
   // Who this conversation is set up on — readable with no transcript at all,
   // which is the whole point: the transcript is a record of turns, the binding
   // is the conversation's own state.
@@ -721,7 +755,7 @@ export function AcpConversationView(props: AcpViewProps) {
     }, t)
     return (
       <div className="ntr-acp-view">
-        <SubagentSection rows={subagents} served={false} t={t} />
+        <SubagentSection rows={subagents} served={served} t={t} />
         <div className="ntr-acp-empty">
           <div className="ntr-acp-empty-title">{empty.title}</div>
           <p className="ntr-acp-empty-body">{empty.body}</p>
@@ -782,7 +816,7 @@ export function AcpConversationView(props: AcpViewProps) {
           {t('刷新', 'refresh')}
         </button>
       </div>
-      <SubagentSection rows={subagents} served t={t} />
+      <SubagentSection rows={subagents} served={served} t={t} />
       <div
         className="ntr-acp-stream"
         ref={streamRef}
