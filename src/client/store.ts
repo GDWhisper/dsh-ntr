@@ -6,8 +6,8 @@
  * Deliberately framework-free: React binds through `useSyncExternalStore`.
  */
 
-import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, IdleReleaseResult, IdleReleaseSetPayload, PermissionTimeoutMode, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView } from '../protocol.ts'
-import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_TAG_HALO } from '../protocol.ts'
+import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, IdleReleaseResult, IdleReleaseSetPayload, PermissionTimeoutMode, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, SubagentDetailEntry, SubagentDetailResult, SubagentRecord } from '../protocol.ts'
+import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_TAG_HALO, MAX_SUBAGENT_DETAIL_ENTRIES } from '../protocol.ts'
 
 /** One slash command the ACP agent declared, whole row (the menu draws name, description and `input.hint`). */
 export type AgentCommand = NonNullable<ChatSessionView['availableCommands']>[number]
@@ -192,6 +192,48 @@ export interface ChatTranscript {
   blocks: Block[]
   /** Highest folded transcript seq (gap detection for the live stream). */
   seq: number
+}
+
+/** The record/detail index key: one `childId` may repeat across conversations. */
+export function subagentKey(dshSessionId: string, childId: string): string {
+  return `${dshSessionId}\u0000${childId}`
+}
+
+/** How many workers' detail indexes the browser keeps at once (LRU eviction). */
+export const MAX_SUBAGENT_DETAIL_WORKERS = 64
+
+/** Raw payload budget for one live-captured detail frame; mirrors the host's `ACP_TOOL_RAW_MAX`. */
+const SUBAGENT_RAW_MAX = 256_000
+
+/** One raw worker entry in the browser's bounded detail index. */
+export interface LiveSubagentDetailEntry extends SubagentDetailEntry {
+  /**
+   * Store-local monotonic order for LIVE-captured frames (absent on history
+   * read from the host). A `subagents/detail` answer describes the host as of
+   * BEFORE the frames that landed while its read was in flight, so the answer
+   * replays them by this mark — the same discipline `chatRowFrames` uses.
+   */
+  liveSeq?: number
+}
+
+/**
+ * The browser's per-worker detail index. Fed by live `session/update` frames
+ * (NEWEST {@link MAX_SUBAGENT_DETAIL_ENTRIES} entries, older ones counted in
+ * {@link omitted}) and, once per page, by an on-demand `subagents/detail` read
+ * for the history that predates the page. Deliberately NOT the folded ACP
+ * transcript: `foldUpdate` drops `_meta` and merges adjacent prose across
+ * workers, and the NTR view must keep rendering what it renders today.
+ */
+export interface SubagentDetailState {
+  dshSessionId: string
+  childId: string
+  entries: LiveSubagentDetailEntry[]
+  /** `subagents/detail` already answered for this worker in this page. */
+  loaded: boolean
+  /** Older entries missing from the index (host cap + local cap); 0 = starts at the first frame. */
+  omitted: number
+  /** LRU clock: when the detail was last opened (or first indexed). */
+  touchedAt: number
 }
 
 /**
@@ -548,6 +590,23 @@ export interface UiState {
    * completed / failed or its turn ends.
    */
   activeSubagents: Record<string, string[]>
+  /**
+   * The plugin's OWN lifecycle records for external workers, keyed by
+   * {@link subagentKey} (`dshSessionId + childId`). Live transitions arrive as
+   * `subagents/record` frames; a `session/chat-list` answer carries the
+   * terminal ones, so a reload or a host restart still answers them. The
+   * panel LIST is still joined from the host's own catalog projection — a
+   * catalog row with no record reads `unknown`, never succeeded.
+   */
+  subagents: Record<string, SubagentRecord>
+  /**
+   * Raw per-worker detail indexes (bounded, LRU-capped at
+   * {@link MAX_SUBAGENT_DETAIL_WORKERS}), keyed like {@link subagents}. An
+   * entry exists only once its detail was opened in this page; from then on
+   * live frames append to it, and the first open reads history from
+   * `subagents/detail`.
+   */
+  subagentDetails: Record<string, SubagentDetailState>
   /**
    * Per-chat-session ACP agent binding, as reported by `session/chat-list`'s
    * `boundAgentId` (the host's intent map plus its live-session fallback): who
@@ -957,6 +1016,8 @@ export class AcpStore {
     chatTranscripts: {},
     acpMode: {},
     activeSubagents: {},
+    subagents: {},
+    subagentDetails: {},
     chatBoundAgent: {},
     chatLockedAgent: {},
     agentLockReveal: {},
@@ -1033,6 +1094,23 @@ export class AcpStore {
    */
   private subagentFrameSeq = 0
   private readonly subagentFrames: Array<{ seq: number; dshSessionId: string; childId: string; running: boolean }> = []
+  /**
+   * Monotonic order plus a short log of applied `subagents/record` frames, for
+   * the same reason as {@link subagentFrames}: a `session/chat-list` answer can
+   * describe the host as of BEFORE a frame that landed while the read was in
+   * flight, and the answer replays the later frames over its snapshot.
+   */
+  private subagentRecordSeq = 0
+  private readonly subagentRecordFrames: Array<{ seq: number; dshSessionId: string; record: SubagentRecord }> = []
+  /** Store-local order for live-captured detail entries (see {@link LiveSubagentDetailEntry.liveSeq}). */
+  private detailLiveSeq = 0
+  /**
+   * ACP session id → owning DSH chat session id, learned from chat-list rows
+   * and `turn/metrics` frames. Live `session/update` frames carry only the ACP
+   * session, and a detail entry must land under the conversation that owns it
+   * (`toolCallId`s can repeat across conversations).
+   */
+  private readonly acpSessionOwners = new Map<string, string>()
   /**
    * Chat sessions whose host read came back WITHOUT a verdict (no `acpMode`
    * field, or the read failed). The seat gate consults this to retract its
@@ -1129,9 +1207,18 @@ export class AcpStore {
     }
     let chatTranscripts = this.state.chatTranscripts
     let chatSessions = this.state.chatSessions
+    let subagentDetails = this.state.subagentDetails
     let blocksChanged = false
     for (const [sessionId, items] of bySession) {
       const last = items[items.length - 1]
+      // A worker's detail index is fed BEFORE the active-session split: the
+      // conversation that dispatched it is not necessarily the ACP view's
+      // active transcript, and the two never share the fold.
+      const owner = this.acpSessionOwners.get(sessionId)
+      if (owner !== undefined) {
+        const folded = this.foldSubagentDetailFrames(owner, items, subagentDetails)
+        if (folded !== undefined) subagentDetails = folded
+      }
       // `usage_update` is state, not stream content: it never becomes a block,
       // but both observed snapshots that carry usage must move with it —
       // otherwise the ACP view header and the composer's occupancy ring only
@@ -1174,8 +1261,46 @@ export class AcpStore {
     const patch: Partial<UiState> = {}
     if (chatTranscripts !== this.state.chatTranscripts) patch.chatTranscripts = chatTranscripts
     if (chatSessions !== this.state.chatSessions) patch.chatSessions = chatSessions
+    if (subagentDetails !== this.state.subagentDetails) patch.subagentDetails = subagentDetails
     if (blocksChanged) patch.blocks = [...this.state.blocks]
     if (Object.keys(patch).length > 0) this.mutate(patch)
+  }
+
+  /**
+   * Append the frames of one batch that belong to an OPEN worker detail index
+   * (see {@link UiState.subagentDetails}). Both filters are required: the
+   * dispatch's own frames (`toolCallId` — raw input and the terminal frame
+   * live there) and the worker's frames
+   * (`_meta["codebuddy.ai/parentToolCallId"]`). Scoped by the ACP session's
+   * owning conversation, never by `childId` alone.
+   *
+   * Returns the next map, or `undefined` when nothing matched.
+   */
+  private foldSubagentDetailFrames(
+    owner: string,
+    items: ReadonlyArray<{ seq: number; update: unknown }>,
+    currentMap: Record<string, SubagentDetailState>,
+  ): Record<string, SubagentDetailState> | undefined {
+    const keys = Object.keys(currentMap)
+    if (keys.length === 0) return undefined
+    let out: Record<string, SubagentDetailState> | undefined
+    for (const item of items) {
+      const update = item.update as Record<string, unknown>
+      if (update === null || typeof update !== 'object') continue
+      const own = typeof update.toolCallId === 'string' && update.toolCallId !== '' ? update.toolCallId : undefined
+      const parent = parentToolCallIdOf(update)
+      if (own === undefined && parent === undefined) continue
+      for (const key of keys) {
+        const detail = (out ?? currentMap)[key]
+        if (detail === undefined || detail.dshSessionId !== owner) continue
+        const toolCallId = detail.childId.startsWith('acp:') ? detail.childId.slice('acp:'.length) : ''
+        if (toolCallId === '') continue
+        if (toolCallId !== own && toolCallId !== parent) continue
+        if (out === undefined) out = { ...currentMap }
+        out[key] = appendSubagentDetailEntry(detail, boundedDetailEntry(item.seq, item.update, ++this.detailLiveSeq))
+      }
+    }
+    return out
   }
 
   private armUpdateFlush(): void {
@@ -1863,6 +1988,7 @@ export class AcpStore {
     // Captured BEFORE the request: every frame applied after this point is
     // newer than whatever state the host will answer with.
     const subagentFramesAtRead = this.subagentFrameSeq
+    const subagentRecordFramesAtRead = this.subagentRecordSeq
     const chatRowFramesAtRead = this.chatRowFrameSeq
     try {
       const { sessions: listed = [], acpMode, boundAgentId, lockedAgentId, choice } = await this.call<{ sessions: ChatSessionView[]; acpMode?: boolean; boundAgentId?: string; lockedAgentId?: string; choice?: AcpConversationChoice }>('session/chat-list', { dshSessionId, refresh: true })
@@ -1916,12 +2042,27 @@ export class AcpStore {
         if (frame.running && at < 0) activeSubagents.push(frame.childId)
         else if (!frame.running && at >= 0) activeSubagents.splice(at, 1)
       }
+      // The plugin's own lifecycle records: REPLACED for this conversation and
+      // refreshed for every other one, then replayed over by the
+      // `subagents/record` frames that landed while this read was in flight
+      // (an in-flight terminal must beat an older snapshot row). Rows of this
+      // conversation also teach the ACP-session→conversation map the live
+      // detail index is scoped by.
+      for (const row of sessions) this.acpSessionOwners.set(row.sessionId, dshSessionId)
+      const subagents = mergeSubagentSnapshot(
+        this.state.subagents,
+        dshSessionId,
+        sessions,
+        this.subagentRecordFrames,
+        subagentRecordFramesAtRead,
+      )
       this.mutate({
         chatSessions: sessions,
         chatSessionsFor: dshSessionId,
         chatLockedAgent,
         agentLockReveal,
         activeSubagents: { ...this.state.activeSubagents, [dshSessionId]: activeSubagents },
+        subagents,
         // The host's binding (intent + live-session fallback) outranks the
         // optimistic entry this store wrote on the click; a host without the
         // field (older half) simply leaves the optimistic value standing.
@@ -1983,6 +2124,118 @@ export class AcpStore {
     if (read === undefined) return
     read.dropped = true
     this.chatSessionReads.delete(dshSessionId)
+  }
+
+  /**
+   * The lifecycle records this page knows for one conversation, oldest
+   * dispatch first. The panel LISTS from the host's catalog projection and
+   * joins these by `childId` — a row with no record here reads `unknown`
+   * (a catalog fact from before the plugin recorded lifecycles), never
+   * succeeded.
+   */
+  subagentsFor(dshSessionId: string): SubagentRecord[] {
+    return Object.values(this.state.subagents)
+      .filter(record => record.dshSessionId === dshSessionId)
+      .sort((a, b) => a.startedAt - b.startedAt)
+  }
+
+  /** One worker's lifecycle record, or `undefined` when this page never saw one. */
+  subagentRecord(dshSessionId: string, childId: string): SubagentRecord | undefined {
+    return this.state.subagents[subagentKey(dshSessionId, childId)]
+  }
+
+  /** One worker's bounded detail index, once its detail was opened in this page. */
+  subagentDetail(dshSessionId: string, childId: string): SubagentDetailState | undefined {
+    return this.state.subagentDetails[subagentKey(dshSessionId, childId)]
+  }
+
+  /**
+   * Ensure one worker's detail index exists and read its history once.
+   *
+   * Creates the index (which is what makes LIVE frames append to it from then
+   * on), moves it to the LRU's recent end, and on the first open of this page
+   * asks the host for the bounded history that predates the page
+   * (`subagents/detail`). Frames that land while that read is in flight are
+   * replayed over its answer by their `liveSeq`, so a slow read cannot erase
+   * a terminal frame the page already saw. A failed read leaves the live
+   * index alone and retries on the next open.
+   */
+  async loadSubagentDetail(dshSessionId: string, childId: string): Promise<void> {
+    const key = subagentKey(dshSessionId, childId)
+    const atRead = this.detailLiveSeq
+    const existing = this.state.subagentDetails[key]
+    const touchedAt = Date.now()
+    const opened: SubagentDetailState = existing === undefined
+      ? { dshSessionId, childId, entries: [], loaded: false, omitted: 0, touchedAt }
+      : { ...existing, touchedAt }
+    // Re-insert so an equal-timestamp tie during LRU eviction keeps this one
+    // (see `withSubagentDetail`).
+    const openedMap = { ...this.state.subagentDetails }
+    delete openedMap[key]
+    openedMap[key] = opened
+    this.mutate({ subagentDetails: this.withSubagentDetail(openedMap, key) })
+    if (opened.loaded) return
+    try {
+      const result = await this.call<SubagentDetailResult>('subagents/detail', { dshSessionId, childId })
+      const current = this.state.subagentDetails[key]
+      if (current === undefined) return
+      // Frames applied while the read was in flight are newer than its answer
+      // in the only sense that matters (the host may not have seen them yet),
+      // so they are replayed over it. A frame the host DID see appears on both
+      // sides; the payload comparison drops that copy (a bare seq is not
+      // enough: a resumed segment restarts its numbering).
+      const hostHistory = new Map<number, Set<string>>()
+      for (const entry of result.entries) {
+        const copy = hostHistory.get(entry.seq) ?? new Set<string>()
+        copy.add(detailPayloadKey(entry.update))
+        hostHistory.set(entry.seq, copy)
+      }
+      const live = current.entries.filter(entry => {
+        if ((entry.liveSeq ?? 0) <= atRead) return false
+        return hostHistory.get(entry.seq)?.has(detailPayloadKey(entry.update)) !== true
+      })
+      const combined = [...result.entries.map(entry => ({ ...entry })), ...live]
+      const overflow = Math.max(0, combined.length - MAX_SUBAGENT_DETAIL_ENTRIES)
+      this.mutate({
+        subagentDetails: this.withSubagentDetail({
+          ...this.state.subagentDetails,
+          [key]: {
+            ...current,
+            entries: overflow > 0 ? combined.slice(overflow) : combined,
+            loaded: true,
+            omitted: current.omitted + overflow + (result.omitted ?? 0),
+            touchedAt: Date.now(),
+          },
+        }, key),
+      })
+    } catch {
+      // An older host (no endpoint) or a dropped read: the live index stays
+      // usable, and the next open retries the one history read.
+    }
+  }
+
+  /**
+   * Apply the {@link MAX_SUBAGENT_DETAIL_WORKERS} LRU. `protect` is never
+   * evicted (the worker just opened); among the rest the oldest `touchedAt`
+   * goes first.
+   */
+  private withSubagentDetail(
+    map: Record<string, SubagentDetailState>,
+    protect?: string,
+  ): Record<string, SubagentDetailState> {
+    const keys = Object.keys(map)
+    if (keys.length <= MAX_SUBAGENT_DETAIL_WORKERS) return map
+    const removable = keys
+      .filter(key => key !== protect)
+      .sort((a, b) => (map[a]?.touchedAt ?? 0) - (map[b]?.touchedAt ?? 0))
+    const next = { ...map }
+    let excess = keys.length - MAX_SUBAGENT_DETAIL_WORKERS
+    for (const key of removable) {
+      if (excess <= 0) break
+      delete next[key]
+      excess -= 1
+    }
+    return next
   }
 
   /**
@@ -3452,6 +3705,9 @@ export class AcpStore {
         // must not regress a turn this page already saw finalized (frames can
         // land out of order across a stream reconnect); any other frame writes
         // the entry. Blocks / sessions stay untouched — this is a metric.
+        // The frame also names BOTH ids, so it refreshes the ACP→chat owner
+        // mapping the worker detail index is scoped by.
+        this.acpSessionOwners.set(event.sessionId, event.dshSessionId)
         const prior = this.state.burstStats[event.sessionId]
         if (event.final === false && prior !== undefined && prior.final === true && prior.turnId === event.turnId) {
           return Promise.resolve()
@@ -3541,6 +3797,34 @@ export class AcpStore {
           ? [...current, event.childId]
           : current.filter(id => id !== event.childId)
         this.mutate({ activeSubagents: { ...this.state.activeSubagents, [event.dshSessionId]: next } })
+        return Promise.resolve()
+      }
+      case 'subagents/record': {
+        // One worker's plugin-owned lifecycle record: creation and every
+        // status transition of one dispatch. Logged for the chat-list replay
+        // (the answer may predate this frame), then folded by key — never by
+        // `childId` alone, which can repeat across conversations.
+        this.subagentRecordSeq += 1
+        this.subagentRecordFrames.push({
+          seq: this.subagentRecordSeq,
+          dshSessionId: event.dshSessionId,
+          record: event.record,
+        })
+        if (this.subagentRecordFrames.length > 256) this.subagentRecordFrames.shift()
+        const key = subagentKey(event.dshSessionId, event.record.childId)
+        const existing = this.state.subagents[key]
+        // A terminal row is never downgraded by a stale in-flight frame: the
+        // worker already reported, and the panel must not start claiming it is
+        // running again. Everything else is last-wins (frames arrive in order).
+        if (existing !== undefined && existing.endedAt !== undefined && event.record.endedAt === undefined) {
+          return Promise.resolve()
+        }
+        this.mutate({
+          subagents: {
+            ...this.state.subagents,
+            [key]: { ...event.record, dshSessionId: event.dshSessionId },
+          },
+        })
         return Promise.resolve()
       }
       default:
@@ -3789,6 +4073,99 @@ export function replayChatRowFrames(
     }
   }
   return next
+}
+
+/**
+ * Merge a `session/chat-list` answer's worker records for ONE conversation
+ * into the store's keyed map, then replay the `subagents/record` frames that
+ * landed while the read was in flight. Other conversations' records are left
+ * untouched. A terminal record is never replaced by a non-terminal one: a
+ * stale snapshot row must not revive a worker that already reported.
+ */
+export function mergeSubagentSnapshot(
+  current: Readonly<Record<string, SubagentRecord>>,
+  dshSessionId: string,
+  rows: readonly ChatSessionView[],
+  frames: ReadonlyArray<{ seq: number; dshSessionId: string; record: SubagentRecord }>,
+  afterSeq: number,
+): Record<string, SubagentRecord> {
+  const next: Record<string, SubagentRecord> = { ...current }
+  for (const key of Object.keys(next)) {
+    if (next[key]?.dshSessionId === dshSessionId) delete next[key]
+  }
+  // One conversation can have several rows; the same record may appear on
+  // each, so merge by `dshSessionId + childId`.
+  for (const row of rows) {
+    for (const record of row.subagents ?? []) {
+      if (record.dshSessionId !== dshSessionId) continue
+      next[subagentKey(dshSessionId, record.childId)] = record
+    }
+  }
+  for (const frame of frames) {
+    if (frame.seq <= afterSeq || frame.dshSessionId !== dshSessionId) continue
+    const key = subagentKey(dshSessionId, frame.record.childId)
+    const existing = next[key]
+    if (existing !== undefined && existing.endedAt !== undefined && frame.record.endedAt === undefined) continue
+    next[key] = frame.record
+  }
+  return next
+}
+
+/** The CodeBuddy worker attribution a live update carries (`parentToolCallId`), if any. */
+function parentToolCallIdOf(update: Record<string, unknown>): string | undefined {
+  const meta = update._meta
+  if (meta === null || typeof meta !== 'object') return undefined
+  const value = (meta as Record<string, unknown>)['codebuddy.ai/parentToolCallId']
+  return typeof value === 'string' && value !== '' ? value : undefined
+}
+
+/** Serialized form of one detail payload (never throws; used to bound AND to de-duplicate). */
+function detailPayloadKey(update: unknown): string {
+  try {
+    return JSON.stringify(update) ?? String(update)
+  } catch {
+    return String(update)
+  }
+}
+
+/**
+ * Bound ONE live detail frame the same way the host's read does: over-budget
+ * payloads become a MARKED cut, never a silent drop and never an unbounded
+ * state object (constraint 29).
+ */
+function boundedDetailEntry(seq: number, update: unknown, liveSeq: number): LiveSubagentDetailEntry {
+  const text = detailPayloadKey(update)
+  if (text.length <= SUBAGENT_RAW_MAX) return { seq, update, liveSeq }
+  const kind = update !== null && typeof update === 'object'
+    ? (update as { sessionUpdate?: unknown }).sessionUpdate
+    : undefined
+  const cut = text.length - SUBAGENT_RAW_MAX
+  return {
+    seq,
+    update: {
+      sessionUpdate: typeof kind === 'string' ? kind : 'unknown',
+      truncated: true,
+      text: `${text.slice(0, SUBAGENT_RAW_MAX)}\n… [truncated ${String(cut)} chars]`,
+    },
+    truncatedChars: cut,
+    liveSeq,
+  }
+}
+
+/** Append one entry to a worker's index, dropping the oldest past the per-worker cap. */
+function appendSubagentDetailEntry(
+  state: SubagentDetailState,
+  entry: LiveSubagentDetailEntry,
+): SubagentDetailState {
+  const entries = [...state.entries, entry]
+  const overflow = entries.length - MAX_SUBAGENT_DETAIL_ENTRIES
+  return {
+    ...state,
+    entries: overflow > 0 ? entries.slice(overflow) : entries,
+    // The marker the panel renders: `omitted > 0` means the index does not
+    // start at the worker's first frame.
+    omitted: state.omitted + Math.max(0, overflow),
+  }
 }
 
 function sameModes(a?: SessionView['modes'], b?: SessionView['modes']): boolean {

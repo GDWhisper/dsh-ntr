@@ -3,7 +3,7 @@ import { AcpStore, composeSaveBanners, foldUpdate, forkStateOf, permissionsForSe
 import { acpModeFromPresetEvent, stagedIsAcpMode } from '../src/client/acp-ui.tsx'
 import { resolveHostFork } from '../src/client/branch-action.tsx'
 import { releasedBannerVisible } from '../src/client/released-banner.tsx'
-import type { AcpAgentDef, ChatSessionView, DetectedAgentInfo } from '../src/protocol.ts'
+import type { AcpAgentDef, ChatSessionView, DetectedAgentInfo, SubagentRecord } from '../src/protocol.ts'
 
 function fold(...updates: Array<Record<string, unknown>>): Block[] {
   const blocks: Block[] = []
@@ -1957,6 +1957,229 @@ describe('AcpStore external subagent activity (the host catalog dot feed)', () =
     releaseList()
     await load
     expect(store.getSnapshot().activeSubagents['chat-1']).toEqual(['acp:old', 'acp:new'])
+  })
+})
+
+describe('AcpStore subagent lifecycle records (the panel data layer)', () => {
+  function record(overrides: Partial<SubagentRecord> = {}): SubagentRecord {
+    return {
+      childId: 'acp:call-1',
+      dshSessionId: 'chat-1',
+      toolCallId: 'call-1',
+      label: 'general-purpose · audit',
+      status: 'pending',
+      startedAt: 1_000,
+      lastActivityAt: 1_000,
+      counts: { updates: 1, toolCalls: 0, textChars: 0 },
+      ...overrides,
+    }
+  }
+
+  function makeStore(rpc: (endpoint: string, payload: unknown) => Promise<{ ok: boolean; value?: unknown; error?: { code: string; message: string } }> = async () => ({ ok: true, value: {} })) {
+    const calls: Array<{ endpoint: string; payload: unknown }> = []
+    const store = new AcpStore(async (_channel, endpoint, payload) => {
+      calls.push({ endpoint, payload })
+      return rpc(endpoint, payload) as never
+    }, (zh) => zh)
+    const apply = (event: unknown): Promise<void> =>
+      (store as unknown as { applyEvent(event: unknown): Promise<void> }).applyEvent(event)
+    return { store, calls, apply }
+  }
+
+  it('folds creation and every transition, keyed by conversation + child id', async () => {
+    const { store, apply } = makeStore()
+    await apply({ type: 'subagents/record', dshSessionId: 'chat-1', record: record() })
+    expect(store.subagentRecord('chat-1', 'acp:call-1')?.status).toBe('pending')
+    // The same child id in another conversation is a different record.
+    await apply({ type: 'subagents/record', dshSessionId: 'chat-2', record: record({ dshSessionId: 'chat-2', status: 'running' }) })
+
+    await apply({
+      type: 'subagents/record',
+      dshSessionId: 'chat-1',
+      record: record({ status: 'failed', endedAt: 2_000, error: 'boom' }),
+    })
+    expect(store.subagentRecord('chat-1', 'acp:call-1')?.status).toBe('failed')
+    expect(store.subagentRecord('chat-1', 'acp:call-1')?.error).toBe('boom')
+    expect(store.subagentRecord('chat-2', 'acp:call-1')?.status).toBe('running')
+
+    // A stale in-flight frame must not revive a terminal row.
+    await apply({ type: 'subagents/record', dshSessionId: 'chat-1', record: record({ status: 'running' }) })
+    expect(store.subagentRecord('chat-1', 'acp:call-1')?.status).toBe('failed')
+    expect(store.subagentsFor('chat-1')).toHaveLength(1)
+  })
+
+  it('sorts one conversation\'s records by dispatch time', async () => {
+    const { store, apply } = makeStore()
+    await apply({
+      type: 'subagents/record',
+      dshSessionId: 'chat-1',
+      record: record({ childId: 'acp:later', toolCallId: 'later', startedAt: 2_000 }),
+    })
+    await apply({
+      type: 'subagents/record',
+      dshSessionId: 'chat-1',
+      record: record({ childId: 'acp:earlier', toolCallId: 'earlier', startedAt: 500 }),
+    })
+    expect(store.subagentsFor('chat-1').map(row => row.childId)).toEqual(['acp:earlier', 'acp:later'])
+  })
+
+  it('seeds records from session/chat-list, de-duplicates across rows, and replays in-flight frames', async () => {
+    // The answer describes the host as of the REQUEST; the terminal frame
+    // below lands while the read is in flight and must win.
+    let releaseList!: () => void
+    const gate = new Promise<void>(resolve => { releaseList = resolve })
+    const { store, apply } = makeStore(async (endpoint) => {
+      if (endpoint !== 'session/chat-list') return { ok: true, value: {} }
+      await gate
+      return {
+        ok: true,
+        value: {
+          sessions: [
+            {
+              agentId: 'codebuddy',
+              sessionId: 'acp-s1',
+              subagents: [record({ status: 'running', dshSessionId: 'chat-1' })],
+            },
+            {
+              agentId: 'codebuddy',
+              sessionId: 'acp-s2',
+              subagents: [record({ status: 'running', dshSessionId: 'chat-1' })],
+            },
+          ],
+          acpMode: true,
+        },
+      }
+    })
+
+    const load = store.loadChatSessions('chat-1')
+    await apply({
+      type: 'subagents/record',
+      dshSessionId: 'chat-1',
+      record: record({ status: 'completed', endedAt: 3_000, dshSessionId: 'chat-1' }),
+    })
+    releaseList()
+    await load
+
+    // Two rows carried the same record; the keyed map holds one.
+    const rows = Object.keys(store.getSnapshot().subagents)
+    expect(rows).toHaveLength(1)
+    expect(store.subagentRecord('chat-1', 'acp:call-1')?.status).toBe('completed')
+    expect(store.subagentsFor('chat-1')).toHaveLength(1)
+  })
+
+  it('reads worker history on the first open only, then folds live frames by both filters', async () => {
+    const { store, calls, apply } = makeStore(async (endpoint) => {
+      if (endpoint !== 'subagents/detail') return { ok: true, value: {} }
+      return {
+        ok: true,
+        value: {
+          entries: [
+            { seq: 1, update: { sessionUpdate: 'tool_call', toolCallId: 'call-1' } },
+            { seq: 2, update: { sessionUpdate: 'tool_call', toolCallId: 'other-call' } },
+          ],
+        },
+      }
+    })
+    // The ACP→chat mapping the live fold is scoped by (turn/metrics names both).
+    await apply({ type: 'turn/metrics', sessionId: 'acp-s1', dshSessionId: 'chat-1', turnId: 't1', outputTokens: 1, burstMs: 1, final: true })
+
+    await store.loadSubagentDetail('chat-1', 'acp:call-1')
+    const detail = store.subagentDetail('chat-1', 'acp:call-1')
+    expect(detail?.loaded).toBe(true)
+    expect(detail?.entries.map(entry => entry.seq)).toEqual([1, 2])
+    expect(calls.filter(call => call.endpoint === 'subagents/detail')).toEqual([
+      { endpoint: 'subagents/detail', payload: { dshSessionId: 'chat-1', childId: 'acp:call-1' } },
+    ])
+    // A second open reuses the index: one read per worker per page.
+    await store.loadSubagentDetail('chat-1', 'acp:call-1')
+    expect(calls.filter(call => call.endpoint === 'subagents/detail')).toHaveLength(1)
+
+    // Live frames: the dispatch's OWN frames (toolCallId) and the worker's
+    // frames (parentToolCallId) both count; anything else does not.
+    await apply({
+      type: 'session/update',
+      sessionId: 'acp-s1',
+      seq: 10,
+      update: { sessionUpdate: 'tool_call_update', toolCallId: 'call-1', status: 'completed' },
+    })
+    await apply({
+      type: 'session/update',
+      sessionId: 'acp-s1',
+      seq: 11,
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'from the worker' },
+        _meta: { 'codebuddy.ai/parentToolCallId': 'call-1' },
+      },
+    })
+    await apply({
+      type: 'session/update',
+      sessionId: 'acp-s1',
+      seq: 12,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'unrelated' } },
+    })
+    store.flushUpdates()
+    expect(store.subagentDetail('chat-1', 'acp:call-1')?.entries.map(entry => entry.seq)).toEqual([1, 2, 10, 11])
+  })
+
+  it('caps one worker at 200 entries and counts the dropped front as a marker', async () => {
+    const { store, apply } = makeStore()
+    await apply({ type: 'turn/metrics', sessionId: 'acp-s1', dshSessionId: 'chat-1', turnId: 't1', outputTokens: 1, burstMs: 1, final: false })
+    await store.loadSubagentDetail('chat-1', 'acp:call-1')
+    for (let seq = 1; seq <= 205; seq += 1) {
+      await apply({
+        type: 'session/update',
+        sessionId: 'acp-s1',
+        seq,
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `chunk ${String(seq)}` }, _meta: { 'codebuddy.ai/parentToolCallId': 'call-1' } },
+      })
+    }
+    store.flushUpdates()
+    const detail = store.subagentDetail('chat-1', 'acp:call-1')
+    expect(detail?.entries).toHaveLength(200)
+    expect(detail?.entries[0]?.seq).toBe(6)
+    expect(detail?.entries.at(-1)?.seq).toBe(205)
+    // The index does not start at the worker's first frame — the panel says so.
+    expect(detail?.omitted).toBe(5)
+  })
+
+  it('replays live frames over a slow detail read without duplicating what the host already saw', async () => {
+    let releaseDetail!: () => void
+    const gate = new Promise<void>(resolve => { releaseDetail = resolve })
+    const dispatchFrame = { sessionUpdate: 'tool_call', toolCallId: 'call-1', status: 'in_progress' }
+    const { store, apply } = makeStore(async (endpoint) => {
+      if (endpoint !== 'subagents/detail') return { ok: true, value: {} }
+      await gate
+      // The host read saw seq 1 but not seq 2.
+      return { ok: true, value: { entries: [{ seq: 1, update: dispatchFrame }] } }
+    })
+    await apply({ type: 'turn/metrics', sessionId: 'acp-s1', dshSessionId: 'chat-1', turnId: 't1', outputTokens: 1, burstMs: 1, final: true })
+
+    const loading = store.loadSubagentDetail('chat-1', 'acp:call-1')
+    // The same frame the host will return (must not be shown twice) and a
+    // worker frame the host's answer predates (must survive it).
+    await apply({ type: 'session/update', sessionId: 'acp-s1', seq: 1, update: dispatchFrame })
+    await apply({
+      type: 'session/update',
+      sessionId: 'acp-s1',
+      seq: 2,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'late' }, _meta: { 'codebuddy.ai/parentToolCallId': 'call-1' } },
+    })
+    store.flushUpdates()
+    releaseDetail()
+    await loading
+    expect(store.subagentDetail('chat-1', 'acp:call-1')?.entries.map(entry => entry.seq)).toEqual([1, 2])
+  })
+
+  it('keeps at most 64 worker detail indexes, evicting the least recently opened', async () => {
+    const { store } = makeStore()
+    for (let index = 0; index < 65; index += 1) {
+      await store.loadSubagentDetail('chat-1', `acp:call-${String(index)}`)
+    }
+    const details = store.getSnapshot().subagentDetails
+    expect(Object.keys(details)).toHaveLength(64)
+    expect(store.subagentDetail('chat-1', 'acp:call-0')).toBeUndefined()
+    expect(store.subagentDetail('chat-1', 'acp:call-64')).toBeDefined()
   })
 })
 

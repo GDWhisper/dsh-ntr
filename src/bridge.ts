@@ -68,6 +68,9 @@ import {
   validatePermissionTimeoutMode,
   normalizeApprovalWindow,
   agentSaveAction,
+  normalizeSubagentRecordMap,
+  capSubagentRecords,
+  boundSubagentDetailEntry,
 } from './impl.ts'
 import type {
   AcpToolCallSnapshot,
@@ -78,8 +81,9 @@ import type {
   AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpMcpServerDef, AcpPresetStatus, AcpReleaseCause, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentRefusalDetail, AgentSaveMode, AgentSaveResult, AgentTestFailureKind, AgentTestResult, AgentView, ChatSessionForkInfo, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
   LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo,
   AcpIdleRelease, ActiveTurnView, ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PluginUpdateState, PreparedAdapterCall, SaveGateFlushResult, SaveGateStatus, SessionView, StreamChunk,
+  SubagentDetailEntry, SubagentDetailResult, SubagentRecord, SubagentStatus,
 } from './protocol.ts'
-import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_TAG_HALO, IDLE_RELEASE_MS } from './protocol.ts'
+import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_TAG_HALO, IDLE_RELEASE_MS, MAX_SUBAGENT_DETAIL_ENTRIES } from './protocol.ts'
 import type { AcpSaveGate } from './save-gate.ts'
 import { SaveGateAborted } from './save-gate.ts'
 import { OUTPUT_CHARS_PER_TOKEN, TurnTpsTracker } from './tps.ts'
@@ -4391,7 +4395,11 @@ interface BackgroundDispatch {
   toolCallId: string
   /** The last status the agent declared for the dispatch call itself. */
   status: string
-  /** Whether the call already reported completed / failed. */
+  /**
+   * Whether the call already reported a TERMINAL status (completed OR failed).
+   * Deliberately still one boolean: the hold only cares whether the worker
+   * reported at all, never whether the report was good (constraint 23).
+   */
   completed: boolean
   /**
    * Whether the work runs DETACHED, read from the wire's own structure: the
@@ -4415,6 +4423,26 @@ interface BackgroundDispatch {
    * never reached the catalog has no row to light, so it is never closed.
    */
   activity?: 'active' | 'idle'
+  /** When the dispatch call was first seen (the record's `startedAt`). */
+  startedAt: number
+  /** Last frame belonging to this dispatch. Memory-only: persisted with the next transition. */
+  lastActivityAt: number
+  /** When a terminal state was written. */
+  endedAt?: number
+  /**
+   * The terminal status, once decided. Never overwritten: a late completion
+   * after the turn already closed with `unknown` is a known limitation, not a
+   * bug (the row must not stay `running`, and it must not be revived either).
+   */
+  terminal?: 'completed' | 'failed' | 'cancelled' | 'unknown'
+  /** The terminal frame's `tool_call_update.content`, verbatim (constraint 29). */
+  error?: unknown
+  /** The worker's declared role (`_meta["codebuddy.ai/subagentType"]`). */
+  subagentType?: string
+  /** Per-worker counters; only `updates` moves per chunk and none of them writes the state file. */
+  counts: { updates: number; toolCalls: number; textChars: number }
+  /** The status last announced through `subagents/record` (creation included). */
+  reportedStatus?: SubagentStatus
 }
 
 /**
@@ -5226,15 +5254,26 @@ class TurnStreamController {
     const toolCallId = typeof row.toolCallId === 'string' ? row.toolCallId.trim() : ''
     const status = typeof row.status === 'string' ? row.status : ''
     const completedStatus = status === 'completed' || status === 'failed'
+    const now = Date.now()
+    const type = typeof meta?.subagentType === 'string' && meta.subagentType !== '' ? meta.subagentType : undefined
     if ((kind === 'tool_call' || kind === 'tool_call_update') && toolCallId !== '') {
       const known = this.dispatches.get(toolCallId)
       if (known !== undefined) {
         // A known dispatch: the id is the whole evidence (see the doc above).
         this.noteBackgroundWorkerActivity()
+        known.lastActivityAt = now
+        known.counts.updates += 1
+        if (type !== undefined && known.subagentType === undefined) known.subagentType = type
         if (status !== '') known.status = status
         const justCompleted = completedStatus && !known.completed
         if (justCompleted) {
           known.completed = true
+          // A terminal frame carries NO `_meta` on the real wire; the status
+          // alone decides success vs failure, and the failure reason is the
+          // frame's own `content`, kept in whatever shape it came in.
+          known.terminal = status === 'failed' ? 'failed' : 'completed'
+          known.endedAt = now
+          if (status === 'failed' && update.content !== undefined) known.error = update.content
           // The catalog row stops being live here, whatever the turn does
           // next — and BEFORE the report below, whose identity fallback may
           // report the row for the first time, and before
@@ -5248,6 +5287,9 @@ class TurnStreamController {
           known.detached = true
           this.reportSubagentDispatch(known)
         }
+        // The record moves with EVERY frame (its activity clock and counters),
+        // but only a status TRANSITION announces a frame / writes the file.
+        this.syncDispatchRecord(known)
         if (justCompleted) this.noteDispatchProgress()
       } else if (meta !== undefined
         && (meta.toolName === 'Agent' || meta.toolName === 'Task')
@@ -5263,8 +5305,23 @@ class TurnStreamController {
           catalogLabel: subagentDispatchLabel(update),
           catalogLabelIdentified: subagentDispatchDeclaresIdentity(update),
           catalogReported: false,
+          startedAt: now,
+          lastActivityAt: now,
+          ...(completedStatus
+            ? {
+                terminal: status === 'failed' ? 'failed' as const : 'completed' as const,
+                endedAt: now,
+                ...(status === 'failed' && update.content !== undefined ? { error: update.content } : {}),
+              }
+            : {}),
+          ...(type === undefined ? {} : { subagentType: type }),
+          counts: { updates: 1, toolCalls: 0, textChars: 0 },
         }
         this.dispatches.set(toolCallId, dispatch)
+        // Creation is a state entering the record, and it is announced HERE —
+        // NOT behind `catalogReported`: a dispatch the host catalog never
+        // accepted must still reach the browser ("目录待同步").
+        this.syncDispatchRecord(dispatch)
         this.noteBackgroundWorkerActivity()
         if (dispatch.detached) this.reportSubagentDispatch(dispatch)
         if (!dispatch.completed) {
@@ -5280,9 +5337,18 @@ class TurnStreamController {
       if (parent !== undefined) {
         this.trackWorkerToolCall(kind, toolCallId, status)
         this.noteBackgroundWorkerActivity()
+        // The worker's own frames are evidence of work, not a status of the
+        // dispatch call: they move its clock and counters, and the first one
+        // (or the first `isBackground` re-send) is what flips it to `running`.
+        parent.lastActivityAt = now
+        parent.counts.updates += 1
+        if (kind === 'tool_call') parent.counts.toolCalls += 1
+        else if (kind === 'agent_message_chunk') parent.counts.textChars += chunkTextOf(update.content).length
+        if (type !== undefined && parent.subagentType === undefined) parent.subagentType = type
         parent.detached = true
         parent.sawWorkerUpdate = true
         this.reportSubagentDispatch(parent)
+        this.syncDispatchRecord(parent)
       }
     }
     if (meta?.unsolicitedTurn !== undefined) {
@@ -5292,6 +5358,72 @@ class TurnStreamController {
         this.startBackgroundDrain(held, meta.unsolicitedTurn.requestId)
       }
     }
+  }
+
+  /** Where one dispatch stands, derived from the wire facts of its own record. */
+  private dispatchStatus(dispatch: BackgroundDispatch): SubagentStatus {
+    if (dispatch.terminal !== undefined) return dispatch.terminal
+    // `pending` is the absence of evidence: a `pending` / status-less first
+    // frame that no worker update has answered yet.
+    if (dispatch.sawWorkerUpdate || dispatch.detached || dispatch.status === 'in_progress') return 'running'
+    return 'pending'
+  }
+
+  /** Build the persisted lifecycle record for one dispatch. */
+  private dispatchRecord(dispatch: BackgroundDispatch, dshSessionId: string): SubagentRecord {
+    return {
+      childId: `acp:${dispatch.toolCallId}`,
+      dshSessionId,
+      toolCallId: dispatch.toolCallId,
+      label: dispatch.catalogLabel,
+      ...(dispatch.subagentType === undefined ? {} : { type: dispatch.subagentType }),
+      status: this.dispatchStatus(dispatch),
+      startedAt: dispatch.startedAt,
+      lastActivityAt: dispatch.lastActivityAt,
+      ...(dispatch.endedAt === undefined ? {} : { endedAt: dispatch.endedAt }),
+      ...(dispatch.error === undefined ? {} : { error: dispatch.error }),
+      counts: { ...dispatch.counts },
+    }
+  }
+
+  /**
+   * Keep the manager's lifecycle record for this dispatch current, announcing
+   * it ONLY when its status changed (creation counts) and writing the state
+   * file on the same transitions. Every wire frame calls this: the activity
+   * clock and counters move in memory, while `persistAgents` rewrites the whole
+   * file synchronously — a write per chunk would stall the host.
+   */
+  private syncDispatchRecord(dispatch: BackgroundDispatch): void {
+    const dshSessionId = this.session.dshSessionId
+    if (dshSessionId === undefined) return
+    const status = this.dispatchStatus(dispatch)
+    const transition = dispatch.reportedStatus !== status
+    if (transition) dispatch.reportedStatus = status
+    this.manager.noteSubagentRecords(
+      [this.dispatchRecord(dispatch, dshSessionId)],
+      { announce: transition, persist: transition },
+    )
+  }
+
+  /**
+   * Write a terminal state for every dispatch that never reported one, as ONE
+   * batch (one announcement per record, one state-file write). Already
+   * terminal rows are left untouched: `cancelled` / `unknown` are not allowed
+   * to overwrite what the agent actually said.
+   */
+  private terminalizeDispatches(status: 'cancelled' | 'unknown'): void {
+    const dshSessionId = this.session.dshSessionId
+    const now = Date.now()
+    const records: SubagentRecord[] = []
+    for (const dispatch of this.dispatches.values()) {
+      if (dispatch.terminal !== undefined) continue
+      dispatch.terminal = status
+      dispatch.endedAt = now
+      dispatch.reportedStatus = status
+      if (dshSessionId !== undefined) records.push(this.dispatchRecord(dispatch, dshSessionId))
+    }
+    if (records.length === 0) return
+    this.manager.noteSubagentRecords(records, { announce: true, persist: true })
   }
 
   /**
@@ -5384,9 +5516,15 @@ class TurnStreamController {
     this.broadcastDispatchActivity(dispatch, false)
   }
 
-  /** Every dispatch this turn still reports as running: turn close / dispose. */
-  private closeAllDispatchActivity(): void {
+  /**
+   * Every dispatch this turn still reports as running goes out, and every
+   * dispatch that never reported a terminal state gets one: `cancelled` when
+   * the turn was cancelled, `unknown` for every other ending (a turn ending is
+   * not evidence the worker ended). Already terminal rows are not overwritten.
+   */
+  private closeAllDispatchActivity(terminal: 'cancelled' | 'unknown' = 'unknown'): void {
     for (const dispatch of this.dispatches.values()) this.closeDispatchActivity(dispatch)
+    this.terminalizeDispatches(terminal)
   }
 
   /**
@@ -5404,13 +5542,14 @@ class TurnStreamController {
   }
 
   /**
-   * Drop every dot this turn owns. The bridge teardown paths call this before
-   * they detach the controller: those paths never reach `closeTurn`, and a
-   * status the browser keeps after the process is gone would show a worker
-   * running forever.
+   * Drop every dot this turn owns and write the `unknown` terminal record for
+   * every dispatch that never reported. The bridge teardown paths
+   * (`parkSessions` / `closeSession` / `forceReset` / `dispose`) call this
+   * before they detach the controller: those paths never reach `closeTurn`,
+   * and a row the browser keeps as running would stay "running" forever.
    */
   releaseDispatchActivity(): void {
-    this.closeAllDispatchActivity()
+    this.closeAllDispatchActivity('unknown')
   }
 
   /**
@@ -5647,8 +5786,10 @@ class TurnStreamController {
     this.clearBackgroundHold()
     // Every catalog row this turn reported is no longer live: the browser must
     // never keep a dot for a turn that already ended (an idle turn whose
-    // worker reports later says so in the ACP transcript view).
-    this.closeAllDispatchActivity()
+    // worker reports later says so in the ACP transcript view). A cancelled
+    // turn also tells its still-open workers they were cancelled; any other
+    // ending leaves them `unknown` (the turn ending is not the worker ending).
+    this.closeAllDispatchActivity(outcome.kind === 'cancelled' ? 'cancelled' : 'unknown')
     // A late answer to a SUPERSEDED turn still has to close this controller's
     // queue (a continuation step may be parked on it) and its settle gate —
     // but it must not touch the session the NEWER turn now owns, nor release
@@ -5829,8 +5970,9 @@ class TurnStreamController {
     // abandoned run's id is retired before the subscription goes away.
     this.clearBackgroundHold({ retire: true })
     // The teardown ends the turn without `closeTurn`: the browser's dots go
-    // with it.
-    this.closeAllDispatchActivity()
+    // with it, and every still-open dispatch becomes `unknown` — a retired
+    // turn is not evidence its worker stopped.
+    this.closeAllDispatchActivity('unknown')
     this.retire()
     releaseAllToolOutputWaiters()
   }
@@ -6814,6 +6956,75 @@ export class BridgeManager {
   }
 
   /**
+   * Record external-worker lifecycle rows for one conversation.
+   *
+   * The in-memory copy is replaced on EVERY call — `lastActivityAt` and
+   * `counts` move with the worker's frames. A `subagents/record` frame goes out
+   * only when the caller says the status changed (creation included), and the
+   * state file is rewritten once for the batch on the same transitions.
+   * `agents.json` is a synchronous full-file write, so a call per worker chunk
+   * would stall the host; the caller enforces that split.
+   */
+  noteSubagentRecords(records: readonly SubagentRecord[], options: { announce: boolean; persist: boolean }): void {
+    for (const record of records) {
+      const list = this.subagentRecords.get(record.dshSessionId) ?? []
+      const at = list.findIndex(row => row.childId === record.childId)
+      // The cap only has work to do when a NEW row arrives (an existing row is
+      // replaced in place, so the length cannot grow past the cap).
+      const next = at < 0
+        ? capSubagentRecords([...list, record])
+        : list.map((row, index) => (index === at ? record : row))
+      this.subagentRecords.set(record.dshSessionId, next)
+      if (options.announce) {
+        this.hub.broadcast({ type: 'subagents/record', dshSessionId: record.dshSessionId, record })
+      }
+    }
+    if (options.persist) this.persistAgents()
+  }
+
+  /**
+   * The plugin's own lifecycle records for one conversation. Empty for a
+   * conversation that never dispatched a worker; the panel joins this with the
+   * host's catalog projection by `childId` (a catalog row with no record reads
+   * `unknown`, never succeeded).
+   */
+  subagentsFor(dshSessionId: string): SubagentRecord[] {
+    return [...(this.subagentRecords.get(dshSessionId) ?? [])]
+  }
+
+  /**
+   * Raw transcript entries for ONE external worker — the detail view's
+   * on-demand read. Two filters, BOTH needed: the dispatch's own frames
+   * (`toolCallId === <dispatch id>`, which is where the raw input and the
+   * terminal frame live) and the worker's frames
+   * (`_meta.parentToolCallId === <dispatch id>`). Released sessions keep
+   * serving their retained buffers. Bounded: the newest
+   * {@link MAX_SUBAGENT_DETAIL_ENTRIES} entries, each raw payload cut at
+   * `ACP_TOOL_RAW_MAX` with a marker — never silently.
+   */
+  subagentsDetail(dshSessionId: string, childId: string): SubagentDetailResult {
+    const toolCallId = childId.startsWith('acp:') ? childId.slice('acp:'.length) : ''
+    if (toolCallId === '') return { entries: [] }
+    const matched: SubagentDetailEntry[] = []
+    for (const session of this.dshSessionMap.values()) {
+      // A closed session is destroyed, not merely unreachable; released ones
+      // still hold the transcript the user is reading.
+      if (session.dshSessionId !== dshSessionId || session.closed) continue
+      for (const entry of session.transcript.since(0)) {
+        const update = entry.update as Record<string, unknown>
+        const meta = codebuddyMetaOf(update)
+        if (update.toolCallId !== toolCallId && meta?.parentToolCallId !== toolCallId) continue
+        matched.push(boundSubagentDetailEntry(entry.seq, entry.update))
+      }
+    }
+    if (matched.length <= MAX_SUBAGENT_DETAIL_ENTRIES) return { entries: matched }
+    return {
+      entries: matched.slice(-MAX_SUBAGENT_DETAIL_ENTRIES),
+      omitted: matched.length - MAX_SUBAGENT_DETAIL_ENTRIES,
+    }
+  }
+
+  /**
    * Whether ONE DSH chat session runs the ACP agent preset, asked by chat
    * session id. The browser's composer surfaces consume this: on hosts whose
    * client runtime does not carry `agentPreset` on the session-list row (their
@@ -6904,6 +7115,12 @@ export class BridgeManager {
    */
   chatSessions(dshSessionId: string): ChatSessionView[] {
     const out: ChatSessionView[] = []
+    // The plugin's own lifecycle records, keyed by the CHAT session: they cover
+    // live and released sessions alike (a parked conversation's terminal
+    // records must survive a reload), and are attached to every row of this
+    // conversation — the browser de-duplicates by `dshSessionId + childId`,
+    // because one conversation can briefly have more than one ACP session row.
+    const subagents = this.subagentRecords.get(dshSessionId)
     for (const session of this.dshSessionMap.values()) {
       if (session.dshSessionId !== dshSessionId || session.closed) continue
       const title = this.defsMap.get(session.agentId)?.title
@@ -6925,6 +7142,7 @@ export class BridgeManager {
         ...(session.released ? { released: true } : {}),
         ...(session.running ? { running: true } : {}),
         ...(activeSubagents.length === 0 ? {} : { activeSubagents }),
+        ...(subagents === undefined || subagents.length === 0 ? {} : { subagents: [...subagents] }),
         ...forkRowInfo(session, this.canForkNow(session.agentId)),
       })
     }
@@ -7881,6 +8099,7 @@ export class BridgeManager {
         }
         this.loadPersistedChoices((parsed as { conversations?: unknown }).conversations)
         this.loadPersistedChatSessions((parsed as { chatSessions?: unknown }).chatSessions)
+        this.loadPersistedSubagents((parsed as { subagents?: unknown }).subagents)
       }
     } catch {
       // Storage load failure is non-fatal
@@ -7992,6 +8211,12 @@ export class BridgeManager {
         ...(this.chatAgentIntent.size === 0
           ? {}
           : { conversations: Object.fromEntries(this.chatAgentIntent) }),
+        // The plugin's own external-worker lifecycle records (status / failure
+        // reason / timings). Absent while none was ever recorded, so a fresh
+        // deployment's state file stays exactly as it was.
+        ...(this.subagentRecords.size === 0
+          ? {}
+          : { subagents: Object.fromEntries(this.subagentRecords) }),
         ...(chatSessions.length === 0 ? {} : { chatSessions }),
       }
       writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf-8')
@@ -8067,6 +8292,33 @@ export class BridgeManager {
       // first message after a restart reaches the process that can `session/load`
       // it, not the agent-wide slot. Creating the holder is pure bookkeeping.
       this.bridgeFor(agentId, { kind: 'chat', dshSessionId }).parkReleased(session)
+    }
+  }
+
+  /**
+   * Read the persisted external-worker records back.
+   *
+   * Orphan keys are dropped AT LOAD, not on every write: only a conversation
+   * that still has a `chatSessions` row or a persisted `conversations` entry
+   * can own records. Everything else names a conversation the file no longer
+   * describes (deleted, or written before a pruning close), and keeping it
+   * would only make `agents.json` grow. Shutdown relies on the map staying
+   * populated, which is why the prune lives here and not in `persistAgents`.
+   *
+   * A restored row that never reached a terminal state reads `unknown`: the
+   * host restart killed every process, so nothing can still be running
+   * (constraint: no row stays `running` forever).
+   */
+  private loadPersistedSubagents(raw: unknown): void {
+    this.subagentRecords.clear()
+    if (raw === undefined) return
+    const keep = new Set<string>()
+    for (const session of this.dshSessionMap.values()) {
+      if (session.dshSessionId !== undefined && !session.closed) keep.add(session.dshSessionId)
+    }
+    for (const dshSessionId of this.chatAgentIntent.keys()) keep.add(dshSessionId)
+    for (const [dshSessionId, records] of Object.entries(normalizeSubagentRecordMap(raw, keep))) {
+      this.subagentRecords.set(dshSessionId, records)
     }
   }
 
@@ -9925,15 +10177,41 @@ export class BridgeManager {
    * conversation↔agent mapping, never a DSH model route (see `bindChatAgent`).
    */
   private readonly chatAgentIntent = new Map<string, AcpConversationChoice>()
+  /**
+   * The plugin's OWN lifecycle records for external (ACP-dispatched) workers,
+   * keyed by DSH chat session and capped at {@link MAX_SUBAGENT_RECORDS} rows
+   * per conversation. The host's `subagentCatalog` projection stays the list
+   * SKELETON (persisted membership); this map supplies what it cannot —
+   * status, failure reason, timings and counts. Persisted under `agents.json`'s
+   * `subagents` key on state transitions only.
+   */
+  private readonly subagentRecords = new Map<string, SubagentRecord[]>()
 
   /** Drop every chat-keyed record pointing at one host session (close/stop paths). */
   private forgetDshSession(sessionId: string): void {
+    const owners = new Set<string>()
     let dropped = false
     for (const [key, session] of this.dshSessionMap) {
       if (session.sessionId === sessionId) {
+        if (session.dshSessionId !== undefined) owners.add(session.dshSessionId)
         this.dshSessionMap.delete(key)
         dropped = true
       }
+    }
+    // An explicitly closed (or force-reset) session destroys the
+    // conversation's worker records with it: the rows belong to a conversation
+    // that no longer exists. Only when NO OTHER ACP session still serves the
+    // same conversation — two sessions of one conversation must not lose each
+    // other's history.
+    for (const dshSessionId of owners) {
+      let stillOwned = false
+      for (const session of this.dshSessionMap.values()) {
+        if (session.dshSessionId === dshSessionId) {
+          stillOwned = true
+          break
+        }
+      }
+      if (!stillOwned) this.subagentRecords.delete(dshSessionId)
     }
     // The disk record goes with it: a closed session is destroyed, not parked,
     // and must not come back on the next boot (constraint 10).

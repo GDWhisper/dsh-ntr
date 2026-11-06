@@ -154,6 +154,13 @@
  *  - "DISPATCHCOMPLETEMETA" (with DISPATCH) → the detached signal and the
  *              completion arrive in ONE frame (isBackground + status completed),
  *              before anyone reported the row: it must never light
+ *  - "DISPATCHFAILED" (with DISPATCH) → the worker's completion frame reports
+ *              `failed` (no `_meta`, matched by callId) and carries the
+ *              agent's own failure `content`; the drain still follows, so a
+ *              failed worker must not change the turn-hold semantics
+ *  - "DISPATCHNOSTATUS" (with DISPATCH) → the dispatch call's first `tool_call`
+ *              frame carries NO status: the record starts `pending` until a
+ *              worker update proves the work is running
  *
  * Environment knobs:
  *  - MOCK_NO_LOAD=1 → `initialize` advertises no `loadSession` capability
@@ -531,7 +538,7 @@ const app = agent({ name: 'mock-acp-agent' })
       await new Promise(() => {})
     }
 
-    if (text.includes('FAIL')) {
+    if (text.includes('FAIL') && !text.includes('DISPATCHFAILED')) {
       throw new Error('mock prompt failure')
     }
 
@@ -590,6 +597,12 @@ const app = agent({ name: 'mock-acp-agent' })
       const lateDrain = text.includes('DISPATCHLATEDRAIN')
       const altFirst = text.includes('DISPATCHALTFIRST')
       const completedMeta = text.includes('DISPATCHCOMPLETEMETA')
+      // The worker's own completion reports `failed` WITH the agent's reason
+      // in `content` (still no `_meta`: matched by callId alone).
+      const failed = text.includes('DISPATCHFAILED')
+      // The first `tool_call` frame carries no status at all: the lifecycle
+      // record starts `pending` until a worker update arrives.
+      const noStatus = text.includes('DISPATCHNOSTATUS')
       // A long but healthy worker: it keeps emitting updates well past the
       // client's worker-phase SILENCE window. Those updates must push that
       // window out instead of letting a fixed total runtime cut the turn.
@@ -614,7 +627,7 @@ const app = agent({ name: 'mock-acp-agent' })
         toolCallId: callId,
         title: 'Agent',
         kind: 'other',
-        status: 'in_progress',
+        ...(noStatus ? {} : { status: 'in_progress' }),
         ...(identityOnly ? {} : {
           rawInput: {
             description: 'audit the repo',
@@ -676,7 +689,12 @@ const app = agent({ name: 'mock-acp-agent' })
         ...(toolName === undefined ? {} : { 'codebuddy.ai/toolName': toolName }),
       })
       // The real completion frame: NO `_meta` at all.
-      const sendCompleted = callId => notify({ sessionUpdate: 'tool_call_update', toolCallId: callId, status: 'completed' })
+      const sendCompleted = (callId, status = 'completed', content) => notify({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: callId,
+        status,
+        ...(content === undefined ? {} : { content }),
+      })
       const announce = id => notify({ sessionUpdate: 'session_info_update' }, {
         'codebuddy.ai/unsolicitedTurn': { requestId: id, reason: 'background_drain' },
         'codebuddy.ai/requestId': id,
@@ -837,7 +855,11 @@ const app = agent({ name: 'mock-acp-agent' })
             return
           }
           await workerTurn(workerId, dispatchId, 'worker_bash')
-          await sendCompleted(dispatchId)
+          await sendCompleted(
+            dispatchId,
+            failed ? 'failed' : 'completed',
+            failed ? [{ type: 'content', content: { type: 'text', text: 'WORKER-FAILED-REASON' } }] : undefined,
+          )
           await drainTurn(altFirst ? 'DISPATCH-ALT-ANSWER' : 'DISPATCH-FINAL-ANSWER')
         })()
       }, 30)

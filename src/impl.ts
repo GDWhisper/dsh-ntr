@@ -10,8 +10,9 @@ import type {
   AcpAgentCatalog, AcpAgentDef, AcpCatalogOption, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpMcpServerDef, AcpPluginConfig, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentTestResult,
   AgentView, ApprovalDeadlineKey, ApprovalDeadlinePatch, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionOptionView, PermissionOutcome, PermissionTimeoutMode, PluginUpdateState, RpcResult,
   ActiveTurnView, AgentSaveMode, AgentSaveResult, SaveGateFlushResult, SaveGateStatus,
+  SubagentDetailEntry, SubagentDetailResult, SubagentRecord, SubagentStatus,
 } from './protocol.ts'
-import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_TAG_HALO, IDLE_RELEASE_MS } from './protocol.ts'
+import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_TAG_HALO, IDLE_RELEASE_MS, MAX_SUBAGENT_RECORDS } from './protocol.ts'
 
 export { randomUUID }
 
@@ -2818,6 +2819,151 @@ export function appendExternalSubagentCatalog(
   }
 }
 
+const SUBAGENT_STATUSES: readonly SubagentStatus[] = ['pending', 'running', 'completed', 'failed', 'cancelled', 'unknown']
+const TERMINAL_SUBAGENT_STATUSES: readonly SubagentStatus[] = ['completed', 'failed', 'cancelled', 'unknown']
+
+/** Whether a stored status is one of the six the contract defines. */
+function isSubagentStatus(value: unknown): value is SubagentStatus {
+  return typeof value === 'string' && (SUBAGENT_STATUSES as readonly string[]).includes(value)
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
+/**
+ * Normalize ONE persisted lifecycle record. Tolerant row by row: the state
+ * file is user- and version-editable, so an unreadable row is dropped rather
+ * than allowed to poison the conversation's whole record list.
+ */
+export function normalizeSubagentRecord(raw: unknown): SubagentRecord | undefined {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const row = raw as Record<string, unknown>
+  // `childId` is the catalog-alignment key; `toolCallId` is its suffix and can
+  // be rebuilt from it, so a row MISSING the child id still reads when the
+  // call id is intact. A child id that is present but not an external one is
+  // rejected rather than silently swapped for a derived value.
+  const childId = row.childId === undefined
+    ? (typeof row.toolCallId === 'string' && row.toolCallId !== '' ? `acp:${row.toolCallId}` : '')
+    : (typeof row.childId === 'string' && row.childId.startsWith('acp:') && row.childId.length > 'acp:'.length
+      ? row.childId
+      : '')
+  if (childId === '') return undefined
+  const dshSessionId = typeof row.dshSessionId === 'string' ? row.dshSessionId : ''
+  if (dshSessionId === '') return undefined
+  const startedAt = finiteNumber(row.startedAt)
+  if (startedAt === undefined) return undefined
+  const endedAt = finiteNumber(row.endedAt)
+  const counts = row.counts !== null && typeof row.counts === 'object' && !Array.isArray(row.counts)
+    ? row.counts as Record<string, unknown>
+    : {}
+  return {
+    childId,
+    dshSessionId,
+    toolCallId: childId.slice('acp:'.length),
+    label: typeof row.label === 'string' ? row.label : '',
+    ...(typeof row.type === 'string' && row.type !== '' ? { type: row.type } : {}),
+    status: isSubagentStatus(row.status) ? row.status : 'unknown',
+    startedAt,
+    lastActivityAt: finiteNumber(row.lastActivityAt) ?? startedAt,
+    ...(endedAt === undefined ? {} : { endedAt }),
+    // Constraint 29: the reason keeps whatever shape the agent used (a string,
+    // an object, an array); the display layer folds it, this layer never does.
+    ...(row.error === undefined ? {} : { error: row.error }),
+    counts: {
+      updates: finiteNumber(counts.updates) ?? 0,
+      toolCalls: finiteNumber(counts.toolCalls) ?? 0,
+      textChars: finiteNumber(counts.textChars) ?? 0,
+    },
+  }
+}
+
+/**
+ * Cap one conversation's records at {@link MAX_SUBAGENT_RECORDS}: the oldest
+ * TERMINAL rows are evicted first, because a running worker's row is the one
+ * the user is watching. A list with fewer than `max` terminal rows is kept
+ * whole (the excess open rows are all live) — the cap never invents a terminal
+ * state to make room.
+ */
+export function capSubagentRecords(
+  records: readonly SubagentRecord[],
+  max = MAX_SUBAGENT_RECORDS,
+): SubagentRecord[] {
+  if (records.length <= max) return [...records]
+  const excess = records.length - max
+  const out: SubagentRecord[] = []
+  let evicted = 0
+  for (const record of records) {
+    if (evicted < excess && (TERMINAL_SUBAGENT_STATUSES as readonly string[]).includes(record.status)) {
+      evicted += 1
+      continue
+    }
+    out.push(record)
+  }
+  return out
+}
+
+/**
+ * Read the persisted `subagents` map back.
+ *
+ * Restored records are read after a host restart, which killed every process
+ * that could have owned a worker: a row that never reached a terminal state is
+ * reported `unknown` (never left `running` forever). Keys with no surviving
+ * owner — no `chatSessions` row and no `conversations` entry — are dropped, so
+ * a deleted conversation cannot keep the file growing.
+ */
+export function normalizeSubagentRecordMap(
+  raw: unknown,
+  keepSessionIds?: ReadonlySet<string>,
+): Record<string, SubagentRecord[]> {
+  const out: Record<string, SubagentRecord[]> = {}
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return out
+  for (const [dshSessionId, rows] of Object.entries(raw as Record<string, unknown>)) {
+    if (dshSessionId === '' || !Array.isArray(rows)) continue
+    if (keepSessionIds !== undefined && !keepSessionIds.has(dshSessionId)) continue
+    const byChild = new Map<string, SubagentRecord>()
+    for (const item of rows) {
+      const normalized = normalizeSubagentRecord(item)
+      if (normalized === undefined) continue
+      const restored: SubagentRecord = normalized.status === 'pending' || normalized.status === 'running'
+        ? { ...normalized, status: 'unknown', endedAt: normalized.endedAt ?? normalized.lastActivityAt }
+        : normalized
+      byChild.set(restored.childId, { ...restored, dshSessionId })
+    }
+    if (byChild.size > 0) out[dshSessionId] = capSubagentRecords([...byChild.values()])
+  }
+  return out
+}
+
+/**
+ * Bound ONE detail entry's serialized payload. A frame over
+ * {@link ACP_TOOL_RAW_MAX} becomes a MARKED cut (`truncated: true` plus the
+ * cut JSON) instead of a silent drop or an unbounded transport payload
+ * (constraint 29 / constraint 8's sibling rule for oversized raw data).
+ */
+export function boundSubagentDetailEntry(seq: number, update: unknown): SubagentDetailEntry {
+  let text: string
+  try {
+    text = JSON.stringify(update) ?? String(update)
+  } catch {
+    text = String(update)
+  }
+  if (text.length <= ACP_TOOL_RAW_MAX) return { seq, update }
+  const kind = update !== null && typeof update === 'object'
+    ? (update as { sessionUpdate?: unknown }).sessionUpdate
+    : undefined
+  const cut = text.length - ACP_TOOL_RAW_MAX
+  return {
+    seq,
+    update: {
+      sessionUpdate: typeof kind === 'string' ? kind : 'unknown',
+      truncated: true,
+      text: `${text.slice(0, ACP_TOOL_RAW_MAX)}\n… [truncated ${String(cut)} chars]`,
+    },
+    truncatedChars: cut,
+  }
+}
+
 /**
  * The agent preset a session actually runs.
  *
@@ -3257,6 +3403,13 @@ export interface AcpManager {
    */
   chatTranscripts?(dshSessionId: string, afterSeq?: number): ChatTranscriptView[]
   /**
+   * Raw transcript entries for ONE external worker, read on demand by the
+   * subagent panel's detail view. Addressed by chat session + catalog child id
+   * (`acp:<toolCallId>`); an unknown pair answers an empty result rather than
+   * failing, and released sessions keep serving their retained buffers.
+   */
+  subagentsDetail?(dshSessionId: string, childId: string): SubagentDetailResult
+  /**
    * Switch one chat-bound ACP session's mode (`session/set_mode`). `agentId`
    * disambiguates when more than one agent has run in the same chat session;
    * without it the live (non-released) session is picked.
@@ -3551,6 +3704,20 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         const after = body.afterSeq
         if (after !== undefined && typeof after !== 'number') throw new AcpError('bad_payload', 'acp: afterSeq must be a number')
         return ok({ views: manager.chatTranscripts?.(dshSessionId, after as number | undefined) ?? [] })
+      }
+      case 'subagents/detail': {
+        // The panel's detail dialog asks on demand — this is never a resident
+        // SSE feed. The child id must name an external catalog row; the two
+        // id fields are validated BEFORE the optional call (the same shape
+        // rule as `session/chat-list`). An unknown conversation / worker is
+        // an empty answer, not an internal error: the panel renders its
+        // "detail no longer readable" line from that.
+        const dshSessionId = str(body, 'dshSessionId', 128)
+        const childId = str(body, 'childId', 256)
+        if (!childId.startsWith('acp:') || childId.length <= 'acp:'.length) {
+          throw new AcpError('bad_payload', 'acp: childId must be an external subagent identity (acp:<toolCallId>)')
+        }
+        return ok(manager.subagentsDetail?.(dshSessionId, childId) ?? { entries: [] })
       }
       case 'session/chat-mode-set': {
         const dshSessionId = str(body, 'dshSessionId', 128)

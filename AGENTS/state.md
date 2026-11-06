@@ -6,7 +6,7 @@
 
 `pluginStateDir()`（`~/.dsh/dsh-ntr`）下只有三样东西：
 
-- `agents.json` —— agent 注册表 + 默认 agent + 每会话选择 + 每聊天会话的会话记录（`chatSessions`，见 §3.1）+ 插件私有偏好（`tagHalo`，经 `ui/tag-halo` RPC 读写；`approvalDeadlines`，经 `ui/approval-deadlines-set` 读写，见 [permissions.md §2.4](./permissions.md)；`idleRelease`，经 `ui/idle-release-set` 读写，是设置页「进程管理」挑的空闲释放窗口，见 [protocol.md §5](./protocol.md)）
+- `agents.json` —— agent 注册表 + 默认 agent + 每会话选择 + 每聊天会话的会话记录（`chatSessions`，见 §3.1）+ 外部子代理生命周期记录（`subagents`，`dshSessionId → SubagentRecord[]`：只在状态迁移落盘、每会话 200 条上限、加载时 prune 孤儿键，见 [protocol.md §6.3](./protocol.md)）+ 插件私有偏好（`tagHalo`，经 `ui/tag-halo` RPC 读写；`approvalDeadlines`，经 `ui/approval-deadlines-set` 读写，见 [permissions.md §2.4](./permissions.md)；`idleRelease`，经 `ui/idle-release-set` 读写，是设置页「进程管理」挑的空闲释放窗口，见 [protocol.md §5](./protocol.md)）
 - `model-catalog.json` —— 模型目录 + agent 最近一次声明的斜杠命令 + agent 的 fork 能力位（最后已知，见 §3.2）
 - `workspaces/` —— 默认执行工作区
 
