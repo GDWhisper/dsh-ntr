@@ -19,7 +19,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { ensureAcpStyle, useUi } from './acp-ui.tsx'
 import type { AcpChatInjected } from './acp-ui.tsx'
 import type { Block, ChatTranscript } from './store.ts'
-import type { AgentView, ChatSessionView, SessionView } from '../protocol.ts'
+import type { AgentView, ChatSessionView, SessionView, SubagentRecord, SubagentStatus } from '../protocol.ts'
 
 /** Props of the ACP view entry (injected face + the frame's session id). */
 export interface AcpViewProps extends AcpChatInjected {
@@ -448,6 +448,227 @@ export function acpEmptyCopy(facts: AcpEmptyFacts, t: Translate): AcpEmptyCopy {
   return copy
 }
 
+// ---- The read-only subagent section ----
+//
+// Task 2 of the subagent panel: show the plugin's own lifecycle records
+// (`UiState.subagents`, fed by Task 1's `subagents/record` frames and the
+// `session/chat-list` snapshot) inside the NTR view tab so the six-state
+// machine can be verified on a real run. This is a VIEW of the records — no
+// cancel / retry / spawn, no click-through (the detail dialog is Task 3), and
+// no `foldUpdate` / `blocks` reads: worker frames are not part of the parent
+// transcript.
+
+/** Badge wording per lifecycle state; six states must read differently. */
+const SUBAGENT_LABEL: Record<SubagentStatus, readonly [zh: string, en: string]> = {
+  pending: ['等待开始', 'pending'],
+  running: ['运行中', 'running'],
+  completed: ['已完成', 'completed'],
+  failed: ['失败', 'failed'],
+  cancelled: ['已取消', 'cancelled'],
+  unknown: ['状态未知', 'state unknown'],
+}
+
+/** Badge tone per lifecycle state, reusing the existing `ntr-acp-badge.is-*` tones. */
+const SUBAGENT_TONE: Record<SubagentStatus, string> = {
+  pending: 'idle',
+  running: 'busy',
+  completed: 'done',
+  failed: 'fail',
+  cancelled: 'warn',
+  unknown: 'idle',
+}
+
+/** The badge label of one lifecycle state. */
+export function subagentStatusLabel(status: SubagentStatus, t: Translate): string {
+  const [zh, en] = SUBAGENT_LABEL[status] ?? SUBAGENT_LABEL.unknown
+  return t(zh, en)
+}
+
+/** The badge tone of one lifecycle state. */
+export function subagentStatusTone(status: SubagentStatus): string {
+  return SUBAGENT_TONE[status] ?? 'idle'
+}
+
+/** Whether the row is still moving: dispatched but not started, or running. */
+function isActiveSubagent(status: SubagentStatus): boolean {
+  return status === 'pending' || status === 'running'
+}
+
+/** Rows still moving (dispatched but not started, or running): the header's "running" count. */
+export function subagentActiveCount(records: readonly Pick<SubagentRecord, 'status'>[]): number {
+  return records.filter(record => isActiveSubagent(record.status)).length
+}
+
+/**
+ * One row's elapsed wall time: from dispatch to the terminal stamp, or to
+ * `now` while the row is still active. A stale end stamp on an active row is
+ * ignored, and a terminal row without one (a teardown-written `unknown`) has
+ * no better stamp to stop at.
+ */
+export function subagentElapsedMs(
+  record: Pick<SubagentRecord, 'startedAt' | 'endedAt' | 'status'>,
+  now: number,
+): number {
+  const end = isActiveSubagent(record.status) ? now : (record.endedAt ?? now)
+  const elapsed = end - record.startedAt
+  return elapsed > 0 ? elapsed : 0
+}
+
+/** Compact elapsed time: `45s`, `1m 05s`, `2h 03m`. */
+export function formatSubagentDuration(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000))
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ${String(seconds % 60).padStart(2, '0')}s`
+  const hours = Math.floor(minutes / 60)
+  return `${hours}h ${String(minutes % 60).padStart(2, '0')}m`
+}
+
+/** `type · label`, falling back to the label, then to the child id. */
+export function subagentTitle(record: Pick<SubagentRecord, 'type' | 'label' | 'childId'>): string {
+  const label = record.label.trim() === '' ? record.childId : record.label.trim()
+  const type = record.type?.trim()
+  return type === undefined || type === '' ? label : `${type} · ${label}`
+}
+
+/** How recently one duplicate record was updated; the fresher copy wins a de-dupe. */
+function subagentFreshness(record: SubagentRecord): number {
+  return Math.max(record.lastActivityAt, record.endedAt ?? 0, record.startedAt)
+}
+
+/**
+ * This conversation's rows, newest dispatch first, one per `childId`.
+ *
+ * The composite store key (`dshSessionId + childId`) already makes duplicates
+ * impossible; the de-dupe is defensive so a bad snapshot frame can never draw
+ * the same worker twice. When two records share a `childId`, the fresher one
+ * wins (the same "the newer frame beats an older snapshot" rule the store
+ * applies to `subagents/record`).
+ */
+export function subagentRowsFor(records: Iterable<SubagentRecord>, dshSessionId: string): SubagentRecord[] {
+  const byChild = new Map<string, SubagentRecord>()
+  for (const record of records) {
+    if (record.dshSessionId !== dshSessionId) continue
+    const prior = byChild.get(record.childId)
+    if (prior === undefined || subagentFreshness(record) > subagentFreshness(prior)) {
+      byChild.set(record.childId, record)
+    }
+  }
+  return [...byChild.values()].sort((a, b) => b.startedAt - a.startedAt)
+}
+
+/** What the section knows when it has no known state to show. */
+export interface SubagentSectionFacts {
+  /** This conversation's records, after filtering / de-duping. */
+  total: number
+  /** Records whose state is known (anything but `unknown`). */
+  known: number
+  /** Whether an ACP session has ever served this conversation. */
+  served: boolean
+}
+
+/** One honest "nothing known" line pair. */
+export interface SubagentSectionCopy {
+  title: string
+  body?: string
+}
+
+/**
+ * The section's copy when it cannot show a known state.
+ *
+ * Two facts must never be conflated: "this conversation has never been served
+ * by an ACP session" (nothing can be said about the agent's subagents at all)
+ * and "the agent dispatched nothing" (a claim only a known-empty list may
+ * make). A history of `unknown` records is a third thing: the records exist,
+ * but their state was never tracked.
+ */
+export function subagentSectionCopy(facts: SubagentSectionFacts, t: Translate): SubagentSectionCopy | undefined {
+  if (facts.total === 0) {
+    if (!facts.served) {
+      return {
+        title: t('没有 ACP 会话记录，子智能体情况未知', 'No ACP session record — subagent history unknown'),
+        body: t(
+          '这个 agent 是否派出过子智能体现在无从判断；它服务本会话后，记录会显示在这里。',
+          'Whether this agent ever dispatched subagents cannot be told yet; once it serves this conversation the records appear here.',
+        ),
+      }
+    }
+    return {
+      title: t('还没有子智能体记录', 'No subagent records yet'),
+      body: t(
+        'agent 派出子智能体后，这里会显示它们的状态与耗时。',
+        'Subagents appear here with their state and elapsed time once this agent dispatches them.',
+      ),
+    }
+  }
+  if (facts.known === 0) {
+    return {
+      title: t('历史记录 · 状态未知', 'Historical records · state unknown'),
+      body: t(
+        '这些记录早于状态跟踪，无法判断它们已完成、失败还是仍在运行。',
+        'These records predate state tracking — whether they finished, failed, or are still running cannot be told.',
+      ),
+    }
+  }
+  return undefined
+}
+
+/** One read-only subagent row: state, name, elapsed time, tool-call count. */
+function SubagentRow({ record, now, t }: { record: SubagentRecord; now: number; t: Translate }) {
+  return (
+    <div className="ntr-acp-subagents-row">
+      <span className={`ntr-acp-badge is-${subagentStatusTone(record.status)}`}>
+        {subagentStatusLabel(record.status, t)}
+      </span>
+      <span className="ntr-acp-subagents-name" title={record.childId}>{subagentTitle(record)}</span>
+      <span className="ntr-acp-subagents-meta">{formatSubagentDuration(subagentElapsedMs(record, now))}</span>
+      <span className="ntr-acp-subagents-meta">
+        {t(`${record.counts.toolCalls} 次工具调用`, `${record.counts.toolCalls} tool calls`)}
+      </span>
+    </div>
+  )
+}
+
+/**
+ * The compact, read-only subagent strip. It stays secondary to the transcript:
+ * one header line, a capped row list, and copy instead of rows when nothing is
+ * known.
+ */
+function SubagentSection({ rows, served, t }: { rows: readonly SubagentRecord[]; served: boolean; t: Translate }) {
+  const now = Date.now()
+  const active = subagentActiveCount(rows)
+  const note = subagentSectionCopy({
+    total: rows.length,
+    known: rows.filter(record => record.status !== 'unknown').length,
+    served,
+  }, t)
+  const totalText = t(`累计 ${rows.length} 个`, `${rows.length} total`)
+  const activeText = t(`${active} 运行中`, `${active} running`)
+  return (
+    <div className="ntr-acp-subagents">
+      <div className="ntr-acp-subagents-head">
+        <span className="ntr-acp-subagents-title">{t('子智能体', 'subagents')}</span>
+        {rows.length > 0 && (
+          <span className="ntr-acp-subagents-count">
+            {active > 0 ? `${totalText} · ${activeText}` : totalText}
+          </span>
+        )}
+      </div>
+      {note !== undefined && (
+        <div className="ntr-acp-subagents-note">
+          {note.title}
+          {note.body !== undefined && <span> · {note.body}</span>}
+        </div>
+      )}
+      {rows.length > 0 && (
+        <div className="ntr-acp-subagents-rows">
+          {rows.map(record => <SubagentRow key={record.childId} record={record} now={now} t={t} />)}
+        </div>
+      )}
+    </div>
+  )
+}
+
 /**
  * The ACP view tab body: who serves this conversation and how it is doing,
  * then the agent's own stream.
@@ -457,6 +678,9 @@ export function AcpConversationView(props: AcpViewProps) {
   const { acp, sessionId } = props
   const t: Translate = (zh, en) => acp.label(zh, en)
   const ui = useUi(acp)
+  // Task 1's records; `loadChatSessions` above carries the snapshot, live
+  // transitions ride `subagents/record` frames straight into the store.
+  const subagents = subagentRowsFor(Object.values(ui.subagents), sessionId)
   const bound = ui.chatSessionsFor === sessionId ? boundSession(ui.chatSessions) : undefined
   const transcript: ChatTranscript | undefined = acp.chatTranscriptOf(sessionId)
   // Who this conversation is set up on — readable with no transcript at all,
@@ -497,6 +721,7 @@ export function AcpConversationView(props: AcpViewProps) {
     }, t)
     return (
       <div className="ntr-acp-view">
+        <SubagentSection rows={subagents} served={false} t={t} />
         <div className="ntr-acp-empty">
           <div className="ntr-acp-empty-title">{empty.title}</div>
           <p className="ntr-acp-empty-body">{empty.body}</p>
@@ -557,6 +782,7 @@ export function AcpConversationView(props: AcpViewProps) {
           {t('刷新', 'refresh')}
         </button>
       </div>
+      <SubagentSection rows={subagents} served t={t} />
       <div
         className="ntr-acp-stream"
         ref={streamRef}

@@ -934,6 +934,18 @@ const STYLE = `
 .ntr-acp-view-agent { font-weight: 600; color: inherit; }
 .ntr-acp-view-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40%; direction: rtl; text-align: left; }
 .ntr-acp-view-head .ntr-acp-more { margin-left: auto; }
+/* The read-only subagent strip under the view head. It stays secondary to the
+   transcript: a compact header, a capped scrolling row list, and no controls.
+   Colors are host alias tokens only (constraint 34). */
+.ntr-acp-subagents { display: flex; flex-direction: column; gap: 4px; padding: 6px 12px 8px; border-bottom: 1px solid var(--dsw-alias-border-l2, #e5e7eb); font-size: 12px; line-height: 1.5; }
+.ntr-acp-subagents-head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.ntr-acp-subagents-title { font-weight: 600; color: var(--dsw-alias-label-secondary, #6b7280); }
+.ntr-acp-subagents-count { color: var(--dsw-alias-label-tertiary, #9ca3af); font-variant-numeric: tabular-nums; }
+.ntr-acp-subagents-note { color: var(--dsw-alias-label-secondary, #6b7280); }
+.ntr-acp-subagents-rows { display: flex; flex-direction: column; gap: 2px; max-height: 132px; overflow: auto; }
+.ntr-acp-subagents-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.ntr-acp-subagents-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ntr-acp-subagents-meta { flex: none; color: var(--dsw-alias-label-tertiary, #9ca3af); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .ntr-acp-stream { flex: 1; min-height: 0; overflow: auto; padding: 12px 14px 24px; display: flex; flex-direction: column; gap: 10px; }
 .ntr-acp-badge { font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px solid transparent; }
 .ntr-acp-badge.is-done { color: color-mix(in srgb, var(--dsw-alias-state-success-primary, #22c55e) 72%, var(--dsw-alias-label-primary, #111827)); background: var(--dsw-alias-state-success-tertiary, #dcfce7); }

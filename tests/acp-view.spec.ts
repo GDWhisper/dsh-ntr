@@ -12,7 +12,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { ACP_PRESET_ID, acpModeFromPresetEvent, formatCommandLine, isAbsolutePathLike, placeMenu, rowAgentPreset, splitAcpModelId, splitCommandLine, stagedIsAcpMode, stagedSessionOf, tokenizeCommandLine } from '../src/client/acp-ui.tsx'
 import { agentLockPhaseOf, FORM_MS, playAgentLockAnim, SHATTER_MS } from '../src/client/agent-lock-anim.ts'
 import { branchIconOf, resolveHostFork } from '../src/client/branch-action.tsx'
-import { acpEmptyCopy, boundAgentOf, diffRows, historyAwaitsReplay, isNewFileDiff } from '../src/client/acp-view.tsx'
+import { acpEmptyCopy, boundAgentOf, diffRows, formatSubagentDuration, historyAwaitsReplay, isNewFileDiff, subagentActiveCount, subagentElapsedMs, subagentRowsFor, subagentSectionCopy, subagentStatusLabel, subagentStatusTone, subagentTitle } from '../src/client/acp-view.tsx'
 import { agentModeVisible } from '../src/client/composer-mode.tsx'
 import { acpMeterUsage, compactTokenCount, contextOccupancy } from '../src/client/context-meter.tsx'
 import { agentTestHint, approvalDeadlineFacts, DEADLINE_MIN_WAIT_MS, deadlineSliderIndex, deadlineValueFor } from '../src/client/panel.tsx'
@@ -21,7 +21,7 @@ import { AcpStore, deadlineRemainingLabel, PERMISSION_DEADLINE_EXPIRED, permissi
 import { mergeSubagentStatuses } from '../src/client/subagent-activity.tsx'
 import type { PendingPermission } from '../src/client/store.ts'
 import { APPROVAL_DEADLINE_MIN_WAIT_MS, isAbsolutePath, splitAdapterModelId, splitCommandLine as hostSplitCommandLine, tokenizeCommandLine as hostTokenizeCommandLine } from '../src/impl.ts'
-import type { AgentCatalogResult, AgentTestResult, AgentView, ChatSessionView } from '../src/protocol.ts'
+import type { AgentCatalogResult, AgentTestResult, AgentView, ChatSessionView, SubagentRecord, SubagentStatus } from '../src/protocol.ts'
 
 /**
  * Model-row ids only. The picker's last row is the explicit refresh ACTION
@@ -1359,5 +1359,121 @@ describe('mergeSubagentStatuses', () => {
     expect((merged.get('acp:a') as { running: boolean }).running).toBe(true)
     expect((merged.get('acp:b') as { running: boolean }).running).toBe(true)
     expect(merged.get('session-1')).toBe(existing.get('session-1'))
+  })
+})
+
+/**
+ * The NTR view's read-only subagent section (Task 2 of the subagent panel).
+ *
+ * The section's whole value is honesty: the six lifecycle states must read
+ * distinctly, an elapsed time must freeze once a row is terminal, and an empty
+ * list must not claim "no subagents" for a conversation no ACP session has
+ * ever served. All of that is pure logic, tested here because this bundle has
+ * no DOM test.
+ */
+describe('the NTR view subagent section', () => {
+  /** Read the English side, so the assertions name what a user would read. */
+  const en = (_zh: string, text: string): string => text
+  /** Read the Chinese side for wording-distinctness checks. */
+  const zh = (text: string): string => text
+  const record = (patch: Partial<SubagentRecord> = {}): SubagentRecord => ({
+    childId: 'acp:a',
+    dshSessionId: 'chat-1',
+    toolCallId: 'a',
+    label: 'worker',
+    status: 'completed',
+    startedAt: 0,
+    lastActivityAt: 0,
+    counts: { updates: 0, toolCalls: 0, textChars: 0 },
+    ...patch,
+  })
+
+  it('gives all six lifecycle states distinct wording and a badge tone', () => {
+    const statuses: SubagentStatus[] = ['pending', 'running', 'completed', 'failed', 'cancelled', 'unknown']
+    const labels = statuses.map(status => subagentStatusLabel(status, en))
+    // Six states, six strings — `pending` must not read like `unknown`.
+    expect(new Set(labels).size).toBe(6)
+    expect(labels).toEqual(['pending', 'running', 'completed', 'failed', 'cancelled', 'state unknown'])
+    expect(statuses.map(status => subagentStatusTone(status)))
+      .toEqual(['idle', 'busy', 'done', 'fail', 'warn', 'idle'])
+    // The Chinese side is six distinct strings too, not a stale shorter set.
+    expect(new Set(statuses.map(status => subagentStatusLabel(status, zh))).size).toBe(6)
+  })
+
+  it('formats seconds, minutes and hours compactly', () => {
+    expect(formatSubagentDuration(0)).toBe('0s')
+    expect(formatSubagentDuration(5_000)).toBe('5s')
+    expect(formatSubagentDuration(59_900)).toBe('59s')
+    expect(formatSubagentDuration(60_000)).toBe('1m 00s')
+    expect(formatSubagentDuration(65_000)).toBe('1m 05s')
+    expect(formatSubagentDuration(3_600_000)).toBe('1h 00m')
+    expect(formatSubagentDuration(2 * 3_600_000 + 3 * 60_000)).toBe('2h 03m')
+    // Clock skew must not print a negative duration.
+    expect(formatSubagentDuration(-1)).toBe('0s')
+  })
+
+  it('counts a running row against now and freezes a terminal row at endedAt', () => {
+    // A running row advances with the clock: dispatch at t=1s, now t=66s.
+    expect(subagentElapsedMs({ startedAt: 1_000, status: 'running' }, 66_000)).toBe(65_000)
+    // A stale end stamp on an active row is ignored — the row is still moving.
+    expect(subagentElapsedMs({ startedAt: 1_000, endedAt: 2_000, status: 'running' }, 66_000)).toBe(65_000)
+    // A terminal row froze at its end stamp; a later render must not grow it.
+    expect(subagentElapsedMs({ startedAt: 1_000, endedAt: 4_000, status: 'completed' }, 99_000)).toBe(3_000)
+  })
+
+  it('sorts newest dispatch first and de-duplicates by child id', () => {
+    const rows = subagentRowsFor([
+      record({ childId: 'acp:old', startedAt: 1_000, lastActivityAt: 2_000 }),
+      record({ childId: 'acp:new', startedAt: 9_000, lastActivityAt: 9_500 }),
+      record({ childId: 'acp:mid', startedAt: 5_000, lastActivityAt: 6_000 }),
+      // The duplicate carrying the terminal state (and fresher activity) wins
+      // over the older copy of the same worker.
+      record({ childId: 'acp:old', startedAt: 1_000, lastActivityAt: 7_000, status: 'failed' }),
+      // Another conversation's records never leak in.
+      record({ childId: 'acp:elsewhere', dshSessionId: 'chat-2', startedAt: 99_000 }),
+    ], 'chat-1')
+    expect(rows.map(row => row.childId)).toEqual(['acp:new', 'acp:mid', 'acp:old'])
+    expect(rows[2]?.status).toBe('failed')
+  })
+
+  it('counts pending and running rows as active', () => {
+    expect(subagentActiveCount([
+      record({ status: 'pending' }),
+      record({ status: 'running' }),
+      record({ status: 'completed' }),
+      record({ status: 'unknown' }),
+    ])).toBe(2)
+    expect(subagentActiveCount([])).toBe(0)
+  })
+
+  it('names a row by type · label, falling back to label then child id', () => {
+    expect(subagentTitle({ type: 'explore', label: '扫描目录', childId: 'acp:x' })).toBe('explore · 扫描目录')
+    expect(subagentTitle({ label: '扫描目录', childId: 'acp:x' })).toBe('扫描目录')
+    expect(subagentTitle({ label: '', childId: 'acp:x' })).toBe('acp:x')
+    expect(subagentTitle({ type: '', label: 'x', childId: 'acp:x' })).toBe('x')
+  })
+
+  it('does not claim "no subagents" before any ACP session has served the chat', () => {
+    // Never served: the agent's subagent history is unknown, not empty.
+    const unseen = subagentSectionCopy({ total: 0, known: 0, served: false }, en)
+    expect(unseen).toBeDefined()
+    expect(unseen?.title).toBe('No ACP session record — subagent history unknown')
+    expect(unseen?.body).toMatch(/cannot be told yet/)
+    // Served but no records: the honest "nothing recorded yet" line, said
+    // differently from the never-served branch.
+    const served = subagentSectionCopy({ total: 0, known: 0, served: true }, en)
+    expect(served?.title).toBe('No subagent records yet')
+    expect(served?.title).not.toBe(unseen?.title)
+    // And in Chinese the two branches stay distinct as well.
+    expect(subagentSectionCopy({ total: 0, known: 0, served: false }, zh).title)
+      .not.toBe(subagentSectionCopy({ total: 0, known: 0, served: true }, zh).title)
+  })
+
+  it('labels an all-unknown history as state unknown and stays quiet otherwise', () => {
+    const history = subagentSectionCopy({ total: 3, known: 0, served: true }, en)
+    expect(history?.title).toBe('Historical records · state unknown')
+    expect(history?.body).toMatch(/predate state tracking/)
+    // One known row is enough: the rows speak for themselves, no banner.
+    expect(subagentSectionCopy({ total: 3, known: 1, served: true }, en)).toBeUndefined()
   })
 })
