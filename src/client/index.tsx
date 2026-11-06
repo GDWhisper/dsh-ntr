@@ -25,6 +25,7 @@ import { AcpComposerAgentTag, AcpSessionControls, AcpSessionMenu } from './sessi
 import { AcpConversationView } from './acp-view.tsx'
 import { AcpSettingsDialog } from './settings-dialog.tsx'
 import { SaveGuardToast } from './save-guard-toast.tsx'
+import { SubagentDetailDialog } from './subagent-panel.tsx'
 import { PermissionDock } from './permission-dock.tsx'
 import { ReleasedBanner } from './released-banner.tsx'
 import { QuotaBanner } from './quota-banner.tsx'
@@ -318,6 +319,17 @@ export function apply(ctx: Context): void {
     order: 40,
     inject: () => ({ acp: store }),
   }, SaveGuardToast as unknown as SlotComponent<any>)), 'dsh-ntr: save guard toast')
+
+  // The subagent panel's read-only detail. The rows live in the header's
+  // `subagent-catalog` cell and this dialog on the frame overlay, so its open
+  // target is the module-level store in acp-ui.tsx. It renders null while no
+  // row is chosen; the dialog itself offers no action beyond closing.
+  ctx.effect(() => ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+    name: 'shell.overlay',
+    id: 'acp-subagent-detail',
+    order: 50,
+    inject: () => ({ acp: store }),
+  }, SubagentDetailDialog as unknown as SlotComponent<any>)), 'dsh-ntr: subagent detail overlay')
 
   // The agent's OWN modes sit in the composer tool row — the seat the slot
   // contract reserves for exactly this ("entries sit beside that chrome, never

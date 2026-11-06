@@ -148,8 +148,10 @@ describe('the header subagent panel clock', () => {
     act(() => { vi.advanceTimersByTime(60_000) })
     expect(screen.getByText('3s')).toBeDefined()
 
-    // Closing an all-terminal list releases the open-driven interval.
-    fireEvent.click(screen.getByRole('button'))
+    // Closing an all-terminal list releases the open-driven interval. The
+    // open row is a button too (it opens the detail in Task 3b), so the
+    // trigger is selected by its `aria-expanded` state.
+    fireEvent.click(screen.getByRole('button', { expanded: true }))
     expect(vi.getTimerCount()).toBe(0)
   })
 
@@ -179,8 +181,9 @@ describe('the header subagent panel clock', () => {
     act(() => { vi.advanceTimersByTime(1_000) })
     expect(screen.getByText(/最后活动 56s 前/)).toBeDefined()
 
-    // Shut: the open-driven interval is released again.
-    fireEvent.click(screen.getByRole('button'))
+    // Shut: the open-driven interval is released again. The open row is a
+    // button too, so the trigger is the one that is still expanded.
+    fireEvent.click(screen.getByRole('button', { expanded: true }))
     expect(vi.getTimerCount()).toBe(0)
 
     // Reopened a minute later: measured from the new open, not the old tick.

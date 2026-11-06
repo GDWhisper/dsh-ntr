@@ -521,6 +521,61 @@ export function useAcpSettingsDialogOpen(): boolean {
   )
 }
 
+// ---- The subagent detail overlay ----
+
+/**
+ * Which worker's read-only detail overlay is open (Task 3b).
+ *
+ * Same seam as the settings dialog above, and for the same reason: the rows
+ * live in the header's `subagent-catalog` cell, the overlay rides the root
+ * `shell.overlay` layer, and no React context spans the two slot trees. The
+ * key is the composite one (`dshSessionId + childId`): the same `toolCallId`
+ * can repeat across conversations (plan §5.4).
+ */
+export interface SubagentDetailTarget {
+  dshSessionId: string
+  childId: string
+}
+
+let subagentDetailTarget: SubagentDetailTarget | null = null
+const subagentDetailListeners = new Set<() => void>()
+
+function emitSubagentDetail(): void {
+  for (const listener of [...subagentDetailListeners]) listener()
+}
+
+/** Open the detail overlay for one worker (a row click in the panel). */
+export function openSubagentDetail(dshSessionId: string, childId: string): void {
+  if (subagentDetailTarget !== null
+    && subagentDetailTarget.dshSessionId === dshSessionId
+    && subagentDetailTarget.childId === childId) return
+  subagentDetailTarget = { dshSessionId, childId }
+  emitSubagentDetail()
+}
+
+/** Close the detail overlay (close button, backdrop click, Escape). */
+export function closeSubagentDetail(): void {
+  if (subagentDetailTarget === null) return
+  subagentDetailTarget = null
+  emitSubagentDetail()
+}
+
+/** Current target, for tests and non-React readers. */
+export function subagentDetailIsOpen(): SubagentDetailTarget | null {
+  return subagentDetailTarget
+}
+
+/** Subscribe to the open target (the root overlay entry reads it). */
+export function useSubagentDetailTarget(): SubagentDetailTarget | null {
+  return useSyncExternalStore(
+    cb => {
+      subagentDetailListeners.add(cb)
+      return () => { subagentDetailListeners.delete(cb) }
+    },
+    subagentDetailIsOpen,
+  )
+}
+
 // ---- Menu presentation ----
 
 /** One selectable row of a picker. */
@@ -967,7 +1022,13 @@ const STYLE = `
 .ntr-acp-subagent-count { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .ntr-acp-subagent-chevron { flex: none; font-size: 10px; color: var(--dsw-alias-label-tertiary, #9ca3af); }
 .ntr-acp-subagent-menu { position: fixed; z-index: 900; display: flex; flex-direction: column; gap: 2px; max-height: min(320px, 50vh); overflow: auto; padding: 6px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); border-radius: 10px; background: var(--dsw-alias-bg-layer-1, #fff); box-shadow: 0 12px 32px rgba(0, 0, 0, 0.16); font-size: 12px; line-height: 1.5; }
-.ntr-acp-subagent-row { display: flex; flex-direction: column; gap: 1px; min-width: 0; padding: 4px 6px; border-radius: 6px; }
+.ntr-acp-subagent-row { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+/* The whole row opens the read-only detail (Task 3b). A real button keeps
+   Enter / Space working; it carries no other gesture (no cancel / retry /
+   spawn — the list is read-only). */
+.ntr-acp-subagent-row-button { display: flex; flex-direction: column; gap: 1px; width: 100%; min-width: 0; padding: 4px 6px; border: none; border-radius: 6px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.ntr-acp-subagent-row-button:hover { background: var(--dsw-alias-interactive-bg-active, #0000000d); }
+.ntr-acp-subagent-row-button:focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary, #2563eb); outline-offset: 1px; }
 .ntr-acp-subagent-row-main { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .ntr-acp-subagent-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ntr-acp-subagent-row-meta { display: flex; flex-wrap: wrap; gap: 6px; color: var(--dsw-alias-label-tertiary, #9ca3af); font-variant-numeric: tabular-nums; }
@@ -1225,6 +1286,28 @@ html[data-ntr-acp] [data-turn-tail] button[aria-label="Remove rating"] {
 /* The section brings its own page scroll for the settings shell's content
    column; the dialog body is the scroll owner here. */
 .ntr-acp-dialog-body > .dwa-root { max-width: none; overflow: visible; }
+/* ---- Subagent detail overlay (shell.overlay, subagent-panel.tsx) ---- */
+/* Reuses the settings dialog's layer / mask / frame; only the width and the
+   body rhythm are its own. Read-only: there is no action row, and the only
+   button in the frame is the close button. Long worker streams scroll inside
+   the body (the dialog frame never grows past the viewport). */
+.ntr-acp-subagent-detail { width: min(760px, calc(100vw - 48px)); height: min(720px, calc(100vh - 48px)); }
+.ntr-acp-subagent-detail-body { display: flex; flex-direction: column; gap: 14px; padding: 4px 24px 24px; font-size: 12px; line-height: 1.6; }
+.ntr-acp-subagent-detail-head { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.ntr-acp-subagent-detail-head-line { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }
+.ntr-acp-subagent-detail-name { font-size: 14px; font-weight: 600; word-break: break-word; }
+.ntr-acp-subagent-detail-meta { display: flex; flex-wrap: wrap; gap: 10px; color: var(--dsw-alias-label-tertiary, #9ca3af); font-variant-numeric: tabular-nums; }
+.ntr-acp-subagent-detail-section { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.ntr-acp-subagent-detail-heading { font-weight: 600; color: var(--dsw-alias-label-secondary, #6b7280); }
+.ntr-acp-subagent-detail-line { word-break: break-word; }
+.ntr-acp-subagent-detail-note { color: var(--dsw-alias-label-secondary, #6b7280); }
+.ntr-acp-subagent-detail-cut { color: var(--dsw-alias-state-warn-label, #b45309); }
+.ntr-acp-subagent-detail-pre { margin: 0; max-height: 320px; overflow: auto; padding: 6px 8px; border-radius: 8px; background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: var(--dsw-alias-label-primary, #111827); font-family: var(--ds-font-family-code, monospace); font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.ntr-acp-subagent-detail-entry { display: flex; flex-direction: column; gap: 4px; padding-top: 8px; border-top: 1px dashed var(--dsw-alias-border-l2, #d1d5db); }
+.ntr-acp-subagent-detail-entry-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }
+.ntr-acp-subagent-detail-kind { flex: none; font-size: 11px; padding: 0 6px; border-radius: 4px; background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: var(--dsw-alias-label-secondary, #6b7280); font-family: var(--ds-font-family-code, monospace); }
+.ntr-acp-subagent-detail-entry-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ntr-acp-subagent-detail-thought { color: var(--dsw-alias-label-secondary, #6b7280); }
 `
 
 let styleMounted = false

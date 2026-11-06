@@ -30,24 +30,27 @@
  * that needs host navigation) the host component is rendered with its original
  * props and the reason goes to the claim's diagnostic line.
  *
- * READ-ONLY IN THIS TASK. The list has no click-through, no cancel / retry /
- * spawn, and no fake controls; Task 3b adds the detail overlay. The old
- * `subagents/update` -> `activeSubagents` -> `mergeSubagentStatuses` path keeps
- * feeding the host component on the fail-open branch (Task 3c retires it).
+ * READ-ONLY. Rows open a read-only detail overlay
+ * ({@link SubagentDetailDialog}, a global `shell.overlay` entry); neither the
+ * list nor the detail offers cancel / retry / spawn / stop or any other fake
+ * control. The old `subagents/update` -> `activeSubagents` ->
+ * `mergeSubagentStatuses` path keeps feeding the host component on the
+ * fail-open branch (Task 3c retires it).
  */
 
 import { createElement, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { ComponentType } from 'react'
 // Type-only: pulls the conversation SlotMap merge into this program.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
-import { ensureAcpStyle, useUi } from './acp-ui.tsx'
+import { closeSubagentDetail, ensureAcpStyle, openSubagentDetail, useSubagentDetailTarget, useUi } from './acp-ui.tsx'
 import {
   formatSubagentDuration, isActiveSubagent, subagentElapsedMs, subagentRowsFor,
   subagentRunningCount, subagentStatusLabel, subagentStatusTone, subagentTitle, SUBAGENT_TICK_MS,
 } from './acp-view.tsx'
 import type { Translate } from './acp-view.tsx'
+import { subagentKey } from './store.ts'
 import type { AcpStore } from './store.ts'
-import type { SubagentRecord, SubagentStatus } from '../protocol.ts'
+import type { SubagentDetailEntry, SubagentRecord, SubagentStatus } from '../protocol.ts'
 
 /** Viewport margin the host's own catalog menu keeps (used for the same geometry). */
 const MENU_VIEWPORT_MARGIN = 16
@@ -286,26 +289,41 @@ function HostFallback(props: OwnSubagentCatalogProps & { reason: string }) {
   return renderHost(props)
 }
 
-/** One read-only row: six-state badge, name, elapsed time, last activity, tool calls. */
-function SubagentPanelRowView({ row, now, t }: { row: SubagentPanelRow; now: number; t: Translate }) {
+/**
+ * One read-only row: six-state badge, name, elapsed time, last activity, tool
+ * calls. The row is a BUTTON so the detail overlay is reachable by mouse and
+ * by keyboard (Enter / Space) alike; opening the detail is the row's ONLY
+ * gesture (no cancel / retry / spawn — the panel is read-only, AGENTS/ui.md §5).
+ */
+function SubagentPanelRowView(
+  { row, now, t, onOpen }: { row: SubagentPanelRow; now: number; t: Translate; onOpen: (childId: string) => void },
+) {
   const duration = formatSubagentDuration(subagentElapsedMs(row, now))
   const activity = subagentLastActivityLabel(row.lastActivityAt, now, t)
   const tools = t(`${row.toolCalls} 次工具调用`, `${row.toolCalls} tool calls`)
   const pending = row.pendingCatalog ? t('目录待同步', 'catalog pending') : undefined
+  const openLabel = t(`查看 ${row.title} 的详情`, `Open details for ${row.title}`)
   return (
     <div className="ntr-acp-subagent-row" role="listitem" data-status={row.status} title={row.childId}>
-      <div className="ntr-acp-subagent-row-main">
-        <span className={`ntr-acp-badge is-${subagentStatusTone(row.status)}`}>
-          {subagentStatusLabel(row.status, t)}
+      <button
+        type="button"
+        className="ntr-acp-subagent-row-button"
+        aria-label={openLabel}
+        onClick={() => { onOpen(row.childId) }}
+      >
+        <span className="ntr-acp-subagent-row-main">
+          <span className={`ntr-acp-badge is-${subagentStatusTone(row.status)}`}>
+            {subagentStatusLabel(row.status, t)}
+          </span>
+          <span className="ntr-acp-subagent-name">{row.title}</span>
         </span>
-        <span className="ntr-acp-subagent-name">{row.title}</span>
-      </div>
-      <div className="ntr-acp-subagent-row-meta">
-        <span>{duration}</span>
-        {activity !== undefined && <span>· {activity}</span>}
-        <span>· {tools}</span>
-        {pending !== undefined && <span>· {pending}</span>}
-      </div>
+        <span className="ntr-acp-subagent-row-meta">
+          <span>{duration}</span>
+          {activity !== undefined && <span>· {activity}</span>}
+          <span>· {tools}</span>
+          {pending !== undefined && <span>· {pending}</span>}
+        </span>
+      </button>
     </div>
   )
 }
@@ -410,6 +428,13 @@ function OwnCatalogProjection(props: OwnSubagentCatalogProps) {
   if (rows.length === 0) return null
   const running = subagentRunningCount(rows)
   const triggerText = subagentTriggerLabel(rows.length, running, t)
+  // Opening the detail closes the dropdown first: its capture-phase Escape
+  // listener would otherwise outlive the visible menu (under the overlay) and
+  // swallow the first Escape meant for the dialog.
+  const openDetail = (childId: string): void => {
+    setOpen(false)
+    openSubagentDetail(sessionId, childId)
+  }
   return (
     <div className="ntr-acp-subagent-panel" ref={rootRef}>
       <button
@@ -435,7 +460,9 @@ function OwnCatalogProjection(props: OwnSubagentCatalogProps) {
             width: placement.width,
           }}
         >
-          {rows.map(row => <SubagentPanelRowView key={row.childId} row={row} now={now} t={t} />)}
+          {rows.map(row => (
+            <SubagentPanelRowView key={row.childId} row={row} now={now} t={t} onOpen={openDetail} />
+          ))}
         </div>
       )}
     </div>
@@ -462,4 +489,447 @@ export function OwnSubagentCatalog(props: OwnSubagentCatalogProps) {
     })
   }
   return createElement(OwnCatalogProjection, props)
+}
+
+// ---- The read-only detail overlay (Task 3b) ----
+//
+// Rows open this dialog; it renders what the plugin already knows — the
+// lifecycle record (`UiState.subagents`) for the header, the bounded raw
+// entries (`UiState.subagentDetails`) for the dispatch input and the worker
+// stream. It is a VIEW: no cancel / retry / spawn / stop, no prompt input.
+//
+// The raw entries come from the store's dedicated index, NOT the folded ACP
+// transcript: `foldUpdate` drops `_meta` and merges adjacent prose across
+// workers, which would splice the parent turn's text into a worker's detail
+// (plan §5.4). The index is fed by live frames and one on-demand
+// `subagents/detail` read per page; the overlay never re-reads history on its
+// own beyond that first open (the store's `loaded` flag is the gate).
+
+/** One dispatch-owned frame's input, as the detail header shows it. */
+export interface SubagentDispatchDetail {
+  /** The dispatch tool call's own title (the agent's label for the tool). */
+  title?: string
+  /** The raw `rawInput` of the newest dispatch frame that carried one. */
+  rawInput?: unknown
+}
+
+/** A plain object view of an arbitrary value (arrays and nulls are not objects here). */
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
+/** The `toolCallId` behind an `acp:<toolCallId>` child id, or '' when it is not one. */
+function dispatchToolCallId(childId: string): string {
+  return childId.startsWith('acp:') ? childId.slice('acp:'.length) : ''
+}
+
+/**
+ * The dispatch's original input from the worker's raw entries.
+ *
+ * The raw input lives on the dispatch's OWN frames (`toolCallId === <dispatch
+ * id>`) — the same frames that carry the terminal state — so a filter that
+ * only matched the worker's `parentToolCallId` frames would lose it. Later
+ * frames win; `undefined` means the page never saw the dispatch frame (an
+ * older run, or an index that starts after it).
+ */
+export function subagentDispatchDetail(
+  entries: readonly Pick<SubagentDetailEntry, 'update'>[],
+  childId: string,
+): SubagentDispatchDetail | undefined {
+  const toolCallId = dispatchToolCallId(childId)
+  if (toolCallId === '') return undefined
+  let found: SubagentDispatchDetail | undefined
+  for (const entry of entries) {
+    const update = objectRecord(entry.update)
+    if (update === undefined || update.toolCallId !== toolCallId) continue
+    const kind = update.sessionUpdate
+    if (kind !== 'tool_call' && kind !== 'tool_call_update') continue
+    if (typeof update.title === 'string' && update.title !== '') {
+      found = { ...found, title: update.title }
+    }
+    if (update.rawInput !== undefined) {
+      found = { ...found, rawInput: update.rawInput }
+    }
+  }
+  return found
+}
+
+/**
+ * Readable text for one arbitrary value: a string verbatim (an agent's own
+ * failure sentence must not gain JSON quotes), everything else pretty JSON.
+ * `error` is `unknown` by contract (string / object / array all legal), and a
+ * value that cannot be serialized still comes back as text — never dropped.
+ */
+export function formatDetailValue(value: unknown): string {
+  if (typeof value === 'string') return value
+  try {
+    return JSON.stringify(value, null, 2) ?? String(value)
+  } catch {
+    return String(value)
+  }
+}
+
+/** One-line form for payloads with no dedicated renderer (constraint 29). */
+function compactDetailValue(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? String(value)
+  } catch {
+    return String(value)
+  }
+}
+
+/** How one raw `session/update` entry is rendered in the worker stream. */
+export interface SubagentDetailLine {
+  /** `sessionUpdate` kind, or `unknown` when the payload carries none. */
+  kind: string
+  /** One-line heading (the tool's own title); the kind chip always renders. */
+  title?: string
+  /** Tool status carried by the frame, shown beside the title. */
+  status?: string
+  /** Readable body (pretty JSON for structured payloads); absent = no body. */
+  body?: string
+}
+
+/** The text of one ACP content chunk, or `undefined` when it carries none. */
+function chunkText(update: Record<string, unknown>): string | undefined {
+  const content = update.content
+  if (typeof content === 'string') return content
+  const block = objectRecord(content)
+  if (block !== undefined && block.type === 'text' && typeof block.text === 'string') return block.text
+  return undefined
+}
+
+/**
+ * Fold one raw update into its rendered line.
+ *
+ * Deliberately NOT `foldUpdate`: that merges adjacent prose into one block,
+ * drops `_meta`, and is shared with the parent transcript. Every kind lands
+ * somewhere — text / thinking chunks as prose, tool frames as a titled card
+ * with their payload, everything else (plans, commands, mode, config, usage,
+ * compaction, and any kind this build does not know) as one compact JSON line.
+ */
+export function describeSubagentDetailUpdate(update: unknown): SubagentDetailLine {
+  const object = objectRecord(update)
+  const kind = object !== undefined && typeof object.sessionUpdate === 'string' && object.sessionUpdate !== ''
+    ? object.sessionUpdate
+    : 'unknown'
+  if (object === undefined) return { kind, body: compactDetailValue(update) }
+  // A host-side bound already cut this frame: `text` IS the retained payload
+  // (the entry's `truncatedChars` draws the marker). Re-wrapping it as JSON
+  // would bury the text under escaping.
+  if (object.truncated === true && typeof object.text === 'string') {
+    return { kind, body: object.text }
+  }
+  if (kind === 'agent_message_chunk' || kind === 'agent_thought_chunk' || kind === 'user_message_chunk') {
+    const text = chunkText(object)
+    if (text !== undefined) return { kind, body: text }
+    return { kind, body: compactDetailValue(object.content ?? update) }
+  }
+  if (kind === 'tool_call' || kind === 'tool_call_update') {
+    const payload: Record<string, unknown> = {}
+    for (const field of ['rawInput', 'rawOutput', 'content', 'locations']) {
+      if (object[field] !== undefined) payload[field] = object[field]
+    }
+    return {
+      kind,
+      ...(typeof object.title === 'string' && object.title !== '' ? { title: object.title } : {}),
+      ...(typeof object.status === 'string' && object.status !== '' ? { status: object.status } : {}),
+      ...(Object.keys(payload).length === 0 ? {} : { body: formatDetailValue(payload) }),
+    }
+  }
+  return { kind, body: compactDetailValue(update) }
+}
+
+/** Translated chip text per `session/update` kind (unknown kinds keep their raw name). */
+const DETAIL_KIND_COPY: Record<string, readonly [zh: string, en: string]> = {
+  user_message_chunk: ['用户消息', 'user message'],
+  agent_message_chunk: ['正文', 'text'],
+  agent_thought_chunk: ['思考', 'reasoning'],
+  tool_call: ['工具调用', 'tool call'],
+  tool_call_update: ['工具更新', 'tool update'],
+  plan: ['计划', 'plan'],
+  plan_update: ['计划更新', 'plan update'],
+  plan_removed: ['计划移除', 'plan removed'],
+  available_commands_update: ['命令清单', 'commands'],
+  current_mode_update: ['模式', 'mode'],
+  config_option_update: ['配置项', 'config options'],
+  session_info_update: ['会话信息', 'session info'],
+  usage_update: ['上下文占用', 'context usage'],
+  compaction_update: ['压缩', 'compaction'],
+  compaction_summary_chunk: ['压缩摘要', 'compaction summary'],
+}
+
+/** The chip text of one `session/update` kind. */
+export function subagentDetailKindLabel(kind: string, t: Translate): string {
+  const copy = DETAIL_KIND_COPY[kind]
+  return copy === undefined ? kind : t(copy[0], copy[1])
+}
+
+/** One raw update row: kind chip, heading, body, and the cut marker when bounded. */
+function DetailEntryView({ entry, t }: { entry: SubagentDetailEntry; t: Translate }) {
+  const line = describeSubagentDetailUpdate(entry.update)
+  const cut = entry.truncatedChars !== undefined && entry.truncatedChars > 0
+  const body = line.body !== undefined && line.body !== '' ? line.body : undefined
+  return (
+    <div className="ntr-acp-subagent-detail-entry" data-kind={line.kind}>
+      <div className="ntr-acp-subagent-detail-entry-head">
+        <span className="ntr-acp-subagent-detail-kind">{subagentDetailKindLabel(line.kind, t)}</span>
+        {line.title !== undefined && (
+          <span className="ntr-acp-subagent-detail-entry-title">{line.title}</span>
+        )}
+        {line.status !== undefined && <span className="ntr-acp-subagent-detail-note">{line.status}</span>}
+        {cut && (
+          <span className="ntr-acp-subagent-detail-cut">
+            {t(`负载截断 ${String(entry.truncatedChars)} 字符`, `payload cut · ${String(entry.truncatedChars)} chars`)}
+          </span>
+        )}
+      </div>
+      {body !== undefined && (line.kind === 'agent_thought_chunk'
+        ? (
+          <details className="ntr-acp-subagent-detail-thought">
+            <summary>{t('思考过程', 'reasoning')}</summary>
+            <pre className="ntr-acp-subagent-detail-pre">{body}</pre>
+          </details>
+        )
+        : <pre className="ntr-acp-subagent-detail-pre">{body}</pre>)}
+    </div>
+  )
+}
+
+/** The root overlay entry's inject face. */
+export interface SubagentDetailDialogProps {
+  acp: AcpStore
+}
+
+/** Locale-shaped end stamp (the browser owns the format; this view just states it). */
+function detailEndStamp(at: number): string {
+  return new Date(at).toLocaleString()
+}
+
+/**
+ * The frame-wide, read-only subagent detail overlay (`shell.overlay`).
+ *
+ * Module-level open state (`openSubagentDetail` in acp-ui.tsx) because the
+ * rows and this dialog live in unrelated slot trees. Renders null while no
+ * target is open.
+ */
+export function SubagentDetailDialog({ acp }: SubagentDetailDialogProps) {
+  ensureAcpStyle()
+  const target = useSubagentDetailTarget()
+  const ui = useUi(acp)
+  const t: Translate = (zh, en) => acp.label(zh, en)
+  const key = target === null ? undefined : subagentKey(target.dshSessionId, target.childId)
+  const record = key === undefined ? undefined : ui.subagents[key]
+  const detail = key === undefined ? undefined : ui.subagentDetails[key]
+  const [failedKey, setFailedKey] = useState<string | undefined>(undefined)
+  const loadsRef = useRef(new Map<string, Promise<void>>())
+
+  // First open reads the bounded history once (`subagents/detail`). The store
+  // owns the answered bit (`loaded`), so reopening a worker whose read landed
+  // never asks again; a FAILED read leaves it retryable on the next open (the
+  // store's documented contract). Re-entry while a read is in flight joins the
+  // same promise instead of issuing a second RPC.
+  useEffect(() => {
+    if (target === null) return
+    const id = subagentKey(target.dshSessionId, target.childId)
+    if (acp.getSnapshot().subagentDetails[id]?.loaded === true) return
+    setFailedKey(previous => (previous === id ? undefined : previous))
+    let cancelled = false
+    let pending = loadsRef.current.get(id)
+    if (pending === undefined) {
+      pending = acp.loadSubagentDetail(target.dshSessionId, target.childId)
+      loadsRef.current.set(id, pending)
+    }
+    const settle = (): void => {
+      if (loadsRef.current.get(id) === pending) loadsRef.current.delete(id)
+      // `loadSubagentDetail` swallows its own RPC failure, so "answered" is
+      // read back from the store: `loaded` still false means the read did not
+      // land (an older host, or a dropped call). Idempotent on purpose — two
+      // subscribers may share one promise (a re-run effect must not strand the
+      // dialog in its loading state).
+      if (acp.getSnapshot().subagentDetails[id]?.loaded !== true && !cancelled) setFailedKey(id)
+    }
+    void pending.then(settle, settle)
+    return () => { cancelled = true }
+  }, [acp, target])
+
+  const open = target !== null
+  const [now, setNow] = useState(() => Date.now())
+  // While open, the relative "last activity" and a running worker's elapsed
+  // clock stay live (a silent worker sends no record frame). The interval
+  // exists only for the open spell.
+  useEffect(() => {
+    if (!open) return
+    setNow(Date.now())
+    const timer = setInterval(() => { setNow(Date.now()) }, SUBAGENT_TICK_MS)
+    return () => { clearInterval(timer) }
+  }, [open])
+
+  // Escape closes unless focus sits in an editor — the banner's rule, so the
+  // composer's own Escape is never taken by this overlay.
+  useEffect(() => {
+    if (!open) return
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape' || event.defaultPrevented) return
+      const node = event.target
+      if (node instanceof HTMLElement) {
+        if (node.tagName === 'INPUT' || node.tagName === 'TEXTAREA' || node.isContentEditable) return
+      }
+      event.preventDefault()
+      event.stopPropagation()
+      closeSubagentDetail()
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => { document.removeEventListener('keydown', onKeyDown) }
+  }, [open])
+
+  if (target === null || key === undefined) return null
+  // Seq order (the brief's contract). Stable for equal seq: the index's own
+  // order breaks the tie (a replayed live frame lands after the host copy).
+  const entries = detail === undefined ? [] : [...detail.entries].sort((a, b) => a.seq - b.seq)
+  const dispatch = subagentDispatchDetail(entries, target.childId)
+  const loaded = detail?.loaded === true
+  const waiting = !loaded && failedKey !== key
+  const status = record?.status ?? 'unknown'
+  const duration = record === undefined
+    ? t('没有生命周期记录', 'no lifecycle record')
+    : formatSubagentDuration(subagentElapsedMs(record, now))
+  const activity = record === undefined ? undefined : subagentLastActivityLabel(record.lastActivityAt, now, t)
+  const name = record !== undefined ? subagentTitle(record) : (dispatch?.title ?? target.childId)
+  const omitted = detail?.omitted ?? 0
+  const title = t('子智能体详情', 'subagent detail')
+  return (
+    <div className="ntr-acp-dialog-layer">
+      <div className="ntr-acp-dialog-mask" aria-hidden onClick={closeSubagentDetail} />
+      <div
+        className="ntr-acp-dialog ntr-acp-subagent-detail"
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+      >
+        <div className="ntr-acp-dialog-head">
+          <span className="ntr-acp-dialog-title">{title}</span>
+          <button
+            type="button"
+            className="ntr-acp-dialog-close"
+            title={t('关闭', 'Close')}
+            aria-label={t('关闭子智能体详情', 'Close subagent detail')}
+            autoFocus
+            onClick={closeSubagentDetail}
+          >
+            ✕
+          </button>
+        </div>
+        <div className="ntr-acp-dialog-body">
+          <div className="ntr-acp-subagent-detail-body">
+            <div className="ntr-acp-subagent-detail-head">
+              <div className="ntr-acp-subagent-detail-head-line">
+                <span className="ntr-acp-subagent-detail-name">{name}</span>
+                <span className={`ntr-acp-badge is-${subagentStatusTone(status)}`}>
+                  {subagentStatusLabel(status, t)}
+                </span>
+              </div>
+              <div className="ntr-acp-subagent-detail-meta">
+                <span>{duration}</span>
+                {activity !== undefined && <span>· {activity}</span>}
+                {record !== undefined && (
+                  <span>· {t(`${record.counts.toolCalls} 次工具调用`, `${record.counts.toolCalls} tool calls`)}</span>
+                )}
+                <span>· {target.childId}</span>
+              </div>
+            </div>
+            {dispatch?.rawInput !== undefined && (
+              <div className="ntr-acp-subagent-detail-section">
+                <div className="ntr-acp-subagent-detail-heading">{t('派遣入参', 'dispatch input')}</div>
+                <pre className="ntr-acp-subagent-detail-pre">{formatDetailValue(dispatch.rawInput)}</pre>
+              </div>
+            )}
+            <div className="ntr-acp-subagent-detail-section">
+              <div className="ntr-acp-subagent-detail-heading">{t('终态', 'terminal state')}</div>
+              {record === undefined
+                ? (
+                  <div className="ntr-acp-subagent-detail-line">
+                    {t(
+                      '这个子智能体没有生命周期记录，状态未知。',
+                      'This subagent has no lifecycle record — its state is unknown.',
+                    )}
+                  </div>
+                )
+                : (
+                  <>
+                    <div className="ntr-acp-subagent-detail-line">
+                      {t(`状态：${subagentStatusLabel(record.status, t)}`, `state: ${subagentStatusLabel(record.status, t)}`)}
+                    </div>
+                    {record.endedAt !== undefined && (
+                      <div className="ntr-acp-subagent-detail-line">
+                        {t(`结束：${detailEndStamp(record.endedAt)}`, `ended: ${detailEndStamp(record.endedAt)}`)}
+                      </div>
+                    )}
+                    {record.error !== undefined && !(typeof record.error === 'string' && record.error.trim() === '') && (
+                      <div className="ntr-acp-subagent-detail-line">
+                        <span>
+                          {record.status === 'failed'
+                            ? t('失败原因：', 'failure reason: ')
+                            : t('原因：', 'reason: ')}
+                        </span>
+                        {typeof record.error === 'string'
+                          ? <span>{record.error}</span>
+                          : <pre className="ntr-acp-subagent-detail-pre">{formatDetailValue(record.error)}</pre>}
+                      </div>
+                    )}
+                    {record.status === 'failed'
+                      && (record.error === undefined
+                        || (typeof record.error === 'string' && record.error.trim() === '')) && (
+                        <div className="ntr-acp-subagent-detail-line">
+                          {t('失败原因：agent 未给原因', 'failure reason: the agent gave no reason')}
+                        </div>
+                      )}
+                    {record.status === 'unknown' && (
+                      <div className="ntr-acp-subagent-detail-note">
+                        {t(
+                          '状态未知：agent 未上报终态，这条记录可能早于状态跟踪，或回合在终态帧之前结束。',
+                          'State unknown: the agent reported no terminal state — this record may predate state tracking, or the turn ended before a terminal frame.',
+                        )}
+                      </div>
+                    )}
+                  </>
+                )}
+            </div>
+            <div className="ntr-acp-subagent-detail-section">
+              <div className="ntr-acp-subagent-detail-heading">{t('运行流', 'worker stream')}</div>
+              {omitted > 0 && (
+                <div className="ntr-acp-subagent-detail-cut">
+                  {t(`更早的 ${omitted} 条明细已省略`, `${omitted} earlier entries omitted`)}
+                </div>
+              )}
+              {failedKey === key && !loaded && (
+                <div className="ntr-acp-subagent-detail-note">
+                  {t(
+                    '历史明细读取失败，这里只显示本页已收到的更新。',
+                    'Reading the history failed — only updates this page received are shown.',
+                  )}
+                </div>
+              )}
+              {entries.length === 0
+                ? (
+                  <div className="ntr-acp-subagent-detail-note">
+                    {waiting
+                      ? t('正在读取明细…', 'loading detail…')
+                      : t(
+                        '本次运行没有读到这个子智能体的明细；早先运行的明细不保留。',
+                        'No detail was recorded for this run; earlier runs’ detail is not retained.',
+                      )}
+                  </div>
+                )
+                : entries.map((entry, index) => (
+                  <DetailEntryView key={`${String(entry.seq)}:${String(index)}`} entry={entry} t={t} />
+                ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
 }
