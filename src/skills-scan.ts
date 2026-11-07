@@ -10,8 +10,8 @@
  * Defense is per skill: a failure skips that skill and never interrupts the
  * scan. Group roots are realpath-anchored; symlinked children must resolve
  * back INSIDE the anchor (`isUnderPath`, the cross-platform containment
- * primitive — never `startsWith('/')`), or they are counted and skipped. Lody's
- * `O_NOFOLLOW` re-check has no Windows equivalent, so the containment check
+ * primitive — never `startsWith('/')`), or they are counted and skipped. An
+ * `O_NOFOLLOW`-style re-check has no Windows equivalent, so the containment check
  * after realpath is the whole defense here and a TOCTOU window between lstat
  * and read is accepted (the documented adaptation; scan input is the user's
  * own home and workspace, not hostile territory).

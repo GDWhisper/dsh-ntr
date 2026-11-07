@@ -2906,7 +2906,7 @@ export const GENERIC_SKILL_DIRS: SkillDirTable = {
   systemDirs: [],
 }
 
-/** Defensive caps for the skill scan (mirrors the Lody budgets; no body is ever read, so no content budget). */
+/** Defensive caps for the skill scan (no body is ever read, so no content budget). */
 export const SKILL_SCAN_LIMITS = {
   /** Direct children per group dir before the rest are cut (and `truncated` set). */
   maxChildrenPerDir: 2000,
@@ -2927,8 +2927,8 @@ function stripFrontmatterQuotes(value: string): string {
 }
 
 /**
- * Parse a SKILL.md frontmatter block into a flat string record (Lody rules,
- * ported). No frontmatter → `{}`; a malformed block THROWS — the scanner
+ * Parse a SKILL.md frontmatter block into a flat string record. No frontmatter
+ * → `{}`; a malformed block THROWS — the scanner
  * catches per skill and skips it, so one broken file never hides the rest.
  *
  * Accepted shape: `---` open marker, top-level `key: value` lines
@@ -2985,7 +2985,7 @@ export function skillMetadata(
 }
 
 /**
- * The whitespace-free pick token for one skill (Lody rule): a whitespace-free
+ * The whitespace-free pick token for one skill: a whitespace-free
  * frontmatter name is used directly; otherwise the last non-empty segment of
  * the skill path (its `SKILL.md` suffix stripped, case-insensitive); when even
  * that is empty, the name with whitespace runs folded to `-`. An empty result
@@ -3001,7 +3001,7 @@ export function skillMentionToken(name: string, relativePath: string): string {
   return trimmed.replaceAll(/\s+/g, '-')
 }
 
-/** Markdown link destination with the Lody escapes (backslash and close-paren), verbatim — no `<>` wrapper is added. */
+/** Markdown link destination escaping backslash and close-paren, verbatim — no `<>` wrapper is added. */
 export function formatSkillPathDestination(path: string): string {
   return path.replaceAll('\\', '\\\\').replaceAll(')', '\\)')
 }

@@ -265,8 +265,8 @@ export function commandCandidates(commands: readonly AgentCommand[], query: stri
 }
 
 /**
- * The agent's skills as menu rows, ranked the way Lody ranks skill mentions
- * (three tiers, ascending — a lower score is a better match): the query (trim +
+ * The agent's skills as menu rows, ranked in three tiers (ascending — a lower
+ * score is a better match): the query (trim +
  * lowercase) PREFIXES the token or the frontmatter name → 0, is CONTAINED in
  * either → 1, only the skill's folder matches → 2, no match → dropped. Ties
  * break by token, and an empty query is "everything, by token".

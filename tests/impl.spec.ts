@@ -3300,7 +3300,7 @@ describe('agent skills (impl)', () => {
     })
   })
 
-  it('escapes destinations the Lody way and formats the prompt verbatim', () => {
+  it('escapes destinations with backslash and close-paren and formats the prompt verbatim', () => {
     expect(formatSkillPathDestination('C:\\a\\x.md')).toBe('C:\\\\a\\\\x.md')
     expect(formatSkillPathDestination('/a/b(x).md')).toBe('/a/b(x\\).md')
     expect(formatSkillMentionPrompt('code-review', '/home/u/.claude/skills/code-review')).toBe(

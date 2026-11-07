@@ -568,13 +568,13 @@ export type AgentSkillScope = 'project' | 'global' | 'system'
  * {@link AgentSkillEntry.insertion} into the draft verbatim.
  */
 export interface AgentSkillEntry {
-  /** Whitespace-free pick token (Lody rule). Doubles as the menu row name. */
+  /** Whitespace-free pick token. Doubles as the menu row name. */
   token: string
   /** Frontmatter name, else the skill directory basename. */
   name: string
   description?: string
   scope: AgentSkillScope
-  /** The skill's own folder path inside its group dir (Lody `getSkillFolderPath`). */
+  /** The skill's own folder path inside its group dir. */
   folder: string
   /** Draft-ready text: `use /<token> [Skill Path](<destination>)`. */
   insertion: string

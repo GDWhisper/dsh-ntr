@@ -139,9 +139,9 @@ NTR 会话的 `/` 属于 agent：菜单只列 agent 自己的行——命令（`
 - **严禁**改写上游文件、注册第二个 `/` 来源、改 preset 行来伪装，或替换整个 `conversation.composer`。
 - agent 命令清单**只由一个来源承载**（按名字优先 `command`，缺席回落第一个 `/` 来源）；agent 技能清单**只由名字为 `skill` 的来源承载**；其余来源在 ACP 会话里返回空——否则同一份清单每组各画一遍。**同源冲突规则**：当 command 回落的「第一个 `/` 来源」恰是 `skill` 来源时，command 角色优先、技能让位静默——命令是既有契约，冲突保旧。
 - 每次调用按会话判定：舞台行自己的 `agentPreset` 优先，否则用 `session/chat-list` 的 `acpMode`；**没有证据时一律当作非 ACP（fail-open）**。
-- `candidates` 每敲一键都会重取，「按需重问宿主」（`ASK_INTERVAL_MS`）与「没有任何命令时补读一次」（`REFRESH_INTERVAL_MS`）都必须节流；技能行的 TTL 与 agentId 解析收在 store（`skillRowsFor` / `loadAgentSkills` / `skillInsertionFor`），数据侧见 [state.md](./state.md) 的「斜杠命令缓存」与「技能清单」。技能行打分走 Lody 三档（token/name 前缀 0、包含 1、folder 2，平手按 token），`hint` 只放 scope 作展示、**不做** inline 过滤（宿主对 hint 行的 inline 行为未验证，异常时回退：scope 并进 description、去掉 hint）。
+- `candidates` 每敲一键都会重取，「按需重问宿主」（`ASK_INTERVAL_MS`）与「没有任何命令时补读一次」（`REFRESH_INTERVAL_MS`）都必须节流；技能行的 TTL 与 agentId 解析收在 store（`skillRowsFor` / `loadAgentSkills` / `skillInsertionFor`），数据侧见 [state.md](./state.md) 的「斜杠命令缓存」与「技能清单」。技能行打分三档（token/name 前缀 0、包含 1、folder 2，平手按 token），`hint` 只放 scope 作展示、**不做** inline 过滤（宿主对 hint 行的 inline 行为未验证，异常时回退：scope 并进 description、去掉 hint）。
 - 技能 pick 的插入文本按**当前**绑定解析（`skillInsertionFor` 复合键）；切 agent 后旧 token 查不到 → 不插入（fail-closed，绝不插出旧 agent 的路径）。
-- **generic 兜底的局限**：风味未识别或没有 skill 体系的 agent 也会被建议 `use /token …` 文本——方向无害（只多建议、不误执行，agent 自行决定）。含空格技能目录的 destination 沿用 Lody 转义（仅 `\` 与 `)`），严格 markdown 解析器下会被截断，与 Lody 同构，已知局限。
+- **generic 兜底的局限**：风味未识别或没有 skill 体系的 agent 也会被建议 `use /token …` 文本——方向无害（只多建议、不误执行，agent 自行决定）。含空格技能目录的 destination 用同款转义（仅 `\` 与 `)`），严格 markdown 解析器下会被截断，已知局限。
 - **失败一律放开**：服务缺失不算故障；服务在但 `live.sources` 形状不认识、或来源没有 `candidates`，就什么都不包、照旧沿用宿主行为，原因写进 `UiState.slashDiag`（ACP 视图空态渲染）与一次 `console.warn`。`dispose` 只还原自己装的包装（跨实例标记 `Symbol.for('dsh-ntr.slash-isolation')` 带 owner）；`sync` 幂等，可在 `internal/service` 与 store 变更时重跑。
 
 ## 7. 快照读取与失败放开

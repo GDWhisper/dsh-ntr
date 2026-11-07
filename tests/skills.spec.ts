@@ -119,7 +119,7 @@ describe('scanSkillDirs', () => {
     // The project destination is relative to the workspace (the agent's session
     // cwd), with hand-joined `/` separators on every platform.
     expect(projRow?.insertion).toBe('use /proj-skill [Skill Path](.claude/skills/proj-skill)')
-    // The global destination is the realpath of the skill dir, Lody-escaped.
+    // The global destination is the realpath of the skill dir, escaped.
     expect(globRow?.insertion).toBe(
       `use /glob-skill [Skill Path](${formatSkillPathDestination(realpathSync(glob))})`,
     )
