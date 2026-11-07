@@ -199,6 +199,7 @@ coordinator 用 `Agent` 工具派发 detached worker、说「已派…」，随�
 - **diff**：同时保留结构化 diff（ACP 视图 `DiffView`）与文本（路径 + `-`/`+` 行，`formatAcpDiff`）。**严禁**退回 `[diff path]` 占位；未知 content kind 保留整条 JSON（`acpContentRows` 的 `other`）。这份文本也是虚拟工具答给宿主执行记录的输出，不能是占位符。**公告帧记下的空输出不是答案**：agent 先公告 `tool_call`（无 content）、后重述带输出，所以 `recordAcpToolOutput` 的空记录只在 agent 报了终态 status（`isFinalToolCallStatus`：非 `pending` / `in_progress`）时才算完成，`waitForToolOutput` 也只在那时或真有输出时解除等待——否则卡片永远拿占位符（issue #10）。
 - **预算**：`ACP_TOOL_RAW_MAX` / `RAW_MAX`（256,000 字符）、`transcriptMaxEntries`（默认 600）、浏览器 `MAX_BLOCKS`（400）是有界容器，不是丢数据的理由；超限必须留截断标记，回合内暂存的后台更新缓冲（`pendingAmbientUpdates`，§6.2）被顶掉时也同样先折一行截断标记再 flush。**Transcript 自身只合并连续同类纯状态 tick**（`usage_update`、无 title 的 `session_info_update`、`config_option_update`）：就地替换末条，seq 前进、数组不增长、保留最新值；内容类一条不丢，`since()` 的 seq 空洞是允许的，实时 SSE 仍逐帧广播。**严禁**给 stderr 行、npm 安装输出这类诊断文本加「取前 N 字符」——那正是激活失败时唯一有用的一行。
 - **通知身份**：没有卡片的种类（plan / mode / 未来新增）在原生流里每种类只发一行，文本变了才重发（`announcedKinds`）；ACP 视图按 kind 折叠（`store.ts` · `foldUpdate` 对 `plan` 就地更新）。
+- **工具卡名字归一化不丢原文**：`src/impl.ts` · `acpToolCallFromUpdate` 把工具卡 `name` 固定成常量 `dsh_ntr__acp_tool_call`，`acpToolCallDelta` 同步归一，中途改标题不能把长命令重新灌回名字；agent 原始 `title`（整条命令）原样进 `arguments` / `argsRaw` 由宿主在参数区渲染，ACP 视图 `block.title` / `block.raw` 逐字保留——约束 29：不静默丢弃，超限只截断并带标记。较新宿主 pre-step 冻结 step 工具集，这个稳定名首现仍记一次 `unknown tool` + 下次清单 diff 的「已添加工具」，属接受的显示层噪音（回合不中断、输出不丢）。`presets/acp/acp-guard.mjs`：`tools.get(CONST, exec.agent)` 撞上真实宿主工具即 fail-closed、回错误结果而非 `return next()`，杜绝宿主进程执行 agent 的命令文本。
 
 ## 代码索引
 

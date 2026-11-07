@@ -91,6 +91,7 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 | 子代理 trigger 点了没反应 / 下拉「出现」但完全看不见 | 宿主 `ConversationRoot` 的 `titleRow` / `titleCluster` 是否带 `container-type` / `mask-image` / `overflow: clip`；`subagent-panel.tsx` 的下拉是否仍 portal 到 `document.body` | 0.2.2-rc.1 的标题行建立布局包含（fixed 改锚）、标题容器带遮罩（0.2.1-rc.5 都无），留在容器内的下拉被整块抹掉；宿主自己的目录菜单同样 portal |
 | 审批卡 / 释放横幅不出现 | `conversation.input.dock`、`session/update` 折叠 | dock 槽位或事件形状变化 |
 | 内置更新不可用 | `pluginManager` 方法面 | 服务或方法签名变化 |
+| 每个新工具名首现 `unknown tool` +「已添加工具」成对，旧版刷屏 | 宿主 pre-step 是否冻结 `ResolvedToolSet`（`ctx.tools.resolve()` 快照，新宿主）vs `tools/execute` 里实时解析（0.2.1-rc.5 无快照） | 虚拟工具执行阶段才注册、进不了冻结的 step：首现记 `unknown tool`、下次 `buildRequest()` 清单 diff 写 `tool-addition`；插件收敛成单一稳定名 `dsh_ntr__acp_tool_call`（最多一对）+ guard 撞真实工具 fail-closed（`tools.get` 命中即返错、不 `return next()`） |
 
 ### 5.3 读宿主源码
 
