@@ -56,7 +56,7 @@
 13. **审批只有一条管线：插件自己接住每一问并广播 `permission/request`**：`handlePermissionRequest` 建 `PermissionLedger` 条目（`auto` + `0` 到达即收场：不建条目、不发帧），**严禁再走宿主 `ctx.approval`，也不读宿主 approval policy**——旧路由会收下问题却不渲染，默认 `wait` 又没有期限，turn 就挂在完全不可见的地方。到点**就地收场**：`abort` 拒绝 / `auto` 按 option **kind 优先级**代答（挑不出合法选项则降级 `abort`）/ `wait`（**默认**）不设期限。
     只有一个等待窗口 `permissionTimeoutMs`（默认 300s；`0` = 不等待，**只属 `auto`**；`abort` 的 0 抬到 30s）；模式与窗口在询问开始时读一次；`ui/approval-deadlines` 热改，覆盖落 `agents.json` 的 `approvalDeadlines` 并压过 `cordis.patch.yml`。到点留痕**恰一条** `agent/notice` + `permission/expired`（再一条 `permission/resolved`）；SSE 连接按快照用同一个 `permissionRequestFrame` 重放未决项（字段逐字节一致）+ `permission/synced`；`signal` 撤回、`session/cancel`、`closeSession`（await `session/close` **之前**）都必须 `settlePermissions`。→ [permissions.md](./AGENTS/permissions.md) / [retired.md](./AGENTS/retired.md)
 14. **审批 UI 归对话，设置页只做镜像与配置**：`PermissionDock` 挂 `conversation.input.dock`，按 `dshSessionId` 过滤、与 composer 卡同宽居中、选项原样原序（含 Always Allow）、单独取消键答 `cancelled`、没有全局 Enter/Esc、按到达顺序堆叠并由 CSS 限高；设置页只要 `ui.permissions` 非空就渲染可答复的跨会话镜像（没有聊天身份的询问只有这里能答），**没有权限策略开关**。
-    时限卡只有两个控件——三档互斥按钮（整宽、文字不折行）+ 一根时长滑块（「不等待」只在 `auto` 档，`abort` 从 30 秒起；`wait` 不画滑块，读数「一直等待」），并有一句话把两者说成一套；覆盖事实挂被覆盖的那一行，重置按钮只有真覆盖才出现。agent mode 控件在 `conversation.input.left`，不写可见标签、选项不依赖活会话、自带 ACP 闸门；agent 卡详情常挂载，工作区保存语义固定。→ [permissions.md](./AGENTS/permissions.md) / [ui.md §10](./AGENTS/ui.md)
+    时限卡只有两个控件——三档互斥按钮（整宽、文字不折行）+ 一根时长滑块（「不等待」只在 `auto` 档，`abort` 从 30 秒起；`wait` 不画滑块，读数「一直等待」），并有一句话把两者说成一套；覆盖事实挂被覆盖的那一行，重置按钮只有真覆盖才出现。agent mode 控件在 `conversation.input.left`，不写可见标签、选项不依赖活会话、自带 ACP 闸门；agent 卡详情常挂载，工作区保存语义固定。→ [permissions.md](./AGENTS/permissions.md) / [conversation-dock.md](./AGENTS/conversation-dock.md)
 15. **【裁决部分已退役】工作区即侧栏路径**：聊天会话的 `session/new` / `session/load` cwd 与子进程 `spawnCwd` 都必须是 DSH 会话自己的工作区，并以 `extraRoots` 传入（create 与 resume 都要）；prompt 严格等于用户文本、不叙述任何边界；agent 的 mode 只经 `session/chat-list` / `chat-mode-set` 与 `agent/catalog` 上报；DSH Access mode 裁决整条已删除。→ [architecture.md §4](./AGENTS/architecture.md) / [retired.md](./AGENTS/retired.md)
 
 ### 转发、preset 与绑定（16–17、22）
@@ -125,7 +125,7 @@
 |---|---|---|
 | [architecture.md](./AGENTS/architecture.md) | 改消息走向、会话绑定、工作区、preset 外壳、agent 锁定、默认 agent，或要目录 / 术语索引 | 动了 `src/bridge.ts` 的 `streamPrompt` / 绑定 / 锁定、`presets/acp/acp-guard.mjs`、或新增顶层源文件 |
 | [protocol.md](./AGENTS/protocol.md) | 改子进程、超时、取消、卡死收口（无活动看门狗）、崩溃恢复、空闲释放、启动命令、会话分叉、ACP 数据折叠 | 动 `AgentBridge` / `BridgeManager` / `TurnStreamController` 的生命周期、超时或 `session/update` 折叠逻辑 |
-| [ui.md](./AGENTS/ui.md) | 改 composer 座位 / 芯片 / 挂牌、mode 控件、NTR 视图、斜杠菜单、消息动作 / 分支按钮、对话内权限卡 / 释放横幅 / 限流横幅 | 动 `src/client/` 的槽位注册、菜单内容或对话面组件 |
+| [ui.md](./AGENTS/ui.md) / [conversation-dock.md](./AGENTS/conversation-dock.md) | 改 composer 座位 / 芯片 / 挂牌、mode 控件、NTR 视图、斜杠菜单、消息动作 / 分支按钮；对话内权限卡 / 释放横幅 / 限流横幅读后者 | 动 `src/client/` 的槽位注册、菜单内容或对话面组件 |
 | [ui-panel.md](./AGENTS/ui-panel.md) | 改设置页布局、保存横幅、版本徽标 / 内置更新卡、文案或主题色 | 动 `panel.tsx`、`save-guard-toast.tsx`、`locale.*` 或 CSS token |
 | [permissions.md](./AGENTS/permissions.md) | 改权限映射、审批卡片（对话 dock / 设置镜像）、审批时限、权限座位、fs 围栏 | 动 `handlePermissionRequest` / `PermissionLedger` / 期限配置 / `PermissionDock` |
 | [state.md](./AGENTS/state.md) | 改落盘、会话选择持久化、模型目录 / 可见性、命令缓存、fork 能力位、内置更新、保存门禁 / HMR 防护 | 动 `agents.json` 结构、`agent/catalog`、`absorbCommands`、`AcpSaveGate`、`hmr-guard` 或 `UpdateService` |

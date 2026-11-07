@@ -118,7 +118,7 @@
 
 - **帧字段**（实时广播与重放共用 `permissionRequestFrame`，字段逐项一致）：`requestId`、`sessionId`（ACP 会话 id）、`dshSessionId?`（`/acp` RPC 会话没有）、`toolCall`（原样保留）、`toolName`（宿主经 `permissionToolName` 派生，含 `_meta` 里 `toolName` 的兜底）、`reason?`（`permissionAskReason` 的一行摘要）、`options`（原样，含顺序与 `kind`）、`timeoutMode`（`wait` / `abort` / `auto`）、`deadlineAt?`（epoch ms；`wait` 模式没有期限时缺席）。重放帧缺一项，靠它过滤 / 显示的对话卡就会在重连后静默丢询问。
 - `session/cancel`、`session/close`（先 settle 未决询问，再发 `session/close` 请求）、`releaseAll` 都会答复未决询问，卡片不会跨回合残留。
-- `approvalRouted` 已删除（`agents/list` 不再上报）：设置页镜像卡片只看 `ui.permissions` 是否非空，见 [ui.md §10](./ui.md)。
+- `approvalRouted` 已删除（`agents/list` 不再上报）：设置页镜像卡片只看 `ui.permissions` 是否非空，见 [conversation-dock.md §10](./conversation-dock.md)。
 
 ## 8. 内置更新
 

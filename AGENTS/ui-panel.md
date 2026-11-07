@@ -30,7 +30,7 @@
 - **NTR agent 保存门禁**：保存前读 `save/status`；目标 agent 有活动会话时弹「取消 / 回合结束后保存 / 立即保存并中断」三键确认，并列出受影响的会话（**排除已 released 的会话**）。无活动回合直通、不弹框。选「回合结束后保存」后，表单说明这是点击时快照，继续编辑会 `save/cancel` 并提示重新保存；**暂存态以 `save/status` 的 `pending`（按 label）为准**，`deferRequested` 只在首帧 `pending` 到达前兜底；终态只在主机 `lastOutcomes.at` 与入队时记录的 `deferOutcomeAt` 不同时结算该次暂存（主机时钟的身份比较，不混用浏览器时钟）——关闭设置面板或刷新页面后仍显示「配置已暂存」。取消必须按返回的 `cancelled` 校验，RPC 失败时**保留暂存态**并出警示横幅。旧宿主没有 `save/status` 时隐藏暂存键，用本地会话行兜底；只有取消与立即保存。行内「移除配置 / 停止当前运行实例」的确认卡显示将影响的会话数（门禁活动会话与本地未关闭会话的并集，**排除 released**）。`save-rejected` 在当前面板不可达：面板总带 `saveMode`，只有旧宿主忽略它、或外部 RPC 调用方不带 `saveMode` 而目标忙碌时才会出现。
 - **Agent 删除的窄窗口**：`agent/delete` 返回 `persist_failed` 时客户端把该 id 记入本地已删除镜像并禁用新建表单里的同名 id；删除后的 id 仍可能从磁盘复活（见 §8.2）。
 - 工作区保存语义：单根模式（非空 `cwd`）把 `allowedCwdRoots` 收窄为 `[cwd]`；`cwd` 为空则两者都不发送（走宿主 `defaultAgentWorkspace()`）；多根模式发送编辑后的去重绝对路径。初始状态带 >1 个 root 的 agent 必须直接进多根模式，避免仅仅打开表单就收窄白名单。
-- 审批卡：对话内的主答案面是 `PermissionDock`（见 [ui.md §10](./ui.md)），本页那张「待处理权限请求」是跨会话镜像。权限语义与期限见 [permissions.md](./permissions.md)。
+- 审批卡：对话内的主答案面是 `PermissionDock`（见 [conversation-dock.md §10](./conversation-dock.md)），本页那张「待处理权限请求」是跨会话镜像。权限语义与期限见 [permissions.md](./permissions.md)。
 
 ### 8.1 版本徽标与内置更新
 

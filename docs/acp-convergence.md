@@ -456,7 +456,7 @@ selection，而 driver 每轮解析的路由（`selectionFor(agent).current`：p
 > 留痕是一次 `agent/notice` + 一条 `permission/expired`（对话里折成一行）。宿主审批策略
 > （`ask` / `never`）不再作用于 ACP 询问，`approval/asked|decided` 也不再为 ACP 询问写入
 > （接受的取舍）。现行形状见
-> [permissions.md](../AGENTS/permissions.md)，座位与交互见 [ui.md §10](../AGENTS/ui.md)。
+> [permissions.md](../AGENTS/permissions.md)，座位与交互见 [conversation-dock.md §10](../AGENTS/conversation-dock.md)。
 
 **重连重放（2026-10-27 补记，对齐 OmniTerm dev）**：`permission/request` 只广播一次，
 之后连上来的客户端（刷新 / 新标签页 / SSE 重连）永远收不到它，而 ledger 卡正是它唯一的
