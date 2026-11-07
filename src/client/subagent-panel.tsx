@@ -38,6 +38,7 @@
 
 import { createElement, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { ComponentType } from 'react'
+import { createPortal } from 'react-dom'
 // Type-only: pulls the conversation SlotMap merge into this program.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { closeSubagentDetail, ensureAcpStyle, openSubagentDetail, useSubagentDetailTarget, useUi } from './acp-ui.tsx'
@@ -362,9 +363,14 @@ function OwnCatalogProjection(props: OwnSubagentCatalogProps) {
 
   const rootRef = useRef<HTMLDivElement | null>(null)
   const triggerRef = useRef<HTMLButtonElement | null>(null)
+  const menuRef = useRef<HTMLDivElement | null>(null)
   const [placement, setPlacement] = useState<SubagentMenuPlacement | undefined>(undefined)
-  // Fixed coordinates measured from the trigger: the header band may clip an
-  // absolutely positioned child, and `position: fixed` escapes that clip.
+  // Fixed coordinates measured from the trigger. The menu is PORTALED to
+  // `document.body` (the host's own dropdown does the same): since DSH
+  // 0.2.2-rc.1 the header's title row establishes layout containment
+  // (`container-type: inline-size`), which re-anchors a fixed descendant to
+  // the row, and the title cluster's `mask-image` + `overflow: clip` then
+  // erases it — the menu painted as a fully transparent rectangle.
   useLayoutEffect(() => {
     if (!open) return
     const place = (): void => {
@@ -391,7 +397,8 @@ function OwnCatalogProjection(props: OwnSubagentCatalogProps) {
       setOpen(false)
     }
     const onPointerDown = (event: PointerEvent): void => {
-      if (event.target instanceof Node && rootRef.current?.contains(event.target) === true) return
+      if (event.target instanceof Node
+        && (rootRef.current?.contains(event.target) === true || menuRef.current?.contains(event.target) === true)) return
       setOpen(false)
     }
     document.addEventListener('keydown', onKey, true)
@@ -432,8 +439,9 @@ function OwnCatalogProjection(props: OwnSubagentCatalogProps) {
         <span className="ntr-acp-subagent-count">{triggerText}</span>
         <span className="ntr-acp-subagent-chevron" aria-hidden>{open ? '▴' : '▾'}</span>
       </button>
-      {open && (
+      {open && createPortal(
         <div
+          ref={menuRef}
           className="ntr-acp-subagent-menu"
           role="list"
           aria-label={t('子智能体列表', 'subagent list')}
@@ -446,7 +454,8 @@ function OwnCatalogProjection(props: OwnSubagentCatalogProps) {
           {rows.map(row => (
             <SubagentPanelRowView key={row.childId} row={row} now={now} t={t} onOpen={openDetail} />
           ))}
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   )

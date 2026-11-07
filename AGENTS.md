@@ -92,7 +92,7 @@
 ## 边界与禁区
 
 - **禁止修改 [`lib/`](./lib)**：构建产物，`npm run build` 全量覆盖，CI 自己 build，不提交。
-- **禁止在 [`tsdown.config.mjs`](./tsdown.config.mjs) 取消 external**：`react`、`react/jsx-runtime`、`@deepseek-ai/cordis`、`@deepseek-ai/dsh-client-ui-slots` 必须由运行时提供，打包进去会破坏 context。
+- **禁止在 [`tsdown.config.mjs`](./tsdown.config.mjs) 取消 external**：`react`、`react-dom`、`react/jsx-runtime`、`@deepseek-ai/cordis`、`@deepseek-ai/dsh-client-ui-slots` 必须由运行时提供，打包进去会破坏 context。
 - **子进程环境按「同级 agent」处理**：默认继承完整宿主环境，再由 agent 自己的 `env` 按键覆盖（`src/impl.ts` · `childEnv`）。**严禁**重新引入隐式凭据过滤——依赖环境变量认证的 agent（如 pi 的自定义供应商）会静默丢掉整个供应商；将来要最小权限必须做成显式 per-agent 开关。
 - **模块纯度**：`src/protocol.ts` 是纯类型契约，**严禁**引入 Node 专属库或运行时代码；`src/impl.ts` **严禁** Node 内置模块与 SDK，必须由 `tests/impl.spec.ts` 覆盖；`src/client/` **严禁** Node 内置模块或 ACP SDK，通信只走 RPC / SSE。
 

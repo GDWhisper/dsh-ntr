@@ -88,6 +88,7 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 | NTR 对话里出现宿主注入（项目指令 / 记忆召回 / model changed） | `agent/pre-step` decision 形状、`message.source.kind` 常量 | 闸门 fail-open；runtime-context 那一条剥不掉（`step()` 自己会追加） |
 | 模型底座 / 座位 / 选择器消失或露出原生控件 | 槽位名（含 `conversation.input.overlay`）、`entriesOfSlot`、projection key | 客户端槽位或投影改名 |
 | 子代理面板退回宿主 trigger / 控制台出现 `subagent catalog:` fail-open 行 | `subagentCatalog` 投影与 `useSessions` 形状；`subagent-panel.tsx` 的 `readSubagentCatalogProjection` / `subagent-activity.tsx` 的 `SubagentCatalogOccupant` | 插槽条目 / id / projection key 改名，出现非 `external` 行或行形状变化 |
+| 子代理 trigger 点了没反应 / 下拉「出现」但完全看不见 | 宿主 `ConversationRoot` 的 `titleRow` / `titleCluster` 是否带 `container-type` / `mask-image` / `overflow: clip`；`subagent-panel.tsx` 的下拉是否仍 portal 到 `document.body` | 0.2.2-rc.1 的标题行建立布局包含（fixed 改锚）、标题容器带遮罩（0.2.1-rc.5 都无），留在容器内的下拉被整块抹掉；宿主自己的目录菜单同样 portal |
 | 审批卡 / 释放横幅不出现 | `conversation.input.dock`、`session/update` 折叠 | dock 槽位或事件形状变化 |
 | 内置更新不可用 | `pluginManager` 方法面 | 服务或方法签名变化 |
 

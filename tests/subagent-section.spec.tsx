@@ -122,6 +122,29 @@ const useSessions = (selector: (value: unknown) => unknown): unknown => selector
   },
 })
 
+describe('the header subagent panel menu', () => {
+  it('portals the open menu to the body so the header mask cannot erase it', () => {
+    startClock(1_000_000)
+    const running = panelState([record({ startedAt: 1_000_000, lastActivityAt: 1_000_000 })])
+    render(
+      <OwnSubagentCatalog host={HostTrigger} acp={panelStore(running)} sessionId="chat-1" useSessions={useSessions} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: /累计 1 个/ }))
+    const menu = screen.getByRole('list', { name: '子智能体列表' })
+    // DSH 0.2.2-rc.1's title cluster carries `mask-image` + `overflow: clip`;
+    // a fixed descendant inside it paints fully transparent. The menu must be
+    // a body child, exactly like the host's own catalog dropdown.
+    expect(menu.parentElement).toBe(document.body)
+
+    // The portal is still "inside" for dismissal purposes...
+    fireEvent.pointerDown(menu)
+    expect(screen.getByRole('list', { name: '子智能体列表' })).toBeDefined()
+    // ...and a genuine outside press still closes it.
+    fireEvent.pointerDown(document.body)
+    expect(screen.queryByRole('list', { name: '子智能体列表' })).toBeNull()
+  })
+})
+
 describe('the header subagent panel clock', () => {
   it('ticks a running row once per second and freezes it at its end stamp', () => {
     startClock(1_000_000)

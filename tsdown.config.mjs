@@ -14,6 +14,8 @@ const BUNDLE_ID = 'dsh-ntr'
 
 const EXTERNAL = [
   'react',
+  // Portals in the subagent panel; the host's module table answers it.
+  'react-dom',
   'react/jsx-runtime',
   '@deepseek-ai/cordis',
   '@deepseek-ai/dsh-client-ui-slots',
