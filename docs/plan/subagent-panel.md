@@ -93,10 +93,10 @@ entries: (projected ?? []).map(entry => ({
 const runningCount = directChildren.filter(e => e.activity === "running").length;
 ```
 
-- `projectionsBySession[parentSessionId].values.subagentCatalog` 是**数组**，每项至少含 `id`（= `childId`）、`mode`、`label`。
+- `projectionsBySession[parentSessionId].values.subagentCatalog` 是**数组**，客户端视图项形状为 `{ id, createdAt, mode: 'one-shot' | 'external' | 'continuable' | 'unknown', label? }`（宿主 view schema 已确认）：`id` = `childId`，`createdAt` = 派出时间。**字段名不是 `childCreatedAt`**。
 - `activity` 是 UI 派生，来自 `useSessionStatus` 的 status map —— 这正是 `mergeSubagentStatuses` 现在 patch 的那条缝。
 - `SubagentCatalogAction` 的 props 是 `{ sessionId, useSessions, useSessionStatus, openChild, openChildAside, refreshProjection, t }`；`tests/subagent-activity.spec.tsx` 的 fake host 已经把 `useSessions` 传进来了，自制面板可直接复用这条接缝。
-- **待实测**：`childCreatedAt` 是否被 `wire.view` 透传到客户端数组（检查点内部 state 里有，但 view 可能裁剪）。不允许假设 —— 兜底见 §3.2。
+- **已确认**：创建时间经 `wire.view` 透传到客户端数组，字段名是 `createdAt`。它直接作为 `startedAt`；只有它缺失时才回落插件 append 时的 `now`，不必冷读宿主日志。
 - `subagentCatalog` 的检查点 `ver` 是宿主内部值；升级导致 `ver` 不匹配时检查点被丢弃并从日志重折叠，**目录成员不会丢**。
 
 ---
@@ -108,7 +108,7 @@ const runningCount = directChildren.filter(e => e.activity === "running").length
 | 字段 | 权威来源 | 落盘 | 备注 |
 |---|---|---|---|
 | `childId` / `label` / `mode` / 累计派出数 | 宿主 `subagentCatalog` projection（持久日志派生） | 宿主侧，插件不重复存 | 列表骨架；`dshSessionId` 由 slot 的 `sessionId` 提供 |
-| `startedAt` | 插件 append 时的 `now`（`appendExternalSubagentCatalog`）；历史行可从宿主日志冷读补齐 | 宿主事件里已有 | 仅当 view 不带 `childCreatedAt` 时用插件自己的记录 |
+| `startedAt` | 宿主 view 的 `createdAt`（= 事件里的 `childCreatedAt`）；缺失时回落插件 append 的 `now` | 宿主侧，插件不重复存 | 历史行与插件记录之前的行都靠这一列，不必冷读日志 |
 | `status` / `endedAt` / `lastActivityAt` / `error` / `counts` | 插件线报（`BackgroundDispatch` + 拆除路径） | **`agents.json` 的 `subagents` 键** | 经 `persistAgents` / `pluginStateDir()`，约束 28 |
 | 明细（原始 `session/update`） | `session.transcript` / SSE `session/update` / `session/chat-transcript` | **不落盘** | 内存 + 浏览器 store，有界，按需拉取 |
 
@@ -130,15 +130,18 @@ interface SubagentRecord {
   startedAt: number
   lastActivityAt: number
   endedAt?: number
-  error?: string                  // tool_call_update.content 原文，无则如实留空
+  error?: unknown                 // tool_call_update.content 原样；字符串 / 对象 / 数组都保留（约束 29），显示层再折叠
   counts: { updates: number; toolCalls: number; textChars: number }
 }
 ```
 
 - `agents.json` 新增 `subagents: Record<dshSessionId, SubagentRecord[]>`；`loadPersistedAgents` / `persistAgents` 一并校验与归一化，形状变化走可选字段，不搞迁移脚本。
-- 列表显示时按 `childId` 把宿主投影数组与插件记录做左连接：**宿主有、插件无** → `unknown`（插件升级前的历史行），**插件有、宿主无** → 仍显示（宿主刚 append 尚未投影 / 写入失败），标「目录待同步」。绝不把 `unknown` 画成成功。
-- 事件帧：新增 `subagents/record`（单条全量状态）+ `subagents/snapshot`（SSE 首帧重放，照 `permissionReplayFrames` 的「先订阅、后快照」顺序）；`subagents/update { running:boolean }` 与 `UiState.activeSubagents` / `ChatSessionView.activeSubagents` **一并退役**，不留第二套事实源。同步 `AGENTS/retired.md` 的幽灵清单。
-- 详情按需：`subagents/detail` RPC 按 `childId` 返回有界原始条目；**不常驻 SSE 广播**。
+- **落盘只在状态迁移**（`pending → running → completed / failed / cancelled / unknown`，含 `startedAt` / `endedAt` / `error` / `counts` 定稿）。`lastActivityAt` 每条 worker 更新都变，只留在内存并在下一次落盘时带上，**严禁**每帧调 `persistAgents`——它同步全量重写 `agents.json`，按 chunk 写会直接把主线程拖死。会话关闭 / 记录被丢弃时 prune 对应的 `subagents` 键；`loadPersistedAgents` 之后只保留在 `chatSessions` 或 `conversations` 里仍有归属的键，孤儿记录直接丢。
+- 列表显示时按 `childId` 把宿主投影数组与插件记录做左连接：**宿主有、插件无** → `unknown`（插件升级前的历史行），**插件有、宿主无** → 仍显示（刚创建尚未上报 / 宿主刚 append 尚未投影 / 写入失败），标「目录待同步」。trigger 的「累计 N」也计入这部分——它是插件已经知道的派出数。绝不把 `unknown` 画成成功。
+- 事件帧：新增 `subagents/record`（单条全量状态）；会话级快照走 `session/chat-list` 行上的 `subagents` 数组，**不是** SSE 首帧全局快照。`subagents/update { running:boolean }`、`UiState.activeSubagents`、`subagentFrames` 与 `ChatSessionView.activeSubagents` **一并退役**，不留第二套事实源。同步 `AGENTS/retired.md` 的幽灵清单。
+- **record 广播点必须与 catalog 上报解耦**：`openDispatchActivity` / `closeDispatchActivity` 只在宿主 catalog 接受后（`catalogReported`）才跑。record 帧要在 dispatch 创建与每次状态迁移处直接发，否则未上报的 dispatch 永远到不了浏览器，「插件有、宿主无」的行也永远不出现。
+- 重放去重照 `readChatSessionList` 的 `chatRowFrameSeq` / `replayChatRowFrames`：store 侧维持单调 seq，读前记 `subagentRecordSeq`，读后重放期间到达的帧；同一 `dshSessionId + childId` 按 seq 后者胜。**不要**把 `chat-list` 快照当成比在途帧更新。同一个 `dshSessionId` 可能对应多行 `ChatSessionView`，记录按 `dshSessionId + childId` 去重合并后再计数。
+- 详情按需：`subagents/detail` RPC 按 `{ dshSessionId, childId }` 返回有界原始条目；**不常驻 SSE 广播**。入参校验 `acp:` 前缀与会话归属，未知 / 越界返回空而不是抛内部错误。
 
 ---
 
@@ -146,7 +149,7 @@ interface SubagentRecord {
 
 | 态 | 判据 | 来源符号 |
 |---|---|---|
-| 排队中 | `status === 'pending'` 且无 `sawWorkerUpdate` | `BackgroundDispatch` |
+| 排队中 | `status === 'pending'`，或首个 `tool_call` 帧没有 status（空串），且无 `sawWorkerUpdate` | `BackgroundDispatch` |
 | 运行中 | `in_progress` / `detached` / `sawWorkerUpdate`；活动时钟由每条 dispatch / worker 更新续期 | `trackBackgroundDispatch` / `noteBackgroundWorkerActivity` |
 | 成功 | `status === 'completed'` | `tool_call_update`，**已知 callId 一律按 id 认**（真实完成帧无 `_meta`） |
 | 失败 | `status === 'failed'`；原因取该帧 `content` 原文，没有就写「agent 未给原因」 | 同上 |
@@ -159,6 +162,19 @@ interface SubagentRecord {
 - 拆 `completed = completed || failed` 为两个终态时，不得改变 `allDispatchesCompleted()` / `dispatchedDetachedWorker` / hold 进入条件 —— 那三个仍只关心「报完没有」，不关心「报得好不好」。
 - 任何拆除路径都必须写一条终态帧，**绝不留下永久「运行中」**。当前 `releaseDispatchActivity` 只发 `running:false`，这是必须补的洞。
 - `failed` 的原因可能为空字符串 / 对象 / 数组；按约束 29 保留形状，不许窄判定读成空。
+
+**拆除路径 → 终态**（已终态的行不得被覆盖）：
+
+| 路径 | 终态 |
+|---|---|
+| `trackBackgroundDispatch` 看到 `status === 'completed'` / `'failed'` | `completed` / `failed`；原因取该帧 `content` 原文，没有就「agent 未给原因」 |
+| `closeTurn` 带 `kind: 'cancelled'`（`abortActiveSegment` / `settle` / cancel 兜底 / 看门狗）且 dispatch 无终态 | `cancelled` |
+| `closeTurn` 带 `kind: 'error'` / `'stop'` 且 dispatch 无终态 | `unknown`（回合结束不是 worker 结束的证据） |
+| `releaseAll`（进程死亡 / 空闲释放） | `unknown` |
+| `closeSession('closed' / 'agent-stopped' / 'agent-died')` | `unknown`（关会话不是取消 worker） |
+| `dispose` / `parkSessions` / `forceReset` | `unknown` |
+
+- **迟到的终态帧**：`trackBackgroundDispatch` 在 `closedTurn` 后直接返回，回合关闭后才到的 completion / failure 不会改写记录，该行保持 `unknown`。这是已知限制，不是 bug；验收只要求不永久「运行中」。
 
 ---
 
@@ -192,7 +208,7 @@ ACP 会话  → <OwnSubagentCatalog />   （插件自绘）
 
 - **trigger**：`累计 N 个 · M 运行中` 分开写（修掉截图里「11 个子智能体」的歧义）；运行中才点亮图标。
 - **每行**：状态徽标（六态）+ `type · 描述` + `耗时 / 最后活动 / 工具调用数`；耗时用 `endedAt ?? now - startedAt`，运行中的行按秒推进，结束后冻结。`unknown` 行明确写「历史记录，状态未知」。
-- **点击整行**打开详情浮层：挂 `shell.overlay`，照 `settings-dialog.tsx` 的模块级 open state 做跨槽位开合（`AcpSettingsDialog` / `useAcpSettingsDialogOpen`）。详情内容：dispatch 的原始入参（`prompt` / `description` / `subagent_type`）、终态与失败原因原文、该 worker 的文本 / 思考 / 工具卡 / 结果流（按 `_meta['codebuddy.ai/parentToolCallId']` 过滤）。
+- **点击整行**打开详情浮层：挂 `shell.overlay`，照 `settings-dialog.tsx` 的模块级 open state 做跨槽位开合（`AcpSettingsDialog` / `useAcpSettingsDialogOpen`）。详情内容：dispatch 的原始入参（`prompt` / `description` / `subagent_type`）、终态与失败原因原文、该 worker 的文本 / 思考 / 工具卡 / 结果流。过滤条件必须**同时**包含两类帧：`toolCallId === <dispatch id>`（dispatch 自己的 `tool_call` / 完成帧；完成帧没有 `_meta`，原始入参也在这里）与 `_meta['codebuddy.ai/parentToolCallId'] === <dispatch id>`（worker 自己的更新）。只按后者会丢掉原始入参与终态原因。
 - **只读**：不做 prompt / cancel / spawn / 重试 / 停止（[AGENTS/ui.md §5](../../AGENTS/ui.md) 的 NTR 视图只读纪律同样适用于此面板）。
 - 样式只走宿主 alias token（约束 34），状态色按 `state-*-tertiary` / `state-*-primary` 配对；不写 `color-scheme`，不维护 JS 主题状态。文案中英双版进 `locale/`。
 
@@ -200,7 +216,7 @@ ACP 会话  → <OwnSubagentCatalog />   （插件自绘）
 
 `src/client/store.ts` · `foldUpdate` 会丢掉 `_meta`，且把相邻同类 prose 合并成一个 `Block` —— worker 正文与父回合正文会串在一起。**不要拿现有 `blocks` 当详情数据源**。两条路线：
 
-- **推荐**：新增独立的有界原始条目索引 `UiState.subagentDetails`，从 live `session/update` 帧按 `parentToolCallId` 追加、从 `session/chat-transcript` 的 raw `entries[].update` 重建（页面重载后）。不碰 `foldUpdate`，不影响 NTR 视图，也不违反约束 29。
+- **推荐**：新增独立的有界原始条目索引 `UiState.subagentDetails`，只从 live `session/update` 帧按上条规则追加；页面刚重载、该 worker 缓冲为空时，打开详情走 `subagents/detail` RPC 向宿主要一次有界历史，再落进同一个索引。**不要**再在浏览器侧从 `session/chat-transcript` 全量重建——那会和 RPC 变成两套事实源，还把整份 transcript 拉进 store。索引主键是 `dshSessionId + childId`，不能只用 `childId`（不同会话的 `toolCallId` 可能重复）。不碰 `foldUpdate`，不影响 NTR 视图，也不违反约束 29。
 - 备选：给 `Block` 加归属并改合并规则 —— 会动到 NTR 视图渲染，且跨 worker 合并必须拆开，回归面更大。**不选**。
 
 ---
@@ -210,12 +226,13 @@ ACP 会话  → <OwnSubagentCatalog />   （插件自绘）
 | 上限 | 值 | 语义 |
 |---|---|---|
 | `MAX_SUBAGENT_DETAIL_ENTRIES` | **200 条 / worker** | 原始 `session/update` 条目；超限丢最旧**并折一行截断标记**（约束 29 / 约束 8） |
+| `MAX_SUBAGENT_DETAIL_WORKERS` | **64 个 / 浏览器会话** | 浏览器 `subagentDetails` 最多保留这么多 worker 的明细索引，超出按最久未打开 LRU 逐出，防长会话打开几十个详情后内存无界 |
 | `MAX_SUBAGENT_RECORDS` | **200 条 / 聊天会话** | `agents.json` 的终态记录；逐出最旧的已终态记录，列表仍从宿主投影读全量，被逐出行标「未知」 |
 | 单条原文 | 复用 `ACP_TOOL_RAW_MAX`（256000 字符） | 超限只截断且留标记 |
 
 - 详情**只在内存 + 浏览器 store，不落盘**：体积大、写放大明显，且 `agents.json` 是整体重写。**DSH 重启后明细不可读**，面板明说「本次运行前的明细已不可读」，但标签 / 派出时间 / 终态 / 耗时仍在 —— 不承诺全量历史。
 - 与整会话的 `transcriptMaxEntries`（600）/ 浏览器 `MAX_BLOCKS`（400）**互不占用**：这是按 worker 计的独立预算，长会话里早期 worker 不会被后来的更新挤光。
-- `subagentFrames` 现有的 256 条重放日志退役后，新帧同样要有「读前记 seq、读后重放在途帧」的去重（照 `readChatSessionList` 的 `chatRowFrameSeq` / `replayChatRowFrames`），否则一份旧快照会盖掉刚到的终态。
+- `subagentFrames` 现有的 256 条重放日志退役后，`subagents/record` 帧沿用同一套 store 侧 seq 与「读前记 seq、读后重放在途帧」去重（照 `readChatSessionList` 的 `chatRowFrameSeq` / `replayChatRowFrames`），否则一份旧 `chat-list` 快照会盖掉刚到的终态。
 
 ---
 
@@ -223,11 +240,11 @@ ACP 会话  → <OwnSubagentCatalog />   （插件自绘）
 
 | 文件 | 改什么 |
 |---|---|
-| `src/protocol.ts` | `AcpEvent` 增 `subagents/record` / `subagents/snapshot`；`ChatSessionView` 用记录数组替换 `activeSubagents`；新增 `subagents/detail` 载荷与 `SubagentRecord` / `SubagentStatus` |
-| `src/impl.ts` | `dispatchRpc` 加路由与校验；`appendExternalSubagentCatalog` **不动**；新增 `subagentReplayFrames`（照 `permissionReplayFrames`） |
-| `src/bridge.ts` | `BackgroundDispatch` 增 `terminal` / `startedAt` / `endedAt` / `lastActivityAt` / `error` / `counts`；`trackBackgroundDispatch` 拆 completed/failed 并记原因；`broadcastDispatchActivity` → `broadcastSubagentRecord`；`closeDispatchActivity` / `closeAllDispatchActivity` / `releaseDispatchActivity` / `closeTurn` / `dispose` 写终态；`BridgeManager.chatSessions` 出记录快照；`persistAgents` / `loadPersistedAgents` 读写 `subagents` 键；`chatTranscripts` 增加按 `parentToolCallId` 过滤的按需详情读 |
-| `src/index.ts` | SSE 首帧重放（`path: '/api/acp/stream'` 的 `fetch`，`hub.subscribe(send)` 之后）；`wireSubagentCatalog` **不动** |
-| `src/client/store.ts` | `UiState.subagents` / `UiState.subagentDetails`；事件折叠与序号重放；`subagents/detail` 调用；有界逐出；`activeSubagents` / `subagentFrames` 退役 |
+| `src/protocol.ts` | `AcpEvent` 增 `subagents/record`（单条全量状态）；`ChatSessionView` 用 `subagents` 记录数组替换 `activeSubagents`；新增 `subagents/detail` 载荷（`{ dshSessionId, childId }`）与 `SubagentRecord` / `SubagentStatus` |
+| `src/impl.ts` | `dispatchRpc` 加路由与校验；`appendExternalSubagentCatalog` **不动**；记录归一化 / 上限裁剪的纯函数放这里（照 `permissionReplayFrames` 的可测试风格） |
+| `src/bridge.ts` | `BackgroundDispatch` 增 `terminal` / `startedAt` / `endedAt` / `lastActivityAt` / `error` / `counts`；`trackBackgroundDispatch` 拆 completed/failed 并记原因；**在 dispatch 创建与状态迁移处发 record 帧，不受 `catalogReported` 门禁**；`closeDispatchActivity` / `closeAllDispatchActivity` / `releaseDispatchActivity` / `closeTurn` / `dispose` 按 §4 的表写终态；`BridgeManager.chatSessions` 带 live + released 会话的记录快照；`persistAgents` / `loadPersistedAgents` 读写 `subagents` 键并只在状态迁移落盘、加载时 prune 孤儿键；`chatTranscripts` 增加按 `toolCallId` + `parentToolCallId` 过滤的按需详情读（含 released 会话的存量 buffer） |
+| `src/index.ts` | 无改动（`wireSubagentCatalog` 与 SSE 路由都不动）；快照由 `session/chat-list` 行携带 |
+| `src/client/store.ts` | `UiState.subagents` / `UiState.subagentDetails`（主键 `dshSessionId + childId`）；`subagents/record` 折叠、store 侧 seq 重放去重；`subagents/detail` 按需调用；明细与记录的有界逐出（worker LRU）；`activeSubagents` / `subagentFrames` 退役 |
 | `src/client/subagent-activity.tsx` | `SubagentCatalogOccupant` 分流；`mergeSubagentStatuses` / `useSessionStatus` patch 退役；`findHostCatalog` / `createSubagentCatalogClaim` 的 fail-open 校验保留并扩展 |
 | `src/client/subagent-panel.tsx`（新） | `OwnSubagentCatalog`（trigger + 列表）+ `SubagentDetailDialog`（`shell.overlay`）+ 状态 / 耗时 / 上限的纯函数 |
 | `src/client/index.tsx` | `syncAcpMode` 的 `subagentCatalogClaim` 注册保持不变；`shell.overlay` 注册详情浮层；`chatFace` 传递不变 |
@@ -241,11 +258,11 @@ ACP 会话  → <OwnSubagentCatalog />   （插件自绘）
 ## 8. 测试计划
 
 - `tests/subagent-activity.spec.tsx`：ACP 分支渲染自绘、非 ACP 直通宿主组件、投影形状不认识时 fail-open、`useSessions` 缺席、claim 的装 / 撤；fake host 已传 `useSessions`（`renderShadow`），补 `projectionsBySession` 的样本数组。
-- `tests/store.spec.ts`：`subagents/record` 折叠、快照与在途帧重放去重、上限逐出留截断标记、页面重载后从 `session/chat-transcript` 重建详情、六态显示文案。
-- `tests/bridge.spec.ts`：completed / failed / cancelled / unknown 四种终态各发一帧；同一帧 detached + completed 不点亮；每条拆除路径都不留 `running`；`agents.json` 落盘往返与历史行标 `unknown`；hold 进入条件不因拆终态而改变。
-- `tests/mock-agent.mjs`：当前没有 `status: 'failed'` 的 dispatch 变体，新增 `DISPATCHFAILED`（完成帧不带 `_meta`，按 callId 认），再补一条带 `content` 失败原文的用例。
-- `tests/impl.spec.ts`：`subagents/detail` 的载荷校验、`subagentReplayFrames`、记录 schema 归一化。
-- `tests/acp-view.spec.ts`：浏览器半区纯函数（状态标签、耗时格式、上限裁剪、截断标记、`unknown` 文案）。
+- `tests/store.spec.ts`：`subagents/record` 折叠、`chat-list` 快照与在途帧按 seq 重放去重、上限逐出留截断标记、页面重载后按需走 `subagents/detail` 拉详情、明细 worker LRU、六态显示文案。
+- `tests/bridge.spec.ts`：completed / failed / cancelled / unknown 四种终态各发一帧；同一帧 detached + completed 不点亮；**未上报 catalog 的 dispatch 也发 record 帧**；每条拆除路径都不留 `running`；`agents.json` 只在状态迁移落盘（活动更新不写盘）、往返与历史行标 `unknown`、孤儿 `subagents` 键在加载时被 prune；回合关闭后迟到的完成帧不改写记录；hold 进入条件不因拆终态而改变。
+- `tests/mock-agent.mjs`：当前没有 `status: 'failed'` 的 dispatch 变体，新增 `DISPATCHFAILED`（完成帧不带 `_meta`，按 callId 认），再补一条带 `content` 失败原文的用例；补一条首个 `tool_call` 帧不带 status 的 dispatch，覆盖 `pending` 默认态。
+- `tests/impl.spec.ts`：`subagents/detail` 的载荷校验（`acp:` 前缀、会话归属）、记录 schema 归一化与上限裁剪。
+- `tests/acp-view.spec.ts`：浏览器半区纯函数（状态标签、耗时格式、上限裁剪、截断标记、`unknown` 文案、详情过滤同时命中 `toolCallId` 与 `parentToolCallId`）。
 - 提交前全量：`npm run prepack`。
 
 ---
@@ -261,13 +278,18 @@ ACP 会话  → <OwnSubagentCatalog />   （插件自绘）
 7. **宿主升级**：`subagentCatalog` 的 `wire.view` 数组形状、`stateVersion`、检查点 `ver` 都可能变；按 [AGENTS/host.md §5](../../AGENTS/host.md) 冒烟并补 §5.2 症状行。检查点 `ver` 不匹配时宿主会从日志重折叠，**目录成员本身不会丢**。
 8. **多视图**：claim 页面级，只有舞台会话替换；同屏其它 ACP 面板仍显示宿主 trigger，视觉不一致是已知取舍，不新增 per-session 钩子去修。
 9. **历史一致性**：插件升级前的 catalog 行没有插件记录 → `unknown`，不许回填成 `completed`。
+10. **写放大**：`agents.json` 是同步全量重写；record 只在状态迁移落盘，`lastActivityAt` 只留内存。任何「每条更新都 persist」的实现都是错的。
+11. **广播点**：record 帧不得挂在 `catalogReported` 门禁后面；未上报 catalog 的 dispatch 必须能被面板看到（「目录待同步」）。
+12. **详情归属**：过滤必须同时命中 dispatch 自己的 `toolCallId` 帧与 worker 的 `parentToolCallId` 帧；索引主键必须带 `dshSessionId`，不能只用 `childId`。
+13. **记录生命周期**：`subagents` 键随会话关闭 / agent 删除 / 加载时 prune，否则 `agents.json` 会一直变胖。
+14. **快照竞态**：`chat-list` 快照与在途 `subagents/record` 帧按 store 侧 seq 去重，后者胜；旧快照不得覆盖新终态。
 
 ---
 
 ## 10. 实施顺序（别一次性大改）
 
-1. **数据层**：`SubagentRecord` 契约 + 帧 + 桥的终态写入 + `agents.json` 落盘 + SSE 快照重放。此时**不动 UI**，仍走宿主 trigger；用 `tests/bridge.spec.ts` / `tests/store.spec.ts` 验证四种终态与重放。
-2. **在 NTR 视图页签里验证状态机**：`src/client/acp-view.tsx` 增一个只读分区显示六态与耗时，零槽位风险；真机（CodeBuddy multitask）跑一轮确认 completed / failed 判据与 `parentToolCallId` 归属。
+1. **数据层**：`SubagentRecord` 契约 + 帧 + 桥的终态写入（§4 的路径表）+ `agents.json` 状态迁移落盘 + `chat-list` 快照 / 在途帧重放。此时**不动 UI**，仍走宿主 trigger；用 `tests/bridge.spec.ts` / `tests/store.spec.ts` 验证四种终态与重放。
+2. **在 NTR 视图页签里验证状态机**：`src/client/acp-view.tsx` 增一个只读分区显示六态与耗时，零槽位风险；真机（CodeBuddy multitask）跑一轮确认 completed / failed 判据，以及详情过滤能否同时命中 dispatch 帧与 worker 帧。
 3. **替换头部 trigger**：§5 的 occupant 分流 + 详情浮层；最后才退役 `mergeSubagentStatuses` / `activeSubagents` / `subagents/update` 并同步 `AGENTS/retired.md`。
 4. 按 [AGENTS/host.md §5](../../AGENTS/host.md) 跑宿主升级冒烟，`npm run prepack`，挂本地 DSH 真机验收 §12。
 
@@ -275,10 +297,9 @@ ACP 会话  → <OwnSubagentCatalog />   （插件自绘）
 
 ## 11. 未决项（接手时先答，别猜）
 
-1. **`childCreatedAt` 是否在客户端 `subagentCatalog` view 里**：按 §5.3 解包 `app.asar` 读 `dsh-subagent` 的 `wire.view` 定义确认；不在就用插件 append 时的 `now`，历史行从宿主日志冷读（`sessionPersistence.open(id, 'read').read`）。
-2. **投影数组里出现原生子代理行时的兜底**：§5.2 暂定「一律直通宿主组件」。若产品要求「原生行与 external 行同屏」，需要重新设计导航，另开方案，不在本方案里塞。
-3. **明细是否落盘**：当前决定**不落**（体积与写放大）。若用户要求跨重启看明细，必须另定有界文件与预算，并同步 `AGENTS/state.md §1`。
-4. **HMR 过渡**：host 与 client 是同一 bundle，`subagents/update` 退役不留兼容层；若实测 HMR 期间旧页面出现空白，靠 §5.2 的 fail-open 兜，不恢复第二套事实源。
+1. **投影数组里出现原生子代理行时的兜底**：§5.2 暂定「一律直通宿主组件」。若产品要求「原生行与 external 行同屏」，需要重新设计导航，另开方案，不在本方案里塞。
+2. **明细是否落盘**：当前决定**不落**（体积与写放大）。若用户要求跨重启看明细，必须另定有界文件与预算，并同步 `AGENTS/state.md §1`。
+3. **HMR 过渡**：host 与 client 是同一 bundle，`subagents/update` 退役不留兼容层；若实测 HMR 期间旧页面出现空白，靠 §5.2 的 fail-open 兜，不恢复第二套事实源。
 
 ---
 
@@ -286,10 +307,12 @@ ACP 会话  → <OwnSubagentCatalog />   （插件自绘）
 
 - [ ] ACP 会话头部只有**一个**子智能体入口，是插件自绘的；非 ACP 会话是宿主原生 trigger，视觉与升级前一致。
 - [ ] trigger 把「累计派出 N」与「当前 M 运行中」分开写；同一会话跨多轮累积的行不会越刷越少。
-- [ ] 六态可辨：派发即 `pending` → worker 更新即 `running` → `completed` / `failed` 分别显示；失败行展示 agent 原文原因（没有就写「agent 未给原因」）；用户取消显示 `cancelled`；进程拆除 / 升级前历史行显示 `unknown`，**没有任何行永久停在「运行中」**。
-- [ ] 点击任一行打开详情：原始入参、终态、失败原因、该 worker 的文本 / 思考 / 工具卡 / 结果流，且不与父回合正文串在一起。
-- [ ] 详情超 200 条 / worker 时丢最旧并留截断标记；终态超 200 条 / 会话时逐出最旧已终态记录，列表仍全量、被逐出行标「未知」。
-- [ ] 刷新页面 / 重连 SSE：列表、终态、耗时恢复；DSH 重启后标签 / 派出时间 / 终态仍在，明细明说不可读。
+- [ ] 六态可辨：派发即 `pending`（含首帧无 status 的空串）→ worker 更新即 `running` → `completed` / `failed` 分别显示；失败行展示 agent 原文原因（没有就写「agent 未给原因」）；用户取消显示 `cancelled`；进程拆除 / 升级前历史行显示 `unknown`，**没有任何行永久停在「运行中」**。
+- [ ] 尚未上报 host catalog 的 dispatch 也出现在列表里，标「目录待同步」，不被 `catalogReported` 门禁吞掉。
+- [ ] 点击任一行打开详情：原始入参、终态、失败原因、该 worker 的文本 / 思考 / 工具卡 / 结果流（dispatch 帧与 worker 帧都命中），且不与父回合正文串在一起。
+- [ ] 详情超 200 条 / worker 时丢最旧并留截断标记；终态超 200 条 / 会话时逐出最旧已终态记录，列表仍全量、被逐出行标「未知」；浏览器明细索引不超过 64 个 worker（LRU）。
+- [ ] `agents.json` 只在状态迁移时写；worker 活动更新不触发落盘；孤儿 `subagents` 键在加载 / 会话关闭时被 prune。
+- [ ] 刷新页面 / 重连：列表、终态、耗时从 `chat-list` 快照恢复，在途帧按 seq 去重不覆盖新终态；DSH 重启后标签 / 派出时间 / 终态仍在，明细明说不可读。
 - [ ] 宿主 entry 缺失 / 投影形状不认识 / 出现原生行时，自动退回宿主组件并在诊断里如实说明；普通会话根本看不到插件面板。
 - [ ] `npm run prepack` 全绿；bridge 集成用例覆盖四种终态与所有拆除路径；§6 的三处 hold 语义一字未变。
 - [ ] `AGENTS/ui.md §4.3` / `AGENTS/protocol.md §6.3` / `AGENTS/host.md §5.1` / `AGENTS/state.md §1` / `AGENTS/retired.md` / `docs/README.md` 同步更新；发版补 `CHANGELOG.md`。
