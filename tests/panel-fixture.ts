@@ -18,6 +18,7 @@ import type {
   IdleReleaseResult,
   PermissionOutcome,
   PluginUpdateState,
+  SessionTitlePrefixSetPayload,
   TagHaloSetPayload,
 } from '../src/protocol.ts'
 
@@ -137,6 +138,7 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
   let firstAgentRead = true
   let defaultAgentId = options.defaultAgentId === null ? undefined : options.defaultAgentId ?? 'codebuddy'
   let halo = structuredClone<AcpTagHalo>(options.tagHalo ?? { mode: 'breath', speed: 'normal' })
+  let titlePrefix = false
   const preset = options.preset === null ? null : structuredClone<AcpPresetStatus>(options.preset ?? {
     id: 'acp', source: 'dsh-ntr/presets/acp/acp.patch.yml', installed: true,
   })
@@ -340,6 +342,10 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
         case 'ui/tag-halo-set':
           halo = structuredClone((payload as TagHaloSetPayload).halo)
           return ok({ done: true })
+        case 'ui/session-title-prefix': return ok({ titlePrefix })
+        case 'ui/session-title-prefix-set':
+          titlePrefix = (payload as SessionTitlePrefixSetPayload).titlePrefix === true
+          return ok({ titlePrefix })
         case 'ui/approval-deadlines':
           return options.approvalDeadlines === null ? unsupported() : ok({ deadlines: approvalDeadlines() })
         case 'ui/approval-deadlines-set': {

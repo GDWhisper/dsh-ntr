@@ -938,9 +938,12 @@ describe('AcpSettingsSection editing', () => {
     expect(payloads(fixture, 'ui/tag-halo-set')).toEqual([
       { halo: { mode: 'breath', speed: 'fast' } }, { halo: { mode: 'steady', speed: 'fast' } },
     ])
+    await click(screen.getByRole('button', { name: '开启' }))
+    expect(payloads(fixture, 'ui/session-title-prefix-set')).toEqual([{ titlePrefix: true }])
     await act(async () => { await fixture.store.resync() })
     expect(fixture.store.getSnapshot().defaultAgent).toBe('pi')
     expect(fixture.store.getSnapshot().tagHalo).toEqual({ mode: 'steady', speed: 'fast' })
+    expect(fixture.store.getSnapshot().titlePrefix).toBe(true)
     expect(screen.queryByRole('button', { name: '快速' })).toBeNull()
     expect(payloads(fixture, 'agent/save')).toEqual([])
     expect(payloads(fixture, 'agent/probe-models')).toEqual([])

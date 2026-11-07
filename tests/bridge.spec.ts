@@ -16,6 +16,7 @@ import {
   type StartAttempt,
   permissionAskReason, permissionToolName,
 } from '../src/bridge.ts'
+import { SESSION_TITLE_PREFIX } from '../src/protocol.ts'
 import { ACP_TOOL_CALL_NAME, AcpError, EventHub, dispatchRpc, permissionReplayFrames } from '../src/impl.ts'
 import { AcpSaveGate } from '../src/save-gate.ts'
 import type { AcpAgentCatalog, AcpAgentDef, AcpEvent, ActiveTurnView, AgentCatalogResult, ChatSessionView, ChatTranscriptView, GenerateMessage, StreamChunk, SubagentRecord } from '../src/protocol.ts'
@@ -813,6 +814,30 @@ describe('ACP bridge over stdio (mock agent)', () => {
     expect(titleText).toBe('给这个仓库写一份测试指南')
     const titleFinish = titleChunks.find((c): c is Extract<StreamChunk, { type: 'finish' }> => c.type === 'finish')
     expect(titleFinish?.reason).toMatchObject({ kind: 'stop' })
+
+    // The settings toggle prefixes the same answer (the flag is read at
+    // request time, so the toggle lands without restarting anything) while
+    // keeping the placeholder's own budget. The pick persists with the agent
+    // registry — the reload round-trip is pinned by its own test below.
+    await manager.setSessionTitlePrefix(true)
+    const prefixedChunks: StreamChunk[] = []
+    for await (const chunk of adapter.stream({
+      provider: 'acp',
+      model: 'mock',
+      sessionId,
+      purpose: 'session-title',
+      messages: [{
+        role: 'user',
+        source: { kind: 'plugin', plugin: 'dsh-session-title-llm' },
+        content: [{ type: 'text', text: 'Generate the session title from this JSON array of human messages: ["给这个仓库写一份测试指南","second human line"]' }],
+      }],
+    })) {
+      prefixedChunks.push(chunk)
+    }
+    const prefixedText = prefixedChunks.find((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')?.text
+    expect(prefixedText).toBe(`${SESSION_TITLE_PREFIX}给这个仓库写一份测试指南`)
+    // Back off, so the shared manager's later tests see the default again.
+    await manager.setSessionTitlePrefix(false)
 
     // A title prompt without a parseable human-message array keeps the old
     // refusal, and compaction is refused outright: the adapter must never turn
@@ -5999,6 +6024,26 @@ describe('pre-chat pick persistence (isolated manager)', () => {
     const reloaded = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
     expect(reloaded.tagHalo()).toEqual({ mode: 'steady', speed: 'slow' })
     await reloaded.shutdownAll()
+    await gm.shutdownAll()
+  })
+
+  it('persists the session-title prefix toggle and reloads it', async () => {
+    const storage = `${tmpdir()}/acp-title-prefix-${Date.now()}.json`
+    const gm = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
+    // The default before anything was ever saved.
+    expect(gm.sessionTitlePrefix()).toBe(false)
+
+    await gm.setSessionTitlePrefix(true)
+    // A fresh manager (host restart) reads the same registry file back.
+    const reloaded = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
+    expect(reloaded.sessionTitlePrefix()).toBe(true)
+    await reloaded.shutdownAll()
+    // A hand-edited non-boolean reads as off, never as on — the same
+    // user-editable-file rule the halo preference hydrates by.
+    writeFileSync(storage, readFileSync(storage, 'utf-8').replace(/"sessionTitlePrefix": ?true/, '"sessionTitlePrefix":"true"'))
+    const coerced = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
+    expect(coerced.sessionTitlePrefix()).toBe(false)
+    await coerced.shutdownAll()
     await gm.shutdownAll()
   })
 

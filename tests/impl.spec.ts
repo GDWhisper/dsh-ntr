@@ -67,7 +67,7 @@ import {
 import { agentRefusalDetail } from '../src/bridge.ts'
 import type { AcpManager } from '../src/impl.ts'
 import type { AcpAgentDef, AgentProbeModelsResult, PermissionOptionView, SubagentRecord } from '../src/protocol.ts'
-import { MAX_SUBAGENT_RECORDS } from '../src/protocol.ts'
+import { MAX_SUBAGENT_RECORDS, SESSION_TITLE_PREFIX } from '../src/protocol.ts'
 
 function agentDef(overrides: Partial<AcpAgentDef> = {}): AcpAgentDef {
   return {
@@ -1644,6 +1644,22 @@ describe('extractSessionTitlePlaceholder (host title prompt → placeholder titl
       .toBe('a'.repeat(SESSION_TITLE_PLACEHOLDER_MAX - 1) + '🙂' + '…')
   })
 
+  it('prepends the settings prefix inside the same total cap', () => {
+    const prefixLen = Array.from(SESSION_TITLE_PREFIX).length
+    // Off (the default): byte-identical to the prefixless answer, explicit or not.
+    expect(extractSessionTitlePlaceholder(titlePrompt('["你好"]'))).toBe('你好')
+    expect(extractSessionTitlePlaceholder(titlePrompt('["你好"]'), '')).toBe('你好')
+    // On: the prefix rides the front of the same placeholder.
+    expect(extractSessionTitlePlaceholder(titlePrompt('["你好"]'), SESSION_TITLE_PREFIX)).toBe(SESSION_TITLE_PREFIX + '你好')
+    // A long title reserves the prefix's code points from the cap first, so
+    // the full answer keeps exactly the prefixless worst-case length.
+    const long = '啊'.repeat(SESSION_TITLE_PLACEHOLDER_MAX + 10)
+    expect(extractSessionTitlePlaceholder(titlePrompt(`["${long}"]`), SESSION_TITLE_PREFIX))
+      .toBe(SESSION_TITLE_PREFIX + '啊'.repeat(SESSION_TITLE_PLACEHOLDER_MAX - prefixLen) + '…')
+    // Unparseable prompts stay undefined either way — no prefix-only answer.
+    expect(extractSessionTitlePlaceholder(titlePrompt('no array here'), SESSION_TITLE_PREFIX)).toBeUndefined()
+  })
+
   it('returns undefined for prompts without a parseable human-message array', () => {
     expect(extractSessionTitlePlaceholder(titlePrompt('Generate the session title from this JSON array of human messages: not json'))).toBeUndefined()
     expect(extractSessionTitlePlaceholder(titlePrompt('Generate the session title: []'))).toBeUndefined()
@@ -2480,6 +2496,8 @@ function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } {
     setDefaultAgent: async id => { calls.push(['setDefaultAgent', id]) },
     tagHalo: () => ({ mode: 'breath', speed: 'slow' }),
     setTagHalo: async halo => { calls.push(['setTagHalo', halo]) },
+    sessionTitlePrefix: () => true,
+    setSessionTitlePrefix: async value => { calls.push(['setSessionTitlePrefix', value]) },
     approvalDeadlines: () => ({ permissionTimeoutMs: 300_000, mode: 'abort' as const }),
     setApprovalDeadlines: async (patch, reset) => { calls.push(['setApprovalDeadlines', patch, reset]) },
     idleRelease: () => ({ idleTimeoutMs: 1_800_000, defaultIdleTimeoutMs: 1_800_000 }),
@@ -2776,6 +2794,15 @@ describe('dispatchRpc', () => {
     await expect(dispatchRpc(manager, 'ui/tag-halo-set', { halo: { mode: 'blink', speed: 'fast' } })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     await expect(dispatchRpc(manager, 'ui/tag-halo-set', { halo: { mode: 'breath', speed: 'ludicrous' } })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     await expect(dispatchRpc(manager, 'ui/tag-halo-set', {})).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    // The session-title prefix toggle: read falls back to off on an older
+    // host half; only a boolean passes the write gate.
+    await expect(dispatchRpc(manager, 'ui/session-title-prefix', {})).resolves.toEqual({ ok: true, value: { titlePrefix: true } })
+    await expect(dispatchRpc({ ...manager, sessionTitlePrefix: undefined }, 'ui/session-title-prefix', {})).resolves.toEqual({ ok: true, value: { titlePrefix: false } })
+    await expect(dispatchRpc(manager, 'ui/session-title-prefix-set', { titlePrefix: true })).resolves.toEqual({ ok: true, value: { titlePrefix: true } })
+    expect(manager.calls).toContainEqual(['setSessionTitlePrefix', true])
+    await expect(dispatchRpc({ ...manager, sessionTitlePrefix: () => false }, 'ui/session-title-prefix-set', { titlePrefix: false })).resolves.toEqual({ ok: true, value: { titlePrefix: false } })
+    await expect(dispatchRpc(manager, 'ui/session-title-prefix-set', {})).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc(manager, 'ui/session-title-prefix-set', { titlePrefix: 'yes' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     // The approval deadlines: read is `undefined` on an older host half (which
     // hides the card), and a write is validated before it reaches the manager —
     // the same range the config file is held to, so a value the card can send is

@@ -1548,7 +1548,7 @@ export function AcpSettingsSection(props: WithStore) {
         <div className="dwa-section-heading">
           <div>
             <h3 className="dwa-section-title">{acp.label('对话外观', 'Conversation appearance')}</h3>
-            <p className="dwa-section-copy">{acp.label('设置对话中 NTR 挂牌的进程存活提示。', 'Choose how the NTR tag indicates a running agent process.')}</p>
+            <p className="dwa-section-copy">{acp.label('设置 NTR 在对话与侧栏里的可见标识。', 'Choose how NTR marks itself up in the conversation and sidebar.')}</p>
           </div>
         </div>
         <div className="dwa-preferences">
@@ -1590,6 +1590,24 @@ export function AcpSettingsSection(props: WithStore) {
               </div>
             </div>
           )}
+          <div className="dwa-preference-row">
+            <div>
+              <div className="dwa-preference-label">{acp.label('标题标识', 'Title badge')}</div>
+              <div className="dwa-preference-copy">{acp.label('生成的会话标题带 [NTR] 前缀。', 'Generated session titles gain the [NTR] prefix.')}</div>
+            </div>
+            <div className="dwa-seg">
+              {([false, true] as const).map(value => (
+                <button
+                  key={String(value)}
+                  type="button"
+                  className={ui.titlePrefix === value ? 'is-on' : ''}
+                  onClick={() => void acp.setTitlePrefix(value)}
+                >
+                  {value ? acp.label('开启', 'On') : acp.label('关闭', 'Off')}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
       </section>
       {/* Conditional on purpose: this list can hold 200 rows, and keeping it

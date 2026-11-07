@@ -12,7 +12,7 @@ import type {
   ActiveTurnView, AgentSaveMode, AgentSaveResult, SaveGateFlushResult, SaveGateStatus,
   SubagentDetailEntry, SubagentDetailResult, SubagentRecord, SubagentStatus,
 } from './protocol.ts'
-import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_TAG_HALO, IDLE_RELEASE_MS, MAX_SUBAGENT_RECORDS } from './protocol.ts'
+import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, IDLE_RELEASE_MS, MAX_SUBAGENT_RECORDS } from './protocol.ts'
 
 export { randomUUID }
 
@@ -2694,11 +2694,16 @@ export const SESSION_TITLE_PLACEHOLDER_MAX = 60
  * `unsupported_purpose` refusal — the worst case stays exactly what shipped
  * before the placeholder existed (issue #11: the host's own text fallback does
  * not fire on every host version, so a parseable prompt must be answered).
+ *
+ * When `prefix` is non-empty, its code-point length is reserved from the cap
+ * and the result comes back with the prefix already prepended — the full
+ * answer keeps exactly the worst-case length the prefixless form had, so the
+ * settings toggle changes what the title starts with, not how long it can get.
  */
 export function extractSessionTitlePlaceholder(messages: readonly {
   role: string
   content?: string | Array<{ type?: string; text?: string; [k: string]: unknown }> | { type?: string; text?: string; [k: string]: unknown }
-}[]): string | undefined {
+}[], prefix = ''): string | undefined {
   const blocks: string[] = []
   for (const message of messages) {
     if (message.role !== 'user') continue
@@ -2714,6 +2719,7 @@ export function extractSessionTitlePlaceholder(messages: readonly {
   }
 
   const prompt = blocks.join('\n')
+  const budget = Math.max(0, SESSION_TITLE_PLACEHOLDER_MAX - Array.from(prefix).length)
   for (let start = prompt.indexOf('['); start !== -1; start = prompt.indexOf('[', start + 1)) {
     let parsed: unknown
     try {
@@ -2732,8 +2738,10 @@ export function extractSessionTitlePlaceholder(messages: readonly {
       const collapsed = value.replace(/\s+/gu, ' ').trim()
       if (collapsed === '') continue
       const chars = Array.from(collapsed)
-      if (chars.length <= SESSION_TITLE_PLACEHOLDER_MAX) return collapsed
-      return chars.slice(0, SESSION_TITLE_PLACEHOLDER_MAX).join('') + '…'
+      const capped = chars.length <= budget
+        ? collapsed
+        : chars.slice(0, budget).join('') + '…'
+      return prefix === '' ? capped : prefix + capped
     }
   }
   return undefined
@@ -3619,6 +3627,13 @@ export interface AcpManager {
   /** Write the halo preference (persisted with the agent registry). */
   setTagHalo?(halo: AcpTagHalo): Promise<void>
   /**
+   * Whether generated NTR session titles carry the {@link SESSION_TITLE_PREFIX}
+   * badge (plugin-private setting, persisted with the agent registry).
+   */
+  sessionTitlePrefix?(): boolean
+  /** Write the title-prefix toggle (persisted with the agent registry). */
+  setSessionTitlePrefix?(value: boolean): Promise<void>
+  /**
    * The approval deadline in force, with the facts that explain an override
    * (the `cordis.patch.yml` baseline it outranks). `undefined` on a host half
    * from before the card existed, which hides the settings card instead of
@@ -4176,6 +4191,15 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
       case 'ui/tag-halo-set': {
         await manager.setTagHalo?.(validateTagHalo(body.halo))
         return ok({ done: true })
+      }
+      case 'ui/session-title-prefix':
+        // Absent on a host half from before the setting existed: the browser
+        // shows off rather than guessing a value it cannot trust.
+        return ok({ titlePrefix: manager.sessionTitlePrefix?.() ?? DEFAULT_SESSION_TITLE_PREFIX })
+      case 'ui/session-title-prefix-set': {
+        if (typeof body.titlePrefix !== 'boolean') throw new AcpError('bad_payload', 'acp: titlePrefix must be boolean')
+        await manager.setSessionTitlePrefix?.(body.titlePrefix)
+        return ok({ titlePrefix: manager.sessionTitlePrefix?.() ?? DEFAULT_SESSION_TITLE_PREFIX })
       }
       case 'ui/approval-deadlines':
         // Absent on a host half from before the card existed: the browser then

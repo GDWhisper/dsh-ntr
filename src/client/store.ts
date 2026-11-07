@@ -7,7 +7,7 @@
  */
 
 import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentSkillsResult, AgentSkillEntry, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, IdleReleaseResult, IdleReleaseSetPayload, PermissionTimeoutMode, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, SubagentDetailEntry, SubagentDetailResult, SubagentRecord } from '../protocol.ts'
-import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_TAG_HALO, MAX_SUBAGENT_DETAIL_ENTRIES } from '../protocol.ts'
+import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, MAX_SUBAGENT_DETAIL_ENTRIES } from '../protocol.ts'
 
 /** One slash command the ACP agent declared, whole row (the menu draws name, description and `input.hint`). */
 export type AgentCommand = NonNullable<ChatSessionView['availableCommands']>[number]
@@ -576,6 +576,13 @@ export interface UiState {
    */
   tagHalo: AcpTagHalo
   /**
+   * Whether generated NTR session titles carry the `[NTR] ` badge (settings
+   * toggle, default off). Writes land optimistically first; the host answer
+   * is the authority. Only future title generations change — titles the host
+   * already accepted are durable and stay as they are.
+   */
+  titlePrefix: boolean
+  /**
    * The approval deadlines in force, as the settings card edits them. Absent on
    * a host half from before the card existed, which hides the card rather than
    * showing a number this browser invented. Writes land optimistically and the
@@ -1025,6 +1032,7 @@ export class AcpStore {
     chatSessions: [],
     burstStats: {},
     tagHalo: { ...DEFAULT_TAG_HALO },
+    titlePrefix: DEFAULT_SESSION_TITLE_PREFIX,
     approvalDeadlines: undefined,
     idleRelease: undefined,
     saveGate: {
@@ -1379,7 +1387,7 @@ export class AcpStore {
   /** Snapshot refresh used on panel open and after a stream outage. */
   async resync(): Promise<void> {
     try {
-      const [{ agents }, { sessions }, defaultAgentInfo, detectResult, presetResult, tagHaloResult, deadlinesResult, idleReleaseResult, saveGateResult, versionResult] = await Promise.all([
+      const [{ agents }, { sessions }, defaultAgentInfo, detectResult, presetResult, tagHaloResult, titlePrefixResult, deadlinesResult, idleReleaseResult, saveGateResult, versionResult] = await Promise.all([
         this.call<{ agents: AgentView[] }>('agents/list'),
         this.call<{ sessions: SessionView[] }>('sessions/list'),
         // The plugin's OWN default ACP agent — a plugin-private id, not a DSH
@@ -1390,6 +1398,8 @@ export class AcpStore {
         this.call<{ preset: AcpPresetStatus | null }>('preset/status').catch(() => null),
         // Host without the endpoint (older half) keeps the local default.
         this.call<{ halo: AcpTagHalo }>('ui/tag-halo').catch(() => ({ halo: { ...DEFAULT_TAG_HALO } })),
+        // Host without the endpoint (older half) keeps the local default (off).
+        this.call<{ titlePrefix: boolean }>('ui/session-title-prefix').catch(() => ({ titlePrefix: DEFAULT_SESSION_TITLE_PREFIX })),
         // `undefined` (older half) hides the deadline card instead of showing a
         // number this browser made up.
         this.call<ApprovalDeadlinesResult>('ui/approval-deadlines').catch(() => ({ deadlines: undefined })),
@@ -1420,6 +1430,7 @@ export class AcpStore {
         detectedAgents,
         preset: presetResult?.preset ?? undefined,
         tagHalo: tagHaloResult?.halo ?? { ...DEFAULT_TAG_HALO },
+        titlePrefix: titlePrefixResult?.titlePrefix ?? DEFAULT_SESSION_TITLE_PREFIX,
         approvalDeadlines: deadlinesResult.deadlines,
         idleRelease: idleReleaseResult.idleRelease,
         ...(nextSaveGate === undefined ? {} : { saveGate: nextSaveGate }),
@@ -3219,6 +3230,23 @@ export class AcpStore {
       await this.call('ui/tag-halo-set', { halo })
     } catch (error) {
       this.mutate({ tagHalo: previous })
+      this.flashError(error)
+    }
+  }
+
+  /**
+   * Write the title-prefix toggle (settings page). Optimistic like
+   * {@link setTagHalo}: the row flips with the click and reverts to the host
+   * answer on a failure. The host persists the pick and applies it from the
+   * next title generation on.
+   */
+  async setTitlePrefix(value: boolean): Promise<void> {
+    const previous = this.state.titlePrefix
+    this.mutate({ titlePrefix: value === true })
+    try {
+      await this.call('ui/session-title-prefix-set', { titlePrefix: value === true })
+    } catch (error) {
+      this.mutate({ titlePrefix: previous })
       this.flashError(error)
     }
   }

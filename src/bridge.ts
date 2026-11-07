@@ -85,7 +85,7 @@ import type {
   AcpIdleRelease, ActiveTurnView, ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PluginUpdateState, PreparedAdapterCall, SaveGateFlushResult, SaveGateStatus, SessionView, StreamChunk,
   SubagentDetailEntry, SubagentDetailResult, SubagentRecord, SubagentStatus,
 } from './protocol.ts'
-import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_TAG_HALO, IDLE_RELEASE_MS, MAX_SUBAGENT_DETAIL_ENTRIES } from './protocol.ts'
+import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, IDLE_RELEASE_MS, MAX_SUBAGENT_DETAIL_ENTRIES, SESSION_TITLE_PREFIX } from './protocol.ts'
 import type { AcpSaveGate } from './save-gate.ts'
 import { SaveGateAborted } from './save-gate.ts'
 import { OUTPUT_CHARS_PER_TOKEN, TurnTpsTracker } from './tps.ts'
@@ -6521,6 +6521,14 @@ export class BridgeManager {
   /** The agent tag's halo preference (persisted; see `persistAgents`). */
   private tagHaloSetting: AcpTagHalo = { ...DEFAULT_TAG_HALO }
   /**
+   * Whether generated NTR session titles carry the {@link SESSION_TITLE_PREFIX}
+   * badge (persisted; see `persistAgents`). Read at title-request time, so a
+   * settings toggle reaches the next generated title without restarting
+   * anything — but already-accepted titles are durable `session/title` events
+   * the host owns, so flipping the switch never rewrites existing rows.
+   */
+  private sessionTitlePrefixEnabled = DEFAULT_SESSION_TITLE_PREFIX
+  /**
    * What `cordis.patch.yml` asked for — ONLY if it actually named the key.
    * This is the deployment baseline, kept apart from
    * {@link deadlineOverride} so the settings card can tell the user which of
@@ -8018,6 +8026,10 @@ export class BridgeManager {
         } catch {
           this.tagHaloSetting = { ...DEFAULT_TAG_HALO }
         }
+        // The settings page's title-prefix toggle. Written only as a boolean
+        // and re-checked here for the same reason the halo is: the file is
+        // user- and version-editable, and anything but a boolean reads as off.
+        this.sessionTitlePrefixEnabled = (parsed as { sessionTitlePrefix?: unknown }).sessionTitlePrefix === true
         // The settings page's approval-deadline override. Re-validated on every
         // boot because the state file is user- and version-editable: an
         // unreadable value must not poison the deadline, and a value the
@@ -8163,6 +8175,7 @@ export class BridgeManager {
         version: 2,
         ...(this.defaultAgentId === undefined ? {} : { defaultAgentId: this.defaultAgentId }),
         tagHalo: this.tagHaloSetting,
+        sessionTitlePrefix: this.sessionTitlePrefixEnabled,
         agents,
         // The settings page's approval deadlines. Absent while none was ever
         // written, so a fresh deployment's state file stays exactly as it was.
@@ -9955,6 +9968,18 @@ export class BridgeManager {
     this.persistAgents()
   }
 
+  /** Whether generated NTR session titles carry the badge (settings page toggle). */
+  sessionTitlePrefix(): boolean {
+    return this.sessionTitlePrefixEnabled
+  }
+
+  async setSessionTitlePrefix(value: boolean): Promise<void> {
+    // Same gate as the RPC route (the one validation a boolean needs), and the
+    // same persisted-with-the-registry story as every other settings toggle.
+    this.sessionTitlePrefixEnabled = value === true
+    this.persistAgents()
+  }
+
   /**
    * Declare the deployment baseline for the idle-release window — the value
    * `cordis.patch.yml` names, passed RAW (only when it names one).
@@ -10602,9 +10627,14 @@ export class BridgeManager {
       // host's `dsh-session-title-llm` prompt). Answer it locally by folding
       // the first one back as the placeholder title: no ACP turn, no bridge
       // session, and the sidebar gets a title even on hosts whose own text
-      // fallback never fires (issue #11, DSH 2.0.22-next).
+      // fallback never fires (issue #11, DSH 2.0.22-next). The settings
+      // toggle opts the placeholder into the badge prefix; the host accepts
+      // it as the title's newest revision either way.
       if (options.purpose === 'session-title') {
-        const title = extractSessionTitlePlaceholder(options.messages ?? [])
+        const title = extractSessionTitlePlaceholder(
+          options.messages ?? [],
+          this.sessionTitlePrefixEnabled ? SESSION_TITLE_PREFIX : '',
+        )
         if (title !== undefined) {
           yield { type: 'block-start', index: 0, blockType: 'text' }
           yield { type: 'text-delta', index: 0, text: title }

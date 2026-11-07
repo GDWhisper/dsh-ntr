@@ -1039,6 +1039,21 @@ export type TagHaloResult = { halo: AcpTagHalo }
 /** `ui/tag-halo-set`: write the halo preference. */
 export interface TagHaloSetPayload { halo: AcpTagHalo }
 
+/**
+ * The badge prepended to an NTR session's generated title when the settings
+ * toggle is on. The title is host-owned session data (the `session/title`
+ * log event), so the prefix shows everywhere the title shows: the sidebar
+ * row, the conversation header, and search results. Kept ASCII-short so the
+ * placeholder's own budget stays intact.
+ */
+export const SESSION_TITLE_PREFIX = '[NTR] '
+/** Default when nothing was ever saved: off — titles stay exactly as generated. */
+export const DEFAULT_SESSION_TITLE_PREFIX = false
+/** `ui/session-title-prefix`: read the toggle in force. */
+export type SessionTitlePrefixResult = { titlePrefix: boolean }
+/** `ui/session-title-prefix-set`: write the toggle. */
+export interface SessionTitlePrefixSetPayload { titlePrefix: boolean }
+
 /** The approval deadline the settings page can edit, by field name. ONE window. */
 export type ApprovalDeadlineKey = 'permissionTimeoutMs'
 

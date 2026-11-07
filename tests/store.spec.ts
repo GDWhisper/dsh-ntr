@@ -354,6 +354,48 @@ describe('AcpStore agent management', () => {
     expect(failing.getSnapshot().tagHalo).toEqual({ mode: 'breath', speed: 'normal' })
   })
 
+  it('reads the title-prefix toggle on resync and writes it back optimistically', async () => {
+    const sent: Array<Record<string, unknown>> = []
+    const store = new (await import('../src/client/store.ts')).AcpStore(
+      async (_channel, endpoint, payload) => {
+        if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
+        if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'ui/session-title-prefix') return { ok: true, value: { titlePrefix: true } }
+        if (endpoint === 'ui/session-title-prefix-set') { sent.push(payload as Record<string, unknown>); return { ok: true, value: {} } }
+        return { ok: true, value: {} }
+      },
+      (zh) => zh,
+    )
+    // The host answer is the authority; the initial local default gives way.
+    await store.resync()
+    expect(store.getSnapshot().titlePrefix).toBe(true)
+
+    // The write lands optimistically and the RPC carries the boolean under
+    // the key the host route validates — a store↔host key drift fails here.
+    await store.setTitlePrefix(false)
+    expect(store.getSnapshot().titlePrefix).toBe(false)
+    expect(sent).toEqual([{ titlePrefix: false }])
+
+    // A failed write reverts to the previous setting instead of leaving the
+    // row showing something the host refused.
+    const failing = new (await import('../src/client/store.ts')).AcpStore(
+      async (_channel, endpoint) => {
+        if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
+        if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'ui/session-title-prefix-set') return { ok: false, error: { code: 'bad_payload', message: 'no' } }
+        return { ok: true, value: {} }
+      },
+      (zh) => zh,
+    )
+    await failing.resync()
+    await failing.setTitlePrefix(true)
+    // The revert target is what resync last knew: the default (off), because
+    // this mock never answers `ui/session-title-prefix`.
+    expect(failing.getSnapshot().titlePrefix).toBe(false)
+  })
+
   it('reads the approval deadlines on resync and writes one back optimistically', async () => {
     const sent: Array<Record<string, unknown>> = []
     const store = new (await import('../src/client/store.ts')).AcpStore(
