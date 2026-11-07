@@ -16,7 +16,7 @@ import {
   type StartAttempt,
   permissionAskReason, permissionToolName,
 } from '../src/bridge.ts'
-import { AcpError, EventHub, dispatchRpc, permissionReplayFrames } from '../src/impl.ts'
+import { ACP_TOOL_CALL_NAME, AcpError, EventHub, dispatchRpc, permissionReplayFrames } from '../src/impl.ts'
 import { AcpSaveGate } from '../src/save-gate.ts'
 import type { AcpAgentCatalog, AcpAgentDef, AcpEvent, ActiveTurnView, AgentCatalogResult, ChatSessionView, ChatTranscriptView, GenerateMessage, StreamChunk, SubagentRecord } from '../src/protocol.ts'
 import { OUTPUT_CHARS_PER_TOKEN } from '../src/tps.ts'
@@ -582,14 +582,14 @@ describe('ACP bridge over stdio (mock agent)', () => {
     const t1Deltas = chunks
       .filter((c): c is Extract<StreamChunk, { type: 'tool-call-delta' }> => c.type === 'tool-call-delta' && (c as { id: string }).id === 't1')
       .map(c => c.argumentsDelta).join('')
-    expect(t1Deltas).toBe('{"cmd":""}')
+    expect(t1Deltas).toBe('first tool\n{"cmd":""}')
     const t1Card = chunks.find((c): c is Extract<StreamChunk, { type: 'block-end' }> =>
       c.type === 'block-end' && (c.block as { type?: string; id?: string }).type === 'tool-call' && (c.block as { id?: string }).id === 't1')
-    expect((t1Card?.block as { arguments?: string } | undefined)?.arguments).toBe('{"cmd":"ls -la"}')
+    expect((t1Card?.block as { arguments?: string } | undefined)?.arguments).toBe('first tool\n{"cmd":"ls -la"}')
     const t2Args = chunks
       .filter((c): c is Extract<StreamChunk, { type: 'tool-call-delta' }> => c.type === 'tool-call-delta' && (c as { id: string }).id === 't2')
       .map(c => c.argumentsDelta).join('')
-    expect(t2Args).toBe('{"path":"a.md"}')
+    expect(t2Args).toBe('second tool\n{"path":"a.md"}')
 
     // …and the answer is still there, in the continuation step after the
     // cards' step.
@@ -600,6 +600,51 @@ describe('ACP bridge over stdio (mock agent)', () => {
     // The tool's real output reached the shared registry (the guard's virtual
     // tool answers the host loop's card execution from it).
     expect(routeBindingRegistry().toolResults.get('t1')).toContain('T1 OUTPUT LINE')
+  }, 30_000)
+
+  it('normalizes a long pwsh command title to the constant name and keeps the command in args', async () => {
+    // Env-gated, DEFAULT-OFF mock knob (MOCK_LONG_TOOL_TITLE=1): the agent puts
+    // a whole pwsh command in `title` and rewrites it mid-call. Its OWN
+    // EventHub / BridgeManager + a distinct call id keep this isolated from the
+    // shared manager and from every byte-exact echo assertion.
+    const longHub = new EventHub()
+    const longDef: AcpAgentDef = { ...def, env: { ...def.env, MOCK_LONG_TOOL_TITLE: '1' } }
+    const longManager = new BridgeManager([longDef], longHub, 500)
+    try {
+      const adapter = new AcpLlmAdapter(longManager)
+      const { chunks } = await hostLoopTurn(adapter, {
+        provider: 'acp',
+        model: 'mock',
+        sessionId: 'dsh-long-title-1',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'LONG TITLE TURN' }] }],
+      })
+      const deltas = chunks.filter((c): c is Extract<StreamChunk, { type: 'tool-call-delta' }> => c.type === 'tool-call-delta')
+      const names = deltas
+        .map(c => (c as { name?: string }).name)
+        .filter((n): n is string => n !== undefined)
+      expect(names.length).toBeGreaterThan(0)
+      // Every name is the constant; the raw pwsh command never becomes a name,
+      // not even on the mid-call title rewrite.
+      expect(names).toContain(ACP_TOOL_CALL_NAME)
+      expect(names.every(n => n === ACP_TOOL_CALL_NAME)).toBe(true)
+      // The full command survives in the arguments/argsRaw payload (no silent
+      // drop), including across the rewrite.
+      expect(deltas.map(c => c.argumentsDelta).join('')).toContain('MOCK_LONG_TITLE_MARKER')
+      const card = chunks.find((c): c is Extract<StreamChunk, { type: 'block-end' }> =>
+        c.type === 'block-end' && (c.block as { type?: string }).type === 'tool-call')
+      expect((card?.block as { arguments?: string } | undefined)?.arguments).toContain('MOCK_LONG_TITLE_MARKER')
+      // noteToolRecord / recordAcpToolOutput key the REAL output by callId.
+      expect(routeBindingRegistry().toolResults.get('long_title_call')).toContain('tool result line')
+      // The knob leaves the byte-exact echo untouched.
+      const answer = chunks
+        .filter((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')
+        .map(c => c.text).join('')
+      expect(answer).toContain('MOCK: echo LONG TITLE TURN perm=none')
+    } finally {
+      await longManager.shutdownAll()
+      routeBindingRegistry().toolResults.delete('long_title_call')
+      routeBindingRegistry().toolOutputFinal.delete('long_title_call')
+    }
   }, 30_000)
 
   it('reports the ACP-mode preset from the harness roster it is wired to', async () => {
@@ -3708,12 +3753,13 @@ describe("a segmented turn interleaves like a native multi-step turn (isolated m
     const firstStarts = first.filter(c => c.type === 'block-start').map(c => (c as { blockType: string }).blockType)
     expect(firstStarts.at(-1)).toBe('tool-call')
     expect(firstStarts.slice(0, -1)).toEqual(['reasoning', 'text'])
-    // The card's arguments came from the update's content (the call itself
-    // disclosed no input), so the executed card shows the tool's output text.
+    // The name is the fixed constant and the card's arguments are the agent's
+    // own title; the tool's real output lives in the shared output registry
+    // (asserted below), not in the card body.
     const cardArgs = first
       .filter((c): c is Extract<StreamChunk, { type: 'tool-call-delta' }> => c.type === 'tool-call-delta')
       .map(c => c.argumentsDelta).join('')
-    expect(cardArgs).toBe('FAKE TOOL OUTPUT')
+    expect(cardArgs).toBe('fake tool')
 
     // Step 2 (the continuation) carries the post-call answer and NO card: the
     // turn's last settled message is tool-free, so the loop completes here.

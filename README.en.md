@@ -210,13 +210,13 @@ That's stale dependency state, not a missing plugin file: the failing path will 
 
 **An NTR session shows `Error: unknown tool "xxx"` followed by a "Tool added: xxx" line. What is that?**
 
-Display-layer noise from the host's card execution record. It is not a failed tool call in the agent.
+This is display-layer noise from the host's card execution record; it depends on the host version and is not a failed tool call in the agent. Newer hosts freeze the set of tools available to a step before assembling the request; a tool name that only appears at execution time can't join that step, so its first occurrence records `unknown tool`, and the next request assembly finds one extra tool and writes a "Tool added" line. On hosts like 0.2.1-rc.5 that resolve tools live inside the waterfall, it never appears.
 
-In an NTR session the agent's tools run inside its own process, and the host only receives notifications. The host still executes each card once, because that execution record is what draws the card. The host has no definition for that name, so the guard registers a virtual tool at execution time and answers with the output the bridge recorded.
+The plugin now folds every tool call into one stable name, `dsh_ntr__acp_tool_call`, and keeps the full command verbatim in the card's parameter area, so this pair of lines appears at most once instead of flooding.
 
-But the step's executable tool set is fixed before the request goes out. A tool registered during execution cannot join that step. So the first call of that tool name records `unknown tool`, and the next request assembly sees one extra tool and writes the "Tool added" line.
+Their number scales only with the number of DISTINCT tool names: some agents (e.g. opencode2) report the whole command as the tool name, which is why older versions flooded.
 
-Impact: this happens once per tool name per session. The turn is not interrupted and the agent is unaffected. That card shows no mirrored output; the real output is in the NTR tab.
+The agent's real output is always in the NTR tab; the first errored card has no mirrored output. In dsh-ntr 0.3.9 and earlier the chat card showed placeholder text (fixed in 0.3.10). Upgrading does not remove the first-time `unknown tool` / "Tool added" pair.
 
 ---
 

@@ -164,6 +164,10 @@
  *
  * Environment knobs:
  *  - MOCK_NO_LOAD=1 → `initialize` advertises no `loadSession` capability
+ *  - MOCK_LONG_TOOL_TITLE=1 → the main tool card carries a LONG pwsh command
+ *              as its `title` (the codebuddy shape) under a distinct call id,
+ *              and rewrites that title mid-call; DEFAULT OFF keeps the
+ *              byte-exact 'mock tool' / 'call_1' shape and the exact echo
  *  - MOCK_IGNORE_CLOSE=1 → `session/close` is never answered (a wedged agent);
  *              the host's stall reset must not wait for a graceful close
  *  - MOCK_FORK=1 → `initialize` advertises the UNSTABLE `sessionCapabilities.fork`
@@ -248,6 +252,18 @@ const MODE_OPTION = process.env.MOCK_MODE_OPTION === '1'
 // ones start on 'default'. That is the "catalog remembers another session's
 // mode" shape a fresh conversation must not silently lose.
 const FIRST_MODE = process.env.MOCK_FIRST_MODE
+/**
+ * MOCK_LONG_TOOL_TITLE=1: reproduce codebuddy's shape where the whole pwsh
+ * command rides in the `title` (docs/acp-convergence.md 1.5) and the title is
+ * rewritten mid-call. Opt-in on purpose: DEFAULT OFF keeps every other prompt
+ * byte-identical, including the exact `MOCK: echo ...` assertion. A DISTINCT
+ * call id keeps this card separate from the shared `call_1` of other turns.
+ */
+const LONG_TOOL_TITLE = process.env.MOCK_LONG_TOOL_TITLE === '1'
+const LONG_TITLE_CALL_ID = 'long_title_call'
+const LONG_TITLE_COMMAND = 'pwsh -NoProfile -Command "Get-ChildItem C:/repo -Recurse | Select-String MOCK_LONG_TITLE_MARKER | Format-Table"'
+const MAIN_CALL_ID = LONG_TOOL_TITLE ? LONG_TITLE_CALL_ID : 'call_1'
+const MAIN_TITLE = LONG_TOOL_TITLE ? LONG_TITLE_COMMAND : 'mock tool'
 
 function mockConfigOptions(state = { temp: 'mid', model: DEFAULT_MODEL, effort: 'high' }) {
   return [
@@ -1378,7 +1394,7 @@ const app = agent({ name: 'mock-acp-agent' })
       await new Promise(() => {})
     }
 
-    await send({ sessionUpdate: 'tool_call', toolCallId: 'call_1', title: 'mock tool', kind: 'other', status: 'pending' })
+    await send({ sessionUpdate: 'tool_call', toolCallId: MAIN_CALL_ID, title: MAIN_TITLE, kind: 'other', status: 'pending' })
 
     if (text.includes('PERM')) {
       // `PERMEDIT` / `PERMEXEC` declare the ACP tool-call kind and
@@ -1403,7 +1419,17 @@ const app = agent({ name: 'mock-acp-agent' })
       permissionAnswer = response.outcome.outcome === 'selected' ? response.outcome.optionId : 'cancelled'
     }
 
-    await send({ sessionUpdate: 'tool_call_update', toolCallId: 'call_1', status: 'in_progress' })
+    await send({ sessionUpdate: 'tool_call_update', toolCallId: MAIN_CALL_ID, status: 'in_progress' })
+    if (LONG_TOOL_TITLE) {
+      // codebuddy rewrites titles mid-call: the raw command must never ride
+      // back out as a tool name, but its (new) text must be preserved.
+      await send({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: LONG_TITLE_CALL_ID,
+        title: `${LONG_TITLE_COMMAND} -Verbose`,
+        status: 'in_progress',
+      })
+    }
     if (text.includes('STEERABLE')) {
       // 卡片之后再发一条正文：插件会在卡片边界切段、把宿主 step 结束，
       // 但本 prompt 仍然在飞 —— 宿主插话正好落在这个窗口。session/cancel
@@ -1443,7 +1469,7 @@ const app = agent({ name: 'mock-acp-agent' })
     }
     await send({
       sessionUpdate: 'tool_call_update',
-      toolCallId: 'call_1',
+      toolCallId: MAIN_CALL_ID,
       status: 'completed',
       content: [{ type: 'content', content: { type: 'text', text: 'tool result line' } }],
     })

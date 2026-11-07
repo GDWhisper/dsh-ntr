@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { apply, inject, name } from '../src/index.ts'
+import { ACP_TOOL_CALL_NAME, acpToolCallFromUpdate } from '../src/impl.ts'
 
 function fakeCtx() {
   return {
@@ -518,7 +519,7 @@ describe('acp-guard preset row', () => {
     expect(toolsWithReal.register).not.toHaveBeenCalled()
     expect(downstream).toHaveBeenCalledTimes(1)
 
-    // An unknown name registers a scoped virtual tool whose body first answers
+    // The reserved constant name registers a scoped virtual tool whose body first answers
     // from the registry when the output already landed…
     recordAcpToolOutput('wait-1', 'REAL OUTPUT')
     try {
@@ -528,9 +529,9 @@ describe('acp-guard preset row', () => {
       const execCard = ctxCard.listeners.get('tools/execute')
       if (execCard === undefined) throw new Error('no tools/execute listener')
       const next = vi.fn(async () => ({ text: 'would-execute' }))
-      await execCard.listener({ name: 'Bash', agent: {}, exec: { callId: 'wait-1' } }, next)
+      await execCard.listener({ name: ACP_TOOL_CALL_NAME, agent: {}, exec: { callId: 'wait-1' } }, next)
       expect(unknown.register).toHaveBeenCalledTimes(1)
-      expect(unknown.register.mock.calls[0][0]).toMatchObject({ name: 'Bash' })
+      expect(unknown.register.mock.calls[0][0]).toMatchObject({ name: ACP_TOOL_CALL_NAME })
       const definition = unknown.register.mock.calls[0][0] as { execute: (args: unknown, exec: { callId: string }) => Promise<{ text: string }> }
       expect(await definition.execute(undefined, { callId: 'wait-1' })).toEqual({ text: 'REAL OUTPUT' })
 
@@ -569,7 +570,7 @@ describe('acp-guard preset row', () => {
       await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
       const exec = ctx.listeners.get('tools/execute')
       if (exec === undefined) throw new Error('no tools/execute listener')
-      await exec.listener({ name: 'Bash', agent: {}, exec: { callId: 'announce-1' } }, async () => ({ text: 'downstream' }))
+      await exec.listener({ name: ACP_TOOL_CALL_NAME, agent: {}, exec: { callId: 'announce-1' } }, async () => ({ text: 'downstream' }))
       const definition = tools.register.mock.calls[0][0] as { execute: (args: unknown, exec: { callId: string }) => Promise<{ text: string }> }
 
       recordAcpToolOutput('announce-1', '')
@@ -639,4 +640,105 @@ describe('acp-guard preset row', () => {
     }))
     expect(decision).toEqual({ kind: 'enter', messages: [handBuilt] })
   })
+
+
+  it('registers a constant-named display card once from a pwsh command title, and reuses it', async () => {
+    // The fix: ACP cards no longer carry the agent's title as their tool name.
+    // Fold a long command title into a snapshot, then execute the card under
+    // the constant name it now has. The guard registers ONE scoped virtual
+    // tool under that constant and never re-registers an identical name.
+    const command = 'pwsh -NoProfile -Command Get-ChildItem C:/repo -Recurse | Select-String "TODO_42"'
+    const snapshot = acpToolCallFromUpdate({ toolCallId: 'pwsh-card-1', title: command })!
+    expect(snapshot.name).toBe(ACP_TOOL_CALL_NAME)
+    expect(snapshot.argsRaw).toContain(command)
+
+    const tools = toolsServiceOf()
+    const ctx = guardCtx({ tools })
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    const exec = ctx.listeners.get('tools/execute')
+    if (exec === undefined) throw new Error('no tools/execute listener')
+    const next = vi.fn(async () => ({ text: 'downstream' }))
+    await exec.listener({ name: snapshot.name, agent: {}, exec: { callId: 'pwsh-card-1' } }, next)
+    expect(tools.register).toHaveBeenCalledTimes(1)
+    expect(tools.register.mock.calls[0][0]).toMatchObject({ name: ACP_TOOL_CALL_NAME })
+    expect(next).toHaveBeenCalledTimes(1)
+    // Same constant name again: the standing scoped virtual tool is reused
+    // (virtualDefs semantics - never unregister/prune/cap/stop-after-N).
+    await exec.listener({ name: snapshot.name, agent: {}, exec: { callId: 'pwsh-card-2' } }, next)
+    expect(tools.register).toHaveBeenCalledTimes(1)
+    expect(next).toHaveBeenCalledTimes(2)
+  })
+
+  it('SIMULATION ONLY: a tools double whose register throws is caught, no exception leaks, next() runs', async () => {
+    // Simulation of a host whose tools service refuses registration. The
+    // guard's catch must fire (observable console.warn only) and still delegate.
+    const tools = toolsServiceOf()
+    tools.register.mockImplementation(() => { throw new Error('simulated register failure') })
+    const ctx = guardCtx({ tools })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+      const exec = ctx.listeners.get('tools/execute')
+      if (exec === undefined) throw new Error('no tools/execute listener')
+      const next = vi.fn(async () => ({ text: 'downstream' }))
+      await expect(exec.listener({ name: ACP_TOOL_CALL_NAME, agent: {}, exec: { callId: 'sim-1' } }, next))
+        .resolves.toEqual({ text: 'downstream' })
+      expect(tools.register).toHaveBeenCalledTimes(1)
+      expect(next).toHaveBeenCalledTimes(1)
+      expect(warn.mock.calls.some(call => String(call[0]).includes('register threw'))).toBe(true)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('HARD ASSERTION: a real host tool under the reserved constant name fails closed (no register, no next)', async () => {
+    // If the reserved name were occupied by a REAL host tool, `return next()`
+    // would let that host tool execute agent-supplied arguments in the host
+    // process, bypassing the plugin's permission ledger. Fail closed instead.
+    const realTool = { name: ACP_TOOL_CALL_NAME, execute: () => ({ text: 'real host tool ran' }) }
+    const tools = toolsServiceOf({ [ACP_TOOL_CALL_NAME]: realTool })
+    const ctx = guardCtx({ tools })
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    const exec = ctx.listeners.get('tools/execute')
+    if (exec === undefined) throw new Error('no tools/execute listener')
+    const next = vi.fn(async () => ({ text: 'downstream' }))
+    const result = await exec.listener({ name: ACP_TOOL_CALL_NAME, agent: {}, exec: { callId: 'collision-1' } }, next)
+    expect(tools.register).not.toHaveBeenCalled()
+    expect(next).not.toHaveBeenCalled()
+    expect(result).toMatchObject({ isError: true })
+  })
+
+  it('no host collision on the normal path: tools.get(CONST) is undefined', async () => {
+    // A normal host has NO real tool named dsh_ntr__acp_tool_call, so the
+    // global collision probe and the hard assertion both see undefined here.
+    const tools = toolsServiceOf()
+    const ctx = guardCtx({ tools })
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    expect(tools.get(ACP_TOOL_CALL_NAME)).toBeUndefined()
+    expect(ACP_TOOL_CALL_NAME).toBe('dsh_ntr__acp_tool_call')
+  })
+
+  it('passes a NON-reserved tool name straight through: one next(), no register, no console.warn', async () => {
+    // The isolation gate: only ACP_TOOL_CALL_NAME reaches the registrar.
+    // Everything else is a single string comparison - no probe, no virtual
+    // tool, no diagnostics. guardCtx fires the listener directly (the double
+    // does not model scope routing), which is exactly what the gate guards.
+    const tools = toolsServiceOf()
+    const ctx = guardCtx({ tools })
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    const exec = ctx.listeners.get('tools/execute')
+    if (exec === undefined) throw new Error('no tools/execute listener')
+    const next = vi.fn(async () => ({ text: 'downstream' }))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const result = await exec.listener({ name: 'SomeOtherTool', agent: {}, exec: { callId: 'gate-1' } }, next)
+      expect(result).toEqual({ text: 'downstream' })
+      expect(next).toHaveBeenCalledTimes(1)
+      expect(tools.register).not.toHaveBeenCalled()
+      expect(warn).not.toHaveBeenCalled()
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
 })

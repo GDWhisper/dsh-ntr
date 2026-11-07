@@ -58,7 +58,7 @@
  * plane draws IS the execution record, so the call must execute and record a
  * result. With no tool registered it would record `Error: unknown tool
  * "Bash"` (a red pile of errors). The `tools/execute` waterfall is the seam:
- * for a name nothing resolves, this row registers a SCOPED virtual tool (this
+ * for that ONE reserved name, this row registers a SCOPED virtual tool (this
  * ctx is the ACP session's agent scope, so the registration shadows nothing
  * outside it) whose body answers with the call's real output — the bridge
  * records every `tool_call` / `tool_call_update` content into the shared
@@ -68,7 +68,17 @@
  * registry's `waitForToolOutput` (released by the record itself, by the
  * turn's settlement, or by a bounded timeout). A name that resolves to a REAL
  * tool passes untouched; a missing `tools` service degrades to the old
- * error-result behavior.
+ * error-result behavior. EXCEPTION: the ONE reserved name this plugin gives
+ * its own cards (`ACP_TOOL_CALL_NAME` below) must never resolve to a real host
+ * tool. If `tools.get(CONST, exec.agent)` does return one, tools/execute fails
+ * closed with an error result (no register, no next()) - delegating would run
+ * agent-supplied args in the host process, bypassing the permission ledger.
+ *
+ * THE ISOLATION GATE: the listener handles ONLY `ACP_TOOL_CALL_NAME`. Every
+ * other tool name is passed straight through with one string comparison at the
+ * very top - no warn, no probe, no virtual-tool registration, no fail-closed.
+ * Non-NTR paths therefore see nothing of this row (belt and braces on top of
+ * the host's scope-filtered `tools/execute` waterfall).
  *
  * Config:
  *   strippedSources?: string[]  — source kinds to drop, REPLACING the allow
@@ -125,6 +135,24 @@
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'acp-guard'
+
+/**
+ * Hand-copy of `ACP_TOOL_CALL_NAME` in src/impl.ts (this preset row is a
+ * SEPARATE module instance the Loader mounts without imports). It is the ONE
+ * name the plugin gives every ACP tool-call display card; a bare identifier
+ * with the plugin-owned prefix that no real host tool may ever occupy.
+ */
+const ACP_TOOL_CALL_NAME = 'dsh_ntr__acp_tool_call'
+
+/**
+ * A fail-closed result. A tools/execute listener that does NOT call `next()`
+ * short-circuits execution; an error-shaped value passes `resolveExecution`
+ * without the host ever running its own tool with agent-supplied arguments.
+ */
+function collisionResult(execName) {
+  const text = `dsh-ntr: refusing to execute "${execName}" - the reserved ACP tool name "${ACP_TOOL_CALL_NAME}" is occupied by a real host tool`
+  return { isError: true, content: [{ type: 'text', text }], text }
+}
 
 /** The source kinds a proposed step keeps (see the module header). */
 const KEPT_SOURCES = new Set(['user', 'tool'])
@@ -276,6 +304,18 @@ const TOOL_OUTPUT_WAIT_MS = 30 * 60 * 1000
 export function apply(ctx, config) {
   const keep = messageFilterOf(config)
   const virtualDefs = makeVirtualDefs()
+  // Probe ONCE at mount: if the host already has a REAL tool under our reserved
+  // name, the plugin's isolation is broken. Record it loudly (console only) and
+  // do not continue as if safe; every execution still fails closed below.
+  try {
+    const globalTools = typeof ctx.get === 'function' ? ctx.get('tools') : undefined
+    const occupied = globalTools !== undefined && typeof globalTools.get === 'function'
+      ? globalTools.get(ACP_TOOL_CALL_NAME)
+      : undefined
+    console.warn('[acp-guard] reserved-name mount probe', { reserved: ACP_TOOL_CALL_NAME, occupiedByRealTool: occupied !== undefined })
+  } catch (error) {
+    console.warn('[acp-guard] reserved-name mount probe threw', { error: String(error) })
+  }
   // The route, before DSH 0.2.2's `preStep` captures it: `inbox/inserted` is
   // the synchronous splice that wakes the driver, and `inbox/claimed` fires
   // inside `preStep` just before the capture (the last-second seam, which also
@@ -315,29 +355,85 @@ export function apply(ctx, config) {
   }, { prepend: true })
 
   // The display-card executor: answer the loop's execution of an ACP tool card
-  // with the call's real output (fourth duty — see the module header).
+  // with the call's real output (fourth duty - see the module header).
   ctx.on('tools/execute', async (exec, next) => {
+    const execName = (exec !== null && typeof exec === 'object' && typeof exec.name === 'string') ? exec.name : ''
+    // ISOLATION GATE. The ONLY name this row owns is the reserved constant:
+    // every other tool call passes straight through with one string comparison
+    // - no probing, no virtual-tool registration, no fail-closed, no warn.
+    // After this line `execName === ACP_TOOL_CALL_NAME` always, so the old
+    // non-object / empty-name / `run_code` skip branches are gone.
+    if (execName !== ACP_TOOL_CALL_NAME) return next()
+    let blocked = null
+    let reason = 'virtual tool ready'
     try {
-      if (exec === null || typeof exec !== 'object') return next()
-      if (typeof exec.name !== 'string' || exec.name === '' || exec.name === 'run_code') return next()
       const tools = typeof ctx.get === 'function' ? ctx.get('tools') : undefined
-      if (tools === undefined || typeof tools.get !== 'function' || typeof tools.register !== 'function') return next()
-      // The scope-aware lookup mirrors `resolveExecution`: scoped tools shadow
-      // globals, and the global view would not see this session's own layer.
-      const existing = tools.get(exec.name, exec.agent)
-      if (existing !== undefined && !virtualDefs.has(existing)) return next()
-      if (existing === undefined) {
-        const definition = virtualToolDefinition(exec.name)
-        tools.register(definition)
-        virtualDefs.add(definition)
+      if (tools === undefined || typeof tools.get !== 'function' || typeof tools.register !== 'function') {
+        reason = 'no usable tools service'
+      } else {
+        // HARD ASSERTION: the reserved constant name must never be occupied
+        // by a REAL host tool. `next()` would let the host's own tool run
+        // with agent-supplied arguments in the host process, bypassing this
+        // plugin's permission ledger. Fail closed: no register, no next().
+        let occupied
+        try {
+          occupied = tools.get(ACP_TOOL_CALL_NAME, exec.agent)
+        } catch (error) {
+          console.warn('[acp-guard] tools/execute: reserved-name probe threw; failing closed', { execName, error: String(error) })
+          blocked = collisionResult(execName)
+        }
+        if (blocked === null) {
+          console.warn('[acp-guard] tools/execute: reserved-name probe', { execName, occupied: occupied !== undefined })
+          if (occupied !== undefined && !virtualDefs.has(occupied)) {
+            console.warn('[acp-guard] tools/execute: reserved name occupied by a real host tool; failing closed', { execName, reserved: ACP_TOOL_CALL_NAME })
+            blocked = collisionResult(execName)
+          }
+        }
+        if (blocked === null) {
+          // The scope-aware lookup mirrors `resolveExecution`: scoped tools
+          // shadow globals, and the global view would not see this session's
+          // own layer.
+          const existing = tools.get(execName, exec.agent)
+          console.warn('[acp-guard] tools/execute: before register', { execName, getBeforeRegister: existing !== undefined })
+          if (existing !== undefined && !virtualDefs.has(existing)) {
+            reason = 'name is a real host tool'
+          } else if (existing === undefined) {
+            const definition = virtualToolDefinition(execName)
+            try {
+              tools.register(definition)
+              virtualDefs.add(definition)
+              console.warn('[acp-guard] tools/execute: registered scoped virtual tool', {
+                execName,
+                registerThrew: false,
+                getAfterRegister: tools.get(execName, exec.agent) !== undefined,
+              })
+            } catch (error) {
+              console.warn('[acp-guard] tools/execute: register threw', {
+                execName,
+                registerThrew: true,
+                error: String(error),
+                getAfterRegister: tools.get(execName, exec.agent) !== undefined,
+              })
+            }
+          } else {
+            console.warn('[acp-guard] tools/execute: reusing scoped virtual tool', { execName, getAfterRegister: true })
+          }
+        }
       }
-      return next()
-    } catch {
-      // Registration is an upgrade, not a dependency: without it the host
-      // records `Error: unknown tool "<name>"` for the card, which is noise in
-      // the transcript and nothing more — the agent ran the tool itself.
-      return next()
+    } catch (error) {
+      console.warn('[acp-guard] tools/execute: unexpected failure; delegating', { execName, error: String(error) })
+      reason = 'unexpected failure'
     }
+    if (blocked !== null) {
+      return blocked
+    }
+    // next() is called EXACTLY ONCE, outside the try: a throwing downstream
+    // must never be re-invoked by an outer catch (that would double-execute a
+    // card). Its result is still logged for observability.
+    console.warn('[acp-guard] tools/execute: delegating', { execName, reason })
+    const result = await next()
+    console.warn('[acp-guard] tools/execute: next() result', { execName, result })
+    return result
   })
 
   // The legacy route rewrite: DSH 0.2.2+ captures the route before this

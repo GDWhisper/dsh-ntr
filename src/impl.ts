@@ -1156,19 +1156,37 @@ export function buildAdapterModelId(agentId: string, choice: string): string {
  */
 
 /**
+ * The fixed name of EVERY ACP tool-call display card.
+ *
+ * A bare identifier with the plugin-owned `dsh_ntr__` prefix that the host has
+ * no built-in tool for. The name must NEVER be the agent's own `title`: that is
+ * often a whole shell command, and a card whose name resolves to a REAL host
+ * tool would let `tools/execute` run the agent-supplied arguments in the host
+ * process, bypassing this plugin's permission ledger (the guard's fail-closed
+ * check is the backstop). The title is preserved in `argsRaw` instead, which
+ * the host renders as the card body (`bodyRaw` / `formatToolBody`).
+ *
+ * Hand-copied as `ACP_TOOL_CALL_NAME` in `presets/acp/acp-guard.mjs` (a separate
+ * module instance the Loader mounts without imports).
+ */
+export const ACP_TOOL_CALL_NAME = 'dsh_ntr__acp_tool_call'
+
+/**
  * One ACP tool call, narrowed to what the Chat plane's tool-call renderer shows.
  *
- * `callId` is the ACP `toolCallId` — it is the only identity the agent gives, and
- * the Chat renderer uses it to group a call with its updates. `name` is the
- * agent's own label (`title`, falling back to nothing at all: the renderer shows
- * the call id when a name is missing). `argsRaw` accumulates whatever the agent
- * chose to disclose — ACP has no mandatory arguments field, so an agent that
- * sends none simply produces an empty block, which is honest.
+ * `callId` is the ACP `toolCallId` - the only identity the agent gives, and the
+ * Chat renderer's grouping key. `name` is the fixed ACP_TOOL_CALL_NAME (empty
+ * only for a content-less status-only update, which the bridge skips as a
+ * phantom card). `title` is the agent's own label, often a whole command;
+ * `argsRaw` is that title folded in front of whatever `rawInput` / `arguments`
+ * the agent disclosed, so nothing is dropped when the name became a constant.
  */
 export interface AcpToolCallSnapshot {
   callId: string
   name: string
-  /** Accumulated argument text (ACP has no fixed vocabulary for it). */
+  /** The agent's own `title` label (kept so title-less updates don't drop it). */
+  title: string
+  /** Accumulated body text: the title plus the disclosed arguments. */
   argsRaw: string
 }
 
@@ -1176,6 +1194,20 @@ export interface AcpToolCallSnapshot {
 export type AcpToolCallDelta =
   | { kind: 'name'; name: string }
   | { kind: 'args'; text: string }
+
+/**
+ * Fold the agent's `title` label in front of the disclosed argument text.
+ *
+ * Both the creating and the updating path use this, so the title - frequently
+ * a whole pwsh command - is preserved in `argsRaw` (constraint 29: no silent
+ * drop) instead of being lost when the card name became a constant, and an
+ * input-prefix extension is still recognizable across updates. No truncation:
+ * the full text is kept (a cut would need a marker).
+ */
+function foldTitleIntoArgs(title: string, args: string): string {
+  if (title === '') return args
+  return args === '' ? title : `${title}\n${args}`
+}
 
 /**
  * The argument text an ACP tool-call notification carries, if any.
@@ -1211,8 +1243,13 @@ export function acpToolCallArgsOf(update: Record<string, unknown>): string {
 export function acpToolCallFromUpdate(update: Record<string, unknown>): AcpToolCallSnapshot | undefined {
   const callId = typeof update.toolCallId === 'string' ? update.toolCallId.trim() : ''
   if (callId === '') return undefined
-  const name = typeof update.title === 'string' ? update.title : ''
-  return { callId, name, argsRaw: acpToolCallArgsOf(update) }
+  const title = typeof update.title === 'string' && update.title !== '' ? update.title : ''
+  const argsRaw = foldTitleIntoArgs(title, acpToolCallArgsOf(update))
+  // A content-less status-only update keeps an empty name: the bridge's
+  // phantom-card guard relies on (name === '' && argsRaw === '') to skip it.
+  // Every real card gets the fixed constant, never the agent's own title.
+  const name = argsRaw === '' ? '' : ACP_TOOL_CALL_NAME
+  return { callId, name, title, argsRaw }
 }
 
 /**
@@ -1241,23 +1278,39 @@ export function acpToolCallDelta(
   update: Record<string, unknown>,
 ): AcpToolCallDelta[] {
   const deltas: AcpToolCallDelta[] = []
-  const title = update.title
-  if (typeof title === 'string' && title !== '' && title !== snapshot.name) {
-    deltas.push({ kind: 'name', name: title })
-    snapshot.name = title
-  }
-  const input = acpToolCallArgsOf(update)
-  if (input !== '') {
-    const suffix = extensionSuffixOf(snapshot.argsRaw, input)
-    if (suffix !== '') deltas.push({ kind: 'args', text: suffix })
-    snapshot.argsRaw = input
-  } else if (snapshot.argsRaw === '') {
-    const text = updateContentToText(update.content)
-    if (text !== '') {
-      deltas.push({ kind: 'args', text })
-      snapshot.argsRaw = text
+  // The card name is a fixed constant. Agents (codebuddy among them) rewrite
+  // `title` mid-call, so emitting that raw text as a name delta would re-inject
+  // a long shell command as a host tool name. Emit NO name delta; the (possibly
+  // rewritten) title is preserved in the args body instead, folded in front of
+  // the disclosed input for BOTH this path and acpToolCallFromUpdate.
+  const incoming = typeof update.title === 'string' && update.title !== '' ? update.title : ''
+  const args = acpToolCallArgsOf(update)
+  if (incoming === '' && args === '') {
+    // A status-only update carries no new body text: keep the card as-is, and
+    // let `content` fill only a call whose agent never disclosed any input.
+    if (snapshot.argsRaw === '') {
+      const text = updateContentToText(update.content)
+      if (text !== '') {
+        if (snapshot.name !== ACP_TOOL_CALL_NAME) {
+          snapshot.name = ACP_TOOL_CALL_NAME
+          deltas.push({ kind: 'name', name: ACP_TOOL_CALL_NAME })
+        }
+        deltas.push({ kind: 'args', text })
+        snapshot.argsRaw = text
+      }
     }
+    return deltas
   }
+  const title = incoming !== '' ? incoming : snapshot.title
+  snapshot.title = title
+  const next = foldTitleIntoArgs(title, args)
+  if (snapshot.name !== ACP_TOOL_CALL_NAME) {
+    snapshot.name = ACP_TOOL_CALL_NAME
+    deltas.push({ kind: 'name', name: ACP_TOOL_CALL_NAME })
+  }
+  const suffix = extensionSuffixOf(snapshot.argsRaw, next)
+  if (suffix !== '') deltas.push({ kind: 'args', text: suffix })
+  snapshot.argsRaw = next
   return deltas
 }
 
