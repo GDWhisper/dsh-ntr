@@ -557,6 +557,39 @@ export interface SubagentDetailResult {
 /** `subagents/detail` payload: the conversation + the catalog child id. */
 export interface SubagentDetailPayload { dshSessionId: string; childId: string }
 
+// ---- Agent skills (`agent/skills`) ----
+
+/** Where one agent skill was found. Sort rank follows the order of the union. */
+export type AgentSkillScope = 'project' | 'global' | 'system'
+
+/**
+ * One agent skill row for `agent/skills`. Host-built and menu-ready: the row
+ * the `/` menu renders IS this object, and the pick inserts
+ * {@link AgentSkillEntry.insertion} into the draft verbatim.
+ */
+export interface AgentSkillEntry {
+  /** Whitespace-free pick token (Lody rule). Doubles as the menu row name. */
+  token: string
+  /** Frontmatter name, else the skill directory basename. */
+  name: string
+  description?: string
+  scope: AgentSkillScope
+  /** The skill's own folder path inside its group dir (Lody `getSkillFolderPath`). */
+  folder: string
+  /** Draft-ready text: `use /<token> [Skill Path](<destination>)`. */
+  insertion: string
+}
+
+/** `agent/skills` answer: the menu rows, plus a cut marker when the scan hit a cap. */
+export interface AgentSkillsResult {
+  skills: AgentSkillEntry[]
+  /** The scan dropped rows (a directory/size/count cap); absent means nothing was cut. */
+  truncated?: boolean
+}
+
+/** `agent/skills` payload: the conversation (for its workspace root) + the serving agent. */
+export interface AgentSkillsPayload { dshSessionId: string; agentId: string }
+
 export type AcpEvent =
   | { type: 'agent/status'; agentId: string; state: AgentProcessState; error?: string; agent?: AgentView }
   | { type: 'agent/notice'; agentId: string; level: 'info' | 'error'; text: string }

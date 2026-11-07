@@ -112,6 +112,12 @@
 - 浏览器 `AcpStore.chatSessionCommands` 的 `undefined` 同时覆盖「还没读」与「没有活声明」，此时按 `chatAgentFor`（活会话 → 锁定 → 宿主 / 乐观绑定 → pick → 插件默认）找到 agent，再读 `agentCommands`（必要时懒读一次纯内存的 `agent/catalog`）。**严禁**把「没有会话」当成「agent 没有命令」。
 - `loadChatSessions` 返回**在飞读取的 promise**（不是立即 resolve 的空壳），这样「我没有判定，去问」的调用才真能收到答案。
 
+### 6.1 技能清单（`agent/skills`，不落盘）
+
+- 技能清单与命令缓存的结构差异：命令只能来自**活会话的声明**、必须持久化；技能是宿主对文件系统的**纯读扫描**（按 `skillFlavorOf` 的命令行风味选目录表，`src/skills-scan.ts`），无 spawn 依赖，重启重扫即可——所以**不落盘**、不进 `model-catalog.json`、不欠 schema bump。
+- 宿主 `BridgeManager.agentSkills` 只读内存 TTL 缓存（60s，agent × workspaceRoot 复合键，上限 32 条最旧驱逐），不广播 SSE 帧；浏览器过 TTL 自然重问。扫描同步跑在 `agent/skills` 的 dispatch 路径上（最坏情形会阻塞事件循环，现实量级毫秒级，注释在扫描器头部）；**严禁**为菜单 spawn / 探测的纪律照旧适用。
+- 浏览器 `UiState.agentSkills` 的缓存键**含 agentId**（`skillRowsKey` = `dshSessionId\0agentId`）：`bindChatAgent` 只乐观写绑定、无失效钩子，复合键让切 agent 即失效（旧键自然失配、下次菜单轮询重取），60 秒内绝不见旧 agent 的行。「不知道当前 agent」绝不记成「确认空」——`[]` 只由带 agentId 的成功 RPC 产生；`loadAgentSkills` 在 agentId 为 undefined 时不写状态、不发 RPC（轮询零网络成本）。
+
 ## 7. 未决权限询问（仅内存）
 
 待答的权限询问是**运行时状态，不落盘**：`agents.json` 里与权限有关的只有 `approvalDeadlines`（设置页热改的期限与模式，见 [permissions.md §2.4](./permissions.md)）。宿主半区的 `PermissionLedger` 与浏览器 `UiState.permissions` 都随进程 / 页面消失，重连靠 `permissionReplayFrames` 重放未决项，并以 `permission/synced` 的活集合收尾。
@@ -177,6 +183,7 @@
 | 分叉 | `src/bridge.ts` · `adoptForkedSession` / `forkSession` / `noteForkCapability` / `canForkNow` / `forkCaps`；`src/client/store.ts` · `forkChatSession` / `forkStateOf`（子会话绑定与能力位见 §3.2） |
 | 未决询问 | `src/bridge.ts` · `handlePermissionRequest`；`src/impl.ts` · `PermissionLedger` / `permissionRequestFrame` / `permissionReplayFrames`；`src/client/store.ts` · `permissionsForSession` |
 | 斜杠缓存 | `src/bridge.ts` · `chatSessions` / `absorbCommands`；`src/client/store.ts` · `chatSessionCommands` / `loadChatSessions` |
+| 技能清单（§6.1） | `src/bridge.ts` · `agentSkills`；`src/skills-scan.ts` · `scanSkillDirs`；`src/impl.ts` · `skillFlavorOf` / `SKILL_DIRS_BY_FLAVOR` / `GENERIC_SKILL_DIRS` / `SKILL_SCAN_LIMITS` / `parseSkillFrontmatter` / `skillMetadata` / `skillMentionToken` / `formatSkillPathDestination` / `formatSkillMentionPrompt`；`src/impl.ts` · `dispatchRpc`（`agent/skills` 分支）；`src/client/store.ts` · `agentSkills` 状态 / `skillRowsFor` / `loadAgentSkills` / `skillInsertionFor` / `skillRowsKey` / `SKILL_MENU_TTL_MS` |
 | 内置更新 | `src/update.ts` · `UpdateService` / `check` / `apply` / `bundleEligibility` / `isRegistrySpec` / `registryPlan` / `pickUpdateTarget` / `compareVersions`；`src/index.ts` · `setUpdateService`；`src/bridge.ts` · `pluginUpdateCheck` / `pluginUpdateApply` / `hasActiveTurns` / `PLUGIN_VERSION`；`src/impl.ts` · `dispatchRpc`（`plugin/update-*` 分支）；`src/client/store.ts` · `checkPluginUpdate` / `applyPluginUpdate`；`src/client/panel.tsx` · `PluginUpdateBadge` / `PluginUpdateCard` / `updateBadgeText` / `updateCardVisible` |
 | 保存门禁 | `src/save-gate.ts` · `AcpSaveGate` / `canSaveNow` / `defer` / `cancel` / `retry` / `waitForIdle` / `forceFlush` / `labelVersions` / `labelOutcomes`；`src/index.ts` · `saveGate` / `ctx.provide('acpSaveGate')`；`src/bridge.ts` · `activeTurnViews` / `saveGateStatus` / `saveGateFlush` / `saveGateCancel` / `saveGateRetry` / `saveGateWaitIdle`；`src/impl.ts` · `dispatchRpc`（`save/*` 分支）/ `emptySaveGateStatus`；`src/client/store.ts` · `forceSaveGate` / `cancelSaveGate` / `retrySaveGate` / `pushSaveBanner` / `dismissBanner` / `retryBanner` / `forceBanner` / `reportFlushResult` / `saveGateInterruptTargets` / `save/status` 折叠；`src/client/save-guard-toast.tsx` · `SaveGuardToast` / `saveGuardToastKind` |
 | HMR 防护 | `src/hmr-guard.ts` · `installHmrReconcileGuard` / `HMR_RECONCILE_GUARD_MARKER` / `EMPTY_RECONCILIATION` / `isHmrReconcileHost`；`src/index.ts` · `installHmrGuard` / `ctx.inject(['hmr'])`；`src/client/store.ts` · `pushSaveBanner`（`hmr-delay` 横幅） |

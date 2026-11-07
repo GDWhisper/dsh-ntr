@@ -6,7 +6,7 @@
  * Deliberately framework-free: React binds through `useSyncExternalStore`.
  */
 
-import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, IdleReleaseResult, IdleReleaseSetPayload, PermissionTimeoutMode, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, SubagentDetailEntry, SubagentDetailResult, SubagentRecord } from '../protocol.ts'
+import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentSkillsResult, AgentSkillEntry, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, IdleReleaseResult, IdleReleaseSetPayload, PermissionTimeoutMode, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, SubagentDetailEntry, SubagentDetailResult, SubagentRecord } from '../protocol.ts'
 import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_TAG_HALO, MAX_SUBAGENT_DETAIL_ENTRIES } from '../protocol.ts'
 
 /** One slash command the ACP agent declared, whole row (the menu draws name, description and `input.hint`). */
@@ -210,6 +210,16 @@ export function subagentToolCallId(childId: string): string {
 
 /** How many workers' detail indexes the browser keeps at once (LRU eviction). */
 export const MAX_SUBAGENT_DETAIL_WORKERS = 64
+
+/** How long one `agent/skills` answer stays fresh in the `/` menu; past it the rows read as "not asked yet" again. */
+export const SKILL_MENU_TTL_MS = 60_000
+/** Composite-key cap for the skill rows record, evicted oldest fetch first. */
+export const MAX_SKILL_KEYS = 64
+
+/** The skill-rows record key: the SERVING agent is part of the key, so a binding switch invalidates by mismatch. */
+export function skillRowsKey(dshSessionId: string, agentId: string): string {
+  return `${dshSessionId}\u0000${agentId}`
+}
 
 /** Raw payload budget for one live-captured detail frame; mirrors the host's `ACP_TOOL_RAW_MAX` (equivalence pinned in tests/acp-view.spec.ts). */
 export const SUBAGENT_RAW_MAX = 256_000
@@ -609,6 +619,16 @@ export interface UiState {
    * `subagents/detail`.
    */
   subagentDetails: Record<string, SubagentDetailState>
+  /**
+   * Agent skill rows for the `/` menu (from `agent/skills`), keyed by
+   * {@link skillRowsKey}. The serving agent is part of the key, so switching
+   * the binding invalidates by mismatch — no invalidation hook needed, the old
+   * agent's rows just stop being looked up. `at` is the fetch time; past
+   * {@link SKILL_MENU_TTL_MS} the rows read as "not asked yet" again. An EMPTY
+   * rows array is a real answer ("this agent has no skills here"), never a
+   * placeholder for "not asked yet" — that case is `undefined` from the reader.
+   */
+  agentSkills: Record<string, { at: number; rows: readonly AgentSkillEntry[] }>
   /**
    * Per-chat-session ACP agent binding, as reported by `session/chat-list`'s
    * `boundAgentId` (the host's intent map plus its live-session fallback): who
@@ -1019,6 +1039,7 @@ export class AcpStore {
     acpMode: {},
     subagents: {},
     subagentDetails: {},
+    agentSkills: {},
     chatBoundAgent: {},
     chatLockedAgent: {},
     agentLockReveal: {},
@@ -1048,6 +1069,13 @@ export class AcpStore {
   private readonly openTurns = new Set<string>()
   /** In-flight `session/chat-list` reads, keyed by chat session id. */
   private readonly chatSessionReads = new Map<string, { dropped: boolean; done: Promise<void> }>()
+  /**
+   * In-flight `agent/skills` reads, keyed by chat session id. In-flight join
+   * only — the menu re-polls on every keystroke and one round-trip answers for
+   * all of them; no lifecycle frame can race this read, so no dropped/force
+   * machinery is owed.
+   */
+  private readonly skillReads = new Map<string, Promise<void>>()
   /**
    * Monotonic order plus a short log of chat-row lifecycle frames. Read
    * starts capture the sequence; the answer replays every later frame over
@@ -2232,6 +2260,82 @@ export class AcpStore {
       ?? this.state.chatBoundAgent[dshSessionId]
       ?? this.state.chatChoice[dshSessionId]?.agentId
       ?? this.state.defaultAgent
+  }
+
+  /**
+   * The skill rows the `/` menu's skill source should offer for this
+   * conversation, read against the CURRENT binding. `undefined` means "no
+   * answer in force": nothing fetched yet, the TTL expired, or the agent
+   * changed (composite-key mismatch) — every one of those is a signal to ask
+   * again. Only a successful read of THIS conversation + THIS agent's key
+   * answers `[]` (a real, confirmed-empty menu).
+   */
+  skillRowsFor(dshSessionId: string): readonly AgentSkillEntry[] | undefined {
+    const agentId = this.chatAgentFor(dshSessionId)
+    if (agentId === undefined) return undefined
+    const entry = this.state.agentSkills[skillRowsKey(dshSessionId, agentId)]
+    if (entry === undefined || Date.now() - entry.at >= SKILL_MENU_TTL_MS) return undefined
+    return entry.rows
+  }
+
+  /**
+   * Fetch the skill rows for one conversation (the slash skill source's cold
+   * read). Concurrent callers share one read; the entry leaves the map when it
+   * settles so the next caller past the TTL re-asks. A conversation with no
+   * answerable agent reads NOTHING: no state is written and no RPC is sent,
+   * so polling an unbound conversation costs zero network — and once a
+   * binding lands, the next menu poll fetches normally.
+   */
+  loadAgentSkills(dshSessionId: string): Promise<void> {
+    const inFlight = this.skillReads.get(dshSessionId)
+    if (inFlight !== undefined) return inFlight
+    const read = this.readAgentSkills(dshSessionId).finally(() => {
+      if (this.skillReads.get(dshSessionId) === read) this.skillReads.delete(dshSessionId)
+    })
+    this.skillReads.set(dshSessionId, read)
+    return read
+  }
+
+  private async readAgentSkills(dshSessionId: string): Promise<void> {
+    // "Don't know the agent" is recorded as NOTHING — never as an empty menu.
+    // An empty rows array must stay a real answer, so the mismatch case re-asks
+    // instead of waiting out the TTL with a wrong empty answer.
+    const agentId = this.chatAgentFor(dshSessionId)
+    if (agentId === undefined) return
+    const result = await this.call<AgentSkillsResult>('agent/skills', { dshSessionId, agentId })
+    this.writeAgentSkills(dshSessionId, agentId, result.skills ?? [])
+  }
+
+  /** Commit one `agent/skills` answer under its composite key, applying the {@link MAX_SKILL_KEYS} eviction. */
+  private writeAgentSkills(dshSessionId: string, agentId: string, rows: readonly AgentSkillEntry[]): void {
+    const key = skillRowsKey(dshSessionId, agentId)
+    const next: Record<string, { at: number; rows: readonly AgentSkillEntry[] }> = {
+      ...this.state.agentSkills,
+      [key]: { at: Date.now(), rows },
+    }
+    const keys = Object.keys(next)
+    if (keys.length > MAX_SKILL_KEYS) {
+      const removable = keys.sort((a, b) => (next[a]?.at ?? 0) - (next[b]?.at ?? 0))
+      let excess = keys.length - MAX_SKILL_KEYS
+      for (const removableKey of removable) {
+        if (excess <= 0) break
+        delete next[removableKey]
+        excess -= 1
+      }
+    }
+    this.mutate({ agentSkills: next })
+  }
+
+  /**
+   * The draft text one skill pick inserts, resolved against the CURRENT
+   * binding: a row seen under a since-switched agent is simply unknown here
+   * (the composite key moved), so the pick does nothing rather than insert the
+   * old agent's path.
+   */
+  skillInsertionFor(dshSessionId: string, token: string): string | undefined {
+    const rows = this.skillRowsFor(dshSessionId)
+    if (rows === undefined) return undefined
+    return rows.find(row => row.token === token)?.insertion
   }
 
   /**

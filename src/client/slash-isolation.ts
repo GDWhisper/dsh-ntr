@@ -2,11 +2,12 @@
  * Slash isolation for ACP conversations.
  *
  * In an ACP conversation the composer's `/` menu belongs to the AGENT: the
- * commands it declared over `available_commands_update`. The host's own slash
- * machinery (`dsh-client-ui-commands` plus the client skill source) describes
- * commands THIS runtime would execute — `/model`, `/permission`, `/export`,
- * the DSH skill catalog — and a name it recognizes is consumed before the
- * draft ever reaches the prompt sink, so the agent never sees the line.
+ * commands it declared over `available_commands_update`, and the skills its
+ * flavor scans from disk (`agent/skills`). The host's own slash machinery
+ * (`dsh-client-ui-commands` plus the client skill source) describes commands
+ * THIS runtime would execute — `/model`, `/permission`, `/export`, the DSH
+ * skill catalog — and a name it recognizes is consumed before the draft ever
+ * reaches the prompt sink, so the agent never sees the line.
  *
  * There is no supported seam for "this session only": `InputTriggerService`
  * adjudicates in REGISTRATION order (`order` only sorts the menu), duplicate
@@ -24,6 +25,20 @@
  * the conversation keeps the host's behaviour (fail-open; a diagnostic line is
  * reported instead of an error).
  *
+ * Two of the wrapped `/` sources carry a ROLE in ACP mode, resolved by NAME so
+ * the choice does not depend on registration order:
+ *
+ * - the `command` source (existing contract) answers the agent's commands;
+ * - the `skill` source (new) answers the agent's skill rows — its pick inserts
+ *   the ready `use /token [Skill Path](…)` text into the draft and never
+ *   executes anything; every other `/` source is silenced, exactly as before.
+ *
+ * SAME-SOURCE CONFLICT RULE: when no `command` source exists and the fallback
+ * "first `/` source" IS the `skill` source, both roles would point at one
+ * source — the command role WINS and the skill rows stay silent. Commands are
+ * the existing contract, skills the new capability; on conflict the old one
+ * keeps the source.
+ *
  * The wrappers are per CALL, not per instance: the source objects are shared
  * by every conversation, and the session id each hook receives is what tells
  * an ACP conversation from an ordinary one.
@@ -31,6 +46,7 @@
 
 import type { AcpSessionsSnapshot } from './acp-ui.tsx'
 import { ACP_PRESET_ID, rowAgentPreset, stagedSessionOf } from './acp-ui.tsx'
+import type { AgentSkillEntry } from '../protocol.ts'
 import type { AgentCommand } from './store.ts'
 
 /** One menu row: the ACP command name, plus whatever makes it findable. */
@@ -89,6 +105,15 @@ export interface SlashIsolationOptions {
    * cached surface first — that read is pure memory on the host.
    */
   commands(sessionId: string): readonly AgentCommand[] | undefined | Promise<readonly AgentCommand[] | undefined>
+  /**
+   * The agent's skill rows for one conversation (`agent/skills` via the
+   * store); `undefined` = nothing in force yet (not read, past its TTL, or the
+   * binding changed), which renders an empty menu — never the host's own
+   * skill catalog.
+   */
+  skills(sessionId: string): Promise<readonly AgentSkillEntry[] | undefined>
+  /** The draft text one skill pick inserts; `undefined` = the token is not the current agent's, insert nothing. */
+  skillInsertion(sessionId: string, token: string): string | undefined
   /** Kick a fresh `session/chat-list` read (fire and forget). */
   refresh(sessionId: string): void
   /** Fail-open reports (console and the caller's own sink). */
@@ -239,19 +264,65 @@ export function commandCandidates(commands: readonly AgentCommand[], query: stri
   return ranked.map(match => match.candidate)
 }
 
+/**
+ * The agent's skills as menu rows, ranked the way Lody ranks skill mentions
+ * (three tiers, ascending — a lower score is a better match): the query (trim +
+ * lowercase) PREFIXES the token or the frontmatter name → 0, is CONTAINED in
+ * either → 1, only the skill's folder matches → 2, no match → dropped. Ties
+ * break by token, and an empty query is "everything, by token".
+ *
+ * Deliberately NOT filtered on `position` (unlike `commandCandidates`): a skill
+ * takes no arguments, so `use /token …` reads the same anywhere in the line and
+ * the rows carry a `hint` only for display. Whether the host menu renders
+ * hint-bearing rows inline is unverified — see the probe note in the plan
+ * (§8b); the fallback, if it misbehaves, is folding the scope into the
+ * description and dropping the hint.
+ */
+export function skillCandidates(rows: readonly AgentSkillEntry[], query: string): SlashCandidate[] {
+  const q = query.trim().toLowerCase()
+  const scored: Array<{ candidate: SlashCandidate; score: number }> = []
+  for (const row of rows) {
+    if (row === null || typeof row !== 'object') continue
+    const token = typeof row.token === 'string' ? row.token : ''
+    if (token === '') continue
+    const name = typeof row.name === 'string' ? row.name.toLowerCase() : ''
+    const folder = typeof row.folder === 'string' ? row.folder.toLowerCase() : ''
+    let score: number
+    if (q === '' || token.toLowerCase().startsWith(q) || name.startsWith(q)) score = 0
+    else if (token.toLowerCase().includes(q) || name.includes(q)) score = 1
+    else if (folder !== '' && folder.includes(q)) score = 2
+    else continue
+    const description = typeof row.description === 'string' && row.description !== '' ? row.description : row.name
+    scored.push({
+      candidate: {
+        name: token,
+        ...(description !== '' ? { description } : {}),
+        ...(row.scope !== undefined ? { hint: row.scope } : {}),
+      },
+      score,
+    })
+  }
+  scored.sort((left, right) => left.score - right.score || left.candidate.name.localeCompare(right.candidate.name))
+  return scored.map(entry => entry.candidate)
+}
+
 export function createSlashIsolation(options: SlashIsolationOptions): SlashIsolation {
   /** This instance's identity in the wrap marker (see `dispose`). */
   const owner = {}
   /** Sources this instance wrapped, so dispose can restore them. */
   const owned = new Set<SlashSource>()
   /**
-   * The ONE `/` source whose menu group serves the agent's commands. Every
-   * other `/` source is silenced in ACP mode — otherwise the same list would
-   * appear once per group (`command` AND `skill` both register on `/`). The
-   * host's command group is the natural carrier; it is picked by name so the
-   * choice does not depend on registration order.
+   * The two `/` sources that carry a role in ACP mode, picked by NAME so the
+   * choice does not depend on registration order: `servingCommand` answers the
+   * agent's commands (the host's command group first, falling back to the
+   * first `/` source so a live menu still exists), `servingSkill` answers the
+   * agent's skill rows and is silent unless a `skill` source exists AND is not
+   * already owned by the command role (the same-source conflict rule in the
+   * header). Every other `/` source stays silenced — otherwise the same list
+   * would appear once per group.
    */
-  let serving: SlashSource | undefined
+  let servingCommand: SlashSource | undefined
+  let servingSkill: SlashSource | undefined
   let lastDiag = 'idle'
   /** A problem line was reported during the current sync. */
   let failed = false
@@ -335,15 +406,29 @@ export function createSlashIsolation(options: SlashIsolationOptions): SlashIsola
 
     const patched: Array<{ key: keyof typeof originals; wrapper: unknown }> = []
 
-    // The menu. In ACP mode its only rows are the agent's own commands; the
-    // host directory is never read (which is also why a broken host catalog
+    // The menu. In ACP mode the carrier sources answer with the AGENT's rows —
+    // commands on the command role, skill rows on the skill role — and the
+    // host directories are never read (which is also why a broken host catalog
     // cannot fail the menu open here).
     const candidates = async (session: SlashSession, req: SlashCandidateRequest): Promise<readonly SlashCandidate[]> => {
       if (await settledVerdict(session) !== true) return originals.candidates!.call(source, session, req)
-      // A second `/` group would list the same commands again (and an empty
-      // group auto-hides), so only the carrier source answers in ACP mode.
-      if (serving !== source) return []
-      const sessionId = sessionIdOf(session)!
+      // A second `/` group would list the same rows again (and an empty
+      // group auto-hides), so only the role sources answer in ACP mode. No
+      // session id → no rows (fail-open keeps ordinary conversations whole).
+      const sessionId = sessionIdOf(session)
+      if (sessionId === undefined) return []
+      if (source === servingSkill && servingSkill !== servingCommand) {
+        let skillRows: readonly AgentSkillEntry[] | undefined
+        try {
+          skillRows = await options.skills(sessionId)
+        } catch {
+          // A failed read is "nothing in force", never a failed menu.
+          skillRows = undefined
+        }
+        if (skillRows === undefined) return []
+        return skillCandidates(skillRows, req?.query ?? '')
+      }
+      if (servingCommand !== source) return []
       let commands: readonly AgentCommand[] | undefined
       try {
         commands = await options.commands(sessionId)
@@ -390,14 +475,28 @@ export function createSlashIsolation(options: SlashIsolationOptions): SlashIsola
       patched.push({ key: 'matchSpace', wrapper: matchSpace })
     }
 
-    // A pick inserts the command into the draft; it never executes anything.
-    // The user still presses Enter, and Enter is not ours to consume — the
-    // same line then travels to the agent like any other message.
+    // A pick inserts text into the draft; it never executes anything. The user
+    // still presses Enter, and Enter is not ours to consume — the same line
+    // then travels to the agent like any other message. The command role
+    // inserts `/<name> `; the skill role resolves the row's ready-made
+    // `use /token [Skill Path](…)` text through the store, and an unknown
+    // token (the binding changed under the open menu) inserts NOTHING —
+    // fail-closed, never the previous agent's path.
     if (typeof originals.onPick === 'function') {
       const onPick: NonNullable<SlashSource['onPick']> = (pick) => {
         if (heldVerdict(pick?.session) !== true) return originals.onPick!.call(source, pick)
         const name = typeof pick?.candidate?.name === 'string' ? pick.candidate.name.trim() : ''
-        return name === '' ? undefined : { text: `/${name} ` }
+        if (name === '') return undefined
+        const sessionId = sessionIdOf(pick?.session)
+        if (source === servingSkill && servingSkill !== servingCommand && sessionId !== undefined) {
+          try {
+            const insertion = options.skillInsertion(sessionId, name)
+            return insertion === undefined ? undefined : { text: insertion }
+          } catch {
+            return undefined
+          }
+        }
+        return { text: `/${name} ` }
       }
       source.onPick = onPick
       patched.push({ key: 'onPick', wrapper: onPick })
@@ -468,9 +567,14 @@ export function createSlashIsolation(options: SlashIsolationOptions): SlashIsola
         return false
       }
       // Prefer the host's command group by name; fall back to any `/` source so
-      // a live menu still exists if upstream renames it.
-      serving = sources.find(source => source?.trigger === '/' && source.name === 'command')
+      // a live menu still exists if upstream renames it. The skill role is
+      // name-only and yields to the command role: if the fallback above landed
+      // ON the skill source, that source keeps answering commands and the
+      // skills stay silent (same-source conflict rule, see the header).
+      servingCommand = sources.find(source => source?.trigger === '/' && source.name === 'command')
         ?? sources.find(source => source?.trigger === '/')
+      const skillSource = sources.find(source => source?.trigger === '/' && source.name === 'skill')
+      servingSkill = skillSource !== undefined && skillSource !== servingCommand ? skillSource : undefined
       let inForce = false
       for (const source of sources) {
         if (source === null || typeof source !== 'object') continue

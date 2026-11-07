@@ -132,14 +132,16 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 
 ## 6. 斜杠菜单隔离
 
-NTR 会话的 `/` 属于 agent：菜单只列 agent 自己经 `available_commands_update` 声明的命令；Enter 对 `/xxx` **不被宿主认领**（整行原样进 agent）；选中菜单项只把 `/<name> ` 插回草稿，**绝不执行**宿主命令；宿主来源的 `warm` / `lexicon` / `header` 同步停用。非 ACP 会话的斜杠行为一字不变。
+NTR 会话的 `/` 属于 agent：菜单只列 agent 自己的行——命令（`available_commands_update` 声明）与技能（`agent/skills` 按命令行风味扫文件系统的清单）；Enter 对 `/xxx` **不被宿主认领**（整行原样进 agent）；选中命令项只把 `/<name> ` 插回草稿，**绝不执行**宿主命令；选中技能项把定稿的 `use /<token> [Skill Path](<destination>)` 一次性插回草稿，由 agent 自己的 skill 工具加载，**绝不执行**；宿主来源的 `warm` / `lexicon` / `header` 同步停用（技能来源也不触发宿主技能目录预热）。非 ACP 会话的斜杠行为一字不变。
 
 **机制**（`src/client/slash-isolation.ts`）：宿主没有受支持的 per-session 接缝——`InputTriggerService.adjudicate` 按注册顺序轮询（`order` 只排菜单）、同 `(trigger,name)` 重复注册直接抛、来源没有 `available(session)`。所以只能**在运行时包装活的来源对象**（`inputTriggers.live.sources` 中 `trigger === '/'` 的项，当前是 `command` 与 `skill`）。
 
 - **严禁**改写上游文件、注册第二个 `/` 来源、改 preset 行来伪装，或替换整个 `conversation.composer`。
-- agent 命令清单**只由一个来源承载**（按名字优先 `command`，缺席回落第一个 `/` 来源），其余来源在 ACP 会话里返回空——否则同一份清单每组各画一遍。
+- agent 命令清单**只由一个来源承载**（按名字优先 `command`，缺席回落第一个 `/` 来源）；agent 技能清单**只由名字为 `skill` 的来源承载**；其余来源在 ACP 会话里返回空——否则同一份清单每组各画一遍。**同源冲突规则**：当 command 回落的「第一个 `/` 来源」恰是 `skill` 来源时，command 角色优先、技能让位静默——命令是既有契约，冲突保旧。
 - 每次调用按会话判定：舞台行自己的 `agentPreset` 优先，否则用 `session/chat-list` 的 `acpMode`；**没有证据时一律当作非 ACP（fail-open）**。
-- `candidates` 每敲一键都会重取，「按需重问宿主」（`ASK_INTERVAL_MS`）与「没有任何命令时补读一次」（`REFRESH_INTERVAL_MS`）都必须节流。数据侧见 [state.md](./state.md) 的「斜杠命令缓存」。
+- `candidates` 每敲一键都会重取，「按需重问宿主」（`ASK_INTERVAL_MS`）与「没有任何命令时补读一次」（`REFRESH_INTERVAL_MS`）都必须节流；技能行的 TTL 与 agentId 解析收在 store（`skillRowsFor` / `loadAgentSkills` / `skillInsertionFor`），数据侧见 [state.md](./state.md) 的「斜杠命令缓存」与「技能清单」。技能行打分走 Lody 三档（token/name 前缀 0、包含 1、folder 2，平手按 token），`hint` 只放 scope 作展示、**不做** inline 过滤（宿主对 hint 行的 inline 行为未验证，异常时回退：scope 并进 description、去掉 hint）。
+- 技能 pick 的插入文本按**当前**绑定解析（`skillInsertionFor` 复合键）；切 agent 后旧 token 查不到 → 不插入（fail-closed，绝不插出旧 agent 的路径）。
+- **generic 兜底的局限**：风味未识别或没有 skill 体系的 agent 也会被建议 `use /token …` 文本——方向无害（只多建议、不误执行，agent 自行决定）。含空格技能目录的 destination 沿用 Lody 转义（仅 `\` 与 `)`），严格 markdown 解析器下会被截断，与 Lody 同构，已知局限。
 - **失败一律放开**：服务缺失不算故障；服务在但 `live.sources` 形状不认识、或来源没有 `candidates`，就什么都不包、照旧沿用宿主行为，原因写进 `UiState.slashDiag`（ACP 视图空态渲染）与一次 `console.warn`。`dispose` 只还原自己装的包装（跨实例标记 `Symbol.for('dsh-ntr.slash-isolation')` 带 owner）；`sync` 幂等，可在 `internal/service` 与 store 变更时重跑。
 
 ## 7. 快照读取与失败放开
@@ -176,4 +178,4 @@ NTR 会话里，宿主的点赞 / 点踩 / 分支三图标是插件的业务：a
 | tok/s | `src/tps.ts` · `TurnTpsTracker`；`src/bridge.ts` · `TurnStreamController.trackTps` / `finalizeTps` / `BridgeManager.noteSessionBurst`；`src/client/activity-pill.tsx` · `createActivityPillClaim` / `ActivityPillOccupant` / `patchedActivityStats` / `activityBurst`；`src/client/index.tsx` · `activityClaim` 注册处 |
 | 子代理面板 | `src/client/subagent-activity.tsx` · `createSubagentCatalogClaim` / `SubagentCatalogOccupant`（ACP 分流）/ `subagentCatalogDiagIsWorthWarn`；`src/client/subagent-panel.tsx` · `OwnSubagentCatalog` / `subagentPanelRows` / `readSubagentCatalogProjection` / `SubagentPanelRowView` / `SubagentDetailDialog`；`src/client/acp-ui.tsx` · `openSubagentDetail` / `closeSubagentDetail`；`src/client/index.tsx` · `createSubagentCatalogDiagSink` / `subagentCatalogClaim` / `acp-subagent-detail` 注册处；`src/bridge.ts` · `TurnStreamController.syncDispatchRecord` / `terminalizeDispatches` / `BridgeManager.noteSubagentRecords` / `subagentsFor` / `subagentsDetail` / `chatSessions`；`src/client/store.ts` · `UiState.subagents` / `subagentDetails` / `loadSubagentDetail` / `subagentToolCallId` / `compactDetailValue` / `boundedDetailEntry`（`subagentToolCallId` 与 `boundedDetailEntry` 是 `src/impl.ts` 同名 / `boundSubagentDetailEntry` 的跨半区手拷贝，等价测试钉在 `tests/acp-view.spec.ts`） |
 | 消息动作 | `src/client/branch-action.tsx` · `AcpBranchAction`；`src/client/store.ts` · `forkStateOf` / `forkChatSession`；`src/client/index.tsx` · `setScopeMarker` / `probeHostActionLabels` / `ntr-branch` 注册处；`src/client/acp-ui.tsx` · 隐藏规则与 `.ntr-branch-action` 样式（见 §12） |
-| 斜杠 | `src/client/slash-isolation.ts` · `createSlashIsolation` / `slashAcpVerdict` / `commandCandidates` |
+| 斜杠 | `src/client/slash-isolation.ts` · `createSlashIsolation` / `slashAcpVerdict` / `commandCandidates` / `skillCandidates`；技能接线 `src/client/index.tsx` · `createSlashIsolation` 的 `skills` / `skillInsertion` 回调；技能状态 `src/client/store.ts` · `skillRowsFor` / `loadAgentSkills` / `skillInsertionFor` / `skillRowsKey`；技能数据 `src/bridge.ts` · `BridgeManager.agentSkills`；`src/skills-scan.ts` · `scanSkillDirs`；`src/impl.ts` · `skillFlavorOf` / `SKILL_DIRS_BY_FLAVOR` / `GENERIC_SKILL_DIRS` / `parseSkillFrontmatter` / `skillMentionToken` / `formatSkillMentionPrompt` |

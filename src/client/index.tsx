@@ -1037,6 +1037,17 @@ export function apply(ctx: Context): void {
         await store.loadAgentCatalog(agentId)
         return store.agentCommands(agentId)
       },
+      // The skill source's rows: whatever is in force (fresh read of the
+      // CURRENT binding), else one fetch — the TTL and the agent resolution
+      // live in the store, and an agent switch invalidates by composite-key
+      // mismatch, so the next open re-asks on its own. No refresh machinery.
+      skills: async (sessionId) => {
+        const held = store.skillRowsFor(sessionId)
+        if (held !== undefined) return held
+        await store.loadAgentSkills(sessionId)
+        return store.skillRowsFor(sessionId)
+      },
+      skillInsertion: (sessionId, token) => store.skillInsertionFor(sessionId, token),
       refresh: (sessionId) => { void store.loadChatSessions(sessionId) },
       onDiag: (line) => {
         store.noteSlashDiag(line)
