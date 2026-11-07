@@ -2822,6 +2822,15 @@ export function appendExternalSubagentCatalog(
 const SUBAGENT_STATUSES: readonly SubagentStatus[] = ['pending', 'running', 'completed', 'failed', 'cancelled', 'unknown']
 const TERMINAL_SUBAGENT_STATUSES: readonly SubagentStatus[] = ['completed', 'failed', 'cancelled', 'unknown']
 
+/**
+ * The `toolCallId` behind an `acp:<toolCallId>` child id, or '' when it is not
+ * one. The browser half hand-copies this as `subagentToolCallId` in
+ * `src/client/store.ts`; the equivalence is pinned in tests/acp-view.spec.ts.
+ */
+export function subagentToolCallId(childId: string): string {
+  return childId.startsWith('acp:') ? childId.slice('acp:'.length) : ''
+}
+
 /** Whether a stored status is one of the six the contract defines. */
 function isSubagentStatus(value: unknown): value is SubagentStatus {
   return typeof value === 'string' && (SUBAGENT_STATUSES as readonly string[]).includes(value)
@@ -2845,9 +2854,7 @@ export function normalizeSubagentRecord(raw: unknown): SubagentRecord | undefine
   // rejected rather than silently swapped for a derived value.
   const childId = row.childId === undefined
     ? (typeof row.toolCallId === 'string' && row.toolCallId !== '' ? `acp:${row.toolCallId}` : '')
-    : (typeof row.childId === 'string' && row.childId.startsWith('acp:') && row.childId.length > 'acp:'.length
-      ? row.childId
-      : '')
+    : (typeof row.childId === 'string' && subagentToolCallId(row.childId) !== '' ? row.childId : '')
   if (childId === '') return undefined
   const dshSessionId = typeof row.dshSessionId === 'string' ? row.dshSessionId : ''
   if (dshSessionId === '') return undefined
@@ -2860,7 +2867,7 @@ export function normalizeSubagentRecord(raw: unknown): SubagentRecord | undefine
   return {
     childId,
     dshSessionId,
-    toolCallId: childId.slice('acp:'.length),
+    toolCallId: subagentToolCallId(childId),
     label: typeof row.label === 'string' ? row.label : '',
     ...(typeof row.type === 'string' && row.type !== '' ? { type: row.type } : {}),
     status: isSubagentStatus(row.status) ? row.status : 'unknown',
@@ -3714,7 +3721,7 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         // "detail no longer readable" line from that.
         const dshSessionId = str(body, 'dshSessionId', 128)
         const childId = str(body, 'childId', 256)
-        if (!childId.startsWith('acp:') || childId.length <= 'acp:'.length) {
+        if (subagentToolCallId(childId) === '') {
           throw new AcpError('bad_payload', 'acp: childId must be an external subagent identity (acp:<toolCallId>)')
         }
         return ok(manager.subagentsDetail?.(dshSessionId, childId) ?? { entries: [] })

@@ -71,6 +71,7 @@ import {
   normalizeSubagentRecordMap,
   capSubagentRecords,
   boundSubagentDetailEntry,
+  subagentToolCallId,
 } from './impl.ts'
 import type {
   AcpToolCallSnapshot,
@@ -6920,7 +6921,7 @@ export class BridgeManager {
    * `ACP_TOOL_RAW_MAX` with a marker — never silently.
    */
   subagentsDetail(dshSessionId: string, childId: string): SubagentDetailResult {
-    const toolCallId = childId.startsWith('acp:') ? childId.slice('acp:'.length) : ''
+    const toolCallId = subagentToolCallId(childId)
     if (toolCallId === '') return { entries: [] }
     const matched: SubagentDetailEntry[] = []
     for (const session of this.dshSessionMap.values()) {

@@ -12,15 +12,15 @@ import { describe, expect, it, vi } from 'vitest'
 import { ACP_PRESET_ID, acpModeFromPresetEvent, formatCommandLine, isAbsolutePathLike, placeMenu, rowAgentPreset, splitAcpModelId, splitCommandLine, stagedIsAcpMode, stagedSessionOf, tokenizeCommandLine } from '../src/client/acp-ui.tsx'
 import { agentLockPhaseOf, FORM_MS, playAgentLockAnim, SHATTER_MS } from '../src/client/agent-lock-anim.ts'
 import { branchIconOf, resolveHostFork } from '../src/client/branch-action.tsx'
-import { acpEmptyCopy, boundAgentOf, diffRows, formatSubagentDuration, historyAwaitsReplay, isNewFileDiff, subagentElapsedMs, subagentRowsFor, subagentRunningCount, subagentSectionCopy, subagentStatusLabel, subagentStatusTone, subagentTitle } from '../src/client/acp-view.tsx'
+import { acpEmptyCopy, boundAgentOf, diffRows, formatSubagentDuration, historyAwaitsReplay, isNewFileDiff, subagentElapsedMs, subagentRowsFor, subagentRunningCount, subagentSectionCopy, subagentStatusLabel, subagentStatusTone, subagentTitle, subagentTriggerLabel } from '../src/client/acp-view.tsx'
 import { agentModeVisible } from '../src/client/composer-mode.tsx'
 import { acpMeterUsage, compactTokenCount, contextOccupancy } from '../src/client/context-meter.tsx'
 import { agentTestHint, approvalDeadlineFacts, DEADLINE_MIN_WAIT_MS, deadlineSliderIndex, deadlineValueFor } from '../src/client/panel.tsx'
 import { describeRoute, menuFor, REFRESH_CATALOG_ITEM } from '../src/client/session-controls.tsx'
-import { AcpStore, deadlineRemainingLabel, PERMISSION_DEADLINE_EXPIRED, permissionsForSession, usageFromUpdate } from '../src/client/store.ts'
-import { placeSubagentMenu, readSubagentCatalogProjection, subagentLastActivityLabel, subagentPanelRows, subagentTriggerLabel } from '../src/client/subagent-panel.tsx'
+import { AcpStore, boundedDetailEntry, deadlineRemainingLabel, PERMISSION_DEADLINE_EXPIRED, permissionsForSession, subagentToolCallId, SUBAGENT_RAW_MAX, usageFromUpdate } from '../src/client/store.ts'
+import { placeSubagentMenu, readSubagentCatalogProjection, subagentLastActivityLabel, subagentPanelRows } from '../src/client/subagent-panel.tsx'
 import type { PendingPermission } from '../src/client/store.ts'
-import { APPROVAL_DEADLINE_MIN_WAIT_MS, isAbsolutePath, splitAdapterModelId, splitCommandLine as hostSplitCommandLine, tokenizeCommandLine as hostTokenizeCommandLine } from '../src/impl.ts'
+import { ACP_TOOL_RAW_MAX, APPROVAL_DEADLINE_MIN_WAIT_MS, boundSubagentDetailEntry, isAbsolutePath, splitAdapterModelId, splitCommandLine as hostSplitCommandLine, subagentToolCallId as hostSubagentToolCallId, tokenizeCommandLine as hostTokenizeCommandLine } from '../src/impl.ts'
 import type { AgentCatalogResult, AgentTestResult, AgentView, ChatSessionView, SubagentRecord, SubagentStatus } from '../src/protocol.ts'
 
 /**
@@ -93,6 +93,41 @@ describe('isAbsolutePathLike', () => {
     // so the form must not bless a cwd that could never resolve.
     expect(isAbsolutePathLike('\\\\?\\C:\\x')).toBe(false)
     expect(isAbsolutePathLike('//?/C:/x')).toBe(false)
+  })
+})
+
+/**
+ * The subagent detail primitives are deliberate browser ⇄ host hand copies
+ * (the browser half must not import the Node half): the `acp:` child-id codec
+ * and the per-frame raw bounder. These samples pin the two halves together —
+ * a drift would bound live frames differently from the host's history read.
+ */
+describe('subagent detail primitives (browser ⇄ host hand copy)', () => {
+  it('decodes the acp: child id identically on both halves', () => {
+    for (const sample of ['acp:call-1', 'acp:', 'acp:a:b', '', 'call-1', 'ACP:x', 'acp: ', 'x-acp:y']) {
+      expect(subagentToolCallId(sample)).toBe(hostSubagentToolCallId(sample))
+    }
+  })
+
+  it('keeps the same raw payload budget as the host', () => {
+    expect(SUBAGENT_RAW_MAX).toBe(ACP_TOOL_RAW_MAX)
+  })
+
+  it('bounds one live frame exactly like the host bounder (plus the liveSeq mark)', () => {
+    const circular: Record<string, unknown> = { sessionUpdate: 'plan' }
+    circular.self = circular
+    const samples: unknown[] = [
+      undefined,
+      'plain text',
+      42,
+      { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hi' } },
+      { sessionUpdate: 'tool_call_update', content: 'x'.repeat(SUBAGENT_RAW_MAX + 10) },
+      { sessionUpdate: 'tool_call_update', content: 'y'.repeat(SUBAGENT_RAW_MAX) },
+      circular,
+    ]
+    for (const update of samples) {
+      expect(boundedDetailEntry(7, update, 3)).toEqual({ ...boundSubagentDetailEntry(7, update), liveSeq: 3 })
+    }
   })
 })
 
@@ -1425,14 +1460,16 @@ describe('the NTR view subagent section', () => {
     expect(unseen).toBeDefined()
     expect(unseen?.title).toBe('No ACP session record — subagent history unknown')
     expect(unseen?.body).toMatch(/cannot be told yet/)
-    // Served but no records: the honest "nothing recorded yet" line, said
-    // differently from the never-served branch.
+    // Served but no records: the honest "nothing reported" line — it claims
+    // only the observation (no reports), never that the agent has no
+    // subagents, and reads differently from the never-served branch.
     const served = subagentSectionCopy({ total: 0, known: 0, served: true }, en)
-    expect(served?.title).toBe('No subagent records yet')
+    expect(served?.title).toBe('This agent has not reported subagents')
     expect(served?.title).not.toBe(unseen?.title)
     // And in Chinese the two branches stay distinct as well.
     expect(subagentSectionCopy({ total: 0, known: 0, served: false }, zh).title)
       .not.toBe(subagentSectionCopy({ total: 0, known: 0, served: true }, zh).title)
+    expect(subagentSectionCopy({ total: 0, known: 0, served: true }, zh).title).toBe('该 agent 未上报子智能体')
   })
 
   it('labels an all-unknown history as state unknown and stays quiet otherwise', () => {

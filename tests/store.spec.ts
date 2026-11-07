@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { AcpStore, composeSaveBanners, foldUpdate, forkStateOf, permissionsForSession, replayChatRowFrames, saveGateTransitions, type Block, type RpcCall, type SaveBanner } from '../src/client/store.ts'
+import { AcpStore, composeSaveBanners, foldUpdate, forkStateOf, permissionsForSession, replayChatRowFrames, saveGateTransitions, subagentKey, type Block, type RpcCall, type SaveBanner, type SubagentDetailState } from '../src/client/store.ts'
 import { acpModeFromPresetEvent, stagedIsAcpMode } from '../src/client/acp-ui.tsx'
 import { resolveHostFork } from '../src/client/branch-action.tsx'
 import { releasedBannerVisible } from '../src/client/released-banner.tsx'
@@ -1880,10 +1880,18 @@ describe('AcpStore subagent lifecycle records (the panel data layer)', () => {
     return { store, calls, apply }
   }
 
+  // The components read the keyed snapshot maps directly; the tests do too.
+  const recordOf = (store: AcpStore, childId: string, dshSessionId = 'chat-1'): SubagentRecord | undefined =>
+    store.getSnapshot().subagents[subagentKey(dshSessionId, childId)]
+  const recordsOf = (store: AcpStore, dshSessionId: string): SubagentRecord[] =>
+    Object.values(store.getSnapshot().subagents).filter(row => row.dshSessionId === dshSessionId)
+  const detailOf = (store: AcpStore, childId: string): SubagentDetailState | undefined =>
+    store.getSnapshot().subagentDetails[subagentKey('chat-1', childId)]
+
   it('folds creation and every transition, keyed by conversation + child id', async () => {
     const { store, apply } = makeStore()
     await apply({ type: 'subagents/record', dshSessionId: 'chat-1', record: record() })
-    expect(store.subagentRecord('chat-1', 'acp:call-1')?.status).toBe('pending')
+    expect(recordOf(store, 'acp:call-1')?.status).toBe('pending')
     // The same child id in another conversation is a different record.
     await apply({ type: 'subagents/record', dshSessionId: 'chat-2', record: record({ dshSessionId: 'chat-2', status: 'running' }) })
 
@@ -1892,29 +1900,14 @@ describe('AcpStore subagent lifecycle records (the panel data layer)', () => {
       dshSessionId: 'chat-1',
       record: record({ status: 'failed', endedAt: 2_000, error: 'boom' }),
     })
-    expect(store.subagentRecord('chat-1', 'acp:call-1')?.status).toBe('failed')
-    expect(store.subagentRecord('chat-1', 'acp:call-1')?.error).toBe('boom')
-    expect(store.subagentRecord('chat-2', 'acp:call-1')?.status).toBe('running')
+    expect(recordOf(store, 'acp:call-1')?.status).toBe('failed')
+    expect(recordOf(store, 'acp:call-1')?.error).toBe('boom')
+    expect(recordOf(store, 'acp:call-1', 'chat-2')?.status).toBe('running')
 
     // A stale in-flight frame must not revive a terminal row.
     await apply({ type: 'subagents/record', dshSessionId: 'chat-1', record: record({ status: 'running' }) })
-    expect(store.subagentRecord('chat-1', 'acp:call-1')?.status).toBe('failed')
-    expect(store.subagentsFor('chat-1')).toHaveLength(1)
-  })
-
-  it('sorts one conversation\'s records by dispatch time', async () => {
-    const { store, apply } = makeStore()
-    await apply({
-      type: 'subagents/record',
-      dshSessionId: 'chat-1',
-      record: record({ childId: 'acp:later', toolCallId: 'later', startedAt: 2_000 }),
-    })
-    await apply({
-      type: 'subagents/record',
-      dshSessionId: 'chat-1',
-      record: record({ childId: 'acp:earlier', toolCallId: 'earlier', startedAt: 500 }),
-    })
-    expect(store.subagentsFor('chat-1').map(row => row.childId)).toEqual(['acp:earlier', 'acp:later'])
+    expect(recordOf(store, 'acp:call-1')?.status).toBe('failed')
+    expect(recordsOf(store, 'chat-1')).toHaveLength(1)
   })
 
   it('seeds records from session/chat-list, de-duplicates across rows, and replays in-flight frames', async () => {
@@ -1957,8 +1950,8 @@ describe('AcpStore subagent lifecycle records (the panel data layer)', () => {
     // Two rows carried the same record; the keyed map holds one.
     const rows = Object.keys(store.getSnapshot().subagents)
     expect(rows).toHaveLength(1)
-    expect(store.subagentRecord('chat-1', 'acp:call-1')?.status).toBe('completed')
-    expect(store.subagentsFor('chat-1')).toHaveLength(1)
+    expect(recordOf(store, 'acp:call-1')?.status).toBe('completed')
+    expect(recordsOf(store, 'chat-1')).toHaveLength(1)
   })
 
   it('reads worker history on the first open only, then folds live frames by both filters', async () => {
@@ -1978,7 +1971,7 @@ describe('AcpStore subagent lifecycle records (the panel data layer)', () => {
     await apply({ type: 'turn/metrics', sessionId: 'acp-s1', dshSessionId: 'chat-1', turnId: 't1', outputTokens: 1, burstMs: 1, final: true })
 
     await store.loadSubagentDetail('chat-1', 'acp:call-1')
-    const detail = store.subagentDetail('chat-1', 'acp:call-1')
+    const detail = detailOf(store, 'acp:call-1')
     expect(detail?.loaded).toBe(true)
     expect(detail?.entries.map(entry => entry.seq)).toEqual([1, 2])
     expect(calls.filter(call => call.endpoint === 'subagents/detail')).toEqual([
@@ -2013,7 +2006,7 @@ describe('AcpStore subagent lifecycle records (the panel data layer)', () => {
       update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'unrelated' } },
     })
     store.flushUpdates()
-    expect(store.subagentDetail('chat-1', 'acp:call-1')?.entries.map(entry => entry.seq)).toEqual([1, 2, 10, 11])
+    expect(detailOf(store, 'acp:call-1')?.entries.map(entry => entry.seq)).toEqual([1, 2, 10, 11])
   })
 
   it('caps one worker at 200 entries and counts the dropped front as a marker', async () => {
@@ -2029,7 +2022,7 @@ describe('AcpStore subagent lifecycle records (the panel data layer)', () => {
       })
     }
     store.flushUpdates()
-    const detail = store.subagentDetail('chat-1', 'acp:call-1')
+    const detail = detailOf(store, 'acp:call-1')
     expect(detail?.entries).toHaveLength(200)
     expect(detail?.entries[0]?.seq).toBe(6)
     expect(detail?.entries.at(-1)?.seq).toBe(205)
@@ -2062,7 +2055,7 @@ describe('AcpStore subagent lifecycle records (the panel data layer)', () => {
     store.flushUpdates()
     releaseDetail()
     await loading
-    expect(store.subagentDetail('chat-1', 'acp:call-1')?.entries.map(entry => entry.seq)).toEqual([1, 2])
+    expect(detailOf(store, 'acp:call-1')?.entries.map(entry => entry.seq)).toEqual([1, 2])
   })
 
   it('keeps at most 64 worker detail indexes, evicting the least recently opened', async () => {
@@ -2072,8 +2065,8 @@ describe('AcpStore subagent lifecycle records (the panel data layer)', () => {
     }
     const details = store.getSnapshot().subagentDetails
     expect(Object.keys(details)).toHaveLength(64)
-    expect(store.subagentDetail('chat-1', 'acp:call-0')).toBeUndefined()
-    expect(store.subagentDetail('chat-1', 'acp:call-64')).toBeDefined()
+    expect(detailOf(store, 'acp:call-0')).toBeUndefined()
+    expect(detailOf(store, 'acp:call-64')).toBeDefined()
   })
 })
 

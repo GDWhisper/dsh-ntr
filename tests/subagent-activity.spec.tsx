@@ -311,8 +311,9 @@ describe('the subagent catalog shadow', () => {
     expect(screen.getByText('累计 2 个')).toBeDefined()
     fireEvent.click(screen.getByRole('button'))
     // A catalog row with no record predates state tracking: it must read
-    // unknown, never succeeded.
+    // unknown, never succeeded, and the row says so in full.
     expect(screen.getByText('状态未知')).toBeDefined()
+    expect(screen.getByText(/历史记录，状态未知/)).toBeDefined()
     // A dispatch the host catalog has not appended yet is still listed.
     expect(screen.getByText('等待开始')).toBeDefined()
     expect(screen.getByText(/目录待同步/)).toBeDefined()

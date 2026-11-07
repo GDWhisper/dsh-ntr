@@ -545,8 +545,20 @@ export function subagentTitle(record: Pick<SubagentRecord, 'type' | 'label' | 'c
 }
 
 /** How recently one duplicate record was updated; the fresher copy wins a de-dupe. */
-function subagentFreshness(record: SubagentRecord): number {
+export function subagentFreshness(record: SubagentRecord): number {
   return Math.max(record.lastActivityAt, record.endedAt ?? 0, record.startedAt)
+}
+
+/**
+ * The trigger's whole sentence: cumulative dispatches, and the running count
+ * only when something runs. Both halves are separate on purpose — the host's
+ * "N subagents" conflated them, so a session that dispatched 11 workers over
+ * two days read as 11 concurrent ones. Shared by the header trigger and the
+ * NTR strip so the two surfaces never word the count differently.
+ */
+export function subagentTriggerLabel(total: number, running: number, t: Translate): string {
+  const totalText = t(`累计 ${total} 个`, `${total} total`)
+  return running > 0 ? `${totalText} · ${t(`${running} 运行中`, `${running} running`)}` : totalText
 }
 
 /**
@@ -591,9 +603,11 @@ export interface SubagentSectionCopy {
  *
  * Two facts must never be conflated: "this conversation has never been served
  * by an ACP session" (nothing can be said about the agent's subagents at all)
- * and "the agent dispatched nothing" (a claim only a known-empty list may
- * make). A history of `unknown` records is a third thing: the records exist,
- * but their state was never tracked.
+ * and "the agent has reported nothing" (the only honest claim an empty list
+ * supports — whether the agent never dispatches or simply has not dispatched
+ * yet is not observable from this seat, so the copy says "not reported",
+ * never "no subagents"). A history of `unknown` records is a third thing: the
+ * records exist, but their state was never tracked.
  */
 export function subagentSectionCopy(facts: SubagentSectionFacts, t: Translate): SubagentSectionCopy | undefined {
   if (facts.total === 0) {
@@ -607,10 +621,10 @@ export function subagentSectionCopy(facts: SubagentSectionFacts, t: Translate): 
       }
     }
     return {
-      title: t('还没有子智能体记录', 'No subagent records yet'),
+      title: t('该 agent 未上报子智能体', 'This agent has not reported subagents'),
       body: t(
-        'agent 派出子智能体后，这里会显示它们的状态与耗时。',
-        'Subagents appear here with their state and elapsed time once this agent dispatches them.',
+        '收到上报后，这里会显示子智能体的状态与耗时。',
+        'Once reports arrive, subagents appear here with their state and elapsed time.',
       ),
     }
   }
@@ -670,15 +684,13 @@ export function SubagentSection({ rows, served, t }: { rows: readonly SubagentRe
     known: rows.filter(record => record.status !== 'unknown').length,
     served,
   }, t)
-  const totalText = t(`累计 ${rows.length} 个`, `${rows.length} total`)
-  const runningText = t(`${running} 运行中`, `${running} running`)
   return (
     <div className="ntr-acp-subagents">
       <div className="ntr-acp-subagents-head">
         <span className="ntr-acp-subagents-title">{t('子智能体', 'subagents')}</span>
         {rows.length > 0 && (
           <span className="ntr-acp-subagents-count">
-            {running > 0 ? `${totalText} · ${runningText}` : totalText}
+            {subagentTriggerLabel(rows.length, running, t)}
           </span>
         )}
       </div>

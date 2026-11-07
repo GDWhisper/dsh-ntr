@@ -199,11 +199,20 @@ export function subagentKey(dshSessionId: string, childId: string): string {
   return `${dshSessionId}\u0000${childId}`
 }
 
+/**
+ * The `toolCallId` behind an `acp:<toolCallId>` child id, or '' when it is not
+ * one. Hand-copied from `src/impl.ts` (the browser half must not import the
+ * Node half); the equivalence is pinned in tests/acp-view.spec.ts.
+ */
+export function subagentToolCallId(childId: string): string {
+  return childId.startsWith('acp:') ? childId.slice('acp:'.length) : ''
+}
+
 /** How many workers' detail indexes the browser keeps at once (LRU eviction). */
 export const MAX_SUBAGENT_DETAIL_WORKERS = 64
 
-/** Raw payload budget for one live-captured detail frame; mirrors the host's `ACP_TOOL_RAW_MAX`. */
-const SUBAGENT_RAW_MAX = 256_000
+/** Raw payload budget for one live-captured detail frame; mirrors the host's `ACP_TOOL_RAW_MAX` (equivalence pinned in tests/acp-view.spec.ts). */
+export const SUBAGENT_RAW_MAX = 256_000
 
 /** One raw worker entry in the browser's bounded detail index. */
 export interface LiveSubagentDetailEntry extends SubagentDetailEntry {
@@ -1276,7 +1285,7 @@ export class AcpStore {
       for (const key of keys) {
         const detail = (out ?? currentMap)[key]
         if (detail === undefined || detail.dshSessionId !== owner) continue
-        const toolCallId = detail.childId.startsWith('acp:') ? detail.childId.slice('acp:'.length) : ''
+        const toolCallId = subagentToolCallId(detail.childId)
         if (toolCallId === '') continue
         if (toolCallId !== own && toolCallId !== parent) continue
         if (out === undefined) out = { ...currentMap }
@@ -2093,29 +2102,6 @@ export class AcpStore {
   }
 
   /**
-   * The lifecycle records this page knows for one conversation, oldest
-   * dispatch first. The panel LISTS from the host's catalog projection and
-   * joins these by `childId` — a row with no record here reads `unknown`
-   * (a catalog fact from before the plugin recorded lifecycles), never
-   * succeeded.
-   */
-  subagentsFor(dshSessionId: string): SubagentRecord[] {
-    return Object.values(this.state.subagents)
-      .filter(record => record.dshSessionId === dshSessionId)
-      .sort((a, b) => a.startedAt - b.startedAt)
-  }
-
-  /** One worker's lifecycle record, or `undefined` when this page never saw one. */
-  subagentRecord(dshSessionId: string, childId: string): SubagentRecord | undefined {
-    return this.state.subagents[subagentKey(dshSessionId, childId)]
-  }
-
-  /** One worker's bounded detail index, once its detail was opened in this page. */
-  subagentDetail(dshSessionId: string, childId: string): SubagentDetailState | undefined {
-    return this.state.subagentDetails[subagentKey(dshSessionId, childId)]
-  }
-
-  /**
    * Ensure one worker's detail index exists and read its history once.
    *
    * Creates the index (which is what makes LIVE frames append to it from then
@@ -2153,12 +2139,12 @@ export class AcpStore {
       const hostHistory = new Map<number, Set<string>>()
       for (const entry of result.entries) {
         const copy = hostHistory.get(entry.seq) ?? new Set<string>()
-        copy.add(detailPayloadKey(entry.update))
+        copy.add(compactDetailValue(entry.update))
         hostHistory.set(entry.seq, copy)
       }
       const live = current.entries.filter(entry => {
         if ((entry.liveSeq ?? 0) <= atRead) return false
-        return hostHistory.get(entry.seq)?.has(detailPayloadKey(entry.update)) !== true
+        return hostHistory.get(entry.seq)?.has(compactDetailValue(entry.update)) !== true
       })
       const combined = [...result.entries.map(entry => ({ ...entry })), ...live]
       const overflow = Math.max(0, combined.length - MAX_SUBAGENT_DETAIL_ENTRIES)
@@ -3752,10 +3738,7 @@ export class AcpStore {
         if (this.subagentRecordFrames.length > 256) this.subagentRecordFrames.shift()
         const key = subagentKey(event.dshSessionId, event.record.childId)
         const existing = this.state.subagents[key]
-        // A terminal row is never downgraded by a stale in-flight frame: the
-        // worker already reported, and the panel must not start claiming it is
-        // running again. Everything else is last-wins (frames arrive in order).
-        if (existing !== undefined && existing.endedAt !== undefined && event.record.endedAt === undefined) {
+        if (isSubagentDowngrade(existing, event.record)) {
           return Promise.resolve()
         }
         this.mutate({
@@ -4015,6 +3998,15 @@ export function replayChatRowFrames(
 }
 
 /**
+ * A terminal record is never downgraded by a stale non-terminal frame: the
+ * worker already reported, and the panel must not start claiming it is
+ * running again. Everything else is last-wins (frames arrive in order).
+ */
+function isSubagentDowngrade(existing: SubagentRecord | undefined, incoming: SubagentRecord): boolean {
+  return existing !== undefined && existing.endedAt !== undefined && incoming.endedAt === undefined
+}
+
+/**
  * Merge a `session/chat-list` answer's worker records for ONE conversation
  * into the store's keyed map, then replay the `subagents/record` frames that
  * landed while the read was in flight. Other conversations' records are left
@@ -4044,7 +4036,7 @@ export function mergeSubagentSnapshot(
     if (frame.seq <= afterSeq || frame.dshSessionId !== dshSessionId) continue
     const key = subagentKey(dshSessionId, frame.record.childId)
     const existing = next[key]
-    if (existing !== undefined && existing.endedAt !== undefined && frame.record.endedAt === undefined) continue
+    if (isSubagentDowngrade(existing, frame.record)) continue
     next[key] = frame.record
   }
   return next
@@ -4058,22 +4050,27 @@ function parentToolCallIdOf(update: Record<string, unknown>): string | undefined
   return typeof value === 'string' && value !== '' ? value : undefined
 }
 
-/** Serialized form of one detail payload (never throws; used to bound AND to de-duplicate). */
-function detailPayloadKey(update: unknown): string {
+/**
+ * Compact serialized form of one detail payload (never throws): the store
+ * bounds and de-duplicates with it, the detail view renders payloads that
+ * have no dedicated renderer with it (constraint 29).
+ */
+export function compactDetailValue(value: unknown): string {
   try {
-    return JSON.stringify(update) ?? String(update)
+    return JSON.stringify(value) ?? String(value)
   } catch {
-    return String(update)
+    return String(value)
   }
 }
 
 /**
  * Bound ONE live detail frame the same way the host's read does: over-budget
  * payloads become a MARKED cut, never a silent drop and never an unbounded
- * state object (constraint 29).
+ * state object (constraint 29). Exported for the equivalence test pinning it
+ * to the host's `boundSubagentDetailEntry` (tests/acp-view.spec.ts).
  */
-function boundedDetailEntry(seq: number, update: unknown, liveSeq: number): LiveSubagentDetailEntry {
-  const text = detailPayloadKey(update)
+export function boundedDetailEntry(seq: number, update: unknown, liveSeq: number): LiveSubagentDetailEntry {
+  const text = compactDetailValue(update)
   if (text.length <= SUBAGENT_RAW_MAX) return { seq, update, liveSeq }
   const kind = update !== null && typeof update === 'object'
     ? (update as { sessionUpdate?: unknown }).sessionUpdate

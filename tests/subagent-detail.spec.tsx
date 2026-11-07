@@ -319,7 +319,7 @@ describe('the subagent detail overlay', () => {
     expect(within(dialog).getByText('没有生命周期记录')).toBeDefined()
     expect(within(dialog).getByText('这个子智能体没有生命周期记录，状态未知。')).toBeDefined()
     expect(within(dialog).getByText(/本次运行没有读到这个子智能体的明细/)).toBeDefined()
-    expect(screen.queryByText('还没有子智能体记录')).toBeNull()
+    expect(screen.queryByText('该 agent 未上报子智能体')).toBeNull()
   })
 
   it('closes from the close button and from Escape, and offers no other action', () => {

@@ -42,11 +42,11 @@ import type { ComponentType } from 'react'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { closeSubagentDetail, ensureAcpStyle, openSubagentDetail, useSubagentDetailTarget, useUi } from './acp-ui.tsx'
 import {
-  formatSubagentDuration, isActiveSubagent, subagentElapsedMs, subagentRowsFor,
-  subagentRunningCount, subagentStatusLabel, subagentStatusTone, subagentTitle, SUBAGENT_TICK_MS,
+  formatSubagentDuration, isActiveSubagent, subagentElapsedMs, subagentFreshness, subagentRowsFor,
+  subagentRunningCount, subagentStatusLabel, subagentStatusTone, subagentTitle, subagentTriggerLabel, SUBAGENT_TICK_MS,
 } from './acp-view.tsx'
 import type { Translate } from './acp-view.tsx'
-import { subagentKey } from './store.ts'
+import { compactDetailValue, subagentKey, subagentToolCallId } from './store.ts'
 import type { AcpStore } from './store.ts'
 import type { SubagentDetailEntry, SubagentRecord, SubagentStatus } from '../protocol.ts'
 
@@ -146,11 +146,6 @@ export interface SubagentPanelRow {
   pendingCatalog: boolean
 }
 
-/** How recently one duplicate record was updated; the fresher copy wins a de-dupe. */
-function recordFreshness(record: SubagentRecord): number {
-  return Math.max(record.lastActivityAt, record.endedAt ?? 0, record.startedAt)
-}
-
 /**
  * Join the host's catalog rows with this conversation's plugin records.
  *
@@ -170,7 +165,7 @@ export function subagentPanelRows(
   const byChild = new Map<string, SubagentRecord>()
   for (const record of records) {
     const prior = byChild.get(record.childId)
-    if (prior === undefined || recordFreshness(record) > recordFreshness(prior)) {
+    if (prior === undefined || subagentFreshness(record) > subagentFreshness(prior)) {
       byChild.set(record.childId, record)
     }
   }
@@ -212,17 +207,6 @@ export function subagentPanelRows(
     })
   }
   return rows.sort((a, b) => b.startedAt - a.startedAt)
-}
-
-/**
- * The trigger's whole sentence: cumulative dispatches, and the running count
- * only when something runs. Both halves are separate on purpose — the host's
- * "N subagents" conflated them, so a session that dispatched 11 workers over
- * two days read as 11 concurrent ones.
- */
-export function subagentTriggerLabel(total: number, running: number, t: Translate): string {
-  const totalText = t(`累计 ${total} 个`, `${total} total`)
-  return running > 0 ? `${totalText} · ${t(`${running} 运行中`, `${running} running`)}` : totalText
 }
 
 /**
@@ -317,6 +301,7 @@ function SubagentPanelRowView(
         </span>
         <span className="ntr-acp-subagent-row-meta">
           <span>{duration}</span>
+          {row.status === 'unknown' && <span>· {t('历史记录，状态未知', 'historical record, state unknown')}</span>}
           {activity !== undefined && <span>· {activity}</span>}
           <span>· {tools}</span>
           {pending !== undefined && <span>· {pending}</span>}
@@ -518,11 +503,6 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined
 }
 
-/** The `toolCallId` behind an `acp:<toolCallId>` child id, or '' when it is not one. */
-function dispatchToolCallId(childId: string): string {
-  return childId.startsWith('acp:') ? childId.slice('acp:'.length) : ''
-}
-
 /**
  * The dispatch's original input from the worker's raw entries.
  *
@@ -536,7 +516,7 @@ export function subagentDispatchDetail(
   entries: readonly Pick<SubagentDetailEntry, 'update'>[],
   childId: string,
 ): SubagentDispatchDetail | undefined {
-  const toolCallId = dispatchToolCallId(childId)
+  const toolCallId = subagentToolCallId(childId)
   if (toolCallId === '') return undefined
   let found: SubagentDispatchDetail | undefined
   for (const entry of entries) {
@@ -564,15 +544,6 @@ export function formatDetailValue(value: unknown): string {
   if (typeof value === 'string') return value
   try {
     return JSON.stringify(value, null, 2) ?? String(value)
-  } catch {
-    return String(value)
-  }
-}
-
-/** One-line form for payloads with no dedicated renderer (constraint 29). */
-function compactDetailValue(value: unknown): string {
-  try {
-    return JSON.stringify(value) ?? String(value)
   } catch {
     return String(value)
   }
