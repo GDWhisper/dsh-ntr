@@ -83,7 +83,7 @@
 
 ### 发版、用量与内置更新（35、36、37）
 
-35. **CHANGELOG 只记确定性的净改动**：每次发版在 [`CHANGELOG.md`](./CHANGELOG.md) 顶部加一节，与 GitHub release note 同一套话（中英双版、中文在前、`---` 分隔），一条一行、挂**引入它的**提交链接；只写这一版留下的**最终用户可见行为**，不写旧行为对照，也不写被推翻、回退或只在开发过程中存在过的中间形态。→ [release.md](./AGENTS/release.md)
+35. **CHANGELOG 只记确定性的净改动，严禁日常提交修改**：日常任务只在 Commit 正文写明面向用户的动机与影响，严禁改写 `CHANGELOG.md`；CHANGELOG 统一在发版时由发版流程提取提交区间，同一功能或 bug 的多次微调合并为一条净改动（去噪、避免流水账），挂引入它的核心提交链接；与 GitHub release note 同一套话（中英双版、中文在前、`---` 分隔），只写最终可见行为，不写旧行为对照与中间形态。→ [release.md](./AGENTS/release.md)
 36. **`usage_update` 是上下文占用，不是请求 token**：`used` / `size` 只写 `session.usage`（ACP 视图与 composer 占用环的 `used/size`，实时落点见 [ui.md §4.1](./AGENTS/ui.md)）；原生聊天流的 `usage` 块只能是按段估算的输出 token（正文 + 思考字符 ÷4，`inputTokens: 0`），**严禁**把 `size` / `used` 映射成 input/output（宿主的原生 ContextMeter 也不吃这条数据）；缓存命中率无数据源，工具参数不计入估算；插件 burst tok/s（`turn/metrics` / `session.burst`）只供同 id `activity` 影子显示，**严禁**回写 `usage` 或另开第二处读数。→ [protocol.md §8](./AGENTS/protocol.md)
 37. **内置更新只转述宿主的安装，绝不自己下载 / 替换 / 重启**：`plugin/update-check` 与 `plugin/update-apply`（只收精确且高于运行版本的 `x.y.z`）都回 `PluginUpdateState`，实现是 `src/update.ts` 的 `UpdateService`；数据源只有 `ctx.get('pluginManager')` 的 `listBundles()` / `registries()` 与直接 GET packument；安装与回滚只调 `installBundle('dsh-ntr@<version>', { enabled: true, registry? })`（HMR 下按宿主原生更新语义先 `removeBundle` 再重试，失败先 remove 再回滚）——**不是自替换**：文件操作全由 pluginManager 完成，且必须由人点击触发。
     资格**正向判定 registry spec**：按最后一个 `@` 拆开、只判 spec 半边；裸 `x.y.z` / 范围 / `*`·`x` / dist-tag 才可更新，含 `:` / `/` / `\` 或以 `.` 开头一律 `source-install` 永不升级；无 pluginManager / 缺方法 / 旧宿主不报 `source` → `unsupported`；`readOnlyReason` 或 `removable === false` → `managed`；磁盘版本经 `compareVersions` ≠ 运行版本 → `restart-required`（不冒充 latest）。
