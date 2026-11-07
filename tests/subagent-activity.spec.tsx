@@ -273,7 +273,7 @@ describe('the subagent catalog shadow', () => {
     // The host component is NOT rendered: the cell is the plugin's own trigger,
     // with the cumulative count and the running count kept apart.
     expect(screen.queryByTestId('subagent-catalog')).toBeNull()
-    expect(screen.getByText('累计 2 个 · 1 运行中')).toBeDefined()
+    expect(screen.getByText('子智能体 · 累计 2 个 · 1 运行中')).toBeDefined()
 
     fireEvent.click(screen.getByRole('button'))
     expect(screen.getAllByRole('listitem')).toHaveLength(2)
@@ -308,7 +308,7 @@ describe('the subagent catalog shadow', () => {
     })
     // `pending` is dispatched but not running: no running segment in the
     // trigger, while the row itself reads pending.
-    expect(screen.getByText('累计 2 个')).toBeDefined()
+    expect(screen.getByText('子智能体 · 累计 2 个')).toBeDefined()
     fireEvent.click(screen.getByRole('button'))
     // A catalog row with no record predates state tracking: it must read
     // unknown, never succeeded, and the row says so in full.
@@ -373,7 +373,7 @@ describe('the subagent catalog shadow', () => {
     // ACP mode: the self-drawn trigger takes the cell in place of the host
     // component.
     expect(screen.queryByTestId('subagent-catalog')).toBeNull()
-    expect(screen.getByText('累计 1 个')).toBeDefined()
+    expect(screen.getByText('子智能体 · 累计 1 个')).toBeDefined()
   })
 
   it('restores the native entry when the claim is released', () => {

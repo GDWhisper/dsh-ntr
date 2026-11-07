@@ -171,6 +171,41 @@ describe('the subagent detail overlay', () => {
     await flush()
   })
 
+  it('opens at the newest content and stops following once the reader scrolls up', () => {
+    const key = subagentKey('chat-1', 'acp:a')
+    const { store } = fakeStore({
+      records: [record()],
+      details: {
+        [key]: loadedDetail({}, [
+          entry(1, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'tail' } }),
+        ]),
+      },
+    })
+    act(() => { openSubagentDetail('chat-1', 'acp:a') })
+    render(<SubagentDetailDialog acp={store} />)
+    const dialog = screen.getByRole('dialog', { name: '子智能体详情' })
+    const body = dialog.querySelector('.ntr-acp-dialog-body') as HTMLElement
+    // The status summary lives outside the scrollport, so it stays on screen
+    // while the content below is pinned to its newest frame.
+    const summary = dialog.querySelector('.ntr-acp-subagent-detail-summary') as HTMLElement
+    expect(summary).not.toBeNull()
+    expect(body.contains(summary)).toBe(false)
+    expect(summary.textContent ?? '').toContain('运行中')
+    // jsdom has no layout: give the scrollport a measurable height.
+    Object.defineProperty(body, 'scrollHeight', { configurable: true, get: () => 500 })
+    Object.defineProperty(body, 'clientHeight', { configurable: true, get: () => 200 })
+
+    // Any content re-render runs the pin effect; a fresh open lands at the end.
+    fireEvent.click(screen.getByRole('button', { name: '原始事件' }))
+    expect(body.scrollTop).toBe(500)
+
+    // Scrolled away: the next content change must not yank the reader back.
+    body.scrollTop = 100
+    fireEvent.scroll(body)
+    fireEvent.click(screen.getByRole('button', { name: '内容视图' }))
+    expect(body.scrollTop).toBe(100)
+  })
+
   it('shows a quiet loading placeholder until the history answers', () => {
     const { store } = fakeStore({ neverLoads: true })
     act(() => { openSubagentDetail('chat-1', 'acp:a') })

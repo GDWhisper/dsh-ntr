@@ -1292,7 +1292,8 @@ html[data-ntr-acp] [data-turn-tail] button[aria-label="Remove rating"] {
    button in the frame is the close button. Long worker streams scroll inside
    the body (the dialog frame never grows past the viewport). */
 .ntr-acp-subagent-detail { width: min(760px, calc(100vw - 48px)); height: min(720px, calc(100vh - 48px)); }
-.ntr-acp-subagent-detail-body { display: flex; flex-direction: column; gap: 14px; padding: 4px 24px 24px; font-size: 12px; line-height: 1.6; }
+.ntr-acp-subagent-detail-summary { flex: none; padding: 4px 24px 12px; border-bottom: 1px solid var(--dsw-alias-border-l2, #e5e7eb); font-size: 12px; line-height: 1.6; }
+.ntr-acp-subagent-detail-body { display: flex; flex-direction: column; gap: 14px; padding: 12px 24px 24px; font-size: 12px; line-height: 1.6; }
 .ntr-acp-subagent-detail-head { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .ntr-acp-subagent-detail-head-line { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }
 .ntr-acp-subagent-detail-name { font-size: 14px; font-weight: 600; word-break: break-word; }

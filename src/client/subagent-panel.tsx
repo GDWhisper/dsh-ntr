@@ -417,7 +417,7 @@ function OwnCatalogProjection(props: OwnSubagentCatalogProps) {
   if (reason !== undefined) return renderHost(props)
   if (rows.length === 0) return null
   const running = subagentRunningCount(rows)
-  const triggerText = subagentTriggerLabel(rows.length, running, t)
+  const triggerText = `${t('子智能体', 'subagents')} · ${subagentTriggerLabel(rows.length, running, t)}`
   // Opening the detail closes the dropdown first: its capture-phase Escape
   // listener would otherwise outlive the visible menu (under the overlay) and
   // swallow the first Escape meant for the dialog.
@@ -689,8 +689,9 @@ export function subagentDetailKindLabel(kind: string, t: Translate): string {
 }
 
 /** One raw update row: kind chip, heading, body, and the cut marker when bounded. */
-function DetailEntryView({ entry, t }: { entry: SubagentDetailEntry; t: Translate }) {
-  const line = describeSubagentDetailUpdate(entry.update)
+function DetailEntryView(
+  { entry, line, t }: { entry: SubagentDetailEntry; line: SubagentDetailLine; t: Translate },
+) {
   const cut = entry.truncatedChars !== undefined && entry.truncatedChars > 0
   const body = line.body !== undefined && line.body !== '' ? line.body : undefined
   return (
@@ -750,6 +751,9 @@ export function SubagentDetailDialog({ acp }: SubagentDetailDialogProps) {
   const [rawViewKey, setRawViewKey] = useState<string | undefined>(undefined)
   const rawView = rawViewKey !== undefined && rawViewKey === key
   const loadsRef = useRef(new Map<string, Promise<void>>())
+  const bodyRef = useRef<HTMLDivElement | null>(null)
+  const pinned = useRef(true)
+  const openedKey = useRef<string | undefined>(undefined)
   // The read answer and the live frames can interleave, so display order is
   // the host seq (stable for equal seq: the index's own order breaks the tie).
   const sortedEntries = useMemo(
@@ -758,6 +762,36 @@ export function SubagentDetailDialog({ acp }: SubagentDetailDialogProps) {
   )
   const childId = target?.childId ?? ''
   const blocks = useMemo(() => subagentDetailBlocks(sortedEntries, childId), [sortedEntries, childId])
+  // Both are tick-independent: the open dialog re-renders every second, and
+  // the scan plus the pretty-printed input would otherwise rerun per tick.
+  const dispatch = useMemo(() => subagentDispatchDetail(sortedEntries, childId), [sortedEntries, childId])
+  const dispatchInput = useMemo(
+    () => dispatch?.rawInput === undefined ? undefined : formatDetailValue(dispatch.rawInput),
+    [dispatch],
+  )
+  // Raw rows are described once per change; the per-second tick must not
+  // re-pretty-print every retained JSON payload again.
+  const rawLines = useMemo(
+    () => rawView ? sortedEntries.map(entry => ({ entry, line: describeSubagentDetailUpdate(entry.update) })) : [],
+    [rawView, sortedEntries],
+  )
+
+  // A running worker is read at its newest end: a fresh open (or a switch to
+  // another worker) pins to the bottom, and new frames follow only while the
+  // reader has not scrolled away — the same rule the NTR view keeps.
+  useLayoutEffect(() => {
+    if (key === undefined) {
+      openedKey.current = undefined
+      return
+    }
+    const node = bodyRef.current
+    if (node === null) return
+    if (openedKey.current !== key) {
+      openedKey.current = key
+      pinned.current = true
+    }
+    if (pinned.current) node.scrollTop = node.scrollHeight
+  }, [key, blocks, rawView])
 
   // First open reads the bounded history once (`subagents/detail`). The store
   // owns the answered bit (`loaded`), so reopening a worker whose read landed
@@ -820,7 +854,6 @@ export function SubagentDetailDialog({ acp }: SubagentDetailDialogProps) {
 
   if (target === null || key === undefined) return null
   const entries = sortedEntries
-  const dispatch = subagentDispatchDetail(entries, target.childId)
   const loaded = detail?.loaded === true
   const waiting = !loaded && failedKey !== key
   const status = record?.status ?? 'unknown'
@@ -853,28 +886,39 @@ export function SubagentDetailDialog({ acp }: SubagentDetailDialogProps) {
             ✕
           </button>
         </div>
-        <div className="ntr-acp-dialog-body">
-          <div className="ntr-acp-subagent-detail-body">
-            <div className="ntr-acp-subagent-detail-head">
-              <div className="ntr-acp-subagent-detail-head-line">
-                <span className="ntr-acp-subagent-detail-name">{name}</span>
-                <span className={`ntr-acp-badge is-${subagentStatusTone(status)}`}>
-                  {subagentStatusLabel(status, t)}
-                </span>
-              </div>
-              <div className="ntr-acp-subagent-detail-meta">
-                <span>{duration}</span>
-                {activity !== undefined && <span>· {activity}</span>}
-                {record !== undefined && (
-                  <span>· {t(`${record.counts.toolCalls} 次工具调用`, `${record.counts.toolCalls} tool calls`)}</span>
-                )}
-                <span>· {target.childId}</span>
-              </div>
+        {/* The status summary is OUTSIDE the scroll body: it stays readable
+            while the content below opens at its newest frame. */}
+        <div className="ntr-acp-subagent-detail-summary">
+          <div className="ntr-acp-subagent-detail-head">
+            <div className="ntr-acp-subagent-detail-head-line">
+              <span className="ntr-acp-subagent-detail-name">{name}</span>
+              <span className={`ntr-acp-badge is-${subagentStatusTone(status)}`}>
+                {subagentStatusLabel(status, t)}
+              </span>
             </div>
-            {dispatch?.rawInput !== undefined && (
+            <div className="ntr-acp-subagent-detail-meta">
+              <span>{duration}</span>
+              {activity !== undefined && <span>· {activity}</span>}
+              {record !== undefined && (
+                <span>· {t(`${record.counts.toolCalls} 次工具调用`, `${record.counts.toolCalls} tool calls`)}</span>
+              )}
+              <span>· {target.childId}</span>
+            </div>
+          </div>
+        </div>
+        <div
+          className="ntr-acp-dialog-body"
+          ref={bodyRef}
+          onScroll={event => {
+            const node = event.currentTarget
+            pinned.current = node.scrollHeight - node.scrollTop - node.clientHeight < 40
+          }}
+        >
+          <div className="ntr-acp-subagent-detail-body">
+            {dispatchInput !== undefined && (
               <div className="ntr-acp-subagent-detail-section">
                 <div className="ntr-acp-subagent-detail-heading">{t('派遣入参', 'dispatch input')}</div>
-                <pre className="ntr-acp-subagent-detail-pre">{formatDetailValue(dispatch.rawInput)}</pre>
+                <pre className="ntr-acp-subagent-detail-pre">{dispatchInput}</pre>
               </div>
             )}
             <div className="ntr-acp-subagent-detail-section">
@@ -966,8 +1010,8 @@ export function SubagentDetailDialog({ acp }: SubagentDetailDialogProps) {
                   </div>
                 )
                 : rawView
-                  ? entries.map((entry, index) => (
-                    <DetailEntryView key={`${String(entry.seq)}:${String(index)}`} entry={entry} t={t} />
+                  ? rawLines.map(({ entry, line }, index) => (
+                    <DetailEntryView key={`${String(entry.seq)}:${String(index)}`} entry={entry} line={line} t={t} />
                   ))
                   : blocks.length === 0
                     ? (

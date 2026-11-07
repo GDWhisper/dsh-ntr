@@ -152,7 +152,7 @@ describe('the header subagent panel clock', () => {
     const view = render(
       <OwnSubagentCatalog host={HostTrigger} acp={panelStore(running)} sessionId="chat-1" useSessions={useSessions} />,
     )
-    expect(screen.getByText('累计 1 个 · 1 运行中')).toBeDefined()
+    expect(screen.getByText('子智能体 · 累计 1 个 · 1 运行中')).toBeDefined()
     fireEvent.click(screen.getByRole('button'))
     expect(screen.getByText('0s')).toBeDefined()
 
@@ -221,7 +221,7 @@ describe('the header subagent panel clock', () => {
     render(
       <OwnSubagentCatalog host={HostTrigger} acp={panelStore(done)} sessionId="chat-1" useSessions={useSessions} />,
     )
-    expect(screen.getByText('累计 1 个')).toBeDefined()
+    expect(screen.getByText('子智能体 · 累计 1 个')).toBeDefined()
     expect(screen.queryByRole('listitem')).toBeNull()
     expect(vi.getTimerCount()).toBe(0)
   })
