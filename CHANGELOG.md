@@ -2,6 +2,38 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [0.4.0] - 2026-11-07
+
+NTR 对话新增子代理面板：头部触发器、六状态清单与只读详情；斜杠菜单接入 agent 技能；连接测试失败时报告原因。
+
+### 新增
+
+- **acp**：连接测试失败时报告原因分类（未安装、安装失败、启动失败、超时、握手失败）与 stderr 尾部。([4e5194e](https://github.com/GDWhisper/dsh-ntr/commit/4e5194e))
+- **acp**：NTR 会话跟踪外部子代理的生命周期状态，取消、回合结束、释放、关闭等路径写入终态，状态行不会停在运行中。([36189de](https://github.com/GDWhisper/dsh-ntr/commit/36189de))
+- **acp**：NTR 视图显示只读子代理条：状态徽标、类型、经过时间与工具调用数，最新派发在前。([d60b44c](https://github.com/GDWhisper/dsh-ntr/commit/d60b44c))
+- **acp**：ACP 对话的头部显示子代理触发器与六状态只读清单，累计数与运行数分开统计；面板无法服务的形状回落宿主组件。([a4a3bcf](https://github.com/GDWhisper/dsh-ntr/commit/a4a3bcf))
+- **acp**：子代理清单可打开只读详情，查看单个 worker 的派发参数与终态。([a678e74](https://github.com/GDWhisper/dsh-ntr/commit/a678e74))
+- **acp**：斜杠菜单列出 agent 的技能，选中后向草稿插入技能引用；命令行与技能行冲突时命令优先。([c931fb1](https://github.com/GDWhisper/dsh-ntr/commit/c931fb1))
+- **acp**：子代理详情按 worker 折叠成与主转录一致的块：消息、思考、工具卡、计划与事件卡，另有原始事件切换。([9db8917](https://github.com/GDWhisper/dsh-ntr/commit/9db8917))
+- **acp**：子代理详情的名称、徽标与计数固定在滚动区外，流从最新帧打开，读者停在底部时跟随直播更新。([bbf3e7a](https://github.com/GDWhisper/dsh-ntr/commit/bbf3e7a))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.3.10...v0.4.0
+
+---
+
+### Added
+
+- **acp**: connection tests report why they failed — classified as not installed, install failed, start failed, timeout, or handshake failed — plus the stderr tail. ([4e5194e](https://github.com/GDWhisper/dsh-ntr/commit/4e5194e))
+- **acp**: NTR conversations track an external subagent's lifecycle; cancel, turn end, release and close write a terminal state, so a row never stays running. ([36189de](https://github.com/GDWhisper/dsh-ntr/commit/36189de))
+- **acp**: the NTR view shows a read-only subagent strip with a state badge, type, elapsed time and tool-call count, newest dispatch first. ([d60b44c](https://github.com/GDWhisper/dsh-ntr/commit/d60b44c))
+- **acp**: ACP conversations get their own subagent trigger in the header with a six-state read-only list; cumulative and running counts stay apart, and a shape the panel cannot serve falls back to the host component. ([a4a3bcf](https://github.com/GDWhisper/dsh-ntr/commit/a4a3bcf))
+- **acp**: the subagent list opens a read-only detail for one worker with its dispatch arguments and terminal state. ([a678e74](https://github.com/GDWhisper/dsh-ntr/commit/a678e74))
+- **acp**: the slash menu lists the agent's skills; picking one inserts a skill reference into the draft, and commands win over skills on a same-source conflict. ([c931fb1](https://github.com/GDWhisper/dsh-ntr/commit/c931fb1))
+- **acp**: the subagent detail folds each worker's stream into the same blocks as the main transcript — messages, reasoning, tool cards, plan and event cards — with a raw-events toggle. ([9db8917](https://github.com/GDWhisper/dsh-ntr/commit/9db8917))
+- **acp**: the subagent detail pins its name, badge and counters outside the scrollport; the stream opens at the newest frame and follows live updates while the reader stays at the bottom. ([bbf3e7a](https://github.com/GDWhisper/dsh-ntr/commit/bbf3e7a))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.3.10...v0.4.0
+
 ## [0.3.10] - 2026-11-06
 
 带工具调用的回合恢复正常：跑完、给出回答，工具卡显示真实输出（[#10](https://github.com/GDWhisper/dsh-ntr/issues/10)）；NTR 会话的侧边栏标题自动取首条用户消息（[#11](https://github.com/GDWhisper/dsh-ntr/issues/11)）。
