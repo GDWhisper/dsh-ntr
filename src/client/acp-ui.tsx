@@ -1299,6 +1299,8 @@ html[data-ntr-acp] [data-turn-tail] button[aria-label="Remove rating"] {
 .ntr-acp-subagent-detail-meta { display: flex; flex-wrap: wrap; gap: 10px; color: var(--dsw-alias-label-tertiary, #9ca3af); font-variant-numeric: tabular-nums; }
 .ntr-acp-subagent-detail-section { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .ntr-acp-subagent-detail-heading { font-weight: 600; color: var(--dsw-alias-label-secondary, #6b7280); }
+.ntr-acp-subagent-detail-heading-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ntr-acp-subagent-detail-stream { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .ntr-acp-subagent-detail-line { word-break: break-word; }
 .ntr-acp-subagent-detail-note { color: var(--dsw-alias-label-secondary, #6b7280); }
 .ntr-acp-subagent-detail-cut { color: var(--dsw-alias-state-warn-label, #b45309); }

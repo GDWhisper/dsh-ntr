@@ -243,11 +243,14 @@ describe('the subagent detail overlay', () => {
     act(() => { openSubagentDetail('chat-1', 'acp:a') })
     render(<SubagentDetailDialog acp={store} />)
     expect(screen.getByText('更早的 3 条明细已省略')).toBeDefined()
-    expect(screen.getByText('负载截断 42 字符')).toBeDefined()
+    // The content view shows the retained text; the per-frame cut marker is
+    // diagnostic detail and lives in the raw view.
     expect(screen.getByText('hello')).toBeDefined()
+    fireEvent.click(screen.getByRole('button', { name: '原始事件' }))
+    expect(screen.getByText('负载截断 42 字符')).toBeDefined()
   })
 
-  it('renders the dispatch input and every worker-stream kind in seq order', () => {
+  it('renders the dispatch input and the folded worker stream, with raw frames on demand', () => {
     const key = subagentKey('chat-1', 'acp:a')
     const entries = [
       entry(4, {
@@ -279,15 +282,22 @@ describe('the subagent detail overlay', () => {
     expect(dialog.textContent).toContain('subagent_type')
     expect(dialog.textContent).toContain('b.ts')
 
-    // Worker stream: prose, thinking, tool results, plans and an unknown kind
-    // all have a place; the entries render in seq order regardless of arrival.
+    // Content view (default): bubbles, a continuous reasoning section that
+    // starts expanded, tool cards, plans and one event card per unknown kind.
+    // The dispatch's own tool_call is not a worker bubble.
     expect(within(dialog).getByText('worker says hi')).toBeDefined()
-    expect(within(dialog).getByText('思考过程')).toBeDefined()
     expect(within(dialog).getByText('thinking hard')).toBeDefined()
+    expect(within(dialog).getByText('思考过程').closest('details')?.open).toBe(true)
     expect(dialog.textContent).toContain('tool result')
     expect(dialog.textContent).toContain('step one')
     expect(dialog.textContent).toContain('mystery_kind')
+    const eventCard = within(dialog).getByText('mystery_kind').closest('.ntr-acp-tool')
+    expect(eventCard).not.toBeNull()
+    fireEvent.click(within(eventCard as HTMLElement).getByRole('button', { name: '原始数据' }))
     expect(dialog.textContent).toContain('"foo"')
+
+    // Raw frames are still one click away, in seq order.
+    fireEvent.click(within(dialog).getByRole('button', { name: '原始事件' }))
     const kinds = [...dialog.querySelectorAll('[data-kind]')].map(node => node.getAttribute('data-kind'))
     expect(kinds).toEqual([
       'tool_call',

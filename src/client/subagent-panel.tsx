@@ -36,19 +36,19 @@
  * control.
  */
 
-import { createElement, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { createElement, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ComponentType } from 'react'
 import { createPortal } from 'react-dom'
 // Type-only: pulls the conversation SlotMap merge into this program.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { closeSubagentDetail, ensureAcpStyle, openSubagentDetail, useSubagentDetailTarget, useUi } from './acp-ui.tsx'
 import {
-  formatSubagentDuration, isActiveSubagent, subagentElapsedMs, subagentFreshness, subagentRowsFor,
+  BlockView, formatSubagentDuration, isActiveSubagent, subagentElapsedMs, subagentFreshness, subagentRowsFor,
   subagentRunningCount, subagentStatusLabel, subagentStatusTone, subagentTitle, subagentTriggerLabel, SUBAGENT_TICK_MS,
 } from './acp-view.tsx'
 import type { Translate } from './acp-view.tsx'
-import { compactDetailValue, subagentKey, subagentToolCallId } from './store.ts'
-import type { AcpStore } from './store.ts'
+import { compactDetailValue, foldUpdate, subagentKey, subagentToolCallId } from './store.ts'
+import type { AcpStore, Block } from './store.ts'
 import type { SubagentDetailEntry, SubagentRecord, SubagentStatus } from '../protocol.ts'
 
 /** Viewport margin the host's own catalog menu keeps (used for the same geometry). */
@@ -490,12 +490,16 @@ export function OwnSubagentCatalog(props: OwnSubagentCatalogProps) {
 // entries (`UiState.subagentDetails`) for the dispatch input and the worker
 // stream. It is a VIEW: no cancel / retry / spawn / stop, no prompt input.
 //
-// The raw entries come from the store's dedicated index, NOT the folded ACP
-// transcript: `foldUpdate` drops `_meta` and merges adjacent prose across
-// workers, which would splice the parent turn's text into a worker's detail
-// (plan §5.4). The index is fed by live frames and one on-demand
-// `subagents/detail` read per page; the overlay never re-reads history on its
-// own beyond that first open (the store's `loaded` flag is the gate).
+// The raw entries come from the store's dedicated per-worker index, NOT the
+// shared ACP transcript: folding the transcript would drop `_meta` and merge
+// adjacent prose across workers, splicing the parent turn's text into a
+// worker's detail (plan §5.4). The index is already scoped by `childId`, so
+// the dialog folds it per worker at view time (`subagentDetailBlocks`) into
+// the same blocks the NTR view renders; the untouched frames stay one
+// "raw events" toggle away. The index is fed by live frames and one
+// on-demand `subagents/detail` read per page; the overlay never re-reads
+// history on its own beyond that first open (the store's `loaded` flag is
+// the gate).
 
 /** One dispatch-owned frame's input, as the detail header shows it. */
 export interface SubagentDispatchDetail {
@@ -556,6 +560,45 @@ export function formatDetailValue(value: unknown): string {
   } catch {
     return String(value)
   }
+}
+
+/**
+ * Fold one worker's raw entries into the same block vocabulary the NTR view
+ * renders: message bubbles, continuous reasoning sections, tool cards, plans
+ * and event cards. This is safe to do per worker because the store's index is
+ * already scoped to one `childId` — `foldUpdate` merges only adjacent prose,
+ * so the parent turn's text can never splice into this stream (the reason the
+ * index is not the shared transcript).
+ *
+ * The dispatch's OWN tool frames are left out: their `rawInput` and terminal
+ * state are the header sections above, not part of the worker's conversation.
+ * A cut frame keeps its retained text as an event (the bounder already left
+ * the truncation marker inside `text`); a non-object payload is kept whole.
+ */
+export function subagentDetailBlocks(
+  entries: readonly Pick<SubagentDetailEntry, 'update' | 'truncatedChars'>[],
+  childId: string,
+): Block[] {
+  const dispatchToolCallId = subagentToolCallId(childId)
+  const blocks: Block[] = []
+  for (const entry of entries) {
+    const update = objectRecord(entry.update)
+    if (update === undefined) {
+      blocks.push({ kind: 'event', event: 'unknown', text: formatDetailValue(entry.update) })
+      continue
+    }
+    if (update.truncated === true && typeof update.text === 'string') {
+      blocks.push({
+        kind: 'event',
+        event: `${typeof update.sessionUpdate === 'string' && update.sessionUpdate !== '' ? update.sessionUpdate : 'unknown'} · truncated`,
+        text: update.text,
+      })
+      continue
+    }
+    if (dispatchToolCallId !== '' && update.toolCallId === dispatchToolCallId) continue
+    foldUpdate(blocks, update)
+  }
+  return blocks
 }
 
 /** How one raw `session/update` entry is rendered in the worker stream. */
@@ -702,7 +745,19 @@ export function SubagentDetailDialog({ acp }: SubagentDetailDialogProps) {
   const record = key === undefined ? undefined : ui.subagents[key]
   const detail = key === undefined ? undefined : ui.subagentDetails[key]
   const [failedKey, setFailedKey] = useState<string | undefined>(undefined)
+  // The raw-event switch belongs to the worker it was opened for; a different
+  // worker starts in the content view without an effect-frame flash.
+  const [rawViewKey, setRawViewKey] = useState<string | undefined>(undefined)
+  const rawView = rawViewKey !== undefined && rawViewKey === key
   const loadsRef = useRef(new Map<string, Promise<void>>())
+  // The read answer and the live frames can interleave, so display order is
+  // the host seq (stable for equal seq: the index's own order breaks the tie).
+  const sortedEntries = useMemo(
+    () => detail === undefined ? [] : [...detail.entries].sort((a, b) => a.seq - b.seq),
+    [detail],
+  )
+  const childId = target?.childId ?? ''
+  const blocks = useMemo(() => subagentDetailBlocks(sortedEntries, childId), [sortedEntries, childId])
 
   // First open reads the bounded history once (`subagents/detail`). The store
   // owns the answered bit (`loaded`), so reopening a worker whose read landed
@@ -764,9 +819,7 @@ export function SubagentDetailDialog({ acp }: SubagentDetailDialogProps) {
   }, [open])
 
   if (target === null || key === undefined) return null
-  // Seq order (the brief's contract). Stable for equal seq: the index's own
-  // order breaks the tie (a replayed live frame lands after the host copy).
-  const entries = detail === undefined ? [] : [...detail.entries].sort((a, b) => a.seq - b.seq)
+  const entries = sortedEntries
   const dispatch = subagentDispatchDetail(entries, target.childId)
   const loaded = detail?.loaded === true
   const waiting = !loaded && failedKey !== key
@@ -876,7 +929,18 @@ export function SubagentDetailDialog({ acp }: SubagentDetailDialogProps) {
                 )}
             </div>
             <div className="ntr-acp-subagent-detail-section">
-              <div className="ntr-acp-subagent-detail-heading">{t('运行流', 'worker stream')}</div>
+              <div className="ntr-acp-subagent-detail-heading-row">
+                <div className="ntr-acp-subagent-detail-heading">{t('运行流', 'worker stream')}</div>
+                {entries.length > 0 && (
+                  <button
+                    type="button"
+                    className="ntr-acp-more"
+                    onClick={() => { setRawViewKey(rawView ? undefined : key) }}
+                  >
+                    {rawView ? t('内容视图', 'content view') : t('原始事件', 'raw events')}
+                  </button>
+                )}
+              </div>
               {omitted > 0 && (
                 <div className="ntr-acp-subagent-detail-cut">
                   {t(`更早的 ${omitted} 条明细已省略`, `${omitted} earlier entries omitted`)}
@@ -901,9 +965,26 @@ export function SubagentDetailDialog({ acp }: SubagentDetailDialogProps) {
                       )}
                   </div>
                 )
-                : entries.map((entry, index) => (
-                  <DetailEntryView key={`${String(entry.seq)}:${String(index)}`} entry={entry} t={t} />
-                ))}
+                : rawView
+                  ? entries.map((entry, index) => (
+                    <DetailEntryView key={`${String(entry.seq)}:${String(index)}`} entry={entry} t={t} />
+                  ))
+                  : blocks.length === 0
+                    ? (
+                      <div className="ntr-acp-subagent-detail-note">
+                        {t(
+                          '这个子智能体的更新只有状态变化，没有可显示的运行内容。',
+                          'This subagent only reported state changes — no stream content to show.',
+                        )}
+                      </div>
+                    )
+                    : (
+                      <div className="ntr-acp-subagent-detail-stream">
+                        {blocks.map((block, index) => (
+                          <BlockView key={index} block={block} label={acp.label} localeRev={ui.localeRev} thoughtOpen />
+                        ))}
+                      </div>
+                    )}
             </div>
           </div>
         </div>

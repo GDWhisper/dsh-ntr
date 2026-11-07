@@ -308,7 +308,15 @@ function PlanCard({ entries, t }: { entries: Extract<Block, { kind: 'plan' }>['e
  * instead of the whole transcript on every store notification. `key` stays the
  * index on purpose: blocks fold append-only, and identity is the block object.
  */
-const BlockView = memo(function BlockView({ block, label }: { block: Block; label: Translate; localeRev: number }) {
+export const BlockView = memo(function BlockView(
+  { block, label, thoughtOpen = false }: {
+    block: Block
+    label: Translate
+    localeRev: number
+    /** Start a reasoning section expanded (the subagent inspector wants it visible). */
+    thoughtOpen?: boolean
+  },
+) {
   const t = label
   switch (block.kind) {
     case 'user':
@@ -317,7 +325,7 @@ const BlockView = memo(function BlockView({ block, label }: { block: Block; labe
       return <div className="ntr-acp-bubble is-agent"><RichText text={block.text} /></div>
     case 'thought':
       return (
-        <details className="ntr-acp-thought">
+        <details className="ntr-acp-thought" open={thoughtOpen || undefined}>
           <summary>{t('思考过程', 'reasoning')}</summary>
           <div className="ntr-acp-thought-body"><RichText text={block.text} /></div>
         </details>

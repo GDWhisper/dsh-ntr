@@ -18,7 +18,7 @@ import { acpMeterUsage, compactTokenCount, contextOccupancy } from '../src/clien
 import { agentTestHint, approvalDeadlineFacts, DEADLINE_MIN_WAIT_MS, deadlineSliderIndex, deadlineValueFor } from '../src/client/panel.tsx'
 import { describeRoute, menuFor, REFRESH_CATALOG_ITEM } from '../src/client/session-controls.tsx'
 import { AcpStore, boundedDetailEntry, deadlineRemainingLabel, PERMISSION_DEADLINE_EXPIRED, permissionsForSession, subagentToolCallId, SUBAGENT_RAW_MAX, usageFromUpdate } from '../src/client/store.ts'
-import { placeSubagentMenu, readSubagentCatalogProjection, subagentLastActivityLabel, subagentPanelRows } from '../src/client/subagent-panel.tsx'
+import { placeSubagentMenu, readSubagentCatalogProjection, subagentDetailBlocks, subagentLastActivityLabel, subagentPanelRows } from '../src/client/subagent-panel.tsx'
 import type { PendingPermission } from '../src/client/store.ts'
 import { ACP_TOOL_RAW_MAX, APPROVAL_DEADLINE_MIN_WAIT_MS, boundSubagentDetailEntry, isAbsolutePath, splitAdapterModelId, splitCommandLine as hostSplitCommandLine, subagentToolCallId as hostSubagentToolCallId, tokenizeCommandLine as hostTokenizeCommandLine } from '../src/impl.ts'
 import type { AgentCatalogResult, AgentTestResult, AgentView, ChatSessionView, SubagentRecord, SubagentStatus } from '../src/protocol.ts'
@@ -128,6 +128,60 @@ describe('subagent detail primitives (browser ⇄ host hand copy)', () => {
     for (const update of samples) {
       expect(boundedDetailEntry(7, update, 3)).toEqual({ ...boundSubagentDetailEntry(7, update), liveSeq: 3 })
     }
+  })
+})
+
+/**
+ * The detail overlay shows the worker's conversation, not one card per raw
+ * frame: adjacent prose merges into one block, tool updates land on their
+ * call's card, and the dispatch's own frames stay in the header sections.
+ */
+describe('subagentDetailBlocks', () => {
+  it('folds adjacent prose and tool updates into native-style blocks', () => {
+    const blocks = subagentDetailBlocks([
+      { update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'think ' } } },
+      { update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'again' } } },
+      { update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hello' } } },
+      { update: { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'Read', status: 'in_progress', kind: 'read' } },
+      {
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 't1',
+          status: 'completed',
+          content: [{ type: 'content', content: { type: 'text', text: 'ok' } }],
+        },
+      },
+    ], 'acp:dispatch')
+    expect(blocks.map(block => block.kind)).toEqual(['thought', 'agent', 'tool'])
+    expect(blocks[0]).toMatchObject({ kind: 'thought', text: 'think again' })
+    expect(blocks[1]).toMatchObject({ kind: 'agent', text: 'hello' })
+    expect(blocks[2]).toMatchObject({ kind: 'tool', toolCallId: 't1', title: 'Read', status: 'completed' })
+  })
+
+  it('leaves the dispatch frames out of the worker stream', () => {
+    const blocks = subagentDetailBlocks([
+      { update: { sessionUpdate: 'tool_call', toolCallId: 'dispatch', title: 'Task' } },
+      { update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'worker' } } },
+      { update: { sessionUpdate: 'tool_call_update', toolCallId: 'dispatch', status: 'completed', content: 'done' } },
+    ], 'acp:dispatch')
+    expect(blocks.map(block => block.kind)).toEqual(['agent'])
+    expect(blocks[0]).toMatchObject({ kind: 'agent', text: 'worker' })
+  })
+
+  it('keeps a cut frame and a non-object payload instead of folding them away', () => {
+    const blocks = subagentDetailBlocks([
+      {
+        update: { sessionUpdate: 'agent_message_chunk', truncated: true, text: 'tail\n… [truncated 5 chars]' },
+        truncatedChars: 5,
+      },
+      { update: 'plain payload' },
+    ], 'acp:a')
+    expect(blocks[0]).toMatchObject({
+      kind: 'event',
+      event: 'agent_message_chunk · truncated',
+      text: 'tail\n… [truncated 5 chars]',
+    })
+    expect(blocks[1]).toMatchObject({ kind: 'event', event: 'unknown', text: 'plain payload' })
   })
 })
 
