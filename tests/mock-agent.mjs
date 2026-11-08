@@ -244,6 +244,9 @@ const DEFAULT_MODEL = process.env.MOCK_MODEL ?? 'mock-model-a'
 // Test knob: reproduce Qoder CN's payload from issue #8, where the only
 // thought control is `reasoning_effort` tagged `category: 'model'`.
 const QODER_MODEL_CATEGORY = process.env.MOCK_QODER_MODEL_CATEGORY === '1'
+// Test knob: the mock's `mock-model-plain` (the variant-less model that
+// publishes no thought_level) is also selectable from the model list.
+const PLAIN_MODEL_CHOICE = process.env.MOCK_PLAIN_MODEL_CHOICE === '1'
 // Test knob: publish the mode as a `category: 'mode'` select too (codebuddy /
 // opencode shape), so the agent-level catalog can carry a mode value that a
 // NEW conversation's `session/new` does not start on.
@@ -276,6 +279,7 @@ function mockConfigOptions(state = { temp: 'mid', model: DEFAULT_MODEL, effort: 
       options: [
         { value: 'mock-model-a', name: 'Mock Model A' },
         { value: 'mock-model-b', name: 'Mock Model B', description: 'The stronger mock model' },
+        ...(PLAIN_MODEL_CHOICE ? [{ value: 'mock-model-plain', name: 'Mock Model Plain' }] : []),
       ],
     },
     // `mock-model-plain` stands for a model with NO variants: like opencode's

@@ -7474,16 +7474,43 @@ export class BridgeManager {
         throw new AcpError('model_unavailable', `acp: agent "${agentId}" no longer offers model "${stale}"`)
       }
     }
+    // A thought level is not a property of the agent alone: opencode publishes
+    // `thought_level` only for models with variants, so the previous model's
+    // level is not the new model's vocabulary. A LIVE session can judge the old
+    // pick against the new model's own option set (`alignSessionConfig`, which
+    // drops it with a notice when the set no longer offers it). Before the first
+    // session there is no such authority — the catalog still describes the model
+    // the agent was last on — so the level is cleared instead of being displayed
+    // as this model's own until the first message.
+    const previous = this.chatAgentIntent.get(dshSessionId)
+    const nextModelId = choice === undefined ? undefined : modelId
+    const modelChanged = previous?.agentId === agentId && previous.modelId !== nextModelId
+    const hasLiveSession = [...this.dshSessionMap.values()].some(session =>
+      session.dshSessionId === dshSessionId && session.agentId === agentId && !session.released)
+    const clearEffort = modelChanged && !hasLiveSession
     // The pick is recorded even when NO live session exists yet — that is the
     // "choose the model before the first message" case. A session that
     // materializes later reads it back (`applyChatChoice`).
-    this.patchChatChoice(dshSessionId, { agentId, modelId: choice === undefined ? undefined : modelId })
+    this.patchChatChoice(dshSessionId, {
+      agentId,
+      modelId: nextModelId,
+      ...(clearEffort ? { effort: undefined } : {}),
+    })
     for (const session of this.dshSessionMap.values()) {
       if (session.dshSessionId !== dshSessionId || session.agentId !== agentId) continue
       session.choice = choice
+      // A row can carry a level without a recorded pick (`streamPrompt` mirrors
+      // the turn's effort onto the session). Clear it on the same evidence as
+      // the pick — the row's own model changed and nothing live can re-validate
+      // it — or the released row keeps naming the old level.
+      const rowModelChanged = session.modelId !== modelId
       session.modelId = modelId
+      // The chip reads this mirror through `session/chat-list`; clearing only
+      // the pick would leave a parked row naming the old level.
+      if (clearEffort || (rowModelChanged && !hasLiveSession)) session.reasoningEffort = undefined
       if (session.released) continue
-      await this.alignSessionConfig(session, choice, session.reasoningEffort)
+      const aligned = await this.alignSessionConfig(session, choice, session.reasoningEffort)
+      if (aligned.effortStale) session.reasoningEffort = undefined
     }
     this.persistAgents()
   }
@@ -8906,7 +8933,7 @@ export class BridgeManager {
     const wantedEffort = effort !== undefined && effort !== '' ? effort : undefined
     const result = { modelStale: false, effortStale: false }
     if (wantedModel === undefined && wantedEffort === undefined) return result
-    const catalog = parseCatalogOptions(session.configOptions)
+    let catalog = parseCatalogOptions(session.configOptions)
     // The session's OWN process: A1 gives one agent several children, and a
     // config write must reach the one holding this session, never the agent-wide
     // slot (which may not even be running).
@@ -8928,6 +8955,12 @@ export class BridgeManager {
       } else {
         try {
           await bridge.setConfigOption(session, model.configId, wantedModel)
+          // The answer carries the NEW model's option set (the bridge has
+          // already folded it into `session.configOptions`). Whether a thought
+          // level still exists is a property of THAT set — opencode publishes
+          // one only for models with variants — so the effort below must be
+          // judged against it, not against the model the user just left.
+          catalog = parseCatalogOptions(session.configOptions)
         } catch (error) {
           notice('error', `acp: failed to switch model to "${wantedModel}": ${describeError(error)}`)
         }
@@ -8936,8 +8969,18 @@ export class BridgeManager {
     if (wantedEffort !== undefined) {
       const thought = catalog.thought
       if (thought === undefined) {
-        // The agent publishes no thought_level option: there is nothing this
-        // pick could ever be applied to (the chip is absent too).
+        // A real answer without the slot means this session's model publishes no
+        // level axis at all (opencode does so only for models with variants), so
+        // the pick is unappliable and must leave the record — otherwise the chip
+        // keeps naming a value this model does not offer. An empty/absent option
+        // set is NOT such an answer (agents answer `[]` mid-reset); that keeps
+        // the pick for a later session.
+        if (usableConfigOptions(session.configOptions)) {
+          result.effortStale = true
+          if (this.dropStalePick(session, 'effort', wantedEffort)) {
+            notice('error', `acp: agent "${session.agentId}" no longer offers thought level "${wantedEffort}"; using its own current level`)
+          }
+        }
       } else if (thought.currentValue === wantedEffort) {
         // Already in force.
       } else if (thought.choices.length > 0 && !thought.choices.some(choice => choice.value === wantedEffort)) {
@@ -10308,7 +10351,20 @@ export class BridgeManager {
       }
     }
     const thought = options.thought
-    if (current?.effort === undefined && displayed.effort !== undefined && thought !== undefined) {
+    // `reasoning.defaultEffort` was observed on whichever model the agent was
+    // last on, and the composer only shows it as THIS conversation's default
+    // when the route resolves to that same model (see `describeRoute`). A model
+    // picked before the first message makes the old default the previous
+    // model's level: seeding it would run a value the chip never showed.
+    const pickedModelValue = current?.modelId === undefined ? undefined : splitAdapterModelId(current.modelId).choice
+    const displayedModelValue = displayed.modelId === undefined ? undefined : splitAdapterModelId(displayed.modelId).choice
+    // A catalog that cannot name its model proves nothing about an explicitly
+    // picked one; only "no model picked" (the bare route / agent's own model)
+    // is safe there. Mirrors `describeRoute`.
+    const effortAppliesToDisplayedModel = pickedModelValue === undefined
+      || (displayedModelValue !== undefined && pickedModelValue === displayedModelValue)
+    if (current?.effort === undefined && displayed.effort !== undefined && thought !== undefined
+      && effortAppliesToDisplayedModel) {
       if (thought.choices.length === 0 || thought.choices.some(choice => choice.value === displayed.effort)) {
         patch.effort = displayed.effort
         changed = true

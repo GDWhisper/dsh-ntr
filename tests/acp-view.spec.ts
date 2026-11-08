@@ -441,8 +441,10 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
     const onVariant = describeRoute([agent], { ...bound, modelId: 'pi@claude-sonnet-4' }, undefined, catalog)
     expect(onVariant.modelLabel).toBe('Pi · Claude Sonnet 4')
     expect(onVariant.efforts.map(e => e.id)).toEqual(['high'])
-    // No effort of its own yet: the agent's own default applies.
-    expect(onVariant.effectiveEffort).toBe('high')
+    // The catalog cannot name the model it observed, so its default level is
+    // not proven to belong to this variant: the default stays gated until a
+    // session reports this model's own options.
+    expect(onVariant.effectiveEffort).toBeUndefined()
     // A variant the agent dropped still labels itself instead of vanishing.
     const stale = describeRoute([agent], { ...bound, modelId: 'pi@gone' }, undefined, catalog)
     expect(stale.modelLabel).toBe('gone')
@@ -483,6 +485,35 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
     })
     expect(otherAgent).toMatchObject({ agentId: 'pi', efforts: [] })
     expect(otherAgent.modelId).toBeUndefined()
+  })
+
+  it("does not present the previous model's thought default after a model switch", () => {
+    // Before any session exists the catalog still describes the model the agent
+    // was last observed on. A model picked in the composer must not inherit that
+    // model's thought level as its "default" — that is the reported chip showing
+    // the previous model's level after switching, before the first turn.
+    const observedOnSonnet: AgentCatalogResult = {
+      ...catalog,
+      currentModel: { value: 'claude-sonnet-4', name: 'Claude Sonnet 4' },
+    }
+    const switched = describeRoute([agent], undefined, undefined, observedOnSonnet, 'pi', {
+      agentId: 'pi',
+      modelId: 'pi@opus',
+    })
+    expect(switched.effectiveEffort).toBeUndefined()
+    // The levels themselves still come from the agent's last-known vocabulary:
+    // the user can still pick one, and the first turn validates it.
+    expect(switched.efforts.map(level => level.id)).toEqual(['high'])
+
+    // The agent's own model (nothing picked / bare route) IS the model the
+    // catalog names, so its default is truthful and stays.
+    const bare = describeRoute([agent], undefined, undefined, observedOnSonnet, 'pi')
+    expect(bare.effectiveEffort).toBe('high')
+    const same = describeRoute([agent], undefined, undefined, observedOnSonnet, 'pi', {
+      agentId: 'pi',
+      modelId: 'pi@claude-sonnet-4',
+    })
+    expect(same.effectiveEffort).toBe('high')
   })
 
   it('shows the model chip for a conversation that has picked nothing yet', () => {

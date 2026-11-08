@@ -6013,6 +6013,28 @@ describe('pre-chat pick persistence (isolated manager)', () => {
     await gm.shutdownAll()
   })
 
+  it('clears a thought-level pick when the model changes before any session exists', async () => {
+    const storage = `${tmpdir()}/acp-pick-switch-${Date.now()}.json`
+    const gm = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
+    gm.bindChatAgent('dsh-pick-switch', 'picked')
+    await gm.setChatSessionModel('dsh-pick-switch', 'picked@opus')
+    await gm.setChatSessionEffort('dsh-pick-switch', 'high')
+    expect(gm.chatChoice('dsh-pick-switch')).toMatchObject({ modelId: 'picked@opus', effort: 'high' })
+
+    // No live session can say whether `high` exists on the new model, so the
+    // level is dropped rather than shown as the new model's own (the reported
+    // "thought level still shows the previous model's" before the first turn).
+    await gm.setChatSessionModel('dsh-pick-switch', 'picked@sonnet')
+    expect(gm.chatChoice('dsh-pick-switch')).toEqual({ agentId: 'picked', modelId: 'picked@sonnet' })
+
+    // Re-picking the SAME model is not a switch: a level chosen after the
+    // switch stands.
+    await gm.setChatSessionEffort('dsh-pick-switch', 'low')
+    await gm.setChatSessionModel('dsh-pick-switch', 'picked@sonnet')
+    expect(gm.chatChoice('dsh-pick-switch')).toEqual({ agentId: 'picked', modelId: 'picked@sonnet', effort: 'low' })
+    await gm.shutdownAll()
+  })
+
   it('persists the tag halo preference and reloads it', async () => {
     const storage = `${tmpdir()}/acp-halo-${Date.now()}.json`
     const gm = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
@@ -6572,6 +6594,61 @@ describe('pre-chat pick persistence (isolated manager)', () => {
     const [session] = gm.chatSessions('dsh-pick-6')
     expect(session?.modelId).toBe('mock@mock-model-b')
     expect(session?.reasoningEffort).toBe('off')
+    await gm.shutdownAll()
+  })
+
+  it('drops a thought level the newly picked model does not publish, and says so once', async () => {
+    const switchHub = new EventHub()
+    const notices: string[] = []
+    switchHub.subscribe(event => {
+      if (event.type === 'agent/notice') notices.push(event.text)
+    })
+    // The knob makes `mock-model-plain` (no thought_level) selectable, so the
+    // switch below is a model the agent really offers.
+    const gm = new BridgeManager([{ ...def, env: { ...def.env, MOCK_PLAIN_MODEL_CHOICE: '1' } }], switchHub, 500, `${tmpdir()}/acp-model-effort-${Date.now()}.json`)
+    gm.bindChatAgent('dsh-model-effort', 'mock')
+    // Materialize a LIVE session on the variant-bearing model (thought off/high).
+    for await (const _chunk of gm.streamPrompt({
+      model: 'mock',
+      sessionId: 'dsh-model-effort',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+    } as never)) { /* drain */ }
+    await gm.setChatSessionEffort('dsh-model-effort', 'high')
+    expect(gm.chatSessions('dsh-model-effort')[0]?.reasoningEffort).toBe('high')
+
+    // `mock-model-plain` publishes no thought_level at all. The set's answer is
+    // the new model's authoritative option set, so the level is stale: it must
+    // leave the pick and the row the chip reads, with exactly one notice.
+    await gm.setChatSessionModel('dsh-model-effort', 'mock@mock-model-plain')
+    expect(gm.chatChoice('dsh-model-effort')).toMatchObject({ agentId: 'mock', modelId: 'mock@mock-model-plain' })
+    expect(gm.chatChoice('dsh-model-effort')?.effort).toBeUndefined()
+    expect(gm.chatSessions('dsh-model-effort')[0]?.reasoningEffort).toBeUndefined()
+    expect(notices.filter(text => text.includes('no longer offers thought level "high"'))).toHaveLength(1)
+    await gm.shutdownAll()
+  })
+
+  it('keeps a thought level a live model switch still offers', async () => {
+    const keepHub = new EventHub()
+    const dropped: string[] = []
+    keepHub.subscribe(event => {
+      if (event.type === 'agent/notice' && event.text.includes('no longer offers thought level')) dropped.push(event.text)
+    })
+    const gm = new BridgeManager([{ ...def, id: 'mock' }], keepHub, 500, `${tmpdir()}/acp-model-keep-${Date.now()}.json`)
+    gm.bindChatAgent('dsh-model-keep', 'mock')
+    for await (const _chunk of gm.streamPrompt({
+      model: 'mock',
+      sessionId: 'dsh-model-keep',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+    } as never)) { /* drain */ }
+    await gm.setChatSessionEffort('dsh-model-keep', 'high')
+    expect(gm.chatSessions('dsh-model-keep')[0]?.reasoningEffort).toBe('high')
+
+    // `mock-model-b` still publishes off/high: the level survives the switch,
+    // on both the pick and the row the chip reads — and nothing is reported.
+    await gm.setChatSessionModel('dsh-model-keep', 'mock@mock-model-b')
+    expect(gm.chatChoice('dsh-model-keep')).toMatchObject({ modelId: 'mock@mock-model-b', effort: 'high' })
+    expect(gm.chatSessions('dsh-model-keep')[0]?.reasoningEffort).toBe('high')
+    expect(dropped).toEqual([])
     await gm.shutdownAll()
   })
 

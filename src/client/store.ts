@@ -3364,14 +3364,29 @@ export class AcpStore {
       // the agent's default until its first turn created one.
       const safeAgent = (agentId && agentId.trim()) || undefined
       const targetAgent = safeAgent ?? (modelId ? splitModelAgentId(modelId) : undefined)
-      this.writeChoice(dshSessionId, choice => ({ ...choice, modelId }), targetAgent)
+      // Mirror the host's model-switch intent (`BridgeManager.setChatSessionModel`):
+      // a thought level belongs to the model it was picked on. The host's own
+      // predicate is authoritative; this only keeps the chip from naming the old
+      // level during the round-trip, and the `session/chat-list` that follows the
+      // pick repairs any disagreement (a level the host kept because a live
+      // session still offers it).
+      const sessions = this.state.chatSessionsFor === dshSessionId ? this.state.chatSessions : []
+      const dropEffort = this.state.chatChoice[dshSessionId]?.modelId !== modelId
+        && !sessions.some(s => !s.released)
+      this.writeChoice(dshSessionId, choice => {
+        const next = { ...choice, modelId }
+        if (dropEffort) delete next.effort
+        return next
+      }, targetAgent)
       if (this.state.chatSessionsFor === dshSessionId) {
         const owner = targetAgent ?? this.state.chatChoice[dshSessionId]?.agentId ?? this.state.chatBoundAgent[dshSessionId] ?? this.state.defaultAgent
         let changed = false
         const chatSessions = this.state.chatSessions.map(s => {
-          if (s.agentId !== owner || s.modelId === modelId) return s
+          if (s.agentId !== owner) return s
+          if (!dropEffort && s.modelId === modelId) return s
+          if (dropEffort && s.modelId === modelId && s.reasoningEffort === undefined) return s
           changed = true
-          return { ...s, modelId }
+          return { ...s, modelId, ...(dropEffort ? { reasoningEffort: undefined } : {}) }
         })
         if (changed) this.mutate({ chatSessions })
       }

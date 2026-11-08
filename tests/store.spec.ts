@@ -2486,6 +2486,39 @@ describe('the conversation↔agent binding (no DSH model route)', () => {
     expect(store.getSnapshot().chatSessions[0]?.reasoningEffort).toBe('low')
   })
 
+  it('drops a pre-first-turn thought pick on a model switch, keeps it on a live session', async () => {
+    let listed: { sessions: Array<{ agentId: string; sessionId: string; modelId: string; reasoningEffort?: string }>; acpMode: boolean } = {
+      sessions: [],
+      acpMode: true,
+    }
+    const store = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint === 'session/chat-list') return { ok: true, value: listed }
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+
+    // No ACP session yet: a level picked for `hy3` cannot be presented as
+    // `hy4`'s (the host clears it for the same reason).
+    await store.loadChatSessions('chat-pick')
+    await store.setChatSessionModel('chat-pick', 'codebuddy@hy3', 'codebuddy')
+    await store.setChatSessionEffort('chat-pick', 'high', 'codebuddy')
+    expect(store.getSnapshot().chatChoice['chat-pick']).toMatchObject({ modelId: 'codebuddy@hy3', effort: 'high' })
+    await store.setChatSessionModel('chat-pick', 'codebuddy@hy4', 'codebuddy')
+    expect(store.getSnapshot().chatChoice['chat-pick']).toEqual({ agentId: 'codebuddy', modelId: 'codebuddy@hy4' })
+
+    // A LIVE session is different: the host re-validates the level against the
+    // new model's own options, so the optimistic path must not drop it first.
+    listed = {
+      sessions: [{ agentId: 'codebuddy', sessionId: 's1', modelId: 'codebuddy@hy3', reasoningEffort: 'high' }],
+      acpMode: true,
+    }
+    await store.loadChatSessions('chat-live')
+    await store.setChatSessionModel('chat-live', 'codebuddy@hy3', 'codebuddy')
+    await store.setChatSessionEffort('chat-live', 'high', 'codebuddy')
+    await store.setChatSessionModel('chat-live', 'codebuddy@hy4', 'codebuddy')
+    expect(store.getSnapshot().chatChoice['chat-live']).toMatchObject({ modelId: 'codebuddy@hy4', effort: 'high' })
+    expect(store.getSnapshot().chatSessions[0]?.reasoningEffort).toBe('high')
+  })
+
   it('attributes a pick to the plugin default before anything was bound', async () => {
     // A fresh conversation served by the default agent has no binding and no
     // choice yet. The host records the pick for that agent; the optimistic

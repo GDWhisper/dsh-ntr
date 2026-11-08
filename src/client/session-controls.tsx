@@ -329,7 +329,20 @@ export function describeRoute(
   const currentName = catalog?.currentModel !== undefined && parsed.choice === catalog.currentModel.value
     ? catalog.currentModel.name
     : undefined
-  const effectiveEffort = effort ?? reasoning?.defaultEffort
+  // The catalog's thought level is the last value observed on whichever model
+  // the AGENT was on — some agents publish `thought_level` only for models with
+  // variants. It is only a truthful default for the model this route will run:
+  // the agent's own (nothing picked / bare route) or the very model the catalog
+  // names. After switching to another model — above all BEFORE the first
+  // session, when nothing has re-read the new model's options — the old default
+  // must not be presented as this model's, so the chip falls back to the agent
+  // default until the first turn.
+  const catalogModelValue = catalog?.currentModel?.value
+  // A catalog that cannot name its current model proves nothing about an
+  // explicitly picked one, so that exemption only covers "no model picked".
+  const modelAgreesWithCatalog = parsed.choice === undefined
+    || (catalogModelValue !== undefined && parsed.choice === catalogModelValue)
+  const effectiveEffort = effort ?? (modelAgreesWithCatalog ? reasoning?.defaultEffort : undefined)
   // The chip names the MODEL, not the agent (user report, 2026-10-18): the agent
   // is already the chip to its right, so "CodeBuddy Code" beside "ACP · CodeBuddy
   // Code" said nothing about which model was running. A bare `agentId` route
@@ -876,8 +889,9 @@ function thoughtSection(context: MenuContext): AcpMenuSection {
     // the user-visible claim, and "provider default" was false (audit finding
     // F43): this axis is the agent's own `thought_level`, with no DSH provider
     // anywhere on it (`listModels('acp')` answers an empty catalog). Clearing
-    // the pick leaves the agent's own `reasoning.defaultEffort` in force, which
-    // is what `effectiveEffort` reports.
+    // the pick leaves the agent's own default in force — `effectiveEffort`
+    // reports `reasoning.defaultEffort` only while the routed model is the one
+    // the catalog names (see `describeRoute`).
     id: 'provider-default',
     label: acp.label('跟随 agent 默认', 'Agent default'),
     active: route.effectiveEffort === undefined,
