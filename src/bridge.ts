@@ -4412,11 +4412,13 @@ interface BackgroundDispatch {
    */
   completed: boolean
   /**
-   * Whether the work runs DETACHED, read from the wire's own structure: the
-   * call re-sent with `_meta["codebuddy.ai/isBackground"] = true`, or any
-   * update naming this call as its `parentToolCallId`. A synchronous
-   * `Agent` / `Task` call carries neither, so it can never make the turn wait
-   * after its own answer.
+   * Whether the work runs DETACHED, read from the dispatch call's OWN structure:
+   * the call re-sent with `_meta["codebuddy.ai/isBackground"] = true`. A worker
+   * update naming this call as its `parentToolCallId` does NOT set it — CodeBuddy
+   * tags a synchronous subagent's child updates the same way, so that signal
+   * only proves the worker alive (`sawWorkerUpdate`). A synchronous `Agent` /
+   * `Task` call never declares `isBackground`, so it can never make the turn
+   * wait after its own answer.
    */
   detached: boolean
   /** Whether any update came FROM the worker (`codebuddy.ai/parentToolCallId`). */
@@ -4831,10 +4833,11 @@ class TurnStreamController {
    * Two ways a dispatch keeps the turn open:
    * - it has not reported back yet (the worker is still running), or
    * - it DID report — before the response, even — but it was structurally
-   *   detached and emitted worker updates: the drain that carries its report
-   *   is still coming.
-   * A synchronous `Agent` / `Task` call (completed, no `isBackground`, no
-   * worker updates) matches neither and closes normally.
+   *   detached (`isBackground`) and emitted worker updates: the drain that
+   *   carries its report is still coming.
+   * A synchronous `Agent` / `Task` call (completed, never declared
+   * `isBackground`) matches neither and closes normally — even though its
+   * child updates carry `parentToolCallId`, that only sets `sawWorkerUpdate`.
    */
   get dispatchedDetachedWorker(): boolean {
     for (const dispatch of this.dispatches.values()) {
@@ -5241,13 +5244,14 @@ class TurnStreamController {
    * other agent, so nothing here can fire for them):
    * - an `Agent` / `Task` `tool_call` records the dispatch — the FIRST send
    *   needs that CodeBuddy shape;
-   * - the SAME call re-sent with `isBackground: true`, or any update naming it
-   *   as its `parentToolCallId`, marks the work DETACHED;
+   * - the SAME call re-sent with `isBackground: true` marks the work DETACHED;
    * - that call reporting completed / failed is read BY ID: the real
    *   completion frame carries NO `_meta` at all, so requiring the CodeBuddy
    *   shape here would miss every real completion;
    * - any update carrying `parentToolCallId` is the worker's OWN turn — it
-   *   proves the worker alive but never belongs to this session's answer;
+   *   proves the worker alive (`sawWorkerUpdate`) but never belongs to this
+   *   session's answer, and does NOT mark the dispatch detached (a synchronous
+   *   subagent's child updates carry it too);
    * - an `unsolicitedTurn` announcement is the drain that carries the report.
    */
   private trackBackgroundDispatch(update: Record<string, unknown>): void {
@@ -5342,7 +5346,10 @@ class TurnStreamController {
         if (kind === 'tool_call') parent.counts.toolCalls += 1
         else if (kind === 'agent_message_chunk') parent.counts.textChars += chunkTextOf(update.content).length
         if (type !== undefined && parent.subagentType === undefined) parent.subagentType = type
-        parent.detached = true
+        // `parentToolCallId` proves the worker alive, NOT that it runs detached:
+        // CodeBuddy tags a SYNCHRONOUS subagent's child updates the same way. Only
+        // the dispatch's own `isBackground` re-send marks it detached; a sync call
+        // completes in-turn and must close at the response, not hold for a drain.
         parent.sawWorkerUpdate = true
         this.reportSubagentDispatch(parent)
         this.syncDispatchRecord(parent)

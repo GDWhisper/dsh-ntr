@@ -613,6 +613,12 @@ const app = agent({ name: 'mock-acp-agent' })
       const lateDrain = text.includes('DISPATCHLATEDRAIN')
       const altFirst = text.includes('DISPATCHALTFIRST')
       const completedMeta = text.includes('DISPATCHCOMPLETEMETA')
+      // A SYNCHRONOUS subagent: the child's own turn streams with
+      // `parentToolCallId` (CodeBuddy labels child updates this way for sync AND
+      // detached workers), but the dispatch is never re-sent with
+      // `isBackground`. The tool completes and the parent answers in the SAME
+      // turn; no drain follows, so the turn must close at the response.
+      const sync = text.includes('DISPATCHSYNC')
       // The worker's own completion reports `failed` WITH the agent's reason
       // in `content` (still no `_meta`: matched by callId alone).
       const failed = text.includes('DISPATCHFAILED')
@@ -772,6 +778,17 @@ const app = agent({ name: 'mock-acp-agent' })
       }
 
       await sendFirst(dispatchId)
+      if (sync) {
+        // The child's own turn streams (`parentToolCallId`, no `isBackground`),
+        // the tool returns its result, and the parent consumes it and answers —
+        // all before the prompt response. Nothing runs off-turn, so the response
+        // must settle the turn normally instead of holding for a drain that will
+        // never come.
+        await workerTurn(workerId, dispatchId, 'worker_bash')
+        await sendCompleted(dispatchId)
+        await sendParentText('DISPATCH-SYNC-ANSWER ')
+        return { stopReason: 'end_turn', _meta: { 'codebuddy.ai/conversationRequestId': drainId, 'codebuddy.ai/requestId': drainId } }
+      }
       if (completedMeta) {
         // One frame that is simultaneously the detached re-send and the
         // completion, on a dispatch nobody has reported yet. The row must not

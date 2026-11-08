@@ -8878,6 +8878,38 @@ describe('a turn that dispatched a detached worker (isolated manager)', () => {
     expect(frames[0]).toMatchObject({ stopReason: 'end_turn' })
   }, 30_000)
 
+  it('closes a synchronous subagent turn at the response, without a deferral', async () => {
+    const dshSessionId = 'dsh-dispatch-sync'
+    const since = dispatchEvents.length
+    const { chunks } = await hostLoopTurn(dispatchAdapter, {
+      provider: 'acp',
+      model: 'dispatch',
+      sessionId: dshSessionId,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'DISPATCHSYNC please' }] }],
+    })
+    const text = dispatchText(chunks)
+
+    // The child streamed its own turn (`parentToolCallId`) but the dispatch was
+    // never declared background (`isBackground`): the parent consumed the result
+    // and answered in the SAME turn. The answer must reach the bubble and the
+    // turn must close at the response — no hold, so no deferral line trailing a
+    // complete answer (the misread this case pins).
+    expect(text).toContain('DISPATCH-SYNC-ANSWER')
+    expect(text).not.toContain(DEFERRAL_REPORT)
+    expect(text).not.toContain(ZERO_OUTPUT_REPORT)
+    expect(dispatchFinish(chunks)?.reason).toEqual({ kind: 'stop' })
+    // The worker's own turn stays transcript-only, as for any dispatch.
+    expect(text).not.toContain('WORKER-INTERNAL-TEXT')
+    expect(text).not.toContain('WORKER-REPORT-TEXT')
+
+    const acpSessionId = dispatchManager.chatSessions(dshSessionId)[0]?.sessionId
+    expect(acpSessionId).toBeDefined()
+    const frames = dispatchEvents.slice(since).filter(event =>
+      event.type === 'turn/end' && event.sessionId === acpSessionId)
+    expect(frames).toHaveLength(1)
+    expect(frames[0]).toMatchObject({ stopReason: 'end_turn' })
+  }, 30_000)
+
   it('ends a holding turn once when the user cancels it', async () => {
     const dshSessionId = 'dsh-dispatch-cancel'
     const since = dispatchEvents.length
