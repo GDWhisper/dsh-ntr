@@ -45,6 +45,9 @@
  *  - "PACED" → a 1.2s tool wait followed by two answer chunks 100ms apart, so a
  *              test can prove the burst rate excludes tool waits but counts the
  *              within-answer gap
+ *  - "LATECARD" → restates the open card's input 1s after the card opened (well
+ *              past the plugin's quiet window), so a test can prove a late
+ *              restatement still replaces the early-settled card at segment close
  *  - "PIDTAG" → appends `PID:<process.pid>` to the echo, so a test can tell
  *              whether the SAME agent process served two turns (a restart /
  *              reclaim shows a different pid). Opt-in on purpose: every other
@@ -1487,6 +1490,18 @@ const app = agent({ name: 'mock-acp-agent' })
       // a working agent whose tool half may legitimately take much longer than
       // its prose half. session/cancel is ignored, like the other HANG modes.
       await new Promise(() => {})
+    }
+    if (text.includes('LATECARD')) {
+      // Well past the plugin's quiet window: the early block-end carries only
+      // the title, and this restatement must reach the segment's closing
+      // block-end (the host replaces the settled card whole).
+      await sleep(1000)
+      await send({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: MAIN_CALL_ID,
+        rawInput: { command: 'git push origin main --tags' },
+        status: 'in_progress',
+      })
     }
     await send({
       sessionUpdate: 'tool_call_update',

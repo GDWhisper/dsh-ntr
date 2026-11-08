@@ -4310,6 +4310,13 @@ interface SegmentState {
    * not even started streaming yet.
    */
   ambient: boolean
+  /**
+   * Whether this segment's open card was settled early (see
+   * `settleOpenCard`). The snapshot stays open so a late restatement still
+   * folds into it; the segment's closing `block-end` then replaces the settled
+   * card with the final text.
+   */
+  cardSettled: boolean
   finished: boolean
 }
 
@@ -4508,6 +4515,25 @@ interface BackgroundHold {
 }
 
 /**
+ * How long a card-bearing segment waits for the agent to stop disclosing the
+ * open call's arguments before the block is settled.
+ *
+ * The settling rule (`docs/acp-convergence.md` §1.8) cuts a segment at the
+ * next non-tool event, which for a long-running tool means the agent's next
+ * words — typically AFTER the tool finished. The host's live "preparing" row
+ * only advances on `argumentsDelta`, and an ACP update restates its input in
+ * whole, so the real command otherwise appears only when the segment closes.
+ * A short quiet window closes the tool-call BLOCK (not the segment): the row
+ * settles its arguments and shows the real command while the agent still
+ * executes the tool, and the segment stays open for the host-side settle,
+ * watchdog and continuation semantics.
+ *
+ * Long enough to batch the announce → rewrite burst observed on
+ * CodeBuddy (all within the same tick or two), short enough to read as live.
+ */
+const CARD_SETTLE_QUIET_MS = 500
+
+/**
  * The state of ONE ACP prompt, shared across every driver step of the turn.
  *
  * The controller owns the hub subscription (for the whole agent-side turn, not
@@ -4580,6 +4606,12 @@ class TurnStreamController {
   /** The outcome of a settle whose closing work is waiting one macrotask (see `settle`). */
   private pendingOutcome?: TurnSettle
   private closeScheduled = false
+  /**
+   * The bounded wait that settles an open card's block while the agent is
+   * still running the tool (see {@link CARD_SETTLE_QUIET_MS}). Only armed for
+   * a segment whose open card has disclosed arguments.
+   */
+  private cardSettleTimer?: ReturnType<typeof setTimeout>
   private cursorSeq: number
   /**
    * Burst tracker for this turn, fed from the LIVE hub frames only. Segment
@@ -4719,6 +4751,7 @@ class TurnStreamController {
       ambient: this.awaitingAmbient !== undefined
         || this.backgroundHold !== undefined
         || this.pendingBackgroundHold !== undefined,
+      cardSettled: false,
       finished: false,
     }
     this.segment = seg
@@ -5918,6 +5951,7 @@ class TurnStreamController {
   retire(): void {
     if (this.disposed) return
     this.disposed = true
+    this.clearCardSettle()
     this.unsubscribe()
     // The session must not keep pointing at a retired turn: the stall watchdog
     // reads this slot as "what is streaming now". A newer controller may have
@@ -5928,8 +5962,79 @@ class TurnStreamController {
 
   // ---- internals ----
 
+  /**
+   * Settle the open tool card's BLOCK once the agent goes quiet.
+   *
+   * Why this exists: the host's live "preparing" row only advances on
+   * `argumentsDelta`; an ACP update restates its input in whole, which the
+   * concatenating accumulator cannot express. Waiting for the next non-tool
+   * event therefore delays the real command until the agent speaks again, and
+   * a long-running tool speaks only after it finished. Closing the block on a
+   * short quiet window lets the row settle its arguments (the real command)
+   * while the tool still runs.
+   *
+   * The SEGMENT stays open: the card is still its last block, the host still
+   * settles the message (and executes the card) on the next non-tool event,
+   * and the watchdog / continuation semantics do not move. Skipped when the
+   * card disclosed no arguments (nothing to settle, and the agent may still
+   * disclose them) and in ambient segments (they open no cards).
+   */
+  private armCardSettle(seg: SegmentState): void {
+    this.clearCardSettle()
+    if (this.disposed || seg.finished || seg.ambient || seg.cardSettled) return
+    const call = seg.activeToolCall
+    if (seg.activeType !== 'tool-call' || call === undefined) return
+    if (call.argsRaw === '') return
+    const timer = setTimeout(() => {
+      this.cardSettleTimer = undefined
+      if (this.disposed || this.segment !== seg || seg.finished) return
+      if (seg.ambient || seg.cardSettled) return
+      if (seg.activeType !== 'tool-call' || seg.activeToolCall === undefined) return
+      if (seg.activeToolCall.argsRaw === '') return
+      this.settleOpenCard(seg)
+    }, CARD_SETTLE_QUIET_MS)
+    // Never pin the process open for a display timer alone.
+    timer.unref?.()
+    this.cardSettleTimer = timer
+  }
+
+  /** Cancel the pending block settle (its segment closed, or a newer card replaced it). */
+  private clearCardSettle(): void {
+    if (this.cardSettleTimer === undefined) return
+    clearTimeout(this.cardSettleTimer)
+    this.cardSettleTimer = undefined
+  }
+
+  /**
+   * Close the open tool-call block WITHOUT ending the segment, so the host's
+   * live row settles its arguments. The block stays the segment's last block;
+   * a later non-tool event cuts the segment exactly as before.
+   *
+   * The SNAPSHOT deliberately stays open. ACP updates restate their input
+   * whole, so the agent can disclose a fuller command after the window: that
+   * update folds into the snapshot (see `foldInto`) and the segment's closing
+   * `block-end` replaces the settled card with the final text. Clearing the
+   * snapshot here would hand the same call's restatements to `seenCalls`, and
+   * the card would stay pinned to the early text for the rest of the turn.
+   */
+  private settleOpenCard(seg: SegmentState): void {
+    if (seg.finished) return
+    const call = seg.activeToolCall
+    if (seg.activeType !== 'tool-call' || call === undefined) return
+    if (seg.cardSettled) return
+    seg.cardSettled = true
+    seg.queue.push({
+      type: 'block-end',
+      index: seg.index,
+      block: { type: 'tool-call' as const, id: call.callId, name: call.name, arguments: call.argsRaw },
+    })
+    seg.activeText = ''
+  }
+
   private finishSegment(seg: SegmentState, reason: SegmentFinishReason): void {
     if (seg.finished) return
+    // A block settle belongs to the segment that armed it; every close cancels it.
+    this.clearCardSettle()
     seg.finished = true
     if (seg.activeType !== null) {
       seg.queue.push({
@@ -6309,11 +6414,20 @@ class TurnStreamController {
       const snapshot = acpToolCallFromUpdate(update)
       if (snapshot === undefined) return true
       if (seg.activeType === 'tool-call' && seg.activeToolCall?.callId === snapshot.callId) {
-        for (const delta of acpToolCallDelta(seg.activeToolCall, update)) {
+        const deltas = acpToolCallDelta(seg.activeToolCall, update)
+        // An early-settled block is already sealed on the host side: a
+        // concatenating delta would append to a settled view. Keep the folded
+        // snapshot only — the segment's closing `block-end` restates it whole.
+        if (seg.cardSettled) return true
+        for (const delta of deltas) {
           seg.queue.push(delta.kind === 'name'
             ? { type: 'tool-call-delta', index: seg.index, id: seg.activeToolCall.callId, name: delta.name, argumentsDelta: '' }
             : { type: 'tool-call-delta', index: seg.index, id: seg.activeToolCall.callId, argumentsDelta: delta.text })
         }
+        // The agent may have JUST disclosed the real command (the announce
+        // often carries only a placeholder title): restart the settle window
+        // so the live row can show that text while the tool runs.
+        this.armCardSettle(seg)
         return true
       }
       if (this.seenCalls.has(snapshot.callId)) return true // a restatement of a card already settled
@@ -6325,6 +6439,9 @@ class TurnStreamController {
       if (kind === 'tool_call_update' && snapshot.name === '' && snapshot.argsRaw === '') return true
       this.seenCalls.add(snapshot.callId)
       this.openToolCallBlock(seg, snapshot)
+      // Let the host's live row settle this card's real command after a short
+      // quiet window, instead of waiting for the next non-tool event.
+      this.armCardSettle(seg)
       return true
     } else if (!BOOKKEEPING_UPDATES.has(kind)) {
       const text = describeUnhandledUpdate(kind, update)
@@ -6382,6 +6499,9 @@ class TurnStreamController {
     seg.activeType = 'tool-call'
     seg.activeText = ''
     seg.activeToolCall = snapshot
+    // A NEW card owns its own settle window; the previous card's settlement
+    // (if any) closed with the block-end above.
+    seg.cardSettled = false
     this.sawVisibleBlock = true
     seg.hasCard = true
     seg.queue.push({ type: 'block-start', index: seg.index, blockType: 'tool-call' })

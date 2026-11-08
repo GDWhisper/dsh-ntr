@@ -273,6 +273,22 @@ callId 显式断块；同 callId 重发的 `tool_call` 按更新折叠。
    （agent 未确认取消前不解开 `settled` 闸门）跨段成立；段间事件只记账
    （工具输出唤醒等待者），游标不动，下一段重放补齐。
 
+**卡片块的静默结算（2026-11-08，现行）**：切段点仍是「下一条非 tool 事件」，
+但卡片参数披露后 agent 连续静默 `CARD_SETTLE_QUIET_MS`（500ms）时，
+`TurnStreamController.armCardSettle` 只发该卡的 `block-end`，**不结束段**。
+宿主的实时 preparing 行据此在工具仍运行时就显示真实命令（`applyDelta` 的
+block-end 会把整包 `arguments` 落到 `args.settle`），而消息落定、卡片交给宿主
+执行、看门狗（段仍开着）与续跑时机全部不变。参数为空时不结算（agent 可能
+还没披露），静默窗也用于批处理 announce → rewrite 的重述突发。
+
+结算只关块、**不清快照**（`SegmentState.cardSettled`）：同一 callId 的迟到参数
+重述仍折进快照，但**不再发 `tool-call-delta`**——宿主视图已 `settle` 成 sealed，
+拼接会追加到已定稿的文本后面。最终由段尾/切块时那次 `block-end` 整包替换
+（`PartialArguments.settle` 可重复调用，同名同 index 覆盖），所以慢披露的 agent
+不会把卡片钉在旧命令上，也不会开第二张卡。回归用例：
+`tests/bridge.spec.ts` 的「replaces an early-settled card with a late restatement」，
+mock marker `LATECARD`。
+
 **同一轮的性能改造**（用户报告：流式期间整机卡顿、时钟跳跃）。排查结论：
 宿主端逐 chunk 成本是 O(1)（广播 + 每连接一次 stringify），压力主因在
 浏览器端**每条 SSE chunk 一次「数组复制 + 全 state 重建 + 所有订阅组件

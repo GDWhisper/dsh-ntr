@@ -517,6 +517,70 @@ describe('ACP bridge over stdio (mock agent)', () => {
     expect(row?.burst).toEqual({ outputTokens: final.outputTokens, burstMs: final.burstMs })
   }, 30_000)
 
+  it('settles a running card block before the agent speaks again', async () => {
+    const adapter = new AcpLlmAdapter(manager)
+    const startedAt = Date.now()
+    const frames: Array<{ at: number; chunk: StreamChunk }> = []
+    for await (const chunk of adapter.stream({
+      provider: 'acp',
+      model: 'mock',
+      sessionId: 'dsh-card-settle',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'PACED settle the card' }] }],
+    })) {
+      frames.push({ at: Date.now() - startedAt, chunk })
+    }
+    const cardEnd = frames.find(({ chunk }) => chunk.type === 'block-end'
+      && (chunk.block as { type?: string }).type === 'tool-call')
+    // The mock holds its answer 1.2s after the tool call; that answer is the
+    // cutting event, so the first stream ends there and the answer itself
+    // belongs to the continuation step.
+    const finish = frames.at(-1)
+    expect(cardEnd).toBeDefined()
+    expect(finish?.chunk.type).toBe('finish')
+    // The card's block settles on its own quiet window, well before the cut:
+    // that is what lets the live row show the real command while the agent is
+    // STILL running the tool.
+    expect(finish?.at ?? 0).toBeGreaterThan((cardEnd?.at ?? 0) + 300)
+    // The settled body carries the agent's own title, not an empty argument
+    // area: it is the command the live row renders during the run.
+    if (cardEnd?.chunk.type !== 'block-end') return
+    expect((cardEnd.chunk.block as { arguments?: string }).arguments).toContain('mock tool')
+    const acpId = manager.chatTranscripts('dsh-card-settle')[0]?.session.sessionId
+    if (acpId !== undefined) await dispatchRpc(manager, 'session/close', { sessionId: acpId })
+  }, 30_000)
+
+  it('replaces an early-settled card with a late restatement at segment close', async () => {
+    const adapter = new AcpLlmAdapter(manager)
+    const startedAt = Date.now()
+    const frames: Array<{ at: number; chunk: StreamChunk }> = []
+    for await (const chunk of adapter.stream({
+      provider: 'acp',
+      model: 'mock',
+      sessionId: 'dsh-card-restate',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'LATECARD restate the card' }] }],
+    })) {
+      frames.push({ at: Date.now() - startedAt, chunk })
+    }
+    const cardEnds = frames.filter(({ chunk }) => chunk.type === 'block-end'
+      && (chunk.block as { type?: string }).type === 'tool-call')
+    // The quiet window settles the announced title; the segment's own close
+    // restates the card whole with the input disclosed later.
+    expect(cardEnds).toHaveLength(2)
+    const first = (cardEnds[0]?.chunk.block as { arguments?: string } | undefined)?.arguments ?? ''
+    const last = (cardEnds[1]?.chunk.block as { arguments?: string } | undefined)?.arguments ?? ''
+    expect(first).toContain('mock tool')
+    expect(first).not.toContain('git push')
+    expect(last).toContain('git push origin main --tags')
+    // A sealed host view takes no further fragment: the late text must NOT
+    // ride in as a delta after the early settle.
+    const settledAt = cardEnds[0]?.at ?? 0
+    const lateDeltas = frames.filter(({ chunk, at }) => chunk.type === 'tool-call-delta'
+      && chunk.argumentsDelta !== '' && at > settledAt)
+    expect(lateDeltas).toHaveLength(0)
+    const acpId = manager.chatTranscripts('dsh-card-restate')[0]?.session.sessionId
+    if (acpId !== undefined) await dispatchRpc(manager, 'session/close', { sessionId: acpId })
+  }, 30_000)
+
   it('persists the burst aggregate across a host restart', async () => {
     const root = mkdtempSync(join(tmpdir(), 'dsh-ntr-burst-'))
     const storage = join(root, 'agents.json')

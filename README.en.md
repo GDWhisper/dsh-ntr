@@ -93,7 +93,7 @@ After saving, the agent shows up in the NTR base at the end of the composer.
 2. Pick an agent in the NTR base at the end of the composer.
 3. Just talk.
 
-The agent's replies and thinking appear in the main chat. Tool activity is interleaved in order: a line of `🛠️ **tool** · args`, with the output in a code block below. For full tool outputs, plans, and diffs, switch to the **NTR** tab in the conversation header.
+The agent's replies and thinking appear in the main chat. Tool activity is interleaved in order: a line of `🛠️ **tool** · args`, with the output in a code block below. As soon as the agent discloses the arguments, the command appears in that line — even while the tool is still running. For full tool outputs, plans, and diffs, switch to the **NTR** tab in the conversation header.
 
 ---
 
