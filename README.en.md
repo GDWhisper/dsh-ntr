@@ -218,6 +218,10 @@ Their number scales only with the number of DISTINCT tool names: some agents (e.
 
 The agent's real output is always in the NTR tab; the first errored card has no mirrored output. In dsh-ntr 0.3.9 and earlier the chat card showed placeholder text (fixed in 0.3.10). Upgrading does not remove the first-time `unknown tool` / "Tool added" pair.
 
+**Why does a run of intermediate narration stay below the "Completed in …" row?**
+
+Not a plugin issue: it's DSH's chat display setting. By default, the host's "Replies After Collapse" is "All replies", so every assistant text in the turn — including intermediate narration — stays visible below the completed row; the final answer is simply the last one. To fold the process into "Completed" and keep only the final answer, open **Settings → General → Replies After Collapse → Final answer only**. The process text remains available in the "Completed" disclosure and the NTR tab.
+
 ---
 
 ## What it can do (feature list)
