@@ -811,16 +811,17 @@ describe('ACP bridge over stdio (mock agent)', () => {
     }
     expect(titleChunks.map(c => c.type)).toEqual(['block-start', 'text-delta', 'block-end', 'finish'])
     const titleText = titleChunks.find((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')?.text
-    expect(titleText).toBe('给这个仓库写一份测试指南')
+    // The badge is on by default, so the placeholder answer carries it.
+    expect(titleText).toBe(`${SESSION_TITLE_PREFIX}给这个仓库写一份测试指南`)
     const titleFinish = titleChunks.find((c): c is Extract<StreamChunk, { type: 'finish' }> => c.type === 'finish')
     expect(titleFinish?.reason).toMatchObject({ kind: 'stop' })
 
-    // The settings toggle prefixes the same answer (the flag is read at
-    // request time, so the toggle lands without restarting anything) while
+    // Switching the badge off drops the prefix from the same answer (the flag
+    // is read at request time, so it lands without restarting anything) while
     // keeping the placeholder's own budget. The pick persists with the agent
     // registry — the reload round-trip is pinned by its own test below.
-    await manager.setSessionTitlePrefix(true)
-    const prefixedChunks: StreamChunk[] = []
+    await manager.setSessionTitlePrefix(false)
+    const bareChunks: StreamChunk[] = []
     for await (const chunk of adapter.stream({
       provider: 'acp',
       model: 'mock',
@@ -832,12 +833,12 @@ describe('ACP bridge over stdio (mock agent)', () => {
         content: [{ type: 'text', text: 'Generate the session title from this JSON array of human messages: ["给这个仓库写一份测试指南","second human line"]' }],
       }],
     })) {
-      prefixedChunks.push(chunk)
+      bareChunks.push(chunk)
     }
-    const prefixedText = prefixedChunks.find((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')?.text
-    expect(prefixedText).toBe(`${SESSION_TITLE_PREFIX}给这个仓库写一份测试指南`)
-    // Back off, so the shared manager's later tests see the default again.
-    await manager.setSessionTitlePrefix(false)
+    const bareText = bareChunks.find((c): c is Extract<StreamChunk, { type: 'text-delta' }> => c.type === 'text-delta')?.text
+    expect(bareText).toBe('给这个仓库写一份测试指南')
+    // Back on, so the shared manager's later tests see the default again.
+    await manager.setSessionTitlePrefix(true)
 
     // A title prompt without a parseable human-message array keeps the old
     // refusal, and compaction is refused outright: the adapter must never turn
