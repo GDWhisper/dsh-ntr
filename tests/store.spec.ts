@@ -390,10 +390,10 @@ describe('AcpStore agent management', () => {
       (zh) => zh,
     )
     await failing.resync()
-    await failing.setTitlePrefix(true)
-    // The revert target is what resync last knew: the default (off), because
+    await failing.setTitlePrefix(false)
+    // The revert target is what resync last knew: the default (on), because
     // this mock never answers `ui/session-title-prefix`.
-    expect(failing.getSnapshot().titlePrefix).toBe(false)
+    expect(failing.getSnapshot().titlePrefix).toBe(true)
   })
 
   it('reads the approval deadlines on resync and writes one back optimistically', async () => {

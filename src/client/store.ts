@@ -577,7 +577,7 @@ export interface UiState {
   tagHalo: AcpTagHalo
   /**
    * Whether generated NTR session titles carry the `[NTR] ` badge (settings
-   * toggle, default off). Writes land optimistically first; the host answer
+   * toggle, default on). Writes land optimistically first; the host answer
    * is the authority. Only future title generations change — titles the host
    * already accepted are durable and stay as they are.
    */
@@ -1398,7 +1398,7 @@ export class AcpStore {
         this.call<{ preset: AcpPresetStatus | null }>('preset/status').catch(() => null),
         // Host without the endpoint (older half) keeps the local default.
         this.call<{ halo: AcpTagHalo }>('ui/tag-halo').catch(() => ({ halo: { ...DEFAULT_TAG_HALO } })),
-        // Host without the endpoint (older half) keeps the local default (off).
+        // Host without the endpoint (older half) keeps the local default (on).
         this.call<{ titlePrefix: boolean }>('ui/session-title-prefix').catch(() => ({ titlePrefix: DEFAULT_SESSION_TITLE_PREFIX })),
         // `undefined` (older half) hides the deadline card instead of showing a
         // number this browser made up.

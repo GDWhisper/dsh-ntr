@@ -8060,10 +8060,13 @@ export class BridgeManager {
         } catch {
           this.tagHaloSetting = { ...DEFAULT_TAG_HALO }
         }
-        // The settings page's title-prefix toggle. Written only as a boolean
-        // and re-checked here for the same reason the halo is: the file is
-        // user- and version-editable, and anything but a boolean reads as off.
-        this.sessionTitlePrefixEnabled = (parsed as { sessionTitlePrefix?: unknown }).sessionTitlePrefix === true
+        // The settings page's title-prefix toggle. Written only as a boolean;
+        // an explicit boolean is honored as-is, while a missing or hand-edited
+        // non-boolean falls back to the default — the same user-editable-file
+        // rule the halo preference hydrates by.
+        const storedTitlePrefix = (parsed as { sessionTitlePrefix?: unknown }).sessionTitlePrefix
+        this.sessionTitlePrefixEnabled =
+          typeof storedTitlePrefix === 'boolean' ? storedTitlePrefix : DEFAULT_SESSION_TITLE_PREFIX
         // The settings page's approval-deadline override. Re-validated on every
         // boot because the state file is user- and version-editable: an
         // unreadable value must not poison the deadline, and a value the

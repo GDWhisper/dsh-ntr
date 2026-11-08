@@ -2794,10 +2794,10 @@ describe('dispatchRpc', () => {
     await expect(dispatchRpc(manager, 'ui/tag-halo-set', { halo: { mode: 'blink', speed: 'fast' } })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     await expect(dispatchRpc(manager, 'ui/tag-halo-set', { halo: { mode: 'breath', speed: 'ludicrous' } })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     await expect(dispatchRpc(manager, 'ui/tag-halo-set', {})).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
-    // The session-title prefix toggle: read falls back to off on an older
-    // host half; only a boolean passes the write gate.
+    // The session-title prefix toggle: read falls back to the default (on) on
+    // an older host half; only a boolean passes the write gate.
     await expect(dispatchRpc(manager, 'ui/session-title-prefix', {})).resolves.toEqual({ ok: true, value: { titlePrefix: true } })
-    await expect(dispatchRpc({ ...manager, sessionTitlePrefix: undefined }, 'ui/session-title-prefix', {})).resolves.toEqual({ ok: true, value: { titlePrefix: false } })
+    await expect(dispatchRpc({ ...manager, sessionTitlePrefix: undefined }, 'ui/session-title-prefix', {})).resolves.toEqual({ ok: true, value: { titlePrefix: true } })
     await expect(dispatchRpc(manager, 'ui/session-title-prefix-set', { titlePrefix: true })).resolves.toEqual({ ok: true, value: { titlePrefix: true } })
     expect(manager.calls).toContainEqual(['setSessionTitlePrefix', true])
     await expect(dispatchRpc({ ...manager, sessionTitlePrefix: () => false }, 'ui/session-title-prefix-set', { titlePrefix: false })).resolves.toEqual({ ok: true, value: { titlePrefix: false } })

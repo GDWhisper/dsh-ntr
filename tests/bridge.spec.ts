@@ -6053,18 +6053,18 @@ describe('pre-chat pick persistence (isolated manager)', () => {
     const storage = `${tmpdir()}/acp-title-prefix-${Date.now()}.json`
     const gm = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
     // The default before anything was ever saved.
-    expect(gm.sessionTitlePrefix()).toBe(false)
+    expect(gm.sessionTitlePrefix()).toBe(true)
 
-    await gm.setSessionTitlePrefix(true)
+    await gm.setSessionTitlePrefix(false)
     // A fresh manager (host restart) reads the same registry file back.
     const reloaded = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
-    expect(reloaded.sessionTitlePrefix()).toBe(true)
+    expect(reloaded.sessionTitlePrefix()).toBe(false)
     await reloaded.shutdownAll()
-    // A hand-edited non-boolean reads as off, never as on — the same
-    // user-editable-file rule the halo preference hydrates by.
-    writeFileSync(storage, readFileSync(storage, 'utf-8').replace(/"sessionTitlePrefix": ?true/, '"sessionTitlePrefix":"true"'))
+    // A hand-edited non-boolean reads as the default (on), never as an
+    // explicit value — the same user-editable-file rule the halo hydrates by.
+    writeFileSync(storage, readFileSync(storage, 'utf-8').replace(/"sessionTitlePrefix": ?false/, '"sessionTitlePrefix":"false"'))
     const coerced = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
-    expect(coerced.sessionTitlePrefix()).toBe(false)
+    expect(coerced.sessionTitlePrefix()).toBe(true)
     await coerced.shutdownAll()
     await gm.shutdownAll()
   })

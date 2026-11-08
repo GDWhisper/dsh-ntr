@@ -1047,8 +1047,8 @@ export interface TagHaloSetPayload { halo: AcpTagHalo }
  * placeholder's own budget stays intact.
  */
 export const SESSION_TITLE_PREFIX = '[NTR] '
-/** Default when nothing was ever saved: off — titles stay exactly as generated. */
-export const DEFAULT_SESSION_TITLE_PREFIX = false
+/** Default when nothing was ever saved: on, so titles carry the [NTR] prefix. */
+export const DEFAULT_SESSION_TITLE_PREFIX = true
 /** `ui/session-title-prefix`: read the toggle in force. */
 export type SessionTitlePrefixResult = { titlePrefix: boolean }
 /** `ui/session-title-prefix-set`: write the toggle. */
