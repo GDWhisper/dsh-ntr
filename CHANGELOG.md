@@ -2,6 +2,38 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [0.4.1] - 2026-11-08
+
+NTR 会话标题默认带 [NTR] 徽标；切换模型不再串用思考等级，同步子代理的回合就地收尾，工具卡不再刷屏。
+
+### 改进
+
+- **acp**：NTR 会话自动生成的标题默认带 `[NTR] ` 前缀，侧栏一眼可辨，设置页可关闭。([c8fc168](https://github.com/GDWhisper/dsh-ntr/commit/c8fc168))
+
+### 修复
+
+- **acp**：工具卡统一成一个固定名称，原始命令保留在参数里，新宿主上不再为每条命令刷出一对「未知工具」提示。([284ca6d](https://github.com/GDWhisper/dsh-ntr/commit/284ca6d))
+- **acp**：同步子代理在回答返回时就结束本轮，不再在已完成的回答后面追加「已转交后台任务」的说明。([02286c9](https://github.com/GDWhisper/dsh-ntr/commit/02286c9))
+- **acp**：切换模型后不再沿用上一个模型的思考等级，首轮用新模型自己的默认值。([a1d40af](https://github.com/GDWhisper/dsh-ntr/commit/a1d40af))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.4.0...v0.4.1
+
+---
+
+NTR session titles carry the [NTR] badge by default; a model switch no longer keeps a stale thought level, synchronous subagents close their turn in place, and tool cards stop flooding the stream.
+
+### Improved
+
+- **acp**: generated NTR session titles carry the `[NTR] ` prefix by default, so they stand out in the sidebar; a settings toggle turns it off. ([c8fc168](https://github.com/GDWhisper/dsh-ntr/commit/c8fc168))
+
+### Fixed
+
+- **acp**: tool cards share one fixed name and keep the original command in their arguments, so newer hosts no longer emit an "unknown tool" pair for every command. ([284ca6d](https://github.com/GDWhisper/dsh-ntr/commit/284ca6d))
+- **acp**: a synchronous subagent's turn closes when its answer returns instead of appending a "deferred to a background task" line under a complete reply. ([02286c9](https://github.com/GDWhisper/dsh-ntr/commit/02286c9))
+- **acp**: switching models no longer carries the previous model's thought level; the first turn runs the new model's own default. ([a1d40af](https://github.com/GDWhisper/dsh-ntr/commit/a1d40af))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.4.0...v0.4.1
+
 ## [0.4.0] - 2026-11-07
 
 NTR 对话新增子代理面板：头部触发器、六状态清单与只读详情；斜杠菜单接入 agent 技能；连接测试失败时报告原因。
