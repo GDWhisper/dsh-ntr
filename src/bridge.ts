@@ -82,10 +82,10 @@ import type {
 import type {
   AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpMcpServerDef, AcpPresetStatus, AcpReleaseCause, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentRefusalDetail, AgentSaveMode, AgentSaveResult, AgentSkillsResult, AgentTestFailureKind, AgentTestResult, AgentView, ChatSessionForkInfo, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions, LlmAdapterLike,
   LlmModelInfo, LlmModelReasoningInfo, LlmProviderInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo,
-  AcpIdleRelease, ActiveTurnView, ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PluginUpdateState, PreparedAdapterCall, SaveGateFlushResult, SaveGateStatus, SessionView, StreamChunk,
+  AcpIdleRelease, ActiveTurnView, ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, PreparedAdapterCall, SaveGateFlushResult, SaveGateStatus, SessionView, StreamChunk,
   SubagentDetailEntry, SubagentDetailResult, SubagentRecord, SubagentStatus,
 } from './protocol.ts'
-import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, IDLE_RELEASE_MS, MAX_SUBAGENT_DETAIL_ENTRIES, SESSION_TITLE_PREFIX } from './protocol.ts'
+import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, IDLE_RELEASE_MS, MAX_SUBAGENT_DETAIL_ENTRIES, SESSION_TITLE_PREFIX, pluginReleaseUrl } from './protocol.ts'
 import type { AcpSaveGate } from './save-gate.ts'
 import { SaveGateAborted } from './save-gate.ts'
 import { OUTPUT_CHARS_PER_TOKEN, TurnTpsTracker } from './tps.ts'
@@ -8003,6 +8003,17 @@ export class BridgeManager {
   /** Delegate one install to the host plugin manager; never touches files itself. */
   async pluginUpdateApply(version: string): Promise<PluginUpdateState> {
     return this.updateService?.apply(version) ?? { status: 'unsupported', current: PLUGIN_VERSION }
+  }
+
+  /**
+   * One version's release notes for the update card's preview. Pure read: no
+   * install, no registry check. `refresh` is the card's retry and skips the
+   * service's cache. Without a wired updater the answer still names the
+   * release page, because that URL needs no network.
+   */
+  async pluginReleaseNotes(version: string, refresh = false): Promise<PluginReleaseNotes> {
+    return this.updateService?.releaseNotes(version, refresh)
+      ?? { version, url: pluginReleaseUrl(version), source: 'none' }
   }
 
   /**

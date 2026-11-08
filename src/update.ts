@@ -5,11 +5,16 @@
  * harness plugin manager owns installation (profile bookkeeping, npm, the
  * restart contract); this module only asks it what is installed, asks an npm
  * registry what is published, and delegates the install back to the manager.
- * Every method therefore reports a {@link PluginUpdateState} instead of
- * throwing; version syntax is validated at the RPC boundary (`impl.ts`).
+ * Release NOTES are the one read that does not go through the harness at all:
+ * they come from the GitHub Releases API, with the tag's own `CHANGELOG.md`
+ * through jsDelivr as the fallback, and that method answers a
+ * {@link PluginReleaseNotes} instead of a {@link PluginUpdateState}.
+ * Every method therefore reports a state instead of throwing; version syntax
+ * is validated at the RPC boundary (`impl.ts`).
  */
 
-import type { PluginUpdateState } from './protocol.ts'
+import type { PluginReleaseNotes, PluginUpdateState } from './protocol.ts'
+import { PLUGIN_REPO, pluginReleaseUrl } from './protocol.ts'
 
 /** The npm package this plugin is published as, and the bundle name to look for. */
 export const UPDATE_PACKAGE = 'dsh-ntr'
@@ -18,6 +23,16 @@ export const UPDATE_PACKAGE = 'dsh-ntr'
 const REGISTRY_TIMEOUT_MS = 8_000
 /** A successful packument answer is reused for this long (per registry base). */
 const CACHE_TTL_MS = 10 * 60 * 1000
+/** A release-notes body is reused for this long; it cannot change for a version. */
+const NOTES_TTL_MS = 10 * 60 * 1000
+/** An answer that only knows the release page is retried sooner than a real body. */
+const NOTES_FAILURE_TTL_MS = 60 * 1000
+/** Upper bound on one release body (GitHub allows far more than a card can scroll). */
+const NOTES_MAX_CHARS = 20_000
+/** GitHub's public API for one tag; the release body lives there. */
+const GITHUB_API = 'https://api.github.com'
+/** jsDelivr serves the repo's files by tag — the CHANGELOG fallback source. */
+const JSDELIVR_GH = 'https://cdn.jsdelivr.net/gh'
 /** Only stable releases are offered for install. */
 const STABLE_VERSION = /^\d+\.\d+\.\d+$/
 /** npm's public registry; the only base a private `resolved` may be widened to. */
@@ -409,6 +424,53 @@ function displayRegistry(base: string): string {
   }
 }
 
+/**
+ * One version's section out of `CHANGELOG.md`.
+ *
+ * Headings look like `## [0.4.1] - 2026-11-08`; the section runs until the
+ * NEXT `## ` heading — never until a `### ` subsection, which is part of it.
+ * The version is compared as STRING, not spliced into a pattern: a version
+ * carrying regex metacharacters would otherwise match more than itself.
+ */
+export function parseChangelogSection(markdown: string, version: string): string | undefined {
+  const lines = markdown.split(/\r?\n/)
+  let start = -1
+  for (let i = 0; i < lines.length; i += 1) {
+    if (start === -1) {
+      if (changelogHeadingVersion(lines[i]) === version) start = i + 1
+      continue
+    }
+    if (/^##\s/.test(lines[i])) return slicedBody(lines, start, i)
+  }
+  if (start === -1) return undefined
+  return slicedBody(lines, start, lines.length)
+}
+
+/** The version a `## ` heading names; `undefined` for any other line. */
+function changelogHeadingVersion(line: string): string | undefined {
+  if (!/^##\s/.test(line)) return undefined
+  const rest = line.slice(2).trim()
+  if (!rest.startsWith('[')) return rest.split(/\s+/)[0]
+  const close = rest.indexOf(']')
+  return close === -1 ? undefined : rest.slice(1, close).trim()
+}
+
+function slicedBody(lines: readonly string[], start: number, end: number): string | undefined {
+  const body = lines.slice(start, end).join('\n').trim()
+  return body === '' ? undefined : body
+}
+
+/** Normalize + bound one release body (CRLF → LF, trimmed, marked when cut). */
+function boundNotesBody(text: string): Pick<PluginReleaseNotes, 'body' | 'truncated'> {
+  const normalized = text.replace(/\r\n/g, '\n').trim()
+  if (normalized.length <= NOTES_MAX_CHARS) return { body: normalized }
+  // Never cut a surrogate pair in half: a lone high surrogate renders as U+FFFD.
+  const end = /[\uD800-\uDBFF]$/.test(normalized.slice(0, NOTES_MAX_CHARS))
+    ? NOTES_MAX_CHARS - 1
+    : NOTES_MAX_CHARS
+  return { body: normalized.slice(0, end), truncated: true }
+}
+
 export interface UpdateServiceOptions {
   resolveManager(): UpdateManagerLike | undefined
   currentVersion: string
@@ -431,6 +493,12 @@ export class UpdateService {
   private readonly fetchImpl: typeof fetch
   private readonly now: () => number
   private readonly cache = new Map<string, { at: number; target: { version?: string; publishedAt?: string } }>()
+  /**
+   * Release notes per VERSION, kept apart from the registry cache: the body of
+   * a version never changes, and apply's cache flush must not force the card
+   * to re-read it.
+   */
+  private readonly notes = new Map<string, { at: number; notes: PluginReleaseNotes }>()
   private applying = false
   /** Registry that answered the last `available` check, passed through to apply. */
   private lastTarget?: { version: string; registry: string }
@@ -708,5 +776,69 @@ export class UpdateService {
     } finally {
       this.applying = false
     }
+  }
+
+  /**
+   * Release notes for one exact version. NEVER throws: a missing body is a
+   * fact about GitHub, not a failure of the settings page, so the answer
+   * always carries the release page and says where the body came from.
+   *
+   * Sources, in order: the GitHub Releases API (the body a human wrote), then
+   * the tag's own `CHANGELOG.md` through jsDelivr. The body keeps its
+   * published shape — Chinese half, `---`, English half — because which half
+   * to draw belongs to the browser, which owns the locale.
+   *
+   * `refresh` is the settings card's retry: it skips the cache READ so the
+   * request really reaches the network. The fresh answer is still cached
+   * (success 10 minutes, body-less 1 minute) — a retry is a user gesture, not
+   * an instruction to hammer GitHub.
+   */
+  async releaseNotes(version: string, refresh = false): Promise<PluginReleaseNotes> {
+    if (!refresh) {
+      const cached = this.notes.get(version)
+      if (cached !== undefined) {
+        const ttl = cached.notes.source === 'none' ? NOTES_FAILURE_TTL_MS : NOTES_TTL_MS
+        if (this.now() - cached.at < ttl) return cached.notes
+      }
+    }
+    const notes = await this.fetchReleaseNotes(version)
+    this.notes.set(version, { at: this.now(), notes })
+    return notes
+  }
+
+  private async fetchReleaseNotes(version: string): Promise<PluginReleaseNotes> {
+    const url = pluginReleaseUrl(version)
+    const failures: string[] = []
+    try {
+      const response = await this.fetchImpl(`${GITHUB_API}/repos/${PLUGIN_REPO}/releases/tags/v${version}`, {
+        headers: { accept: 'application/vnd.github+json', 'user-agent': 'dsh-ntr' },
+        signal: AbortSignal.timeout(REGISTRY_TIMEOUT_MS),
+      })
+      if (!response.ok) throw new Error(`github answered ${String(response.status)}`)
+      const row = await response.json() as unknown
+      const record = typeof row === 'object' && row !== null ? row as Record<string, unknown> : {}
+      const body = typeof record.body === 'string' ? record.body : ''
+      if (body.trim() === '') throw new Error('github returned no release body')
+      // Only an https page is a link a card may point at; anything else falls
+      // back to the URL this module can derive itself.
+      const htmlUrl = typeof record.html_url === 'string' && /^https:\/\//i.test(record.html_url)
+        ? record.html_url
+        : url
+      return { version, url: htmlUrl, ...boundNotesBody(body), source: 'github' }
+    } catch (error) {
+      failures.push(`github: ${messageOf(error)}`)
+    }
+    try {
+      const response = await this.fetchImpl(`${JSDELIVR_GH}/${PLUGIN_REPO}@v${version}/CHANGELOG.md`, {
+        signal: AbortSignal.timeout(REGISTRY_TIMEOUT_MS),
+      })
+      if (!response.ok) throw new Error(`jsdelivr answered ${String(response.status)}`)
+      const section = parseChangelogSection(await response.text(), version)
+      if (section === undefined) throw new Error(`CHANGELOG has no ${version} section`)
+      return { version, url, ...boundNotesBody(section), source: 'changelog' }
+    } catch (error) {
+      failures.push(`changelog: ${messageOf(error)}`)
+    }
+    return { version, url, source: 'none', message: failures.join('; ') }
   }
 }

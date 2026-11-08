@@ -8,11 +8,11 @@
 import { randomUUID } from './ids.ts'
 import type {
   AcpAgentCatalog, AcpAgentDef, AcpCatalogOption, AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpMcpServerDef, AcpPluginConfig, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSkillsResult, AgentTestResult,
-  AgentView, ApprovalDeadlineKey, ApprovalDeadlinePatch, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionOptionView, PermissionOutcome, PermissionTimeoutMode, PluginUpdateState, RpcResult,
+  AgentView, ApprovalDeadlineKey, ApprovalDeadlinePatch, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionOptionView, PermissionOutcome, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, RpcResult,
   ActiveTurnView, AgentSaveMode, AgentSaveResult, SaveGateFlushResult, SaveGateStatus,
   SubagentDetailEntry, SubagentDetailResult, SubagentRecord, SubagentStatus,
 } from './protocol.ts'
-import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, IDLE_RELEASE_MS, MAX_SUBAGENT_RECORDS } from './protocol.ts'
+import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, IDLE_RELEASE_MS, MAX_SUBAGENT_RECORDS, pluginReleaseUrl } from './protocol.ts'
 
 export { randomUUID }
 
@@ -26,6 +26,8 @@ export class AcpError extends Error {
 // ---- Config validation ----
 
 const AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/
+/** The only version shape the update endpoints accept: an exact stable semver. */
+const STABLE_SEMVER = /^\d+\.\d+\.\d+$/
 /**
  * npm package name (optionally `@scope/name`, optionally `@version`/`@tag`).
  * Deliberately charset-only (letters, digits, `.`, `_`, `-`, `/`, `@`): this
@@ -3824,6 +3826,13 @@ export interface AcpManager {
    */
   pluginUpdateApply?(version: string): Promise<PluginUpdateState>
   /**
+   * One version's release notes for the update card's preview. READ-ONLY: it
+   * never installs and never participates in a check. `refresh` is the card's
+   * retry: it must bypass every cache on the way to the network. Absent on an
+   * older host half, which leaves the card with the release-page URL only.
+   */
+  pluginReleaseNotes?(version: string, refresh?: boolean): Promise<PluginReleaseNotes>
+  /**
    * The ACP-turn save gate. Optional on older host halves: the RPCs then
    * answer "always save now" so a browser from this bundle keeps working.
    */
@@ -4161,10 +4170,25 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         return ok(await (manager.pluginUpdateCheck?.() ?? { status: 'unsupported' as const, current: '' }))
       case 'plugin/update-apply': {
         const version = str(body, 'version', 64)
-        if (!/^\d+\.\d+\.\d+$/.test(version)) {
+        if (!STABLE_SEMVER.test(version)) {
           throw new AcpError('bad_payload', 'acp: version must be a stable semver (x.y.z)')
         }
         return ok(await (manager.pluginUpdateApply?.(version) ?? { status: 'unsupported' as const, current: '' }))
+      }
+      case 'plugin/release-notes': {
+        // Same version syntax as apply, but nothing is installed: this only
+        // previews what a version says. `refresh` (the card's retry) must
+        // reach the network, so it is passed through rather than swallowed.
+        const version = str(body, 'version', 64)
+        if (!STABLE_SEMVER.test(version)) {
+          throw new AcpError('bad_payload', 'acp: version must be a stable semver (x.y.z)')
+        }
+        const refresh = body.refresh
+        if (refresh !== undefined && typeof refresh !== 'boolean') {
+          throw new AcpError('bad_payload', 'acp: refresh must be a boolean')
+        }
+        return ok(await (manager.pluginReleaseNotes?.(version, refresh)
+          ?? { version, url: pluginReleaseUrl(version), source: 'none' as const }))
       }
       case 'agent/stop':
         await manager.stopAgent(str(body, 'agentId', 64)); return ok({ done: true })

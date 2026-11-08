@@ -17,6 +17,7 @@ import type {
   DetectedAgentInfo,
   IdleReleaseResult,
   PermissionOutcome,
+  PluginReleaseNotes,
   PluginUpdateState,
   SessionTitlePrefixSetPayload,
   TagHaloSetPayload,
@@ -49,6 +50,8 @@ export interface PanelFixtureOptions {
   pluginUpdateApplied?: PluginUpdateState
   /** Reject `plugin/update-apply` with this message (a transport/RPC failure). */
   pluginUpdateApplyError?: string
+  /** null simulates an older host without `plugin/release-notes` (the default). */
+  pluginReleaseNotes?: PluginReleaseNotes | null
   tagHalo?: AcpTagHalo
   permissions?: PanelPermissionRequest[]
   /** Hold the first agents/list response to preview/test the loading state. */
@@ -152,6 +155,9 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
   let pluginUpdate = options.pluginUpdate === null
     ? null
     : structuredClone<PluginUpdateState>(options.pluginUpdate ?? DEFAULT_PLUGIN_UPDATE)
+  const pluginReleaseNotes = options.pluginReleaseNotes === undefined || options.pluginReleaseNotes === null
+    ? null
+    : structuredClone<PluginReleaseNotes>(options.pluginReleaseNotes)
   const saveGate = options.saveGate === null
     ? null
     : structuredClone<SaveGateStatus>(options.saveGate ?? {
@@ -255,6 +261,8 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
           })
           return ok(pluginUpdate)
         }
+        case 'plugin/release-notes':
+          return pluginReleaseNotes === null ? unsupported() : ok(pluginReleaseNotes)
         case 'default/agent':
           return ok({ agentId: defaultAgentId !== undefined && definitions.has(defaultAgentId) ? defaultAgentId : undefined })
         case 'default/agent-set': {

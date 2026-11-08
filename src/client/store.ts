@@ -6,8 +6,8 @@
  * Deliberately framework-free: React binds through `useSyncExternalStore`.
  */
 
-import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentSkillsResult, AgentSkillEntry, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, IdleReleaseResult, IdleReleaseSetPayload, PermissionTimeoutMode, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, SubagentDetailEntry, SubagentDetailResult, SubagentRecord } from '../protocol.ts'
-import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, MAX_SUBAGENT_DETAIL_ENTRIES } from '../protocol.ts'
+import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentSkillsResult, AgentSkillEntry, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, IdleReleaseResult, IdleReleaseSetPayload, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, SubagentDetailEntry, SubagentDetailResult, SubagentRecord } from '../protocol.ts'
+import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, MAX_SUBAGENT_DETAIL_ENTRIES, pluginReleaseUrl } from '../protocol.ts'
 
 /** One slash command the ACP agent declared, whole row (the menu draws name, description and `input.hint`). */
 export type AgentCommand = NonNullable<ChatSessionView['availableCommands']>[number]
@@ -733,6 +733,10 @@ interface Listener { (): void }
 const MAX_BLOCKS = 400
 /** How many observed ACP transcripts stay live at once (insertion-ordered eviction). */
 const MAX_WATCHED = 6
+/** How long one version's release notes are reused before asking the host again. */
+const PLUGIN_RELEASE_NOTES_TTL_MS = 10 * 60 * 1000
+/** A body-less answer is retried sooner: the next open may hit a working GitHub. */
+const PLUGIN_RELEASE_NOTES_FAILURE_TTL_MS = 60 * 1000
 
 /** Raw JSON budget for one event block; the cut is marked. */
 const RAW_MAX = 256_000
@@ -1168,8 +1172,23 @@ export class AcpStore {
    * the install's verdict with the pre-install `available`.
    */
   private pluginUpdateGeneration = 0
+  /** One version's release notes, so reopening the card does not re-read GitHub. */
+  private readonly releaseNotesCache = new Map<string, { at: number; notes: PluginReleaseNotes }>()
+  /** Shared in-flight `plugin/release-notes` reads, keyed by version. */
+  private readonly releaseNotesInflight = new Map<string, Promise<PluginReleaseNotes | undefined>>()
 
   constructor(private readonly rpc: RpcCall, private readonly locale: (zh: string, en: string) => string) {}
+
+  /**
+   * Whether the active locale draws the Chinese half of a bilingual body.
+   *
+   * Asked THROUGH the same resolver `label` uses, so a locale switch reaches
+   * this on the next render: the resolver is called with a pair that resolves
+   * to its own locale id, and the answer is compared. Nothing is cached.
+   */
+  prefersZh(): boolean {
+    return this.locale('zh', 'en') === 'zh'
+  }
 
   // ---- React bridge ----
 
@@ -1548,6 +1567,63 @@ export class AcpStore {
       // answer would otherwise land on top of this call's final verdict.
       this.pluginUpdateGeneration += 1
       this.pluginUpdateApplying = false
+    }
+  }
+
+  /**
+   * One version's release notes (`plugin/release-notes`), cached per version
+   * for ten minutes (a body-less answer for one minute); `force` skips the
+   * window AND sends `refresh: true` so the host's own cache is bypassed too —
+   * otherwise the card's retry would read the same failure back.
+   *
+   * An older host has no such endpoint, and a transport failure says nothing
+   * about the release: both answer a body-less result carrying the release
+   * PAGE, which this module can derive without a network. That is a normal
+   * degradation, not an error worth a notice — the link still works.
+   *
+   * The host's answer is remote data: a body that is not a string is dropped,
+   * and only an http(s) page becomes a link, so nothing else can reach the
+   * renderer.
+   */
+  async loadPluginReleaseNotes(version: string, force = false): Promise<PluginReleaseNotes | undefined> {
+    if (!force) {
+      const cached = this.releaseNotesCache.get(version)
+      if (cached !== undefined) {
+        const ttl = cached.notes.source === 'none'
+          ? PLUGIN_RELEASE_NOTES_FAILURE_TTL_MS
+          : PLUGIN_RELEASE_NOTES_TTL_MS
+        if (Date.now() - cached.at < ttl) return cached.notes
+      }
+    }
+    const inflight = this.releaseNotesInflight.get(version)
+    if (inflight !== undefined) return inflight
+    const read = (async (): Promise<PluginReleaseNotes> => {
+      const page = pluginReleaseUrl(version)
+      let notes: PluginReleaseNotes
+      try {
+        const value = await this.call<PluginReleaseNotes>(
+          'plugin/release-notes',
+          force ? { version, refresh: true } : { version },
+        )
+        notes = {
+          version,
+          url: typeof value.url === 'string' && /^https?:\/\//i.test(value.url) ? value.url : page,
+          source: value.source === 'github' || value.source === 'changelog' ? value.source : 'none',
+          ...(typeof value.body === 'string' ? { body: value.body } : {}),
+          ...(value.truncated === true ? { truncated: true } : {}),
+          ...(typeof value.message === 'string' ? { message: value.message } : {}),
+        }
+      } catch {
+        notes = { version, url: page, source: 'none' }
+      }
+      this.releaseNotesCache.set(version, { at: Date.now(), notes })
+      return notes
+    })()
+    this.releaseNotesInflight.set(version, read)
+    try {
+      return await read
+    } finally {
+      this.releaseNotesInflight.delete(version)
     }
   }
 

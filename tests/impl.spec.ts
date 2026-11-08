@@ -2692,6 +2692,10 @@ describe('dispatchRpc', () => {
         manager.calls.push(['updateApply', version])
         return { status: 'applied' as const, current: '1.2.3', installed: version }
       },
+      pluginReleaseNotes: async (version: string, refresh?: boolean) => {
+        manager.calls.push(['releaseNotes', version, refresh])
+        return { version, url: `https://example.test/releases/tag/v${version}`, source: 'github' as const, body: 'notes' }
+      },
     }
     await expect(dispatchRpc(withUpdate, 'plugin/update-check', {}))
       .resolves.toEqual({ ok: true, value: { status: 'current', current: '1.2.3' } })
@@ -2701,10 +2705,35 @@ describe('dispatchRpc', () => {
     expect(manager.calls).toContainEqual(['updateApply', '1.3.0'])
     await expect(dispatchRpc(withUpdate, 'plugin/update-apply', { version: '1.3' }))
       .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    // Release notes are a read: the same version syntax, nothing installed.
+    await expect(dispatchRpc(withUpdate, 'plugin/release-notes', { version: '1.3.0' }))
+      .resolves.toEqual({
+        ok: true,
+        value: { version: '1.3.0', url: 'https://example.test/releases/tag/v1.3.0', source: 'github', body: 'notes' },
+      })
+    expect(manager.calls).toContainEqual(['releaseNotes', '1.3.0', undefined])
+    // The card's retry must reach the network: `refresh` passes straight through.
+    await expect(dispatchRpc(withUpdate, 'plugin/release-notes', { version: '1.3.0', refresh: true }))
+      .resolves.toMatchObject({ ok: true, value: { version: '1.3.0', source: 'github' } })
+    expect(manager.calls).toContainEqual(['releaseNotes', '1.3.0', true])
+    await expect(dispatchRpc(withUpdate, 'plugin/release-notes', { version: '1.3.0', refresh: 'yes' }))
+      .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc(withUpdate, 'plugin/release-notes', { version: '1.3' }))
+      .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     await expect(dispatchRpc(manager, 'plugin/update-check', {}))
       .resolves.toEqual({ ok: true, value: { status: 'unsupported', current: '' } })
     await expect(dispatchRpc(manager, 'plugin/update-apply', { version: '1.3.0' }))
       .resolves.toEqual({ ok: true, value: { status: 'unsupported', current: '' } })
+    // An older host half still answers a link it can derive without a network.
+    await expect(dispatchRpc(manager, 'plugin/release-notes', { version: '1.3.0' }))
+      .resolves.toEqual({
+        ok: true,
+        value: {
+          version: '1.3.0',
+          url: 'https://github.com/GDWhisper/dsh-ntr/releases/tag/v1.3.0',
+          source: 'none',
+        },
+      })
     await expect(dispatchRpc(manager, 'agent/save', { id: 'pi', command: 'pi-acp' })).resolves.toEqual({ ok: true, value: { done: true } })
     expect(manager.calls).toContainEqual(['save', expect.objectContaining({ id: 'pi', command: 'pi-acp' })])
     const withSaveMode = {

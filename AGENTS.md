@@ -85,16 +85,16 @@
 
 35. **CHANGELOG 只记确定性的净改动，严禁日常提交修改**：日常任务只在 Commit 正文写明面向用户的动机与影响，严禁改写 `CHANGELOG.md`；CHANGELOG 统一在发版时由发版流程提取提交区间，同一功能或 bug 的多次微调合并为一条净改动（去噪、避免流水账），挂引入它的核心提交链接；与 GitHub release note 同一套话（中英双版、中文在前、`---` 分隔），只写最终可见行为，不写旧行为对照与中间形态。→ [release.md](./AGENTS/release.md)
 36. **`usage_update` 是上下文占用，不是请求 token**：`used` / `size` 只写 `session.usage`（ACP 视图与 composer 占用环的 `used/size`，实时落点见 [ui.md §4.1](./AGENTS/ui.md)）；原生聊天流的 `usage` 块只能是按段估算的输出 token（正文 + 思考字符 ÷4，`inputTokens: 0`），**严禁**把 `size` / `used` 映射成 input/output（宿主的原生 ContextMeter 也不吃这条数据）；缓存命中率无数据源，工具参数不计入估算；插件 burst tok/s（`turn/metrics` / `session.burst`）只供同 id `activity` 影子显示，**严禁**回写 `usage` 或另开第二处读数。→ [protocol.md §8](./AGENTS/protocol.md)
-37. **内置更新只转述宿主的安装，绝不自己下载 / 替换 / 重启**：`plugin/update-check` 与 `plugin/update-apply`（只收精确且高于运行版本的 `x.y.z`）都回 `PluginUpdateState`，实现是 `src/update.ts` 的 `UpdateService`；数据源只有 `ctx.get('pluginManager')` 的 `listBundles()` / `registries()` 与直接 GET packument；安装与回滚只调 `installBundle('dsh-ntr@<version>', { enabled: true, registry? })`（HMR 下按宿主原生更新语义先 `removeBundle` 再重试，失败先 remove 再回滚）——**不是自替换**：文件操作全由 pluginManager 完成，且必须由人点击触发。
+37. **内置更新只转述宿主的安装，绝不自己下载 / 替换 / 重启**：`plugin/update-check` 与 `plugin/update-apply`（只收精确且高于运行版本的 `x.y.z`）都回 `PluginUpdateState`，实现是 `src/update.ts` 的 `UpdateService`；check / apply 的数据源只有 `ctx.get('pluginManager')` 的 `listBundles()` / `registries()` 与直接 GET packument；安装与回滚只调 `installBundle('dsh-ntr@<version>', { enabled: true, registry? })`（HMR 下按宿主原生更新语义先 `removeBundle` 再重试，失败先 remove 再回滚）——**不是自替换**：文件操作全由 pluginManager 完成，且必须由人点击触发。
     资格**正向判定 registry spec**：按最后一个 `@` 拆开、只判 spec 半边；裸 `x.y.z` / 范围 / `*`·`x` / dist-tag 才可更新，含 `:` / `/` / `\` 或以 `.` 开头一律 `source-install` 永不升级；无 pluginManager / 缺方法 / 旧宿主不报 `source` → `unsupported`；`readOnlyReason` 或 `removable === false` → `managed`；磁盘版本经 `compareVersions` ≠ 运行版本 → `restart-required`（不冒充 latest）。
-    check **不因对话在跑而 `busy`**（只有 apply 查 `BridgeManager.hasActiveTurns`）；`applied` / `restart-required` 为成功，`overridden` / `cancelled` / 带 error / 未知 `application` 一律 `failed`，错误正文优先 `error.diagnostic`；检查随设置页自动（10 分钟节流 + in-flight 去重），**安装必须人手点击**；**严禁**把 `pluginManager` 写进顶层 `inject`。→ [state.md §8](./AGENTS/state.md) / [ui-panel.md §8.1](./AGENTS/ui-panel.md)
+    check **不因对话在跑而 `busy`**（只有 apply 查 `BridgeManager.hasActiveTurns`）；`applied` / `restart-required` 为成功，`overridden` / `cancelled` / 带 error / 未知 `application` 一律 `failed`，错误正文优先 `error.diagnostic`；只读的 `plugin/release-notes`（`{ version, refresh? }`）另走 GitHub Release / tag 版 CHANGELOG，回 `PluginReleaseNotes`（发布页 URL + 原始双语正文；仅预览，不安装、不参与 check），按需拉取；检查随设置页自动（10 分钟节流 + in-flight 去重），**安装必须人手点击**；**严禁**把 `pluginManager` 写进顶层 `inject`。→ [state.md §8](./AGENTS/state.md) / [ui-panel.md §8.1](./AGENTS/ui-panel.md)
 
 ## 边界与禁区
 
 - **禁止修改 [`lib/`](./lib)**：构建产物，`npm run build` 全量覆盖，CI 自己 build，不提交。
 - **禁止在 [`tsdown.config.mjs`](./tsdown.config.mjs) 取消 external**：`react`、`react-dom`、`react/jsx-runtime`、`@deepseek-ai/cordis`、`@deepseek-ai/dsh-client-ui-slots` 必须由运行时提供，打包进去会破坏 context。
 - **子进程环境按「同级 agent」处理**：默认继承完整宿主环境，再由 agent 自己的 `env` 按键覆盖（`src/impl.ts` · `childEnv`）。**严禁**重新引入隐式凭据过滤——依赖环境变量认证的 agent（如 pi 的自定义供应商）会静默丢掉整个供应商；将来要最小权限必须做成显式 per-agent 开关。
-- **模块纯度**：`src/protocol.ts` 是纯类型契约，**严禁**引入 Node 专属库或运行时代码；`src/impl.ts` **严禁** Node 内置模块与 SDK，必须由 `tests/impl.spec.ts` 覆盖；`src/client/` **严禁** Node 内置模块或 ACP SDK，通信只走 RPC / SSE。
+- **模块纯度**：`src/protocol.ts` 是纯类型契约与纯常量 / 纯函数，**严禁**引入 Node 专属库、有副作用的运行时代码或 ACP SDK 运行时值；`src/impl.ts` **严禁** Node 内置模块与 SDK，必须由 `tests/impl.spec.ts` 覆盖；`src/client/` **严禁** Node 内置模块或 ACP SDK，通信只走 RPC / SSE。
 
 ## 常见任务配方
 
@@ -104,7 +104,7 @@
 
 ## 测试约定
 
-测试在 [`tests/`](./tests)，`.spec.ts` 命名；其余按模块就近（`panel.spec.ts` 设置页、`update.spec.ts` 更新服务、`acp-guard.spec.ts` preset guard 的步进闸门与路由选择），浏览器侧纯逻辑一律放 `acp-view.spec.ts`，不要塞进 `impl.spec.ts`。
+测试在 [`tests/`](./tests)，`.spec.ts` 命名；其余按模块就近（`panel.spec.ts` 设置页、`update.spec.ts` 更新服务、`acp-guard.spec.ts` preset guard 的步进闸门与路由选择），浏览器侧共享纯逻辑放 `acp-view.spec.ts`，组件 / 模块专属用例就近放同名 `.spec.tsx`（如 `release-notes.spec.tsx`），不要塞进 `impl.spec.ts`。
 
 - `impl.spec.ts`：纯逻辑单测，无子进程，秒级返回。
 - `register.spec.ts`：Cordis 上下文注册，用 `fakeCtx()` 模拟宿主。

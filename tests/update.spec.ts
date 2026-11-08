@@ -6,6 +6,7 @@ import {
   compareVersions,
   isRegistrySpec,
   pickUpdateTarget,
+  parseChangelogSection,
   registryPlan,
 } from '../src/update.ts'
 import type {
@@ -20,6 +21,14 @@ function jsonResponse(body: unknown, status = 200): Response {
     ok: status >= 200 && status < 300,
     status,
     json: async () => body,
+  } as unknown as Response
+}
+
+function textResponse(body: string, status = 200): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => body,
   } as unknown as Response
 }
 
@@ -997,5 +1006,269 @@ describe('UpdateService.apply', () => {
     expect(state.installed).toBeUndefined()
     expect(state.message).toContain('installing 1.1.0 failed: the plugin manager answered cancelled')
     expect(state.message).toContain('rolling back to 1.0.0 also failed')
+  })
+})
+
+describe('parseChangelogSection', () => {
+  const changelog = [
+    '# Changelog',
+    '',
+    '## [1.2.0] - 2026-11-08',
+    '',
+    '摘要一行。',
+    '',
+    '### 新增',
+    '',
+    '- 一条',
+    '',
+    '---',
+    '',
+    '### Added',
+    '',
+    '- one',
+    '',
+    '## [1.1.0] - 2026-10-01',
+    '',
+    'older notes',
+  ].join('\n')
+
+  it('returns one version section and stops at the next release heading', () => {
+    expect(parseChangelogSection(changelog, '1.2.0')).toBe([
+      '摘要一行。',
+      '',
+      '### 新增',
+      '',
+      '- 一条',
+      '',
+      '---',
+      '',
+      '### Added',
+      '',
+      '- one',
+    ].join('\n'))
+  })
+
+  it('accepts an unbracketed heading and a section that ends at EOF', () => {
+    expect(parseChangelogSection('## 2.0.0\n\n- last', '2.0.0')).toBe('- last')
+  })
+
+  it('answers undefined for a version the changelog does not carry', () => {
+    expect(parseChangelogSection(changelog, '9.9.9')).toBeUndefined()
+    expect(parseChangelogSection('', '1.2.0')).toBeUndefined()
+  })
+
+  it('compares the version as a string, not as a pattern', () => {
+    // `1.2` would match `1.2.0` under a naive `^## \[?1.2` prefix test.
+    expect(parseChangelogSection(changelog, '1.2')).toBeUndefined()
+    expect(parseChangelogSection('## [1.2.0]\n\nbody', '1.2.0')).toBe('body')
+  })
+
+  it('does not treat a subsection heading as the section boundary', () => {
+    const body = parseChangelogSection(changelog, '1.2.0')
+    expect(body).toContain('### 新增')
+    expect(body).toContain('### Added')
+    expect(body).not.toContain('older notes')
+  })
+})
+
+describe('UpdateService.releaseNotes', () => {
+  const releaseUrl = 'https://github.com/GDWhisper/dsh-ntr/releases/tag/v9.9.9'
+  const githubUrl = 'https://api.github.com/repos/GDWhisper/dsh-ntr/releases/tags/v9.9.9'
+  const changelogUrl = 'https://cdn.jsdelivr.net/gh/GDWhisper/dsh-ntr@v9.9.9/CHANGELOG.md'
+
+  it('reads the GitHub release body and its page URL', async () => {
+    const calls: string[] = []
+    const inits: RequestInit[] = []
+    const page = 'https://example.test/releases/tag/v9.9.9'
+    const fetchImpl = fetchFrom(() => jsonResponse({
+      body: '中文版\n\n---\n\nEnglish version',
+      html_url: page,
+    }), calls, inits)
+    const notes = await service({ fetchImpl }).releaseNotes('9.9.9')
+    expect(notes).toEqual({
+      version: '9.9.9',
+      url: page,
+      body: '中文版\n\n---\n\nEnglish version',
+      source: 'github',
+    })
+    // The host's page URL is adopted, not the one this module could derive.
+    expect(notes.url).not.toBe(releaseUrl)
+    expect(calls).toEqual([githubUrl])
+    expect(inits[0]?.headers).toEqual({ accept: 'application/vnd.github+json', 'user-agent': 'dsh-ntr' })
+  })
+
+  it('falls back to the derived page URL when html_url is not https', async () => {
+    const fetchImpl = fetchFrom(() => jsonResponse({ body: 'body', html_url: 'http://github.com/x' }), [])
+    expect(await service({ fetchImpl }).releaseNotes('9.9.9')).toMatchObject({ url: releaseUrl, source: 'github' })
+  })
+
+  it('falls back to the tag CHANGELOG through jsDelivr', async () => {
+    const calls: string[] = []
+    const fetchImpl = fetchFrom(url => url.startsWith('https://api.github.com')
+      ? jsonResponse({ message: 'Not Found' }, 404)
+      : textResponse([
+        '# Changelog',
+        '',
+        '## [9.9.9] - 2026-11-08',
+        '',
+        '中文版',
+        '',
+        '---',
+        '',
+        'English',
+        '',
+        '## [9.9.8] - 2026-10-01',
+        '',
+        'older',
+      ].join('\n')), calls)
+    expect(await service({ fetchImpl }).releaseNotes('9.9.9')).toEqual({
+      version: '9.9.9',
+      url: releaseUrl,
+      body: '中文版\n\n---\n\nEnglish',
+      source: 'changelog',
+    })
+    expect(calls).toEqual([githubUrl, changelogUrl])
+  })
+
+  it('answers the release page with a technical reason when both sources fail', async () => {
+    const fetchImpl = fetchFrom(url => url.startsWith('https://api.github.com')
+      ? jsonResponse({ message: 'Not Found' }, 404)
+      : textResponse('nope', 500), [])
+    expect(await service({ fetchImpl }).releaseNotes('9.9.9')).toEqual({
+      version: '9.9.9',
+      url: releaseUrl,
+      source: 'none',
+      message: 'github: github answered 404; changelog: jsdelivr answered 500',
+    })
+  })
+
+  it('treats an empty release body as missing', async () => {
+    const fetchImpl = fetchFrom(url => url.startsWith('https://api.github.com')
+      ? jsonResponse({ body: '   ' })
+      : textResponse('## [9.9.9]\n\nx'), [])
+    expect(await service({ fetchImpl }).releaseNotes('9.9.9')).toMatchObject({
+      source: 'changelog',
+      body: 'x',
+    })
+  })
+
+  it('normalizes CRLF and trims the body', async () => {
+    const fetchImpl = fetchFrom(() => jsonResponse({ body: '\r\n中文\r\n\r\n---\r\n\r\nEnglish\r\n' }), [])
+    expect((await service({ fetchImpl }).releaseNotes('9.9.9')).body).toBe('中文\n\n---\n\nEnglish')
+  })
+
+  it('truncates an oversized body and marks it', async () => {
+    const fetchImpl = fetchFrom(() => jsonResponse({ body: 'x'.repeat(20_001) }), [])
+    const notes = await service({ fetchImpl }).releaseNotes('9.9.9')
+    expect(notes.body).toHaveLength(20_000)
+    expect(notes.truncated).toBe(true)
+    expect(notes.source).toBe('github')
+  })
+
+  it('does not mark a body that fits', async () => {
+    const fetchImpl = fetchFrom(() => jsonResponse({ body: 'x'.repeat(20_000) }), [])
+    expect((await service({ fetchImpl }).releaseNotes('9.9.9')).truncated).toBeUndefined()
+  })
+
+  it('reuses a successful body for ten minutes', async () => {
+    let now = 1_000_000
+    const calls: string[] = []
+    const fetchImpl = fetchFrom(() => jsonResponse({ body: 'body' }), calls)
+    const svc = service({ fetchImpl, now: () => now })
+    await svc.releaseNotes('9.9.9')
+    now += 9 * 60 * 1000
+    await svc.releaseNotes('9.9.9')
+    expect(calls).toHaveLength(1)
+    now += 2 * 60 * 1000
+    await svc.releaseNotes('9.9.9')
+    expect(calls).toHaveLength(2)
+  })
+
+  it('retries a body-less answer after one minute', async () => {
+    let now = 1_000_000
+    const calls: string[] = []
+    const fetchImpl = fetchFrom(url => url.startsWith('https://api.github.com')
+      ? jsonResponse({}, 404)
+      : textResponse('', 404), calls)
+    const svc = service({ fetchImpl, now: () => now })
+    expect((await svc.releaseNotes('9.9.9')).source).toBe('none')
+    now += 30_000
+    expect((await svc.releaseNotes('9.9.9')).source).toBe('none')
+    expect(calls).toHaveLength(2)
+    now += 31_000
+    await svc.releaseNotes('9.9.9')
+    expect(calls).toHaveLength(4)
+  })
+
+  it('keeps the notes cache when an install succeeds', async () => {
+    const calls: string[] = []
+    const fetchImpl = fetchFrom(() => jsonResponse({ body: 'body' }), calls)
+    const svc = service({ manager: managerWith(), fetchImpl })
+    await svc.releaseNotes('9.9.9')
+    await svc.apply('1.1.0')
+    await svc.releaseNotes('9.9.9')
+    expect(calls).toHaveLength(1)
+  })
+
+  it('bypasses the cache when asked to refresh (the card retry)', async () => {
+    let now = 1_000_000
+    const calls: string[] = []
+    const fetchImpl = fetchFrom(url => url.startsWith('https://api.github.com')
+      ? jsonResponse({}, 404)
+      : textResponse('', 404), calls)
+    const svc = service({ fetchImpl, now: () => now })
+    expect((await svc.releaseNotes('9.9.9')).source).toBe('none')
+    now += 1_000
+    // Inside the 1-minute failure window: only `refresh` can reach the network.
+    await svc.releaseNotes('9.9.9')
+    expect(calls).toHaveLength(2)
+    await svc.releaseNotes('9.9.9', true)
+    expect(calls).toHaveLength(4)
+  })
+
+  it('caches the body a refresh brought back', async () => {
+    let body = ''
+    const calls: string[] = []
+    const fetchImpl = fetchFrom(() => jsonResponse(body === '' ? {} : { body }), calls)
+    const svc = service({ fetchImpl })
+    expect((await svc.releaseNotes('9.9.9')).source).toBe('none')
+    body = 'fresh body'
+    expect((await svc.releaseNotes('9.9.9', true)).body).toBe('fresh body')
+    expect((await svc.releaseNotes('9.9.9')).body).toBe('fresh body')
+    // Failed github read + jsDelivr, one refreshing github read, then cache.
+    expect(calls).toHaveLength(3)
+  })
+
+  it('never throws when the transport rejects', async () => {
+    const fetchImpl = fetchFrom(url => {
+      if (url.startsWith('https://api.github.com')) throw new TypeError('fetch failed')
+      return textResponse('## [9.9.9]\n\nfrom the changelog')
+    }, [])
+    expect(await service({ fetchImpl }).releaseNotes('9.9.9')).toMatchObject({
+      source: 'changelog',
+      body: 'from the changelog',
+      url: releaseUrl,
+    })
+  })
+
+  it('never throws when GitHub answers non-JSON', async () => {
+    const fetchImpl = fetchFrom(url => url.startsWith('https://api.github.com')
+      ? { ok: true, status: 200, json: async () => { throw new SyntaxError('Unexpected token <') } } as unknown as Response
+      : textResponse('', 503), [])
+    const notes = await service({ fetchImpl }).releaseNotes('9.9.9')
+    expect(notes).toMatchObject({ version: '9.9.9', url: releaseUrl, source: 'none' })
+    expect(notes.message).toContain('github:')
+    expect(notes.message).toContain('changelog:')
+  })
+
+  it('never splits a surrogate pair when truncating', async () => {
+    // 19_999 ASCII chars + one emoji: its high surrogate sits at index 19_999,
+    // so cutting at 20_000 would keep half of the pair.
+    const body = 'x'.repeat(19_999) + '😀' + 'tail'
+    const fetchImpl = fetchFrom(() => jsonResponse({ body }), [])
+    const notes = await service({ fetchImpl }).releaseNotes('9.9.9')
+    expect(notes.truncated).toBe(true)
+    expect(notes.body).toHaveLength(19_999)
+    expect(notes.body).not.toMatch(/[\uD800-\uDBFF]$/)
   })
 })

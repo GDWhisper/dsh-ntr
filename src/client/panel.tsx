@@ -26,6 +26,7 @@ import {
 } from './store.ts'
 import type { AcpStore, UiState } from './store.ts'
 import type { Translate } from './acp-view.tsx'
+import { ReleaseNotesSection } from './release-notes.tsx'
 import { IDLE_RELEASE_MS } from '../protocol.ts'
 import type { AcpAgentDef, AcpApprovalDeadlines, AcpCatalogChoice, AcpMcpServerDef, ActiveTurnView, AgentSaveMode, AgentSavePayload, AgentTestResult, AgentView, DetectedAgentInfo, PermissionTimeoutMode, PluginUpdateState } from '../protocol.ts'
 
@@ -137,6 +138,23 @@ const STYLE = `
 .dwa-update-copy { margin: 6px 0 0; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
 .dwa-update-message { margin: 6px 0 0; color: var(--ntr-muted); font-size: var(--ntr-font-xs); white-space: pre-wrap; overflow-wrap: anywhere; }
 .dwa-update-actions { margin-top: 10px; }
+/* The release-notes preview: its own block under the card's copy, with a
+   separator so a long body never reads as part of the sentence above it. The
+   body scrolls (40vh) instead of stretching the card; every rule below uses a
+   host token, with a light fallback only where the host may lack one. */
+.dwa-update-notes { margin-top: 12px; padding-top: 12px; border-top: var(--ntr-line); display: grid; gap: 6px; }
+.dwa-update-notes-head { margin: 0; font-size: var(--ntr-font-xs); font-weight: 550; }
+.dwa-update-notes-body { max-height: 40vh; overflow: auto; font-size: var(--ntr-font-xs); line-height: 1.6; overflow-wrap: anywhere; }
+.dwa-update-notes-body > :first-child { margin-top: 0; }
+.dwa-update-notes-body > :last-child { margin-bottom: 0; }
+.dwa-update-notes-body h4, .dwa-update-notes-body h5, .dwa-update-notes-body h6 { margin: 10px 0 4px; font-size: 1em; font-weight: 600; }
+.dwa-update-notes-body p { margin: 6px 0; }
+.dwa-update-notes-body ul { margin: 6px 0; padding-left: 18px; }
+.dwa-update-notes-body li { margin: 2px 0; }
+.dwa-update-notes-body code { font-family: var(--ds-font-family-code, ui-monospace, monospace); background: var(--dsw-alias-markdown-inline-code, rgba(0, 0, 0, 0.06)); border-radius: 4px; padding: 0 3px; }
+.dwa-update-notes-body a { color: var(--dsw-alias-button-primary-fill, #2563eb); text-decoration: underline; }
+.dwa-update-notes-url { color: var(--ntr-muted); font-size: var(--ntr-font-xs); overflow-wrap: anywhere; }
+.dwa-update-notes-url a { color: inherit; text-decoration: underline; }
 .dwa-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
 .dwa-agent-list { display: flex; flex-direction: column; border-top: var(--ntr-line); }
 .dwa-agent-card { border-bottom: var(--ntr-line); min-width: 0; }
@@ -1235,6 +1253,8 @@ function PluginUpdateCard(props: { acp: AcpStore; update: PluginUpdateState; onC
       </div>
       {copy !== undefined && <p className="dwa-update-copy">{copy}</p>}
       {showMessage && <div className="dwa-update-message">{update.message}</div>}
+      {/* What the offered version SAYS, before the buttons that act on it. */}
+      <ReleaseNotesSection acp={acp} update={update} />
       <div className="dwa-row-actions dwa-update-actions">
         {update.status === 'available' && (
           <button type="button" className="dwa-btn dwa-btn-primary" onClick={() => { void apply() }}>
