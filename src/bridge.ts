@@ -85,7 +85,7 @@ import type {
   AcpIdleRelease, ActiveTurnView, ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, PreparedAdapterCall, SaveGateFlushResult, SaveGateStatus, SessionView, StreamChunk,
   SubagentDetailEntry, SubagentDetailResult, SubagentRecord, SubagentStatus,
 } from './protocol.ts'
-import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, IDLE_RELEASE_MS, MAX_SUBAGENT_DETAIL_ENTRIES, SESSION_TITLE_PREFIX, pluginReleaseUrl } from './protocol.ts'
+import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, IDLE_RELEASE_MS, MAX_SUBAGENT_DETAIL_ENTRIES, MAX_SUBAGENT_RECORDS, SESSION_TITLE_PREFIX, pluginReleaseUrl } from './protocol.ts'
 import type { AcpSaveGate } from './save-gate.ts'
 import { SaveGateAborted } from './save-gate.ts'
 import { OUTPUT_CHARS_PER_TOKEN, TurnTpsTracker } from './tps.ts'
@@ -479,6 +479,14 @@ interface LiveSession {
    * bounds how long a stale banner can sit on a live session.
    */
   quotaRefusal?: { message: string; at: number }
+  /**
+   * Detached workers this session dispatched that may still run after the
+   * turn that dispatched them CLOSED. Session-level on purpose: the worker's
+   * completion / drain frames arrive after that turn's controller retired,
+   * and the idle clock must see the pending work so a release cannot kill the
+   * agent out from under it.
+   */
+  backgroundDispatches?: Map<string, BackgroundDispatch>
   transcript: Transcript
 }
 
@@ -656,9 +664,19 @@ export interface BridgeTuning {
    * perfectly alive, and reading that as death closes the turn before the
    * report arrives.
    *
-   * `0` falls back to `backgroundTaskMaxMs`. Default 1800000 ms (30 minutes).
+   * `0` falls back to `backgroundTaskMaxMs`. Default 2400000 ms (40 minutes).
    */
   backgroundTaskToolMs?: number
+  /**
+   * How long an OPEN worker tool call may stay open before the idle clock reads
+   * the worker as WEDGED and allows the process to be released.
+   *
+   * An open call is stronger evidence of life than silence: a long build emits
+   * no updates for tens of minutes. While one is open the plain silence window
+   * (`backgroundTaskToolMs`) never applies; this ceiling does. `0` = no ceiling.
+   * Default 7200000 ms (120 minutes).
+   */
+  backgroundOpenToolCeilingMs?: number
   /**
    * Optional ABSOLUTE ceiling on a detached-worker hold, both phases included.
    * `backgroundTaskMaxMs` keeps an ACTIVE worker alive indefinitely; this is
@@ -689,6 +707,16 @@ export interface BridgeTuning {
    * when a prompt response arrives (see `streamPrompt`), never on a timer.
    */
   ambientStaleMs?: number
+  /**
+   * Hold the turn across the WORKER phase too (the pre-2026-11 behaviour).
+   *
+   * Default `false`: the prompt response closes the turn, so the user keeps
+   * talking while the worker runs; the report lands in the transcript / NTR
+   * view. `true` keeps the whole turn open until the drain delivers the report
+   * — one bubble, but the composer stays locked for the worker's whole run.
+   * Only a deployment tuning key (no settings control).
+   */
+  backgroundHoldWorkerPhase?: boolean
 }
 
 /**
@@ -783,10 +811,12 @@ const DEFAULT_TUNING: Required<BridgeTuning> = {
   ambientQuietMs: 10_000,
   ambientMaxMs: 120_000,
   backgroundTaskMaxMs: 600_000,
-  backgroundTaskToolMs: 1_800_000,
+  backgroundTaskToolMs: 2_400_000,
+  backgroundOpenToolCeilingMs: 7_200_000,
   backgroundTaskCeilingMs: 0,
   backgroundParkedGraceMs: 30_000,
   ambientStaleMs: 300_000,
+  backgroundHoldWorkerPhase: false,
 }
 
 type BridgeState = 'stopped' | 'starting' | 'ready' | 'error'
@@ -918,6 +948,12 @@ export class AgentBridge {
   private readonly staleCancelRetryDelayMs: number
   private readonly staleCancelMaxRetries: number
   private readonly turnSettleMs: number
+  /** How long a background drain's record still counts as live work for the idle clock. */
+  private readonly ambientStaleMs: number
+  /** How long an unfinished dispatch may stay silent and still count as live work. */
+  private readonly backgroundDispatchSilenceMs: number
+  /** How long an OPEN worker tool call may stay open before it is presumed wedged. */
+  private readonly backgroundOpenToolCeilingMs: number
   private defaultIdleTimeoutMs: number
   private readonly probeIdleTimeoutMs: number
   /** Armed while READY; fires the idle-release check. */
@@ -1020,6 +1056,19 @@ export class AgentBridge {
      * point, which keeps their frame byte-for-byte as it was.
      */
     private readonly onStatus?: (bridge: AgentBridge) => void,
+    /**
+     * Every `session/update` of a live session, BEFORE the transcript cursor
+     * guard: the manager's session-level bookkeeping for detached workers and
+     * background drains. It must see frames no turn controller observes any
+     * more (a worker reporting after the turn that dispatched it closed).
+     */
+    private readonly onSessionBackgroundUpdate?: (session: LiveSession, update: SessionUpdate) => void,
+    /**
+     * Terminalize every unfinished detached-worker record when a SESSION goes
+     * away (close / release / force reset / process death). A closed TURN is
+     * deliberately not one of these: its worker may still be running.
+     */
+    private readonly onSessionBackgroundTeardown?: (session: LiveSession, status: 'cancelled' | 'unknown') => void,
   ) {
     const merged = { ...DEFAULT_TUNING, ...tuning }
     this.startupTimeoutMs = merged.startupTimeoutMs
@@ -1031,6 +1080,11 @@ export class AgentBridge {
     this.staleCancelRetryDelayMs = merged.staleCancelRetryDelayMs
     this.staleCancelMaxRetries = merged.staleCancelMaxRetries
     this.turnSettleMs = merged.turnSettleMs
+    this.ambientStaleMs = merged.ambientStaleMs
+    this.backgroundDispatchSilenceMs = merged.backgroundTaskToolMs > 0
+      ? merged.backgroundTaskToolMs
+      : merged.backgroundTaskMaxMs
+    this.backgroundOpenToolCeilingMs = merged.backgroundOpenToolCeilingMs
     this.defaultIdleTimeoutMs = merged.idleTimeoutMs
     this.probeIdleTimeoutMs = merged.probeIdleTimeoutMs
   }
@@ -1306,6 +1360,7 @@ export class AgentBridge {
       || this.starting !== undefined) return true
     for (const session of this.sessions.values()) {
       if (session.running || session.settled !== undefined) return true
+      if (hasPendingBackgroundWork(session, this.ambientStaleMs, this.backgroundDispatchSilenceMs, this.backgroundOpenToolCeilingMs)) return true
     }
     return false
   }
@@ -1351,6 +1406,7 @@ export class AgentBridge {
     for (const other of this.sessions.values()) {
       if (other === session) continue
       if (other.running || other.settled !== undefined) return true
+      if (hasPendingBackgroundWork(other, this.ambientStaleMs, this.backgroundDispatchSilenceMs, this.backgroundOpenToolCeilingMs)) return true
     }
     return false
   }
@@ -2242,7 +2298,7 @@ export class AgentBridge {
       if (session.closed) continue
       // The process that owed the turn is gone, so no worker is still running:
       // every still-open dispatch becomes `unknown` before the turn/end below.
-      session.turnController?.terminalizeDispatches('unknown')
+      this.onSessionBackgroundTeardown?.(session, 'unknown')
       if (session.running) {
         session.running = false
         this.hub.broadcast({ type: 'turn/end', sessionId: session.sessionId, turnId: '', error: reason })
@@ -2364,9 +2420,9 @@ export class AgentBridge {
     // The session is going away: whatever background drain it announced ends
     // with it (a re-created session must not inherit a stale ambient).
     clearAmbientState(session)
-    // ...and so does every still-open dispatch record the turn owned; a closed
+    // ...and so does every still-open dispatch record of this session; a closed
     // session is not a cancelled worker.
-    session.turnController?.terminalizeDispatches('unknown')
+    this.onSessionBackgroundTeardown?.(session, 'unknown')
     // ...and so does its prompt slot: nothing may keep rejecting a new prompt
     // for a record that is being deleted.
     session.promptInFlight = false
@@ -2455,7 +2511,7 @@ export class AgentBridge {
       session.activeToolCalls.clear()
       // A forced teardown never closes its turn: every still-open dispatch
       // becomes `unknown` here.
-      session.turnController?.terminalizeDispatches('unknown')
+      this.onSessionBackgroundTeardown?.(session, 'unknown')
       clearAmbientState(session)
       this.sessions.delete(session.sessionId)
       this.acpIndex.delete(session.acpSessionId)
@@ -2773,6 +2829,10 @@ export class AgentBridge {
     // agent's `session/close`; an update racing that wait must not revive
     // activity (e.g. report a new dispatch) on a record already going away.
     if (session.closed) return
+    // Detached-worker / drain bookkeeping runs BEFORE the turn controller and
+    // the cursor: a worker may report after the turn that dispatched it closed,
+    // and the session-level record is the only place that fact can land.
+    this.onSessionBackgroundUpdate?.(session, params.update)
     // Any update is the agent speaking: restart the stall clock here. A
     // tool-call status also says whether the agent is inside a long-running
     // tool, which earns the wider watchdog window.
@@ -3038,6 +3098,57 @@ function hasRecentRetiredAmbient(session: LiveSession, withinMs: number): boolea
   if (retired === undefined || retired.length === 0) return false
   const cutoff = Date.now() - withinMs
   return retired.some(entry => entry.retiredAt >= cutoff)
+}
+
+/**
+ * Work that OUTLIVES a closed turn: a detached worker that is alive (inside an
+ * open tool call, or recently active), or a background drain that spoke within
+ * the staleness window. Both must pin the process — an idle release would kill
+ * the agent out from under them.
+ *
+ * An OPEN worker tool call is stronger evidence of life than silence: a long
+ * build emits no updates for tens of minutes, so the plain silence window never
+ * applies while one is open — the long `openToolCeilingMs` does. ANY open call
+ * still inside that ceiling proves the worker alive; when every open call has
+ * outlived it, plain recency decides (a worker that keeps reporting is alive).
+ * `0` means no ceiling. Without some bound a worker that never reports would
+ * pin the process forever.
+ */
+function hasPendingBackgroundWork(
+  session: LiveSession,
+  ambientStaleMs: number,
+  dispatchSilenceMs: number,
+  openToolCeilingMs: number,
+): boolean {
+  const dispatches = session.backgroundDispatches
+  if (dispatches !== undefined) {
+    for (const dispatch of dispatches.values()) {
+      if (dispatch.terminal !== undefined) continue
+      const openSince = latestOpenWorkerTool(dispatch)
+      if (openSince !== undefined
+        && (openToolCeilingMs <= 0 || Date.now() - openSince <= openToolCeilingMs)) return true
+      // Every open call outlived the ceiling: fall back to plain recency, so a
+      // worker that keeps reporting is still alive.
+      if (Date.now() - dispatch.lastActivityAt <= dispatchSilenceMs) return true
+    }
+  }
+  return session.ambient !== undefined
+    && Date.now() - session.ambient.lastActivityAt <= ambientStaleMs
+}
+
+/**
+ * When the LATEST still-open worker tool call opened, if any. The newest one
+ * decides: one call may have outlived the ceiling while a sibling started
+ * later and is still perfectly alive.
+ */
+function latestOpenWorkerTool(dispatch: BackgroundDispatch): number | undefined {
+  const open = dispatch.openWorkerToolCalls
+  if (open === undefined || open.size === 0) return undefined
+  let latest = Number.NEGATIVE_INFINITY
+  for (const at of open.values()) {
+    if (at > latest) latest = at
+  }
+  return latest
 }
 
 /**
@@ -4456,6 +4567,13 @@ interface BackgroundDispatch {
   counts: { updates: number; toolCalls: number; textChars: number }
   /** The status last announced through `subagents/record` (creation included). */
   reportedStatus?: SubagentStatus
+  /**
+   * The WORKER's own tool calls that are still open, by `toolCallId` → when the
+   * call opened. A worker silent inside a long command is alive, not wedged:
+   * while one is open the idle clock grants the long open-tool ceiling instead
+   * of the plain silence window (see `hasPendingBackgroundWork`).
+   */
+  openWorkerToolCalls?: Map<string, number>
 }
 
 /**
@@ -4629,12 +4747,21 @@ class TurnStreamController {
    */
   private readonly ambientTuning: { quietMs: number; maxMs: number }
   /**
-   * The detached workers this turn dispatched (see {@link BackgroundDispatch}),
-   * by `toolCallId`, recorded from the wire while the turn is still streaming —
-   * typically in the first step, before the prompt response lands. A turn may
-   * dispatch several, and the hold waits for ALL of them.
+   * Detached-worker records live on the SESSION, not on this turn: a worker
+   * that outlives the turn still reports, and the record has to move with it
+   * (see {@link LiveSession.backgroundDispatches}). The hold still waits for
+   * ALL of a turn's dispatches, but the map survives its controller.
    */
-  private readonly dispatches = new Map<string, BackgroundDispatch>()
+  private get dispatches(): Map<string, BackgroundDispatch> {
+    return this.session.backgroundDispatches ??= new Map()
+  }
+  /**
+   * The ids of dispatches THIS turn created. A hold may only wait for work the
+   * turn itself handed out: a completed worker of an EARLIER turn still sits
+   * in the session map, and waiting on it would hold an unrelated successor
+   * turn against a drain it does not own.
+   */
+  private readonly turnDispatchIds = new Set<string>()
   /** The detached-worker hold in progress, once a segment carries it. */
   private backgroundHold?: BackgroundHold
   /**
@@ -4859,25 +4986,37 @@ class TurnStreamController {
   }
 
   /**
-   * Whether this turn dispatched a detached worker whose answer is still
-   * outstanding. Read when the prompt response lands: such a turn is NOT over
-   * even though the agent answered it (see {@link holdForBackgroundDispatch}).
+   * Whether the prompt response should keep this turn open for a detached
+   * worker.
    *
-   * Two ways a dispatch keeps the turn open:
-   * - it has not reported back yet (the worker is still running), or
-   * - it DID report — before the response, even — but it was structurally
-   *   detached (`isBackground`) and emitted worker updates: the drain that
-   *   carries its report is still coming.
+   * With `backgroundHoldWorkerPhase` (a deployment tuning key) the answer is
+   * whenever any dispatch is still running OR a detached one already reported
+   * and left its drain pending. Without it, a RUNNING worker does not hold the
+   * turn: the user keeps talking while it runs, and its report lands in the
+   * transcript / NTR view. Only the short last window — every dispatch reported
+   * and a detached one emitted worker updates, so the drain carrying the report
+   * is imminent — is held.
+   *
    * A synchronous `Agent` / `Task` call (completed, never declared
-   * `isBackground`) matches neither and closes normally — even though its
-   * child updates carry `parentToolCallId`, that only sets `sawWorkerUpdate`.
+   * `isBackground`) matches neither and closes normally.
    */
-  get dispatchedDetachedWorker(): boolean {
-    for (const dispatch of this.dispatches.values()) {
-      if (!dispatch.completed) return true
-      if (dispatch.detached && dispatch.sawWorkerUpdate) return true
+  detachedHoldWanted(holdWorkerPhase: boolean): boolean {
+    let drainPending = false
+    for (const toolCallId of this.turnDispatchIds) {
+      const dispatch = this.dispatches.get(toolCallId)
+      if (dispatch === undefined) continue
+      if (!dispatch.completed) {
+        if (!holdWorkerPhase) return false
+        return true
+      }
+      if (dispatch.detached && dispatch.sawWorkerUpdate) drainPending = true
     }
-    return false
+    return drainPending
+  }
+
+  /** A dispatch created while this turn was on air: the only work a hold waits for. */
+  noteTurnDispatch(toolCallId: string): void {
+    this.turnDispatchIds.add(toolCallId)
   }
 
   /** The hold this turn is inside — adopted, or parked waiting for a step. */
@@ -4885,10 +5024,11 @@ class TurnStreamController {
     return this.backgroundHold ?? this.pendingBackgroundHold
   }
 
-  /** Whether every KNOWN dispatch has reported (no dispatch at all counts as done). */
+  /** Every dispatch THIS TURN knows about reported (no dispatch counts as done). */
   private allDispatchesCompleted(): boolean {
-    for (const dispatch of this.dispatches.values()) {
-      if (!dispatch.completed) return false
+    for (const toolCallId of this.turnDispatchIds) {
+      const dispatch = this.dispatches.get(toolCallId)
+      if (dispatch !== undefined && !dispatch.completed) return false
     }
     return true
   }
@@ -5092,6 +5232,9 @@ class TurnStreamController {
   /** The hold went silent past its window, or outlived the absolute ceiling. */
   private onBackgroundHard(hold: BackgroundHold): void {
     if (hold !== this.backgroundHold && hold !== this.pendingBackgroundHold) return
+    // The ceiling is the evidence the worker (or its drain) never finished:
+    // a row that keeps `running` here would pin the idle clock forever.
+    this.manager.terminalizeSessionDispatches(this.session, 'unknown')
     this.closeBackgroundHold(hold, { hard: true })
   }
 
@@ -5108,6 +5251,9 @@ class TurnStreamController {
   private onBackgroundGraceExpired(hold: BackgroundHold): void {
     if (this.pendingBackgroundHold !== hold) return
     this.pendingBackgroundHold = undefined
+    // No step came back for this turn: nobody is left to read a report, so the
+    // unfinished rows must not stay `running` (they would pin the idle clock).
+    this.manager.terminalizeSessionDispatches(this.session, 'unknown')
     this.clearBackgroundHoldTimers(hold)
     const line = hold.answerChars > 0 ? undefined : backgroundDeferralLine(this.session.agentId)
     this.releaseBackgroundHoldIds(hold, { hard: true })
@@ -5271,261 +5417,52 @@ class TurnStreamController {
   }
 
   /**
-   * Follow the detached-worker signals of one live update.
-   *
-   * Only CodeBuddy sends them (`codebuddyMetaOf` answers `undefined` for every
-   * other agent, so nothing here can fire for them):
-   * - an `Agent` / `Task` `tool_call` records the dispatch — the FIRST send
-   *   needs that CodeBuddy shape;
-   * - the SAME call re-sent with `isBackground: true` marks the work DETACHED;
-   * - that call reporting completed / failed is read BY ID: the real
-   *   completion frame carries NO `_meta` at all, so requiring the CodeBuddy
-   *   shape here would miss every real completion;
-   * - any update carrying `parentToolCallId` is the worker's OWN turn — it
-   *   proves the worker alive (`sawWorkerUpdate`) but never belongs to this
-   *   session's answer, and does NOT mark the dispatch detached (a synchronous
-   *   subagent's child updates carry it too);
-   * - an `unsolicitedTurn` announcement is the drain that carries the report.
+   * A session-level dispatch frame landed. A live hold pushes its worker
+   * silence clock; once every known dispatch reported, the hold moves to its
+   * drain phase.
    */
-  private trackBackgroundDispatch(update: Record<string, unknown>): void {
-    if (this.closedTurn) return
-    const meta = codebuddyMetaOf(update)
-    const kind = String(update.sessionUpdate ?? '')
-    const row = update as { toolCallId?: unknown; status?: unknown }
-    const toolCallId = typeof row.toolCallId === 'string' ? row.toolCallId.trim() : ''
-    const status = typeof row.status === 'string' ? row.status : ''
-    const completedStatus = status === 'completed' || status === 'failed'
-    const now = Date.now()
-    const type = typeof meta?.subagentType === 'string' && meta.subagentType !== '' ? meta.subagentType : undefined
-    if ((kind === 'tool_call' || kind === 'tool_call_update') && toolCallId !== '') {
-      const known = this.dispatches.get(toolCallId)
-      if (known !== undefined) {
-        // A known dispatch: the id is the whole evidence (see the doc above).
-        this.noteBackgroundWorkerActivity()
-        known.lastActivityAt = now
-        known.counts.updates += 1
-        if (type !== undefined && known.subagentType === undefined) known.subagentType = type
-        if (status !== '') known.status = status
-        const justCompleted = completedStatus && !known.completed
-        if (justCompleted) {
-          known.completed = true
-          // A terminal frame carries NO `_meta` on the real wire; the status
-          // alone decides success vs failure, and the failure reason is the
-          // frame's own `content`, kept in whatever shape it came in.
-          known.terminal = status === 'failed' ? 'failed' : 'completed'
-          known.endedAt = now
-          if (status === 'failed' && update.content !== undefined) known.error = update.content
-        }
-        if (!known.catalogReported) this.refreshSubagentDispatchLabel(known, update)
-        if (meta?.isBackground === true) {
-          known.detached = true
-          this.reportSubagentDispatch(known)
-        }
-        // The record moves with EVERY frame (its activity clock and counters),
-        // but only a status TRANSITION announces a frame / writes the file.
-        this.syncDispatchRecord(known)
-        if (justCompleted) this.noteDispatchProgress()
-      } else if (meta !== undefined
-        && (meta.toolName === 'Agent' || meta.toolName === 'Task')
-        && (kind === 'tool_call' || meta.isBackground === true)) {
-        // A NEW dispatch needs the CodeBuddy shape. A turn may dispatch more
-        // than one worker; the hold waits for all of them.
-        const dispatch: BackgroundDispatch = {
-          toolCallId,
-          status,
-          completed: completedStatus,
-          detached: meta.isBackground === true,
-          sawWorkerUpdate: false,
-          catalogLabel: subagentDispatchLabel(update),
-          catalogLabelIdentified: subagentDispatchDeclaresIdentity(update),
-          catalogReported: false,
-          startedAt: now,
-          lastActivityAt: now,
-          ...(completedStatus
-            ? {
-                terminal: status === 'failed' ? 'failed' as const : 'completed' as const,
-                endedAt: now,
-                ...(status === 'failed' && update.content !== undefined ? { error: update.content } : {}),
-              }
-            : {}),
-          ...(type === undefined ? {} : { subagentType: type }),
-          counts: { updates: 1, toolCalls: 0, textChars: 0 },
-        }
-        this.dispatches.set(toolCallId, dispatch)
-        // Creation is a state entering the record, and it is announced HERE —
-        // NOT behind `catalogReported`: a dispatch the host catalog never
-        // accepted must still reach the browser ("目录待同步").
-        this.syncDispatchRecord(dispatch)
-        this.noteBackgroundWorkerActivity()
-        if (dispatch.detached) this.reportSubagentDispatch(dispatch)
-        if (!dispatch.completed) {
-          const held = this.activeBackgroundHold()
-          // A dispatch registered after the drain phase began means new work:
-          // the worker phase (and its absence of a quiet clock) is back.
-          if (held !== undefined) this.enterBackgroundWorkerPhase(held)
-        }
-      }
+  onBackgroundDispatchFrame(): void {
+    this.noteBackgroundWorkerActivity()
+    const held = this.activeBackgroundHold()
+    if (held === undefined) return
+    if (!this.allDispatchesCompleted()) {
+      // New work handed out after the drain phase began: the worker phase (and
+      // its silence window) is back, so no drain quiet clock may cut the turn.
+      this.enterBackgroundWorkerPhase(held)
+      return
     }
-    if (meta?.parentToolCallId !== undefined) {
-      const parent = this.dispatches.get(meta.parentToolCallId)
-      if (parent !== undefined) {
-        this.trackWorkerToolCall(kind, toolCallId, status)
-        this.noteBackgroundWorkerActivity()
-        // The worker's own frames are evidence of work, not a status of the
-        // dispatch call: they move its clock and counters, and the first one
-        // (or the first `isBackground` re-send) is what flips it to `running`.
-        parent.lastActivityAt = now
-        parent.counts.updates += 1
-        if (kind === 'tool_call') parent.counts.toolCalls += 1
-        else if (kind === 'agent_message_chunk') parent.counts.textChars += chunkTextOf(update.content).length
-        if (type !== undefined && parent.subagentType === undefined) parent.subagentType = type
-        // `parentToolCallId` proves the worker alive, NOT that it runs detached:
-        // CodeBuddy tags a SYNCHRONOUS subagent's child updates the same way. Only
-        // the dispatch's own `isBackground` re-send marks it detached; a sync call
-        // completes in-turn and must close at the response, not hold for a drain.
-        parent.sawWorkerUpdate = true
-        this.reportSubagentDispatch(parent)
-        this.syncDispatchRecord(parent)
-      }
-    }
-    if (meta?.unsolicitedTurn !== undefined) {
-      const held = this.activeBackgroundHold()
-      if (held !== undefined) {
-        this.noteBackgroundWorkerActivity()
-        this.startBackgroundDrain(held, meta.unsolicitedTurn.requestId)
-      }
-    }
+    this.startBackgroundDrain(held)
   }
 
-  /** Where one dispatch stands, derived from the wire facts of its own record. */
-  private dispatchStatus(dispatch: BackgroundDispatch): SubagentStatus {
-    if (dispatch.terminal !== undefined) return dispatch.terminal
-    // `pending` is the absence of evidence: a `pending` / status-less first
-    // frame that no worker update has answered yet.
-    if (dispatch.sawWorkerUpdate || dispatch.detached || dispatch.status === 'in_progress') return 'running'
-    return 'pending'
+  /** The agent announced the drain that carries a detached worker's report. */
+  onBackgroundDrainAnnounced(requestId: string): void {
+    const held = this.activeBackgroundHold()
+    if (held === undefined) return
+    this.noteBackgroundWorkerActivity()
+    this.startBackgroundDrain(held, requestId)
   }
 
-  /** Build the persisted lifecycle record for one dispatch. */
-  private dispatchRecord(dispatch: BackgroundDispatch, dshSessionId: string): SubagentRecord {
-    return {
-      childId: `acp:${dispatch.toolCallId}`,
-      dshSessionId,
-      toolCallId: dispatch.toolCallId,
-      label: dispatch.catalogLabel,
-      ...(dispatch.subagentType === undefined ? {} : { type: dispatch.subagentType }),
-      status: this.dispatchStatus(dispatch),
-      startedAt: dispatch.startedAt,
-      lastActivityAt: dispatch.lastActivityAt,
-      ...(dispatch.endedAt === undefined ? {} : { endedAt: dispatch.endedAt }),
-      ...(dispatch.error === undefined ? {} : { error: dispatch.error }),
-      counts: { ...dispatch.counts },
-    }
+  /** Every known dispatch reported: a live hold moves to its drain phase. */
+  onAllDispatchesCompleted(): void {
+    if (!this.allDispatchesCompleted()) return
+    const held = this.activeBackgroundHold()
+    if (held !== undefined) this.startBackgroundDrain(held)
   }
 
   /**
-   * Keep the manager's lifecycle record for this dispatch current, announcing
-   * it ONLY when its status changed (creation counts) and writing the state
-   * file on the same transitions. Every wire frame calls this: the activity
-   * clock and counters move in memory, while `persistAgents` rewrites the whole
-   * file synchronously — a write per chunk would stall the host.
+   * A worker's own tool call moved: the long-tier silence evidence for a
+   * worker-phase hold (see `backgroundSilenceMs`). No-op for a turn that is
+   * already closed (the worker now reports through the session record).
    */
-  private syncDispatchRecord(dispatch: BackgroundDispatch): void {
-    const dshSessionId = this.session.dshSessionId
-    if (dshSessionId === undefined) return
-    const status = this.dispatchStatus(dispatch)
-    const transition = dispatch.reportedStatus !== status
-    if (transition) dispatch.reportedStatus = status
-    this.manager.noteSubagentRecords(
-      [this.dispatchRecord(dispatch, dshSessionId)],
-      { announce: transition, persist: transition },
-    )
-  }
-
-  /**
-   * Write a terminal state for every dispatch that never reported one, as ONE
-   * batch (one announcement per record, one state-file write). Already
-   * terminal rows are left untouched: `cancelled` / `unknown` are not allowed
-   * to overwrite what the agent actually said.
-   *
-   * This is the record half of every teardown path: a turn / session / process
-   * that goes away without a terminal frame must still leave the panel a
-   * terminal row (`cancelled` for a cancelled turn, `unknown` for everything
-   * else — those endings are not evidence the worker ended).
-   */
-  terminalizeDispatches(status: 'cancelled' | 'unknown'): void {
-    const dshSessionId = this.session.dshSessionId
-    const now = Date.now()
-    const records: SubagentRecord[] = []
-    for (const dispatch of this.dispatches.values()) {
-      if (dispatch.terminal !== undefined) continue
-      dispatch.terminal = status
-      dispatch.endedAt = now
-      dispatch.reportedStatus = status
-      if (dshSessionId !== undefined) records.push(this.dispatchRecord(dispatch, dshSessionId))
-    }
-    if (records.length === 0) return
-    this.manager.noteSubagentRecords(records, { announce: true, persist: true })
-  }
-
-  /**
-   * Mirror one tool call of the WORKER's own turn into the long-tier evidence
-   * set: a call announced (or still in progress) keeps the worker "busy";
-   * completed / failed clears it. An UPDATE without a status carries no news
-   * either way (same rule as the main turn's `activeToolCalls`).
-   */
-  private trackWorkerToolCall(kind: string, toolCallId: string, status: string): void {
+  onWorkerToolCall(kind: string, toolCallId: string, status: string): void {
     if (toolCallId === '' || (kind !== 'tool_call' && kind !== 'tool_call_update')) return
     if (status === 'completed' || status === 'failed') this.workerToolCalls.delete(toolCallId)
     else if (status === 'pending' || status === 'in_progress') this.workerToolCalls.add(toolCallId)
     else if (kind === 'tool_call' && status === '') this.workerToolCalls.add(toolCallId)
-  }
-
-  /**
-   * Hand one DETACHED dispatch to the host's subagent catalog. One fact per
-   * tool call, and only once the wire's structure proves the work runs
-   * off-turn — a synchronous `Agent` / `Task` call is a tool call, not a
-   * catalog child.
-   */
-  private reportSubagentDispatch(dispatch: BackgroundDispatch): void {
-    if (dispatch.catalogReported) return
-    // A bare "Agent" row says nothing; wait for the identity frame. A
-    // completed dispatch reports with whatever it has — a row must not be
-    // lost because the agent never declared more than the tool name.
-    if (!dispatch.catalogLabelIdentified && !dispatch.completed) return
-    if (this.manager.reportSubagentCatalog(this.session, `acp:${dispatch.toolCallId}`, dispatch.catalogLabel)) {
-      dispatch.catalogReported = true
-    }
-  }
-
-  /**
-   * Take a better label from a later frame of the SAME dispatch call.
-   *
-   * CodeBuddy omits `rawInput` (and often the title) on the dispatch call's
-   * first send, then restates the whole task identity in `_meta` on the result
-   * frame. A frame with no identity and no title is a bare status update and
-   * must not downgrade what is already known.
-   */
-  private refreshSubagentDispatchLabel(dispatch: BackgroundDispatch, update: Record<string, unknown>): void {
-    const identified = subagentDispatchDeclaresIdentity(update)
-    if (!identified && dispatch.catalogLabelIdentified) return
-    const title = update.title
-    if (!identified && !(typeof title === 'string' && title !== '')) return
-    dispatch.catalogLabel = subagentDispatchLabel(update)
-    dispatch.catalogLabelIdentified = identified
-  }
-
-  /**
-   * A dispatch just reported: once the LAST one has, the drain phase starts.
-   * Until then the turn stays in its worker phase, with no quiet clock.
-   */
-  private noteDispatchProgress(): void {
-    if (!this.allDispatchesCompleted()) return
-    // Last chance for a row still waiting on identity: completion is a fact
-    // even when the agent never said more than the tool name.
-    for (const dispatch of this.dispatches.values()) this.reportSubagentDispatch(dispatch)
-    const held = this.activeBackgroundHold()
-    if (held !== undefined) this.startBackgroundDrain(held)
+    // The set decides the NEXT window's tier, so the silence clock has to be
+    // re-armed with the new tier now (a worker entering a long tool switches
+    // the hold from the short tier to the long one).
+    this.noteBackgroundWorkerActivity()
   }
 
   /** Any session update is evidence the drain still works: push the quiet clock out. */
@@ -5747,18 +5684,23 @@ class TurnStreamController {
     // run's record (`closeBackgroundHold` retired or kept it); only the clocks
     // are still ours to drop.
     this.clearBackgroundHold()
-    // Every still-open worker of this turn gets a terminal record now: the
-    // browser must never keep a running row for a turn that already ended (an
-    // idle turn whose worker reports later says so in the ACP transcript
-    // view). A cancelled turn also tells its still-open workers they were
-    // cancelled; any other ending leaves them `unknown` (the turn ending is
-    // not the worker ending).
-    this.terminalizeDispatches(outcome.kind === 'cancelled' ? 'cancelled' : 'unknown')
+    // A worker that is still running is NOT terminalized here: it outlives
+    // this turn (see `LiveSession.backgroundDispatches`), and only a session
+    // teardown writes `unknown` for it. The turn closing is not evidence the
+    // worker stopped.
     // A late answer to a SUPERSEDED turn still has to close this controller's
     // queue (a continuation step may be parked on it) and its settle gate —
     // but it must not touch the session the NEWER turn now owns, nor release
     // process-wide waiters that belong to that turn.
     const current = this.session.turnSeq === this.turnSeqAtStart
+    if (current) {
+      // A user cancel stops THIS turn's workers on the agent side too, and an
+      // ERROR / watchdog ending means the agent stopped responding: neither
+      // leaves a worker that can still report. Only this turn's own dispatches
+      // are touched — a worker left over from an EARLIER turn may still run.
+      if (outcome.kind === 'cancelled') this.manager.terminalizeSessionDispatches(this.session, 'cancelled', this.turnDispatchIds)
+      else if (outcome.kind === 'error') this.manager.terminalizeSessionDispatches(this.session, 'unknown', this.turnDispatchIds)
+    }
     const reason: SegmentFinishReason = outcome.kind === 'cancelled'
       ? { kind: 'aborted', failure: { message: 'Turn was cancelled', code: 'CANCELLED' } }
       : outcome.kind === 'error'
@@ -5933,11 +5875,9 @@ class TurnStreamController {
     // A successor turn must never fold this hold's drain or worker text: the
     // abandoned run's id is retired before the subscription goes away.
     this.clearBackgroundHold({ retire: true })
-    // The teardown ends the turn without `closeTurn`: every still-open
-    // dispatch becomes `unknown` here — a retired turn is not evidence its
-    // worker stopped, and a missing terminal record would leave the panel's
-    // row permanently running.
-    this.terminalizeDispatches('unknown')
+    // A still-running worker is NOT terminalized here: retiring a turn is not
+    // evidence its worker stopped. Only a session teardown writes `unknown`
+    // (see `AgentBridge.onSessionBackgroundTeardown`).
     this.retire()
     releaseAllToolOutputWaiters()
   }
@@ -6114,10 +6054,9 @@ class TurnStreamController {
       // `BridgeTuning.backgroundTaskMaxMs`).
       this.noteBackgroundHoldActivity()
       const update = typed.update as Record<string, unknown>
-      // The dispatch / worker / announcement bookkeeping runs BEFORE the cursor
-      // guard: those are turn-level facts, not segment content, and an update
-      // withheld by the ambient buffer must still keep them.
-      this.trackBackgroundDispatch(update)
+      // Detached-worker / drain bookkeeping now lives on the SESSION (see
+      // `BridgeManager.trackSessionBackgroundDispatch`): it has to outlive this
+      // controller, so this turn only consumes segment content here.
       if (typed.seq <= this.cursorSeq) return
       // A background drain's prose is not this turn's answer: keep it out of
       // the plane (the transcript still has it). Fail-open — nothing is split
@@ -6951,7 +6890,7 @@ export class BridgeManager {
     return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, onCommands, this.tuning, () => this.sessionWorkspaceResolver, onSessionsDirty, onForkCapability, bridge => {
       this.publishAgentStatus(bridge.def.id)
       this.noticeBridgeFailure(bridge)
-    })
+    }, (session, update) => this.trackSessionBackgroundDispatch(session, update), (session, status) => this.terminalizeSessionDispatches(session, status))
   }
 
   /**
@@ -7046,6 +6985,259 @@ export class BridgeManager {
       }
     }
     if (options.persist) this.persistAgents()
+  }
+
+  /**
+   * Session-level bookkeeping for CodeBuddy's detached workers and background
+   * drains. Runs for EVERY `session/update`, with or without a turn controller:
+   * a worker that finishes after its dispatching turn CLOSED must still move
+   * its record, and the idle clock must see the pending work.
+   *
+   * The wire shape is unchanged from the turn-level version:
+   * - the dispatch call's own frames (matched by id, completion carries no
+   *   `_meta`) move status / counters and may mark it `detached`;
+   * - `parentToolCallId` frames are the worker's own turn: evidence of life
+   *   (`sawWorkerUpdate`), never the dispatch record's `_meta` identity;
+   * - `unsolicitedTurn` names the drain that will carry the report.
+   */
+  private trackSessionBackgroundDispatch(session: LiveSession, update: SessionUpdate): void {
+    const raw = update as Record<string, unknown>
+    const meta = codebuddyMetaOf(raw)
+    const kind = String(raw.sessionUpdate ?? '')
+    const row = raw as { toolCallId?: unknown; status?: unknown }
+    const toolCallId = typeof row.toolCallId === 'string' ? row.toolCallId.trim() : ''
+    const status = typeof row.status === 'string' ? row.status : ''
+    const completedStatus = status === 'completed' || status === 'failed'
+    const now = Date.now()
+    const type = typeof meta?.subagentType === 'string' && meta.subagentType !== '' ? meta.subagentType : undefined
+    const dispatches = session.backgroundDispatches ??= new Map<string, BackgroundDispatch>()
+    if ((kind === 'tool_call' || kind === 'tool_call_update') && toolCallId !== '') {
+      // A terminal tool frame may arrive WITHOUT `parentToolCallId` (the real
+      // completion shape): close that id in every dispatch's table by id.
+      if (completedStatus) {
+        for (const dispatch of dispatches.values()) dispatch.openWorkerToolCalls?.delete(toolCallId)
+      }
+      const known = dispatches.get(toolCallId)
+      if (known !== undefined) {
+        // A known dispatch: the id is the whole evidence (see the doc above).
+        known.lastActivityAt = now
+        known.counts.updates += 1
+        if (type !== undefined && known.subagentType === undefined) known.subagentType = type
+        if (status !== '') known.status = status
+        const justCompleted = completedStatus && !known.completed
+        if (justCompleted) {
+          known.completed = true
+          // The worker finished: no tool call of its own turn can still be open.
+          known.openWorkerToolCalls?.clear()
+          // A terminal state already written (cancelled / unknown) is never
+          // overwritten by a late completion: the row keeps the ending that
+          // actually happened, and the late frame only stops further counting.
+          if (known.terminal === undefined) {
+            known.terminal = status === 'failed' ? 'failed' : 'completed'
+            known.endedAt = now
+            if (status === 'failed' && raw.content !== undefined) known.error = raw.content
+          }
+        }
+        if (!known.catalogReported) this.refreshSubagentDispatchLabel(known, raw)
+        if (meta?.isBackground === true) {
+          known.detached = true
+          this.reportSubagentDispatch(session, known)
+        }
+        this.syncDispatchRecord(session, known)
+        // Every frame of a known dispatch is evidence its worker still works:
+        // the worker phase is SILENCE-based, so a live hold must not time out.
+        session.turnController?.onBackgroundDispatchFrame()
+        if (justCompleted) {
+          // Last chance for a row still waiting on identity: completion is a
+          // fact even when the agent never said more than the tool name.
+          this.reportSubagentDispatch(session, known)
+          this.noteSessionDispatchProgress(session)
+        }
+      } else if (meta !== undefined
+        && (meta.toolName === 'Agent' || meta.toolName === 'Task')
+        && (kind === 'tool_call' || meta.isBackground === true)) {
+        const dispatch: BackgroundDispatch = {
+          toolCallId,
+          status,
+          completed: completedStatus,
+          detached: meta.isBackground === true,
+          sawWorkerUpdate: false,
+          catalogLabel: subagentDispatchLabel(raw),
+          catalogLabelIdentified: subagentDispatchDeclaresIdentity(raw),
+          catalogReported: false,
+          startedAt: now,
+          lastActivityAt: now,
+          ...(completedStatus
+            ? {
+                terminal: status === 'failed' ? 'failed' as const : 'completed' as const,
+                endedAt: now,
+                ...(status === 'failed' && raw.content !== undefined ? { error: raw.content } : {}),
+              }
+            : {}),
+          ...(type === undefined ? {} : { subagentType: type }),
+          counts: { updates: 1, toolCalls: 0, textChars: 0 },
+        }
+        dispatches.set(toolCallId, dispatch)
+        this.pruneSessionDispatches(dispatches)
+        // A hold may only wait for work THIS turn handed out; a worker left
+        // over from an earlier turn is not this turn's drain.
+        session.turnController?.noteTurnDispatch(toolCallId)
+        // Creation is a state entering the record, announced HERE — not behind
+        // `catalogReported`: a row the host catalog never accepted must still
+        // reach the browser ("目录待同步").
+        this.syncDispatchRecord(session, dispatch)
+        session.turnController?.onBackgroundDispatchFrame()
+        if (dispatch.detached) this.reportSubagentDispatch(session, dispatch)
+      }
+    }
+    if (meta?.parentToolCallId !== undefined) {
+      const parent = dispatches.get(meta.parentToolCallId)
+      if (parent !== undefined) {
+        // The worker's own tool calls: an OPEN one is the long-tier evidence
+        // the idle clock reads (`hasPendingBackgroundWork`). Completed / failed
+        // closes it; an update with no status carries no news (same rule as
+        // the main turn's `activeToolCalls`).
+        const openTools = parent.openWorkerToolCalls ??= new Map<string, number>()
+        if (toolCallId !== '' && (kind === 'tool_call' || kind === 'tool_call_update')) {
+          if (status === 'completed' || status === 'failed') openTools.delete(toolCallId)
+          else if (status === 'pending' || status === 'in_progress') openTools.set(toolCallId, openTools.get(toolCallId) ?? now)
+          else if (kind === 'tool_call') openTools.set(toolCallId, now)
+        }
+        session.turnController?.onWorkerToolCall(kind, toolCallId, status)
+        parent.lastActivityAt = now
+        parent.counts.updates += 1
+        if (kind === 'tool_call') parent.counts.toolCalls += 1
+        else if (kind === 'agent_message_chunk') parent.counts.textChars += chunkTextOf(raw.content).length
+        if (type !== undefined && parent.subagentType === undefined) parent.subagentType = type
+        // `parentToolCallId` proves the worker alive, NOT that it runs detached:
+        // CodeBuddy tags a SYNCHRONOUS subagent's child updates the same way.
+        parent.sawWorkerUpdate = true
+        this.reportSubagentDispatch(session, parent)
+        this.syncDispatchRecord(session, parent)
+        // The worker's own prose / tool frames are evidence of work too.
+        session.turnController?.onBackgroundDispatchFrame()
+      }
+    }
+    if (meta?.unsolicitedTurn !== undefined) {
+      session.turnController?.onBackgroundDrainAnnounced(meta.unsolicitedTurn.requestId)
+    }
+  }
+
+  /** Where one dispatch stands, derived from the wire facts of its own record. */
+  private dispatchStatus(dispatch: BackgroundDispatch): SubagentStatus {
+    if (dispatch.terminal !== undefined) return dispatch.terminal
+    if (dispatch.sawWorkerUpdate || dispatch.detached || dispatch.status === 'in_progress') return 'running'
+    return 'pending'
+  }
+
+  /** Build the persisted lifecycle record for one dispatch. */
+  private dispatchRecord(dispatch: BackgroundDispatch, dshSessionId: string): SubagentRecord {
+    return {
+      childId: `acp:${dispatch.toolCallId}`,
+      dshSessionId,
+      toolCallId: dispatch.toolCallId,
+      label: dispatch.catalogLabel,
+      ...(dispatch.subagentType === undefined ? {} : { type: dispatch.subagentType }),
+      status: this.dispatchStatus(dispatch),
+      startedAt: dispatch.startedAt,
+      lastActivityAt: dispatch.lastActivityAt,
+      ...(dispatch.endedAt === undefined ? {} : { endedAt: dispatch.endedAt }),
+      ...(dispatch.error === undefined ? {} : { error: dispatch.error }),
+      counts: { ...dispatch.counts },
+    }
+  }
+
+  /**
+   * Keep the lifecycle record current, announcing it ONLY when its status
+   * changed (creation included) and writing the state file on the same
+   * transitions. A write per worker chunk would stall the host.
+   */
+  private syncDispatchRecord(session: LiveSession, dispatch: BackgroundDispatch): void {
+    const dshSessionId = session.dshSessionId
+    if (dshSessionId === undefined) return
+    const status = this.dispatchStatus(dispatch)
+    const transition = dispatch.reportedStatus !== status
+    if (transition) dispatch.reportedStatus = status
+    this.noteSubagentRecords(
+      [this.dispatchRecord(dispatch, dshSessionId)],
+      { announce: transition, persist: transition },
+    )
+  }
+
+  /**
+   * Hand one DETACHED dispatch to the host's subagent catalog. One fact per
+   * tool call, and only once the wire's structure proves the work runs off-turn.
+   */
+  private reportSubagentDispatch(session: LiveSession, dispatch: BackgroundDispatch): void {
+    if (dispatch.catalogReported) return
+    if (!dispatch.catalogLabelIdentified && !dispatch.completed) return
+    if (this.reportSubagentCatalog(session, `acp:${dispatch.toolCallId}`, dispatch.catalogLabel)) {
+      dispatch.catalogReported = true
+    }
+  }
+
+  /**
+   * Take a better label from a later frame of the SAME dispatch call. A frame
+   * with no identity and no title must not downgrade what is already known.
+   */
+  private refreshSubagentDispatchLabel(dispatch: BackgroundDispatch, update: Record<string, unknown>): void {
+    const identified = subagentDispatchDeclaresIdentity(update)
+    if (!identified && dispatch.catalogLabelIdentified) return
+    const title = update.title
+    if (!identified && !(typeof title === 'string' && title !== '')) return
+    dispatch.catalogLabel = subagentDispatchLabel(update)
+    dispatch.catalogLabelIdentified = identified
+  }
+
+  /**
+   * A dispatch just reported: tell the turn controller it may move to its
+   * drain phase. The catalog row was already offered by the completing frame.
+   */
+  private noteSessionDispatchProgress(session: LiveSession): void {
+    session.turnController?.onAllDispatchesCompleted()
+  }
+
+  /**
+   * Bound the session map. Terminal rows are history for the record view (the
+   * detail read uses the transcript, not this map), so evicting the oldest
+   * finished one keeps a long-lived conversation from growing without limit.
+   */
+  private pruneSessionDispatches(dispatches: Map<string, BackgroundDispatch>): void {
+    if (dispatches.size <= MAX_SUBAGENT_RECORDS) return
+    for (const [id, dispatch] of dispatches) {
+      if (dispatch.terminal !== undefined) {
+        dispatches.delete(id)
+        return
+      }
+    }
+  }
+
+  /**
+   * Terminalize every unfinished dispatch of a SESSION that goes away
+   * (close / release / force reset / process death), or of a turn the user
+   * cancelled / that failed. A normal stop is not one of these: its worker may
+   * still be running (see `LiveSession.backgroundDispatches`).
+   */
+  terminalizeSessionDispatches(
+    session: LiveSession,
+    status: 'cancelled' | 'unknown',
+    onlyIds?: ReadonlySet<string>,
+  ): void {
+    const dispatches = session.backgroundDispatches
+    const dshSessionId = session.dshSessionId
+    if (dispatches === undefined) return
+    const now = Date.now()
+    const records: SubagentRecord[] = []
+    for (const dispatch of dispatches.values()) {
+      if (onlyIds !== undefined && !onlyIds.has(dispatch.toolCallId)) continue
+      if (dispatch.terminal !== undefined) continue
+      dispatch.terminal = status
+      dispatch.endedAt = now
+      dispatch.reportedStatus = status
+      if (dshSessionId !== undefined) records.push(this.dispatchRecord(dispatch, dshSessionId))
+    }
+    if (records.length === 0) return
+    this.noteSubagentRecords(records, { announce: true, persist: true })
   }
 
   /**
@@ -11265,19 +11457,17 @@ export class BridgeManager {
             session.quotaRefusal = undefined
             this.hub.broadcast({ type: 'session/meta', sessionId: session.sessionId, session: snapshot(session) })
           }
-          // A DETACHED-WORKER HOLD: this turn's `Agent` call handed real work
-          // to a background worker that has not produced its answer yet, yet
-          // the agent answered the prompt normally (CodeBuddy says "已派…" and
-          // ends its own turn). Closing here loses the only answer the turn
-          // will ever produce — the worker's report streams into this same
-          // session later, as a background drain. Hold the turn open until
-          // every dispatch reports and the drain goes quiet (see
-          // `holdForBackgroundDispatch`); the prompt slot is released there.
+          // A DETACHED-WORKER DRAIN: every dispatched worker already reported
+          // and the drain that carries its report is imminent, so keep this
+          // turn open for that last window (see `holdForBackgroundDispatch`).
+          // A worker STILL RUNNING does NOT hold the turn: the user keeps
+          // talking, and the worker's report lands in the transcript / NTR
+          // view when it finishes (CodeBuddy's own "已派…" answer closes here).
           //
           // The decision comes BEFORE `adoptTurnRequestId`: adopting the id
           // would clear the updates the drain streamed while this turn's own id
           // was unknown, and those are exactly the ones the hold must fold.
-          const holdDispatch = controller.dispatchedDetachedWorker
+          const holdDispatch = controller.detachedHoldWanted(this.tuning.backgroundHoldWorkerPhase === true)
             && !session.released
             && !session.closed
             && result.stopReason !== 'cancelled'

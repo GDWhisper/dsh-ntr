@@ -8748,6 +8748,9 @@ describe('a turn that dispatched a detached worker (isolated manager)', () => {
       backgroundTaskToolMs: 8_000,
       // The parked case delays the host's next step by 100ms on purpose.
       backgroundParkedGraceMs: 1_000,
+      // These cases pin the LEGACY worker-phase hold; the product default
+      // closes the turn at the response so the user keeps talking.
+      backgroundHoldWorkerPhase: true,
     },
   )
   const dispatchAdapter = new AcpLlmAdapter(dispatchManager)
@@ -9119,17 +9122,17 @@ describe('a turn that dispatched a detached worker (isolated manager)', () => {
     expect(dispatchText(firstResult.chunks)).not.toContain('DISPATCH-FINAL-ANSWER')
 
     // The superseded controller was disposed by the successor's
-    // `rememberTurnStream`, and that teardown owns the record half: its
-    // still-open dispatch must end terminal (`unknown` — a retired turn is no
-    // evidence the worker stopped) or the panel keeps a row running forever.
+    // `rememberTurnStream`. Its worker now belongs to the SESSION (see
+    // `LiveSession.backgroundDispatches`), so its record keeps moving on its
+    // own: still running, or `completed` once it reports — never `unknown`,
+    // because retiring the turn is no evidence the worker stopped.
     const records = dispatchEvents
       .slice(since)
       .filter((event): event is Extract<AcpEvent, { type: 'subagents/record' }> =>
         event.type === 'subagents/record' && event.record.childId === 'acp:agent_dispatch')
       .map(event => event.record)
     expect(records.length).toBeGreaterThan(0)
-    expect(records.at(-1)?.status).toBe('unknown')
-    expect(records.at(-1)?.endedAt).toBeDefined()
+    expect(['running', 'completed']).toContain(records.at(-1)?.status)
     expect(unexpectedSubagentFrames(dispatchEvents, since)).toEqual([])
 
     // Nothing gave the conversation back: the session and its transcript live.
@@ -9372,6 +9375,203 @@ describe('a turn that dispatched a detached worker (isolated manager)', () => {
 })
 
 /**
+ * The DEFAULT detached-worker behaviour: the prompt response closes the turn,
+ * so the composer is free while the worker runs. The worker's own record still
+ * moves (it belongs to the SESSION), and its report lands in the transcript /
+ * NTR view instead of being folded into the closed bubble.
+ *
+ * The idle clock must see that pending work: releasing the agent here would
+ * kill the worker before it can report.
+ */
+describe('a detached worker settles the turn at the response (isolated manager)', () => {
+  const settleWorkspace = `${tmpdir()}/dsh-ntr-settle-workspace`
+  mkdirSync(settleWorkspace, { recursive: true })
+  const settleHub = new EventHub()
+  const settleEvents: AcpEvent[] = []
+  settleHub.subscribe(event => { settleEvents.push(event) })
+  const settleManager = new BridgeManager(
+    [{ ...def, id: 'settle', cwd: settleWorkspace, allowedCwdRoots: [settleWorkspace] }],
+    settleHub,
+    500,
+    undefined,
+    undefined,
+    false,
+    {
+      startupTimeoutMs: 3_000,
+      cancelFallbackMs: 100,
+      ambientQuietMs: 250,
+      idleTimeoutMs: 400,
+      ambientStaleMs: 2_000,
+    },
+  )
+  const settleAdapter = new AcpLlmAdapter(settleManager)
+
+  afterAll(async () => {
+    await settleManager.shutdownAll()
+  })
+
+  function settleText(chunks: StreamChunk[]): string {
+    return chunks
+      .filter((chunk): chunk is Extract<StreamChunk, { type: 'text-delta' }> => chunk.type === 'text-delta')
+      .map(chunk => chunk.text)
+      .join('')
+  }
+
+  function settleRecords(since: number): SubagentRecord[] {
+    return settleEvents
+      .slice(since)
+      .filter((event): event is Extract<AcpEvent, { type: 'subagents/record' }> => event.type === 'subagents/record')
+      .map(event => event.record)
+      .filter(record => record.childId === 'acp:agent_dispatch')
+  }
+
+  /** A manager of its own, so a previous case's ambient record cannot mask the idle clock. */
+  function idleHarness(tuning: {
+    backgroundTaskToolMs?: number
+    backgroundOpenToolCeilingMs?: number
+  }): { manager: BridgeManager; events: AcpEvent[]; adapter: AcpLlmAdapter } {
+    const hub = new EventHub()
+    const events: AcpEvent[] = []
+    hub.subscribe(event => { events.push(event) })
+    const manager = new BridgeManager(
+      [{ ...def, id: 'settle', cwd: settleWorkspace, allowedCwdRoots: [settleWorkspace] }],
+      hub,
+      500,
+      undefined,
+      undefined,
+      false,
+      {
+        startupTimeoutMs: 3_000,
+        cancelFallbackMs: 100,
+        ambientQuietMs: 250,
+        idleTimeoutMs: 400,
+        ambientStaleMs: 2_000,
+        ...tuning,
+      },
+    )
+    return { manager, events, adapter: new AcpLlmAdapter(manager) }
+  }
+
+  function recordStatus(events: AcpEvent[], since: number): string[] {
+    return events
+      .slice(since)
+      .filter((event): event is Extract<AcpEvent, { type: 'subagents/record' }> => event.type === 'subagents/record')
+      .map(event => event.record)
+      .filter(record => record.childId === 'acp:agent_dispatch')
+      .map(record => record.status)
+  }
+
+  it('closes at the response, then finishes the worker record from the session', async () => {
+    const dshSessionId = 'dsh-settle-default'
+    const since = settleEvents.length
+    const { chunks } = await hostLoopTurn(settleAdapter, {
+      provider: 'acp',
+      model: 'settle',
+      sessionId: dshSessionId,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'DISPATCH please' }] }],
+    })
+    const text = settleText(chunks)
+
+    // The coordinator's ack is the whole answer of this turn: the drain's
+    // final answer is NOT folded into a bubble that already closed.
+    expect(text).toContain('DISPATCH-ACK')
+    expect(text).not.toContain('DISPATCH-FINAL-ANSWER')
+    expect(text).not.toContain('WORKER-REPORT-TEXT')
+
+    // A `turn/end` fired at the response: this mock's worker reports on its
+    // own clock, so the record may finish before or after this assertion.
+    const ends = settleEvents.slice(since).filter(event => event.type === 'turn/end')
+    expect(ends).toHaveLength(1)
+
+    // The record still moves after the turn closed: the SESSION owns it.
+    await until(() => settleRecords(since).some(record => record.status === 'completed'), 10_000)
+  }, 30_000)
+
+  it('keeps the process alive while the worker runs, then releases it once it reports', async () => {
+    const { manager, events, adapter } = idleHarness({})
+    try {
+      const dshSessionId = 'dsh-settle-idle'
+      const since = events.length
+      const { chunks } = await hostLoopTurn(adapter, {
+        provider: 'acp',
+        model: 'settle',
+        sessionId: dshSessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'DISPATCHKEEPALIVE please' }] }],
+      })
+      expect(settleText(chunks)).toContain('DISPATCH-ACK')
+
+      // The idle window is 400ms. The worker is still reporting well past it.
+      await new Promise(resolve => setTimeout(resolve, 1_200))
+      expect(events.slice(since).some(event => event.type === 'session/released')).toBe(false)
+
+      // Once it reports (and its drain goes quiet), the idle clock may release.
+      await until(() => recordStatus(events, since).includes('completed'), 10_000)
+      await until(() => events.slice(since).some(event => event.type === 'session/released'), 8_000)
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
+  it('extends the alive window while the worker is inside an open tool call', async () => {
+    const { manager, events, adapter } = idleHarness({
+      backgroundTaskToolMs: 600,
+      backgroundOpenToolCeilingMs: 5_000,
+    })
+    try {
+      const dshSessionId = 'dsh-settle-open-tool'
+      const since = events.length
+      const { chunks } = await hostLoopTurn(adapter, {
+        provider: 'acp',
+        model: 'settle',
+        sessionId: dshSessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'DISPATCHLONGTOOL please' }] }],
+      })
+      expect(settleText(chunks)).toContain('DISPATCH-ACK')
+
+      // Wait until the worker's tool call has actually opened, then hold for
+      // longer than the plain silence window.
+      await until(() => recordStatus(events, since).includes('running'), 2_000)
+      // The worker opens its Bash call and says nothing for 2.5s: far past the
+      // 600ms silence window, still inside the 5s open-tool ceiling.
+      await new Promise(resolve => setTimeout(resolve, 1_200))
+      expect(events.slice(since).some(event => event.type === 'session/released')).toBe(false)
+
+      await until(() => recordStatus(events, since).includes('completed'), 10_000)
+      await until(() => events.slice(since).some(event => event.type === 'session/released'), 8_000)
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
+  it('releases a worker whose open tool call passes the wedged ceiling', async () => {
+    const { manager, events, adapter } = idleHarness({
+      backgroundTaskToolMs: 600,
+      backgroundOpenToolCeilingMs: 800,
+    })
+    try {
+      const dshSessionId = 'dsh-settle-wedged-tool'
+      const since = events.length
+      const { chunks } = await hostLoopTurn(adapter, {
+        provider: 'acp',
+        model: 'settle',
+        sessionId: dshSessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'DISPATCHULTRALONGTOOL please' }] }],
+      })
+      expect(settleText(chunks)).toContain('DISPATCH-ACK')
+
+      // The call opens early and stays open for 10s; past 800ms the worker is
+      // presumed wedged, so the idle clock releases it long before completion.
+      // The teardown then writes `unknown`, proving this was the wedged path.
+      await until(() => recordStatus(events, since).includes('running'), 2_000)
+      await until(() => recordStatus(events, since).includes('unknown'), 5_000)
+      expect(events.slice(since).some(event => event.type === 'session/released')).toBe(true)
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+})
+
+/**
  * The plugin-owned lifecycle record for external workers: six states derived
  * from the wire, terminal rows persisted in `agents.json` on TRANSITIONS only,
  * and a snapshot carried on `session/chat-list` for live AND released sessions.
@@ -9399,6 +9599,9 @@ describe('external subagent lifecycle records (isolated manager)', () => {
       backgroundTaskMaxMs: 1_500,
       backgroundTaskToolMs: 8_000,
       backgroundParkedGraceMs: 1_000,
+      // These cases pin the LEGACY worker-phase hold; the product default
+      // closes the turn at the response so the user keeps talking.
+      backgroundHoldWorkerPhase: true,
     },
   )
   const recordAdapter = new AcpLlmAdapter(recordManager)

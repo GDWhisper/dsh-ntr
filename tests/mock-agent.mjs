@@ -640,6 +640,9 @@ const app = agent({ name: 'mock-acp-agent' })
       // emits nothing for longer than the client's SHORT worker silence
       // window. The open call alone must move the wait to the long tier.
       const longTool = text.includes('DISPATCHLONGTOOL')
+      // An open tool call that outlives any test-scale ceiling: the worker is
+      // presumed wedged and the idle clock may release it before it finishes.
+      const ultraLongTool = text.includes('DISPATCHULTRALONGTOOL')
       // The real first send omits `rawInput` (repl display) AND the title, so
       // its only label source is `_meta.toolName`. The identity arrives later,
       // on the result frame's `_meta` — the shape this variant pins.
@@ -747,7 +750,7 @@ const app = agent({ name: 'mock-acp-agent' })
           status: 'in_progress',
           rawInput: { command: 'rg TODO src' },
         }, id, parent)
-        await sleep(longTool ? 2_500 : slow ? 400 : 60)
+        await sleep(ultraLongTool ? 10_000 : longTool ? 2_500 : slow ? 400 : 60)
         await sendWorker({
           sessionUpdate: 'tool_call_update',
           toolCallId,

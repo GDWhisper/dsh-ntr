@@ -289,6 +289,25 @@ block-end 会把整包 `arguments` 落到 `args.settle`），而消息落定、�
 `tests/bridge.spec.ts` 的「replaces an early-settled card with a late restatement」，
 mock marker `LATECARD`。
 
+**派发即收口（2026-11-08，现行）**：CodeBuddy 的 detached worker 不再把主回合按在
+worker 阶段。`streamPrompt` 的响应一到就收口：主聊天只留「已派…」，输入框解锁，
+用户可以继续说话；worker 的完成帧、`subagents/record` 与 catalog 上报仍由会话级
+`LiveSession.backgroundDispatches` 跟踪（`BridgeManager.trackSessionBackgroundDispatch`），
+报告进 transcript / NTR 视图。只有「本回合所有 dispatch 已完成、drain 即将到来」这
+最后一小段仍走 `holdForBackgroundDispatch`；内部 tuning 键 `backgroundHoldWorkerPhase: true`
+恢复旧的整段 hold（代价是 worker 运行期间锁输入）。
+
+空闲释放必须看见这些后台工作：未终态且最近有活动的 dispatch 与 `ambientStaleMs` 内
+活跃的 drain 都让 `hasActiveWork` 为真，绝不杀还有 worker 在跑的进程。若 dispatch
+**有未闭合的 worker tool call**，按工具打开时刻给 `backgroundOpenToolCeilingMs`
+（默认 120 分钟，`0` = 不限）的宽限，期间无帧也算活跃；任一工具在宽限内即算活，
+全部超限后回落最近活动判定。没有打开工具时，静默超过 `backgroundTaskToolMs`
+（默认 40 分钟，`0` 回落 `backgroundTaskMaxMs`）才允许释放（否则永不报告 worker
+会永久钉住进程）。「允许释放」不等于立刻释放：真正释放发生在下一次空闲检查（默认
+多等一个窗口），拆除路径把它标 `unknown`。worker 终态且 drain 过期后时钟同样恢复。
+回归用例：`tests/bridge.spec.ts` 的「a detached worker settles the turn at the response」
+与两个 open-tool 用例。
+
 **同一轮的性能改造**（用户报告：流式期间整机卡顿、时钟跳跃）。排查结论：
 宿主端逐 chunk 成本是 O(1)（广播 + 每连接一次 stringify），压力主因在
 浏览器端**每条 SSE chunk 一次「数组复制 + 全 state 重建 + 所有订阅组件
