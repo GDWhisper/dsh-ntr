@@ -103,7 +103,7 @@ ACP `session/request_permission` 原样映射：选项列表 / 名称 / 顺序 /
 | 部署基线 | `cordis.patch.yml` 的 `config` | 宿主入口在 `apply()` 里把**原始**值交给 manager（`setConfiguredApprovalDeadlines`）——`validateConfig` 已把默认值填满，分不出「文件写了 600000」和「文件没写、300000 是内置默认」，而卡片必须能区分：前者是重置按钮的去处，后者不是 |
 | 内置默认 | `DEFAULT_TUNING`（300_000 / `wait`） | 两层都没说时的值 |
 
-- **热应用**：`BridgeManager.applyDeadlineTuning` 改写自己持有的 tuning 并逐个调
+- **热应用**：`SettingsService.applyDeadlineTuning` 改写 manager 持有的 tuning 并逐个调
   `AgentBridge.applyApprovalDeadlines`。两个字段因此不是 `readonly`——它们每次询问时读取，
   改写对之后的询问立即生效。**已启动的定时器不重排**：正在决定中的人不该被移动球门。
 - **持久化**：写进 `agents.json`（与 `tagHalo` / `conversations` 同一个文件），每次启动重新过
@@ -181,7 +181,7 @@ to the config file"、"adopts a deadline the settings page writes while a sessio
 | 对话审批卡 | `src/client/permission-dock.tsx` · `PermissionDock`；`src/client/index.tsx` · `conversation.input.dock` 注册；`src/client/store.ts` · `permissionsForSession` / `deadlineRemainingLabel` |
 | 重连重放 | `src/impl.ts` · `permissionRequestFrame` / `permissionReplayFrames` / `PermissionLedger.pendingViews`；`src/index.ts` · `/api/acp/stream` |
 | 超时收场 | `src/bridge/agent-bridge.ts` · `announceExpiredAsk` / `settleExpiredAsk`；`src/bridge/turn-stream.ts` · `TurnStreamController.expiredLine` / `permissionLine`；`src/impl.ts` · `pickAutoOption` / `AUTO_OPTION_KIND_PRIORITY` |
-| 期限与模式热改 | `src/bridge/manager.ts` · `approvalDeadlines` / `setApprovalDeadlines` / `setConfiguredApprovalDeadlines` / `applyDeadlineTuning`；`src/bridge/agent-bridge.ts` · `AgentBridge.applyApprovalDeadlines`；`src/impl.ts` · `validateApprovalDeadlines` / `validateApprovalDeadlineMs` / `validatePermissionTimeoutMode`；`src/index.ts` · `apply()` 的原始配置透传 |
+| 期限与模式热改 | `src/bridge/settings-service.ts` · `approvalDeadlines` / `setApprovalDeadlines` / `setConfiguredApprovalDeadlines` / `applyDeadlineTuning`；`src/bridge/agent-bridge.ts` · `AgentBridge.applyApprovalDeadlines`；`src/impl.ts` · `validateApprovalDeadlines` / `validateApprovalDeadlineMs` / `validatePermissionTimeoutMode`；`src/index.ts` · `apply()` 的原始配置透传 |
 | 期限 UI | `src/client/panel.tsx` · `ApprovalDeadlinesCard` / `DeadlineModeBlock` / `DeadlineSliderBlock` / `deadlineSliderIndex` / `modeText` / `deadlineText` / `approvalDeadlineFacts`；`src/client/store.ts` · `setApprovalDeadline` / `setApprovalTimeoutMode` / `resetApprovalDeadlines` |
 | fs 围栏 | `src/bridge/agent-bridge.ts` · `handleFsWrite` / `guardFsPath`；`src/impl.ts` · `resolveFsPath` |
 | 设置页镜像 | `src/client/panel.tsx` · `permissionLedgerCard` |
