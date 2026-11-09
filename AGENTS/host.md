@@ -64,14 +64,14 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 |---|---|---|---|
 | 1 | bundle patch / preset | `dsh.bundle.patch`；`@deepseek-ai/dsh-agent-preset` 的 `config.{id,name,description,order,plugins}`；`persona` 的 `complete` / `includeRuntimeContext`；插件名按 profile 基准解析 | `package.json`、`presets/acp/acp.patch.yml` |
 | 2 | Cordis 入口与服务 | 具名 `name` / `inject` / `apply`；`ctx.connection.register(owner, '/acp', …)`；`ctx.connection.fetch.register({ path, methods, fetch })`，path 必须是 `/api/…` 完整路径；可选服务 `ctx.get` / `ctx.inject` | `src/index.ts` |
-| 3 | LLM adapter | `ctx.llm.registerAdapter(['acp'], …)`；`LlmAdapter` 的 `providerInfo` / `providerRetryPolicy` / `imageRequestPricing` / `listModels` / `resolveModel` / `prepareCall` / `stream`（前三个在注册 / 计费路径被无条件调用）；`GenerateOptions`（`sessionId` / `messages` / `model` / `purpose` / `signal`）；`StreamChunk` 词表 | `src/bridge.ts` · `AcpLlmAdapter` / `streamPrompt` |
+| 3 | LLM adapter | `ctx.llm.registerAdapter(['acp'], …)`；`LlmAdapter` 的 `providerInfo` / `providerRetryPolicy` / `imageRequestPricing` / `listModels` / `resolveModel` / `prepareCall` / `stream`（前三个在注册 / 计费路径被无条件调用）；`GenerateOptions`（`sessionId` / `messages` / `model` / `purpose` / `signal`）；`StreamChunk` 词表 | `src/bridge/adapter.ts` · `AcpLlmAdapter`；`src/bridge/manager.ts` · `streamPrompt` |
 | 4 | 路由与步进 seam | `agent.model.select/current`；`agent/inbox/inserted` / `claimed` 与 `preStep` 取路由的先后；`agent/request` waterfall（仅老宿主）；`agent/pre-step` 的 decision 形状与 waterfall 顺序；**`decision.messages` 只是本步 inbox 认领 + loop 自己的 runtime-context 投影，不是请求消息**（adapter 拿到的 `GenerateOptions.messages` 来自 `session.deriveMessages()`，即整份 transcript）；工具结果**不进** next-step inbox（loop 只 stage 工具自己的 `additionalContexts`）；`step()` 无条件追加自己那份 runtime-context 投影，闸门剥不掉它，只能决定它的位置 | `presets/acp/acp-guard.mjs` · `selectBoundRoute` / 闸门 / 改写 |
 | 5 | 工具卡执行 | `tools/execute` 的 `{ name, agent, callId }`；`ctx.tools.get(name, agent)` / `register(def)`；`message.source.kind === 'tool'` 与 `callId` | `presets/acp/acp-guard.mjs` |
 | 6 | 会话事实 | `agent-preset/selected` 事件；`sessions.get` 的 `events`；`sessionPersistence.open` 的 `header`（冷会话 preset）；`agentPresets.list` | `src/index.ts` · `wireAcpMode` / `wirePresetRoster`；`src/impl.ts` · `sessionAgentPreset` |
 | 7 | 浏览器槽位与宿主原语 | `conversation.input.model` / `left` / `overlay` / `dock`、`conversation.view`、`conversation.composer.dock`、`conversation.chat.assistant-actions`、`shell.overlay`；projection `agentPreset`；`ctx.slots.inject` / `entriesOfSlot` / `uiSession.adapter.current`；`sessions.fork` 与 `remote.$on('agent-preset/selected')` | `src/client/` |
 | 8 | 插件管理 / 更新 | `pluginManager.listBundles()` / `registries()` / `installBundle()`；packument | `src/update.ts` |
 | 9 | 子代理目录投影 | `conversation.session.header.actions` 的 list 条目 id `subagent-catalog`（宿主组件 + `inject` 的 `openChild` / `openChildAside` / `refreshProjection` + `locale` / `order`）；`useSessions(s => s.projectionsBySession)` → `[sessionId].values.subagentCatalog`（数组，每行 `{ id, createdAt?, label?, mode: 'external' }`）；`useSessionStatus` 原样透传 | `src/client/subagent-activity.tsx` · `createSubagentCatalogClaim` / `SubagentCatalogOccupant`；`src/client/subagent-panel.tsx` · `readSubagentCatalogProjection` / `OwnSubagentCatalog` / `SubagentDetailDialog` |
-| 10 | 持久消息来源（V4） | `dsh-session-persistence-jsonl` 的 `assertV4MessageSources`：解释性消息槽要求 `source.kind` 非空且不是 `plugin`（旧 V3 `plugin` 只在迁移时改写成 `plugin:<name>`）；`form: 'notice'` 的 `summary` 是宿主上下文行的一行摘要，缺失时界面退回 opaque 字段列表 | `src/bridge.ts` · `wakeChatWithBackgroundReport` / `BACKGROUND_REPORT_SOURCE` / `BACKGROUND_REPORT_FORM`；`presets/acp/acp-guard.mjs` · `isBackgroundWake` |
+| 10 | 持久消息来源（V4） | `dsh-session-persistence-jsonl` 的 `assertV4MessageSources`：解释性消息槽要求 `source.kind` 非空且不是 `plugin`（旧 V3 `plugin` 只在迁移时改写成 `plugin:<name>`）；`form: 'notice'` 的 `summary` 是宿主上下文行的一行摘要，缺失时界面退回 opaque 字段列表 | `src/bridge/manager.ts` · `wakeChatWithBackgroundReport`；`src/bridge/registries.ts` · `BACKGROUND_REPORT_SOURCE` / `BACKGROUND_REPORT_FORM`；`presets/acp/acp-guard.mjs` · `isBackgroundWake` |
 
 非宿主面：ACP 协议与 `session/update` 词表在 `@agentclientprotocol/sdk`，升级依赖时看 SDK 类型，不走本表。
 
@@ -121,5 +121,5 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 |---|---|
 | 通道 | `src/index.ts` · `/acp` 注册处 / `ChannelRegisteringConnection` |
 | 服务探测 | `src/index.ts` · `wireWorkspace` / `wirePresetRoster` |
-| preset | `presets/acp/acp.patch.yml`；`package.json` · `dsh.bundle.patch` / `exports`；`src/impl.ts` · `acpPresetStatusFromRoster` / `ACP_PRESET_SOURCE`；`src/bridge.ts` · `setPresetRosterReader` / `presetStatus` |
-| 模型层 abstain | `src/bridge.ts` · `AcpLlmAdapter.listModels` |
+| preset | `presets/acp/acp.patch.yml`；`package.json` · `dsh.bundle.patch` / `exports`；`src/impl.ts` · `acpPresetStatusFromRoster` / `ACP_PRESET_SOURCE`；`src/bridge/manager.ts` · `setPresetRosterReader` / `presetStatus` |
+| 模型层 abstain | `src/bridge/adapter.ts` · `AcpLlmAdapter.listModels` |

@@ -177,12 +177,12 @@ to the config file"、"adopts a deadline the settings page writes while a sessio
 
 | 主题 | 位置 |
 |---|---|
-| 权限请求处理 | `src/bridge.ts` · `handlePermissionRequest` / `permissionToolName` / `permissionAskReason` |
+| 权限请求处理 | `src/bridge/agent-bridge.ts` · `handlePermissionRequest`；`src/bridge/turn-stream.ts` · `permissionToolName`；`src/bridge/shape.ts` · `permissionAskReason` |
 | 对话审批卡 | `src/client/permission-dock.tsx` · `PermissionDock`；`src/client/index.tsx` · `conversation.input.dock` 注册；`src/client/store.ts` · `permissionsForSession` / `deadlineRemainingLabel` |
 | 重连重放 | `src/impl.ts` · `permissionRequestFrame` / `permissionReplayFrames` / `PermissionLedger.pendingViews`；`src/index.ts` · `/api/acp/stream` |
-| 超时收场 | `src/bridge.ts` · `announceExpiredAsk` / `settleExpiredAsk` / `TurnStreamController.expiredLine` / `permissionLine`；`src/impl.ts` · `pickAutoOption` / `AUTO_OPTION_KIND_PRIORITY` |
-| 期限与模式热改 | `src/bridge.ts` · `approvalDeadlines` / `setApprovalDeadlines` / `setConfiguredApprovalDeadlines` / `applyDeadlineTuning` / `AgentBridge.applyApprovalDeadlines`；`src/impl.ts` · `validateApprovalDeadlines` / `validateApprovalDeadlineMs` / `validatePermissionTimeoutMode`；`src/index.ts` · `apply()` 的原始配置透传 |
+| 超时收场 | `src/bridge/agent-bridge.ts` · `announceExpiredAsk` / `settleExpiredAsk`；`src/bridge/turn-stream.ts` · `TurnStreamController.expiredLine` / `permissionLine`；`src/impl.ts` · `pickAutoOption` / `AUTO_OPTION_KIND_PRIORITY` |
+| 期限与模式热改 | `src/bridge/manager.ts` · `approvalDeadlines` / `setApprovalDeadlines` / `setConfiguredApprovalDeadlines` / `applyDeadlineTuning`；`src/bridge/agent-bridge.ts` · `AgentBridge.applyApprovalDeadlines`；`src/impl.ts` · `validateApprovalDeadlines` / `validateApprovalDeadlineMs` / `validatePermissionTimeoutMode`；`src/index.ts` · `apply()` 的原始配置透传 |
 | 期限 UI | `src/client/panel.tsx` · `ApprovalDeadlinesCard` / `DeadlineModeBlock` / `DeadlineSliderBlock` / `deadlineSliderIndex` / `modeText` / `deadlineText` / `approvalDeadlineFacts`；`src/client/store.ts` · `setApprovalDeadline` / `setApprovalTimeoutMode` / `resetApprovalDeadlines` |
-| fs 围栏 | `src/bridge.ts` · `handleFsWrite` / `guardFsPath`；`src/impl.ts` · `resolveFsPath` |
+| fs 围栏 | `src/bridge/agent-bridge.ts` · `handleFsWrite` / `guardFsPath`；`src/impl.ts` · `resolveFsPath` |
 | 设置页镜像 | `src/client/panel.tsx` · `permissionLedgerCard` |
 | 权限座位 | `src/client/model-seat.tsx` · `createPermissionSeatClaim` |

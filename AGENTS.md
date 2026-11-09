@@ -33,7 +33,7 @@
 
 ### 配置、目录与状态（7–9、21、27、28、32）
 
-7. **agent 定义必须过 `validateAgentDef` / `saveAgent`**：严格校验 command / id / args，自动施加 `allowedCwdRoots`；默认工作区取 `defaultAgentWorkspace()`，**严禁把 `process.cwd()` 塞进 roots**（宿主启动目录可能是 `$HOME`）。预设 `AGENT_PRESETS`（bridge.ts）与 `DEFAULT_KNOWN_PRESETS`（client/store.ts）是手拷贝，必须同步。→ [state.md §2](./AGENTS/state.md)
+7. **agent 定义必须过 `validateAgentDef` / `saveAgent`**：严格校验 command / id / args，自动施加 `allowedCwdRoots`；默认工作区取 `defaultAgentWorkspace()`，**严禁把 `process.cwd()` 塞进 roots**（宿主启动目录可能是 `$HOME`）。预设 `AGENT_PRESETS`（bridge/state-paths.ts）与 `DEFAULT_KNOWN_PRESETS`（client/store.ts）是手拷贝，必须同步。→ [state.md §2](./AGENTS/state.md)
 8. **【旧隔离前提已退役】ACP 模型不进 DSH 模型目录，模型面只走 `agent/catalog`**：`listModels('acp')` 返回空。`agent/catalog` 纯内存、**绝不 spawn**；探测只允许三种有手势来源（设置页按钮或模型菜单「刷新目录」/ 该 agent 自己的 session new·load / 旧缓存被顺带修好）；变体按需、`exposedModels` 只做可见性过滤、目录变化必须广播 `catalog/updated`。→ [state.md §4](./AGENTS/state.md)
 9. **可见性筛选走轻量 RPC**：`agent/set-exposed-models` / `set-auto-discover-models` 原地改、不重启进程（`agent/save` 会杀全部活动会话）；自动发现只追加「相对上一份目录新增」的模型；任何变更都广播 `agent/exposure`。→ [state.md §5](./AGENTS/state.md)
 21. **NTR preset 只能由 bundle patch 声明**：`package.json` 的 `dsh.bundle.patch` + `presets/acp/acp.patch.yml`。**严禁**再往 `~/.dsh/.agent-presets/` 复制文件，**严禁**新增「安装 / 修复 preset」入口；声明内插件名按 profile 基准解析，本地插件只能经包名子路径 `dsh-ntr/acp-guard` 引用；面板读宿主 roster。→ [host.md §2](./AGENTS/host.md)
@@ -98,7 +98,7 @@
 
 ## 常见任务配方
 
-- **新增 / 修改 ACP RPC**：`src/protocol.ts` 加契约 → `src/impl.ts` 加进 `AcpManager` 并在 `dispatchRpc` 路由 + 校验 → `src/bridge.ts` 实现调度 → `src/client/store.ts` 加调用并测状态流转。验证：`npx vitest run tests/impl.spec.ts tests/store.spec.ts`。
+- **新增 / 修改 ACP RPC**：`src/protocol.ts` 加契约 → `src/impl.ts` 加进 `AcpManager` 并在 `dispatchRpc` 路由 + 校验 → `src/bridge/` 实现调度 → `src/client/store.ts` 加调用并测状态流转。验证：`npx vitest run tests/impl.spec.ts tests/store.spec.ts`。
 - **改 UI 与挂载槽位**：`panel.tsx` / `session-controls.tsx` / `acp-view.tsx` / `permission-dock.tsx` 改组件 → `src/client/index.tsx` 经 `ctx.slots.inject` 管理注册（槽位清单见文件头注释）→ `npx tsdown` 验证 bundle。
 - **扩展配置字段**：`AcpAgentDef` / `AcpPluginConfig`（protocol.ts）→ `validateAgentDef`（会重建对象，新字段必须纳入且 optional）→ `AgentSavePayload` + panel 的 `initialForm` / `buildPayload` / `payloadEquals` 三处同步 → `cordis.patch.yml`。**宿主只校验不改形状**，否则设置页永远判脏、每次保存都重启 agent。
 
@@ -123,7 +123,7 @@
 
 | 文档 | 何时读取 | 何时维护 |
 |---|---|---|
-| [architecture.md](./AGENTS/architecture.md) | 改消息走向、会话绑定、工作区、preset 外壳、agent 锁定、默认 agent，或要目录 / 术语索引 | 动了 `src/bridge.ts` 的 `streamPrompt` / 绑定 / 锁定、`presets/acp/acp-guard.mjs`、或新增顶层源文件 |
+| [architecture.md](./AGENTS/architecture.md) | 改消息走向、会话绑定、工作区、preset 外壳、agent 锁定、默认 agent，或要目录 / 术语索引 | 动了 `src/bridge/manager.ts` 的 `streamPrompt` / 绑定 / 锁定、`presets/acp/acp-guard.mjs`、或新增顶层源文件 |
 | [protocol.md](./AGENTS/protocol.md) | 改子进程、超时、取消、卡死收口（无活动看门狗）、崩溃恢复、空闲释放、启动命令、会话分叉、ACP 数据折叠 | 动 `AgentBridge` / `BridgeManager` / `TurnStreamController` 的生命周期、超时或 `session/update` 折叠逻辑 |
 | [ui.md](./AGENTS/ui.md) / [conversation-dock.md](./AGENTS/conversation-dock.md) | 改 composer 座位 / 芯片 / 挂牌、mode 控件、NTR 视图、斜杠菜单、消息动作 / 分支按钮；对话内权限卡 / 释放横幅 / 限流横幅读后者 | 动 `src/client/` 的槽位注册、菜单内容或对话面组件 |
 | [ui-panel.md](./AGENTS/ui-panel.md) | 改设置页布局、保存横幅、版本徽标 / 内置更新卡、文案或主题色 | 动 `panel.tsx`、`save-guard-toast.tsx`、`locale.*` 或 CSS token |

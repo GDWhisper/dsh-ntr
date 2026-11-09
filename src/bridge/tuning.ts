@@ -1,0 +1,26 @@
+import type { BridgeTuning } from './types.ts'
+import { DEFAULT_IDLE_TIMEOUT_MS } from '../protocol.ts'
+
+export const DEFAULT_TUNING: Required<BridgeTuning> = {
+  startupTimeoutMs: 60_000,
+  permissionTimeoutMs: 300_000,
+  permissionTimeoutMode: 'wait',
+  cancelFallbackMs: 15_000,
+  staleCancelRetryDelayMs: 600,
+  staleCancelMaxRetries: 2,
+  turnSettleMs: 5_000,
+  turnStallMs: 600_000,
+  turnStallToolMs: 1_800_000,
+  turnStallTickMs: 30_000,
+  idleTimeoutMs: DEFAULT_IDLE_TIMEOUT_MS,
+  probeIdleTimeoutMs: 300_000,
+  ambientQuietMs: 10_000,
+  ambientMaxMs: 120_000,
+  backgroundTaskMaxMs: 600_000,
+  backgroundTaskToolMs: 2_400_000,
+  backgroundOpenToolCeilingMs: 7_200_000,
+  backgroundTaskCeilingMs: 0,
+  backgroundParkedGraceMs: 30_000,
+  ambientStaleMs: 300_000,
+  backgroundHoldWorkerPhase: false,
+}

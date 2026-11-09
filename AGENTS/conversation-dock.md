@@ -45,4 +45,4 @@ agent 因配额拒绝本轮时，`conversation.input.dock` 的第三条目 `Quot
 |---|---|
 | 权限卡 | `src/client/permission-dock.tsx` · `PermissionDock` / `PermissionAskCard`；`src/client/store.ts` · `permissionsForSession` / `deadlineRemainingLabel`；`src/client/index.tsx` · `acp-permissions` 注册处 |
 | 释放横幅 | `src/client/released-banner.tsx` · `ReleasedBanner` / `releasedBannerVisible`；`src/client/store.ts` · `resumeChatSession` / `withSessionReleased`；`src/client/index.tsx` · `acp-released-banner` 注册处 |
-| 限流横幅 | `src/client/quota-banner.tsx` · `QuotaBanner` / `quotaRefusalMessage`；`src/client/index.tsx` · `acp-quota-banner` 注册处；`src/bridge.ts` · `agentRefusalDetail` / `snapshot` 的 `quotaRefusal` |
+| 限流横幅 | `src/client/quota-banner.tsx` · `QuotaBanner` / `quotaRefusalMessage`；`src/client/index.tsx` · `acp-quota-banner` 注册处；`src/bridge/shape.ts` · `agentRefusalDetail` / `snapshot` 的 `quotaRefusal` |

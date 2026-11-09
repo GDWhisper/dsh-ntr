@@ -98,7 +98,7 @@
    - 注册 `{ prepend: true }`：waterfall 外层后执行，其返回值才是 driver 看到的；harness 自己的 `installModelSelection` 先注册，只有最外层能让绑定赢。
    - 改写丢掉继承的 `reasoningEffort`：那是别的路由的 effort，agent 的思考等级走插件自己的轴，外来 effort 还会撞 adapter 校验。
    - 无绑定的会话回落插件默认 agent；连默认 agent 都没有就不改写（部署默认照旧）。
-   - 绑定注册表经 `globalThis[Symbol.for('dsh-ntr.acp-binding')]` 跨模块实例共享（guard 由 Loader 独立加载，import 不共享）。`ACP_ROUTE_BINDING_KEY`（`src/bridge.ts`）与 guard 的 `BINDING_KEY` 是手拷贝，`tests/register.spec.ts` 断言两侧看到同一个注册表。
+   - 绑定注册表经 `globalThis[Symbol.for('dsh-ntr.acp-binding')]` 跨模块实例共享（guard 由 Loader 独立加载，import 不共享）。`ACP_ROUTE_BINDING_KEY`（`src/bridge/registries.ts`）与 guard 的 `BINDING_KEY` 是手拷贝，`tests/register.spec.ts` 断言两侧看到同一个注册表。
 3. **adapter 自己的复查**（`BridgeManager.streamPrompt`）
    - driver 仍带来旧 agent id（旧 header 回放、guard 未挂载）时，`conversationRouteModel` 的绑定 model 串优先。
    - 材料化的默认 effort（`reasoning.defaultEffort`、`modelDefaultEffort`）不算用户选择，不得回写覆盖：catalog 缓存不随 per-session `set_config_option` 刷新，覆盖会把座位刚选的思考等级静默改回去。
@@ -161,13 +161,13 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 
 | 主题 | 位置 |
 |---|---|
-| 消息选择 / 转发 | `src/impl.ts` · `selectForwardPrompt`；`src/bridge.ts` · `streamPrompt` |
-| 工具卡快照 / delta / 输出注册 | `src/impl.ts` · `acpToolCallFromUpdate` / `acpToolCallDelta` / `acpToolCallArgsOf` / `isFinalToolCallStatus`；`src/bridge.ts` · `recordAcpToolOutput` / `waitForToolOutput`；详见 [protocol.md](./protocol.md) |
-| 绑定 RPC | `src/impl.ts` · `dispatchRpc('session/chat-*')`；`src/bridge.ts` · `bindChatAgent` / `setChatSessionModel` / `setChatSessionEffort` / `setChatSessionMode` |
-| 路由选择 / 老宿主请求改写 | `presets/acp/acp-guard.mjs` · `selectBoundRoute` / `agent/request`；`src/bridge.ts` · `conversationRouteModel` |
-| 工作区 | `src/index.ts` · `wireWorkspace`；`src/bridge.ts` · `chatWorkspaceRoot` / `getOrCreateDshSession` / `doResumeSession` |
-| 锁定 | `src/bridge.ts` · `lockedAgentFor` / `lockChatAgent` / `rollbackFirstTurn` / `provisionalLock` |
-| 默认 agent | `src/bridge.ts` · `defaultAgent` / `setDefaultAgent` |
+| 消息选择 / 转发 | `src/impl.ts` · `selectForwardPrompt`；`src/bridge/manager.ts` · `streamPrompt` |
+| 工具卡快照 / delta / 输出注册 | `src/impl.ts` · `acpToolCallFromUpdate` / `acpToolCallDelta` / `acpToolCallArgsOf` / `isFinalToolCallStatus`；`src/bridge/registries.ts` · `recordAcpToolOutput` / `waitForToolOutput`；详见 [protocol.md](./protocol.md) |
+| 绑定 RPC | `src/impl.ts` · `dispatchRpc('session/chat-*')`；`src/bridge/manager.ts` · `bindChatAgent` / `setChatSessionModel` / `setChatSessionEffort` / `setChatSessionMode` |
+| 路由选择 / 老宿主请求改写 | `presets/acp/acp-guard.mjs` · `selectBoundRoute` / `agent/request`；`src/bridge/manager.ts` · `conversationRouteModel` |
+| 工作区 | `src/index.ts` · `wireWorkspace`；`src/bridge/state-paths.ts` · `chatWorkspaceRoot`；`src/bridge/manager.ts` · `getOrCreateDshSession`；`src/bridge/agent-bridge.ts` · `doResumeSession` |
+| 锁定 | `src/bridge/manager.ts` · `lockedAgentFor` / `lockChatAgent` / `rollbackFirstTurn`；`src/bridge/turn-stream.ts` · `provisionalLock` |
+| 默认 agent | `src/bridge/manager.ts` · `defaultAgent` / `setDefaultAgent` |
 
 ## 目录索引
 
@@ -176,7 +176,7 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 | `src/index.ts` | Cordis 插件宿主入口：挂载 `/acp` RPC 通道与 `/api/acp/stream` SSE 路由，接线可选宿主服务 |
 | `src/protocol.ts` | 前后端共享契约（纯类型）；严禁 Node 专属库或运行时代码 |
 | `src/impl.ts` | 纯宿主端逻辑：配置校验、环境组装（`childEnv`）、路径防越权、Transcript、EventHub、目录解析 |
-| `src/bridge.ts` | 宿主 ↔ ACP 子进程的 stdio 桥：进程、回合、绑定、锁、数据折叠 |
+| `src/bridge/` | 宿主 ↔ ACP 子进程的 stdio 桥：进程、回合、绑定、锁、数据折叠 |
 | `src/skills-scan.ts` | 宿主侧 skill 目录扫描：按 agent 风味（`skillFlavorOf`，`src/impl.ts`）扫 project/global/system 三层目录并解析 SKILL.md，喂给 `agent/skills` RPC（`BridgeManager.agentSkills`，内存 TTL 缓存）；只读文件系统，不 spawn、不落盘 |
 | `src/update.ts` | 内置更新：资格矩阵、registry 探测，把安装委托给宿主 `pluginManager`；不下载、不替换文件、不重启 |
 | `src/client/` | 浏览器 React 扩展：`acp-ui.tsx` 座位共用结构 / 样式 / 菜单壳，`session-controls.tsx` composer 底座，`acp-view.tsx` NTR 视图，`permission-dock.tsx` 对话审批卡，`panel.tsx` 设置页，`model-seat.tsx` 座位 claim，`slash-isolation.ts` 斜杠隔离，`store.ts` 前端状态 |
@@ -189,7 +189,7 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 
 ## 术语
 
-- **Host Half / Browser Half**：DSH 插件双端架构——Node 宿主服务与浏览器 UI 模块。本仓对应 `src/index.ts` + `src/bridge.ts` 与 `src/client/`。
+- **Host Half / Browser Half**：DSH 插件双端架构——Node 宿主服务与浏览器 UI 模块。本仓对应 `src/index.ts` + `src/bridge/` 与 `src/client/`。
 - **Transcript**：宿主为每个会话维护的有界环形缓冲（`transcriptMaxEntries`），用于重连后按 seq 补齐、续跑段补读段间事件。连续同类纯状态 tick（`usage_update`、无 title 的 `session_info_update`、`config_option_update`）就地替换末条：seq 前进、数组不增长、保留最新值；`since()` 的 seq 空洞是正常的，实时 SSE 仍逐帧广播（细节见 [protocol.md §8](./protocol.md)）。
 - **Model Catalog**：`agent/catalog` 下发的 agent 自己的 `model` / `thought_level` 面（`base` + `variants` + `reasoning`）。DSH 自己的模型目录里没有 ACP 条目。
 - **exposedModels**：per-agent 的座位可见性过滤。空 = 只留 `base`；只影响 `agentCatalog` 的变体展开，不影响 `resolveAdapterModel`。细节见 [state.md §5](./state.md)。
