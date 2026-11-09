@@ -2229,7 +2229,7 @@ describe('model catalog (isolated manager)', () => {
     // Served, so the seats keep working across the upgrade…
     expect(stale.agentCatalog('mock')).toMatchObject({ probed: true, currentModel: { value: 'mock-model-a' } })
     // …and marked, so the next real session on this agent knows to rewrite it.
-    expect((stale as unknown as { catalogStale: Set<string> }).catalogStale.has('mock')).toBe(true)
+    expect((stale as unknown as { catalog: { catalogStale: Set<string> } }).catalog.catalogStale.has('mock')).toBe(true)
     // A REAL session publishing its options discharges the mark — this is the
     // repair path, and it costs no process because the session already exists.
     for await (const _ of stale.streamPrompt({
@@ -2237,7 +2237,7 @@ describe('model catalog (isolated manager)', () => {
       sessionId: 'dsh-stale-repair',
       messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
     } as never)) { /* drain */ }
-    expect((stale as unknown as { catalogStale: Set<string> }).catalogStale.has('mock')).toBe(false)
+    expect((stale as unknown as { catalog: { catalogStale: Set<string> } }).catalog.catalogStale.has('mock')).toBe(false)
     await stale.shutdownAll()
   }, 30_000)
 
@@ -6981,8 +6981,8 @@ describe('pre-chat pick persistence (isolated manager)', () => {
       // The catalog the composer reads before this conversation has a session:
       // model B / thought off / temperature high. `session/new` will answer A /
       // high / mid, so a seed that does not happen is visible in the result.
-      const internal = gm as unknown as { catalogs: Map<string, { catalog: AcpAgentCatalog; updatedAt: number }> }
-      internal.catalogs.set('mock', {
+      const internal = gm as unknown as { catalog: { catalogs: Map<string, { catalog: AcpAgentCatalog; updatedAt: number }> } }
+      internal.catalog.catalogs.set('mock', {
         catalog: {
           model: {
             configId: 'model',
@@ -7047,8 +7047,8 @@ describe('pre-chat pick persistence (isolated manager)', () => {
     const hub = new EventHub()
     const gm = new BridgeManager([{ ...def, id: 'mock' }], hub, 500, `${tmpdir()}/acp-displayed-stale-${Date.now()}.json`)
     try {
-      const internal = gm as unknown as { catalogs: Map<string, { catalog: AcpAgentCatalog; updatedAt: number }> }
-      internal.catalogs.set('mock', {
+      const internal = gm as unknown as { catalog: { catalogs: Map<string, { catalog: AcpAgentCatalog; updatedAt: number }> } }
+      internal.catalog.catalogs.set('mock', {
         catalog: {
           model: {
             configId: 'model',
