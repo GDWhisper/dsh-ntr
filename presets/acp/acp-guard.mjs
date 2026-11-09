@@ -17,10 +17,10 @@
  * is its position, not its presence.
  *
  * KEPT SOURCES — AN ALLOW LIST, NOT A DENY LIST: only `user` (the person), `tool`
- * (the loop's own continuity), this plugin's OWN idle-drain wake (the host
- * `plugin` kind naming `dsh-ntr` with the `notice` form — see
- * `isBackgroundWake`), and a message with no `source` at all (the
- * hand-built-request convention the bridge's forward picker uses).
+ * (the loop's own continuity), this plugin's OWN idle-drain wake (source kind
+ * `dsh-ntr` with the `notice` form — see `isBackgroundWake`), and a message
+ * with no `source` at all (the hand-built-request convention the bridge's
+ * forward picker uses).
  * Everything else the harness contributes is context by construction: its
  * identity, the AGENTS.md digest (`agent-instructions`), the skill catalog, the
  * runtime snapshot (`runtime-context` — the host's own constant, NOT `plugin`),
@@ -158,18 +158,19 @@ function collisionResult(execName) {
 
 /**
  * The host `source` of the plugin's IDLE-DRAIN WAKE message — hand-copies of
- * `BACKGROUND_REPORT_SOURCE` / `BACKGROUND_REPORT_PLUGIN` /
- * `BACKGROUND_REPORT_FORM` in src/bridge.ts (this row is a separate module
- * instance the Loader mounts without imports, same discipline as the reserved
- * tool name). The bridge injects one such user message when a background drain
- * finished while no chat turn owned it; the adapter answers it LOCALLY with
- * the drained report (no ACP prompt). It uses the host's declared `plugin` kind
- * (a custom kind would have to pass the host's durable-message validation) plus
- * this plugin's name and the `notice` form, and the chat renders it as injected
+ * `BACKGROUND_REPORT_SOURCE` / `BACKGROUND_REPORT_FORM` in src/bridge.ts (this
+ * row is a separate module instance the Loader mounts without imports, same
+ * discipline as the reserved tool name). The bridge injects one such user
+ * message when a background drain finished while no chat turn owned it; the
+ * adapter answers it LOCALLY with the drained report (no ACP prompt).
+ *
+ * The kind must be PRODUCER-OWNED: DSH's V4 session format refuses the retired
+ * catch-all `'plugin'` kind in every durable message slot ("format v4 message
+ * requires a producer-owned source kind"). The wake therefore uses this
+ * plugin's own kind plus the `notice` form, and the chat renders it as injected
  * context — never as the person's own message.
  */
-const BACKGROUND_REPORT_SOURCE = 'plugin'
-const BACKGROUND_REPORT_PLUGIN = 'dsh-ntr'
+const BACKGROUND_REPORT_SOURCE = 'dsh-ntr'
 const BACKGROUND_REPORT_FORM = 'notice'
 
 /**
@@ -185,14 +186,14 @@ const KEPT_SOURCES = new Set(['user', 'tool'])
 
 /**
  * Whether this message is the plugin's own idle-drain wake — and ONLY that.
- * `plugin` is a shared host kind (compaction and every plugin notice use it),
- * so the name AND the `notice` form are both required: the gate must not keep
- * an unrelated plugin message. The predicate is SHAPE-ONLY — deliberately not
- * "carries a string report": a host pipeline that strips `source.report` must
- * still let the wake through so `streamPrompt` can close the step locally with
- * the bridge's `BACKGROUND_REPORT_LOST_TEXT` instead of re-forwarding the
- * person's last message as a duplicate prompt. A borrowed-name plugin message
- * (no form, or another form) is ordinary context and stays stripped.
+ * Another producer's `notice` (or any other form) is ordinary context and
+ * stays stripped, so the gate matches this plugin's own kind AND the wake
+ * form. The predicate is SHAPE-ONLY — deliberately not "carries a string
+ * report": a host pipeline that strips `source.report` must still let the
+ * wake through so `streamPrompt` can close the step locally with the bridge's
+ * `BACKGROUND_REPORT_LOST_TEXT` instead of re-forwarding the person's last
+ * message as a duplicate prompt. A message with another form is ordinary
+ * context and stays stripped.
  *
  * The `role === 'user'` check keeps this predicate in step with the bridge's
  * own `isBackgroundWakeMessage` (which requires it): a wake-shaped row under
@@ -203,7 +204,6 @@ function isBackgroundWake(message) {
   const source = message?.source
   if (source === null || typeof source !== 'object') return false
   return source.kind === BACKGROUND_REPORT_SOURCE
-    && source.plugin === BACKGROUND_REPORT_PLUGIN
     && source.form === BACKGROUND_REPORT_FORM
 }
 

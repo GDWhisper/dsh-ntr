@@ -10,7 +10,7 @@ import { join } from 'node:path'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { afterAll, describe, expect, it, vi } from 'vitest'
 import {
-  AcpLlmAdapter, AgentBridge, BACKGROUND_REPORT_FORM, BACKGROUND_REPORT_LOST_TEXT, BACKGROUND_REPORT_PLUGIN, BACKGROUND_REPORT_SOURCE, BridgeManager, backgroundReportOf, bridgeKey, classifyTestFailure, defaultAgentWorkspace,
+  AcpLlmAdapter, AgentBridge, BACKGROUND_REPORT_FORM, BACKGROUND_REPORT_LOST_TEXT, BACKGROUND_REPORT_SOURCE, BridgeManager, backgroundReportOf, bridgeKey, classifyTestFailure, defaultAgentWorkspace,
   detectHostAgents, ensureAgentExecutable, findExecutable, isPerSessionAgent, killProcessTree, perSessionLaunchArgs, perSessionLaunchEnv, pluginStateDir, routeBindingRegistry, windowsShimLaunch,
   type BackgroundWake,
   type BridgeTuning,
@@ -9491,7 +9491,7 @@ describe('a detached worker settles the turn at the response (isolated manager)'
     const wakes: Array<{
       role?: string
       content?: Array<{ type?: string; text?: string }>
-      source?: { kind?: string; report?: string }
+      source?: { kind?: string; form?: string; summary?: string; report?: string }
     }> = []
     manager.setDshAgentResolver(id => id === dshSessionId
       ? { session: { id: dshSessionId }, followup: message => { wakes.push(message as (typeof wakes)[number]) } }
@@ -9512,7 +9512,11 @@ describe('a detached worker settles the turn at the response (isolated manager)'
       const wake = wakes[0]
       expect(wake.role).toBe('user')
       expect(wake.source?.kind).toBe(BACKGROUND_REPORT_SOURCE)
-      expect((wake.source as { plugin?: string } | undefined)?.plugin).toBe(BACKGROUND_REPORT_PLUGIN)
+      // Producer-owned kind, NOT the retired V4 `plugin` wrapper.
+      expect(wake.source?.kind).not.toBe('plugin')
+      expect(wake.source?.form).toBe(BACKGROUND_REPORT_FORM)
+      // A `notice` without `summary` renders as the opaque source-field list.
+      expect(wake.source?.summary).toBe('Background task completed.')
       expect(wake.source?.report).toContain('DISPATCH-FINAL-ANSWER')
       expect(wake.source?.report).not.toContain('WORKER-REPORT-TEXT')
       expect(wake.content?.[0]?.text).toBe('Background task completed.')
@@ -9644,7 +9648,7 @@ describe('a detached worker settles the turn at the response (isolated manager)'
   it('reads the OLDEST unanswered wake (FIFO), and calls a report-less one lost', () => {
     const wake = (report: string | undefined, form: string | null = BACKGROUND_REPORT_FORM) => ({
       role: 'user',
-      source: { kind: BACKGROUND_REPORT_SOURCE, plugin: BACKGROUND_REPORT_PLUGIN, ...(form === null ? {} : { form }), ...(report === undefined ? {} : { report }) },
+      source: { kind: BACKGROUND_REPORT_SOURCE, ...(form === null ? {} : { form }), ...(report === undefined ? {} : { report }) },
       content: [],
     })
     expect(backgroundReportOf([wake('REPORT')])).toEqual({ kind: 'report', text: 'REPORT' })
@@ -9655,9 +9659,10 @@ describe('a detached worker settles the turn at the response (isolated manager)'
     expect(backgroundReportOf([wake('REPORT'), { role: 'user', source: { kind: 'user' }, content: [] }])).toBeUndefined()
     expect(backgroundReportOf([wake('REPORT'), { role: 'assistant', source: { kind: 'model' }, content: [] }])).toBeUndefined()
     expect(backgroundReportOf([wake('REPORT'), { role: 'tool', source: { kind: 'tool' }, content: [] }])).toBeUndefined()
-    // Only THIS plugin's named wake in the `notice` form counts; a borrowed
-    // name (no form / another form) or another plugin never matches.
-    expect(backgroundReportOf([{ role: 'user', source: { kind: 'plugin', plugin: 'other', form: BACKGROUND_REPORT_FORM, report: 'X' } }])).toBeUndefined()
+    // Only THIS plugin's own kind in the `notice` form counts; a borrowed
+    // kind (another producer using `notice`) or our kind without the wake
+    // form never matches.
+    expect(backgroundReportOf([{ role: 'user', source: { kind: 'plugin:other', form: BACKGROUND_REPORT_FORM, report: 'X' } }])).toBeUndefined()
     expect(backgroundReportOf([wake('X', null)])).toBeUndefined()
     expect(backgroundReportOf([wake('X', 'other-form')])).toBeUndefined()
     // Wake shape, but the host pipeline stripped (or blanked) the report:
@@ -9799,7 +9804,7 @@ describe('a detached worker settles the turn at the response (isolated manager)'
     const dshSessionId = 'dsh-settle-wake-lost'
     const lost = {
       role: 'user',
-      source: { kind: BACKGROUND_REPORT_SOURCE, plugin: BACKGROUND_REPORT_PLUGIN, form: BACKGROUND_REPORT_FORM },
+      source: { kind: BACKGROUND_REPORT_SOURCE, form: BACKGROUND_REPORT_FORM },
       content: [{ type: 'text', text: 'Background task completed.' }],
     }
     try {
@@ -9832,7 +9837,7 @@ describe('a detached worker settles the turn at the response (isolated manager)'
     const dshSessionId = 'dsh-settle-two-wakes'
     const wakeMessage = (report: string) => ({
       role: 'user' as const,
-      source: { kind: BACKGROUND_REPORT_SOURCE, plugin: BACKGROUND_REPORT_PLUGIN, form: BACKGROUND_REPORT_FORM, report },
+      source: { kind: BACKGROUND_REPORT_SOURCE, form: BACKGROUND_REPORT_FORM, report },
       content: [{ type: 'text' as const, text: 'Background task completed.' }],
     })
     try {

@@ -71,6 +71,7 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 | 7 | 浏览器槽位与宿主原语 | `conversation.input.model` / `left` / `overlay` / `dock`、`conversation.view`、`conversation.composer.dock`、`conversation.chat.assistant-actions`、`shell.overlay`；projection `agentPreset`；`ctx.slots.inject` / `entriesOfSlot` / `uiSession.adapter.current`；`sessions.fork` 与 `remote.$on('agent-preset/selected')` | `src/client/` |
 | 8 | 插件管理 / 更新 | `pluginManager.listBundles()` / `registries()` / `installBundle()`；packument | `src/update.ts` |
 | 9 | 子代理目录投影 | `conversation.session.header.actions` 的 list 条目 id `subagent-catalog`（宿主组件 + `inject` 的 `openChild` / `openChildAside` / `refreshProjection` + `locale` / `order`）；`useSessions(s => s.projectionsBySession)` → `[sessionId].values.subagentCatalog`（数组，每行 `{ id, createdAt?, label?, mode: 'external' }`）；`useSessionStatus` 原样透传 | `src/client/subagent-activity.tsx` · `createSubagentCatalogClaim` / `SubagentCatalogOccupant`；`src/client/subagent-panel.tsx` · `readSubagentCatalogProjection` / `OwnSubagentCatalog` / `SubagentDetailDialog` |
+| 10 | 持久消息来源（V4） | `dsh-session-persistence-jsonl` 的 `assertV4MessageSources`：解释性消息槽要求 `source.kind` 非空且不是 `plugin`（旧 V3 `plugin` 只在迁移时改写成 `plugin:<name>`）；`form: 'notice'` 的 `summary` 是宿主上下文行的一行摘要，缺失时界面退回 opaque 字段列表 | `src/bridge.ts` · `wakeChatWithBackgroundReport` / `BACKGROUND_REPORT_SOURCE` / `BACKGROUND_REPORT_FORM`；`presets/acp/acp-guard.mjs` · `isBackgroundWake` |
 
 非宿主面：ACP 协议与 `session/update` 词表在 `@agentclientprotocol/sdk`，升级依赖时看 SDK 类型，不走本表。
 
@@ -86,6 +87,7 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 | NTR 会话被宿主模型回答（没进 ACP） | `agent.model.select` 是否存在；`inbox/inserted` / `claimed` 是否仍早于路由读取 | 选择写入没生效，路由落到部署默认 |
 | 回合以 `blocked` 收尾 / 工具续跑断 | 宿主 `turn()` 里 `preStep` 的 `reject` 分支（`blocked` 记在 `step/start` **之前**：日志里没有第二个 `step/start` 就是这条路）；guard 闸门的保留白名单 | 闸门把宿主新增的注入种类当成「外来批次」拒了——0.3.8 之前是 `runtime-context`，0.3.9 之前是 `dsh-mnemon`；改成白名单后不再依赖种类清单 |
 | 工具卡输出永远是 `ran inside the ACP agent process` 占位符 | `recordAcpToolOutput` 的空记录、`waitForToolOutput` 的短路条件、ACP `tool_call_update.status` 词表 | 公告帧先落一条空记录，等待被空串立刻解除；agent 从不发终态 status 时会挂到 turn settle 才解除 |
+| 后台任务完成唤醒主聊天时整轮失败 `format v4 message requires a producer-owned source kind` | `dsh-session-persistence-jsonl` 的 `assertV4MessageSources`（内部 `source()` 校验）；`dsh-session-format-v3-to-v4` 的 source 转换；`BACKGROUND_REPORT_SOURCE` | V4 拒绝 `source.kind: 'plugin'`（只属于旧日志迁移），新消息必须用生产者自己的 kind（`dsh-ntr`）；`notice` 还必须带 `summary` |
 | NTR 对话里出现宿主注入（项目指令 / 记忆召回 / model changed） | `agent/pre-step` decision 形状、`message.source.kind` 常量 | 闸门 fail-open；runtime-context 那一条剥不掉（`step()` 自己会追加） |
 | 模型底座 / 座位 / 选择器消失或露出原生控件 | 槽位名（含 `conversation.input.overlay`）、`entriesOfSlot`、projection key | 客户端槽位或投影改名 |
 | 子代理面板退回宿主 trigger / 控制台出现 `subagent catalog:` fail-open 行 | `subagentCatalog` 投影与 `useSessions` 形状；`subagent-panel.tsx` 的 `readSubagentCatalogProjection` / `subagent-activity.tsx` 的 `SubagentCatalogOccupant` | 插槽条目 / id / projection key 改名，出现非 `external` 行或行形状变化 |

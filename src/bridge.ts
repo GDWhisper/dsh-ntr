@@ -4767,30 +4767,36 @@ const CARD_SETTLE_QUIET_MS = 500
  * the prompt response" nothing owns its prose. The only entry into the main
  * plane is a driver step, so the manager injects one hidden user message and
  * the adapter answers it LOCALLY with the collected report (no ACP prompt is
- * sent — the agent already produced that text). The message uses the host's
- * OWN `plugin` source kind (a declared member of `MessageSourceMap`) plus this
- * plugin's name: a custom kind would have to pass the host's durable-message
- * validation, which only knows the declared union. The chat row renders as
+ * sent — the agent already produced that text). The chat row renders as
  * injected context (`source.kind !== 'user'`), never as the person's words,
  * and the report rides in `source.report` so the visible text stays one neutral
  * line.
  *
+ * The kind MUST be producer-owned: DSH's V4 session format refuses the retired
+ * catch-all `'plugin'` kind in every durable message slot ("format v4 message
+ * requires a producer-owned source kind"). A released V3 `plugin` source is
+ * rewritten to `plugin:<name>` only while an old log is migrated; a live
+ * producer declares its own kind. This plugin therefore owns `dsh-ntr` and
+ * keeps its attribution in `form` + `summary` + `report`.
+ *
  * The preset guard hand-copies ALL of these constants (a separate module
  * instance the loader mounts without imports). All sides must change together.
  */
-export const BACKGROUND_REPORT_SOURCE = 'plugin'
-
-/** The `source.plugin` of that wake message (see {@link BACKGROUND_REPORT_SOURCE}). */
-export const BACKGROUND_REPORT_PLUGIN = 'dsh-ntr'
+export const BACKGROUND_REPORT_SOURCE = 'dsh-ntr'
 
 /**
  * The `source.form` of that wake message (see {@link BACKGROUND_REPORT_SOURCE}).
  *
- * The wake-shape predicate is kind + plugin + FORM — deliberately NOT "carries
- * a report": a host pipeline that strips `source.report` must still let the
- * wake reach `streamPrompt`, which then closes the turn LOCALLY with
- * {@link BACKGROUND_REPORT_LOST_TEXT}. A borrowed-name plugin message (no
- * form, or another form) is ordinary context and stays stripped.
+ * The wake-shape predicate is kind + FORM — deliberately NOT "carries a report":
+ * a host pipeline that strips `source.report` must still let the wake reach
+ * `streamPrompt`, which then closes the turn LOCALLY with
+ * {@link BACKGROUND_REPORT_LOST_TEXT}. A message with another kind or another
+ * form is ordinary context and stays stripped.
+ *
+ * A `notice` also needs a `summary`: the host's context row reads it as the
+ * collapsed one-line account and falls back to the OPAQUE body when it is
+ * absent (that body lists every source field, including `report`). The wake
+ * therefore records the same neutral line there.
  */
 export const BACKGROUND_REPORT_FORM = 'notice'
 
@@ -4832,9 +4838,9 @@ export interface DshAgentLike {
  * {@link backgroundReportOf} and the local replay in `streamPrompt`; the preset
  * guard hand-copies the same predicate (`isBackgroundWake`).
  *
- * Deliberately shape-only (kind + plugin + form, no report): a host pipeline
- * that strips `source.report` must still let the wake through so the adapter
- * can close the step locally with {@link BACKGROUND_REPORT_LOST_TEXT}.
+ * Deliberately shape-only (kind + form, no report): a host pipeline that
+ * strips `source.report` must still let the wake through so the adapter can
+ * close the step locally with {@link BACKGROUND_REPORT_LOST_TEXT}.
  *
  * Residual risk (an unguardable lower bound): a host that strips `source`
  * ENTIRELY turns the wake into a source-less message, which the forward picker
@@ -4842,12 +4848,11 @@ export interface DshAgentLike {
  * that; it is the reason the predicate is shape-based at all.
  */
 function isBackgroundWakeMessage(message: unknown): boolean {
-  const row = message as { role?: unknown; source?: { kind?: unknown; plugin?: unknown; form?: unknown } } | undefined
+  const row = message as { role?: unknown; source?: { kind?: unknown; form?: unknown } } | undefined
   if (row?.role !== 'user') return false
   const source = row.source
   if (source === undefined || source === null || typeof source !== 'object') return false
   return source.kind === BACKGROUND_REPORT_SOURCE
-    && source.plugin === BACKGROUND_REPORT_PLUGIN
     && source.form === BACKGROUND_REPORT_FORM
 }
 
@@ -7524,8 +7529,8 @@ export class BridgeManager {
         content: [{ type: 'text', text: BACKGROUND_WAKE_TEXT }],
         source: {
           kind: BACKGROUND_REPORT_SOURCE,
-          plugin: BACKGROUND_REPORT_PLUGIN,
           form: BACKGROUND_REPORT_FORM,
+          summary: BACKGROUND_WAKE_TEXT,
           report,
         },
       })

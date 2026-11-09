@@ -314,12 +314,12 @@ CodeBuddy 的 `unsolicitedTurn` drain 到达（CodeBuddy ACP 文档
 凭空 append，但可以让宿主再开一个真实回合：`BridgeManager.trackBackgroundDrainText`
 收集空闲 drain 的 `agent_message_chunk` 正文，静默 `ambientQuietMs` 后由
 `deliverBackgroundReport` 经宿主 `agent.followup` 注入一条
-`source.kind = 'plugin'`、`source.plugin = 'dsh-ntr'` 的隐藏消息（可见文本只有一行
-notice，正文放 `source.report`）；`AcpLlmAdapter.streamPrompt` 用 `backgroundReportOf`
-认出它并 **本地回放**报告，不再向 CodeBuddy 发 `session/prompt`。preset guard 只放行
-「本插件名 + `form: 'notice'`」这一种 plugin 消息（形状谓词不看 report），其余照旧剥离。
-会话忙时按 `ambientMaxMs` 有界重试；`/acp` RPC 或 headless 没有宿主 agent 时同样有界
-重试（记录保住全文），超限才退回只进 transcript。
+`source.kind = 'dsh-ntr'`、`source.form = 'notice'`、`source.summary = 那行 notice`、
+`source.report = 正文` 的隐藏消息（可见文本只有一行 notice）；`AcpLlmAdapter.streamPrompt`
+用 `backgroundReportOf` 认出它并 **本地回放**报告，不再向 CodeBuddy 发 `session/prompt`。
+preset guard 只放行「本插件 kind + `form: 'notice'`」这一种消息（形状谓词不看 report），
+其余照旧剥离。会话忙时按 `ambientMaxMs` 有界重试；`/acp` RPC 或 headless 没有宿主 agent
+时同样有界重试（记录保住全文），超限才退回只进 transcript。
 
 语义修正（2026-11-09，同批修复 F1–F7、D1）：投递前复查 `consumedDrains`（回合已折走
 答案就丢弃，不重复唤醒）；报告记录不跨 run（run 切换即就地收口旧报告、开新记录，绝不
@@ -353,6 +353,19 @@ is mounted」、「consumes the folded run and spares the zero-output run」（m
 `DISPATCHWEIRDTOOL` / `RUNMIX`），F1 / F6 既有用例补证据断言（帧到达证据 + 空闲窗口
 override），`tests/acp-guard.spec.ts` 的「drops a wake-shaped message that is not a user
 message」。
+
+唤醒来源修正（2026-11-09，宿主 V4 会话格式）：唤醒消息原来用
+`source.kind = 'plugin'`。DSH 0.2.1-rc.5 的 V4 持久化在每个消息槽校验「kind 非空且不等于
+`plugin`」，`agent/inbox/spliced` 落账时抛出 `format v4 message requires a producer-owned
+source kind`，聊天显示「本轮运行失败」，drain 报告与唤醒回合全部丢失。V4 的 `plugin`
+只属于旧日志迁移（V3 `plugin` 会被改写成 `plugin:<name>`，且丢掉 `plugin` 字段），新消息
+必须用生产者自己的 kind。现改用 `source.kind = 'dsh-ntr'`、去掉 `plugin` 字段，并补上
+`notice` 行需要的 `source.summary`（缺失时宿主上下文行退回 opaque，会把 `report` 当
+source 字段展开）；guard 的 `isBackgroundWake` 与 bridge 的 `isBackgroundWakeMessage` 同步为
+kind + form。回归用例：`tests/bridge.spec.ts` 的「wakes the chat with an idle drain report」
+断言 kind 非 `plugin`、form 与 summary，`tests/acp-guard.spec.ts` 的
+「keeps the plugin background-report wake message」「drops a notice that only borrows the
+wake kind」。
 
 **同一轮的性能改造**（用户报告：流式期间整机卡顿、时钟跳跃）。排查结论：
 宿主端逐 chunk 成本是 O(1)（广播 + 每连接一次 stringify），压力主因在
