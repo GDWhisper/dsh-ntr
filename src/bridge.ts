@@ -2926,6 +2926,12 @@ export class AgentBridge {
     session.lastAgentActivityAt = Date.now()
     const kind = params.update.sessionUpdate
     const meta = codebuddyMetaOf(params.update)
+    // History replay (same two signals as the dispatch tracker): a replayed
+    // drain announcement must not rebuild a live ambient, and replayed tool
+    // frames must not leave calls open in the stall watchdog's set — the
+    // replay never sends their terminal frame. Derived display state, the
+    // transcript and the broadcast below still take every frame.
+    const replay = session.loadingHistory === true || meta?.historyReplay === true
     // A RETIRED drain that speaks again is alive, not retired. Un-retire it
     // BEFORE this update is classified and rebuild the ambient record: the run
     // may never re-announce itself, yet the next prompt folded into it must
@@ -2935,7 +2941,7 @@ export class AgentBridge {
     // `retiredDrain` only drives the revive below: an already-consumed run
     // stays transcript-only for the idle collector (`LiveSession.consumedDrains`),
     // so this frame cannot open a second answer after its deferral.
-    const retiredDrain = meta?.requestId !== undefined && isRetiredAmbientId(session, meta.requestId)
+    const retiredDrain = !replay && meta?.requestId !== undefined && isRetiredAmbientId(session, meta.requestId)
     if (retiredDrain && meta?.requestId !== undefined) {
       reviveAmbientId(session, meta.requestId)
       session.ambient = {
@@ -2945,7 +2951,7 @@ export class AgentBridge {
         sawOutput: session.ambient?.sawOutput ?? false,
       }
     }
-    if (meta?.unsolicitedTurn !== undefined) {
+    if (!replay && meta?.unsolicitedTurn !== undefined) {
       // The agent started a background turn on its own: remember it so a
       // prompt the agent folds into it (answered instantly, no conversation
       // request id) can be kept open until the drain speaks. Announced once per
@@ -2974,7 +2980,7 @@ export class AgentBridge {
         })
       }
     }
-    if (session.ambient !== undefined
+    if (!replay && session.ambient !== undefined
       && meta?.requestId === session.ambient.requestId) {
       // The run is alive: refresh the staleness clock on ANY update it owns,
       // not just prose (a tool-heavy stretch is still the drain working).
@@ -2988,7 +2994,7 @@ export class AgentBridge {
     // drain's prose from here (a steered prompt or a hold already consumes it,
     // and the collector checks that before taking anything).
     this.onSessionDrainText?.(session, params.update)
-    if (kind === 'tool_call' || kind === 'tool_call_update') {
+    if (!replay && (kind === 'tool_call' || kind === 'tool_call_update')) {
       const { toolCallId, status } = params.update as { toolCallId: string; status?: string | null }
       if (status === 'completed' || status === 'failed') session.activeToolCalls.delete(toolCallId)
       else if (status === 'pending' || status === 'in_progress') session.activeToolCalls.add(toolCallId)
@@ -7328,6 +7334,9 @@ export class BridgeManager {
   private trackBackgroundDrainText(session: LiveSession, update: SessionUpdate): void {
     const raw = update as Record<string, unknown>
     const meta = codebuddyMetaOf(raw)
+    // History replay is not a live drain: collecting its prose would arm a
+    // quiet timer and wake the chat with a ghost report after the resume.
+    if (meta?.historyReplay === true || session.loadingHistory === true) return
     // A worker's own frame names its parent call: it is the worker's report,
     // not the parent's drained answer (the real wire gives it another
     // requestId, but an agent that tags both must not leak into this report).

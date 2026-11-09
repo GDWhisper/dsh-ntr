@@ -185,8 +185,9 @@
  *  - MOCK_NO_LOAD=1 → `initialize` advertises no `loadSession` capability
  *  - MOCK_LOAD_REPLAY_DISPATCH=1 → `session/load` replays a historical detached
  *              dispatch (pending `tool_call` + in_progress `tool_call_update`,
- *              no terminal frame) with CodeBuddy's history marker; `bare`
- *              omits the marker so only the load window can identify it
+ *              no terminal frame) plus its drain announcement and prose, with
+ *              CodeBuddy's history marker; `bare` omits the marker so only the
+ *              load window can identify it
  *  - MOCK_LONG_TOOL_TITLE=1 → the main tool card carries a LONG pwsh command
  *              as its `title` (the codebuddy shape) under a distinct call id,
  *              and rewrites that title mid-call; DEFAULT OFF keeps the
@@ -250,7 +251,8 @@ const LOAD_DELAY_MS = Number(process.env.MOCK_LOAD_DELAY_MS ?? '0')
  * `tool_call` (pending, identity meta, `isBackground: false`) followed by a
  * `tool_call_update` (in_progress) — NEVER a terminal frame, so a client that
  * cannot tell replay from live dispatch resurrects a finished worker as
- * running. `1` carries the agent's history marker
+ * running — then the drain's `unsolicitedTurn` announcement and report prose.
+ * `1` carries the agent's history marker
  * (`_meta["codebuddy.ai"] = { mode: "history", offset }`); `bare` omits it, so
  * only the in-flight load window can identify the replay. Unset keeps every
  * other test byte-identical.
@@ -495,6 +497,26 @@ const app = agent({ name: 'mock-acp-agent' })
           'codebuddy.ai/toolName': 'Agent',
           'codebuddy.ai/requestId': 'req-dispatch',
           ...(marked ? { 'codebuddy.ai': { mode: 'history', offset: 3 }, timestamp: '2026-11-09T07:30:23.694Z' } : {}),
+        },
+      })
+      // The drain that carried the worker's report is history too: its
+      // announcement and prose must not rebuild a live ambient or collect a
+      // background report that wakes the chat after the resume.
+      await send({
+        sessionUpdate: 'session_info_update',
+        _meta: {
+          'codebuddy.ai/unsolicitedTurn': { requestId: 'req-dispatch', reason: 'background_drain' },
+          'codebuddy.ai/requestId': 'req-dispatch',
+          ...(marked ? { 'codebuddy.ai': { mode: 'history', offset: 4 } } : {}),
+        },
+      })
+      await send({
+        sessionUpdate: 'agent_message_chunk',
+        messageId: 'replay-drain',
+        content: { type: 'text', text: 'REPLAYED-DRAIN-ANSWER' },
+        _meta: {
+          'codebuddy.ai/requestId': 'req-dispatch',
+          ...(marked ? { 'codebuddy.ai': { mode: 'history', offset: 5 } } : {}),
         },
       })
     }

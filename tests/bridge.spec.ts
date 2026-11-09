@@ -4803,12 +4803,19 @@ describe('idle release (isolated manager)', () => {
         event.type === 'subagents/record'
         && event.record.childId === 'acp:agent_dispatch'
         && (event.record.status === 'running' || event.record.status === 'pending'))).toEqual([])
+      // The replayed drain announcement is history too: rebuilding a live
+      // ambient from it would collect the replayed prose into a background
+      // report and wake the chat with a ghost turn once the quiet window ends.
+      expect(events2.filter(event => event.type === 'agent/notice'
+        && event.text.includes('background task turn'))).toEqual([])
       // Constraint 29: skipping lifecycle bookkeeping must not drop the replay
       // DATA — the dispatch frames and the marker text still reach the view.
       const entries = second.chatTranscripts(dshSessionId)[0]?.entries as Array<{ update: Record<string, unknown> }> | undefined
       expect(entries?.some(entry => entry.update.toolCallId === 'agent_dispatch' && entry.update.sessionUpdate === 'tool_call')).toBe(true)
       expect(entries?.some(entry => entry.update.sessionUpdate === 'agent_message_chunk'
         && String((entry.update.content as { text?: string }).text ?? '').includes('REPLAYED: earlier conversation'))).toBe(true)
+      expect(entries?.some(entry => entry.update.sessionUpdate === 'agent_message_chunk'
+        && String((entry.update.content as { text?: string }).text ?? '').includes('REPLAYED-DRAIN-ANSWER'))).toBe(true)
     } finally {
       await second.shutdownAll()
     }
@@ -4849,6 +4856,49 @@ describe('idle release (isolated manager)', () => {
       expect(rows[0]).toMatchObject({ status: 'completed', startedAt: original!.startedAt, counts: original!.counts })
     } finally {
       await second.shutdownAll()
+    }
+  }, 30_000)
+
+  it('leaves surviving terminal dispatches untouched when an idle release resumes in process', async () => {
+    // No host restart here: the LiveSession (and its backgroundDispatches map)
+    // survives the idle release, so the replay lands on the KNOWN-dispatch
+    // branch. Letting it through would pollute counts / lastActivityAt of a
+    // finished worker even though its terminal state cannot regress.
+    const storage = `${tmpdir()}/acp-replay-dispatch-inproc-${Date.now()}.json`
+    const dshSessionId = 'dsh-replay-dispatch-inproc'
+    const hub2 = new EventHub()
+    const events2: AcpEvent[] = []
+    hub2.subscribe(event => { events2.push(event) })
+    const manager = new BridgeManager(
+      [{ ...def, id: 'replay-inproc', env: { MOCK_LOAD_REPLAY_DISPATCH: '1' } }],
+      hub2, 500, storage, undefined, false, { idleTimeoutMs: 200 },
+    )
+    try {
+      for await (const _ of manager.streamPrompt({
+        model: 'replay-inproc',
+        sessionId: dshSessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'DISPATCH DISPATCHCOMPLETEMETA' }] }],
+      } as never)) { /* drain */ }
+      await until(() => manager.subagentsFor(dshSessionId).some(row => row.childId === 'acp:agent_dispatch' && row.status === 'completed'))
+      const original = manager.subagentsFor(dshSessionId).find(row => row.childId === 'acp:agent_dispatch')
+      // The idle window parks the session; the process dies but the record —
+      // and its dispatch map — stay on the same LiveSession object.
+      await until(() => manager.agentViews()[0]?.state === 'stopped')
+      const since = events2.length
+      await manager.resumeChatSession(dshSessionId)
+      const rows = manager.subagentsFor(dshSessionId).filter(row => row.childId === 'acp:agent_dispatch')
+      expect(rows).toHaveLength(1)
+      expect(rows[0]).toMatchObject({
+        status: 'completed',
+        startedAt: original!.startedAt,
+        endedAt: original!.endedAt,
+        counts: original!.counts,
+        lastActivityAt: original!.lastActivityAt,
+      })
+      expect(events2.slice(since).filter((event): event is Extract<AcpEvent, { type: 'subagents/record' }> =>
+        event.type === 'subagents/record' && event.record.childId === 'acp:agent_dispatch')).toEqual([])
+    } finally {
+      await manager.shutdownAll()
     }
   }, 30_000)
 
