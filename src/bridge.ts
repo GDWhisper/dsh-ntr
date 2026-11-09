@@ -11659,6 +11659,30 @@ export class BridgeManager {
       return
     }
 
+    // HOST-INTERNAL AUXILIARY CALLS WITH NO SESSION IDENTITY. DSH 0.2.1-rc.5's
+    // auto-review risk classifier calls `ctx.llm.stream` with the session
+    // header's route (`acp`) but neither a `purpose` nor a `sessionId`. Left
+    // alone, that anonymous call reaches `getOrCreateDshSession(undefined, …)`
+    // (the `ephemeral:<agent>` bucket), starts a real ACP session and sends the
+    // review text as a user prompt — a hidden agent turn with tool access.
+    // Real chat always carries a non-empty DSH session id (the host loop names
+    // it) and title/compaction carry `purpose` (handled above, which still
+    // wins), so this pair is exactly the host-internal auxiliary lane; an
+    // empty or null id is no identity at all (runtime null included).
+    if (!options.sessionId) {
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            message: 'acp: host-internal auxiliary model calls without a session are not forwarded to the ACP agent',
+            code: 'unsupported_auxiliary_call',
+          },
+        },
+      }
+      return
+    }
+
     // An IDLE background drain became a chat turn: the manager injected its
     // hidden wake message, and this step must ANSWER it with the collected
     // report — the agent already produced that text, so no `session/prompt` is

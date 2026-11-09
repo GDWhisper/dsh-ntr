@@ -94,7 +94,8 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 | 子代理 trigger 点了没反应 / 下拉「出现」但完全看不见 | 宿主 `ConversationRoot` 的 `titleRow` / `titleCluster` 是否带 `container-type` / `mask-image` / `overflow: clip`；`subagent-panel.tsx` 的下拉是否仍 portal 到 `document.body` | 0.2.2-rc.1 的标题行建立布局包含（fixed 改锚）、标题容器带遮罩（0.2.1-rc.5 都无），留在容器内的下拉被整块抹掉；宿主自己的目录菜单同样 portal |
 | 审批卡 / 释放横幅不出现 | `conversation.input.dock`、`session/update` 折叠 | dock 槽位或事件形状变化 |
 | 内置更新不可用 | `pluginManager` 方法面 | 服务或方法签名变化 |
-| 每个新工具名首现 `unknown tool` +「已添加工具」成对，旧版刷屏 | 宿主 pre-step 是否冻结 `ResolvedToolSet`（`ctx.tools.resolve()` 快照，新宿主）vs `tools/execute` 里实时解析（0.2.1-rc.5 无快照） | 虚拟工具执行阶段才注册、进不了冻结的 step：首现记 `unknown tool`、下次 `buildRequest()` 清单 diff 写 `tool-addition`；插件收敛成单一稳定名 `dsh_ntr__acp_tool_call`（最多一对）+ guard 撞真实工具 fail-closed（`tools.get` 命中即返错、不 `return next()`） |
+| 保留名工具卡首现 `unknown tool` +「已添加工具」成对（旧版按不同工具名刷屏；现在只剩回落路径与升级前已存活的会话可能看到） | guard 是否在挂载时把保留名预注册进 preset 这一代的 scope；宿主 pre-step 是否冻结 `ResolvedToolSet`（`ctx.tools.resolve()` 快照，新宿主）vs `tools/execute` 里实时解析（0.2.1-rc.5 无快照） | 挂载早于本会话首份请求头时 schema 已进请求头，不再有首现噪音；只有挂载时 `tools` 服务未就绪或挂载注册失败、回落到执行阶段惰性注册时才复现（首现记 `unknown tool`、下次 `buildRequest()` 清单 diff 写 `tool-addition`）；升级 / HMR 前已存在的会话下一份请求头仍可能补记一次。guard 撞真实工具仍 fail-closed（`tools.get` 命中即返错、不 `return next()`） |
+| Auto 权限档下每个 ACP 工具卡都失败（红色错误），宿主日志出现 `auto-review` 的模型调用 / 辅助调用拒绝 | guard 挂载预注册是否让 schema 进了请求头；Auto 的自动审查要调会话模型判风险；adapter 的 `purpose` 闸门与匿名辅助调用拒绝 | 挂载预注册后 schema 闸门能过，但 Auto 的宿主实验性自动审查还要调用会话模型判风险，而 NTR 会话的模型是外部 ACP agent。插件不能把宿主这段内部提示转发给 agent：adapter 在 `purpose` 闸门之后、建 ACP 会话之前拒收既无 `purpose` 也无 `sessionId` 的匿名辅助调用（0.2.2 的 `purpose: "auto-review"` 由既有闸门拒成 `unsupported_purpose`），审查得不出结论，宿主拒绝每一张卡；agent 自己的执行继续。**不是插件能修好的**——指引是改用非 Auto 权限档 |
 
 ### 5.3 读宿主源码
 

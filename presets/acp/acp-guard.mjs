@@ -61,7 +61,7 @@
  * result. With no tool registered it would record `Error: unknown tool
  * "Bash"` (a red pile of errors). The `tools/execute` waterfall is the seam:
  * for that ONE reserved name, this row registers a SCOPED virtual tool (this
- * ctx is the ACP session's agent scope, so the registration shadows nothing
+ * ctx is the preset generation's scope (all NTR sessions share it), so it shadows nothing
  * outside it) whose body answers with the call's real output — the bridge
  * records every `tool_call` / `tool_call_update` content into the shared
  * registry (`toolResults`, keyed by call id). Under the SEGMENTED turn shape
@@ -297,10 +297,13 @@ function virtualToolValue(callId) {
   return { text: toolOutputFor(callId) ?? 'This tool call ran inside the ACP agent process; its output lives in the ACP transcript view.' }
 }
 
-/** The marker set for definitions this row registered (never shadow a real tool). */
-function makeVirtualDefs() {
-  return new WeakSet()
-}
+/**
+ * The marker set for definitions this row registered (never shadow a real
+ * tool). Module-level so a re-applied guard in the same preset scope (HMR)
+ * recognizes its predecessor's registration by object identity instead of
+ * failing closed on its own tool.
+ */
+const virtualDefs = new WeakSet()
 
 /**
  * One scoped virtual tool per ACP tool name. Returns the registry definition.
@@ -338,12 +341,105 @@ function virtualToolDefinition(toolName) {
 }
 
 /**
+ * Canonical JSON for the stable DATA fields of a definition fingerprint.
+ *
+ * Key order and function-valued members are irrelevant, so a host that clones
+ * or normalizes the registered object still matches. Getters may run: the
+ * caller's try/catch turns a hostile object into "not ours", never into a
+ * thrown turn.
+ */
+function stableData(value, seen) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (seen.includes(value)) throw new TypeError('cyclic definition data')
+  seen.push(value)
+  const out = Array.isArray(value)
+    ? `[${value.map(item => stableData(item, seen)).join(',')}]`
+    : `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableData(value[key], seen)}`).join(',')}}`
+  seen.pop()
+  return out
+}
+
+/**
+ * Whether a registry entry is one of OUR display-card definitions.
+ *
+ * Identity (`virtualDefs`) does not span module instances: after an HMR
+ * reload the previous preset-scope registration survives, the new module's
+ * mount probe (which sees only the global layer) finds nothing, its scoped
+ * `register` throws, and `tools.get(CONST, exec.agent)` then hands the execute
+ * listener an object the new WeakSet has never seen. Matching the stable data
+ * fields (`name`, `description`, `parameters` - NOT functions) recognizes
+ * that predecessor as our own instead of failing every card closed. A real
+ * host tool under the reserved name has a different schema and stays
+ * fail-closed.
+ */
+function isVirtualToolDefinition(candidate) {
+  try {
+    if (candidate === null || typeof candidate !== 'object') return false
+    const reference = virtualToolDefinition(ACP_TOOL_CALL_NAME)
+    return candidate.name === reference.name
+      && candidate.description === reference.description
+      && stableData(candidate.parameters, []) === stableData(reference.parameters, [])
+  } catch {
+    // A hostile / getter-bearing entry is not recognizable as ours.
+    return false
+  }
+}
+
+/**
  * How long a virtual tool parks on `waitForToolOutput` before answering with
  * the transcript pointer. Generous on purpose: the ACP agent runs the tool on
  * its own clock, and the turn's settlement releases the wait long before this
  * fires in every healthy case — this bound only caps a wedged agent.
  */
 const TOOL_OUTPUT_WAIT_MS = 30 * 60 * 1000
+
+/**
+ * Reserve the display card's name on this preset scope as early as possible.
+ *
+ * Issue #18: Auto review (`@deepseek-ai/dsh-experimental-auto-review`) reads the
+ * pending tool name from `session.requestHeader().tools` inside
+ * `tools/pre-execute` and denies the call when no schema matches. The request
+ * header is assembled per step from the tools registered on this scope, so a
+ * lazy register inside the execute listener was always too late - pre-execute
+ * denied first. Reserving at apply/mount is early enough.
+ *
+ * Best-effort by contract: a missing or unusable tools service is a silent
+ * skip, a throwing register is swallowed, and `apply` never throws. An entry
+ * already under the reserved name is never shadowed (execute fails closed for
+ * a real host tool); a definition already in `virtualDefs` is a predecessor's
+ * registration on the same scope (HMR) and is reused. The execute listener's
+ * lazy register remains only as the fallback when this attempt did not land.
+ */
+function reserveVirtualTool(ctx) {
+  let settled = false
+  const attempt = from => {
+    if (settled) return
+    try {
+      const tools = typeof from?.get === 'function' ? from.get('tools') : undefined
+      // The service may still be loading; the inject seam below retries.
+      if (tools === undefined) return
+      settled = true
+      if (typeof tools.get !== 'function' || typeof tools.register !== 'function') return
+      if (tools.get(ACP_TOOL_CALL_NAME) !== undefined) return
+      const definition = virtualToolDefinition(ACP_TOOL_CALL_NAME)
+      tools.register(definition)
+      virtualDefs.add(definition)
+    } catch {
+      // Best-effort: a reservation bug must never fail the preset mount. The
+      // execute listener retries the registration once when a card runs.
+    }
+  }
+  attempt(ctx)
+  // Only the late-arrival seam is still needed when the service was not there.
+  if (settled) return
+  try {
+    if (typeof ctx.inject === 'function') {
+      ctx.inject(['tools'], injected => { attempt(injected) })
+    }
+  } catch {
+    // Hosts without the inject seam keep the synchronous attempt.
+  }
+}
 
 /**
  * Register the step gate, the display-card executor, and the route selection
@@ -353,19 +449,11 @@ const TOOL_OUTPUT_WAIT_MS = 30 * 60 * 1000
  */
 export function apply(ctx, config) {
   const keep = messageFilterOf(config)
-  const virtualDefs = makeVirtualDefs()
-  // Probe ONCE at mount: if the host already has a REAL tool under our reserved
-  // name, the plugin's isolation is broken. Record it loudly (console only) and
-  // do not continue as if safe; every execution still fails closed below.
-  try {
-    const globalTools = typeof ctx.get === 'function' ? ctx.get('tools') : undefined
-    const occupied = globalTools !== undefined && typeof globalTools.get === 'function'
-      ? globalTools.get(ACP_TOOL_CALL_NAME)
-      : undefined
-    console.warn('[acp-guard] reserved-name mount probe', { reserved: ACP_TOOL_CALL_NAME, occupiedByRealTool: occupied !== undefined })
-  } catch (error) {
-    console.warn('[acp-guard] reserved-name mount probe threw', { error: String(error) })
-  }
+  // Issue #18: reserve the display card's name IMMEDIATELY, before the host
+  // assembles this step's tool list. Auto review checks the request header's
+  // tool schemas in `tools/pre-execute`, so a lazy register inside the execute
+  // listener never ran in time under the Auto preset.
+  reserveVirtualTool(ctx)
   // The route, before DSH 0.2.2's `preStep` captures it: `inbox/inserted` is
   // the synchronous splice that wakes the driver, and `inbox/claimed` fires
   // inside `preStep` just before the capture (the last-second seam, which also
@@ -433,6 +521,13 @@ export function apply(ctx, config) {
           blocked = collisionResult(execName)
         }
         if (blocked === null) {
+          // A predecessor module instance's registration (HMR) survives in
+          // this preset scope while the new module's WeakSet cannot see it.
+          // Same stable data fields -> our own definition: adopt and reuse.
+          if (occupied !== undefined && !virtualDefs.has(occupied) && isVirtualToolDefinition(occupied)) {
+            virtualDefs.add(occupied)
+            console.warn('[acp-guard] tools/execute: adopting a predecessor definition by schema fingerprint', { execName })
+          }
           console.warn('[acp-guard] tools/execute: reserved-name probe', { execName, occupied: occupied !== undefined })
           if (occupied !== undefined && !virtualDefs.has(occupied)) {
             console.warn('[acp-guard] tools/execute: reserved name occupied by a real host tool; failing closed', { execName, reserved: ACP_TOOL_CALL_NAME })
@@ -446,8 +541,16 @@ export function apply(ctx, config) {
           const existing = tools.get(execName, exec.agent)
           console.warn('[acp-guard] tools/execute: before register', { execName, getBeforeRegister: existing !== undefined })
           if (existing !== undefined && !virtualDefs.has(existing)) {
-            reason = 'name is a real host tool'
+            if (isVirtualToolDefinition(existing)) {
+              virtualDefs.add(existing)
+              reason = 'reusing a predecessor definition (schema match)'
+            } else {
+              console.warn('[acp-guard] tools/execute: scoped name is a real host tool; failing closed', { execName })
+              blocked = collisionResult(execName)
+            }
           } else if (existing === undefined) {
+            // Fallback only: the mount reservation did not land (no tools
+            // service at apply, or its register threw).
             const definition = virtualToolDefinition(execName)
             try {
               tools.register(definition)

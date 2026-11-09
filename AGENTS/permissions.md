@@ -10,6 +10,8 @@ ACP `session/request_permission` 原样映射：选项列表 / 名称 / 顺序 /
 
 **宿主 approval policy 不再作用于 ACP 询问**：`ask` / `never` 只管宿主自己的工具；ACP 询问永远走插件这条管线。无人值守部署改用插件自己的 `auto` / `abort` 窗口（§2.1）。同理，DSH 会话日志里不再写 ACP 询问的 `approval/asked` / `approval/decided`，审计痕迹由插件 transcript 承载。这两个是**接受的代价**，不是缺陷；细节与理由见 [retired.md](./retired.md)。
 
+**DSH 的 Auto 权限档是另一道宿主闸门，不在本管线内**：它在 `tools/pre-execute` 里核对工具 schema，再调会话模型判风险，因此 NTR 会话用不了它——请求头模型是外部 ACP agent，adapter 会拒收这段辅助调用（无 `purpose` 也无 `sessionId`；0.2.2 的 `purpose: "auto-review"` 由既有 purpose 闸门拒掉），宿主随即拒绝每张 ACP 工具卡。指引是改用非 Auto 权限档；这与本节的 `auto` 超时模式无关。
+
 已删除、不要带回：`decidePermission` / `authorizeWrite` / `dshSessionPolicyOf` / `sandboxDenialMarker` / `wireAccessMode` / `setSessionPolicyResolver` / `DshSessionPolicy`。DSH 的 Access mode / sandboxPolicy 不参与 ACP 裁决。
 
 **工具名与理由由宿主派生**：`permissionToolName` 依次读 `toolCall.title` → 任意 `_meta` 键末段为 `toolName`（codebuddy 的 `_meta["codebuddy.ai/toolName"]` 就是实例）→ `kind` → `'tool call'`；`permissionAskReason` 从 `rawInput` 里挑一个具名标量（`command` / `cmd` / `path` / …），与工具名拼成一行并限长 240。两者只读 agent 自己声明的字段，不猜、不序列化整个对象。

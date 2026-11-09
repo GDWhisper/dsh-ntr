@@ -214,13 +214,17 @@ That's stale dependency state, not a missing plugin file: the failing path will 
 
 **An NTR session shows `Error: unknown tool "xxx"` followed by a "Tool added: xxx" line. What is that?**
 
-This is display-layer noise from the host's card execution record; it depends on the host version and is not a failed tool call in the agent. Newer hosts freeze the set of tools available to a step before assembling the request; a tool name that only appears at execution time can't join that step, so its first occurrence records `unknown tool`, and the next request assembly finds one extra tool and writes a "Tool added" line. On hosts like 0.2.1-rc.5 that resolve tools live inside the waterfall, it never appears.
+This is display-layer noise from the host's card execution record; it is not a failed tool call in the agent. Newer hosts freeze the set of tools available to a step before assembling the request; a tool name that only appears at execution time can't join that step, so its first occurrence records `unknown tool`, and the next request assembly finds one extra tool and writes a "Tool added" line. The plugin now pre-registers its reserved tool name, `dsh_ntr__acp_tool_call`, when the guard mounts: as long as the mount lands before this session's first request is assembled, the schema ships with the very first request header and the pair no longer appears; it can still show up once when the tools service is unavailable or mount registration fails, and registration falls back to execution time, and a session already alive across an upgrade or hot reload may still record one "Tool added" line in its next header. Hosts like 0.2.1-rc.5 that resolve tools live inside the waterfall never showed it.
 
-The plugin now folds every tool call into one stable name, `dsh_ntr__acp_tool_call`, and keeps the full command verbatim in the card's parameter area, so this pair of lines appears at most once instead of flooding.
+The plugin folds every tool call into that one stable name and keeps the full command verbatim in the card's parameter area, so it no longer floods per command.
 
-Their number scales only with the number of DISTINCT tool names: some agents (e.g. opencode2) report the whole command as the tool name, which is why older versions flooded.
+In older versions the number of these lines scaled with the number of DISTINCT tool names: some agents (e.g. opencode2) report the whole command as the tool name, which is why they flooded.
 
-The agent's real output is always in the NTR tab; the first errored card has no mirrored output. In dsh-ntr 0.3.9 and earlier the chat card showed placeholder text (fixed in 0.3.10). Upgrading does not remove the first-time `unknown tool` / "Tool added" pair.
+The agent's real output is always in the NTR tab. In dsh-ntr 0.3.9 and earlier the chat card showed placeholder text (fixed in 0.3.10). Upgrading to the current version removes this pair from the normal path (mount before this session's first request assembly).
+
+**Why does every ACP tool card fail under the Auto permission preset?**
+
+For every tool call under Auto, the host first runs an experimental auto-review: it checks the tool schema in the request header, then calls the session's model to classify risk. In an NTR session that model is the external ACP agent, and the plugin will not forward this host-internal prompt to it, so the review can never reach a verdict: the host denies every ACP tool card and shows a red error. The agent's own tools still run inside its own process; the cards just do not get their normal result. This is a host gate the plugin cannot bypass, and it is not fixed — use a non-Auto permission preset.
 
 **Why does a run of intermediate narration stay below the "Completed in …" row?**
 

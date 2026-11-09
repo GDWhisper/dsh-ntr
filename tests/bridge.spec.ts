@@ -944,6 +944,64 @@ describe('ACP bridge over stdio (mock agent)', () => {
     expect(wakeChunks).toEqual([{ type: 'finish', reason: { kind: 'stop' } }])
   }, 30_000)
 
+  it('refuses an anonymous host-internal auxiliary call before any ACP session exists', async () => {
+    // DSH 0.2.1-rc.5's auto-review risk classifier calls `ctx.llm.stream`
+    // with the session header's `acp` route but WITHOUT `purpose` and WITHOUT
+    // a usable `sessionId` (absent, or an empty string). Forwarding that call
+    // would create an `ephemeral:<agent>` ACP session and send the review text
+    // as a user prompt — a hidden agent turn with tool access.
+    const adapter = new AcpLlmAdapter(manager)
+    for (const anonymousSessionId of [undefined, ''] as const) {
+      const since = events.length
+      const chunks: StreamChunk[] = []
+      for await (const chunk of adapter.stream({
+        provider: 'acp',
+        model: 'mock',
+        sessionId: anonymousSessionId,
+        system: 'Rate the risk of the pending tool call.',
+        messages: [{
+          role: 'user',
+          source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-experimental-auto-review' },
+          content: [{ type: 'text', text: 'pending tool: Bash {"command":"rm -rf build"}' }],
+        }],
+      })) chunks.push(chunk)
+
+      // Exactly one closing chunk: no text, no block, no forwarded prompt.
+      expect(chunks).toEqual([{
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            code: 'unsupported_auxiliary_call',
+            message: expect.stringContaining('not forwarded to the ACP agent'),
+          },
+        },
+      }])
+      expect(chunks.some(chunk => chunk.type === 'text-delta' || chunk.type === 'block-start')).toBe(false)
+      // Nothing was spawned: the guard runs before `getOrCreateDshSession` (the
+      // `ephemeral:<agent>` bucket) and before `selectForwardPrompt`.
+      await new Promise(resolve => setTimeout(resolve, 100))
+      expect(events.slice(since).filter(event => event.type === 'session/created' || event.type === 'turn/start')).toEqual([])
+    }
+
+    // `purpose` still WINS: a title call without a session id answers locally
+    // through the title path instead of hitting the anonymous-call guard.
+    const titleChunks: StreamChunk[] = []
+    for await (const chunk of adapter.stream({
+      provider: 'acp',
+      model: 'mock',
+      purpose: 'session-title',
+      messages: [{
+        role: 'user',
+        source: { kind: 'plugin', plugin: 'dsh-session-title-llm' },
+        content: [{ type: 'text', text: 'Generate the session title from this JSON array of human messages: ["匿名标题","second"]' }],
+      }],
+    })) titleChunks.push(chunk)
+    expect(titleChunks.map(chunk => chunk.type)).toEqual(['block-start', 'text-delta', 'block-end', 'finish'])
+    expect(titleChunks.find((chunk): chunk is Extract<StreamChunk, { type: 'text-delta' }> => chunk.type === 'text-delta')?.text)
+      .toBe(`${SESSION_TITLE_PREFIX}匿名标题`)
+  }, 30_000)
+
   it('handles cancellation in adapter.stream via AbortSignal', async () => {
     const adapter = new AcpLlmAdapter(manager)
     const controller = new AbortController()
@@ -3041,11 +3099,10 @@ describe('every ACP permission ask reaches the human through the ledger (isolate
     expect(chat.reasoning()).toContain('please answer the permission card above the composer')
     expect(chat.reasoning()).not.toContain('within')
 
-    // An adapter call with no DSH chat session has no conversation to show a
-    // card in; its answer entry is the settings page. The inline agent asks
-    // BEFORE announcing any tool call, so the line lands in the open segment
-    // (a sessionless turn cannot resume a card-bearing segment — there is no
-    // controller lookup key to find).
+    // An adapter call with no DSH chat session is now refused before it starts
+    // (the host-internal auxiliary-call guard), so the sessionless ask is a
+    // real `/acp` RPC turn. Its only answer entry is the settings page, and
+    // the frame proves it: no `dshSessionId`.
     const plainScript = [
       '(async () => {',
       "  const { agent, methods, ndJsonStream, PROTOCOL_VERSION } = await import('@agentclientprotocol/sdk')",
@@ -3087,19 +3144,18 @@ describe('every ACP permission ask reaches the human through the ledger (isolate
       void dispatchRpc(plainManager, 'permission/respond', { requestId: event.requestId, optionId: 'allow1' })
     })
     try {
-      const parts: string[] = []
-      for await (const chunk of new AcpLlmAdapter(plainManager).stream({
-        provider: 'acp',
-        model: 'plain-ask',
-        messages: [{ role: 'user', content: [{ type: 'text', text: 'PERM rpc line' }] }],
-      })) {
-        if (chunk.type === 'reasoning-delta') parts.push(chunk.text)
-      }
-      const frame = plainEvents.find((event): event is Extract<AcpEvent, { type: 'permission/request' }> => event.type === 'permission/request')
+      const start = await dispatchRpc(plainManager, 'session/start', { agentId: 'plain-ask' })
+      if (!start.ok) throw new Error('start failed')
+      const id = (start.value as { sessionId: string }).sessionId
+      const since = plainEvents.length
+      const prompted = dispatchRpc(plainManager, 'session/prompt', { sessionId: id, text: 'PERM rpc line' })
+      await until(() => plainEvents.slice(since).some(event => event.type === 'permission/request'))
+      const frame = plainEvents.slice(since).find((event): event is Extract<AcpEvent, { type: 'permission/request' }> => event.type === 'permission/request')
       expect(frame).toBeDefined()
       expect(frame).not.toHaveProperty('dshSessionId')
-      expect(parts.join('')).toContain('please approve in Settings')
-      expect(parts.join('')).not.toContain('above the composer')
+      expect(frame?.toolName).toBe('Bash')
+      await expect(prompted).resolves.toMatchObject({ ok: true, value: { accepted: true } })
+      await until(() => plainEvents.slice(since).some(event => event.type === 'turn/end' && event.sessionId === id))
     } finally {
       answers()
       await plainManager.shutdownAll()
@@ -5685,20 +5741,29 @@ describe('a silent turn is force-finalized and the next message recovers (isolat
     expect(oldTurnEnds[0]).toMatchObject({ error: expect.stringContaining('sent no activity') })
   }, 20_000)
 
-  it('closes an ephemeral turn\'s driver stream on a stall (no chat session id)', async () => {
-    // A turn with no `options.sessionId` has no chat id to index its controller
-    // under: the session attachment is the ONLY route the watchdog has to the
-    // driver's segment queue. Without it the turn falls into the `/acp` branch,
-    // which force-finalizes the session state but leaves that queue OPEN — this
-    // stream would never finish (and the cancel fallback would not close it
-    // either, since `finalizeTurn` only broadcasts the frame).
+  it('closes a stalled driver stream through its chat turn controller', async () => {
+    // Adapter turns without a DSH session id are refused before they start
+    // (the host-internal auxiliary-call guard), so the driver stream the
+    // watchdog must close always belongs to a chat-identified turn. Warm the
+    // conversation FIRST: a provisional first turn that delivers nothing rolls
+    // back instead, and that path is pinned by its own test above. Here the
+    // controller is found by its chat id, and its segment queue must CLOSE —
+    // finalizing the session state alone would leave this stream hanging.
+    const sessionId = 'dsh-stall-driver'
+    await hostLoopTurn(stallAdapter, {
+      provider: 'acp',
+      model: 'stall',
+      sessionId,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello warmup' }] }],
+    })
     const since = stallEvents.length
     const chunks: StreamChunk[] = []
     const drained = (async () => {
       for await (const chunk of stallAdapter.stream({
         provider: 'acp',
         model: 'stall',
-        messages: [{ role: 'user', content: [{ type: 'text', text: 'HANG ephemeral' }] }],
+        sessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'HANG driver' }] }],
       })) chunks.push(chunk)
     })()
     // Bounded so a regression FAILS the suite instead of hanging it.
@@ -5710,19 +5775,20 @@ describe('a silent turn is force-finalized and the next message recovers (isolat
     expect(finishOf(chunks)?.reason).toMatchObject({ kind: 'error', failure: { code: 'INACTIVITY_TIMEOUT' } })
     expect(stallMessage(chunks)).toContain('sent no activity')
 
-    // The host session id is the ephemeral turn's only identity: the watchdog's
-    // frame and its notice both name it, and the turn ends exactly once.
+    // The chat id is the turn's identity: the watchdog's frame and its notice
+    // both name the ACP session, and the turn ends exactly once.
     const started = stallEvents.slice(since).find((event): event is Extract<AcpEvent, { type: 'turn/start' }> =>
-      event.type === 'turn/start' && event.text === 'HANG ephemeral')
-    if (started === undefined) throw new Error('no turn/start for the ephemeral turn')
+      event.type === 'turn/start' && event.text === 'HANG driver')
+    if (started === undefined) throw new Error('no turn/start for the stalled turn')
+    expect(stallManager.chatTranscripts(sessionId)[0]?.session.sessionId).toBe(started.sessionId)
     const ends = stallEvents.slice(since)
       .filter(event => event.type === 'turn/end' && event.sessionId === started.sessionId)
     expect(ends).toHaveLength(1)
     const notices = stallEvents.slice(since)
       .filter(event => event.type === 'agent/notice' && event.agentId === 'stall' && event.text.includes('sent no activity'))
     expect(notices).toHaveLength(1)
-    // No conversation lock was written, so there is nothing to roll back: the
-    // notice promises the ordinary resume.
+    // The conversation already carried context (the warmup turn), so there is
+    // nothing to roll back: the notice promises the ordinary resume.
     if (notices[0]?.type === 'agent/notice') {
       expect(notices[0].text).toContain('restart the agent and resume the session')
     }

@@ -118,11 +118,11 @@
 
 NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 行）：`persona` 行 `complete: true` + `includeRuntimeContext: false`，**不挂**工具行 / `agent-instructions` / `tool-skill` / plan-mode / todo / compaction / 委派行。
 
-`acp-guard.mjs` 挂四类监听器：
+`acp-guard.mjs` 挂四类监听器（另在挂载时预注册保留的虚拟工具名，见下）：
 
 - `agent/pre-step` 步进闸门（`{ prepend: true }`，最外层：宿主 `installModelSelection` 在 `next()` 之后才追加 model-changed 通知，内层闸门剥不到）：**白名单保留** `user` / `tool` / 无 source 三类，其余一律按宿主注入剥掉（`agent-instructions` / `skill-catalog` / `runtime-context` / `plugin` / `model-selection` / `dsh-mnemon`，以及以后任何新种类）；显式给 `config.strippedSources` 时改为按该黑名单剥离（调试口，`[]` = 全保留），也只有这条路径还会 `reject`（剥完既无 user 也无 tool）。
 - **闸门绝不拒绝续跑步**：宿主的 `turn()` 把 `preStep` 的 `reject` 记成 `turn/end blocked`，且记在 `step/start` 之前（日志里没有第二个 `step/start` 就是这条路）。issue #10 两次事故都是「漏剥一个注入种类 → 续跑步批次留下残渣 → 拒绝」。续跑步批次里**本来就没有工具结果**：`dsh-agent-loop` 只把工具自己的 `additionalContexts` stage 进 next-step inbox，而 adapter 收到的 `GenerateOptions.messages` 来自 `session.deriveMessages()`（整份 transcript）。剥完通常为空——首步空批次走宿主原 completed 空转，续跑步照常进步，由 `isAcpToolContinuation` 决定是续读同一 prompt 还是收一行指针。另注：`step()` 会无条件追加自己那份 runtime-context 投影，剥不掉它，只能决定它的位置。
-- `tools/execute` 虚拟工具（§2.2）：解析不到的工具名即时注册 agent 作用域虚拟工具，工具体从 `toolResults` 取真实输出，未到则挂 `waitForToolOutput`（真实输出落库 / agent 报终态 status（`isFinalToolCallStatus`）/ turn settle / 30 分钟兜底，四者任一解除）。**公告帧记下的空输出不算答案**，否则卡片永远只拿得到占位符（issue #10 的第 1 条观察）。真实工具与缺席的 `tools` 服务原样放行。
+- `tools/execute` 虚拟工具（§2.2）：guard 在 `apply` 挂载时先把保留名 `dsh_ntr__acp_tool_call` 预注册进 **preset 这一代的 scope**（同一代的所有 NTR 会话共用，不是 per-agent 作用域），schema 随本会话第一份请求头下发——挂载早于首次请求组装时，`unknown tool` + 下次清单 diff 的「已添加工具」这对噪音不再出现；升级 / HMR 时已经活着的会话，下一份请求头仍可能补记一次 `tool-addition`。只有挂载时 `tools` 服务未就绪或挂载注册失败，才回落到执行阶段对解析不到的工具名即时注册；execute 路径按 **schema 指纹**识别前一个模块实例留下的同一份定义，HMR 后 preset scope 上存活的注册会被复用，不会被误判成真实宿主工具而 fail-closed。**Auto 权限档仍然不可用**：宿主实验性自动审查在 schema 命中后还要调用会话模型判风险，而 NTR 请求头里的模型是外部 ACP agent；adapter 在 `purpose` 闸门之后、建 ACP 会话之前拒收既无 `purpose` 也无 `sessionId` 的匿名辅助调用（0.2.2 的 `purpose: "auto-review"` 由既有闸门拒掉），审查得不出结论，宿主拒绝每一张卡并显示错误，agent 自己的执行继续；指引是改用非 Auto 权限档。工具体从 `toolResults` 取真实输出，未到则挂 `waitForToolOutput`（真实输出落库 / agent 报终态 status（`isFinalToolCallStatus`）/ turn settle / 30 分钟兜底，四者任一解除）。**公告帧记下的空输出不算答案**，否则卡片永远只拿得到占位符（issue #10 的第 1 条观察）。真实工具与缺席的 `tools` 服务原样放行。
 - `agent/inbox/inserted` / `agent/inbox/claimed` 路由选择：见 §3，宿主有 `agent.model` 时把绑定写成会话选择。
 - `agent/request` 路由改写：见 §3，仅老宿主（无 `agent.model`）生效。
 

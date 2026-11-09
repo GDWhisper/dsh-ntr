@@ -512,11 +512,15 @@ describe('acp-guard preset row', () => {
     const toolsWithReal = toolsServiceOf({ real: realTool })
     const ctxReal = guardCtx({ tools: toolsWithReal })
     await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctxReal as never, undefined))
+    // Issue #18: the reserved name is reserved at mount. Executing a REAL tool
+    // still passes untouched and adds no registration.
+    expect(toolsWithReal.register).toHaveBeenCalledTimes(1)
+    expect(toolsWithReal.register.mock.calls[0][0]).toMatchObject({ name: ACP_TOOL_CALL_NAME })
     const execReal = ctxReal.listeners.get('tools/execute')
     if (execReal === undefined) throw new Error('no tools/execute listener')
     const downstream = vi.fn(async () => ({ text: 'downstream' }))
     await execReal.listener({ name: 'real', agent: {}, exec: { callId: 'r1' } }, downstream)
-    expect(toolsWithReal.register).not.toHaveBeenCalled()
+    expect(toolsWithReal.register).toHaveBeenCalledTimes(1)
     expect(downstream).toHaveBeenCalledTimes(1)
 
     // The reserved constant name registers a scoped virtual tool whose body first answers
@@ -655,12 +659,14 @@ describe('acp-guard preset row', () => {
     const tools = toolsServiceOf()
     const ctx = guardCtx({ tools })
     await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    // Issue #18: the reservation lands at mount, before the first card runs.
+    expect(tools.register).toHaveBeenCalledTimes(1)
+    expect(tools.register.mock.calls[0][0]).toMatchObject({ name: ACP_TOOL_CALL_NAME })
     const exec = ctx.listeners.get('tools/execute')
     if (exec === undefined) throw new Error('no tools/execute listener')
     const next = vi.fn(async () => ({ text: 'downstream' }))
     await exec.listener({ name: snapshot.name, agent: {}, exec: { callId: 'pwsh-card-1' } }, next)
     expect(tools.register).toHaveBeenCalledTimes(1)
-    expect(tools.register.mock.calls[0][0]).toMatchObject({ name: ACP_TOOL_CALL_NAME })
     expect(next).toHaveBeenCalledTimes(1)
     // Same constant name again: the standing scoped virtual tool is reused
     // (virtualDefs semantics - never unregister/prune/cap/stop-after-N).
@@ -670,20 +676,24 @@ describe('acp-guard preset row', () => {
   })
 
   it('SIMULATION ONLY: a tools double whose register throws is caught, no exception leaks, next() runs', async () => {
-    // Simulation of a host whose tools service refuses registration. The
-    // guard's catch must fire (observable console.warn only) and still delegate.
+    // Simulation of a host whose tools service refuses registration. Retry
+    // policy (issue #18): the mount reservation throws and is swallowed so
+    // apply never fails; the execute listener's lazy path is the ONE retry,
+    // which throws again and still delegates.
     const tools = toolsServiceOf()
     tools.register.mockImplementation(() => { throw new Error('simulated register failure') })
     const ctx = guardCtx({ tools })
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     try {
-      await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+      await expect(import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined)))
+        .resolves.toBeUndefined()
+      expect(tools.register).toHaveBeenCalledTimes(1) // the swallowed mount attempt
       const exec = ctx.listeners.get('tools/execute')
       if (exec === undefined) throw new Error('no tools/execute listener')
       const next = vi.fn(async () => ({ text: 'downstream' }))
       await expect(exec.listener({ name: ACP_TOOL_CALL_NAME, agent: {}, exec: { callId: 'sim-1' } }, next))
         .resolves.toEqual({ text: 'downstream' })
-      expect(tools.register).toHaveBeenCalledTimes(1)
+      expect(tools.register).toHaveBeenCalledTimes(2) // mount attempt + execute retry
       expect(next).toHaveBeenCalledTimes(1)
       expect(warn.mock.calls.some(call => String(call[0]).includes('register threw'))).toBe(true)
     } finally {
@@ -699,6 +709,8 @@ describe('acp-guard preset row', () => {
     const tools = toolsServiceOf({ [ACP_TOOL_CALL_NAME]: realTool })
     const ctx = guardCtx({ tools })
     await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    // Mount must not shadow the occupied name either.
+    expect(tools.register).not.toHaveBeenCalled()
     const exec = ctx.listeners.get('tools/execute')
     if (exec === undefined) throw new Error('no tools/execute listener')
     const next = vi.fn(async () => ({ text: 'downstream' }))
@@ -708,17 +720,20 @@ describe('acp-guard preset row', () => {
     expect(result).toMatchObject({ isError: true })
   })
 
-  it('no host collision on the normal path: tools.get(CONST) is undefined', async () => {
-    // A normal host has NO real tool named dsh_ntr__acp_tool_call, so the
-    // global collision probe and the hard assertion both see undefined here.
+  it('pre-registers the reserved tool at mount, so tools.get(CONST) is defined', async () => {
+    // Issue #18: a normal host has NO real tool named dsh_ntr__acp_tool_call,
+    // so the mount reservation registers the display card immediately. Auto
+    // review then finds exactly one schema match in the request header.
     const tools = toolsServiceOf()
     const ctx = guardCtx({ tools })
     await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
-    expect(tools.get(ACP_TOOL_CALL_NAME)).toBeUndefined()
     expect(ACP_TOOL_CALL_NAME).toBe('dsh_ntr__acp_tool_call')
+    expect(tools.register).toHaveBeenCalledTimes(1)
+    expect(tools.register.mock.calls[0][0]).toMatchObject({ name: ACP_TOOL_CALL_NAME })
+    expect(tools.get(ACP_TOOL_CALL_NAME)).toBeDefined()
   })
 
-  it('passes a NON-reserved tool name straight through: one next(), no register, no console.warn', async () => {
+  it('passes a NON-reserved tool name straight through: one next(), no extra register, no console.warn', async () => {
     // The isolation gate: only ACP_TOOL_CALL_NAME reaches the registrar.
     // Everything else is a single string comparison - no probe, no virtual
     // tool, no diagnostics. guardCtx fires the listener directly (the double
@@ -726,6 +741,7 @@ describe('acp-guard preset row', () => {
     const tools = toolsServiceOf()
     const ctx = guardCtx({ tools })
     await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    expect(tools.register).toHaveBeenCalledTimes(1) // mount reservation only
     const exec = ctx.listeners.get('tools/execute')
     if (exec === undefined) throw new Error('no tools/execute listener')
     const next = vi.fn(async () => ({ text: 'downstream' }))
@@ -734,11 +750,166 @@ describe('acp-guard preset row', () => {
       const result = await exec.listener({ name: 'SomeOtherTool', agent: {}, exec: { callId: 'gate-1' } }, next)
       expect(result).toEqual({ text: 'downstream' })
       expect(next).toHaveBeenCalledTimes(1)
-      expect(tools.register).not.toHaveBeenCalled()
+      expect(tools.register).toHaveBeenCalledTimes(1)
       expect(warn).not.toHaveBeenCalled()
     } finally {
       warn.mockRestore()
     }
+  })
+
+  it('pre-registers the display card at mount, and execute does not register again', async () => {
+    // Issue #18: Auto review reads the step's tool schemas in
+    // `tools/pre-execute`, before `tools/execute`; the reservation must
+    // already be on the request header when the card executes.
+    const tools = toolsServiceOf()
+    const ctx = guardCtx({ tools })
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    expect(tools.register).toHaveBeenCalledTimes(1)
+    expect(tools.register.mock.calls[0][0]).toMatchObject({ name: ACP_TOOL_CALL_NAME })
+    expect(tools.get(ACP_TOOL_CALL_NAME)).toBeDefined()
+
+    const exec = ctx.listeners.get('tools/execute')
+    if (exec === undefined) throw new Error('no tools/execute listener')
+    const next = vi.fn(async () => ({ text: 'downstream' }))
+    const result = await exec.listener({ name: ACP_TOOL_CALL_NAME, agent: {}, exec: { callId: 'pre-1' } }, next)
+    expect(result).toEqual({ text: 'downstream' })
+    expect(tools.register).toHaveBeenCalledTimes(1)
+    expect(next).toHaveBeenCalledTimes(1)
+  })
+
+  it('applies without a tools service and still delegates the card execution', async () => {
+    const ctx = guardCtx()
+    await expect(import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined)))
+      .resolves.toBeUndefined()
+    const exec = ctx.listeners.get('tools/execute')
+    if (exec === undefined) throw new Error('no tools/execute listener')
+    const next = vi.fn(async () => ({ text: 'downstream' }))
+    const result = await exec.listener({ name: ACP_TOOL_CALL_NAME, agent: {}, exec: { callId: 'no-tools' } }, next)
+    expect(result).toEqual({ text: 'downstream' })
+    expect(next).toHaveBeenCalledTimes(1)
+  })
+
+  it('reserves once when the tools service arrives after mount', async () => {
+    // The preset may mount before the tools service; the inject seam retries
+    // there, and a repeated delivery must not register a second definition.
+    const services: Record<string, unknown> = {}
+    const ctx = guardCtx(services) as ReturnType<typeof guardCtx> & {
+      inject: (deps: string[], callback: (injected: unknown) => void) => void
+    }
+    let pending: ((injected: unknown) => void) | undefined
+    ctx.inject = vi.fn((_deps, callback) => { pending = callback })
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+    if (pending === undefined) throw new Error('guard did not use the inject seam')
+    const tools = toolsServiceOf()
+    services.tools = tools
+    pending(ctx)
+    pending(ctx)
+    expect(tools.register).toHaveBeenCalledTimes(1)
+    expect(tools.get(ACP_TOOL_CALL_NAME)).toBeDefined()
+  })
+
+  it('adopts a predecessor module instance definition by schema fingerprint', async () => {
+    // HMR can leave the PREVIOUS module instance's scoped registration under
+    // the reserved name. The new instance's mount probe only sees the global
+    // layer (undefined), its scoped register throws (the name is taken), and
+    // the execute path receives an object the new WeakSet has never seen.
+    // Identical stable data fields must mark it as ours instead of failing
+    // every card closed.
+    const firstTools = toolsServiceOf()
+    const first = guardCtx({ tools: firstTools })
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(first as never, undefined))
+    const registered = firstTools.register.mock.calls[0][0] as {
+      name: string
+      description: string
+      parameters: unknown
+    }
+    // A DISTINCT object with the same stable data fields: exactly what a
+    // reloaded module's registration looks like to this module instance
+    // (functions differ in identity, and the WeakSet cannot see it).
+    const predecessor = {
+      ...registered,
+      parameters: JSON.parse(JSON.stringify(registered.parameters)) as unknown,
+      execute: async () => ({ text: 'predecessor module' }),
+    }
+
+    const register = vi.fn(() => { throw new Error('name already registered in this scope') })
+    const tools = {
+      // Mount reservation: the global layer has no entry. Execute: the preset
+      // scope still holds the predecessor's definition.
+      get: vi.fn((name: string, scope?: unknown) => (
+        name === ACP_TOOL_CALL_NAME && scope !== undefined ? predecessor : undefined
+      )),
+      register,
+    }
+    const ctx = guardCtx({ tools })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await expect(import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined)))
+        .resolves.toBeUndefined()
+      expect(register).toHaveBeenCalledTimes(1) // the swallowed mount attempt
+      const exec = ctx.listeners.get('tools/execute')
+      if (exec === undefined) throw new Error('no tools/execute listener')
+      const next = vi.fn(async () => ({ text: 'downstream' }))
+      const result = await exec.listener({ name: ACP_TOOL_CALL_NAME, agent: {}, exec: { callId: 'fingerprint-1' } }, next)
+      expect(result).toEqual({ text: 'downstream' })
+      expect(next).toHaveBeenCalledTimes(1)
+      expect(register).toHaveBeenCalledTimes(1) // reuse must not register again
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('fails closed when the scoped name is a real tool with a different schema', async () => {
+    // The fingerprint fallback must not adopt an arbitrary host tool that
+    // occupies the reserved name: different stable fields keep the
+    // isError / no-next path.
+    const realTool = {
+      name: ACP_TOOL_CALL_NAME,
+      description: 'a real host tool that shares the reserved name',
+      parameters: { type: 'object', properties: { command: { type: 'string' } } },
+      execute: async () => ({ text: 'real host tool ran' }),
+    }
+    const register = vi.fn(() => { throw new Error('name already registered in this scope') })
+    const tools = {
+      get: vi.fn((name: string, scope?: unknown) => (
+        name === ACP_TOOL_CALL_NAME && scope !== undefined ? realTool : undefined
+      )),
+      register,
+    }
+    const ctx = guardCtx({ tools })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(ctx as never, undefined))
+      expect(register).toHaveBeenCalledTimes(1) // mount attempt, swallowed
+      const exec = ctx.listeners.get('tools/execute')
+      if (exec === undefined) throw new Error('no tools/execute listener')
+      const next = vi.fn(async () => ({ text: 'downstream' }))
+      const result = await exec.listener({ name: ACP_TOOL_CALL_NAME, agent: {}, exec: { callId: 'real-schema-1' } }, next)
+      expect(result).toMatchObject({ isError: true })
+      expect(next).not.toHaveBeenCalled()
+      expect(register).toHaveBeenCalledTimes(1)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('a re-applied guard reuses its predecessor\'s definition instead of failing closed', async () => {
+    // HMR mounts the row again on the same preset scope; the tools registry
+    // still holds the first definition, so identity must mark it as ours.
+    const tools = toolsServiceOf()
+    const first = guardCtx({ tools })
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(first as never, undefined))
+    expect(tools.get(ACP_TOOL_CALL_NAME)).toBeDefined()
+
+    const second = guardCtx({ tools })
+    await import('../presets/acp/acp-guard.mjs').then(({ apply }) => apply(second as never, undefined))
+    expect(tools.register).toHaveBeenCalledTimes(1)
+    const exec = second.listeners.get('tools/execute')
+    if (exec === undefined) throw new Error('no tools/execute listener')
+    const next = vi.fn(async () => ({ text: 'downstream' }))
+    const result = await exec.listener({ name: ACP_TOOL_CALL_NAME, agent: {}, exec: { callId: 'hmr-1' } }, next)
+    expect(result).toEqual({ text: 'downstream' })
+    expect(next).toHaveBeenCalledTimes(1)
   })
 
 })
