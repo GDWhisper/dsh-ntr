@@ -36,11 +36,12 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 - `sandboxPolicy` / `sessions` —— 工作区根解析（`wireWorkspace` 注入 `BridgeManager.setSessionWorkspaceResolver`，解析结果只有 `{ workspaceRoot }`，不含任何 mode / approval 语义）
 - `sessions.append` / `subagent/catalog` —— detached ACP worker 的外部子代理目录事实（`wireSubagentCatalog` → `appendExternalSubagentCatalog`）：只写 `mode: 'external'`，无子会话 / activity / continuation；宿主没有该事件时 `append` 抛错即静默跳过。它写进宿主 session log，不落 `~/.dsh/dsh-ntr/`。
 - `agentPresets` —— preset roster（`wirePresetRoster`）
+- `agents` —— idle background drain 的唤醒入口（`wireChatAgent` → `BridgeManager.setDshAgentResolver`）：`ctx.get('agents').list()` 按 `agent.session.id` 找到该聊天的 agent，调用 `agent.followup(...)` 注入一条隐藏唤醒消息；宿主没有该注册表或 `list` / `followup` 缺失时退回「drain 只进 transcript」。这是**唯一的** `agents` 调用点，与审批无关（见下方第 43 行说明）。
 - 浏览器侧 `sessions` —— 经 `service<T>(name)` 在调用点惰性解析（见 [ui.md](./ui.md)）
 
 服务缺失必须是**可用性下降**，不是加载失败；可选服务迟到时由 `ctx.inject` 补挂，不得让插件整体不激活。
 
-**宿主审批服务不再是协作方**：权限询问全部走插件自己的 `PermissionLedger` 管线，`approval` / `agents` 不再被探测或调用；宿主的审批策略（`ask` / `never`）不再作用于 ACP 询问，`approval/asked|decided` 也不再为 ACP 询问写入（接受的取舍）。见 [permissions.md](./permissions.md)。
+**宿主审批服务不再是协作方**：权限询问全部走插件自己的 `PermissionLedger` 管线，`approval` 不再被探测或调用（`agents` 只服务于 §3 的 idle-drain 唤醒，与审批无关）；宿主的审批策略（`ask` / `never`）不再作用于 ACP 询问，`approval/asked|decided` 也不再为 ACP 询问写入（接受的取舍）。见 [permissions.md](./permissions.md)。
 
 ## 4. 不碰宿主的模型层
 

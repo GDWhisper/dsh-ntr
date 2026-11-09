@@ -8,7 +8,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { ConnectionRpcHandler, HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
-import { ACP_PRESET_ID, AcpLlmAdapter, BridgeManager, PLUGIN_VERSION } from './bridge.ts'
+import { ACP_PRESET_ID, AcpLlmAdapter, BridgeManager, PLUGIN_VERSION, type DshAgentLike } from './bridge.ts'
 import { appendExternalSubagentCatalog, EventHub, dispatchRpc, permissionReplayFrames, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
 import { AcpSaveGate } from './save-gate.ts'
 import { installHmrReconcileGuard } from './hmr-guard.ts'
@@ -42,6 +42,15 @@ interface ChannelRegisteringConnection extends HostConnectionHandle {
 /** Structural view of the host session store (`@deepseek-ai/dsh-session`'s `ctx.sessions`). */
 interface SessionsLike {
   get(sessionId: string): SessionCatalogLike | undefined
+}
+
+/**
+ * Structural view of the host agent registry (`@deepseek-ai/dsh-agent`'s
+ * `ctx.agents`), as far as an idle-drain wake needs it: `list()` exposes the
+ * live agents, and `agent.session.id` identifies the conversation.
+ */
+interface AgentRegistryLike {
+  list?: () => readonly DshAgentLike[]
 }
 
 /**
@@ -353,6 +362,24 @@ export function apply(ctx: Context, config?: unknown): void {
     })
   }
 
+  /**
+   * Optional host integration: let an IDLE CodeBuddy background drain wake its
+   * conversation. The host registry is probed structurally — a deployment
+   * without `ctx.agents` keeps the transcript-only behavior.
+   */
+  const wireChatAgent = (): void => {
+    const agents = (typeof ctx.get === 'function' ? ctx.get('agents') : undefined) as AgentRegistryLike | undefined
+    if (agents === undefined || typeof agents.list !== 'function') return
+    manager.setDshAgentResolver(dshSessionId => {
+      try {
+        for (const agent of agents.list?.() ?? []) {
+          if (agent?.session?.id === dshSessionId) return agent
+        }
+      } catch {}
+      return undefined
+    })
+  }
+
   wireWorkspace()
   if (typeof ctx.inject === 'function') {
     // Late arrival for the workspace collaborators: a deployment missing one
@@ -365,10 +392,14 @@ export function apply(ctx: Context, config?: unknown): void {
   // persistence store (cold); the sandbox knobs are NOT its dependencies.
   wireAcpMode()
   wireSubagentCatalog()
+  wireChatAgent()
   if (typeof ctx.inject === 'function') {
     ctx.inject(['sessions'], () => {
       wireAcpMode()
       wireSubagentCatalog()
+    })
+    ctx.inject(['agents'], () => {
+      wireChatAgent()
     })
   }
 

@@ -308,6 +308,52 @@ worker 阶段。`streamPrompt` 的响应一到就收口：主聊天只留「已�
 回归用例：`tests/bridge.spec.ts` 的「a detached worker settles the turn at the response」
 与两个 open-tool 用例。
 
+**空闲 drain 自动唤醒（2026-11-08 追加）**：worker 报告与最终答案在 prompt 响应之后以
+CodeBuddy 的 `unsolicitedTurn` drain 到达（CodeBuddy ACP 文档
+「非用户发起的 drain 轮」），而那时主回合已经收口、没有任何控制器在读它。插件不能
+凭空 append，但可以让宿主再开一个真实回合：`BridgeManager.trackBackgroundDrainText`
+收集空闲 drain 的 `agent_message_chunk` 正文，静默 `ambientQuietMs` 后由
+`deliverBackgroundReport` 经宿主 `agent.followup` 注入一条
+`source.kind = 'plugin'`、`source.plugin = 'dsh-ntr'` 的隐藏消息（可见文本只有一行
+notice，正文放 `source.report`）；`AcpLlmAdapter.streamPrompt` 用 `backgroundReportOf`
+认出它并 **本地回放**报告，不再向 CodeBuddy 发 `session/prompt`。preset guard 只放行
+「本插件名 + `form: 'notice'`」这一种 plugin 消息（形状谓词不看 report），其余照旧剥离。
+会话忙时按 `ambientMaxMs` 有界重试；`/acp` RPC 或 headless 没有宿主 agent 时同样有界
+重试（记录保住全文），超限才退回只进 transcript。
+
+语义修正（2026-11-09，同批修复 F1–F7、D1）：投递前复查 `consumedDrains`（回合已折走
+答案就丢弃，不重复唤醒）；报告记录不跨 run（run 切换即就地收口旧报告、开新记录，绝不
+混报，投递/丢弃/计时器都按传入记录操作）；收集对象 run 的一切帧重置静默时钟（含空文本
+chunk 与 tool 帧）；drain 有未闭合 tool call 时不起静默唤醒（关闭帧按 toolCallId 认，
+无 `_meta` 的真实完成帧也算），`ambientMaxMs` 到点无论忙态还是工具未闭都截断投递并带
+标记；quiet 收口在零可见输出时不消费 drain id（`foldedDrainIds` 按 run 逐 id 分流，run
+复活后仍可唤醒）；`backgroundReportOf` 改 FIFO 回放最旧的未回答 wake（双 wake 排队不丢报告、不
+重复 prompt）；唤醒形消息 report 丢失时本地答一行固定说明 + 一条 `agent/notice`，绝不
+重发用户旧消息（guard 放行谓词同为 kind+plugin+form）；同步抛错与异步 reject 的失败后
+果统一（丢报告、消费 id、各一条 notice、零 wake）。
+回归用例：`tests/bridge.spec.ts` 的「wakes the chat with an idle drain report」、
+「drops a queued report the user's turn already answered」、「splits two interleaved
+drain runs into two clean reports」、「waits out a drain tool that outlives the quiet
+window」、「closes a report-less wake locally」、「replays two queued wakes FIFO」、
+「wakes for a revived run after a zero-output quiet close」、wake 抛错/reject 两例，与
+`tests/acp-guard.spec.ts` 的「keeps the plugin background-report wake message」、
+「keeps a wake whose report was lost」。
+
+复审修正（2026-11-09，R1–R6）：quiet 收口的 `consume` 改**按 run 逐 id** 判定
+（`TurnStreamController.foldedDrainIds`，fold 时按 update 的 requestId 记入；收口 id 不在
+集合则不消费，集合里已折叠但非收口 id 的 run 一并消费防复活二次唤醒）；无宿主 agent 的
+投递改 `ambientMaxMs` 内有界重试（保住已收集全文），超限丢弃转 transcript-only（全文在
+transcript，半份报告宁可不发，「日后重试」是误导）；guard 的 `isBackgroundWake` 补
+`role === 'user'` 与 bridge 谓词同步；guard 删除死常量 `BACKGROUND_REPORT_LOST_TEXT`
+（丢失文案由 bridge 唯一持有）；drain 工具开闭只认 completed / failed 为关闭，未知 /
+无 status 一律按未闭合处理（安全侧，`ambientMaxMs` 截断兜底）。
+回归用例：`tests/bridge.spec.ts` 的「cuts a report at the ambient ceiling」、
+「treats an unknown tool status as open」、「keeps a collected report when no host agent
+is mounted」、「consumes the folded run and spares the zero-output run」（mock 触发器
+`DISPATCHWEIRDTOOL` / `RUNMIX`），F1 / F6 既有用例补证据断言（帧到达证据 + 空闲窗口
+override），`tests/acp-guard.spec.ts` 的「drops a wake-shaped message that is not a user
+message」。
+
 **同一轮的性能改造**（用户报告：流式期间整机卡顿、时钟跳跃）。排查结论：
 宿主端逐 chunk 成本是 O(1)（广播 + 每连接一次 stringify），压力主因在
 浏览器端**每条 SSE chunk 一次「数组复制 + 全 state 重建 + 所有订阅组件

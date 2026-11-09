@@ -151,6 +151,10 @@
  *  - "DISPATCHLATEDRAIN" (with DISPATCH) → the dispatch completes WITHOUT
  *              `_meta` and the drain's announcement is delayed past the test's
  *              quiet window: the completion itself must start the drain phase
+ *  - "DISPATCHLATE" (with DISPATCH) → the same drained run emits ONE more
+ *              `agent_message_chunk` ~700ms after its quiet window closed: the
+ *              answer was already delivered, so it must stay transcript-only
+ *              (no second wake, no second bubble)
  *  - "DISPATCHPARKED" (with DISPATCH) → the response lands between driver
  *              steps (right after the ack) and the worker starts while the
  *              host is away: a parked hold's step must adopt it later
@@ -164,6 +168,18 @@
  *  - "DISPATCHNOSTATUS" (with DISPATCH) → the dispatch call's first `tool_call`
  *              frame carries NO status: the record starts `pending` until a
  *              worker update proves the work is running
+ *  - "DISPATCHWEIRDTOOL" (with DISPATCH) → the drain's tool call arrives as a
+ *              SINGLE `tool_call_update` with an UNKNOWN status (`running`) —
+ *              no opening `tool_call`, no close frame. Unknown must count as
+ *              OPEN: the quiet window must not wake a half report; only the
+ *              `ambientMaxMs` cut delivers, with its truncation marker
+ *  - "RUNMIX" → the multi-run interleave: run B announces and this prompt is
+ *              folded into it; the RETIRED run A (a prior "QUIETDRAIN" prompt's
+ *              zero-output close left its id retired but UNCONSUMED) revives
+ *              mid-wait with text the steered turn folds into its bubble, then
+ *              B re-announces (the ambient record switches back to B) and stays
+ *              silent; after the quiet close B revives with its real answer
+ *              (must wake) and A revives late (must never answer twice)
  *
  * Environment knobs:
  *  - MOCK_NO_LOAD=1 → `initialize` advertises no `loadSession` capability
@@ -613,6 +629,21 @@ const app = agent({ name: 'mock-acp-agent' })
       const slow = text.includes('DISPATCHSLOW')
       const silent = text.includes('DISPATCHSILENT')
       const two = text.includes('DISPATCHTWO')
+      // The drain's answer arrives in TWO waves with a gap WIDER than the
+      // quiet window, so a test can interject a user turn between them (the
+      // interjected turn then folds the tail and consumes the drain).
+      const split = text.includes('DISPATCHSPLIT')
+      // The drain SWITCHES runs mid-collection: run A speaks, then a second
+      // `unsolicitedTurn` announcement hands the ambient to run B, which
+      // speaks too. Two independent reports, never one mixed report.
+      const switchRuns = text.includes('DISPATCHSWITCH')
+      // The drain opens a tool call MID-ANSWER that outlives the quiet window
+      // (its completion frame arrives BARE, no `_meta`): the wake must wait for
+      // the close instead of firing half a report.
+      const toolDrain = text.includes('DISPATCHTOOL')
+      // The tool's ONLY frame is a `tool_call_update` with an UNKNOWN status:
+      // "unknown = unclosed" must hold the quiet wake back to the ceiling cut.
+      const weirdTool = text.includes('DISPATCHWEIRDTOOL')
       const fast = text.includes('DISPATCHFAST')
       const parked = text.includes('DISPATCHPARKED')
       const noDrain = text.includes('DISPATCHNODRAIN')
@@ -903,7 +934,72 @@ const app = agent({ name: 'mock-acp-agent' })
             failed ? 'failed' : 'completed',
             failed ? [{ type: 'content', content: { type: 'text', text: 'WORKER-FAILED-REASON' } }] : undefined,
           )
+          if (split) {
+            // The drain announces itself and answers in two waves (the gap is
+            // wider than the client's quiet window): a user turn landing in the
+            // gap folds the tail into its own bubble and consumes the drain.
+            await announce(parentRun)
+            await sendDrain({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'DISPATCH-INT-HEAD ' } })
+            await sleep(600)
+            await sendDrain({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'DISPATCH-INT-TAIL' } })
+            return
+          }
+          if (switchRuns) {
+            // Run A announces and speaks; the announcement of run B hands the
+            // ambient record over mid-collection; B speaks; A then emits one
+            // late line that must stay transcript-only (A's answer is out).
+            parentRun = 'req-run-a'
+            await announce(parentRun)
+            await sendDrain({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'DISPATCH-RUN-A-TEXT ' } })
+            await sleep(80)
+            parentRun = 'req-run-b'
+            await announce(parentRun)
+            await sleep(40)
+            await sendDrain({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'DISPATCH-RUN-B-TEXT ' } })
+            setTimeout(() => {
+              void notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'DISPATCH-RUN-A-LATE ' } }, { 'codebuddy.ai/requestId': 'req-run-a' })
+            }, 700)
+            return
+          }
+          if (weirdTool) {
+            // Head text, then a tool call whose ONLY frame carries an UNKNOWN
+            // status (`running`) — no opening `tool_call`, no close frame at
+            // all. "Unknown = unclosed" must hold the quiet wake back: only the
+            // `ambientMaxMs` cut delivers, with its truncation marker.
+            await announce(parentRun)
+            await sendDrain({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'DISPATCH-TOOL-HEAD ' } })
+            await sendDrain({ sessionUpdate: 'tool_call_update', toolCallId: 'drain_unknown_tool', status: 'running' }, 'TaskOutput')
+            return
+          }
+          if (toolDrain) {
+            // Head text, then a tool call that runs LONGER than the quiet
+            // window, then a BARE completion (the real wire's shape: no
+            // `_meta` at all) and the tail text. One wake, both halves.
+            await announce(parentRun)
+            await sendDrain({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'DISPATCH-TOOL-HEAD ' } })
+            await sendDrain({
+              sessionUpdate: 'tool_call',
+              toolCallId: 'drain_long_tool',
+              title: 'TaskOutput',
+              kind: 'read',
+              status: 'in_progress',
+            }, 'TaskOutput')
+            await sleep(700)
+            await sendCompleted('drain_long_tool', 'completed', [{ type: 'content', content: { type: 'text', text: 'LONG TOOL OUTPUT' } }])
+            await sendDrain({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'DISPATCH-TOOL-TAIL' } })
+            return
+          }
           await drainTurn(altFirst ? 'DISPATCH-ALT-ANSWER' : 'DISPATCH-FINAL-ANSWER')
+          if (text.includes('DISPATCHLATE')) {
+            // The SAME drained run speaks once more, long after its quiet
+            // window closed: the answer was already delivered, so this late
+            // line must stay transcript-only (no second wake, no second
+            // bubble). A drained run may legitimately revive (`reviveAmbientId`)
+            // — the consumed-id table is what stops a duplicate answer.
+            setTimeout(() => {
+              void sendDrain({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'DISPATCH-LATE-LINE ' } })
+            }, 700)
+          }
         })()
       }, 30)
       return response
@@ -1068,6 +1164,82 @@ const app = agent({ name: 'mock-acp-agent' })
       setTimeout(() => {
         void drainSend({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'DRAIN-FIRST-TAIL' } })
       }, 20)
+      return { stopReason: 'end_turn' }
+    }
+
+    if (text.includes('QUIETWAKE')) {
+      // QUIETDRAIN's shape PLUS a late revival while the conversation is IDLE:
+      // the drain answers NOTHING before the ambient quiet close (the turn gets
+      // only the deferral line), then delivers the real answer ~500ms later.
+      // The quiet close must NOT mark the id consumed — nothing was delivered —
+      // so the revived answer still reaches the chat as an idle-drain wake.
+      const requestId = 'amb-quiet'
+      await ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: {
+          sessionUpdate: 'session_info_update',
+          _meta: { 'codebuddy.ai/unsolicitedTurn': { requestId, reason: 'background_drain' } },
+        },
+      })
+      await sleep(25)
+      quietDrainId = requestId
+      setTimeout(() => {
+        void ctx.client.notify(methods.client.session.update, {
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'QUIET-REVIVED-ANSWER' },
+            _meta: { 'codebuddy.ai/requestId': requestId },
+          },
+        })
+      }, 500)
+      return { stopReason: 'end_turn' }
+    }
+
+    if (text.includes('RUNMIX')) {
+      // The multi-run interleave: run B announces and THIS prompt is folded
+      // into it; the RETIRED run A (a prior "QUIETDRAIN" prompt's zero-output
+      // close left its id retired but UNCONSUMED) revives mid-wait with text
+      // the steered turn folds into its bubble, then B re-announces (the
+      // ambient record switches back to B) and stays silent. The quiet close
+      // must consume A (its answer was delivered) and NOT B (zero delivery):
+      // B's revival still wakes the chat, while A's late revival can never
+      // answer the same text twice.
+      const runA = quietDrainId ?? 'amb-quiet'
+      const runB = 'amb-mix-b'
+      const mixSend = (update, id) => ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: { ...update, _meta: { 'codebuddy.ai/requestId': id } },
+      })
+      const mixAnnounce = id => ctx.client.notify(methods.client.session.update, {
+        sessionId,
+        update: {
+          sessionUpdate: 'session_info_update',
+          _meta: { 'codebuddy.ai/unsolicitedTurn': { requestId: id, reason: 'background_drain' }, 'codebuddy.ai/requestId': id },
+        },
+      })
+      await mixAnnounce(runB)
+      // The announcement must be in the client's hands before its response is
+      // judged: 25ms is dispatch time, not a timing bet.
+      await sleep(25)
+      setTimeout(() => {
+        void (async () => {
+          // Run A revives: its id is retired-unconsumed, so the update alone
+          // rebuilds the ambient record and its text is the steered answer.
+          await mixSend({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'MIX-RUN-A-TEXT ' } }, runA)
+          await sleep(60)
+          // Run B takes the ambient record back and says nothing: the quiet
+          // close retires B with ZERO delivery.
+          await mixAnnounce(runB)
+          await sleep(500)
+          // B revives AFTER the quiet close with its real answer (must wake) ...
+          await mixSend({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'MIX-RUN-B-ANSWER' } }, runB)
+          await sleep(500)
+          // ... and A revives late: its answer is already on screen.
+          await mixAnnounce(runA)
+          await mixSend({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'MIX-RUN-A-LATE' } }, runA)
+        })()
+      }, 30)
       return { stopReason: 'end_turn' }
     }
 

@@ -487,7 +487,74 @@ interface LiveSession {
    * agent out from under it.
    */
   backgroundDispatches?: Map<string, BackgroundDispatch>
+  /**
+   * Prose an IDLE background drain streamed while no turn controller observed
+   * it. With the default "settle at the prompt response" (docs/acp-convergence
+   * §派发即收口), CodeBuddy's unsolicited turn lands on a conversation nobody
+   * is driving: the text reaches the transcript, but the chat plane would stay
+   * silent until the person spoke again. This record lets the manager hand the
+   * report to the host as a wake-up message, which turns it into a REAL chat
+   * turn (`BridgeManager.deliverBackgroundReport`).
+   *
+   * ONE record per run: a frame of a DIFFERENT run (a drain that announced
+   * itself while the report waited) closes the old record out in place and
+   * opens a fresh one — two runs' prose never mix in one report, and each
+   * run's id is retired on its own delivery (`trackBackgroundDrainText`).
+   */
+  backgroundReport?: BackgroundReport
+  /**
+   * Background drain request ids whose answer already reached a turn or the
+   * chat plane. A drain that speaks after its wait closed is alive again
+   * (`reviveAmbientId`), but its text belongs to a deliverable that ALREADY
+   * exists — collecting it again would answer the same run twice (one more
+   * bubble, or a second wake after the first one). Bounded, oldest evicted.
+   *
+   * "Already delivered" is evidence-based, per run id: a quiet close only marks
+   * an id consumed when the turn actually FOLDED that run's visible text
+   * (`TurnStreamController.foldedDrainIds`). A zero-output close (just the
+   * deferral line) leaves it unconsumed — the answer never reached anyone, so
+   * a revived run must still be able to wake the chat.
+   */
+  consumedDrains?: Set<string>
   transcript: Transcript
+}
+
+/**
+ * One idle drain's collected answer, waiting to become a chat turn.
+ *
+ * Collected ONLY while no turn controller exists (or the conversation is
+ * otherwise idle): a steered prompt or a `backgroundHoldWorkerPhase` hold
+ * already consumes the drain inside its own bubble, and a second delivery
+ * would duplicate the answer.
+ *
+ * The record is BOUND TO ONE RUN (`requestId`): a frame of a different run
+ * closes it out and opens a fresh record, so a report never carries two runs'
+ * prose and each run's id is retired on its own delivery.
+ */
+interface BackgroundReport {
+  /** The drain's request id: the run this report belongs to. */
+  requestId?: string
+  /** Concatenated `agent_message_chunk` text of the drain, verbatim. */
+  text: string
+  /**
+   * When the run last showed any frame (the quiet clock measures the run's
+   * silence from here — see `armReportTimer`).
+   */
+  lastAt: number
+  /** When the first frame landed; bounds how long a busy conversation defers. */
+  firstAt: number
+  /** The armed quiet timer, or `undefined` while none is pending. */
+  timer?: ReturnType<typeof setTimeout>
+  /** Whether the host already received this report (never twice). */
+  delivered: boolean
+  /**
+   * Tool calls THIS run opened in the drain and never reported `completed` /
+   * `failed` for, by `toolCallId`. While one is open the quiet timer does not
+   * deliver: the run is still answering, and a tool can outlive the quiet
+   * window (the completion frame arrives with NO `_meta` on the real wire and
+   * closes the call by id alone — the dispatch-completion convention).
+   */
+  openToolCalls: Set<string>
 }
 
 /** One unsolicited (background) turn the agent is running, as announced in `_meta`. */
@@ -1063,6 +1130,14 @@ export class AgentBridge {
      * more (a worker reporting after the turn that dispatched it closed).
      */
     private readonly onSessionBackgroundUpdate?: (session: LiveSession, update: SessionUpdate) => void,
+    /**
+     * Every `session/update` of a live session — AFTER the session-level drain
+     * record was refreshed. The manager collects an IDLE drain's prose here so
+     * it can wake the chat with it (see `LiveSession.backgroundReport`). Kept
+     * separate from {@link onSessionBackgroundUpdate} on purpose: that one runs
+     * BEFORE the drain record exists, and this one needs THIS frame's record.
+     */
+    private readonly onSessionDrainText?: (session: LiveSession, update: SessionUpdate) => void,
     /**
      * Terminalize every unfinished detached-worker record when a SESSION goes
      * away (close / release / force reset / process death). A closed TURN is
@@ -2844,7 +2919,12 @@ export class AgentBridge {
     // may never re-announce itself, yet the next prompt folded into it must
     // still be recognised as steered and receive the drain's text. A
     // re-announcement below does the same for its id.
-    if (meta?.requestId !== undefined && isRetiredAmbientId(session, meta.requestId)) {
+    //
+    // `retiredDrain` only drives the revive below: an already-consumed run
+    // stays transcript-only for the idle collector (`LiveSession.consumedDrains`),
+    // so this frame cannot open a second answer after its deferral.
+    const retiredDrain = meta?.requestId !== undefined && isRetiredAmbientId(session, meta.requestId)
+    if (retiredDrain && meta?.requestId !== undefined) {
       reviveAmbientId(session, meta.requestId)
       session.ambient = {
         requestId: meta.requestId,
@@ -2892,6 +2972,10 @@ export class AgentBridge {
         session.ambient.sawOutput = true
       }
     }
+    // The drain record above is THIS frame's: the manager collects an IDLE
+    // drain's prose from here (a steered prompt or a hold already consumes it,
+    // and the collector checks that before taking anything).
+    this.onSessionDrainText?.(session, params.update)
     if (kind === 'tool_call' || kind === 'tool_call_update') {
       const { toolCallId, status } = params.update as { toolCallId: string; status?: string | null }
       if (status === 'completed' || status === 'failed') session.activeToolCalls.delete(toolCallId)
@@ -3071,13 +3155,27 @@ function codebuddyMetaOf(source: unknown): CodebuddyMeta | undefined {
  * no late update can plausibly still carry. Re-retiring an id refreshes its
  * timestamp and moves it to the end.
  */
-function retireAmbientId(session: LiveSession, requestId: string): void {
+function retireAmbientId(session: LiveSession, requestId: string, consume = true): void {
   const retired = session.retiredAmbients ?? []
   const existing = retired.findIndex(entry => entry.requestId === requestId)
   if (existing >= 0) retired.splice(existing, 1)
   retired.push({ requestId, retiredAt: Date.now() })
   while (retired.length > RETIRED_AMBIENT_MAX) retired.shift()
   session.retiredAmbients = retired
+  // An answer that was DELIVERED (a closed wait, a hold, or an idle wake) is
+  // final: its later frames are transcript-only, never a second answer. A
+  // stale retirement (`consume: false`) delivered nothing, so a drain that
+  // comes back to life may still wake the chat.
+  if (!consume) return
+  const consumed = session.consumedDrains ?? new Set<string>()
+  session.consumedDrains = consumed
+  consumed.delete(requestId)
+  consumed.add(requestId)
+  while (consumed.size > CONSUMED_DRAIN_MAX) {
+    const oldest = consumed.values().next().value
+    if (oldest === undefined) break
+    consumed.delete(oldest)
+  }
 }
 
 /** Whether this request id names a drain the session already stopped waiting on. */
@@ -3178,9 +3276,12 @@ function reviveAmbientId(session: LiveSession, requestId: string): void {
  * detail, and a quota recorded against the OLD process must not outlive it.
  */
 function clearAmbientState(session: LiveSession): void {
+  if (session.backgroundReport?.timer !== undefined) clearTimeout(session.backgroundReport.timer)
+  session.backgroundReport = undefined
   session.ambient = undefined
   session.ambientNotices?.clear()
   session.retiredAmbients = undefined
+  session.consumedDrains = undefined
   session.quotaRefusal = undefined
 }
 
@@ -4474,6 +4575,13 @@ const AMBIENT_NOTICE_MAX = 64
 const RETIRED_AMBIENT_MAX = 32
 
 /**
+ * Bound on {@link LiveSession.consumedDrains}: one id per delivered answer.
+ * The set only grows with drains this session actually consumed, so a small
+ * ring covers every run whose late frames could still arrive; oldest first.
+ */
+const CONSUMED_DRAIN_MAX = 64
+
+/**
  * Floor for the "recently retired" lookback the zero-output fallback uses
  * (twice `ambientQuietMs`). Only test-sized quiet windows fall below it; a
  * production window (10s) always wins. Without the floor a 250ms quiet window
@@ -4652,6 +4760,149 @@ interface BackgroundHold {
 const CARD_SETTLE_QUIET_MS = 500
 
 /**
+ * The `source` of the host message that carries an idle background drain's
+ * report into the chat plane.
+ *
+ * CodeBuddy's unsolicited turn is not a chat turn: with the default "settle at
+ * the prompt response" nothing owns its prose. The only entry into the main
+ * plane is a driver step, so the manager injects one hidden user message and
+ * the adapter answers it LOCALLY with the collected report (no ACP prompt is
+ * sent — the agent already produced that text). The message uses the host's
+ * OWN `plugin` source kind (a declared member of `MessageSourceMap`) plus this
+ * plugin's name: a custom kind would have to pass the host's durable-message
+ * validation, which only knows the declared union. The chat row renders as
+ * injected context (`source.kind !== 'user'`), never as the person's words,
+ * and the report rides in `source.report` so the visible text stays one neutral
+ * line.
+ *
+ * The preset guard hand-copies ALL of these constants (a separate module
+ * instance the loader mounts without imports). All sides must change together.
+ */
+export const BACKGROUND_REPORT_SOURCE = 'plugin'
+
+/** The `source.plugin` of that wake message (see {@link BACKGROUND_REPORT_SOURCE}). */
+export const BACKGROUND_REPORT_PLUGIN = 'dsh-ntr'
+
+/**
+ * The `source.form` of that wake message (see {@link BACKGROUND_REPORT_SOURCE}).
+ *
+ * The wake-shape predicate is kind + plugin + FORM — deliberately NOT "carries
+ * a report": a host pipeline that strips `source.report` must still let the
+ * wake reach `streamPrompt`, which then closes the turn LOCALLY with
+ * {@link BACKGROUND_REPORT_LOST_TEXT}. A borrowed-name plugin message (no
+ * form, or another form) is ordinary context and stays stripped.
+ */
+export const BACKGROUND_REPORT_FORM = 'notice'
+
+/**
+ * The visible text of that wake message. Deliberately NEUTRAL: it is shown as
+ * an injected-notice row, while the actual answer follows as the assistant
+ * message the adapter replay yields.
+ */
+const BACKGROUND_WAKE_TEXT = 'Background task completed.'
+
+/**
+ * What the adapter answers a wake whose `source.report` the host pipeline
+ * lost. One fixed, neutral English line, answered LOCALLY (no `session/prompt`
+ * — and never a fall-through to the forward picker: that would re-send the
+ * person's last real message as a duplicate prompt and the agent might
+ * dispatch the work all over again). The full output is in the ACP transcript
+ * view either way.
+ */
+export const BACKGROUND_REPORT_LOST_TEXT = 'Background task completed, but its report was lost in the host pipeline. The full output is in the ACP transcript view.'
+
+/**
+ * Bound on one drained report. The text rides TWO payloads (the hidden wake
+ * message's `source.report` and the assistant reply the adapter yields), so an
+ * unbounded transcript-sized answer would be copied twice. Same budget as an
+ * ACP tool payload; the tail is dropped WITH a marker, never silently.
+ */
+const BACKGROUND_REPORT_MAX = 256_000
+
+/** A host chat agent, as far as a wake-up needs it (see `setDshAgentResolver`). */
+export interface DshAgentLike {
+  session?: { id?: string }
+  /** The host's inbox+driver wake: queues the message and starts a step. */
+  followup?: (message: unknown) => unknown
+}
+
+/**
+ * Whether this message is the plugin's own idle-drain wake — the ONE shape
+ * `wakeChatWithBackgroundReport` injects. Shared by
+ * {@link backgroundReportOf} and the local replay in `streamPrompt`; the preset
+ * guard hand-copies the same predicate (`isBackgroundWake`).
+ *
+ * Deliberately shape-only (kind + plugin + form, no report): a host pipeline
+ * that strips `source.report` must still let the wake through so the adapter
+ * can close the step locally with {@link BACKGROUND_REPORT_LOST_TEXT}.
+ *
+ * Residual risk (an unguardable lower bound): a host that strips `source`
+ * ENTIRELY turns the wake into a source-less message, which the forward picker
+ * reads as the person's own words. Nothing in this repo can defend against
+ * that; it is the reason the predicate is shape-based at all.
+ */
+function isBackgroundWakeMessage(message: unknown): boolean {
+  const row = message as { role?: unknown; source?: { kind?: unknown; plugin?: unknown; form?: unknown } } | undefined
+  if (row?.role !== 'user') return false
+  const source = row.source
+  if (source === undefined || source === null || typeof source !== 'object') return false
+  return source.kind === BACKGROUND_REPORT_SOURCE
+    && source.plugin === BACKGROUND_REPORT_PLUGIN
+    && source.form === BACKGROUND_REPORT_FORM
+}
+
+/**
+ * What one driver step must answer for a wake message, or `undefined` when the
+ * step is an ordinary turn.
+ *
+ * FIFO — the OLDEST unanswered wake wins. Candidates are the wake-shaped
+ * messages; a candidate is skipped when anything after it already answered it
+ * (an `assistant` / `tool` message — the replay, or a continuation) or
+ * outranks it (a REAL user message — the person spoke again; injected
+ * projections and system/developer nodes say nothing about who this step
+ * answers). The host opens one step per queued wake, so a newest-first scan
+ * would replay the SECOND wake first, drop the first report, and leave the
+ * next step with nothing to answer — `selectForwardPrompt` would then re-send
+ * the person's old message as a duplicate prompt.
+ */
+export function backgroundReportOf(messages: readonly unknown[]): BackgroundWake | undefined {
+  for (let index = 0; index < messages.length; index += 1) {
+    if (!isBackgroundWakeMessage(messages[index])) continue
+    let answered = false
+    for (let later = index + 1; later < messages.length; later += 1) {
+      const row = messages[later] as { role?: unknown; source?: { kind?: unknown } } | undefined
+      // An assistant reply consumed it; a tool result is a continuation step.
+      if (row?.role === 'assistant' || row?.role === 'tool') {
+        answered = true
+        break
+      }
+      // The person spoke again: their words outrank a queued wake.
+      if (row?.role === 'user') {
+        const kind = row.source?.kind
+        if (kind === 'user' || kind === undefined) {
+          answered = true
+          break
+        }
+      }
+    }
+    if (answered) continue
+    const report = (messages[index] as { source?: { report?: unknown } }).source?.report
+    return typeof report === 'string' && report.trim() !== ''
+      ? { kind: 'report', text: report }
+      : { kind: 'lost' }
+  }
+  return undefined
+}
+
+/**
+ * The wake shape {@link backgroundReportOf} recognized, discriminated:
+ * `report` replays the collected text, `lost` means the wake arrived without
+ * its report (the host pipeline stripped `source.report`) and the step must
+ * close locally with {@link BACKGROUND_REPORT_LOST_TEXT}.
+ */
+export type BackgroundWake = { kind: 'report'; text: string } | { kind: 'lost' }
+
+/**
  * The state of ONE ACP prompt, shared across every driver step of the turn.
  *
  * The controller owns the hub subscription (for the whole agent-side turn, not
@@ -4684,6 +4935,21 @@ class TurnStreamController {
    * text, and must say so when it closes.
    */
   private sawVisibleText = false
+  /**
+   * The drain run ids whose visible answer text this turn FOLDED (the fold
+   * treatment set). `closeTurn`'s quiet close reads it to decide the `consume`
+   * half of `retireAmbientId` PER RUN: only an answer the user has SEEN is
+   * delivered — a close that printed nothing but the deferral line must leave
+   * the id unconsumed, or a run that revives with the real answer would be
+   * eaten by `consumedDrains` and never reach the chat.
+   *
+   * Per RUN id, never one turn-level bit: one turn can fold run A's answer
+   * while the ambient record has already moved to run B. A turn-level bit would
+   * then consume B (which delivered nothing — its revival could never wake
+   * again) and spare A (whose answer is already on screen — its revival would
+   * answer the same text twice). Ids, not "folded anything".
+   */
+  private readonly foldedDrainIds = new Set<string>()
   /**
    * The CodeBuddy request id this turn has adopted as its own (from the
    * prompt RESPONSE's `conversationRequestId`, or from the first update that
@@ -5350,7 +5616,11 @@ class TurnStreamController {
     if (hold.retired) return
     hold.retired = true
     if (!options.hard) {
-      for (const id of hold.acceptedIds) retireAmbientId(this.session, id)
+      // `consume` mirrors the quiet-close rule in `closeTurn`: an id is marked
+      // consumed only when the hold actually SHOWED the run's answer text. A
+      // zero-answer close printed just the deferral line — the answer was never
+      // delivered, so a revived run must still be able to wake the chat.
+      for (const id of hold.acceptedIds) retireAmbientId(this.session, id, hold.answerChars > 0)
       if (this.session.ambient !== undefined && hold.acceptedIds.has(this.session.ambient.requestId)) {
         this.session.ambient = undefined
       }
@@ -5731,7 +6001,21 @@ class TurnStreamController {
           // prompt the agent folds into that same revived drain may not receive
           // the drain's text on the chat plane (transcript-only); a double
           // answer is worse.
-          if (ambient.requestId !== undefined) retireAmbientId(this.session, ambient.requestId)
+          //
+          // `consume` is evidence-based and PER RUN (see `foldedDrainIds`): an
+          // id is marked consumed only when this turn actually FOLDED that
+          // run's visible answer. A zero-output close (just the deferral line
+          // above) delivered nothing — same reasoning as the stale expiry's
+          // `consume: false` — so the id stays unconsumed and a run that revives
+          // with the real answer can still wake the chat.
+          if (ambient.requestId !== undefined) retireAmbientId(this.session, ambient.requestId, this.foldedDrainIds.has(ambient.requestId))
+          // Runs this turn folded whose id the retire above did not cover (the
+          // ambient record moved to another run mid-turn): their answers WERE
+          // delivered, so consume them too — a revived run must never answer
+          // the same text a second time.
+          for (const id of this.foldedDrainIds) {
+            if (id !== ambient.requestId) retireAmbientId(this.session, id, true)
+          }
           this.session.ambient = undefined
         }
       }
@@ -6217,6 +6501,21 @@ class TurnStreamController {
       || isRetiredAmbientId(this.session, requestId)
   }
 
+  /**
+   * Whether this update is the drained run's ANSWER text — the text a quiet
+   * close must count as delivered (`foldedDrainIds`, one entry per run): the
+   * wait's own run, a hold's accepted run, or a run the session still owns as
+   * ambient.
+   */
+  private isDrainAnswerText(update: Record<string, unknown>): boolean {
+    const requestId = codebuddyMetaOf(update)?.requestId
+    if (requestId === undefined) return false
+    if (this.awaitingAmbient?.requestId === requestId) return true
+    const hold = this.activeBackgroundHold()
+    if (hold !== undefined) return hold.acceptedIds.has(requestId)
+    return this.isAmbientOwned(update)
+  }
+
   /** Learn this turn's own CodeBuddy request id from the first update naming one. */
   private noteTurnRequestId(update: Record<string, unknown>): void {
     if (this.turnRequestId !== undefined) return
@@ -6327,6 +6626,13 @@ class TurnStreamController {
       if (!this.isAmbientOwned(update)) this.sawAgentProse = true
       if (kind === 'agent_message_chunk') {
         this.sawVisibleText = true
+        // The fold treatment set (see `foldedDrainIds`): text that belongs to
+        // a drain being folded is an answer DELIVERED to the user, recorded
+        // under THAT run's id — the quiet close's per-run `consume` decision
+        // must reflect it even when the ambient record has moved on to another
+        // run.
+        const drainId = codebuddyMetaOf(update)?.requestId
+        if (drainId !== undefined && this.isDrainAnswerText(update)) this.foldedDrainIds.add(drainId)
         // A hold's closing line asks whether ITS runs delivered answer text.
         // The parent's interim acknowledgement arrived before the hold and
         // already set `sawVisibleText`, so the hold keeps its own counter —
@@ -6890,7 +7196,7 @@ export class BridgeManager {
     return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, onCommands, this.tuning, () => this.sessionWorkspaceResolver, onSessionsDirty, onForkCapability, bridge => {
       this.publishAgentStatus(bridge.def.id)
       this.noticeBridgeFailure(bridge)
-    }, (session, update) => this.trackSessionBackgroundDispatch(session, update), (session, status) => this.terminalizeSessionDispatches(session, status))
+    }, (session, update) => this.trackSessionBackgroundDispatch(session, update), (session, update) => this.trackBackgroundDrainText(session, update), (session, status) => this.terminalizeSessionDispatches(session, status))
   }
 
   /**
@@ -6941,6 +7247,297 @@ export class BridgeManager {
    */
   setSubagentCatalogReporter(reporter?: SubagentCatalogReporter): void {
     this.subagentCatalogReporter = reporter
+  }
+
+  /**
+   * Wire the host's chat-agent lookup, so an IDLE background drain can wake the
+   * conversation it belongs to.
+   *
+   * A CodeBuddy background drain runs after the prompt response (its documented
+   * `unsolicitedTurn` shape), so under the default "settle at the response"
+   * there is no driver step for its prose. The only entry into the chat plane
+   * is a driver step: the manager injects one hidden user message through the
+   * host agent's `followup` and the adapter answers it locally with the
+   * collected report (no ACP prompt — the agent already produced the text).
+   * An absent resolver degrades to the old transcript-only behavior.
+   */
+  setDshAgentResolver(resolver?: (dshSessionId: string) => DshAgentLike | undefined): void {
+    this.dshAgentResolver = resolver
+  }
+
+  /**
+   * Collect an IDLE drain's prose (see {@link LiveSession.backgroundReport}).
+   *
+   * Prose is collected only while no turn controller owns the session: a
+   * steered prompt and a `backgroundHoldWorkerPhase` hold both consume the
+   * drain inside their own bubble, and a second delivery would duplicate the
+   * answer. The quiet clock is the ambient one — the drain has no end frame
+   * (the SDK drops `session_end`), so its silence is the end.
+   *
+   * EVERY frame of the collected run is evidence of life and restarts that
+   * clock (protocol.md §6.2: any `session/update` resets the quiet timer) — an
+   * empty chunk, a thought tick, a tool frame — not just message prose. A run
+   * that OPENED a tool call it never reported `completed` / `failed` for is
+   * still answering: the quiet timer must not wake a half-report while a tool
+   * outlives the window (the tail would then be eaten by `consumedDrains`).
+   * The real wire sends a tool's completion frame with NO `_meta` at all, so
+   * the close is recognised by `toolCallId` alone (the dispatch-completion
+   * convention); worker frames (`parentToolCallId`) never count.
+   *
+   * ONE record per run: a frame of a DIFFERENT run (the drain that announced
+   * itself while this one waited) closes the current record out in place and
+   * opens a fresh one — two runs' prose never mix, and each run's id is
+   * retired on ITS OWN delivery.
+   */
+  private trackBackgroundDrainText(session: LiveSession, update: SessionUpdate): void {
+    const raw = update as Record<string, unknown>
+    const meta = codebuddyMetaOf(raw)
+    // A worker's own frame names its parent call: it is the worker's report,
+    // not the parent's drained answer (the real wire gives it another
+    // requestId, but an agent that tags both must not leak into this report).
+    // Its tool calls are the worker's own and never block the quiet close.
+    if (meta?.parentToolCallId !== undefined) return
+    const kind = String(raw.sessionUpdate ?? '')
+    const requestId = meta?.requestId
+    // This run already delivered its answer (a closed wait, a hold, or an
+    // earlier idle wake). Its late frames are transcript-only: reviving it
+    // must not answer the same drain twice.
+    if (requestId !== undefined && session.consumedDrains?.has(requestId) === true) return
+    const ambient = session.ambient
+    if (ambient === undefined) return
+    const toolCallId = typeof raw.toolCallId === 'string' && raw.toolCallId !== '' ? raw.toolCallId : undefined
+    // A BARE completion of a call THIS run opened is the run's frame even with
+    // no `_meta` (see the doc above).
+    const trackedTool = toolCallId !== undefined
+      && (kind === 'tool_call' || kind === 'tool_call_update')
+      && session.backgroundReport?.openToolCalls.has(toolCallId) === true
+    if (requestId !== ambient.requestId && !(requestId === undefined && trackedTool)) return
+
+    // Ownership confirmed. A RUN SWITCH (this frame's run is the session's new
+    // ambient, while the record collects the old one) closes the old record
+    // out in place: its collection is over — waiting can only cut the report
+    // at the same place later — so deliver it now and give the new run a fresh
+    // record. Reports never span two runs.
+    let report = session.backgroundReport
+    if (report !== undefined && requestId !== undefined && report.requestId !== ambient.requestId) {
+      this.deliverBackgroundReport(session, report, true)
+      report = undefined
+    }
+    if (report === undefined) {
+      const now = Date.now()
+      report = {
+        requestId: ambient.requestId,
+        text: '',
+        lastAt: now,
+        firstAt: now,
+        delivered: false,
+        openToolCalls: new Set<string>(),
+      }
+      session.backgroundReport = report
+    }
+    // Tool-call bookkeeping (see the doc above): ONLY `completed` / `failed`
+    // close a call. Everything else — the opening `tool_call`, an unknown
+    // status like `running`, or a status-less `tool_call_update` — opens it or
+    // keeps it open. "Unknown = unclosed" is the safe side: a call the quiet
+    // check wrongly passes wakes with HALF a report, while an over-open call
+    // merely defers the wake to the `ambientMaxMs` cut (which says so).
+    if (toolCallId !== undefined && (kind === 'tool_call' || kind === 'tool_call_update')) {
+      const status = typeof raw.status === 'string' ? raw.status : ''
+      if (status === 'completed' || status === 'failed') report.openToolCalls.delete(toolCallId)
+      else report.openToolCalls.add(toolCallId)
+    }
+    // Prose collection is idle-only (see the doc above); every frame of the
+    // run — this one included — still restarts the quiet clock below.
+    if (kind === 'agent_message_chunk'
+      && session.turnController === undefined
+      && !session.running
+      && session.promptInFlight !== true) {
+      const text = chunkTextOf((raw as { content?: unknown }).content)
+      if (text !== '') {
+        report.text += text
+        if (report.text.length > BACKGROUND_REPORT_MAX) {
+          report.text = `${report.text.slice(0, BACKGROUND_REPORT_MAX)}\n[truncated by dsh-ntr: background report exceeded ${String(BACKGROUND_REPORT_MAX)} characters]`
+        }
+      }
+    }
+    report.lastAt = Date.now()
+    this.armReportTimer(session, report)
+  }
+
+  /**
+   * (Re-)arm one report's quiet timer — always against ITS record, never
+   * `session.backgroundReport`, which a newer run may already own.
+   */
+  private armReportTimer(session: LiveSession, report: BackgroundReport): void {
+    if (report.timer !== undefined) clearTimeout(report.timer)
+    report.timer = setTimeout(() => {
+      report.timer = undefined
+      this.deliverBackgroundReport(session, report)
+    }, this.tuning.ambientQuietMs)
+    report.timer.unref?.()
+  }
+
+  /**
+   * Hand one collected idle drain to the chat plane as a real turn.
+   *
+   * A conversation turn that came on air while the report waited gets the
+   * report retried instead of a second bubble — its controller folds the drain
+   * itself. A tool call the run left OPEN waits for its close frame: waking on
+   * the quiet timer inside a long tool would answer with half a report and
+   * lose the rest to the consumed-id table. Past the ambient ceiling the wait
+   * is CUT and what was collected is delivered with a truncation marker (the
+   * transcript keeps the rest) — never deferred or dropped forever.
+   *
+   * `settleNow` (a run switch closed this record's collection) never defers:
+   * waiting cannot grow the report. The decision happens in place — deliver,
+   * or drop transcript-only (id NOT consumed, so a revived run may still
+   * answer) when a turn is on air and could fold this very run.
+   *
+   * Every path acts on THIS record (never `session.backgroundReport`, which a
+   * newer run may already own). One report = one wake: the delivery commits
+   * BEFORE the hand-off, so a host that throws or rejects — synchronously or
+   * asynchronously — leaves the exact same outcome (record gone, id consumed,
+   * one `agent/notice`, zero wake); a re-delivery is the one thing that must
+   * never happen, and the answer is in the transcript either way.
+   */
+  private deliverBackgroundReport(session: LiveSession, report: BackgroundReport, settleNow = false): void {
+    if (report.delivered) return
+    // The turn that folded this drain already delivered the answer (its quiet
+    // close marked the id consumed). Waking now would answer the same run twice.
+    if (report.requestId !== undefined && session.consumedDrains?.has(report.requestId) === true) {
+      this.dropBackgroundReport(session, report)
+      return
+    }
+    if (session.closed || session.released) {
+      this.dropBackgroundReport(session, report)
+      return
+    }
+    if (report.text.trim() === '') {
+      // Nothing was ever delivered: do NOT consume the id — the run may revive
+      // and its real answer must still be able to wake the chat.
+      this.dropBackgroundReport(session, report)
+      return
+    }
+    const busy = session.turnController !== undefined || session.running || session.promptInFlight === true
+    const waitingOnTool = !settleNow && report.openToolCalls.size > 0
+    if (busy || waitingOnTool) {
+      if (settleNow) {
+        // The run switch closed this report's collection while a turn is on
+        // air: delivering now risks a double answer (the turn may be folding
+        // this very run), and waiting can no longer grow the report. Stay
+        // transcript-only WITHOUT consuming the id — the run may revive.
+        this.dropBackgroundReport(session, report)
+        return
+      }
+      if (Date.now() - report.firstAt < this.tuning.ambientMaxMs) {
+        this.armReportTimer(session, report)
+        return
+      }
+      // The ambient ceiling cut the wait (a conversation still busy, or a tool
+      // that never closed): deliver what was collected and say it was cut —
+      // never wait forever, never drop the answer silently.
+      report.text = `${report.text}\n[truncated by dsh-ntr: the background report hit its ambient ceiling while the run was still active; the remaining output is in the ACP transcript view]`
+    }
+    const agent = this.wakeAgentFor(session)
+    if (agent === undefined) {
+      // No host chat agent YET (`/acp` RPC, headless deployment, or a resolver
+      // the host mounts late): retry on the quiet timer within the ambient
+      // bound — the record keeps its full text, so a late-mounted agent still
+      // gets the WHOLE answer. Past the bound the report is dropped
+      // transcript-only (the id is NOT consumed): the full text stays in the
+      // ACP transcript view, and a wake rebuilt from only the frames that
+      // arrive after a drop would be a HALF report — rather send nothing than
+      // half.
+      if (Date.now() - report.firstAt < this.tuning.ambientMaxMs) {
+        this.armReportTimer(session, report)
+        return
+      }
+      this.dropBackgroundReport(session, report)
+      return
+    }
+    const text = report.text
+    const requestId = report.requestId
+    // COMMIT FIRST (one report = one wake): a host that throws or rejects must
+    // not leave a re-deliverable report behind. Both failure shapes end the
+    // same way — one notice, zero wake, id consumed so late frames cannot open
+    // a second answer (`wakeChatWithBackgroundReport`).
+    report.delivered = true
+    this.dropBackgroundReport(session, report)
+    // Retire the id EVEN when a newer announcement replaced the ambient
+    // record: that replacement is another run, and this one's answer is out.
+    if (requestId !== undefined) {
+      retireAmbientId(session, requestId)
+      if (session.ambient?.requestId === requestId) session.ambient = undefined
+    }
+    this.wakeChatWithBackgroundReport(session, agent, text)
+  }
+
+  /**
+   * Drop one report record — its timer, and the session slot only when the
+   * slot still holds THIS record (a newer run's record must survive).
+   */
+  private dropBackgroundReport(session: LiveSession, report: BackgroundReport): void {
+    if (report.timer !== undefined) {
+      clearTimeout(report.timer)
+      report.timer = undefined
+    }
+    if (session.backgroundReport === report) session.backgroundReport = undefined
+  }
+
+  /** The host chat agent a wake can be handed to, or `undefined` when none can. */
+  private wakeAgentFor(session: LiveSession): DshAgentLike | undefined {
+    const dshSessionId = session.dshSessionId
+    const resolver = this.dshAgentResolver
+    if (dshSessionId === undefined || resolver === undefined) return undefined
+    try {
+      const agent = resolver(dshSessionId)
+      return agent !== undefined && typeof agent.followup === 'function' ? agent : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Inject the wake message and let the host start its step.
+   *
+   * The report was already committed (see `deliverBackgroundReport`), so the
+   * two failure shapes — a synchronous throw and an asynchronously rejecting
+   * `followup` — are OBSERVABLY IDENTICAL: no wake landed, the id is consumed
+   * (late frames cannot answer again), and exactly ONE `agent/notice` goes to
+   * the settings log. Determinism over retry; the answer is in the transcript.
+   * A host without the chat agent never reaches this method (the report stays
+   * transcript-only).
+   */
+  private wakeChatWithBackgroundReport(session: LiveSession, agent: DshAgentLike, report: string): void {
+    const wakeNotice = (error: unknown): void => {
+      this.hub.broadcast({
+        type: 'agent/notice',
+        agentId: session.agentId,
+        level: 'info',
+        text: `acp: could not wake the chat for a background report: ${describeError(error)}`,
+      })
+    }
+    try {
+      const result = agent.followup?.({
+        id: randomUUID(),
+        role: 'user',
+        content: [{ type: 'text', text: BACKGROUND_WAKE_TEXT }],
+        source: {
+          kind: BACKGROUND_REPORT_SOURCE,
+          plugin: BACKGROUND_REPORT_PLUGIN,
+          form: BACKGROUND_REPORT_FORM,
+          report,
+        },
+      })
+      // `followup` may be async on the host. An unhandled rejection would kill
+      // the host process (Node 22), so the returned thenable is always drained
+      // — and a rejection is the same failure as a synchronous throw.
+      if (result !== undefined && result !== null && typeof (result as { then?: unknown }).then === 'function') {
+        void Promise.resolve(result as PromiseLike<unknown>).catch(wakeNotice)
+      }
+    } catch (error) {
+      wakeNotice(error)
+    }
   }
 
   /**
@@ -10590,6 +11187,7 @@ export class BridgeManager {
   private sessionWorkspaceResolver?: SessionWorkspaceResolver
   private acpModeResolver?: AcpModeResolver
   private subagentCatalogReporter?: SubagentCatalogReporter
+  private dshAgentResolver?: (dshSessionId: string) => DshAgentLike | undefined
   private attachmentResolver?: unknown
   /** Cached `chatSessionAcpMode` answers, keyed by DSH chat session id. */
   private readonly acpModeCache = new Map<string, boolean>()
@@ -11048,6 +11646,33 @@ export class BridgeManager {
       return
     }
 
+    // An IDLE background drain became a chat turn: the manager injected its
+    // hidden wake message, and this step must ANSWER it with the collected
+    // report — the agent already produced that text, so no `session/prompt` is
+    // sent (a second one would make the agent answer its own answer). A wake
+    // whose report the host pipeline LOST still closes HERE, locally: one
+    // fixed line + one `agent/notice` (kept searchable with the words
+    // "background report"). Falling through to the forward picker would
+    // re-send the person's last real message as a duplicate prompt — and the
+    // agent might dispatch the work all over again.
+    const wake = backgroundReportOf(options.messages ?? [])
+    if (wake !== undefined) {
+      const text = wake.kind === 'report' ? wake.text : BACKGROUND_REPORT_LOST_TEXT
+      if (wake.kind === 'lost') {
+        this.hub.broadcast({
+          type: 'agent/notice',
+          agentId,
+          level: 'info',
+          text: 'acp: a background report wake arrived without its report; answering locally (the full output is in the ACP transcript view)',
+        })
+      }
+      yield { type: 'block-start', index: 0, blockType: 'text' }
+      yield { type: 'text-delta', index: 0, text }
+      yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+      return
+    }
+
     // A segmented tool-bearing turn arrives as MANY driver steps. The host
     // loop starts a next step whenever the settled assistant message contains
     // `tool-call` blocks — which is exactly what the ACP agent's cards are —
@@ -11487,7 +12112,7 @@ export class BridgeManager {
           // set with it) so this response settles normally.
           if (session.ambient !== undefined
             && Date.now() - session.ambient.lastActivityAt > this.tuning.ambientStaleMs) {
-            retireAmbientId(session, session.ambient.requestId)
+            retireAmbientId(session, session.ambient.requestId, false)
             session.ambient = undefined
             session.ambientNotices?.clear()
           }

@@ -14,6 +14,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { BACKGROUND_REPORT_FORM, BACKGROUND_REPORT_PLUGIN, BACKGROUND_REPORT_SOURCE } from '../src/bridge.ts'
 
 function guardCtx(services: Record<string, unknown> = {}) {
   const listeners = new Map<string, { listener: (payload: any, next: any) => any }>()
@@ -92,6 +93,82 @@ describe('acp-guard pre-step source filtering', () => {
     const preStep = await mountGuard()
     const future = { role: 'user', source: { kind: 'some-future-host-section' }, content: [{ type: 'text', text: '?' }] }
     const decision = await preStep({ messages: [], turn: 2, step: 1 }, nextWith([future]))
+    expect(decision).toEqual({ kind: 'enter', messages: [] })
+  })
+
+  it('keeps the plugin background-report wake message', async () => {
+    // The bridge injects this message to open a driver step for an IDLE
+    // background drain; the adapter answers it locally. The gate must let it
+    // through (it is neither the person nor a tool result, but it IS this
+    // plugin's own turn seed).
+    const preStep = await mountGuard()
+    const wake = {
+      role: 'user',
+      source: { kind: BACKGROUND_REPORT_SOURCE, plugin: BACKGROUND_REPORT_PLUGIN, form: 'notice', report: 'DISPATCH-FINAL-ANSWER' },
+      content: [{ type: 'text', text: 'Background task completed.' }],
+    }
+    const decision = await preStep({ messages: [], turn: 3, step: 1 }, nextWith([wake]))
+    expect(decision).toEqual({ kind: 'enter', messages: [wake] })
+  })
+
+  it('drops a plugin notice that only borrows the wake name', async () => {
+    // `plugin` is shared with every plugin notice and compaction checkpoints.
+    // Without the wake form the message is ordinary context and must be stripped.
+    const preStep = await mountGuard()
+    const notice = {
+      role: 'user',
+      source: { kind: BACKGROUND_REPORT_SOURCE, plugin: BACKGROUND_REPORT_PLUGIN },
+      content: [{ type: 'text', text: 'notice' }],
+    }
+    const decision = await preStep({ messages: [], turn: 2, step: 1 }, nextWith([notice]))
+    expect(decision).toEqual({ kind: 'enter', messages: [] })
+  })
+
+  it('keeps a wake whose report was lost (form matches, report missing)', async () => {
+    // The host pipeline can strip `source.report`. The gate must still let the
+    // wake through so `streamPrompt` can close the step LOCALLY (one line +
+    // one notice) instead of falling through to the forward picker — a
+    // duplicated prompt that might re-dispatch the work. The predicate is
+    // shape-only: kind + plugin + form.
+    const preStep = await mountGuard()
+    const wake = {
+      role: 'user',
+      source: { kind: BACKGROUND_REPORT_SOURCE, plugin: BACKGROUND_REPORT_PLUGIN, form: BACKGROUND_REPORT_FORM },
+      content: [{ type: 'text', text: 'Background task completed.' }],
+    }
+    const decision = await preStep({ messages: [], turn: 3, step: 1 }, nextWith([wake]))
+    expect(decision).toEqual({ kind: 'enter', messages: [wake] })
+  })
+
+  it('drops a plugin notice whose form is not the wake form', async () => {
+    // The name alone must never be enough: another plugin checkpoint carrying
+    // a report-looking payload in a different form stays context.
+    const preStep = await mountGuard()
+    const notice = {
+      role: 'user',
+      source: { kind: BACKGROUND_REPORT_SOURCE, plugin: BACKGROUND_REPORT_PLUGIN, form: 'checkpoint', report: 'X' },
+      content: [{ type: 'text', text: 'notice' }],
+    }
+    const decision = await preStep({ messages: [], turn: 2, step: 1 }, nextWith([notice]))
+    expect(decision).toEqual({ kind: 'enter', messages: [] })
+  })
+
+  it('drops a wake-shaped message that is not a user message', async () => {
+    // R3: the bridge's own predicate (`isBackgroundWakeMessage`) requires
+    // `role === 'user'`; the guard must agree. A wake-shaped row under another
+    // role — or with no role at all — is context, not this plugin's turn seed,
+    // and stays stripped.
+    const preStep = await mountGuard()
+    const assistantWake = {
+      role: 'assistant',
+      source: { kind: BACKGROUND_REPORT_SOURCE, plugin: BACKGROUND_REPORT_PLUGIN, form: BACKGROUND_REPORT_FORM, report: 'X' },
+      content: [{ type: 'text', text: 'Background task completed.' }],
+    }
+    const rolelessWake = {
+      source: { kind: BACKGROUND_REPORT_SOURCE, plugin: BACKGROUND_REPORT_PLUGIN, form: BACKGROUND_REPORT_FORM, report: 'X' },
+      content: [{ type: 'text', text: 'Background task completed.' }],
+    }
+    const decision = await preStep({ messages: [], turn: 2, step: 1 }, nextWith([assistantWake, rolelessWake]))
     expect(decision).toEqual({ kind: 'enter', messages: [] })
   })
 
