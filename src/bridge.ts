@@ -320,6 +320,14 @@ interface LiveSession {
    */
   hasHistory?: boolean
   /**
+   * A `session/load` is in flight: the ACP spec puts the agent's whole history
+   * replay BEFORE the response, so every update arriving in this window is
+   * replay, not live work. Set by `doResumeSession` around the request; the
+   * dispatch tracker skips it so a replayed historical dispatch cannot
+   * resurrect a finished worker as running.
+   */
+  loadingHistory?: boolean
+  /**
    * When the agent last showed ANY sign of life on this session: an update, a
    * permission ask (arrival or answer), or a turn start. The stall watchdog
    * measures silence from here rather than from the prompt, which may
@@ -2290,10 +2298,14 @@ export class AgentBridge {
       // is in flight, and let the browser drop its blocks/watermark first.
       this.acpIndex.set(session.acpSessionId, session)
       this.hub.broadcast({ type: 'session/reset', sessionId: session.sessionId, session: snapshot(session) })
+      // The whole replay lands before the response (ACP): flag the window so
+      // replayed dispatches read as history, not new work. Cleared on failure
+      // too — a parked session must not carry a stuck window into its retry.
+      session.loadingHistory = true
       const result = await this.withStartupTimeout(
         conn.agent.request(methods.agent.session.load, { sessionId: session.acpSessionId, cwd: resolved, mcpServers: toAcpMcpServers(this.def.mcpServers) }),
         'session/load',
-      )
+      ).finally(() => { session.loadingHistory = false })
       if (this.onCatalog !== undefined && usableConfigOptions(result.configOptions)) {
         this.onCatalog(this.def.id, result.configOptions)
       }
@@ -3096,6 +3108,13 @@ interface CodebuddyMeta {
   subagentType?: string
   subagentDescription?: string
   subagentName?: string
+  /**
+   * `_meta["codebuddy.ai"] = { mode: "history", offset }` — the agent's own
+   * marker on every update it REPLAYS during `session/load` (captured on the
+   * wire). A replayed dispatch is history, not live work: it must not create
+   * or move a lifecycle record.
+   */
+  historyReplay?: boolean
 }
 
 /** Read the CodeBuddy `_meta` keys off an update or a `{ _meta }` wrapper. */
@@ -3142,6 +3161,10 @@ function codebuddyMetaOf(source: unknown): CodebuddyMeta | undefined {
   if (typeof phase === 'object' && phase !== null) {
     const tick = phase as Record<string, unknown>
     if (typeof tick.phase === 'string' && tick.phase !== '') out.agentPhase = { phase: tick.phase }
+  }
+  const history = meta['codebuddy.ai']
+  if (typeof history === 'object' && history !== null && (history as Record<string, unknown>).mode === 'history') {
+    out.historyReplay = true
   }
   return Object.keys(out).length === 0 ? undefined : out
 }
@@ -7620,6 +7643,16 @@ export class BridgeManager {
   private trackSessionBackgroundDispatch(session: LiveSession, update: SessionUpdate): void {
     const raw = update as Record<string, unknown>
     const meta = codebuddyMetaOf(raw)
+    // History replay is not live work. CodeBuddy's `session/load` re-sends
+    // every historical Agent dispatch as a pending `tool_call` plus an
+    // in_progress `tool_call_update` — NEVER a terminal frame — so tracking it
+    // would rebuild finished workers as running and overwrite the restored
+    // records. Two signals identify the replay: the agent's own history marker
+    // (catches frames even if they land after the response) and the in-flight
+    // load window (agents without the marker; the spec puts the whole replay
+    // before the response). Only lifecycle bookkeeping skips — the frames
+    // still fold into the transcript through the normal update path.
+    if (meta?.historyReplay === true || session.loadingHistory === true) return
     const kind = String(raw.sessionUpdate ?? '')
     const row = raw as { toolCallId?: unknown; status?: unknown }
     const toolCallId = typeof row.toolCallId === 'string' ? row.toolCallId.trim() : ''

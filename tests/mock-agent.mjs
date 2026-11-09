@@ -183,6 +183,10 @@
  *
  * Environment knobs:
  *  - MOCK_NO_LOAD=1 → `initialize` advertises no `loadSession` capability
+ *  - MOCK_LOAD_REPLAY_DISPATCH=1 → `session/load` replays a historical detached
+ *              dispatch (pending `tool_call` + in_progress `tool_call_update`,
+ *              no terminal frame) with CodeBuddy's history marker; `bare`
+ *              omits the marker so only the load window can identify it
  *  - MOCK_LONG_TOOL_TITLE=1 → the main tool card carries a LONG pwsh command
  *              as its `title` (the codebuddy shape) under a distinct call id,
  *              and rewrites that title mid-call; DEFAULT OFF keeps the
@@ -240,6 +244,18 @@ const SINGLE_SESSION = process.env.MOCK_SINGLE_SESSION === '1'
  * request itself. Default 0 keeps every other test byte-identical.
  */
 const LOAD_DELAY_MS = Number(process.env.MOCK_LOAD_DELAY_MS ?? '0')
+/**
+ * MOCK_LOAD_REPLAY_DISPATCH: `session/load` also replays a HISTORICAL detached
+ * dispatch in the exact shape captured from CodeBuddy: the call's first
+ * `tool_call` (pending, identity meta, `isBackground: false`) followed by a
+ * `tool_call_update` (in_progress) — NEVER a terminal frame, so a client that
+ * cannot tell replay from live dispatch resurrects a finished worker as
+ * running. `1` carries the agent's history marker
+ * (`_meta["codebuddy.ai"] = { mode: "history", offset }`); `bare` omits it, so
+ * only the in-flight load window can identify the replay. Unset keeps every
+ * other test byte-identical.
+ */
+const LOAD_REPLAY_DISPATCH = process.env.MOCK_LOAD_REPLAY_DISPATCH
 /**
  * MOCK_CANCEL_ANSWER_DELAY_MS=<ms>: "SLOW" acknowledges `session/cancel` and
  * answers `cancelled` only after this pause. A test uses it to keep the prompt
@@ -450,6 +466,38 @@ const app = agent({ name: 'mock-acp-agent' })
     // marker update, then answer with the session state.
     sessions.set(sessionId, { cwd, modeId: 'default', temp: 'mid', model: DEFAULT_MODEL, effort: 'high', stream: false, mcpServers: ctx.params.mcpServers })
     const send = update => ctx.client.notify(methods.client.session.update, { sessionId, update })
+    if (LOAD_REPLAY_DISPATCH !== undefined) {
+      const marked = LOAD_REPLAY_DISPATCH !== 'bare'
+      await send({
+        sessionUpdate: 'tool_call',
+        toolCallId: 'agent_dispatch',
+        title: '@explorer',
+        kind: 'other',
+        status: 'pending',
+        rawInput: { description: 'audit the repo', subagent_type: 'general-purpose', name: 'explorer', prompt: 'read the tree' },
+        _meta: {
+          'codebuddy.ai/toolName': 'Agent',
+          'codebuddy.ai/toolArgumentsComplete': true,
+          'codebuddy.ai/isSubagent': true,
+          'codebuddy.ai/subagentType': 'general-purpose',
+          'codebuddy.ai/isBackground': false,
+          'codebuddy.ai/memberName': 'explorer',
+          'codebuddy.ai/description': 'audit the repo',
+          'codebuddy.ai/requestId': 'req-dispatch',
+          ...(marked ? { 'codebuddy.ai': { mode: 'history', offset: 2 }, timestamp: '2026-11-09T07:30:22.830Z' } : {}),
+        },
+      })
+      await send({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'agent_dispatch',
+        status: 'in_progress',
+        _meta: {
+          'codebuddy.ai/toolName': 'Agent',
+          'codebuddy.ai/requestId': 'req-dispatch',
+          ...(marked ? { 'codebuddy.ai': { mode: 'history', offset: 3 }, timestamp: '2026-11-09T07:30:23.694Z' } : {}),
+        },
+      })
+    }
     await send({ sessionUpdate: 'tool_call', toolCallId: 'replay_tool', title: 'replayed tool', kind: 'other', status: 'completed' })
     await send({ sessionUpdate: 'agent_message_chunk', messageId: 'replay-1', content: { type: 'text', text: 'REPLAYED: earlier conversation' } })
     // MOCK_LOAD_DELAY_MS: hold the RESPONSE open so a test can act while the

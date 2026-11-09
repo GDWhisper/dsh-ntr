@@ -4745,6 +4745,113 @@ describe('idle release (isolated manager)', () => {
     }
   }, 30_000)
 
+  it('does not resurrect a historical dispatch as running when a resume replays it', async () => {
+    // CodeBuddy's `session/load` replays every historical Agent dispatch as a
+    // pending `tool_call` plus an in_progress `tool_call_update` — never a
+    // terminal frame. Treating that replay as live dispatches rebuilt finished
+    // workers as `running` with the resume instant as their start time,
+    // overwriting the persisted completed records.
+    const storage = `${tmpdir()}/acp-replay-dispatch-${Date.now()}.json`
+    const dshSessionId = 'dsh-replay-dispatch'
+    let original: SubagentRecord | undefined
+    {
+      // The knob rides the PERSISTED definition: `loadPersistedAgents` rebuilds
+      // defsMap from disk, so a knob only on the second manager would be
+      // overwritten. It fires on `session/load` alone, which the first never does.
+      const manager = new BridgeManager(
+        [{ ...def, id: 'replay-dispatch', env: { MOCK_LOAD_REPLAY_DISPATCH: '1' } }],
+        new EventHub(), 500, storage,
+      )
+      try {
+        for await (const _ of manager.streamPrompt({
+          model: 'replay-dispatch',
+          sessionId: dshSessionId,
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'DISPATCH DISPATCHCOMPLETEMETA' }] }],
+        } as never)) { /* drain */ }
+        await until(() => manager.subagentsFor(dshSessionId).some(row => row.childId === 'acp:agent_dispatch' && row.status === 'completed'))
+        original = manager.subagentsFor(dshSessionId).find(row => row.childId === 'acp:agent_dispatch')
+        expect(original).toMatchObject({ status: 'completed' })
+      } finally {
+        await manager.shutdownAll()
+      }
+    }
+
+    // A fresh manager over the same state dir is a DSH restart; its agent
+    // replays the historical dispatch frames during `session/load`.
+    const hub2 = new EventHub()
+    const events2: AcpEvent[] = []
+    hub2.subscribe(event => { events2.push(event) })
+    const second = new BridgeManager(
+      [{ ...def, id: 'replay-dispatch', env: { MOCK_LOAD_REPLAY_DISPATCH: '1' } }],
+      hub2, 500, storage,
+    )
+    try {
+      expect(second.chatSessions(dshSessionId)).toMatchObject([{ released: true }])
+      expect(second.subagentsFor(dshSessionId).find(row => row.childId === 'acp:agent_dispatch'))
+        .toMatchObject({ status: 'completed', startedAt: original!.startedAt })
+      await second.resumeChatSession(dshSessionId)
+      const rows = second.subagentsFor(dshSessionId).filter(row => row.childId === 'acp:agent_dispatch')
+      expect(rows).toHaveLength(1)
+      expect(rows[0]).toMatchObject({
+        status: 'completed',
+        startedAt: original!.startedAt,
+        endedAt: original!.endedAt,
+        counts: original!.counts,
+      })
+      // The replay must not announce a lifecycle regression either.
+      expect(events2.filter((event): event is Extract<AcpEvent, { type: 'subagents/record' }> =>
+        event.type === 'subagents/record'
+        && event.record.childId === 'acp:agent_dispatch'
+        && (event.record.status === 'running' || event.record.status === 'pending'))).toEqual([])
+      // Constraint 29: skipping lifecycle bookkeeping must not drop the replay
+      // DATA — the dispatch frames and the marker text still reach the view.
+      const entries = second.chatTranscripts(dshSessionId)[0]?.entries as Array<{ update: Record<string, unknown> }> | undefined
+      expect(entries?.some(entry => entry.update.toolCallId === 'agent_dispatch' && entry.update.sessionUpdate === 'tool_call')).toBe(true)
+      expect(entries?.some(entry => entry.update.sessionUpdate === 'agent_message_chunk'
+        && String((entry.update.content as { text?: string }).text ?? '').includes('REPLAYED: earlier conversation'))).toBe(true)
+    } finally {
+      await second.shutdownAll()
+    }
+  }, 30_000)
+
+  it('does not resurrect an unmarked historical dispatch replayed inside the load window', async () => {
+    // An agent that replays without CodeBuddy's history marker: the in-flight
+    // `session/load` window alone must keep the replay from creating live
+    // dispatches (the ACP spec puts the whole replay before the response).
+    const storage = `${tmpdir()}/acp-replay-dispatch-bare-${Date.now()}.json`
+    const dshSessionId = 'dsh-replay-dispatch-bare'
+    let original: SubagentRecord | undefined
+    {
+      const manager = new BridgeManager(
+        [{ ...def, id: 'replay-bare', env: { MOCK_LOAD_REPLAY_DISPATCH: 'bare' } }],
+        new EventHub(), 500, storage,
+      )
+      try {
+        for await (const _ of manager.streamPrompt({
+          model: 'replay-bare',
+          sessionId: dshSessionId,
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'DISPATCH DISPATCHCOMPLETEMETA' }] }],
+        } as never)) { /* drain */ }
+        await until(() => manager.subagentsFor(dshSessionId).some(row => row.childId === 'acp:agent_dispatch' && row.status === 'completed'))
+        original = manager.subagentsFor(dshSessionId).find(row => row.childId === 'acp:agent_dispatch')
+      } finally {
+        await manager.shutdownAll()
+      }
+    }
+    const second = new BridgeManager(
+      [{ ...def, id: 'replay-bare', env: { MOCK_LOAD_REPLAY_DISPATCH: 'bare' } }],
+      new EventHub(), 500, storage,
+    )
+    try {
+      await second.resumeChatSession(dshSessionId)
+      const rows = second.subagentsFor(dshSessionId).filter(row => row.childId === 'acp:agent_dispatch')
+      expect(rows).toHaveLength(1)
+      expect(rows[0]).toMatchObject({ status: 'completed', startedAt: original!.startedAt, counts: original!.counts })
+    } finally {
+      await second.shutdownAll()
+    }
+  }, 30_000)
+
   it('does not resurrect a closed session across a host restart', async () => {
     // Closed is destroyed, released is parked — the two must not blur at the
     // persistence boundary (constraint 10).
