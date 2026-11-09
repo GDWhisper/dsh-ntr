@@ -3916,6 +3916,14 @@ export const AGENT_PRESETS: AgentPreset[] = [
     defaultCommand: 'qoderclicn',
     defaultArgs: ['--acp'],
   },
+  {
+    id: 'agy',
+    name: 'Antigravity CLI',
+    description: 'Antigravity — run as `agy acp` over stdio',
+    executables: ['agy'],
+    defaultCommand: 'agy',
+    defaultArgs: ['acp'],
+  },
 ]
 
 export function findExecutable(command: string): string | undefined {

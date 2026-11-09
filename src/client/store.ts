@@ -1010,6 +1010,14 @@ export const DEFAULT_KNOWN_PRESETS: DetectedAgentInfo[] = [
     defaultCommand: 'qoderclicn',
     defaultArgs: ['--acp'],
   },
+  {
+    id: 'agy',
+    name: 'Antigravity CLI',
+    description: 'Antigravity — run as `agy acp` over stdio',
+    detected: false,
+    defaultCommand: 'agy',
+    defaultArgs: ['acp'],
+  },
 ]
 
 export class AcpStore {
