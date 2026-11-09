@@ -41,7 +41,7 @@ import type {
   AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSaveResult, AgentSkillsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions,
   LlmModelReasoningInfo, LlmReasoningEffortInfo, LlmResolvedModelInfo,
   AcpIdleRelease, ActiveTurnView, ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, SaveGateFlushResult, SaveGateStatus, SessionView, StreamChunk,
-  SubagentDetailEntry, SubagentDetailResult, SubagentRecord, SubagentStatus,
+  SubagentDetailEntry, SubagentDetailResult, SubagentRecord,
 } from '../protocol.ts'
 import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, IDLE_RELEASE_MS, MAX_SUBAGENT_DETAIL_ENTRIES, MAX_SUBAGENT_RECORDS, SESSION_TITLE_PREFIX, pluginReleaseUrl } from '../protocol.ts'
 import type { AcpSaveGate } from '../save-gate.ts'
@@ -115,6 +115,12 @@ import {
 import { DEFAULT_TUNING } from './tuning.ts'
 import { AgentBridge, SHUTDOWN_BUDGET_MS, TEST_EXIT_GRACE_MS } from './agent-bridge.ts'
 import { classifyTestFailure } from './test-failure.ts'
+import {
+  dispatchRecord,
+  dispatchStatus,
+  pruneSessionDispatches,
+  refreshSubagentDispatchLabel,
+} from './dispatch-shape.ts'
 
 /** How long one `agent/skills` scan answer stays fresh; the browser re-asks past it. */
 const SKILL_SCAN_TTL_MS = 60_000
@@ -949,7 +955,7 @@ export class BridgeManager {
             if (status === 'failed' && raw.content !== undefined) known.error = raw.content
           }
         }
-        if (!known.catalogReported) this.refreshSubagentDispatchLabel(known, raw)
+        if (!known.catalogReported) refreshSubagentDispatchLabel(known, raw)
         if (meta?.isBackground === true) {
           known.detached = true
           this.reportSubagentDispatch(session, known)
@@ -989,7 +995,7 @@ export class BridgeManager {
           counts: { updates: 1, toolCalls: 0, textChars: 0 },
         }
         dispatches.set(toolCallId, dispatch)
-        this.pruneSessionDispatches(dispatches)
+        pruneSessionDispatches(dispatches)
         // A hold may only wait for work THIS turn handed out; a worker left
         // over from an earlier turn is not this turn's drain.
         session.turnController?.noteTurnDispatch(toolCallId)
@@ -1034,30 +1040,6 @@ export class BridgeManager {
     }
   }
 
-  /** Where one dispatch stands, derived from the wire facts of its own record. */
-  private dispatchStatus(dispatch: BackgroundDispatch): SubagentStatus {
-    if (dispatch.terminal !== undefined) return dispatch.terminal
-    if (dispatch.sawWorkerUpdate || dispatch.detached || dispatch.status === 'in_progress') return 'running'
-    return 'pending'
-  }
-
-  /** Build the persisted lifecycle record for one dispatch. */
-  private dispatchRecord(dispatch: BackgroundDispatch, dshSessionId: string): SubagentRecord {
-    return {
-      childId: `acp:${dispatch.toolCallId}`,
-      dshSessionId,
-      toolCallId: dispatch.toolCallId,
-      label: dispatch.catalogLabel,
-      ...(dispatch.subagentType === undefined ? {} : { type: dispatch.subagentType }),
-      status: this.dispatchStatus(dispatch),
-      startedAt: dispatch.startedAt,
-      lastActivityAt: dispatch.lastActivityAt,
-      ...(dispatch.endedAt === undefined ? {} : { endedAt: dispatch.endedAt }),
-      ...(dispatch.error === undefined ? {} : { error: dispatch.error }),
-      counts: { ...dispatch.counts },
-    }
-  }
-
   /**
    * Keep the lifecycle record current, announcing it ONLY when its status
    * changed (creation included) and writing the state file on the same
@@ -1066,11 +1048,11 @@ export class BridgeManager {
   private syncDispatchRecord(session: LiveSession, dispatch: BackgroundDispatch): void {
     const dshSessionId = session.dshSessionId
     if (dshSessionId === undefined) return
-    const status = this.dispatchStatus(dispatch)
+    const status = dispatchStatus(dispatch)
     const transition = dispatch.reportedStatus !== status
     if (transition) dispatch.reportedStatus = status
     this.noteSubagentRecords(
-      [this.dispatchRecord(dispatch, dshSessionId)],
+      [dispatchRecord(dispatch, dshSessionId)],
       { announce: transition, persist: transition },
     )
   }
@@ -1088,39 +1070,11 @@ export class BridgeManager {
   }
 
   /**
-   * Take a better label from a later frame of the SAME dispatch call. A frame
-   * with no identity and no title must not downgrade what is already known.
-   */
-  private refreshSubagentDispatchLabel(dispatch: BackgroundDispatch, update: Record<string, unknown>): void {
-    const identified = subagentDispatchDeclaresIdentity(update)
-    if (!identified && dispatch.catalogLabelIdentified) return
-    const title = update.title
-    if (!identified && !(typeof title === 'string' && title !== '')) return
-    dispatch.catalogLabel = subagentDispatchLabel(update)
-    dispatch.catalogLabelIdentified = identified
-  }
-
-  /**
    * A dispatch just reported: tell the turn controller it may move to its
    * drain phase. The catalog row was already offered by the completing frame.
    */
   private noteSessionDispatchProgress(session: LiveSession): void {
     session.turnController?.onAllDispatchesCompleted()
-  }
-
-  /**
-   * Bound the session map. Terminal rows are history for the record view (the
-   * detail read uses the transcript, not this map), so evicting the oldest
-   * finished one keeps a long-lived conversation from growing without limit.
-   */
-  private pruneSessionDispatches(dispatches: Map<string, BackgroundDispatch>): void {
-    if (dispatches.size <= MAX_SUBAGENT_RECORDS) return
-    for (const [id, dispatch] of dispatches) {
-      if (dispatch.terminal !== undefined) {
-        dispatches.delete(id)
-        return
-      }
-    }
   }
 
   /**
@@ -1145,7 +1099,7 @@ export class BridgeManager {
       dispatch.terminal = status
       dispatch.endedAt = now
       dispatch.reportedStatus = status
-      if (dshSessionId !== undefined) records.push(this.dispatchRecord(dispatch, dshSessionId))
+      if (dshSessionId !== undefined) records.push(dispatchRecord(dispatch, dshSessionId))
     }
     if (records.length === 0) return
     this.noteSubagentRecords(records, { announce: true, persist: true })
