@@ -7433,6 +7433,7 @@ export class BridgeManager {
     }
     const busy = session.turnController !== undefined || session.running || session.promptInFlight === true
     const waitingOnTool = !settleNow && report.openToolCalls.size > 0
+    let cut = false
     if (busy || waitingOnTool) {
       if (settleNow) {
         // The run switch closed this report's collection while a turn is on
@@ -7450,6 +7451,7 @@ export class BridgeManager {
       // that never closed): deliver what was collected and say it was cut —
       // never wait forever, never drop the answer silently.
       report.text = `${report.text}\n[truncated by dsh-ntr: the background report hit its ambient ceiling while the run was still active; the remaining output is in the ACP transcript view]`
+      cut = true
     }
     const agent = this.wakeAgentFor(session)
     if (agent === undefined) {
@@ -7472,15 +7474,20 @@ export class BridgeManager {
     const requestId = report.requestId
     // COMMIT FIRST (one report = one wake): a host that throws or rejects must
     // not leave a re-deliverable report behind. Both failure shapes end the
-    // same way — one notice, zero wake, id consumed so late frames cannot open
-    // a second answer (`wakeChatWithBackgroundReport`).
+    // same way — one notice, zero wake, record gone (`wakeChatWithBackgroundReport`).
     report.delivered = true
     this.dropBackgroundReport(session, report)
     // Retire the id EVEN when a newer announcement replaced the ambient
     // record: that replacement is another run, and this one's answer is out.
+    // A COMPLETE quiet delivery is final: consume the id so late frames stay
+    // transcript-only (no duplicate answer). A ceiling CUT delivered a
+    // truncated report while the run was still active — its continuation (the
+    // real deliverable the user is waiting for) must still wake the chat, so
+    // the id is retired but NOT consumed and the ambient stays alive to collect
+    // the tail into a fresh report.
     if (requestId !== undefined) {
-      retireAmbientId(session, requestId)
-      if (session.ambient?.requestId === requestId) session.ambient = undefined
+      retireAmbientId(session, requestId, !cut)
+      if (!cut && session.ambient?.requestId === requestId) session.ambient = undefined
     }
     this.wakeChatWithBackgroundReport(session, agent, text)
   }

@@ -9959,10 +9959,14 @@ describe('a detached worker settles the turn at the response (isolated manager)'
     }
   }, 30_000)
 
-  it('cuts a report at the ambient ceiling and wakes once with the truncation marker', async () => {
+  it('cuts a report at the ambient ceiling, then wakes again with the continuation', async () => {
     // R6: the drain's tool call never closes inside a tiny `ambientMaxMs`.
     // The quiet window must NOT wake a half report; the ceiling cuts the wait
-    // and delivers exactly once, saying the report was cut.
+    // and delivers the collected head with a truncation marker. But the run is
+    // still alive: once the tool closes and the tail (the real deliverable)
+    // arrives, it must wake the chat AGAIN as a continuation — consuming the id
+    // at the cut would swallow the final answer and the conversation looks
+    // aborted.
     const { manager, events, adapter } = idleHarness({ ambientMaxMs: 400, idleTimeoutMs: 8_000 })
     const dshSessionId = 'dsh-settle-ceiling-cut'
     const wakes: Array<{ source?: { report?: string } }> = []
@@ -9977,16 +9981,17 @@ describe('a detached worker settles the turn at the response (isolated manager)'
         messages: [{ role: 'user', content: [{ type: 'text', text: 'DISPATCHTOOL please' }] }],
       })
       await until(() => wakes.length > 0, 10_000)
-      // The tool closed only at +700ms — after the 400ms ceiling — so the wake
-      // carries the collected head and the truncation marker, and the tail
-      // (which arrived later) stays transcript-only.
-      await new Promise(resolve => setTimeout(resolve, 800))
-      expect(wakes).toHaveLength(1)
+      // The tool closed only at +700ms — after the 400ms ceiling — so the first
+      // wake carries the collected head and the truncation marker, not the tail.
       expect(wakes[0]?.source?.report).toContain('DISPATCH-TOOL-HEAD')
       expect(wakes[0]?.source?.report).toContain('the background report hit its ambient ceiling')
       expect(wakes[0]?.source?.report).not.toContain('DISPATCH-TOOL-TAIL')
-      // Evidence the tail really arrived afterwards: one wake is suppression
-      // (the delivered id is consumed), not a missing frame.
+      // The tail really arrived afterwards and wakes as the continuation: a
+      // fresh report, no head repeated, no truncation marker (it completed).
+      await until(() => wakes.length > 1, 10_000)
+      expect(wakes[1]?.source?.report).toContain('DISPATCH-TOOL-TAIL')
+      expect(wakes[1]?.source?.report).not.toContain('DISPATCH-TOOL-HEAD')
+      expect(wakes[1]?.source?.report).not.toContain('the background report hit its ambient ceiling')
       expect(sawAgentText(events, 'DISPATCH-TOOL-TAIL')).toBe(true)
     } finally {
       await manager.shutdownAll()
