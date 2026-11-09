@@ -2,6 +2,40 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [0.4.2] - 2026-11-09
+
+后台工作线程不再占用主对话，报告到达后进入聊天；工具卡在调用进行中提前显示命令；更新卡在安装前预览发布说明；新增 Antigravity CLI 预设。
+
+### 新增
+
+- **update**：设置页的更新卡在安装前预览目标版本的发布说明，按界面语言展示，并给出发布页链接。([d34bc25](https://github.com/GDWhisper/dsh-ntr/commit/d34bc25))
+- **acp**：添加 agent 页新增 Antigravity CLI 预设，启动命令为 `agy acp`。([3acfb6f](https://github.com/GDWhisper/dsh-ntr/commit/3acfb6f))
+
+### 改进
+
+- **acp**：工具调用还在运行时，工具卡就显示该次调用的真实命令。([cbf63bd](https://github.com/GDWhisper/dsh-ntr/commit/cbf63bd))
+- **acp**：派出的后台 worker 运行期间，主对话保持可用，本轮不再被它占用。([ae45e2d](https://github.com/GDWhisper/dsh-ntr/commit/ae45e2d))
+- **acp**：后台 worker 静默后，它的报告作为一条对话消息进入聊天。([70c0dd8](https://github.com/GDWhisper/dsh-ntr/commit/70c0dd8))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.4.1...v0.4.2
+
+---
+
+Detached workers no longer hold the chat, and their reports arrive in the chat; tool cards show the real command while the call runs; the update card previews release notes before installing; a new Antigravity CLI preset is available.
+
+### Added
+
+- **update**: the settings update card previews the target version's release notes before installing, in the interface language, with a release-page link. ([d34bc25](https://github.com/GDWhisper/dsh-ntr/commit/d34bc25))
+- **acp**: the add-agent page offers an Antigravity CLI preset, launched as `agy acp`. ([3acfb6f](https://github.com/GDWhisper/dsh-ntr/commit/3acfb6f))
+
+### Improved
+
+- **acp**: a running tool card shows the call's real command while the tool still runs. ([cbf63bd](https://github.com/GDWhisper/dsh-ntr/commit/cbf63bd))
+- **acp**: the main chat stays usable while a detached worker runs and no longer holds the turn. ([ae45e2d](https://github.com/GDWhisper/dsh-ntr/commit/ae45e2d))
+- **acp**: once a background worker goes quiet, its report arrives in the chat as a conversation message. ([70c0dd8](https://github.com/GDWhisper/dsh-ntr/commit/70c0dd8))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.4.1...v0.4.2
+
 ## [0.4.1] - 2026-11-08
 
 NTR 会话标题默认带 [NTR] 徽标；切换模型不再串用思考等级，同步子代理的回合就地收尾，工具卡不再刷屏。
