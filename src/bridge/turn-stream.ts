@@ -11,7 +11,7 @@ import {
 } from '../impl.ts'
 import type { AcpEvent, PermissionOutcome, SessionView, StreamChunk } from '../protocol.ts'
 import { OUTPUT_CHARS_PER_TOKEN, TurnTpsTracker } from '../tps.ts'
-import { recordAcpToolOutput, releaseAllToolOutputWaiters } from './registries.ts'
+import { BACKGROUND_REPORT_MAX, recordAcpToolOutput, releaseAllToolOutputWaiters } from './registries.ts'
 import type { AmbientTurn, BackgroundDispatch, BackgroundReport, BridgeTuning, RetiredAmbient } from './types.ts'
 import { AsyncQueue } from './async-queue.ts'
 // Type-only edge into the manager; erased completely at runtime, so the
@@ -245,6 +245,50 @@ export interface LiveSession {
    * bounds how long a stale banner can sit on a live session.
    */
   quotaRefusal?: { message: string; at: number }
+  /**
+   * The answer Antigravity's own transcript reported late, after the turn
+   * closed, and when it was delivered (see `docs/plan/antigravity-late-output.md`).
+   *
+   * The agent replays that text on the NEXT prompt (it sends no update while
+   * no prompt is in flight), so the echo guard in `TurnStreamController`
+   * swallows exactly this text once. Written only when
+   * `BridgeManager.streamPrompt` actually replays the pending report — a wake
+   * skipped by the background-report FIFO must NOT write it, or the replayed
+   * answer would be swallowed twice.
+   */
+  lateEcho?: { text: string; at: number }
+  /**
+   * A late report handed to the chat plane that no step has replayed yet.
+   * `streamPrompt` matches its `report` against the report it is about to
+   * yield and converts it into {@link LiveSession.lateEcho}, whose `text` is
+   * the UNMARKED truncated prefix (`guard`): the echo guard's deduplication key
+   * must match the agent's replay, never our truncation marker.
+   */
+  pendingLateEcho?: { guard: string; report: string; at: number }
+  /**
+   * The visible answer text of the turn that just closed, kept to recognise
+   * the agent writing the SAME answer late: a candidate equal to it is this
+   * turn's own text, not a new report.
+   */
+  lastTurnAnswerText?: string
+  /**
+   * `toolCallId`s seen in a COMPLETED turn (Antigravity only). The agent
+   * replays the previous turn's tool frames on the next prompt: a known id
+   * must not open a second card, and its replay must not re-open the stall
+   * watchdog's long tool window. Bounded (`KNOWN_TOOL_CALL_MAX`), oldest
+   * evicted first; `turnToolCalls` collects the current turn's ids and they
+   * rotate in here at `closeTurn`.
+   */
+  knownToolCalls?: Set<string>
+  /** `toolCallId`s seen in the turn currently on air (Antigravity only). */
+  turnToolCalls?: Set<string>
+  /**
+   * Stops this session's transcript watch (the late-output service's
+   * `disarm`). Set at arm time, called by `clearAmbientState` at every
+   * lifecycle boundary — the writer is the agent process, so a released
+   * session's transcript cannot grow and a watch must not outlive it.
+   */
+  stopLateWatch?: () => void
   /**
    * Detached workers this session dispatched that may still run after the
    * turn that dispatched them CLOSED. Session-level on purpose: the worker's
@@ -546,6 +590,16 @@ export function clearAmbientState(session: LiveSession): void {
   session.retiredAmbients = undefined
   session.consumedDrains = undefined
   session.quotaRefusal = undefined
+  // The Antigravity late-output state is transient too: a replay record only
+  // speaks for the prompt that delivered it, and a watch must not outlive the
+  // session it observes (the transcript writer is the agent process).
+  session.lateEcho = undefined
+  session.pendingLateEcho = undefined
+  session.turnToolCalls?.clear()
+  session.knownToolCalls?.clear()
+  const stopLateWatch = session.stopLateWatch
+  session.stopLateWatch = undefined
+  stopLateWatch?.()
 }
 
 /**
@@ -634,6 +688,54 @@ type TurnSettle =
   | { kind: 'cancelled' }
   | { kind: 'error'; message: string; code?: string; errorKind?: 'quota' }
 
+/** One step of the echo guard's state machine (see {@link applyEchoGuard}). */
+export type EchoGuardResult =
+  /** Still a strict prefix of the late answer: hold it, emit nothing yet. */
+  | { kind: 'hold'; buffer: string }
+  /** Exactly the late answer: drop it and stop guarding. */
+  | { kind: 'swallow'; buffer: string }
+  /** The late answer followed by new text: emit the new tail only. */
+  | { kind: 'release'; buffer: string; emit: string }
+  /** Not the late answer at all: emit everything (fail-open). */
+  | { kind: 'mismatch'; buffer: string; emit: string }
+
+/**
+ * The replay deduplication state machine for Antigravity's next prompt.
+ *
+ * The agent flushes the previous turn's answer at the start of the next prompt,
+ * and that text was ALREADY delivered as a background report. Chunks are
+ * incremental (no `replace` semantics), so a strict prefix accumulation is
+ * enough to recognise it. Every branch but `hold` clears the guard state:
+ * anything that deviates emits the text instead of eating a real answer.
+ */
+export function applyEchoGuard(late: string, buffer: string, chunk: string): EchoGuardResult {
+  const next = buffer + chunk
+  if (next.length < late.length && late.startsWith(next)) return { kind: 'hold', buffer: next }
+  if (next === late) return { kind: 'swallow', buffer: '' }
+  if (next.length > late.length && next.startsWith(late)) return { kind: 'release', buffer: '', emit: next.slice(late.length) }
+  return { kind: 'mismatch', buffer: '', emit: next }
+}
+
+/**
+ * Whether a `content` value is TEXT in the agent's own declared shape. The
+ * echo guard only applies here: `chunkTextOf` folds any other shape into a
+ * JSON string, and matching that against a prose answer would be meaningless.
+ */
+function isTextualContent(content: unknown): boolean {
+  if (typeof content === 'string') return true
+  if (Array.isArray(content)) {
+    return content.every(item => typeof item === 'string'
+      || (typeof item === 'object' && item !== null
+        && typeof (item as Record<string, unknown>).text === 'string'
+        && ((item as Record<string, unknown>).type === undefined || (item as Record<string, unknown>).type === 'text')))
+  }
+  if (typeof content === 'object' && content !== null) {
+    const row = content as Record<string, unknown>
+    return typeof row.text === 'string' && (row.type === undefined || row.type === 'text')
+  }
+  return false
+}
+
 /** How often a running turn's live burst aggregate is pushed to the browser. */
 const TPS_PUSH_INTERVAL_MS = 1000
 
@@ -663,6 +765,13 @@ export const AMBIENT_NOTICE_MAX = 64
  * small ring is enough; the oldest is evicted first.
  */
 export const RETIRED_AMBIENT_MAX = 32
+
+/**
+ * Bound on {@link LiveSession.knownToolCalls}: the ids only exist to recognise
+ * a replayed card, and an id older than this many completed turns is no longer
+ * plausible. Oldest evicted first.
+ */
+export const KNOWN_TOOL_CALL_MAX = 512
 
 /**
  * Bound on {@link LiveSession.consumedDrains}: one id per delivered answer.
@@ -812,6 +921,26 @@ export class TurnStreamController {
    * text, and must say so when it closes.
    */
   private sawVisibleText = false
+  /**
+   * The visible answer text this turn streamed (agent MESSAGE chunks only, in
+   * order). `closeTurn` publishes it as
+   * {@link LiveSession.lastTurnAnswerText}, so the transcript watcher can tell
+   * the turn's own answer — written late — from a new report.
+   *
+   * Bounded by {@link BACKGROUND_REPORT_MAX}: past the bound the field stops
+   * accumulating and `turnAnswerOverflow` is set, so `closeTurn` publishes
+   * `undefined` instead of a prefix (a truncated prefix would silently
+   * misclassify a genuinely new answer as this turn's own).
+   */
+  private turnAnswerText = ''
+  /** The answer exceeded {@link BACKGROUND_REPORT_MAX}; no equality evidence. */
+  private turnAnswerOverflow = false
+  /**
+   * Text held while it is still a strict prefix of the late answer the echo
+   * guard is waiting to swallow (Antigravity only). `undefined` means the guard
+   * is not currently accumulating.
+   */
+  private echoBuffer?: string
   /**
    * The drain run ids whose visible answer text this turn FOLDED (the fold
    * treatment set). `closeTurn`'s quiet close reads it to decide the `consume`
@@ -1931,6 +2060,15 @@ export class TurnStreamController {
     }
     const seg = this.segment
     if (seg !== undefined) {
+      // Echo guard flush (Antigravity): a turn that ends while it still holds a
+      // strict prefix must not drop it. A normal stop emits what it held
+      // (duplicate is better than lost); a cancel / error discards it.
+      if (current && this.echoBuffer !== undefined) {
+        const held = this.echoBuffer
+        this.echoBuffer = undefined
+        this.session.lateEcho = undefined
+        if (outcome.kind === 'stop' && !seg.finished && held !== '') this.emitProse(seg, 'text', held)
+      }
       if (ambient !== undefined) {
         // The ambient line is OUR report, so it only appears when the drain
         // delivered no answer text of its own; reasoning alone does not count.
@@ -1951,6 +2089,22 @@ export class TurnStreamController {
       // The turn is over: no call from it can still earn the long tool window.
       this.session.activeToolCalls.clear()
       releaseAllToolOutputWaiters()
+      // Publish the turn's own visible answer BEFORE a transcript watch may
+      // arm: a late write of exactly this text is not a new background answer.
+      // An answer past the bound is published as `undefined` — losing the
+      // equality evidence only risks the same text appearing twice, which is
+      // the fail-open direction the whole late-output path follows.
+      this.session.lastTurnAnswerText = this.turnAnswerOverflow || this.turnAnswerText === ''
+        ? undefined
+        : this.turnAnswerText
+      // Rotate the turn's tool-call ids into the completed-turn set (Antigravity
+      // replays them on the next prompt) and start the late-output watch. Only
+      // a chat turn that ended on its own can have post-turn work: an ambient
+      // close already folded its answer, and a cancel / error owns no promise.
+      this.rotateTurnToolCalls()
+      if (ambient === undefined && outcome.kind === 'stop') {
+        this.manager.armLateOutputWatch(this.session, Date.now())
+      }
     }
     this.endTurn()
     // The controller stays indexed only while a continuation step can still
@@ -1960,6 +2114,23 @@ export class TurnStreamController {
     // would pin the controller (and its session id) to a turn nobody can continue.
     if (!current) this.retire()
     else if (ambient !== undefined || outcome.kind !== 'stop' || this.seenCalls.size === 0) this.dispose()
+  }
+
+  /**
+   * Move this turn's tool-call ids into the completed-turn set, so the agent's
+   * replay of them on the NEXT prompt opens no second card. Antigravity-only
+   * state: a session without the sets is untouched.
+   */
+  private rotateTurnToolCalls(): void {
+    const known = this.session.knownToolCalls
+    if (known === undefined) return
+    for (const callId of this.session.turnToolCalls ?? []) known.add(callId)
+    while (known.size > KNOWN_TOOL_CALL_MAX) {
+      const oldest = known.values().next().value
+      if (oldest === undefined) break
+      known.delete(oldest)
+    }
+    this.session.turnToolCalls = new Set<string>()
   }
 
   /**
@@ -2469,6 +2640,21 @@ export class TurnStreamController {
   }
 
   /**
+   * Whether the echo guard is live for this turn: a delivered late answer
+   * exists, is still inside its window, and this turn began AFTER it. A stale
+   * record is dropped here (the lazy expiry the plan calls for).
+   */
+  private echoGuardActive(): boolean {
+    const late = this.session.lateEcho
+    if (late === undefined) return false
+    if (Date.now() - late.at > this.manager.lateEchoTuning.echoMs) {
+      this.session.lateEcho = undefined
+      return false
+    }
+    return this.constructedAt > late.at
+  }
+
+  /**
    * The turn's whole fold, shared by live events and segment replay. Visible
    * non-tool events END a card-bearing segment instead of joining it — that is
    * the segmentation rule that puts each card between two assistant messages.
@@ -2491,8 +2677,33 @@ export class TurnStreamController {
       return true
     }
     if (kind === 'agent_thought_chunk' || kind === 'agent_message_chunk') {
-      const text = chunkTextOf(update.content)
+      let text = chunkTextOf(update.content)
       if (text === '') return true
+      // The agent replays the delivered late answer at the start of the next
+      // prompt: hold it while it is a strict prefix, swallow it when it ends
+      // exactly, and fail-open the moment it deviates (a real answer must never
+      // be eaten). Reasoning is never guarded, and neither is an ambient /
+      // background segment (its text is not this turn's answer).
+      if (kind === 'agent_message_chunk' && !seg.ambient && isTextualContent(update.content) && this.echoGuardActive()) {
+        const late = this.session.lateEcho?.text ?? ''
+        const guarded = applyEchoGuard(late, this.echoBuffer ?? '', text)
+        switch (guarded.kind) {
+          case 'hold':
+            this.echoBuffer = guarded.buffer
+            return true
+          case 'swallow':
+            this.echoBuffer = undefined
+            this.session.lateEcho = undefined
+            return true
+          case 'release':
+          case 'mismatch':
+            this.echoBuffer = undefined
+            this.session.lateEcho = undefined
+            text = guarded.emit
+            break
+        }
+        if (text === '') return true
+      }
       if (seg.hasCard) {
         this.finishSegment(seg, { kind: 'stop' })
         return false
@@ -2519,11 +2730,29 @@ export class TurnStreamController {
         if (hold !== undefined && (seq === undefined || seq > hold.floorSeq)) {
           hold.answerChars += text.length
         }
+        if (!this.isAmbientOwned(update)) {
+          if (!this.turnAnswerOverflow) {
+            this.turnAnswerText += text
+            if (this.turnAnswerText.length > BACKGROUND_REPORT_MAX) {
+              this.turnAnswerOverflow = true
+              // Release the prefix: `closeTurn` publishes nothing once the
+              // bound is crossed, so keeping the bytes would only waste it.
+              this.turnAnswerText = ''
+            }
+          }
+        }
       }
       this.emitProse(seg, kind === 'agent_thought_chunk' ? 'reasoning' : 'text', text)
       return true
     } else if (kind === 'tool_call' || kind === 'tool_call_update') {
       this.noteToolRecord(update)
+      const callId = typeof update.toolCallId === 'string' ? update.toolCallId : ''
+      if (callId !== '' && this.session.knownToolCalls?.has(callId) === true) {
+        // A replay of a COMPLETED turn's tool frame: its card already sits in an
+        // earlier assistant message, so open no second card and start no
+        // continuation step. The output still reaches the shared registry.
+        return true
+      }
       if (seg.ambient || this.isAmbientOwned(update)) {
         // A background drain's tools stay in the transcript: opening a card
         // would make the host execute a tool and propose a continuation step

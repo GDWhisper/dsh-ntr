@@ -114,6 +114,9 @@ export function apply(ctx: Context, config?: unknown): void {
       turnStallToolMs: resolved.turnStallToolMs,
       turnStallTickMs: resolved.turnStallTickMs,
       idleTimeoutMs: resolved.idleTimeoutMs,
+      // Only forward an EXPLICIT value: an absent key must keep the tuning
+      // default (on), not override it with `undefined`.
+      ...(resolved.agyLateOutput === undefined ? {} : { agyLateOutput: resolved.agyLateOutput }),
     },
   )
   const adapter = new AcpLlmAdapter(manager)

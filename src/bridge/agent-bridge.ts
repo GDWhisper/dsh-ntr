@@ -2164,12 +2164,24 @@ export class AgentBridge {
     this.onSessionDrainText?.(session, params.update)
     if (!replay && (kind === 'tool_call' || kind === 'tool_call_update')) {
       const { toolCallId, status } = params.update as { toolCallId: string; status?: string | null }
-      if (status === 'completed' || status === 'failed') session.activeToolCalls.delete(toolCallId)
-      else if (status === 'pending' || status === 'in_progress') session.activeToolCalls.add(toolCallId)
-      // A `tool_call` without a status is a call the agent just announced and
-      // has not finished: count it as in flight. On an UPDATE the status is
-      // optional, and an absent one carries no news either way.
-      else if (kind === 'tool_call' && (status === undefined || status === null)) session.activeToolCalls.add(toolCallId)
+      // Antigravity replays a COMPLETED turn's tool frames on the next prompt.
+      // A known id must not re-open the stall watchdog's long tool window: the
+      // replay reports no terminal frame for the call, so counting it would
+      // leave the id in `activeToolCalls` until the session dies — lifting the
+      // window from `turnStallMs` to `turnStallToolMs`. The id is still recorded
+      // for THIS turn so it can rotate into the completed-turn set at close.
+      const replayed = session.knownToolCalls?.has(toolCallId) === true
+      if (session.turnToolCalls !== undefined && typeof toolCallId === 'string' && toolCallId !== '') {
+        session.turnToolCalls.add(toolCallId)
+      }
+      if (!replayed) {
+        if (status === 'completed' || status === 'failed') session.activeToolCalls.delete(toolCallId)
+        else if (status === 'pending' || status === 'in_progress') session.activeToolCalls.add(toolCallId)
+        // A `tool_call` without a status is a call the agent just announced and
+        // has not finished: count it as in flight. On an UPDATE the status is
+        // optional, and an absent one carries no news either way.
+        else if (kind === 'tool_call' && (status === undefined || status === null)) session.activeToolCalls.add(toolCallId)
+      }
     }
     this.applyDerived(session, params.update)
     const seq = session.transcript.append(params.update)

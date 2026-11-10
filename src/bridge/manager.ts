@@ -70,6 +70,8 @@ import {
   snapshot,
 } from './shape.ts'
 import { DEFAULT_TUNING } from './tuning.ts'
+import { AgyLateOutputService } from './agy-late-output.ts'
+import { agyStoreRoot, isAntigravityAgent } from './agy-transcript.ts'
 import { AgentBridge, SHUTDOWN_BUDGET_MS } from './agent-bridge.ts'
 import { ModelCatalogService } from './catalog-service.ts'
 import { SubagentService } from './subagent-service.ts'
@@ -214,6 +216,31 @@ export class BridgeManager {
     }
   }
 
+  /**
+   * The echo guard's window (see {@link BridgeTuning.agyLateOutputEchoMs}): a
+   * delivered late answer stays eligible for deduplication this long, because
+   * the agent may replay it on a prompt that comes minutes later. Read from
+   * the CURRENT tuning at each use, like every other live window.
+   */
+  get lateEchoTuning(): { echoMs: number } {
+    return { echoMs: this.tuning.agyLateOutputEchoMs }
+  }
+
+  /** Start watching a closed chat turn's transcript (see `AgyLateOutputService.arm`). */
+  armLateOutputWatch(session: LiveSession, closedAt: number): void {
+    this.lateOutput.arm(session, closedAt)
+  }
+
+  /**
+   * Initialise the Antigravity-only transient sets on a NEW session: tool-call
+   * replay deduplication and the late-output watch only exist for this agent.
+   */
+  private initLateOutputState(session: LiveSession): void {
+    if (!this.lateOutput.isAgentFor(session.agentId)) return
+    session.knownToolCalls ??= new Set<string>()
+    session.turnToolCalls ??= new Set<string>()
+  }
+
   /** Index a turn's controller, retiring whatever turn it supersedes. */
   rememberTurnStream(dshSessionId: string, controller: TurnStreamController): void {
     const previous = this.turnStreams.get(dshSessionId)
@@ -342,6 +369,12 @@ export class BridgeManager {
     /** Auto-probe agents for model catalogs (boot + lazy); manual probes always run. */
     private readonly probeModelsOnBoot = true,
     tuning?: BridgeTuning,
+    /**
+     * Test seam for the Antigravity transcript path: production omits it and
+     * the defaults read the launch command line. A test injects its own agent
+     * predicate and store root instead of rewriting `process.env.HOME`.
+     */
+    lateOutputProbe?: { isAgent(def: AcpAgentDef): boolean; storeRoot(): string | undefined },
   ) {
     // Held as a live object rather than the raw parameter: the approval
     // deadline and the idle window are rewritten in place when the settings
@@ -425,6 +458,20 @@ export class BridgeManager {
       sessions: () => this.registry.sessions(),
       persistAgents: () => this.persistence.persistAgents(),
       ambientTuning: () => this.ambientTuning,
+      lateEchoMs: () => this.tuning.agyLateOutputEchoMs,
+    })
+    // The late-output watch reads Antigravity's private transcript (see the
+    // plan). Every manager capability arrives as a closure; the probe pair is
+    // the test seam, defaults read the launch command line.
+    this.lateOutput = new AgyLateOutputService({
+      isAgent: def => (lateOutputProbe === undefined ? isAntigravityAgent(def) : lateOutputProbe.isAgent(def)),
+      storeRoot: def => (lateOutputProbe === undefined ? agyStoreRoot(def) ?? undefined : lateOutputProbe.storeRoot()),
+      tuning: () => this.tuning,
+      host: {
+        defOf: agentId => this.defsMap.get(agentId),
+        isBusy: session => session.running || session.promptInFlight === true,
+        deliver: (session, text) => this.subagents.deliverLateReport(session, text),
+      },
     })
     // The settings / tuning cluster (see `SettingsService`) needs the live
     // bridges a hot write reaches, the tuning object it rewrites, the registry
@@ -526,6 +573,9 @@ export class BridgeManager {
       applyPersistedChatSessions: sessions => {
         for (const session of sessions) {
           this.registry.putSession(session)
+          // The transient Antigravity sets are per-agent and not persisted:
+          // restore must initialise them like a new / forked session does.
+          this.initLateOutputState(session)
           const dshSessionId = session.dshSessionId
           if (dshSessionId === undefined) continue
           this.bridgeFor(session.agentId, { kind: 'chat', dshSessionId }).parkReleased(session)
@@ -566,7 +616,12 @@ export class BridgeManager {
     return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, onCommands, this.tuning, () => this.sessionWorkspaceResolver, onSessionsDirty, onForkCapability, bridge => {
       this.publishAgentStatus(bridge.def.id)
       this.noticeBridgeFailure(bridge)
-    }, (session, update) => this.subagents.trackSessionBackgroundDispatch(session, update), (session, update) => this.subagents.trackBackgroundDrainText(session, update), (session, status) => this.subagents.terminalizeSessionDispatches(session, status))
+    }, (session, update) => this.subagents.trackSessionBackgroundDispatch(session, update), (session, update) => this.subagents.trackBackgroundDrainText(session, update), (session, status) => {
+      // A session teardown that skips `clearAmbientState` must still stop the
+      // transcript watch: its writer is the process that is going away.
+      this.lateOutput.disarm(session)
+      this.subagents.terminalizeSessionDispatches(session, status)
+    })
   }
 
   /**
@@ -765,7 +820,11 @@ export class BridgeManager {
    * all-or-nothing.
    */
   async adoptForkedSession(childDshSessionId: string, parentDshSessionId: string): Promise<{ sessionId: string; acpSessionId: string }> {
-    return this.registry.adoptForkedSession(childDshSessionId, parentDshSessionId)
+    const adopted = await this.registry.adoptForkedSession(childDshSessionId, parentDshSessionId)
+    // A fork is the fourth session-creation point: the child needs the same
+    // Antigravity-only transient state a fresh chat session gets.
+    for (const session of this.registry.sessionsOf(childDshSessionId)) this.initLateOutputState(session)
+    return adopted
   }
 
   /**
@@ -1845,6 +1904,13 @@ export class BridgeManager {
    * (RPC handlers, the adapter and tests read them here) as thin delegates.
    */
   private readonly subagents: SubagentService
+  /**
+   * The Antigravity transcript watch (see `docs/plan/antigravity-late-output.md`):
+   * armed by a chat turn that ended on its own, disarmed at every lifecycle
+   * boundary and by the bridge teardown. It only DELIVERS; it never closes a
+   * turn, kills a process or changes `running`.
+   */
+  private readonly lateOutput: AgyLateOutputService
   private sessionWorkspaceResolver?: SessionWorkspaceResolver
   private attachmentResolver?: unknown
 
@@ -1953,6 +2019,7 @@ export class BridgeManager {
     // Absent for `/acp`-RPC sessions and for adapter calls without a chat
     // session; their permission cards are addressed by the ACP session only.
     session.dshSessionId = dshSessionId
+    this.initLateOutputState(session)
     this.registry.putSession(session)
     // Turn the displayed defaults into this conversation's pick, so the first
     // prompt runs on what the user was shown (see `seedChatChoiceFromCatalog`).
@@ -2203,6 +2270,27 @@ export class BridgeManager {
     const wake = backgroundReportOf(options.messages ?? [])
     if (wake !== undefined) {
       const text = wake.kind === 'report' ? wake.text : BACKGROUND_REPORT_LOST_TEXT
+      // A replay of an Antigravity late report is about to reach the user: from
+      // here the echo guard may swallow the SAME text the agent replays on the
+      // next prompt. Only the step that actually yields the report records it —
+      // a wake the FIFO skipped shows nothing, so its next replay must show the
+      // old answer again (fail-open, never a double swallow).
+      if (wake.kind === 'report') {
+        const late = this.registry.sessionAt(options.sessionId, agentId)
+        if (late !== undefined) {
+          const pending = late.pendingLateEcho
+          // Lazy expiry: a record older than the guard window can never match
+          // a replay, and committing it would only swallow an unrelated answer.
+          if (pending !== undefined && Date.now() - pending.at > this.tuning.agyLateOutputEchoMs) {
+            late.pendingLateEcho = undefined
+          } else if (pending !== undefined && pending.report === text) {
+            // The guard key is the UNMARKED truncated prefix: the agent replays
+            // the original answer, never our truncation marker.
+            late.lateEcho = { text: pending.guard, at: Date.now() }
+            late.pendingLateEcho = undefined
+          }
+        }
+      }
       if (wake.kind === 'lost') {
         this.hub.broadcast({
           type: 'agent/notice',
