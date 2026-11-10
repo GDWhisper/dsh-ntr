@@ -19,7 +19,6 @@ import {
   isAbsolutePath,
   splitAdapterModelId,
   validateAgentDef,
-  agentSaveAction,
 } from '../impl.ts'
 import type {
   PendingPermissionView,
@@ -31,9 +30,8 @@ import type {
   AcpIdleRelease, ActiveTurnView, ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, SaveGateFlushResult, SaveGateStatus, SessionView, StreamChunk,
   SubagentDetailResult, SubagentRecord,
 } from '../protocol.ts'
-import { DEFAULT_SAVE_GATE_TIMEOUT_MS, SESSION_TITLE_PREFIX } from '../protocol.ts'
+import { SESSION_TITLE_PREFIX } from '../protocol.ts'
 import type { AcpSaveGate } from '../save-gate.ts'
-import { SaveGateAborted } from '../save-gate.ts'
 import { scanSkillDirs } from '../skills-scan.ts'
 import type { UpdateService } from '../update.ts'
 import {
@@ -52,7 +50,6 @@ import type {
 
 import {
   chatWorkspaceRoot,
-  ensureDefaultWorkspace,
   legacyFallback,
   migrateLegacyState,
   pluginStateDir,
@@ -61,7 +58,6 @@ import {
 } from './state-paths.ts'
 
 import {
-  detectHostAgents,
   quoteLegacyCommand,
 } from './process.ts'
 
@@ -89,12 +85,12 @@ import {
   snapshot,
 } from './shape.ts'
 import { DEFAULT_TUNING } from './tuning.ts'
-import { AgentBridge, SHUTDOWN_BUDGET_MS, TEST_EXIT_GRACE_MS } from './agent-bridge.ts'
+import { AgentBridge, SHUTDOWN_BUDGET_MS } from './agent-bridge.ts'
 import { ModelCatalogService } from './catalog-service.ts'
-import { classifyTestFailure } from './test-failure.ts'
 import { SubagentService } from './subagent-service.ts'
 import { SettingsService } from './settings-service.ts'
 import { ChatChoiceService } from './chat-choice-service.ts'
+import { AgentAdminService } from './agent-admin-service.ts'
 import { describeError } from './errors.ts'
 
 /** How long one `agent/skills` scan answer stays fresh; the browser re-asks past it. */
@@ -145,35 +141,18 @@ export class BridgeManager {
    */
   private readonly choices: ChatChoiceService
   /**
+   * Agent-definition administration + the save gate (see `AgentAdminService`):
+   * the delete tombstones, the delete / save generations and the `save/*` gate
+   * state machine. The registry (`defsMap`) and the bridge table stay here and
+   * reach the service as host callbacks.
+   */
+  private readonly admin: AgentAdminService
+  /**
    * `agent/skills` answers, keyed `agentId\0workspaceRoot`, TTL'd by
    * {@link SKILL_SCAN_TTL_MS}. Memory-only: the scan is a pure fs read, so a
    * fresh boot re-scans and nothing is owed to `agents.json`.
    */
   private readonly skillCache = new Map<string, { at: number; result: AgentSkillsResult }>()
-  /**
-   * Process-lifetime delete tombstones. `deleteAgent` records the id BEFORE it
-   * awaits anything, so a save that is already running can notice the delete
-   * after its own await and refuse to write the definition back. The value is
-   * the delete generation: `deleteAgent` bumps it every time, and a save only
-   * survives when the generation it captured still matches AND no tombstone
-   * exists.
-   *
-   * There is deliberately no "recreate a deleted id" entry point: a same-id
-   * re-import would have to remove the tombstone explicitly (and start a fresh
-   * generation), which no caller does today. Clearing it on a plain save would
-   * reopen exactly the resurrection race this map closes.
-   */
-  private readonly deletedAgentIds = new Set<string>()
-  /** Delete generation per agent id; absent = never deleted in this process. */
-  private readonly agentDeleteGenerations = new Map<string, number>()
-  /**
-   * Save generation per agent id. Every `saveAgent` call that will actually
-   * write (direct / defer / force) bumps it BEFORE doing anything. An older
-   * save already executing captures its generation at the start and refuses to
-   * write once a newer save has bumped it: otherwise the older, slower write
-   * could land last and silently replace the definition the user just saved.
-   */
-  private readonly agentSaveGenerations = new Map<string, number>()
   /** Last persist failure already reported, so a hot retry loop cannot spam the log. */
   private lastPersistFailure?: string
   /**
@@ -381,7 +360,7 @@ export class BridgeManager {
     }
     this.catalog = new ModelCatalogService({
       defOf: agentId => this.defsMap.get(agentId),
-      isAgentDeleted: agentId => this.deletedAgentIds.has(agentId),
+      isAgentDeleted: agentId => this.admin.isAgentDeleted(agentId),
       bridgeForProbe: agentId => this.bridgeFor(agentId, { kind: 'probe' }),
       releaseProbe: agentId => {
         this.pruneBridge(bridgeKey(agentId, { kind: 'probe' }))
@@ -435,6 +414,59 @@ export class BridgeManager {
       lockedAgentFor: dshSessionId => this.lockedAgentFor(dshSessionId),
       persistAgents: () => this.persistAgents(),
     }, this.chatAgentIntent)
+    // The agent-administration cluster (see `AgentAdminService`) needs the
+    // registry, the bridge teardown, the strict state-file write, the live turn
+    // list and the event stream; every one is a closure so the service never
+    // imports this module. The tombstone / generation maps and the save gate
+    // move WITH the service.
+    this.admin = new AgentAdminService({
+      defOf: agentId => this.defsMap.get(agentId),
+      defs: () => [...this.defsMap.values()],
+      replaceDef: def => { this.defsMap.set(def.id, def) },
+      removeDef: agentId => {
+        this.defsMap.delete(agentId)
+        // The default agent is a pointer INTO this registry: deleting its
+        // target must drop the pointer too, or the file would keep naming a
+        // ghost. Same for the request-path bindings and the catalog cache.
+        this.settings.forgetAgent(agentId)
+        for (const [dshSessionId, model] of routeBindingRegistry().conversations) {
+          if (splitAdapterModelId(model).agentId === agentId) routeBindingRegistry().conversations.delete(dshSessionId)
+        }
+        if (routeBindingRegistry().defaultModel === agentId) routeBindingRegistry().defaultModel = undefined
+        this.catalog.forgetAgent(agentId)
+      },
+      hasBridge: agentId => this.bridges.has(agentId) || this.bridgesOf(agentId).length > 0,
+      stopAgent: async (agentId, persist = false) => {
+        if (!this.bridges.has(agentId) && this.bridgesOf(agentId).length === 0) return
+        await this.stopAgent(agentId, persist)
+        // `stopAgent` drops every per-scope key; the bare key is the non-A1 /
+        // pre-spawn slot and is removed here as well.
+        this.bridges.delete(agentId)
+        this.bridgeScopes.delete(agentId)
+      },
+      persistAgents: (strict = false, staged) => { this.persistAgents(strict, staged) },
+      activeTurnViews: () => this.activeTurnViews(),
+      preSpawnView: def => new AgentBridge(def, this.hub, this.transcriptMax, () => {}).view(),
+      publishCatalog: (agentId, withStatus) => {
+        if (withStatus) {
+          const def = this.defsMap.get(agentId)
+          if (def !== undefined) {
+            const view = this.aggregateView(def)
+            // The aggregate is the agent's state; the view rides along only
+            // when a holder exists, exactly as this frame always did.
+            this.hub.broadcast({
+              type: 'agent/status',
+              agentId,
+              state: view.state,
+              ...(this.bridgesOf(agentId).length === 0 ? {} : { agent: view }),
+            })
+          }
+        }
+        this.catalog.broadcastExposure(agentId)
+      },
+      probeAgentModels: agentId => this.probeAgentModels(agentId),
+      hub: this.hub,
+    })
     this.loadPersistedAgents()
     this.catalog.loadPersistedCatalogs()
     // A persisted deadline override must reach the tuning the bridges are built
@@ -1094,6 +1126,14 @@ export class BridgeManager {
     return [...views.values()]
   }
 
+  // ---- Agent-definition administration (owned by `AgentAdminService`) ----
+
+  /**
+   * Thin delegates: the RPC handlers, the settings page and the tests call
+   * these on the manager, but the tombstone / generation bookkeeping and the
+   * save gate live in `agent-admin-service.ts`. Names and signatures stay put.
+   */
+
   /**
    * Wire the profile-save gate (host entry only). The gate is exposed as the
    * `acpSaveGate` Cordis service so `dsh-settings` / `dsh-hmr` can ask before
@@ -1101,21 +1141,12 @@ export class BridgeManager {
    * RPC surface answers "always save now".
    */
   setSaveGate(gate?: AcpSaveGate): void {
-    this.saveGate = gate
+    this.admin.setSaveGate(gate)
   }
 
   /** Current gate state; the RPC/SSE surface and the settings page read it. */
   saveGateStatus(): SaveGateStatus {
-    return this.saveGate?.status() ?? {
-      // No gate wired: this is the same synthetic idle snapshot
-      // `emptySaveGateStatus` answers, and it must not claim gate availability.
-      gateAvailable: false,
-      canSave: true,
-      activeTurns: 0,
-      activeSessions: [],
-      pending: [],
-      timeoutMs: DEFAULT_SAVE_GATE_TIMEOUT_MS,
-    }
+    return this.admin.saveGateStatus()
   }
 
   /**
@@ -1127,22 +1158,22 @@ export class BridgeManager {
    * agent's own held write.
    */
   async saveGateFlush(): Promise<SaveGateFlushResult> {
-    return this.saveGate?.forceFlush() ?? { saved: 0, expired: 0, failed: 0 }
+    return this.admin.saveGateFlush()
   }
 
   /** Cancel one label's held write (the settings form's "I kept editing" path). */
   saveGateCancel(label: string): number {
-    return this.saveGate?.cancel(label) ?? 0
+    return this.admin.saveGateCancel(label)
   }
 
   /** Re-run a failed/expired held write (the failure banner's retry gesture). */
   saveGateRetry(label: string): boolean {
-    return this.saveGate?.retry(label) ?? false
+    return this.admin.saveGateRetry(label)
   }
 
   /** Host query: wait bounded for the ACP plane to become idle. */
   async saveGateWaitIdle(timeoutMs?: number): Promise<boolean> {
-    return this.saveGate?.waitForIdle(timeoutMs) ?? true
+    return this.admin.saveGateWaitIdle(timeoutMs)
   }
 
   private getStoragePath(): string | undefined {
@@ -1738,352 +1769,34 @@ export class BridgeManager {
     })
   }
 
+  /** Host-agent detection: the registry snapshot is the only input. */
   async detectAgents(): Promise<DetectedAgentInfo[]> {
-    return detectHostAgents([...this.defsMap.values()])
+    return this.admin.detectAgents()
   }
 
-  /**
-   * True once `deleteAgent` ran for this id in this process. The tombstone
-   * lives for the process lifetime (see `deletedAgentIds`), so a stale save
-   * snapshot and a fresh explicit save are both refused.
-   */
-  private isAgentDeleted(agentId: string): boolean {
-    return this.deletedAgentIds.has(agentId)
-  }
-
-  private agentDeleteGeneration(agentId: string): number {
-    return this.agentDeleteGenerations.get(agentId) ?? 0
-  }
-
-  private agentSaveGeneration(agentId: string): number {
-    return this.agentSaveGenerations.get(agentId) ?? 0
-  }
-
-  /** Start a new save generation; returns the number this call owns. */
-  private nextAgentSaveGeneration(agentId: string): number {
-    const generation = this.agentSaveGeneration(agentId) + 1
-    this.agentSaveGenerations.set(agentId, generation)
-    return generation
-  }
-
-  /**
-   * Abort a save whose captured delete/save generation no longer matches, or
-   * whose id has a delete tombstone. Runs after every await in `saveAgentNow`,
-   * so either a delete or a NEWER save that landed while this one was
-   * executing wins over the definition it raced.
-   * Throwing {@link SaveGateAborted} makes the gate settle `cancelled` (no
-   * failure banner, no retryable entry) instead of `failed`.
-   */
-  private assertAgentSaveCurrent(agentId: string, saveGeneration: number, deleteGeneration: number): void {
-    if (
-      !this.isAgentDeleted(agentId)
-      && this.agentDeleteGeneration(agentId) === deleteGeneration
-      && this.agentSaveGeneration(agentId) === saveGeneration
-    ) return
-    throw new SaveGateAborted(`acp: agent "${agentId}" was deleted or superseded while its save was in flight`)
-  }
-
-  /** Record a delete BEFORE awaiting the stop, so in-flight saves can see it. */
-  private tombstoneAgent(agentId: string): void {
-    this.deletedAgentIds.add(agentId)
-    this.agentDeleteGenerations.set(agentId, this.agentDeleteGeneration(agentId) + 1)
-  }
-
+  /** Save one definition; the gate semantics live in `AgentAdminService.saveAgent`. */
   async saveAgent(def: AcpAgentDef, mode: AgentSaveMode = 'direct'): Promise<AgentSaveResult> {
-    // A deleted id never comes back through this entry point. Re-creating one
-    // would need an explicit "recreate" gesture that clears the tombstone; no
-    // such caller exists today, and a plain save must not reopen the race.
-    if (this.isAgentDeleted(def.id)) {
-      throw new AcpError('agent_deleted', `acp: agent "${def.id}" was deleted and cannot be saved again`)
-    }
-    // The host is the single authority for this save: callers that bypass the
-    // panel (RPC, scripts) must not interrupt a turn implicitly. Only the two
-    // explicit gestures (`defer` / `force`) change that outcome.
-    //
-    // Order matters: the target's active turns decide whether a force flush is
-    // even relevant. Forcing a save on an IDLE agent must not drain unrelated
-    // agents' queued writes.
-    const label = `agent-save:${def.id}`
-    const activeSessions = this.activeTurnViews().filter(view => view.agentId === def.id)
-    const action = agentSaveAction(activeSessions, mode)
-    if (activeSessions.length > 0 && mode === 'force') {
-      // This call owns the definition from here on. The bump happens BEFORE
-      // the cancel: an older save already executing must see it and abort at
-      // its next await rather than land after the new definition.
-      const saveGeneration = this.nextAgentSaveGeneration(def.id)
-      // ONLY this agent's held snapshot is dropped. The user authorised the
-      // interruption from THIS agent's dialog, so the gesture may not spend
-      // that authorisation on other agents: their queued writes stay behind
-      // the gate and run at the next idle boundary. The global gesture is
-      // the separate `save/flush` -> `saveGateFlush()` entry, which still
-      // force-flushes every label.
-      this.saveGate?.cancel(label)
-      return this.saveAgentDirectly(def, saveGeneration)
-    }
-    if (activeSessions.length > 0) {
-      if (action === 'defer' && this.saveGate !== undefined) {
-        // The gate supersedes an older queued save of the same label: the old
-        // entry would write values this save has already replaced. The
-        // generation this entry owns is captured NOW, so a still-executing
-        // older save cannot win after this one is queued.
-        const saveGeneration = this.nextAgentSaveGeneration(def.id)
-        void this.saveGate.defer(label, () => this.saveAgentNow(def, saveGeneration)).then(outcome => {
-          if (outcome.status === 'failed') {
-            this.hub.broadcast({
-              type: 'agent/notice',
-              agentId: def.id,
-              level: 'error',
-              text: `acp: deferred agent save failed: ${outcome.message}`,
-            })
-          } else if (outcome.status === 'expired') {
-            this.hub.broadcast({
-              type: 'agent/notice',
-              agentId: def.id,
-              level: 'error',
-              text: 'acp: deferred agent save expired; save it again',
-            })
-          }
-          // `cancelled` is a silent terminal state: a newer save superseded
-          // this entry, or the agent was deleted.
-        }, error => {
-          this.hub.broadcast({
-            type: 'agent/notice',
-            agentId: def.id,
-            level: 'error',
-            text: `acp: deferred agent save failed: ${describeError(error)}`,
-          })
-        })
-        return { done: true, deferred: true }
-      }
-      // A confirm-only gesture never supersedes a running save: no newer
-      // definition exists yet. The user's next explicit save does that.
-      return { done: false, confirmationRequired: true, activeSessions }
-    }
-    // Idle target: this save is the current version, so a stale queued entry
-    // for the same agent must not flush later and overwrite it. Bump the
-    // generation BEFORE the write so an older in-flight save aborts at its
-    // next await instead of landing after this definition.
-    const saveGeneration = this.nextAgentSaveGeneration(def.id)
-    this.saveGate?.cancel(label)
-    return this.saveAgentDirectly(def, saveGeneration)
+    return this.admin.saveAgent(def, mode)
   }
 
-  /**
-   * A direct save has no gate entry to settle, so a subject-gone abort becomes
-   * a benign `cancelled` RESULT. Rethrowing it here would turn a delete the
-   * user just performed into a failed RPC and a failure banner. The deferred
-   * path deliberately keeps `saveAgentNow` unwrapped: the gate needs the thrown
-   * marker to settle the queued entry `cancelled` without recording an outcome.
-   */
-  private async saveAgentDirectly(def: AcpAgentDef, saveGeneration: number): Promise<AgentSaveResult> {
-    try {
-      return await this.saveAgentNow(def, saveGeneration)
-    } catch (error) {
-      if (error instanceof SaveGateAborted) return { done: true, cancelled: true }
-      throw error
-    }
-  }
-
-  /** The original save body: stop this agent's process, persist, then probe. */
-  private async saveAgentNow(def: AcpAgentDef, saveGeneration: number): Promise<AgentSaveResult> {
-    // Captured before the first await. A delete bumps the generation and adds
-    // the tombstone, and a newer save bumps the save generation, so each check
-    // below sees that specific competing gesture.
-    const deleteGeneration = this.agentDeleteGeneration(def.id)
-    this.assertAgentSaveCurrent(def.id, saveGeneration, deleteGeneration)
-    const defaultWorkspace = ensureDefaultWorkspace()
-    const resolvedCwd = def.cwd ?? defaultWorkspace
-    // Deduplicated on purpose: the panel pre-fills the same path in several
-    // fields, and the old fallback also appended `process.cwd()`, which handed
-    // the agent the whole launch directory as an allowed root.
-    const resolvedRoots = (def.allowedCwdRoots && def.allowedCwdRoots.length > 0)
-      ? [...new Set(def.allowedCwdRoots)]
-      : [...new Set([resolvedCwd, defaultWorkspace])]
-
-    const resolvedDef: AcpAgentDef = {
-      ...def,
-      cwd: resolvedCwd,
-      allowedCwdRoots: resolvedRoots,
-    }
-
-    if (this.bridges.has(resolvedDef.id) || this.bridgesOf(resolvedDef.id).length > 0) {
-      // The save performs its own strict registry write below, so the stop
-      // must not race it with a second best-effort one.
-      await this.stopAgent(resolvedDef.id, false)
-      // First await cleared: the user may have deleted this agent, or a newer
-      // save may have started, while the process was stopping. Abort before
-      // touching the registry or the file.
-      this.assertAgentSaveCurrent(resolvedDef.id, saveGeneration, deleteGeneration)
-      // `stopAgent` drops the per-scope keys; the bare slot goes here too.
-      this.bridges.delete(resolvedDef.id)
-      this.bridgeScopes.delete(resolvedDef.id)
-    }
-
-    // Second gate immediately before the two writes that make the save
-    // observable: either a tombstone or a newer save recorded during any
-    // earlier callback wins here.
-    this.assertAgentSaveCurrent(resolvedDef.id, saveGeneration, deleteGeneration)
-    // Strict + STAGED: the file lands first. `defsMap` only commits after a
-    // successful write, so a failed disk write cannot leave memory naming a
-    // definition the registry file does not have.
-    this.persistAgents(true, resolvedDef)
-    this.defsMap.set(resolvedDef.id, resolvedDef)
-    this.hub.broadcast({
-      type: 'agent/status',
-      agentId: resolvedDef.id,
-      state: 'stopped',
-      agent: new AgentBridge(resolvedDef, this.hub, this.transcriptMax, () => {}).view(),
-    })
-    // A save is user-initiated: probe the model catalog immediately so the ACP
-    // seats fill in; a failing startup surfaces as a notice.
-    void this.probeAgentModels(resolvedDef.id).catch((error: unknown) => {
-      this.hub.broadcast({
-        type: 'agent/notice',
-        agentId: resolvedDef.id,
-        level: 'error',
-        text: `acp: model probe failed: ${describeError(error)}`,
-      })
-    })
-    return { done: true }
-  }
-
-  /**
-   * Lightweight model-visibility update: mutates the def in place (the live
-   * bridge shares the same object, so nothing needs restarting), persists, and
-   * republishes status. `undefined` clears the filter, which — being the same
-   * as `[]` — leaves only the agent's base entry in the ACP seats.
-   */
+  /** Lightweight model-visibility update: no process restart. */
   async setExposedModels(agentId: string, exposedModels: readonly string[] | undefined): Promise<void> {
-    const def = this.defsMap.get(agentId)
-    if (def === undefined) throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
-    if (exposedModels === undefined) delete def.exposedModels
-    else def.exposedModels = [...exposedModels]
-    this.persistAgents()
-    const view = this.aggregateView(def)
-    // The aggregate is the agent's state; the view rides along only when a
-    // holder exists, exactly as this frame always did (no `error` field here).
-    this.hub.broadcast({
-      type: 'agent/status',
-      agentId,
-      state: view.state,
-      ...(this.bridgesOf(agentId).length === 0 ? {} : { agent: view }),
-    })
-    this.catalog.broadcastExposure(agentId)
+    return this.admin.setExposedModels(agentId, exposedModels)
   }
 
-  /**
-   * Toggle auto-discovery of newly published models. Lightweight like
-   * `setExposedModels`: the def is mutated in place (live bridges share the
-   * object) and persisted; no process is restarted, and the current selection
-   * is left exactly as it is. On is the default, so only the opt-out
-   * (`false`) is written to the file.
-   */
+  /** Toggle auto-discovery of newly published models; no process restart. */
   async setAutoDiscoverModels(agentId: string, autoDiscoverModels: boolean): Promise<void> {
-    const def = this.defsMap.get(agentId)
-    if (def === undefined) throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
-    if (autoDiscoverModels) delete def.autoDiscoverModels
-    else def.autoDiscoverModels = false
-    this.persistAgents()
-    this.catalog.broadcastExposure(agentId)
+    return this.admin.setAutoDiscoverModels(agentId, autoDiscoverModels)
   }
 
+  /** Delete one definition and every pointer into it. */
   async deleteAgent(agentId: string): Promise<void> {
-    // Tombstone FIRST, before any await: a save that is already past its
-    // generation check must see the delete when it resumes, and every later
-    // save of this id is refused outright.
-    this.tombstoneAgent(agentId)
-    // Drop the agent's held save BEFORE stopping it: stopping ends its turns,
-    // and a deferred snapshot flushing afterwards would write the definition
-    // straight back into `agents.json` (the deleted agent would come back).
-    this.saveGate?.cancel(`agent-save:${agentId}`)
-    if (this.bridges.has(agentId) || this.bridgesOf(agentId).length > 0) {
-      // This method performs its own strict registry write below.
-      await this.stopAgent(agentId, false)
-      // `stopAgent` drops every per-scope key; the bare key is the non-A1 /
-      // pre-spawn slot and is removed here as well.
-      this.bridges.delete(agentId)
-      this.bridgeScopes.delete(agentId)
-    }
-    this.defsMap.delete(agentId)
-    // The default agent is a pointer INTO this registry: deleting its target
-    // must drop the pointer too, or the file would keep naming a ghost.
-    this.settings.forgetAgent(agentId)
-    // Same for the request-path binding: a conversation pointed at the deleted
-    // agent must fall back (to the default, or to no rewrite) rather than send
-    // the next turn after a ghost.
-    for (const [dshSessionId, model] of routeBindingRegistry().conversations) {
-      if (splitAdapterModelId(model).agentId === agentId) routeBindingRegistry().conversations.delete(dshSessionId)
-    }
-    if (routeBindingRegistry().defaultModel === agentId) routeBindingRegistry().defaultModel = undefined
-    // All three maps are independent (any may be missing), so delete all
-    // before deciding whether the file needs rewriting. The fork capability
-    // goes with the agent: a same-id rebuild must not inherit the OLD agent's
-    // "supported" and click into a `fork_unsupported` wall before its own
-    // first `initialize` answers.
-    this.catalog.forgetAgent(agentId)
-    // Strict: the delete must not report success when the registry still names
-    // the agent. The tombstone and the in-memory deletion stay in place even
-    // when this throws, so nothing resurrects it inside this process; the RPC
-    // failure tells the user the file needs another attempt.
-    this.persistAgents(true)
-    this.hub.broadcast({
-      type: 'agent/status',
-      agentId,
-      state: 'stopped',
-    })
+    return this.admin.deleteAgent(agentId)
   }
 
-  /**
-   * Spawn a throwaway agent process from raw form values and run the ACP
-   * handshake against it. The bridge is never registered in `defsMap` /
-   * `bridges` and broadcasts on a private hub with no sinks, so a test cannot
-   * touch persisted config, real sessions, or the browser event stream. The
-   * process is torn down in every outcome.
-   */
+  /** Probe a throwaway process built from raw form values. */
   async testAgent(def: AcpAgentDef): Promise<AgentTestResult> {
-    const bridge = new AgentBridge(def, new EventHub(), 50, () => {})
-    const startedAt = Date.now()
-    try {
-      await bridge.ensureReady()
-      const info = bridge.initResult?.agentInfo
-      return {
-        ok: true,
-        ...(info
-          ? { agentInfo: { name: info.name, title: info.title ?? undefined, version: info.version } }
-          : {}),
-        durationMs: Date.now() - startedAt,
-        stderr: [...bridge.stderrTail],
-      }
-    } catch (error) {
-      // The child's exit may still be in flight when the handshake failure is
-      // reported (see `awaitStartChildExit`): give it a bounded moment so the
-      // verdict can carry the exit code.
-      await bridge.awaitStartChildExit(TEST_EXIT_GRACE_MS)
-      // The failure is reported as FACTS, not only as the SDK's sentence: every
-      // spawn failure rejects the pending `initialize` with the same
-      // "ACP connection closed", which cannot tell "the agent is not installed"
-      // from "the launch command is wrong". The browser writes the sentence from
-      // `failure`; `error` stays for the raw text.
-      const attempt = bridge.startAttempt
-      return {
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
-        failure: classifyTestFailure(attempt),
-        ...(attempt === undefined
-          ? {}
-          : {
-            command: attempt.command,
-            ...(attempt.executablePath === undefined ? {} : { executablePath: attempt.executablePath }),
-            installTried: attempt.installTried,
-            ...(attempt.spawnError === undefined ? {} : { spawnError: attempt.spawnError }),
-            ...(attempt.exit === undefined ? {} : { exit: attempt.exit }),
-          }),
-        durationMs: Date.now() - startedAt,
-        stderr: [...bridge.stderrTail],
-      }
-    } finally {
-      await bridge.stop().catch(() => { /* already torn down by the failure path */ })
-    }
+    return this.admin.testAgent(def)
   }
 
   async startSession(agentId: string, cwd: string | undefined): Promise<{ sessionId: string }> {
@@ -2395,9 +2108,6 @@ export class BridgeManager {
     // records are terminal — nothing reads them again after disposal.
     await Promise.allSettled([...this.bridges.values()].map(b => b.shutdown(SHUTDOWN_BUDGET_MS)))
   }
-
-  /** The host-entry save gate; absent in pure bridge tests. */
-  private saveGate?: AcpSaveGate
 
   /** The plugin's own default ACP agent (the panel's ★ gesture; see `SettingsService`). */
   defaultAgent(): string | undefined {
