@@ -1899,8 +1899,8 @@ describe('agent saves behind the save gate (isolated manager)', () => {
       closed: false,
       transcript: { since: () => [] },
     }
-    ;(isolated as unknown as { dshSessionMap: Map<string, unknown> })
-      .dshSessionMap.set('dsh-stop:stop-me', sessionRecord)
+    ;(isolated as unknown as { registry: { dshSessionMap: Map<string, unknown> } })
+      .registry.dshSessionMap.set('dsh-stop:stop-me', sessionRecord)
     await isolated.setExposedModels('stop-me', [])
     const before = JSON.parse(readFileSync(storage, 'utf-8')) as { chatSessions?: Array<{ dshSessionId: string }> }
     expect(before.chatSessions?.some(row => row.dshSessionId === 'dsh-stop')).toBe(true)
@@ -11439,10 +11439,10 @@ describe('A1: codebuddy runs one agent process per conversation', () => {
       if (holder === undefined) throw new Error('holder missing')
       const internals = harness.manager as unknown as {
         bridges: Map<string, AgentBridge>
-        dshSessionMap: Map<string, { sessionId: string; acpSessionId?: string; closed?: boolean; released?: boolean }>
+        registry: { dshSessionMap: Map<string, { sessionId: string; acpSessionId?: string; closed?: boolean; released?: boolean }> }
       }
       const recordKey = 'a1-orphan:codebuddy'
-      const record = internals.dshSessionMap.get(recordKey)
+      const record = internals.registry.dshSessionMap.get(recordKey)
       expect(record?.sessionId).toBe(sessionId)
       expect(record?.closed).toBeFalsy()
       expect(record?.released).toBeFalsy()
@@ -11466,7 +11466,7 @@ describe('A1: codebuddy runs one agent process per conversation', () => {
       // holder to record the death, otherwise the state assertion below races the
       // bridge's own teardown (and would read the stale `ready`).
       await until(() => chatBridge(harness, 'a1-orphan')?.state === 'stopped')
-      expect(internals.dshSessionMap.get(recordKey)?.released).toBeFalsy()
+      expect(internals.registry.dshSessionMap.get(recordKey)?.released).toBeFalsy()
 
       const createdBefore = harness.events.filter(event => event.type === 'session/created').length
       let orphanError: unknown
@@ -11479,7 +11479,7 @@ describe('A1: codebuddy runs one agent process per conversation', () => {
       expect(orphanError).toBeInstanceOf(AcpError)
       expect((orphanError as AcpError).code).toBe('session_orphaned')
       // Forget ran BEFORE the throw: the unusable record must not survive.
-      expect(internals.dshSessionMap.has(recordKey)).toBe(false)
+      expect(internals.registry.dshSessionMap.has(recordKey)).toBe(false)
       // No hidden spawn, three ways. The `session/created` count alone is NOT
       // sufficient: a spawn whose frame was lost would slip past it. The two
       // load-bearing guards are the `stopped` state and the absent child below —
@@ -11836,7 +11836,7 @@ describe('A1: codebuddy runs one agent process per conversation', () => {
     const internals = harness.manager as unknown as {
       bridges: Map<string, AgentBridge>
       bridgeScopes: Map<string, unknown>
-      dshSessionMap: Map<string, unknown>
+      registry: { dshSessionMap: Map<string, unknown> }
     }
     // Capture every holder the manager ever registers, so a child spawned in
     // the stop window is checked for life even after its key is swept.
@@ -11860,7 +11860,7 @@ describe('A1: codebuddy runs one agent process per conversation', () => {
 
       // No record without a holder: the rejected conversation never became a
       // `dshSessionMap` entry, and the two real ones were forgotten.
-      expect(internals.dshSessionMap.size).toBe(0)
+      expect(internals.registry.dshSessionMap.size).toBe(0)
       expect(chatRow(harness, 'a1-stop-new')).toBeUndefined()
       expect(harness.manager.sessions()).toEqual([])
       // The key sweep left nothing behind, scopes included.

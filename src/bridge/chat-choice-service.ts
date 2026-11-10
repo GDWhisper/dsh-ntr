@@ -14,9 +14,9 @@
  *
  * The service never imports the manager: the live sessions, the bridges, the
  * roster predicate, the catalog reads and the state-file write arrive through
- * {@link ChatChoiceHost}. The persisted pick map itself stays owned by the
- * manager (it is written with `agents.json` and read by the lock helpers), so
- * it is passed BY REFERENCE, not copied.
+ * {@link ChatChoiceHost}. The persisted pick map itself is owned by the
+ * session registry (it is written with `agents.json` and read by the lock
+ * helpers), so it is passed BY REFERENCE, not copied.
  */
 import type { EventHub } from '../impl.ts'
 import {
@@ -78,9 +78,9 @@ export class ChatChoiceService {
 
   /**
    * @param host Manager capabilities, all callbacks (never the manager itself).
-   * @param picks The persisted pick map, owned by the manager (see the file
-   *   header) — written here through `patchChatChoice`, read by the lock
-   *   helpers and serialized with `agents.json` by the manager.
+   * @param picks The persisted pick map, owned by the session registry (see
+   *   the file header) — written here through `patchChatChoice`, read by the
+   *   lock helpers and serialized with `agents.json` by the registry.
    */
   constructor(
     private readonly host: ChatChoiceHost,

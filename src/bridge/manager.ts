@@ -76,11 +76,9 @@ import {
 import type { LiveSession } from './turn-stream.ts'
 import {
   agentRefusalDetail,
-  forkRowInfo,
   isPersistedBurst,
   isPersistedModes,
   isPersistedUsage,
-  persistedChatSession,
   rateLimitedTurnError,
   snapshot,
 } from './shape.ts'
@@ -91,6 +89,7 @@ import { SubagentService } from './subagent-service.ts'
 import { SettingsService } from './settings-service.ts'
 import { ChatChoiceService } from './chat-choice-service.ts'
 import { AgentAdminService } from './agent-admin-service.ts'
+import { SessionRegistryService } from './session-registry-service.ts'
 import { describeError } from './errors.ts'
 
 /** How long one `agent/skills` scan answer stays fresh; the browser re-asks past it. */
@@ -137,9 +136,17 @@ export class BridgeManager {
   /**
    * Chat-choice cluster: the conversation's bottom-bar selection, the
    * request-path route pin and the ACP-mode verdict cache (see
-   * `ChatChoiceService`). It operates on this manager's persisted pick map.
+   * `ChatChoiceService`). It operates on the session registry's pick map
+   * (passed by reference).
    */
   private readonly choices: ChatChoiceService
+  /**
+   * Chat-session registry + conversation binding + first-turn lock (see
+   * `SessionRegistryService`): the DSH session records, the persisted picks
+   * and the lock helpers. The process table and the start / resume / retry
+   * flows stay here; the service reaches them through host callbacks.
+   */
+  private readonly registry: SessionRegistryService
   /**
    * Agent-definition administration + the save gate (see `AgentAdminService`):
    * the delete tombstones, the delete / save generations and the `save/*` gate
@@ -378,12 +385,51 @@ export class BridgeManager {
       persistAgents: () => this.persistAgents(),
       hub: this.hub,
     }, catalogStoragePath)
+    // The chat-session registry (see `SessionRegistryService`) owns the DSH
+    // session records, the conversation↔agent picks and the first-turn lock.
+    // Every manager capability it needs arrives as a closure, so the service
+    // never imports this module; the pick map is shared BY REFERENCE with the
+    // chat-choice service below (that service owns the single write path).
+    this.registry = new SessionRegistryService({
+      hub: this.hub,
+      defOf: agentId => this.defsMap.get(agentId),
+      subagents: {
+        recordsFor: dshSessionId => this.subagents.recordsFor(dshSessionId),
+        forget: dshSessionId => { this.subagents.forget(dshSessionId) },
+      },
+      canForkNow: agentId => this.catalog.canForkNow(agentId),
+      forkSession: (agentId, parent, childDshSessionId) => this.bridge(agentId).forkSession(parent, childDshSessionId),
+      patchChatChoice: (dshSessionId, patch) => { this.choices.patchChatChoice(dshSessionId, patch) },
+      applyChatChoice: session => this.choices.applyChatChoice(session),
+      syncConversationRoute: dshSessionId => { this.choices.syncConversationRoute(dshSessionId) },
+      persistAgents: () => this.persistAgents(),
+      closeSessionHolder: session => {
+        // The session's OWN bridge, not `bridge(id)` / a map lookup by agent:
+        // the agent may have been deleted while its first turn was failing, and
+        // a rollback must never throw — `bridgeOwning` never creates, never
+        // throws, and never routes a session to another process.
+        const failed = this.bridgeOwning(session.agentId, session.sessionId)
+        if (failed === undefined) return
+        // Once the agent-side close has settled, drop the holder too: a failed
+        // first turn leaves nothing resumable behind it (the record was
+        // forgotten above), so a per-session holder would otherwise linger with
+        // a live child and no session — an orphan the next message could not
+        // use. `keyOfBridge` runs inside the callback so it names the holder
+        // only if this bridge is still registered.
+        void failed.closeSession(session, 'closed')
+          .catch(() => { /* already gone */ })
+          .finally(() => {
+            const key = this.keyOfBridge(failed)
+            if (key !== undefined) this.pruneBridge(key)
+          })
+      },
+    })
     // The subagent / background-report cluster (see `SubagentService`) needs
     // the manager's hub, live sessions, state write and ambient windows; every
     // one is passed as a closure so the service never imports this module.
     this.subagents = new SubagentService({
       hub: this.hub,
-      sessions: () => this.dshSessionMap.values(),
+      sessions: () => this.registry.sessions(),
       persistAgents: () => this.persistAgents(),
       ambientTuning: () => this.ambientTuning,
     })
@@ -401,19 +447,20 @@ export class BridgeManager {
     // The chat-choice cluster (see `ChatChoiceService`) needs the roster, the
     // catalog reads, the session set, the holder of a session, the two lock
     // readers and the state-file write; every one is a closure so the service
-    // never imports this module. The pick map itself stays HERE: the lock
-    // helpers and the `agents.json` payload read and write it directly.
+    // never imports this module. The pick map itself is owned by the session
+    // registry and passed BY REFERENCE: the lock helpers and the `agents.json`
+    // payload read and write it there.
     this.choices = new ChatChoiceService({
       hub: this.hub,
       defOf: agentId => this.defsMap.get(agentId),
       catalogFor: agentId => this.catalog.catalogFor(agentId),
       reasoningMeta: agentId => this.catalog.reasoningMeta(agentId),
-      sessions: () => this.dshSessionMap.values(),
+      sessions: () => this.registry.sessions(),
       bridgeForSession: session => this.bridgeForSession(session),
-      chatAgentFor: dshSessionId => this.chatAgentFor(dshSessionId),
-      lockedAgentFor: dshSessionId => this.lockedAgentFor(dshSessionId),
+      chatAgentFor: dshSessionId => this.registry.chatAgentFor(dshSessionId),
+      lockedAgentFor: dshSessionId => this.registry.lockedAgentFor(dshSessionId),
       persistAgents: () => this.persistAgents(),
-    }, this.chatAgentIntent)
+    }, this.registry.picks)
     // The agent-administration cluster (see `AgentAdminService`) needs the
     // registry, the bridge teardown, the strict state-file write, the live turn
     // list and the event stream; every one is a closure so the service never
@@ -674,268 +721,44 @@ export class BridgeManager {
   }
 
   /**
-   * The ACP agent sessions backing one DSH chat session. The composer uses this
-   * to offer the agent's OWN modes next to the host's Access mode control —
-   * "how the agent works" beside "what it may touch", which is the split that
-   * keeps the two controls from reading as duplicates.
+   * The ACP agent sessions backing one DSH chat session (see
+   * `SessionRegistryService.chatSessions`). The composer uses this to offer the
+   * agent's OWN modes next to the host's Access mode control — "how the agent
+   * works" beside "what it may touch", which is the split that keeps the two
+   * controls from reading as duplicates.
    */
   chatSessions(dshSessionId: string): ChatSessionView[] {
-    const out: ChatSessionView[] = []
-    // The plugin's own lifecycle records, keyed by the CHAT session: they cover
-    // live and released sessions alike (a parked conversation's terminal
-    // records must survive a reload), and are attached to every row of this
-    // conversation — the browser de-duplicates by `dshSessionId + childId`,
-    // because one conversation can briefly have more than one ACP session row.
-    const subagents = this.subagents.recordsFor(dshSessionId)
-    for (const session of this.dshSessionMap.values()) {
-      if (session.dshSessionId !== dshSessionId || session.closed) continue
-      const title = this.defsMap.get(session.agentId)?.title
-      out.push({
-        agentId: session.agentId,
-        ...(title === undefined ? {} : { agentTitle: title }),
-        sessionId: session.sessionId,
-        ...(session.title === undefined ? {} : { title: session.title }),
-        ...(session.modelId === undefined ? {} : { modelId: session.modelId }),
-        ...(session.reasoningEffort === undefined ? {} : { reasoningEffort: session.reasoningEffort }),
-        ...(session.modes === undefined ? {} : { modes: session.modes }),
-        ...(session.availableCommands === undefined ? {} : { availableCommands: session.availableCommands }),
-        ...(session.usage === undefined ? {} : { usage: session.usage }),
-        ...(session.burst === undefined ? {} : { burst: session.burst }),
-        ...(session.released ? { released: true } : {}),
-        ...(session.running ? { running: true } : {}),
-        ...(subagents === undefined || subagents.length === 0 ? {} : { subagents: [...subagents] }),
-        ...forkRowInfo(session, this.catalog.canForkNow(session.agentId)),
-      })
-    }
-    return out
+    return this.registry.chatSessions(dshSessionId)
   }
 
   /**
-   * Adopt the ACP side of a branched conversation: the browser has already
-   * asked the HOST to fork the DSH session tree (`sessions.fork`), and this
-   * runs the agent's own `session/fork` of the parent conversation's live ACP
-   * session so the child actually remembers the parent context — then binds
-   * the child to it (the fourth session-creation point, with every discipline
-   * the other three carry).
-   *
-   * Failure is deliberately all-or-nothing: nothing is written for the child
-   * until the agent has answered, so a failed adopt leaves the child an
-   * ordinary copied-history conversation whose first message starts a fresh
-   * `session/new` (today's behavior) — never a half-bound record.
-   *
-   * @param childDshSessionId - the DSH session the host fork created.
-   * @param parentDshSessionId - the conversation being branched; its ACP
-   *   session must be LIVE on this connection (a released parent has no
-   *   process to fork from — the browser blocks the click, this is the hard
-   *   stop behind it).
+   * Adopt the ACP side of a branched conversation — the agent's own
+   * `session/fork` of the parent's live ACP session, then the child's binding
+   * (see `SessionRegistryService.adoptForkedSession`). Failure stays
+   * all-or-nothing.
    */
   async adoptForkedSession(childDshSessionId: string, parentDshSessionId: string): Promise<{ sessionId: string; acpSessionId: string }> {
-    // One conversation, one agent (the lock). The parent's LIVE session is
-    // the fork source; released or in-flight-settling parents are refused —
-    // forking a parked record would silently resume it, and forking mid-turn
-    // would fork an agent state the parent turn is still changing.
-    const parent = [...this.dshSessionMap.values()].find(session =>
-      session.dshSessionId === parentDshSessionId && !session.closed && !session.released)
-    if (parent === undefined) {
-      throw new AcpError('parent_not_live', 'acp: the conversation to branch has no live ACP session; send a message to resume it first')
-    }
-    if (parent.running || parent.settled !== undefined) {
-      throw new AcpError('turn_in_flight', 'acp: the conversation to branch is running a turn; wait for it to finish')
-    }
-    const agentId = parent.agentId
-    // A1 (F2): refuse before any request or record is written. `canForkNow`
-    // below also answers `false`, but failing here keeps the error the same
-    // shape even if the capability gate ever changes.
-    if (isPerSessionAgent(agentId)) {
-      throw new AcpError('fork_unsupported', `acp: agent "${agentId}" runs one process per conversation and cannot fork`)
-    }
-    const childKey = `${childDshSessionId}:${agentId}`
-    if (this.dshSessionMap.has(childKey)) {
-      throw new AcpError('id_conflict', 'acp: the forked conversation is already bound to an ACP session')
-    }
-    // Capability gate BEFORE any request: an agent that never advertised
-    // `session/fork` must not be asked (it would answer an unknown-method
-    // error at best). Live init wins, last-known falls back — the same
-    // verdict the browser's row already showed.
-    if (!this.catalog.canForkNow(agentId)) {
-      throw new AcpError('fork_unsupported', `acp: agent "${agentId}" does not advertise the session/fork capability`)
-    }
-    const session = await this.bridge(agentId).forkSession(parent, childDshSessionId)
-    // The fork answered — the child is real on the agent side. From here the
-    // binding is written through the SAME paths as any chat session: one
-    // choice record (a copy of the parent's, locked — a branched conversation
-    // belongs to its agent from birth), the route pin, and persistence.
-    this.dshSessionMap.set(childKey, session)
-    const parentChoice = this.chatAgentIntent.get(parentDshSessionId)
-    this.choices.patchChatChoice(childDshSessionId, {
-      agentId,
-      locked: true,
-      ...(parentChoice?.modelId === undefined ? {} : { modelId: parentChoice.modelId }),
-      ...(parentChoice?.effort === undefined ? {} : { effort: parentChoice.effort }),
-      ...(parentChoice?.mode === undefined ? {} : { mode: parentChoice.mode }),
-      ...(parentChoice?.extraConfigs === undefined ? {} : { extraConfigs: { ...parentChoice.extraConfigs } }),
-    })
-    // The fourth creation point follows the same discipline as `createSession`
-    // and `doResumeSession`: apply the recorded pick to the fresh session, so
-    // mode and extra configs (which only this path applies) cannot drift from
-    // what the composer shows — a forked session starts on the agent-side
-    // state the fork copied, and the record must match what runs.
-    await this.choices.applyChatChoice(session)
-    // Re-publish so the browser's list and the composer's occupancy ring see
-    // the child immediately (with its just-bound choice mirrors).
-    this.hub.broadcast({ type: 'session/meta', sessionId: session.sessionId, session: snapshot(session) })
-    this.persistAgents()
-    return { sessionId: session.sessionId, acpSessionId: session.acpSessionId }
+    return this.registry.adoptForkedSession(childDshSessionId, parentDshSessionId)
   }
 
   /**
-   * Bind one DSH chat session to an ACP agent.
-   *
-   * This is the plugin's OWN conversation↔agent mapping. It deliberately does
-   * NOT call the host's `session.selectModel` RPC: the retired "express the
-   * agent as a `provider: 'acp'` route" axis used it, which both polluted the
-   * deployment default model and got refused by the GUI's catalog gate
-   * (`session/model-unavailable`) — even though prompt admission never checked
-   * catalog membership. The guard instead writes the session's selection
-   * directly (`agent.model.select`) at wake time, on hosts that fix the route
-   * before `agent/request`. See docs/acp-convergence.md §1.1 and §2.2.
-   *
-   * The host half records the intent; the actual ACP session is created on the
-   * next turn (which is also what resumes a released one).
+   * Bind one DSH chat session to an ACP agent — the plugin's OWN
+   * conversation↔agent mapping, never a host model route. Once the first ACP
+   * turn has run the conversation is locked to its agent (see
+   * `SessionRegistryService.bindChatAgent`).
    */
   bindChatAgent(dshSessionId: string, agentId: string): void {
-    if (!this.defsMap.has(agentId)) {
-      throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
-    }
-    // ONE CONVERSATION, ONE AGENT (user decision, 2026-10-20): once the first
-    // ACP turn has run, the conversation is locked to its agent. A different
-    // agent has none of the context on its side, so switching is refused
-    // rather than silently starting a second, empty conversation. Re-picking
-    // the SAME agent is idempotent. The lock is persisted with the choice, so
-    // this holds across restarts and after the ACP session is gone.
-    const lockedTo = this.lockedAgentFor(dshSessionId)
-    if (lockedTo !== undefined) {
-      if (lockedTo === agentId) return
-      throw new AcpError(
-        'agent_locked',
-        `acp: conversation is locked to agent "${lockedTo}" once its first turn has started; start a new conversation to use another agent`,
-      )
-    }
-    // A switch to a DIFFERENT agent drops its model/effort/mode/configs: those
-    // values are the PREVIOUS agent's vocabulary (a `choice` from its catalog, a
-    // value of ITS `thought_level`, one of ITS `session/set_mode` ids, one of ITS
-    // extra config options) and would be rejected or silently remapped by the
-    // new one. Re-picking the SAME agent
-    // is not a switch, so its picks stand. `patchChatChoice` owns that rule —
-    // both entry points go through it so the two cannot drift.
-    this.choices.patchChatChoice(dshSessionId, { agentId })
+    return this.registry.bindChatAgent(dshSessionId, agentId)
   }
 
-  /** The ACP agent a chat session was last pointed at, when one is known. */
+  /** The ACP agent a chat session was last pointed at (see `SessionRegistryService`). */
   chatAgentFor(dshSessionId: string): string | undefined {
-    const recorded = this.chatAgentIntent.get(dshSessionId)?.agentId
-    if (recorded !== undefined && this.defsMap.has(recorded)) return recorded
-    // Fall back to the binding itself: a session that already ran an agent is
-    // pointed at that agent even if the intent map was never seeded.
-    for (const session of this.dshSessionMap.values()) {
-      if (session.dshSessionId === dshSessionId && !session.closed) return session.agentId
-    }
-    return undefined
+    return this.registry.chatAgentFor(dshSessionId)
   }
 
-  /**
-   * The agent a conversation is LOCKED to, if its first ACP turn has run.
-   *
-   * The persisted `locked` flag is the durable answer and deliberately ignores
-   * the roster: a deleted agent still owns the conversation's context, and the
-   * conversation must not pretend it is unbound (that would offer a switch the
-   * turn path then has to refuse). The live/released session fallback covers
-   * conversations recorded before the flag existed; the next turn writes the
-   * flag (`lockChatAgent`).
-   */
+  /** The agent a conversation is LOCKED to, if its first ACP turn has run (see `SessionRegistryService`). */
   lockedAgentFor(dshSessionId: string): string | undefined {
-    const recorded = this.chatAgentIntent.get(dshSessionId)
-    if (recorded?.locked === true) return recorded.agentId
-    for (const session of this.dshSessionMap.values()) {
-      if (session.dshSessionId === dshSessionId && !session.closed) return session.agentId
-    }
-    return undefined
-  }
-
-  /**
-   * Write the conversation's agent lock and announce it once.
-   *
-   * Called at the START of the conversation's first ACP turn (the session was
-   * just materialized), so the composer can play its base→tag hand-off while
-   * the turn is running instead of waiting for it to settle. Returns true when
-   * this call created the lock; the caller marks a newly created session
-   * `provisionalLock`, and a first turn that delivers nothing rolls it back
-   * (`rollbackFirstTurn`). The broadcast is what lets the browser react at
-   * once: a `session/chat-list` read is a round-trip behind.
-   */
-  private lockChatAgent(dshSessionId: string, agentId: string): boolean {
-    const current = this.chatAgentIntent.get(dshSessionId)
-    if (current?.locked === true && current.agentId === agentId) return false
-    const newlyLocked = current?.locked !== true
-    this.choices.patchChatChoice(dshSessionId, { agentId, locked: true })
-    if (newlyLocked) {
-      this.hub.broadcast({ type: 'chat/agent-locked', dshSessionId, agentId })
-    }
-    return newlyLocked
-  }
-
-  /**
-   * Undo the provisional lock of a first turn that delivered nothing, and drop
-   * the failed session with it.
-   *
-   * A turn that produced an error before any text/reasoning, or a silent
-   * provider failure folded into a normal stop, exchanged nothing with the
-   * agent: there is no context to protect, so the conversation may choose
-   * another agent. The session is CLOSED rather than kept, because both lock
-   * readers (`lockedAgentFor` here and `lockedAgentOf` in the browser) treat a
-   * live session as a lock — keeping it would leave a visually locked
-   * conversation whose picker the host still accepts.
-   *
-   * The pick itself (agent/model/effort/mode/extra configs) stays recorded: the
-   * base comes back showing the same agent, ready to be changed or retried.
-   */
-  private rollbackFirstTurn(session: LiveSession): void {
-    session.provisionalLock = false
-    const dshSessionId = session.dshSessionId
-    if (dshSessionId === undefined) return
-    const current = this.chatAgentIntent.get(dshSessionId)
-    if (current?.locked === true && current.agentId === session.agentId) {
-      const next: AcpConversationChoice = { ...current }
-      delete next.locked
-      this.chatAgentIntent.set(dshSessionId, next)
-      this.persistAgents()
-      // Keep the request-path binding on the picked agent: it is still what
-      // the base shows and what an unchanged retry should run.
-      this.choices.syncConversationRoute(dshSessionId)
-      this.hub.broadcast({ type: 'chat/agent-unlocked', dshSessionId })
-    }
-    // Drop the chat-keyed record BEFORE the asynchronous agent-side close: the
-    // browser's very next `session/chat-list` must not see this session.
-    this.forgetDshSession(session.sessionId)
-    // Use the session's OWN bridge, not `this.bridge(id)` / a map lookup by
-    // agent: the agent may have been deleted while its first turn was failing,
-    // and a rollback must never throw — `bridgeOwning` never creates, never
-    // throws, and never routes a session to another process.
-    const failed = this.bridgeOwning(session.agentId, session.sessionId)
-    if (failed !== undefined) {
-      // Once the agent-side close has settled, drop the holder too: a failed
-      // first turn leaves nothing resumable behind it (the record was forgotten
-      // above), so a per-session holder would otherwise linger with a live
-      // child and no session — an orphan the next message could not use.
-      // `keyOfBridge` runs inside the callback so it names the holder only if
-      // this bridge is still registered.
-      void failed.closeSession(session, 'closed')
-        .catch(() => { /* already gone */ })
-        .finally(() => {
-          const key = this.keyOfBridge(failed)
-          if (key !== undefined) this.pruneBridge(key)
-        })
-    }
+    return this.registry.lockedAgentFor(dshSessionId)
   }
 
   /**
@@ -982,23 +805,13 @@ export class BridgeManager {
   }
 
   /**
-   * Every ACP session's transcript that belongs to one DSH chat session, so the
-   * conversation can render the REAL agent stream (tool calls, plans, diffs) as
-   * its own view tab. Released sessions keep serving their pre-crash buffer —
-   * a dead agent must not blank the history the user is reading.
-   *
-   * Read-only and synchronous: like `transcript`, it never spawns and never
-   * resumes (a `session/load` resume is triggered by *sending*, not looking).
+   * Every ACP session's transcript that belongs to one DSH chat session — the
+   * conversation's REAL agent stream view tab (see
+   * `SessionRegistryService.chatTranscripts`). Read-only: it never spawns and
+   * never resumes.
    */
   chatTranscripts(dshSessionId: string, afterSeq?: number): ChatTranscriptView[] {
-    const views: ChatTranscriptView[] = []
-    for (const session of this.dshSessionMap.values()) {
-      // A closed session is destroyed, not merely unreachable: its buffered
-      // transcript would be a ghost the user cannot act on.
-      if (session.dshSessionId !== dshSessionId || session.closed) continue
-      views.push({ session: snapshot(session), entries: session.transcript.since(afterSeq ?? 0) })
-    }
-    return views
+    return this.registry.chatTranscripts(dshSessionId, afterSeq)
   }
 
   /**
@@ -1018,9 +831,7 @@ export class BridgeManager {
    * so a double click (or a click racing the next message) spawns nothing.
    */
   async resumeChatSession(dshSessionId: string): Promise<void> {
-    const candidates = [...this.dshSessionMap.values()].filter(
-      session => session.dshSessionId === dshSessionId && !session.closed,
-    )
+    const candidates = this.registry.sessionsOf(dshSessionId)
     // The session the NEXT message would use — the bound agent's — is the one
     // to bring back; the first candidate is the fallback for a conversation
     // whose binding has drifted (same selection `setChatSessionMode` makes
@@ -1040,8 +851,8 @@ export class BridgeManager {
     // would show one thing and the process run another (see
     // `getOrCreateDshSession`).
     resumed.dshSessionId = dshSessionId
-    this.lockChatAgent(dshSessionId, target.agentId)
-    if (this.chatAgentIntent.has(dshSessionId)) this.choices.syncConversationRoute(dshSessionId)
+    this.registry.lockChatAgent(dshSessionId, target.agentId)
+    if (this.registry.hasChoice(dshSessionId)) this.choices.syncConversationRoute(dshSessionId)
     else routeBindingRegistry().conversations.set(dshSessionId, resumed.modelId ?? target.agentId)
     await this.choices.applyChatChoice(resumed)
     resumed.provisionalLock = false
@@ -1276,7 +1087,7 @@ export class BridgeManager {
         ? Object.fromEntries(Object.entries(extraConfigs as Record<string, unknown>)
           .filter(([, value]) => typeof value === 'boolean' || (typeof value === 'string' && value !== ''))) as Record<string, string | boolean>
         : {}
-      this.chatAgentIntent.set(dshSessionId, {
+      this.registry.setChoice(dshSessionId, {
         agentId,
         ...(locked === true ? { locked: true } : {}),
         ...(typeof modelId === 'string' && modelId !== '' ? { modelId } : {}),
@@ -1290,7 +1101,7 @@ export class BridgeManager {
     // registry, which starts empty on a fresh process. Without this a host
     // restart would send a bound (and possibly locked) conversation to the
     // deployment default until its next turn re-pinned it.
-    for (const dshSessionId of this.chatAgentIntent.keys()) this.choices.syncConversationRoute(dshSessionId)
+    for (const dshSessionId of this.registry.choiceKeys()) this.choices.syncConversationRoute(dshSessionId)
   }
 
   /**
@@ -1330,9 +1141,8 @@ export class BridgeManager {
       // processes but not the agent-side sessions, so restoring these as
       // PARKED keeps a conversation resumable (`session/load`) instead of
       // its next message silently starting a context-less new one.
-      const chatSessions = [...this.dshSessionMap.values()]
-        .filter(session => session.dshSessionId !== undefined && !session.closed)
-        .map(persistedChatSession)
+      const chatSessions = this.registry.persistedRows()
+      const conversations = this.registry.persistedConversations()
       const subagentRecords = this.subagents.persistedRecords()
       // A save passes its candidate here so the file can land BEFORE `defsMap`
       // commits it. Every other caller writes the committed registry.
@@ -1364,9 +1174,7 @@ export class BridgeManager {
         // The per-conversation picks: agent + model + thought level + mode +
         // extra config values chosen in the composer, including for
         // conversations with no live session yet.
-        ...(this.chatAgentIntent.size === 0
-          ? {}
-          : { conversations: Object.fromEntries(this.chatAgentIntent) }),
+        ...(conversations === undefined ? {} : { conversations }),
         // The plugin's own external-worker lifecycle records (status / failure
         // reason / timings). Absent while none was ever recorded, so a fresh
         // deployment's state file stays exactly as it was.
@@ -1442,7 +1250,7 @@ export class BridgeManager {
         activeToolCalls: new Set<string>(),
         transcript: new Transcript(this.transcriptMax),
       }
-      this.dshSessionMap.set(`${dshSessionId}:${agentId}`, session)
+      this.registry.putSession(session)
       // A1: the record parks on the holder its own DSH conversation will
       // resume through — the same scope the create branch would pick — so the
       // first message after a restart reaches the process that can `session/load`
@@ -1467,10 +1275,10 @@ export class BridgeManager {
    */
   private loadPersistedSubagents(raw: unknown): void {
     const keep = new Set<string>()
-    for (const session of this.dshSessionMap.values()) {
+    for (const session of this.registry.sessions()) {
       if (session.dshSessionId !== undefined && !session.closed) keep.add(session.dshSessionId)
     }
-    for (const dshSessionId of this.chatAgentIntent.keys()) keep.add(dshSessionId)
+    for (const dshSessionId of this.registry.choiceKeys()) keep.add(dshSessionId)
     this.subagents.restore(raw, keep)
   }
 
@@ -1966,7 +1774,7 @@ export class BridgeManager {
     const live = this.tryLocate(sessionId)
     if (live !== undefined) {
       await live.bridge.closeSession(live.session, 'closed')
-      this.forgetDshSession(sessionId)
+      this.registry.forgetDshSession(sessionId)
       const key = this.keyOfBridge(live.bridge)
       if (key !== undefined) this.pruneBridge(key)
       return
@@ -2036,8 +1844,8 @@ export class BridgeManager {
     // until this call returns, `bridgeFor` refuses to mint or hand out a holder
     // for this agent. Without it a message arriving during the `await` below
     // could spawn a child the snapshot never saw, and the key sweep would then
-    // delete its holder — leaving an orphan process plus a live `dshSessionMap`
-    // record that no bridge serves (the next prompt would fail on a dead
+    // delete its holder — leaving an orphan process plus a live session record
+    // that no bridge serves (the next prompt would fail on a dead
     // `acpSessionId`).
     this.stoppingAgents.set(agentId, (this.stoppingAgents.get(agentId) ?? 0) + 1)
     try {
@@ -2057,11 +1865,7 @@ export class BridgeManager {
       for (const bridge of bridges) {
         for (const sessionId of this.sessionIdsOf(bridge)) owned.add(sessionId)
       }
-      for (const [key, session] of this.dshSessionMap) {
-        if (session.agentId !== agentId) continue
-        owned.add(session.sessionId)
-        this.dshSessionMap.delete(key)
-      }
+      for (const sessionId of this.registry.dropSessionsOfAgent(agentId)) owned.add(sessionId)
       this.disposeTurnStreamsOf(controller => owned.has(controller.session.sessionId))
       if (persist) this.persistAgents()
       // One stop per process, all at once: the children are independent, so the
@@ -2098,7 +1902,7 @@ export class BridgeManager {
     }
     this.disposeTurnStreamsOf(() => true)
     // NOT cleared before the shutdown: `persistAgents` (called from
-    // `parkSessions`) writes the parked records out of `dshSessionMap`, and
+    // `parkSessions`) writes the parked records out of the session registry, and
     // that write is what keeps the conversations resumable across the restart.
     //
     // `allSettled`, not `all`: one bridge's failure must neither skip the
@@ -2166,52 +1970,12 @@ export class BridgeManager {
     return this.settings.setApprovalDeadlines(patch, reset)
   }
 
-  private readonly dshSessionMap = new Map<string, LiveSession>()
   /**
    * External-worker lifecycle records plus the idle-drain report wake-ups.
    * Owned by {@link SubagentService}; the manager keeps the public entry points
    * (RPC handlers, the adapter and tests read them here) as thin delegates.
    */
   private readonly subagents: SubagentService
-  /**
-   * What each DSH chat session has chosen for its ACP agent — the agent itself
-   * plus the agent's model and thought level. Persisted with the agent registry
-   * (`conversations`), so the pick survives a host restart and is readable
-   * before the conversation has ever run a turn. This is the plugin's own
-   * conversation↔agent mapping, never a DSH model route (see `bindChatAgent`).
-   */
-  private readonly chatAgentIntent = new Map<string, AcpConversationChoice>()
-
-  /** Drop every chat-keyed record pointing at one host session (close/stop paths). */
-  private forgetDshSession(sessionId: string): void {
-    const owners = new Set<string>()
-    let dropped = false
-    for (const [key, session] of this.dshSessionMap) {
-      if (session.sessionId === sessionId) {
-        if (session.dshSessionId !== undefined) owners.add(session.dshSessionId)
-        this.dshSessionMap.delete(key)
-        dropped = true
-      }
-    }
-    // An explicitly closed (or force-reset) session destroys the
-    // conversation's worker records with it: the rows belong to a conversation
-    // that no longer exists. Only when NO OTHER ACP session still serves the
-    // same conversation — two sessions of one conversation must not lose each
-    // other's history.
-    for (const dshSessionId of owners) {
-      let stillOwned = false
-      for (const session of this.dshSessionMap.values()) {
-        if (session.dshSessionId === dshSessionId) {
-          stillOwned = true
-          break
-        }
-      }
-      if (!stillOwned) this.subagents.forget(dshSessionId)
-    }
-    // The disk record goes with it: a closed session is destroyed, not parked,
-    // and must not come back on the next boot (constraint 10).
-    if (dropped) this.persistAgents()
-  }
   private sessionWorkspaceResolver?: SessionWorkspaceResolver
   private attachmentResolver?: unknown
 
@@ -2228,8 +1992,7 @@ export class BridgeManager {
         )
       }
     }
-    const key = `${dshSessionId ?? 'ephemeral'}:${agentId}`
-    const existing = this.dshSessionMap.get(key)
+    const existing = this.registry.sessionAt(dshSessionId, agentId)
     if (existing !== undefined && !existing.closed && !existing.released) {
       const owner = this.bridgeOwning(agentId, existing.sessionId)
       // A LIVE record must have a holder. This state is not reachable today:
@@ -2241,7 +2004,7 @@ export class BridgeManager {
       // surface later as a dead `acpSessionId`, far from its cause. Drop the
       // unusable record and fail cleanly; the next attempt starts fresh.
       if (owner === undefined) {
-        this.forgetDshSession(existing.sessionId)
+        this.registry.forgetDshSession(existing.sessionId)
         throw new AcpError(
           'session_orphaned',
           `acp: the session for this conversation has no live agent process; send again to start a new one`,
@@ -2257,7 +2020,7 @@ export class BridgeManager {
       // An existing session already carries context, so this is never a
       // provisional lock; it only repairs a record from before the flag (the
       // next turn's start writes/announces the lock).
-      if (dshSessionId !== undefined) this.lockChatAgent(dshSessionId, agentId)
+      if (dshSessionId !== undefined) this.registry.lockChatAgent(dshSessionId, agentId)
       return ready
     }
     // The session's agent died earlier: resume in place so the conversation
@@ -2278,8 +2041,8 @@ export class BridgeManager {
       // conversation was ON (its own model string when one was recorded). The
       // recorded pick wins when there is one (it carries the model half).
       if (dshSessionId !== undefined) {
-        this.lockChatAgent(dshSessionId, agentId)
-        if (this.chatAgentIntent.has(dshSessionId)) this.choices.syncConversationRoute(dshSessionId)
+        this.registry.lockChatAgent(dshSessionId, agentId)
+        if (this.registry.hasChoice(dshSessionId)) this.choices.syncConversationRoute(dshSessionId)
         else routeBindingRegistry().conversations.set(dshSessionId, resumed.modelId ?? agentId)
       }
       // ...and the persisted pick (model / thought level) is re-applied to the
@@ -2321,7 +2084,7 @@ export class BridgeManager {
     // Absent for `/acp`-RPC sessions and for adapter calls without a chat
     // session; their permission cards are addressed by the ACP session only.
     session.dshSessionId = dshSessionId
-    this.dshSessionMap.set(key, session)
+    this.registry.putSession(session)
     // Turn the displayed defaults into this conversation's pick, so the first
     // prompt runs on what the user was shown (see `seedChatChoiceFromCatalog`).
     if (dshSessionId !== undefined) this.choices.seedChatChoiceFromCatalog(dshSessionId, agentId, session, displayed)
@@ -2330,7 +2093,7 @@ export class BridgeManager {
     // The recorded pick wins when there is one (it carries the model half);
     // otherwise the agent that just served this turn is pinned bare.
     if (dshSessionId !== undefined) {
-      if (this.chatAgentIntent.has(dshSessionId)) this.choices.syncConversationRoute(dshSessionId)
+      if (this.registry.hasChoice(dshSessionId)) this.choices.syncConversationRoute(dshSessionId)
       else routeBindingRegistry().conversations.set(dshSessionId, agentId)
     }
     // Apply whatever the conversation picked BEFORE this session existed — the
@@ -2343,7 +2106,7 @@ export class BridgeManager {
       // belonging to this agent. The lock is PROVISIONAL until this turn shows
       // something: if it delivers nothing, `rollbackFirstTurn` gives the
       // conversation back (a failed first attempt must not trap it).
-      session.provisionalLock = this.lockChatAgent(dshSessionId, agentId)
+      session.provisionalLock = this.registry.lockChatAgent(dshSessionId, agentId)
     }
     // The record is on disk from here: a host restart restores it as parked
     // instead of the next message starting a context-less new session.
@@ -2412,7 +2175,7 @@ export class BridgeManager {
     // answer that never comes; `forceReset` is the local half only.
     session.reclaimedTurnSeq = session.turnSeq
     bridge.forceReset('agent-stopped')
-    this.forgetDshSession(session.sessionId)
+    this.registry.forgetDshSession(session.sessionId)
     session.orphanPromptTurnSeq = undefined
     this.hub.broadcast({
       type: 'agent/notice',
@@ -2677,7 +2440,7 @@ export class BridgeManager {
     // Same key `getOrCreateDshSession` looks up: a session the watchdog left
     // orphaned must be reclaimed BEFORE the acquisition, so this message cannot
     // queue behind a prompt the agent will never answer.
-    const stalled = this.dshSessionMap.get(`${options.sessionId ?? 'ephemeral'}:${agentId}`)
+    const stalled = this.registry.sessionAt(options.sessionId, agentId)
     if (stalled !== undefined && stalled.orphanPromptTurnSeq !== undefined) {
       const prepared = await this.prepareStalledSession(stalled)
       if (!prepared.ok) {
@@ -2714,7 +2477,7 @@ export class BridgeManager {
     if (blockedModel !== undefined) {
       // Nothing was exchanged, so a provisional first turn must hand the
       // conversation back (same rule as any other zero-output failure).
-      if (session.provisionalLock === true) this.rollbackFirstTurn(session)
+      if (session.provisionalLock === true) this.registry.rollbackFirstTurn(session)
       yield {
         type: 'finish',
         reason: {
@@ -2730,7 +2493,7 @@ export class BridgeManager {
 
     const hasImages = (selection.images?.length ?? 0) > 0 || (selection.content?.some(b => b.type === 'image') ?? false)
     if (hasImages && this.bridgeForSession(session).initResult?.agentCapabilities?.promptCapabilities?.image !== true) {
-      if (session.provisionalLock === true) this.rollbackFirstTurn(session)
+      if (session.provisionalLock === true) this.registry.rollbackFirstTurn(session)
       yield {
         type: 'finish',
         reason: {
@@ -2838,7 +2601,7 @@ export class BridgeManager {
     // alignment (a `config_option_update` landed in that window). Same rule:
     // never run a model the user did not select.
     if (aligned.modelStale) {
-      if (session.provisionalLock === true) this.rollbackFirstTurn(session)
+      if (session.provisionalLock === true) this.registry.rollbackFirstTurn(session)
       yield {
         type: 'finish',
         reason: {
@@ -2919,7 +2682,7 @@ export class BridgeManager {
       session,
       turnId,
       endTurn,
-      victim => this.rollbackFirstTurn(victim),
+      victim => this.registry.rollbackFirstTurn(victim),
     )
     if (session.dshSessionId !== undefined) this.rememberTurnStream(session.dshSessionId, controller)
     // The session itself carries the controller too: an EPHEMERAL turn

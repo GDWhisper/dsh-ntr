@@ -38,7 +38,7 @@
 | `BridgeManager.stoppingAgents` | `agentId` | agent | 停止中的重入计数。>0 时 `bridgeFor` 拒绝新建、已存在 holder 拒绝外借（`agent_stopping`）；归零后才允许下一条消息新建进程。**消息不排队**。 |
 | `BridgeManager.noticedBridgeFailures` | `AgentBridge` 对象 | 进程 | 启动失败通知的去重表（值为文本）。同一 holder 同一失败文本只发一次 `agent/notice`；holder 被回收后条目随 WeakMap 消失。 |
 | `AgentBridge.pendingPrompts` | ACP 会话 id | 进程 | 未结算的 `session/prompt`，**按会话 id 计数**（同一会话可重入）。请求发出前加一、响应或失败 `.finally` 减一，归零删键。两套读数：`hasActiveWork()` 默认严格计数含已 `closed` 会话，`pendingPromptsOnServableSessions()` 只数仍存在于 `sessions` / `released` 的 id，供空闲释放。 |
-| `BridgeManager.dshSessionMap` | `${dshSessionId ?? 'ephemeral'}:${agentId}` | 会话 | DSH 会话 → `LiveSession` 的插件地址。键含 agent（同一 DSH 会话换 agent 时不让旧记录冒充新绑定）；匿名 `/acp` 回合用 `ephemeral` 前缀。 |
+| `SessionRegistryService.dshSessionMap` | `${dshSessionId ?? 'ephemeral'}:${agentId}` | 会话 | DSH 会话 → `LiveSession` 的插件地址。键含 agent（同一 DSH 会话换 agent 时不让旧记录冒充新绑定）；匿名 `/acp` 回合用 `ephemeral` 前缀。 |
 | `BridgeManager.turnStreams` | `dshSessionId` | 会话 | 在飞分段流的控制器。清理按会话 id / `sessionIdsOf` 选中的集合，不做 agent 级连带清除。 |
 
 - 模型目录、命令缓存、fork 能力位、`exposedModels` 仍是 **per-agent** 状态（`agentCatalog` / `forkCaps`）：会话换了进程不换这些事实源。
@@ -50,7 +50,7 @@
 
 ## 3. 会话选择持久化
 
-一个 DSH 聊天会话对它的 ACP agent 做的全部选择（`agentId` + `modelId` + `effort` + `mode` + `extraConfigs`）记在 `AcpConversationChoice`（`src/protocol.ts`），由 `BridgeManager.chatAgentIntent` 持有并持久化到 `agents.json` 的 `conversations` 键（`persistAgents` / `loadPersistedChoices`）。
+一个 DSH 聊天会话对它的 ACP agent 做的全部选择（`agentId` + `modelId` + `effort` + `mode` + `extraConfigs`）记在 `AcpConversationChoice`（`src/protocol.ts`），由 `SessionRegistryService.chatAgentIntent` 持有并持久化到 `agents.json` 的 `conversations` 键（`persistAgents` / `loadPersistedChoices`）。
 
 - **严禁**只存内存 Map 或只写进 `LiveSession`：活会话在第一条消息之前根本不存在，而「对话前选模型」正是要在这个窗口里表达。
 - **应用时机**：`applyChatChoice` 必须在 `createSession`（首轮建会话）与 `getOrCreateDshSession` 的 resume 分支各调一次。`session/new` 与 `session/load` 回的都是 agent 自己的默认值，不补这一步就是「选了 A 却跑 B」，且只从第二条消息才生效。同样两条路径还必须调 `lockChatAgent`，锁与 pick 在同一条记录里（见 [architecture.md §7](./architecture.md)）。
@@ -107,7 +107,7 @@
 
 ## 6. 斜杠命令缓存
 
-- 宿主 `BridgeManager.chatSessions` 必须带 `availableCommands`（**整行**，不只 name / description），这是**活会话**的权威声明。
+- 宿主 `SessionRegistryService.chatSessions` 必须带 `availableCommands`（**整行**，不只 name / description），这是**活会话**的权威声明。
 - 同一份声明必须经 `AgentBridge.onCommands` → `ModelCatalogService.absorbCommands` 按 agent 缓存、随 `model-catalog.json` 持久化，并由 `agent/catalog` 的 `commands` 字段下发：**首条消息之前没有会话可问**，没有这份缓存，新 NTR 会话的 `/` 菜单就是空的。
 - 活会话声明永远优先于缓存；两者都没有时菜单为空，**严禁**为菜单去 spawn 或探测。
 - 浏览器 `AcpStore.chatSessionCommands` 的 `undefined` 同时覆盖「还没读」与「没有活声明」，此时按 `chatAgentFor`（活会话 → 锁定 → 宿主 / 乐观绑定 → pick → 插件默认）找到 agent，再读 `agentCommands`（必要时懒读一次纯内存的 `agent/catalog`）。**严禁**把「没有会话」当成「agent 没有命令」。
@@ -182,9 +182,9 @@
 | 校验 | `src/impl.ts` · `validateAgentDef` / `validateConfig` / `validateMcpServers`；`src/bridge/agent-admin-service.ts` · `saveAgent` |
 | 会话选择 | `src/bridge/chat-choice-service.ts` · `chatChoice` / `patchChatChoice` / `applyChatChoice` / `syncConversationRoute`；`src/bridge/manager.ts` · `loadPersistedChoices` / `persistAgents` |
 | 目录 | `src/bridge/catalog-service.ts` · `agentCatalog` / `resolveAdapterModel` / `absorbCatalog` / `absorbCatalogShape` / `autoExposeNewModels` / `broadcastExposure` / `probeAgentModels`；`src/bridge/agent-admin-service.ts` · `setExposedModels` / `setAutoDiscoverModels`；`src/impl.ts` · `parseCatalogOptions` / `mergeCatalogShape` / `usableConfigOptions` |
-| 分叉 | `src/bridge/manager.ts` · `adoptForkedSession`；`src/bridge/agent-bridge.ts` · `forkSession`；`src/bridge/catalog-service.ts` · `noteForkCapability` / `canForkNow` / `forkCaps`；`src/client/store.ts` · `forkChatSession` / `forkStateOf`（子会话绑定与能力位见 §3.2） |
+| 分叉 | `src/bridge/session-registry-service.ts` · `adoptForkedSession`；`src/bridge/agent-bridge.ts` · `forkSession`；`src/bridge/catalog-service.ts` · `noteForkCapability` / `canForkNow` / `forkCaps`；`src/client/store.ts` · `forkChatSession` / `forkStateOf`（子会话绑定与能力位见 §3.2） |
 | 未决询问 | `src/bridge/agent-bridge.ts` · `handlePermissionRequest`；`src/impl.ts` · `PermissionLedger` / `permissionRequestFrame` / `permissionReplayFrames`；`src/client/store.ts` · `permissionsForSession` |
-| 斜杠缓存 | `src/bridge/manager.ts` · `chatSessions`；`src/bridge/catalog-service.ts` · `absorbCommands`；`src/client/store.ts` · `chatSessionCommands` / `loadChatSessions` |
+| 斜杠缓存 | `src/bridge/session-registry-service.ts` · `chatSessions`；`src/bridge/catalog-service.ts` · `absorbCommands`；`src/client/store.ts` · `chatSessionCommands` / `loadChatSessions` |
 | 技能清单（§6.1） | `src/bridge/manager.ts` · `agentSkills`；`src/skills-scan.ts` · `scanSkillDirs`；`src/impl.ts` · `skillFlavorOf` / `SKILL_DIRS_BY_FLAVOR` / `GENERIC_SKILL_DIRS` / `SKILL_SCAN_LIMITS` / `parseSkillFrontmatter` / `skillMetadata` / `skillMentionToken` / `formatSkillPathDestination` / `formatSkillMentionPrompt`；`src/impl.ts` · `dispatchRpc`（`agent/skills` 分支）；`src/client/store.ts` · `agentSkills` 状态 / `skillRowsFor` / `loadAgentSkills` / `skillInsertionFor` / `skillRowsKey` / `SKILL_MENU_TTL_MS` |
 | 内置更新 | `src/update.ts` · `UpdateService` / `check` / `apply` / `releaseNotes` / `parseChangelogSection` / `bundleEligibility` / `isRegistrySpec` / `registryPlan` / `pickUpdateTarget` / `compareVersions`；`src/index.ts` · `setUpdateService`；`src/bridge/manager.ts` · `pluginUpdateCheck` / `pluginUpdateApply` / `pluginReleaseNotes` / `hasActiveTurns`；`src/bridge/identity.ts` · `PLUGIN_VERSION`；`src/impl.ts` · `dispatchRpc`（`plugin/update-*` / `plugin/release-notes` 分支）；`src/client/store.ts` · `checkPluginUpdate` / `applyPluginUpdate` / `loadPluginReleaseNotes` / `prefersZh`；`src/client/panel.tsx` · `PluginUpdateBadge` / `PluginUpdateCard` / `updateBadgeText` / `updateCardVisible`；`src/client/release-notes.tsx` · `ReleaseNotesSection` / `pickReleaseLanguage` / `releaseNoteVersion`；`src/protocol.ts` · `PLUGIN_REPO` / `pluginReleaseUrl` / `PluginReleaseNotes` |
 | 保存门禁 | `src/save-gate.ts` · `AcpSaveGate` / `canSaveNow` / `defer` / `cancel` / `retry` / `waitForIdle` / `forceFlush` / `labelVersions` / `labelOutcomes`；`src/index.ts` · `saveGate` / `ctx.provide('acpSaveGate')`；`src/bridge/agent-admin-service.ts` · `saveGateStatus` / `saveGateFlush` / `saveGateCancel` / `saveGateRetry` / `saveGateWaitIdle`；`src/bridge/manager.ts` · `activeTurnViews`；`src/impl.ts` · `dispatchRpc`（`save/*` 分支）/ `emptySaveGateStatus`；`src/client/store.ts` · `forceSaveGate` / `cancelSaveGate` / `retrySaveGate` / `pushSaveBanner` / `dismissBanner` / `retryBanner` / `forceBanner` / `reportFlushResult` / `saveGateInterruptTargets` / `save/status` 折叠；`src/client/save-guard-toast.tsx` · `SaveGuardToast` / `saveGuardToastKind` |
