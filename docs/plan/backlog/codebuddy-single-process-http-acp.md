@@ -1,6 +1,6 @@
 # CodeBuddy 单进程 + 多条 HTTP ACP 连接（A2）：暂缓方案
 
-**日期**：2026-11-04　**状态**：未决策（当前不启动；触发条件见 §5）。**适用范围**：`src/bridge.ts` 的 `AgentBridge` / `BridgeManager` 进程与连接拓扑；不涉及浏览器半区。
+**日期**：2026-11-04　**状态**：未决策（当前不启动；触发条件见 §5）。**适用范围**：`src/bridge/agent-bridge.ts` 的 `AgentBridge` 与 `src/bridge/manager.ts` 的 `BridgeManager` 进程与连接拓扑；不涉及浏览器半区。
 
 **一句话**：不按「每会话一进程」（A1）扩展，而是让一个 CodeBuddy 进程用 streamable-http 承载 N 条 ACP 连接、每条连接一个会话。它省掉每会话约 300 MB 的进程内存，代价是把 stdio 传输层换成 HTTP 传输层、连接池、token 与端口生命周期，并且隔离仍依赖 CodeBuddy 的连接级语义。
 
@@ -39,7 +39,7 @@
 | 7 | `SessionManager` 有一个进程级 `sessionSubject` 当前指针，`getRuntimeSession()` 先看它、再回退到会话表；同一会话多客户端有 `claimSessionTakeover` 与 `writer_occupied` 的独占 writer 语义 | 跨连接的会话可能被进程级指针串线；同一会话的 writer 只能有一个。这两条是 A2 的硬风险 |
 | 8 | ACP stdio 模式下每个进程只有一条连接 | 要并发只能每会话一进程，所以 A1 是 stdio 下唯一可行的并发拓扑 |
 
-**本仓基线**：`src/bridge.ts` 头注释写明「一个 agent 定义一个子进程、在 stdio 连接上复用任意多个 ACP 会话」；`AgentBridge.spawnAndConnect` 用 `ndJsonStream(Writable.toWeb(child.stdin), Readable.toWeb(child.stdout))` 建唯一连接，`BridgeManager` 持有 bridge 表。A2 要改的正是这条唯一连接假设。
+**本仓基线**：`src/bridge.ts`（桶文件）头注释写明「一个 agent 定义一个子进程、在 stdio 连接上复用任意多个 ACP 会话」；`src/bridge/agent-bridge.ts` · `AgentBridge.spawnAndConnect` 用 `ndJsonStream(Writable.toWeb(child.stdin), Readable.toWeb(child.stdout))` 建唯一连接，`src/bridge/manager.ts` · `BridgeManager` 持有 bridge 表。A2 要改的正是这条唯一连接假设。
 
 ### 2.1 与本仓现有约束直接冲突的两点
 
@@ -50,7 +50,7 @@
 
 ### 3.1 传输层：stdio 客户端改为 HTTP 客户端
 
-- `src/bridge.ts` · `AgentBridge.spawnAndConnect` 现在把进程与连接绑死。A2 需要把「进程所有者」与「一条 ACP 连接」拆成两层：进程层负责 spawn、端口、健康与 stderr；连接层负责一条 token、一条 `Stream`、一次 `initialize`。
+- `src/bridge/agent-bridge.ts` · `AgentBridge.spawnAndConnect` 现在把进程与连接绑死。A2 需要把「进程所有者」与「一条 ACP 连接」拆成两层：进程层负责 spawn、端口、健康与 stderr；连接层负责一条 token、一条 `Stream`、一次 `initialize`。
 - 传输实现用 SDK 已导出的 `@agentclientprotocol/sdk/experimental/http-client` 的 `createHttpStream`（`HttpStreamOptions` 支持 `fetch` / `headers` / `cookies` / `cookieStore`，并带 `MemoryAcpCookieStore`）。`client(...).connect(stream)` 与现有 `handleSessionUpdate` / 权限 / fs 处理器可以保留，改动集中在连接建立处。
 - 每条连接的 token 进 `acp-session-token` 请求头；`POST /acp/connect` 取 token，`GET /acp` 接 SSE。
 - **每个 `LiveSession` 需要自己的 `ClientConnection`**。现在 `AgentBridge` 只持有一个 `conn`，`runPrompt` / `cancel` / `setMode` / `setConfigOption` / `resumeSession` 都直接用它；要么给 `LiveSession` 加连接租约，要么改成「一个连接一个 bridge」。这是本方案最大的结构性改动。
@@ -170,6 +170,6 @@
 | [AGENTS/architecture.md](../../../AGENTS/architecture.md) §4 | 工作区与 `spawnCwd` 的单进程限制 |
 | [docs/todo.md](../../todo.md) 与 [backlog README](./README.md) | 状态与待办去向 |
 
-**接手阅读顺序**：本文 → [AGENTS/protocol.md](../../../AGENTS/protocol.md) §7 → `src/bridge.ts` 的 `AgentBridge` / `spawnAndConnect` / `LiveSession` / `BridgeManager` → `node_modules/@agentclientprotocol/sdk/dist/http-stream.d.ts` 的 `createHttpStream` / `HttpStreamOptions` → 上游的 `AcpAgentManager` / `SessionManager`。
+**接手阅读顺序**：本文 → [AGENTS/protocol.md](../../../AGENTS/protocol.md) §7 → `src/bridge/agent-bridge.ts` 的 `AgentBridge` / `spawnAndConnect` → `src/bridge/turn-stream.ts` 的 `LiveSession` → `src/bridge/manager.ts` 的 `BridgeManager` → `node_modules/@agentclientprotocol/sdk/dist/http-stream.d.ts` 的 `createHttpStream` / `HttpStreamOptions` → 上游的 `AcpAgentManager` / `SessionManager`。
 
 **命令**：本节只列验证入口，具体命令按本机 CodeBuddy 的 `--help` 与端口配置填写；不要照抄未经实测的输出。

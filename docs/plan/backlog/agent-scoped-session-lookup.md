@@ -1,6 +1,6 @@
 # 按 agent 过滤的会话归属查询：暂缓方案
 
-**日期**：2026-11-04　**状态**：未决策（当前不改）。**适用范围**：`src/bridge.ts` 的 `BridgeManager` 会话查找路径；不涉及浏览器半区。
+**日期**：2026-11-04　**状态**：未决策（当前不改）。**适用范围**：`src/bridge/manager.ts` 的 `BridgeManager` 会话查找路径；不涉及浏览器半区。
 
 **一句话**：`find` / `tryLocate` / `locateOrResume` 只按 `sessionId` 遍历全部 bridge。A1 把子进程数量放大到「每 DSH 会话一个」之后，这条查找不再带 agent 维度；本方案记录「要不要加 agent 过滤、加了要动什么」。
 

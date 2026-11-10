@@ -1,6 +1,6 @@
 # 孤儿 agent 进程的回收：两条候选路线与一条暂缓路线
 
-**日期**：2026-11-01　**状态**：未落地，待决策。**适用范围**：`src/bridge.ts` 的进程生命周期与 `src/impl.ts` 的启动命令解析；不涉及浏览器半区。
+**日期**：2026-11-01　**状态**：未落地，待决策。**适用范围**：`src/bridge/agent-bridge.ts` / `src/bridge/process.ts` 的进程生命周期与 `src/impl.ts` 的启动命令解析；不涉及浏览器半区。
 
 **一句话**：宿主被强杀（`SIGKILL` / `taskkill /F`）时，插件拉起的 ACP agent 会作为孤儿活下来；本文记下「为什么现在的代码兜不住」「三条候选路线各自的机制与验收口径」「同行怎么做的」，供之后决定做不做、做哪一条。
 
@@ -18,9 +18,9 @@
 
 | 路径 | 覆盖的退出方式 | 符号 |
 |---|---|---|
-| 优雅关闭 | 宿主主动停机：并发 `shutdown`，`SHUTDOWN_BUDGET_MS = 4s` 是整条预算 | `BridgeManager.shutdownAll` / `AgentBridge.shutdown` / `parkSessions` / `disposeChild` |
-| 主动杀进程 | 空闲释放、崩溃、`forceReset`、启动失败、启动竞态 | `AgentBridge.killChild` / `killChildAndWait` / `disposeChild` / `killProcessTree` |
-| 退出钩子 | 宿主还能执行 `process.once('exit')` 的退出（含未捕获异常、显式 `process.exit()`） | `trackAgentChild` / `reapLiveChildren` |
+| 优雅关闭 | 宿主主动停机：并发 `shutdown`，`SHUTDOWN_BUDGET_MS = 4s` 是整条预算 | `BridgeManager.shutdownAll` / `AgentBridge.shutdown` / `AgentBridge.parkSessions` / `src/bridge/process.ts` · `disposeChild` |
+| 主动杀进程 | 空闲释放、崩溃、`forceReset`、启动失败、启动竞态 | `AgentBridge.killChild` / `AgentBridge.killChildAndWait` / `src/bridge/process.ts` · `disposeChild` / `killProcessTree` |
+| 退出钩子 | 宿主还能执行 `process.once('exit')` 的退出（含未捕获异常、显式 `process.exit()`） | `src/bridge/process.ts` · `trackAgentChild` / `reapLiveChildren` |
 | **缺口** | 宿主被 `SIGKILL` / `taskkill /F`：进程里没有代码可跑 | 无 |
 
 `AGENTS/protocol.md` §7 末尾把这件事写成**明确的非目标**（「宿主被 SIGKILL 或断电仍可能留下孤儿进程」）。所以本文任何一条路线落地，都要在同一个提交里改写那句话——不能留着「非目标」自称覆盖。
@@ -39,7 +39,7 @@
 | 2 | 只 `child.stdin.end()`（父进程仍活着）：+62 s 仍活。关 stdin **加**两条输出管道：+30 s 仍活 | 「管道关了就会退」是错的，不能拿它当兜底 |
 | 3 | codebuddy 2.179.0 有 `startOrphanWatchdog`（模块 `714234`），但 `isBrokeredSession()`（模块 `879700`）为假时直接返回；为真时它轮询 `process.ppid` 与启动快照比对，而 Windows 上该值不变 → 永不触发。插件拉起的会话根本不装 watchdog | 不能指望 agent 侧自救 |
 | 4 | libuv 给每个**非** `detached` 的 spawn 建 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 job，但带 `SILENT_BREAKAWAY_OK`：`cmd.exe` 壳起的 `node.exe` 会脱离该 job。对照组——直接 spawn 的 agent 在父进程被杀后 ≤1 s 消失 | 这是方案 A 的全部依据：**归属只要接上，内核会替我们收** |
-| 5 | `src/bridge.ts` · `spawnAndConnect` 的 spawn 选项是 `detached: process.platform !== 'win32'`；`.cmd` / `.bat` 走 `windowsShimLaunch`（`cmd.exe /d /s /c` + `windowsVerbatimArguments`）；回收走 `killProcessTree`（`taskkill /pid /t /f`）；收尾走 `disposeChild`（同一条预算内先 `stdin.end()` + 平台 kill，再升级）；退出钩子是 `reapLiveChildren` | 改拓扑要动的位置就这几处 |
+| 5 | `src/bridge/agent-bridge.ts` · `AgentBridge.spawnAndConnect` 的 spawn 选项是 `detached: process.platform !== 'win32'`；`.cmd` / `.bat` 走 `src/bridge/process.ts` · `windowsShimLaunch`（`cmd.exe /d /s /c` + `windowsVerbatimArguments`）；回收走 `killProcessTree`（`taskkill /pid /t /f`）；收尾走 `disposeChild`（同一条预算内先 `stdin.end()` + 平台 kill，再升级）；退出钩子是 `reapLiveChildren` | 改拓扑要动的位置就这几处 |
 | 6 | ACP SDK 1.4.0 与传输无关（`ndJsonStream(output, input)`），并带 `experimental/http-client` / `ws-client` / `server`；其文档明确 v1 **不**跨断线重放飞行中的消息 | 方案 C 的可行性边界 |
 
 ---
@@ -52,7 +52,7 @@
 
 ### 3.2 怎么做
 
-1. `src/bridge.ts` · `findExecutable` 命中 `.cmd` / `.bat` 时，解析 shim 的真实目标。npm 生成的 shim 结构固定为 `node "%~dp0\node_modules\<pkg>\…\<cli>.js" %*`，解析产物是「解释器 + 脚本 + 其余参数」。
+1. `src/bridge/process.ts` · `findExecutable` 命中 `.cmd` / `.bat` 时，解析 shim 的真实目标。npm 生成的 shim 结构固定为 `node "%~dp0\node_modules\<pkg>\…\<cli>.js" %*`，解析产物是「解释器 + 脚本 + 其余参数」。
 2. 或者在 `AcpAgentDef` 上允许显式 `binPath` 覆盖，让用户在 shim 解析不了时手动给真身。新增字段的纪律照 [AGENTS.md](../../../AGENTS.md) 的「扩展配置字段」：`validateAgentDef` 会重建对象（新字段必须纳入且 optional），`src/client/panel.tsx` 的 `initialForm` / `buildPayload` / `payloadEquals` 三处同步。
 3. 解析成功时不再调 `windowsShimLaunch`（那条路径只服务剩下的壳）。**这不违反约束 26**：约束 26 禁止的是把 `.cmd` 直接交给 `shell: false`，而不是禁止绕开壳；绕开之后交给 spawn 的是真 exe，`findExecutable` 的 `EINVAL` 问题自然不存在。
 4. 解析失败（含 `npx` 这类会再起一层的壳）原样回落现有 `windowsShimLaunch`——行为不变，只是没有回收保证。
@@ -102,10 +102,10 @@ host (Node, 插件)
 
 | 位置 | 改动 |
 |---|---|
-| `src/bridge.ts` · `spawnAndConnect` | spawn supervisor（`process.execPath` + helper 路径），`detached` 按角色取；`child.pid` 变 supervisor 的 pid |
-| `src/bridge.ts` · `windowsShimLaunch` | 引号 / `/d /s /c` 逻辑下沉成与 helper 共享的模块（helper 要用同一套，否则两条路径的引号行为分叉） |
-| `src/bridge.ts` · `killProcessTree` / `disposeChild` | 打 supervisor 树；预算与升级重述（见 4.2 第 7 条） |
-| `src/bridge.ts` · `trackAgentChild` / `reapLiveChildren` | 登记的 pid 语义变化，退出钩子要连 supervisor 一起收 |
+| `src/bridge/agent-bridge.ts` · `AgentBridge.spawnAndConnect` | spawn supervisor（`process.execPath` + helper 路径），`detached` 按角色取；`child.pid` 变 supervisor 的 pid |
+| `src/bridge/process.ts` · `windowsShimLaunch` | 引号 / `/d /s /c` 逻辑下沉成与 helper 共享的模块（helper 要用同一套，否则两条路径的引号行为分叉） |
+| `src/bridge/process.ts` · `killProcessTree` / `disposeChild` | 打 supervisor 树；预算与升级重述（见 4.2 第 7 条） |
+| `src/bridge/process.ts` · `trackAgentChild` / `reapLiveChildren` | 登记的 pid 语义变化，退出钩子要连 supervisor 一起收 |
 | 新增 helper | 运行时子路径，先例是 `presets/acp/acp-guard.mjs`：`package.json` 的 `exports` 加一条映射、`files` 放行该目录（现在已含 `presets`，若另开目录要加进去） |
 | [AGENTS/protocol.md](../../../AGENTS/protocol.md) §7 | 启动命令 / Windows / 宿主退出三段的措辞与预算 |
 | [AGENTS.md](../../../AGENTS.md) 硬约束 26 | 视实现补一句（「壳经 `cmd.exe`」与「谁负责回收」）；若 supervisor 让「子进程」不再等于 agent 本身，还要一并检查 10 / 11 的措辞（崩溃 ≠ 销毁、`child === child` 身份校验） |
@@ -194,7 +194,7 @@ host (Node, 插件)
 
 ## 9. 接手须知
 
-**阅读顺序**：本文 → [AGENTS/protocol.md](../../../AGENTS/protocol.md) §7（启动命令、Windows、宿主退出、进程级兜底）→ `src/bridge.ts` 的 `spawnAndConnect` → `windowsShimLaunch` → `killProcessTree` / `disposeChild` / `reapLiveChildren`。
+**阅读顺序**：本文 → [AGENTS/protocol.md](../../../AGENTS/protocol.md) §7（启动命令、Windows、宿主退出、进程级兜底）→ `src/bridge/agent-bridge.ts` 的 `AgentBridge.spawnAndConnect` → `src/bridge/process.ts` 的 `windowsShimLaunch` → `killProcessTree` / `disposeChild` / `reapLiveChildren`。
 
 **命令**：`npm run prepack`（提交前全量）；`npx vitest run tests/bridge.spec.ts -t "spawns, initializes"`。
 

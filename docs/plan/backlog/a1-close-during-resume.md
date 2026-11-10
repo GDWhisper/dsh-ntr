@@ -1,6 +1,6 @@
 # A1 恢复在途时关闭会话返回 `unknown_session`
 
-**日期**：2026-11-04　**状态**：未决策（当前不改）。**适用范围**：`src/bridge.ts` 的 `BridgeManager.closeSession` 与 `doResumeSession`；A1（`codebuddy`）的 released 会话。
+**日期**：2026-11-04　**状态**：未决策（当前不改）。**适用范围**：`src/bridge/manager.ts` 的 `BridgeManager.closeSession` 与 `src/bridge/agent-bridge.ts` 的 `AgentBridge.doResumeSession`；A1（`codebuddy`）的 released 会话。
 
 **一句话**：恢复在途的会话不在 `sessions` 也不在 `released`，`closeSession` 的两个查找都看不到它，关闭请求因此失败。
 
@@ -8,7 +8,7 @@
 
 ## 1. 现象
 
-`BridgeManager.closeSession` 先用 `tryLocate` 找 holder，再 `dropReleased`。`doResumeSession` 在 `session/load` 期间清掉 `released`，并要等响应返回后才 `sessions.set`，此期间记录只存在于 `resuming`。两个查找都看不到它，关闭请求于是抛 `unknown_session`。
+`src/bridge/manager.ts` · `BridgeManager.closeSession` 先用 `tryLocate` 找 holder，再 `dropReleased`。`src/bridge/agent-bridge.ts` · `AgentBridge.doResumeSession` 在 `session/load` 期间清掉 `released`，并要等响应返回后才 `sessions.set`，此期间记录只存在于 `resuming`。两个查找都看不到它，关闭请求于是抛 `unknown_session`。
 
 ## 2. 影响
 
