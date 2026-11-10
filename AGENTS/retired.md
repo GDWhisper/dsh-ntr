@@ -41,7 +41,7 @@
 ### 时长轴上的「一直等待」档（以及 `0` = 一直等的旧义）
 
 - **退役**：滑块最右端的「一直等待」档，以及「窗口 `0` 表示这一窗永不触发」的旧义。理由：「永不到期」是**模式**（`wait`）的事，时长轴再放一档，同一件事两处各说一遍，用户只会怀疑自己漏配了什么。旧义更要命——`0` 一旦被重新解释成「不等待」，一个无人值守的部署会从「一直等」静默变成「立即自动放行」。
-- **仍然有效**：`wait` 模式是**唯一**能表达「永不到期」的档；新键 `permissionTimeoutMs: 0` 是**不等待**，且**只属 `auto`**（它代答，agent 继续）；`abort` 档**没有**这一档——同样的 0 在那里是立刻拒绝每一问，agent 在每个门口都停住，所以落到最短真实等待 30 秒（`normalizeApprovalWindow`）。归一只有三处，且都只作用于自己那一层：运行时由 `applyDeadlineTuning` 读取持久化覆盖值并归一；配置解析期由 `validateConfig` 归一；`setConfiguredApprovalDeadlines` 只把配置基线归一后用于展示。状态文件与模式切换都保存用户原值，不归一、不重写。滑块档位为 不等待 / 30 秒 / 1 分 / 5 分 / 15 分 / 30 分 / 1 小时 / 6 小时（`wait` 档下不画滑块），「不等待」只在自动推进档出现。旧键里的 `0` 迁移成 `wait` 模式 + 300_000 窗口（`validateConfig` 的 `legacyNever`、`BridgeManager.loadPersistedAgents` 同规则）。见 [permissions.md §2.1、§2.4](./permissions.md) 与 [ui-panel.md §8](./ui-panel.md)。
+- **仍然有效**：`wait` 模式是**唯一**能表达「永不到期」的档；新键 `permissionTimeoutMs: 0` 是**不等待**，且**只属 `auto`**（它代答，agent 继续）；`abort` 档**没有**这一档——同样的 0 在那里是立刻拒绝每一问，agent 在每个门口都停住，所以落到最短真实等待 30 秒（`normalizeApprovalWindow`）。归一只有三处，且都只作用于自己那一层：运行时由 `applyDeadlineTuning` 读取持久化覆盖值并归一；配置解析期由 `validateConfig` 归一；`setConfiguredApprovalDeadlines` 只把配置基线归一后用于展示。状态文件与模式切换都保存用户原值，不归一、不重写。滑块档位为 不等待 / 30 秒 / 1 分 / 5 分 / 15 分 / 30 分 / 1 小时 / 6 小时（`wait` 档下不画滑块），「不等待」只在自动推进档出现。旧键里的 `0` 迁移成 `wait` 模式 + 300_000 窗口（`validateConfig` 的 `legacyNever`、`PersistenceService.loadPersistedAgents` 同规则）。见 [permissions.md §2.1、§2.4](./permissions.md) 与 [ui-panel.md §8](./ui-panel.md)。
 
 ### agent 定义上的权限策略字段
 

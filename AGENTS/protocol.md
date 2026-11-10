@@ -35,7 +35,7 @@
 
 ### session/fork（第四个建会话点）
 
-「在新对话中分支」的 ACP 半段：agent 把自己的内部状态拷进一条**新的** ACP 会话，子会话真的记得父会话的上文。分叉固定两段——**宿主先建 DSH 会话树**（`sessions.fork` 复制历史、标题 `(1)`、挂工作区），**插件再接管 ACP 侧**（`session/chat-fork-adopt` → `BridgeManager.adoptForkedSession` → `AgentBridge.forkSession`）；顺序不可对调，因为 ACP fork 没有切点参数，反过来先 ACP fork 再宿主 fork，第二步失败会留下无法归属的 ACP 会话。UI 侧见 [ui.md §12](./ui.md)。
+「在新对话中分支」的 ACP 半段：agent 把自己的内部状态拷进一条**新的** ACP 会话，子会话真的记得父会话的上文。分叉固定两段——**宿主先建 DSH 会话树**（`sessions.fork` 复制历史、标题 `(1)`、挂工作区），**插件再接管 ACP 侧**（`session/chat-fork-adopt` → `SessionRegistryService.adoptForkedSession` → `AgentBridge.forkSession`）；顺序不可对调，因为 ACP fork 没有切点参数，反过来先 ACP fork 再宿主 fork，第二步失败会留下无法归属的 ACP 会话。UI 侧见 [ui.md §12](./ui.md)。
 
 - **UNSTABLE 方法与能力位**：请求经 `methods.agent.session.fork`（SDK 的 `unstable_forkSession`，UNSTABLE / @experimental），能力位是 `initialize` 的 `agentCapabilities.sessionCapabilities.fork`。请求形状 `{ sessionId, cwd, mcpServers }` —— **没有切点参数**，只能从 agent 当前末端分叉。cwd 取父会话已验证的工作区并把它自己加进 extraRoots 重新信任（`resolveSessionCwd`），**严禁**回落 agent 配置的沙箱 cwd——那不是会话所在的地方。
 - **与其它三个建会话点共享的纪律**：同一份 `mcpServers`（进程级作用域，上方四处）；包 `withStartupTimeout`（与 `session/new` / `session/load` 同一超时）；在飞时计入 `pendingForks`（进 `hasActiveWork` / `hasOtherActiveWork`，空闲回收不能杀掉 fork 途中的进程）；响应的 `modes` / `configOptions` 过 `usableConfigOptions` 建 `LiveSession`，并经 `onCatalog` 反哺 agent 级目录——子会话的 composer 芯片不用等一次探测；返回 id 去重后才注册 `acpIndex` / `sessions`。

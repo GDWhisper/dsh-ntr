@@ -303,7 +303,7 @@ dsh plugin --profile web add ./   # 挂载到 Web Profile
 
 以下每条都对应一处真实故障，改代码前先读对应文档。浏览器半区经 `/acp` RPC 与 `/api/acp/stream` SSE 和宿主半区通信；宿主半区每会话一个 `AgentBridge`，经 stdio JSON-RPC 驱动 agent 子进程。
 
-代码位置：`src/index.ts`（插件入口）· `src/protocol.ts`（共享类型）· `src/impl.ts`（纯宿主逻辑）· `src/bridge.ts`（子进程通信桥）· `src/client/`（React 扩展）· `presets/acp/`（NTR 模式声明）· `~/.dsh/dsh-ntr/`（运行时落盘）。
+代码位置：`src/index.ts`（插件入口）· `src/protocol.ts`（共享类型）· `src/impl.ts`（纯宿主逻辑）· `src/bridge/`（子进程通信、回合、绑定、状态等宿主模块；`src/bridge.ts` 仅再导出）· `src/client/`（React 扩展）· `presets/acp/`（NTR 模式声明）· `~/.dsh/dsh-ntr/`（运行时落盘）。
 
 - **DSH 只出显示层**：插件不写全局默认模型，不接管宿主的模型目录，也不让 ACP 模型出现在 DSH 原生选择器里；唯一的模型层写入是 guard 用 `agent.model.select()` 把会话绑定记成该会话的模型选择（宿主 0.2.2+ 在 step preparation 前固定路由）。
 - **工作区即侧栏路径**：侧栏点开的目录必须成为 `session/new` 的 cwd **和** agent 子进程自己的 cwd。有一条 agent（codebuddy）在进程启动那一刻就定死工作区。

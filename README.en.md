@@ -303,7 +303,7 @@ dsh plugin --profile web add ./   # mount into the Web profile
 
 Each item below corresponds to a real past failure; read the linked doc before changing code. The browser half talks to the host half via `/acp` RPC and `/api/acp/stream` SSE; the host half runs one `AgentBridge` per conversation, driving the agent child process over stdio JSON-RPC.
 
-Code map: `src/index.ts` (plugin entry) · `src/protocol.ts` (shared types) · `src/impl.ts` (pure host logic) · `src/bridge.ts` (child-process bridge) · `src/client/` (React extension) · `presets/acp/` (NTR mode declaration) · `~/.dsh/dsh-ntr/` (runtime state).
+Code map: `src/index.ts` (plugin entry) · `src/protocol.ts` (shared types) · `src/impl.ts` (pure host logic) · `src/bridge/` (host modules for the child-process bridge, turns, bindings and state; `src/bridge.ts` only re-exports) · `src/client/` (React extension) · `presets/acp/` (NTR mode declaration) · `~/.dsh/dsh-ntr/` (runtime state).
 
 - **DSH renders, nothing more**: the plugin doesn't write DSH's model routing, doesn't take over the host's model catalog, and never lets ACP models appear in DSH's native selector.
 - **Workspace = the side-panel path**: the directory opened in the side panel must become both the `session/new` cwd **and** the agent child's own cwd. One agent (codebuddy) pins its workspace at process startup.
