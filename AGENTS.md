@@ -13,14 +13,14 @@
 
 ## 快速命令
 
-- 提交前全量验证：`npm run prepack`（typecheck + `vitest run tests` + build，见 [package.json](./package.json) `scripts`）
+- 提交前全量验证：`npm run prepack`（行数门禁 + typecheck + `vitest run tests` + build，见 [package.json](./package.json) `scripts`）
 - 单文件 / 单用例：`npx vitest run tests/bridge.spec.ts -t "spawns, initializes"`
 - 只重建浏览器 Bundle：`npx tsdown`
 - 挂到本地 DSH：`dsh plugin --profile web add ./`
 
 ## 硬约束（摘要）
 
-> 38 条编号全部有效；每条是规则摘要，细节与「为什么」在箭头指向的文档。
+> 39 条编号全部有效；每条是规则摘要，细节与「为什么」在箭头指向的文档。
 
 ### 构建与入口（1–6）
 
@@ -95,6 +95,7 @@
 - **禁止在 [`tsdown.config.mjs`](./tsdown.config.mjs) 取消 external**：`react`、`react-dom`、`react/jsx-runtime`、`@deepseek-ai/cordis`、`@deepseek-ai/dsh-client-ui-slots` 必须由运行时提供，打包进去会破坏 context。
 - **子进程环境按「同级 agent」处理**：默认继承完整宿主环境，再由 agent 自己的 `env` 按键覆盖（`src/impl.ts` · `childEnv`）。**严禁**重新引入隐式凭据过滤——依赖环境变量认证的 agent（如 pi 的自定义供应商）会静默丢掉整个供应商；将来要最小权限必须做成显式 per-agent 开关。
 - **模块纯度**：`src/protocol.ts` 是纯类型契约与纯常量 / 纯函数，**严禁**引入 Node 专属库、有副作用的运行时代码或 ACP SDK 运行时值；`src/impl.ts` **严禁** Node 内置模块与 SDK，必须由 `tests/impl.spec.ts` 覆盖；`src/client/` **严禁** Node 内置模块或 ACP SDK，通信只走 RPC / SSE。
+- **文件行数棘轮门禁**：`npm run check:size`（prepack 第一道）硬卡——新文件 ≤1000 行；存量超限文件锁在 [file-size-baseline.json](./scripts/file-size-baseline.json) 的当前行数，只许缩不许长（缩到 ≤1000 即删条目），**严禁**新增条目或抬线；单文件超 500 行或单次会话净增 200 行，收尾必须向用户报告行数与增长原因。
 
 ## 常见任务配方
 
@@ -114,10 +115,6 @@
 - `session-controls.spec.ts`：composer 芯片与菜单**说了什么**（`agentBaseChip` / `describeRoute` / `menuFor`）。
 - `model-seat.spec.ts`：座位 claim 与 ACP gate 的装 / 撤 / 重取（含 `conversation.view` / `conversation.composer.dock` 的 ACP-only 动态注册）。
 - `slash-isolation.spec.ts`：斜杠来源包装与 fail-open。
-
-## 环境前置条件
-
-- **Node.js** `>= 22.12.0`（`package.json` `engines`；依赖 Web Streams API 与 Node 22+ 特性）；**Agent 密钥变量**默认继承完整宿主环境，agent 自己配置的 `env` 按键覆盖（见边界与禁区）。
 
 ## 按需文档索引（`AGENTS/`）
 

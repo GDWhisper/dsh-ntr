@@ -36,7 +36,7 @@ git log --format='%h %s' "${PREV}"..HEAD
 ## 发布前检查
 
 - [ ] 工作区干净（`git status --short` 无输出）
-- [ ] `npm run prepack` 通过（typecheck + 全部测试 + build）
+- [ ] `npm run prepack` 通过（行数门禁 + typecheck + 全部测试 + build）
 - [ ] 已用 `git log vPREV..HEAD` 逐笔核对：区间内每个用户可见改动都有净改动条目，同一功能的多次迭代已合并去噪
 - [ ] `CHANGELOG.md` 已加本版一节，与 release note 同一套话、带提交号；中英双版、同一分区按提交顺序排列、两版末尾都有 compare 链接
 - [ ] 每条条目链接的 commit 都在本版区间内；内部文档 / 测试 / 重构提交没有记成用户改动
@@ -158,7 +158,7 @@ EOF
 
 `.github/workflows/publish-npm.yml`，push `v*` tag 触发：
 
-1. `npm ci` → `npm run prepack`（typecheck + tests + build）
+1. `npm ci` → `npm run prepack`（行数门禁 + typecheck + tests + build）
 2. 校验 `tag == v` + `package.json` version
 3. `npm publish --access public --provenance`
 4. 等 registry 可见后 `npm dist-tag add … latest`

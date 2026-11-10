@@ -1,0 +1,21 @@
+{
+  "src/bridge/agent-bridge.ts": 2225,
+  "src/bridge/manager.ts": 2739,
+  "src/bridge/turn-stream.ts": 2705,
+  "src/client/acp-ui.tsx": 1325,
+  "src/client/index.tsx": 1115,
+  "src/client/panel.tsx": 3414,
+  "src/client/session-controls.tsx": 1136,
+  "src/client/store.ts": 4387,
+  "src/client/subagent-panel.tsx": 1038,
+  "src/impl.ts": 4300,
+  "src/protocol.ts": 1700,
+  "tests/acp-view.spec.ts": 1699,
+  "tests/bridge.spec.ts": 12165,
+  "tests/impl.spec.ts": 3445,
+  "tests/mock-agent.mjs": 1771,
+  "tests/model-seat.spec.ts": 1314,
+  "tests/panel.spec.ts": 1173,
+  "tests/store.spec.ts": 4201,
+  "tests/update.spec.ts": 1274
+}
