@@ -66,10 +66,26 @@ function stepSecond(createdAt: string | undefined): number | undefined {
   return Math.floor(parsed / 1_000)
 }
 
+/**
+ * Whitespace-folded text: the agent's own write may differ from the delivered
+ * text only in line wrapping, so equality is judged on the folded form.
+ */
+function foldWhitespace(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
 export class AgyLateOutputService {
   private readonly watches = new Map<string, LateWatch>()
 
   constructor(private readonly deps: AgyLateOutputDeps) {}
+
+  /**
+   * Number of armed watches. Observability ONLY (tests prove that a teardown
+   * really withdrew its watch): nothing in the delivery decision reads it.
+   */
+  get armedCount(): number {
+    return this.watches.size
+  }
 
   /** Whether this agent id runs Antigravity (the caller gates session state on it). */
   isAgentFor(agentId: string): boolean {
@@ -103,7 +119,10 @@ export class AgyLateOutputService {
     }
     // One watch per session: a new turn supersedes the previous one.
     this.disarm(session)
-    const path = paths.find(candidate => existsSync(candidate)) ?? paths[0]
+    // Both candidates must ALREADY exist: a tail built on a missing file has a
+    // 0/0 baseline, and the first flush after the file appears would present
+    // the whole session history as a late answer. No file, no watch.
+    const path = paths.find(candidate => existsSync(candidate))
     if (path === undefined) return
     const tail = new AgyTranscriptTail(path)
     tail.baseline()
@@ -148,9 +167,14 @@ export class AgyLateOutputService {
     if (steps.length === 0) return
     const floorSecond = Math.floor(watch.closedAt / 1_000)
     const candidates = steps.filter(step => {
+      // Only planner responses are kept: fewer bytes held, and no sub-agent
+      // report ever enters the late-answer buffer.
+      if (step.type !== 'PLANNER_RESPONSE') return false
       if (step.stepIndex <= watch.baselineStepIndex) return false
+      // A line with NO timestamp cannot be told apart from history: fail
+      // closed. A line that reaches us through this filter is new AND dated.
       const second = stepSecond(step.createdAt)
-      return second === undefined || second >= floorSecond
+      return second !== undefined && second >= floorSecond
     })
     if (candidates.length === 0) return
     watch.steps.push(...candidates)
@@ -177,7 +201,7 @@ export class AgyLateOutputService {
       // Background tool frames only: the answer may still follow.
       return
     }
-    if (watch.session.lastTurnAnswerText !== undefined && watch.session.lastTurnAnswerText === text) {
+    if (this.isOwnTurnAnswer(watch.session, text)) {
       // The turn's own answer, written late: nothing to announce.
       this.disarmWatch(watch)
       return
@@ -197,9 +221,21 @@ export class AgyLateOutputService {
     this.disarmWatch(watch)
   }
 
+  /**
+   * Whether this text is the answer the closed turn already displayed. The
+   * agent's own transcript write may re-wrap lines, so both sides are
+   * whitespace-folded before the comparison (folded HERE, not per poll: a
+   * 256 KiB answer must not be re-folded on every tick).
+   */
+  private isOwnTurnAnswer(session: LiveSession, text: string): boolean {
+    const shown = session.lastTurnAnswerText
+    if (shown === undefined) return false
+    return foldWhitespace(shown) === foldWhitespace(text)
+  }
+
   /** Hand one answer over. A session the host no longer accepts throws nothing. */
   private deliver(watch: LateWatch, text: string): void {
-    if (watch.session.lastTurnAnswerText !== undefined && watch.session.lastTurnAnswerText === text) return
+    if (this.isOwnTurnAnswer(watch.session, text)) return
     try {
       this.deps.host.deliver(watch.session, text)
     } catch {

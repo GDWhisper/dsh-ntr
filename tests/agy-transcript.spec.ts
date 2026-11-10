@@ -4,7 +4,7 @@
  * answer extraction. The echo guard's four states are pinned here too (P3).
  */
 import { mkdtempSync, rmSync, statSync, writeFileSync, appendFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
@@ -79,6 +79,18 @@ describe('Antigravity store root', () => {
       .toBe('/home/u/other/store2')
   })
 
+  it('never treats the NEXT flag as a missing flag value', () => {
+    // `--gemini-dir --app-data-dir x`: the token after the first flag is
+    // another option, so the gemini directory falls back to its default.
+    expect(agyStoreRoot(agentDef(['acp', '--gemini-dir', '--app-data-dir', 'x']), { HOME: '/home/u' }, 'linux'))
+      .toBe('/home/u/.gemini/x')
+    // Empty values (both spellings) are "not given" too.
+    expect(agyStoreRoot(agentDef(['acp', '--gemini-dir=', '--app-data-dir=', '--gemini_dir', '']), { HOME: '/home/u' }, 'linux'))
+      .toBe('/home/u/.gemini/antigravity-cli')
+    expect(agyStoreRoot(agentDef(['acp', '--app-data-dir', '', '--gemini-dir', 'g']), { HOME: '/home/u' }, 'linux'))
+      .toBe('/home/u/g/antigravity-cli')
+  })
+
   it('keeps an absolute directory as given', () => {
     expect(agyStoreRoot(agentDef(['acp', '--app-data-dir=/var/data/agy']), { HOME: '/home/u' }, 'linux'))
       .toBe('/var/data/agy')
@@ -86,11 +98,10 @@ describe('Antigravity store root', () => {
       .toBe('C:\\G\\store')
   })
 
-  it('returns null without a usable home', () => {
-    // `homedir()` is the documented fallback; only an EMPTY environment plus an
-    // impossible platform has no home at all, so that is what this checks.
-    const root = agyStoreRoot(agentDef(['acp']), {}, 'linux')
-    expect(root === null || root.startsWith('/')).toBe(true)
+  it('falls back to os.homedir() when the environment has no home', () => {
+    // An EMPTY HOME is "unset": the documented fallback is `os.homedir()`.
+    const root = agyStoreRoot(agentDef(['acp']), { HOME: '' }, 'linux')
+    expect(root?.startsWith(homedir())).toBe(true)
   })
 })
 
@@ -133,8 +144,13 @@ describe('transcript step parsing', () => {
 })
 
 describe('late answer extraction', () => {
-  it('joins every DONE planner response in step order', () => {
-    expect(lateAnswerText([step(2, 'second'), step(1, 'first')])).toBe('first\n\nsecond')
+  it('keeps only the LAST finished planner response', () => {
+    // A background run announces only its final answer; earlier intermediate
+    // replies stay in the transcript but must never be concatenated.
+    expect(lateAnswerText([step(2, 'second'), step(1, 'first')])).toBe('second')
+    expect(lateAnswerText([step(1, 'first'), step(2, 'second'), step(3, 'third')])).toBe('third')
+    // An unfinished later step does not displace an earlier finished one.
+    expect(lateAnswerText([step(1, 'first'), step(2, 'pending', { status: 'RUNNING' })])).toBe('first')
   })
 
   it('skips unfinished, empty and non-planner steps', () => {
@@ -251,7 +267,12 @@ describe('incremental transcript tail', () => {
     const tail = new AgyTranscriptTail(path)
     tail.baseline()
     appendFileSync(path, `${'y'.repeat(1024 * 1024)}\n${transcriptLine(9, 'after the long line')}`)
-    const steps = tail.readNew()
+    // A FULL 512 KiB window without a newline is discarded AT ONCE: the offset
+    // moves past it, so the next tick never re-reads the same bytes.
+    expect(tail.readNew()).toEqual([])
+    expect(tail.offset).toBe(512 * 1024)
+    const steps: TranscriptStep[] = []
+    for (let pass = 0; pass < 4 && steps.length === 0; pass += 1) steps.push(...tail.readNew())
     expect(steps.map(item => item.stepIndex)).toEqual([9])
     expect(tail.lastStepIndex).toBe(9)
   })

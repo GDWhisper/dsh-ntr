@@ -11,7 +11,7 @@ import {
 } from '../impl.ts'
 import type { AcpEvent, PermissionOutcome, SessionView, StreamChunk } from '../protocol.ts'
 import { OUTPUT_CHARS_PER_TOKEN, TurnTpsTracker } from '../tps.ts'
-import { recordAcpToolOutput, releaseAllToolOutputWaiters } from './registries.ts'
+import { BACKGROUND_REPORT_MAX, recordAcpToolOutput, releaseAllToolOutputWaiters } from './registries.ts'
 import type { AmbientTurn, BackgroundDispatch, BackgroundReport, BridgeTuning, RetiredAmbient } from './types.ts'
 import { AsyncQueue } from './async-queue.ts'
 // Type-only edge into the manager; erased completely at runtime, so the
@@ -259,11 +259,12 @@ export interface LiveSession {
   lateEcho?: { text: string; at: number }
   /**
    * A late report handed to the chat plane that no step has replayed yet.
-   * `streamPrompt` matches it against the report it is about to yield and
-   * converts it into {@link LiveSession.lateEcho}; a failed wake clears it
-   * again by object identity.
+   * `streamPrompt` matches its `report` against the report it is about to
+   * yield and converts it into {@link LiveSession.lateEcho}, whose `text` is
+   * the UNMARKED truncated prefix (`guard`): the echo guard's deduplication key
+   * must match the agent's replay, never our truncation marker.
    */
-  pendingLateEcho?: { text: string; at: number }
+  pendingLateEcho?: { guard: string; report: string; at: number }
   /**
    * The visible answer text of the turn that just closed, kept to recognise
    * the agent writing the SAME answer late: a candidate equal to it is this
@@ -925,8 +926,15 @@ export class TurnStreamController {
    * order). `closeTurn` publishes it as
    * {@link LiveSession.lastTurnAnswerText}, so the transcript watcher can tell
    * the turn's own answer — written late — from a new report.
+   *
+   * Bounded by {@link BACKGROUND_REPORT_MAX}: past the bound the field stops
+   * accumulating and `turnAnswerOverflow` is set, so `closeTurn` publishes
+   * `undefined` instead of a prefix (a truncated prefix would silently
+   * misclassify a genuinely new answer as this turn's own).
    */
   private turnAnswerText = ''
+  /** The answer exceeded {@link BACKGROUND_REPORT_MAX}; no equality evidence. */
+  private turnAnswerOverflow = false
   /**
    * Text held while it is still a strict prefix of the late answer the echo
    * guard is waiting to swallow (Antigravity only). `undefined` means the guard
@@ -2083,7 +2091,12 @@ export class TurnStreamController {
       releaseAllToolOutputWaiters()
       // Publish the turn's own visible answer BEFORE a transcript watch may
       // arm: a late write of exactly this text is not a new background answer.
-      this.session.lastTurnAnswerText = this.turnAnswerText === '' ? undefined : this.turnAnswerText
+      // An answer past the bound is published as `undefined` — losing the
+      // equality evidence only risks the same text appearing twice, which is
+      // the fail-open direction the whole late-output path follows.
+      this.session.lastTurnAnswerText = this.turnAnswerOverflow || this.turnAnswerText === ''
+        ? undefined
+        : this.turnAnswerText
       // Rotate the turn's tool-call ids into the completed-turn set (Antigravity
       // replays them on the next prompt) and start the late-output watch. Only
       // a chat turn that ended on its own can have post-turn work: an ambient
@@ -2717,7 +2730,17 @@ export class TurnStreamController {
         if (hold !== undefined && (seq === undefined || seq > hold.floorSeq)) {
           hold.answerChars += text.length
         }
-        if (!this.isAmbientOwned(update)) this.turnAnswerText += text
+        if (!this.isAmbientOwned(update)) {
+          if (!this.turnAnswerOverflow) {
+            this.turnAnswerText += text
+            if (this.turnAnswerText.length > BACKGROUND_REPORT_MAX) {
+              this.turnAnswerOverflow = true
+              // Release the prefix: `closeTurn` publishes nothing once the
+              // bound is crossed, so keeping the bytes would only waste it.
+              this.turnAnswerText = ''
+            }
+          }
+        }
       }
       this.emitProse(seg, kind === 'agent_thought_chunk' ? 'reasoning' : 'text', text)
       return true

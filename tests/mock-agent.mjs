@@ -243,8 +243,27 @@ const sessions = new Map()
  * `AGY_REPLAY_PARTIAL` variant sends only the first half and ends the turn.
  */
 const AGY_STORE = process.env.MOCK_AGY_STORE
+/** The completed tool call an agy turn announces and the next prompt replays. */
+const AGY_CALL_ID = 'call_agy_1'
 const agyStepIndex = new Map()
 const agyLateAnswers = new Map()
+
+/**
+ * agy's transcript file exists before its first late answer: the plugin's
+ * watch only arms on an EXISTING file (a missing file would baseline 0/0 and
+ * replay the whole history later). The mock creates it at `session/new`, then
+ * appends the late step after the turn.
+ */
+function ensureAgyTranscript(sessionId) {
+  if (AGY_STORE === undefined) return
+  try {
+    const dir = join(AGY_STORE, 'brain', sessionId, '.system_generated', 'logs')
+    mkdirSync(dir, { recursive: true })
+    appendFileSync(join(dir, 'transcript_full.jsonl'), '')
+  } catch {
+    // Best effort: a transcript write never changes the agent's answer.
+  }
+}
 /**
  * MOCK_SINGLE_SESSION=1: the CodeBuddy connection shape — one live session per
  * connection. Every `session/new` / `session/load` on this connection evicts
@@ -449,6 +468,7 @@ const app = agent({ name: 'mock-acp-agent' })
     evictForNewSession(sessionId)
     const modeId = FIRST_MODE !== undefined && counter === 1 ? FIRST_MODE : 'default'
     sessions.set(sessionId, { cwd: ctx.params.cwd, modeId, temp: 'mid', model: DEFAULT_MODEL, effort: 'high', stream: false, mcpServers: ctx.params.mcpServers })
+    ensureAgyTranscript(sessionId)
     return {
       sessionId,
       modes: {
@@ -644,6 +664,9 @@ const app = agent({ name: 'mock-acp-agent' })
     // plugin's echo guard is the only thing that can drop it.
     const lateAnswer = agyLateAnswers.get(sessionId)
     if (lateAnswer !== undefined && text.includes('AGY_REPLAY')) {
+      // agy also replays the PREVIOUS turn's completed tool frame. The id was
+      // seen in a completed turn, so the client must open no second card.
+      await send({ sessionUpdate: 'tool_call_update', toolCallId: AGY_CALL_ID, status: 'completed' })
       const partial = text.includes('AGY_REPLAY_PARTIAL')
       const replay = partial ? lateAnswer.slice(0, Math.ceil(lateAnswer.length / 2)) : lateAnswer
       await send({ sessionUpdate: 'agent_message_chunk', messageId: 'm-agy-replay', content: { type: 'text', text: replay } })
@@ -1690,6 +1713,18 @@ const app = agent({ name: 'mock-acp-agent' })
       await new Promise(() => {})
     }
 
+    if (AGY_STORE !== undefined && text.includes('AGY_LATE')) {
+      // The turn carries a completed tool card BEFORE its answer. The next
+      // prompt replays that call id; it must open no second card.
+      await send({
+        sessionUpdate: 'tool_call',
+        toolCallId: AGY_CALL_ID,
+        title: 'agy scheduled tool',
+        kind: 'other',
+        status: 'completed',
+        content: [{ type: 'content', content: { type: 'text', text: 'agy tool result' } }],
+      })
+    }
     await send({ sessionUpdate: 'tool_call', toolCallId: MAIN_CALL_ID, title: MAIN_TITLE, kind: 'other', status: 'pending' })
 
     if (text.includes('PERM')) {

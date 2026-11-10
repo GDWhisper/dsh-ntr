@@ -217,10 +217,10 @@ export class BridgeManager {
   }
 
   /**
-   * The echo guard's window, read once at controller construction (see
-   * {@link BridgeTuning.agyLateOutputEchoMs}): a delivered late answer stays
-   * eligible for deduplication this long, because the agent may replay it on a
-   * prompt that comes minutes later.
+   * The echo guard's window (see {@link BridgeTuning.agyLateOutputEchoMs}): a
+   * delivered late answer stays eligible for deduplication this long, because
+   * the agent may replay it on a prompt that comes minutes later. Read from
+   * the CURRENT tuning at each use, like every other live window.
    */
   get lateEchoTuning(): { echoMs: number } {
     return { echoMs: this.tuning.agyLateOutputEchoMs }
@@ -458,6 +458,7 @@ export class BridgeManager {
       sessions: () => this.registry.sessions(),
       persistAgents: () => this.persistence.persistAgents(),
       ambientTuning: () => this.ambientTuning,
+      lateEchoMs: () => this.tuning.agyLateOutputEchoMs,
     })
     // The late-output watch reads Antigravity's private transcript (see the
     // plan). Every manager capability arrives as a closure; the probe pair is
@@ -572,6 +573,9 @@ export class BridgeManager {
       applyPersistedChatSessions: sessions => {
         for (const session of sessions) {
           this.registry.putSession(session)
+          // The transient Antigravity sets are per-agent and not persisted:
+          // restore must initialise them like a new / forked session does.
+          this.initLateOutputState(session)
           const dshSessionId = session.dshSessionId
           if (dshSessionId === undefined) continue
           this.bridgeFor(session.agentId, { kind: 'chat', dshSessionId }).parkReleased(session)
@@ -2151,9 +2155,18 @@ export class BridgeManager {
       // old answer again (fail-open, never a double swallow).
       if (wake.kind === 'report') {
         const late = this.registry.sessionAt(options.sessionId, agentId)
-        if (late !== undefined && late.pendingLateEcho !== undefined && late.pendingLateEcho.text === text) {
-          late.lateEcho = { text, at: Date.now() }
-          late.pendingLateEcho = undefined
+        if (late !== undefined) {
+          const pending = late.pendingLateEcho
+          // Lazy expiry: a record older than the guard window can never match
+          // a replay, and committing it would only swallow an unrelated answer.
+          if (pending !== undefined && Date.now() - pending.at > this.tuning.agyLateOutputEchoMs) {
+            late.pendingLateEcho = undefined
+          } else if (pending !== undefined && pending.report === text) {
+            // The guard key is the UNMARKED truncated prefix: the agent replays
+            // the original answer, never our truncation marker.
+            late.lateEcho = { text: pending.guard, at: Date.now() }
+            late.pendingLateEcho = undefined
+          }
         }
       }
       if (wake.kind === 'lost') {

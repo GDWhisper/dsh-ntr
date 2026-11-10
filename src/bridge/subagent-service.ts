@@ -46,6 +46,8 @@ export interface SubagentHost {
   persistAgents(): void
   /** The ambient quiet / ceiling windows (see `BridgeTuning.ambientQuietMs`). */
   ambientTuning(): { quietMs: number; maxMs: number }
+  /** How long a delivered late answer stays eligible for the echo guard. */
+  lateEchoMs(): number
 }
 
 export class SubagentService {
@@ -599,12 +601,23 @@ export class SubagentService {
     const agent = this.wakeAgentFor(session)
     if (agent === undefined) return false
     if (text.trim() === '') return false
-    const clipped = text.length > BACKGROUND_REPORT_MAX
-      ? `${text.slice(0, BACKGROUND_REPORT_MAX)}\n[truncated by dsh-ntr: late output exceeded ${String(BACKGROUND_REPORT_MAX)} characters]`
+    // A record older than the guard window can never match a replay: drop it
+    // before writing this answer's record (lazy expiry — no timer).
+    const previous = session.pendingLateEcho
+    if (previous !== undefined && Date.now() - previous.at > this.host.lateEchoMs()) {
+      session.pendingLateEcho = undefined
+    }
+    // `guard` is the unmarked prefix the echo guard matches against the agent's
+    // replay; `report` is the text actually delivered, truncation marker
+    // included. They differ only when the answer is cut.
+    const truncated = text.length > BACKGROUND_REPORT_MAX
+    const guard = truncated ? text.slice(0, BACKGROUND_REPORT_MAX) : text
+    const report = truncated
+      ? `${guard}\n[truncated by dsh-ntr: late output exceeded ${String(BACKGROUND_REPORT_MAX)} characters]`
       : text
-    const record = { text: clipped, at: Date.now() }
+    const record = { guard, report, at: Date.now() }
     session.pendingLateEcho = record
-    this.wakeChatWithBackgroundReport(session, agent, clipped, {
+    this.wakeChatWithBackgroundReport(session, agent, report, {
       lateOutput: true,
       onFailure: () => {
         // Object identity, not the slot: a late failure must not clear the

@@ -39,8 +39,6 @@ const TRANSCRIPT_NAMES = ['transcript_full.jsonl', 'transcript.jsonl'] as const
 const BASELINE_TAIL_BYTES = 64 * 1024
 /** Bytes read per incremental pass. */
 const READ_CHUNK_BYTES = 512 * 1024
-/** A line this long without a newline is discarded instead of pinning the tail. */
-const NO_NEWLINE_DISCARD_BYTES = 1024 * 1024
 /** An ACP session id is a file-name segment: refuse separators and traversal. */
 const SESSION_ID_PATTERN = /^[\w-]+$/
 
@@ -56,16 +54,29 @@ export function isAntigravityAgent(def: AcpAgentDef): boolean {
   return bare === 'agy' && (def.args ?? []).includes('acp')
 }
 
-/** One `--flag=value` / `--flag value` argument, first spelling found. */
+/**
+ * One `--flag=value` / `--flag value` argument, first USABLE spelling found.
+ *
+ * A missing value must never swallow the NEXT flag: `--gemini-dir
+ * --app-data-dir x` names no gemini directory (the following token is another
+ * option), so the default applies. The same holds for an empty value in either
+ * spelling (`--flag=` / `--flag ''`).
+ */
 function flagValue(args: readonly string[], names: readonly string[]): string | undefined {
+  const usable = (value: string | undefined): value is string =>
+    value !== undefined && value !== '' && !value.startsWith('-')
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index] ?? ''
     for (const name of names) {
       if (arg === name) {
         const next = args[index + 1]
-        return next === undefined ? undefined : next
+        if (usable(next)) return next
+        continue
       }
-      if (arg.startsWith(`${name}=`)) return arg.slice(name.length + 1)
+      if (arg.startsWith(`${name}=`)) {
+        const value = arg.slice(name.length + 1)
+        if (usable(value)) return value
+      }
     }
   }
   return undefined
@@ -127,16 +138,22 @@ export function parseTranscriptStep(line: string): TranscriptStep | undefined {
 }
 
 /**
- * The late answer a set of steps carries: every finished planner response,
- * oldest first. `SYSTEM_MESSAGE` steps are sub-agent reports, not answers, and
- * are deliberately ignored.
+ * The late answer a set of steps carries: the LAST finished planner response.
+ *
+ * One background run announces only its FINAL answer. Earlier intermediate
+ * replies stay in the transcript, but they are not part of this delivery:
+ * agy replays a run as a contiguous chunk stream with no separator, so joining
+ * several replies would make the echo guard fail on the second one and show
+ * the whole old answer again. `SYSTEM_MESSAGE` steps are sub-agent reports,
+ * not answers, and are deliberately ignored.
  */
 export function lateAnswerText(steps: readonly TranscriptStep[]): string {
-  return steps
-    .filter(step => step.type === 'PLANNER_RESPONSE' && step.status === 'DONE' && step.content.trim() !== '')
-    .sort((left, right) => left.stepIndex - right.stepIndex)
-    .map(step => step.content)
-    .join('\n\n')
+  let latest: TranscriptStep | undefined
+  for (const step of steps) {
+    if (step.type !== 'PLANNER_RESPONSE' || step.status !== 'DONE' || step.content.trim() === '') continue
+    if (latest === undefined || step.stepIndex > latest.stepIndex) latest = step
+  }
+  return latest?.content ?? ''
 }
 
 /**
@@ -193,34 +210,19 @@ export class AgyTranscriptTail {
     if (window === undefined || window.length === 0) return []
     const newline = window.lastIndexOf(0x0a)
     if (newline < 0) {
-      // No complete line in this pass. A single over-long line must not pin the
-      // tail forever: past the discard bound, skip to the next newline.
-      if (size - this.offset < NO_NEWLINE_DISCARD_BYTES) return []
-      return this.discardOverlongLine(size)
+      // No complete line in this pass. A FULL window (512 KiB without a single
+      // newline) is an over-long line: drop the bytes already read instead of
+      // re-reading them every tick. The next pass starts after them, so the
+      // same discard semantics as the old "skip to the next newline" scan hold
+      // without its per-tick cost. A window that did NOT fill up is a normal
+      // half-written line: wait for the next tick.
+      if (window.length < READ_CHUNK_BYTES) return []
+      this.offset += window.length
+      return []
     }
     const consumed = window.subarray(0, newline + 1)
     this.offset += consumed.length
     return this.collect(consumed.toString('utf8'))
-  }
-
-  /** Drop bytes through the first newline (bounded by the file end), then resume. */
-  private discardOverlongLine(size: number): TranscriptStep[] {
-    let position = this.offset
-    while (position < size) {
-      const window = this.readRange(position, Math.min(READ_CHUNK_BYTES, size - position))
-      if (window === undefined || window.length === 0) {
-        this.offset = size
-        return []
-      }
-      const newline = window.indexOf(0x0a)
-      if (newline >= 0) {
-        this.offset = position + newline + 1
-        return this.readNew()
-      }
-      position += window.length
-    }
-    this.offset = size
-    return []
   }
 
   /** Parse a complete-text block, skipping blank and malformed lines. */
