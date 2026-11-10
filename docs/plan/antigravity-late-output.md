@@ -102,8 +102,8 @@ turn/end (chat 面, agy 会话, outcome.kind === 'stop', 非 ambient)
 - `parseTranscriptStep(line): TranscriptStep | undefined`
   - JSON 解析失败返回 `undefined`；`step_index` 非有限数字的也返回 `undefined`。
 - `lateAnswerText(steps): string`
-  - 按 `step_index` 升序取 `PLANNER_RESPONSE` 且 `status === 'DONE'` 且 `content.trim() !== ''` 的 `content`；
-  - 多条用 `\n\n` 连接；没有任何一条返回 `''`。
+  - 取 `stepIndex` **最大**的一条 `PLANNER_RESPONSE`，且 `status === 'DONE'`、`content.trim() !== ''`；返回该条 `content`。
+  - 一次后台回合只宣告它的**最终答案**；更早的中间答复仍留在 transcript，但不拼接、不投递。没有任何一条返回 `''`。
 
 ### 5.2 增量读取（同文件 `AgyTranscriptTail`）
 
@@ -121,8 +121,8 @@ interface AgyTranscriptTail {
 
 1. `stat(path)`。异常、非普通文件、大小小于 `offset`（被截断/重建）→ 重置 `offset = 0`。
 2. 从 `offset` 读最多 512 KiB 字节。
-3. 在字节层找最后一个 `0x0A`。存在 → 只取到该字节（含），`offset += 该长度`，然后整体 `toString('utf8')`（不切多字节字符）；不存在 → 本次不产出、不推进（等下一次 tick）。
-4. 兜底：若缓冲已是 1 MiB 仍无换行，丢弃到第一个换行并推进，避免永久卡住。
+3. 在字节层找最后一个 `0x0A`。存在 → 只取到该字节（含），`offset += 该长度`，然后整体 `toString('utf8')`（不切多字节字符）；不存在且窗口未读满 → 本次不产出、不推进（等下一次 tick）。
+4. 兜底：窗口读满 512 KiB 仍无换行 → 把 `offset` 推进该窗口长度（丢弃这个超长行），避免每 tick 重读同一段字节；后续窗口照常继续，行为与「丢弃到下一个换行」一致。
 5. 按 `\n` 切行，逐行 `parseTranscriptStep`，跳过空行与坏行。
 6. 更新 `lastStepIndex`（取最大值）。
 
@@ -146,21 +146,22 @@ interface LateWatch {
 依赖注入（构造参数）：`{ isAgent(def), storeRoot(), tuning(), host }`，`host` 提供 `sessionOf(agentId, dshSessionId)`、`isBusy(session)`、`deliver(session, text)`、`notice()`。测试替换 `isAgent` / `storeRoot`。
 
 - `arm(session, closedAt)`：
-  - 前置：`isAgent(defOf(session.agentId))`、`session.dshSessionId !== undefined`、`!session.closed && !session.released`、`session.acpSessionId` 合法、目标文件可读；
+  - 前置：`isAgent(defOf(session.agentId))`、`session.dshSessionId !== undefined`、`!session.closed && !session.released`、`session.acpSessionId` 合法、**两个候选目标文件至少一个已存在**（都不存在就不 arm：绝不拿不存在的文件建 tail，否则 baseline 0/0 会把随后出现的整段历史当晚到答案）；
   - 全局开关 `agyLateOutput === false` 直接返回；
   - 同会话已有 watch → 先 `disarm`；
   - `baseline()` 后起 poll（`agyLateOutputPollMs`，默认 1000）与 deadline（`agyLateOutputMaxMs`，默认 600000），全部 `unref()`。
 - `poll`：
   - `session.closed || session.released` → `disarm`。
   - **忙判定只用 `session.running === true || session.promptInFlight === true`**。为真 → `disarm`，不投递（下一轮会把积压折进来）。不要用 `session.turnController`：带工具卡的回合收口后控制器仍保留到续跑段结束，用它判忙会让第一次 poll 自杀。
-  - `readNew()` 后筛候选：`step_index > baseline.lastStepIndex` **且** `created_at` 存在时其整秒 `>= floor(closedAt / 1000)`。时钟同机；`created_at` 秒精度决定用整秒比较。
+  - `readNew()` 后筛候选：只留 `type === 'PLANNER_RESPONSE'`、`step_index > baseline.lastStepIndex`、**`created_at` 必须存在**且其整秒 `>= floor(closedAt / 1000)`。没有 `created_at` 的行一律不投递（缺时间戳无法区分历史与新答案，fail-closed）。时钟同机；`created_at` 秒精度决定用整秒比较。
   - 收到候选即入 `steps` 并重置 quietTimer（`agyLateOutputQuietMs`，默认 1500，可续期）；不改变 deadline。
 - `quiet` 到点：`text = lateAnswerText(steps)`；
   - 空 → 继续等（后台可能只有工具帧）；
-  - 与 `session.lastTurnAnswerText` 全等 → 是本轮自己刚显示的答案被迟写，丢弃并 `disarm`；
+  - 与 `session.lastTurnAnswerText` **折叠空白后**全等（两边都 `replace(/\s+/g, ' ').trim()`）→ 是本轮自己刚显示的答案被迟写，丢弃并 `disarm`；
   - 否则 `deliver`，然后 `disarm`。
 - `deadline` 到点：有文本且不忙就投递，否则静默 `disarm`。
 - `disarm(session)`：清三个 timer，删记录；幂等。
+- `armedCount`：只读数（`watches.size`），供测试证明撤表真的发生，不参与任何投递决策。
 
 生命周期钩子（**不要写在 `BridgeManager` 的 `releaseAll` 上：该方法在 `AgentBridge`**）：
 
@@ -185,8 +186,8 @@ deliverLateReport(session: LiveSession, text: string): boolean
 2. `session.running || session.promptInFlight` → `false`。
 3. `wakeAgentFor(session)` 为空 → `false`（`/acp`、headless、resolver 未挂载）。
 4. `trim()` 为空 → `false`。
-5. 正文按 `BACKGROUND_REPORT_MAX` 截断，留截断标记（约束 29）。
-6. `session.pendingLateEcho = { text: clipped, at: Date.now() }`，调用 `wakeChatWithBackgroundReport(session, agent, clipped, { onFailure })`，返回 `true`。
+5. 正文按 `BACKGROUND_REPORT_MAX` 截断并留截断标记，得到真正投递的 `report`；`guard` 是**不带标记**的同一前 `BACKGROUND_REPORT_MAX` 字符（未截断时两者相同）。
+6. 写 `pendingLateEcho` 前先做惰性过期：已有记录且 `Date.now() - at > agyLateOutputEchoMs` 就清掉。然后 `session.pendingLateEcho = { guard, report, at: Date.now() }`，调用 `wakeChatWithBackgroundReport(session, agent, report, { onFailure })`，返回 `true`。
 7. `wakeChatWithBackgroundReport` 增加可选 `onFailure`：`followup` 同步抛错或 thenable reject → 发既有 `agent/notice`（措辞标明「late output」以区别于 CodeBuddy drain）并调 `onFailure`。
 8. `onFailure` **按对象身份**比对后再清 `session.pendingLateEcho`：`if (session.pendingLateEcho === record) session.pendingLateEcho = undefined`。迟到的失败回调不能清掉下一轮的新记录。
 
@@ -195,12 +196,15 @@ deliverLateReport(session: LiveSession, text: string): boolean
 - `BridgeManager.streamPrompt` 的 `backgroundReportOf` 命中分支里，真正 `yield` 报告前提交：
   ```ts
   const late = options.sessionId === undefined ? undefined : this.registry.sessionAt(options.sessionId, agentId)
-  if (late !== undefined && late.pendingLateEcho !== undefined && late.pendingLateEcho.text === text) {
-    late.lateEcho = { text, at: Date.now() }
+  // 惰性过期：超过 agyLateOutputEchoMs 的记录无法再匹配任何回放。
+  if (late?.pendingLateEcho !== undefined && Date.now() - late.pendingLateEcho.at > echoMs) {
+    late.pendingLateEcho = undefined
+  } else if (late?.pendingLateEcho !== undefined && late.pendingLateEcho.report === text) {
+    late.lateEcho = { text: late.pendingLateEcho.guard, at: Date.now() }
     late.pendingLateEcho = undefined
   }
   ```
-- `sessionAt` 不创建会话（区别于 `getOrCreateDshSession`）。
+- `lateEcho.text` 只取 `guard`：echo 去重键必须是 agent 回放的无标记文本，截断标记只出现在投递正文里。`sessionAt` 不创建会话（区别于 `getOrCreateDshSession`）。
 - 被 FIFO 跳过时什么都没发生：下一轮会重复显示旧答案一次，这是可接受的失败方向（fail-open）。
 
 不写 `consumedDrains`：那不是同一个 `requestId` 语义，硬塞会污染 CodeBuddy 的消费表。不建 `BackgroundReport` 记录：`lateEcho` 自己就是「已投递、待去重」的证据。
@@ -339,9 +343,11 @@ agy 冲积压时还会重发上一轮的 `tool_call_update`（真实会话里是
 | agy 改 transcript 格式 | 解析失败即静默；watch 到 deadline 自动停；不抛异常 |
 | 唤醒成功但 flush 被误吞 | 只有完全命中且前缀连续才吞；任何失配立即 fail-open；投递失败清 `pendingLateEcho` |
 | 投递与用户发消息竞态 | 投递前只查 `running` / `promptInFlight`；wake 被 FIFO 跳过时不写 `lateEcho` |
-| 本轮答案迟写被当成晚到答案 | 候选文本与本轮已显示正文全等即丢弃 |
-| 读取隐私 | 只读；只取 `PLANNER_RESPONSE.content`；不落盘；不进 notice 正文 |
-| 多会话定时器开销 | 每会话最多 1s poll，全部 `unref`；deadline 10 分钟；`agyLateOutput: false` 一键关；`agyLateOutputMaxMs: 0` 关整个机制 |
+| 本轮答案迟写被当成晚到答案 | 两边折叠空白（`replace(/\s+/g, ' ').trim()`）后全等即丢弃；本轮正文超过 `BACKGROUND_REPORT_MAX` 时不发布等值证据（宁可重复，不误吞） |
+| 进程被空闲释放 | agy 的后台作业随进程消失，本功能救不回；watch 随 release 由 `clearAmbientState` 停掉，revive 后才重新 arm |
+| 宿主仍在执行卡片时注入 wake | wake 可能占用下一步；续跑随后仍会到来，本机制不另开收口路径、不杀进程 |
+| 读取隐私 | 只读；`watch.steps` 只留 `PLANNER_RESPONSE`；不落盘；不进 notice 正文 |
+| 多会话定时器开销 | 每会话最多 1s poll，全部 `unref`；deadline 10 分钟；`agyLateOutput: false` 一键关；`agyLateOutputMaxMs: 0` 是内部 tuning 键（不承诺部署可达） |
 | Windows 路径 | `USERPROFILE`；`isAbsolutePath` 判定；失败返回 null |
 | 网络盘 / 权限错误 | `stat` / `read` 异常一律 fail-open |
 | 宿主把 `source` 整体剥掉 | 仓库内不可防（与既有后台报告同一条残余下界），wake 会退化成普通用户消息 |
