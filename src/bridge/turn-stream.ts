@@ -246,6 +246,49 @@ export interface LiveSession {
    */
   quotaRefusal?: { message: string; at: number }
   /**
+   * The answer Antigravity's own transcript reported late, after the turn
+   * closed, and when it was delivered (see `docs/plan/antigravity-late-output.md`).
+   *
+   * The agent replays that text on the NEXT prompt (it sends no update while
+   * no prompt is in flight), so the echo guard in `TurnStreamController`
+   * swallows exactly this text once. Written only when
+   * `BridgeManager.streamPrompt` actually replays the pending report — a wake
+   * skipped by the background-report FIFO must NOT write it, or the replayed
+   * answer would be swallowed twice.
+   */
+  lateEcho?: { text: string; at: number }
+  /**
+   * A late report handed to the chat plane that no step has replayed yet.
+   * `streamPrompt` matches it against the report it is about to yield and
+   * converts it into {@link LiveSession.lateEcho}; a failed wake clears it
+   * again by object identity.
+   */
+  pendingLateEcho?: { text: string; at: number }
+  /**
+   * The visible answer text of the turn that just closed, kept to recognise
+   * the agent writing the SAME answer late: a candidate equal to it is this
+   * turn's own text, not a new report.
+   */
+  lastTurnAnswerText?: string
+  /**
+   * `toolCallId`s seen in a COMPLETED turn (Antigravity only). The agent
+   * replays the previous turn's tool frames on the next prompt: a known id
+   * must not open a second card, and its replay must not re-open the stall
+   * watchdog's long tool window. Bounded (`KNOWN_TOOL_CALL_MAX`), oldest
+   * evicted first; `turnToolCalls` collects the current turn's ids and they
+   * rotate in here at `closeTurn`.
+   */
+  knownToolCalls?: Set<string>
+  /** `toolCallId`s seen in the turn currently on air (Antigravity only). */
+  turnToolCalls?: Set<string>
+  /**
+   * Stops this session's transcript watch (the late-output service's
+   * `disarm`). Set at arm time, called by `clearAmbientState` at every
+   * lifecycle boundary — the writer is the agent process, so a released
+   * session's transcript cannot grow and a watch must not outlive it.
+   */
+  stopLateWatch?: () => void
+  /**
    * Detached workers this session dispatched that may still run after the
    * turn that dispatched them CLOSED. Session-level on purpose: the worker's
    * completion / drain frames arrive after that turn's controller retired,
@@ -546,6 +589,16 @@ export function clearAmbientState(session: LiveSession): void {
   session.retiredAmbients = undefined
   session.consumedDrains = undefined
   session.quotaRefusal = undefined
+  // The Antigravity late-output state is transient too: a replay record only
+  // speaks for the prompt that delivered it, and a watch must not outlive the
+  // session it observes (the transcript writer is the agent process).
+  session.lateEcho = undefined
+  session.pendingLateEcho = undefined
+  session.turnToolCalls?.clear()
+  session.knownToolCalls?.clear()
+  const stopLateWatch = session.stopLateWatch
+  session.stopLateWatch = undefined
+  stopLateWatch?.()
 }
 
 /**
@@ -663,6 +716,13 @@ export const AMBIENT_NOTICE_MAX = 64
  * small ring is enough; the oldest is evicted first.
  */
 export const RETIRED_AMBIENT_MAX = 32
+
+/**
+ * Bound on {@link LiveSession.knownToolCalls}: the ids only exist to recognise
+ * a replayed card, and an id older than this many completed turns is no longer
+ * plausible. Oldest evicted first.
+ */
+export const KNOWN_TOOL_CALL_MAX = 512
 
 /**
  * Bound on {@link LiveSession.consumedDrains}: one id per delivered answer.
@@ -812,6 +872,13 @@ export class TurnStreamController {
    * text, and must say so when it closes.
    */
   private sawVisibleText = false
+  /**
+   * The visible answer text this turn streamed (agent MESSAGE chunks only, in
+   * order). `closeTurn` publishes it as
+   * {@link LiveSession.lastTurnAnswerText}, so the transcript watcher can tell
+   * the turn's own answer — written late — from a new report.
+   */
+  private turnAnswerText = ''
   /**
    * The drain run ids whose visible answer text this turn FOLDED (the fold
    * treatment set). `closeTurn`'s quiet close reads it to decide the `consume`
@@ -1951,6 +2018,17 @@ export class TurnStreamController {
       // The turn is over: no call from it can still earn the long tool window.
       this.session.activeToolCalls.clear()
       releaseAllToolOutputWaiters()
+      // Publish the turn's own visible answer BEFORE a transcript watch may
+      // arm: a late write of exactly this text is not a new background answer.
+      this.session.lastTurnAnswerText = this.turnAnswerText === '' ? undefined : this.turnAnswerText
+      // Rotate the turn's tool-call ids into the completed-turn set (Antigravity
+      // replays them on the next prompt) and start the late-output watch. Only
+      // a chat turn that ended on its own can have post-turn work: an ambient
+      // close already folded its answer, and a cancel / error owns no promise.
+      this.rotateTurnToolCalls()
+      if (ambient === undefined && outcome.kind === 'stop') {
+        this.manager.armLateOutputWatch(this.session, Date.now())
+      }
     }
     this.endTurn()
     // The controller stays indexed only while a continuation step can still
@@ -1960,6 +2038,23 @@ export class TurnStreamController {
     // would pin the controller (and its session id) to a turn nobody can continue.
     if (!current) this.retire()
     else if (ambient !== undefined || outcome.kind !== 'stop' || this.seenCalls.size === 0) this.dispose()
+  }
+
+  /**
+   * Move this turn's tool-call ids into the completed-turn set, so the agent's
+   * replay of them on the NEXT prompt opens no second card. Antigravity-only
+   * state: a session without the sets is untouched.
+   */
+  private rotateTurnToolCalls(): void {
+    const known = this.session.knownToolCalls
+    if (known === undefined) return
+    for (const callId of this.session.turnToolCalls ?? []) known.add(callId)
+    while (known.size > KNOWN_TOOL_CALL_MAX) {
+      const oldest = known.values().next().value
+      if (oldest === undefined) break
+      known.delete(oldest)
+    }
+    this.session.turnToolCalls = new Set<string>()
   }
 
   /**
@@ -2519,6 +2614,7 @@ export class TurnStreamController {
         if (hold !== undefined && (seq === undefined || seq > hold.floorSeq)) {
           hold.answerChars += text.length
         }
+        if (!this.isAmbientOwned(update)) this.turnAnswerText += text
       }
       this.emitProse(seg, kind === 'agent_thought_chunk' ? 'reasoning' : 'text', text)
       return true

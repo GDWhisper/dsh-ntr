@@ -265,6 +265,34 @@ export interface BridgeTuning {
    */
   ambientStaleMs?: number
   /**
+   * Total switch for the Antigravity transcript late-output path (see
+   * docs/plan/antigravity-late-output.md). Default on: only an automatically
+   * recognised `agy acp` session arms a watch, and the transcript format is
+   * private, so a deployment that does not trust it can turn the feature off
+   * with one key.
+   */
+  agyLateOutput?: boolean
+  /** How often an armed transcript is polled for new lines. Default 1000 ms. */
+  agyLateOutputPollMs?: number
+  /**
+   * How long a new late step must be the LAST one before its answer is
+   * delivered. Every further new step extends the window. Default 1500 ms.
+   */
+  agyLateOutputQuietMs?: number
+  /**
+   * Absolute bound on one transcript watch: a background run that never goes
+   * quiet must not poll forever. At the bound whatever arrived is delivered
+   * when the session is idle. `0` disables the whole mechanism. Default
+   * 600000 ms.
+   */
+  agyLateOutputMaxMs?: number
+  /**
+   * How long a delivered late answer stays eligible for the echo guard — the
+   * agent replays it on the next prompt, which may come minutes later. Default
+   * 600000 ms.
+   */
+  agyLateOutputEchoMs?: number
+  /**
    * Hold the turn across the WORKER phase too (the pre-2026-11 behaviour).
    *
    * Default `false`: the prompt response closes the turn, so the user keeps

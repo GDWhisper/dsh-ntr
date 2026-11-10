@@ -227,10 +227,24 @@
  * replays a marker update before answering, simulating agent-side persistence.
  */
 import { Writable, Readable } from 'node:stream'
-import { appendFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync } from 'node:fs'
+import { join } from 'node:path'
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from '@agentclientprotocol/sdk'
 
 const sessions = new Map()
+/**
+ * MOCK_AGY_STORE=<dir>: the Antigravity transcript shape (see
+ * docs/plan/antigravity-late-output.md). An "AGY_LATE" prompt answers normally,
+ * then one second later appends a `PLANNER_RESPONSE` to
+ * `<dir>/brain/<sessionId>/.system_generated/logs/transcript_full.jsonl` and
+ * sends NO `session/update` — exactly how agy reports work finished after
+ * `end_turn`. "AGY_REPLAY" makes the next prompt replay that text before its
+ * own answer (agy flushes the backlog when a prompt arrives); the
+ * `AGY_REPLAY_PARTIAL` variant sends only the first half and ends the turn.
+ */
+const AGY_STORE = process.env.MOCK_AGY_STORE
+const agyStepIndex = new Map()
+const agyLateAnswers = new Map()
 /**
  * MOCK_SINGLE_SESSION=1: the CodeBuddy connection shape — one live session per
  * connection. Every `session/new` / `session/load` on this connection evicts
@@ -624,6 +638,19 @@ const app = agent({ name: 'mock-acp-agent' })
 
     const send = update => ctx.client.notify(methods.client.session.update, { sessionId, update })
     let permissionAnswer = 'none'
+
+    // agy flushes the previous turn's late answer at the START of the next
+    // prompt: replay it here, without any marker of its own (just text), so the
+    // plugin's echo guard is the only thing that can drop it.
+    const lateAnswer = agyLateAnswers.get(sessionId)
+    if (lateAnswer !== undefined && text.includes('AGY_REPLAY')) {
+      const partial = text.includes('AGY_REPLAY_PARTIAL')
+      const replay = partial ? lateAnswer.slice(0, Math.ceil(lateAnswer.length / 2)) : lateAnswer
+      await send({ sessionUpdate: 'agent_message_chunk', messageId: 'm-agy-replay', content: { type: 'text', text: replay } })
+      // The turn ends in the middle of a strict prefix of the replayed answer:
+      // the client must flush what it held instead of dropping it.
+      if (partial) return { stopReason: 'end_turn' }
+    }
 
     // Stale-cancel swallow: a prompt landing inside the cleanup window of the
     // PREVIOUS cancel is answered from that cancel — no updates, no turn.
@@ -1764,6 +1791,29 @@ const app = agent({ name: 'mock-acp-agent' })
     const imgTag = imageBlocks.length > 0 ? ` images=${String(imageBlocks.length)}` : ''
     await send({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: ` echo ${text} perm=${permissionAnswer}${pidTag}${imgTag}` } })
     await send({ sessionUpdate: 'usage_update', used: 123, size: 1000 })
+    if (AGY_STORE !== undefined && text.includes('AGY_LATE')) {
+      // The late answer lands only in agy's own transcript, after the response.
+      const answer = `AGY-LATE-ANSWER ${text}`
+      agyLateAnswers.set(sessionId, answer)
+      const stepIndex = (agyStepIndex.get(sessionId) ?? 0) + 1
+      agyStepIndex.set(sessionId, stepIndex)
+      setTimeout(() => {
+        try {
+          const dir = join(AGY_STORE, 'brain', sessionId, '.system_generated', 'logs')
+          mkdirSync(dir, { recursive: true })
+          const line = JSON.stringify({
+            step_index: stepIndex,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            created_at: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+            content: answer,
+          })
+          appendFileSync(join(dir, 'transcript_full.jsonl'), `${line}\n`)
+        } catch {
+          // Best effort: a transcript write never changes the agent's answer.
+        }
+      }, 1000)
+    }
     return { stopReason: 'end_turn' }
   })
 

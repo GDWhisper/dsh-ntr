@@ -582,6 +582,40 @@ export class SubagentService {
   }
 
   /**
+   * Hand an answer Antigravity finished AFTER its turn closed to the chat plane
+   * (see `docs/plan/antigravity-late-output.md`). Unlike an idle drain report,
+   * this text never reached the transcript view of a turn: the agent will
+   * replay it on the next prompt, which is why the delivery also records
+   * {@link LiveSession.pendingLateEcho}.
+   *
+   * Returns whether the wake was handed to a host chat agent. Every "no" is a
+   * legitimate refusal — a closed / released / busy session, no chat identity
+   * (`/acp`, headless, an unmounted resolver), or an empty answer — and the
+   * answer is still in the transcript file.
+   */
+  deliverLateReport(session: LiveSession, text: string): boolean {
+    if (session.closed || session.released) return false
+    if (session.running || session.promptInFlight === true) return false
+    const agent = this.wakeAgentFor(session)
+    if (agent === undefined) return false
+    if (text.trim() === '') return false
+    const clipped = text.length > BACKGROUND_REPORT_MAX
+      ? `${text.slice(0, BACKGROUND_REPORT_MAX)}\n[truncated by dsh-ntr: late output exceeded ${String(BACKGROUND_REPORT_MAX)} characters]`
+      : text
+    const record = { text: clipped, at: Date.now() }
+    session.pendingLateEcho = record
+    this.wakeChatWithBackgroundReport(session, agent, clipped, {
+      lateOutput: true,
+      onFailure: () => {
+        // Object identity, not the slot: a late failure must not clear the
+        // NEXT late answer's record.
+        if (session.pendingLateEcho === record) session.pendingLateEcho = undefined
+      },
+    })
+    return true
+  }
+
+  /**
    * Drop one report record — its timer, and the session slot only when the
    * slot still holds THIS record (a newer run's record must survive).
    */
@@ -617,14 +651,26 @@ export class SubagentService {
    * A host without the chat agent never reaches this method (the report stays
    * transcript-only).
    */
-  private wakeChatWithBackgroundReport(session: LiveSession, agent: DshAgentLike, report: string): void {
+  private wakeChatWithBackgroundReport(
+    session: LiveSession,
+    agent: DshAgentLike,
+    report: string,
+    options?: { lateOutput?: boolean; onFailure?: () => void },
+  ): void {
     const wakeNotice = (error: unknown): void => {
+      // "late output" names the Antigravity transcript path, so a failure is
+      // never mistaken for a CodeBuddy drain report (constraint 29: the failure
+      // is logged; the full text still sits in the transcript file).
+      const what = options?.lateOutput === true
+        ? "the agent's late output (read from the Antigravity transcript)"
+        : 'a background report'
       this.host.hub.broadcast({
         type: 'agent/notice',
         agentId: session.agentId,
         level: 'info',
-        text: `acp: could not wake the chat for a background report: ${describeError(error)}`,
+        text: `acp: could not wake the chat for ${what}: ${describeError(error)}`,
       })
+      options?.onFailure?.()
     }
     try {
       const result = agent.followup?.({

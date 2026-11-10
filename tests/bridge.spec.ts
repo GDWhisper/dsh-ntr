@@ -12016,3 +12016,189 @@ describe('A1: codebuddy runs one agent process per conversation', () => {
   }, 40_000)
 })
 
+
+/**
+ * Antigravity transcript late output (docs/plan/antigravity-late-output.md):
+ * `agy acp` finishes work AFTER `end_turn` without sending any
+ * `session/update`. The mock writes the answer only into its own transcript, so
+ * the manager's file watch is the only way the chat can hear it, and the next
+ * prompt's replay of the same text is the only trace the adapter sees.
+ */
+describe('AGY-LATE: Antigravity transcript late output', () => {
+  function textOf(chunks: readonly StreamChunk[]): string {
+    return chunks
+      .filter((chunk): chunk is Extract<StreamChunk, { type: 'text-delta' }> => chunk.type === 'text-delta')
+      .map(chunk => chunk.text)
+      .join('')
+  }
+
+  function userText(text: string): GenerateMessage {
+    return { role: 'user', content: [{ type: 'text', text }] }
+  }
+
+  interface LateHarness {
+    manager: BridgeManager
+    events: AcpEvent[]
+    adapter: AcpLlmAdapter
+    store: string
+    prompts: string
+    workspace: string
+  }
+
+  /**
+   * A manager whose only agent is the mock, with the Antigravity seam forced on:
+   * `isAgent: () => true` plus a fixed transcript store. `MOCK_AGY_STORE` is
+   * passed through the agent definition, not the host environment.
+   */
+  function lateHarness(options: { writeTranscript?: boolean; tuning?: BridgeTuning } = {}): LateHarness {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-ntr-agy-late-'))
+    const store = join(workspace, 'store')
+    const prompts = join(workspace, 'prompts.log')
+    const hub = new EventHub()
+    const events: AcpEvent[] = []
+    hub.subscribe(event => { events.push(event) })
+    const agent: AcpAgentDef = {
+      ...def,
+      id: 'agy-late',
+      cwd: workspace,
+      allowedCwdRoots: [workspace],
+      env: {
+        ...(options.writeTranscript === false ? {} : { MOCK_AGY_STORE: store }),
+        MOCK_PROMPT_LOG: prompts,
+      },
+    }
+    const manager = new BridgeManager(
+      [agent],
+      hub,
+      500,
+      undefined,
+      undefined,
+      false,
+      {
+        startupTimeoutMs: 3_000,
+        idleTimeoutMs: 60_000,
+        agyLateOutputPollMs: 25,
+        agyLateOutputQuietMs: 40,
+        agyLateOutputMaxMs: 5_000,
+        agyLateOutputEchoMs: 60_000,
+        ...options.tuning,
+      },
+      { isAgent: () => true, storeRoot: () => store },
+    )
+    return { manager, events, adapter: new AcpLlmAdapter(manager), store, prompts, workspace }
+  }
+
+  const cleanups: Array<() => Promise<void>> = []
+  afterAll(async () => {
+    for (const cleanup of cleanups.splice(0)) await cleanup()
+  })
+
+  function harnessWithResolver(dshSessionId: string, wakes: GenerateMessage[]): { harness: LateHarness; cleanup: () => Promise<void> } {
+    const harness = lateHarness()
+    harness.manager.setDshAgentResolver(id => id === dshSessionId
+      ? { session: { id: dshSessionId }, followup: message => { wakes.push(message as GenerateMessage) } }
+      : undefined)
+    const cleanup = async (): Promise<void> => {
+      await harness.manager.shutdownAll()
+      rmSync(harness.workspace, { recursive: true, force: true })
+    }
+    cleanups.push(cleanup)
+    return { harness, cleanup }
+  }
+
+  function promptCount(path: string): number {
+    if (!existsSync(path)) return 0
+    const text = readFileSync(path, 'utf8')
+    return text === '' ? 0 : text.trimEnd().split('\n').length
+  }
+
+  async function firstLateTurn(harness: LateHarness, dshSessionId: string, text = 'AGY_LATE please'): Promise<string> {
+    const { chunks } = await hostLoopTurn(harness.adapter, {
+      provider: 'acp',
+      model: 'agy-late',
+      sessionId: dshSessionId,
+      messages: [userText(text)],
+    })
+    return textOf(chunks)
+  }
+
+  /** The host step that answers the injected wake: it replays the report locally. */
+  async function wakeStep(harness: LateHarness, dshSessionId: string, messages: GenerateMessage[]): Promise<string> {
+    const chunks: StreamChunk[] = []
+    for await (const chunk of harness.adapter.stream({ provider: 'acp', model: 'agy-late', sessionId: dshSessionId, messages })) {
+      chunks.push(chunk)
+    }
+    return textOf(chunks)
+  }
+
+  it('delivers a post-turn answer once, without sending a second prompt', async () => {
+    const dshSessionId = 'dsh-agy-late-deliver'
+    const wakes: GenerateMessage[] = []
+    const { harness } = harnessWithResolver(dshSessionId, wakes)
+    const first = await firstLateTurn(harness, dshSessionId)
+    expect(first).toContain('MOCK: echo AGY_LATE please')
+
+    await until(() => wakes.length === 1, 10_000)
+    const wake = wakes[0]
+    expect(wake?.role).toBe('user')
+    expect(wake?.source?.kind).toBe(BACKGROUND_REPORT_SOURCE)
+    expect(wake?.source?.form).toBe(BACKGROUND_REPORT_FORM)
+    expect(String(wake?.source?.report)).toContain('AGY-LATE-ANSWER AGY_LATE please')
+    // The watch delivered; the agent itself saw exactly ONE prompt.
+    expect(promptCount(harness.prompts)).toBe(1)
+  }, 30_000)
+
+  it('does not wake while the next user turn is still running', async () => {
+    const dshSessionId = 'dsh-agy-late-busy'
+    const wakes: GenerateMessage[] = []
+    const { harness } = harnessWithResolver(dshSessionId, wakes)
+    await firstLateTurn(harness, dshSessionId)
+    // A slow turn is on air when the transcript line lands one second later:
+    // the backlog belongs to that turn, so the watch must stand down.
+    const { chunks } = await hostLoopTurn(harness.adapter, {
+      provider: 'acp',
+      model: 'agy-late',
+      sessionId: dshSessionId,
+      messages: [userText('HANG_DELAY:1500 AGY_BUSY please')],
+    })
+    expect(textOf(chunks)).toContain('MOCK: echo HANG_DELAY:1500 AGY_BUSY please')
+    // Give the (disarmed) watch's poll cadence room to prove it delivers nothing.
+    await new Promise(resolve => setTimeout(resolve, 400))
+    expect(wakes).toHaveLength(0)
+  }, 30_000)
+
+  it('stops the watch when the session is closed', async () => {
+    const dshSessionId = 'dsh-agy-late-closed'
+    const wakes: GenerateMessage[] = []
+    const { harness } = harnessWithResolver(dshSessionId, wakes)
+    await firstLateTurn(harness, dshSessionId)
+    const listed = await dispatchRpc(harness.manager, 'sessions/list', {})
+    expect(listed.ok).toBe(true)
+    const acpSessionId = listed.ok ? (listed.value as { sessions: Array<{ sessionId: string }> }).sessions[0]?.sessionId : undefined
+    expect(acpSessionId).toBeDefined()
+    if (acpSessionId === undefined) return
+    const closed = await dispatchRpc(harness.manager, 'session/close', { sessionId: acpSessionId })
+    expect(closed.ok).toBe(true)
+    await new Promise(resolve => setTimeout(resolve, 1_600))
+    expect(wakes).toHaveLength(0)
+  }, 30_000)
+
+  it('reads a missing transcript without waking or flooding notices', async () => {
+    const dshSessionId = 'dsh-agy-late-missing'
+    const wakes: GenerateMessage[] = []
+    const harness = lateHarness({ writeTranscript: false })
+    harness.manager.setDshAgentResolver(id => id === dshSessionId
+      ? { session: { id: dshSessionId }, followup: message => { wakes.push(message as GenerateMessage) } }
+      : undefined)
+    cleanups.push(async () => {
+      await harness.manager.shutdownAll()
+      rmSync(harness.workspace, { recursive: true, force: true })
+    })
+    await firstLateTurn(harness, dshSessionId)
+    await new Promise(resolve => setTimeout(resolve, 1_200))
+    expect(wakes).toHaveLength(0)
+    expect(harness.events.filter(event => event.type === 'agent/notice')).toHaveLength(0)
+  }, 30_000)
+
+
+})

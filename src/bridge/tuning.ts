@@ -23,4 +23,9 @@ export const DEFAULT_TUNING: Required<BridgeTuning> = {
   backgroundParkedGraceMs: 30_000,
   ambientStaleMs: 300_000,
   backgroundHoldWorkerPhase: false,
+  agyLateOutput: true,
+  agyLateOutputPollMs: 1_000,
+  agyLateOutputQuietMs: 1_500,
+  agyLateOutputMaxMs: 600_000,
+  agyLateOutputEchoMs: 600_000,
 }
