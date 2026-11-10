@@ -3,6 +3,7 @@ import { apply, inject, name } from '../src/index.ts'
 import { ACP_TOOL_CALL_NAME, acpToolCallFromUpdate } from '../src/impl.ts'
 
 function fakeCtx() {
+  const listeners: Record<string, Array<(...args: unknown[]) => unknown>> = {}
   return {
     webServer: {},
     connection: {
@@ -13,10 +14,17 @@ function fakeCtx() {
       if (typeof fn === 'function') (fn as () => unknown)()
       return fn
     }),
+    on: vi.fn((name: string, listener: (...args: unknown[]) => unknown) => {
+      (listeners[name] ??= []).push(listener)
+      return () => { /* the plugin owns no listener state */ }
+    }),
+    listeners,
   } as unknown as {
     webServer: object
     connection: { rpc: { handle: ReturnType<typeof vi.fn> }; fetch: { register: ReturnType<typeof vi.fn> } }
     effect: ReturnType<typeof vi.fn>
+    on: ReturnType<typeof vi.fn>
+    listeners: Record<string, Array<(...args: unknown[]) => unknown>>
   }
 }
 
@@ -36,6 +44,43 @@ describe('host plugin contract', () => {
       methods: ['GET'],
     }))
     expect(ctx.effect).toHaveBeenCalled()
+  })
+
+  it('wires archive admission and archive writes as event listeners, never polling', () => {
+    const ctx = fakeCtx()
+    apply(ctx as never, { agents: [{ id: 'a', command: 'x' }] })
+    // The host's registry asks providers before an archive and emits the
+    // workspace-domain write afterwards; both are plain Cordis events.
+    expect(ctx.on.mock.calls.map(call => call[0])).toEqual(expect.arrayContaining([
+      'workspace/session-activity',
+      'workspace/session-stop',
+      'domain/changed',
+    ]))
+  })
+
+  it('answers archive admission with the next result when the plugin has no work', async () => {
+    const ctx = fakeCtx()
+    apply(ctx as never, { agents: [{ id: 'a', command: 'x' }] })
+    const listener = ctx.listeners['workspace/session-activity']?.[0]
+    expect(listener).toBeDefined()
+    // A conversation this plugin never served adds nothing of its own.
+    const rest = [{ kind: 'turn' }]
+    await expect(Promise.resolve(listener!({ sessionId: 'dsh-cold' }, async () => rest))).resolves.toEqual(rest)
+  })
+
+  it('ignores a domain write that is not the workspace archive set', () => {
+    const ctx = fakeCtx()
+    apply(ctx as never, { agents: [{ id: 'a', command: 'x' }] })
+    const listener = ctx.listeners['domain/changed']?.[0]
+    expect(listener).toBeDefined()
+    expect(() => listener!({ domain: 'session', table: '', key: '', operation: 'put', value: {} })).not.toThrow()
+    expect(() => listener!(undefined)).not.toThrow()
+  })
+
+  it('keeps archiving alive on a runtime without the archive event face', () => {
+    const ctx = fakeCtx()
+    delete (ctx as unknown as { on?: unknown }).on
+    expect(() => apply(ctx as never, { agents: [{ id: 'a', command: 'x' }] })).not.toThrow()
   })
 
   it('prefers the owner-explicit channel register when the runtime Connection service exposes it', () => {

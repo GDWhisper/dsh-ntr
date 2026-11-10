@@ -10,6 +10,8 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { ConnectionRpcHandler, HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
 import { ACP_PRESET_ID, AcpLlmAdapter, BridgeManager, PLUGIN_VERSION, type DshAgentLike } from './bridge.ts'
 import { appendExternalSubagentCatalog, EventHub, dispatchRpc, permissionReplayFrames, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
+import { ArchiveReleaseTracker, archiveActivityFrames } from './archive-release.ts'
+import type { SessionActivityLike } from './archive-release.ts'
 import { AcpSaveGate } from './save-gate.ts'
 import { installHmrReconcileGuard } from './hmr-guard.ts'
 import type { AcpEvent, ApprovalDeadlineKey } from './protocol.ts'
@@ -42,6 +44,15 @@ interface ChannelRegisteringConnection extends HostConnectionHandle {
 /** Structural view of the host session store (`@deepseek-ai/dsh-session`'s `ctx.sessions`). */
 interface SessionsLike {
   get(sessionId: string): SessionCatalogLike | undefined
+}
+
+/**
+ * Structural view of the host's archive-admission event face
+ * (`@deepseek-ai/dsh-workspace` emits these on Cordis). Only `on` is needed:
+ * a runtime without it keeps archiving, and only the release is skipped.
+ */
+interface HostArchiveEventsLike {
+  on?(name: string, listener: (...args: unknown[]) => unknown): (() => void) | void
 }
 
 /**
@@ -137,6 +148,83 @@ export function apply(ctx: Context, config?: unknown): void {
     saveGate.dispose()
     manager.setSaveGate(undefined)
   }, 'dsh-ntr: save gate teardown')
+
+  /**
+   * Archive release: the host's workspace registry asks every provider whether
+   * a conversation still has work before archiving it, and writes the archive
+   * set into the `workspace` domain afterwards. That write is the ONLY signal
+   * a plain (idle) archive produces, so the plugin drains its pending releases
+   * from it instead of polling the sidebar.
+   *
+   * The event face is structural: `@deepseek-ai/dsh-workspace` is not a
+   * dependency, and a host without these events keeps archiving exactly as
+   * before — only the release is skipped.
+   */
+  const archiveReleases = new ArchiveReleaseTracker({
+    release: dshSessionId => manager.releaseArchivedSession(dshSessionId),
+  })
+  ctx.effect(() => {
+    const events = ctx as unknown as HostArchiveEventsLike
+    if (typeof events.on !== 'function') return () => { archiveReleases.dispose() }
+    const disposers: Array<() => void> = []
+    const listen = (name: string, listener: (...args: unknown[]) => unknown): void => {
+      try {
+        const dispose = events.on?.(name, listener)
+        if (typeof dispose === 'function') disposers.push(dispose)
+      } catch {
+        // An unusable event face is no better than none: archiving still works.
+      }
+    }
+    // Archive admission: answer with the host's own `turn` family while this
+    // conversation has an ACP turn, an unanswered prompt or a pending approval.
+    listen('workspace/session-activity', async (...args: unknown[]) => {
+      const request = args[0] as { sessionId?: unknown } | undefined
+      const next = args[1]
+      // Do not swallow a failing downstream provider: an error there means the
+      // activity is unknown, and reporting "none" would let the archive proceed.
+      const rest: readonly SessionActivityLike[] = typeof next === 'function'
+        ? await (next as () => Promise<readonly SessionActivityLike[]>)()
+        : []
+      if (typeof request?.sessionId !== 'string') return rest
+      try {
+        return archiveActivityFrames(manager.archiveActivityFacts(request.sessionId).length > 0, rest)
+      } catch {
+        return rest
+      }
+    })
+    // "Stop and archive": the archive write is already durable, so the turn is
+    // cancelled without waiting for the agent to acknowledge it.
+    listen('workspace/session-stop', (...args: unknown[]) => {
+      const request = args[0] as { sessionId?: unknown } | undefined
+      if (typeof request?.sessionId !== 'string') return
+      try { manager.cancelArchivedSession(request.sessionId) } catch { /* never break the host's stop */ }
+    })
+    // The archive set is a workspace-domain global write; anything else is not ours.
+    listen('domain/changed', (...args: unknown[]) => {
+      try { archiveReleases.onDomainChange(args[0]) } catch { /* never break the host's write */ }
+    })
+    // Draining is event-driven: every frame that can mean "work settled" asks
+    // the tracker again. No timer, no interval.
+    //
+    // `turn/end` is broadcast BEFORE the turn clears `running` (the turn stream
+    // announces the boundary first and flips the flag after), so a synchronous
+    // pump would read the just-finished turn as busy. A microtask runs after
+    // that synchronous tail, and the timeout path of an archive never waits on
+    // it: the next frame simply finds the pending id gone.
+    const unsubscribe = hub.subscribe(event => {
+      if (event.type === 'turn/end'
+        || event.type === 'session/released'
+        || event.type === 'session/closed'
+        || event.type === 'agent/status') queueMicrotask(() => { archiveReleases.pump() })
+    })
+    return () => {
+      unsubscribe()
+      for (const dispose of disposers) {
+        try { dispose() } catch { /* teardown must continue */ }
+      }
+      archiveReleases.dispose()
+    }
+  }, 'dsh-ntr: archive release')
 
   /**
    * Hot-reload guard (Q): wrap the HMR service's public `reconcileProfile`.

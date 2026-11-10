@@ -4950,6 +4950,153 @@ describe('idle release (isolated manager)', () => {
       await manager.shutdownAll()
     }
   }, 30_000)
+
+  /** The agent_message_chunk text of one session's transcript, joined. */
+  function transcriptText(manager: BridgeManager, sessionId: string): string {
+    const { entries } = manager.transcript(sessionId, undefined)
+    return (entries as Array<{ update: Record<string, unknown> }>)
+      .filter(entry => entry.update.sessionUpdate === 'agent_message_chunk')
+      .map(entry => String((entry.update.content as { text?: string }).text ?? ''))
+      .join('')
+  }
+
+  it('releases an archived idle conversation and resumes it on the next prompt', async () => {
+    const { events, manager } = idleManager('archive-idle', { idleTimeoutMs: 60_000 })
+    try {
+      const session = await manager.getOrCreateDshSession('dsh-archive-idle', 'archive-idle')
+      const sessionId = session.sessionId
+      expect(manager.agentViews()[0]).toMatchObject({ state: 'ready', liveSessions: [sessionId] })
+
+      // Archiving a QUIET conversation is the idle park: the process goes away
+      // and the record stays resumable. If this returned `busy` or `none`, the
+      // host's archive waterfall would either retry forever or report a
+      // release it never performed.
+      expect(manager.releaseArchivedSession('dsh-archive-idle')).toBe('released')
+      expect(manager.agentViews()[0]).toMatchObject({ state: 'stopped', liveSessions: [] })
+      // The record itself is what the browser renders as "parked": losing it
+      // would make the archive indistinguishable from a deleted conversation.
+      expect(manager.chatSessions('dsh-archive-idle')).toMatchObject([{ sessionId, released: true }])
+      // The cause is load-bearing: the runtime log names WHY a process left,
+      // and only `archived` tells the user this was the archive gesture.
+      expect(events.filter(event => event.type === 'session/released' && event.sessionId === sessionId))
+        .toMatchObject([{ cause: 'archived', reason: 'archived chat session' }])
+
+      // Park ≠ destroy: the next message must reload the same conversation on
+      // a fresh child, with its history replayed rather than started over.
+      await manager.prompt(sessionId, 'back again')
+      expect(await waitUntil(() => events.some(event => event.type === 'turn/end'
+        && event.sessionId === sessionId && event.stopReason === 'end_turn'))).toBe(true)
+      expect(manager.agentViews()[0]?.liveSessions).toEqual([sessionId])
+      expect(manager.chatSessions('dsh-archive-idle')[0]?.released).toBeFalsy()
+      expect(transcriptText(manager, sessionId)).toContain('REPLAYED: earlier conversation')
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
+  it('reports an active turn as archive activity and clears it after settle', async () => {
+    const { events, manager } = idleManager('archive-active', { idleTimeoutMs: 60_000 })
+    try {
+      const session = await manager.getOrCreateDshSession('dsh-archive-active', 'archive-active')
+      // HANG_DELAY keeps `session/prompt` on air without any output, so the
+      // facts are read while the turn is demonstrably still the agent's work.
+      await manager.prompt(session.sessionId, 'HANG_DELAY:900')
+      expect(manager.archiveActivityFacts('dsh-archive-active')).toMatchObject([{ acpSessionId: session.acpSessionId }])
+
+      // Once the turn settles the same query must go empty: a stale fact would
+      // make every later archive attempt report `busy` forever.
+      expect(await waitUntil(() => events.some(event => event.type === 'turn/end'
+        && event.sessionId === session.sessionId && event.stopReason === 'end_turn'))).toBe(true)
+      expect(manager.archiveActivityFacts('dsh-archive-active')).toEqual([])
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
+  it('keeps the archive release pending while a sibling conversation runs', async () => {
+    const { events, manager } = idleManager('archive-sibling', { idleTimeoutMs: 60_000 })
+    try {
+      // Both conversations ride ONE agent-wide process (the mock is not a
+      // per-session agent), so releasing either one kills the other's work.
+      const idle = await manager.getOrCreateDshSession('dsh-archive-sib-idle', 'archive-sibling')
+      const busy = await manager.getOrCreateDshSession('dsh-archive-sib-busy', 'archive-sibling')
+      expect([...(manager.agentViews()[0]?.liveSessions ?? [])].sort())
+        .toEqual([idle.sessionId, busy.sessionId].sort())
+
+      await manager.prompt(busy.sessionId, 'HANG_DELAY:900')
+      // `busy` rather than a silent park: the host retries later, and the turn
+      // the sibling still owns is not lost to a teardown it never agreed to.
+      expect(manager.releaseArchivedSession('dsh-archive-sib-idle')).toBe('busy')
+      expect(manager.agentViews()[0]?.state).toBe('ready')
+
+      expect(await waitUntil(() => events.some(event => event.type === 'turn/end'
+        && event.sessionId === busy.sessionId && event.stopReason === 'end_turn'))).toBe(true)
+      expect(manager.releaseArchivedSession('dsh-archive-sib-idle')).toBe('released')
+      expect(manager.agentViews()[0]?.state).toBe('stopped')
+      // `releaseAll` parks every session of the process, not only the archived
+      // one: both records must stay resumable after the shared child disappears.
+      expect(manager.chatSessions('dsh-archive-sib-idle')).toMatchObject([{ released: true }])
+      expect(manager.chatSessions('dsh-archive-sib-busy')).toMatchObject([{ released: true }])
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
+  it('refuses an archive release for an agent that cannot reload a parked session', async () => {
+    const { events, manager } = idleManager('archive-no-load', { idleTimeoutMs: 60_000 }, { env: { MOCK_NO_LOAD: '1' } })
+    try {
+      const session = await manager.getOrCreateDshSession('dsh-archive-no-load', 'archive-no-load')
+      // Without `session/load` the park would destroy the conversation instead
+      // of shelving it, so the conservative verdict is `unsupported` — and the
+      // process must be left alone rather than torn down first.
+      expect(manager.releaseArchivedSession('dsh-archive-no-load')).toBe('unsupported')
+      expect(manager.agentViews()[0]).toMatchObject({ state: 'ready', liveSessions: [session.sessionId] })
+      // No frame means the browser was never told the session is parked.
+      expect(events.some(event => event.type === 'session/released')).toBe(false)
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
+  it('archiving an already released conversation emits no second frame', async () => {
+    const { events, manager } = idleManager('archive-twice', { idleTimeoutMs: 60_000 })
+    try {
+      const session = await manager.getOrCreateDshSession('dsh-archive-twice', 'archive-twice')
+      expect(manager.releaseArchivedSession('dsh-archive-twice')).toBe('released')
+      // The parked record already satisfies the request; a retry is a no-op.
+      // A second `session/released` frame would make the runtime log claim two
+      // releases for one teardown and could re-trigger the browser's release
+      // banner for a conversation that never moved.
+      expect(manager.releaseArchivedSession('dsh-archive-twice')).toBe('released')
+      expect(events.filter(event => event.type === 'session/released' && event.sessionId === session.sessionId))
+        .toHaveLength(1)
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
+  it('cancels an archived running turn and releases it once the turn settles', async () => {
+    const { events, manager } = idleManager('archive-cancel', { idleTimeoutMs: 60_000 })
+    try {
+      const session = await manager.getOrCreateDshSession('dsh-archive-cancel', 'archive-cancel')
+      // `SLOW` keeps the agent waiting for a cancel (unlike `HANG_DELAY`, which
+      // completes on its own), so this turn can only end through the stop
+      // gesture — exactly the path an archive takes on a running conversation.
+      await manager.prompt(session.sessionId, 'SLOW please')
+      // The archive write can land while the turn is still owed: the release
+      // must wait, and the host's stop gesture is what ends that turn first.
+      expect(manager.releaseArchivedSession('dsh-archive-cancel')).toBe('busy')
+      manager.cancelArchivedSession('dsh-archive-cancel')
+      expect(await waitUntil(() => events.some(event => event.type === 'turn/end'
+        && event.sessionId === session.sessionId && event.stopReason === 'cancelled'))).toBe(true)
+      // Once the turn is over the next drain parks the conversation — this is
+      // the sequence the wiring performs on the turn/end frame.
+      expect(manager.releaseArchivedSession('dsh-archive-cancel')).toBe('released')
+      expect(manager.chatSessions('dsh-archive-cancel')).toMatchObject([{ released: true }])
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
 })
 
 describe('prompt slot (isolated manager)', () => {

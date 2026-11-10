@@ -692,6 +692,21 @@ export class AgentBridge {
     return this.sessions.size === 0 || this.initResult?.agentCapabilities?.loadSession === true
   }
 
+  /** Whether the agent advertises `session/load`, i.e. a parked session can come back. */
+  supportsSessionLoad(): boolean {
+    return this.initResult?.agentCapabilities?.loadSession === true
+  }
+
+  /**
+   * Archive release is the same park as an idle release, but it may fire while
+   * the conversation is quiet even if OTHER conversations on this process are
+   * live. It never fires while any work is outstanding, and never for an agent
+   * that cannot reload a parked session.
+   */
+  canReleaseForArchive(): boolean {
+    return this.state === 'ready' && this.supportsSessionLoad() && !this.hasActiveWork(false)
+  }
+
   /**
    * Memoized spawn + `initialize`; failures reset so the next call can retry.
    *

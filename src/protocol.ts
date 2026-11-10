@@ -348,10 +348,10 @@ export interface AgentView {
 
 /**
  * Why the host released a session's agent process. The browser turns this into
- * one runtime-log line per cause; `idle` and `shutdown` stay silent (both are
- * expected lifecycle transitions, not faults).
+ * one runtime-log line per cause; `idle`, `shutdown` and `archived` stay silent
+ * (expected lifecycle transitions or a user gesture, not faults).
  */
-export type AcpReleaseCause = 'idle' | 'workspace' | 'resume-failed' | 'stalled' | 'died' | 'shutdown'
+export type AcpReleaseCause = 'idle' | 'workspace' | 'resume-failed' | 'stalled' | 'died' | 'shutdown' | 'archived'
 
 /** One ACP turn currently owed by an agent; the save gate reports these while deciding a profile write. */
 export interface ActiveTurnView {

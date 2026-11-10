@@ -3715,8 +3715,9 @@ export class AcpStore {
         // the agent tag's live halo keeps breathing for a process that is gone:
         // nothing else re-reads this list until the next turn settles.
         const chatSessions = withSessionReleased(this.state.chatSessions, event.sessionId, true)
-        // One runtime-log line per release cause; `idle` stays silent on
-        // purpose (an expected lifecycle transition, not a fault).
+        // One runtime-log line per release cause; `idle` and `archived` stay
+        // silent on purpose (an expected lifecycle transition or the user's own
+        // archive gesture, not a fault).
         const cause = event.cause ?? 'died'
         let log: Partial<Pick<UiState, 'logs' | 'logUnread'>> = {}
         if (cause === 'workspace') {
