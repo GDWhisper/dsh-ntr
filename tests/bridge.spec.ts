@@ -12200,5 +12200,94 @@ describe('AGY-LATE: Antigravity transcript late output', () => {
     expect(harness.events.filter(event => event.type === 'agent/notice')).toHaveLength(0)
   }, 30_000)
 
+  it('swallows the replayed old answer once and keeps the new one', async () => {
+    const dshSessionId = 'dsh-agy-late-replay'
+    const wakes: GenerateMessage[] = []
+    const { harness } = harnessWithResolver(dshSessionId, wakes)
+    const first = await firstLateTurn(harness, dshSessionId)
+    await until(() => wakes.length === 1, 10_000)
+    const wake = wakes[0]
+    expect(wake).toBeDefined()
+    if (wake === undefined) return
+    const replayed = await wakeStep(harness, dshSessionId, [userText('AGY_LATE please'), wake])
+    expect(replayed).toContain('AGY-LATE-ANSWER AGY_LATE please')
+    // The guard only applies to a turn that began AFTER the delivery was
+    // recorded, and a real person never sends inside the same millisecond.
+    await new Promise(resolve => setTimeout(resolve, 5))
 
+    const next = await hostLoopTurn(harness.adapter, {
+      provider: 'acp',
+      model: 'agy-late',
+      sessionId: dshSessionId,
+      messages: [userText('AGY_REPLAY please')],
+    })
+    const answered = textOf(next.chunks)
+    expect(answered).toContain('MOCK: echo AGY_REPLAY please')
+    expect(answered).not.toContain('AGY-LATE-ANSWER')
+    // The old answer is on screen exactly once: in the wake step, never again.
+    const all = `${first}${replayed}${answered}`
+    expect(all.split('AGY-LATE-ANSWER').length - 1).toBe(1)
+    // The replayed tool frame opened no second card either.
+    const cardIds = next.chunks
+      .filter((chunk): chunk is Extract<StreamChunk, { type: 'tool-call-delta' }> => chunk.type === 'tool-call-delta')
+      .map(chunk => chunk.id)
+    expect(cardIds).not.toContain('call_1')
+    expect(promptCount(harness.prompts)).toBe(2)
+  }, 30_000)
+
+  it('flushes a held echo prefix when the turn ends mid-prefix', async () => {
+    const dshSessionId = 'dsh-agy-late-partial'
+    const wakes: GenerateMessage[] = []
+    const { harness } = harnessWithResolver(dshSessionId, wakes)
+    await firstLateTurn(harness, dshSessionId)
+    await until(() => wakes.length === 1, 10_000)
+    const wake = wakes[0]
+    if (wake === undefined) return
+    const replayed = await wakeStep(harness, dshSessionId, [userText('AGY_LATE please'), wake])
+    expect(replayed).toContain('AGY-LATE-ANSWER')
+    await new Promise(resolve => setTimeout(resolve, 5))
+
+    const { chunks } = await hostLoopTurn(harness.adapter, {
+      provider: 'acp',
+      model: 'agy-late',
+      sessionId: dshSessionId,
+      messages: [userText('AGY_REPLAY_PARTIAL please')],
+    })
+    const answered = textOf(chunks)
+    // The mock ends the turn after the first half of the replayed answer: the
+    // strict prefix the guard held must be emitted, never dropped.
+    expect(answered).toContain('AGY-LATE-ANSWER ')
+    expect(answered.split('AGY-LATE-ANSWER').length - 1).toBe(1)
+  }, 30_000)
+
+  it('leaves lateEcho unset when a real user message outranks the wake', async () => {
+    const dshSessionId = 'dsh-agy-late-skipped'
+    const wakes: GenerateMessage[] = []
+    const { harness } = harnessWithResolver(dshSessionId, wakes)
+    await firstLateTurn(harness, dshSessionId)
+    await until(() => wakes.length === 1, 10_000)
+    const wake = wakes[0]
+    if (wake === undefined) return
+    // The person spoke again after the wake was queued: the FIFO skips it, so
+    // the report never reaches the plane and its echo must not be swallowed.
+    const skipped = await hostLoopTurn(harness.adapter, {
+      provider: 'acp',
+      model: 'agy-late',
+      sessionId: dshSessionId,
+      messages: [userText('AGY_LATE please'), wake, userText('AGY_INSERTED please')],
+    })
+    const skippedText = textOf(skipped.chunks)
+    expect(skippedText).toContain('MOCK: echo AGY_INSERTED please')
+    expect(skippedText).not.toContain('AGY-LATE-ANSWER')
+
+    const { chunks } = await hostLoopTurn(harness.adapter, {
+      provider: 'acp',
+      model: 'agy-late',
+      sessionId: dshSessionId,
+      messages: [userText('AGY_REPLAY please')],
+    })
+    const answered = textOf(chunks)
+    expect(answered).toContain('AGY-LATE-ANSWER AGY_LATE please')
+    expect(answered).toContain('MOCK: echo AGY_REPLAY please')
+  }, 30_000)
 })

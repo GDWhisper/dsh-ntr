@@ -16,6 +16,7 @@ import {
   parseTranscriptStep,
   type TranscriptStep,
 } from '../src/bridge/agy-transcript.ts'
+import { applyEchoGuard } from '../src/bridge/turn-stream.ts'
 import type { AcpAgentDef } from '../src/protocol.ts'
 
 function agentDef(args: string[], command = '/usr/local/bin/agy'): AcpAgentDef {
@@ -253,5 +254,50 @@ describe('incremental transcript tail', () => {
     const steps = tail.readNew()
     expect(steps.map(item => item.stepIndex)).toEqual([9])
     expect(tail.lastStepIndex).toBe(9)
+  })
+})
+
+describe('echo guard', () => {
+  const late = 'the whole late answer'
+
+  it('holds every strict prefix and emits nothing', () => {
+    expect(applyEchoGuard(late, '', 'the whole')).toEqual({ kind: 'hold', buffer: 'the whole' })
+    expect(applyEchoGuard(late, 'the whole', ' late')).toEqual({ kind: 'hold', buffer: 'the whole late' })
+  })
+
+  it('swallows a chunk that ends exactly on the late answer', () => {
+    expect(applyEchoGuard(late, 'the whole late ', 'answer')).toEqual({ kind: 'swallow', buffer: '' })
+    // The whole answer in ONE chunk is the same case.
+    expect(applyEchoGuard(late, '', late)).toEqual({ kind: 'swallow', buffer: '' })
+  })
+
+  it('releases only the new tail when the old answer is a prefix', () => {
+    expect(applyEchoGuard(late, '', `${late} and the new answer`)).toEqual({
+      kind: 'release',
+      buffer: '',
+      emit: ' and the new answer',
+    })
+    expect(applyEchoGuard(late, 'the whole', ' late answer plus more')).toEqual({
+      kind: 'release',
+      buffer: '',
+      emit: ' plus more',
+    })
+  })
+
+  it('fails open on a mismatch instead of eating a real answer', () => {
+    expect(applyEchoGuard(late, '', 'a completely different answer')).toEqual({
+      kind: 'mismatch',
+      buffer: '',
+      emit: 'a completely different answer',
+    })
+    expect(applyEchoGuard(late, 'the whole', ' odd turn')).toEqual({
+      kind: 'mismatch',
+      buffer: '',
+      emit: 'the whole odd turn',
+    })
+  })
+
+  it('treats an empty chunk while holding as another hold', () => {
+    expect(applyEchoGuard(late, 'the ', '')).toEqual({ kind: 'hold', buffer: 'the ' })
   })
 })
