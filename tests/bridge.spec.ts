@@ -12171,7 +12171,27 @@ describe('AGY-LATE: Antigravity transcript late output', () => {
     const dshSessionId = 'dsh-agy-late-closed'
     const wakes: GenerateMessage[] = []
     const { harness } = harnessWithResolver(dshSessionId, wakes)
+    // Observability only (AgyLateOutputService.armedCount): the watch is on
+    // the map, and the transcript file it observes is the mock's existing one.
+    const lateOutput = (harness.manager as unknown as {
+      lateOutput: { armedCount: number; disarm(session: unknown): void }
+    }).lateOutput
+    const armed = (): number => lateOutput.armedCount
     await firstLateTurn(harness, dshSessionId)
+    expect(armed()).toBe(1)
+    // The service's own `disarm` is the same table withdrawal `arm` uses when
+    // a new turn supersedes the previous watch; a no-op here would make BOTH
+    // paths lie to the map.
+    const sessions = [...(harness.manager as unknown as {
+      registry: { sessions(): Iterable<unknown> }
+    }).registry.sessions()]
+    const session = sessions[0]
+    expect(session).toBeDefined()
+    if (session === undefined) return
+    lateOutput.disarm(session)
+    expect(armed()).toBe(0)
+    harness.manager.armLateOutputWatch(session as never, Date.now())
+    expect(armed()).toBe(1)
     const listed = await dispatchRpc(harness.manager, 'sessions/list', {})
     expect(listed.ok).toBe(true)
     const acpSessionId = listed.ok ? (listed.value as { sessions: Array<{ sessionId: string }> }).sessions[0]?.sessionId : undefined
@@ -12179,6 +12199,9 @@ describe('AGY-LATE: Antigravity transcript late output', () => {
     if (acpSessionId === undefined) return
     const closed = await dispatchRpc(harness.manager, 'session/close', { sessionId: acpSessionId })
     expect(closed.ok).toBe(true)
+    // The teardown really withdrew the watch, not merely silenced it.
+    expect(armed()).toBe(0)
+    // The mock appends its late answer anyway; a withdrawn watch must not wake.
     await new Promise(resolve => setTimeout(resolve, 1_600))
     expect(wakes).toHaveLength(0)
   }, 30_000)
@@ -12195,6 +12218,9 @@ describe('AGY-LATE: Antigravity transcript late output', () => {
       rmSync(harness.workspace, { recursive: true, force: true })
     })
     await firstLateTurn(harness, dshSessionId)
+    // Neither transcript candidate exists: nothing is armed (a tail built on a
+    // missing file would replay the whole history once the file appeared).
+    expect((harness.manager as unknown as { lateOutput: { armedCount: number } }).lateOutput.armedCount).toBe(0)
     await new Promise(resolve => setTimeout(resolve, 1_200))
     expect(wakes).toHaveLength(0)
     expect(harness.events.filter(event => event.type === 'agent/notice')).toHaveLength(0)
@@ -12227,12 +12253,35 @@ describe('AGY-LATE: Antigravity transcript late output', () => {
     // The old answer is on screen exactly once: in the wake step, never again.
     const all = `${first}${replayed}${answered}`
     expect(all.split('AGY-LATE-ANSWER').length - 1).toBe(1)
-    // The replayed tool frame opened no second card either.
+    // The replayed tool frame opened no second card: its id belongs to a
+    // COMPLETED turn, so the replay is transcript-only.
     const cardIds = next.chunks
       .filter((chunk): chunk is Extract<StreamChunk, { type: 'tool-call-delta' }> => chunk.type === 'tool-call-delta')
       .map(chunk => chunk.id)
-    expect(cardIds).not.toContain('call_1')
+    expect(cardIds).not.toContain('call_agy_1')
     expect(promptCount(harness.prompts)).toBe(2)
+  }, 30_000)
+
+  it('delivers the late answer of a turn that carried a tool card', async () => {
+    const dshSessionId = 'dsh-agy-late-toolcard'
+    const wakes: GenerateMessage[] = []
+    const { harness } = harnessWithResolver(dshSessionId, wakes)
+    const { chunks } = await hostLoopTurn(harness.adapter, {
+      provider: 'acp',
+      model: 'agy-late',
+      sessionId: dshSessionId,
+      messages: [userText('AGY_LATE tool card')],
+    })
+    // The turn really carried a card (`seenCalls.size > 0`): its controller is
+    // kept for the continuation step instead of being disposed at closeTurn.
+    const cardIds = chunks
+      .filter((chunk): chunk is Extract<StreamChunk, { type: 'tool-call-delta' }> => chunk.type === 'tool-call-delta')
+      .map(chunk => chunk.id)
+    expect(cardIds).toContain('call_agy_1')
+
+    await until(() => wakes.length === 1, 10_000)
+    expect(String(wakes[0]?.source?.report)).toContain('AGY-LATE-ANSWER')
+    expect(promptCount(harness.prompts)).toBe(1)
   }, 30_000)
 
   it('flushes a held echo prefix when the turn ends mid-prefix', async () => {
