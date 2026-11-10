@@ -2,6 +2,32 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [0.4.3] - 2026-11-10
+
+工具卡不再把正常调用显示成错误；恢复会话不再复活已结束的后台子代理；被长度上限截断的后台报告会补上完整总结；宿主内部的辅助请求不再转给 agent。
+
+### 修复
+
+- **acp**：工具卡不再把正常调用显示成错误：首次使用时的「未知工具 / 已添加工具」成对提示消失，插件热重载后也不会整批报错。([b1437f1](https://github.com/GDWhisper/dsh-ntr/commit/b1437f1)) ([#12](https://github.com/GDWhisper/dsh-ntr/issues/12))
+- **acp**：宿主内部的辅助请求不再作为隐藏用户消息转给 agent，对话只转述你写的内容。([b1437f1](https://github.com/GDWhisper/dsh-ntr/commit/b1437f1))
+- **acp**：后台报告被长度上限截断后，运行结束时再送完整总结，后续内容不再丢失。([66e5a99](https://github.com/GDWhisper/dsh-ntr/commit/66e5a99))
+- **acp**：重启 DSH 后恢复 NTR 会话，已完成的后台子代理保持已完成，不再变回运行中；恢复后也不会多出一轮后台任务提示。([4d2ac9d](https://github.com/GDWhisper/dsh-ntr/commit/4d2ac9d))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.4.2...v0.4.3
+
+---
+
+Tool cards no longer report a normal call as an error; resuming a conversation no longer revives finished background subagents; a report cut by the length limit delivers its full summary; host-internal auxiliary requests no longer reach the agent.
+
+### Fixed
+
+- **acp**: tool cards no longer report a normal call as an error — the first-use "unknown tool" / "tool added" pair is gone, and a plugin hot reload no longer fails every card. ([b1437f1](https://github.com/GDWhisper/dsh-ntr/commit/b1437f1)) ([#12](https://github.com/GDWhisper/dsh-ntr/issues/12))
+- **acp**: host-internal auxiliary requests are no longer forwarded to the agent as a hidden user message; the conversation only carries what you write. ([b1437f1](https://github.com/GDWhisper/dsh-ntr/commit/b1437f1))
+- **acp**: a background report cut by the length limit delivers its full summary once the run settles, so the tail is no longer lost. ([66e5a99](https://github.com/GDWhisper/dsh-ntr/commit/66e5a99))
+- **acp**: resuming an NTR conversation after a host restart keeps finished background subagents finished instead of running again, and no background-task notice appears on resume. ([4d2ac9d](https://github.com/GDWhisper/dsh-ntr/commit/4d2ac9d))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.4.2...v0.4.3
+
 ## [0.4.2] - 2026-11-09
 
 后台工作线程不再占用主对话，报告到达后进入聊天；工具卡在调用进行中提前显示命令；更新卡在安装前预览发布说明；新增 Antigravity CLI 预设。
