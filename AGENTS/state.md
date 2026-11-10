@@ -180,7 +180,7 @@
 |---|---|
 | 状态目录 | `src/bridge/state-paths.ts` · `pluginStateDir` / `hostStateDir` / `stateDirExplicit` / `legacyStatePaths` / `migrateLegacyState` / `rewriteLegacyWorkspaceRoots` / `defaultAgentWorkspace` |
 | 校验 | `src/impl.ts` · `validateAgentDef` / `validateConfig` / `validateMcpServers`；`src/bridge/manager.ts` · `saveAgent` |
-| 会话选择 | `src/bridge/manager.ts` · `chatChoice` / `patchChatChoice` / `applyChatChoice` / `syncConversationRoute` / `loadPersistedChoices` / `persistAgents` |
+| 会话选择 | `src/bridge/chat-choice-service.ts` · `chatChoice` / `patchChatChoice` / `applyChatChoice` / `syncConversationRoute`；`src/bridge/manager.ts` · `loadPersistedChoices` / `persistAgents` |
 | 目录 | `src/bridge/catalog-service.ts` · `agentCatalog` / `resolveAdapterModel` / `absorbCatalog` / `absorbCatalogShape` / `autoExposeNewModels` / `broadcastExposure` / `probeAgentModels`；`src/bridge/manager.ts` · `setExposedModels` / `setAutoDiscoverModels`；`src/impl.ts` · `parseCatalogOptions` / `mergeCatalogShape` / `usableConfigOptions` |
 | 分叉 | `src/bridge/manager.ts` · `adoptForkedSession`；`src/bridge/agent-bridge.ts` · `forkSession`；`src/bridge/catalog-service.ts` · `noteForkCapability` / `canForkNow` / `forkCaps`；`src/client/store.ts` · `forkChatSession` / `forkStateOf`（子会话绑定与能力位见 §3.2） |
 | 未决询问 | `src/bridge/agent-bridge.ts` · `handlePermissionRequest`；`src/impl.ts` · `PermissionLedger` / `permissionRequestFrame` / `permissionReplayFrames`；`src/client/store.ts` · `permissionsForSession` |

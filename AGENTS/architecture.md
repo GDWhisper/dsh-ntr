@@ -163,8 +163,8 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 |---|---|
 | 消息选择 / 转发 | `src/impl.ts` · `selectForwardPrompt`；`src/bridge/manager.ts` · `streamPrompt` |
 | 工具卡快照 / delta / 输出注册 | `src/impl.ts` · `acpToolCallFromUpdate` / `acpToolCallDelta` / `acpToolCallArgsOf` / `isFinalToolCallStatus`；`src/bridge/registries.ts` · `recordAcpToolOutput` / `waitForToolOutput`；详见 [protocol.md](./protocol.md) |
-| 绑定 RPC | `src/impl.ts` · `dispatchRpc('session/chat-*')`；`src/bridge/manager.ts` · `bindChatAgent` / `setChatSessionModel` / `setChatSessionEffort` / `setChatSessionMode` |
-| 路由选择 / 老宿主请求改写 | `presets/acp/acp-guard.mjs` · `selectBoundRoute` / `agent/request`；`src/bridge/manager.ts` · `conversationRouteModel` |
+| 绑定 RPC | `src/impl.ts` · `dispatchRpc('session/chat-*')`；`src/bridge/manager.ts` · `bindChatAgent`；`src/bridge/chat-choice-service.ts` · `setChatSessionModel` / `setChatSessionEffort` / `setChatSessionMode` |
+| 路由选择 / 老宿主请求改写 | `presets/acp/acp-guard.mjs` · `selectBoundRoute` / `agent/request`；`src/bridge/chat-choice-service.ts` · `conversationRouteModel` |
 | 工作区 | `src/index.ts` · `wireWorkspace`；`src/bridge/state-paths.ts` · `chatWorkspaceRoot`；`src/bridge/manager.ts` · `getOrCreateDshSession`；`src/bridge/agent-bridge.ts` · `doResumeSession` |
 | 锁定 | `src/bridge/manager.ts` · `lockedAgentFor` / `lockChatAgent` / `rollbackFirstTurn`；`src/bridge/turn-stream.ts` · `provisionalLock` |
 | 默认 agent | `src/bridge/manager.ts` · `defaultAgent` / `setDefaultAgent` |
