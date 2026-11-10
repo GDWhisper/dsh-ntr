@@ -1,6 +1,6 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import {
   type ContentBlock,
   type SessionUpdate,
@@ -8,7 +8,6 @@ import {
 import {
   AcpError,
   EventHub,
-  Transcript,
   buildAdapterModelId,
   isAcpToolContinuation,
   parseCatalogOptions,
@@ -18,7 +17,6 @@ import {
   extractSessionTitlePlaceholder,
   isAbsolutePath,
   splitAdapterModelId,
-  validateAgentDef,
 } from '../impl.ts'
 import type {
   PendingPermissionView,
@@ -50,16 +48,8 @@ import type {
 
 import {
   chatWorkspaceRoot,
-  legacyFallback,
   migrateLegacyState,
-  pluginStateDir,
-  rewriteLegacyWorkspaceRoots,
-  stateDirExplicit,
 } from './state-paths.ts'
-
-import {
-  quoteLegacyCommand,
-} from './process.ts'
 
 import {
   BACKGROUND_REPORT_LOST_TEXT,
@@ -76,9 +66,6 @@ import {
 import type { LiveSession } from './turn-stream.ts'
 import {
   agentRefusalDetail,
-  isPersistedBurst,
-  isPersistedModes,
-  isPersistedUsage,
   rateLimitedTurnError,
   snapshot,
 } from './shape.ts'
@@ -90,6 +77,7 @@ import { SettingsService } from './settings-service.ts'
 import { ChatChoiceService } from './chat-choice-service.ts'
 import { AgentAdminService } from './agent-admin-service.ts'
 import { SessionRegistryService } from './session-registry-service.ts'
+import { PersistenceService } from './persistence-service.ts'
 import { describeError } from './errors.ts'
 
 /** How long one `agent/skills` scan answer stays fresh; the browser re-asks past it. */
@@ -155,13 +143,18 @@ export class BridgeManager {
    */
   private readonly admin: AgentAdminService
   /**
+   * `agents.json` persistence (see `PersistenceService`): where the state file
+   * lives, its tolerant restore and its strict / best-effort writes. Every
+   * cluster's persisted shape is read and written through it, so the file's key
+   * order and its "absent while never written" rules have ONE owner.
+   */
+  private readonly persistence: PersistenceService
+  /**
    * `agent/skills` answers, keyed `agentId\0workspaceRoot`, TTL'd by
    * {@link SKILL_SCAN_TTL_MS}. Memory-only: the scan is a pure fs read, so a
    * fresh boot re-scans and nothing is owed to `agents.json`.
    */
   private readonly skillCache = new Map<string, { at: number; result: AgentSkillsResult }>()
-  /** Last persist failure already reported, so a hot retry loop cannot spam the log. */
-  private lastPersistFailure?: string
   /**
    * Tuning in force, defaults applied. The approval deadline and the idle
    * window are rewritten IN PLACE by `SettingsService` (through the host's
@@ -344,7 +337,7 @@ export class BridgeManager {
     defs: readonly AcpAgentDef[],
     readonly hub: EventHub,
     private readonly transcriptMax: number,
-    private readonly configStoragePath?: string,
+    configStoragePath?: string,
     catalogStoragePath?: string,
     /** Auto-probe agents for model catalogs (boot + lazy); manual probes always run. */
     private readonly probeModelsOnBoot = true,
@@ -362,7 +355,7 @@ export class BridgeManager {
     // own directory BEFORE reading it (see `migrateLegacyState`). Storage paths
     // injected by a caller are that caller's business; the migration only runs
     // for the default, plugin-owned locations.
-    if (this.configStoragePath === undefined && catalogStoragePath === undefined) {
+    if (configStoragePath === undefined && catalogStoragePath === undefined) {
       migrateLegacyState()
     }
     this.catalog = new ModelCatalogService({
@@ -382,7 +375,7 @@ export class BridgeManager {
         if (def === undefined) return
         def.exposedModels = patch.exposedModels
       },
-      persistAgents: () => this.persistAgents(),
+      persistAgents: () => this.persistence.persistAgents(),
       hub: this.hub,
     }, catalogStoragePath)
     // The chat-session registry (see `SessionRegistryService`) owns the DSH
@@ -402,7 +395,7 @@ export class BridgeManager {
       patchChatChoice: (dshSessionId, patch) => { this.choices.patchChatChoice(dshSessionId, patch) },
       applyChatChoice: session => this.choices.applyChatChoice(session),
       syncConversationRoute: dshSessionId => { this.choices.syncConversationRoute(dshSessionId) },
-      persistAgents: () => this.persistAgents(),
+      persistAgents: () => this.persistence.persistAgents(),
       closeSessionHolder: session => {
         // The session's OWN bridge, not `bridge(id)` / a map lookup by agent:
         // the agent may have been deleted while its first turn was failing, and
@@ -430,7 +423,7 @@ export class BridgeManager {
     this.subagents = new SubagentService({
       hub: this.hub,
       sessions: () => this.registry.sessions(),
-      persistAgents: () => this.persistAgents(),
+      persistAgents: () => this.persistence.persistAgents(),
       ambientTuning: () => this.ambientTuning,
     })
     // The settings / tuning cluster (see `SettingsService`) needs the live
@@ -442,7 +435,7 @@ export class BridgeManager {
       bridges: () => this.bridges.values(),
       currentTuning: () => this.tuning,
       replaceTuning: next => { Object.assign(this.tuning, next) },
-      persistAgents: () => this.persistAgents(),
+      persistAgents: () => this.persistence.persistAgents(),
     })
     // The chat-choice cluster (see `ChatChoiceService`) needs the roster, the
     // catalog reads, the session set, the holder of a session, the two lock
@@ -459,7 +452,7 @@ export class BridgeManager {
       bridgeForSession: session => this.bridgeForSession(session),
       chatAgentFor: dshSessionId => this.registry.chatAgentFor(dshSessionId),
       lockedAgentFor: dshSessionId => this.registry.lockedAgentFor(dshSessionId),
-      persistAgents: () => this.persistAgents(),
+      persistAgents: () => this.persistence.persistAgents(),
     }, this.registry.picks)
     // The agent-administration cluster (see `AgentAdminService`) needs the
     // registry, the bridge teardown, the strict state-file write, the live turn
@@ -491,7 +484,7 @@ export class BridgeManager {
         this.bridges.delete(agentId)
         this.bridgeScopes.delete(agentId)
       },
-      persistAgents: (strict = false, staged) => { this.persistAgents(strict, staged) },
+      persistAgents: (strict = false, staged) => { this.persistence.persistAgents(strict, staged) },
       activeTurnViews: () => this.activeTurnViews(),
       preSpawnView: def => new AgentBridge(def, this.hub, this.transcriptMax, () => {}).view(),
       publishCatalog: (agentId, withStatus) => {
@@ -514,7 +507,41 @@ export class BridgeManager {
       probeAgentModels: agentId => this.probeAgentModels(agentId),
       hub: this.hub,
     })
-    this.loadPersistedAgents()
+    // The `agents.json` persistence cluster (see `PersistenceService`) owns the
+    // state file itself; each cluster's persisted shape crosses as a reader +
+    // an applier, so the file's key order and its absent-when-unwritten rules
+    // stay in one place. The roster is shared BY REFERENCE, like the pick map:
+    // the loader repairs the same `defsMap` the bridge table routes with.
+    this.persistence = new PersistenceService({
+      hub: this.hub,
+      defs: () => this.defsMap,
+      settingsPersisted: () => this.settings.persistedSettings(),
+      applyPersistedSettings: parsed => { this.settings.loadPersistedSettings(parsed) },
+      conversationsPersisted: () => this.registry.persistedConversations(),
+      applyPersistedConversations: choices => {
+        for (const [dshSessionId, choice] of choices) this.registry.setChoice(dshSessionId, choice)
+        for (const dshSessionId of this.registry.choiceKeys()) this.choices.syncConversationRoute(dshSessionId)
+      },
+      chatSessionsPersisted: () => this.registry.persistedRows(),
+      applyPersistedChatSessions: sessions => {
+        for (const session of sessions) {
+          this.registry.putSession(session)
+          const dshSessionId = session.dshSessionId
+          if (dshSessionId === undefined) continue
+          this.bridgeFor(session.agentId, { kind: 'chat', dshSessionId }).parkReleased(session)
+        }
+      },
+      subagentsPersisted: () => this.subagents.persistedRecords(),
+      applyPersistedSubagents: raw => {
+        const keep = new Set<string>()
+        for (const session of this.registry.sessions()) {
+          if (session.dshSessionId !== undefined && !session.closed) keep.add(session.dshSessionId)
+        }
+        for (const dshSessionId of this.registry.choiceKeys()) keep.add(dshSessionId)
+        this.subagents.restore(raw, keep)
+      },
+    }, configStoragePath, this.transcriptMax)
+    this.persistence.loadPersistedAgents()
     this.catalog.loadPersistedCatalogs()
     // A persisted deadline override must reach the tuning the bridges are built
     // from, not just the settings card's readout.
@@ -987,123 +1014,6 @@ export class BridgeManager {
     return this.admin.saveGateWaitIdle(timeoutMs)
   }
 
-  private getStoragePath(): string | undefined {
-    if (this.configStoragePath !== undefined) return this.configStoragePath
-    if (process.env.DSH_ACP_CONFIG_FILE) return process.env.DSH_ACP_CONFIG_FILE
-    // The test-runner guard exists so a suite never reads or writes the real
-    // home directory. An explicitly redirected state dir (tests that exercise
-    // the migration, or a relocated deployment) is already hermetic, so it is
-    // allowed through instead of silently disabling persistence.
-    if (!stateDirExplicit() && (process.env.VITEST !== undefined || process.env.NODE_ENV === 'test')) {
-      return undefined
-    }
-    try {
-      // A legacy registry that has not been migrated yet stays readable; the
-      // next persist writes to the plugin's own state dir and retires it.
-      const migrated = join(pluginStateDir(), 'agents.json')
-      if (!existsSync(migrated)) {
-        const legacy = legacyFallback('agents')
-        if (existsSync(legacy)) return legacy
-      }
-      mkdirSync(pluginStateDir(), { recursive: true })
-      return migrated
-    } catch {
-      return undefined
-    }
-  }
-
-  /**
-   * Read the agent registry file.
-   *
-   * TWO shapes on purpose: version 1 was a bare array of agent definitions,
-   * while `defaultAgentId` (the panel's ★ gesture — the agent an ACP-mode
-   * conversation should start on) needs a home that is not the deployment
-   * default model. A legacy bare array still loads; it is rewritten in the
-   * current shape on the next persist.
-   */
-  private loadPersistedAgents(): void {
-    const filePath = this.getStoragePath()
-    if (!filePath || !existsSync(filePath)) return
-    try {
-      const content = readFileSync(filePath, 'utf-8')
-      const parsed = JSON.parse(content) as unknown
-      const rows = Array.isArray(parsed)
-        ? parsed
-        : (parsed !== null && typeof parsed === 'object' ? (parsed as { agents?: unknown }).agents : undefined)
-      if (Array.isArray(rows)) {
-        let rewritten = false
-        for (const item of rows) {
-          try {
-            // `rewriteLegacyWorkspaceRoots` folds a definition that still names
-            // the pre-migration workspace into the plugin's own state dir: the
-            // recorded absolute cwd is fed straight to `session/new`, and the
-            // cwd resolver rejects one that does not exist.
-            const validated = validateAgentDef(quoteLegacyCommand(item))
-            const def = rewriteLegacyWorkspaceRoots(validated)
-            if (def !== validated) rewritten = true
-            this.defsMap.set(def.id, def)
-          } catch {
-            // Ignore invalid entry
-          }
-        }
-        // Write the corrected paths back. Without this the correction lives
-        // only in memory: the directory was already renamed, so the file on
-        // disk keeps naming a cwd that no longer exists, and every boot has to
-        // repair it again (and anything reading the file directly sees the
-        // stale path).
-        if (rewritten) this.persistAgents()
-      }
-      if (!Array.isArray(parsed) && parsed !== null && typeof parsed === 'object') {
-        // The persisted preferences (default agent, halo, title prefix, approval
-        // deadlines, idle release) are the settings service's state; it
-        // re-validates them on every boot because the file is user- and
-        // version-editable (see `SettingsService.loadPersistedSettings`).
-        this.settings.loadPersistedSettings(parsed as Record<string, unknown>)
-        this.loadPersistedChoices((parsed as { conversations?: unknown }).conversations)
-        this.loadPersistedChatSessions((parsed as { chatSessions?: unknown }).chatSessions)
-        this.loadPersistedSubagents((parsed as { subagents?: unknown }).subagents)
-      }
-    } catch {
-      // Storage load failure is non-fatal
-    }
-  }
-
-  /**
-   * Read the per-conversation picks back. Tolerant on purpose, one row at a
-   * time: a single corrupt entry must not cost the user every other
-   * conversation's set-up. Entries are kept even when the named agent is not
-   * configured on this boot — `chatChoice` filters those out, so a temporarily
-   * missing agent does not erase the choice it was made for.
-   */
-  private loadPersistedChoices(raw: unknown): void {
-    if (raw === null || typeof raw !== 'object') return
-    for (const [dshSessionId, row] of Object.entries(raw as Record<string, unknown>)) {
-      if (dshSessionId === '' || row === null || typeof row !== 'object') continue
-      const { agentId, locked, modelId, effort, mode, extraConfigs } = row as {
-        agentId?: unknown; locked?: unknown; modelId?: unknown; effort?: unknown; mode?: unknown; extraConfigs?: unknown
-      }
-      if (typeof agentId !== 'string' || agentId === '') continue
-      const configs = extraConfigs !== null && typeof extraConfigs === 'object' && !Array.isArray(extraConfigs)
-        ? Object.fromEntries(Object.entries(extraConfigs as Record<string, unknown>)
-          .filter(([, value]) => typeof value === 'boolean' || (typeof value === 'string' && value !== ''))) as Record<string, string | boolean>
-        : {}
-      this.registry.setChoice(dshSessionId, {
-        agentId,
-        ...(locked === true ? { locked: true } : {}),
-        ...(typeof modelId === 'string' && modelId !== '' ? { modelId } : {}),
-        ...(typeof effort === 'string' && effort !== '' ? { effort } : {}),
-        ...(typeof mode === 'string' && mode !== '' ? { mode } : {}),
-        ...(Object.keys(configs).length === 0 ? {} : { extraConfigs: configs }),
-      })
-    }
-    // Put every restored record back on the REQUEST path, not just in this
-    // map: the guard's rewrite and `conversationRouteModel` read the route
-    // registry, which starts empty on a fresh process. Without this a host
-    // restart would send a bound (and possibly locked) conversation to the
-    // deployment default until its next turn re-pinned it.
-    for (const dshSessionId of this.registry.choiceKeys()) this.choices.syncConversationRoute(dshSessionId)
-  }
-
   /**
    * Fold one settled ACP turn's measurable burst into the session aggregate and
    * persist it. A turn with no measured inter-chunk gap contributes neither
@@ -1116,170 +1026,7 @@ export class BridgeManager {
       outputTokens: base.outputTokens + outputTokens,
       burstMs: base.burstMs + burstMs,
     }
-    this.persistAgents()
-  }
-
-  /**
-   * Write the agent registry.
-   *
-   * `strict` is for a save whose success the user is waiting on: a failed write
-   * must reach the save gate as a rejection instead of a silent "saved". All
-   * other call sites keep the old best-effort behavior, but the failure is no
-   * longer invisible — it lands in the settings log as one notice per distinct
-   * error (a burst of session writes can retry the same broken path).
-   */
-  private persistAgents(strict = false, staged?: AcpAgentDef): void {
-    const filePath = this.getStoragePath()
-    if (!filePath) {
-      // A strict save has nowhere to write. Silent success here would tell the
-      // user the definition survived when the next boot would not load it.
-      if (strict) throw new AcpError('persist_failed', 'acp: failed to persist agent state: no writable state path')
-      return
-    }
-    try {
-      // The chat-bound session records themselves: a host restart kills the
-      // processes but not the agent-side sessions, so restoring these as
-      // PARKED keeps a conversation resumable (`session/load`) instead of
-      // its next message silently starting a context-less new one.
-      const chatSessions = this.registry.persistedRows()
-      const conversations = this.registry.persistedConversations()
-      const subagentRecords = this.subagents.persistedRecords()
-      // A save passes its candidate here so the file can land BEFORE `defsMap`
-      // commits it. Every other caller writes the committed registry.
-      const agents = [...this.defsMap.values()]
-      if (staged !== undefined) {
-        const index = agents.findIndex(agent => agent.id === staged.id)
-        if (index >= 0) agents[index] = staged
-        else agents.push(staged)
-      }
-      // The settings half of the file (default agent, halo, title prefix,
-      // approval deadlines, idle release), in its persisted key order.
-      const persistedSettings = this.settings.persistedSettings()
-      const payload = {
-        version: 2,
-        ...(persistedSettings.defaultAgentId === undefined ? {} : { defaultAgentId: persistedSettings.defaultAgentId }),
-        tagHalo: persistedSettings.tagHalo,
-        sessionTitlePrefix: persistedSettings.sessionTitlePrefix,
-        agents,
-        // The settings page's approval deadlines. Absent while none was ever
-        // written, so a fresh deployment's state file stays exactly as it was.
-        ...(persistedSettings.approvalDeadlines === undefined
-          ? {}
-          : { approvalDeadlines: persistedSettings.approvalDeadlines }),
-        // The settings page's idle-release pick. Absent while none was
-        // ever written, so a fresh deployment's state file stays as it was.
-        ...(persistedSettings.idleRelease === undefined
-          ? {}
-          : { idleRelease: persistedSettings.idleRelease }),
-        // The per-conversation picks: agent + model + thought level + mode +
-        // extra config values chosen in the composer, including for
-        // conversations with no live session yet.
-        ...(conversations === undefined ? {} : { conversations }),
-        // The plugin's own external-worker lifecycle records (status / failure
-        // reason / timings). Absent while none was ever recorded, so a fresh
-        // deployment's state file stays exactly as it was.
-        ...(Object.keys(subagentRecords).length === 0
-          ? {}
-          : { subagents: subagentRecords }),
-        ...(chatSessions.length === 0 ? {} : { chatSessions }),
-      }
-      writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf-8')
-      this.lastPersistFailure = undefined
-    } catch (error) {
-      const message = describeError(error)
-      if (strict) throw new AcpError('persist_failed', `acp: failed to persist agent state: ${message}`)
-      if (this.lastPersistFailure === message) return
-      this.lastPersistFailure = message
-      this.hub.broadcast({
-        type: 'agent/notice',
-        agentId: 'dsh-ntr',
-        level: 'error',
-        text: `acp: failed to persist agent state: ${message}`,
-      })
-    }
-  }
-
-  /**
-   * Restore chat session records from disk as PARKED sessions.
-   *
-   * Every process died with the host, so nothing comes back live — but the
-   * agent-side sessions did not. Restoring each record as `released` is what
-   * makes the released banner, its resume button and the "next message
-   * resumes it" promise survive a restart (the alternative is the next
-   * message quietly starting a NEW, context-less session — constraint 10's
-   * "released ≠ destroyed" lost at the process boundary). Tolerant, one row
-   * at a time: a single corrupt entry must not cost every other conversation
-   * its context. Records whose agent is no longer configured are dropped —
-   * there is nothing to resume ON, and the next write omits them.
-   */
-  private loadPersistedChatSessions(raw: unknown): void {
-    if (!Array.isArray(raw)) return
-    for (const row of raw) {
-      if (row === null || typeof row !== 'object') continue
-      const record = row as Record<string, unknown>
-      const { sessionId, acpSessionId, agentId, dshSessionId, cwd } = record
-      if (typeof sessionId !== 'string' || sessionId === '') continue
-      if (typeof acpSessionId !== 'string' || acpSessionId === '') continue
-      if (typeof agentId !== 'string' || agentId === '') continue
-      if (typeof dshSessionId !== 'string' || dshSessionId === '') continue
-      if (typeof cwd !== 'string') continue
-      if (!this.defsMap.has(agentId)) continue
-      const { title, modelId, reasoningEffort, modes, usage, burst, hasHistory } = record as {
-        title?: unknown; modelId?: unknown; reasoningEffort?: unknown; modes?: unknown; usage?: unknown; burst?: unknown; hasHistory?: unknown
-      }
-      const session: LiveSession = {
-        sessionId,
-        acpSessionId,
-        agentId,
-        dshSessionId,
-        cwd,
-        ...(typeof title === 'string' && title !== '' ? { title } : {}),
-        ...(typeof modelId === 'string' && modelId !== ''
-          ? { modelId, ...(splitAdapterModelId(modelId).choice === undefined ? {} : { choice: splitAdapterModelId(modelId).choice }) }
-          : {}),
-        ...(typeof reasoningEffort === 'string' && reasoningEffort !== '' ? { reasoningEffort } : {}),
-        ...(isPersistedModes(modes) ? { modes } : {}),
-        ...(isPersistedUsage(usage) ? { usage } : {}),
-        ...(isPersistedBurst(burst) ? { burst } : {}),
-        ...(hasHistory === true ? { hasHistory: true } : {}),
-        running: false,
-        turnSeq: 0,
-        closed: false,
-        released: true,
-        lastAgentActivityAt: Date.now(),
-        activeToolCalls: new Set<string>(),
-        transcript: new Transcript(this.transcriptMax),
-      }
-      this.registry.putSession(session)
-      // A1: the record parks on the holder its own DSH conversation will
-      // resume through — the same scope the create branch would pick — so the
-      // first message after a restart reaches the process that can `session/load`
-      // it, not the agent-wide slot. Creating the holder is pure bookkeeping.
-      this.bridgeFor(agentId, { kind: 'chat', dshSessionId }).parkReleased(session)
-    }
-  }
-
-  /**
-   * Read the persisted external-worker records back.
-   *
-   * Orphan keys are dropped AT LOAD, not on every write: only a conversation
-   * that still has a `chatSessions` row or a persisted `conversations` entry
-   * can own records. Everything else names a conversation the file no longer
-   * describes (deleted, or written before a pruning close), and keeping it
-   * would only make `agents.json` grow. Shutdown relies on the map staying
-   * populated, which is why the prune lives here and not in `persistAgents`.
-   *
-   * A restored row that never reached a terminal state reads `unknown`: the
-   * host restart killed every process, so nothing can still be running
-   * (constraint: no row stays `running` forever).
-   */
-  private loadPersistedSubagents(raw: unknown): void {
-    const keep = new Set<string>()
-    for (const session of this.registry.sessions()) {
-      if (session.dshSessionId !== undefined && !session.closed) keep.add(session.dshSessionId)
-    }
-    for (const dshSessionId of this.registry.choiceKeys()) keep.add(dshSessionId)
-    this.subagents.restore(raw, keep)
+    this.persistence.persistAgents()
   }
 
   /** Auto-spawning probes are suppressed under test runners so suites stay deterministic. */
@@ -1342,7 +1089,7 @@ export class BridgeManager {
       }, (observedAgentId, commands) => {
         this.catalog.absorbCommands(observedAgentId, commands)
       }, () => {
-        this.persistAgents()
+        this.persistence.persistAgents()
       }, (observedAgentId, supported) => {
         this.catalog.noteForkCapability(observedAgentId, supported)
       })
@@ -1867,7 +1614,7 @@ export class BridgeManager {
       }
       for (const sessionId of this.registry.dropSessionsOfAgent(agentId)) owned.add(sessionId)
       this.disposeTurnStreamsOf(controller => owned.has(controller.session.sessionId))
-      if (persist) this.persistAgents()
+      if (persist) this.persistence.persistAgents()
       // One stop per process, all at once: the children are independent, so the
       // wall clock is the slowest single teardown rather than their sum.
       await Promise.allSettled(bridges.map(bridge => bridge.stop('agent-stopped')))
@@ -2053,7 +1800,7 @@ export class BridgeManager {
       resumed.provisionalLock = false
       // The load refreshed the record's mirrors (modes / usage / hasHistory);
       // persist so a later restart restores what this resume saw.
-      this.persistAgents()
+      this.persistence.persistAgents()
       return resumed
     }
     // A chat session runs where its DSH session lives, not in the plugin's
@@ -2110,7 +1857,7 @@ export class BridgeManager {
     }
     // The record is on disk from here: a host restart restores it as parked
     // instead of the next message starting a context-less new session.
-    this.persistAgents()
+    this.persistence.persistAgents()
     return session
   }
 

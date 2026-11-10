@@ -65,7 +65,7 @@
 
 ### 3.1 会话记录持久化（`chatSessions`）
 
-聊天绑定的会话记录持久化在 `agents.json` 的 `chatSessions` 键（`persistedChatSession`，`src/bridge/shape.ts`；`loadPersistedChatSessions`，`src/bridge/manager.ts`）。宿主重启把每条记录以 **released** 复原进 `dshSessionMap` 与**它自己的** chat holder 的 released map（`AgentBridge.parkReleased`）——A1 下每条记录一个 holder，不同会话不共享进程槽。进程死了但 agent 侧会话还在，`session/load` 照常恢复。这是「released ≠ 销毁」在进程边界上的落点（约束 10）：没有它，重启后释放横幅直接消失、下一条消息还会静默新开一条没有上下文的会话。
+聊天绑定的会话记录持久化在 `agents.json` 的 `chatSessions` 键（`persistedChatSession`，`src/bridge/shape.ts`；`loadPersistedChatSessions`，`src/bridge/persistence-service.ts`）。宿主重启把每条记录以 **released** 复原进 `dshSessionMap` 与**它自己的** chat holder 的 released map（`AgentBridge.parkReleased`）——A1 下每条记录一个 holder，不同会话不共享进程槽。进程死了但 agent 侧会话还在，`session/load` 照常恢复。这是「released ≠ 销毁」在进程边界上的落点（约束 10）：没有它，重启后释放横幅直接消失、下一条消息还会静默新开一条没有上下文的会话。
 
 - **只落身份与显示镜像**（`sessionId` / `acpSessionId` / `agentId` / `dshSessionId` / `cwd` + `title` / `modelId` / `reasoningEffort` / `modes` / `usage` / `hasHistory`）。**不落 transcript 与 `configOptions`**——两者都由 agent 在 `session/load` 时回放/带回；重启后到恢复前的空缓冲由 `hasHistory` 说明「历史待回放」（[ui.md §5](./ui.md)），不写「还没有消息」。
 - **写点**：`getOrCreateDshSession` 的建/恢复分支、`forgetDshSession`（closed 销毁即删盘）、以及 `AgentBridge` 的 `onSessionsDirty` 回调（`releaseAll` / `doResumeSession`——release 时 transcript 还在，`hasHistory` 正是在那里算的：`hasHistory || since(0).length > 0`）。
@@ -180,7 +180,8 @@
 |---|---|
 | 状态目录 | `src/bridge/state-paths.ts` · `pluginStateDir` / `hostStateDir` / `stateDirExplicit` / `legacyStatePaths` / `migrateLegacyState` / `rewriteLegacyWorkspaceRoots` / `defaultAgentWorkspace` |
 | 校验 | `src/impl.ts` · `validateAgentDef` / `validateConfig` / `validateMcpServers`；`src/bridge/agent-admin-service.ts` · `saveAgent` |
-| 会话选择 | `src/bridge/chat-choice-service.ts` · `chatChoice` / `patchChatChoice` / `applyChatChoice` / `syncConversationRoute`；`src/bridge/manager.ts` · `loadPersistedChoices` / `persistAgents` |
+| 落盘 | `src/bridge/persistence-service.ts` · `PersistenceService` / `getStoragePath` / `loadPersistedAgents` / `loadPersistedChoices` / `loadPersistedChatSessions` / `loadPersistedSubagents` / `persistAgents`；`src/bridge/state-paths.ts` · `pluginStateDir` / `legacyFallback` |
+| 会话选择 | `src/bridge/chat-choice-service.ts` · `chatChoice` / `patchChatChoice` / `applyChatChoice` / `syncConversationRoute` |
 | 目录 | `src/bridge/catalog-service.ts` · `agentCatalog` / `resolveAdapterModel` / `absorbCatalog` / `absorbCatalogShape` / `autoExposeNewModels` / `broadcastExposure` / `probeAgentModels`；`src/bridge/agent-admin-service.ts` · `setExposedModels` / `setAutoDiscoverModels`；`src/impl.ts` · `parseCatalogOptions` / `mergeCatalogShape` / `usableConfigOptions` |
 | 分叉 | `src/bridge/session-registry-service.ts` · `adoptForkedSession`；`src/bridge/agent-bridge.ts` · `forkSession`；`src/bridge/catalog-service.ts` · `noteForkCapability` / `canForkNow` / `forkCaps`；`src/client/store.ts` · `forkChatSession` / `forkStateOf`（子会话绑定与能力位见 §3.2） |
 | 未决询问 | `src/bridge/agent-bridge.ts` · `handlePermissionRequest`；`src/impl.ts` · `PermissionLedger` / `permissionRequestFrame` / `permissionReplayFrames`；`src/client/store.ts` · `permissionsForSession` |
