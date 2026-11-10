@@ -4,7 +4,7 @@
 
 ## [0.4.3] - 2026-11-10
 
-工具卡不再把正常调用显示成错误；恢复会话不再复活已结束的后台子代理；被长度上限截断的后台报告会补上完整总结；宿主内部的辅助请求不再转给 agent。
+这一版修正对话显示与会话恢复中几处容易误导人的提示。
 
 ### 修复
 
@@ -17,7 +17,7 @@
 
 ---
 
-Tool cards no longer report a normal call as an error; resuming a conversation no longer revives finished background subagents; a report cut by the length limit delivers its full summary; host-internal auxiliary requests no longer reach the agent.
+This release fixes several misleading signals in conversation display and in session recovery.
 
 ### Fixed
 
