@@ -105,6 +105,15 @@ describe('validateConfig', () => {
     expect(validateConfig({ agents: [], probeModelsOnBoot: false }).probeModelsOnBoot).toBe(false)
     expect(() => validateConfig({ agents: [], probeModelsOnBoot: 'yes' })).toThrow(/probeModelsOnBoot/)
   })
+  it('accepts the agyLateOutput switch as an optional boolean', () => {
+    // Absent: the tuning default (on) stays in force; the config object must
+    // not carry `undefined`, or the host entry would overwrite the default.
+    expect(validateConfig({ agents: [] })).not.toHaveProperty('agyLateOutput')
+    expect(validateConfig({ agents: [], agyLateOutput: false }).agyLateOutput).toBe(false)
+    expect(validateConfig({ agents: [], agyLateOutput: true }).agyLateOutput).toBe(true)
+    expect(() => validateConfig({ agents: [], agyLateOutput: 'yes' })).toThrow(/agyLateOutput/)
+    expect(() => validateConfig({ agents: [], agyLateOutput: 0 })).toThrow(/agyLateOutput/)
+  })
   it('defaults and bounds the reliability timeouts', () => {
     const config = validateConfig({ agents: [] })
     expect(config.startupTimeoutMs).toBe(60_000)

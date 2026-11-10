@@ -100,6 +100,12 @@
         #                              set); 0 = fall back to turnStallMs
         # turnStallTickMs: 30000     # how often the watchdog scans; tuning / tests
         #                              only, there is no settings-page control
+        # agyLateOutput: true        # Antigravity transcript late-output path
+        #                              (default on; only an automatically
+        #                              recognised `agy acp` session arms it).
+        #                              false turns the whole path off. Its poll /
+        #                              quiet / max / echo windows are internal
+        #                              tuning keys, not deployment promises.
         # idleTimeoutMs: 1800000     # how long a chat process may sit idle before
         #                              it is released (parked, then resumed by the
         #                              next message). 0 = never release. The

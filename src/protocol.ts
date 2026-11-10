@@ -296,6 +296,17 @@ export interface AcpPluginConfig {
    * file. Default 30000 ms.
    */
   turnStallTickMs?: number
+  /**
+   * Total switch for the Antigravity transcript late-output path (see
+   * docs/plan/antigravity-late-output.md).
+   *
+   * Default ON, and only an AUTOMATICALLY recognised `agy acp` session arms a
+   * watch: the agent id is user-editable, so recognition reads the launch
+   * command line. The transcript format is private to Antigravity, so a
+   * deployment that does not trust it sets this to `false` and the whole path
+   * is off. Not editable from the settings page: a deployment key.
+   */
+  agyLateOutput?: boolean
 }
 
 // ---- Host → browser events (`/api/acp/stream`, SSE) ----

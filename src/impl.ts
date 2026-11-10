@@ -578,6 +578,14 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
   if (typeof turnStallTickMs !== 'number' || !Number.isInteger(turnStallTickMs) || turnStallTickMs < 1 || turnStallTickMs > 60_000) {
     throw new AcpError('bad_config', 'acp: turnStallTickMs must be an integer in [1, 60000]')
   }
+  // The Antigravity transcript path's deployment switch: absent means "use the
+  // tuning default" (on), and only an explicit boolean is accepted. Kept out
+  // of the returned object when absent so the host entry never overrides the
+  // default with `undefined`.
+  const agyLateOutput = value.agyLateOutput
+  if (agyLateOutput !== undefined && typeof agyLateOutput !== 'boolean') {
+    throw new AcpError('bad_config', 'acp: agyLateOutput must be a boolean')
+  }
   return {
     agents,
     transcriptMaxEntries: max,
@@ -592,6 +600,7 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
     turnStallToolMs,
     turnStallTickMs,
     idleTimeoutMs,
+    ...(agyLateOutput === undefined ? {} : { agyLateOutput }),
   }
 }
 
