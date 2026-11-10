@@ -166,7 +166,7 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 | 绑定 RPC | `src/impl.ts` · `dispatchRpc('session/chat-*')`；`src/bridge/session-registry-service.ts` · `bindChatAgent`；`src/bridge/chat-choice-service.ts` · `setChatSessionModel` / `setChatSessionEffort` / `setChatSessionMode` |
 | 路由选择 / 老宿主请求改写 | `presets/acp/acp-guard.mjs` · `selectBoundRoute` / `agent/request`；`src/bridge/chat-choice-service.ts` · `conversationRouteModel` |
 | 工作区 | `src/index.ts` · `wireWorkspace`；`src/bridge/state-paths.ts` · `chatWorkspaceRoot`；`src/bridge/manager.ts` · `getOrCreateDshSession`；`src/bridge/agent-bridge.ts` · `doResumeSession` |
-| 锁定 | `src/bridge/session-registry-service.ts` · `lockedAgentFor` / `lockChatAgent` / `rollbackFirstTurn`；`src/bridge/turn-stream.ts` · `provisionalLock` |
+| 锁定 | `src/bridge/session-registry-service.ts` · `lockedAgentFor` / `lockChatAgent` / `rollbackFirstTurn`；`src/bridge/live-session.ts` · `provisionalLock` |
 | 默认 agent | `src/bridge/manager.ts` · `defaultAgent` / `setDefaultAgent` |
 
 ## 目录索引
@@ -175,6 +175,8 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 |---|---|
 | `src/index.ts` | Cordis 插件宿主入口：挂载 `/acp` RPC 通道与 `/api/acp/stream` SSE 路由，接线可选宿主服务 |
 | `src/protocol.ts` | 前后端共享契约（纯类型）；严禁 Node 专属库或运行时代码 |
+| `src/protocol-subagent.ts` | 子代理记录与详情的契约半区（`SubagentRecord` / `SubagentDetailEntry` / `SubagentDetailPayload` / 上限常量）：纯类型与常量，由 `protocol.ts` 重导出 |
+| `src/subagent-records.ts` | 子代理记录的归一与封顶（`normalizeSubagentRecord` / `capSubagentRecords` / `subagentToolCallId` / `boundSubagentDetailEntry`）：纯函数，由 `impl.ts` 重导出 |
 | `src/impl.ts` | 纯宿主端逻辑：配置校验、环境组装（`childEnv`）、路径防越权、Transcript、EventHub、目录解析 |
 | `src/bridge/` | 宿主 ↔ ACP 子进程的 stdio 桥：进程、回合、绑定、锁、数据折叠 |
 | `src/skills-scan.ts` | 宿主侧 skill 目录扫描：按 agent 风味（`skillFlavorOf`，`src/impl.ts`）扫 project/global/system 三层目录并解析 SKILL.md，喂给 `agent/skills` RPC（`BridgeManager.agentSkills`，内存 TTL 缓存）；只读文件系统，不 spawn、不落盘 |

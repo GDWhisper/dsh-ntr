@@ -17,6 +17,7 @@ import {
   type TranscriptStep,
 } from '../src/bridge/agy-transcript.ts'
 import { applyEchoGuard } from '../src/bridge/turn-stream.ts'
+import { validateConfig } from '../src/impl.ts'
 import type { AcpAgentDef } from '../src/protocol.ts'
 
 function agentDef(args: string[], command = '/usr/local/bin/agy'): AcpAgentDef {
@@ -320,5 +321,17 @@ describe('echo guard', () => {
 
   it('treats an empty chunk while holding as another hold', () => {
     expect(applyEchoGuard(late, 'the ', '')).toEqual({ kind: 'hold', buffer: 'the ' })
+  })
+})
+
+describe('Antigravity late-output switch', () => {
+  it('accepts the agyLateOutput switch as an optional boolean', () => {
+    // Absent: the tuning default (on) stays in force; the config object must
+    // not carry `undefined`, or the host entry would overwrite the default.
+    expect(validateConfig({ agents: [] })).not.toHaveProperty('agyLateOutput')
+    expect(validateConfig({ agents: [], agyLateOutput: false }).agyLateOutput).toBe(false)
+    expect(validateConfig({ agents: [], agyLateOutput: true }).agyLateOutput).toBe(true)
+    expect(() => validateConfig({ agents: [], agyLateOutput: 'yes' })).toThrow(/agyLateOutput/)
+    expect(() => validateConfig({ agents: [], agyLateOutput: 0 })).toThrow(/agyLateOutput/)
   })
 })
