@@ -4,26 +4,28 @@
 
 ## 1. 状态快照
 
-基线提交：`6d5c10d`（`refactor(acp): extract agents.json persistence from BridgeManager`）。工作树应为干净。
+基线提交：`6adeb3b`（`fix(acp): skip Antigravity permission prompts in the agy preset`）。工作树应为干净。P9.7 之后合入了 Antigravity late-output 工作（`8a6a554` / `f5b364d`），本快照已按 HEAD 重新基线化。
 
-- `src/bridge.ts` 已是 24 行纯桶文件，公共导出面 **48 个名称**，不得增减。
+- `src/bridge.ts` 已是 28 行纯桶文件，公共导出面 **56 个名称**（原 48 + Antigravity 新增 8），不得增减。
 - 宿主实现全部在 `src/bridge/` 下。当前规模（行数只作体量参考，不作代码位置引用）：
 
 | 行数 | 文件 | 职责 |
 |---|---|---|
-| 2600 | `turn-stream.ts` | `TurnStreamController`、`LiveSession`、段 / ambient / 后台持有 |
-| 2471 | `manager.ts` | 剩余门面：桥注册表、看门狗、RPC 面、会话启动 / resume |
-| 2130 | `agent-bridge.ts` | `AgentBridge`：单 agent 进程与会话 |
-| 841 | `chat-choice-service.ts` | 会话选择、路由、ACP mode 缓存 |
-| 663 | `subagent-service.ts` | 子代理记录、后台报告 |
-| 626 | `catalog-service.ts` | 模型目录、探测、fork 能力位、命令缓存 |
-| 561 | `settings-service.ts` | 设置、审批期限、空闲释放、preset / 更新 |
-| 471 | `agent-admin-service.ts` | agent 保存 / 删除 / 测试、保存门禁 |
-| 468 | `session-registry-service.ts` | DSH 会话注册表、绑定、锁、transcript 投影 |
-| 356 | `persistence-service.ts` | `agents.json` 读取、组装、严格 / 非严格写盘 |
-| 其余 | `shape/process/state-paths/registries/types/identity/...` | 纯函数与常量 |
+| 2486 | `manager.ts` | 剩余门面：看门狗、RPC 面、会话启动 / resume、`makeBridge` |
+| 2626 | `turn-stream.ts` | `TurnStreamController`、段 / ambient / 后台持有 |
+| 2202 | `agent-bridge.ts` | `AgentBridge`：单 agent 进程与会话 |
+| 865 | `chat-choice-service.ts` | 会话选择、路由、ACP mode 缓存 |
+| 747 | `subagent-service.ts` | 子代理记录、后台报告 |
+| 650 | `catalog-service.ts` | 模型目录、探测、fork 能力位、命令缓存 |
+| 592 | `settings-service.ts` | 设置、审批期限、空闲释放、preset / 更新 |
+| 498 | `session-registry-service.ts` | DSH 会话注册表、绑定、锁、transcript 投影 |
+| 497 | `agent-admin-service.ts` | agent 保存 / 删除 / 测试、保存门禁 |
+| 431 | `bridge-registry-service.ts` | 桥注册表与生命周期（P9.8a 拆出） |
+| 365 | `persistence-service.ts` | `agents.json` 读取、组装、严格 / 非严格写盘 |
+| 320 | `live-session.ts` | `LiveSession` 接口（已从 turn-stream 拆出） |
+| 其余 | `shape/process/state-paths/registries/types/identity/agy-*/archive-release-service/...` | 纯函数、常量与 Antigravity 专属模块 |
 
-- 测试：25 个文件、1234 个用例；`tests/bridge.spec.ts` 约 11.5k 行、34 个顶层 `describe`。
+- 测试：28 个文件（总用例数以 prepack 实测为准）；`tests/bridge.spec.ts` 12164 行、34 个顶层 `describe`、304 个用例。
 - 已完成阶段与提交：
 
 | 阶段 | 内容 | 提交 |
@@ -40,7 +42,7 @@
 
 ## 2. 不变约束
 
-1. 公共导出面固定 48 个名称。任何阶段先核对 `src/bridge.ts` 的再导出集合。
+1. 公共导出面固定 56 个名称。任何阶段先核对 `src/bridge.ts` 的再导出集合。
 2. 只改 `src/`、`tests/` 与 `AGENTS/`；禁止改 `lib/`。
 3. 相对导入必须带 `.ts` / `.tsx` 后缀（[AGENTS.md](../../AGENTS.md) 约束 6）。
 4. 单向依赖：服务不得运行时导入 `../bridge.ts` 或 `./manager.ts`；只允许 `import type` 且必须注释说明。
@@ -93,8 +95,8 @@
 ### 验收
 
 - `manager.ts` 降到 1500 行左右，或剩余仅为 `makeBridge` 与少量门面。
-- 公共导出面 48 个名称不变。
-- `npm run prepack` 全绿（25 个测试文件、1234 个用例）。
+- 公共导出面 56 个名称不变。
+- `npm run prepack` 全绿（28 个测试文件，用例数以实测为准）。
 - `lib/bridge/*.js` 不出现 `from '../bridge.js'` 或 `require('../bridge.js')`。
 
 ## 4. P10：拆 `tests/bridge.spec.ts`
@@ -122,7 +124,7 @@
 ### T3 收尾
 
 - 删除空壳文件与重复 helper。
-- 确认用例总数不变（当前 300 个 `bridge.spec` 用例）。
+- 确认用例总数不变（当前 304 个 `bridge.spec` 用例）。
 - 全量 `npm run prepack`。
 
 ## 5. 已知环境抖动

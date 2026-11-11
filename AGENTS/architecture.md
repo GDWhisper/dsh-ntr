@@ -32,7 +32,7 @@
 
 `PER_SESSION_AGENT_IDS` 目前只含 `codebuddy`（`isPerSessionAgent(agentId)`）。其余 agent 仍是**一条连接、一个进程**：每个 scope 都折叠到裸 `agentId`，语义与 A1 之前一致。
 
-**复合键**：`BridgeManager.bridges` 的键由 `bridgeKey(agentId, scope)` 生成——非 A1 返回裸 `agentId`；A1 返回 `agentId + '\u0000' + <kind>[:<token>]`。`BridgeScope` 四态：
+**复合键**：`BridgeRegistryService.bridges`（`src/bridge/bridge-registry-service.ts`；manager 保留同名 getter 供测试内省同一 Map 实例）的键由 `bridgeKey(agentId, scope)` 生成——非 A1 返回裸 `agentId`；A1 返回 `agentId + '\u0000' + <kind>[:<token>]`。`BridgeScope` 四态：
 
 | scope | 何时创建 | 谁回收 |
 |---|---|---|
@@ -41,7 +41,7 @@
 | `ephemeral` | `/acp` 的 `startSession`（键含 `randomUUID()` token）与匿名回合（token 固定 `anonymous`） | `closeSession`；`streamPrompt` 结算后的 `.finally` |
 | `probe` | `probeAgentModels` 的目录探测 | 探测 `try/finally` 立即回收 |
 
-`bridgeScopes` 是 `bridges` 键集合的伴生状态，**仅供测试与诊断**：生产代码 1 处声明、1 处写入、4 处删除，没有任何消费者；唯一读取方是 `tests/bridge.spec.ts` 的 3 处断言（`agent/delete` 与 `stopAgent` 用例比对 `bridgeScopes.size` 与 `bridges.size`）。运行时判定作用域的唯一权威是 `bridges` 的复合键与 `bridgeKey`。清理时应删字段并把那 3 处断言改为只看 `bridges` 键（或提供测试可见的派生 getter），**不要**为消除死代码在业务逻辑里接读取。
+`bridgeScopes` 是 `bridges` 键集合的伴生状态，**仅供测试与诊断**：生产代码 1 处声明、1 处写入、3 处删除（服务内 `pruneBridge` / `stopAgent` 两处 + manager 的 admin 停止包装一处），没有任何消费者；唯一读取方是 `tests/bridge.spec.ts` 的 3 处断言（`agent/delete` 与 `stopAgent` 用例比对 `bridgeScopes.size` 与 `bridges.size`）。运行时判定作用域的唯一权威是 `bridges` 的复合键与 `bridgeKey`。清理时应删字段并把那 3 处断言改为只看 `bridges` 键（或提供测试可见的派生 getter），**不要**为消除死代码在业务逻辑里接读取。
 
 **启动清洗（只对 A1）**：`perSessionLaunchArgs` 删除 `--port <值>` 与 `--port=<值>`；`perSessionLaunchEnv` 按大写键名删除 `SERVER__PORT` / `SERVER__HOST`。原因是 CodeBuddy 的 ACP 模式会去绑 `127.0.0.1:6156`，每会话一个进程时必然 `EADDRINUSE`；stdio 传输不需要监听端口。
 
@@ -167,6 +167,7 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 | 路由选择 / 老宿主请求改写 | `presets/acp/acp-guard.mjs` · `selectBoundRoute` / `agent/request`；`src/bridge/chat-choice-service.ts` · `conversationRouteModel` |
 | 工作区 | `src/index.ts` · `wireWorkspace`；`src/bridge/state-paths.ts` · `chatWorkspaceRoot`；`src/bridge/manager.ts` · `getOrCreateDshSession`；`src/bridge/agent-bridge.ts` · `doResumeSession` |
 | 锁定 | `src/bridge/session-registry-service.ts` · `lockedAgentFor` / `lockChatAgent` / `rollbackFirstTurn`；`src/bridge/live-session.ts` · `provisionalLock` |
+| 桥注册表 / 生命周期 | `src/bridge/bridge-registry-service.ts` · `bridgeFor` / `pruneBridge` / `stopAgent` / `shutdownAll`（manager 保留同名转发与 `bridges` / `bridgeScopes` getter） |
 | 默认 agent | `src/bridge/manager.ts` · `defaultAgent` / `setDefaultAgent` |
 
 ## 目录索引
