@@ -34,7 +34,6 @@ import { scanSkillDirs } from '../skills-scan.ts'
 import type { UpdateService } from '../update.ts'
 import {
   bridgeKey,
-  isPerSessionAgent,
   type BridgeScope,
 } from './identity.ts'
 
@@ -75,6 +74,7 @@ import { agyStoreRoot, isAntigravityAgent } from './agy-transcript.ts'
 import { ArchiveReleaseService } from './archive-release-service.ts'
 import { AgentBridge } from './agent-bridge.ts'
 import { BridgeRegistryService } from './bridge-registry-service.ts'
+import { BridgeRpcService } from './bridge-rpc-service.ts'
 import { TurnWatchdogService } from './turn-watchdog-service.ts'
 import { ModelCatalogService } from './catalog-service.ts'
 import { SubagentService } from './subagent-service.ts'
@@ -174,6 +174,13 @@ export class BridgeManager {
   private get turnStreams(): Map<string, TurnStreamController> {
     return this.watchdog.turnStreams
   }
+  /**
+   * The `/acp` RPC face (see `BridgeRpcService`): session creation, the prompt
+   * turn loop, cancel / close, mode / config writes, permission answers and
+   * the transcript / session reads. The manager keeps same-named delegates;
+   * the stalled-turn reclaim it calls stays here (the chat plane shares it).
+   */
+  private readonly rpc: BridgeRpcService
 
   /**
    * The echo guard's window (see {@link BridgeTuning.agyLateOutputEchoMs}): a
@@ -317,6 +324,17 @@ export class BridgeManager {
       registry: this.registry,
       disposeTurnStreamsOf: match => { this.disposeTurnStreamsOf(match) },
       disarmStallTimer: () => { this.watchdog.disarmStallTimer() },
+    })
+    // The `/acp` RPC face (see `BridgeRpcService`) needs the process table,
+    // the turn-stream index, the session records and the stalled-turn reclaim
+    // that stays here; every capability arrives as a sibling service or a
+    // closure, so it never imports this module.
+    this.rpc = new BridgeRpcService({
+      hub: this.hub,
+      bridgeRegistry: this.bridgeRegistry,
+      watchdog: this.watchdog,
+      registry: this.registry,
+      prepareStalledSession: session => this.prepareStalledSession(session),
     })
     // The archive-release cluster (see `ArchiveReleaseService`) needs the
     // session lookup, the turn stream, the session owner and the teardown.
@@ -1109,226 +1127,52 @@ export class BridgeManager {
     return this.admin.testAgent(def)
   }
 
+  // ---- /acp RPC face (owned by `BridgeRpcService`) ----
+
+  /**
+   * Thin delegates: the `/acp` session / turn / permission RPCs live in
+   * `bridge-rpc-service.ts`. `dispatchRpc` and the tests call these on the
+   * manager, so their names and signatures stay put.
+   */
   async startSession(agentId: string, cwd: string | undefined): Promise<{ sessionId: string }> {
-    // A1: an `/acp` session gets its own process. The token is only the bridge
-    // key; later lookups find the session by the id it was registered with.
-    const scope: BridgeScope = isPerSessionAgent(agentId)
-      ? { kind: 'ephemeral', token: randomUUID() }
-      : { kind: 'agent' }
-    const session = await this.bridgeFor(agentId, scope).createSession(cwd)
-    return { sessionId: session.sessionId }
+    return this.rpc.startSession(agentId, cwd)
   }
 
   async prompt(sessionId: string, prompt: string | ContentBlock[]): Promise<{ turnId: string }> {
-    let located = await this.locateOrResume(sessionId)
-    // The watchdog abandoned a previous turn here and the agent may still be
-    // holding its prompt slot on the old process: reclaim BEFORE sending, or
-    // this message queues behind a turn that will never answer.
-    if (located.session.orphanPromptTurnSeq !== undefined) {
-      const prepared = await this.prepareStalledSession(located.session)
-      if (!prepared.ok) throw new AcpError('agent_unresponsive', prepared.message)
-      // Without `session/load` there is nothing to re-locate: the record was
-      // dropped on purpose, and "/acp" has no conversation to recreate it from.
-      // Re-locating anyway would surface a misleading `unknown_session`.
-      if (prepared.reset === true) {
-        throw new AcpError('session_reset', `acp: agent "${located.session.agentId}" does not support session resume; start a new session`)
-      }
-      // A resumable reclaim released the record: re-locate what is live now.
-      located = await this.locateOrResume(sessionId)
-    }
-    const { bridge, session } = located
-    // The agent prompt slot is SHARED with chat turns: `running` alone misses
-    // a chat turn whose cancellation already released it (`running` false,
-    // `promptInFlight` still naming the agent-side turn), and a live chat
-    // controller means a continuation step may resume the SAME agent turn.
-    // A controller that already SETTLED (kept only so its card's continuation
-    // can still stream) has given the agent slot back: `/acp` may use it, and
-    // advancing `turnSeq` retires it — the behaviour the stale-controller
-    // watchdog case pins.
-    const chatController = session.turnController
-    if (session.running
-      || session.promptInFlight === true
-      || (chatController !== undefined && !chatController.stale && !chatController.hasSettled)) {
-      throw new AcpError('turn_in_flight', 'acp: this session already has a prompt in flight')
-    }
-
-    const blocks: ContentBlock[] = typeof prompt === 'string'
-      ? [{ type: 'text', text: prompt }]
-      : prompt
-
-    if (blocks.length === 0) {
-      throw new AcpError('empty_prompt', 'acp: prompt cannot be empty')
-    }
-
-    const hasImages = blocks.some(b => b.type === 'image')
-    if (hasImages && bridge.initResult?.agentCapabilities?.promptCapabilities?.image !== true) {
-      throw new AcpError('image_unsupported', `acp: agent "${bridge.def.id}" does not support image input`)
-    }
-
-    // Claim the SAME slot the chat path claims (`claimTurn` + `beginTurn`): an
-    // `/acp` turn in flight must make the next chat prompt wait, and vice
-    // versa. The settler is idempotent and identity-guarded; the turn still
-    // ends through `turn/end` below, so chat and RPC turns share one gate
-    // without sharing a stream controller.
-    const endTurn = bridge.beginTurn(session)
-    session.running = true
-    session.turnSeq += 1
-    const turnGen = session.turnSeq
-    session.lastAgentActivityAt = Date.now()
-    session.activeToolCalls.clear()
-    // A new turn owns the session from here: any reclaim marker named an
-    // earlier generation and must not suppress THIS turn's settle.
-    session.reclaimedTurnSeq = undefined
-    this.armStallTimer()
-    const turnId = randomUUID()
-    const promptText = typeof prompt === 'string'
-      ? prompt
-      : blocks.filter(b => b.type === 'text').map(b => (b as { text: string }).text).join('\n')
-    this.hub.broadcast({ type: 'turn/start', sessionId, turnId, text: promptText })
-    void bridge.runPrompt(session, blocks, turnId, turnGen)
-      .then(result => {
-        // The reclaim already ended this turn locally; the answer it caused is
-        // that same turn reporting back, not a second turn end for the caller.
-        if (session.reclaimedTurnSeq === turnGen) {
-          session.reclaimedTurnSeq = undefined
-          return
-        }
-        // A superseded turn's late answer must not end the turn now on air.
-        if (session.turnSeq !== turnGen) return
-        this.clearOrphanPrompt(session, turnGen)
-        // The SAME rate-limit refusal the chat plane settles on (see
-        // `streamPrompt`): a refused prompt RESOLVES, so without this the turn
-        // would end as a plain `refusal` stop and the reason — which lives only
-        // in the response `_meta` — would be dropped. The banner is a chat
-        // surface, but the record hangs off the SESSION, and one LiveSession
-        // can be driven from both planes: a chat conversation whose last
-        // `/acp` answer was normal must not keep showing a quota the agent has
-        // already stopped reporting.
-        const refusal = result.stopReason === 'refusal' ? agentRefusalDetail(result.meta) : undefined
-        if (refusal?.kind === 'quota') {
-          session.quotaRefusal = { message: refusal.message, at: Date.now() }
-          this.hub.broadcast({ type: 'session/meta', sessionId, session: snapshot(session) })
-        } else if (session.quotaRefusal !== undefined) {
-          session.quotaRefusal = undefined
-          this.hub.broadcast({ type: 'session/meta', sessionId, session: snapshot(session) })
-        }
-        // Release the shared slot BEFORE the terminal frame: a listener that
-        // sends the next prompt on `turn/end` must not read a stale claim.
-        endTurn()
-        session.running = false
-        if (refusal?.kind === 'quota') {
-          this.hub.broadcast({
-            type: 'turn/end',
-            sessionId,
-            turnId,
-            error: rateLimitedTurnError(session.agentId, refusal),
-            errorKind: 'quota',
-          })
-        } else {
-          this.hub.broadcast({ type: 'turn/end', sessionId, turnId, stopReason: result.stopReason })
-        }
-      })
-      .catch((error: unknown) => {
-        if (session.reclaimedTurnSeq === turnGen) {
-          session.reclaimedTurnSeq = undefined
-          return
-        }
-        if (session.turnSeq !== turnGen) return
-        // The turn was ended by an EXTERNAL close (idle release, agent stop):
-        // that teardown already broadcast the turn's end, and the session is
-        // parked or closed. Reporting the close's rejection again would put a
-        // second terminal frame on a turn the browser already saw finish.
-        if (session.released || session.closed) {
-          this.clearOrphanPrompt(session, turnGen)
-          return
-        }
-        this.clearOrphanPrompt(session, turnGen)
-        endTurn()
-        session.running = false
-        this.hub.broadcast({
-          type: 'turn/end',
-          sessionId,
-          turnId,
-          error: describeError(error),
-        })
-      })
-      // Every outcome — normal answer, failure, reclaim early-return, or a
-      // close's rejection — releases the shared prompt slot exactly once.
-      .finally(() => { endTurn() })
-    return { turnId }
+    return this.rpc.prompt(sessionId, prompt)
   }
 
   /** The late answer landed (or failed): the turn is no longer an orphan. */
   private clearOrphanPrompt(session: LiveSession, turnGen: number): void {
-    if (session.orphanPromptTurnSeq === turnGen) session.orphanPromptTurnSeq = undefined
+    this.rpc.clearOrphanPrompt(session, turnGen)
   }
 
   async cancel(sessionId: string): Promise<void> {
-    const live = this.tryLocate(sessionId)
-    if (live === undefined) return // released/stale session: nothing to cancel
-    await live.bridge.cancel(live.session)
+    return this.rpc.cancel(sessionId)
   }
 
   async closeSession(sessionId: string): Promise<void> {
-    // The turn stream of this session dies with it: a continuation step that
-    // is already on its way must not resume a closed session.
-    this.disposeTurnStreamsOf(controller => controller.session.sessionId === sessionId)
-    const live = this.tryLocate(sessionId)
-    if (live !== undefined) {
-      await live.bridge.closeSession(live.session, 'closed')
-      this.registry.forgetDshSession(sessionId)
-      const key = this.keyOfBridge(live.bridge)
-      if (key !== undefined) this.pruneBridge(key)
-      return
-    }
-    // A released session has no process left to close; just drop the record.
-    for (const [key, bridge] of this.bridges) {
-      if (bridge.dropReleased(sessionId)) {
-        this.hub.broadcast({ type: 'session/closed', sessionId, reason: 'closed' })
-        this.pruneBridge(key)
-        return
-      }
-    }
-    throw new AcpError('unknown_session', `acp: no live session ${sessionId}`)
+    return this.rpc.closeSession(sessionId)
   }
 
   async setMode(sessionId: string, modeId: string): Promise<void> {
-    const { bridge, session } = await this.locateOrResume(sessionId)
-    await bridge.setMode(session, modeId)
+    return this.rpc.setMode(sessionId, modeId)
   }
 
   async setConfigOption(sessionId: string, configId: string, value: string | boolean): Promise<void> {
-    const { bridge, session } = await this.locateOrResume(sessionId)
-    await bridge.setConfigOption(session, configId, value)
+    return this.rpc.setConfigOption(sessionId, configId, value)
   }
 
   respondPermission(requestId: string, optionId: string | undefined): void {
-    for (const bridge of this.bridges.values()) {
-      const owner = bridge.permissions.sessionIds().find(p => p.requestId === requestId)
-      if (owner === undefined) continue
-      bridge.permissions.respond(requestId, optionId === undefined ? { outcome: 'cancelled' } : { outcome: 'selected', optionId })
-      return
-    }
-    throw new AcpError('unknown_request', `acp: no pending permission ${requestId}`)
+    this.rpc.respondPermission(requestId, optionId)
   }
 
   transcript(sessionId: string, afterSeq: number | undefined): { session: unknown; entries: Array<{ seq: number; update: unknown }> } {
-    const live = this.tryLocate(sessionId)
-    if (live !== undefined) {
-      return { session: snapshot(live.session), entries: live.session.transcript.since(afterSeq ?? 0) }
-    }
-    // A released session still serves its pre-crash transcript for viewing.
-    for (const bridge of this.bridges.values()) {
-      const released = bridge.hasReleased(sessionId)
-      if (released !== undefined) {
-        return { session: snapshot(released), entries: released.transcript.since(afterSeq ?? 0) }
-      }
-    }
-    throw new AcpError('unknown_session', `acp: no live session ${sessionId}`)
+    return this.rpc.transcript(sessionId, afterSeq)
   }
 
   sessions(): unknown[] {
-    return [...this.bridges.values()].flatMap(b => [...b.sessionList, ...b.releasedList].map(snapshot))
+    return this.rpc.sessions()
   }
 
   /** The plugin's own default ACP agent (the panel's ★ gesture; see `SettingsService`). */
