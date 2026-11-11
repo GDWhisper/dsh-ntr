@@ -10,11 +10,21 @@ import { defineConfig } from 'vitest/config'
  * the browser build keeps the real require (tsdown EXTERNAL).
  */
 export default defineConfig({
-  // Keep Vitest's 5s default: the heaviest panel render finishes in about 1.5s.
-  // Subprocess bridge cases that need longer carry their own per-test bound.
   resolve: {
     alias: {
       '@deepseek-ai/dsh-client-ui-primitives': fileURLToPath(new URL('./tests/primitives-stub.ts', import.meta.url)),
+    },
+  },
+  test: {
+    // Keep Vitest's 5s default: the heaviest panel render finishes in about 1.5s.
+    // Subprocess bridge cases that need longer carry their own per-test bound.
+    // Cap fork parallelism: every tests/bridge/*.spec.ts file keeps spawning real
+    // mock-agent child processes, and unbounded file-level parallelism (one fork
+    // per CPU) overloads Windows process creation, starving timing-sensitive
+    // kill/liveness/watchdog cases. Even 2 forks still flaked under residual
+    // machine load, so run fully sequential (1 fork) — the measured-stable value.
+    poolOptions: {
+      forks: { maxForks: 1 },
     },
   },
 })

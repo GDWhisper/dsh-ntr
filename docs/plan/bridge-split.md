@@ -1,5 +1,7 @@
 # 源码拆分后续计划（P9.8 / P10）
 
+**状态：已全部完成（2026-11-11）。** P9.8a–d 与 P10 T1–T3 均落地，各阶段独立审核 PASS、单独提交；本文件保留作拆分记录，不再有待执行阶段。
+
 本文件承接 `src/bridge.ts` 巨型文件拆分任务的剩余部分。新会话先读 [AGENTS.md](../../AGENTS.md)、[AGENTS/architecture.md](../../AGENTS/architecture.md)、[AGENTS/protocol.md](../../AGENTS/protocol.md)，再读本文件。
 
 ## 1. 状态快照
@@ -28,7 +30,7 @@
 | 320 | `live-session.ts` | `LiveSession` 接口（已从 turn-stream 拆出） |
 | 其余 | `shape/process/state-paths/registries/types/identity/agy-*/archive-release-service/...` | 纯函数、常量与 Antigravity 专属模块 |
 
-- 测试：28 个文件（总用例数 1293，以 prepack 实测为准）；`tests/bridge.spec.ts` 11997 行、34 个顶层 `describe`、306 个用例（304 `it` + 2 `it.runIf(win32)`）；共享 helper 已抽到 `tests/bridge/harness.ts`（179 行，P10-T1）。
+- 测试：44 个文件、1293 个用例（prepack 实测）；`tests/bridge.spec.ts` 1186 行（只留首个 describe）；其余 33 个 describe 在 `tests/bridge/` 的 16 个主题文件里，共享 harness 在 `tests/bridge/harness.ts`（179 行）。
 - 已完成阶段与提交：
 
 | 阶段 | 内容 | 提交 |
@@ -45,6 +47,8 @@
 | P9.8a | 桥注册表与生命周期 → `bridge-registry-service.ts` | `792f55b` |
 | P9.8b | turn 看门狗与 turnStream 注册 → `turn-watchdog-service.ts` | `9bc5ec4` |
 | P9.8c | /acp RPC 面 → `bridge-rpc-service.ts` | `148d42e` |
+| P9.8d | 会话启动 / resume → `session-boot-service.ts` | `054e2ad` |
+| P10-T1 | 测试共享 harness → `tests/bridge/harness.ts` | `c119d57` |
 
 ## 2. 不变约束
 
@@ -134,6 +138,12 @@
 - 删除空壳文件与重复 helper。
 - 确认用例总数不变（当前 306 个 `bridge.spec` 用例：304 `it` + 2 `it.runIf(win32)`）。
 - 全量 `npm run prepack`。
+
+### 实际结果（T1–T3 已完成）
+
+- 34 个 describe 块逐字节迁移、标题与用例数不变（合计 306）；仅首个 describe 用共享 manager/events/waitFor，save gate 与 model catalog 两块用文件级 harness 的 hub 作隔离 manager 总线，其余自包含。
+- **最终 16 个新文件**（比建议表细：新文件 ≤1000 行硬门禁，建议的 5 文件每个都超限）：agent-admin 735 / model-catalog 434 / reliability 722 / permissions 647 / permission-deadlines 450 / chat-picks 920 / sessions 862 / idle-release 734 / silent-turn 917 / turn-stream 556 / background-drain 758 / detached-worker 673 / worker-settles 758 / subagent-records 367 / image-input 417 / a1-per-session 977（行数）。
+- **vitest 并发修复**：拆分后文件级并行（默认 20 fork）让 17 个 bridge 文件同时持续 spawn 子进程，Windows 下时序用例系统性超时（连未触碰的 panel/skills 也同轮失败）。`vitest.config.ts` 新增 `test.poolOptions.forks.maxForks: 1`（注意必须嵌在 `test` 键下，顶层 poolOptions 被 vitest 3 静默忽略）；maxForks=2 实测仍抖动，=1 连续多次 prepack 全绿（约 240–260s）。将来可按 project 分池提速。
 
 ## 5. 已知环境抖动
 
