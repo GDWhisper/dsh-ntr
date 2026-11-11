@@ -3,6 +3,8 @@ lib/
 *.tgz
 # Local agent planning scratch (never shipped)
 .zcode/
+# Trae IDE local workspace artifacts
+.trae/
 # Code-graph index caches (local tool artifacts, never part of the source)
 .codegraph/
 .codegraph-probe/
