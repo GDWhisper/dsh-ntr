@@ -334,4 +334,20 @@ describe('Antigravity late-output switch', () => {
     expect(() => validateConfig({ agents: [], agyLateOutput: 'yes' })).toThrow(/agyLateOutput/)
     expect(() => validateConfig({ agents: [], agyLateOutput: 0 })).toThrow(/agyLateOutput/)
   })
+
+  it('accepts the two watch windows as optional non-negative integers', () => {
+    // Absent keys stay absent so the host entry keeps the tuning defaults.
+    const absent = validateConfig({ agents: [] })
+    expect(absent).not.toHaveProperty('agyLateOutputMaxMs')
+    expect(absent).not.toHaveProperty('agyLateOutputCeilingMs')
+    expect(validateConfig({ agents: [], agyLateOutputMaxMs: 0 }).agyLateOutputMaxMs).toBe(0)
+    expect(validateConfig({ agents: [], agyLateOutputMaxMs: 1_800_000 }).agyLateOutputMaxMs).toBe(1_800_000)
+    expect(validateConfig({ agents: [], agyLateOutputCeilingMs: 0 }).agyLateOutputCeilingMs).toBe(0)
+    expect(validateConfig({ agents: [], agyLateOutputCeilingMs: 60_000 }).agyLateOutputCeilingMs).toBe(60_000)
+    expect(() => validateConfig({ agents: [], agyLateOutputMaxMs: -1 })).toThrow(/agyLateOutputMaxMs/)
+    expect(() => validateConfig({ agents: [], agyLateOutputMaxMs: 1.5 })).toThrow(/agyLateOutputMaxMs/)
+    expect(() => validateConfig({ agents: [], agyLateOutputMaxMs: 'x' })).toThrow(/agyLateOutputMaxMs/)
+    expect(() => validateConfig({ agents: [], agyLateOutputCeilingMs: -1 })).toThrow(/agyLateOutputCeilingMs/)
+    expect(() => validateConfig({ agents: [], agyLateOutputCeilingMs: 86_400_001 })).toThrow(/agyLateOutputCeilingMs/)
+  })
 })

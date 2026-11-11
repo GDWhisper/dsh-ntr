@@ -308,6 +308,18 @@ export interface AcpPluginConfig {
    * is off. Not editable from the settings page: a deployment key.
    */
   agyLateOutput?: boolean
+  /**
+   * Idle window of the Antigravity transcript watch: how long it may see no new
+   * transcript step before standing down. Every new step extends it, so a long
+   * background run is not cut off mid-work. `0` disables the whole mechanism.
+   * A deployment key (no settings-page control). Default 1800000 ms (30 min).
+   */
+  agyLateOutputMaxMs?: number
+  /**
+   * Absolute hard ceiling on the Antigravity transcript watch, from arm time;
+   * activity never extends it. `0` = no ceiling. A deployment key. Default 0.
+   */
+  agyLateOutputCeilingMs?: number
 }
 
 // ---- Host → browser events (`/api/acp/stream`, SSE) ----

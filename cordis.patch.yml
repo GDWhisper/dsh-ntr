@@ -103,9 +103,15 @@
         # agyLateOutput: true        # Antigravity transcript late-output path
         #                              (default on; only an automatically
         #                              recognised `agy acp` session arms it).
-        #                              false turns the whole path off. Its poll /
-        #                              quiet / max / echo windows are internal
-        #                              tuning keys, not deployment promises.
+        #                              false turns the whole path off.
+        # agyLateOutputMaxMs: 1800000 # IDLE window: stand down after this long
+        #                              with no new transcript step; every new
+        #                              step extends it (0 = disable the watch).
+        #                              Must outlast a silent subagent run.
+        # agyLateOutputCeilingMs: 0  # absolute hard cap from arm time, never
+        #                              extended by activity (0 = no ceiling).
+        #                              The poll / quiet / echo windows stay
+        #                              internal tuning keys.
         # idleTimeoutMs: 1800000     # how long a chat process may sit idle before
         #                              it is released (parked, then resumed by the
         #                              next message). 0 = never release. The

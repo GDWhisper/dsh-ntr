@@ -8,6 +8,16 @@
  * watch when a chat turn closes, waits for the new `PLANNER_RESPONSE` to go
  * quiet, and hands its text to {@link SubagentService.deliverLateReport}.
  *
+ * Two clocks bound the watch. The IDLE window (`agyLateOutputMaxMs`) is pushed
+ * forward by EVERY new transcript step — a `SYSTEM_MESSAGE` / `GENERIC` / tool
+ * step is evidence the background run is still alive, so a long subagent that
+ * writes nothing for a while is not cut off the moment its answer finally
+ * lands. The HARD CEILING (`agyLateOutputCeilingMs`, `0` = none) is an absolute
+ * cap from arm time that no activity extends, so a run that never goes quiet
+ * cannot poll forever. (The parent transcript stays silent while a child works
+ * in its OWN brain, so the idle window must be generous enough to outlast such
+ * a run; monitoring the child transcript is a separate feature.)
+ *
  * It NEVER closes a turn, kills a process or alters `running`: it is a new
  * SOURCE for the delivery family, not a watchdog.
  */
@@ -32,7 +42,10 @@ interface LateWatch {
   readonly steps: TranscriptStep[]
   pollTimer?: ReturnType<typeof setInterval>
   quietTimer?: ReturnType<typeof setTimeout>
+  /** Idle deadline: pushed forward by every new step (see `armIdleDeadline`). */
   deadlineTimer?: ReturnType<typeof setTimeout>
+  /** Absolute hard cap from arm time; activity never extends it. */
+  ceilingTimer?: ReturnType<typeof setTimeout>
   /** Cleared by the timer callbacks so a disarmed watch cannot deliver. */
   finished: boolean
   /** The session's `stopLateWatch` target; lets teardown disarm exactly this watch. */
@@ -139,9 +152,13 @@ export class AgyLateOutputService {
     const pollTimer = setInterval(() => { this.poll(watch) }, pollMs)
     pollTimer.unref?.()
     watch.pollTimer = pollTimer
-    const deadlineTimer = setTimeout(() => { this.onDeadline(watch) }, Math.max(1, tuning.agyLateOutputMaxMs))
-    deadlineTimer.unref?.()
-    watch.deadlineTimer = deadlineTimer
+    this.armIdleDeadline(watch)
+    const ceilingMs = tuning.agyLateOutputCeilingMs
+    if (ceilingMs > 0) {
+      const ceilingTimer = setTimeout(() => { this.settle(watch) }, Math.max(1, ceilingMs))
+      ceilingTimer.unref?.()
+      watch.ceilingTimer = ceilingTimer
+    }
     this.watches.set(session.sessionId, watch)
     session.stopLateWatch = watch.stop
   }
@@ -165,6 +182,10 @@ export class AgyLateOutputService {
     }
     const steps = watch.tail.readNew()
     if (steps.length === 0) return
+    // ANY new step is evidence the background run is alive: push the idle
+    // deadline out, even for a non-answer step (a subagent report or a tool
+    // frame). Only the hard ceiling is immune to this extension.
+    this.armIdleDeadline(watch)
     const floorSecond = Math.floor(watch.closedAt / 1_000)
     const candidates = steps.filter(step => {
       // Only planner responses are kept: fewer bytes held, and no sub-agent
@@ -210,8 +231,23 @@ export class AgyLateOutputService {
     this.disarmWatch(watch)
   }
 
-  /** Deadline: deliver whatever is there when the session is idle, then stop. */
-  private onDeadline(watch: LateWatch): void {
+  /** (Re-)arm the idle deadline against the CURRENT tuning window. */
+  private armIdleDeadline(watch: LateWatch): void {
+    if (watch.deadlineTimer !== undefined) clearTimeout(watch.deadlineTimer)
+    const timer = setTimeout(() => {
+      watch.deadlineTimer = undefined
+      this.settle(watch)
+    }, Math.max(1, this.deps.tuning().agyLateOutputMaxMs))
+    timer.unref?.()
+    watch.deadlineTimer = timer
+  }
+
+  /**
+   * A clock elapsed (idle window or hard ceiling): deliver whatever arrived
+   * when the session is idle, then stop. An empty buffer disarms silently —
+   * the answer, if any, is still in the transcript for the next prompt.
+   */
+  private settle(watch: LateWatch): void {
     if (watch.finished) return
     const session = watch.session
     const text = lateAnswerText(watch.steps)
@@ -250,6 +286,7 @@ export class AgyLateOutputService {
     if (watch.pollTimer !== undefined) clearInterval(watch.pollTimer)
     if (watch.quietTimer !== undefined) clearTimeout(watch.quietTimer)
     if (watch.deadlineTimer !== undefined) clearTimeout(watch.deadlineTimer)
+    if (watch.ceilingTimer !== undefined) clearTimeout(watch.ceilingTimer)
     const key = watch.session.sessionId
     if (this.watches.get(key) === watch) this.watches.delete(key)
     if (watch.session.stopLateWatch === watch.stop) watch.session.stopLateWatch = undefined

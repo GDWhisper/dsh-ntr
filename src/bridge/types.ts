@@ -280,12 +280,23 @@ export interface BridgeTuning {
    */
   agyLateOutputQuietMs?: number
   /**
-   * Absolute bound on one transcript watch: a background run that never goes
-   * quiet must not poll forever. At the bound whatever arrived is delivered
-   * when the session is idle. `0` disables the whole mechanism. Default
-   * 600000 ms.
+   * IDLE window of one transcript watch: how long it may see NO new step before
+   * it stands down. Every new step (answer or not) pushes it forward, so a long
+   * background run is not cut off mid-work. At the window whatever arrived is
+   * delivered when the session is idle. Must outlast a silent subagent run (the
+   * parent transcript stays quiet while a child works in its own brain); the
+   * process idle release is the outer bound. `0` disables the whole mechanism.
+   * Default 1800000 ms (30 minutes).
    */
   agyLateOutputMaxMs?: number
+  /**
+   * Absolute HARD CEILING on one transcript watch, measured from arm time; no
+   * activity extends it. A run that keeps producing steps forever must not poll
+   * forever. At the ceiling whatever arrived is delivered when the session is
+   * idle. `0` = no ceiling (the idle window and the process idle release bound
+   * the watch). Default 0.
+   */
+  agyLateOutputCeilingMs?: number
   /**
    * How long a delivered late answer stays eligible for the echo guard — the
    * agent replays it on the next prompt, which may come minutes later. Default

@@ -117,6 +117,8 @@ export function apply(ctx: Context, config?: unknown): void {
       // Only forward an EXPLICIT value: an absent key must keep the tuning
       // default (on), not override it with `undefined`.
       ...(resolved.agyLateOutput === undefined ? {} : { agyLateOutput: resolved.agyLateOutput }),
+      ...(resolved.agyLateOutputMaxMs === undefined ? {} : { agyLateOutputMaxMs: resolved.agyLateOutputMaxMs }),
+      ...(resolved.agyLateOutputCeilingMs === undefined ? {} : { agyLateOutputCeilingMs: resolved.agyLateOutputCeilingMs }),
     },
   )
   const adapter = new AcpLlmAdapter(manager)

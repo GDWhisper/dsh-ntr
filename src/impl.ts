@@ -587,6 +587,20 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
   if (agyLateOutput !== undefined && typeof agyLateOutput !== 'boolean') {
     throw new AcpError('bad_config', 'acp: agyLateOutput must be a boolean')
   }
+  // The transcript watch's two windows: absent keeps the tuning default. The
+  // idle window's `0` disables the mechanism; the ceiling's `0` means "none".
+  const agyLateOutputMaxMs = value.agyLateOutputMaxMs
+  if (agyLateOutputMaxMs !== undefined
+    && (typeof agyLateOutputMaxMs !== 'number' || !Number.isInteger(agyLateOutputMaxMs)
+      || agyLateOutputMaxMs < 0 || agyLateOutputMaxMs > 86_400_000)) {
+    throw new AcpError('bad_config', 'acp: agyLateOutputMaxMs must be an integer in [0, 86400000] (0 = disable the watch)')
+  }
+  const agyLateOutputCeilingMs = value.agyLateOutputCeilingMs
+  if (agyLateOutputCeilingMs !== undefined
+    && (typeof agyLateOutputCeilingMs !== 'number' || !Number.isInteger(agyLateOutputCeilingMs)
+      || agyLateOutputCeilingMs < 0 || agyLateOutputCeilingMs > 86_400_000)) {
+    throw new AcpError('bad_config', 'acp: agyLateOutputCeilingMs must be an integer in [0, 86400000] (0 = no ceiling)')
+  }
   return {
     agents,
     transcriptMaxEntries: max,
@@ -602,6 +616,8 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
     turnStallTickMs,
     idleTimeoutMs,
     ...(agyLateOutput === undefined ? {} : { agyLateOutput }),
+    ...(agyLateOutputMaxMs === undefined ? {} : { agyLateOutputMaxMs }),
+    ...(agyLateOutputCeilingMs === undefined ? {} : { agyLateOutputCeilingMs }),
   }
 }
 
