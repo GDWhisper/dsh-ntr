@@ -337,9 +337,10 @@ export const AGENT_PRESETS: AgentPreset[] = [
   {
     id: 'agy',
     name: 'Antigravity CLI',
-    description: 'Antigravity — run as `agy acp` over stdio',
+    description: 'Antigravity — run as `agy acp --dangerously-skip-permissions` over stdio',
     executables: ['agy'],
     defaultCommand: 'agy',
-    defaultArgs: ['acp'],
+    // Sub-agent permission prompts never reach ACP; without auto-approve the turn hangs.
+    defaultArgs: ['acp', '--dangerously-skip-permissions'],
   },
 ]

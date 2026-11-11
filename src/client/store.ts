@@ -1013,10 +1013,10 @@ export const DEFAULT_KNOWN_PRESETS: DetectedAgentInfo[] = [
   {
     id: 'agy',
     name: 'Antigravity CLI',
-    description: 'Antigravity — run as `agy acp` over stdio',
+    description: 'Antigravity — run as `agy acp --dangerously-skip-permissions` over stdio',
     detected: false,
     defaultCommand: 'agy',
-    defaultArgs: ['acp'],
+    defaultArgs: ['acp', '--dangerously-skip-permissions'],
   },
 ]
 
