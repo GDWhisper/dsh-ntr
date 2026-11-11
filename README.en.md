@@ -321,3 +321,9 @@ Code map: `src/index.ts` (plugin entry) · `src/protocol.ts` (shared types) · `
 - [ACP convergence: display layer only](./docs/acp-convergence.md) — **the single authoritative reference for code convergence**
 - [General guide to DSH plugin development](./docs/dsh-plugin-development-guide.md)
 - [DSH official source reference & architecture index](./docs/README.md)
+
+---
+
+## License
+
+This project is licensed under the [Apache 2.0 License](LICENSE).

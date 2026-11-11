@@ -321,3 +321,9 @@ dsh plugin --profile web add ./   # 挂载到 Web Profile
 - [ACP 收敛方向：只借显示层](./docs/acp-convergence.md) —— **代码收敛的唯一权威依据**
 - [DSH 插件开发通用指南](./docs/dsh-plugin-development-guide.md)
 - [DSH 官方源码参考与架构索引](./docs/README.md)
+
+---
+
+## 开源协议
+
+本项目采用 [Apache 2.0](LICENSE) 许可证开源。

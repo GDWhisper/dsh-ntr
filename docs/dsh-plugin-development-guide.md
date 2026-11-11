@@ -100,7 +100,7 @@ my-dsh-plugin/
     //   "inject": ["@deepseek-ai/dsh-client-ui-settings"]
     // }
   },
-  "license": "MIT"
+  "license": "Apache-2.0"
 }
 ```
 
