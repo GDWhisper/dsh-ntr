@@ -2,6 +2,36 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [0.4.4] - 2026-11-11
+
+这一版把 Antigravity 回合结束后才完成的回答接回聊天，归档对话也会及时释放 agent 进程。
+
+### 新增
+
+- **acp**：Antigravity 会话在回合结束后完成的定时任务与子代理工作，其回答作为后台报告自动进入聊天；下一轮开头的重复回放会被吞掉，已完成的工具卡也不会重开。([a96131e](https://github.com/GDWhisper/dsh-ntr/commit/a96131e))
+- **acp**：插件配置新增 `agyLateOutput` 开关，可关闭 Antigravity 回合后输出的回收，默认开启。([1c9ae6c](https://github.com/GDWhisper/dsh-ntr/commit/1c9ae6c))
+
+### 改进
+
+- **acp**：在侧栏归档对话后，对应的 agent 进程随之释放；正在跑的回合先取消、结算后再挂起，需要时下一条消息照常恢复，不支持会话恢复的 agent 保持原样。([e55fe37](https://github.com/GDWhisper/dsh-ntr/commit/e55fe37))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.4.3...v0.4.4
+
+---
+
+This release brings Antigravity's post-turn answers back into the chat and frees agent processes promptly when conversations are archived.
+
+### Added
+
+- **acp**: in an Antigravity session, scheduled and sub-agent work that finishes after the turn ends arrives in the chat as a background report; the replayed copy at the start of the next prompt is swallowed, and no second tool card opens for a completed call. ([a96131e](https://github.com/GDWhisper/dsh-ntr/commit/a96131e))
+- **acp**: the plugin config accepts an `agyLateOutput` switch that turns off Antigravity's post-turn output recovery; it is on by default. ([1c9ae6c](https://github.com/GDWhisper/dsh-ntr/commit/1c9ae6c))
+
+### Improved
+
+- **acp**: archiving a conversation in the sidebar releases its agent process; a running turn is cancelled first and parked once it settles, the next message resumes as usual, and agents without session recovery stay untouched. ([e55fe37](https://github.com/GDWhisper/dsh-ntr/commit/e55fe37))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.4.3...v0.4.4
+
 ## [0.4.3] - 2026-11-10
 
 这一版修正对话显示与会话恢复中几处容易误导人的提示。
