@@ -11,7 +11,7 @@
 
 | 行数 | 文件 | 职责 |
 |---|---|---|
-| 2486 | `manager.ts` | 剩余门面：看门狗、RPC 面、会话启动 / resume、`makeBridge` |
+| 2317 | `manager.ts` | 剩余门面：RPC 面、会话启动 / resume、`makeBridge` |
 | 2626 | `turn-stream.ts` | `TurnStreamController`、段 / ambient / 后台持有 |
 | 2202 | `agent-bridge.ts` | `AgentBridge`：单 agent 进程与会话 |
 | 865 | `chat-choice-service.ts` | 会话选择、路由、ACP mode 缓存 |
@@ -21,6 +21,7 @@
 | 498 | `session-registry-service.ts` | DSH 会话注册表、绑定、锁、transcript 投影 |
 | 497 | `agent-admin-service.ts` | agent 保存 / 删除 / 测试、保存门禁 |
 | 431 | `bridge-registry-service.ts` | 桥注册表与生命周期（P9.8a 拆出） |
+| 289 | `turn-watchdog-service.ts` | turn 看门狗与 turnStream 注册（P9.8b 拆出） |
 | 365 | `persistence-service.ts` | `agents.json` 读取、组装、严格 / 非严格写盘 |
 | 320 | `live-session.ts` | `LiveSession` 接口（已从 turn-stream 拆出） |
 | 其余 | `shape/process/state-paths/registries/types/identity/agy-*/archive-release-service/...` | 纯函数、常量与 Antigravity 专属模块 |
@@ -39,6 +40,7 @@
 | P9.5 | agent 管理与保存门禁 → `agent-admin-service.ts` | `3e0cf18` |
 | P9.6 | 会话注册表 → `session-registry-service.ts` | `dcd489c` |
 | P9.7 | `agents.json` 持久化 → `persistence-service.ts` | `6d5c10d` |
+| P9.8a | 桥注册表与生命周期 → `bridge-registry-service.ts` | `792f55b` |
 
 ## 2. 不变约束
 
