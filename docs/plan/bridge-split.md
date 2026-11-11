@@ -49,6 +49,7 @@
 | P9.8c | /acp RPC 面 → `bridge-rpc-service.ts` | `148d42e` |
 | P9.8d | 会话启动 / resume → `session-boot-service.ts` | `054e2ad` |
 | P10-T1 | 测试共享 harness → `tests/bridge/harness.ts` | `c119d57` |
+| P10-T2/T3 | 33 个 describe → `tests/bridge/` 16 个主题文件 + `maxForks: 1` | `10bc580` |
 
 ## 2. 不变约束
 

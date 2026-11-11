@@ -110,7 +110,7 @@
 - `impl.spec.ts`：纯逻辑单测，无子进程，秒级返回。
 - `register.spec.ts`：Cordis 上下文注册，用 `fakeCtx()` 模拟宿主。
 - `store.spec.ts`：前端状态机与消息块折叠。
-- `bridge.spec.ts`：集成测试，用真实子进程跑 `tests/mock-agent.mjs` 验证 stdio ACP 全链路。
+- `bridge.spec.ts` + `tests/bridge/*.spec.ts`：集成测试，用真实子进程跑 `tests/mock-agent.mjs` 验证 stdio ACP 全链路；共享 harness 在 `tests/bridge/harness.ts`。
 - `acp-view.spec.ts`：浏览器半区纯函数（diff / 空状态 / codec / 路径等价 / 审批期限事实）。
 - `session-controls.spec.ts`：composer 芯片与菜单**说了什么**（`agentBaseChip` / `describeRoute` / `menuFor`）。
 - `model-seat.spec.ts`：座位 claim 与 ACP gate 的装 / 撤 / 重取（含 `conversation.view` / `conversation.composer.dock` 的 ACP-only 动态注册）。
