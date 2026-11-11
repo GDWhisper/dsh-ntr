@@ -28,7 +28,7 @@
 | 320 | `live-session.ts` | `LiveSession` 接口（已从 turn-stream 拆出） |
 | 其余 | `shape/process/state-paths/registries/types/identity/agy-*/archive-release-service/...` | 纯函数、常量与 Antigravity 专属模块 |
 
-- 测试：28 个文件（总用例数以 prepack 实测为准）；`tests/bridge.spec.ts` 12164 行、34 个顶层 `describe`、304 个用例。
+- 测试：28 个文件（总用例数 1293，以 prepack 实测为准）；`tests/bridge.spec.ts` 11997 行、34 个顶层 `describe`、306 个用例（304 `it` + 2 `it.runIf(win32)`）；共享 helper 已抽到 `tests/bridge/harness.ts`（179 行，P10-T1）。
 - 已完成阶段与提交：
 
 | 阶段 | 内容 | 提交 |
@@ -132,7 +132,7 @@
 ### T3 收尾
 
 - 删除空壳文件与重复 helper。
-- 确认用例总数不变（当前 304 个 `bridge.spec` 用例）。
+- 确认用例总数不变（当前 306 个 `bridge.spec` 用例：304 `it` + 2 `it.runIf(win32)`）。
 - 全量 `npm run prepack`。
 
 ## 5. 已知环境抖动
