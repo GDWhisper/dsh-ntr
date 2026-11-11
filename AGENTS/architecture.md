@@ -165,9 +165,10 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 | 工具卡快照 / delta / 输出注册 | `src/impl.ts` · `acpToolCallFromUpdate` / `acpToolCallDelta` / `acpToolCallArgsOf` / `isFinalToolCallStatus`；`src/bridge/registries.ts` · `recordAcpToolOutput` / `waitForToolOutput`；详见 [protocol.md](./protocol.md) |
 | 绑定 RPC | `src/impl.ts` · `dispatchRpc('session/chat-*')`；`src/bridge/session-registry-service.ts` · `bindChatAgent`；`src/bridge/chat-choice-service.ts` · `setChatSessionModel` / `setChatSessionEffort` / `setChatSessionMode` |
 | 路由选择 / 老宿主请求改写 | `presets/acp/acp-guard.mjs` · `selectBoundRoute` / `agent/request`；`src/bridge/chat-choice-service.ts` · `conversationRouteModel` |
-| 工作区 | `src/index.ts` · `wireWorkspace`；`src/bridge/state-paths.ts` · `chatWorkspaceRoot`；`src/bridge/manager.ts` · `getOrCreateDshSession`；`src/bridge/agent-bridge.ts` · `doResumeSession` |
+| 工作区 | `src/index.ts` · `wireWorkspace`；`src/bridge/state-paths.ts` · `chatWorkspaceRoot`；`src/bridge/session-boot-service.ts` · `SessionBootService.getOrCreateDshSession`（manager 同名转发）；`src/bridge/agent-bridge.ts` · `doResumeSession` |
 | 锁定 | `src/bridge/session-registry-service.ts` · `lockedAgentFor` / `lockChatAgent` / `rollbackFirstTurn`；`src/bridge/live-session.ts` · `provisionalLock` |
 | 桥注册表 / 生命周期 | `src/bridge/bridge-registry-service.ts` · `bridgeFor` / `pruneBridge` / `stopAgent` / `shutdownAll`（manager 保留同名转发与 `bridges` / `bridgeScopes` getter） |
+| 会话启动 / resume | `src/bridge/session-boot-service.ts` · `SessionBootService`（`getOrCreateDshSession` / `resumeChatSession` / `prepareStalledSession` / `reclaimChatPrompt`，manager 保留同名转发；`waitForSettleGate` 仅服务内部使用） |
 | 默认 agent | `src/bridge/manager.ts` · `defaultAgent` / `setDefaultAgent` |
 
 ## 目录索引

@@ -11,7 +11,7 @@
 
 | 行数 | 文件 | 职责 |
 |---|---|---|
-| 2161 | `manager.ts` | 剩余门面：会话启动 / resume、`makeBridge`、streamPrompt 接线 |
+| 1925 | `manager.ts` | 剩余门面：`makeBridge`、`streamPrompt` 接线、构造器装配、薄转发 |
 | 2626 | `turn-stream.ts` | `TurnStreamController`、段 / ambient / 后台持有 |
 | 2202 | `agent-bridge.ts` | `AgentBridge`：单 agent 进程与会话 |
 | 865 | `chat-choice-service.ts` | 会话选择、路由、ACP mode 缓存 |
@@ -23,6 +23,7 @@
 | 431 | `bridge-registry-service.ts` | 桥注册表与生命周期（P9.8a 拆出） |
 | 289 | `turn-watchdog-service.ts` | turn 看门狗与 turnStream 注册（P9.8b 拆出） |
 | 266 | `bridge-rpc-service.ts` | /acp RPC 面（P9.8c 拆出） |
+| 331 | `session-boot-service.ts` | 会话启动 / resume / 插话 / 卡死预处理（P9.8d 拆出） |
 | 365 | `persistence-service.ts` | `agents.json` 读取、组装、严格 / 非严格写盘 |
 | 320 | `live-session.ts` | `LiveSession` 接口（已从 turn-stream 拆出） |
 | 其余 | `shape/process/state-paths/registries/types/identity/agy-*/archive-release-service/...` | 纯函数、常量与 Antigravity 专属模块 |
@@ -43,6 +44,7 @@
 | P9.7 | `agents.json` 持久化 → `persistence-service.ts` | `6d5c10d` |
 | P9.8a | 桥注册表与生命周期 → `bridge-registry-service.ts` | `792f55b` |
 | P9.8b | turn 看门狗与 turnStream 注册 → `turn-watchdog-service.ts` | `9bc5ec4` |
+| P9.8c | /acp RPC 面 → `bridge-rpc-service.ts` | `148d42e` |
 
 ## 2. 不变约束
 
@@ -102,6 +104,8 @@
 - 公共导出面 56 个名称不变。
 - `npm run prepack` 全绿（28 个测试文件，用例数以实测为准）。
 - `lib/bridge/*.js` 不出现 `from '../bridge.js'` 或 `require('../bridge.js')`。
+
+**结果（P9.8a–d 全部完成，各子步 Host ≤10、独立审核 PASS、测试零改动）**：`manager.ts` 2735 → 1925 行。剩余为 `streamPrompt`（约 660 行）、构造器装配（约 305 行）、`makeBridge`、`agentSkills`、Antigravity 胶水与约百条薄转发——「1500 行左右」未达，但 P9.8 四个簇已拆尽，`streamPrompt` 本就不在 P9.8 方法清单内；再降需另立阶段（如 streamPrompt 拆分），不属于本计划范围。
 
 ## 4. P10：拆 `tests/bridge.spec.ts`
 
