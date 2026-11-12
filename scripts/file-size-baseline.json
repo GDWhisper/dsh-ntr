@@ -7,7 +7,6 @@
   "src/client/panel.tsx": 3414,
   "src/client/session-controls.tsx": 1136,
   "src/client/store.ts": 4387,
-  "src/client/subagent-panel.tsx": 1038,
   "src/impl.ts": 4300,
   "src/protocol.ts": 1700,
   "tests/acp-view.spec.ts": 1699,

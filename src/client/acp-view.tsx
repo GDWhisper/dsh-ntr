@@ -545,6 +545,23 @@ export function formatSubagentDuration(ms: number): string {
   return `${hours}h ${String(minutes % 60).padStart(2, '0')}m`
 }
 
+/**
+ * A row's "last activity" segment, or `undefined` when the row has no record
+ * (a catalog-only history row never had an activity clock). Relative to `now`,
+ * so an in-flight row's line keeps moving with its elapsed clock. Shared by
+ * the header list (`subagent-panel.tsx`) and the detail overlay
+ * (`subagent-detail.tsx`).
+ */
+export function subagentLastActivityLabel(
+  lastActivityAt: number | undefined,
+  now: number,
+  t: Translate,
+): string | undefined {
+  if (lastActivityAt === undefined) return undefined
+  const ago = formatSubagentDuration(Math.max(0, now - lastActivityAt))
+  return t(`最后活动 ${ago} 前`, `last activity ${ago} ago`)
+}
+
 /** `type · label`, falling back to the label, then to the child id. */
 export function subagentTitle(record: Pick<SubagentRecord, 'type' | 'label' | 'childId'>): string {
   const label = record.label.trim() === '' ? record.childId : record.label.trim()

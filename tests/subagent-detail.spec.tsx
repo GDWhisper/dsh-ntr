@@ -22,7 +22,8 @@ import type { ComponentType } from 'react'
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { closeSubagentDetail, openSubagentDetail, subagentDetailIsOpen } from '../src/client/acp-ui.tsx'
-import { OwnSubagentCatalog, SubagentDetailDialog } from '../src/client/subagent-panel.tsx'
+import { OwnSubagentCatalog } from '../src/client/subagent-panel.tsx'
+import { SubagentDetailDialog, subagentDetailBlocks } from '../src/client/subagent-detail.tsx'
 import { subagentKey } from '../src/client/store.ts'
 import type { AcpStore, SubagentDetailState } from '../src/client/store.ts'
 import type { SubagentDetailEntry, SubagentRecord } from '../src/protocol.ts'
@@ -403,5 +404,61 @@ describe('the subagent detail overlay', () => {
     fireEvent.keyDown(composer, { key: 'Escape' })
     expect(subagentDetailIsOpen()).toEqual({ dshSessionId: 'chat-1', childId: 'acp:a' })
     expect(screen.getByRole('dialog', { name: '子智能体详情' })).toBeDefined()
+  })
+})
+
+/**
+ * The detail overlay shows the worker's conversation, not one card per raw
+ * frame: adjacent prose merges into one block, tool updates land on their
+ * call's card, and the dispatch's own frames stay in the header sections.
+ * (Moved here with `subagentDetailBlocks` itself, out of the locked
+ * acp-view.spec.ts, when the detail module split from the panel.)
+ */
+describe('subagentDetailBlocks', () => {
+  it('folds adjacent prose and tool updates into native-style blocks', () => {
+    const blocks = subagentDetailBlocks([
+      { update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'think ' } } },
+      { update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'again' } } },
+      { update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hello' } } },
+      { update: { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'Read', status: 'in_progress', kind: 'read' } },
+      {
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 't1',
+          status: 'completed',
+          content: [{ type: 'content', content: { type: 'text', text: 'ok' } }],
+        },
+      },
+    ], 'acp:dispatch')
+    expect(blocks.map(block => block.kind)).toEqual(['thought', 'agent', 'tool'])
+    expect(blocks[0]).toMatchObject({ kind: 'thought', text: 'think again' })
+    expect(blocks[1]).toMatchObject({ kind: 'agent', text: 'hello' })
+    expect(blocks[2]).toMatchObject({ kind: 'tool', toolCallId: 't1', title: 'Read', status: 'completed' })
+  })
+
+  it('leaves the dispatch frames out of the worker stream', () => {
+    const blocks = subagentDetailBlocks([
+      { update: { sessionUpdate: 'tool_call', toolCallId: 'dispatch', title: 'Task' } },
+      { update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'worker' } } },
+      { update: { sessionUpdate: 'tool_call_update', toolCallId: 'dispatch', status: 'completed', content: 'done' } },
+    ], 'acp:dispatch')
+    expect(blocks.map(block => block.kind)).toEqual(['agent'])
+    expect(blocks[0]).toMatchObject({ kind: 'agent', text: 'worker' })
+  })
+
+  it('keeps a cut frame and a non-object payload instead of folding them away', () => {
+    const blocks = subagentDetailBlocks([
+      {
+        update: { sessionUpdate: 'agent_message_chunk', truncated: true, text: 'tail\n… [truncated 5 chars]' },
+        truncatedChars: 5,
+      },
+      { update: 'plain payload' },
+    ], 'acp:a')
+    expect(blocks[0]).toMatchObject({
+      kind: 'event',
+      event: 'agent_message_chunk · truncated',
+      text: 'tail\n… [truncated 5 chars]',
+    })
+    expect(blocks[1]).toMatchObject({ kind: 'event', event: 'unknown', text: 'plain payload' })
   })
 })

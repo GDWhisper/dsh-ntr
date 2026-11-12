@@ -25,7 +25,7 @@ import { AcpComposerAgentTag, AcpSessionControls, AcpSessionMenu } from './sessi
 import { AcpConversationView } from './acp-view.tsx'
 import { AcpSettingsDialog } from './settings-dialog.tsx'
 import { SaveGuardToast } from './save-guard-toast.tsx'
-import { SubagentDetailDialog } from './subagent-panel.tsx'
+import { SubagentDetailDialog } from './subagent-detail.tsx'
 import { PermissionDock } from './permission-dock.tsx'
 import { ReleasedBanner } from './released-banner.tsx'
 import { QuotaBanner } from './quota-banner.tsx'

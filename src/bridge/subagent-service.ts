@@ -36,6 +36,7 @@ import { subagentDispatchDeclaresIdentity, subagentDispatchLabel } from './shape
 import { dispatchRecord, dispatchStatus, pruneSessionDispatches, refreshSubagentDispatchLabel } from './dispatch-shape.ts'
 import { AgySubagentTracker } from './agy-subagents.ts'
 import { AgySubagentPollService, type AgySubagentPollWiring } from './agy-subagent-poll.ts'
+import { readAgyChildDetail } from './agy-subagent-detail.ts'
 import { describeError } from './errors.ts'
 
 /** What the subagent service needs from the bridge manager, injected. */
@@ -77,8 +78,15 @@ export class SubagentService {
    * when the manager provided no poll wiring (the wire states still work).
    */
   private readonly agyPoll?: AgySubagentPollService
+  /**
+   * The agy store-root resolver (the poll wiring's closure), kept for the
+   * on-demand DETAIL read: a child transcript is named by the session's agent,
+   * not by the record. Absent when no poll wiring was composed.
+   */
+  private readonly agyStoreRoot?: (session: LiveSession) => string | undefined
 
   constructor(private readonly host: SubagentHost, agyPoll?: AgySubagentPollWiring) {
+    this.agyStoreRoot = agyPoll?.storeRoot
     this.agy = new AgySubagentTracker({
       noteRecords: (records, options) => { this.noteSubagentRecords(records, options) },
       reportCatalog: (session, childId, label) => this.reportSubagentCatalog(session, childId, label),
@@ -504,17 +512,31 @@ export class SubagentService {
 
   /**
    * Raw transcript entries for ONE external worker — the detail view's
-   * on-demand read. Two filters, BOTH needed: the dispatch's own frames
-   * (`toolCallId === <dispatch id>`, which is where the raw input and the
-   * terminal frame live) and the worker's frames
-   * (`_meta.parentToolCallId === <dispatch id>`). Released sessions keep
-   * serving their retained buffers. Bounded: the newest
+   * on-demand read. An agy record (`childConversationId`) reads the child's
+   * OWN brain transcript as a marked step stream (`readAgyChildDetail`,
+   * bounded + fail-open, never persisted); the store root resolves through the
+   * session's agent, released sessions included (a host restart keeps the
+   * child file readable). Without one, the CodeBuddy path is unchanged: two
+   * filters, BOTH needed — the dispatch's own frames (`toolCallId === <dispatch
+   * id>`, which is where the raw input and the terminal frame live) and the
+   * worker's frames (`_meta.parentToolCallId === <dispatch id>`). Released
+   * sessions keep serving their retained buffers. Bounded: the newest
    * `MAX_SUBAGENT_DETAIL_ENTRIES` entries, each raw payload cut at
    * `ACP_TOOL_RAW_MAX` with a marker — never silently.
    */
   subagentsDetail(dshSessionId: string, childId: string): SubagentDetailResult {
     const toolCallId = subagentToolCallId(childId)
     if (toolCallId === '') return { entries: [] }
+    const record = this.records.get(dshSessionId)?.find(row => row.childId === childId)
+    if (record?.childConversationId !== undefined) {
+      let storeRoot: string | undefined
+      for (const session of this.host.sessions()) {
+        if (session.dshSessionId !== dshSessionId || session.closed) continue
+        storeRoot = this.agyStoreRoot?.(session)
+        break
+      }
+      return readAgyChildDetail(storeRoot, record.childConversationId)
+    }
     const matched: SubagentDetailEntry[] = []
     for (const session of this.host.sessions()) {
       // A closed session is destroyed, not merely unreachable; released ones

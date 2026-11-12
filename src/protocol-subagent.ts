@@ -89,6 +89,15 @@ export interface SubagentDetailEntry {
   update: unknown
   /** Serialized characters cut from this frame; absent means the payload is verbatim. */
   truncatedChars?: number
+  /**
+   * Antigravity ONLY: this entry is a step of the child's OWN brain transcript
+   * (a read-only step stream), not a `session/update` frame. `update` then
+   * carries the transcript step verbatim (`step_index` / `type` / `status` /
+   * `content` / `thinking` / `tool_calls` / `error`), a host cut, or a read
+   * notice (`{ notice: 'unreadable' | 'bad-lines' | 'window-cut', lines? }`).
+   * CodeBuddy entries never carry the marker and render unchanged.
+   */
+  source?: 'agy-transcript'
 }
 
 /** `subagents/detail`: raw transcript entries for one worker (bounded per worker). */
