@@ -1,6 +1,6 @@
 # 方案：Antigravity 子代理进入子智能体面板（transcript 方案）
 
-**状态**：**方案待审**（设计建议见 §1，代码未动；拍板后再登记 [docs/todo.md](../todo.md) 与 [docs/README.md](../README.md)）。
+**状态**：**已实现，待真机验收**（P1–P3 已落地，任务级审核 + 整枝终审 + 修复波复审全部通过，`npm run prepack` 全绿；§12 未决项与 §13 真机验收需一个已认证的 agy 会话，由用户执行；docs/todo.md 与 docs/README.md 登记随合并进行）。
 **适用范围**：ACP preset 会话里由 `agy acp` 服务的会话；桥接层新增 agy 专属识别与读取，浏览器面板尽量复用既有 `OwnSubagentCatalog`。
 **一句话**：agy 的 ACP wire 不上报任何子代理生命周期（没有 CodeBuddy 那套 `_meta`），但它的私有 transcript 留了完整证据——派发结果里有子代理 `conversationId`，子代理自己的 brain transcript 有完整步骤流，报告以 `SYSTEM_MESSAGE` 写回父 transcript。照 [antigravity-late-output.md](./antigravity-late-output.md) 的「只读 transcript」路子，把 agy 子代理喂进既有 `SubagentRecord` / 面板，做到六态可辨、可点进详情。
 
