@@ -8,6 +8,7 @@
 
 import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentSkillsResult, AgentSkillEntry, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, IdleReleaseResult, IdleReleaseSetPayload, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, SubagentDetailEntry, SubagentDetailResult, SubagentRecord } from '../protocol.ts'
 import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, MAX_SUBAGENT_DETAIL_ENTRIES, pluginReleaseUrl } from '../protocol.ts'
+import { commitFrame, consumeVerdict, invalidateVerdict, markUnsettled, peekVerdict, projectAcpMode, settleFromHost, type AcpVerdict } from './acp-verdict.ts'
 
 /** One slash command the ACP agent declared, whole row (the menu draws name, description and `input.hint`). */
 export type AgentCommand = NonNullable<ChatSessionView['availableCommands']>[number]
@@ -1120,20 +1121,14 @@ export class AcpStore {
    */
   private readonly chatUnlocked = new Set<string>()
   /**
-   * Sessions whose ACP-mode verdict a committed `agent-preset/selected` frame
-   * settled. A frame settles the verdict; the host's log read can lag a switch
-   * by one (the appended row is not yet visible to a fresh read, and the seat
-   * taking the model cell re-mounts readers), so a read may only settle a
-   * session no frame has spoken for — otherwise a stale answer would regress a
-   * verdict the runtime already told us the truth about.
-   *
-   * The ONE exception is the gate's own re-ask ({@link loadChatSessions} with
-   * `settleVerdict`): a verdict the gate has held as its only fact source for
-   * longer than its TTL is exactly the case where the frame path has gone
-   * quiet, and without an authorized re-read a switch the runtime never framed
-   * could never be corrected.
+   * The ACP-mode verdicts this page holds, keyed by chat session id (see
+   * {@link AcpVerdict}): `frame` (a committed `agent-preset/selected` frame)
+   * outranks `host` (a `session/chat-list` answer), and absent means "never
+   * asked". `UiState.acpMode` is a projection of the entries that carry a value.
+   * A host read may only settle a session no frame has spoken for, except the
+   * gate's own TTL re-ask: it updates the value, the frame keeps its authority.
    */
-  private readonly acpModeLive = new Set<string>()
+  private readonly acpVerdicts = new Map<string, AcpVerdict>()
   /**
    * Monotonic order plus a short log of applied `subagents/record` frames: a
    * `session/chat-list` answer can describe the host as of BEFORE a frame that
@@ -1152,12 +1147,10 @@ export class AcpStore {
    */
   private readonly acpSessionOwners = new Map<string, string>()
   /**
-   * Chat sessions whose host read came back WITHOUT a verdict (no `acpMode`
-   * field, or the read failed). The seat gate consults this to retract its
-   * one-shot ask ledger entry, so a read that could not answer costs one retry
-   * instead of leaving the native model seat visible for the rest of the page.
+   * When the seat gate last asked the host for a session's verdict (epoch ms).
+   * Kept apart from {@link acpVerdicts} so a held verdict is re-asked per TTL.
    */
-  private readonly acpModeUnsettled = new Set<string>()
+  private readonly acpAsked = new Map<string, number>()
   /** In-flight `agent/catalog` reads, keyed by agent id. */
   private readonly seatCatalogReads = new Set<string>()
   /** In-flight `agent/cached-models` reads, keyed by agent id. */
@@ -2065,7 +2058,7 @@ export class AcpStore {
    * the binding a fresh conversation just created shows up).
    *
    * `settleVerdict` is the seat gate's own re-ask and the ONLY read allowed to
-   * settle a verdict a frame had already settled (see {@link acpModeLive}): the
+   * settle a verdict a frame had already settled (see {@link acpVerdicts}): the
    * gate holds such a verdict as its only fact source while the session row
    * stays silent, and a host read is the one place a switch the runtime never
    * framed can still be learned from. Composer readers pass nothing and keep
@@ -2099,7 +2092,7 @@ export class AcpStore {
     options: { settleVerdict?: boolean; force?: boolean } | undefined,
     read: { dropped: boolean },
   ): Promise<void> {
-    const settle = options?.settleVerdict === true || !this.acpModeLive.has(dshSessionId)
+    const settle = options?.settleVerdict === true || peekVerdict(this.acpVerdicts, dshSessionId)?.kind !== 'frame'
     // Captured BEFORE the request: every frame applied after this point is
     // newer than whatever state the host will answer with.
     const subagentRecordFramesAtRead = this.subagentRecordSeq
@@ -2181,7 +2174,7 @@ export class AcpStore {
         // re-mounts readers, so a stale answer would otherwise regress it.
         ...(acpMode === undefined || !settle
           ? {}
-          : { acpMode: { ...this.state.acpMode, [dshSessionId]: acpMode === true } }),
+          : { acpMode: this.commitHostVerdict(dshSessionId, acpMode === true) }),
       })
       // A read that answered but carried no verdict has NOT settled this
       // session. The gate's ask ledger is one-shot per id, so unless the id is
@@ -2191,7 +2184,7 @@ export class AcpStore {
       // on its next evaluation (every store mutation re-runs it), which is
       // what makes the fallback recoverable instead of a single coin flip.
       if (acpMode === undefined && settle) {
-        this.acpModeUnsettled.add(dshSessionId)
+        markUnsettled(this.acpVerdicts, dshSessionId)
       }
     } catch {
       // A host without this surface (older build) has nothing to show; the
@@ -2199,7 +2192,7 @@ export class AcpStore {
       if (read.dropped) return
       this.mutate({ chatSessions: [], chatSessionsFor: dshSessionId })
       if (settle) {
-        this.acpModeUnsettled.add(dshSessionId)
+        markUnsettled(this.acpVerdicts, dshSessionId)
       }
     } finally {
       if (this.chatSessionReads.get(dshSessionId) === read) this.chatSessionReads.delete(dshSessionId)
@@ -2433,26 +2426,34 @@ export class AcpStore {
     return rows.find(row => row.token === token)?.insertion
   }
 
+  /** Fold a host answer in and return the derived projection for the caller's `mutate`. */
+  private commitHostVerdict(dshSessionId: string, value: boolean): Record<string, boolean> {
+    settleFromHost(this.acpVerdicts, dshSessionId, value)
+    return projectAcpMode(this.acpVerdicts)
+  }
+
+  /** Publish the projection when it moved; a restated verdict keeps the record's identity. */
+  private publishAcpMode(): void {
+    const acpMode = projectAcpMode(this.acpVerdicts)
+    const held = this.state.acpMode
+    const keys = Object.keys(acpMode)
+    if (keys.length === Object.keys(held).length && keys.every(id => held[id] === acpMode[id])) return
+    this.mutate({ acpMode })
+  }
+
   /**
    * Record the verdict a committed `agent-preset/selected` frame carries, folded
-   * from the frame's own preset field ({@link acpModeFromPresetEvent}). The
-   * frame is authoritative: it marks the session live-settled, so no later host
-   * read may regress it (see {@link acpModeLive}) — the gate's own TTL re-ask
-   * being the one authorized exception. Same no-op-when-unchanged discipline as
-   * the other accessors, so a frame restating the held verdict costs no
-   * listener churn.
+   * from its own preset field ({@link acpModeFromPresetEvent}): it promotes the
+   * session's verdict to `frame`, so no later host read may regress it, the
+   * gate's TTL re-ask being the one exception. Restating it costs no churn.
    *
-   * The seat gate (`syncAcpMode`) is the SECOND caller: it folds the runtime
-   * row's own `agentPreset` — the same session-log source the frames announce —
-   * through here, in both directions. That hands the row the frame's authority
-   * on purpose (one provenance, one rank): a stale projection is corrected by
-   * the gate's next evaluation with fresher row data, and only HOST READS are
-   * barred from regressing what the runtime itself already said.
+   * The seat gate (`syncAcpMode`) is the second caller: folding the runtime
+   * row's `agentPreset` through here hands the row the frame's authority on
+   * purpose (one provenance, one rank); only HOST READS may not regress it.
    */
   noteAcpMode(dshSessionId: string, acpMode: boolean): void {
-    this.acpModeLive.add(dshSessionId)
-    if (this.state.acpMode[dshSessionId] === acpMode) return
-    this.mutate({ acpMode: { ...this.state.acpMode, [dshSessionId]: acpMode } })
+    commitFrame(this.acpVerdicts, dshSessionId, acpMode)
+    this.publishAcpMode()
   }
 
   /**
@@ -2484,43 +2485,41 @@ export class AcpStore {
   }
 
   /**
-   * Whether a chat session's host read produced a verdict the seat gate can
-   * rely on. `false` means "asked but not answered" — the read returned no
-   * `acpMode` field or failed outright — and is the signal for the gate to
-   * retract its one-shot ask ledger entry for this id so it can ask again.
-   *
-   * A verdict handed down by a committed `agent-preset/selected` frame is
-   * authoritative and outranks everything (see {@link acpModeLive}); such a
-   * session always answers `true` here, settled or not.
+   * Whether the seat gate can rely on a verdict here. `false` means "asked but
+   * not answered", the signal to withdraw the one-shot ask entry and retry.
+   * DESTRUCTIVE for an `unsettled` marker (see {@link consumeVerdict}).
    */
   hasAcpModeVerdict(dshSessionId: string): boolean {
-    if (this.acpModeLive.has(dshSessionId)) return true
-    if (this.acpModeUnsettled.has(dshSessionId)) {
-      this.acpModeUnsettled.delete(dshSessionId)
-      return false
-    }
-    return this.state.acpMode[dshSessionId] !== undefined
+    return consumeVerdict(this.acpVerdicts, dshSessionId)
   }
 
   /**
-   * Drop one chat session's ACP-mode verdict — or the whole map. The preset
-   * switch a session committed is announced by the host (`agent-preset/selected`)
-   * and folded by the runtime into its own rows, but NOT into this map, so the
-   * gate re-asks instead of trusting a verdict the session log has moved past.
+   * Whether the seat gate may ask the host for this session's verdict now, and
+   * stamps the ledger when it may: never asked, no verdict held (an unanswered
+   * ask is retried, not parked), or the held verdict aged past `ttlMs` while the
+   * row stays silent. A held verdict keeps its ledger entry either way.
+   */
+  claimAcpAsk(dshSessionId: string, ttlMs: number): boolean {
+    const verdictHeld = this.state.acpMode[dshSessionId] !== undefined || this.hasAcpModeVerdict(dshSessionId)
+    const askedAt = this.acpAsked.get(dshSessionId)
+    if (askedAt !== undefined && verdictHeld && Date.now() - askedAt < ttlMs) return false
+    this.acpAsked.set(dshSessionId, Date.now())
+    return true
+  }
+
+  /** Drop the ask ledger entry so a later evaluation asks again. */
+  releaseAcpAsk(dshSessionId: string): void {
+    this.acpAsked.delete(dshSessionId)
+  }
+
+  /**
+   * Drop one chat session's verdict — or every one — so the gate re-asks
+   * instead of trusting a moved-past answer. An unanswered ask's marker and the
+   * ask ledger survive: they describe an open question, not a stale answer.
    */
   invalidateAcpMode(dshSessionId?: string): void {
-    if (dshSessionId === undefined) {
-      // Dropping the whole map also re-opens every session to host reads.
-      this.acpModeLive.clear()
-      if (Object.keys(this.state.acpMode).length === 0) return
-      this.mutate({ acpMode: {} })
-      return
-    }
-    this.acpModeLive.delete(dshSessionId)
-    if (this.state.acpMode[dshSessionId] === undefined) return
-    const acpMode = { ...this.state.acpMode }
-    delete acpMode[dshSessionId]
-    this.mutate({ acpMode })
+    invalidateVerdict(this.acpVerdicts, dshSessionId)
+    this.publishAcpMode()
   }
 
   /**

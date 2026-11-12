@@ -476,28 +476,6 @@ export function apply(ctx: Context): void {
     }
   }
 
-  /**
-   * Chat session ids the ACP-mode tracker has already asked the host about (the
-   * `session/chat-list` fallback), mapped to WHEN the last ask went out. The
-   * ask is once per id so a host whose answer carries no `acpMode` cannot turn
-   * every store mutation into a fresh RPC — the classic resolve-loop this file
-   * already guards against elsewhere. `agent-preset/selected` clears an id so a
-   * committed preset switch re-asks.
-   *
-   * An id is REMOVED again when its ask comes back without a verdict: a
-   * one-shot ask that cannot answer must not wedge the gate for the rest of
-   * the page's life. The next store mutation or list notification retries it,
-   * which is what makes the fallback recoverable rather than a single coin
-   * flip (a host half that transiently fails, or answers `{}` because the
-   * session's projection row is not resident yet, used to leave the native
-   * model seat visible forever with nothing in the console to say why).
-   *
-   * A verdict that IS held is re-asked once per {@link ACP_MODE_VERDICT_TTL_MS}
-   * while the row stays silent — see the constant for why a held verdict may
-   * not be permanent.
-   */
-  const acpModeAsked = new Map<string, number>()
-
   /** The host-side verdict for the seat gate, when we hold one (`AcpStore.acpMode`). */
   const acpModeVerdict = (sessionId: string): boolean | undefined => store.getSnapshot().acpMode[sessionId]
 
@@ -628,6 +606,8 @@ export function apply(ctx: Context): void {
      */
     let seatDiag = 'idle'
     let permissionSeatDiag = 'idle'
+    /** The session this gate last judged; its ask ledger entry dies with the gate. */
+    let judgedSessionId: string | undefined
     /**
      * Hand every ACP-only surface back: both composer cells, the NTR view tab
      * and the context ring.
@@ -717,23 +697,21 @@ export function apply(ctx: Context): void {
       // gate's only fact source, and the host's log read is the one place a
       // switch the runtime never framed can still be learned from.
       const verdictHeld = acpModeVerdict(staged.sessionId) !== undefined || store.hasAcpModeVerdict(staged.sessionId)
-      const askedAt = acpModeAsked.get(staged.sessionId)
-      const askIsDue = askedAt === undefined
-        || (!verdictHeld || Date.now() - askedAt >= ACP_MODE_VERDICT_TTL_MS)
-      if (rowAgentPreset(staged.row) === undefined && askIsDue) {
-        acpModeAsked.set(staged.sessionId, Date.now())
+      judgedSessionId = staged.sessionId
+      if (rowAgentPreset(staged.row) === undefined
+        && store.claimAcpAsk(staged.sessionId, ACP_MODE_VERDICT_TTL_MS)) {
         // `settleVerdict` on the TTL re-ask only: the answer of a read the gate
         // itself commissioned may settle a verdict a frame had settled (see
-        // `acpModeLive`), which is what lets a switch the runtime never framed
+        // `acpVerdicts`), which is what lets a switch the runtime never framed
         // still reach this gate. A composer reader's answer keeps deferring to
         // the frame, because the host's log read can lag a switch by one.
         void store.loadChatSessions(staged.sessionId, verdictHeld ? { settleVerdict: true } : undefined)
-      } else if (!verdictHeld && askedAt !== undefined) {
+      } else if (!verdictHeld) {
         // The previous ask for this session came back without a verdict (or is
         // still in flight). Withdraw the one-shot mark so the round-trip can be
         // repeated: without this, one silent failure pins the native seat in
         // place for the rest of the page's life with nothing to show why.
-        acpModeAsked.delete(staged.sessionId)
+        store.releaseAcpAsk(staged.sessionId)
       }
       // An ACP conversation's models belong to the external agent, so the
       // host's native model seat must not be on screen here — it would list
@@ -861,7 +839,7 @@ export function apply(ctx: Context): void {
         const sessionId = args[0]
         if (typeof sessionId !== 'string') return
         // A frame supersedes both a held verdict and a pending one-shot ask.
-        acpModeAsked.delete(sessionId)
+        store.releaseAcpAsk(sessionId)
         if (args.length >= 2) {
           // The late answer to an ask that predates the frame must not win: it
           // describes the log from before the switch.
@@ -957,6 +935,7 @@ export function apply(ctx: Context): void {
       stopPreset?.()
       stopWatch?.()
       stopCurrent?.()
+      if (judgedSessionId !== undefined) store.releaseAcpAsk(judgedSessionId)
       disarmVerdictReask()
       // The scope marker dies with the gate: a reload (HMR) must not leave the
       // hiding CSS pointed at conversations nothing confirms anymore.
