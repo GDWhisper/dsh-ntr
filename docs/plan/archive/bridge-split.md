@@ -1,8 +1,8 @@
 # 源码拆分后续计划（P9.8 / P10）
 
-**状态：已全部完成（2026-11-11）。** P9.8a–d 与 P10 T1–T3 均落地，各阶段独立审核 PASS、单独提交；本文件保留作拆分记录，不再有待执行阶段。
+**状态：已完成 / 已归档（2026-11-11）。** P9.8a–d 与 P10 T1–T3 均落地，各阶段独立审核 PASS、单独提交；本文件保留作拆分记录，不再有待执行阶段。
 
-本文件承接 `src/bridge.ts` 巨型文件拆分任务的剩余部分。新会话先读 [AGENTS.md](../../AGENTS.md)、[AGENTS/architecture.md](../../AGENTS/architecture.md)、[AGENTS/protocol.md](../../AGENTS/protocol.md)，再读本文件。
+本文件承接 `src/bridge.ts` 巨型文件拆分任务的剩余部分。新会话先读 [AGENTS.md](../../../AGENTS.md)、[AGENTS/architecture.md](../../../AGENTS/architecture.md)、[AGENTS/protocol.md](../../../AGENTS/protocol.md)，再读本文件。
 
 ## 1. 状态快照
 
@@ -55,7 +55,7 @@
 
 1. 公共导出面固定 56 个名称。任何阶段先核对 `src/bridge.ts` 的再导出集合。
 2. 只改 `src/`、`tests/` 与 `AGENTS/`；禁止改 `lib/`。
-3. 相对导入必须带 `.ts` / `.tsx` 后缀（[AGENTS.md](../../AGENTS.md) 约束 6）。
+3. 相对导入必须带 `.ts` / `.tsx` 后缀（[AGENTS.md](../../../AGENTS.md) 约束 6）。
 4. 单向依赖：服务不得运行时导入 `../bridge.ts` 或 `./manager.ts`；只允许 `import type` 且必须注释说明。
 5. 每个阶段单独提交，提交前 `npm run prepack`；提交信息用 `refactor(acp):`。
 6. 动了 `AGENTS/` 描述的代码，同提交更新对应文档（符号归属路径）。
@@ -152,7 +152,7 @@
 
 ## 6. 新会话启动步骤
 
-1. 读 [AGENTS.md](../../AGENTS.md) 与 [AGENTS/architecture.md](../../AGENTS/architecture.md)、[AGENTS/protocol.md](../../AGENTS/protocol.md)。
+1. 读 [AGENTS.md](../../../AGENTS.md) 与 [AGENTS/architecture.md](../../../AGENTS/architecture.md)、[AGENTS/protocol.md](../../../AGENTS/protocol.md)。
 2. 读本文件，确认 HEAD 与状态快照一致（`git log -1 --oneline`、`git status --short`）。
 3. 从 P9.8a 开始：先让实现子代理分析字段与方法依赖，再决定是否满足注入回调上限。
 4. 实现完成后，派独立子代理审核；审核 PASS 后再提交。

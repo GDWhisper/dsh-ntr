@@ -1,6 +1,8 @@
 # Antigravity 后台结果补发（transcript 方案）
 
-本文件是 [docs/todo.md](../todo.md) 里「Antigravity 后台结果不推送」的实施方案。先读 [AGENTS.md](../../AGENTS.md)、[AGENTS/protocol.md](../../AGENTS/protocol.md) 的 §6.2 / §6.3，再读本文件。
+**状态**：已完成 / 已归档。
+
+本文件是 [docs/todo.md](../../todo.md) 里「Antigravity 后台结果不推送」的实施方案。先读 [AGENTS.md](../../../AGENTS.md)、[AGENTS/protocol.md](../../../AGENTS/protocol.md) 的 §6.2 / §6.3，再读本文件。
 
 本版已按对抗审核结论修订（6 条阻塞 + 12 条建议），设计细节以本文件为准。
 
