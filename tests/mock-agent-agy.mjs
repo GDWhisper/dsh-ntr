@@ -12,6 +12,18 @@
  * "AGY_REPLAY" makes the next prompt replay that text before its own answer
  * (agy flushes the backlog when a prompt arrives); the `AGY_REPLAY_PARTIAL`
  * variant sends only the first half and ends the turn.
+ *
+ * "AGY_DISPATCH" prompts script the `invoke_subagent` wire shape (task 1 of
+ * docs/plan/antigravity-subagent-panel.md): an ordinary tool call titled
+ * "Run invoke_subagent" whose COMPLETED result only says the child was
+ * CREATED — no CodeBuddy `_meta` anywhere, and no completion frame ever.
+ * Variants: AGY_DISPATCHLATE (result lands after the turn response),
+ * AGY_DISPATCHSLOW (result after 1.2s, so a test can cancel first),
+ * AGY_DISPATCHNORESULT (no result at all), AGY_DISPATCHTWO (two dispatches),
+ * AGY_DISPATCHBARE (rawInput without Role / TypeName).
+ * MOCK_AGY_LOAD_REPLAY=1: `session/load` replays the dispatch + result frames
+ * (agy's real replay shape is unmeasured; the plugin must skip the whole
+ * load window fail-open).
  */
 import { appendFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
@@ -19,10 +31,51 @@ import { join } from 'node:path'
 const AGY_STORE = process.env.MOCK_AGY_STORE
 /** The completed tool call an agy turn announces and the next prompt replays. */
 const AGY_CALL_ID = 'call_agy_1'
+/** The dispatch call ids the AGY_DISPATCH scenarios open. */
+const AGY_DISPATCH_ID = 'agy_dispatch_1'
+const AGY_DISPATCH_ID_TWO = 'agy_dispatch_2'
 const agyStepIndex = new Map()
 const agyLateAnswers = new Map()
 /** Answer text waiting for its turn's response (`agyLateAnswer`). */
 const agyPendingLate = new Map()
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+/** The dispatch `tool_call`: title + rawInput are the ONLY identity evidence. */
+function agyDispatchCall(toolCallId, role) {
+  return {
+    sessionUpdate: 'tool_call',
+    toolCallId,
+    title: 'Run invoke_subagent',
+    kind: 'other',
+    status: 'pending',
+    rawInput: role === undefined
+      ? { Model: 'inherit', Prompt: 'migrate the license headers' }
+      : { Model: 'inherit', Prompt: 'migrate the license headers', Role: role, TypeName: 'self' },
+  }
+}
+
+/** The creation result: `completed` means CREATED, never "child finished". */
+function agyDispatchResult(toolCallId, sessionId, suffix) {
+  const childId = `agy-child-${sessionId}-${suffix}`
+  const text = `Created the following subagent:\n${JSON.stringify({
+    conversationId: childId,
+    logAbsoluteUri: `file:///mock/brain/${childId}/.system_generated/logs/transcript.jsonl`,
+    workspaceUris: [],
+  })}`
+  return {
+    sessionUpdate: 'tool_call_update',
+    toolCallId,
+    status: 'completed',
+    content: [{ type: 'content', content: { type: 'text', text } }],
+  }
+}
+
+const agyDispatchAck = {
+  sessionUpdate: 'agent_message_chunk',
+  messageId: 'm-agy-dispatch',
+  content: { type: 'text', text: 'AGY-DISPATCH-ACK' },
+}
 
 /**
  * agy's transcript file exists before its first late answer: the plugin's
@@ -44,11 +97,53 @@ function ensureAgyTranscript(sessionId) {
 
 /**
  * Run the Antigravity replay behaviour for one prompt, at the very start of
- * the turn (before its ordinary opening frames). Returns true when the turn
- * must end immediately (a partial replay). An "AGY_LATE" prompt only records
- * its pending answer here; the write is anchored by `agyLateAnswer`.
+ * the turn (before its ordinary opening frames). Returns `false` when the
+ * prompt is not an agy scenario, `true` to end the turn with `end_turn`, or
+ * `'cancelled'` to answer a cancel the way the real agent does. An "AGY_LATE"
+ * prompt only records its pending answer here; the write is anchored by
+ * `agyLateAnswer`. `cancelWait` is the host's cancel-waiter factory.
  */
-export async function agyPrompt(send, sessionId, text) {
+export async function agyPrompt(send, sessionId, text, cancelWait) {
+  if (text.includes('AGY_DISPATCH')) {
+    const role = text.includes('AGY_DISPATCHBARE') ? undefined : 'License Migrator'
+    await send(agyDispatchCall(AGY_DISPATCH_ID, role))
+    if (text.includes('AGY_DISPATCHTWO')) await send(agyDispatchCall(AGY_DISPATCH_ID_TWO, 'Header Auditor'))
+    if (text.includes('AGY_DISPATCHNORESULT')) {
+      await send(agyDispatchAck)
+      return true
+    }
+    if (text.includes('AGY_DISPATCHLATE')) {
+      // The creation result lands AFTER the turn response (real wire: ~5s
+      // after the call). The session-level tracker must still move the record.
+      setTimeout(() => {
+        void Promise.resolve(send(agyDispatchResult(AGY_DISPATCH_ID, sessionId, '1'))).catch(() => {})
+      }, 200)
+      await send(agyDispatchAck)
+      return true
+    }
+    if (text.includes('AGY_DISPATCHSLOW')) {
+      // A slow creation result, so a test can cancel first. The cancel is
+      // acknowledged the way the real agent does (stopReason cancelled).
+      const wasCancelled = await Promise.race([
+        sleep(1_200).then(() => false),
+        cancelWait(sessionId).then(() => true),
+      ])
+      if (wasCancelled) {
+        // The child exists already: its creation result still lands late,
+        // after the cancel — a terminal row must not be revived by it.
+        setTimeout(() => {
+          void Promise.resolve(send(agyDispatchResult(AGY_DISPATCH_ID, sessionId, '1'))).catch(() => {})
+        }, 300)
+        return 'cancelled'
+      }
+    } else {
+      await sleep(120)
+    }
+    await send(agyDispatchResult(AGY_DISPATCH_ID, sessionId, '1'))
+    if (text.includes('AGY_DISPATCHTWO')) await send(agyDispatchResult(AGY_DISPATCH_ID_TWO, sessionId, '2'))
+    await send(agyDispatchAck)
+    return true
+  }
   // agy flushes the previous turn's late answer at the START of the next
   // prompt: replay it here, without any marker of its own (just text), so the
   // plugin's echo guard is the only thing that can drop it.
@@ -125,4 +220,18 @@ export async function sendOpeningToolCard(send, text, card) {
     })
   }
   await send(card)
+}
+
+/**
+ * The `session/load` replay hook. Owns the generic `replay_tool` frame (moved
+ * here verbatim so mock-agent.mjs stays inside its line ratchet) and, under
+ * MOCK_AGY_LOAD_REPLAY, the historical dispatch + creation result. agy's real
+ * replay shape is UNMEASURED (task-1 brief): the plugin must skip bookkeeping
+ * for the whole load window fail-open, whatever the replay carries.
+ */
+export async function agyLoadReplay(send, sessionId) {
+  await send({ sessionUpdate: 'tool_call', toolCallId: 'replay_tool', title: 'replayed tool', kind: 'other', status: 'completed' })
+  if (process.env.MOCK_AGY_LOAD_REPLAY === undefined) return
+  await send(agyDispatchCall(AGY_DISPATCH_ID, 'License Migrator'))
+  await send(agyDispatchResult(AGY_DISPATCH_ID, sessionId, '1'))
 }

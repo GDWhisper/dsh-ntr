@@ -48,6 +48,13 @@ export interface SubagentRecord {
   label: string
   /** The worker's declared role (`_meta["codebuddy.ai/subagentType"]`). */
   type?: string
+  /**
+   * Antigravity ONLY: the child's brain conversationId, read from the
+   * `invoke_subagent` creation result. Names the child's private transcript
+   * for the detail / completion reads — NEVER a catalog key (the catalog
+   * stays aligned on `childId`). CodeBuddy records do not carry it.
+   */
+  childConversationId?: string
   status: SubagentStatus
   startedAt: number
   lastActivityAt: number

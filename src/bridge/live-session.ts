@@ -288,6 +288,16 @@ export interface LiveSession {
    */
   backgroundDispatches?: Map<string, BackgroundDispatch>
   /**
+   * Antigravity `invoke_subagent` dispatches (see `AgySubagentTracker`).
+   * Session-level for the same reason as {@link backgroundDispatches} — the
+   * creation result may land after the dispatching turn closed — but in a
+   * SEPARATE map: the CodeBuddy tracker must never read an agy row (its
+   * `completed` result means "child created", not "worker finished"), and the
+   * detached-worker hold / idle-clock dispatch scan must never see one (agy
+   * children are always off-turn). Teardown covers both maps alike.
+   */
+  agyDispatches?: Map<string, BackgroundDispatch>
+  /**
    * Prose an IDLE background drain streamed while no turn controller observed
    * it. With the default "settle at the prompt response" (docs/acp-convergence
    * §派发即收口), CodeBuddy's unsolicited turn lands on a conversation nobody

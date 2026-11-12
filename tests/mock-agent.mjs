@@ -229,7 +229,7 @@
 import { Writable, Readable } from 'node:stream'
 import { appendFileSync } from 'node:fs'
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from '@agentclientprotocol/sdk'
-import { agyLateAnswer, agyPrompt, sendOpeningToolCard } from './mock-agent-agy.mjs'
+import { agyLateAnswer, agyLoadReplay, agyPrompt, sendOpeningToolCard } from './mock-agent-agy.mjs'
 
 const sessions = new Map()
 /**
@@ -521,7 +521,7 @@ const app = agent({ name: 'mock-acp-agent' })
         },
       })
     }
-    await send({ sessionUpdate: 'tool_call', toolCallId: 'replay_tool', title: 'replayed tool', kind: 'other', status: 'completed' })
+    await agyLoadReplay(send, sessionId)
     await send({ sessionUpdate: 'agent_message_chunk', messageId: 'replay-1', content: { type: 'text', text: 'REPLAYED: earlier conversation' } })
     // MOCK_LOAD_DELAY_MS: hold the RESPONSE open so a test can act while the
     // session is mid-recovery (released cleared, not yet in `sessions`). The
@@ -625,9 +625,9 @@ const app = agent({ name: 'mock-acp-agent' })
 
     const send = update => ctx.client.notify(methods.client.session.update, { sessionId, update })
     let permissionAnswer = 'none'
-    if (await agyPrompt(send, sessionId, text)) return { stopReason: 'end_turn' }
-    // Stale-cancel swallow: a prompt landing inside the cleanup window of the
-    // PREVIOUS cancel is answered from that cancel — no updates, no turn.
+    const agyStop = await agyPrompt(send, sessionId, text, cancelPromise)
+    if (agyStop !== false) return { stopReason: agyStop === true ? 'end_turn' : agyStop }
+    // Stale-cancel swallow: a prompt inside the PREVIOUS cancel's cleanup window is answered from that cancel — no updates, no turn.
     const cleanupUntil = cancelCleanupUntil.get(sessionId)
     if (cleanupUntil !== undefined && Date.now() < cleanupUntil) {
       return { stopReason: 'cancelled' }

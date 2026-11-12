@@ -18,6 +18,7 @@ export function dispatchRecord(dispatch: BackgroundDispatch, dshSessionId: strin
     toolCallId: dispatch.toolCallId,
     label: dispatch.catalogLabel,
     ...(dispatch.subagentType === undefined ? {} : { type: dispatch.subagentType }),
+    ...(dispatch.childConversationId === undefined ? {} : { childConversationId: dispatch.childConversationId }),
     status: dispatchStatus(dispatch),
     startedAt: dispatch.startedAt,
     lastActivityAt: dispatch.lastActivityAt,

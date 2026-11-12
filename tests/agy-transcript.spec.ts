@@ -13,6 +13,7 @@ import {
   agyTranscriptPaths,
   isAntigravityAgent,
   lateAnswerText,
+  parseAgyConversationId,
   parseTranscriptStep,
   type TranscriptStep,
 } from '../src/bridge/agy-transcript.ts'
@@ -349,5 +350,50 @@ describe('Antigravity late-output switch', () => {
     expect(() => validateConfig({ agents: [], agyLateOutputMaxMs: 'x' })).toThrow(/agyLateOutputMaxMs/)
     expect(() => validateConfig({ agents: [], agyLateOutputCeilingMs: -1 })).toThrow(/agyLateOutputCeilingMs/)
     expect(() => validateConfig({ agents: [], agyLateOutputCeilingMs: 86_400_001 })).toThrow(/agyLateOutputCeilingMs/)
+  })
+})
+
+describe('dispatch result conversationId parsing', () => {
+  /** The measured `invoke_subagent` result text (task-1 brief evidence). */
+  function resultText(childId: string): string {
+    return `Created the following subagent:\n${JSON.stringify({
+      conversationId: childId,
+      logAbsoluteUri: `file:///home/u/.gemini/antigravity-cli/brain/${childId}/.system_generated/logs/transcript.jsonl`,
+      workspaceUris: ['file:///home/u/project'],
+    })}`
+  }
+
+  it('reads the conversationId out of the creation result', () => {
+    expect(parseAgyConversationId(resultText('agy-child-42'))).toBe('agy-child-42')
+  })
+
+  it('reads a pretty-printed payload behind several prefix lines', () => {
+    const text = `Created the following subagent:\nSome extra prose line.\n${JSON.stringify({ conversationId: 'child_x-9', workspaceUris: [] }, null, 2)}`
+    expect(parseAgyConversationId(text)).toBe('child_x-9')
+  })
+
+  it('returns undefined when the field is missing or not a usable id', () => {
+    expect(parseAgyConversationId('Created the following subagent:\n{"logAbsoluteUri":"file:///x"}')).toBeUndefined()
+    expect(parseAgyConversationId('{"conversationId":123}')).toBeUndefined()
+    expect(parseAgyConversationId('{"conversationId":""}')).toBeUndefined()
+    // The id names a brain directory: separators / traversal are not ids.
+    expect(parseAgyConversationId('{"conversationId":"../escape"}')).toBeUndefined()
+    expect(parseAgyConversationId('{"conversationId":"a/b"}')).toBeUndefined()
+  })
+
+  it('fails open on bad JSON, missing braces and empty text — never throws', () => {
+    expect(parseAgyConversationId('Created the following subagent:\n{conversationId: broken')).toBeUndefined()
+    expect(parseAgyConversationId('no json here at all')).toBeUndefined()
+    expect(parseAgyConversationId('')).toBeUndefined()
+    expect(parseAgyConversationId('{')).toBeUndefined()
+    expect(parseAgyConversationId('{"conversationId":"ok"} trailing }')).toBeUndefined()
+  })
+
+  it('stays bounded on pathological input', () => {
+    // A prefix longer than the scan window pushes the payload out of reach:
+    // the answer is undefined, not an unbounded scan or a throw.
+    const huge = `${'x'.repeat(128 * 1024)}\n${resultText('late-child')}`
+    expect(parseAgyConversationId(huge)).toBeUndefined()
+    expect(parseAgyConversationId(resultText('ok-child').padEnd(200_000, ' '))).toBe('ok-child')
   })
 })

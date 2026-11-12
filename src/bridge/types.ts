@@ -458,6 +458,13 @@ export interface BackgroundDispatch {
   error?: unknown
   /** The worker's declared role (`_meta["codebuddy.ai/subagentType"]`). */
   subagentType?: string
+  /**
+   * Antigravity ONLY: the child's brain conversationId from the dispatch's
+   * creation result (`parseAgyConversationId`). Its presence is the RUNNING
+   * evidence — the result says "created", never "finished" — and it names the
+   * child transcript later reads use. CodeBuddy dispatches never set it.
+   */
+  childConversationId?: string
   /** Per-worker counters; only `updates` moves per chunk and none of them writes the state file. */
   counts: { updates: number; toolCalls: number; textChars: number }
   /** The status last announced through `subagents/record` (creation included). */

@@ -19,7 +19,7 @@ export type { AcpRouteBindingRegistry, BackgroundWake } from './bridge/registrie
 export { AsyncQueue } from './bridge/async-queue.ts'
 export { permissionToolName } from './bridge/turn-stream.ts'
 export { agentRefusalDetail, permissionAskReason, subagentDispatchLabel } from './bridge/shape.ts'
-export { AgyTranscriptTail, agyStoreRoot, agyTranscriptPaths, isAntigravityAgent, lateAnswerText, parseTranscriptStep } from './bridge/agy-transcript.ts'
+export { AgyTranscriptTail, agyStoreRoot, agyTranscriptPaths, isAntigravityAgent, lateAnswerText, parseAgyConversationId, parseTranscriptStep } from './bridge/agy-transcript.ts'
 export type { TranscriptStep } from './bridge/agy-transcript.ts'
 export { AgyLateOutputService } from './bridge/agy-late-output.ts'
 export { AgentBridge } from './bridge/agent-bridge.ts'

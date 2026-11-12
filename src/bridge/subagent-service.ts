@@ -34,6 +34,7 @@ import type { LiveSession } from './turn-stream.ts'
 import type { BackgroundDispatch, BackgroundReport, DshAgentLike, SubagentCatalogReporter } from './types.ts'
 import { subagentDispatchDeclaresIdentity, subagentDispatchLabel } from './shape.ts'
 import { dispatchRecord, dispatchStatus, pruneSessionDispatches, refreshSubagentDispatchLabel } from './dispatch-shape.ts'
+import { AgySubagentTracker } from './agy-subagents.ts'
 import { describeError } from './errors.ts'
 
 /** What the subagent service needs from the bridge manager, injected. */
@@ -62,8 +63,19 @@ export class SubagentService {
   private readonly records = new Map<string, SubagentRecord[]>()
   private catalogReporter?: SubagentCatalogReporter
   private dshAgentResolver?: (dshSessionId: string) => DshAgentLike | undefined
+  /**
+   * Antigravity dispatch tracking (see `AgySubagentTracker`): a parallel
+   * recognizer for the `invoke_subagent` wire, composed here so its rows
+   * share the record store, the catalog reporter and the teardown batch.
+   */
+  private readonly agy: AgySubagentTracker
 
-  constructor(private readonly host: SubagentHost) {}
+  constructor(private readonly host: SubagentHost) {
+    this.agy = new AgySubagentTracker({
+      noteRecords: (records, options) => { this.noteSubagentRecords(records, options) },
+      reportCatalog: (session, childId, label) => this.reportSubagentCatalog(session, childId, label),
+    })
+  }
 
   /** Wire the host's external-worker catalog (see `setSubagentCatalogReporter`). */
   setCatalogReporter(reporter?: SubagentCatalogReporter): void {
@@ -324,6 +336,16 @@ export class SubagentService {
   }
 
   /**
+   * Antigravity dispatch bookkeeping, parallel to the CodeBuddy tracker above
+   * and never mixed with it (see `AgySubagentTracker`). The manager routes
+   * every `session/update` of an `agy acp` session here; the tracker itself
+   * only acts on recognized dispatch frames.
+   */
+  trackAgyDispatch(session: LiveSession, update: SessionUpdate): void {
+    this.agy.track(session, update)
+  }
+
+  /**
    * Hand one detached worker to the host catalog. Returns whether a reporter
    * handled it; a missing chat id or reporter leaves the dispatch unclaimed so
    * a later wire update can retry.
@@ -380,17 +402,21 @@ export class SubagentService {
   ): void {
     const dispatches = session.backgroundDispatches
     const dshSessionId = session.dshSessionId
-    if (dispatches === undefined) return
     const now = Date.now()
     const records: SubagentRecord[] = []
-    for (const dispatch of dispatches.values()) {
-      if (onlyIds !== undefined && !onlyIds.has(dispatch.toolCallId)) continue
-      if (dispatch.terminal !== undefined) continue
-      dispatch.terminal = status
-      dispatch.endedAt = now
-      dispatch.reportedStatus = status
-      if (dshSessionId !== undefined) records.push(dispatchRecord(dispatch, dshSessionId))
+    if (dispatches !== undefined) {
+      for (const dispatch of dispatches.values()) {
+        if (onlyIds !== undefined && !onlyIds.has(dispatch.toolCallId)) continue
+        if (dispatch.terminal !== undefined) continue
+        dispatch.terminal = status
+        dispatch.endedAt = now
+        dispatch.reportedStatus = status
+        if (dshSessionId !== undefined) records.push(dispatchRecord(dispatch, dshSessionId))
+      }
     }
+    // agy rows terminalize under the SAME rule (never left running), and ride
+    // the same announce + single state-file write as the CodeBuddy batch.
+    records.push(...this.agy.terminalize(session, status, onlyIds))
     if (records.length === 0) return
     this.noteSubagentRecords(records, { announce: true, persist: true })
   }

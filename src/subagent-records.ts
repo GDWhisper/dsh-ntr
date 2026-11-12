@@ -62,6 +62,11 @@ export function normalizeSubagentRecord(raw: unknown): SubagentRecord | undefine
     toolCallId: subagentToolCallId(childId),
     label: typeof row.label === 'string' ? row.label : '',
     ...(typeof row.type === 'string' && row.type !== '' ? { type: row.type } : {}),
+    // agy's brain conversationId rides the round trip untouched (task 1 of
+    // the Antigravity subagent panel); absent on CodeBuddy rows.
+    ...(typeof row.childConversationId === 'string' && row.childConversationId !== ''
+      ? { childConversationId: row.childConversationId }
+      : {}),
     status: isSubagentStatus(row.status) ? row.status : 'unknown',
     startedAt,
     lastActivityAt: finiteNumber(row.lastActivityAt) ?? startedAt,

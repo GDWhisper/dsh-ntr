@@ -122,6 +122,28 @@ function rawInputObjectOf(update: Record<string, unknown>): Record<string, unkno
   return undefined
 }
 
+/** The dispatch title measured on the agy wire (the `invoke_subagent` tool). */
+const AGY_DISPATCH_TITLE = 'Run invoke_subagent'
+
+/**
+ * The structured input of an Antigravity `invoke_subagent` dispatch, or
+ * `undefined` when the frame is not one. Recognition reads title / rawInput
+ * ONLY — agy sends none of CodeBuddy's `_meta` keys (measured), so a meta
+ * check would never fire. The measured title alone is enough; without it the
+ * input must carry the invoke_subagent shape (a `Prompt` plus a `Role` or
+ * `TypeName`). Result frames are recognised by their known call id instead
+ * (see `AgySubagentTracker`), not here: they carry neither title nor input.
+ */
+export function agyDispatchInputOf(update: Record<string, unknown>): Record<string, unknown> | undefined {
+  const input = rawInputObjectOf(update)
+  const byTitle = update.title === AGY_DISPATCH_TITLE
+  const byInput = input !== undefined
+    && nonEmptyStringOf(input.Prompt) !== undefined
+    && (nonEmptyStringOf(input.Role) !== undefined || nonEmptyStringOf(input.TypeName) !== undefined)
+  if (!byTitle && !byInput) return undefined
+  return input ?? {}
+}
+
 /**
  * One line naming a detached ACP worker in the host's subagent catalog.
  *
@@ -131,8 +153,19 @@ function rawInputObjectOf(update: Record<string, unknown>): Record<string, unkno
  * these are often the only source), then the structured `rawInput`, then the
  * tool title. The prompt body is only used when nothing shorter exists. Capped
  * so a pathological input cannot fill the catalog row.
+ *
+ * Antigravity dispatches take their own branch FIRST: their identity lives in
+ * the dispatch `rawInput` alone (`Role` → `TypeName` → title), never in
+ * `_meta`. CodeBuddy frames never match the agy recognizer, so their path is
+ * unchanged.
  */
 export function subagentDispatchLabel(update: Record<string, unknown>): string {
+  const agyInput = agyDispatchInputOf(update)
+  if (agyInput !== undefined) {
+    const title = typeof update.title === 'string' && update.title !== '' ? update.title : AGY_DISPATCH_TITLE
+    const line = nonEmptyStringOf(agyInput.Role) ?? nonEmptyStringOf(agyInput.TypeName) ?? title
+    return line.length > SUBAGENT_CATALOG_LABEL_MAX ? `${line.slice(0, SUBAGENT_CATALOG_LABEL_MAX - 1)}…` : line
+  }
   const meta = codebuddyMetaOf(update)
   const input = rawInputObjectOf(update) ?? {}
   const type = meta?.subagentType

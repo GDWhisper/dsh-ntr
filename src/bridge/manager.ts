@@ -536,6 +536,10 @@ export class BridgeManager {
       // transcript watch: its writer is the process that is going away.
       this.lateOutput.disarm(session)
       this.subagents.terminalizeSessionDispatches(session, status)
+    }, (session, update) => {
+      // agy dispatch tracking shares the late-output agent probe (production:
+      // the launch command line; tests: the injected seam).
+      if (this.lateOutput.isAgentFor(session.agentId)) this.subagents.trackAgyDispatch(session, update)
     })
   }
 

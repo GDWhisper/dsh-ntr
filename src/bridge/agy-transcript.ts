@@ -41,6 +41,8 @@ const BASELINE_TAIL_BYTES = 64 * 1024
 const READ_CHUNK_BYTES = 512 * 1024
 /** An ACP session id is a file-name segment: refuse separators and traversal. */
 const SESSION_ID_PATTERN = /^[\w-]+$/
+/** Bytes of dispatch-result text scanned for the creation payload. */
+const DISPATCH_RESULT_SCAN_MAX = 64 * 1024
 
 /**
  * Whether a definition launches Antigravity's ACP server.
@@ -154,6 +156,34 @@ export function lateAnswerText(steps: readonly TranscriptStep[]): string {
     if (latest === undefined || step.stepIndex > latest.stepIndex) latest = step
   }
   return latest?.content ?? ''
+}
+
+/**
+ * The brain conversationId an `invoke_subagent` result frame carries.
+ *
+ * The measured result text is `Created the following subagent:\n{ … }` with
+ * `conversationId` / `logAbsoluteUri` / `workspaceUris` inside; the JSON may
+ * sit behind several prefix lines and may be pretty-printed. This says the
+ * child was CREATED, never that it finished. Read-only, bounded, fail-open:
+ * anything unreadable returns `undefined`, nothing throws. The id must be
+ * usable as a brain directory name (the same rule {@link agyTranscriptPaths}
+ * enforces), so a separator / traversal payload is not an id.
+ */
+export function parseAgyConversationId(text: string): string | undefined {
+  if (typeof text !== 'string' || text === '') return undefined
+  const bounded = text.length > DISPATCH_RESULT_SCAN_MAX ? text.slice(0, DISPATCH_RESULT_SCAN_MAX) : text
+  const start = bounded.indexOf('{')
+  const end = bounded.lastIndexOf('}')
+  if (start < 0 || end <= start) return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(bounded.slice(start, end + 1))
+  } catch {
+    return undefined
+  }
+  if (typeof parsed !== 'object' || parsed === null) return undefined
+  const id = (parsed as Record<string, unknown>).conversationId
+  return typeof id === 'string' && SESSION_ID_PATTERN.test(id) ? id : undefined
 }
 
 /**

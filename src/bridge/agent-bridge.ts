@@ -270,6 +270,12 @@ export class AgentBridge {
      * deliberately not one of these: its worker may still be running.
      */
     private readonly onSessionBackgroundTeardown?: (session: LiveSession, status: 'cancelled' | 'unknown') => void,
+    /**
+     * Antigravity dispatch bookkeeping, parallel to
+     * {@link onSessionBackgroundUpdate} and gated by the manager to `agy acp`
+     * agents (see `SubagentService.trackAgyDispatch`).
+     */
+    private readonly onSessionAgyDispatch?: (session: LiveSession, update: SessionUpdate) => void,
   ) {
     const merged = { ...DEFAULT_TUNING, ...tuning }
     this.startupTimeoutMs = merged.startupTimeoutMs
@@ -2053,6 +2059,8 @@ export class AgentBridge {
     // the cursor: a worker may report after the turn that dispatched it closed,
     // and the session-level record is the only place that fact can land.
     this.onSessionBackgroundUpdate?.(session, params.update)
+    // agy dispatch recognition runs in parallel: own map, own rules, no meta.
+    this.onSessionAgyDispatch?.(session, params.update)
     // Any update is the agent speaking: restart the stall clock here. A
     // tool-call status also says whether the agent is inside a long-running
     // tool, which earns the wider watchdog window.
