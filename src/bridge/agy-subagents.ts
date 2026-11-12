@@ -1,22 +1,23 @@
 /**
- * Antigravity dispatch recognition and lifecycle tracking (task 1 of
+ * Antigravity dispatch recognition and lifecycle tracking (tasks 1–2 of
  * docs/plan/antigravity-subagent-panel.md).
  *
  * agy's ACP wire reports NO subagent lifecycle: the dispatch is an ordinary
  * `invoke_subagent` tool call (title / rawInput are the only evidence — no
  * CodeBuddy `_meta` key exists on this wire), and its COMPLETED result only
  * says the child was CREATED, carrying the brain conversationId. No
- * completion frame ever arrives; completion / failure evidence lives in the
- * child's private transcript (a later task). This tracker therefore owns two
- * states only — `pending` (dispatch seen) → `running` (creation result parsed)
- * — and leaves every terminal state to the shared teardown path
- * (`SubagentService.terminalizeSessionDispatches`).
+ * completion frame ever arrives: this tracker owns the wire states —
+ * `pending` (dispatch seen) → `running` (creation result parsed) — and hands
+ * every live dispatch to the transcript poll (`AgySubagentPollService`),
+ * which drives `completed` / `unknown` from the child's and parent's
+ * transcripts. Teardown (`SubagentService.terminalizeSessionDispatches`)
+ * still ends whatever the poll has not.
  *
  * Rows reuse the `BackgroundDispatch` shape but live in their OWN session map
  * (`LiveSession.agyDispatches`): the CodeBuddy tracker must never see them
  * (it would read the creation result's `completed` as worker completion), and
- * agy rows must not enter the detached-worker hold or the idle clock's
- * dispatch scan — an agy child is always off-turn.
+ * agy rows must not enter the detached-worker hold — an agy child is always
+ * off-turn. The idle clock counts them through its own agy branch.
  */
 import type { SessionUpdate } from '@agentclientprotocol/sdk'
 import type { SubagentRecord, SubagentStatus } from '../protocol.ts'
@@ -33,6 +34,11 @@ export interface AgySubagentHost {
   noteRecords(records: readonly SubagentRecord[], options: { announce: boolean; persist: boolean }): void
   /** Hand one child to the host catalog; false leaves it unclaimed for a retry. */
   reportCatalog(session: LiveSession, childId: string, label: string): boolean
+  /**
+   * Ensure transcript polling for one LIVE dispatch (idempotent). Absent when
+   * no poll wiring was provided; the wire states still work without it.
+   */
+  poll?(session: LiveSession, dispatch: BackgroundDispatch): void
 }
 
 function nonEmpty(value: unknown): string | undefined {
@@ -87,6 +93,8 @@ export class AgySubagentTracker {
       this.refreshLabel(known, raw)
       this.reportCatalog(session, known)
       this.sync(session, known)
+      // Idempotent: a later frame retries a child tail whose file appeared.
+      this.host.poll?.(session, known)
       return
     }
     // Creation only on the dispatch's own opening frame: a stray update with
@@ -121,16 +129,29 @@ export class AgySubagentTracker {
     // rule): a row the host catalog never accepted must still reach the panel.
     this.sync(session, dispatch)
     this.reportCatalog(session, dispatch)
+    // The poll covers pending dispatches too: one whose creation result never
+    // lands still ends `unknown` past the silence ceiling.
+    this.host.poll?.(session, dispatch)
+  }
+
+  /**
+   * Memory-only record refresh from the transcript poll (activity / counters
+   * moved, no wire frame). Announces + persists ONLY on a status transition,
+   * which polling alone never produces — the shared transitions-only rule.
+   */
+  refresh(session: LiveSession, dispatch: BackgroundDispatch): void {
+    this.sync(session, dispatch)
   }
 
   /**
    * Write the terminal state onto every unfinished agy dispatch of a session
    * going away (close / release / force reset / process death), or of a turn
-   * the user cancelled / that failed (`onlyIds`). Returns the rows to
-   * announce + persist; the caller batches them with the CodeBuddy rows so
-   * one teardown is one state-file write.
+   * the user cancelled / that failed (`onlyIds`), or of ONE dispatch the
+   * transcript poll finished (`completed` / `unknown`, a single-id set).
+   * Returns the rows to announce + persist; the caller batches them with the
+   * CodeBuddy rows so one teardown is one state-file write.
    */
-  terminalize(session: LiveSession, status: 'cancelled' | 'unknown', onlyIds?: ReadonlySet<string>): SubagentRecord[] {
+  terminalize(session: LiveSession, status: 'completed' | 'cancelled' | 'unknown', onlyIds?: ReadonlySet<string>): SubagentRecord[] {
     const dispatches = session.agyDispatches
     if (dispatches === undefined) return []
     const dshSessionId = session.dshSessionId

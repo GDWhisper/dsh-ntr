@@ -351,22 +351,41 @@ export class BridgeManager {
       bridgeOwning: (agentId, sessionId) => this.bridgeOwning(agentId, sessionId),
       disposeTurnStreamsOf: match => { this.disposeTurnStreamsOf(match) },
     })
+    // One Antigravity store-root resolution for BOTH transcript features (the
+    // late-output watch and the subagent poll): production reads the launch
+    // command line, tests inject the probe seam.
+    const agyStoreRootOf = (def: AcpAgentDef): string | undefined =>
+      lateOutputProbe === undefined ? agyStoreRoot(def) ?? undefined : lateOutputProbe.storeRoot()
     // The subagent / background-report cluster (see `SubagentService`) needs
     // the manager's hub, live sessions, state write and ambient windows; every
     // one is passed as a closure so the service never imports this module.
+    // The second argument wires the agy child-transcript poll: its silence
+    // windows use the SAME derivation as the idle clock (`AgentBridge`).
     this.subagents = new SubagentService({
       hub: this.hub,
       sessions: () => this.registry.sessions(),
       persistAgents: () => this.persistence.persistAgents(),
       ambientTuning: () => this.ambientTuning,
       lateEchoMs: () => this.tuning.agyLateOutputEchoMs,
+    }, {
+      storeRoot: session => {
+        const def = this.defsMap.get(session.agentId)
+        return def === undefined ? undefined : agyStoreRootOf(def)
+      },
+      tuning: () => this.tuning,
+      silenceWindows: () => ({
+        silenceMs: this.tuning.backgroundTaskToolMs > 0
+          ? this.tuning.backgroundTaskToolMs
+          : this.tuning.backgroundTaskMaxMs,
+        openToolCeilingMs: this.tuning.backgroundOpenToolCeilingMs,
+      }),
     })
     // The late-output watch reads Antigravity's private transcript (see the
     // plan). Every manager capability arrives as a closure; the probe pair is
     // the test seam, defaults read the launch command line.
     this.lateOutput = new AgyLateOutputService({
       isAgent: def => (lateOutputProbe === undefined ? isAntigravityAgent(def) : lateOutputProbe.isAgent(def)),
-      storeRoot: def => (lateOutputProbe === undefined ? agyStoreRoot(def) ?? undefined : lateOutputProbe.storeRoot()),
+      storeRoot: agyStoreRootOf,
       tuning: () => this.tuning,
       host: {
         defOf: agentId => this.defsMap.get(agentId),
@@ -533,8 +552,10 @@ export class BridgeManager {
       this.noticeBridgeFailure(bridge)
     }, (session, update) => this.subagents.trackSessionBackgroundDispatch(session, update), (session, update) => this.subagents.trackBackgroundDrainText(session, update), (session, status) => {
       // A session teardown that skips `clearAmbientState` must still stop the
-      // transcript watch: its writer is the process that is going away.
+      // transcript watch: its writer is the process that is going away. The
+      // subagent poll reads the same process's transcripts — same rule.
       this.lateOutput.disarm(session)
+      this.subagents.disarmAgyPoll(session)
       this.subagents.terminalizeSessionDispatches(session, status)
     }, (session, update) => {
       // agy dispatch tracking shares the late-output agent probe (production:

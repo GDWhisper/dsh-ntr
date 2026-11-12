@@ -35,6 +35,7 @@ import type { BackgroundDispatch, BackgroundReport, DshAgentLike, SubagentCatalo
 import { subagentDispatchDeclaresIdentity, subagentDispatchLabel } from './shape.ts'
 import { dispatchRecord, dispatchStatus, pruneSessionDispatches, refreshSubagentDispatchLabel } from './dispatch-shape.ts'
 import { AgySubagentTracker } from './agy-subagents.ts'
+import { AgySubagentPollService, type AgySubagentPollWiring } from './agy-subagent-poll.ts'
 import { describeError } from './errors.ts'
 
 /** What the subagent service needs from the bridge manager, injected. */
@@ -69,12 +70,27 @@ export class SubagentService {
    * share the record store, the catalog reporter and the teardown batch.
    */
   private readonly agy: AgySubagentTracker
+  /**
+   * Antigravity child-transcript polling (see `AgySubagentPollService`):
+   * drives the agy rows to `completed` / `unknown` from the transcripts and
+   * keeps them counted as active work inside the silence windows. Absent
+   * when the manager provided no poll wiring (the wire states still work).
+   */
+  private readonly agyPoll?: AgySubagentPollService
 
-  constructor(private readonly host: SubagentHost) {
+  constructor(private readonly host: SubagentHost, agyPoll?: AgySubagentPollWiring) {
     this.agy = new AgySubagentTracker({
       noteRecords: (records, options) => { this.noteSubagentRecords(records, options) },
       reportCatalog: (session, childId, label) => this.reportSubagentCatalog(session, childId, label),
+      ...(agyPoll === undefined ? {} : { poll: (session, dispatch) => { this.agyPoll?.arm(session, dispatch) } }),
     })
+    if (agyPoll !== undefined) {
+      this.agyPoll = new AgySubagentPollService({
+        ...agyPoll,
+        terminalize: (session, toolCallId, status) => { this.terminalizeAgyDispatch(session, toolCallId, status) },
+        noteActivity: (session, dispatch) => { this.agy.refresh(session, dispatch) },
+      })
+    }
   }
 
   /** Wire the host's external-worker catalog (see `setSubagentCatalogReporter`). */
@@ -419,6 +435,30 @@ export class SubagentService {
     records.push(...this.agy.terminalize(session, status, onlyIds))
     if (records.length === 0) return
     this.noteSubagentRecords(records, { announce: true, persist: true })
+    // A turn-level cancel ends only some dispatches: drop their child tails,
+    // keep the watch for the rest (a session teardown disarms it outright).
+    this.agyPoll?.prune(session)
+  }
+
+  /**
+   * Stop one session's agy transcript poll outright (the manager's teardown
+   * callback, beside the late-output disarm): the writer is the process that
+   * is going away, and a resume must never revive the old dispatches' poll.
+   */
+  disarmAgyPoll(session: LiveSession): void {
+    this.agyPoll?.disarm(session)
+  }
+
+  /**
+   * One agy dispatch reached a terminal state from its transcripts (the poll
+   * service's completion / silence-ceiling decision). Same write rule as the
+   * teardown batch: one announce, one state-file write, terminal never
+   * overwritten — the second completion signal of the same finish is a no-op.
+   */
+  private terminalizeAgyDispatch(session: LiveSession, toolCallId: string, status: 'completed' | 'unknown'): void {
+    const records = this.agy.terminalize(session, status, new Set([toolCallId]))
+    if (records.length > 0) this.noteSubagentRecords(records, { announce: true, persist: true })
+    this.agyPoll?.prune(session)
   }
 
   /**

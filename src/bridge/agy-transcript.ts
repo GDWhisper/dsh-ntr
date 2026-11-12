@@ -9,7 +9,11 @@
  *
  * The format is PRIVATE to Antigravity and has no contract: every read is
  * bounded, every parse failure returns `undefined`, and no function throws to
- * its caller. Only `PLANNER_RESPONSE` steps are ever consumed.
+ * its caller. The late-output watch consumes only `PLANNER_RESPONSE` steps;
+ * the subagent poll (task 2 of docs/plan/antigravity-subagent-panel.md) also
+ * reads `SYSTEM_MESSAGE` reports and `GENERIC` tool steps — every derivation
+ * stays fail-open, and an `ERROR` step is a runtime tool failure, never a
+ * terminal failure (the real failure shape is unmeasured).
  */
 import { homedir } from 'node:os'
 import { closeSync, openSync, readSync, statSync } from 'node:fs'
@@ -31,6 +35,12 @@ export interface TranscriptStep {
   content: string
   /** `thinking`; only present when the line carries a string. */
   thinking?: string
+  /**
+   * How many entries the line's `tool_calls` array carries, when it has any.
+   * A `GENERIC` step with tool calls and `status === 'RUNNING'` is an OPEN
+   * tool step — the long-tier silence evidence (see `foldAgyOpenToolSteps`).
+   */
+  toolCallCount?: number
 }
 
 /** The two candidate transcript file names, `transcript_full.jsonl` first. */
@@ -136,6 +146,7 @@ export function parseTranscriptStep(line: string): TranscriptStep | undefined {
   }
   if (typeof row.created_at === 'string' && row.created_at !== '') step.createdAt = row.created_at
   if (typeof row.thinking === 'string' && row.thinking !== '') step.thinking = row.thinking
+  if (Array.isArray(row.tool_calls) && row.tool_calls.length > 0) step.toolCallCount = row.tool_calls.length
   return step
 }
 
@@ -184,6 +195,61 @@ export function parseAgyConversationId(text: string): string | undefined {
   if (typeof parsed !== 'object' || parsed === null) return undefined
   const id = (parsed as Record<string, unknown>).conversationId
   return typeof id === 'string' && SESSION_ID_PATTERN.test(id) ? id : undefined
+}
+
+/**
+ * Whether one PARENT-transcript step is the report that finishes a child: a
+ * `SYSTEM_MESSAGE` whose `sender=` token names the child's conversationId.
+ * Measured shape: `[Message] timestamp=<ISO> sender=<childId>
+ * priority=MESSAGE_PRIORITY_HIGH content=<report>]` — the report delivery
+ * itself, the AUTHORITATIVE completion signal. The child's own "Message sent
+ * to …" `GENERIC` step is NOT a signal. Fail-open: anything unreadable, any
+ * other sender (a prefix included), any other step type is not a report.
+ */
+export function isAgyChildReport(step: TranscriptStep, childConversationId: string): boolean {
+  if (step.type !== 'SYSTEM_MESSAGE' || childConversationId === '') return false
+  const match = /(?:^|\s)sender=(\S+)/.exec(step.content)
+  return match !== null && match[1] === childConversationId
+}
+
+/**
+ * Fold one batch of CHILD-transcript steps into the completion fallback: the
+ * newest `PLANNER_RESPONSE` seen so far (carried across batches) and whether
+ * it is the measured finishing shape — `DONE` with non-empty content. A
+ * `RUNNING` response means the child still works; `ERROR` steps are runtime
+ * tool failures and never derive a terminal failure (the real failure shape
+ * is unmeasured — callers must not guess one). Pure and fail-open.
+ */
+export function agyChildProgress(
+  steps: readonly TranscriptStep[],
+  lastPlanner: TranscriptStep | undefined,
+): { lastPlanner: TranscriptStep | undefined; done: boolean } {
+  let latest = lastPlanner
+  for (const step of steps) {
+    if (step.type !== 'PLANNER_RESPONSE') continue
+    if (latest === undefined || step.stepIndex >= latest.stepIndex) latest = step
+  }
+  return {
+    lastPlanner: latest,
+    done: latest !== undefined && latest.status === 'DONE' && latest.content.trim() !== '',
+  }
+}
+
+/**
+ * Fold one batch of child steps into the open-tool-step table (`step_index`
+ * → when first seen), the SAME two-tier silence evidence the CodeBuddy worker
+ * table feeds (`hasPendingBackgroundWork`). A step carrying tool calls with
+ * `status === 'RUNNING'` is open; ANY step at or above its index closes it —
+ * the transcript is append-only, so a newer step means the child moved on,
+ * and a re-sent index reporting `DONE` / `ERROR` is an explicit close.
+ */
+export function foldAgyOpenToolSteps(open: Map<string, number>, steps: readonly TranscriptStep[], now: number): void {
+  for (const step of steps) {
+    for (const key of [...open.keys()]) {
+      if (Number(key) <= step.stepIndex) open.delete(key)
+    }
+    if ((step.toolCallCount ?? 0) > 0 && step.status === 'RUNNING') open.set(String(step.stepIndex), now)
+  }
 }
 
 /**

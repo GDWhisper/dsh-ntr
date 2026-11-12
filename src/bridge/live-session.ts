@@ -280,6 +280,14 @@ export interface LiveSession {
    */
   stopLateWatch?: () => void
   /**
+   * Stops this session's subagent transcript poll (the agy poll service's
+   * `disarm`). Set at arm time, called by `clearAmbientState` at every
+   * lifecycle boundary — the child transcripts' writer is the agent process,
+   * so a released session's poll must not outlive it, and a resume must never
+   * revive polling for dispatches that teardown already terminalized.
+   */
+  stopAgyPoll?: () => void
+  /**
    * Detached workers this session dispatched that may still run after the
    * turn that dispatched them CLOSED. Session-level on purpose: the worker's
    * completion / drain frames arrive after that turn's controller retired,
@@ -293,8 +301,9 @@ export interface LiveSession {
    * creation result may land after the dispatching turn closed — but in a
    * SEPARATE map: the CodeBuddy tracker must never read an agy row (its
    * `completed` result means "child created", not "worker finished"), and the
-   * detached-worker hold / idle-clock dispatch scan must never see one (agy
-   * children are always off-turn). Teardown covers both maps alike.
+   * detached-worker hold must never see one (agy children are always
+   * off-turn). The idle clock counts them through its OWN agy branch of
+   * `hasPendingBackgroundWork`; teardown covers both maps alike.
    */
   agyDispatches?: Map<string, BackgroundDispatch>
   /**

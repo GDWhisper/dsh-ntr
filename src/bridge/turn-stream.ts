@@ -229,6 +229,21 @@ export function hasPendingBackgroundWork(
       if (Date.now() - dispatch.lastActivityAt <= dispatchSilenceMs) return true
     }
   }
+  // Antigravity children (own map, same two-tier evidence): a non-terminal
+  // dispatch inside its silence window pins the process — an idle release
+  // would kill a silent child mid-work. The poll service writes `unknown`
+  // once the window passes; this is NEVER a turn force-finalize (constraint
+  // 23). CodeBuddy sessions have no agy map: their path is unchanged.
+  const agyDispatches = session.agyDispatches
+  if (agyDispatches !== undefined) {
+    for (const dispatch of agyDispatches.values()) {
+      if (dispatch.terminal !== undefined) continue
+      const openSince = latestOpenWorkerTool(dispatch)
+      if (openSince !== undefined
+        && (openToolCeilingMs <= 0 || Date.now() - openSince <= openToolCeilingMs)) return true
+      if (Date.now() - dispatch.lastActivityAt <= dispatchSilenceMs) return true
+    }
+  }
   return session.ambient !== undefined
     && Date.now() - session.ambient.lastActivityAt <= ambientStaleMs
 }
@@ -236,9 +251,10 @@ export function hasPendingBackgroundWork(
 /**
  * When the LATEST still-open worker tool call opened, if any. The newest one
  * decides: one call may have outlived the ceiling while a sibling started
- * later and is still perfectly alive.
+ * later and is still perfectly alive. Shared with the agy subagent poll,
+ * whose open TOOL STEPS use the same table shape.
  */
-function latestOpenWorkerTool(dispatch: BackgroundDispatch): number | undefined {
+export function latestOpenWorkerTool(dispatch: BackgroundDispatch): number | undefined {
   const open = dispatch.openWorkerToolCalls
   if (open === undefined || open.size === 0) return undefined
   let latest = Number.NEGATIVE_INFINITY
@@ -284,7 +300,8 @@ export function clearAmbientState(session: LiveSession): void {
   session.quotaRefusal = undefined
   // The Antigravity late-output state is transient too: a replay record only
   // speaks for the prompt that delivered it, and a watch must not outlive the
-  // session it observes (the transcript writer is the agent process).
+  // session it observes (the transcript writer is the agent process). The
+  // subagent transcript poll stops on the same boundary for the same reason.
   session.lateEcho = undefined
   session.pendingLateEcho = undefined
   session.turnToolCalls?.clear()
@@ -292,6 +309,9 @@ export function clearAmbientState(session: LiveSession): void {
   const stopLateWatch = session.stopLateWatch
   session.stopLateWatch = undefined
   stopLateWatch?.()
+  const stopAgyPoll = session.stopAgyPoll
+  session.stopAgyPoll = undefined
+  stopAgyPoll?.()
 }
 
 /**

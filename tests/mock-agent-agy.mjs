@@ -21,6 +21,15 @@
  * AGY_DISPATCHSLOW (result after 1.2s, so a test can cancel first),
  * AGY_DISPATCHNORESULT (no result at all), AGY_DISPATCHTWO (two dispatches),
  * AGY_DISPATCHBARE (rawInput without Role / TypeName).
+ * Under MOCK_AGY_STORE the in-turn variants also write the child's brain
+ * transcript (task 2): the file appears with its first step at creation-result
+ * time, then a scenario marker schedules the rest —
+ * AGY_DISPATCHREPORT (tool step, then child DONE + parent SYSTEM_MESSAGE
+ * report in the SAME write), AGY_DISPATCHCHILDDONE (child DONE only, no
+ * parent report), AGY_DISPATCHERROR (two ERROR tool steps, then DONE +
+ * report), AGY_DISPATCHOPENTOOL (a RUNNING tool step, then silence),
+ * AGY_DISPATCHNOFILE (no child file at all; only the parent report lands),
+ * AGY_DISPATCHSILENT / plain (the first step is the whole story).
  * MOCK_AGY_LOAD_REPLAY=1: `session/load` replays the dispatch + result frames
  * (agy's real replay shape is unmeasured; the plugin must skip the whole
  * load window fail-open).
@@ -95,6 +104,90 @@ function ensureAgyTranscript(sessionId) {
   }
 }
 
+/** One transcript step line in agy's measured shape (UTC-second timestamps). */
+function agyStepLine(stepIndex, type, status, content, source, extra = {}) {
+  return `${JSON.stringify({
+    step_index: stepIndex,
+    source,
+    type,
+    status,
+    created_at: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+    content,
+    ...extra,
+  })}\n`
+}
+
+/** Parent-transcript step counter (the child counter is per child file). */
+const agyParentStep = new Map()
+
+/**
+ * Task 2: the child's brain transcript step stream + the parent report frame.
+ * The child file is created with its USER_INPUT step at creation-result time
+ * (the plugin only builds a tail on an EXISTING file); the scenario marker
+ * then schedules the remaining steps, anchored to the result. The parent
+ * report is the measured authoritative completion signal:
+ * `[Message] timestamp=<ISO> sender=<childId> priority=… content=<report>`.
+ */
+function agyChildScript(sessionId, text) {
+  if (AGY_STORE === undefined) return
+  const childId = `agy-child-${sessionId}-1`
+  // The parent file must exist for the report tail (even with no child file).
+  ensureAgyTranscript(sessionId)
+  const report = () => {
+    try {
+      const index = (agyParentStep.get(sessionId) ?? 0) + 1
+      agyParentStep.set(sessionId, index)
+      const content = `[Message] timestamp=${new Date().toISOString()} sender=${childId} priority=MESSAGE_PRIORITY_HIGH content=License migration complete.`
+      const dir = join(AGY_STORE, 'brain', sessionId, '.system_generated', 'logs')
+      appendFileSync(join(dir, 'transcript_full.jsonl'), agyStepLine(index, 'SYSTEM_MESSAGE', 'DONE', content, 'SYSTEM'))
+    } catch {
+      // Best effort.
+    }
+  }
+  if (text.includes('AGY_DISPATCHNOFILE')) {
+    // The child transcript never appears: no tail may be built on a missing
+    // file, but the parent report is still the authoritative completion.
+    setTimeout(report, 500)
+    return
+  }
+  const childDir = join(AGY_STORE, 'brain', childId, '.system_generated', 'logs')
+  const childFile = join(childDir, 'transcript.jsonl')
+  try {
+    mkdirSync(childDir, { recursive: true })
+    appendFileSync(childFile, agyStepLine(1, 'USER_INPUT', 'DONE', 'migrate the license headers', 'SYSTEM'))
+  } catch {
+    return
+  }
+  const child = (stepIndex, type, status, content, extra) => {
+    try {
+      appendFileSync(childFile, agyStepLine(stepIndex, type, status, content, 'MODEL', extra))
+    } catch {
+      // Best effort: a transcript write never changes the agent's answer.
+    }
+  }
+  const toolCalls = [{ name: 'run_command', args: { CommandLine: 'ls -la' } }]
+  if (text.includes('AGY_DISPATCHREPORT')) {
+    setTimeout(() => child(2, 'GENERIC', 'RUNNING', '', { tool_calls: toolCalls }), 300)
+    // Both completion signals in the SAME write: the plugin must count one.
+    setTimeout(() => {
+      child(3, 'PLANNER_RESPONSE', 'DONE', 'License migration complete.', { thinking: 'wrapping up' })
+      report()
+    }, 600)
+  } else if (text.includes('AGY_DISPATCHCHILDDONE')) {
+    setTimeout(() => child(2, 'PLANNER_RESPONSE', 'DONE', 'License migration complete.'), 500)
+  } else if (text.includes('AGY_DISPATCHERROR')) {
+    setTimeout(() => child(2, 'GENERIC', 'ERROR', '', { error: 'command failed', tool_calls: toolCalls }), 250)
+    setTimeout(() => child(3, 'GENERIC', 'ERROR', 'retrying', { error: 'command failed again' }), 400)
+    setTimeout(() => {
+      child(4, 'PLANNER_RESPONSE', 'DONE', 'Recovered and finished.')
+      report()
+    }, 650)
+  } else if (text.includes('AGY_DISPATCHOPENTOOL')) {
+    setTimeout(() => child(2, 'GENERIC', 'RUNNING', '', { tool_calls: [{ name: 'run_command', args: { CommandLine: 'sleep 100' } }] }), 300)
+  }
+  // AGY_DISPATCHSILENT / plain: the first step is the whole story.
+}
+
 /**
  * Run the Antigravity replay behaviour for one prompt, at the very start of
  * the turn (before its ordinary opening frames). Returns `false` when the
@@ -141,6 +234,8 @@ export async function agyPrompt(send, sessionId, text, cancelWait) {
     }
     await send(agyDispatchResult(AGY_DISPATCH_ID, sessionId, '1'))
     if (text.includes('AGY_DISPATCHTWO')) await send(agyDispatchResult(AGY_DISPATCH_ID_TWO, sessionId, '2'))
+    // The child's transcript evidence (task 2) starts at the creation result.
+    agyChildScript(sessionId, text)
     await send(agyDispatchAck)
     return true
   }

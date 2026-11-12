@@ -473,7 +473,9 @@ export interface BackgroundDispatch {
    * The WORKER's own tool calls that are still open, by `toolCallId` → when the
    * call opened. A worker silent inside a long command is alive, not wedged:
    * while one is open the idle clock grants the long open-tool ceiling instead
-   * of the plain silence window (see `hasPendingBackgroundWork`).
+   * of the plain silence window (see `hasPendingBackgroundWork`). Antigravity
+   * reuses the table for the child transcript's open TOOL STEPS, keyed by
+   * `step_index` (see `foldAgyOpenToolSteps`).
    */
   openWorkerToolCalls?: Map<string, number>
 }

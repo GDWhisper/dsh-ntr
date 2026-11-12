@@ -9,8 +9,11 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   AgyTranscriptTail,
+  agyChildProgress,
   agyStoreRoot,
   agyTranscriptPaths,
+  foldAgyOpenToolSteps,
+  isAgyChildReport,
   isAntigravityAgent,
   lateAnswerText,
   parseAgyConversationId,
@@ -395,5 +398,139 @@ describe('dispatch result conversationId parsing', () => {
     const huge = `${'x'.repeat(128 * 1024)}\n${resultText('late-child')}`
     expect(parseAgyConversationId(huge)).toBeUndefined()
     expect(parseAgyConversationId(resultText('ok-child').padEnd(200_000, ' '))).toBe('ok-child')
+  })
+})
+
+describe('subagent transcript tool-step parsing', () => {
+  it('counts the tool_calls entries of a step', () => {
+    const line = JSON.stringify({
+      step_index: 4,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: '',
+      tool_calls: [{ name: 'run_command', args: { CommandLine: 'ls' } }, { name: 'read_file', args: {} }],
+    })
+    expect(parseTranscriptStep(line)?.toolCallCount).toBe(2)
+  })
+
+  it('leaves the count absent when there are no usable tool calls', () => {
+    const base = { step_index: 1, type: 'GENERIC', status: 'DONE', content: 'x' }
+    expect(parseTranscriptStep(JSON.stringify(base))?.toolCallCount).toBeUndefined()
+    expect(parseTranscriptStep(JSON.stringify({ ...base, tool_calls: [] }))?.toolCallCount).toBeUndefined()
+    expect(parseTranscriptStep(JSON.stringify({ ...base, tool_calls: 'run_command' }))?.toolCallCount).toBeUndefined()
+    expect(parseTranscriptStep(JSON.stringify({ ...base, tool_calls: null }))?.toolCallCount).toBeUndefined()
+  })
+})
+
+describe('subagent completion: parent report signal', () => {
+  /** The measured parent-transcript report shape (task-2 brief evidence). */
+  function reportStep(childId: string, overrides: Partial<TranscriptStep> = {}): TranscriptStep {
+    return {
+      stepIndex: 9,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: `[Message] timestamp=2026-11-10T01:56:23Z sender=${childId} priority=MESSAGE_PRIORITY_HIGH content=License migration complete.`,
+      ...overrides,
+    }
+  }
+
+  it('matches a SYSTEM_MESSAGE whose sender token names the child', () => {
+    expect(isAgyChildReport(reportStep('child-42'), 'child-42')).toBe(true)
+  })
+
+  it('rejects another child, a prefix and a missing sender', () => {
+    expect(isAgyChildReport(reportStep('child-42'), 'child-43')).toBe(false)
+    // A prefix of the id is not the id: the token must match whole.
+    expect(isAgyChildReport(reportStep('child-42'), 'child-4')).toBe(false)
+    expect(isAgyChildReport(reportStep('child-42'), '')).toBe(false)
+    expect(isAgyChildReport({ ...reportStep('child-42'), content: '[Message] no sender here' }, 'child-42')).toBe(false)
+  })
+
+  it('rejects non-SYSTEM_MESSAGE steps even when they quote the sender', () => {
+    // The child's own "Message sent to …" GENERIC step is NOT a signal.
+    expect(isAgyChildReport(reportStep('child-42', { type: 'GENERIC' }), 'child-42')).toBe(false)
+    expect(isAgyChildReport(reportStep('child-42', { type: 'PLANNER_RESPONSE' }), 'child-42')).toBe(false)
+  })
+})
+
+describe('subagent completion: child DONE fallback', () => {
+  function planner(stepIndex: number, status: string, content: string): TranscriptStep {
+    return { stepIndex, type: 'PLANNER_RESPONSE', status, content }
+  }
+
+  it('fires when the last planner response is DONE with content', () => {
+    const steps = [planner(1, 'DONE', 'first answer'), planner(2, 'DONE', 'final answer')]
+    const outcome = agyChildProgress(steps, undefined)
+    expect(outcome.done).toBe(true)
+    expect(outcome.lastPlanner?.stepIndex).toBe(2)
+  })
+
+  it('does not fire while the last planner response is RUNNING or empty', () => {
+    expect(agyChildProgress([planner(1, 'RUNNING', 'partial')], undefined).done).toBe(false)
+    expect(agyChildProgress([planner(1, 'DONE', '   ')], undefined).done).toBe(false)
+    expect(agyChildProgress([], undefined).done).toBe(false)
+  })
+
+  it('carries the newest planner response across batches', () => {
+    const first = agyChildProgress([planner(1, 'DONE', 'done once')], undefined)
+    expect(first.done).toBe(true)
+    // A later batch with only tool steps keeps the last planner response.
+    const toolBatch = agyChildProgress([{ stepIndex: 2, type: 'GENERIC', status: 'DONE', content: '' }], first.lastPlanner)
+    expect(toolBatch.lastPlanner?.stepIndex).toBe(1)
+    // A NEWER running response supersedes the old DONE: the child works again.
+    const resumed = agyChildProgress([planner(3, 'RUNNING', 'more work')], toolBatch.lastPlanner)
+    expect(resumed.done).toBe(false)
+    expect(resumed.lastPlanner?.stepIndex).toBe(3)
+    // An out-of-order older line never replaces the newest one.
+    const stale = agyChildProgress([planner(0, 'DONE', 'ancient')], resumed.lastPlanner)
+    expect(stale.lastPlanner?.stepIndex).toBe(3)
+  })
+
+  it('treats ERROR steps as runtime tool failures, never a terminal failure', () => {
+    // Measured: a child with six ERROR steps still finished DONE. Nothing here
+    // may derive `failed` from an ERROR step (the real shape is unmeasured).
+    const errors: TranscriptStep[] = [
+      { stepIndex: 1, type: 'GENERIC', status: 'ERROR', content: '', toolCallCount: 1 },
+      { stepIndex: 2, type: 'GENERIC', status: 'ERROR', content: 'command failed' },
+    ]
+    const outcome = agyChildProgress(errors, undefined)
+    expect(outcome.done).toBe(false)
+    expect(outcome.lastPlanner).toBeUndefined()
+    const finished = agyChildProgress([...errors, planner(3, 'DONE', 'recovered')], undefined)
+    expect(finished.done).toBe(true)
+  })
+})
+
+describe('subagent open tool-step fold', () => {
+  function toolStep(stepIndex: number, status: string): TranscriptStep {
+    return { stepIndex, type: 'GENERIC', status, content: '', toolCallCount: 1 }
+  }
+
+  it('opens a RUNNING tool step and closes it when the child moves on', () => {
+    const open = new Map<string, number>()
+    foldAgyOpenToolSteps(open, [toolStep(2, 'RUNNING')], 1_000)
+    expect([...open.entries()]).toEqual([['2', 1_000]])
+    // ANY newer step supersedes the running tool (append-only transcript).
+    foldAgyOpenToolSteps(open, [{ stepIndex: 3, type: 'GENERIC', status: 'DONE', content: 'result' }], 2_000)
+    expect(open.size).toBe(0)
+  })
+
+  it('closes a re-sent index that reports DONE or ERROR', () => {
+    const open = new Map<string, number>()
+    foldAgyOpenToolSteps(open, [toolStep(2, 'RUNNING')], 1_000)
+    foldAgyOpenToolSteps(open, [toolStep(2, 'ERROR')], 2_000)
+    expect(open.size).toBe(0)
+  })
+
+  it('never opens a step without tool calls, whatever its status', () => {
+    const open = new Map<string, number>()
+    foldAgyOpenToolSteps(open, [{ stepIndex: 1, type: 'PLANNER_RESPONSE', status: 'RUNNING', content: 'thinking' }], 1_000)
+    expect(open.size).toBe(0)
+  })
+
+  it('keeps the newest open step when a batch opens several', () => {
+    const open = new Map<string, number>()
+    foldAgyOpenToolSteps(open, [toolStep(2, 'RUNNING'), toolStep(3, 'RUNNING')], 1_000)
+    expect([...open.keys()]).toEqual(['3'])
   })
 })
