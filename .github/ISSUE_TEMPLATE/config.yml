@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 用法提问 / 配置咨询
+    url: https://github.com/GDWhisper/dsh-ntr/discussions
+    about: 不会用、怎么配请到这里问；功能建议和 bug 报告请走对应的 issue 模板。
