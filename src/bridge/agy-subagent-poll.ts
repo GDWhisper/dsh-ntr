@@ -26,7 +26,7 @@ import {
   isAgyChildReport,
   type TranscriptStep,
 } from './agy-transcript.ts'
-import { latestOpenWorkerTool } from './turn-stream.ts'
+import { dispatchWithinWindows } from './turn-stream.ts'
 import type { LiveSession } from './turn-stream.ts'
 import type { BackgroundDispatch, BridgeTuning } from './types.ts'
 
@@ -188,7 +188,7 @@ export class AgySubagentPollService {
     const windows = this.deps.silenceWindows()
     for (const dispatch of live) {
       if (dispatch.terminal !== undefined) continue
-      if (!this.withinWindows(dispatch, windows, now)) {
+      if (!dispatchWithinWindows(dispatch, windows.silenceMs, windows.openToolCeilingMs, now)) {
         this.deps.terminalize(session, dispatch.toolCallId, 'unknown')
       }
     }
@@ -233,18 +233,6 @@ export class AgySubagentPollService {
     if (path === undefined) return undefined
     watch.parentTail = new AgyTranscriptTail(path)
     return watch.parentTail
-  }
-
-  /** Mirror of the idle clock's agy branch — one rule, two readers. */
-  private withinWindows(
-    dispatch: BackgroundDispatch,
-    windows: { silenceMs: number; openToolCeilingMs: number },
-    now: number,
-  ): boolean {
-    const openSince = latestOpenWorkerTool(dispatch)
-    if (openSince !== undefined
-      && (windows.openToolCeilingMs <= 0 || now - openSince <= windows.openToolCeilingMs)) return true
-    return now - dispatch.lastActivityAt <= windows.silenceMs
   }
 
   /** Drop children whose dispatch ended; stop the watch when nothing lives. */

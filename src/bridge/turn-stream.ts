@@ -201,15 +201,8 @@ export function hasRecentRetiredAmbient(session: LiveSession, withinMs: number):
  * Work that OUTLIVES a closed turn: a detached worker that is alive (inside an
  * open tool call, or recently active), or a background drain that spoke within
  * the staleness window. Both must pin the process — an idle release would kill
- * the agent out from under them.
- *
- * An OPEN worker tool call is stronger evidence of life than silence: a long
- * build emits no updates for tens of minutes, so the plain silence window never
- * applies while one is open — the long `openToolCeilingMs` does. ANY open call
- * still inside that ceiling proves the worker alive; when every open call has
- * outlived it, plain recency decides (a worker that keeps reporting is alive).
- * `0` means no ceiling. Without some bound a worker that never reports would
- * pin the process forever.
+ * the agent out from under them. The two-tier dispatch rule is
+ * {@link dispatchWithinWindows}, shared verbatim with the agy subagent poll.
  */
 export function hasPendingBackgroundWork(
   session: LiveSession,
@@ -221,12 +214,7 @@ export function hasPendingBackgroundWork(
   if (dispatches !== undefined) {
     for (const dispatch of dispatches.values()) {
       if (dispatch.terminal !== undefined) continue
-      const openSince = latestOpenWorkerTool(dispatch)
-      if (openSince !== undefined
-        && (openToolCeilingMs <= 0 || Date.now() - openSince <= openToolCeilingMs)) return true
-      // Every open call outlived the ceiling: fall back to plain recency, so a
-      // worker that keeps reporting is still alive.
-      if (Date.now() - dispatch.lastActivityAt <= dispatchSilenceMs) return true
+      if (dispatchWithinWindows(dispatch, dispatchSilenceMs, openToolCeilingMs, Date.now())) return true
     }
   }
   // Antigravity children (own map, same two-tier evidence): a non-terminal
@@ -238,10 +226,7 @@ export function hasPendingBackgroundWork(
   if (agyDispatches !== undefined) {
     for (const dispatch of agyDispatches.values()) {
       if (dispatch.terminal !== undefined) continue
-      const openSince = latestOpenWorkerTool(dispatch)
-      if (openSince !== undefined
-        && (openToolCeilingMs <= 0 || Date.now() - openSince <= openToolCeilingMs)) return true
-      if (Date.now() - dispatch.lastActivityAt <= dispatchSilenceMs) return true
+      if (dispatchWithinWindows(dispatch, dispatchSilenceMs, openToolCeilingMs, Date.now())) return true
     }
   }
   return session.ambient !== undefined
@@ -262,6 +247,20 @@ export function latestOpenWorkerTool(dispatch: BackgroundDispatch): number | und
     if (at > latest) latest = at
   }
   return latest
+}
+
+/**
+ * The two-tier silence rule for ONE non-terminal dispatch, shared by the idle
+ * clock (`hasPendingBackgroundWork`, CodeBuddy and agy maps) and the agy
+ * subagent poll so the two can never drift. An OPEN worker tool call outranks
+ * silence (a long build reports nothing for tens of minutes): any open call
+ * inside `ceilingMs` proves life (`0` = no ceiling); past it plain recency
+ * decides — without some bound a never-reporting worker pins the process forever.
+ */
+export function dispatchWithinWindows(dispatch: BackgroundDispatch, silenceMs: number, ceilingMs: number, now: number): boolean {
+  const openSince = latestOpenWorkerTool(dispatch)
+  if (openSince !== undefined && (ceilingMs <= 0 || now - openSince <= ceilingMs)) return true
+  return now - dispatch.lastActivityAt <= silenceMs
 }
 
 /**
