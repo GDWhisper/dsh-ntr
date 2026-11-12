@@ -15,7 +15,8 @@
  * - missing file / no store root / no session → an explicit `unreadable`
  *   notice; bad lines → readable part + a `bad-lines` notice; a file larger
  *   than the read window → a `window-cut` notice; nothing throws;
- * - notices sort AFTER steps so the browser's own cap cannot evict them;
+ * - notices display AFTER steps (seq orders display); the host appends them
+ *   last and the browser's positional front-trim is what keeps them alive;
  * - a record WITHOUT `childConversationId` falls back to the unchanged
  *   CodeBuddy parent-transcript filter (no `source` marker).
  */
@@ -204,8 +205,9 @@ describe('agy subagent detail: the child brain transcript read', () => {
     const steps = detail.entries.filter(entry => (entry.update as Record<string, unknown>).notice === undefined)
     expect(steps.map(entry => entry.seq)).toEqual([0, 1])
     expect(notices(detail.entries)).toEqual([{ notice: 'bad-lines', lines: 2 }])
-    // Notices sort AFTER every step: the browser's own entry cap evicts from
-    // the front, and a marker must never be the thing it evicts.
+    // Notices display AFTER every step (seq orders display). Their survival
+    // under the browser cap comes from the host appending them LAST and the
+    // store merge trimming positionally from the front — not from the seq.
     const noticeSeq = detail.entries.find(entry => (entry.update as Record<string, unknown>).notice !== undefined)?.seq ?? 0
     expect(noticeSeq).toBeGreaterThan(1)
   })
@@ -221,6 +223,50 @@ describe('agy subagent detail: the child brain transcript read', () => {
     const detail = service.subagentsDetail('chat-1', 'acp:d1')
     expect(detail.entries).toHaveLength(1)
     expect(detail.entries[0]?.seq).toBe(0)
+    expect(notices(detail.entries)).toEqual([])
+  })
+
+  it('keeps a complete final step the writer never newline-terminated', () => {
+    // A ONE-SHOT read of a finished child: the last line may be the final
+    // PLANNER_RESPONSE without its trailing newline — the report the user
+    // opened the dialog for. Dropping it silently is constraint-29 loss.
+    const root = mkdtempSync(join(tmpdir(), 'dsh-ntr-agy-detail-nonl-'))
+    cleanups.push(() => { rmSync(root, { recursive: true, force: true }) })
+    const dir = join(root, 'brain', 'child-1', '.system_generated', 'logs')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'transcript.jsonl'), [
+      stepLine(0, 'USER_INPUT', 'DONE', { content: 'prompt' }),
+      stepLine(1, 'PLANNER_RESPONSE', 'DONE', { content: 'the final report' }),
+    ].join('\n'))
+    const service = serviceWith({ storeRoot: root })
+    service.noteSubagentRecords([record({ childConversationId: 'child-1' })], { announce: false, persist: false })
+    const detail = service.subagentsDetail('chat-1', 'acp:d1')
+    expect(detail.entries.map(entry => entry.seq)).toEqual([0, 1])
+    expect((detail.entries[1]?.update as Record<string, unknown>).content).toBe('the final report')
+    expect(notices(detail.entries)).toEqual([])
+  })
+
+  it('keeps looking when the first servable session cannot name a store root', () => {
+    // The agent-switch edge: two live sessions share the conversation, the
+    // first one's agent resolves no root. A resolved root further down the
+    // list must still serve the detail — not a false `unreadable`.
+    const root = store([stepLine(0, 'USER_INPUT', 'DONE', { content: 'prompt' })])
+    const sessions = [session({ sessionId: 'S0', agentId: 'other' }), session()]
+    const service = new SubagentService({
+      hub: new EventHub(),
+      sessions: () => sessions,
+      persistAgents: () => {},
+      ambientTuning: () => ({ quietMs: 1_000, maxMs: 5_000 }),
+      lateEchoMs: () => 1_000,
+    }, {
+      storeRoot: candidate => (candidate.agentId === 'agy' ? root : undefined),
+      tuning: () => ({ agyLateOutputPollMs: 1_000 }) as unknown as Required<BridgeTuning>,
+      silenceWindows: () => ({ silenceMs: 1_000, openToolCeilingMs: 5_000 }),
+    })
+    service.noteSubagentRecords([record({ childConversationId: 'child-1' })], { announce: false, persist: false })
+    const detail = service.subagentsDetail('chat-1', 'acp:d1')
+    expect(detail.entries).toHaveLength(1)
+    expect(detail.entries[0]?.source).toBe('agy-transcript')
     expect(notices(detail.entries)).toEqual([])
   })
 

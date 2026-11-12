@@ -2,6 +2,8 @@ import { tmpdir } from 'node:os'
 import { existsSync, readFileSync, rmSync } from 'node:fs'
 import { afterAll, describe, expect, it } from 'vitest'
 import { AcpLlmAdapter, BridgeManager, routeBindingRegistry } from '../../src/bridge.ts'
+import { dispatchWithinWindows } from '../../src/bridge/turn-stream.ts'
+import type { BackgroundDispatch } from '../../src/bridge/types.ts'
 import { type AcpEvent, type ChatSessionView, type GenerateMessage, type StreamChunk } from '../../src/protocol.ts'
 import { dispatchRpc, EventHub } from '../../src/impl.ts'
 import { def, hostLoopTurn } from './harness.ts'
@@ -553,4 +555,47 @@ describe('the /acp prompt shares the chat prompt slot (isolated manager)', () =>
     await gateWaitFor('turn/end', since, event => event.sessionId === session.sessionId
       && event.stopReason === 'cancelled', 30_000)
   }, 30_000)
+})
+
+/**
+ * The two-tier dispatch silence rule, pinned directly (it is shared verbatim
+ * by the idle clock's CodeBuddy + agy branches and the agy subagent poll).
+ */
+describe('dispatchWithinWindows (pure two-tier silence rule)', () => {
+  function dispatch(lastActivityAt: number, open?: Map<string, number>): BackgroundDispatch {
+    return { lastActivityAt, ...(open === undefined ? {} : { openWorkerToolCalls: open }) } as BackgroundDispatch
+  }
+
+  it('plain recency decides with exact <= boundaries', () => {
+    expect(dispatchWithinWindows(dispatch(1_000), 500, 0, 1_500)).toBe(true)
+    expect(dispatchWithinWindows(dispatch(1_000), 500, 0, 1_501)).toBe(false)
+    expect(dispatchWithinWindows(dispatch(1_000), 0, 0, 1_000)).toBe(true)
+    expect(dispatchWithinWindows(dispatch(1_000), 0, 0, 1_001)).toBe(false)
+  })
+
+  it('an open tool call outranks plain silence, with exact <= boundaries', () => {
+    const open = new Map([['t1', 2_000]])
+    // Silent for an hour, but the tool opened 10s ago inside a 60s ceiling.
+    expect(dispatchWithinWindows(dispatch(0, open), 500, 60_000, 12_000)).toBe(true)
+    expect(dispatchWithinWindows(dispatch(0, open), 500, 60_000, 62_000)).toBe(true)
+    expect(dispatchWithinWindows(dispatch(0, open), 500, 60_000, 62_001)).toBe(false)
+  })
+
+  it('ceilingMs <= 0 means no ceiling: any open call proves life', () => {
+    const open = new Map([['t1', 0]])
+    expect(dispatchWithinWindows(dispatch(0, open), 500, 0, 10_000_000)).toBe(true)
+    expect(dispatchWithinWindows(dispatch(0, open), 500, -1, 10_000_000)).toBe(true)
+  })
+
+  it('the NEWEST open call decides; all-open-past-ceiling falls back to recency', () => {
+    // One call outlived the ceiling, a sibling opened later and is alive.
+    const mixed = new Map([['old', 0], ['new', 9_000]])
+    expect(dispatchWithinWindows(dispatch(0, mixed), 500, 5_000, 10_000)).toBe(true)
+    // BOTH past the ceiling: plain recency decides again.
+    const stale = new Map([['a', 0], ['b', 1_000]])
+    expect(dispatchWithinWindows(dispatch(9_800, stale), 500, 5_000, 10_000)).toBe(true)
+    expect(dispatchWithinWindows(dispatch(9_000, stale), 500, 5_000, 10_000)).toBe(false)
+    // An empty open table is no open call at all.
+    expect(dispatchWithinWindows(dispatch(0, new Map()), 500, 60_000, 10_000)).toBe(false)
+  })
 })

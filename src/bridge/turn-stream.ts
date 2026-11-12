@@ -236,10 +236,11 @@ export function hasPendingBackgroundWork(
 /**
  * When the LATEST still-open worker tool call opened, if any. The newest one
  * decides: one call may have outlived the ceiling while a sibling started
- * later and is still perfectly alive. Shared with the agy subagent poll,
- * whose open TOOL STEPS use the same table shape.
+ * later and is still perfectly alive. Internal to {@link dispatchWithinWindows}
+ * — the agy subagent poll's open TOOL STEPS use the same table shape through
+ * that shared rule, never this helper directly.
  */
-export function latestOpenWorkerTool(dispatch: BackgroundDispatch): number | undefined {
+function latestOpenWorkerTool(dispatch: BackgroundDispatch): number | undefined {
   const open = dispatch.openWorkerToolCalls
   if (open === undefined || open.size === 0) return undefined
   let latest = Number.NEGATIVE_INFINITY
@@ -261,6 +262,19 @@ export function dispatchWithinWindows(dispatch: BackgroundDispatch, silenceMs: n
   const openSince = latestOpenWorkerTool(dispatch)
   if (openSince !== undefined && (ceilingMs <= 0 || now - openSince <= ceilingMs)) return true
   return now - dispatch.lastActivityAt <= silenceMs
+}
+
+/**
+ * The idle clock's two-tier silence windows derived from ONE tuning object:
+ * the tool tier when set (`0` falls back to the plain tier) plus the open-tool
+ * ceiling. `AgentBridge` and the agy poll wiring both read this so the key
+ * selection can never drift between the idle clock and the poll.
+ */
+export function silenceWindowsOf(tuning: Required<BridgeTuning>): { silenceMs: number; openToolCeilingMs: number } {
+  return {
+    silenceMs: tuning.backgroundTaskToolMs > 0 ? tuning.backgroundTaskToolMs : tuning.backgroundTaskMaxMs,
+    openToolCeilingMs: tuning.backgroundOpenToolCeilingMs,
+  }
 }
 
 /**

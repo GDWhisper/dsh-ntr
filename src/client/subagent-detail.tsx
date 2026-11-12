@@ -22,10 +22,10 @@
  * The raw entries come from the store's dedicated per-worker index, NOT the
  * shared ACP transcript: folding the transcript would drop `_meta` and merge
  * adjacent prose across workers, splicing the parent turn's text into a
- * worker's detail (plan §5.4). The index is fed by live frames and one
- * on-demand `subagents/detail` read per page; the overlay never re-reads
- * history on its own beyond that first open (the store's `loaded` flag is
- * the gate).
+ * worker's detail (plan §5.4). The index is fed by live frames and on-demand
+ * `subagents/detail` reads: once per page for CodeBuddy (the store's `loaded`
+ * flag is the gate), on EVERY open for an agy-marked index — agy sends no
+ * wire frames after creation, so a one-shot read would freeze the stream.
  */
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
@@ -343,15 +343,18 @@ export function SubagentDetailDialog({ acp }: SubagentDetailDialogProps) {
     if (pinned.current) node.scrollTop = node.scrollHeight
   }, [key, blocks, rawView, agyEntries])
 
-  // First open reads the bounded history once (`subagents/detail`). The store
-  // owns the answered bit (`loaded`), so reopening a worker whose read landed
-  // never asks again; a FAILED read leaves it retryable on the next open (the
-  // store's documented contract). Re-entry while a read is in flight joins the
-  // same promise instead of issuing a second RPC.
+  // An open reads the bounded history (`subagents/detail`). The store owns
+  // the answered bit (`loaded`): reopening a CodeBuddy worker whose read
+  // landed never asks again (live frames keep it fresh), while an agy-marked
+  // index re-reads on EVERY open (no wire frames exist after creation). A
+  // FAILED read leaves it retryable on the next open (the store's documented
+  // contract). Re-entry while a read is in flight joins the same promise
+  // instead of issuing a second RPC.
   useEffect(() => {
     if (target === null) return
     const id = subagentKey(target.dshSessionId, target.childId)
-    if (acp.getSnapshot().subagentDetails[id]?.loaded === true) return
+    const opened = acp.getSnapshot().subagentDetails[id]
+    if (opened?.loaded === true && !opened.entries.some(entry => entry.source === 'agy-transcript')) return
     setFailedKey(previous => (previous === id ? undefined : previous))
     let cancelled = false
     let pending = loadsRef.current.get(id)

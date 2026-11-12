@@ -144,9 +144,18 @@ export function describeAgyStep(update: unknown): AgyStepView {
   else if (type === 'SYSTEM_MESSAGE') view.kind = 'system'
   else if (type === 'GENERIC') view.kind = tools.length > 0 ? 'tool' : 'generic'
   // Unknown types keep the whole step as JSON; a known type with keys this
-  // build does not render keeps a raw disclosure (constraint 29).
+  // build does not render keeps a raw disclosure (constraint 29). A KNOWN key
+  // whose value this build could not consume (a future format's non-string
+  // thinking, non-array tool_calls, …) earns the same disclosure — a measured
+  // field changing shape must not vanish silently.
   const extra = Object.keys(object).some(key => !KNOWN_STEP_KEYS.has(key))
-  if (view.kind === 'unknown' || extra) view.raw = prettyValue(update)
+  const shapeLost = (object.thinking !== undefined && typeof object.thinking !== 'string')
+    || (object.tool_calls !== undefined && !Array.isArray(object.tool_calls))
+    || (object.status !== undefined && typeof object.status !== 'string')
+    || (object.created_at !== undefined && typeof object.created_at !== 'string')
+    || (object.source !== undefined && typeof object.source !== 'string')
+    || (object.step_index !== undefined && (typeof object.step_index !== 'number' || !Number.isFinite(object.step_index)))
+  if (view.kind === 'unknown' || extra || shapeLost) view.raw = prettyValue(update)
   return view
 }
 

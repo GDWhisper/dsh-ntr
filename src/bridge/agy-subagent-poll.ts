@@ -5,8 +5,10 @@
  * agy's wire reports NO subagent lifecycle after the creation result: the
  * child works in its OWN brain transcript while the parent transcript stays
  * silent, and completion lands as a `SYSTEM_MESSAGE` report in the PARENT
- * transcript (authoritative) plus the child's last `PLANNER_RESPONSE` DONE
- * (fallback). This service arms one read-only watch per session with pending
+ * transcript (authoritative) plus the child's LAST `PLANNER_RESPONSE` DONE
+ * (fallback, gated: the DONE planner must be the newest step and the
+ * transcript quiet for `agyLateOutputQuietMs` — intermediate DONE replies
+ * exist). This service arms one read-only watch per session with pending
  * agy dispatches, tails each running child's transcript (activity, counters,
  * open tool steps, the DONE fallback) and the parent transcript (reports),
  * and drives the dispatch records to their terminal states.
@@ -37,8 +39,8 @@ export interface AgySubagentPollWiring {
   /** The live tuning object (the poll cadence reuses `agyLateOutputPollMs`). */
   tuning(): Required<BridgeTuning>
   /**
-   * The idle clock's two-tier silence windows, with the SAME derivation
-   * `AgentBridge` uses (`backgroundTaskToolMs`, `0` → `backgroundTaskMaxMs`).
+   * The idle clock's two-tier silence windows — the SAME `silenceWindowsOf`
+   * derivation `AgentBridge` reads (`backgroundTaskToolMs`, `0` → plain tier).
    */
   silenceWindows(): { silenceMs: number; openToolCeilingMs: number }
 }
@@ -51,10 +53,14 @@ export interface AgySubagentPollDeps extends AgySubagentPollWiring {
   noteActivity(session: LiveSession, dispatch: BackgroundDispatch): void
 }
 
-/** One child's tail plus the newest planner response seen across batches. */
+/** One child's tail plus the fallback evidence carried across batches. */
 interface ChildWatch {
   readonly tail: AgyTranscriptTail
   lastPlanner?: TranscriptStep
+  /** Newest step index of ANY type seen so far (the DONE candidate's "last" gate). */
+  lastStepIndex: number
+  /** When the child transcript last grew (the DONE candidate's quiet gate). */
+  lastNewStepAt?: number
 }
 
 /** One armed session watch; at most one per LiveSession. */
@@ -143,27 +149,36 @@ export class AgySubagentPollService {
       return
     }
     const now = Date.now()
+    const quietMs = Math.max(0, this.deps.tuning().agyLateOutputQuietMs)
     // 1. Child transcripts: activity, counters, open tool steps, DONE fallback.
     for (const dispatch of live) {
       if (dispatch.terminal !== undefined) continue
       const child = this.ensureChildTail(watch, dispatch)
       if (child === undefined) continue
       const steps = child.tail.readNew()
-      if (steps.length === 0) continue
-      dispatch.lastActivityAt = now
-      dispatch.counts.updates += steps.length
-      for (const step of steps) {
-        dispatch.counts.toolCalls += step.toolCallCount ?? 0
-        dispatch.counts.textChars += step.content.length + (step.thinking?.length ?? 0)
+      if (steps.length > 0) {
+        child.lastNewStepAt = now
+        dispatch.lastActivityAt = now
+        dispatch.counts.updates += steps.length
+        for (const step of steps) {
+          dispatch.counts.toolCalls += step.toolCallCount ?? 0
+          dispatch.counts.textChars += step.content.length + (step.thinking?.length ?? 0)
+        }
+        foldAgyOpenToolSteps(dispatch.openWorkerToolCalls ??= new Map<string, number>(), steps, now)
       }
-      foldAgyOpenToolSteps(dispatch.openWorkerToolCalls ??= new Map<string, number>(), steps, now)
-      const progress = agyChildProgress(steps, child.lastPlanner)
+      const progress = agyChildProgress(steps, child.lastPlanner, child.lastStepIndex)
       child.lastPlanner = progress.lastPlanner
-      if (progress.done) {
+      child.lastStepIndex = progress.lastStepIndex
+      // The fallback is the child's LAST planner response, not the latest seen
+      // so far: intermediate DONE replies exist (the late-output watch reads
+      // the same append-only format). Fire only while the DONE planner is
+      // still the NEWEST step AND the transcript has been quiet for the whole
+      // window — a newer step of any kind disarms it until the child finishes.
+      if (progress.done && now - (child.lastNewStepAt ?? now) >= quietMs) {
         this.deps.terminalize(session, dispatch.toolCallId, 'completed')
         continue
       }
-      this.deps.noteActivity(session, dispatch)
+      if (steps.length > 0) this.deps.noteActivity(session, dispatch)
     }
     // 2. Parent reports: the AUTHORITATIVE signal for children still running
     //    (a child whose file never appeared can still complete this way).
@@ -216,7 +231,7 @@ export class AgySubagentPollService {
     if (childId === undefined || watch.storeRoot === undefined) return undefined
     const path = agyTranscriptPaths(watch.storeRoot, childId).find(candidate => existsSync(candidate))
     if (path === undefined) return undefined
-    const child: ChildWatch = { tail: new AgyTranscriptTail(path) }
+    const child: ChildWatch = { tail: new AgyTranscriptTail(path), lastStepIndex: 0 }
     watch.children.set(dispatch.toolCallId, child)
     return child
   }

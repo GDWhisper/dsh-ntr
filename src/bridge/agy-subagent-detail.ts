@@ -18,12 +18,12 @@
  *   cut via `boundSubagentDetailEntry`, never a silent drop.
  *
  * Unreadable file / no store root → an explicit `unreadable` notice; malformed
- * lines → the readable part plus a `bad-lines` notice. Notices sort AFTER every
- * step (`Number.MAX_SAFE_INTEGER`): the browser's own entry cap evicts from the
- * front, and a marker must never be the thing it evicts.
+ * lines → the readable part plus a `bad-lines` notice. Notices are appended
+ * LAST and the browser's merge trims its entry cap from the FRONT positionally,
+ * so a marker survives; their `Number.MAX_SAFE_INTEGER` seq only orders display.
  */
 import { closeSync, existsSync, openSync, readSync, statSync } from 'node:fs'
-import { agyTranscriptPaths } from './agy-transcript.ts'
+import { agyTranscriptPaths, parseTranscriptStep } from './agy-transcript.ts'
 import { boundSubagentDetailEntry } from '../subagent-records.ts'
 import { MAX_SUBAGENT_DETAIL_ENTRIES } from '../protocol.ts'
 import type { SubagentDetailEntry, SubagentDetailResult } from '../protocol.ts'
@@ -107,7 +107,8 @@ function readWindow(path: string, maxBytes: number): { text: string; windowCut: 
  * wire's own keys — `tool_calls`, `thinking`, `error` and any unknown key all
  * survive; the browser's step view gives each a destination). A half-written
  * trailing line is not a bad line: it is the writer mid-append, and the next
- * read will see it complete.
+ * read will see it complete — but a COMPLETE final step without its newline
+ * is kept (a one-shot read of a finished child must not drop its report).
  */
 export function readAgyChildDetail(storeRoot: string | undefined, childConversationId: string): SubagentDetailResult {
   if (storeRoot === undefined) return unreadable()
@@ -116,9 +117,14 @@ export function readAgyChildDetail(storeRoot: string | undefined, childConversat
   const window = readWindow(path, AGY_DETAIL_READ_MAX_BYTES)
   if (window === undefined) return unreadable()
   const lines = window.text.split('\n')
-  // The trailing segment without a newline is still being written — wait for
-  // it rather than count it as unreadable (the tail reader's same discipline).
-  if (!window.text.endsWith('\n')) lines.pop()
+  // A trailing segment without a newline is usually the writer mid-append —
+  // but this ONE-SHOT read of a finished child may end on a complete final
+  // step agy never newline-terminated (the report the dialog was opened for).
+  // Keep it when it parses as a whole step; a partial line stays excluded.
+  if (!window.text.endsWith('\n')) {
+    const trailing = lines.pop() ?? ''
+    if (parseTranscriptStep(trailing) !== undefined) lines.push(trailing)
+  }
   const steps: Array<{ seq: number; raw: unknown }> = []
   let badLines = 0
   for (const line of lines) {

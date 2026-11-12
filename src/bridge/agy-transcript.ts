@@ -213,9 +213,15 @@ export function isAgyChildReport(step: TranscriptStep, childConversationId: stri
 }
 
 /**
- * Fold one batch of CHILD-transcript steps into the completion fallback: the
- * newest `PLANNER_RESPONSE` seen so far (carried across batches) and whether
- * it is the measured finishing shape — `DONE` with non-empty content. A
+ * Fold one batch of CHILD-transcript steps into the completion fallback's
+ * evidence: the newest `PLANNER_RESPONSE` seen so far, the newest step index
+ * of ANY type (both carried across batches), and whether the planner is a
+ * completion CANDIDATE — `DONE` with non-empty content AND still the newest
+ * step in the transcript. Intermediate DONE replies exist (the late-output
+ * watch reads the same append-only format and delivers only the LAST one),
+ * so "latest planner seen so far" is not "last": any newer step disarms the
+ * candidate. The caller must ALSO require a quiet window (`agyLateOutputQuietMs`,
+ * no new steps) before terminalizing — this fold is pure and clock-free. A
  * `RUNNING` response means the child still works; `ERROR` steps are runtime
  * tool failures and never derive a terminal failure (the real failure shape
  * is unmeasured — callers must not guess one). Pure and fail-open.
@@ -223,15 +229,19 @@ export function isAgyChildReport(step: TranscriptStep, childConversationId: stri
 export function agyChildProgress(
   steps: readonly TranscriptStep[],
   lastPlanner: TranscriptStep | undefined,
-): { lastPlanner: TranscriptStep | undefined; done: boolean } {
+  lastStepIndex = 0,
+): { lastPlanner: TranscriptStep | undefined; lastStepIndex: number; done: boolean } {
   let latest = lastPlanner
+  let newest = lastStepIndex
   for (const step of steps) {
+    if (step.stepIndex > newest) newest = step.stepIndex
     if (step.type !== 'PLANNER_RESPONSE') continue
     if (latest === undefined || step.stepIndex >= latest.stepIndex) latest = step
   }
   return {
     lastPlanner: latest,
-    done: latest !== undefined && latest.status === 'DONE' && latest.content.trim() !== '',
+    lastStepIndex: newest,
+    done: latest !== undefined && latest.stepIndex === newest && latest.status === 'DONE' && latest.content.trim() !== '',
   }
 }
 

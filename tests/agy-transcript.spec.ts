@@ -471,19 +471,47 @@ describe('subagent completion: child DONE fallback', () => {
     expect(agyChildProgress([], undefined).done).toBe(false)
   })
 
-  it('carries the newest planner response across batches', () => {
+  it('carries the newest planner across batches, but DONE only counts as the LAST step', () => {
     const first = agyChildProgress([planner(1, 'DONE', 'done once')], undefined)
+    // The DONE planner IS the newest step seen so far: a fallback CANDIDATE
+    // (the poll adds the quiet-window gate before terminalizing).
     expect(first.done).toBe(true)
-    // A later batch with only tool steps keeps the last planner response.
-    const toolBatch = agyChildProgress([{ stepIndex: 2, type: 'GENERIC', status: 'DONE', content: '' }], first.lastPlanner)
+    expect(first.lastStepIndex).toBe(1)
+    // A later batch with only tool steps keeps the planner but DISARMS done:
+    // intermediate DONE replies exist (the late-output watch reads the same
+    // append-only format), so "latest planner seen so far" is not "last".
+    const toolBatch = agyChildProgress([{ stepIndex: 2, type: 'GENERIC', status: 'DONE', content: '' }], first.lastPlanner, first.lastStepIndex)
     expect(toolBatch.lastPlanner?.stepIndex).toBe(1)
+    expect(toolBatch.done).toBe(false)
+    expect(toolBatch.lastStepIndex).toBe(2)
     // A NEWER running response supersedes the old DONE: the child works again.
-    const resumed = agyChildProgress([planner(3, 'RUNNING', 'more work')], toolBatch.lastPlanner)
+    const resumed = agyChildProgress([planner(3, 'RUNNING', 'more work')], toolBatch.lastPlanner, toolBatch.lastStepIndex)
     expect(resumed.done).toBe(false)
     expect(resumed.lastPlanner?.stepIndex).toBe(3)
     // An out-of-order older line never replaces the newest one.
-    const stale = agyChildProgress([planner(0, 'DONE', 'ancient')], resumed.lastPlanner)
+    const stale = agyChildProgress([planner(0, 'DONE', 'ancient')], resumed.lastPlanner, resumed.lastStepIndex)
     expect(stale.lastPlanner?.stepIndex).toBe(3)
+    expect(stale.done).toBe(false)
+    // The child really finishes: a DONE planner as the newest step re-arms it.
+    const finished = agyChildProgress([planner(4, 'DONE', 'final')], stale.lastPlanner, stale.lastStepIndex)
+    expect(finished.done).toBe(true)
+    expect(finished.lastStepIndex).toBe(4)
+  })
+
+  it('does not fire when a newer non-planner step shares the batch', () => {
+    // The measured finishing shape is "Message sent to …" GENERIC THEN the
+    // last PLANNER_RESPONSE DONE — the reverse order is an intermediate reply.
+    const intermediate = agyChildProgress([
+      planner(2, 'DONE', 'intermediate reply'),
+      { stepIndex: 3, type: 'GENERIC', status: 'RUNNING', content: '', toolCallCount: 1 },
+    ], undefined)
+    expect(intermediate.done).toBe(false)
+    expect(intermediate.lastPlanner?.stepIndex).toBe(2)
+    const finishing = agyChildProgress([
+      { stepIndex: 5, type: 'GENERIC', status: 'DONE', content: 'Message sent to parent' },
+      planner(6, 'DONE', 'reported back to the main agent'),
+    ], undefined)
+    expect(finishing.done).toBe(true)
   })
 
   it('treats ERROR steps as runtime tool failures, never a terminal failure', () => {

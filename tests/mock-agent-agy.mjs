@@ -27,9 +27,14 @@
  * AGY_DISPATCHREPORT (tool step, then child DONE + parent SYSTEM_MESSAGE
  * report in the SAME write), AGY_DISPATCHCHILDDONE (child DONE only, no
  * parent report), AGY_DISPATCHERROR (two ERROR tool steps, then DONE +
- * report), AGY_DISPATCHOPENTOOL (a RUNNING tool step, then silence),
- * AGY_DISPATCHNOFILE (no child file at all; only the parent report lands),
- * AGY_DISPATCHSILENT / plain (the first step is the whole story).
+ * report), AGY_DISPATCHMIDTURN (an INTERMEDIATE planner DONE at step 2,
+ * GENERIC work at steps 3–5, the parent report only afterwards — the row
+ * must stay running until the report), AGY_DISPATCHOPENTOOL (a RUNNING
+ * tool step, then silence), AGY_DISPATCHNOFILE (no child file at all; only
+ * the parent report lands), AGY_DISPATCHSILENT / plain (the first step is
+ * the whole story). AGY_DISPATCHTWO also scripts the SECOND child's own
+ * transcript (an open tool step, then silence): the first child finishes
+ * via its report while the sibling stays running.
  * MOCK_AGY_LOAD_REPLAY=1: `session/load` replays the dispatch + result frames
  * (agy's real replay shape is unmeasured; the plugin must skip the whole
  * load window fail-open).
@@ -166,7 +171,7 @@ function agyChildScript(sessionId, text) {
     }
   }
   const toolCalls = [{ name: 'run_command', args: { CommandLine: 'ls -la' } }]
-  if (text.includes('AGY_DISPATCHREPORT')) {
+  if (text.includes('AGY_DISPATCHREPORT') || text.includes('AGY_DISPATCHTWO')) {
     setTimeout(() => child(2, 'GENERIC', 'RUNNING', '', { tool_calls: toolCalls }), 300)
     // Both completion signals in the SAME write: the plugin must count one.
     setTimeout(() => {
@@ -175,6 +180,16 @@ function agyChildScript(sessionId, text) {
     }, 600)
   } else if (text.includes('AGY_DISPATCHCHILDDONE')) {
     setTimeout(() => child(2, 'PLANNER_RESPONSE', 'DONE', 'License migration complete.'), 500)
+  } else if (text.includes('AGY_DISPATCHMIDTURN')) {
+    // An INTERMEDIATE planner DONE (step 2), then more tool work (steps 3–5):
+    // the row must stay running until the parent report lands. The report is
+    // deliberately later than the quiet window measured from the intermediate
+    // DONE, so a "latest planner seen so far" fallback completes too early.
+    setTimeout(() => child(2, 'PLANNER_RESPONSE', 'DONE', 'Intermediate reply, still working.'), 300)
+    setTimeout(() => child(3, 'GENERIC', 'RUNNING', '', { tool_calls: toolCalls }), 600)
+    setTimeout(() => child(4, 'GENERIC', 'DONE', 'tool result'), 900)
+    setTimeout(() => child(5, 'GENERIC', 'DONE', 'more work'), 1200)
+    setTimeout(report, 4000)
   } else if (text.includes('AGY_DISPATCHERROR')) {
     setTimeout(() => child(2, 'GENERIC', 'ERROR', '', { error: 'command failed', tool_calls: toolCalls }), 250)
     setTimeout(() => child(3, 'GENERIC', 'ERROR', 'retrying', { error: 'command failed again' }), 400)
@@ -186,6 +201,26 @@ function agyChildScript(sessionId, text) {
     setTimeout(() => child(2, 'GENERIC', 'RUNNING', '', { tool_calls: [{ name: 'run_command', args: { CommandLine: 'sleep 100' } }] }), 300)
   }
   // AGY_DISPATCHSILENT / plain: the first step is the whole story.
+  // The second dispatch's OWN child transcript (AGY_DISPATCHTWO): an open
+  // tool step, then silence — it stays running while the first child finishes.
+  if (text.includes('AGY_DISPATCHTWO')) {
+    const siblingId = `agy-child-${sessionId}-2`
+    const siblingDir = join(AGY_STORE, 'brain', siblingId, '.system_generated', 'logs')
+    const siblingFile = join(siblingDir, 'transcript.jsonl')
+    try {
+      mkdirSync(siblingDir, { recursive: true })
+      appendFileSync(siblingFile, agyStepLine(1, 'USER_INPUT', 'DONE', 'audit the headers', 'SYSTEM'))
+      setTimeout(() => {
+        try {
+          appendFileSync(siblingFile, agyStepLine(2, 'GENERIC', 'RUNNING', '', 'MODEL', { tool_calls: [{ name: 'run_command', args: { CommandLine: 'sleep 100' } }] }))
+        } catch {
+          // Best effort: a transcript write never changes the agent's answer.
+        }
+      }, 300)
+    } catch {
+      // Best effort.
+    }
+  }
 }
 
 /**

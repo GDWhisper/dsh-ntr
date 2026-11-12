@@ -146,6 +146,27 @@ describe('describeAgyStep (pure step normalization)', () => {
     expect(view.raw).toContain('token_count')
   })
 
+  it('a KNOWN key with an unexpected shape earns the raw disclosure too', () => {
+    // A future format may change a measured field's shape; the value this
+    // build cannot consume must not vanish (constraint 29, same rule as an
+    // unknown key).
+    const base = { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'ok' }
+    const thinking = describeAgyStep({ ...base, thinking: { blocks: ['future shape'] } })
+    expect(thinking.raw).toContain('future shape')
+    const tools = describeAgyStep({ ...base, type: 'GENERIC', tool_calls: 'run_command' })
+    expect(tools.raw).toContain('run_command')
+    const status = describeAgyStep({ ...base, status: 42 })
+    expect(status.raw).toContain('42')
+    const createdAt = describeAgyStep({ ...base, created_at: 1_700_000_000 })
+    expect(createdAt.raw).toContain('1700000000')
+    const source = describeAgyStep({ ...base, source: ['SYSTEM'] })
+    expect(source.raw).toContain('SYSTEM')
+    const stepIndex = describeAgyStep({ ...base, step_index: '1' })
+    expect(stepIndex.raw).toContain('"1"')
+    // The measured shapes stay clean: no raw disclosure for a normal step.
+    expect(describeAgyStep({ ...base, thinking: 'hmm', tool_calls: [] }).raw).toBeUndefined()
+  })
+
   it('keeps the error string and maps the status tone', () => {
     const view = describeAgyStep({ step_index: 2, type: 'GENERIC', status: 'ERROR', error: 'command exited 1' })
     expect(view.error).toBe('command exited 1')

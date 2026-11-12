@@ -64,6 +64,7 @@ import {
   isRetiredAmbientId,
   permissionToolName,
   reviveAmbientId,
+  silenceWindowsOf,
 } from './turn-stream.ts'
 import type { LiveSession } from './turn-stream.ts'
 import { permissionAskReason, snapshot } from './shape.ts'
@@ -288,10 +289,9 @@ export class AgentBridge {
     this.staleCancelMaxRetries = merged.staleCancelMaxRetries
     this.turnSettleMs = merged.turnSettleMs
     this.ambientStaleMs = merged.ambientStaleMs
-    this.backgroundDispatchSilenceMs = merged.backgroundTaskToolMs > 0
-      ? merged.backgroundTaskToolMs
-      : merged.backgroundTaskMaxMs
-    this.backgroundOpenToolCeilingMs = merged.backgroundOpenToolCeilingMs
+    const silenceWindows = silenceWindowsOf(merged)
+    this.backgroundDispatchSilenceMs = silenceWindows.silenceMs
+    this.backgroundOpenToolCeilingMs = silenceWindows.openToolCeilingMs
     this.defaultIdleTimeoutMs = merged.idleTimeoutMs
     this.probeIdleTimeoutMs = merged.probeIdleTimeoutMs
   }

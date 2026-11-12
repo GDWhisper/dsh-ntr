@@ -60,6 +60,7 @@ import {
   codebuddyMetaOf,
   hasRecentRetiredAmbient,
   retireAmbientId,
+  silenceWindowsOf,
 } from './turn-stream.ts'
 import type { LiveSession } from './turn-stream.ts'
 import {
@@ -373,12 +374,7 @@ export class BridgeManager {
         return def === undefined ? undefined : agyStoreRootOf(def)
       },
       tuning: () => this.tuning,
-      silenceWindows: () => ({
-        silenceMs: this.tuning.backgroundTaskToolMs > 0
-          ? this.tuning.backgroundTaskToolMs
-          : this.tuning.backgroundTaskMaxMs,
-        openToolCeilingMs: this.tuning.backgroundOpenToolCeilingMs,
-      }),
+      silenceWindows: () => silenceWindowsOf(this.tuning),
     })
     // The late-output watch reads Antigravity's private transcript (see the
     // plan). Every manager capability arrives as a closure; the probe pair is

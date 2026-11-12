@@ -533,7 +533,9 @@ export class SubagentService {
       for (const session of this.host.sessions()) {
         if (session.dshSessionId !== dshSessionId || session.closed) continue
         storeRoot = this.agyStoreRoot?.(session)
-        break
+        // An agent-switch edge can leave a servable session whose agent names
+        // no root: keep looking — only a RESOLVED root ends the search.
+        if (storeRoot !== undefined) break
       }
       return readAgyChildDetail(storeRoot, record.childConversationId)
     }

@@ -2225,15 +2225,15 @@ export class AcpStore {
   }
 
   /**
-   * Ensure one worker's detail index exists and read its history once.
+   * Ensure one worker's detail index exists and read its history on demand.
    *
    * Creates the index (which is what makes LIVE frames append to it from then
-   * on), moves it to the LRU's recent end, and on the first open of this page
-   * asks the host for the bounded history that predates the page
-   * (`subagents/detail`). Frames that land while that read is in flight are
-   * replayed over its answer by their `liveSeq`, so a slow read cannot erase
-   * a terminal frame the page already saw. A failed read leaves the live
-   * index alone and retries on the next open.
+   * on), moves it to the LRU's recent end, and asks the host for the bounded
+   * history predating the page (`subagents/detail`) — once for CodeBuddy, on
+   * EVERY open of an agy-marked index (no wire frames after creation). Frames
+   * landing during a read are replayed over its answer by their `liveSeq`, so
+   * a slow read cannot erase a terminal frame the page saw. A failed read
+   * leaves the live index alone and retries on the next open.
    */
   async loadSubagentDetail(dshSessionId: string, childId: string): Promise<void> {
     const key = subagentKey(dshSessionId, childId)
@@ -2249,7 +2249,7 @@ export class AcpStore {
     delete openedMap[key]
     openedMap[key] = opened
     this.mutate({ subagentDetails: this.withSubagentDetail(openedMap, key) })
-    if (opened.loaded) return
+    if (opened.loaded && !opened.entries.some(entry => entry.source === 'agy-transcript')) return
     try {
       const result = await this.call<SubagentDetailResult>('subagents/detail', { dshSessionId, childId })
       const current = this.state.subagentDetails[key]

@@ -171,15 +171,78 @@ describe('Antigravity subagent transcript polling', () => {
   }, 30_000)
 
   it('the child DONE fallback completes when the parent report never lands', async () => {
-    const subject = harness()
+    // A short quiet window keeps the gate observable: the DONE planner is the
+    // newest step, so the fallback fires — but only AFTER the window, never
+    // on the tick that first reads the DONE.
+    const subject = harness({ tuning: { agyLateOutputQuietMs: 800 } })
     const dshSessionId = 'dsh-agy-poll-childdone'
     const since = subject.events.length
     await runTurn(subject, dshSessionId, 'AGY_DISPATCHCHILDDONE please')
+    // 2 wire frames (dispatch + creation result) + 2 child steps: the DONE
+    // planner response has just been read.
+    await until(() => (subject.manager.subagentsFor(dshSessionId)[0]?.counts.updates ?? 0) >= 4)
+    // The DONE was just read: the quiet window has not elapsed yet.
+    expect(subject.manager.subagentsFor(dshSessionId)[0]?.status).toBe('running')
     await until(() => recordFrames(subject.events, since).some(frame => frame.status === 'completed'))
     expect(recordFrames(subject.events, since).map(frame => frame.status)).toEqual(['pending', 'running', 'completed'])
     // The parent transcript really carries no report: the fallback did it.
     const parent = readFileSync(parentFile(subject, dshSessionId), 'utf-8')
     expect(parent).not.toContain('SYSTEM_MESSAGE')
+    expect(unexpectedSubagentFrames(subject.events, since)).toEqual([])
+  }, 30_000)
+
+  it('an intermediate planner DONE does not complete the child; the parent report does', async () => {
+    const subject = harness()
+    const dshSessionId = 'dsh-agy-poll-midturn'
+    const since = subject.events.length
+    await runTurn(subject, dshSessionId, 'AGY_DISPATCHMIDTURN please')
+    // All five child steps are read (2 wire frames + 5 steps): the DONE at
+    // step 2 was INTERMEDIATE — GENERIC work followed it, so the row must
+    // still be running.
+    await until(() => (subject.manager.subagentsFor(dshSessionId)[0]?.counts.updates ?? 0) >= 7)
+    expect(subject.manager.subagentsFor(dshSessionId)[0]?.status).toBe('running')
+    expect(recordFrames(subject.events, since).some(frame => frame.status === 'completed')).toBe(false)
+    // Past the quiet window measured from the intermediate DONE (300ms +
+    // 1500ms): a "latest planner seen so far" fallback would have fired by
+    // now. The newest-step gate keeps the row running until the report.
+    await sleep(1_000)
+    expect(subject.manager.subagentsFor(dshSessionId)[0]?.status).toBe('running')
+    expect(recordFrames(subject.events, since).some(frame => frame.status === 'completed')).toBe(false)
+    // The authoritative parent report (the scenario's 6th step, ~4s)
+    // completes it exactly once.
+    await until(() => recordFrames(subject.events, since).some(frame => frame.status === 'completed'))
+    const frames = recordFrames(subject.events, since)
+    expect(frames.filter(frame => frame.status === 'completed')).toHaveLength(1)
+    expect(frames.map(frame => frame.status)).toEqual(['pending', 'running', 'completed'])
+    expect(readFileSync(parentFile(subject, dshSessionId), 'utf-8')).toContain('SYSTEM_MESSAGE')
+    expect(unexpectedSubagentFrames(subject.events, since)).toEqual([])
+    await until(() => armedCount(subject) === 0)
+  }, 30_000)
+
+  it('one child completing leaves the sibling running with its tail and watch alive', async () => {
+    const subject = harness()
+    const dshSessionId = 'dsh-agy-poll-siblings'
+    const since = subject.events.length
+    await runTurn(subject, dshSessionId, 'AGY_DISPATCHTWO please')
+    await until(() => recordFrames(subject.events, since, 'acp:agy_dispatch_1').some(frame => frame.status === 'completed'))
+    // The first child finished via its parent report; the second is untouched.
+    const second = subject.manager.subagentsFor(dshSessionId).find(row => row.childId === 'acp:agy_dispatch_2')!
+    expect(second.status).toBe('running')
+    expect(second.endedAt).toBeUndefined()
+    expect(recordFrames(subject.events, since, 'acp:agy_dispatch_2').some(frame => frame.status === 'completed' || frame.status === 'unknown')).toBe(false)
+    // The session watch stays armed for the sibling (one watch per session).
+    expect(armedCount(subject)).toBe(1)
+    // The sibling's tail still reads: a new child step moves its counters.
+    const before = second.counts.updates
+    appendChildStep(subject, second.childConversationId!, 3, 'GENERIC', 'DONE', 'sibling still works')
+    await until(() => (subject.manager.subagentsFor(dshSessionId).find(row => row.childId === 'acp:agy_dispatch_2')?.counts.updates ?? 0) > before)
+    expect(subject.manager.subagentsFor(dshSessionId).find(row => row.childId === 'acp:agy_dispatch_2')?.status).toBe('running')
+    // The sibling finishes via its OWN parent report: completed exactly once,
+    // and only then does the watch withdraw.
+    appendParentReport(subject, dshSessionId, second.childConversationId!)
+    await until(() => recordFrames(subject.events, since, 'acp:agy_dispatch_2').some(frame => frame.status === 'completed'))
+    expect(recordFrames(subject.events, since, 'acp:agy_dispatch_2').filter(frame => frame.status === 'completed')).toHaveLength(1)
+    await until(() => armedCount(subject) === 0)
     expect(unexpectedSubagentFrames(subject.events, since)).toEqual([])
   }, 30_000)
 
@@ -242,13 +305,14 @@ describe('Antigravity subagent transcript polling', () => {
   }, 30_000)
 
   it('an open tool step grants the long ceiling past the plain silence window', async () => {
-    const subject = harness({ tuning: { idleTimeoutMs: 200, backgroundTaskToolMs: 300, backgroundOpenToolCeilingMs: 10_000 } })
+    const subject = harness({ tuning: { idleTimeoutMs: 200, backgroundTaskToolMs: 500, backgroundOpenToolCeilingMs: 10_000 } })
     const dshSessionId = 'dsh-agy-poll-opentool'
     await runTurn(subject, dshSessionId, 'AGY_DISPATCHOPENTOOL please')
     await until(() => (subject.manager.subagentsFor(dshSessionId)[0]?.counts.toolCalls ?? 0) >= 1)
-    // The plain window (300ms) expires while the tool step stays open: the
-    // long ceiling (10s) still counts the child as active work.
-    await sleep(600)
+    // The plain window (500ms) expires while the tool step stays open: the
+    // long ceiling (10s) still counts the child as active work. The margin
+    // is wide so full-suite load cannot expire it before the assertion.
+    await sleep(1_200)
     expect(subject.manager.subagentsFor(dshSessionId)[0]?.status).toBe('running')
     expect(subject.manager.agentViews()[0]?.state).toBe('ready')
   }, 30_000)

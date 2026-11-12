@@ -24,8 +24,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { closeSubagentDetail, openSubagentDetail, subagentDetailIsOpen } from '../src/client/acp-ui.tsx'
 import { OwnSubagentCatalog } from '../src/client/subagent-panel.tsx'
 import { SubagentDetailDialog, subagentDetailBlocks } from '../src/client/subagent-detail.tsx'
-import { subagentKey } from '../src/client/store.ts'
-import type { AcpStore, SubagentDetailState } from '../src/client/store.ts'
+import { AcpStore, subagentKey } from '../src/client/store.ts'
+import type { SubagentDetailState } from '../src/client/store.ts'
 import type { SubagentDetailEntry, SubagentRecord } from '../src/protocol.ts'
 
 afterEach(() => {
@@ -229,6 +229,31 @@ describe('the subagent detail overlay', () => {
     await flush()
     expect(calls).toHaveLength(1)
     expect(screen.getByRole('dialog', { name: '子智能体详情' })).toBeDefined()
+  })
+
+  it('re-reads an agy step stream on every open — no wire frames keep it fresh', async () => {
+    const key = subagentKey('chat-1', 'acp:a')
+    const marked = (seq: number, content: string): SubagentDetailEntry => ({
+      seq,
+      source: 'agy-transcript',
+      update: { step_index: seq, type: 'PLANNER_RESPONSE', status: 'DONE', content },
+    })
+    const { store, calls } = fakeStore({
+      records: [record({ childConversationId: 'child-1' })],
+      details: { [key]: loadedDetail({}, [marked(1, 'first read')]) },
+      history: [marked(2, 'fresh read')],
+    })
+    act(() => { openSubagentDetail('chat-1', 'acp:a') })
+    render(<SubagentDetailDialog acp={store} />)
+    await flush()
+    // `loaded` is true, but an agy-marked index is a demand read: the open
+    // re-issued the RPC and the fresh answer replaced the frozen steps.
+    expect(calls).toEqual([['chat-1', 'acp:a']])
+    expect(screen.getByRole('dialog', { name: '子智能体详情' }).textContent).toContain('fresh read')
+    fireEvent.click(screen.getByRole('button', { name: '关闭子智能体详情' }))
+    act(() => { openSubagentDetail('chat-1', 'acp:a') })
+    await flush()
+    expect(calls).toHaveLength(2)
   })
 
   it('renders a string failure reason verbatim', () => {
@@ -460,5 +485,60 @@ describe('subagentDetailBlocks', () => {
       text: 'tail\n… [truncated 5 chars]',
     })
     expect(blocks[1]).toMatchObject({ kind: 'event', event: 'unknown', text: 'plain payload' })
+  })
+})
+
+/**
+ * The REAL store gate behind the overlay: an agy-marked detail index has no
+ * live wire frames after creation, so every open must re-issue the demand
+ * read; the CodeBuddy one-shot contract (live frames keep appending) is
+ * unchanged. (Here rather than store.spec.ts: that file is zero-headroom.)
+ */
+describe('loadSubagentDetail: the agy re-read gate', () => {
+  it('re-issues subagents/detail for an agy-marked index and replaces the steps', async () => {
+    const calls: unknown[] = []
+    let revision = 0
+    const store = new AcpStore(async (_channel, endpoint, payload) => {
+      if (endpoint !== 'subagents/detail') return { ok: true, value: {} }
+      calls.push(payload)
+      revision += 1
+      return {
+        ok: true,
+        value: {
+          entries: [{
+            seq: revision,
+            source: 'agy-transcript',
+            update: { step_index: revision, type: 'PLANNER_RESPONSE', status: 'DONE', content: `revision ${String(revision)}` },
+          }],
+        },
+      }
+    }, zh => zh)
+    await store.loadSubagentDetail('chat-1', 'acp:a')
+    expect(calls).toHaveLength(1)
+    // Every open of an agy-marked row is a fresh demand read.
+    await store.loadSubagentDetail('chat-1', 'acp:a')
+    expect(calls).toHaveLength(2)
+    expect(calls[1]).toEqual({ dshSessionId: 'chat-1', childId: 'acp:a' })
+    const detail = store.getSnapshot().subagentDetails[subagentKey('chat-1', 'acp:a')]
+    expect(detail?.loaded).toBe(true)
+    // The fresh answer REPLACES the old steps — no duplicate accumulation.
+    expect(detail?.entries).toHaveLength(1)
+    expect(detail?.entries[0]?.seq).toBe(2)
+  })
+
+  it('keeps the CodeBuddy one-shot read for unmarked entries', async () => {
+    const calls: unknown[] = []
+    const store = new AcpStore(async (_channel, endpoint, payload) => {
+      if (endpoint !== 'subagents/detail') return { ok: true, value: {} }
+      calls.push(payload)
+      return {
+        ok: true,
+        value: { entries: [{ seq: 1, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'worker' } } }] },
+      }
+    }, zh => zh)
+    await store.loadSubagentDetail('chat-1', 'acp:a')
+    await store.loadSubagentDetail('chat-1', 'acp:a')
+    expect(calls).toHaveLength(1)
+    expect(store.getSnapshot().subagentDetails[subagentKey('chat-1', 'acp:a')]?.loaded).toBe(true)
   })
 })
