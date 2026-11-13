@@ -63,7 +63,7 @@
 ```
 turn/end (chat 面, agy 会话, outcome.kind === 'stop', 非 ambient)
    └─ manager.armLateOutputWatch(session, closedAt)
-         └─ AgyLateOutputService.arm: baseline(offset) + poll 1s + deadline
+         └─ AgyLateOutputService.arm: baseline(offset) + poll 1s（可选 deadline）
                └─ poll: 读 transcript 新增行
                      ├─ 会话忙 (running || promptInFlight) → disarm，不投递
                      ├─ 发现 step_index > baseline 的 PLANNER_RESPONSE，且
@@ -149,17 +149,17 @@ interface LateWatch {
   - 前置：`isAgent(defOf(session.agentId))`、`session.dshSessionId !== undefined`、`!session.closed && !session.released`、`session.acpSessionId` 合法、**两个候选目标文件至少一个已存在**（都不存在就不 arm：绝不拿不存在的文件建 tail，否则 baseline 0/0 会把随后出现的整段历史当晚到答案）；
   - 全局开关 `agyLateOutput === false` 直接返回；
   - 同会话已有 watch → 先 `disarm`；
-  - `baseline()` 后起 poll（`agyLateOutputPollMs`，默认 1000）与 deadline（`agyLateOutputMaxMs`，默认 600000），全部 `unref()`。
+  - `baseline()` 后起 poll（`agyLateOutputPollMs`，默认 1000），全部 `unref()`；**默认没有 deadline**（`agyLateOutputMaxMs: 0`）——寿命跟会话走，release / close / 下一轮开始才 disarm。固定窗口已在现场失败过：`session-af26f3a8` 的研究子代理 754 秒后才写出答案，600000 的旧默认把它丢掉了。正数才装 deadline（定时器卫生用途），到点有正文且空闲就投递，然后 disarm。
 - `poll`：
   - `session.closed || session.released` → `disarm`。
   - **忙判定只用 `session.running === true || session.promptInFlight === true`**。为真 → `disarm`，不投递（下一轮会把积压折进来）。不要用 `session.turnController`：带工具卡的回合收口后控制器仍保留到续跑段结束，用它判忙会让第一次 poll 自杀。
   - `readNew()` 后筛候选：只留 `type === 'PLANNER_RESPONSE'`、`step_index > baseline.lastStepIndex`、**`created_at` 必须存在**且其整秒 `>= floor(closedAt / 1000)`。没有 `created_at` 的行一律不投递（缺时间戳无法区分历史与新答案，fail-closed）。时钟同机；`created_at` 秒精度决定用整秒比较。
-  - 收到候选即入 `steps` 并重置 quietTimer（`agyLateOutputQuietMs`，默认 1500，可续期）；不改变 deadline。
+  - 收到候选即入 `steps` 并重置 quietTimer（`agyLateOutputQuietMs`，默认 1500，可续期）；不改变（可选的）deadline。
 - `quiet` 到点：`text = lateAnswerText(steps)`；
   - 空 → 继续等（后台可能只有工具帧）；
   - 与 `session.lastTurnAnswerText` **折叠空白后**全等（两边都 `replace(/\s+/g, ' ').trim()`）→ 是本轮自己刚显示的答案被迟写，丢弃并 `disarm`；
   - 否则 `deliver`，然后 `disarm`。
-- `deadline` 到点：有文本且不忙就投递，否则静默 `disarm`。
+- `deadline` 到点（仅正数上限时安装）：有文本且不忙就投递，否则静默 `disarm`。
 - `disarm(session)`：清三个 timer，删记录；幂等。
 - `armedCount`：只读数（`watches.size`），供测试证明撤表真的发生，不参与任何投递决策。
 
@@ -340,14 +340,14 @@ agy 冲积压时还会重发上一轮的 `tool_call_update`（真实会话里是
 
 | 风险 | 处理 |
 |---|---|
-| agy 改 transcript 格式 | 解析失败即静默；watch 到 deadline 自动停；不抛异常 |
+| agy 改 transcript 格式 | 解析失败即静默；watch 随会话消亡（可选 deadline 兜底）；不抛异常 |
 | 唤醒成功但 flush 被误吞 | 只有完全命中且前缀连续才吞；任何失配立即 fail-open；投递失败清 `pendingLateEcho` |
 | 投递与用户发消息竞态 | 投递前只查 `running` / `promptInFlight`；wake 被 FIFO 跳过时不写 `lateEcho` |
 | 本轮答案迟写被当成晚到答案 | 两边折叠空白（`replace(/\s+/g, ' ').trim()`）后全等即丢弃；本轮正文超过 `BACKGROUND_REPORT_MAX` 时不发布等值证据（宁可重复，不误吞） |
 | 进程被空闲释放 | agy 的后台作业随进程消失，本功能救不回；watch 随 release 由 `clearAmbientState` 停掉，revive 后才重新 arm |
 | 宿主仍在执行卡片时注入 wake | wake 可能占用下一步；续跑随后仍会到来，本机制不另开收口路径、不杀进程 |
 | 读取隐私 | 只读；`watch.steps` 只留 `PLANNER_RESPONSE`；不落盘；不进 notice 正文 |
-| 多会话定时器开销 | 每会话最多 1s poll，全部 `unref`；deadline 10 分钟；`agyLateOutput: false` 一键关；`agyLateOutputMaxMs: 0` 是内部 tuning 键（不承诺部署可达） |
+| 多会话定时器开销 | 每会话最多 1s poll，全部 `unref`，空转只做一次 stat；watch 随会话消亡（release / close / 下一轮），空闲释放默认 30 分钟即兜底；`agyLateOutput: false` 一键关；`agyLateOutputMaxMs` 正数可加时间上限（内部 tuning，不承诺部署可达） |
 | Windows 路径 | `USERPROFILE`；`isAbsolutePath` 判定；失败返回 null |
 | 网络盘 / 权限错误 | `stat` / `read` 异常一律 fail-open |
 | 宿主把 `source` 整体剥掉 | 仓库内不可防（与既有后台报告同一条残余下界），wake 会退化成普通用户消息 |

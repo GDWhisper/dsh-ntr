@@ -280,10 +280,11 @@ export interface BridgeTuning {
    */
   agyLateOutputQuietMs?: number
   /**
-   * Absolute bound on one transcript watch: a background run that never goes
-   * quiet must not poll forever. At the bound whatever arrived is delivered
-   * when the session is idle. `0` disables the whole mechanism. Default
-   * 600000 ms.
+   * Optional absolute bound on one transcript watch. `0` (the default) means
+   * no time bound: the watch ends when the session is released, closed or its
+   * next turn starts, which is exactly as long as the agent can still write a
+   * late answer. A positive value delivers whatever arrived when the session
+   * is idle and then stops — only useful as a timer-hygiene override.
    */
   agyLateOutputMaxMs?: number
   /**

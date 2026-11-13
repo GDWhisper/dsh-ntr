@@ -8,12 +8,13 @@
 import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
-import { afterAll, describe, expect, it } from 'vitest'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { afterAll, describe, expect, it, vi } from 'vitest'
 import {
-  AcpLlmAdapter, BACKGROUND_REPORT_FORM, BACKGROUND_REPORT_SOURCE, BridgeManager,
+  AcpLlmAdapter, AgyLateOutputService, BACKGROUND_REPORT_FORM, BACKGROUND_REPORT_SOURCE, BridgeManager,
   type BridgeTuning,
 } from '../src/bridge.ts'
+import { DEFAULT_TUNING } from '../src/bridge/tuning.ts'
 import { EventHub, dispatchRpc } from '../src/impl.ts'
 import type { AcpAgentDef, AcpEvent, GenerateMessage, StreamChunk } from '../src/protocol.ts'
 
@@ -397,4 +398,103 @@ describe('AGY-LATE: Antigravity transcript late output', () => {
     expect(answered).toContain('AGY-LATE-ANSWER AGY_LATE please')
     expect(answered).toContain('MOCK: echo AGY_REPLAY please')
   }, 30_000)
+})
+
+/**
+ * Lifetime of one watch, on a fake clock: the field failure this guards against
+ * is a research subagent that finished 12m34s after its turn closed and was
+ * dropped by a fixed 10-minute deadline (session-af26f3a8, 2026-11-13). The
+ * watch is bounded by the SESSION (release / close / next turn), not by time.
+ */
+describe('AGY-LATE: watch lifetime', () => {
+  const CLOSED_AT = new Date('2026-11-13T03:04:23.000Z')
+  const LATE_AT = '2026-11-13T03:16:57Z'
+
+  interface Lifetime {
+    service: AgyLateOutputService
+    session: Parameters<AgyLateOutputService['arm']>[0]
+    transcript: string
+    delivered: string[]
+    workspace: string
+  }
+
+  function lifetime(maxMs: number): Lifetime {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-ntr-agy-lifetime-'))
+    const logs = join(workspace, 'brain', 'acp-session-1', '.system_generated', 'logs')
+    mkdirSync(logs, { recursive: true })
+    const transcript = join(logs, 'transcript_full.jsonl')
+    // The transcript already exists when the turn closes (arm requires that),
+    // with the turn's own answer at or below the baseline.
+    writeFileSync(transcript, `${JSON.stringify({
+      step_index: 3, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-13T03:04:15Z', content: 'turn answer',
+    })}\n`)
+    const delivered: string[] = []
+    const service = new AgyLateOutputService({
+      isAgent: () => true,
+      storeRoot: () => workspace,
+      tuning: () => ({
+        ...DEFAULT_TUNING,
+        agyLateOutputPollMs: 1_000,
+        agyLateOutputQuietMs: 1_500,
+        agyLateOutputMaxMs: maxMs,
+      }),
+      host: {
+        defOf: () => def,
+        isBusy: () => false,
+        deliver: (_session, text) => { delivered.push(text); return true },
+      },
+    })
+    const session = {
+      sessionId: 'live-lifetime',
+      agentId: 'mock',
+      acpSessionId: 'acp-session-1',
+      dshSessionId: 'dsh-lifetime',
+      closed: false,
+      released: false,
+    } as unknown as Parameters<AgyLateOutputService['arm']>[0]
+    return { service, session, transcript, delivered, workspace }
+  }
+
+  function appendLateAnswer(transcript: string): void {
+    writeFileSync(transcript, `${JSON.stringify({
+      step_index: 5, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: LATE_AT, content: 'the missing late answer',
+    })}\n`, { flag: 'a' })
+  }
+
+  it('delivers an answer that lands thirteen minutes after the turn closed', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(CLOSED_AT)
+      const { service, session, transcript, delivered, workspace } = lifetime(0)
+      service.arm(session, Date.now())
+      expect(service.armedCount).toBe(1)
+      // The old fixed bound (600000 ms) expired here with nothing to deliver.
+      await vi.advanceTimersByTimeAsync(754_000)
+      appendLateAnswer(transcript)
+      await vi.advanceTimersByTimeAsync(3_000)
+      expect(delivered).toEqual(['the missing late answer'])
+      expect(service.armedCount).toBe(0)
+      rmSync(workspace, { recursive: true, force: true })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('still honours a positive deadline when a deployment sets one', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(CLOSED_AT)
+      const { service, session, transcript, delivered, workspace } = lifetime(600_000)
+      service.arm(session, Date.now())
+      expect(service.armedCount).toBe(1)
+      await vi.advanceTimersByTimeAsync(600_001)
+      expect(service.armedCount).toBe(0)
+      appendLateAnswer(transcript)
+      await vi.advanceTimersByTimeAsync(3_000)
+      expect(delivered).toEqual([])
+      rmSync(workspace, { recursive: true, force: true })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })

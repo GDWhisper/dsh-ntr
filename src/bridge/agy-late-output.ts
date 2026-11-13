@@ -4,9 +4,11 @@
  *
  * After `end_turn` the agent keeps working without a `session/prompt` in
  * flight, and it sends no `session/update` in that window: the answer lands
- * only in its private transcript. This service arms a bounded transcript
- * watch when a chat turn closes, waits for the new `PLANNER_RESPONSE` to go
- * quiet, and hands its text to {@link SubagentService.deliverLateReport}.
+ * only in its private transcript. This service arms a transcript watch when a
+ * chat turn closes, waits for the new `PLANNER_RESPONSE` to go quiet, and hands
+ * its text to {@link SubagentService.deliverLateReport}. The watch is bounded
+ * by the SESSION (release / close / next turn), not by a fixed deadline: field
+ * background work has run 12m34s past its turn (session-af26f3a8).
  *
  * It NEVER closes a turn, kills a process or alters `running`: it is a new
  * SOURCE for the delivery family, not a watchdog.
@@ -103,7 +105,6 @@ export class AgyLateOutputService {
   arm(session: LiveSession, closedAt: number): void {
     const tuning = this.deps.tuning()
     if (!tuning.agyLateOutput) return
-    if (tuning.agyLateOutputMaxMs <= 0) return
     if (session.dshSessionId === undefined) return
     if (session.closed || session.released) return
     const def = this.deps.host.defOf(session.agentId)
@@ -139,9 +140,16 @@ export class AgyLateOutputService {
     const pollTimer = setInterval(() => { this.poll(watch) }, pollMs)
     pollTimer.unref?.()
     watch.pollTimer = pollTimer
-    const deadlineTimer = setTimeout(() => { this.onDeadline(watch) }, Math.max(1, tuning.agyLateOutputMaxMs))
-    deadlineTimer.unref?.()
-    watch.deadlineTimer = deadlineTimer
+    // The watch lives as long as the SESSION can still produce a late answer:
+    // release, close and the next turn all disarm it. Only a positive bound
+    // arms the deadline, so a background run that outlives any fixed window
+    // (a research subagent that took 12m34s in the field) still gets delivered.
+    const maxMs = tuning.agyLateOutputMaxMs
+    if (maxMs > 0) {
+      const deadlineTimer = setTimeout(() => { this.onDeadline(watch) }, Math.max(1, maxMs))
+      deadlineTimer.unref?.()
+      watch.deadlineTimer = deadlineTimer
+    }
     this.watches.set(session.sessionId, watch)
     session.stopLateWatch = watch.stop
   }
@@ -210,7 +218,11 @@ export class AgyLateOutputService {
     this.disarmWatch(watch)
   }
 
-  /** Deadline: deliver whatever is there when the session is idle, then stop. */
+  /**
+   * Optional deadline (only armed when `agyLateOutputMaxMs > 0`): deliver
+   * whatever is there when the session is idle, then stop. The default is no
+   * deadline at all — see {@link arm}.
+   */
   private onDeadline(watch: LateWatch): void {
     if (watch.finished) return
     const session = watch.session
