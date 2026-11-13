@@ -1681,6 +1681,17 @@ export function AcpSettingsSection(props: WithStore) {
   )
 }
 
+/**
+ * One agent row's save gesture. `held` is the only staged stage: the queue lists
+ * `agent-save:<id>` and the write waits behind active turns. `confirming` and
+ * `saving` describe one attempt, never a staged one; the dialog stays in `saveConfirm`.
+ */
+type SaveStage =
+  | { kind: 'idle' }
+  | { kind: 'confirming'; payload: AgentSavePayload }
+  | { kind: 'saving'; payload: AgentSavePayload }
+  | { kind: 'held'; signature: string; sawQueue: boolean; outcomeBaseline?: number }
+
 /** One row per agent: compact when collapsed, the full form when expanded. */
 function AgentRow({
   detected,
@@ -1710,25 +1721,15 @@ function AgentRow({
   const [expanded, setExpanded] = useState(!configured)
   const [detailPage, setDetailPage] = useState<'models' | 'connection' | 'advanced'>(configured ? 'models' : 'connection')
   const [form, setForm] = useState<AgentForm>(() => initialForm(detected, activeAgent))
-  const [saving, setSaving] = useState(false)
   const [savedSuccess, setSavedSuccess] = useState(false)
   /**
-   * Whether THIS visit asked for "save after turns". The visible held state is
-   * derived from the gate's pending queue (`agent-save:<id>`), so remounting the
-   * panel or refreshing the page still shows it. This flag only bridges the
-   * short gap between the host's `deferred` answer and its first status frame.
+   * The save gesture. `held` is the only staged stage: the queue lists
+   * `agent-save:<id>`, so a remount or refresh still shows it. `signature`
+   * freezes the payload it will write; `sawQueue` records that the queue listed
+   * this label, and `outcomeBaseline` the terminal outcome seen at queue time.
    */
-  const [deferRequested, setDeferRequested] = useState(false)
-  /**
-   * The payload signature held when the save was queued. On a remount the exact
-   * payload is gone, but the queue still knows a save is waiting: this baseline
-   * is re-captured from the form so any later edit cancels it.
-   */
-  const [heldSignature, setHeldSignature] = useState<string>()
-  /** True once the queue listed this label during the current held attempt. */
-  const [sawPending, setSawPending] = useState(false)
-  /** Terminal outcome that already existed when this defer was queued. */
-  const [deferOutcomeAt, setDeferOutcomeAt] = useState<number>()
+  const [saveStage, setSaveStage] = useState<SaveStage>({ kind: 'idle' })
+  const saving = saveStage.kind === 'saving'
   /** One line of edit/cancel feedback; a failed cancel is a page banner. */
   const [saveNotice, setSaveNotice] = useState<string>()
   // Every save re-reads the gate before it shows the dialog, so this starting
@@ -1797,52 +1798,50 @@ function AgentRow({
   const saveLabel = `agent-save:${payload.id}`
   const labelOutcome = saveGateOutcomeForLabel(ui.saveGate, saveLabel)
   const savePending = ui.saveGate.pending.some(entry => entry.label === saveLabel)
+  const payloadSignature = JSON.stringify(payload)
+  if (saveStage.kind === 'idle' && savePending) {
+    // A queue entry with no local answer (a remount, or another surface's
+    // write) becomes this row's held attempt with the form signature frozen.
+    // The update makes `idle` false on the re-render, so this cannot loop.
+    setSaveStage({ kind: 'held', signature: payloadSignature, sawQueue: true })
+  }
   // Held while this label is queued, or while the local defer answer is still
   // waiting for its first queue frame. No browser clock is compared with the
   // host's: the queue plus a terminal outcome for this label decide settlement.
-  const saveDeferred = deferRequested || savePending
-  const payloadSignature = JSON.stringify(payload)
+  const saveDeferred = saveStage.kind === 'held'
   const cancelInFlight = useRef(false)
   const latestPayloadSignature = useRef(payloadSignature)
   latestPayloadSignature.current = payloadSignature
 
   useEffect(() => {
-    if (!saveDeferred || heldSignature !== undefined) return
-    setHeldSignature(payloadSignature)
-  }, [saveDeferred, heldSignature, payloadSignature])
-
-  useEffect(() => {
     if (savePending) {
-      if (!sawPending) setSawPending(true)
       // The queue is back: a "cancelled, save again" line would now contradict
       // the held state shown in the same composer.
       if (saveNotice !== undefined) setSaveNotice(undefined)
+      if (saveStage.kind === 'held' && !saveStage.sawQueue) setSaveStage({ ...saveStage, sawQueue: true })
       return
     }
-    if (!deferRequested && !sawPending) return
+    if (saveStage.kind !== 'held') return
     if (labelOutcome === undefined) return
     // A superseded row belongs to a newer save, not to this held attempt.
     if (saveGateOutcomeSuperseded(labelOutcome)) return
     // A terminal outcome that predates this defer cannot settle it. Identity
     // (not ordering) is enough: the outcome's `at` names the host's settlement,
     // and it is only "new" when it differs from the one captured at defer time.
-    const outcomeIsNew = deferOutcomeAt === undefined || labelOutcome.at !== deferOutcomeAt
-    if (!sawPending && !outcomeIsNew) return
-    setDeferRequested(false)
-    setSawPending(false)
-    setHeldSignature(undefined)
-    setDeferOutcomeAt(undefined)
+    const outcomeIsNew = saveStage.outcomeBaseline === undefined || labelOutcome.at !== saveStage.outcomeBaseline
+    if (!saveStage.sawQueue && !outcomeIsNew) return
+    setSaveStage({ kind: 'idle' })
     if (labelOutcome.status === 'cancelled') {
       setSaveNotice(acp.label('已取消暂存，请重新保存。', 'The held setting was cancelled. Please save again.'))
     }
-  }, [savePending, sawPending, deferRequested, labelOutcome, deferOutcomeAt, saveNotice, acp])
+  }, [savePending, saveStage, labelOutcome, saveNotice, acp])
 
   useEffect(() => {
-    if (!saveDeferred || heldSignature === undefined) return
+    if (saveStage.kind !== 'held') return
     // The user kept editing: the held snapshot would write stale values, so
     // drop it explicitly and tell the user to save again. Checking the queue
     // keeps this working after a remount, where the exact payload is gone.
-    if (payloadSignature === heldSignature) return
+    if (payloadSignature === saveStage.signature) return
     if (cancelInFlight.current) return
     cancelInFlight.current = true
     const signatureAtStart = payloadSignature
@@ -1859,17 +1858,14 @@ function AgentRow({
         // A failed cancel keeps the held state; the store already raised the
         // "cancel did not take effect" banner with its retry gesture.
         if (!cancelled) return
-        setDeferRequested(false)
-        setSawPending(false)
-        setHeldSignature(undefined)
-        setDeferOutcomeAt(undefined)
+        setSaveStage({ kind: 'idle' })
         setSaveNotice(acp.label('已取消暂存，请重新保存。', 'The held setting was cancelled. Please save again.'))
         void acp.readSaveGate().catch(() => { /* the status frame remains authoritative */ })
       } finally {
         cancelInFlight.current = false
       }
     })()
-  }, [payloadSignature, saveDeferred, heldSignature, saveLabel, acp])
+  }, [payloadSignature, saveStage, saveLabel, acp])
 
   const handleUseDefault = (): void => patch({ commandLine: formatCommandLine(detected.defaultCommand, detected.defaultArgs) })
 
@@ -1882,32 +1878,30 @@ function AgentRow({
     // An older host has no gate to queue behind: offering "save after turns"
     // there would silently interrupt them when it ignores `saveMode`.
     if (mode === 'defer' && !saveGateAvailable) return
-    setSaving(true)
     setSavedSuccess(false)
-    setDeferRequested(false)
-    setSawPending(false)
-    setHeldSignature(undefined)
-    setDeferOutcomeAt(undefined)
+    setSaveStage({ kind: 'saving', payload })
     setSaveNotice(undefined)
     setSaveConfirm(undefined)
     try {
       const result = await acp.saveAgent(payload, mode)
       // The agent was deleted while this save ran; the host aborted without
       // writing. That is not a success and not a staged settlement.
-      if (result.cancelled === true) return
+      if (result.cancelled === true) {
+        setSaveStage({ kind: 'idle' })
+        return
+      }
       if (result.confirmationRequired) {
         const fromHost = result.activeSessions ?? []
         const active = fromHost.length > 0 ? fromHost : activeSessionsForSave(saveGateAvailable)
         setSaveConfirm(active)
+        setSaveStage({ kind: 'confirming', payload })
         return
       }
       if (result.deferred) {
         // Freeze the signature this deferred save will write. Editing the form
         // afterwards cancels it (see the effect above). The gate read brings the
         // queue in immediately; the pending state itself survives a remount.
-        setDeferRequested(true)
-        setHeldSignature(payloadSignature)
-        setDeferOutcomeAt(labelOutcome?.at)
+        setSaveStage({ kind: 'held', signature: payloadSignature, sawQueue: false, outcomeBaseline: labelOutcome?.at })
         void acp.readSaveGate().catch(() => { /* the status frame remains authoritative */ })
         return
       }
@@ -1915,14 +1909,14 @@ function AgentRow({
       // now lives in the configured list, and keeping the same card mounted
       // would render it twice. Configured rows pass no `onCreated`, so this is
       // a no-op for them.
+      setSaveStage({ kind: 'idle' })
       onCreated?.()
       if (newCustom) return
       setSavedSuccess(true)
       setTimeout(() => setSavedSuccess(false), 2000)
     } catch {
       // Error handled by store
-    } finally {
-      setSaving(false)
+      setSaveStage({ kind: 'idle' })
     }
   }
 
@@ -1945,6 +1939,8 @@ function AgentRow({
         : activeSessionsForSave(false)
       if (active.length > 0) {
         setSaveConfirm(active)
+        // A dialog must not overwrite a staged write, or the next edit stops cancelling it.
+        if (saveStage.kind !== 'held') setSaveStage({ kind: 'confirming', payload })
         return
       }
     } catch (error) {
@@ -1964,6 +1960,7 @@ function AgentRow({
       const active = activeSessionsForSave(!unsupported && saveGateAvailable)
       if (active.length > 0) {
         setSaveConfirm(active)
+        if (saveStage.kind !== 'held') setSaveStage({ kind: 'confirming', payload })
         return
       }
       if (!unsupported) return
@@ -2134,7 +2131,10 @@ function AgentRow({
             saveNotice={saveNotice}
             saveConfirm={saveConfirm}
             canDefer={saveGateAvailable}
-            onSaveCancel={() => setSaveConfirm(undefined)}
+            onSaveCancel={() => {
+              setSaveConfirm(undefined)
+              setSaveStage(prev => (prev.kind === 'confirming' ? { kind: 'idle' } : prev))
+            }}
             onSaveDefer={() => void performSave('defer')}
             onSaveForce={() => void performSave('force')}
             testing={testing}
