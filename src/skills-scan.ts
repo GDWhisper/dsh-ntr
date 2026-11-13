@@ -24,8 +24,9 @@
  * repeat cost at zero.
  */
 
-import { closeSync, lstatSync, openSync, readSync, readdirSync, realpathSync, statSync } from 'node:fs'
+import { closeSync, lstatSync, openSync, readSync, readdirSync, readlinkSync, realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
+import { dirname, resolve } from 'node:path'
 import type { AgentSkillEntry, AgentSkillScope } from './protocol.ts'
 import {
   GENERIC_SKILL_DIRS,
@@ -44,7 +45,7 @@ import {
 export interface SkillScanResult {
   skills: AgentSkillEntry[]
   truncated: boolean
-  /** Symlinked skill dirs that resolved OUTSIDE their group anchor, skipped. */
+  /** Symlinked skill dirs that resolved OUTSIDE their group anchor, or whose target could not be resolved, skipped. */
   skippedExternalSymlinks: number
 }
 
@@ -115,6 +116,43 @@ function realPathOr(path: string): string {
   }
 }
 
+/**
+ * A link read can fail for a moment right after the link is created (Windows
+ * indexer/AV races), and a filesystem virtualizer can leave the link itself
+ * unfollowable while its recorded target stays readable. Bounded retries plus
+ * a recorded-target fallback keep such a child from vanishing silently.
+ */
+const LINK_READ_ATTEMPTS = 3
+const LINK_RETRY_PAUSE_MS = 10
+const linkRetryPause = new Int32Array(new SharedArrayBuffer(4))
+
+/** Retry one fs read; `undefined` when every attempt throws. */
+function retryLinkRead<T>(read: () => T): T | undefined {
+  for (let attempt = 0; attempt < LINK_READ_ATTEMPTS; attempt += 1) {
+    try {
+      return read()
+    } catch {
+      // fall through to the pause and the next attempt
+    }
+    if (attempt < LINK_READ_ATTEMPTS - 1) Atomics.wait(linkRetryPause, 0, 0, LINK_RETRY_PAUSE_MS)
+  }
+  return undefined
+}
+
+/** Canonical path a symlinked child points at; `undefined` when even its recorded target is unusable. */
+function resolveLinkTarget(linkPath: string): string | undefined {
+  const followed = retryLinkRead(() => realpathSync(linkPath))
+  if (followed !== undefined) return followed
+  // The link cannot be followed: canonicalize the target the reparse point
+  // records instead. Containment is still judged on this canonical path.
+  try {
+    const recorded = readlinkSync(linkPath)
+    return realpathSync.native(resolve(dirname(linkPath), recorded))
+  } catch {
+    return undefined
+  }
+}
+
 function sortScope(left: AgentSkillScope, right: AgentSkillScope): number {
   const rank: Record<AgentSkillScope, number> = { project: 0, global: 1, system: 2 }
   return rank[left] - rank[right]
@@ -145,23 +183,33 @@ export function scanSkillDirs(flavor: SkillFlavor, workspaceRoot: string | undef
       if (child === '' || child === '.' || child === '..' || child === '.git') continue
       const childPath = `${group.absolute}/${child}`
       let childReal: string
+      let stat: ReturnType<typeof lstatSync>
       try {
-        const stat = lstatSync(childPath)
-        if (stat.isSymbolicLink()) {
-          // A symlinked child must resolve INSIDE its group anchor; anything
-          // that escapes is counted and skipped, never followed.
-          childReal = realPathOr(childPath)
-          if (!isUnderPath(childReal, groupReal)) {
-            skippedExternalSymlinks += 1
-            continue
-          }
-          if (!statSync(childReal).isDirectory()) continue
-        } else {
-          if (!stat.isDirectory()) continue
-          childReal = childPath
-        }
+        stat = lstatSync(childPath)
       } catch {
         continue
+      }
+      if (stat.isSymbolicLink()) {
+        // A symlinked child must resolve INSIDE its group anchor; anything
+        // that escapes is counted and skipped, never followed.
+        const resolved = resolveLinkTarget(childPath)
+        if (resolved === undefined) {
+          // Known link, unknowable destination: never follow it, but keep the
+          // skip visible instead of dropping the child silently. It shares the
+          // external counter — both buckets mean "a link we refused to scan".
+          skippedExternalSymlinks += 1
+          continue
+        }
+        if (!isUnderPath(resolved, groupReal)) {
+          skippedExternalSymlinks += 1
+          continue
+        }
+        const target = retryLinkRead(() => statSync(resolved))
+        if (target === undefined || !target.isDirectory()) continue
+        childReal = resolved
+      } else {
+        if (!stat.isDirectory()) continue
+        childReal = childPath
       }
       const skillMdPath = `${childReal}/SKILL.md`
       let frontmatter: Record<string, string>
