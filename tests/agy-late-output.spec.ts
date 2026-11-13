@@ -269,6 +269,231 @@ describe('AGY-LATE: Antigravity transcript late output', () => {
     expect(String(wakes[1]?.source?.report)).toContain('AGY-SECOND-ANSWER')
   }, 30_000)
 
+  it('skips poll chatter across interleaved synchronous tools and delivers the answer after a task completion message', async () => {
+    vi.useFakeTimers()
+    try {
+      const closedAt = new Date('2026-11-13T04:32:38.000Z')
+      vi.setSystemTime(closedAt)
+      const workspace = mkdtempSync(join(tmpdir(), 'dsh-ntr-agy-interleaved-'))
+      const logs = join(workspace, 'brain', 'acp-session-1', '.system_generated', 'logs')
+      mkdirSync(logs, { recursive: true })
+      const transcript = join(logs, 'transcript_full.jsonl')
+      writeFileSync(transcript, `${JSON.stringify({
+        step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-13T04:32:32Z', content: 'turn answer',
+      })}\n`)
+      const delivered: string[] = []
+      const service = new AgyLateOutputService({
+        isAgent: () => true,
+        storeRoot: () => workspace,
+        tuning: () => ({
+          ...DEFAULT_TUNING,
+          agyLateOutputPollMs: 1_000,
+          agyLateOutputQuietMs: 1_500,
+          agyLateOutputMaxMs: 0,
+        }),
+        host: {
+          defOf: () => def,
+          isBusy: () => false,
+          deliver: (_session, text) => { delivered.push(text); return true },
+        },
+      })
+      const session = {
+        sessionId: 'live-interleaved',
+        agentId: 'mock',
+        acpSessionId: 'acp-session-1',
+        dshSessionId: 'dsh-interleaved',
+        closed: false,
+        released: false,
+      } as unknown as Parameters<AgyLateOutputService['arm']>[0]
+      service.arm(session, Date.now())
+
+      // A background task starts, then a synchronous tool (`manage_subagents list`)
+      // and a `manage_task status` (Status: RUNNING) run, followed by poll chatter.
+      // None of the synchronous GENERIC DONE lines may disarm the waiting gate.
+      appendFileSync(transcript, [
+        JSON.stringify({
+          step_index: 2, type: 'GENERIC', status: 'RUNNING', created_at: '2026-11-13T04:33:00Z',
+          content: 'Tool is running as a background task with task id: acp-session-1/task-2',
+        }),
+        JSON.stringify({
+          step_index: 3, type: 'GENERIC', status: 'DONE', created_at: '2026-11-13T04:33:10Z',
+          content: 'You have 1 active subagent(s)',
+        }),
+        JSON.stringify({
+          step_index: 4, type: 'GENERIC', status: 'DONE', created_at: '2026-11-13T04:33:11Z',
+          content: 'Task: acp-session-1/task-2\nStatus: RUNNING',
+        }),
+        JSON.stringify({
+          step_index: 5, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-13T04:33:12Z',
+          content: 'I am waiting for the background task.',
+        }),
+      ].join('\n') + '\n')
+      await vi.advanceTimersByTimeAsync(4_000)
+      expect(delivered).toEqual([])
+
+      // When the background task completes via its own SYSTEM_MESSAGE, the
+      // following PLANNER_RESPONSE IS the real answer and must be delivered
+      // even without a separate GENERIC DONE step.
+      appendFileSync(transcript, [
+        JSON.stringify({
+          step_index: 6, type: 'SYSTEM_MESSAGE', status: 'DONE', created_at: '2026-11-13T04:34:00Z',
+          content: '<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-13T04:34:00Z sender=acp-session-1/task-2 priority=MESSAGE_PRIORITY_HIGH content=done\n</SYSTEM_MESSAGE>',
+        }),
+        JSON.stringify({
+          step_index: 7, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-13T04:34:01Z',
+          content: 'Here is the finished command report.',
+        }),
+      ].join('\n') + '\n')
+      await vi.advanceTimersByTimeAsync(3_000)
+      expect(delivered).toEqual(['Here is the finished command report.'])
+      rmSync(workspace, { recursive: true, force: true })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not lose a subagent report written between wake delivery and armAfterWake', async () => {
+    vi.useFakeTimers()
+    try {
+      const closedAt = new Date('2026-11-13T04:32:38.000Z')
+      vi.setSystemTime(closedAt)
+      const workspace = mkdtempSync(join(tmpdir(), 'dsh-ntr-agy-gap-'))
+      const logs = join(workspace, 'brain', 'acp-session-1', '.system_generated', 'logs')
+      mkdirSync(logs, { recursive: true })
+      const transcript = join(logs, 'transcript_full.jsonl')
+      writeFileSync(transcript, `${JSON.stringify({
+        step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-13T04:32:32Z', content: 'turn answer',
+      })}\n`)
+      const delivered: string[] = []
+      const service = new AgyLateOutputService({
+        isAgent: () => true,
+        storeRoot: () => workspace,
+        tuning: () => ({
+          ...DEFAULT_TUNING,
+          agyLateOutputPollMs: 1_000,
+          agyLateOutputQuietMs: 1_500,
+          agyLateOutputMaxMs: 0,
+        }),
+        host: {
+          defOf: () => def,
+          isBusy: () => false,
+          deliver: (_session, text) => { delivered.push(text); return true },
+        },
+      })
+      const session = {
+        sessionId: 'live-gap',
+        agentId: 'mock',
+        acpSessionId: 'acp-session-1',
+        dshSessionId: 'dsh-gap',
+        closed: false,
+        released: false,
+      } as unknown as Parameters<AgyLateOutputService['arm']>[0]
+      service.arm(session, Date.now())
+
+      // First late answer lands and is delivered; watch disarms while wake is scheduled.
+      appendFileSync(transcript, `${JSON.stringify({
+        step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-13T04:32:40Z', content: 'first update',
+      })}\n`)
+      await vi.advanceTimersByTimeAsync(3_000)
+      expect(delivered).toEqual(['first update'])
+
+      // Before `armAfterWake` runs (1 second later), the subagent finishes and
+      // writes its report + answer (whose `created_at` may even precede armAfterWake).
+      appendFileSync(transcript, [
+        JSON.stringify({
+          step_index: 3, type: 'SYSTEM_MESSAGE', status: 'DONE', created_at: '2026-11-13T04:32:41Z',
+          content: '<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-13T04:32:41Z sender=subagent-99 priority=MESSAGE_PRIORITY_HIGH content=report\n</SYSTEM_MESSAGE>',
+        }),
+        JSON.stringify({
+          step_index: 4, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-13T04:32:41Z',
+          content: 'final subagent answer',
+        }),
+      ].join('\n') + '\n')
+
+      await vi.advanceTimersByTimeAsync(2_000)
+      service.armAfterWake(session)
+      await vi.advanceTimersByTimeAsync(3_000)
+      expect(delivered).toEqual(['first update', 'final subagent answer'])
+      rmSync(workspace, { recursive: true, force: true })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('drops a stale reportGate when a new background task starts before answering', async () => {
+    vi.useFakeTimers()
+    try {
+      const closedAt = new Date('2026-11-13T04:32:38.000Z')
+      vi.setSystemTime(closedAt)
+      const workspace = mkdtempSync(join(tmpdir(), 'dsh-ntr-agy-gate-reset-'))
+      const logs = join(workspace, 'brain', 'acp-session-1', '.system_generated', 'logs')
+      mkdirSync(logs, { recursive: true })
+      const transcript = join(logs, 'transcript_full.jsonl')
+      writeFileSync(transcript, `${JSON.stringify({
+        step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-13T04:32:32Z', content: 'turn answer',
+      })}\n`)
+      const delivered: string[] = []
+      const service = new AgyLateOutputService({
+        isAgent: () => true,
+        storeRoot: () => workspace,
+        tuning: () => ({
+          ...DEFAULT_TUNING,
+          agyLateOutputPollMs: 1_000,
+          agyLateOutputQuietMs: 1_500,
+          agyLateOutputMaxMs: 0,
+        }),
+        host: {
+          defOf: () => def,
+          isBusy: () => false,
+          deliver: (_session, text) => { delivered.push(text); return true },
+        },
+      })
+      const session = {
+        sessionId: 'live-gate-reset',
+        agentId: 'mock',
+        acpSessionId: 'acp-session-1',
+        dshSessionId: 'dsh-gate-reset',
+        closed: false,
+        released: false,
+      } as unknown as Parameters<AgyLateOutputService['arm']>[0]
+      service.arm(session, Date.now())
+
+      // Subagent reports, then planner launches a background verification task and writes waiting prose.
+      appendFileSync(transcript, [
+        JSON.stringify({
+          step_index: 2, type: 'SYSTEM_MESSAGE', status: 'DONE', created_at: '2026-11-13T04:33:00Z',
+          content: '<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-13T04:33:00Z sender=subagent-1 priority=MESSAGE_PRIORITY_HIGH content=report\n</SYSTEM_MESSAGE>',
+        }),
+        JSON.stringify({
+          step_index: 3, type: 'GENERIC', status: 'RUNNING', created_at: '2026-11-13T04:33:05Z',
+          content: 'Tool is running as a background task with task id: acp-session-1/task-3',
+        }),
+        JSON.stringify({
+          step_index: 4, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-13T04:33:06Z',
+          content: 'Waiting for verification command to complete.',
+        }),
+      ].join('\n') + '\n')
+      await vi.advanceTimersByTimeAsync(4_000)
+      expect(delivered).toEqual([])
+
+      appendFileSync(transcript, [
+        JSON.stringify({
+          step_index: 5, type: 'SYSTEM_MESSAGE', status: 'DONE', created_at: '2026-11-13T04:33:20Z',
+          content: '<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-13T04:33:20Z sender=acp-session-1/task-3 priority=MESSAGE_PRIORITY_HIGH content=done\n</SYSTEM_MESSAGE>',
+        }),
+        JSON.stringify({
+          step_index: 6, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-11-13T04:33:21Z',
+          content: 'Verified and complete.',
+        }),
+      ].join('\n') + '\n')
+      await vi.advanceTimersByTimeAsync(3_000)
+      expect(delivered).toEqual(['Verified and complete.'])
+      rmSync(workspace, { recursive: true, force: true })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('does not wake while the next user turn is still running', async () => {
     const dshSessionId = 'dsh-agy-late-busy'
     const wakes: GenerateMessage[] = []

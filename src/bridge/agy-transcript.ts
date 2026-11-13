@@ -171,25 +171,33 @@ export class AgyTranscriptTail {
 
   constructor(readonly path: string) {}
 
-  /** Start at the CURRENT end of the file: nothing before this arm is replayed. */
-  baseline(): void {
+  /**
+   * Start at the CURRENT end of the file: nothing before this arm is replayed.
+   * Returns the parsed steps from the inspected tail window so callers can seed
+   * non-replay gate state (e.g. an already-running background task).
+   */
+  baseline(): TranscriptStep[] {
     this.offset = 0
     this.lastStepIndex = 0
     let size: number
     try {
       const stat = statSync(this.path)
-      if (!stat.isFile()) return
+      if (!stat.isFile()) return []
       size = stat.size
     } catch {
-      return
+      return []
     }
     this.offset = size
     const window = this.readRange(Math.max(0, size - BASELINE_TAIL_BYTES), Math.min(size, BASELINE_TAIL_BYTES))
-    if (window === undefined) return
+    if (window === undefined) return []
+    const steps: TranscriptStep[] = []
     for (const line of window.toString('utf8').split('\n')) {
       const step = parseTranscriptStep(line)
-      if (step !== undefined && step.stepIndex > this.lastStepIndex) this.lastStepIndex = step.stepIndex
+      if (step === undefined) continue
+      steps.push(step)
+      if (step.stepIndex > this.lastStepIndex) this.lastStepIndex = step.stepIndex
     }
+    return steps
   }
 
   /** Steps appended since the previous pass. Never throws. */

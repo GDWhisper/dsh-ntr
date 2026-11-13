@@ -13,7 +13,7 @@
  * It NEVER closes a turn, kills a process or alters `running`: it is a new
  * SOURCE for the delivery family, not a watchdog.
  */
-import { existsSync } from 'node:fs'
+import { existsSync, statSync } from 'node:fs'
 import {
   AgyTranscriptTail,
   agyTranscriptPaths,
@@ -23,6 +23,11 @@ import {
 import type { AcpAgentDef } from '../protocol.ts'
 import type { BridgeTuning } from './types.ts'
 import type { LiveSession } from './turn-stream.ts'
+
+interface GateState {
+  reportGate: boolean
+  waiting: boolean
+}
 
 /** One armed watch; at most one per LiveSession. */
 interface LateWatch {
@@ -38,8 +43,13 @@ interface LateWatch {
    * own subagent POLL produces (those messages come from `<session>/task-N`).
    */
   reportGate: boolean
-  /** Status of the newest GENERIC step: `RUNNING` means a background tool is mid-flight. */
-  lastGenericStatus: string
+  /**
+   * Whether a background task (`GENERIC` `RUNNING` or `Task: ... Status: RUNNING`)
+   * is currently active without a subsequent task completion / `SYSTEM_MESSAGE`.
+   * Synchronous `GENERIC` calls (`read_file`, `manage_subagents list`) must not
+   * clear this flag while the background wait is still running.
+   */
+  waiting: boolean
   pollTimer?: ReturnType<typeof setInterval>
   quietTimer?: ReturnType<typeof setTimeout>
   deadlineTimer?: ReturnType<typeof setTimeout>
@@ -76,6 +86,12 @@ function stepSecond(createdAt: string | undefined): number | undefined {
   return Math.floor(parsed / 1_000)
 }
 
+/** Extract `sender=<id>` from a `<SYSTEM_MESSAGE>` step, if present. */
+function senderOf(content: string): string | undefined {
+  const match = /\bsender=(\S+)/.exec(content)
+  return match?.[1]
+}
+
 /**
  * Whether one `SYSTEM_MESSAGE` carries a report rather than agy's own poll.
  *
@@ -86,11 +102,47 @@ function stepSecond(createdAt: string | undefined): number | undefined {
  * delivery, the text still sits in the transcript).
  */
 function isReportMessage(content: string, acpSessionId: string): boolean {
-  const match = /\bsender=(\S+)/.exec(content)
-  if (match === null) return false
-  const sender = match[1]
+  const sender = senderOf(content)
   if (sender === undefined || sender === 'system') return false
   return !sender.startsWith(`${acpSessionId}/`)
+}
+
+/**
+ * Advance the wait / report gates for non-planner transcript steps.
+ *
+ * Background waits begin on `GENERIC` `RUNNING` (or a `manage_task` poll
+ * reporting `Task: <id>\nStatus: RUNNING`, whose outer `step.status` is `DONE`)
+ * and end on a non-system `SYSTEM_MESSAGE` (either a subagent report or a
+ * background task/timer firing) or explicit task completion / cancellation.
+ * Ordinary synchronous `GENERIC` steps (`read_file`, `manage_subagents list`)
+ * leave `waiting` intact.
+ */
+function applyGateStep(state: GateState, step: TranscriptStep, acpSessionId: string): void {
+  if (step.type === 'USER_INPUT') {
+    state.waiting = false
+    state.reportGate = false
+    return
+  }
+  if (step.type === 'SYSTEM_MESSAGE') {
+    const sender = senderOf(step.content)
+    if (sender !== undefined && sender !== 'system') {
+      state.waiting = false
+      state.reportGate = isReportMessage(step.content, acpSessionId)
+    } else {
+      state.reportGate = false
+    }
+    return
+  }
+  if (step.type === 'GENERIC') {
+    if (step.status === 'RUNNING' || /\bTask:\s*\S+\s+Status:\s*RUNNING\b/.test(step.content)) {
+      state.waiting = true
+      state.reportGate = false
+      return
+    }
+    if (/\bTask:\s*\S+\s+Status:\s*(?!RUNNING\b)\S+/.test(step.content) || /Task\s+"[^"]+"\s+cancelled/.test(step.content)) {
+      state.waiting = false
+    }
+  }
 }
 
 /**
@@ -128,21 +180,10 @@ export class AgyLateOutputService {
    * A failed precondition arms nothing — no caller observes an error.
    */
   arm(session: LiveSession, closedAt: number): void {
-    const tuning = this.deps.tuning()
-    if (!tuning.agyLateOutput) return
-    if (session.dshSessionId === undefined) return
-    if (session.closed || session.released) return
-    const def = this.deps.host.defOf(session.agentId)
-    if (def === undefined || !this.deps.isAgent(def)) return
-    const storeRoot = this.deps.storeRoot(def)
-    if (storeRoot === undefined) return
-    const paths = agyTranscriptPaths(storeRoot, session.acpSessionId)
-    if (paths.length === 0) return
-    // An echo record older than the guard window can never match a replay:
-    // drop it at the one moment a new watch starts.
-    if (session.lateEcho !== undefined && Date.now() - session.lateEcho.at > tuning.agyLateOutputEchoMs) {
-      session.lateEcho = undefined
-    }
+    session.lateWatchCheckpoint = undefined
+    const resolved = this.resolvePaths(session)
+    if (resolved === undefined) return
+    const { tuning, paths } = resolved
     // One watch per session: a new turn supersedes the previous one.
     this.disarm(session)
     // Both candidates must ALREADY exist: a tail built on a missing file has a
@@ -151,16 +192,98 @@ export class AgyLateOutputService {
     const path = paths.find(candidate => existsSync(candidate))
     if (path === undefined) return
     const tail = new AgyTranscriptTail(path)
-    tail.baseline()
+    const seedSteps = tail.baseline()
+    const seedGate: GateState = { reportGate: false, waiting: false }
+    for (const step of seedSteps) applyGateStep(seedGate, step, session.acpSessionId)
+    seedGate.reportGate = false
+    this.startWatch(session, tail, closedAt, tail.lastStepIndex, seedGate, tuning)
+  }
+
+  /**
+   * Re-arm after a WAKE turn. That turn has no ACP controller, so `closeTurn`
+   * cannot arm: without this call the watch that produced the wake stays
+   * disarmed and the rest of the same background run is lost
+   * (session-af26f3a8: the final answer arrived 12 minutes later, never shown).
+   *
+   * Resumes from the saved {@link LiveSession.lateWatchCheckpoint} when the
+   * same file still covers that offset so steps written between `onQuiet` and
+   * `armAfterWake` (or started earlier in `created_at` before finishing) are
+   * never skipped by `baseline()`.
+   */
+  armAfterWake(session: LiveSession | undefined): void {
+    if (session === undefined) return
+    const checkpoint = session.lateWatchCheckpoint
+    session.lateWatchCheckpoint = undefined
+    if (checkpoint === undefined) {
+      this.arm(session, Date.now())
+      return
+    }
+    const resolved = this.resolvePaths(session)
+    if (resolved === undefined) return
+    const { tuning, paths } = resolved
+    if (!paths.includes(checkpoint.path) || !this.fileCoversOffset(checkpoint.path, checkpoint.offset)) {
+      this.arm(session, Date.now())
+      return
+    }
+    this.disarm(session)
+    const tail = new AgyTranscriptTail(checkpoint.path)
+    tail.offset = checkpoint.offset
+    tail.lastStepIndex = checkpoint.lastStepIndex
+    this.startWatch(
+      session,
+      tail,
+      checkpoint.closedAt,
+      checkpoint.lastStepIndex,
+      { reportGate: checkpoint.reportGate, waiting: checkpoint.waiting },
+      tuning,
+    )
+  }
+
+  private resolvePaths(session: LiveSession): { tuning: Required<BridgeTuning>; paths: string[] } | undefined {
+    const tuning = this.deps.tuning()
+    if (!tuning.agyLateOutput) return undefined
+    if (session.dshSessionId === undefined) return undefined
+    if (session.closed || session.released) return undefined
+    const def = this.deps.host.defOf(session.agentId)
+    if (def === undefined || !this.deps.isAgent(def)) return undefined
+    const storeRoot = this.deps.storeRoot(def)
+    if (storeRoot === undefined) return undefined
+    const paths = agyTranscriptPaths(storeRoot, session.acpSessionId)
+    if (paths.length === 0) return undefined
+    // An echo record older than the guard window can never match a replay:
+    // drop it at the one moment a new watch starts.
+    if (session.lateEcho !== undefined && Date.now() - session.lateEcho.at > tuning.agyLateOutputEchoMs) {
+      session.lateEcho = undefined
+    }
+    return { tuning, paths }
+  }
+
+  private fileCoversOffset(path: string, offset: number): boolean {
+    try {
+      const stat = statSync(path)
+      return stat.isFile() && stat.size >= offset
+    } catch {
+      return false
+    }
+  }
+
+  private startWatch(
+    session: LiveSession,
+    tail: AgyTranscriptTail,
+    closedAt: number,
+    baselineStepIndex: number,
+    gate: GateState,
+    tuning: Required<BridgeTuning>,
+  ): void {
     const pollMs = Math.max(1, tuning.agyLateOutputPollMs)
     const watch: LateWatch = {
       session,
       tail,
       closedAt,
-      baselineStepIndex: tail.lastStepIndex,
+      baselineStepIndex,
       steps: [],
-      reportGate: false,
-      lastGenericStatus: 'DONE',
+      reportGate: gate.reportGate,
+      waiting: gate.waiting,
       finished: false,
       stop: () => { this.disarmWatch(watch) },
     }
@@ -179,18 +302,6 @@ export class AgyLateOutputService {
     }
     this.watches.set(session.sessionId, watch)
     session.stopLateWatch = watch.stop
-  }
-
-  /**
-   * Re-arm after a WAKE turn. That turn has no ACP controller, so `closeTurn`
-   * cannot arm: without this call the watch that produced the wake stays
-   * disarmed and the rest of the same background run is lost
-   * (session-af26f3a8: the final answer arrived 12 minutes later, never shown).
-   * A wake for a session that no longer resolves to a live record is ignored.
-   */
-  armAfterWake(session: LiveSession | undefined): void {
-    if (session === undefined) return
-    this.arm(session, Date.now())
   }
 
   /** Stop this session's watch, if any. Idempotent; safe from a teardown. */
@@ -215,22 +326,14 @@ export class AgyLateOutputService {
     const floorSecond = Math.floor(watch.closedAt / 1_000)
     const candidates: TranscriptStep[] = []
     for (const step of steps) {
-      if (step.type === 'SYSTEM_MESSAGE') {
-        // A report just landed (a subagent finished, a scheduled task fired):
-        // the NEXT planner response is the agent's answer to it. A task TIMER
-        // message is agy's own "check the subagent" poll, so it opens nothing.
-        watch.reportGate = isReportMessage(step.content, session.acpSessionId)
-        continue
-      }
-      if (step.type === 'GENERIC') {
-        // Antigravity's subagent polling runs as a background tool. While one
-        // is RUNNING, a planner line is the agent's "still waiting" chatter.
-        if (step.status !== '') watch.lastGenericStatus = step.status
+      if (step.type === 'USER_INPUT' || step.type === 'SYSTEM_MESSAGE' || step.type === 'GENERIC') {
+        applyGateStep(watch, step, session.acpSessionId)
         continue
       }
       // Only planner responses are kept: fewer bytes held, and no sub-agent
       // report ever enters the late-answer buffer.
       if (step.type !== 'PLANNER_RESPONSE') continue
+      if (step.status !== 'DONE') continue
       if (step.stepIndex <= watch.baselineStepIndex) continue
       // A line with NO timestamp cannot be told apart from history: fail
       // closed. A line that reaches us through this filter is new AND dated.
@@ -238,9 +341,9 @@ export class AgyLateOutputService {
       if (second === undefined || second < floorSecond) continue
       if (step.content.trim() === '') continue
       // Two ways to be a late ANSWER: the agent is answering a report, or no
-      // background tool is in flight (the run's own tail). Anything else is
-      // progress prose the poll loop wrote while a timer was running.
-      if (!watch.reportGate && watch.lastGenericStatus === 'RUNNING') continue
+      // background wait is in flight (the run's own tail). Anything else is
+      // progress prose the poll loop wrote while a timer or command was running.
+      if (!watch.reportGate && watch.waiting) continue
       watch.reportGate = false
       candidates.push(step)
     }
@@ -274,7 +377,20 @@ export class AgyLateOutputService {
       this.disarmWatch(watch)
       return
     }
-    this.deliver(watch, text)
+    if (watch.session.closed || watch.session.released || this.deps.host.isBusy(watch.session)) {
+      this.disarmWatch(watch)
+      return
+    }
+    if (this.deliver(watch, text)) {
+      watch.session.lateWatchCheckpoint = {
+        path: watch.tail.path,
+        offset: watch.tail.offset,
+        lastStepIndex: watch.tail.lastStepIndex,
+        closedAt: watch.closedAt,
+        reportGate: watch.reportGate,
+        waiting: watch.waiting,
+      }
+    }
     this.disarmWatch(watch)
   }
 
@@ -306,12 +422,13 @@ export class AgyLateOutputService {
   }
 
   /** Hand one answer over. A session the host no longer accepts throws nothing. */
-  private deliver(watch: LateWatch, text: string): void {
-    if (this.isOwnTurnAnswer(watch.session, text)) return
+  private deliver(watch: LateWatch, text: string): boolean {
+    if (this.isOwnTurnAnswer(watch.session, text)) return false
     try {
-      this.deps.host.deliver(watch.session, text)
+      return this.deps.host.deliver(watch.session, text)
     } catch {
       // Fail-open: a delivery path must never throw into a timer.
+      return false
     }
   }
 

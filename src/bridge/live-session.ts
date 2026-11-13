@@ -280,6 +280,20 @@ export interface LiveSession {
    */
   stopLateWatch?: () => void
   /**
+   * Cursor and gate snapshot saved when a late-output watch delivers a wake
+   * turn, so `armAfterWake` resumes from the exact byte offset and turn floor
+   * instead of calling `baseline()` and jumping over steps written during wake
+   * scheduling. Cleared when consumed, on a fresh `arm`, or on teardown.
+   */
+  lateWatchCheckpoint?: {
+    readonly path: string
+    readonly offset: number
+    readonly lastStepIndex: number
+    readonly closedAt: number
+    readonly reportGate: boolean
+    readonly waiting: boolean
+  }
+  /**
    * Detached workers this session dispatched that may still run after the
    * turn that dispatched them CLOSED. Session-level on purpose: the worker's
    * completion / drain frames arrive after that turn's controller retired,

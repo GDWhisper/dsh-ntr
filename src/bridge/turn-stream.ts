@@ -287,6 +287,7 @@ export function clearAmbientState(session: LiveSession): void {
   // session it observes (the transcript writer is the agent process).
   session.lateEcho = undefined
   session.pendingLateEcho = undefined
+  session.lateWatchCheckpoint = undefined
   session.turnToolCalls?.clear()
   session.knownToolCalls?.clear()
   const stopLateWatch = session.stopLateWatch
