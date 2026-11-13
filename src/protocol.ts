@@ -421,9 +421,9 @@ export interface SaveGateOutcomeView {
  */
 export interface SaveGateStatus {
   /**
-   * Whether a real {@link AcpSaveGate} produced this snapshot. `false` on an
-   * older host half, where the status is only a synthetic idle state: the
-   * settings form must not offer queue / force affordances it cannot honour.
+   * Whether a live {@link AcpSaveGate} produced this snapshot. `false` on an older
+   * host half and after that gate is disposed: the settings form must not offer
+   * queue / force affordances the snapshot cannot honour.
    */
   gateAvailable: boolean
   canSave: boolean

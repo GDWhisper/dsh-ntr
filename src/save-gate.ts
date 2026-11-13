@@ -148,8 +148,8 @@ export class AcpSaveGate {
     const active = this.host.hasActiveTurns()
     const activeSessions = this.host.activeTurnViews()
     return {
-      // This snapshot comes from the real gate, not a host-half fallback.
-      gateAvailable: true,
+      // A disposed gate cannot save, so it is not an available gate.
+      gateAvailable: this.phase !== 'disposed',
       canSave: !active,
       // A manager with a turn stream but no session view still counts as busy;
       // one is the honest lower bound there.
@@ -485,8 +485,13 @@ export class AcpSaveGate {
       }
       try {
         const value = await entry.operation()
-        result.saved += 1
         this.retryables.delete(entry.label)
+        if (this.phase === 'disposed') { // a torn-down gate must not report saved
+          result.failed += 1
+          entry.settle({ status: 'failed', message: 'acp: save gate was disposed while the write ran' })
+          continue
+        }
+        result.saved += 1
         this.recordOutcome(entry.label, { status: 'saved', value })
         entry.settle({ status: 'saved', value })
       } catch (error) {

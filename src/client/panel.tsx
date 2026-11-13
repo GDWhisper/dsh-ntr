@@ -1929,11 +1929,11 @@ function AgentRow({
       const status = await acp.readSaveGate()
       const available = saveGateIsAvailable(status)
       setSaveGateAvailable(available)
-      // Only a live gate snapshot is an authority. On an older/non-wired host
-      // its empty `activeSessions` proves nothing: use the browser's own live
-      // session rows, and if those are empty still send the direct save — the
-      // host's `agent/save` guard answers `confirmationRequired` and the dialog
-      // opens from that answer.
+      // Only a live gate snapshot is an authority. `false` also covers a
+      // disposed gate. On an older/non-wired host its empty `activeSessions`
+      // proves nothing: use the browser's own live session rows, and if those
+      // are empty still send the direct save — the host's `agent/save` guard
+      // answers `confirmationRequired` and the dialog opens from that answer.
       const active = available
         ? status.activeSessions.filter(view => view.agentId === payload.id)
         : activeSessionsForSave(false)

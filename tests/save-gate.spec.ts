@@ -202,6 +202,13 @@ describe('AcpSaveGate', () => {
     expect(gate.status()).toMatchObject({ gateAvailable: true, canSave: true })
   })
 
+  it('reports gateAvailable false after dispose, because a disposed gate is not a usable gate.', () => {
+    const gate = new AcpSaveGate(host(false))
+    gate.dispose()
+    // The snapshot must not advertise a gate the browser can no longer use.
+    expect(gate.status()).toMatchObject({ gateAvailable: false, canSave: true })
+  })
+
   it('forces only the writes that were queued when the pass started', async () => {
     const h = host(true, [view()])
     const gate = new AcpSaveGate(h)
@@ -339,5 +346,31 @@ describe('AcpSaveGate', () => {
       message: 'acp: save gate was disposed before the write ran',
     })
     expect(operation).not.toHaveBeenCalled()
+  })
+
+  it('settles an in-flight write failed when the gate is disposed while the operation runs.', async () => {
+    const h = host(true, [view()])
+    const gate = new AcpSaveGate(h)
+    let release!: () => void
+    let started!: () => void
+    const startedPromise = new Promise<void>(resolve => { started = resolve })
+    const pending = gate.defer('agent-save:alpha', async () => {
+      started()
+      await new Promise<void>(resolve => { release = resolve })
+      return 'alpha'
+    })
+    const flushed = gate.forceFlush()
+    await startedPromise
+    // The entry is dequeued and its write is in flight: disposing now must not
+    // let the already-running write report a save to a torn-down gate.
+    gate.dispose()
+    release()
+    await expect(flushed).resolves.toMatchObject({ saved: 0, failed: 1 })
+    await expect(pending).resolves.toEqual({
+      status: 'failed',
+      message: 'acp: save gate was disposed while the write ran',
+    })
+    expect(gate.status().lastOutcomes?.['agent-save:alpha']).toBeUndefined()
+    expect(gate.status().lastOutcome).toBeUndefined()
   })
 })
