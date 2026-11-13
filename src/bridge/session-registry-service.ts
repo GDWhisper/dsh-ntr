@@ -33,6 +33,7 @@ import type {
 import type { PersistedChatSession } from './types.ts'
 import { isPerSessionAgent } from './identity.ts'
 import { forkRowInfo, persistedChatSession, snapshot } from './shape.ts'
+import { isSettling, lifecycleOf } from './session-lifecycle.ts'
 import type { LiveSession } from './turn-stream.ts'
 
 /** The subagent rows the chat-session view attaches and the close paths drop. */
@@ -130,7 +131,7 @@ export class SessionRegistryService {
   sessionsOf(dshSessionId: string): LiveSession[] {
     const out: LiveSession[] = []
     for (const session of this.dshSessionMap.values()) {
-      if (session.dshSessionId === dshSessionId && !session.closed) out.push(session)
+      if (session.dshSessionId === dshSessionId && lifecycleOf(session) !== 'closed') out.push(session)
     }
     return out
   }
@@ -160,7 +161,7 @@ export class SessionRegistryService {
   persistedRows(): PersistedChatSession[] {
     const rows: PersistedChatSession[] = []
     for (const session of this.dshSessionMap.values()) {
-      if (session.dshSessionId === undefined || session.closed) continue
+      if (session.dshSessionId === undefined || lifecycleOf(session) === 'closed') continue
       rows.push(persistedChatSession(session))
     }
     return rows
@@ -207,7 +208,7 @@ export class SessionRegistryService {
     // because one conversation can briefly have more than one ACP session row.
     const subagents = this.host.subagents.recordsFor(dshSessionId)
     for (const session of this.dshSessionMap.values()) {
-      if (session.dshSessionId !== dshSessionId || session.closed) continue
+      if (session.dshSessionId !== dshSessionId || lifecycleOf(session) === 'closed') continue
       const title = this.host.defOf(session.agentId)?.title
       out.push({
         agentId: session.agentId,
@@ -220,7 +221,7 @@ export class SessionRegistryService {
         ...(session.availableCommands === undefined ? {} : { availableCommands: session.availableCommands }),
         ...(session.usage === undefined ? {} : { usage: session.usage }),
         ...(session.burst === undefined ? {} : { burst: session.burst }),
-        ...(session.released ? { released: true } : {}),
+        ...(lifecycleOf(session) === 'parked' ? { released: true } : {}),
         ...(session.running ? { running: true } : {}),
         ...(subagents === undefined || subagents.length === 0 ? {} : { subagents: [...subagents] }),
         ...forkRowInfo(session, this.host.canForkNow(session.agentId)),
@@ -243,7 +244,7 @@ export class SessionRegistryService {
     for (const session of this.dshSessionMap.values()) {
       // A closed session is destroyed, not merely unreachable: its buffered
       // transcript would be a ghost the user cannot act on.
-      if (session.dshSessionId !== dshSessionId || session.closed) continue
+      if (session.dshSessionId !== dshSessionId || lifecycleOf(session) === 'closed') continue
       views.push({ session: snapshot(session), entries: session.transcript.since(afterSeq ?? 0) })
     }
     return views
@@ -276,11 +277,11 @@ export class SessionRegistryService {
     // forking a parked record would silently resume it, and forking mid-turn
     // would fork an agent state the parent turn is still changing.
     const parent = [...this.dshSessionMap.values()].find(session =>
-      session.dshSessionId === parentDshSessionId && !session.closed && !session.released)
+      session.dshSessionId === parentDshSessionId && lifecycleOf(session) === 'live')
     if (parent === undefined) {
       throw new AcpError('parent_not_live', 'acp: the conversation to branch has no live ACP session; send a message to resume it first')
     }
-    if (parent.running || parent.settled !== undefined) {
+    if (parent.running || isSettling(parent)) {
       throw new AcpError('turn_in_flight', 'acp: the conversation to branch is running a turn; wait for it to finish')
     }
     const agentId = parent.agentId
@@ -381,7 +382,7 @@ export class SessionRegistryService {
     // Fall back to the binding itself: a session that already ran an agent is
     // pointed at that agent even if the intent map was never seeded.
     for (const session of this.dshSessionMap.values()) {
-      if (session.dshSessionId === dshSessionId && !session.closed) return session.agentId
+      if (session.dshSessionId === dshSessionId && lifecycleOf(session) !== 'closed') return session.agentId
     }
     return undefined
   }
@@ -400,7 +401,7 @@ export class SessionRegistryService {
     const recorded = this.chatAgentIntent.get(dshSessionId)
     if (recorded?.locked === true) return recorded.agentId
     for (const session of this.dshSessionMap.values()) {
-      if (session.dshSessionId === dshSessionId && !session.closed) return session.agentId
+      if (session.dshSessionId === dshSessionId && lifecycleOf(session) !== 'closed') return session.agentId
     }
     return undefined
   }

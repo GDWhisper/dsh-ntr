@@ -14,6 +14,7 @@ import type { BridgeScope } from './identity.ts'
 import { routeBindingRegistry } from './registries.ts'
 import type { SessionRegistryService } from './session-registry-service.ts'
 import { chatWorkspaceRoot } from './state-paths.ts'
+import { hasPromptSlot, lifecycleOf } from './session-lifecycle.ts'
 import type { LiveSession, TurnStreamController } from './turn-stream.ts'
 import type { TurnWatchdogService } from './turn-watchdog-service.ts'
 import type { SessionWorkspaceResolver } from './types.ts'
@@ -63,7 +64,7 @@ export class SessionBootService {
     if (target === undefined) {
       throw new AcpError('unknown_session', `acp: no ACP session is bound to chat session ${dshSessionId}`)
     }
-    if (!target.released) return
+    if (lifecycleOf(target) !== 'parked') return
     // The parked record belongs to the holder it was parked on (A1); resuming
     // on any other process would open the same session twice.
     const bridge = this.host.bridgeRegistry.bridgeForSession(target)
@@ -95,7 +96,7 @@ export class SessionBootService {
       }
     }
     const existing = this.host.registry.sessionAt(dshSessionId, agentId)
-    if (existing !== undefined && !existing.closed && !existing.released) {
+    if (existing !== undefined && lifecycleOf(existing) === 'live') {
       const owner = this.host.bridgeRegistry.bridgeOwning(agentId, existing.sessionId)
       // A LIVE record must have a holder. This state is not reachable today:
       // every production deletion path parks the record first (`closeSession` /
@@ -127,7 +128,7 @@ export class SessionBootService {
     }
     // The session's agent died earlier: resume in place so the conversation
     // context survives via `session/load`.
-    if (existing !== undefined && existing.released) {
+    if (existing !== undefined && lifecycleOf(existing) === 'parked') {
       // The bridge that parked this record owns the resume; a chat conversation
       // falls back to the scope its DSH id names, exactly like the `new`
       // branch. Without a DSH id the old anonymous bucket stays as it was.
@@ -238,8 +239,8 @@ export class SessionBootService {
     // `closed` back to false, resurrecting a closed session. Its owner deletes
     // the record; the caller's own acquisition creates a new session (chat) or
     // rejects `session_closed` (`/acp`).
-    if (session.closed) return { ok: true }
-    if (session.released) return { ok: true } // the acquisition resumes it
+    if (lifecycleOf(session) === 'closed') return { ok: true }
+    if (lifecycleOf(session) === 'parked') return { ok: true } // the acquisition resumes it
     const bridge = this.host.bridgeRegistry.bridgeForSession(session)
     const blocked = `acp: agent "${session.agentId}" is unresponsive, but other conversations are still using it; retry after they finish`
     if (bridge.hasOtherActiveWork(session)) return { ok: false, message: blocked }
@@ -256,7 +257,7 @@ export class SessionBootService {
     for (const controller of this.host.watchdog.turnStreams.values()) {
       if (controller.session === session) continue
       if (!owned.has(controller.session.sessionId)) continue
-      if (controller.session.closed || controller.session.released) continue
+      if (lifecycleOf(controller.session) !== 'live') continue
       if (!controller.stale) return { ok: false, message: blocked }
     }
     const capabilities = bridge.view().agentCapabilities as { loadSession?: boolean } | undefined
@@ -306,8 +307,8 @@ export class SessionBootService {
     controller: TurnStreamController,
     signal?: AbortSignal,
   ): Promise<'ok' | 'aborted'> {
-    if (session.closed || session.released) return 'ok'
-    if (!controller.hasSettled && session.promptInFlight === true) {
+    if (lifecycleOf(session) !== 'live') return 'ok'
+    if (!controller.hasSettled && hasPromptSlot(session)) {
       await this.host.bridgeRegistry.bridgeForSession(session).cancel(session)
       controller.abortActiveSegment()
     }
@@ -316,7 +317,7 @@ export class SessionBootService {
 
   /** 等 agent 侧 prompt slot 真正释放；步骤被取消时立即返回 aborted。 */
   waitForSettleGate(session: LiveSession, signal?: AbortSignal): Promise<'ok' | 'aborted'> {
-    const pending = session.settled
+    const pending = session.turnSlot?.promise
     if (pending === undefined) return Promise.resolve('ok')
     if (signal?.aborted) return Promise.resolve('aborted')
     return new Promise(resolve => {

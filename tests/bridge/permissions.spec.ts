@@ -340,7 +340,7 @@ describe('permission ask withdrawal and close ordering (AgentBridge)', () => {
     hub.subscribe(event => { events.push(event) })
     const bridge = new AgentBridge({ ...def, id: 'withdraw' }, hub, 500, () => {})
     const seam = bridge as unknown as AskSeam
-    seam.acpIndex.set('acp-withdraw', { sessionId: 'host-withdraw', acpSessionId: 'acp-withdraw', closed: false })
+    seam.acpIndex.set('acp-withdraw', { sessionId: 'host-withdraw', acpSessionId: 'acp-withdraw', lifecycle: 'live' })
 
     const controller = new AbortController()
     const answered = seam.handlePermissionRequest('acp-withdraw', { title: 'Bash' }, askOptions, controller.signal)
@@ -364,7 +364,7 @@ describe('permission ask withdrawal and close ordering (AgentBridge)', () => {
     hub.subscribe(event => { events.push(event) })
     const bridge = new AgentBridge({ ...def, id: 'detach' }, hub, 500, () => {})
     const seam = bridge as unknown as AskSeam
-    seam.acpIndex.set('acp-detach', { sessionId: 'host-detach', acpSessionId: 'acp-detach', closed: false })
+    seam.acpIndex.set('acp-detach', { sessionId: 'host-detach', acpSessionId: 'acp-detach', lifecycle: 'live' })
 
     const controller = new AbortController()
     const answered = seam.handlePermissionRequest('acp-detach', { title: 'Bash' }, askOptions, controller.signal)
@@ -381,7 +381,7 @@ describe('permission ask withdrawal and close ordering (AgentBridge)', () => {
     const hub = new EventHub()
     const bridge = new AgentBridge({ ...def, id: 'close-order' }, hub, 500, () => {})
     const seam = bridge as unknown as AskSeam
-    const session = { sessionId: 'host-close', acpSessionId: 'acp-close', closed: false, running: true }
+    const session = { sessionId: 'host-close', acpSessionId: 'acp-close', lifecycle: 'live', running: true }
     seam.acpIndex.set('acp-close', session)
 
     const asked = seam.handlePermissionRequest('acp-close', { title: 'Bash' }, askOptions)

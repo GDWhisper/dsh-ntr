@@ -1,11 +1,13 @@
 import { tmpdir } from 'node:os'
 import { existsSync, readFileSync, rmSync } from 'node:fs'
 import { afterAll, describe, expect, it } from 'vitest'
-import { AcpLlmAdapter, BridgeManager, routeBindingRegistry } from '../../src/bridge.ts'
+import { AcpLlmAdapter, AgentBridge, BridgeManager, routeBindingRegistry } from '../../src/bridge.ts'
 import { dispatchWithinWindows } from '../../src/bridge/turn-stream.ts'
+import type { LiveSession } from '../../src/bridge/live-session.ts'
+import { hasPromptSlot, isSettling, openTurnSlot, releasePromptSlot } from '../../src/bridge/session-lifecycle.ts'
 import type { BackgroundDispatch } from '../../src/bridge/types.ts'
 import { type AcpEvent, type ChatSessionView, type GenerateMessage, type StreamChunk } from '../../src/protocol.ts'
-import { dispatchRpc, EventHub } from '../../src/impl.ts'
+import { dispatchRpc, EventHub, Transcript } from '../../src/impl.ts'
 import { def, hostLoopTurn } from './harness.ts'
 
 /**
@@ -328,8 +330,9 @@ describe('observed chat transcripts (isolated manager)', () => {
 /**
  * The `/acp` RPC prompt and the chat adapter drive the SAME agent session: one
  * `session/prompt` at a time is a protocol rule, whichever face sent it. The
- * RPC path must therefore claim the chat path's slot (`promptInFlight` + the
- * settle gate), and each face must refuse while the other is in flight.
+ * RPC path must therefore claim the chat path's slot (`turnSlot`: the prompt
+ * slot plus the settle gate), and each face must refuse while the other is in
+ * flight.
  */
 describe('the /acp prompt shares the chat prompt slot (isolated manager)', () => {
   const gateLog = `${tmpdir()}/dsh-ntr-gate-prompts-${String(process.pid)}-${String(Date.now())}.log`
@@ -597,5 +600,101 @@ describe('dispatchWithinWindows (pure two-tier silence rule)', () => {
     expect(dispatchWithinWindows(dispatch(9_000, stale), 500, 5_000, 10_000)).toBe(false)
     // An empty open table is no open call at all.
     expect(dispatchWithinWindows(dispatch(0, new Map()), 500, 60_000, 10_000)).toBe(false)
+  })
+})
+
+/**
+ * The turn slot is ONE value object for the host prompt slot and the settle
+ * gate, stamped with the `turnSeq` that owns it. Both boundaries clear it by
+ * generation, so a superseded turn's late callback cannot reach the newer
+ * turn on air.
+ */
+describe('the turn slot is generation-guarded (AgentBridge)', () => {
+  function bareSession(): LiveSession {
+    return {
+      sessionId: 'slot-session-1',
+      agentId: 'slot-fixture',
+      acpSessionId: 'acp-slot-fixture',
+      cwd: tmpdir(),
+      running: false,
+      turnSeq: 0,
+      lifecycle: 'live',
+      lastAgentActivityAt: Date.now(),
+      activeToolCalls: new Set<string>(),
+      transcript: new Transcript(64),
+    }
+  }
+
+  it('a late settler from a superseded turn must not clear the newer turn\'s prompt slot or settle gate', () => {
+    const bridge = new AgentBridge({ ...def, id: 'slot-guard' }, new EventHub(), 500, () => {})
+    const session = bareSession()
+    session.turnSeq = 1
+    const settleFirst = bridge.beginTurn(session)
+    // The first turn is aborted: the host slot goes, the settle gate stays.
+    releasePromptSlot(session, 1)
+    expect(hasPromptSlot(session)).toBe(false)
+    expect(isSettling(session)).toBe(true)
+    // A new turn claims BOTH; the old settler now lands late.
+    session.turnSeq = 2
+    const settleSecond = bridge.beginTurn(session)
+    settleFirst()
+    expect(hasPromptSlot(session)).toBe(true)
+    expect(isSettling(session)).toBe(true)
+    // The turn that actually owns the slot still releases it.
+    settleSecond()
+    expect(hasPromptSlot(session)).toBe(false)
+    expect(isSettling(session)).toBe(false)
+  })
+
+  it('a settler from a turn whose generation moved on without a rebuilt slot must not clear the gate', () => {
+    const bridge = new AgentBridge({ ...def, id: 'slot-seq-only' }, new EventHub(), 500, () => {})
+    const session = bareSession()
+    session.turnSeq = 1
+    const settleFirst = bridge.beginTurn(session)
+    // A turn start bumps `turnSeq` before it rebuilds the slot; while the old
+    // slot is still the one in place, it belongs to the PAST generation. Its
+    // settler must not open the gate the newer generation will inherit.
+    session.turnSeq = 2
+    settleFirst()
+    expect(hasPromptSlot(session)).toBe(true)
+    expect(isSettling(session)).toBe(true)
+  })
+
+  it('opening the settle gate for a superseded turnSeq must leave the newer turn\'s gate claimed', () => {
+    const bridge = new AgentBridge({ ...def, id: 'slot-open-seq' }, new EventHub(), 500, () => {})
+    const session = bareSession()
+    session.turnSeq = 2
+    const slot = bridge.beginTurn(session)
+    openTurnSlot(session, 1)
+    expect(session.turnSlot).toBeDefined()
+    expect(hasPromptSlot(session)).toBe(true)
+    expect(isSettling(session)).toBe(true)
+    // The generation that actually owns the slot still opens it.
+    openTurnSlot(session, 2)
+    expect(hasPromptSlot(session)).toBe(false)
+    expect(isSettling(session)).toBe(false)
+    slot()
+  })
+
+  it('a park that races a close must not resurrect the destroyed session as resumable', async () => {
+    const hub = new EventHub()
+    const events: AcpEvent[] = []
+    hub.subscribe(event => { events.push(event) })
+    const bridge = new AgentBridge({ ...def, id: 'close-race' }, hub, 500, () => {})
+    const session = bareSession()
+    const seam = bridge as unknown as { sessions: Map<string, LiveSession> }
+    seam.sessions.set(session.sessionId, session)
+    await bridge.closeSession(session, 'closed')
+    expect(session.lifecycle).toBe('closed')
+    expect(bridge.hasSession(session.sessionId)).toBeUndefined()
+    // `closeSession` marks the lifecycle BEFORE it awaits `session/close`, so a
+    // park (idle release / archive) can arrive while the record is still
+    // registered. It must skip a closed record: parking it would leave a
+    // resumable entry, and the next resume would load a destroyed session.
+    seam.sessions.set(session.sessionId, session)
+    bridge.releaseAll('late park', 'idle')
+    expect(bridge.hasReleased(session.sessionId)).toBeUndefined()
+    expect(session.lifecycle).toBe('closed')
+    expect(events.filter(event => event.type === 'session/released' && event.sessionId === session.sessionId)).toEqual([])
   })
 })

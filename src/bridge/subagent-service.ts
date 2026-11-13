@@ -37,6 +37,7 @@ import { dispatchRecord, dispatchStatus, pruneSessionDispatches, refreshSubagent
 import { AgySubagentTracker } from './agy-subagents.ts'
 import { AgySubagentPollService, type AgySubagentPollWiring } from './agy-subagent-poll.ts'
 import { readAgyChildDetail } from './agy-subagent-detail.ts'
+import { hasPromptSlot, lifecycleOf } from './session-lifecycle.ts'
 import { describeError } from './errors.ts'
 
 /** What the subagent service needs from the bridge manager, injected. */
@@ -200,7 +201,7 @@ export class SubagentService {
     if (kind === 'agent_message_chunk'
       && session.turnController === undefined
       && !session.running
-      && session.promptInFlight !== true) {
+      && !hasPromptSlot(session)) {
       const text = chunkTextOf((raw as { content?: unknown }).content)
       if (text !== '') {
         report.text += text
@@ -531,7 +532,7 @@ export class SubagentService {
     if (record?.childConversationId !== undefined) {
       let storeRoot: string | undefined
       for (const session of this.host.sessions()) {
-        if (session.dshSessionId !== dshSessionId || session.closed) continue
+        if (session.dshSessionId !== dshSessionId || lifecycleOf(session) === 'closed') continue
         storeRoot = this.agyStoreRoot?.(session)
         // An agent-switch edge can leave a servable session whose agent names
         // no root: keep looking — only a RESOLVED root ends the search.
@@ -543,7 +544,7 @@ export class SubagentService {
     for (const session of this.host.sessions()) {
       // A closed session is destroyed, not merely unreachable; released ones
       // still hold the transcript the user is reading.
-      if (session.dshSessionId !== dshSessionId || session.closed) continue
+      if (session.dshSessionId !== dshSessionId || lifecycleOf(session) === 'closed') continue
       for (const entry of session.transcript.since(0)) {
         const update = entry.update as Record<string, unknown>
         const meta = codebuddyMetaOf(update)
@@ -602,7 +603,7 @@ export class SubagentService {
       this.dropBackgroundReport(session, report)
       return
     }
-    if (session.closed || session.released) {
+    if (lifecycleOf(session) !== 'live') {
       this.dropBackgroundReport(session, report)
       return
     }
@@ -612,7 +613,7 @@ export class SubagentService {
       this.dropBackgroundReport(session, report)
       return
     }
-    const busy = session.turnController !== undefined || session.running || session.promptInFlight === true
+    const busy = session.turnController !== undefined || session.running || hasPromptSlot(session)
     const waitingOnTool = !settleNow && report.openToolCalls.size > 0
     let cut = false
     if (busy || waitingOnTool) {
@@ -686,8 +687,8 @@ export class SubagentService {
    * answer is still in the transcript file.
    */
   deliverLateReport(session: LiveSession, text: string): boolean {
-    if (session.closed || session.released) return false
-    if (session.running || session.promptInFlight === true) return false
+    if (lifecycleOf(session) !== 'live') return false
+    if (session.running || hasPromptSlot(session)) return false
     const agent = this.wakeAgentFor(session)
     if (agent === undefined) return false
     if (text.trim() === '') return false

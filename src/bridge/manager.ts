@@ -85,6 +85,7 @@ import { SessionRegistryService } from './session-registry-service.ts'
 import { PersistenceService } from './persistence-service.ts'
 import { SessionBootService } from './session-boot-service.ts'
 import { describeError } from './errors.ts'
+import { hasPromptSlot, lifecycleOf } from './session-lifecycle.ts'
 
 /** How long one `agent/skills` scan answer stays fresh; the browser re-asks past it. */
 const SKILL_SCAN_TTL_MS = 60_000
@@ -385,7 +386,7 @@ export class BridgeManager {
       tuning: () => this.tuning,
       host: {
         defOf: agentId => this.defsMap.get(agentId),
-        isBusy: session => session.running || session.promptInFlight === true,
+        isBusy: session => session.running || hasPromptSlot(session),
         deliver: (session, text) => this.subagents.deliverLateReport(session, text),
       },
     })
@@ -515,7 +516,7 @@ export class BridgeManager {
       applyPersistedSubagents: raw => {
         const keep = new Set<string>()
         for (const session of this.registry.sessions()) {
-          if (session.dshSessionId !== undefined && !session.closed) keep.add(session.dshSessionId)
+          if (session.dshSessionId !== undefined && lifecycleOf(session) !== 'closed') keep.add(session.dshSessionId)
         }
         for (const dshSessionId of this.registry.choiceKeys()) keep.add(dshSessionId)
         this.subagents.restore(raw, keep)
@@ -1595,7 +1596,7 @@ export class BridgeManager {
       // re-claim here.
       //
       // Only `busy` can be a steer: it means the AGENT still holds OUR prompt
-      // (`promptInFlight`). `unsettled` means our side already released the
+      // slot. `unsettled` means our side already released the
       // slot (the person pressed stop, or an earlier steer cancelled): the
       // agent has not acknowledged yet, and quietly queueing the next message
       // behind a turn the user stopped is not this path's business — that
@@ -1625,7 +1626,7 @@ export class BridgeManager {
         }
         // A first turn that produced nothing rolled its provisional lock back
         // and CLOSED (and forgot) this session: the steer needs a fresh one.
-        if (session.closed || session.released) {
+        if (lifecycleOf(session) !== 'live') {
           try {
             session = await this.getOrCreateDshSession(options.sessionId, agentId)
           } catch (err) {
@@ -1845,8 +1846,7 @@ export class BridgeManager {
           // would clear the updates the drain streamed while this turn's own id
           // was unknown, and those are exactly the ones the hold must fold.
           const holdDispatch = controller.detachedHoldWanted(this.tuning.backgroundHoldWorkerPhase === true)
-            && !session.released
-            && !session.closed
+            && lifecycleOf(session) === 'live'
             && result.stopReason !== 'cancelled'
           if (!holdDispatch && responseMeta?.conversationRequestId !== undefined) {
             // The response names the conversation turn it queued: an instant
@@ -1882,8 +1882,7 @@ export class BridgeManager {
           // prompt was folded into that drain (CodeBuddy's multitask). The
           // response is a formality — keep the turn open until the drain speaks.
           if (session.ambient !== undefined
-            && !session.released
-            && !session.closed
+            && lifecycleOf(session) === 'live'
             && result.stopReason !== 'cancelled'
             && responseMeta?.conversationRequestId === undefined
             && !controller.hasAgentProse) {

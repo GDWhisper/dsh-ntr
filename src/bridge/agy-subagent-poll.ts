@@ -29,6 +29,7 @@ import {
   type TranscriptStep,
 } from './agy-transcript.ts'
 import { dispatchWithinWindows } from './turn-stream.ts'
+import { lifecycleOf } from './session-lifecycle.ts'
 import type { LiveSession } from './turn-stream.ts'
 import type { BackgroundDispatch, BridgeTuning } from './types.ts'
 
@@ -97,7 +98,7 @@ export class AgySubagentPollService {
    * and a later call retries.
    */
   arm(session: LiveSession, dispatch: BackgroundDispatch): void {
-    if (session.closed || session.released) return
+    if (lifecycleOf(session) !== 'live') return
     if (dispatch.terminal !== undefined) return
     let watch = this.watches.get(session.sessionId)
     if (watch === undefined) {
@@ -139,7 +140,7 @@ export class AgySubagentPollService {
     // Identity guard (constraint 11): a released / closed session's watch is
     // over — the resume builds a NEW process whose dispatches start fresh,
     // and the old ones were terminalized by the teardown that parked it.
-    if (session.closed || session.released) {
+    if (lifecycleOf(session) !== 'live') {
       this.disarmWatch(watch)
       return
     }

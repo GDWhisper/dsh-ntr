@@ -399,13 +399,12 @@ describe('A1: codebuddy runs one agent process per conversation', () => {
       if (holder === undefined) throw new Error('holder missing')
       const internals = harness.manager as unknown as {
         bridges: Map<string, AgentBridge>
-        registry: { dshSessionMap: Map<string, { sessionId: string; acpSessionId?: string; closed?: boolean; released?: boolean }> }
+        registry: { dshSessionMap: Map<string, { sessionId: string; acpSessionId?: string; lifecycle?: string }> }
       }
       const recordKey = 'a1-orphan:codebuddy'
       const record = internals.registry.dshSessionMap.get(recordKey)
       expect(record?.sessionId).toBe(sessionId)
-      expect(record?.closed).toBeFalsy()
-      expect(record?.released).toBeFalsy()
+      expect(record?.lifecycle).toBe('live')
 
       // Detach the OWNERSHIP only, then let the child die. Production
       // `closeSession` / `forceReset` drop BOTH indexes, so the synthetic residue
@@ -426,7 +425,7 @@ describe('A1: codebuddy runs one agent process per conversation', () => {
       // holder to record the death, otherwise the state assertion below races the
       // bridge's own teardown (and would read the stale `ready`).
       await until(() => chatBridge(harness, 'a1-orphan')?.state === 'stopped')
-      expect(internals.registry.dshSessionMap.get(recordKey)?.released).toBeFalsy()
+      expect(internals.registry.dshSessionMap.get(recordKey)?.lifecycle).toBe('live')
 
       const createdBefore = harness.events.filter(event => event.type === 'session/created').length
       let orphanError: unknown

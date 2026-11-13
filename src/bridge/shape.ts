@@ -2,6 +2,7 @@ import type { AgentRefusalDetail, ChatSessionForkInfo, SessionView } from '../pr
 import type { PersistedChatSession } from './types.ts'
 import { codebuddyMetaOf, permissionToolName } from './turn-stream.ts'
 import type { LiveSession } from './turn-stream.ts'
+import { isSettling, lifecycleOf } from './session-lifecycle.ts'
 
 /**
  * Why the agent refused a `session/prompt` it ANSWERED, read off the
@@ -203,6 +204,7 @@ function nonEmptyStringOf(value: unknown): string | undefined {
 }
 
 function snapshot(session: LiveSession): SessionView {
+  const lifecycle = lifecycleOf(session)
   return {
     sessionId: session.sessionId,
     agentId: session.agentId,
@@ -216,9 +218,9 @@ function snapshot(session: LiveSession): SessionView {
     ...(session.usage !== undefined ? { usage: session.usage } : {}),
     ...(session.burst !== undefined ? { burst: session.burst } : {}),
     running: session.running,
-    closed: session.closed,
-    ...(session.settled !== undefined ? { settled: true } : {}),
-    ...(session.released ? { released: true } : {}),
+    closed: lifecycle === 'closed',
+    ...(isSettling(session) ? { settled: true } : {}),
+    ...(lifecycle === 'parked' ? { released: true } : {}),
     ...(session.hasHistory === true ? { hasHistory: true } : {}),
     // The agent's own words only: the `at` timestamp is host-side bookkeeping
     // and no browser surface has a use for it.
@@ -237,8 +239,8 @@ function snapshot(session: LiveSession): SessionView {
  */
 function forkRowInfo(session: LiveSession, capability: boolean): { fork: ChatSessionForkInfo } {
   if (!capability) return { fork: { supported: false, reason: 'unsupported' } }
-  if (session.released) return { fork: { supported: false, reason: 'released' } }
-  if (session.running || session.settled !== undefined) return { fork: { supported: false, reason: 'busy' } }
+  if (lifecycleOf(session) === 'parked') return { fork: { supported: false, reason: 'released' } }
+  if (session.running || isSettling(session)) return { fork: { supported: false, reason: 'busy' } }
   return { fork: { supported: true } }
 }
 

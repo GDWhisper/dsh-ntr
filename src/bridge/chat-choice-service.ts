@@ -36,6 +36,7 @@ import type {
 import type { AcpModeResolver, DisplayedChatDefaults } from './types.ts'
 import { routeBindingRegistry } from './registries.ts'
 import type { LiveSession } from './turn-stream.ts'
+import { lifecycleOf } from './session-lifecycle.ts'
 import { describeError } from './errors.ts'
 
 /**
@@ -292,7 +293,7 @@ export class ChatChoiceService {
     // doomed to `model_unavailable`. Before a session exists there is nothing
     // authoritative to validate against — the send-time gate covers it.
     for (const session of this.host.sessions()) {
-      if (session.dshSessionId !== dshSessionId || session.agentId !== agentId || session.released) continue
+      if (session.dshSessionId !== dshSessionId || session.agentId !== agentId || lifecycleOf(session) === 'parked') continue
       const stale = choice === undefined ? undefined : this.staleModelChoice(session, choice)
       if (stale !== undefined) {
         throw new AcpError('model_unavailable', `acp: agent "${agentId}" no longer offers model "${stale}"`)
@@ -310,7 +311,7 @@ export class ChatChoiceService {
     const nextModelId = choice === undefined ? undefined : modelId
     const modelChanged = previous?.agentId === agentId && previous.modelId !== nextModelId
     const hasLiveSession = [...this.host.sessions()].some(session =>
-      session.dshSessionId === dshSessionId && session.agentId === agentId && !session.released)
+      session.dshSessionId === dshSessionId && session.agentId === agentId && lifecycleOf(session) !== 'parked')
     const clearEffort = modelChanged && !hasLiveSession
     // The pick is recorded even when NO live session exists yet — that is the
     // "choose the model before the first message" case. A session that
@@ -332,7 +333,7 @@ export class ChatChoiceService {
       // The chip reads this mirror through `session/chat-list`; clearing only
       // the pick would leave a parked row naming the old level.
       if (clearEffort || (rowModelChanged && !hasLiveSession)) session.reasoningEffort = undefined
-      if (session.released) continue
+      if (lifecycleOf(session) === 'parked') continue
       const aligned = await this.alignSessionConfig(session, choice, session.reasoningEffort)
       if (aligned.effortStale) session.reasoningEffort = undefined
     }
@@ -365,7 +366,7 @@ export class ChatChoiceService {
       if (session.dshSessionId !== dshSessionId) continue
       if (agentId !== undefined && session.agentId !== agentId) continue
       session.reasoningEffort = effort
-      if (session.released) continue
+      if (lifecycleOf(session) === 'parked') continue
       const aligned = await this.alignSessionConfig(session, session.choice, effort)
       // Same rule as the model axis: a dropped level is no longer "in force".
       session.reasoningEffort = aligned.effortStale ? undefined : effort
@@ -398,7 +399,7 @@ export class ChatChoiceService {
       throw new AcpError('agent_locked', `acp: conversation is locked to agent "${lockedTo}" once its first turn has started`)
     }
     const live = [...this.host.sessions()].find(session =>
-      session.dshSessionId === dshSessionId && session.agentId === bound && !session.released)
+      session.dshSessionId === dshSessionId && session.agentId === bound && lifecycleOf(session) !== 'parked')
     const observed = live === undefined
       ? undefined
       : parseCatalogOptions(live.configOptions).extras?.find(option => option.configId === configId)
@@ -424,7 +425,7 @@ export class ChatChoiceService {
     const extraConfigs = current?.agentId === bound ? { ...current.extraConfigs } : {}
     this.patchChatChoice(dshSessionId, { agentId: bound, extraConfigs: { ...extraConfigs, [configId]: value } })
     for (const session of this.host.sessions()) {
-      if (session.dshSessionId !== dshSessionId || session.agentId !== bound || session.released) continue
+      if (session.dshSessionId !== dshSessionId || session.agentId !== bound || lifecycleOf(session) === 'parked') continue
       try {
         await this.host.bridgeForSession(session).setConfigOption(session, configId, value)
       } catch (error) {
@@ -558,7 +559,7 @@ export class ChatChoiceService {
     }
     const candidates = [...this.host.sessions()].filter(session => session.dshSessionId === dshSessionId)
     const target = agentId === undefined
-      ? (candidates.find(session => !session.released) ?? candidates[0])
+      ? (candidates.find(session => lifecycleOf(session) !== 'parked') ?? candidates[0])
       : candidates.find(session => session.agentId === agentId)
     // No live session yet: this is the "choose the mode before the first
     // message" case, and the pick is recorded WITHOUT spawning anything — the
@@ -574,14 +575,14 @@ export class ChatChoiceService {
       this.patchChatChoice(dshSessionId, { agentId: bound, mode: modeId })
       return
     }
-    if (target.closed) {
+    if (lifecycleOf(target) === 'closed') {
       throw new AcpError('unknown_session', `acp: the ACP session bound to chat session ${dshSessionId} is closed`)
     }
     // A PARKED session gets the same record-only treatment (its agent is its
     // own `agentId`, whatever the caller passed — the selection above already
     // matched it). Resuming here was the one composer axis that broke ranks
     // with the others, and it woke a process the user had explicitly parked.
-    if (target.released) {
+    if (lifecycleOf(target) === 'parked') {
       this.patchChatChoice(dshSessionId, { agentId: target.agentId, mode: modeId })
       if (target.modes !== undefined) {
         target.modes = { ...target.modes, currentModeId: modeId }

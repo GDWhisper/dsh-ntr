@@ -15,6 +15,7 @@ import type { EventHub, PendingPermissionView } from '../impl.ts'
 import type { ActiveTurnView } from '../protocol.ts'
 import type { AgentBridge } from './agent-bridge.ts'
 import type { LiveSession, TurnStreamController } from './turn-stream.ts'
+import { isSettling, lifecycleOf } from './session-lifecycle.ts'
 import type { BridgeTuning } from './types.ts'
 
 /**
@@ -122,7 +123,7 @@ export class TurnWatchdogService {
     for (const bridge of this.host.bridges()) {
       for (const session of bridge.sessionList) {
         if (session.running) anyRunning = true
-        if (!session.running || session.closed || session.released) continue
+        if (!session.running || lifecycleOf(session) !== 'live') continue
         // A question is on the table: the agent is waiting on a human, not
         // stuck, and that wait is the permission deadline's business.
         if (bridge.permissions.hasPendingFor(session.sessionId)) continue
@@ -225,7 +226,7 @@ export class TurnWatchdogService {
     }
     for (const bridge of this.host.bridges()) {
       for (const session of bridge.sessionList) {
-        if (!session.running && session.settled === undefined) continue
+        if (!session.running && !isSettling(session)) continue
         views.set(session.sessionId, {
           sessionId: session.sessionId,
           agentId: session.agentId,

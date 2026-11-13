@@ -57,8 +57,7 @@ function session(patch: Partial<LiveSession> = {}): LiveSession {
     agentId: 'agy',
     acpSessionId: 'A1',
     cwd: tmpdir(),
-    closed: false,
-    released: false,
+    lifecycle: 'live',
     running: false,
     activeToolCalls: new Set<string>(),
     transcript: new Transcript(500),
@@ -296,14 +295,14 @@ describe('agy subagent detail: the child brain transcript read', () => {
     noWiring.noteSubagentRecords([record({ childConversationId: 'child-1' })], { announce: false, persist: false })
     expect(notices(noWiring.subagentsDetail('chat-1', 'acp:d1').entries)).toEqual([{ notice: 'unreadable' }])
     // The session is closed: nothing can resolve its agent's store root.
-    const closed = serviceWith({ storeRoot: store([]), sessions: [session({ closed: true })] })
+    const closed = serviceWith({ storeRoot: store([]), sessions: [session({ lifecycle: 'closed' })] })
     closed.noteSubagentRecords([record({ childConversationId: 'child-1' })], { announce: false, persist: false })
     expect(notices(closed.subagentsDetail('chat-1', 'acp:d1').entries)).toEqual([{ notice: 'unreadable' }])
   })
 
   it('released sessions keep serving the child detail (readable after a host restart)', () => {
     const root = store([stepLine(0, 'USER_INPUT', 'DONE', { content: 'prompt' })])
-    const service = serviceWith({ storeRoot: root, sessions: [session({ released: true })] })
+    const service = serviceWith({ storeRoot: root, sessions: [session({ lifecycle: 'parked' })] })
     service.noteSubagentRecords([record({ childConversationId: 'child-1', status: 'unknown' })], { announce: false, persist: false })
     const detail = service.subagentsDetail('chat-1', 'acp:d1')
     expect(detail.entries).toHaveLength(1)

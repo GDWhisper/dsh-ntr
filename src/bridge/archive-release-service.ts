@@ -9,6 +9,7 @@
  */
 import type { AgentBridge } from './agent-bridge.ts'
 import type { LiveSession, TurnStreamController } from './turn-stream.ts'
+import { hasPromptSlot, isSettling, lifecycleOf } from './session-lifecycle.ts'
 
 /** What the archive-release service needs from the bridge manager, injected. */
 export interface ArchiveReleaseDeps {
@@ -46,10 +47,10 @@ export class ArchiveReleaseService {
       facts.set(controller.session.acpSessionId, { acpSessionId: controller.session.acpSessionId })
     }
     for (const session of this.deps.registry.sessionsOf(dshSessionId)) {
-      if (session.closed) continue
+      if (lifecycleOf(session) === 'closed') continue
       const active = session.running
-        || session.settled !== undefined
-        || session.promptInFlight === true
+        || isSettling(session)
+        || hasPromptSlot(session)
         || this.deps.bridgeOwning(session.agentId, session.sessionId)?.permissions.hasPendingFor(session.sessionId) === true
       if (!active) continue
       facts.set(session.acpSessionId, { acpSessionId: session.acpSessionId })
@@ -66,14 +67,14 @@ export class ArchiveReleaseService {
    */
   cancelArchivedSession(dshSessionId: string): void {
     for (const session of this.deps.registry.sessionsOf(dshSessionId)) {
-      if (session.released || session.closed) continue
+      if (lifecycleOf(session) !== 'live') continue
       const bridge = this.deps.bridgeOwning(session.agentId, session.sessionId)
       if (bridge === undefined) continue
       // A quiet conversation owes no turn: sending `session/cancel` there would
       // arm the cancel fallback for a turn that never started.
       const active = session.running
-        || session.settled !== undefined
-        || session.promptInFlight === true
+        || isSettling(session)
+        || hasPromptSlot(session)
         || bridge.permissions.hasPendingFor(session.sessionId)
       if (!active) continue
       void bridge.cancel(session)
@@ -106,7 +107,7 @@ export class ArchiveReleaseService {
       for (const session of records) {
         // A parked record has nothing left to release; only live ones name a
         // process whose teardown this call has to decide.
-        if (session.released) continue
+        if (lifecycleOf(session) === 'parked') continue
         const bridge = this.deps.bridgeOwning(session.agentId, session.sessionId)
         if (bridge !== undefined) bridges.add(bridge)
       }

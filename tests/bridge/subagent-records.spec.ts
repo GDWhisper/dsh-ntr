@@ -65,7 +65,7 @@ describe('external subagent lifecycle records (isolated manager)', () => {
     const deadline = Date.now() + 10_000
     for (;;) {
       const live = recordManager.turnStreamFor(dshSessionId)
-      if (live !== undefined && !live.hasSettled && live.hasOpenSegment && live.session.settled === undefined) return
+      if (live !== undefined && !live.hasSettled && live.hasOpenSegment && live.session.turnSlot === undefined) return
       if (Date.now() > deadline) throw new Error('the turn never entered a detached-worker hold')
       await new Promise(resolve => setTimeout(resolve, 5))
     }

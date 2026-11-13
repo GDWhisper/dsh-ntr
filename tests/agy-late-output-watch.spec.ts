@@ -60,10 +60,8 @@ function watchHarness(overrides: Partial<BridgeTuning> = {}): WatchHarness {
     dshSessionId: 'dsh-watch',
     agentId: 'agy',
     acpSessionId,
-    closed: false,
-    released: false,
+    lifecycle: 'live',
     running: false,
-    promptInFlight: false,
   } as unknown as LiveSession
 
   const service = new AgyLateOutputService({

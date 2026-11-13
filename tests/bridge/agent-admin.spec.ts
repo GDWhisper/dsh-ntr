@@ -548,7 +548,7 @@ describe('agent saves behind the save gate (isolated manager)', () => {
       agentId: 'stop-me',
       dshSessionId: 'dsh-stop',
       cwd: tmpdir(),
-      closed: false,
+      lifecycle: 'live',
       transcript: { since: () => [] },
     }
     ;(isolated as unknown as { registry: { dshSessionMap: Map<string, unknown> } })

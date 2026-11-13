@@ -7,6 +7,7 @@ import type { Transcript } from '../impl.ts'
 import type { SessionView } from '../protocol.ts'
 import type { AmbientTurn, BackgroundDispatch, BackgroundReport, RetiredAmbient } from './types.ts'
 import type { TurnStreamController } from './turn-stream.ts'
+import type { SessionLifecycle, TurnSlot } from './session-lifecycle.ts'
 
 export interface LiveSession {
   /** Host-minted id (stable across an agent restart; the ACP id is per-connection). */
@@ -40,24 +41,33 @@ export interface LiveSession {
   burst?: SessionView['burst']
   running: boolean
   /**
-   * The HOST's prompt slot for this session: true from the moment a turn
-   * starts until the agent answers it (or the host aborts the turn, or the
-   * turn is discarded). Together with the {@link settled} gate — which STAYS
-   * claimed after an abort until the agent acknowledges the cancel — this is
-   * what `claimTurn` arbitrates, NOT `running`.
+   * The HOST's prompt slot and the agent-side settle gate of the turn on air,
+   * as one value object. `promptHeld` is true from the moment a turn starts
+   * until the agent answers it (or the host aborts the turn, or the turn is
+   * discarded); the slot itself STAYS claimed after an abort until the agent
+   * acknowledges the cancel. Together they are what `claimTurn` arbitrates,
+   * NOT `running`.
    *
    * The three are deliberately different:
    * - an ambient wait keeps `running` true (the background drain is still the
-   *   session's work, so nothing may release the process) while this slot is
-   *   already FREE (the agent answered; only the drain keeps talking);
-   * - an aborted turn drops THIS flag at once (our face of the turn ends) but
-   *   leaves `settled` in place, so the next prompt still waits out
+   *   session's work, so nothing may release the process) while `promptHeld`
+   *   is already false (the agent answered; only the drain keeps talking);
+   * - an aborted turn clears `promptHeld` at once (our face of the turn ends)
+   *   but leaves the slot in place, so the next prompt still waits out
    *   `turnSettleMs` for the agent instead of racing a concurrent prompt.
+   *
+   * Absent = the settle gate is open. `turnSeq` names the generation that owns
+   * the slot, so a superseded turn's late settler cannot clear a newer one's.
    */
-  promptInFlight?: boolean
-  closed: boolean
-  /** The agent process died; the session awaits a `session/load` resume. */
-  released: boolean
+  turnSlot?: TurnSlot
+  /**
+   * The explicit lifecycle of this record: `live` while it is registered on an
+   * open connection, `parked` once released and awaiting a `session/load`
+   * resume, `closed` once it is being destroyed. The single truth behind
+   * `SessionView.closed` / `SessionView.released`; `assertLifecycle` checks it
+   * against the released-record map at every lifecycle boundary.
+   */
+  lifecycle: SessionLifecycle
   /**
    * The agent-side session has history while the LOCAL buffer is empty: this
    * record was restored from disk after a host restart (the replay has not
@@ -103,20 +113,6 @@ export interface LiveSession {
    * the host arbitrates nothing (see docs/acp-convergence.md §2.3).
    */
   acpMode?: boolean
-  /**
-   * Resolves when the AGENT has settled the turn it is currently running (its
-   * `session/prompt` response, or its acknowledgement of a cancel). This is
-   * deliberately not `running`: an aborted turn ends our stream at once,
-   * while the agent keeps working until it observes the cancel — and the ACP
-   * protocol forbids a second `session/prompt` on a busy session.
-   */
-  settled?: Promise<void>
-  /**
-   * The resolver of {@link settled}, kept alongside so turn-scoped force
-   * finalization (the cancel fallback) can open the gate without owning the
-   * stream. Cleared by the same settler that clears {@link settled}.
-   */
-  settledResolve?: () => void
   /**
    * This session's first turn wrote the conversation's agent lock just now
    * (the conversation had none before). The lock is provisional until that

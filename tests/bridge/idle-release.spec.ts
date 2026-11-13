@@ -225,7 +225,7 @@ describe('idle release (isolated manager)', () => {
       expect(promptResumed).toMatchObject({
         modelId: 'idle-model-pick@mock-model-a',
         reasoningEffort: 'high',
-        released: false,
+        lifecycle: 'live',
       })
       expect(manager.chatSessions('dsh-idle-model-pick')[0]).toMatchObject({
         modelId: 'idle-model-pick@mock-model-a',

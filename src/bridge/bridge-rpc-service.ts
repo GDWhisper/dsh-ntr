@@ -14,6 +14,7 @@ import { describeError } from './errors.ts'
 import { isPerSessionAgent, type BridgeScope } from './identity.ts'
 import type { SessionRegistryService } from './session-registry-service.ts'
 import { agentRefusalDetail, rateLimitedTurnError, snapshot } from './shape.ts'
+import { hasPromptSlot, lifecycleOf } from './session-lifecycle.ts'
 import type { LiveSession } from './turn-stream.ts'
 import type { TurnWatchdogService } from './turn-watchdog-service.ts'
 
@@ -73,7 +74,7 @@ export class BridgeRpcService {
     const { bridge, session } = located
     // The agent prompt slot is SHARED with chat turns: `running` alone misses
     // a chat turn whose cancellation already released it (`running` false,
-    // `promptInFlight` still naming the agent-side turn), and a live chat
+    // the prompt slot still naming the agent-side turn), and a live chat
     // controller means a continuation step may resume the SAME agent turn.
     // A controller that already SETTLED (kept only so its card's continuation
     // can still stream) has given the agent slot back: `/acp` may use it, and
@@ -81,7 +82,7 @@ export class BridgeRpcService {
     // watchdog case pins.
     const chatController = session.turnController
     if (session.running
-      || session.promptInFlight === true
+      || hasPromptSlot(session)
       || (chatController !== undefined && !chatController.stale && !chatController.hasSettled)) {
       throw new AcpError('turn_in_flight', 'acp: this session already has a prompt in flight')
     }
@@ -101,12 +102,13 @@ export class BridgeRpcService {
 
     // Claim the SAME slot the chat path claims (`claimTurn` + `beginTurn`): an
     // `/acp` turn in flight must make the next chat prompt wait, and vice
-    // versa. The settler is idempotent and identity-guarded; the turn still
+    // versa. The settler is idempotent and generation-guarded; the turn still
     // ends through `turn/end` below, so chat and RPC turns share one gate
-    // without sharing a stream controller.
-    const endTurn = bridge.beginTurn(session)
+    // without sharing a stream controller. The generation advances BEFORE the
+    // slot is claimed: the slot carries it, and a superseded settler compares.
     session.running = true
     session.turnSeq += 1
+    const endTurn = bridge.beginTurn(session)
     const turnGen = session.turnSeq
     session.lastAgentActivityAt = Date.now()
     session.activeToolCalls.clear()
@@ -172,7 +174,7 @@ export class BridgeRpcService {
         // that teardown already broadcast the turn's end, and the session is
         // parked or closed. Reporting the close's rejection again would put a
         // second terminal frame on a turn the browser already saw finish.
-        if (session.released || session.closed) {
+        if (lifecycleOf(session) !== 'live') {
           this.clearOrphanPrompt(session, turnGen)
           return
         }

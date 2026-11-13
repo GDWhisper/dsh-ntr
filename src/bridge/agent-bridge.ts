@@ -67,6 +67,7 @@ import {
   silenceWindowsOf,
 } from './turn-stream.ts'
 import type { LiveSession } from './turn-stream.ts'
+import { assertLifecycle, beginTurnSlot, freshSessionFacts, hasPromptSlot, isSettling, lifecycleOf, markClosed, markLive, markParked, openTurnSlot, releasePromptSlot, settleTurnSlot } from './session-lifecycle.ts'
 import { permissionAskReason, snapshot } from './shape.ts'
 import { toAcpMcpServers } from './mcp.ts'
 import { DEFAULT_TUNING } from './tuning.ts'
@@ -433,17 +434,18 @@ export class AgentBridge {
    * same session — forbidden by the protocol and rejected (or worse, mishandled)
    * by the agent. Waiting turns a protocol error into a short delay.
    *
-   * The gate is {@link LiveSession.promptInFlight} + the settle promise, NOT
-   * {@link LiveSession.running}: an ambient turn keeps `running` true for the
-   * whole drain while its prompt slot is already free, so `running` would
-   * refuse every message the user sends during a background task.
+   * The gate is {@link LiveSession.turnSlot} — the host prompt slot plus the
+   * settle promise — NOT {@link LiveSession.running}: an ambient turn keeps
+   * `running` true for the whole drain while its prompt slot is already free,
+   * so `running` would refuse every message the user sends during a
+   * background task.
    *
    * @param session - the session asking for the slot.
    * @returns whether the slot was claimed, and why not when it was not.
    */
   async claimTurn(session: LiveSession): Promise<{ ok: true } | { ok: false; reason: 'busy' | 'unsettled' }> {
     if (this.promptSlotHeld(session)) return { ok: false, reason: 'busy' }
-    const pending = session.settled
+    const pending = session.turnSlot?.promise
     if (pending === undefined) return { ok: true }
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
@@ -459,16 +461,16 @@ export class AgentBridge {
     }
     // The agent never acknowledged: sending now would start a concurrent turn,
     // so report it honestly instead of handing the agent two prompts at once.
-    if (session.settled !== undefined) return { ok: false, reason: 'unsettled' }
+    if (isSettling(session)) return { ok: false, reason: 'unsettled' }
     // Re-checked after the wait: another turn may have claimed the slot while
     // this one was waiting on the gate.
     if (this.promptSlotHeld(session)) return { ok: false, reason: 'busy' }
     return { ok: true }
   }
 
-  /** Whether a turn currently holds the agent prompt slot (see `promptInFlight`). */
+  /** Whether a turn currently holds the agent prompt slot (see `turnSlot`). */
   private promptSlotHeld(session: LiveSession): boolean {
-    return session.promptInFlight === true
+    return hasPromptSlot(session)
   }
 
   /**
@@ -476,26 +478,21 @@ export class AgentBridge {
    * open the settle gate — and hand back the settler its stream owner must
    * call once the agent is actually done with it.
    *
+   * The caller must have advanced {@link LiveSession.turnSeq} to this turn's
+   * generation first: the slot carries that generation, which is what lets a
+   * superseded settler leave a newer turn's slot alone.
+   *
    * @param session - the session whose turn is starting.
    * @returns the settler (idempotent; also used by connection loss).
    */
   beginTurn(session: LiveSession): () => void {
-    let settle: () => void = () => { /* replaced below */ }
-    const settled = new Promise<void>(resolve => { settle = resolve })
-    session.settled = settled
-    session.settledResolve = settle
-    session.promptInFlight = true
+    const slot = beginTurnSlot(session)
     this.touch()
     return () => {
-      // Identity-guarded: only THIS turn's settler may release the slot. A
-      // superseded turn's late settler must not clear the flag a NEWER turn
-      // has already claimed (its settle gate was replaced with a new promise).
-      if (session.settled === settled) {
-        session.settled = undefined
-        session.settledResolve = undefined
-        session.promptInFlight = false
-      }
-      settle()
+      // Identity- and generation-guarded: only THIS turn's settler may release
+      // the slot. A superseded turn's late settler must not clear the slot a
+      // NEWER turn has already claimed.
+      settleTurnSlot(session, slot)
       // The turn is over: a fresh window starts here rather than at the prompt
       // that may have started a long time ago.
       this.touch()
@@ -508,12 +505,8 @@ export class AgentBridge {
    * this promise, and nothing is left that could ever resolve it. The prompt
    * slot itself goes with it: whatever held it is gone too.
    */
-  private openSettleGate(session: LiveSession): void {
-    const settle = session.settledResolve
-    session.settled = undefined
-    session.settledResolve = undefined
-    session.promptInFlight = false
-    settle?.()
+  private openSettleGate(session: LiveSession, turnSeq: number = session.turnSeq): void {
+    openTurnSlot(session, turnSeq)
   }
 
   view(): AgentView {
@@ -566,7 +559,7 @@ export class AgentBridge {
       || this.permissions.sessionIds().length > 0
       || this.starting !== undefined) return true
     for (const session of this.sessions.values()) {
-      if (session.running || session.settled !== undefined) return true
+      if (session.running || isSettling(session)) return true
       if (hasPendingBackgroundWork(session, this.ambientStaleMs, this.backgroundDispatchSilenceMs, this.backgroundOpenToolCeilingMs)) return true
     }
     return false
@@ -612,7 +605,7 @@ export class AgentBridge {
     if (this.permissions.sessionIds().some(entry => entry.sessionId !== session.sessionId)) return true
     for (const other of this.sessions.values()) {
       if (other === session) continue
-      if (other.running || other.settled !== undefined) return true
+      if (other.running || isSettling(other)) return true
       if (hasPendingBackgroundWork(other, this.ambientStaleMs, this.backgroundDispatchSilenceMs, this.backgroundOpenToolCeilingMs)) return true
     }
     return false
@@ -646,7 +639,7 @@ export class AgentBridge {
    */
   hasActiveTurn(): boolean {
     for (const session of this.sessions.values()) {
-      if (session.running || session.settled !== undefined) return true
+      if (session.running || isSettling(session)) return true
     }
     return false
   }
@@ -1028,8 +1021,7 @@ export class AgentBridge {
       cwd: resolved,
       running: false,
       turnSeq: 0,
-      closed: false,
-      released: false,
+      ...freshSessionFacts(),
       lastAgentActivityAt: Date.now(),
       activeToolCalls: new Set(),
       transcript: new Transcript(this.transcriptMax),
@@ -1157,8 +1149,7 @@ export class AgentBridge {
         cwd: resolved,
         running: false,
         turnSeq: 0,
-        closed: false,
-        released: false,
+        ...freshSessionFacts(),
         lastAgentActivityAt: Date.now(),
         activeToolCalls: new Set(),
         transcript: new Transcript(this.transcriptMax),
@@ -1227,7 +1218,7 @@ export class AgentBridge {
    */
   async runPrompt(session: LiveSession, prompt: string | ContentBlock[], turnId: string, turnGen: number): Promise<{ stopReason: string; meta?: Record<string, unknown> }> {
     const conn = this.conn
-    if (conn === undefined || session.closed || session.released) throw new AcpError('session_closed', 'acp: session is closed')
+    if (conn === undefined || lifecycleOf(session) !== 'live') throw new AcpError('session_closed', 'acp: session is closed')
     this.touch()
 
     const blocks: ContentBlock[] = typeof prompt === 'string'
@@ -1272,7 +1263,7 @@ export class AgentBridge {
       if (session.turnSeq !== turnGen) return answered()
       if (attempt >= this.staleCancelMaxRetries) return answered()
       await new Promise(resolve => setTimeout(resolve, this.staleCancelRetryDelayMs))
-      if (session.closed || this.conn !== conn) throw new AcpError('session_closed', 'acp: session is closed')
+      if (lifecycleOf(session) === 'closed' || this.conn !== conn) throw new AcpError('session_closed', 'acp: session is closed')
       // Re-check after the delay: the successor may have started while waiting.
       if (session.turnSeq !== turnGen) return answered()
       // ...and a SECOND stop during the delay names this same generation. The
@@ -1348,7 +1339,7 @@ export class AgentBridge {
    * `false` means the caller was late and must leave the session alone.
    */
   finalizeTurn(session: LiveSession, turnGen: number, message: string): boolean {
-    if (session.closed || session.turnSeq !== turnGen) return false
+    if (lifecycleOf(session) === 'closed' || session.turnSeq !== turnGen) return false
     const controller = session.turnController
     if (controller !== undefined && !controller.stale) {
       controller.forceFinalize({ kind: 'error', message })
@@ -1357,9 +1348,9 @@ export class AgentBridge {
     // Nothing is in flight anymore (the turn settled on its own): nothing to
     // finalize. A still-pending settle gate counts as in flight even though
     // the stream is gone — that gate is what the next prompt waits on.
-    if (!session.running && session.settled === undefined) return false
+    if (!session.running && !isSettling(session)) return false
     session.running = false
-    this.openSettleGate(session)
+    this.openSettleGate(session, turnGen)
     this.hub.broadcast({
       type: 'turn/end',
       sessionId: session.sessionId,
@@ -1422,8 +1413,7 @@ export class AgentBridge {
       session.transcript = new Transcript(this.transcriptMax)
       session.cwd = resolved
       session.running = false
-      session.closed = false
-      session.released = false
+      markLive(session)
       // A resume is a fresh agent-side state: nothing from the dead process's
       // turn survives it, including the settle gate and the stall markers. A
       // background drain belonged to that process too.
@@ -1461,6 +1451,7 @@ export class AgentBridge {
       if (usableConfigOptions(result.configOptions)) session.configOptions = result.configOptions
       this.sessions.set(session.sessionId, session)
       this.released.delete(session.sessionId)
+      assertLifecycle(session, this.released)
       // Same flip as `createSession`: a registered session makes this a chat
       // process; re-arm the idle clock on the agent's own window.
       this.clearIdleTimer()
@@ -1473,8 +1464,7 @@ export class AgentBridge {
     } catch (error) {
       this.acpIndex.delete(session.acpSessionId)
       this.sessions.delete(session.sessionId)
-      session.released = true
-      this.released.set(session.sessionId, session)
+      markParked(session, this.released)
       this.hub.broadcast({ type: 'session/released', sessionId: session.sessionId, session: snapshot(session), reason: 'resume failed', cause: 'resume-failed' })
       this.onSessionsDirty?.()
       throw error
@@ -1507,8 +1497,8 @@ export class AgentBridge {
    *
    * This is the local half shared by `releaseAll` (crash / idle / workspace) and
    * `shutdown` (host exit): those paths differ only in what happens to the child
-   * afterwards. A `closed` session is skipped — its record belongs to
-   * `closeSession`, and flipping it to released would let a resume resurrect a
+   * afterwards. A session whose lifecycle is `closed` is skipped — its record
+   * belongs to `closeSession`, and parking it would let a resume resurrect a
    * conversation that is being destroyed (constraint 10).
    *
    * Returns how many sessions were parked, so a shutdown with nothing to park
@@ -1518,10 +1508,10 @@ export class AgentBridge {
   private parkSessions(reason: string, cause: AcpReleaseCause): number {
     let parked = 0
     for (const session of [...this.sessions.values()]) {
-      // A session already being closed is `closeSession`'s to delete. Marking
-      // it released would park it as resumable, and `doResumeSession` flips
-      // `closed` back to false — an idle release resurrecting a closed session.
-      if (session.closed) continue
+      // A session already being closed is `closeSession`'s to delete. Parking
+      // it would mark it resumable, and `doResumeSession` marks the record live
+      // again — an idle release resurrecting a closed session.
+      if (lifecycleOf(session) === 'closed') continue
       // The process that owed the turn is gone, so no worker is still running:
       // every still-open dispatch becomes `unknown` before the turn/end below.
       this.onSessionBackgroundTeardown?.(session, 'unknown')
@@ -1537,9 +1527,8 @@ export class AgentBridge {
       // with it, and a stale ambient would misclassify the NEXT prompt.
       session.activeToolCalls.clear()
       clearAmbientState(session)
-      session.released = true
+      markParked(session, this.released)
       this.settlePermissions(session)
-      this.released.set(session.sessionId, session)
       this.hub.broadcast({ type: 'session/released', sessionId: session.sessionId, session: snapshot(session), reason, cause })
       parked += 1
     }
@@ -1554,6 +1543,7 @@ export class AgentBridge {
 
   /** Detach one released session record for a resume attempt. */
   takeReleased(sessionId: string): LiveSession | undefined {
+    // Detached, not destroyed: lifecycle stays 'parked' until the resume marks it live.
     const session = this.released.get(sessionId)
     if (session === undefined) return undefined
     this.released.delete(sessionId)
@@ -1562,6 +1552,7 @@ export class AgentBridge {
 
   /** Drop a released session record for good (user closed it or the agent was stopped). */
   dropReleased(sessionId: string): boolean {
+    // The record is discarded; its lifecycle stays 'parked' for any reader that still holds it.
     return this.released.delete(sessionId)
   }
 
@@ -1571,7 +1562,7 @@ export class AgentBridge {
    * would have left it — resumable via `session/load`, never live.
    */
   parkReleased(session: LiveSession): void {
-    this.released.set(session.sessionId, session)
+    markParked(session, this.released)
   }
 
   get releasedList(): LiveSession[] {
@@ -1641,8 +1632,8 @@ export class AgentBridge {
   }
 
   async closeSession(session: LiveSession, reason: 'closed' | 'agent-stopped' | 'agent-died'): Promise<void> {
-    if (session.closed) return
-    session.closed = true
+    if (lifecycleOf(session) === 'closed') return
+    markClosed(session, this.released)
     // The session is going away: whatever background drain it announced ends
     // with it (a re-created session must not inherit a stale ambient).
     clearAmbientState(session)
@@ -1650,8 +1641,11 @@ export class AgentBridge {
     // session is not a cancelled worker.
     this.onSessionBackgroundTeardown?.(session, 'unknown')
     // ...and so does its prompt slot: nothing may keep rejecting a new prompt
-    // for a record that is being deleted.
-    session.promptInFlight = false
+    // for a record that is being deleted. The SLOT's own generation is passed,
+    // not the session's: when `turnSeq` advanced without a rebuilt slot, the
+    // generation guard would otherwise leave `promptHeld` on a closed record.
+    // The settle gate is NOT opened here — do not assume it was already open.
+    releasePromptSlot(session, session.turnSlot?.turnSeq)
     // Closing a session is activity of its own: restart the idle window here
     // rather than at the prompt that opened it.
     this.touch()
@@ -1731,7 +1725,7 @@ export class AgentBridge {
     this.starting = undefined
     this.clearIdleTimer()
     for (const session of [...this.sessions.values()]) {
-      session.closed = true
+      markClosed(session, this.released)
       this.settlePermissions(session)
       this.openSettleGate(session)
       session.activeToolCalls.clear()
@@ -1838,7 +1832,7 @@ export class AgentBridge {
    */
   private async handlePermissionRequest(acpSessionId: string, toolCall: unknown, options: PermissionOption[], signal?: AbortSignal): Promise<RequestPermissionResponse> {
     const session = this.acpIndex.get(acpSessionId)
-    if (session === undefined || session.closed) return { outcome: { outcome: 'cancelled' } }
+    if (session === undefined || lifecycleOf(session) === 'closed') return { outcome: { outcome: 'cancelled' } }
     // An ask is the agent speaking, not silence: the stall watchdog measures
     // from here, and the pending ask exempts the session anyway.
     session.lastAgentActivityAt = Date.now()
@@ -2054,7 +2048,7 @@ export class AgentBridge {
     // `closeSession` marks the record synchronously and then awaits the
     // agent's `session/close`; an update racing that wait must not revive
     // activity (e.g. report a new dispatch) on a record already going away.
-    if (session.closed) return
+    if (lifecycleOf(session) === 'closed') return
     // Detached-worker / drain bookkeeping runs BEFORE the turn controller and
     // the cursor: a worker may report after the turn that dispatched it closed,
     // and the session-level record is the only place that fact can land.

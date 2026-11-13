@@ -78,7 +78,7 @@ describe('a turn that dispatched a detached worker (isolated manager)', () => {
     const deadline = Date.now() + 10_000
     for (;;) {
       const live = dispatchManager.turnStreamFor(dshSessionId)
-      if (live !== undefined && !live.hasSettled && live.hasOpenSegment && live.session.settled === undefined) return live
+      if (live !== undefined && !live.hasSettled && live.hasOpenSegment && live.session.turnSlot === undefined) return live
       if (Date.now() > deadline) throw new Error('the turn never entered a detached-worker hold')
       await new Promise(resolve => setTimeout(resolve, 5))
     }
@@ -434,7 +434,7 @@ describe('a turn that dispatched a detached worker (isolated manager)', () => {
     expect(unexpectedSubagentFrames(dispatchEvents, since)).toEqual([])
 
     // Nothing gave the conversation back: the session and its transcript live.
-    expect(holding.session.closed).toBe(false)
+    expect(holding.session.lifecycle).toBe('live')
     expect(dispatchManager.chatSessions(dshSessionId)).toHaveLength(1)
     expect(dispatchEvents.slice(since).some(event =>
       event.type === 'chat/agent-unlocked' && event.dshSessionId === dshSessionId)).toBe(false)
@@ -656,7 +656,7 @@ describe('a turn that dispatched a detached worker (isolated manager)', () => {
     let parked = false
     while (!parked) {
       const live = dispatchManager.turnStreamFor(dshSessionId)
-      parked = live !== undefined && !live.hasSettled && !live.hasOpenSegment && live.session.settled === undefined
+      parked = live !== undefined && !live.hasSettled && !live.hasOpenSegment && live.session.turnSlot === undefined
       if (!parked) {
         if (Date.now() > deadline) throw new Error('the hold never parked between steps')
         await new Promise(resolve => setTimeout(resolve, 5))

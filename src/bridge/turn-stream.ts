@@ -18,6 +18,7 @@ import { AsyncQueue } from './async-queue.ts'
 // manager → controller value import stays acyclic.
 import type { BridgeManager } from './manager.ts'
 import type { LiveSession } from './live-session.ts'
+import { releasePromptSlot } from './session-lifecycle.ts'
 
 export type { LiveSession } from './live-session.ts'
 
@@ -1892,16 +1893,15 @@ export class TurnStreamController {
       return
     }
     this.finishActive({ kind: 'aborted', failure: { message: 'aborted', code: 'ABORTED' } })
-    // The agent may take its time acknowledging the cancel, but OUR face of
-    // the turn ends now: the session stops running, the HOST's prompt slot is
-    // released (so a new prompt may claim it), and a provisional first lock
-    // settles against what was actually shown. The AGENT-side gate (`settled`)
-    // stays claimed: the prompt is still in flight over there, and a second
-    // prompt sent into that window would be a concurrent `session/prompt` the
-    // protocol forbids — `claimTurn` waits it out, `settle` (or the cancel
-    // fallback) opens it.
+    // The agent may take its time acknowledging the cancel, but OUR face of the
+    // turn ends now: the session stops running, the HOST's prompt slot is
+    // released, and a provisional first lock settles against what was shown.
+    // The AGENT-side gate stays claimed: the prompt is still in flight over
+    // there, and a second prompt sent into that window would be a concurrent
+    // `session/prompt` the protocol forbids — `claimTurn` waits it out, and
+    // `settle` (or the cancel fallback) opens it.
     this.session.running = false
-    this.session.promptInFlight = false
+    releasePromptSlot(this.session, this.turnSeqAtStart)
     if (this.session.provisionalLock === true) {
       this.session.provisionalLock = false
       if (!this.sawVisibleBlock) this.rollbackFirstTurn(this.session)

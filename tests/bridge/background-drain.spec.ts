@@ -76,7 +76,7 @@ describe('a prompt steered into a background drain (isolated manager)', () => {
     const deadline = Date.now() + 10_000
     for (;;) {
       const live = drainManager.turnStreamFor(dshSessionId)
-      if (live !== undefined && !live.hasSettled && live.hasOpenSegment && live.session.settled === undefined) return live
+      if (live !== undefined && !live.hasSettled && live.hasOpenSegment && live.session.turnSlot === undefined) return live
       if (Date.now() > deadline) throw new Error('the turn never entered an ambient wait')
       await new Promise(resolve => setTimeout(resolve, 5))
     }
@@ -397,12 +397,12 @@ describe('a prompt steered into a background drain (isolated manager)', () => {
     })()
 
     // Entered the ambient wait: the response already released the prompt slot
-    // (`endTurn` cleared `session.settled`) while the segment is still open and
+    // (`endTurn` cleared `session.turnSlot`) while the segment is still open and
     // the turn is NOT settled.
     const deadline = Date.now() + 10_000
     let live = drainManager.turnStreamFor(dshSessionId)
     for (;;) {
-      if (live !== undefined && live.hasOpenSegment && live.session.settled === undefined) break
+      if (live !== undefined && live.hasOpenSegment && live.session.turnSlot === undefined) break
       if (Date.now() > deadline) throw new Error('the turn never entered an ambient wait')
       await new Promise(resolve => setTimeout(resolve, 5))
       live = drainManager.turnStreamFor(dshSessionId)
@@ -485,7 +485,7 @@ describe('a prompt steered into a background drain (isolated manager)', () => {
 
     // Nothing gave the conversation back: the session (and its ACP transcript)
     // survived, and the lock was never rolled back.
-    expect(session.closed).toBe(false)
+    expect(session.lifecycle).toBe('live')
     expect(drainManager.chatSessions(dshSessionId)).toHaveLength(1)
     expect(drainEvents.slice(since).some(event =>
       event.type === 'chat/agent-unlocked' && event.dshSessionId === dshSessionId)).toBe(false)

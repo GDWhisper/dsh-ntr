@@ -75,7 +75,7 @@
 - **启动期请求必须有超时**：`initialize` / `session/new` / `session/load` 一律经 `withStartupTimeout`（`startupTimeoutMs`，默认 60s）。SDK 的 `cancellationSignal` 是协作式的，挂死的 agent 不响应 `$/cancel_request`，唯一有效超时是 race + `killChild`。
 - **取消必须有强制定稿兜底**：`session/cancel` 后经 `armCancelFallback`（`cancelFallbackMs`，默认 15s）强制发出 `turn/end`（turnId='' + error）。agent 无视 cancel 不得让会话永久停在 `running`。
 - **强制定稿必须带世代守卫**：武装时捕获 `session.turnSeq`（`/acp` RPC `prompt` 与适配器 `streamPrompt` 两个 turn 起点都递增），触发时世代已前进就不得动手。否则「agent 迟到结算旧 turn、用户已发新 turn」时，定时器会误杀无辜的新 turn。
-- **强制定稿必须解开 `settled` 闸门**（`settledResolve`）：只置 `running=false` 不够，适配器路径的下一轮 prompt 会卡在 `unsettled`。
+- **强制定稿必须解开 settle 闸门**（`LiveSession.turnSlot`）：只置 `running=false` 不够，适配器路径的下一轮 prompt 会卡在 `unsettled`。闸门的存在性就是 `turnSlot` 是否存在（`isSettling`），`openTurnSlot` 按 `turnSeq` 世代比对后清掉它并 resolve 其 promise。`promptHeld` 是宿主自己的 prompt 槽位，与闸门同一值对象但独立失效：abort 先释放它，闸门等 agent 确认取消才开。
 - **粘滞取消吞消息必须检测重发**：部分 agent（实测 codebuddy 2.161.4）异步清理 cancel 状态，清理窗口内的下一条 prompt 被秒回 `cancelled`（复用旧 requestId、不生成 turn），用户消息静默丢失。
   - 判据是「本世代是否发起过 cancel」（`session.cancelRequestedAtTurn` 对比当前 `session.turnSeq`），**不是延时**（延时随负载漂移）。
   - 判为粘滞就等 `staleCancelRetryDelayMs`（默认 600ms，须长于清理窗口）原样重发，有界 `staleCancelMaxRetries`（默认 2）。
@@ -135,7 +135,7 @@
   - 没有 `loadSession` → 还要求同 bridge 上没有别的 live 会话；`AgentBridge.forceReset('agent-stopped')` 杀掉子进程并就地关闭记录、广播 `session/closed`（**不发** `session/close`，也不清 `released`），随后 `forgetDshSession`。聊天下一条消息新建会话；`/acp` prompt 抛 `AcpError('session_reset', … start a new session)`，不是 `unknown_session`。
   - `AgentBridge.closeSession` 的 `session/close` 有 `SESSION_CLOSE_TIMEOUT_MS`（5000ms）上限：卡死的 agent 不能挂住 stop / rollback。
 - **旧 turn 只以看门狗那一帧结束（reclaim 之后）**：reclaim 记 `LiveSession.reclaimedTurnSeq`；它关闭连接导致的旧 `session/prompt` 迟到 then / catch 对该世代被丢弃，所以看门狗的 `turn/end` 是唯一的旧轮次结束帧。cancel 兜底**不**记这个标记，它迟到的真 `end_turn` 照常广播（既有测试）。两个 turn 起点（`streamPrompt` / `/acp` `prompt`）与 resume 都会清掉这个标记，只有同一世代才抑制。
-- **防御性补丁**：`openSettleGate` 清掉 `settled` / `settledResolve` 并解开闸门，`releaseAll` / `doResumeSession` / `finalizeTurn` 都经它；`releaseAll` 跳过已 `closed` 的会话（§2）并清空 `activeToolCalls`，`doResumeSession` 同样清空 `activeToolCalls`、另清 `orphanPromptTurnSeq` / `reclaimedTurnSeq` 并重置 `lastAgentActivityAt`，避免孤儿标记跨进程存活。
+- **防御性补丁**：`openSettleGate` 清掉 `turnSlot` 并解开闸门（按 `turnSeq` 世代守卫，不碰更新回合的槽；`promptHeld` 随槽一起消失），`releaseAll` / `doResumeSession` / `finalizeTurn` 都经它；`releaseAll` 跳过已 `closed` 的会话（§2）并清空 `activeToolCalls`，`doResumeSession` 同样清空 `activeToolCalls`、另清 `orphanPromptTurnSeq` / `reclaimedTurnSeq` 并重置 `lastAgentActivityAt`，避免孤儿标记跨进程存活。
 
 ### 6.2 被并入后台 drain 的回合（CodeBuddy unsolicited turn）
 

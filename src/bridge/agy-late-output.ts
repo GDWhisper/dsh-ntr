@@ -30,6 +30,7 @@ import {
 } from './agy-transcript.ts'
 import type { AcpAgentDef } from '../protocol.ts'
 import type { BridgeTuning } from './types.ts'
+import { lifecycleOf } from './session-lifecycle.ts'
 import type { LiveSession } from './turn-stream.ts'
 
 /** One armed watch; at most one per LiveSession. */
@@ -118,7 +119,7 @@ export class AgyLateOutputService {
     if (!tuning.agyLateOutput) return
     if (tuning.agyLateOutputMaxMs <= 0) return
     if (session.dshSessionId === undefined) return
-    if (session.closed || session.released) return
+    if (lifecycleOf(session) !== 'live') return
     const def = this.deps.host.defOf(session.agentId)
     if (def === undefined || !this.deps.isAgent(def)) return
     const storeRoot = this.deps.storeRoot(def)
@@ -174,7 +175,7 @@ export class AgyLateOutputService {
   private poll(watch: LateWatch): void {
     if (watch.finished) return
     const session = watch.session
-    if (session.closed || session.released || this.deps.host.isBusy(session)) {
+    if (lifecycleOf(session) !== 'live' || this.deps.host.isBusy(session)) {
       // A busy session will fold the backlog itself on its next prompt; this
       // watch must not deliver a second copy of it.
       this.disarmWatch(watch)
@@ -251,7 +252,7 @@ export class AgyLateOutputService {
     if (watch.finished) return
     const session = watch.session
     const text = lateAnswerText(watch.steps)
-    if (text.trim() !== '' && !session.closed && !session.released && !this.deps.host.isBusy(session)) {
+    if (text.trim() !== '' && lifecycleOf(session) === 'live' && !this.deps.host.isBusy(session)) {
       this.deliver(watch, text)
     }
     this.disarmWatch(watch)
