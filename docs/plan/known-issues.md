@@ -5,7 +5,7 @@
 
 ## 1. `tests/skills.spec.ts` 的符号链接用例在整仓运行时偶发失败
 
-**状态**：已修复（提交号：待填）。观察于阶段 1（`refactor(state): stage 1 ACP verdict book`，提交 `e1638db`）。
+**状态**：已修复（提交 `23bc581`）。观察于阶段 1（`refactor(state): stage 1 ACP verdict book`，提交 `e1638db`）。
 
 **失败用例**：`scanSkillDirs > skips symlinked skill dirs that resolve outside their group anchor, and counts them`。
 
