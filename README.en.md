@@ -156,13 +156,13 @@ One class of agents pins the workspace the moment the process starts, and ignore
 
 ## FAQ
 
-**Will the platform risk-control me? Will I get banned? Is this a reverse proxy?**
+**Will the platform risk-control me? Will I get banned? Does it forward my requests?**
 
-No, it isn't a reverse proxy. dsh-ntr only launches the ACP entry point that the agent itself provides, locally, and talks to it over ACP. The plugin never touches platform APIs and forwards no requests; all model calls are made by the local agent process itself — the same as using that agent directly in a terminal.
+No. dsh-ntr only launches the ACP entry point that the agent itself provides, locally, and talks to it over ACP. The plugin never touches platform APIs and forwards no requests; all model calls are made by the local agent process itself — the same as using that agent directly in a terminal.
 
 When the plugin is used the way it is designed, this is normally fine: the target is the agent's official ACP entry point, credentials and subscriptions come from official channels, and usage stays within what the platform's terms allow. That is the officially supported way to use the agent.
 
-The plugin cannot judge whether third-party configurations are compliant, though. If you point an agent at a third-party relay or a reverse-engineered endpoint, or use it beyond the terms, the risk is determined by that setup and usage. Those cases are outside this plugin's support scope, and the plugin cannot guarantee you won't be risk-controlled or banned.
+The plugin cannot judge whether third-party configurations are compliant, though. If you point an agent at a third-party channel or an undisclosed endpoint, or use it beyond the terms, the risk is determined by that setup and usage. Those cases are outside this plugin's support scope, and the plugin cannot guarantee you won't be risk-controlled or banned.
 
 **Why is DSH's model selector gone from the composer after I pick an agent?**
 
