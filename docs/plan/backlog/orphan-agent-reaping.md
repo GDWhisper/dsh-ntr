@@ -109,7 +109,7 @@ host (Node, 插件)
 | 新增 helper | 运行时子路径，先例是 `presets/acp/acp-guard.mjs`：`package.json` 的 `exports` 加一条映射、`files` 放行该目录（现在已含 `presets`，若另开目录要加进去） |
 | [AGENTS/protocol.md](../../../AGENTS/protocol.md) §7 | 启动命令 / Windows / 宿主退出三段的措辞与预算 |
 | [AGENTS.md](../../../AGENTS.md) 硬约束 26 | 视实现补一句（「壳经 `cmd.exe`」与「谁负责回收」）；若 supervisor 让「子进程」不再等于 agent 本身，还要一并检查 10 / 11 的措辞（崩溃 ≠ 销毁、`child === child` 身份校验） |
-| `tests/bridge.spec.ts` | 新用例：EOF 自杀、信号自杀、agent 先退透传、stderr 行归属 |
+| `tests/bridge.spec.ts` | 新用例：EOF 退出、信号终止、agent 先退透传、stderr 行归属 |
 
 ### 4.4 验收
 
@@ -170,7 +170,7 @@ host (Node, 插件)
 
 - `packages/shared/src/node/process.ts` · `acquireProcess`：Windows **不** `detached`、POSIX 起独立进程组。
 - `windowsTree` 用 `taskkill /PID /T`；其注释直言「父进程先退的孙进程只有 Job Object 兜得住，本树不声称能」——与本文事实 4 同一条结论。
-- supervisor 只包 CLI worker（`registerLocalSupervisorControl` 的 IPC 断连自杀）；agent 恢复一律走 `session/load`；**无 Job Object**。
+- supervisor 只包 CLI worker（`registerLocalSupervisorControl` 的 IPC 断连退出）；agent 恢复一律走 `session/load`；**无 Job Object**。
 
 **OmniTerm**（Rust / Axum）
 

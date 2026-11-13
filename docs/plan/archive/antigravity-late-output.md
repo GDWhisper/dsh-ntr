@@ -154,7 +154,7 @@ interface LateWatch {
   - `baseline()` 后起 poll（`agyLateOutputPollMs`，默认 1000）与 deadline（`agyLateOutputMaxMs`，默认 600000），全部 `unref()`。
 - `poll`：
   - `session.closed || session.released` → `disarm`。
-  - **忙判定只用 `session.running === true || session.promptInFlight === true`**。为真 → `disarm`，不投递（下一轮会把积压折进来）。不要用 `session.turnController`：带工具卡的回合收口后控制器仍保留到续跑段结束，用它判忙会让第一次 poll 自杀。
+  - **忙判定只用 `session.running === true || session.promptInFlight === true`**。为真 → `disarm`，不投递（下一轮会把积压折进来）。不要用 `session.turnController`：带工具卡的回合收口后控制器仍保留到续跑段结束，用它判忙会让第一次 poll 自行退出。
   - `readNew()` 后筛候选：只留 `type === 'PLANNER_RESPONSE'`、`step_index > baseline.lastStepIndex`、**`created_at` 必须存在**且其整秒 `>= floor(closedAt / 1000)`。没有 `created_at` 的行一律不投递（缺时间戳无法区分历史与新答案，fail-closed）。时钟同机；`created_at` 秒精度决定用整秒比较。
   - 收到候选即入 `steps` 并重置 quietTimer（`agyLateOutputQuietMs`，默认 1500，可续期）；不改变 deadline。
 - `quiet` 到点：`text = lateAnswerText(steps)`；
