@@ -43,6 +43,10 @@ export interface SaveGateOptions {
   clearTimer?: (handle: ReturnType<typeof setTimeout>) => void
 }
 
+/** Gate stage (`disposed` is terminal); the two schedules can wait together. */
+type GatePhase = 'idle' | 'flushing' | 'disposed'
+type Schedule = 'flush' | 'resync'
+
 /** One write waiting for the ACP turns to finish. */
 interface QueuedSave {
   id: string
@@ -106,13 +110,11 @@ export class AcpSaveGate {
   private readonly setTimer: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>
   private readonly clearTimer: (handle: ReturnType<typeof setTimeout>) => void
   private seq = 0
-  private flushing?: Promise<SaveGateFlushResult>
+  private phase: GatePhase = 'idle'
+  private readonly scheduled = new Set<Schedule>()
+  private activeFlush?: Promise<SaveGateFlushResult>
   /** A forced pass requested while another flush is still running. */
-  private forceTail?: Promise<SaveGateFlushResult>
-  private flushScheduled = false
-  /** A post-turn-boundary re-check is already queued (see `sync`). */
-  private resyncScheduled = false
-  private disposed = false
+  private followUp?: Promise<SaveGateFlushResult>
   /** Current generation per label; a stale queued entry never runs. */
   private readonly labelVersions = new Map<string, number>()
   /** Most recent terminal result PER LABEL, so one agent's save cannot erase another's. */
@@ -174,9 +176,7 @@ export class AcpSaveGate {
    * window for this one write; `0` waits forever.
    */
   defer(label: string, operation: () => Promise<unknown>, options: { timeoutMs?: number } = {}): Promise<SaveGateOutcome> {
-    if (this.disposed) {
-      return Promise.resolve({ status: 'failed', message: 'acp: save gate is disposed' })
-    }
+    if (this.phase === 'disposed') return Promise.resolve({ status: 'failed', message: 'acp: save gate is disposed' })
     // A newer save for the same label supersedes anything still waiting: the
     // old entry would write values the user has already replaced. Those entries
     // settle `cancelled` WITH `superseded: true`, so the toast can distinguish
@@ -229,7 +229,7 @@ export class AcpSaveGate {
    * replaced it). The failure banner's "retry" action uses this.
    */
   retry(label: string): boolean {
-    if (this.disposed) return false
+    if (this.phase === 'disposed') return false
     const retryable = this.retryables.get(label)
     if (retryable === undefined) return false
     void this.defer(label, retryable.operation, retryable.timeoutMs === undefined ? {} : { timeoutMs: retryable.timeoutMs })
@@ -260,7 +260,7 @@ export class AcpSaveGate {
     // plane is already idle so a deferred reload cannot wait forever.
     if (!this.host.hasActiveTurns()) {
       queueMicrotask(() => {
-        if (this.disposed || !this.idleListeners.has(listener)) return
+        if (this.phase === 'disposed' || !this.idleListeners.has(listener)) return
         try { listener() } catch { /* a listener must never break a turn boundary */ }
       })
     }
@@ -269,7 +269,7 @@ export class AcpSaveGate {
 
   /** Re-read the host's state after a turn boundary; flush the queue when idle. */
   sync(): void {
-    if (this.disposed) return
+    if (this.phase === 'disposed') return
     this.notify()
     if (!this.host.hasActiveTurns()) {
       this.settleIdle()
@@ -282,12 +282,9 @@ export class AcpSaveGate {
     // when the turn is about to disappear. Re-check once after the current
     // synchronous teardown; without this the last frame would keep claiming
     // "saving" and a queued write would never flush.
-    if (this.resyncScheduled) return
-    this.resyncScheduled = true
-    this.setTimer(() => {
-      this.resyncScheduled = false
-      this.recheck()
-    }, 0)
+    if (this.scheduled.has('resync')) return
+    this.scheduled.add('resync')
+    this.setTimer(() => this.recheck(), 0)
   }
 
   /**
@@ -305,21 +302,21 @@ export class AcpSaveGate {
    * empty queue.
    */
   async forceFlush(): Promise<SaveGateFlushResult> {
-    if (this.disposed) return { saved: 0, expired: 0, failed: 0 }
-    if (this.flushing === undefined) return this.flushQueue(true)
-    this.forceTail ??= this.flushing
+    if (this.phase === 'disposed') return { saved: 0, expired: 0, failed: 0 }
+    if (this.activeFlush === undefined) return this.flushQueue(true)
+    this.followUp ??= this.activeFlush
       .then(() => undefined, () => undefined)
       .then(() => {
-        this.forceTail = undefined
+        this.followUp = undefined
         return this.flushQueue(true)
       })
-    return this.forceTail
+    return this.followUp
   }
 
   /** Stop accepting writes; queued writes settle `failed` and are never run. */
   dispose(): void {
-    if (this.disposed) return
-    this.disposed = true
+    if (this.phase === 'disposed') return
+    this.phase = 'disposed'
     for (const entry of [...this.queue]) {
       this.clearExpiry(entry)
       entry.settle({ status: 'failed', message: 'acp: save gate was disposed before the write ran' })
@@ -409,9 +406,10 @@ export class AcpSaveGate {
     }
   }
 
-  /** One post-teardown re-read; it does NOT schedule another. */
+  /** One post-teardown re-read; consumes the `resync` schedule and arms nothing. */
   private recheck(): void {
-    if (this.disposed) return
+    this.scheduled.delete('resync')
+    if (this.phase === 'disposed') return
     this.notify()
     if (!this.host.hasActiveTurns()) {
       this.settleIdle()
@@ -420,13 +418,13 @@ export class AcpSaveGate {
   }
 
   private scheduleIdleFlush(): void {
-    if (this.disposed || this.flushScheduled || this.flushing !== undefined) return
+    if (this.phase !== 'idle' || this.scheduled.has('flush')) return
     if (this.queue.length === 0 || this.host.hasActiveTurns()) return
-    this.flushScheduled = true
+    this.scheduled.add('flush')
     // A macrotask, not a microtask: `turn/end` is broadcast BEFORE the turn
     // stream retires its controller, and the gate must see the retired state.
     this.setTimer(() => {
-      this.flushScheduled = false
+      this.scheduled.delete('flush')
       void this.flushQueue(false)
     }, 0)
   }
@@ -440,13 +438,15 @@ export class AcpSaveGate {
   }
 
   private flushQueue(force: boolean): Promise<SaveGateFlushResult> {
-    if (this.flushing !== undefined) return this.flushing
-    this.flushing = this.runFlush(force).finally(() => {
-      this.flushing = undefined
+    if (this.activeFlush !== undefined) return this.activeFlush
+    if (this.phase === 'disposed') return Promise.resolve({ saved: 0, expired: 0, failed: 0 })
+    this.phase = 'flushing'
+    return (this.activeFlush = this.runFlush(force).finally(() => {
+      this.activeFlush = undefined
+      if (this.phase === 'flushing') this.phase = 'idle'
       this.notify()
       this.scheduleIdleFlush()
-    })
-    return this.flushing
+    }))
   }
 
   private async runFlush(force: boolean): Promise<SaveGateFlushResult> {

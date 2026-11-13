@@ -282,6 +282,35 @@ describe('AcpSaveGate', () => {
     expect(gate.status().pending).toEqual([])
   })
 
+  it('holds a flush schedule and a resync schedule at the same time and runs each exactly once', async () => {
+    // A single-value schedule would drop one of the two; both must survive until they fire.
+    const h = host(true, [view()])
+    const timers: Array<() => void> = []
+    const gate = new AcpSaveGate(h, undefined, {
+      setTimer: callback => {
+        timers.push(callback)
+        return 0 as unknown as ReturnType<typeof setTimeout>
+      },
+      clearTimer: () => { /* the write below never arms an expiry timer */ },
+    })
+    const operation = vi.fn(async () => 'written')
+    const pending = gate.defer('settings:llm-pi-ai', operation, { timeoutMs: 0 })
+    // A busy turn arms only the post-turn re-check.
+    gate.sync()
+    expect(timers).toHaveLength(1)
+    // The turn ends before that re-check fires, so the idle flush is armed too.
+    h.state.active = false
+    h.state.views = []
+    gate.sync()
+    expect(timers).toHaveLength(2)
+    for (const fire of timers.splice(0)) fire()
+    await expect(pending).resolves.toEqual({ status: 'saved', value: 'written' })
+    expect(operation).toHaveBeenCalledTimes(1)
+    // Each schedule consumed its own timer; neither armed a second pass.
+    expect(timers).toHaveLength(0)
+    expect(gate.status().pending).toEqual([])
+  })
+
   it('retains a failed write so the retry gesture can run it again', async () => {
     const h = host(true, [view()])
     const gate = new AcpSaveGate(h, undefined, { timeoutMs: 50 })
