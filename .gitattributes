@@ -1,0 +1,3 @@
+# Hook scripts run under sh: a CRLF shebang breaks them on Windows.
+.githooks/* text eol=lf
+.gitattributes text eol=lf
