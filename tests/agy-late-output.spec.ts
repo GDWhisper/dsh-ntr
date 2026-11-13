@@ -207,6 +207,25 @@ describe('AGY-LATE: Antigravity transcript late output', () => {
     expect(promptCount(harness.prompts)).toBe(1)
   }, 30_000)
 
+  it('keeps the agent echo of the user prompt out of the answer mirror', async () => {
+    const dshSessionId = 'dsh-agy-echo'
+    const wakes: GenerateMessage[] = []
+    const { harness } = harnessWithResolver(dshSessionId, wakes)
+    const { chunks } = await hostLoopTurn(harness.adapter, {
+      provider: 'acp',
+      model: 'agy-late',
+      sessionId: dshSessionId,
+      messages: [userText('AGY_ECHO please')],
+    })
+    const answered = textOf(chunks)
+    expect(answered).toContain('MOCK: echo AGY_ECHO please')
+    // agy echoes the user's own prompt at the start of the turn. The host
+    // already renders that message, so the answer mirror must not repeat its
+    // raw JSON (field: session-af26f3a8, 2026-11-13).
+    expect(answered).not.toContain('user_message_chunk')
+    expect(answered).not.toContain('"sessionUpdate"')
+  }, 30_000)
+
   it('does not wake while the next user turn is still running', async () => {
     const dshSessionId = 'dsh-agy-late-busy'
     const wakes: GenerateMessage[] = []

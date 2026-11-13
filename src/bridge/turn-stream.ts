@@ -2486,6 +2486,14 @@ export class TurnStreamController {
       // quiet window, instead of waiting for the next non-tool event.
       this.armCardSettle(seg)
       return true
+    } else if (kind === 'user_message_chunk') {
+      // The agent echoing the user's own message: it sends one for every
+      // prompt, and Antigravity also replays queued ones after a resume. The
+      // host already renders that message in the conversation, so folding the
+      // echo here would only dump its raw JSON into the assistant bubble. The
+      // ACP transcript view still maps the kind to a `user` entry, so nothing
+      // is lost — this is an explicit destination, not the forbidden default.
+      return true
     } else if (!BOOKKEEPING_UPDATES.has(kind)) {
       const text = describeUnhandledUpdate(kind, update)
       if (this.announcedKinds.get(kind) === text) return true

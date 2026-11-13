@@ -49,6 +49,12 @@ function ensureAgyTranscript(sessionId) {
  * its pending answer here; the write is anchored by `agyLateAnswer`.
  */
 export async function agyPrompt(send, sessionId, text) {
+  // agy echoes the user's own prompt as a `user_message_chunk` at the start of
+  // every turn. The chat plane already shows that message, so the client must
+  // drop the echo instead of folding its raw JSON into the answer.
+  if (text.includes('AGY_ECHO')) {
+    await send({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text } })
+  }
   // agy flushes the previous turn's late answer at the START of the next
   // prompt: replay it here, without any marker of its own (just text), so the
   // plugin's echo guard is the only thing that can drop it.
