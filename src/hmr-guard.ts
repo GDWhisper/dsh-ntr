@@ -81,6 +81,12 @@ const DEFAULT_GIVE_UP_MS = 600_000
 
 type AnyRecord = Record<PropertyKey, unknown>
 
+/**
+ * One deferred reload transaction. `attempts`, the idle listener and `lastArgs`
+ * are subsidiary data; `pending` and `notified` are derived from this phase.
+ */
+type Phase = 'idle' | 'deferred' | 'retrying' | 'givenUp' | 'closed'
+
 /** A handle for every degraded path; the caller must not record it as installed. */
 function disabledHandle(): HmrGuardHandle {
   return Object.assign((): void => { /* nothing was installed */ }, { installed: false })
@@ -146,9 +152,14 @@ export function installHmrReconcileGuard(
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined
   let lastArgs: unknown[] = []
   let attempts = 0
-  let pending = false
-  let notified = false
-  let closed = false
+  let phase: Phase = 'idle'
+
+  /**
+   * A deferred reload is still owed in every phase but `idle` and `closed`.
+   * `givenUp` keeps the wait alive: the turn boundary still triggers the reload.
+   */
+  const hasDeferredReload = (): boolean =>
+    phase === 'deferred' || phase === 'retrying' || phase === 'givenUp'
 
   /** Schedule a timer that may wait minutes without keeping the host process alive. */
   const arm = (callback: () => void, delayMs: number): ReturnType<typeof setTimeout> => {
@@ -156,15 +167,15 @@ export function installHmrReconcileGuard(
     timer.unref?.()
     return timer
   }
-  const clearRetryTimer = (): void => {
-    if (retryTimer === undefined) return
-    clearTimeout(retryTimer)
-    retryTimer = undefined
-  }
-  const clearDeadlineTimer = (): void => {
-    if (deadlineTimer === undefined) return
-    clearTimeout(deadlineTimer)
-    deadlineTimer = undefined
+  const clearTimers = (): void => {
+    if (retryTimer !== undefined) {
+      clearTimeout(retryTimer)
+      retryTimer = undefined
+    }
+    if (deadlineTimer !== undefined) {
+      clearTimeout(deadlineTimer)
+      deadlineTimer = undefined
+    }
   }
   const clearIdleListener = (): void => {
     if (offline === undefined) return
@@ -174,31 +185,29 @@ export function installHmrReconcileGuard(
 
   /** The deferred reload ran: forget the wait, its timers and the idle listener. */
   const settle = (): void => {
-    if (closed) return
-    pending = false
+    if (phase === 'closed') return
+    phase = 'idle'
     attempts = 0
-    notified = false
-    clearRetryTimer()
-    clearDeadlineTimer()
+    clearTimers()
     clearIdleListener()
   }
 
   /** One explicit report per wait; a later turn boundary starts a fresh cycle. */
   const giveUp = (message: string): void => {
-    clearRetryTimer()
-    clearDeadlineTimer()
-    if (notified) return
-    notified = true
+    clearTimers()
+    if (phase === 'givenUp') return
+    phase = 'givenUp'
     report(message)
   }
 
   /** The gate fires this on every transition to idle; a turn boundary resets the bound. */
   function ensureIdleListener(): void {
-    if (closed || offline !== undefined) return
+    if (phase === 'closed' || offline !== undefined) return
     try {
       offline = gate.onIdle(() => {
+        if (!hasDeferredReload()) return
+        phase = 'retrying'
         attempts = 0
-        notified = false
         scheduleRetry()
       })
     } catch (error) {
@@ -213,7 +222,7 @@ export function installHmrReconcileGuard(
    * that may never arrive.
    */
   function scheduleRetry(): void {
-    if (closed || !pending) return
+    if (!hasDeferredReload()) return
     if (!gate.canSaveNow()) {
       ensureIdleListener()
       return
@@ -227,7 +236,7 @@ export function installHmrReconcileGuard(
     attempts += 1
     retryTimer = arm(() => {
       retryTimer = undefined
-      if (closed || !pending) return
+      if (!hasDeferredReload()) return
       if (!gate.canSaveNow()) {
         ensureIdleListener()
         return
@@ -254,19 +263,18 @@ export function installHmrReconcileGuard(
     if (gate.canSaveNow()) {
       // A new request while the plane is idle supersedes any deferred one: run
       // the original now instead of leaving a stale wait behind.
-      if (pending) settle()
+      if (hasDeferredReload()) settle()
       return original.apply(host, args)
     }
     lastArgs = args
-    if (!pending) {
-      pending = true
+    if (phase === 'idle') {
+      phase = 'deferred'
       attempts = 0
-      notified = false
       if (giveUpMs > 0) {
         const seconds = Math.max(1, Math.round(giveUpMs / 1000))
         deadlineTimer = arm(() => {
           deadlineTimer = undefined
-          if (closed || !pending || gate.canSaveNow()) return
+          if (!hasDeferredReload() || gate.canSaveNow()) return
           giveUp(`hmr reconcile is still deferred after ${String(seconds)}s: the ACP turn has not ended. The deferred profile reload will run when the turn ends`)
         }, giveUpMs)
       }
@@ -312,10 +320,10 @@ export function installHmrReconcileGuard(
   }
 
   return Object.assign((): void => {
-    if (closed) return
-    closed = true
-    clearRetryTimer()
-    clearDeadlineTimer()
+    if (phase === 'closed') return
+    phase = 'closed'
+    lastArgs = []
+    clearTimers()
     clearIdleListener()
     restoreMethod()
     // A foreign wrapper may have replaced the method while our marker stayed

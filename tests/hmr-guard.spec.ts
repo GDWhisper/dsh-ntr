@@ -284,4 +284,101 @@ describe('installHmrReconcileGuard', () => {
 
     expect(Object.getOwnPropertyDescriptor(host, 'reconcileProfile')).toEqual(before)
   })
+
+  it('binds the deadline to the first defer: a second defer does not arm another one', async () => {
+    vi.useFakeTimers()
+    try {
+      const { host, original, calls } = fakeHost()
+      const { gate, state, fireIdle } = fakeGate(true)
+      const notices: string[] = []
+      installHmrReconcileGuard(host, gate, {
+        giveUpMs: 100,
+        notify: message => { notices.push(message) },
+      })
+
+      await host.reconcileProfile('first')
+      await vi.advanceTimersByTimeAsync(60)
+      await host.reconcileProfile('second')
+      // The first deadline is still the only timer; a second one would re-arm here.
+      expect(vi.getTimerCount()).toBe(1)
+
+      await vi.advanceTimersByTimeAsync(60)
+      expect(notices).toHaveLength(1)
+      expect(notices[0]).toContain('has not ended')
+      expect(vi.getTimerCount()).toBe(0)
+
+      state.active = false
+      fireIdle()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(original).toHaveBeenCalledTimes(1)
+      expect(calls).toEqual([['second']])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps the idle listener after giving up so the turn boundary still reloads', async () => {
+    vi.useFakeTimers()
+    try {
+      const { host, original, calls } = fakeHost()
+      const { gate, state, fireIdle, hasListener } = fakeGate(true)
+      const notices: string[] = []
+      installHmrReconcileGuard(host, gate, {
+        retryDelayMs: 0,
+        giveUpMs: 50,
+        notify: message => { notices.push(message) },
+      })
+
+      await host.reconcileProfile('blocked')
+      await vi.advanceTimersByTimeAsync(80)
+      expect(notices).toHaveLength(1)
+      expect(hasListener()).toBe(true)
+
+      state.active = false
+      fireIdle()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(original).toHaveBeenCalledTimes(1)
+      expect(calls).toEqual([['blocked']])
+      // The completed reload left no idle listener and no timers behind.
+      expect(hasListener()).toBe(false)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not revive, arm timers, or replay arguments after dispose', async () => {
+    // The guard also drops `lastArgs` in its disposer, but that field is
+    // closure-private: the black box can only verify these observable proxies.
+    vi.useFakeTimers()
+    try {
+      const { host, original } = fakeHost()
+      let listener: (() => void) | undefined
+      const gate: HmrReconcileGate = {
+        canSaveNow: () => false,
+        // This host keeps the callback even after unsubscribe, so a disposed
+        // guard must not resurrect a retry or replay its captured arguments.
+        onIdle: (next) => { listener = next; return () => { /* retained on purpose */ } },
+      }
+      const notices: string[] = []
+      const restore = installHmrReconcileGuard(host, gate, {
+        retryDelayMs: 0,
+        giveUpMs: 50,
+        notify: message => { notices.push(message) },
+      })
+
+      await host.reconcileProfile('stale-args')
+      const wrapped = host.reconcileProfile
+      restore()
+      expect(vi.getTimerCount()).toBe(0)
+
+      await wrapped('late-args')
+      listener?.()
+      await vi.advanceTimersByTimeAsync(200)
+      expect(original).not.toHaveBeenCalled()
+      expect(notices).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })
