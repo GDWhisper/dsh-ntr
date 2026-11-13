@@ -8,7 +8,7 @@
 import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { afterAll, describe, expect, it, vi } from 'vitest'
 import {
   AcpLlmAdapter, AgyLateOutputService, BACKGROUND_REPORT_FORM, BACKGROUND_REPORT_SOURCE, BridgeManager,
@@ -224,6 +224,49 @@ describe('AGY-LATE: Antigravity transcript late output', () => {
     // raw JSON (field: session-af26f3a8, 2026-11-13).
     expect(answered).not.toContain('user_message_chunk')
     expect(answered).not.toContain('"sessionUpdate"')
+  }, 30_000)
+
+  it('delivers the answer a subagent report produced, never the poll chatter', async () => {
+    const dshSessionId = 'dsh-agy-report-gate'
+    const wakes: GenerateMessage[] = []
+    const { harness } = harnessWithResolver(dshSessionId, wakes)
+    await firstLateTurn(harness, dshSessionId, 'AGY_REPORT please')
+    await until(() => wakes.length >= 1, 10_000)
+    // The polling loop's own status line landed 550 ms earlier; give it room
+    // to (wrongly) deliver as well before asserting the one-report shape.
+    await new Promise(resolve => setTimeout(resolve, 600))
+    expect(wakes).toHaveLength(1)
+    const report = String(wakes[0]?.source?.report)
+    expect(report).toContain('AGY-REPORT-ANSWER')
+    expect(report).not.toContain('I am waiting')
+  }, 30_000)
+
+  it('keeps watching after a wake turn, so a later answer still arrives', async () => {
+    const dshSessionId = 'dsh-agy-rearm'
+    const wakes: GenerateMessage[] = []
+    const { harness } = harnessWithResolver(dshSessionId, wakes)
+    await firstLateTurn(harness, dshSessionId)
+    await until(() => wakes.length === 1, 10_000)
+    const first = wakes[0]
+    if (first === undefined) return
+    // The host answers the wake in a turn that has NO ACP controller, so the
+    // only re-arm point is the manager's wake branch.
+    await wakeStep(harness, dshSessionId, [userText('AGY_LATE please'), first])
+    const brainRoot = join(harness.store, 'brain')
+    const [acpSessionId] = readdirSync(brainRoot)
+    expect(acpSessionId).toBeDefined()
+    if (acpSessionId === undefined) return
+    await new Promise(resolve => setTimeout(resolve, 100))
+    const transcript = join(brainRoot, acpSessionId, '.system_generated', 'logs', 'transcript_full.jsonl')
+    appendFileSync(transcript, `${JSON.stringify({
+      step_index: 99,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+      content: 'AGY-SECOND-ANSWER without a new prompt',
+    })}\n`)
+    await until(() => wakes.length === 2, 10_000)
+    expect(String(wakes[1]?.source?.report)).toContain('AGY-SECOND-ANSWER')
   }, 30_000)
 
   it('does not wake while the next user turn is still running', async () => {

@@ -130,6 +130,8 @@ interface AgyTranscriptTail {
 
 ### 5.3 监听生命周期（新文件 `src/bridge/agy-late-output.ts`）
 
+- **wake 回合必须自己重新 arm**：wake 没有 ACP 控制器，`closeTurn` 不会调用 `armLateOutputWatch`，只靠收口点的话产生 wake 的那个 watch 会永久撤表（`session-af26f3a8` 实测：wake 之后 12 分钟才写出的最终答案全丢）。所以 `streamPrompt` 的 wake 分支在收口前调用 `AgyLateOutputService.armAfterWake`，按当前文件重新 `baseline()`。
+
 `AgyLateOutputService`，由 `BridgeManager` 持有，每会话最多一条记录：
 
 ```ts
@@ -154,6 +156,7 @@ interface LateWatch {
   - `session.closed || session.released` → `disarm`。
   - **忙判定只用 `session.running === true || session.promptInFlight === true`**。为真 → `disarm`，不投递（下一轮会把积压折进来）。不要用 `session.turnController`：带工具卡的回合收口后控制器仍保留到续跑段结束，用它判忙会让第一次 poll 自杀。
   - `readNew()` 后筛候选：只留 `type === 'PLANNER_RESPONSE'`、`step_index > baseline.lastStepIndex`、**`created_at` 必须存在**且其整秒 `>= floor(closedAt / 1000)`。没有 `created_at` 的行一律不投递（缺时间戳无法区分历史与新答案，fail-closed）。时钟同机；`created_at` 秒精度决定用整秒比较。
+  - **只认答案，不认轮询状态行**（实测修正）：agy 的后台研究回合会用工时计时器轮询子代理，transcript 里因此长出一串「I am waiting…」。`SYSTEM_MESSAGE` 按 `sender=` 分成两类——子代理 / 定时任务报告（无斜杠的会话 id）打开 `reportGate`，agy 自己的 `<acpSessionId>/task-N` 计时器不打开；`GENERIC` 的 `status` 记进 `lastGenericStatus`。`PLANNER_RESPONSE` 只有满足「紧跟报告类 SYSTEM_MESSAGE」或「最新 GENERIC 不是 RUNNING」才是候选，其余状态行跳过；空答案继续等。
   - 收到候选即入 `steps` 并重置 quietTimer（`agyLateOutputQuietMs`，默认 1500，可续期）；不改变（可选的）deadline。
 - `quiet` 到点：`text = lateAnswerText(steps)`；
   - 空 → 继续等（后台可能只有工具帧）；

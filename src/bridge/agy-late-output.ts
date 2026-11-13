@@ -32,6 +32,14 @@ interface LateWatch {
   /** Highest `step_index` at arm time: nothing at or below it is a late answer. */
   baselineStepIndex: number
   readonly steps: TranscriptStep[]
+  /**
+   * Whether the newest SYSTEM_MESSAGE was a subagent / scheduled-task report —
+   * the agent's answer to it is content, not the "still waiting" chatter its
+   * own subagent POLL produces (those messages come from `<session>/task-N`).
+   */
+  reportGate: boolean
+  /** Status of the newest GENERIC step: `RUNNING` means a background tool is mid-flight. */
+  lastGenericStatus: string
   pollTimer?: ReturnType<typeof setInterval>
   quietTimer?: ReturnType<typeof setTimeout>
   deadlineTimer?: ReturnType<typeof setTimeout>
@@ -66,6 +74,23 @@ function stepSecond(createdAt: string | undefined): number | undefined {
   const parsed = Date.parse(createdAt)
   if (!Number.isFinite(parsed)) return undefined
   return Math.floor(parsed / 1_000)
+}
+
+/**
+ * Whether one `SYSTEM_MESSAGE` carries a report rather than agy's own poll.
+ *
+ * Two shapes measured on 1.5.3: a subagent / scheduled task reports with
+ * `sender=<conversation id>` (no slash), while the agent's own "check the
+ * subagent" timers come from `sender=<sessionId>/task-N`. A `sender=system`
+ * notice is neither. Anything unparsable opens nothing (fail closed: no
+ * delivery, the text still sits in the transcript).
+ */
+function isReportMessage(content: string, acpSessionId: string): boolean {
+  const match = /\bsender=(\S+)/.exec(content)
+  if (match === null) return false
+  const sender = match[1]
+  if (sender === undefined || sender === 'system') return false
+  return !sender.startsWith(`${acpSessionId}/`)
 }
 
 /**
@@ -134,6 +159,8 @@ export class AgyLateOutputService {
       closedAt,
       baselineStepIndex: tail.lastStepIndex,
       steps: [],
+      reportGate: false,
+      lastGenericStatus: 'DONE',
       finished: false,
       stop: () => { this.disarmWatch(watch) },
     }
@@ -152,6 +179,18 @@ export class AgyLateOutputService {
     }
     this.watches.set(session.sessionId, watch)
     session.stopLateWatch = watch.stop
+  }
+
+  /**
+   * Re-arm after a WAKE turn. That turn has no ACP controller, so `closeTurn`
+   * cannot arm: without this call the watch that produced the wake stays
+   * disarmed and the rest of the same background run is lost
+   * (session-af26f3a8: the final answer arrived 12 minutes later, never shown).
+   * A wake for a session that no longer resolves to a live record is ignored.
+   */
+  armAfterWake(session: LiveSession | undefined): void {
+    if (session === undefined) return
+    this.arm(session, Date.now())
   }
 
   /** Stop this session's watch, if any. Idempotent; safe from a teardown. */
@@ -174,16 +213,37 @@ export class AgyLateOutputService {
     const steps = watch.tail.readNew()
     if (steps.length === 0) return
     const floorSecond = Math.floor(watch.closedAt / 1_000)
-    const candidates = steps.filter(step => {
+    const candidates: TranscriptStep[] = []
+    for (const step of steps) {
+      if (step.type === 'SYSTEM_MESSAGE') {
+        // A report just landed (a subagent finished, a scheduled task fired):
+        // the NEXT planner response is the agent's answer to it. A task TIMER
+        // message is agy's own "check the subagent" poll, so it opens nothing.
+        watch.reportGate = isReportMessage(step.content, session.acpSessionId)
+        continue
+      }
+      if (step.type === 'GENERIC') {
+        // Antigravity's subagent polling runs as a background tool. While one
+        // is RUNNING, a planner line is the agent's "still waiting" chatter.
+        if (step.status !== '') watch.lastGenericStatus = step.status
+        continue
+      }
       // Only planner responses are kept: fewer bytes held, and no sub-agent
       // report ever enters the late-answer buffer.
-      if (step.type !== 'PLANNER_RESPONSE') return false
-      if (step.stepIndex <= watch.baselineStepIndex) return false
+      if (step.type !== 'PLANNER_RESPONSE') continue
+      if (step.stepIndex <= watch.baselineStepIndex) continue
       // A line with NO timestamp cannot be told apart from history: fail
       // closed. A line that reaches us through this filter is new AND dated.
       const second = stepSecond(step.createdAt)
-      return second !== undefined && second >= floorSecond
-    })
+      if (second === undefined || second < floorSecond) continue
+      if (step.content.trim() === '') continue
+      // Two ways to be a late ANSWER: the agent is answering a report, or no
+      // background tool is in flight (the run's own tail). Anything else is
+      // progress prose the poll loop wrote while a timer was running.
+      if (!watch.reportGate && watch.lastGenericStatus === 'RUNNING') continue
+      watch.reportGate = false
+      candidates.push(step)
+    }
     if (candidates.length === 0) return
     watch.steps.push(...candidates)
     this.armQuiet(watch)

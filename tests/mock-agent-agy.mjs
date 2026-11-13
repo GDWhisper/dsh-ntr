@@ -21,6 +21,10 @@ const AGY_STORE = process.env.MOCK_AGY_STORE
 const AGY_CALL_ID = 'call_agy_1'
 const agyStepIndex = new Map()
 const agyLateAnswers = new Map()
+/** Sessions running the scripted "subagent behind a poll loop" scenario. */
+const agyReportScripts = new Set()
+/** Stand-in for a subagent conversation id (no slash: a report, not a timer). */
+const AGY_SUBAGENT_SENDER = '0a800c12-6dae-47bb-80b9-6ec4599db763'
 /** Answer text waiting for its turn's response (`agyLateAnswer`). */
 const agyPendingLate = new Map()
 
@@ -71,6 +75,13 @@ export async function agyPrompt(send, sessionId, text) {
     if (partial) return true
   }
 
+  if (AGY_STORE !== undefined && text.includes('AGY_REPORT')) {
+    // The real shape of a post-turn research run: agy polls its subagent with
+    // 1-minute timers (task-sender SYSTEM_MESSAGE + GENERIC RUNNING + a short
+    // "still waiting" planner line), and only the subagent's own report
+    // produces the answer. See session-af26f3a8 (2026-11-13).
+    agyReportScripts.add(sessionId)
+  }
   if (AGY_STORE !== undefined && text.includes('AGY_LATE')) {
     // The late answer lands only in agy's own transcript, one second AFTER
     // this turn's response: `agyLateAnswer` owns the anchor and the write.
@@ -81,6 +92,22 @@ export async function agyPrompt(send, sessionId, text) {
   return false
 }
 
+/** ISO second-precision timestamp, agy's own `created_at` shape. */
+function nowSecond() {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z')
+}
+
+/** Append whole steps to the session transcript. */
+function appendAgySteps(sessionId, steps) {
+  try {
+    const dir = join(AGY_STORE, 'brain', sessionId, '.system_generated', 'logs')
+    mkdirSync(dir, { recursive: true })
+    appendFileSync(join(dir, 'transcript_full.jsonl'), `${steps.map(step => JSON.stringify(step)).join('\n')}\n`)
+  } catch {
+    // Best effort: a transcript write never changes the agent's answer.
+  }
+}
+
 /**
  * End the turn the way agy does, and arm the late answer one second from now:
  * the delay is anchored to the TURN RESPONSE, not to the prompt, so a slow
@@ -88,6 +115,45 @@ export async function agyPrompt(send, sessionId, text) {
  * Returns the prompt handler's terminal result.
  */
 export function agyLateAnswer(sessionId) {
+  if (agyReportScripts.delete(sessionId)) {
+    ensureAgyTranscript(sessionId)
+    const base = agyStepIndex.get(sessionId) ?? 0
+    agyStepIndex.set(sessionId, base + 5)
+    // Phase 1: the poll loop. The task sender and the RUNNING background tool
+    // mark this as progress prose, so the client must NOT deliver it.
+    setTimeout(() => {
+      const at = nowSecond()
+      appendAgySteps(sessionId, [
+        {
+          step_index: base + 1, type: 'SYSTEM_MESSAGE', status: 'DONE', created_at: at,
+          content: `The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=${at} sender=${sessionId}/task-1 priority=MESSAGE_PRIORITY_HIGH content=Check if subagent has responded\n</SYSTEM_MESSAGE>`,
+        },
+        {
+          step_index: base + 2, type: 'GENERIC', status: 'RUNNING', created_at: at,
+          content: `Created At: ${at}\nTool is running as a background task with task id: ${sessionId}/task-1\nTask Description: Timer: 1m, Prompt: Check if subagent has responded`,
+        },
+        {
+          step_index: base + 3, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: at,
+          content: 'I am waiting for the subagent analysis to complete.',
+        },
+      ])
+    }, 150)
+    // Phase 2: the subagent's report, then the answer to it.
+    setTimeout(() => {
+      const at = nowSecond()
+      appendAgySteps(sessionId, [
+        {
+          step_index: base + 4, type: 'SYSTEM_MESSAGE', status: 'DONE', created_at: at,
+          content: `The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=${at} sender=${AGY_SUBAGENT_SENDER} priority=MESSAGE_PRIORITY_HIGH content=# research report\n</SYSTEM_MESSAGE>`,
+        },
+        {
+          step_index: base + 5, type: 'PLANNER_RESPONSE', status: 'DONE', created_at: at,
+          content: 'AGY-REPORT-ANSWER the subagent finished.',
+        },
+      ])
+    }, 700)
+    return { stopReason: 'end_turn' }
+  }
   const answer = agyPendingLate.get(sessionId)
   if (answer !== undefined) {
     agyPendingLate.delete(sessionId)

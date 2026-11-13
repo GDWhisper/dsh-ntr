@@ -2207,6 +2207,8 @@ export class BridgeManager {
           text: 'acp: a background report wake arrived without its report; answering locally (the full output is in the ACP transcript view)',
         })
       }
+      // A wake turn has NO ACP controller, so `closeTurn` cannot re-arm.
+      if (options.sessionId !== undefined) this.lateOutput.armAfterWake(this.registry.sessionAt(options.sessionId, agentId))
       yield { type: 'block-start', index: 0, blockType: 'text' }
       yield { type: 'text-delta', index: 0, text }
       yield { type: 'block-end', index: 0, block: { type: 'text', text } }
