@@ -28,8 +28,6 @@
 
 ## 2. `docs/acp-mode.md` 仍提到已删除的 `acpModeAsked`
 
-**状态**：文档残留，未修复。观察于阶段 1。
+**状态**：已修复（提交 `bed46e9`）。观察于阶段 1。
 
-`docs/acp-mode.md:136` 仍以 `acpModeAsked` 描述提问节流。阶段 1 已把它下沉为 store 内的独立节流表，对外暴露 `claimAcpAsk(sid, ttlMs)` 与 `releaseAcpAsk(sid)`。该文档目前与代码不一致。
-
-修复方式：把该段改为描述 store 的提问节流表与方法名，单独提交为 `docs:`。
+`docs/acp-mode.md:136` 曾以 `acpModeAsked` 描述提问节流。阶段 1 已把它下沉为 store 内的独立节流表，对外暴露 `claimAcpAsk(sid, ttlMs)` 与 `releaseAcpAsk(sid)`。该段现在按 store 的方法名描述，并说明 `agent-preset/selected` 帧携带 / 不携带 preset 时的两条路径。
