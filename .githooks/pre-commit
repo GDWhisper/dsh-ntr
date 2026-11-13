@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Pre-commit hook: 拦截约定词汇进入仓库（只看暂存区的内容）。
+#
+# 安装：git config core.hooksPath .githooks
+# 临时跳过：git commit --no-verify（确认该处用法合理时再用）
+#
+# 约定词汇分两类：
+#   1. 代理/滥用类措辞：容易被内容过滤器当成违规用法；
+#   2. 进程隐喻：正文里可以直说进程怎么退出。
+# 本文件自身不参与扫描，所以这里可以写出这些词；名单按需在这条 PATTERN 里增删。
+PATTERN='反代|反向代理|逆向|中转|自杀|reverse[ -]?proxy|reverse[ -]?engineer'
+
+set +e
+HIT=$(git grep --cached --no-color -nI -E -e "$PATTERN" -- . ':(exclude).githooks')
+RC=$?
+set -e
+
+# git grep 退出码 0=命中、1=无命中、2+=出错；只有 1 能当作「干净」放行。
+if [ "$RC" -gt 1 ]; then
+  echo "[pre-commit] 校验器出错（git grep 退出码 $RC），拒绝提交" >&2
+  exit 1
+fi
+
+[ -n "$HIT" ] || exit 0
+
+echo "[pre-commit] 拒绝提交：暂存内容包含约定词汇" >&2
+printf '%s\n' "$HIT" | sed 's/^/  /' >&2
+echo "  换一种说法；确属必要才用 git commit --no-verify 跳过。" >&2
+exit 1
