@@ -3,7 +3,24 @@ import { mkdirSync } from 'node:fs'
 import { afterAll, describe, expect, it } from 'vitest'
 import { AcpLlmAdapter, BridgeManager } from '../../src/bridge.ts'
 import { type AcpEvent, type StreamChunk } from '../../src/protocol.ts'
-import { dispatchRpc, EventHub } from '../../src/impl.ts'
+import { dispatchRpc, EventHub, Transcript } from '../../src/impl.ts'
+import type { LiveSession } from '../../src/bridge/live-session.ts'
+import {
+  AMBIENT_NOTICE_MAX,
+  CONSUMED_DRAIN_MAX,
+  RETIRED_AMBIENT_MAX,
+  activeDrain,
+  createDrainLedger,
+  isConsumedDrain,
+  isRetiredDrain,
+  markNotice,
+  retireDrain,
+  reviveDrain,
+  startDrain,
+  stopDrain,
+} from '../../src/bridge/drain-record.ts'
+import { persistedChatSession, snapshot } from '../../src/bridge/shape.ts'
+import { clearAmbientState } from '../../src/bridge/turn-stream.ts'
 import { def, hostLoopTurn, settleTranscript } from './harness.ts'
 
 /**
@@ -649,6 +666,26 @@ describe('a prompt steered into a background drain (isolated manager)', () => {
     expect(drainEvents.slice(since).some(event =>
       event.type === 'turn/end' && event.sessionId === session.sessionId)).toBe(false)
   }, 30_000)
+
+  it('keeps a turn controller\'s folded drain ids when the session drain ledger is cleared', async () => {
+    const dshSessionId = 'dsh-drain-folded-isolation'
+    const drained = drainTurn(dshSessionId, 'STEER please')
+    const controller = await waitForAmbient(dshSessionId)
+    // `foldedDrainIds` is per TURN (one id per run whose visible answer this
+    // turn folded); the session ledger is per SESSION. Clearing the session
+    // side must not wipe the controller's evidence, or its quiet close would
+    // stop consuming a run it already delivered.
+    const folded = (controller as unknown as { foldedDrainIds: Set<string> }).foldedDrainIds
+    const deadline = Date.now() + 10_000
+    while (folded.size === 0 && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+    expect(folded.size).toBeGreaterThan(0)
+    const before = [...folded]
+    clearAmbientState(controller.session)
+    expect([...folded]).toEqual(before)
+    await drained
+  }, 30_000)
 })
 
 /**
@@ -755,4 +792,102 @@ describe('the ambient hard ceiling (isolated manager)', () => {
       .filter(event => event.type === 'agent/notice' && event.text.startsWith('acp: agent "drainhard" started a background task turn'))
     expect(notices).toHaveLength(1)
   }, 30_000)
+})
+
+/**
+ * The session-level drain ledger keeps the old containers' capacity and
+ * eviction order in three bounded id rings, and stays out of every outward
+ * shape. These cases pin those bookkeeping rules directly.
+ */
+describe('the drain ledger rings and guards (unit)', () => {
+  /**
+   * A plain-object probe for a leaked ledger: `JSON.stringify` renders a Map as
+   * `{}`, so string matching can never catch one. Report any Map value or any
+   * drain-named key at any depth.
+   */
+  function drainLeaks(value: unknown, path = ''): string[] {
+    if (value instanceof Map) return [path === '' ? '<map>' : path]
+    if (Array.isArray(value)) return value.flatMap((entry, index) => drainLeaks(entry, `${path}[${String(index)}]`))
+    if (typeof value !== 'object' || value === null) return []
+    return Object.entries(value).flatMap(([key, entry]) =>
+      key.toLowerCase().includes('drain') ? [`${path}.${key}`] : drainLeaks(entry, `${path}.${key}`))
+  }
+
+  it('evicts the oldest retired drain id past the 32-entry ring and drops its record', () => {
+    let ledger = createDrainLedger()
+    for (let index = 0; index <= RETIRED_AMBIENT_MAX; index += 1) {
+      ledger = retireDrain(ledger, `retired-${String(index)}`, 1_000 + index, false)
+    }
+    expect(ledger.retired).toHaveLength(RETIRED_AMBIENT_MAX)
+    expect(ledger.retired[0]).toBe('retired-1')
+    expect(ledger.retired.at(-1)).toBe(`retired-${String(RETIRED_AMBIENT_MAX)}`)
+    // The evicted id is no longer retired and its record is unreachable — a
+    // late frame for it can neither revive nor mute anything.
+    expect(isRetiredDrain(ledger, 'retired-0')).toBe(false)
+    expect(ledger.records.has('retired-0')).toBe(false)
+    expect(isRetiredDrain(ledger, `retired-${String(RETIRED_AMBIENT_MAX)}`)).toBe(true)
+  })
+
+  it('keeps a revived drain consumed and evicts the oldest consumed id past its ring', () => {
+    let ledger = createDrainLedger()
+    ledger = startDrain(ledger, 'run-revived', 1, 1, true)
+    ledger = retireDrain(ledger, 'run-revived', 2, true)
+    stopDrain(ledger, 'run-revived')
+    reviveDrain(ledger, 'run-revived')
+    // Revival clears the retirement but never the delivery evidence; the run
+    // re-enters the ambient slot and stays silent (the fourth state).
+    expect(isRetiredDrain(ledger, 'run-revived')).toBe(false)
+    expect(isConsumedDrain(ledger, 'run-revived')).toBe(true)
+    ledger = startDrain(ledger, 'run-revived', 3, 3, false)
+    expect(activeDrain(ledger)?.requestId).toBe('run-revived')
+    expect(isConsumedDrain(ledger, 'run-revived')).toBe(true)
+    for (let index = 0; index < CONSUMED_DRAIN_MAX; index += 1) {
+      ledger = retireDrain(ledger, `consumed-${String(index)}`, 10 + index, true)
+    }
+    expect(ledger.consumed).toHaveLength(CONSUMED_DRAIN_MAX)
+    expect(ledger.consumed).not.toContain('run-revived')
+    expect(isConsumedDrain(ledger, 'run-revived')).toBe(false)
+    expect(isConsumedDrain(ledger, `consumed-${String(CONSUMED_DRAIN_MAX - 1)}`)).toBe(true)
+  })
+
+  it('keeps drain bookkeeping out of the session view and the persisted row', () => {
+    const session: LiveSession = {
+      sessionId: 'drain-guard',
+      agentId: 'drain',
+      acpSessionId: 'acp-drain-guard',
+      cwd: '/tmp/drain-guard',
+      dshSessionId: 'dsh-drain-guard',
+      running: false,
+      turnSeq: 0,
+      lifecycle: 'live',
+      lastAgentActivityAt: 1,
+      activeToolCalls: new Set<string>(),
+      transcript: new Transcript(1_000),
+      drains: startDrain(createDrainLedger(), 'guarded-run', 1, 1, true),
+    }
+    // The ledger is populated, so a clean view/row is meaningful.
+    expect(activeDrain(session.drains)?.requestId).toBe('guarded-run')
+    const view = snapshot(session)
+    expect(Object.hasOwn(view, 'drains')).toBe(false)
+    expect(drainLeaks(view)).toEqual([])
+    const row = persistedChatSession(session)
+    expect(Object.hasOwn(row, 'drains')).toBe(false)
+    expect(drainLeaks(row)).toEqual([])
+  })
+
+  it('evicts the oldest noticed drain id past its ring without dropping the active record', () => {
+    let ledger = startDrain(createDrainLedger(), 'active-run', 1, 1, false)
+    ledger = markNotice(ledger, 'active-run', 2)
+    for (let index = 0; index < AMBIENT_NOTICE_MAX; index += 1) {
+      ledger = markNotice(ledger, `noticed-${String(index)}`, 3 + index)
+    }
+    expect(ledger.notices).toHaveLength(AMBIENT_NOTICE_MAX)
+    expect(ledger.notices).not.toContain('active-run')
+    expect(ledger.notices.at(-1)).toBe(`noticed-${String(AMBIENT_NOTICE_MAX - 1)}`)
+    expect(ledger.records.get('active-run')?.noticeSent).toBe(false)
+    // Ring eviction must not prune the live record: it still owns the ambient
+    // slot, and a re-announcement of it must be able to log a notice again.
+    expect(ledger.records.has('active-run')).toBe(true)
+    expect(activeDrain(ledger)?.requestId).toBe('active-run')
+  })
 })

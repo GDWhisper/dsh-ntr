@@ -56,15 +56,19 @@ import {
   windowsShimLaunch,
 } from './process.ts'
 import {
-  AMBIENT_NOTICE_MAX,
+  activeDrain,
   chunkTextOf,
   clearAmbientState,
   codebuddyMetaOf,
+  drainOf,
   hasPendingBackgroundWork,
   isRetiredAmbientId,
+  markNotice,
   permissionToolName,
   reviveAmbientId,
   silenceWindowsOf,
+  startDrain,
+  touchDrain,
 } from './turn-stream.ts'
 import type { LiveSession } from './turn-stream.ts'
 import { assertLifecycle, beginTurnSlot, freshSessionFacts, hasPromptSlot, isSettling, lifecycleOf, markClosed, markLive, markParked, openTurnSlot, releasePromptSlot, settleTurnSlot } from './session-lifecycle.ts'
@@ -2074,17 +2078,13 @@ export class AgentBridge {
     // re-announcement below does the same for its id.
     //
     // `retiredDrain` only drives the revive below: an already-consumed run
-    // stays transcript-only for the idle collector (`LiveSession.consumedDrains`),
+    // stays transcript-only for the idle collector (its `DrainRecord.consumed`),
     // so this frame cannot open a second answer after its deferral.
     const retiredDrain = !replay && meta?.requestId !== undefined && isRetiredAmbientId(session, meta.requestId)
     if (retiredDrain && meta?.requestId !== undefined) {
       reviveAmbientId(session, meta.requestId)
-      session.ambient = {
-        requestId: meta.requestId,
-        startedAt: session.ambient?.startedAt ?? Date.now(),
-        lastActivityAt: Date.now(),
-        sawOutput: session.ambient?.sawOutput ?? false,
-      }
+      const previous = activeDrain(session.drains)
+      session.drains = startDrain(session.drains, meta.requestId, previous?.startedAt ?? Date.now(), Date.now(), previous?.sawOutput ?? false)
     }
     if (!replay && meta?.unsolicitedTurn !== undefined) {
       // The agent started a background turn on its own: remember it so a
@@ -2093,20 +2093,11 @@ export class AgentBridge {
       // request id — a repeated announcement is the same run, not news.
       const run = meta.unsolicitedTurn
       // A re-announcement also revives a drain whose wait already closed: the
-      // same run is alive, and the notice de-dupe set keeps it silent.
+      // same run is alive, and the notice de-dupe ring keeps it silent.
       reviveAmbientId(session, run.requestId)
-      session.ambient = { requestId: run.requestId, startedAt: Date.now(), lastActivityAt: Date.now(), sawOutput: false }
-      const announced = session.ambientNotices ?? new Set<string>()
-      session.ambientNotices = announced
-      if (!announced.has(run.requestId)) {
-        announced.add(run.requestId)
-        // The de-dupe set outlives individual turns (a hard ceiling keeps the
-        // drain record), so it is bounded: evict the oldest ids first.
-        while (announced.size > AMBIENT_NOTICE_MAX) {
-          const oldest = announced.values().next().value
-          if (oldest === undefined) break
-          announced.delete(oldest)
-        }
+      session.drains = startDrain(session.drains, run.requestId, Date.now(), Date.now(), false)
+      if (drainOf(session.drains, run.requestId)?.noticeSent !== true) {
+        session.drains = markNotice(session.drains, run.requestId)
         this.hub.broadcast({
           type: 'agent/notice',
           agentId: session.agentId,
@@ -2115,15 +2106,13 @@ export class AgentBridge {
         })
       }
     }
-    if (!replay && session.ambient !== undefined
-      && meta?.requestId === session.ambient.requestId) {
+    const liveDrain = replay ? undefined : activeDrain(session.drains)
+    if (liveDrain !== undefined && meta?.requestId === liveDrain.requestId) {
       // The run is alive: refresh the staleness clock on ANY update it owns,
       // not just prose (a tool-heavy stretch is still the drain working).
-      session.ambient.lastActivityAt = Date.now()
-      if ((kind === 'agent_message_chunk' || kind === 'agent_thought_chunk')
-        && chunkTextOf((params.update as { content?: unknown }).content) !== '') {
-        session.ambient.sawOutput = true
-      }
+      const sawText = (kind === 'agent_message_chunk' || kind === 'agent_thought_chunk')
+        && chunkTextOf((params.update as { content?: unknown }).content) !== ''
+      touchDrain(session.drains, liveDrain.requestId, Date.now(), sawText)
     }
     // The drain record above is THIS frame's: the manager collects an IDLE
     // drain's prose from here (a steered prompt or a hold already consumes it,

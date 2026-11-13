@@ -47,33 +47,6 @@ export interface BackgroundReport {
   openToolCalls: Set<string>
 }
 
-/** One unsolicited (background) turn the agent is running, as announced in `_meta`. */
-export interface AmbientTurn {
-  /** `codebuddy.ai/requestId` of the drain; every update of the run carries it. */
-  requestId: string
-  startedAt: number
-  /**
-   * When this drain last showed any sign of life (announcement or an update
-   * carrying its request id). {@link BridgeTuning.ambientStaleMs} expires the
-   * record from here, so a drain that died silently does not capture a later
-   * normal turn as steered.
-   */
-  lastActivityAt: number
-  /** Whether the drain already streamed prose (text or thought) into the transcript. */
-  sawOutput: boolean
-}
-
-/** A drain id the session stopped waiting on, and when it was retired. */
-export interface RetiredAmbient {
-  requestId: string
-  /**
-   * When the wait was retired. `hasRecentRetiredAmbient` uses it to tell a
-   * prompt folded into a just-quieted drain from one that ended on its own;
-   * `adoptTurnRequestId` / `noteTurnRequestId` ignore the id at any age.
-   */
-  retiredAt: number
-}
-
 /** Reliability tuning, threaded from `AcpPluginConfig` through the manager. */
 export interface BridgeTuning {
   startupTimeoutMs?: number

@@ -5,7 +5,8 @@
  */
 import type { Transcript } from '../impl.ts'
 import type { SessionView } from '../protocol.ts'
-import type { AmbientTurn, BackgroundDispatch, BackgroundReport, RetiredAmbient } from './types.ts'
+import type { DrainLedger } from './drain-record.ts'
+import type { BackgroundDispatch, BackgroundReport } from './types.ts'
 import type { TurnStreamController } from './turn-stream.ts'
 import type { SessionLifecycle, TurnSlot } from './session-lifecycle.ts'
 
@@ -169,43 +170,6 @@ export interface LiveSession {
    */
   turnController?: TurnStreamController
   /**
-   * A background turn the agent started on its OWN initiative (CodeBuddy's
-   * multitask drains: a sub-agent completion notice starts a run the client
-   * never asked for). Its first `session_info_update` announces the request id
-   * every later update of that run carries in `_meta`; a `session/prompt`
-   * answered instantly with no conversation request id was folded into this
-   * drain and its real answer arrives as the drain's updates.
-   *
-   * Only lifetime events clear it (close / release / resume / stop): a drain
-   * may outlive the turn that was steered into it, and clearing on a normal
-   * settle would misclassify the NEXT steered prompt.
-   */
-  ambient?: AmbientTurn
-  /**
-   * Request ids whose `agent/notice` already went out, so a repeated
-   * announcement of the same background run is not logged twice.
-   */
-  ambientNotices?: Set<string>
-  /**
-   * Background drains this session already STOPPED waiting on (an ambient wait
-   * that closed on silence, or a record that outlived `ambientStaleMs`). The
-   * record is gone from {@link ambient}, but the drain itself may still be
-   * running: a queued message or a long tool makes it speak again while the
-   * NEXT turn is on air. Without this list the late text would teach that turn
-   * the drain's id (`noteTurnRequestId` / `adoptTurnRequestId`) and fold the
-   * background run's answer into the user's answer (a double answer).
-   *
-   * An update or re-announcement carrying a listed id REVIVES it
-   * (`reviveAmbientId` + a rebuilt {@link ambient}): the run is alive, so its
-   * next steered prompt must receive the drain's text. Only while the record
-   * stays retired is its text transcript-only. Timestamps let the zero-output
-   * report recognise a prompt folded into a recently quieted drain
-   * (`hasRecentRetiredAmbient`). Bounded ({@link RETIRED_AMBIENT_MAX}), oldest
-   * evicted first; every lifecycle boundary clears the list
-   * (`clearAmbientState`).
-   */
-  retiredAmbients?: RetiredAmbient[]
-  /**
    * The agent's last rate-limit refusal on this session, and when it landed.
    *
    * CodeBuddy answers a rate-limited prompt with a RESOLVED response
@@ -318,18 +282,13 @@ export interface LiveSession {
    */
   backgroundReport?: BackgroundReport
   /**
-   * Background drain request ids whose answer already reached a turn or the
-   * chat plane. A drain that speaks after its wait closed is alive again
-   * (`reviveAmbientId`), but its text belongs to a deliverable that ALREADY
-   * exists — collecting it again would answer the same run twice (one more
-   * bubble, or a second wake after the first one). Bounded, oldest evicted.
-   *
-   * "Already delivered" is evidence-based, per run id: a quiet close only marks
-   * an id consumed when the turn actually FOLDED that run's visible text
-   * (`TurnStreamController.foldedDrainIds`). A zero-output close (just the
-   * deferral line) leaves it unconsumed — the answer never reached anyone, so
-   * a revived run must still be able to wake the chat.
+   * Every background drain this session has a trace of: one
+   * {@link DrainRecord} per request id plus the three bounded id rings that
+   * preserve the old containers' capacity and eviction order (stage 6 of
+   * `docs/plan/implicit-state-machines.md`). Created lazily by the first
+   * writer, like {@link backgroundDispatches}; a lifecycle boundary drops the
+   * whole ledger (`clearAmbientState`).
    */
-  consumedDrains?: Set<string>
+  drains?: DrainLedger
   transcript: Transcript
 }

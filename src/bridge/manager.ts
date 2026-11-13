@@ -57,9 +57,10 @@ import {
 import {
   RETIRED_AMBIENT_RECENT_MIN_MS,
   TurnStreamController,
+  activeDrain,
   codebuddyMetaOf,
+  expireAmbientDrain,
   hasRecentRetiredAmbient,
-  retireAmbientId,
   silenceWindowsOf,
 } from './turn-stream.ts'
 import type { LiveSession } from './turn-stream.ts'
@@ -1862,11 +1863,10 @@ export class BridgeManager {
           // first, so a late update or a response naming it is never adopted as
           // this session's own turn; then forget the record (the notice de-dupe
           // set with it) so this response settles normally.
-          if (session.ambient !== undefined
-            && Date.now() - session.ambient.lastActivityAt > this.tuning.ambientStaleMs) {
-            retireAmbientId(session, session.ambient.requestId, false)
-            session.ambient = undefined
-            session.ambientNotices?.clear()
+          let active = activeDrain(session.drains)
+          if (active !== undefined && Date.now() - active.lastActivityAt > this.tuning.ambientStaleMs) {
+            expireAmbientDrain(session)
+            active = undefined
           }
           if (holdDispatch) {
             // The response may name one run while an announcement named
@@ -1881,12 +1881,12 @@ export class BridgeManager {
           // announced a background drain this turn has not spoken into: the
           // prompt was folded into that drain (CodeBuddy's multitask). The
           // response is a formality — keep the turn open until the drain speaks.
-          if (session.ambient !== undefined
+          if (active !== undefined
             && lifecycleOf(session) === 'live'
             && result.stopReason !== 'cancelled'
             && responseMeta?.conversationRequestId === undefined
             && !controller.hasAgentProse) {
-            controller.awaitAmbient(session.ambient.requestId, result.stopReason)
+            controller.awaitAmbient(active.requestId, result.stopReason)
             return
           }
           // No ambient record to wait on, but a drain this session stopped
@@ -1894,7 +1894,7 @@ export class BridgeManager {
           // prompt WITHOUT re-announcing itself. The turn cannot be held open
           // (nothing names the drain), but a silent close must say the output
           // may be in the transcript instead of blaming the agent.
-          if (session.ambient === undefined
+          if (active === undefined
             && result.stopReason !== 'cancelled'
             && responseMeta?.conversationRequestId === undefined
             && hasRecentRetiredAmbient(session, Math.max(this.tuning.ambientQuietMs * 2, RETIRED_AMBIENT_RECENT_MIN_MS))) {

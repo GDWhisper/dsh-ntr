@@ -29,7 +29,7 @@ import {
   BACKGROUND_REPORT_SOURCE,
   BACKGROUND_WAKE_TEXT,
 } from './registries.ts'
-import { chunkTextOf, codebuddyMetaOf, retireAmbientId } from './turn-stream.ts'
+import { activeDrain, chunkTextOf, codebuddyMetaOf, isConsumedDrain, retireAmbientId, stopDrain } from './turn-stream.ts'
 import type { LiveSession } from './turn-stream.ts'
 import type { BackgroundDispatch, BackgroundReport, DshAgentLike, SubagentCatalogReporter } from './types.ts'
 import { subagentDispatchDeclaresIdentity, subagentDispatchLabel } from './shape.ts'
@@ -126,7 +126,7 @@ export class SubagentService {
    * empty chunk, a thought tick, a tool frame — not just message prose. A run
    * that OPENED a tool call it never reported `completed` / `failed` for is
    * still answering: the quiet timer must not wake a half-report while a tool
-   * outlives the window (the tail would then be eaten by `consumedDrains`).
+   * outlives the window (the tail would then be eaten by the consumed record).
    * The real wire sends a tool's completion frame with NO `_meta` at all, so
    * the close is recognised by `toolCallId` alone (the dispatch-completion
    * convention); worker frames (`parentToolCallId`) never count.
@@ -152,8 +152,8 @@ export class SubagentService {
     // This run already delivered its answer (a closed wait, a hold, or an
     // earlier idle wake). Its late frames are transcript-only: reviving it
     // must not answer the same drain twice.
-    if (requestId !== undefined && session.consumedDrains?.has(requestId) === true) return
-    const ambient = session.ambient
+    if (requestId !== undefined && isConsumedDrain(session.drains, requestId)) return
+    const ambient = activeDrain(session.drains)
     if (ambient === undefined) return
     const toolCallId = typeof raw.toolCallId === 'string' && raw.toolCallId !== '' ? raw.toolCallId : undefined
     // A BARE completion of a call THIS run opened is the run's frame even with
@@ -599,7 +599,7 @@ export class SubagentService {
     if (report.delivered) return
     // The turn that folded this drain already delivered the answer (its quiet
     // close marked the id consumed). Waking now would answer the same run twice.
-    if (report.requestId !== undefined && session.consumedDrains?.has(report.requestId) === true) {
+    if (report.requestId !== undefined && isConsumedDrain(session.drains, report.requestId)) {
       this.dropBackgroundReport(session, report)
       return
     }
@@ -668,8 +668,9 @@ export class SubagentService {
     // the id is retired but NOT consumed and the ambient stays alive to collect
     // the tail into a fresh report.
     if (requestId !== undefined) {
+      const ownsAmbient = !cut && activeDrain(session.drains)?.requestId === requestId
       retireAmbientId(session, requestId, !cut)
-      if (!cut && session.ambient?.requestId === requestId) session.ambient = undefined
+      if (ownsAmbient) stopDrain(session.drains, requestId)
     }
     this.wakeChatWithBackgroundReport(session, agent, text)
   }

@@ -12,13 +12,15 @@ import {
 import type { AcpEvent, PermissionOutcome, StreamChunk } from '../protocol.ts'
 import { OUTPUT_CHARS_PER_TOKEN, TurnTpsTracker } from '../tps.ts'
 import { BACKGROUND_REPORT_MAX, recordAcpToolOutput, releaseAllToolOutputWaiters } from './registries.ts'
-import type { AmbientTurn, BackgroundDispatch, BackgroundReport, BridgeTuning, RetiredAmbient } from './types.ts'
+import type { BackgroundDispatch, BackgroundReport, BridgeTuning } from './types.ts'
 import { AsyncQueue } from './async-queue.ts'
 // Type-only edge into the manager; erased completely at runtime, so the
 // manager → controller value import stays acyclic.
 import type { BridgeManager } from './manager.ts'
 import type { LiveSession } from './live-session.ts'
 import { releasePromptSlot } from './session-lifecycle.ts'
+import { activeDrain, clearNotices, drainOf, hasRecentRetiredDrain, isConsumedDrain, isRetiredDrain, markNotice, retireDrain, reviveDrain, startDrain, stopDrain, touchDrain } from './drain-record.ts'
+export { activeDrain, drainOf, isConsumedDrain, markNotice, startDrain, stopDrain, touchDrain }
 
 export type { LiveSession } from './live-session.ts'
 
@@ -156,32 +158,12 @@ export function codebuddyMetaOf(source: unknown): CodebuddyMeta | undefined {
  * timestamp and moves it to the end.
  */
 export function retireAmbientId(session: LiveSession, requestId: string, consume = true): void {
-  const retired = session.retiredAmbients ?? []
-  const existing = retired.findIndex(entry => entry.requestId === requestId)
-  if (existing >= 0) retired.splice(existing, 1)
-  retired.push({ requestId, retiredAt: Date.now() })
-  while (retired.length > RETIRED_AMBIENT_MAX) retired.shift()
-  session.retiredAmbients = retired
-  // An answer that was DELIVERED (a closed wait, a hold, or an idle wake) is
-  // final: its later frames are transcript-only, never a second answer. A
-  // stale retirement (`consume: false`) delivered nothing, so a drain that
-  // comes back to life may still wake the chat.
-  if (!consume) return
-  const consumed = session.consumedDrains ?? new Set<string>()
-  session.consumedDrains = consumed
-  consumed.delete(requestId)
-  consumed.add(requestId)
-  while (consumed.size > CONSUMED_DRAIN_MAX) {
-    const oldest = consumed.values().next().value
-    if (oldest === undefined) break
-    consumed.delete(oldest)
-  }
+  session.drains = retireDrain(session.drains, requestId, Date.now(), consume)
 }
 
 /** Whether this request id names a drain the session already stopped waiting on. */
 export function isRetiredAmbientId(session: LiveSession, requestId: string | undefined): boolean {
-  return requestId !== undefined
-    && session.retiredAmbients?.some(entry => entry.requestId === requestId) === true
+  return isRetiredDrain(session.drains, requestId)
 }
 
 /**
@@ -192,10 +174,7 @@ export function isRetiredAmbientId(session: LiveSession, requestId: string | und
  * ordinary zero-output warning applies.
  */
 export function hasRecentRetiredAmbient(session: LiveSession, withinMs: number): boolean {
-  const retired = session.retiredAmbients
-  if (retired === undefined || retired.length === 0) return false
-  const cutoff = Date.now() - withinMs
-  return retired.some(entry => entry.retiredAt >= cutoff)
+  return hasRecentRetiredDrain(session.drains, withinMs)
 }
 
 /**
@@ -230,8 +209,7 @@ export function hasPendingBackgroundWork(
       if (dispatchWithinWindows(dispatch, dispatchSilenceMs, openToolCeilingMs, Date.now())) return true
     }
   }
-  return session.ambient !== undefined
-    && Date.now() - session.ambient.lastActivityAt <= ambientStaleMs
+  return (activeDrain(session.drains)?.lastActivityAt ?? Number.NEGATIVE_INFINITY) >= Date.now() - ambientStaleMs
 }
 
 /**
@@ -280,18 +258,21 @@ export function silenceWindowsOf(tuning: Required<BridgeTuning>): { silenceMs: n
 
 /**
  * The retired drain spoke again (an update or a re-announcement carried its
- * id): it is alive, not retired. The caller rebuilds {@link LiveSession.ambient}
- * so the next prompt folded into it is recognised as steered and its text can
- * reach the user's turn; only while the id stays retired does its text remain
- * transcript-only.
+ * id): it is alive, not retired, so the next prompt folded into it is
+ * recognised as steered and its text can reach the user's turn. Only while the
+ * id stays retired does its text remain transcript-only.
  */
 export function reviveAmbientId(session: LiveSession, requestId: string): void {
-  const retired = session.retiredAmbients
-  if (retired === undefined) return
-  const index = retired.findIndex(entry => entry.requestId === requestId)
-  if (index < 0) return
-  retired.splice(index, 1)
-  if (retired.length === 0) session.retiredAmbients = undefined
+  reviveDrain(session.drains, requestId)
+}
+
+/** Retire a stale drain, then forget its record and notice de-dupe. */
+export function expireAmbientDrain(session: LiveSession): void {
+  const stale = activeDrain(session.drains)
+  if (stale === undefined) return
+  retireAmbientId(session, stale.requestId, false)
+  stopDrain(session.drains, stale.requestId)
+  if (session.drains !== undefined) session.drains = clearNotices(session.drains)
 }
 
 /**
@@ -307,10 +288,7 @@ export function reviveAmbientId(session: LiveSession, requestId: string): void {
 export function clearAmbientState(session: LiveSession): void {
   if (session.backgroundReport?.timer !== undefined) clearTimeout(session.backgroundReport.timer)
   session.backgroundReport = undefined
-  session.ambient = undefined
-  session.ambientNotices?.clear()
-  session.retiredAmbients = undefined
-  session.consumedDrains = undefined
+  session.drains = undefined
   session.quotaRefusal = undefined
   // The Antigravity late-output state is transient too: a replay record only
   // speaks for the prompt that delivered it, and a watch must not outlive the
@@ -476,35 +454,11 @@ const PENDING_AMBIENT_MAX_ENTRIES = 200
 const PENDING_AMBIENT_MAX_CHARS = 64 * 1024
 
 /**
- * Bound on {@link LiveSession.ambientNotices}. The set now outlives the turn
- * that announced a drain (a hard ceiling keeps the record, and a repeated
- * announcement of the same run must stay silent), so it needs a ceiling of its
- * own for a chatty agent. Oldest ids are evicted first; an id that far back is
- * a run nobody is waiting on anymore.
- */
-export const AMBIENT_NOTICE_MAX = 64
-
-/**
- * Bound on {@link LiveSession.retiredAmbients}. The ids only exist to catch a
- * drain that speaks again after its wait closed, and the timestamp lets the
- * next silent close recognise a recent fold — a short-horizon concern, so a
- * small ring is enough; the oldest is evicted first.
- */
-export const RETIRED_AMBIENT_MAX = 32
-
-/**
  * Bound on {@link LiveSession.knownToolCalls}: the ids only exist to recognise
  * a replayed card, and an id older than this many completed turns is no longer
  * plausible. Oldest evicted first.
  */
 export const KNOWN_TOOL_CALL_MAX = 512
-
-/**
- * Bound on {@link LiveSession.consumedDrains}: one id per delivered answer.
- * The set only grows with drains this session actually consumed, so a small
- * ring covers every run whose late frames could still arrive; oldest first.
- */
-export const CONSUMED_DRAIN_MAX = 64
 
 /**
  * Floor for the "recently retired" lookback the zero-output fallback uses
@@ -673,7 +627,7 @@ export class TurnStreamController {
    * half of `retireAmbientId` PER RUN: only an answer the user has SEEN is
    * delivered — a close that printed nothing but the deferral line must leave
    * the id unconsumed, or a run that revives with the real answer would be
-   * eaten by `consumedDrains` and never reach the chat.
+   * eaten by the consumed drain record and never reach the chat.
    *
    * Per RUN id, never one turn-level bit: one turn can fold run A's answer
    * while the ambient record has already moved to run B. A turn-level bit would
@@ -1078,7 +1032,7 @@ export class TurnStreamController {
     // announcement may have named a different id than the response). One that
     // predates the turn is some earlier run's, and folding its text would mix
     // two answers.
-    const announced = this.session.ambient
+    const announced = activeDrain(this.session.drains)
     if (announced !== undefined && announced.startedAt >= this.constructedAt) {
       hold.acceptedIds.add(announced.requestId)
       if (hold.requestId === undefined) hold.requestId = announced.requestId
@@ -1341,8 +1295,8 @@ export class TurnStreamController {
    * else the hold's primary run — with its activity clock refreshed; the other
    * accepted ids are retired. A hold whose primary id had no session record
    * CREATES one, so a successor's `noteTurnRequestId` cannot adopt that id.
-   * Every accepted id therefore ends up either retired or owned by
-   * `session.ambient`; never both unowned and unretired.
+   * Every accepted id therefore ends up either retired or owned by the
+   * session's single active drain record; never both unowned and unretired.
    */
   private releaseBackgroundHoldIds(hold: BackgroundHold, options: { hard: boolean }): void {
     if (hold.retired) return
@@ -1352,28 +1306,22 @@ export class TurnStreamController {
       // consumed only when the hold actually SHOWED the run's answer text. A
       // zero-answer close printed just the deferral line — the answer was never
       // delivered, so a revived run must still be able to wake the chat.
+      const active = activeDrain(this.session.drains)?.requestId
       for (const id of hold.acceptedIds) retireAmbientId(this.session, id, hold.answerChars > 0)
-      if (this.session.ambient !== undefined && hold.acceptedIds.has(this.session.ambient.requestId)) {
-        this.session.ambient = undefined
-      }
+      if (active !== undefined && hold.acceptedIds.has(active)) stopDrain(this.session.drains, active)
       return
     }
-    const survivor = this.session.ambient?.requestId ?? hold.requestId
+    const survivor = activeDrain(this.session.drains)?.requestId ?? hold.requestId
     for (const id of hold.acceptedIds) {
       if (id === survivor) continue
       retireAmbientId(this.session, id)
     }
     if (survivor === undefined) return
     const now = Date.now()
-    if (this.session.ambient?.requestId === survivor) {
-      this.session.ambient.lastActivityAt = now
+    if (activeDrain(this.session.drains)?.requestId === survivor) {
+      touchDrain(this.session.drains, survivor, now)
     } else {
-      this.session.ambient = {
-        requestId: survivor,
-        startedAt: now,
-        lastActivityAt: now,
-        sawOutput: hold.answerChars > 0,
-      }
+      this.session.drains = startDrain(this.session.drains, survivor, now, now, hold.answerChars > 0)
     }
     // The surviving run is alive, not retired (an earlier wait of this turn
     // may have retired it before it spoke again).
@@ -1717,12 +1665,12 @@ export class TurnStreamController {
       // evidence — the drain was still ticking when the turn was cut — so the
       // record SURVIVES (activity clock refreshed; `ambientStaleMs` expires it
       // lazily) precisely so the next prompt folded into the same drain is
-      // still recognised as steered. `ambientNotices` is never cleared here:
+      // still recognised as steered. The notice ring is never cleared here:
       // a repeated announcement of the same run must stay silent, and the set
       // is bounded where entries are added.
       if (ambient !== undefined) {
         if (ambient.keepAmbient === true) {
-          if (this.session.ambient !== undefined) this.session.ambient.lastActivityAt = Date.now()
+          touchDrain(this.session.drains, activeDrain(this.session.drains)?.requestId, Date.now())
         } else {
           // Silence closed this wait, but silence is not proof the run ended: a
           // queued message or a long tool can make the drain speak again. So
@@ -1748,7 +1696,7 @@ export class TurnStreamController {
           for (const id of this.foldedDrainIds) {
             if (id !== ambient.requestId) retireAmbientId(this.session, id, true)
           }
-          this.session.ambient = undefined
+          stopDrain(this.session.drains, activeDrain(this.session.drains)?.requestId)
         }
       }
       // The turn's burst aggregate must be visible before the turn is marked
@@ -2270,7 +2218,7 @@ export class TurnStreamController {
   private isAmbientOwned(update: Record<string, unknown>): boolean {
     const requestId = codebuddyMetaOf(update)?.requestId
     if (requestId === undefined) return false
-    return requestId === this.session.ambient?.requestId
+    return requestId === activeDrain(this.session.drains)?.requestId
       || isRetiredAmbientId(this.session, requestId)
   }
 
@@ -2306,7 +2254,7 @@ export class TurnStreamController {
     // would make `isForeignAmbientText` pass the drain's own text through. A
     // RETIRED drain (its wait closed on silence, the run revived) is the same
     // trap — that id belongs to the background run whichever turn is on air.
-    if (requestId === undefined || requestId === this.session.ambient?.requestId) return
+    if (requestId === undefined || requestId === activeDrain(this.session.drains)?.requestId) return
     if (isRetiredAmbientId(this.session, requestId)) return
     this.turnRequestId = requestId
   }
@@ -2360,7 +2308,7 @@ export class TurnStreamController {
     if (isRetiredAmbientId(this.session, requestId)) return true
     if (this.turnRequestId === undefined) return false
     if (requestId === undefined || requestId === this.turnRequestId) return false
-    const ambient = this.session.ambient
+    const ambient = activeDrain(this.session.drains)
     return ambient !== undefined && requestId === ambient.requestId
   }
 
