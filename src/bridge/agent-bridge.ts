@@ -40,6 +40,7 @@ import type {
   PermissionTimeoutMode,
   SessionView,
 } from '../protocol.ts'
+import { mergeUsageSample } from '../usage.ts'
 import {
   PLUGIN_VERSION,
   isPerSessionAgent,
@@ -2186,13 +2187,8 @@ export class AgentBridge {
         session.plan = update.entries
         break
       case 'usage_update':
-        session.usage = {
-          used: update.used,
-          size: update.size,
-          ...(update.cost !== undefined && update.cost !== null
-            ? { cost: { amount: update.cost.amount, currency: update.cost.currency } }
-            : {}),
-        }
+        // A cost-only tick (CodeBuddy's team member) must not erase the reading.
+        session.usage = mergeUsageSample(session.usage, update)
         break
       case 'session_info_update':
         if (update.title !== undefined && update.title !== null) session.title = update.title

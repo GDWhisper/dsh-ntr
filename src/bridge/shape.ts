@@ -272,7 +272,10 @@ function isPersistedModes(value: unknown): value is SessionView['modes'] {
 function isPersistedUsage(value: unknown): value is SessionView['usage'] {
   if (value === null || typeof value !== 'object') return false
   const usage = value as { used?: unknown; size?: unknown }
-  return typeof usage.used === 'number' && typeof usage.size === 'number'
+  // A persisted 0/0 (a cost-only record written before the merge guard) is not
+  // a reading: loading it back would hide the ring until the agent speaks again.
+  return typeof usage.used === 'number' && usage.used >= 0
+    && typeof usage.size === 'number' && usage.size > 0
 }
 
 /** Tolerant shape check for a `burst` aggregate read back from disk. */

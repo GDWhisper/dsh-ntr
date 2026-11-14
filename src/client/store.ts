@@ -4132,15 +4132,15 @@ export const STATE_ONLY_UPDATES: ReadonlySet<string> = new Set([
 ])
 
 /**
- * Context occupancy carried by one raw `usage_update` frame, in the shape the
- * session snapshots already use. A malformed frame is ignored (the last good
- * sample stays on screen) instead of zeroing the meter.
+ * Context occupancy carried by one raw `usage_update` frame. A malformed or
+ * degenerate frame (CodeBuddy's cost-only team-member tick is `used: 0, size: 0`)
+ * is ignored: the last good sample stays on screen instead of a zeroed meter.
  */
 export function usageFromUpdate(update: Record<string, unknown>): SessionView['usage'] | undefined {
   const used = update.used
   const size = update.size
-  if (typeof used !== 'number' || !Number.isFinite(used)) return undefined
-  if (typeof size !== 'number' || !Number.isFinite(size)) return undefined
+  if (typeof used !== 'number' || !Number.isFinite(used) || used < 0) return undefined
+  if (typeof size !== 'number' || !Number.isFinite(size) || size <= 0) return undefined
   const cost = update.cost
   if (cost !== null && typeof cost === 'object' && !Array.isArray(cost)) {
     const row = cost as Record<string, unknown>
