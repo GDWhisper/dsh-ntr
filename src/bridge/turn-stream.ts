@@ -19,8 +19,8 @@ import { AsyncQueue } from './async-queue.ts'
 import type { BridgeManager } from './manager.ts'
 import type { LiveSession } from './live-session.ts'
 import { releasePromptSlot } from './session-lifecycle.ts'
-import { activeDrain, clearNotices, drainOf, hasRecentRetiredDrain, isConsumedDrain, isRetiredDrain, markNotice, retireDrain, reviveDrain, startDrain, stopDrain, touchDrain } from './drain-record.ts'
-export { activeDrain, drainOf, isConsumedDrain, markNotice, startDrain, stopDrain, touchDrain }
+import { activeDrain, clearNotices, drainOf, hasRecentRetiredDrain, isConsumedDrain, isRetiredDrain, markNotice, openDrainGeneration, retireDrain, reviveDrain, startDrain, stopDrain, touchDrain, type DrainDelivery } from './drain-record.ts'
+export { activeDrain, drainOf, isConsumedDrain, markNotice, openDrainGeneration, startDrain, stopDrain, touchDrain }
 
 export type { LiveSession } from './live-session.ts'
 
@@ -156,9 +156,15 @@ export function codebuddyMetaOf(source: unknown): CodebuddyMeta | undefined {
  * the next turn's own. Bounded, oldest first — an id this far back names a run
  * no late update can plausibly still carry. Re-retiring an id refreshes its
  * timestamp and moves it to the end.
+ *
+ * `delivery` says WHO delivered the answer (see `DrainDelivery`): `'none'` =
+ * nothing was delivered, `'turn'` = a user turn folded it, `'wake'` = an idle
+ * wake handed it to the chat plane. Required, not defaulted: an omitted
+ * argument must never silently consume, and TypeScript rejects an explicit
+ * `undefined` only when there is no default to swallow it.
  */
-export function retireAmbientId(session: LiveSession, requestId: string, consume = true): void {
-  session.drains = retireDrain(session.drains, requestId, Date.now(), consume)
+export function retireAmbientId(session: LiveSession, requestId: string, delivery: DrainDelivery): void {
+  session.drains = retireDrain(session.drains, requestId, Date.now(), delivery)
 }
 
 /** Whether this request id names a drain the session already stopped waiting on. */
@@ -270,7 +276,7 @@ export function reviveAmbientId(session: LiveSession, requestId: string): void {
 export function expireAmbientDrain(session: LiveSession): void {
   const stale = activeDrain(session.drains)
   if (stale === undefined) return
-  retireAmbientId(session, stale.requestId, false)
+  retireAmbientId(session, stale.requestId, 'none')
   stopDrain(session.drains, stale.requestId)
   if (session.drains !== undefined) session.drains = clearNotices(session.drains)
 }
@@ -623,8 +629,8 @@ export class TurnStreamController {
   private echoBuffer?: string
   /**
    * The drain run ids whose visible answer text this turn FOLDED (the fold
-   * treatment set). `closeTurn`'s quiet close reads it to decide the `consume`
-   * half of `retireAmbientId` PER RUN: only an answer the user has SEEN is
+   * treatment set). `closeTurn`'s quiet close reads it to decide the
+   * `retireAmbientId` delivery PER RUN: only an answer the user has SEEN is
    * delivered — a close that printed nothing but the deferral line must leave
    * the id unconsumed, or a run that revives with the real answer would be
    * eaten by the consumed drain record and never reach the chat.
@@ -1302,19 +1308,19 @@ export class TurnStreamController {
     if (hold.retired) return
     hold.retired = true
     if (!options.hard) {
-      // `consume` mirrors the quiet-close rule in `closeTurn`: an id is marked
+      // `delivery` mirrors the quiet-close rule in `closeTurn`: an id is marked
       // consumed only when the hold actually SHOWED the run's answer text. A
       // zero-answer close printed just the deferral line — the answer was never
       // delivered, so a revived run must still be able to wake the chat.
       const active = activeDrain(this.session.drains)?.requestId
-      for (const id of hold.acceptedIds) retireAmbientId(this.session, id, hold.answerChars > 0)
+      for (const id of hold.acceptedIds) retireAmbientId(this.session, id, hold.answerChars > 0 ? 'turn' : 'none')
       if (active !== undefined && hold.acceptedIds.has(active)) stopDrain(this.session.drains, active)
       return
     }
     const survivor = activeDrain(this.session.drains)?.requestId ?? hold.requestId
     for (const id of hold.acceptedIds) {
       if (id === survivor) continue
-      retireAmbientId(this.session, id)
+      retireAmbientId(this.session, id, 'turn')
     }
     if (survivor === undefined) return
     const now = Date.now()
@@ -1682,19 +1688,19 @@ export class TurnStreamController {
           // the drain's text on the chat plane (transcript-only); a double
           // answer is worse.
           //
-          // `consume` is evidence-based and PER RUN (see `foldedDrainIds`): an
+          // `delivery` is evidence-based and PER RUN (see `foldedDrainIds`): an
           // id is marked consumed only when this turn actually FOLDED that
           // run's visible answer. A zero-output close (just the deferral line
-          // above) delivered nothing — same reasoning as the stale expiry's
-          // `consume: false` — so the id stays unconsumed and a run that revives
+          // above) delivered nothing — same evidence rule as the stale expiry's
+          // `'none'` — so the id stays unconsumed and a run that revives
           // with the real answer can still wake the chat.
-          if (ambient.requestId !== undefined) retireAmbientId(this.session, ambient.requestId, this.foldedDrainIds.has(ambient.requestId))
+          if (ambient.requestId !== undefined) retireAmbientId(this.session, ambient.requestId, this.foldedDrainIds.has(ambient.requestId) ? 'turn' : 'none')
           // Runs this turn folded whose id the retire above did not cover (the
           // ambient record moved to another run mid-turn): their answers WERE
           // delivered, so consume them too — a revived run must never answer
           // the same text a second time.
           for (const id of this.foldedDrainIds) {
-            if (id !== ambient.requestId) retireAmbientId(this.session, id, true)
+            if (id !== ambient.requestId) retireAmbientId(this.session, id, 'turn')
           }
           stopDrain(this.session.drains, activeDrain(this.session.drains)?.requestId)
         }
@@ -2389,7 +2395,7 @@ export class TurnStreamController {
         this.sawVisibleText = true
         // The fold treatment set (see `foldedDrainIds`): text that belongs to
         // a drain being folded is an answer DELIVERED to the user, recorded
-        // under THAT run's id — the quiet close's per-run `consume` decision
+        // under THAT run's id — the quiet close's per-run `delivery` decision
         // must reflect it even when the ambient record has moved on to another
         // run.
         const drainId = codebuddyMetaOf(update)?.requestId

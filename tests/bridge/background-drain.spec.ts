@@ -14,6 +14,7 @@ import {
   isConsumedDrain,
   isRetiredDrain,
   markNotice,
+  openDrainGeneration,
   retireDrain,
   reviveDrain,
   startDrain,
@@ -816,7 +817,7 @@ describe('the drain ledger rings and guards (unit)', () => {
   it('evicts the oldest retired drain id past the 32-entry ring and drops its record', () => {
     let ledger = createDrainLedger()
     for (let index = 0; index <= RETIRED_AMBIENT_MAX; index += 1) {
-      ledger = retireDrain(ledger, `retired-${String(index)}`, 1_000 + index, false)
+      ledger = retireDrain(ledger, `retired-${String(index)}`, 1_000 + index, 'none')
     }
     expect(ledger.retired).toHaveLength(RETIRED_AMBIENT_MAX)
     expect(ledger.retired[0]).toBe('retired-1')
@@ -831,7 +832,7 @@ describe('the drain ledger rings and guards (unit)', () => {
   it('keeps a revived drain consumed and evicts the oldest consumed id past its ring', () => {
     let ledger = createDrainLedger()
     ledger = startDrain(ledger, 'run-revived', 1, 1, true)
-    ledger = retireDrain(ledger, 'run-revived', 2, true)
+    ledger = retireDrain(ledger, 'run-revived', 2, 'turn')
     stopDrain(ledger, 'run-revived')
     reviveDrain(ledger, 'run-revived')
     // Revival clears the retirement but never the delivery evidence; the run
@@ -842,12 +843,49 @@ describe('the drain ledger rings and guards (unit)', () => {
     expect(activeDrain(ledger)?.requestId).toBe('run-revived')
     expect(isConsumedDrain(ledger, 'run-revived')).toBe(true)
     for (let index = 0; index < CONSUMED_DRAIN_MAX; index += 1) {
-      ledger = retireDrain(ledger, `consumed-${String(index)}`, 10 + index, true)
+      ledger = retireDrain(ledger, `consumed-${String(index)}`, 10 + index, 'turn')
     }
     expect(ledger.consumed).toHaveLength(CONSUMED_DRAIN_MAX)
     expect(ledger.consumed).not.toContain('run-revived')
     expect(isConsumedDrain(ledger, 'run-revived')).toBe(false)
     expect(isConsumedDrain(ledger, `consumed-${String(CONSUMED_DRAIN_MAX - 1)}`)).toBe(true)
+  })
+
+  it('opens a new drain generation only over a wake delivery, never over a turn fold', () => {
+    // CodeBuddy's `codebuddy.ai/requestId` is conversation-request scoped: every
+    // drain of one user request reuses the id. A WAKE delivery ended the run, so
+    // the next drain's announcement must open a fresh generation (the lost
+    // message this pins). A TURN FOLD does not end the run — its late
+    // re-announcement is the same run, and must stay transcript-only.
+    let ledger = startDrain(createDrainLedger(), 'conv-run', 1, 1, true)
+    ledger = markNotice(ledger, 'conv-run', 2)
+    ledger = retireDrain(ledger, 'conv-run', 3, 'turn')
+    expect(isConsumedDrain(ledger, 'conv-run')).toBe(true)
+    const folded = openDrainGeneration(ledger, 'conv-run')
+    expect(folded).toBe(ledger)
+    expect(isConsumedDrain(folded, 'conv-run')).toBe(true)
+    expect(folded.consumed).toContain('conv-run')
+
+    ledger = markNotice(ledger, 'conv-run', 4)
+    ledger = retireDrain(ledger, 'conv-run', 5, 'wake')
+    const woken = openDrainGeneration(ledger, 'conv-run')
+    // The delivered mark, its ring entry and the notice de-dupe all go away, so
+    // the second drain is collected and announced like the first one.
+    expect(isConsumedDrain(woken, 'conv-run')).toBe(false)
+    expect(woken.consumed).not.toContain('conv-run')
+    expect(woken.notices).not.toContain('conv-run')
+    expect(woken.records.get('conv-run')?.noticeSent).toBe(false)
+    // The closed wait survives: the announcement path revives + starts the run.
+    expect(isRetiredDrain(woken, 'conv-run')).toBe(true)
+    expect(activeDrain(woken)?.requestId).toBe('conv-run')
+
+    // Nothing delivered, and an id the ledger never saw: both are no-ops with
+    // no dereference (an announcement for a FIRST drain passes a missing record
+    // through this function, so a crash here would break every new run).
+    const undelivered = retireDrain(woken, 'conv-undelivered', 6, 'none')
+    expect(openDrainGeneration(undelivered, 'conv-undelivered')).toBe(undelivered)
+    expect(isConsumedDrain(undelivered, 'conv-undelivered')).toBe(false)
+    expect(openDrainGeneration(undelivered, 'conv-never-seen')).toBe(undelivered)
   })
 
   it('keeps drain bookkeeping out of the session view and the persisted row', () => {

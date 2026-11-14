@@ -13,13 +13,29 @@
  * only in combination:
  * - `active`: this id owns the session's single ambient slot;
  * - `retiredAt`: the wait on it closed (silence, ceiling, hold, teardown);
- * - `consumed`: its answer was DELIVERED, so late frames stay transcript-only;
+ * - `consumedBy`: its answer was DELIVERED — by the user's turn or by an idle
+ *   wake — so late frames stay transcript-only;
  * - `noticeSent`: the `agent/notice` for its announcement already went out.
  *
  * Retired and consumed are independent on purpose: a retired-but-unconsumed
  * drain may still wake the chat when it revives, while a revived drain that
  * was already consumed stays silent.
  */
+
+/**
+ * Who took a drain's answer. `'turn'` folded it into the user's own turn (the
+ * run may still be speaking, so a later announcement of the id is that same
+ * run); `'wake'` delivered it to the chat plane as its own message (the run is
+ * over). Only `'wake'` can open a new generation — see `openDrainGeneration`.
+ */
+export type DrainConsumer = 'turn' | 'wake'
+
+/**
+ * How one wait closed. `'none'` means nothing was delivered (a zero-output
+ * close), so a revived run must still be able to wake the chat. Explicit, not
+ * an optional parameter: `undefined` would silently take the `'turn'` default.
+ */
+export type DrainDelivery = 'none' | DrainConsumer
 
 /** One background drain's lifetime, keyed by its `codebuddy.ai/requestId`. */
 export interface DrainRecord {
@@ -34,8 +50,9 @@ export interface DrainRecord {
   noticeSent: boolean
   /** When the wait on this run closed; absent = never retired. */
   retiredAt?: number
-  /** The run's answer was delivered; late frames are transcript-only. */
-  consumed: boolean
+  /** Who delivered the run's answer; absent = nothing delivered, late frames
+   *  may still wake the chat. */
+  consumedBy?: DrainConsumer
 }
 
 /**
@@ -85,7 +102,6 @@ function ensure(ledger: DrainLedger, requestId: string, at: number): DrainRecord
     lastActivityAt: at,
     sawOutput: false,
     noticeSent: false,
-    consumed: false,
   }
   ledger.records.set(requestId, record)
   return record
@@ -115,7 +131,7 @@ function reconcile(ledger: DrainLedger): void {
   const notices = new Set(ledger.notices)
   for (const record of [...ledger.records.values()]) {
     if (record.retiredAt !== undefined && !retired.has(record.requestId)) record.retiredAt = undefined
-    if (record.consumed && !consumed.has(record.requestId)) record.consumed = false
+    if (record.consumedBy !== undefined && !consumed.has(record.requestId)) record.consumedBy = undefined
     if (record.noticeSent && !notices.has(record.requestId)) record.noticeSent = false
     prune(ledger, record)
   }
@@ -213,25 +229,27 @@ export function reviveDrain(ledger: DrainLedger | undefined, requestId: string):
 }
 
 /**
- * Bookkeeping only: the wait on this run closed. `consume` is decided per path
- * by the caller and never re-derived here (see the five retire paths in the
- * plan). The ambient slot is NOT touched — a ceiling cut or a run switch keeps
- * the run alive, so clearing the slot is a separate {@link stopDrain} at the
- * path that really ends it. Re-retiring refreshes `retiredAt` and moves the id
- * to the end of the ring (the recency window `hasRecentRetiredDrain` reads).
+ * Bookkeeping only: the wait on this run closed. `delivery` is decided per
+ * path by the caller and never re-derived here (see the five retire paths in
+ * the plan): `'none'` = nothing was delivered, `'turn'` = a user turn folded the
+ * answer, `'wake'` = an idle wake delivered it. The ambient slot is NOT
+ * touched — a ceiling cut or a run switch keeps the run alive, so clearing the
+ * slot is a separate {@link stopDrain} at the path that really ends it.
+ * Re-retiring refreshes `retiredAt` and moves the id to the end of the ring
+ * (the recency window `hasRecentRetiredDrain` reads).
  */
 export function retireDrain(
   ledger: DrainLedger | undefined,
   requestId: string,
   retiredAt: number,
-  consume: boolean,
+  delivery: DrainDelivery,
 ): DrainLedger {
   const next = ledger ?? createDrainLedger()
   ringPush(next.retired, requestId, RETIRED_AMBIENT_MAX)
-  if (consume) ringPush(next.consumed, requestId, CONSUMED_DRAIN_MAX)
+  if (delivery !== 'none') ringPush(next.consumed, requestId, CONSUMED_DRAIN_MAX)
   const record = ensure(next, requestId, retiredAt)
   record.retiredAt = retiredAt
-  if (consume) record.consumed = true
+  if (delivery !== 'none') record.consumedBy = delivery
   reconcile(next)
   assertAtMostOneActive(next)
   return next
@@ -274,5 +292,40 @@ export function hasRecentRetiredDrain(ledger: DrainLedger | undefined, withinMs:
 
 /** Whether this run's answer already reached a turn or the chat plane. */
 export function isConsumedDrain(ledger: DrainLedger | undefined, requestId: string | undefined): boolean {
-  return drainOf(ledger, requestId)?.consumed === true
+  return drainOf(ledger, requestId)?.consumedBy !== undefined
+}
+
+/**
+ * A new unsolicited-turn announcement named an id whose answer an IDLE WAKE had
+ * already delivered. CodeBuddy's `codebuddy.ai/requestId` is
+ * conversation-request scoped, not run scoped: every drain of one user
+ * request carries the same id, so the consumed mark set by the previous
+ * drain's delivery would muzzle the whole new run (its frames would stay
+ * transcript-only and the chat would never wake). The announcement is the
+ * run boundary — the id starts a new generation: drop the consumed mark
+ * AND the notice de-dupe so the new run is collected and announced like
+ * the first one. The closed wait (`retiredAt`) stays — unless the retired ring
+ * already evicted the id, in which case `reconcile` drops it too and the
+ * caller's `startDrain` rebuilds the record; revive plus start re-open it
+ * either way.
+ *
+ * ONLY a wake delivery ends a run. A turn fold does not — the run may still be
+ * speaking, and a late re-announcement of it is the SAME run continuing, so it
+ * stays transcript-only (a second wake would answer one run twice). Late frames
+ * of ANY delivered run that arrive WITHOUT an announcement also keep the
+ * consumed mark (see `reviveDrain`); only an announcement opens a generation.
+ */
+export function openDrainGeneration(ledger: DrainLedger | undefined, requestId: string): DrainLedger {
+  const next = ledger ?? createDrainLedger()
+  const record = next.records.get(requestId)
+  if (record?.consumedBy !== 'wake') return next
+  const consumedIndex = next.consumed.indexOf(requestId)
+  if (consumedIndex >= 0) next.consumed.splice(consumedIndex, 1)
+  const noticeIndex = next.notices.indexOf(requestId)
+  if (noticeIndex >= 0) next.notices.splice(noticeIndex, 1)
+  record.consumedBy = undefined
+  record.noticeSent = false
+  reconcile(next)
+  assertAtMostOneActive(next)
+  return next
 }

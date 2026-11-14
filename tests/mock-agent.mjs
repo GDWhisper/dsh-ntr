@@ -154,7 +154,10 @@
  *  - "DISPATCHLATE" (with DISPATCH) → the same drained run emits ONE more
  *              `agent_message_chunk` ~700ms after its quiet window closed: the
  *              answer was already delivered, so it must stay transcript-only
- *              (no second wake, no second bubble)
+ *              (no second wake, no second bubble). Use with "DISPATCHTWICE" to
+ *              model CodeBuddy's conversation-scoped request id (same id for
+ *              every drain): the second drain re-announces that id AFTER the
+ *              first delivery consumed it; the chat must wake again.
  *  - "DISPATCHPARKED" (with DISPATCH) → the response lands between driver
  *              steps (right after the ack) and the worker starts while the
  *              host is away: a parked hold's step must adopt it later
@@ -839,26 +842,14 @@ const app = agent({ name: 'mock-acp-agent' })
         { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
         { 'codebuddy.ai/requestId': parentRun },
       )
+      // Worker's own turn: prose, a tool, its report. None of it is the
+      // session's answer; it belongs in the ACP transcript view.
       const workerTurn = async (id, parent, toolCallId) => {
-        // The worker's own turn: prose, a tool, its report. None of it is the
-        // session's answer; it belongs in the ACP transcript view.
         await sendWorker({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'WORKER-THOUGHT ' } }, id, parent)
         await sendWorker({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'WORKER-INTERNAL-TEXT ' } }, id, parent)
-        await sendWorker({
-          sessionUpdate: 'tool_call',
-          toolCallId,
-          title: 'Bash',
-          kind: 'execute',
-          status: 'in_progress',
-          rawInput: { command: 'rg TODO src' },
-        }, id, parent)
+        await sendWorker({ sessionUpdate: 'tool_call', toolCallId, title: 'Bash', kind: 'execute', status: 'in_progress', rawInput: { command: 'rg TODO src' } }, id, parent)
         await sleep(ultraLongTool ? 10_000 : longTool ? 2_500 : slow ? 400 : 60)
-        await sendWorker({
-          sessionUpdate: 'tool_call_update',
-          toolCallId,
-          status: 'completed',
-          content: [{ type: 'content', content: { type: 'text', text: 'src/a.ts:3 TODO' } }],
-        }, id, parent)
+        await sendWorker({ sessionUpdate: 'tool_call_update', toolCallId, status: 'completed', content: [{ type: 'content', content: { type: 'text', text: 'src/a.ts:3 TODO' } }] }, id, parent)
         await sendWorker({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'WORKER-REPORT-TEXT ' } }, id, parent)
         if (keepAlive) {
           // Live evidence far beyond the client's 1.5s worker-phase window.
@@ -871,20 +862,9 @@ const app = agent({ name: 'mock-acp-agent' })
       }
       const drainTurn = async (finalText = 'DISPATCH-FINAL-ANSWER', announceRun = true) => {
         if (announceRun && !altFirst) await announce(parentRun)
-        await sendDrain({
-          sessionUpdate: 'tool_call',
-          toolCallId: 'drain_task_output',
-          title: 'TaskOutput',
-          kind: 'read',
-          status: 'in_progress',
-        }, 'TaskOutput')
+        await sendDrain({ sessionUpdate: 'tool_call', toolCallId: 'drain_task_output', title: 'TaskOutput', kind: 'read', status: 'in_progress' }, 'TaskOutput')
         await sleep(slow ? 300 : 40)
-        await sendDrain({
-          sessionUpdate: 'tool_call_update',
-          toolCallId: 'drain_task_output',
-          status: 'completed',
-          content: [{ type: 'content', content: { type: 'text', text: 'WORKER REPORT BODY' } }],
-        })
+        await sendDrain({ sessionUpdate: 'tool_call_update', toolCallId: 'drain_task_output', status: 'completed', content: [{ type: 'content', content: { type: 'text', text: 'WORKER REPORT BODY' } }] })
         // The parent's own answer — the text the main chat must receive.
         await sendDrain({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: finalText } })
       }
@@ -1061,6 +1041,14 @@ const app = agent({ name: 'mock-acp-agent' })
             return
           }
           await drainTurn(altFirst ? 'DISPATCH-ALT-ANSWER' : 'DISPATCH-FINAL-ANSWER')
+          if (text.includes('DISPATCHTWICE')) {
+            // CodeBuddy reuses the conversation-level request id for EVERY
+            // drain. After the first report's quiet delivery consumes that id,
+            // the second drain re-announces the SAME id — it must wake again.
+            await sleep(900)
+            await announce(parentRun)
+            await drainTurn('DISPATCH-SECOND-ANSWER', false)
+          }
           if (text.includes('DISPATCHLATE')) {
             // The SAME drained run speaks once more, long after its quiet
             // window closed: the answer was already delivered, so this late

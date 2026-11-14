@@ -66,6 +66,7 @@ import {
   hasPendingBackgroundWork,
   isRetiredAmbientId,
   markNotice,
+  openDrainGeneration,
   permissionToolName,
   reviveAmbientId,
   silenceWindowsOf,
@@ -2095,7 +2096,7 @@ export class AgentBridge {
     // re-announcement below does the same for its id.
     //
     // `retiredDrain` only drives the revive below: an already-consumed run
-    // stays transcript-only for the idle collector (its `DrainRecord.consumed`),
+    // stays transcript-only for the idle collector (its `DrainRecord.consumedBy`),
     // so this frame cannot open a second answer after its deferral.
     const retiredDrain = !replay && meta?.requestId !== undefined && isRetiredAmbientId(session, meta.requestId)
     if (retiredDrain && meta?.requestId !== undefined) {
@@ -2109,6 +2110,9 @@ export class AgentBridge {
       // request id) can be kept open until the drain speaks. Announced once per
       // request id — a repeated announcement is the same run, not news.
       const run = meta.unsolicitedTurn
+      // EVERY drain of one user request shares this id (conversation-scoped): a
+      // new announcement after an idle-wake delivery opens a fresh generation.
+      session.drains = openDrainGeneration(session.drains, run.requestId)
       // A re-announcement also revives a drain whose wait already closed: the
       // same run is alive, and the notice de-dupe ring keeps it silent.
       reviveAmbientId(session, run.requestId)

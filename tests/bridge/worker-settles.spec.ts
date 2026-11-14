@@ -276,6 +276,39 @@ describe('a detached worker settles the turn at the response (isolated manager)'
     }
   }, 30_000)
 
+  it('wakes again when a second drain re-announces the same request id', async () => {
+    // CodeBuddy's `codebuddy.ai/requestId` is conversation-request scoped:
+    // every drain of one user request carries the SAME id. After the first
+    // drain's quiet delivery consumes that id, the second drain re-announces
+    // it — its announcement opens a fresh generation and the chat must wake
+    // again with the second report. Without regeneration the second drain's
+    // frames stay transcript-only (the regression this pins).
+    const { manager, events, adapter } = idleHarness({ idleTimeoutMs: 8_000 })
+    const dshSessionId = 'dsh-settle-wake-twice'
+    const wakes: Array<{ source?: { report?: string } }> = []
+    manager.setDshAgentResolver(id => id === dshSessionId
+      ? { session: { id: dshSessionId }, followup: message => { wakes.push(message as (typeof wakes)[number]) } }
+      : undefined)
+    try {
+      await hostLoopTurn(adapter, {
+        provider: 'acp',
+        model: 'settle',
+        sessionId: dshSessionId,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'DISPATCHTWICE please' }] }],
+      })
+      // Two drains share the id; both must wake the chat.
+      await until(() => wakes.length >= 2, 10_000)
+      expect(wakes).toHaveLength(2)
+      expect(wakes[0]?.source?.report).toContain('DISPATCH-FINAL-ANSWER')
+      expect(wakes[1]?.source?.report).toContain('DISPATCH-SECOND-ANSWER')
+      // Both reports landed in the transcript too.
+      expect(sawAgentText(events, 'DISPATCH-FINAL-ANSWER')).toBe(true)
+      expect(sawAgentText(events, 'DISPATCH-SECOND-ANSWER')).toBe(true)
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
   it('reads the OLDEST unanswered wake (FIFO), and calls a report-less one lost', () => {
     const wake = (report: string | undefined, form: string | null = BACKGROUND_REPORT_FORM) => ({
       role: 'user',

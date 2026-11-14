@@ -661,15 +661,17 @@ export class SubagentService {
     this.dropBackgroundReport(session, report)
     // Retire the id EVEN when a newer announcement replaced the ambient
     // record: that replacement is another run, and this one's answer is out.
-    // A COMPLETE quiet delivery is final: consume the id so late frames stay
-    // transcript-only (no duplicate answer). A ceiling CUT delivered a
-    // truncated report while the run was still active — its continuation (the
-    // real deliverable the user is waiting for) must still wake the chat, so
-    // the id is retired but NOT consumed and the ambient stays alive to collect
-    // the tail into a fresh report.
+    // A COMPLETE quiet delivery is final: consume the id — as a `'wake'`, the
+    // only delivery that ENDS a run — so late frames stay transcript-only (no
+    // duplicate answer) while the next drain of the same conversation-scoped
+    // request id may open a new generation on its own announcement. A ceiling
+    // CUT delivered a truncated report while the run was still active — its
+    // continuation (the real deliverable the user is waiting for) must still
+    // wake the chat, so the id is retired but NOT consumed and the ambient stays
+    // alive to collect the tail into a fresh report.
     if (requestId !== undefined) {
       const ownsAmbient = !cut && activeDrain(session.drains)?.requestId === requestId
-      retireAmbientId(session, requestId, !cut)
+      retireAmbientId(session, requestId, cut ? 'none' : 'wake')
       if (ownsAmbient) stopDrain(session.drains, requestId)
     }
     this.wakeChatWithBackgroundReport(session, agent, text)
