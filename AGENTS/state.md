@@ -175,6 +175,16 @@
 - **已知边界**：删除写盘失败后墓碑只在进程内有效；重启前若没有一次成功写盘，旧 agent 仍可能从文件复活，但 RPC 已返回 `persist_failed`。`stopAgent` 的非严格持久化失败只发通知，磁盘可能保留旧 `chatSessions`，重启后可能恢复可 resume。
 - 宿主接入点（可选，不在本仓改文件）：`dsh-settings` 的 `SettingsForms.write` 在 `canSaveNow() === false` 时 `await gate.defer(...)`，失败时重抛 `outcome.error` 以保留 `settings/conflict` 分类；`dsh-hmr` 的 `reconcileProfile` 在 ACP 回合活动时 `await gate.waitForIdle()`，超时则用 `onIdle` 重试。Q 已覆盖当前设置保存路径；这两处宿主改动是更耐久的替代/补强，而不是 Q 的前提。
 
+## 10. 状态表示纪律
+
+一个事务只保留一个显式判别字段，用字符串字面量联合，状态集合在类型里列全。**严禁**用 `enum`；**严禁**把状态拆成多个独立布尔 / `Set` 再靠多字段同真判定；**严禁**靠写入时序、effect 顺序、`at` 基线、`sawQueue` 之类痕迹反推当前态。
+
+迁移只在命名纯函数里发生，附属数据与判别字段分开存。可并存的排程（Promise 句柄、`Set`）不压进单值 phase。破坏性查询与非破坏性查询不能混用。
+
+双写过渡期必须断言新旧两套一致；收口时删净旧字段，让判别字段成为唯一真相。内部阶段不进协议、快照与持久化（对外形状如 `SaveGateStatus` 只暴露对外事实）。
+
+改状态先补不变量测试，再改迁移函数。字段映射范例见 `docs/plan/implicit-state-machines.md`；协议侧的会话生命周期（阶段 5）与后台 drain 身份（阶段 6）同样适用本纪律，互链见 [protocol.md §2](./protocol.md) / [protocol.md §6](./protocol.md)。
+
 ## 代码索引
 
 | 主题 | 位置 |

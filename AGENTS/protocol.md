@@ -45,6 +45,8 @@
 
 ## 2. 进程死亡 ≠ 会话销毁
 
+本节的会话生命周期（阶段 5，`src/bridge/session-lifecycle.ts` · `SessionLifecycle`）同样把状态收敛成单一显式判别字段，适用 [state.md · 状态表示纪律](./state.md) 的正向要求与严禁清单。
+
 **崩溃路径**：`connectionLost` 只能走 `AgentBridge.releaseAll`——会话标记 `released`、settled 权限、广播 `session/released`。**已 `closed` 的会话跳过**：它的记录归 `closeSession` 删，标成 `released` 会让 `doResumeSession` 把 `closed` 翻回 `false`，复活一条正在关闭的会话。严禁在崩溃路径删除会话记录或广播 `session/closed`。
 
 **未结算 prompt 保护**：`AgentBridge.pendingPrompts` 是「会话 id → 计数」的 Map，在 `session/prompt` 请求发出前加一、在响应或错误落地时减一，包住整个 await。两套读数刻意不同：`hasActiveWork()` 的严格计数（含已 `closed` 会话）进入 `isQuiet()`，所以 `pruneBridge` 与工作区搬迁必须等残留请求落地；空闲释放用 `hasActiveWork(false)` 的 `pendingPromptsOnServableSessions()`，只数 live / released 会话上的请求——已 `closed` 会话的永不答复不能钉死进程（约束 19）。`streamPrompt` 结算后的 `.finally` 再补一次 `pruneBridge`。没有这层，「会话关了、请求还在跑」会把唯一能答的进程杀掉，pending request 永远悬挂；没有放宽，一个坏 agent 会让进程永久常驻。
@@ -101,6 +103,8 @@
 - **busy 只等事件，不轮询**：仍有活跃工作时 `releaseArchivedSession` 返回 `busy`，pending 保留，由 `turn/end`、`session/released`、`session/closed`、`agent/status` 再 drain。取消归档只从集合移除、不释放；已 released 的重复归档不发第二帧；不支持 `loadSession` 的 agent 报 `unsupported` 并保留进程（park 会丢上下文）。**`releaseAll` 会 park 该进程上的全部 live 会话**，所以同 agent 的兄弟会话也会变成 released、显示释放横幅，并在下一条消息经 `session/load` 自动恢复——这是共享进程的既定语义，不是归档泄漏。
 
 ## 6. 轮次收尾与分段
+
+本节的后台 drain 身份（阶段 6，`src/bridge/drain-record.ts` · `DrainRecord` / `DrainLedger`）同样把状态收敛成单一显式判别字段，适用 [state.md · 状态表示纪律](./state.md) 的正向要求与严禁清单。
 
 - `turn/end` 的权威来源是 `session/prompt` 的**响应**。`settle` 当场认领（幂等，与看门狗竞速），收口工作隔一个宏任务（`setImmediate` → `flushScheduledClose`）：`drainTail` 把**已进入 transcript** 却还没折进段的通知按序补读（停在切段事件之前；stale 回合不补读；只读已到达的通知，不无限等待），`finalizeTps` 的 final `turn/metrics` 先于 `turn/end`；续跑段若在这个窗口打开，先 flush 这次收口。**拆除当场作废这次收口**：`TurnStreamController.dispose`（关会话 / retire）清掉 `closeScheduled` / `pendingOutcome`，settle 之后紧接的拆除不会在宏任务里补发第二帧 `turn/end`；同一窗口里的用户 abort 则丢掉排队结果、就地按 cancelled 收口（`abortActiveSegment`）。强制定稿**恰有两条**受控路径：`session/cancel` 后的 `armCancelFallback`（§4，人已经按过取消）与无活动看门狗（§6.1，agent 自己彻底沉默）。**严禁**再加第三种，尤其不要拿「宿主观察到的空闲」直接收尾——宿主分不清「正在想」与「在忙自己的事」，提前收尾会把答案切在流中间。被并入后台 drain 的回合与派发 detached worker 的回合只**延后收口**（§6.2 / §6.3），不算第三条。
 - 一个 turn 由**多个段**组成（逐步切分，[architecture.md §2.2](./architecture.md)）：段的 `finish(stop)` 是步边界不是轮边界；`TurnStreamController`（`src/bridge/turn-stream.ts`）持有跨段的游标 / `seenCalls` / 记账。续跑批次（`isAcpToolContinuation`）**绝不新发 prompt**，用 `transcript.since(cursorSeq)` 补读段间事件；段间事件只记账（`recordAcpToolOutput` 唤醒等待者），游标不动。**卡片块的静默结算**：卡片披露参数后 agent 连续静默 `CARD_SETTLE_QUIET_MS`（500ms）时，`armCardSettle` 只发该卡的 `block-end`、**不结束段**——宿主的实时 preparing 行因此能在工具运行中显示真实命令；切段点、卡片交给宿主的时机与看门狗判据都不变。结算后快照保持打开，同一 callId 的迟到重述只折进快照、不发 `tool-call-delta`，由段尾 `block-end` 整包替换。
