@@ -12,11 +12,22 @@
   - 为什么：宿主把 `mode: 'external'` 行写死为「外部任务」——`completed = !external && …`、无 activity 文案、不可点进详情；插件原先只塞一个 `running` 布尔圆点，成功 / 失败 / 耗时 / 明细全不可达。实测宿主持久的只有目录成员（日志事件 + `subagentCatalog` 检查点），运行态不持久，external 行连 `subagentTiming` 数据源都没有
   - 怎么做：claim 的 occupant 在 ACP 会话分流到自绘面板（非 ACP 原样渲染宿主组件）；列表复用宿主 `subagentCatalog` projection，终态落 `agents.json` 新增的 `subagents` 键，明细按 worker 单独限 200 条且只在内存；六态 = 排队 / 运行 / 成功 / 失败 / 已取消 / 未知，详情挂 `shell.overlay`
   - 状态：已实现待验收（彻底替换 / 宿主持久性已调查 / 同意单独上限）；证据、契约、变更清单与验收口径见文内
+- [方案：Antigravity 子代理进入子智能体面板（transcript 方案，已实现待真机验收）](./plan/antigravity-subagent-panel.md)
+  - 为什么：agy 的 ACP wire 不带任何子代理生命周期 `_meta`（CodeBuddy 那套键全缺），既有面板对 agy 永远空；但 agy 私有 brain transcript 留有完整证据——派发结果含子代理 `conversationId`、子代理自己的步骤流、报告以 `SYSTEM_MESSAGE` 写回父 transcript
+  - 怎么做：wire 认 `invoke_subagent` 派发 → 复用 `SubagentRecord` 六态（`childId = acp:<toolCallId>`，新增可选 `childConversationId`）；状态由子代理 transcript 轮询驱动（父 `SYSTEM_MESSAGE` 权威 + 子最后 `PLANNER_RESPONSE` DONE 兜底，「最新步 + 静默窗」双门控去重），未终态 dispatch 算活跃工作阻止空闲释放（两档静默上限复用，不是第三种强制定稿）；明细按需读子 brain transcript，浏览器只读步骤视图（详情浮层搬出 `subagent-panel.tsx`，1038→468 行数锁退役）
+  - 状态：已实现待真机验收（P1–P3 落地，任务审核 + 整枝终审 + 修复波复审通过，prepack 1388 测试全绿）；§12 未决项与 §13 验收需已认证 agy 会话，真机清单与 DEFER 后续见 [docs/todo.md](./todo.md)
+- [方案：隐式状态机显式化（分阶段执行手册）](./plan/implicit-state-machines.md)
+  - 为什么：6 处生命周期靠布尔、可选值、计数器与集合成员性组合表达，存在真实非法组合（`closed && released`、`retired && consumed`）与重置缺口；全量扫描已完成并分级
+  - 怎么做：按 ACP 模式 → 保存暂存 → HMR → SaveGate → 会话生命周期 → 背景 drain 六个阶段，每个阶段先双写再迁读取方后删旧字段；含行数门禁对策、验证命令、验收测试与回滚纪律
+  - 状态：未开始；新会话从文内 §0 接手协议进入
 - [上游实测：CodeBuddy 多会话串话](./upstream/codebuddy-acp-multi-session-prompt-cross-talk.md)
   - 一条 ACP 连接只有一个 `currentSession` 的现场证据：新建会话的首条 prompt 被旧会话接走并以 `end_turn` 零输出返回，新建会话还会取消旧会话的后台任务
   - 用途：A1（每 DSH 会话一个进程）与 A2（单进程多连接）的判定依据；证据原文与复现步骤见文内
 - [源码拆分第一轮：bridge 巨型文件（已完成 / 已归档）](./plan/archive/bridge-split.md)
   - `src/bridge.ts` 拆成 `src/bridge/` 模块 + 固定导出面的桶文件；`tests/bridge.spec.ts` 按主题拆进 `tests/bridge/`；各阶段独立审核、单独提交的完整记录
+- [巨型文件拆分第二轮：三件套 / 设置页 / 协议覆盖 / UI 面（未开始）](./plan/file-size-split.md)
+  - 为什么：行数基线仍锁着一批存量文件，其中 RPC 三件套（protocol / impl / store）、设置页、协议覆盖与 UI 面在爆发期仍持续增长；update / model-seat / bridge.spec 等功能面已封闭的不拆
+  - 怎么做：P0 先把基线锁定值收紧到实测（补棘轮漏洞），再按 P1–P6 逐领域簇拆到 ≤1000 并删条目；沿用第一轮的桶文件、Host 回调上限、停止条件与独立审核纪律；计划不锁行数，执行时以 HEAD 重新盘点
 - [方案：NTR 会话内的消息动作接管（已完成 / 已归档）](./plan/archive/ntr-message-actions.md)
   - 为什么：NTR 会话里宿主的点赞 / 点踩 / 分支三图标要么无意义、要么分支出来 agent 记不住上文；本方案把它们在 NTR 会话内隐藏，换成插件自己的分支入口（同图标、同尺寸），可用性由插件按六态判定
   - 怎么做：`html[data-ntr-acp]` 作用域 + `aria-label` 选择器隐藏（锚点 `[data-turn-tail]`）；`conversation.chat.assistant-actions` 注册自绘按钮；点击走「宿主 `sessions.fork` → 插件 `session/fork` adopt」两段式，子会话的 ACP 上下文来自 agent 自己的 fork
@@ -40,7 +51,7 @@
   - 状态：已完成 / 已归档；细节见文内
 - [待办清单](./todo.md)
   - 本仓唯一的待办清单：只留尚未落地的项，用户确认完结即删（结论并入 AGENTS.md 对应约束，不留「已落地」历史）
-  - 当前两项：自制子智能体展示（方案见 [docs/plan/subagent-panel.md](./plan/subagent-panel.md)）；宿主被强杀后残留的 ACP agent 进程（方案见 [docs/plan/backlog](./plan/backlog/README.md)）
+  - 当前四项：Antigravity 子代理面板真机验收（方案见 [docs/plan/antigravity-subagent-panel.md](./plan/antigravity-subagent-panel.md)）；巨型文件拆分第二轮（方案见 [docs/plan/file-size-split.md](./plan/file-size-split.md)）；自制子智能体展示（方案见 [docs/plan/subagent-panel.md](./plan/subagent-panel.md)）；宿主被强杀后残留的 ACP agent 进程（方案见 [docs/plan/backlog](./plan/backlog/README.md)）
 - [发版手册](../AGENTS/release.md)
   - agent 操作文档（由根 AGENTS.md 索引）：版本与 tag 规则、发布前检查，从提交到 npm 发布与 GitHub Release 的完整命令
   - release note 与 [`CHANGELOG.md`](../CHANGELOG.md) 的写法：面向用户、只写能感知到的变化与确定性净改动，不写根因与内部机制

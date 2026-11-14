@@ -2,7 +2,7 @@
 
 **状态**：**已实现，待真机验收**（P1–P3 已落地，任务级审核 + 整枝终审 + 修复波复审全部通过，`npm run prepack` 全绿；§12 未决项与 §13 真机验收需一个已认证的 agy 会话，由用户执行；docs/todo.md 与 docs/README.md 登记随合并进行）。
 **适用范围**：ACP preset 会话里由 `agy acp` 服务的会话；桥接层新增 agy 专属识别与读取，浏览器面板尽量复用既有 `OwnSubagentCatalog`。
-**一句话**：agy 的 ACP wire 不上报任何子代理生命周期（没有 CodeBuddy 那套 `_meta`），但它的私有 transcript 留了完整证据——派发结果里有子代理 `conversationId`，子代理自己的 brain transcript 有完整步骤流，报告以 `SYSTEM_MESSAGE` 写回父 transcript。照 [antigravity-late-output.md](./antigravity-late-output.md) 的「只读 transcript」路子，把 agy 子代理喂进既有 `SubagentRecord` / 面板，做到六态可辨、可点进详情。
+**一句话**：agy 的 ACP wire 不上报任何子代理生命周期（没有 CodeBuddy 那套 `_meta`），但它的私有 transcript 留了完整证据——派发结果里有子代理 `conversationId`，子代理自己的 brain transcript 有完整步骤流，报告以 `SYSTEM_MESSAGE` 写回父 transcript。照 [antigravity-late-output.md](./archive/antigravity-late-output.md) 的「只读 transcript」路子，把 agy 子代理喂进既有 `SubagentRecord` / 面板，做到六态可辨、可点进详情。
 
 > 写作约定：代码位置一律用「文件 + 符号名」，不写行号。本文不是 `AGENTS/` 文档。本文是**可独立接手**的方案：§2 是改动前不必重查的证据，§4–§7 是设计，§12 是接手先答的未决项，§13 是验收口径。
 
