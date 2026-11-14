@@ -2,6 +2,52 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [0.4.5] - 2026-11-14
+
+这一版把 Antigravity 的子代理接入子智能体面板，并修正后台报告、上下文占用与思考档位显示中几处丢信息的问题。
+
+### 新增
+
+- **acp**：Antigravity 会话派出的子代理进入子智能体面板，运行状态随子会话进展更新。([9ab777c](https://github.com/GDWhisper/dsh-ntr/commit/9ab777c))
+- **acp**：点击 Antigravity 子代理条目可查看其子会话工作过程，内容只读。([f690001](https://github.com/GDWhisper/dsh-ntr/commit/f690001))
+- **acp**：思考档位按模型分别记录；切换到尚未观测的模型时，思考卡可单独获取该模型的档位。([19ec81f](https://github.com/GDWhisper/dsh-ntr/commit/19ec81f))
+
+### 修复
+
+- **acp**：Antigravity CLI 预设默认跳过工具权限请求，子代理不再卡在无人应答的授权上；已保存的 agent 保持原有启动参数。([6adeb3b](https://github.com/GDWhisper/dsh-ntr/commit/6adeb3b))
+- **acp**：Antigravity 回合后输出的等待改为按活动续期，长跑子代理的回答不再被固定时限截断；新增 `agyLateOutputMaxMs` 与 `agyLateOutputCeilingMs` 两个配置项。([e387103](https://github.com/GDWhisper/dsh-ntr/commit/e387103))
+- **acp**：多轮 Antigravity 子代理不再在启动数秒后被误判完成；打开运行中的子代理详情会重新读取最新内容。([85d1dfc](https://github.com/GDWhisper/dsh-ntr/commit/85d1dfc))
+- **save-gate**：设置在写入途中插件被销毁时按失败上报，不再误报已保存；此时也不再提供排队或强制保存。([269088d](https://github.com/GDWhisper/dsh-ntr/commit/269088d))
+- **skills-scan**：符号链接技能在链接本身无法读取时改用其记录的目标解析，不再被静默漏掉。([23bc581](https://github.com/GDWhisper/dsh-ntr/commit/23bc581))
+- **acp**：等待后台子代理期间，只有费用的用量更新不再清空上下文占用环。([7d8ef91](https://github.com/GDWhisper/dsh-ntr/commit/7d8ef91))
+- **acp**：同一用户请求的后续后台报告不再逐帧丢失，聊天会再次被唤醒接收完整回答。([00546de](https://github.com/GDWhisper/dsh-ntr/commit/00546de))
+- **acp**：配置选项缺少模型槽时保留各模型思考档位，其他模型不再显示「尚未连接」。([86d6c2e](https://github.com/GDWhisper/dsh-ntr/commit/86d6c2e))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.4.4...v0.4.5
+
+---
+
+This release brings Antigravity subagents into the subagent panel and fixes several places where background reports, context occupancy, and thought-level display lost information.
+
+### Added
+
+- **acp**: subagents dispatched by an Antigravity session show up in the subagent panel, and their state follows the child session's progress. ([9ab777c](https://github.com/GDWhisper/dsh-ntr/commit/9ab777c))
+- **acp**: opening an Antigravity subagent entry shows the child session's work as a read-only step view. ([f690001](https://github.com/GDWhisper/dsh-ntr/commit/f690001))
+- **acp**: thought levels are recorded per model; switching to a model that was never observed lets the thought card fetch that model's levels on demand. ([19ec81f](https://github.com/GDWhisper/dsh-ntr/commit/19ec81f))
+
+### Fixed
+
+- **acp**: the Antigravity CLI preset skips tool permission prompts by default, so subagents no longer hang on an approval nobody can answer; saved agents keep their existing launch arguments. ([6adeb3b](https://github.com/GDWhisper/dsh-ntr/commit/6adeb3b))
+- **acp**: Antigravity's post-turn output watch now renews on activity, so a long-running subagent's answer is no longer cut off by a fixed deadline; two new config keys, `agyLateOutputMaxMs` and `agyLateOutputCeilingMs`, tune the windows. ([e387103](https://github.com/GDWhisper/dsh-ntr/commit/e387103))
+- **acp**: a multi-turn Antigravity subagent is no longer marked completed seconds after it starts; opening the detail of a running child re-reads its latest content. ([85d1dfc](https://github.com/GDWhisper/dsh-ntr/commit/85d1dfc))
+- **save-gate**: a settings save whose plugin is disposed mid-write reports failure instead of claiming it was saved, and a disposed gate no longer offers queue or force options. ([269088d](https://github.com/GDWhisper/dsh-ntr/commit/269088d))
+- **skills-scan**: a symlinked skill whose link itself cannot be read now falls back to its recorded target instead of being dropped silently. ([23bc581](https://github.com/GDWhisper/dsh-ntr/commit/23bc581))
+- **acp**: while the chat waits for a background subagent, a cost-only usage tick no longer blanks the context occupancy ring. ([7d8ef91](https://github.com/GDWhisper/dsh-ntr/commit/7d8ef91))
+- **acp**: later background reports for the same user request are no longer dropped frame by frame; the chat wakes again to receive the full answer. ([00546de](https://github.com/GDWhisper/dsh-ntr/commit/00546de))
+- **acp**: a configOptions answer without a model slot keeps the per-model thought map instead of resetting every other model to "not connected yet". ([86d6c2e](https://github.com/GDWhisper/dsh-ntr/commit/86d6c2e))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.4.4...v0.4.5
+
 ## [0.4.4] - 2026-11-11
 
 这一版把 Antigravity 回合结束后才完成的回答接回聊天，归档对话也会及时释放 agent 进程。
