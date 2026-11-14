@@ -400,7 +400,13 @@ export class ModelCatalogService {
     observed: AcpAgentCatalog,
   ): AcpAgentCatalog {
     const model = observed.model?.currentValue
-    if (model === null || model === undefined || model === '') return base
+    // An answer that names NO model describes no model, so the map stays as it
+    // was: `parseCatalogOptions` / `mergeCatalogShape` never carry
+    // `thoughtByModel`, and letting one model-less answer through would erase
+    // every per-model record AND write that loss to `model-catalog.json`.
+    if (model === null || model === undefined || model === '') {
+      return previous?.thoughtByModel === undefined ? base : { ...base, thoughtByModel: previous.thoughtByModel }
+    }
     return { ...base, thoughtByModel: { ...previous?.thoughtByModel, [model]: observed.thought ?? null } }
   }
 
