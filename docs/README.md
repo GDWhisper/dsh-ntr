@@ -20,6 +20,8 @@
   - 为什么：6 处生命周期靠布尔、可选值、计数器与集合成员性组合表达，存在真实非法组合（`closed && released`、`retired && consumed`）与重置缺口；全量扫描已完成并分级
   - 怎么做：按 ACP 模式 → 保存暂存 → HMR → SaveGate → 会话生命周期 → 背景 drain 六个阶段，每个阶段先双写再迁读取方后删旧字段；含行数门禁对策、验证命令、验收测试与回滚纪律
   - 状态：未开始；新会话从文内 §0 接手协议进入
+- [DSH 技能只读 MCP 实施计划（待实施）](./plan/dsh-skills-mcp.md)
+  - 范围：内置零依赖、只读、stdio MCP server `dsh-skills`，只提供 `skills_list` 与 `skill_read`
 - [上游实测：CodeBuddy 多会话串话](./upstream/codebuddy-acp-multi-session-prompt-cross-talk.md)
   - 一条 ACP 连接只有一个 `currentSession` 的现场证据：新建会话的首条 prompt 被旧会话接走并以 `end_turn` 零输出返回，新建会话还会取消旧会话的后台任务
   - 用途：A1（每 DSH 会话一个进程）与 A2（单进程多连接）的判定依据；证据原文与复现步骤见文内
