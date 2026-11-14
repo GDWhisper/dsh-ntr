@@ -84,7 +84,7 @@ DSH 的"模式"就是 **agent preset**：一条 `@deepseek-ai/dsh-agent-preset` 
 
 **消息展示在主聊天平面**：用户说的话与 agent 的回包都渲染进原生聊天流，不另起炉灶。
 
-**agent 自己的模型面读 `agent/catalog`**：`base`（裸 `agentId` = agent 默认模型）+ `exposedModels` 过滤后的 `agent@choice` 变体 + agent 自己的 `thought_level`（作为 `reasoning`）。这份读是**纯内存**的：**不 spawn、也不顺手起探测**——没有缓存的 agent 如实报 `probed: false` 与内存里现有的（可能为空的）内容。探测只允许三种有手势的来源：`agent/probe-models`（设置页卡片按钮，一次点击一个 agent）、agent 自己的 `session/new` / `session/load`（用户正在跟它说话）、旧 schema 的磁盘缓存（不重探，被下一次活会话顺带修好）。`probeModelsOnBoot` 因此是**死配置**：`validateConfig` 仍收它，但 `bootstrapCatalogs()` 是空实现，没有任何自动 spawn 留给它关。目录按 agent 缓存于 `AcpStore.seatCatalogs`，并在探测或勾选变动后失效重读。
+**agent 自己的模型面读 `agent/catalog`**：`base`（裸 `agentId` = agent 默认模型）+ `exposedModels` 过滤后的 `agent@choice` 变体 + agent 自己的 `thought_level`（作为 `reasoning`；每个观测过的模型还有自己的 `reasoningByModel`，见 [AGENTS/state.md §4](../AGENTS/state.md)）。这份读是**纯内存**的：**不 spawn、也不顺手起探测**——没有缓存的 agent 如实报 `probed: false` 与内存里现有的（可能为空的）内容。探测只允许三种有手势的来源：`agent/probe-models`（设置页卡片按钮，一次点击一个 agent）、agent 自己的 `session/new` / `session/load`（用户正在跟它说话）、旧 schema 的磁盘缓存（不重探，被下一次活会话顺带修好）。`probeModelsOnBoot` 因此是**死配置**：`validateConfig` 仍收它，但 `bootstrapCatalogs()` 是空实现，没有任何自动 spawn 留给它关。目录按 agent 缓存于 `AcpStore.seatCatalogs`，并在探测或勾选变动后失效重读。
 
 ### 【历史做法】那条 provider 路由与共享的模型目录
 

@@ -70,8 +70,10 @@ describe('model catalog (isolated manager)', () => {
 
     const resolved = await catalogAdapter.resolveModel('acp', 'mock@mock-model-b')
     expect(resolved).toMatchObject({ provider: 'acp', id: 'mock@mock-model-b', name: 'Mock · Mock Model B' })
-    expect(resolved.reasoning?.efforts.map(e => e.id)).toEqual(['off', 'high'])
-    expect(resolved.reasoning?.defaultEffort).toBe('high')
+    // `mock-model-b` has never been observed: advertise NO levels for it. The
+    // agent-level slot describes model A, and borrowing it here would name
+    // another model's levels as this one's (the composer calls that unknown).
+    expect(resolved.reasoning).toBeUndefined()
 
     // The base entry carries the same reasoning metadata (agent default model).
     const base = await catalogAdapter.resolveModel('acp', 'mock')
@@ -105,6 +107,16 @@ describe('model catalog (isolated manager)', () => {
     expect(view?.configOptions?.find(o => o.configId === 'model')?.currentValue).toBe('mock-model-b')
     expect(view?.configOptions?.find(o => o.configId === 'thought')?.currentValue).toBe('off')
   }, 30_000)
+
+  it('advertises a variant’s own levels once the agent was observed on it', async () => {
+    // The per-turn switch above observed `mock-model-b`, so its record exists
+    // now — and it belongs to THAT model, with no agent-wide default.
+    const resolved = await catalogAdapter.resolveModel('acp', 'mock@mock-model-b')
+    expect(resolved.reasoning?.efforts.map(e => e.id)).toEqual(['off', 'high'])
+    expect(resolved.reasoning?.defaultEffort).toBeUndefined()
+    // The base route keeps the agent-level default (the model it is on).
+    expect((await catalogAdapter.resolveModel('acp', 'mock')).reasoning?.defaultEffort).toBe('high')
+  })
 
   it('narrows the ACP seats via setExposedModels; hidden variants still resolve', async () => {
     // Unset and empty are the same state: no variants, only the base entry

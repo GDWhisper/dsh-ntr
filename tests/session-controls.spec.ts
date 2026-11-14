@@ -40,6 +40,7 @@ import {
   REFRESH_CATALOG_ITEM,
 } from '../src/client/session-controls.tsx'
 import { AcpStore } from '../src/client/store.ts'
+import { FETCH_THOUGHT_ITEM, thoughtChip } from '../src/client/thought-card.ts'
 import type { AcpConversationChoice, AgentCatalogResult, AgentView, ChatSessionView } from '../src/protocol.ts'
 
 describe('the agent base chip names only an agent that serves the conversation', () => {
@@ -545,5 +546,111 @@ describe('the agent-mode tooltip does not call the host access mode complementar
     expect(agentModeVisible(undefined, true)).toBe(true)
     expect(agentModeVisible(false, true)).toBe(false)
     expect(agentModeVisible(undefined, false)).toBe(false)
+  })
+})
+
+describe('the thought card offers a fetch only for a model nobody has seen', () => {
+  const acp = new AcpStore(async () => ({ ok: true, value: {} }), zh => zh)
+  const agent: AgentView = {
+    id: 'pi', title: 'Pi', command: 'pi-acp', args: [],
+    allowedCwdRoots: [], state: 'ready', liveSessions: [],
+  }
+  const catalog: AgentCatalogResult = {
+    agentId: 'pi',
+    title: 'Pi',
+    base: { id: 'pi', name: 'Pi' },
+    variants: [
+      { id: 'pi@plain', name: 'Plain' },
+      { id: 'pi@full', name: 'Full' },
+      { id: 'pi@never', name: 'Never' },
+    ],
+    reasoning: { efforts: [{ id: 'off', name: 'Off' }, { id: 'high', name: 'High' }], defaultEffort: 'high' },
+    currentModel: { value: 'base-model', name: 'Base' },
+    reasoningByModel: {
+      'base-model': { efforts: [{ id: 'off', name: 'Off' }, { id: 'high', name: 'High' }] },
+      plain: { efforts: [] },
+      full: { efforts: [{ id: 'low', name: 'Low' }, { id: 'max', name: 'Max' }] },
+    },
+    probed: true,
+    updatedAt: 1,
+  }
+  const routeFor = (modelId: string, effort?: string) =>
+    describeRoute([agent], undefined, undefined, catalog, 'pi', { agentId: 'pi', modelId, ...(effort === undefined ? {} : { effort }) })
+
+  it('keeps the default row first and offers the fetch after it while the model is unknown', () => {
+    const route = routeFor('pi@never')
+    // No levels to offer (the previous model's list is not borrowed)...
+    expect(route.efforts).toEqual([])
+    // ...and the status is the fetchable one, named as the target model.
+    expect(route.thoughtUnknown).toBe('never')
+    expect(thoughtChip(route, acp).label).toBe('思考 · 默认')
+    expect(thoughtChip(route, acp).title).toContain('还没连接过')
+
+    const menu = menuFor('thought', { acp, agents: [agent], catalog, route })
+    expect(menu.note).toContain('该模型还没连接过')
+    expect(menu.note).toContain('默认思考等级')
+    // "Unknown levels" does not mean "no default": the model's own default is
+    // still selectable, and it is the SAME sentinel the known state uses (the
+    // pick handler clears the record with it — no probe, no notice).
+    expect(menu.sections[0]?.items).toEqual([
+      { id: 'provider-default', label: '跟随 agent 默认', active: true },
+      { id: FETCH_THOUGHT_ITEM, label: '获取模型思考等级列表', detail: '连上 agent 读一次它的配置', disabled: false },
+    ])
+  })
+
+  it('disables the row while fetching and turns it into a retry after a failure', () => {
+    const route = routeFor('pi@never')
+    const busy = menuFor('thought', { acp, agents: [agent], catalog, route, probing: true })
+    expect(busy.sections[0]?.items[1]).toMatchObject({ id: FETCH_THOUGHT_ITEM, label: '正在获取…', disabled: true })
+    // The default row stays clickable while the fetch runs.
+    expect(busy.sections[0]?.items[0]?.id).toBe('provider-default')
+    expect(busy.sections[0]?.items[0]?.disabled).toBeUndefined()
+
+    // The failure text is the card's own error block (the menu shell renders
+    // `error`), and the row stays clickable so the user can retry.
+    const failed = menuFor('thought', { acp, agents: [agent], catalog, route, error: 'acp: agent "pi" does not offer model "never"' })
+    expect(failed.error).toContain('does not offer model')
+    expect(failed.sections[0]?.items[1]).toMatchObject({ label: '重试获取', disabled: false })
+    expect(failed.sections[0]?.items[1]?.detail).toContain('重试')
+  })
+
+  it('renders the default row from the FACTS when an unknown model still reports a level', () => {
+    // A live row can still name a level (a switch clears it, but the card
+    // renders what the route says): the default row must stay, unmarked.
+    const live = describeRoute(
+      [agent],
+      { agentId: 'pi', agentTitle: 'Pi', sessionId: 's1', modelId: 'pi@never', reasoningEffort: 'high' },
+      undefined,
+      catalog,
+    )
+    expect(live.thoughtUnknown).toBe('never')
+    expect(live.effectiveEffort).toBe('high')
+    const items = menuFor('thought', { acp, agents: [agent], catalog, route: live }).sections[0]?.items ?? []
+    expect(items[0]).toMatchObject({ id: 'provider-default', active: false })
+    expect(items[1]?.id).toBe(FETCH_THOUGHT_ITEM)
+  })
+
+  it('never shows the button for a model with a record — even an empty one', () => {
+    const full = routeFor('pi@full')
+    expect(full.thoughtUnknown).toBeUndefined()
+    const fullMenu = menuFor('thought', { acp, agents: [agent], catalog, route: full })
+    expect(fullMenu.note).not.toContain('还没连接过')
+    expect(fullMenu.sections[0]?.items.map(item => item.id)).toEqual(['provider-default', 'low', 'max'])
+    expect(fullMenu.sections[0]?.items.some(item => item.id === FETCH_THOUGHT_ITEM)).toBe(false)
+
+    // Observed WITHOUT the axis (`{ efforts: [] }`) is knowledge, not unknown:
+    // there is nothing to fetch and no chip/menu row to offer it from.
+    const plain = routeFor('pi@plain')
+    expect(plain.thoughtUnknown).toBeUndefined()
+    expect(menuFor('thought', { acp, agents: [agent], catalog, route: plain }).sections[0]?.items.map(item => item.id))
+      .toEqual(['provider-default'])
+  })
+
+  it('keeps the level in force when the record has it', () => {
+    // The fetch changes the CATALOG, not the pick: a known model keeps showing
+    // the user's level, and the card's row labels it as before.
+    const route = routeFor('pi@full', 'max')
+    expect(route.effortLabel).toBe('Max')
+    expect(thoughtChip(route, acp).label).toBe('思考 · Max')
   })
 })

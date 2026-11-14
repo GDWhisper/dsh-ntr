@@ -9,6 +9,7 @@
 import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentSkillsResult, AgentSkillEntry, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, IdleReleaseResult, IdleReleaseSetPayload, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, SubagentDetailEntry, SubagentDetailResult, SubagentRecord } from '../protocol.ts'
 import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, MAX_SUBAGENT_DETAIL_ENTRIES, pluginReleaseUrl } from '../protocol.ts'
 import { commitFrame, consumeVerdict, invalidateVerdict, markUnsettled, peekVerdict, projectAcpMode, settleFromHost, type AcpVerdict } from './acp-verdict.ts'
+import { modelOffersEffort, modelValueOf } from './route-reasoning.ts'
 
 /** One slash command the ACP agent declared, whole row (the menu draws name, description and `input.hint`). */
 export type AgentCommand = NonNullable<ChatSessionView['availableCommands']>[number]
@@ -1799,15 +1800,15 @@ export class AcpStore {
     }
   }
 
-  /** Ask the host to probe one agent's model catalog (spawn + throwaway session). */
-  async probeModels(agentId: string): Promise<void> {
+  /** Ask the host to probe one agent's model catalog (spawn + throwaway session); `model` fetches just that model's thought levels for the card, without the page notice. */
+  async probeModels(agentId: string, model?: string): Promise<void> {
     const previousError = this.state.probeErrors[agentId]
     this.mutate({
       probingModels: { ...this.state.probingModels, [agentId]: true },
       probeErrors: this.clearProbeError(agentId),
     })
     try {
-      const result = await this.call<AgentProbeModelsResult>('agent/probe-models', { agentId })
+      const result = await this.call<AgentProbeModelsResult>('agent/probe-models', model === undefined ? { agentId } : { agentId, model })
       // The seat list is a filtered view of the same catalog: drop the cached
       // one (in the same patch) and re-read below, so a fresh probe lands in an
       // open conversation too.
@@ -1829,7 +1830,7 @@ export class AcpStore {
         ? this.locale('宿主服务运行着旧版本代码，请在终端重启 dsh web 服务以激活模型检测功能。', 'Host running older version. Please restart dsh web to enable model detection.')
         : msg
       this.mutate({
-        notice,
+        ...(model === undefined ? { notice } : {}),
         probingModels: { ...this.state.probingModels, [agentId]: false },
         probeErrors: { ...this.state.probeErrors, [agentId]: notice },
       })
@@ -3447,22 +3448,22 @@ export class AcpStore {
       // the agent's default until its first turn created one.
       const safeAgent = (agentId && agentId.trim()) || undefined
       const targetAgent = safeAgent ?? (modelId ? splitModelAgentId(modelId) : undefined)
-      // Mirror the host's model-switch intent (`BridgeManager.setChatSessionModel`):
-      // a thought level belongs to the model it was picked on. The host's own
-      // predicate is authoritative; this only keeps the chip from naming the old
-      // level during the round-trip, and the `session/chat-list` that follows the
-      // pick repairs any disagreement (a level the host kept because a live
-      // session still offers it).
+      // A thought level belongs to the model it was picked on. The host clears
+      // one the new model does not offer (it is the authority); mirror that here
+      // so the chip does not keep naming it during the round-trip. A model the
+      // catalog has no record for counts as "does not offer" — the same
+      // conservative answer the host gives.
+      const owner = targetAgent ?? this.state.chatChoice[dshSessionId]?.agentId ?? this.state.chatBoundAgent[dshSessionId] ?? this.state.defaultAgent
       const sessions = this.state.chatSessionsFor === dshSessionId ? this.state.chatSessions : []
       const dropEffort = this.state.chatChoice[dshSessionId]?.modelId !== modelId
         && !sessions.some(s => !s.released)
+        && !modelOffersEffort(this.state.seatCatalogs[owner ?? ''], modelValueOf(modelId), this.state.chatChoice[dshSessionId]?.effort)
       this.writeChoice(dshSessionId, choice => {
         const next = { ...choice, modelId }
         if (dropEffort) delete next.effort
         return next
       }, targetAgent)
       if (this.state.chatSessionsFor === dshSessionId) {
-        const owner = targetAgent ?? this.state.chatChoice[dshSessionId]?.agentId ?? this.state.chatBoundAgent[dshSessionId] ?? this.state.defaultAgent
         let changed = false
         const chatSessions = this.state.chatSessions.map(s => {
           if (s.agentId !== owner) return s

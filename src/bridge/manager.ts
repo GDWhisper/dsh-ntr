@@ -413,6 +413,7 @@ export class BridgeManager {
       defOf: agentId => this.defsMap.get(agentId),
       catalogFor: agentId => this.catalog.catalogFor(agentId),
       reasoningMeta: agentId => this.catalog.reasoningMeta(agentId),
+      modelReasoning: (agentId, modelValue) => this.catalog.modelReasoning(agentId, modelValue),
       sessions: () => this.registry.sessions(),
       bridgeForSession: session => this.bridgeForSession(session),
       chatAgentFor: dshSessionId => this.registry.chatAgentFor(dshSessionId),
@@ -1017,8 +1018,8 @@ export class BridgeManager {
     return this.catalog.cachedAgentModels(agentId)
   }
 
-  async probeAgentModels(agentId: string): Promise<AgentProbeModelsResult> {
-    return this.catalog.probeAgentModels(agentId)
+  async probeAgentModels(agentId: string, model?: string): Promise<AgentProbeModelsResult> {
+    return this.catalog.probeAgentModels(agentId, model)
   }
 
   bootstrapCatalogs(): void {

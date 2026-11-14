@@ -447,9 +447,9 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
       modelId: 'pi@opus',
     })
     expect(switched.effectiveEffort).toBeUndefined()
-    // The levels themselves still come from the agent's last-known vocabulary:
-    // the user can still pick one, and the first turn validates it.
-    expect(switched.efforts.map(level => level.id)).toEqual(['high'])
+    // The new model has no recorded levels, so the catalog's last-known list
+    // must not be offered as this model's; the first turn reads its own.
+    expect(switched.efforts).toEqual([])
 
     // The agent's own model (nothing picked / bare route) IS the model the
     // catalog names, so its default is truthful and stays.

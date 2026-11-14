@@ -195,6 +195,6 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 
 - **Host Half / Browser Half**：DSH 插件双端架构——Node 宿主服务与浏览器 UI 模块。本仓对应 `src/index.ts` + `src/bridge/` 与 `src/client/`。
 - **Transcript**：宿主为每个会话维护的有界环形缓冲（`transcriptMaxEntries`），用于重连后按 seq 补齐、续跑段补读段间事件。连续同类纯状态 tick（`usage_update`、无 title 的 `session_info_update`、`config_option_update`）就地替换末条：seq 前进、数组不增长、保留最新值；`since()` 的 seq 空洞是正常的，实时 SSE 仍逐帧广播（细节见 [protocol.md §8](./protocol.md)）。
-- **Model Catalog**：`agent/catalog` 下发的 agent 自己的 `model` / `thought_level` 面（`base` + `variants` + `reasoning`）。DSH 自己的模型目录里没有 ACP 条目。
+- **Model Catalog**：`agent/catalog` 下发的 agent 自己的 `model` / `thought_level` 面（`base` + `variants` + `reasoning` + per-model 的 `reasoningByModel`）。DSH 自己的模型目录里没有 ACP 条目。
 - **exposedModels**：per-agent 的座位可见性过滤。空 = 只留 `base`；只影响 `agentCatalog` 的变体展开，不影响 `resolveAdapterModel`。细节见 [state.md §5](./state.md)。
 

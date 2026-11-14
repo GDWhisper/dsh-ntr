@@ -70,6 +70,8 @@ import type {
   AcpChatInjected, AcpMenuKind, AcpMenuItem, AcpMenuSection, AcpSessionHook,
 } from './acp-ui.tsx'
 import type { AcpConversationChoice, AcpTagHalo, AgentCatalogResult, AgentView, ChatSessionView } from '../protocol.ts'
+import { reasoningForModel, thoughtLevelsUnknown } from './route-reasoning.ts'
+import { FETCH_THOUGHT_ITEM, thoughtChip, thoughtSection } from './thought-card.ts'
 
 /**
  * Props every entry in this file receives: the injected face (built in
@@ -111,6 +113,8 @@ interface RouteInfo {
   modelId?: string
   modelLabel?: string
   efforts: readonly { id: string; name: string; description?: string }[]
+  /** The model whose levels were never observed; absent = known, or no model to name. */
+  thoughtUnknown?: string
   /** `current.reasoningEffort` folded over the model's default (native seat semantics). */
   effectiveEffort?: string
   effortLabel?: string
@@ -309,7 +313,8 @@ export function describeRoute(
   const effort = bound?.released === true
     ? (pick?.effort ?? bound?.reasoningEffort)
     : (bound?.reasoningEffort ?? pick?.effort)
-  const reasoning = catalog?.reasoning
+  const parsed = splitAcpModelId(modelId ?? '')
+  const reasoning = reasoningForModel(catalog, parsed.choice)
   // The model the AGENT says it is on, for a conversation nobody has picked a
   // model for yet. Without it the chip has no label and does not render at all,
   // so an agent with a perfectly good model axis looked like it had none (user
@@ -321,7 +326,6 @@ export function describeRoute(
   if (bound === undefined && pick === undefined && agentModel === undefined) {
     return { agentId, agentTitle, efforts: [] }
   }
-  const parsed = splitAcpModelId(modelId ?? '')
   const variant = catalog?.variants.find(entry => entry.id === modelId)
   // A model the conversation picked may be outside `exposedModels` (the pick
   // outlives the visibility filter). Its NAME is still known from the catalog's
@@ -329,20 +333,23 @@ export function describeRoute(
   const currentName = catalog?.currentModel !== undefined && parsed.choice === catalog.currentModel.value
     ? catalog.currentModel.name
     : undefined
-  // The catalog's thought level is the last value observed on whichever model
-  // the AGENT was on — some agents publish `thought_level` only for models with
-  // variants. It is only a truthful default for the model this route will run:
-  // the agent's own (nothing picked / bare route) or the very model the catalog
-  // names. After switching to another model — above all BEFORE the first
-  // session, when nothing has re-read the new model's options — the old default
-  // must not be presented as this model's, so the chip falls back to the agent
-  // default until the first turn.
+  // The thought levels THIS route's model publishes. A per-model observation
+  // answers for another model; the agent-level slot answers for the bare route
+  // and the model the catalog names, including its `defaultEffort`. A model
+  // nobody has observed yet has no levels here — before the first session the
+  // old model's list must not be shown as the new model's. `modelAgrees…`
+  // still gates the agent's default: only the model the catalog names may
+  // present it.
   const catalogModelValue = catalog?.currentModel?.value
   // A catalog that cannot name its current model proves nothing about an
   // explicitly picked one, so that exemption only covers "no model picked".
   const modelAgreesWithCatalog = parsed.choice === undefined
     || (catalogModelValue !== undefined && parsed.choice === catalogModelValue)
   const effectiveEffort = effort ?? (modelAgreesWithCatalog ? reasoning?.defaultEffort : undefined)
+  // Unknown (never observed) is not the same as "observed without the axis";
+  // only the former gets the card's fetch button.
+  const thoughtModel = parsed.choice ?? catalogModelValue
+  const thoughtUnknown = thoughtLevelsUnknown(catalog, thoughtModel) ? thoughtModel : undefined
   // The chip names the MODEL, not the agent (user report, 2026-10-18): the agent
   // is already the chip to its right, so "CodeBuddy Code" beside "ACP · CodeBuddy
   // Code" said nothing about which model was running. A bare `agentId` route
@@ -360,6 +367,7 @@ export function describeRoute(
     ...(modelId === undefined ? {} : { modelId }),
     ...(modelLabel === undefined ? {} : { modelLabel }),
     efforts: reasoning?.efforts ?? [],
+    ...(thoughtUnknown === undefined ? {} : { thoughtUnknown }),
     ...effectiveEffort === undefined ? {} : { effectiveEffort },
     ...effectiveEffort === undefined
       ? {}
@@ -628,7 +636,7 @@ export function AcpSessionControls(props: AcpClusterProps) {
   const showAgentBase = !agentBaseHidden(lockedTo) || shattering
   const modelLabel = routed ? route.modelLabel : undefined
   const showModel = agentListed && modelLabel !== undefined
-  const showThought = agentListed && routed && route.efforts.length > 0
+  const showThought = agentListed && routed && (route.efforts.length > 0 || route.thoughtUnknown !== undefined)
   const extras = advancedOptions(catalog, choice)
   const showAdvanced = agentListed && routed && extras.length > 0
   // Nothing left to show: the cell stays claimed (the claim owns it), but this
@@ -668,8 +676,7 @@ export function AcpSessionControls(props: AcpClusterProps) {
       )}
       {showThought && (
         <AcpChip
-          label={`${acp.label('思考', 'think')} · ${route.effortLabel ?? acp.label('默认', 'default')}`}
-          title={acp.label('思考等级（agent 的 thought_level）', "Thought level (the agent's thought_level)")}
+          {...thoughtChip(route, acp)}
           active={menu?.sessionId === sessionId && menu.kind === 'thought'}
           onClick={(trigger) => { open('thought', trigger) }}
         />
@@ -880,40 +887,6 @@ function modelSection(context: MenuContext): AcpMenuSection | undefined {
   }
 }
 
-/** The agent's `thought_level` levels (its own vocabulary). */
-function thoughtSection(context: MenuContext): AcpMenuSection {
-  const { acp, route } = context
-  const items: AcpMenuItem[] = [{
-    // The id keeps its historical name on purpose: it is an internal sentinel
-    // the pick handler compares against, and no user ever reads it. The LABEL is
-    // the user-visible claim, and "provider default" was false (audit finding
-    // F43): this axis is the agent's own `thought_level`, with no DSH provider
-    // anywhere on it (`listModels('acp')` answers an empty catalog). Clearing
-    // the pick leaves the agent's own default in force — `effectiveEffort`
-    // reports `reasoning.defaultEffort` only while the routed model is the one
-    // the catalog names (see `describeRoute`).
-    id: 'provider-default',
-    label: acp.label('跟随 agent 默认', 'Agent default'),
-    active: route.effectiveEffort === undefined,
-  }]
-  for (const level of route.efforts) {
-    items.push({
-      id: level.id,
-      label: level.name,
-      ...level.description === undefined ? {} : { detail: level.description },
-      active: level.id === route.effectiveEffort,
-    })
-  }  return {
-    id: 'thought',
-    title: acp.label('思考等级', 'Thought level'),
-    note: acp.label(
-      '由 agent 的 thought_level 配置项驱动，下一次请求生效。',
-      "Driven by the agent's own thought_level option; applies to the next request.",
-    ),
-    items,
-  }
-}
-
 /**
  * The advanced base's sections: one per extra config option.
  *
@@ -966,6 +939,7 @@ export function menuFor(kind: AcpMenuKind, context: MenuContext): {
   loading?: boolean
 } {
   const { acp, route } = context
+  const errorField = context.error === undefined ? {} : { error: context.error }
 
   if (kind === 'agent') {
     // The agent base is ONLY the entry point for starting/replacing the agent
@@ -982,7 +956,7 @@ export function menuFor(kind: AcpMenuKind, context: MenuContext): {
     // down for no information the user needed at the moment of picking.
     return {
       title: acp.label('选择你的 Agent', 'Choose your agent'),
-      sections: [{ ...agentSection(context), title: undefined, note: undefined }],
+      sections: [{ ...agentSection(context), title: undefined, note: undefined }], ...errorField,
     }
   }
 
@@ -991,12 +965,12 @@ export function menuFor(kind: AcpMenuKind, context: MenuContext): {
     if (section === undefined) return { title: acp.label('模型', 'Models'), sections: [] }
     // The single-axis picker keeps the shape it had before: one title + note on
     // the menu header, rows under a header-less section.
-    return { title: section.title ?? acp.label('模型', 'Models'), note: section.note, sections: [{ ...section, title: undefined, note: undefined }] }
+    return { title: section.title ?? acp.label('模型', 'Models'), note: section.note, sections: [{ ...section, title: undefined, note: undefined }], ...errorField }
   }
 
   if (kind === 'thought') {
-    const section = thoughtSection(context)
-    return { title: section.title ?? acp.label('思考等级', 'Thought level'), note: section.note, sections: [{ ...section, title: undefined, note: undefined }] }
+    const section = thoughtSection(route, acp, { probing: context.probing, error: context.error })
+    return { title: section.title ?? acp.label('思考等级', 'Thought level'), note: section.note, sections: [{ ...section, title: undefined, note: undefined }], ...errorField }
   }
 
   if (kind === 'advanced') {
@@ -1006,11 +980,11 @@ export function menuFor(kind: AcpMenuKind, context: MenuContext): {
         'agent 自己发布的额外配置项；选中只作用于这条会话，下一条消息生效。',
         'Extra config options published by the agent; a pick belongs to this conversation and applies from the next message.',
       ),
-      sections: advancedSections(context),
+      sections: advancedSections(context), ...errorField,
     }
   }
 
-  return { title: acp.label('NTR', 'NTR'), sections: [] }
+  return { title: acp.label('NTR', 'NTR'), sections: [], ...errorField }
 }
 
 /**
@@ -1059,8 +1033,11 @@ export function AcpSessionMenu(props: AcpClusterProps) {
   // the menu instead of dying.
   let model: ReturnType<typeof menuFor>
   try {
-    const probing = menu.kind === 'model' && agentId !== undefined && ui.probingModels[agentId] === true
-    const menuError = menu.error ?? (menu.kind === 'model' && agentId !== undefined ? ui.probeErrors[agentId] : undefined)
+    const probeKind = menu.kind === 'model' || menu.kind === 'thought'
+    const probing = probeKind && agentId !== undefined && ui.probingModels[agentId] === true
+    // The thought card only owns a probe error while it IS the unknown card.
+    const ownError = menu.kind === 'thought' && route.thoughtUnknown === undefined ? undefined : (agentId === undefined ? undefined : ui.probeErrors[agentId])
+    const menuError = menu.error ?? ownError
     model = menuFor(menu.kind, {
       acp,
       agents,
@@ -1087,6 +1064,13 @@ export function AcpSessionMenu(props: AcpClusterProps) {
         // Opening the menu never probes; this row does. Keep the picker open so
         // the fresh list (or the probe error) lands where the user asked.
         if (agentId !== undefined) await acp.probeModels(agentId)
+        return
+      }
+      if (sectionId === 'thought' && itemId === FETCH_THOUGHT_ITEM) {
+        // The unknown card's gesture: the same probe RPC, one model. Keep the
+        // menu open so the fetched levels (or the failure) land where the user
+        // asked; a success re-renders this card with the real level rows.
+        if (agentId !== undefined && route.thoughtUnknown !== undefined) await acp.probeModels(agentId, route.thoughtUnknown)
         return
       }
       if (sectionId === 'agent' && itemId === OPEN_SETTINGS_ITEM) {

@@ -24,6 +24,7 @@ import {
 import type {
   AcpAgentCatalog,
   AcpAgentDef,
+  AcpCatalogOption,
   AgentCatalogResult,
   AgentProbeModelsResult,
   LlmModelReasoningInfo,
@@ -53,7 +54,25 @@ const CATALOG_SCHEMA = 3
 
 /** The one bridge method a probe needs; `AgentBridge` satisfies it structurally. */
 export interface CatalogProbeBridge {
-  probeConfigOptions(): Promise<unknown>
+  probeConfigOptions(model?: string): Promise<unknown>
+}
+
+/**
+ * The levels one `thought_level` option declares. No `defaultEffort`: the
+ * current value of a per-model observation is one session's pick, not the
+ * agent's default for that model.
+ */
+function reasoningFromOption(option: AcpCatalogOption): LlmModelReasoningInfo | undefined {
+  const efforts: LlmReasoningEffortInfo[] = []
+  for (const choice of option.choices) {
+    if (efforts.some(e => e.id === choice.value)) continue
+    efforts.push({
+      id: choice.value,
+      name: choice.name,
+      ...(choice.description !== undefined ? { description: choice.description } : {}),
+    })
+  }
+  return efforts.length === 0 ? undefined : { efforts }
 }
 
 /**
@@ -216,16 +235,19 @@ export class ModelCatalogService {
     const catalog = parseCatalogOptions(configOptions)
     this.catalogStale.delete(agentId)
     const existing = this.catalogs.get(agentId)
+    // The per-model thought knowledge rides the same entry: a full answer names
+    // the model it describes, so this observation is that model's truth.
+    const observed = this.rememberModelThought(catalog, existing?.catalog, catalog)
     // Auto-discovery compares this observation against the catalog known
     // BEFORE it. The first observation is only a baseline — nothing is "new"
     // yet, and calling every choice of a 500-model catalog "new" would flood
     // the selection the switch is meant to keep tidy.
-    const exposedChanged = this.autoExposeNewModels(agentId, catalog, existing?.catalog)
-    if (existing !== undefined && JSON.stringify(existing.catalog) === JSON.stringify(catalog)) {
+    const exposedChanged = this.autoExposeNewModels(agentId, observed, existing?.catalog)
+    if (existing !== undefined && JSON.stringify(existing.catalog) === JSON.stringify(observed)) {
       if (exposedChanged) this.broadcastExposure(agentId)
       return existing
     }
-    const entry = { catalog, updatedAt: Date.now() }
+    const entry = { catalog: observed, updatedAt: Date.now() }
     this.catalogs.set(agentId, entry)
     this.persistCatalogs()
     // The browser caches the seat surface per agent and only re-reads it when
@@ -257,7 +279,7 @@ export class ModelCatalogService {
     if (!usableConfigOptions(configOptions)) return
     const observed = parseCatalogOptions(configOptions)
     const existing = this.catalogs.get(agentId)
-    const catalog = mergeCatalogShape(existing?.catalog, observed)
+    const catalog = this.rememberModelThought(mergeCatalogShape(existing?.catalog, observed), existing?.catalog, observed)
     if (existing !== undefined && JSON.stringify(existing.catalog) === JSON.stringify(catalog)) return
     const entry = { catalog, updatedAt: Date.now() }
     this.catalogs.set(agentId, entry)
@@ -363,6 +385,52 @@ export class ModelCatalogService {
     })
   }
 
+  /**
+   * Remember which `thought_level` surface one observed MODEL publishes.
+   *
+   * `session/set_config_option` answers and `config_option_update` frames name
+   * the model they describe in `model.currentValue`; the slot (or its absence)
+   * beside it is that model's own vocabulary. This is what lets a model
+   * switched before the first message show the NEW model's levels instead of
+   * the previous one's, without spawning anything.
+   */
+  private rememberModelThought(
+    base: AcpAgentCatalog,
+    previous: AcpAgentCatalog | undefined,
+    observed: AcpAgentCatalog,
+  ): AcpAgentCatalog {
+    const model = observed.model?.currentValue
+    if (model === null || model === undefined || model === '') return base
+    return { ...base, thoughtByModel: { ...previous?.thoughtByModel, [model]: observed.thought ?? null } }
+  }
+
+  /**
+   * The `thought_level` surface ONE model publishes, as last observed.
+   * `null` = observed without the slot; `undefined` = never observed (the
+   * caller must not substitute another model's levels).
+   */
+  modelReasoning(agentId: string, modelValue?: string): LlmModelReasoningInfo | null | undefined {
+    const catalog = this.catalogs.get(agentId)?.catalog
+    if (catalog === undefined) return undefined
+    const observed = modelValue !== undefined && modelValue !== ''
+      ? modelValue
+      : catalog.model?.currentValue ?? undefined
+    if (observed === undefined) {
+      return catalog.thought === undefined ? undefined : reasoningFromOption(catalog.thought) ?? null
+    }
+    const recorded = catalog.thoughtByModel
+    if (recorded !== undefined && Object.prototype.hasOwnProperty.call(recorded, observed)) {
+      const option = recorded[observed]
+      return option === null || option === undefined ? null : reasoningFromOption(option) ?? null
+    }
+    // A catalog written before the per-model map existed: its agent-level slot
+    // describes the model it names, so that one model keeps its answer.
+    if (catalog.model?.currentValue === observed) {
+      return catalog.thought === undefined ? undefined : reasoningFromOption(catalog.thought) ?? null
+    }
+    return undefined
+  }
+
   catalogFor(agentId: string): AcpAgentCatalog | undefined {
     return this.catalogs.get(agentId)?.catalog
   }
@@ -390,7 +458,7 @@ export class ModelCatalogService {
    * read its `configOptions`, close it. Errors propagate to the caller (the
    * RPC result or a notice broadcast).
    */
-  async probeAgentModels(agentId: string): Promise<AgentProbeModelsResult> {
+  async probeAgentModels(agentId: string, model?: string): Promise<AgentProbeModelsResult> {
     // Never spawn for an id the registry no longer owns. `absorbCatalog` also
     // guards the write, because a delete can land while this probe is awaited.
     if (this.host.defOf(agentId) === undefined || this.host.isAgentDeleted(agentId)) {
@@ -398,7 +466,21 @@ export class ModelCatalogService {
     }
     const bridge = this.host.bridgeForProbe(agentId)
     try {
-      const configOptions = await bridge.probeConfigOptions()
+      const configOptions = await bridge.probeConfigOptions(model)
+      // A model-targeted probe is ONE MODEL's shape: the answer names the model
+      // it was switched to, so `thoughtByModel` records it, while the
+      // agent-level `currentModel` keeps what a real session reported (a probe
+      // must not rename the agent's own default in every other composer).
+      if (model !== undefined) {
+        this.absorbCatalogShape(agentId, configOptions)
+        // `undefined` = the answer named no model record at all; reporting
+        // success would leave the card's button spinning forever.
+        if (this.modelReasoning(agentId, model) === undefined) {
+          throw new AcpError('unsupported', `acp: agent "${agentId}" did not report thought levels for model "${model}"`)
+        }
+        const learned = this.catalogs.get(agentId)
+        return { agentId, catalog: learned?.catalog ?? {}, updatedAt: learned?.updatedAt ?? Date.now() }
+      }
       const entry = this.absorbCatalog(agentId, configOptions)
       // A fresh probe answers in the CURRENT schema by construction.
       this.catalogStale.delete(agentId)
@@ -485,6 +567,14 @@ export class ModelCatalogService {
       })
     }
     const reasoning = this.reasoningMeta(agentId)
+    // Per-model levels, so a conversation whose model was switched before its
+    // first message can show THAT model's vocabulary (an empty list = observed
+    // without a level axis). The agent-level `reasoning` above stays the
+    // default-model answer, including its `defaultEffort`.
+    const reasoningByModel: Record<string, LlmModelReasoningInfo> = {}
+    for (const [value, option] of Object.entries(entry?.catalog.thoughtByModel ?? {})) {
+      reasoningByModel[value] = option === null ? { efforts: [] } : reasoningFromOption(option) ?? { efforts: [] }
+    }
     const modelOption = entry?.catalog.model
     // The model the agent reports it is ON (its `model.currentValue`, refreshed
     // every time a session publishes `configOptions`). This is what the base
@@ -519,6 +609,7 @@ export class ModelCatalogService {
       variants,
       probed: entry !== undefined,
       ...(reasoning !== undefined ? { reasoning } : {}),
+      ...(Object.keys(reasoningByModel).length === 0 ? {} : { reasoningByModel }),
       // The agent's OWN current model, so the model chip has something to show
       // before this conversation has picked one. Absent when the agent publishes
       // no model selector at all — then there really is no model axis.
@@ -598,7 +689,10 @@ export class ModelCatalogService {
       // Stale variant (agent dropped the model): degrade instead of throwing.
       return { provider, id: model, name: model }
     }
-    const reasoning = this.reasoningMeta(agentId)
+    // Only THIS model's observed levels. A model nobody has seen has none
+    // here, exactly like the composer's "unknown" card — borrowing the
+    // agent-level list would advertise another model's levels as this one's.
+    const reasoning = this.modelReasoning(agentId, choice) ?? undefined
     return {
       provider,
       id: model,
@@ -616,20 +710,12 @@ export class ModelCatalogService {
   reasoningMeta(agentId: string): LlmModelReasoningInfo | undefined {
     const thought = this.catalogs.get(agentId)?.catalog.thought
     if (thought === undefined) return undefined
-    const efforts: LlmReasoningEffortInfo[] = []
-    for (const choice of thought.choices) {
-      if (efforts.some(e => e.id === choice.value)) continue
-      efforts.push({
-        id: choice.value,
-        name: choice.name,
-        ...(choice.description !== undefined ? { description: choice.description } : {}),
-      })
-    }
-    if (efforts.length === 0) return undefined
+    const info = reasoningFromOption(thought)
+    if (info === undefined) return undefined
     const defaultEffort = thought.currentValue
     return {
-      efforts,
-      ...(defaultEffort !== null && efforts.some(e => e.id === defaultEffort) ? { defaultEffort } : {}),
+      efforts: info.efforts,
+      ...(defaultEffort !== null && info.efforts.some(e => e.id === defaultEffort) ? { defaultEffort } : {}),
     }
   }
 

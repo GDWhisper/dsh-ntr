@@ -22,6 +22,7 @@ import {
   Transcript,
   childEnv,
   normalizeApprovalWindow,
+  parseCatalogOptions,
   permissionRequestFrame,
   pickAutoOption,
   randomUUID,
@@ -1070,10 +1071,11 @@ export class AgentBridge {
    * `mcp__injected__*` tools disappeared). One list per agent process is the
    * only shape that keeps every session of that process consistent.
    */
-  async probeConfigOptions(): Promise<unknown[]> {
+  async probeConfigOptions(model?: string): Promise<unknown[]> {
     // A probe is the reason an agent process can be resident with NOTHING else
     // going on: it opens a session it deliberately never registers, so the
     // probe itself is the only thing keeping it from being idle-released.
+    let probeSession: string | undefined
     this.pendingProbes += 1
     try {
       await this.ensureReady()
@@ -1084,9 +1086,23 @@ export class AgentBridge {
         conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: toAcpMcpServers(this.def.mcpServers) }),
         'session/new',
       )
-      await conn.agent.request(methods.agent.session.close, { sessionId: result.sessionId }).catch(() => { /* optional capability */ })
-      return Array.isArray(result.configOptions) ? result.configOptions : []
+      probeSession = result.sessionId
+      // `model` asks for ONE model's option set (the thought card's fetch).
+      let configOptions: unknown = result.configOptions
+      const selector = model === undefined ? undefined : parseCatalogOptions(configOptions).model
+      if (model !== undefined) {
+        if (selector === undefined || (selector.choices.length > 0 && !selector.choices.some(choice => choice.value === model))) throw new AcpError('unknown_model', `acp: agent "${this.def.id}" does not offer model "${model}"`)
+        if (selector.currentValue !== model) {
+          const answer = await this.withStartupTimeout(
+            conn.agent.request(methods.agent.session.setConfigOption, { sessionId: result.sessionId, configId: selector.configId, value: model }),
+            'session/set_config_option',
+          ) as { configOptions?: unknown }
+          if (usableConfigOptions(answer.configOptions)) configOptions = answer.configOptions
+        }
+      }
+      return Array.isArray(configOptions) ? configOptions : []
     } finally {
+      if (probeSession !== undefined) await this.conn?.agent.request(methods.agent.session.close, { sessionId: probeSession }).catch(() => { /* optional capability */ })
       this.pendingProbes -= 1
       this.touch()
     }

@@ -3556,7 +3556,7 @@ export interface AcpManager {
   setExposedModels?(agentId: string, exposedModels: readonly string[] | undefined): Promise<void>
   /** Toggle auto-discovery of newly published models. Must not restart the agent. */
   setAutoDiscoverModels?(agentId: string, autoDiscoverModels: boolean): Promise<void>
-  probeAgentModels?(agentId: string): Promise<AgentProbeModelsResult>
+  probeAgentModels?(agentId: string, model?: string): Promise<AgentProbeModelsResult>
   /**
    * The ACP model surface for one agent (the seats' data source): base entry,
    * the `exposedModels` variants, and the agent's own reasoning efforts.
@@ -4158,7 +4158,7 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         }
         // Must invoke as a method: extracting the function would drop the
         // manager receiver (`this`) and crash the real BridgeManager.
-        return ok(await manager.probeAgentModels(str(body, 'agentId', 64)))
+        return ok(await manager.probeAgentModels(str(body, 'agentId', 64), optionalStr(body, 'model', 200)))
       }
       case 'agent/cached-models': {
         // Persistent-cache read for the settings panel. `null` (not an error)

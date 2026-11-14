@@ -917,4 +917,80 @@ describe('pre-chat pick persistence (isolated manager)', () => {
       await gm.shutdownAll()
     }
   }, 30_000)
+  it('drops an effort the target model was observed without, before any session exists, with one notice', async () => {
+    const hub = new EventHub()
+    const notices: string[] = []
+    hub.subscribe(event => { if (event.type === 'agent/notice') notices.push(event.text) })
+    const gm = new BridgeManager([{ ...def, env: { ...def.env, MOCK_PLAIN_MODEL_CHOICE: '1' } }], hub, 500, `${tmpdir()}/acp-model-plain-${Date.now()}.json`)
+    gm.bindChatAgent('learn-plain', 'mock')
+    // A live session observes the variant-less model: its answer is the only
+    // place that model's option set exists, and it records "no thought axis".
+    for await (const _chunk of gm.streamPrompt({
+      model: 'mock',
+      sessionId: 'learn-plain',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+    } as never)) { /* drain */ }
+    await gm.setChatSessionModel('learn-plain', 'mock@mock-model-plain')
+    expect(gm.agentCatalog('mock').reasoningByModel?.['mock-model-plain']).toEqual({ efforts: [] })
+
+    // A DIFFERENT conversation with no ACP session at all — the pre-first-turn
+    // window this record exists for.
+    gm.bindChatAgent('fresh-plain', 'mock')
+    await gm.setChatSessionEffort('fresh-plain', 'high', 'mock')
+    const before = notices.length
+    await gm.setChatSessionModel('fresh-plain', 'mock@mock-model-plain')
+    expect(gm.chatChoice('fresh-plain')).toEqual({ agentId: 'mock', modelId: 'mock@mock-model-plain' })
+    // Exactly one notice: the cleared level is news, and it is said once.
+    expect(notices.length - before).toBe(1)
+    expect(notices.at(-1)).toContain('no longer offers thought level "high"')
+    await gm.shutdownAll()
+  }, 30_000)
+
+  it('keeps a level the target model declares, and the first turn runs it after the switch', async () => {
+    const hub = new EventHub()
+    const notices: string[] = []
+    const meta: Array<Array<{ configId: string; currentValue: string }>> = []
+    hub.subscribe(event => {
+      if (event.type === 'agent/notice') notices.push(event.text)
+      if (event.type !== 'session/meta') return
+      const options = (event.session as unknown as { configOptions?: Array<{ configId: string; currentValue: string }> }).configOptions
+      if (options !== undefined) meta.push(options)
+    })
+    const gm = new BridgeManager([{ ...def, id: 'mock' }], hub, 500, `${tmpdir()}/acp-model-keep-pre-${Date.now()}.json`)
+    // Learn `mock-model-b`'s own levels by switching a live session to it.
+    gm.bindChatAgent('learn-b', 'mock')
+    for await (const _chunk of gm.streamPrompt({
+      model: 'mock',
+      sessionId: 'learn-b',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+    } as never)) { /* drain */ }
+    await gm.setChatSessionModel('learn-b', 'mock@mock-model-b')
+    expect(gm.agentCatalog('mock').reasoningByModel?.['mock-model-b']?.efforts.map(level => level.id))
+      .toEqual(['off', 'high'])
+
+    gm.bindChatAgent('fresh-b', 'mock')
+    await gm.setChatSessionModel('fresh-b', 'mock@mock-model-a')
+    await gm.setChatSessionEffort('fresh-b', 'high', 'mock')
+    const before = notices.length
+    await gm.setChatSessionModel('fresh-b', 'mock@mock-model-b')
+    // The level is part of B's vocabulary, so the pick survives — silently.
+    expect(gm.chatChoice('fresh-b')).toEqual({ agentId: 'mock', modelId: 'mock@mock-model-b', effort: 'high' })
+    expect(notices.length).toBe(before)
+
+    // The first message materializes the session; `applyChatChoice` applies the
+    // record, so the turn runs on the model AND the level the composer showed.
+    for await (const _chunk of gm.streamPrompt({
+      model: 'mock',
+      sessionId: 'fresh-b',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+    } as never)) { /* drain */ }
+    const [session] = gm.chatSessions('fresh-b')
+    expect(session?.modelId).toBe('mock@mock-model-b')
+    expect(session?.reasoningEffort).toBe('high')
+    const last = meta.at(-1) ?? []
+    expect(last.find(option => option.configId === 'model')?.currentValue).toBe('mock-model-b')
+    expect(last.find(option => option.configId === 'thought')?.currentValue).toBe('high')
+    await gm.shutdownAll()
+  }, 30_000)
+
 })

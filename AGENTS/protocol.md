@@ -17,7 +17,7 @@
 **MCP 服务器随会话建立下发**：agent 级 `mcpServers`（见 [state.md §2](./state.md)）在四个建会话点**各发一次**，内容是同一份列表：
 
 - `createSession`（`session/new`）
-- `probeConfigOptions`（目录探测也走 `session/new`）
+- `probeConfigOptions`（目录探测也走 `session/new`；带 `model` 时再经 `session/set_config_option` 切到该模型，答案即它的 `configOptions`，这条一次性会话无论成败都关掉）
 - resume 路径的 `session/load`
 - 分叉路径的 `session/fork`（见下方「第四个建会话点」）
 

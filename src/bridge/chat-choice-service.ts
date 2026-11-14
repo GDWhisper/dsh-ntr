@@ -58,6 +58,8 @@ export interface ChatChoiceHost {
   catalogFor(agentId: string): AcpAgentCatalog | undefined
   /** The agent's reasoning metadata (its MATERIALIZED default effort). */
   reasoningMeta(agentId: string): LlmModelReasoningInfo | undefined
+  /** The thought levels ONE model publishes; `null` = observed without the slot, `undefined` = never observed. */
+  modelReasoning(agentId: string, modelValue: string | undefined): LlmModelReasoningInfo | null | undefined
   /** Every live / parked ACP session the manager holds, in map order. */
   sessions(): Iterable<LiveSession>
   /** The process holding one session (never an agent-wide guess; see A1). */
@@ -303,16 +305,19 @@ export class ChatChoiceService {
     // `thought_level` only for models with variants, so the previous model's
     // level is not the new model's vocabulary. A LIVE session can judge the old
     // pick against the new model's own option set (`alignSessionConfig`, which
-    // drops it with a notice when the set no longer offers it). Before the first
-    // session there is no such authority — the catalog still describes the model
-    // the agent was last on — so the level is cleared instead of being displayed
-    // as this model's own until the first message.
+    // drops it with a notice when the set no longer offers it). Without one,
+    // the catalog's per-model observation answers; a model it has never seen
+    // must NOT inherit the old level — the chip would name a value this model
+    // may not offer.
     const previous = this.picks.get(dshSessionId)
     const nextModelId = choice === undefined ? undefined : modelId
     const modelChanged = previous?.agentId === agentId && previous.modelId !== nextModelId
     const hasLiveSession = [...this.host.sessions()].some(session =>
       session.dshSessionId === dshSessionId && session.agentId === agentId && lifecycleOf(session) !== 'parked')
-    const clearEffort = modelChanged && !hasLiveSession
+    const staleEffort = modelChanged && !hasLiveSession ? previous?.effort : undefined
+    const known = staleEffort === undefined ? undefined : this.host.modelReasoning(agentId, choice)
+    const clearEffort = staleEffort !== undefined
+      && !(known !== null && known !== undefined && known.efforts.some(level => level.id === staleEffort))
     // The pick is recorded even when NO live session exists yet — that is the
     // "choose the model before the first message" case. A session that
     // materializes later reads it back (`applyChatChoice`).
@@ -321,6 +326,16 @@ export class ChatChoiceService {
       modelId: nextModelId,
       ...(clearEffort ? { effort: undefined } : {}),
     })
+    if (clearEffort) {
+      this.host.hub.broadcast({
+        type: 'agent/notice',
+        agentId,
+        level: 'info',
+        text: known === undefined
+          ? `acp: agent "${agentId}" has not reported this model's thought levels yet; cleared thought level "${staleEffort}" (fetch it from the thought card)`
+          : `acp: agent "${agentId}" no longer offers thought level "${staleEffort}" for model "${choice ?? 'default'}"; using its own current level`,
+      })
+    }
     for (const session of this.host.sessions()) {
       if (session.dshSessionId !== dshSessionId || session.agentId !== agentId) continue
       session.choice = choice
@@ -659,7 +674,7 @@ export class ChatChoiceService {
         if (usableConfigOptions(session.configOptions)) {
           result.effortStale = true
           if (this.dropStalePick(session, 'effort', wantedEffort)) {
-            notice('error', `acp: agent "${session.agentId}" no longer offers thought level "${wantedEffort}"; using its own current level`)
+            notice('info', `acp: agent "${session.agentId}" no longer offers thought level "${wantedEffort}"; using its own current level`)
           }
         }
       } else if (thought.currentValue === wantedEffort) {
@@ -667,8 +682,9 @@ export class ChatChoiceService {
       } else if (thought.choices.length > 0 && !thought.choices.some(choice => choice.value === wantedEffort)) {
         result.effortStale = true
         if (this.dropStalePick(session, 'effort', wantedEffort)) {
-          notice('error', `acp: agent "${session.agentId}" no longer offers thought level "${wantedEffort}"; using its own current level`)
-        }      } else {
+          notice('info', `acp: agent "${session.agentId}" no longer offers thought level "${wantedEffort}"; using its own current level`)
+        }
+      } else {
         try {
           await bridge.setConfigOption(session, thought.configId, wantedEffort)
         } catch (error) {

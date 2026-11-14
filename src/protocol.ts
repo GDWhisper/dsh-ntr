@@ -1345,26 +1345,25 @@ export interface AcpCatalogOption {
 /**
  * The per-category catalog derived from one agent's `configOptions`.
  *
- * `mode` is the agent's own permission/working mode published as a
- * `category: 'mode'` select. It duplicates the `modes` field of `session/new`
- * on the agents observed so far (omp, codebuddy), but it is the only copy a
- * conversation can read BEFORE it has a live session — which is exactly the
- * window in which the composer must still show the control (user report,
- * 2026-10-18: the mode select vanished on a conversation set up ahead of its
- * first message).
+ * `mode` duplicates `session/new`'s `modes` on the agents observed so far,
+ * but it is the only copy a conversation can read BEFORE it has a live
+ * session — the window in which the composer must still show the control.
  *
- * `extras` are the agent's REMAINING select options (temperature, vendor
- * switches, `model_config` entries, anything unknown). They have no dedicated
- * control in the composer, so they ride the "advanced" base to the left of the
- * model chip. Keeping them here — rather than in the browser's raw
- * `configOptions` — is what lets a conversation with no live session show and
- * set them.
+ * `extras` are the remaining select options (temperature, `model_config`,
+ * anything unknown); they ride the "advanced" base, which is what lets a
+ * session-less conversation show and set them.
  */
 export interface AcpAgentCatalog {
   model?: AcpCatalogOption
   thought?: AcpCatalogOption
   mode?: AcpCatalogOption
   extras?: AcpCatalogOption[]
+  /**
+   * The `thought` slot each MODEL was observed with, keyed by the choice
+   * value; `null` = observed without the slot (opencode only publishes
+   * `effort` for models with variants). Absent key = never observed.
+   */
+  thoughtByModel?: Record<string, AcpCatalogOption | null>
 }
 
 /**
@@ -1480,24 +1479,24 @@ export interface AgentCatalogResult {
   /** The `agentId@choice` variants this agent exposes (`exposedModels` applied). */
   variants: Array<{ id: string; name: string; description?: string }>
   /**
-   * Reasoning efforts from the agent's own `thought_level` option, when it
-   * advertises one. Agent-wide by construction (a thought level is not a
-   * property of one model), which is why it rides here and not on `variants`.
+   * The agent-level `thought_level` slot: the last observed model's levels,
+   * including its `defaultEffort`. Per-model answers ride `reasoningByModel`.
    */
   reasoning?: LlmModelReasoningInfo
   /**
+   * The levels each MODEL was observed with, keyed by the choice value.
+   * `{ efforts: [] }` = observed without the axis; absent = never observed
+   * (that model must not borrow another model's levels).
+   */
+  reasoningByModel?: Record<string, LlmModelReasoningInfo>
+  /**
    * The model the agent itself reports as selected (`model.currentValue`).
    *
-   * This is what the model chip shows for a conversation that has not picked
-   * anything yet: without it the chip has no label and therefore does not
-   * render at all, so an agent the user simply has not tuned yet looks like an
-   * agent with no model axis (user report, 2026-10-18). Its absence is
-   * meaningful — an agent that publishes no `category: 'model'` select has no
-   * model axis, and the chip stays away.
-   *
-   * NOTE the difference from `base`: `base` is a ROUTE (bare `agentId`), this is
-   * a MODEL VALUE (a choice id). The picker needs both — one to name the route,
-   * one to mark the row the conversation is actually on.
+   * Without it the model chip has no label for a conversation that has not
+   * picked one and does not render at all; its absence means the agent
+   * publishes no `category: 'model'` select. Unlike `base` (a ROUTE, the bare
+   * `agentId`), this is a MODEL VALUE: the picker needs both to name the route
+   * and to mark the row in force.
    */
   currentModel?: { value: string; name: string; description?: string }
   /**
