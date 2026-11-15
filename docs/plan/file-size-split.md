@@ -1,6 +1,6 @@
 # 巨型文件拆分计划（第二轮：三件套 / 设置页 / 协议覆盖 / UI 面）
 
-**状态**：**P0 / P1 / P2 / P3a 已完成，P3b 第一批（leaf 服务）与第二批（save-banners / agent-admin）已完成，P3b 其余批次与 P4–P6 未开始**。承接 [bridge-split.md](./archive/bridge-split.md)（第一轮，已完成）的纪律与模式。
+**状态**：**P0 / P1 / P2 / P3a 已完成，P3b 第一至第三批（leaf 服务 / save-banners + agent-admin / chat-choice + chat-sessions）已完成，P3b 余下（connection）与 P4–P6 未开始**。承接 [bridge-split.md](./archive/bridge-split.md)（第一轮，已完成）的纪律与模式。
 **一句话**：把行数基线里**仍在增长**的存量文件按领域簇拆到 ≤1000 行并删除基线条目；功能面已封闭的文件继续锁着不动。
 
 > 写作约定：代码位置一律用「文件 + 符号名」，不写行号。**本文不锁定任何文件的当前行数**——正式执行前代码仍会变动，行数与符号清单在每个子步开工时以 HEAD 实测重新核对；本文锁定的只有「领域簇划分、归属、顺序、停止条件」。索引登记进 [docs/README.md](../README.md)，待办登记进 [docs/todo.md](../todo.md)。
@@ -144,6 +144,8 @@ impl 几乎全是纯函数 + 小类 + 一个自由函数分发器，按领域机
 测试镜像：`tests/store.spec.ts` 107 例 → 69 例 + `tests/store/save-banners.spec.ts` 33 例 + `tests/store/agent-admin.spec.ts` 5 例（合计仍 107，describe 标题与用例逐字不变；locale 切换类用例留在原文件，断的是门面 `refreshLocale`）。基线收紧：`src/client/store.ts` 2676 → 2026，`tests/store.spec.ts` 3016 → 1928。
 
 - `tests/store.spec.ts` 按同领域拆；纯函数用例已随 P3a 搬进 `tests/store/`，其余（类驱动）随 P3b 的服务划分迁移。
+
+**落地记录（P3b 第三批）**：`chat-choice.ts`（`ChatChoiceService`，Host：`call` / `mutate` / `state` / `flashError`，4 个）与 `chat-sessions.ts`（`ChatSessionsService`，Host：`call` / `mutate` / `state` / `flashError` / `locale` / `verdicts{settleAllowed,commit,markUnsettled}` / `noteAcpSessionOwners` / `writeChoice`，8 项）落成。判定账本 `acpVerdicts` 与 ACP→会话归属表 `acpSessionOwners` **留在门面**（座位闸门的 `claimAcpAsk` / `hasAcpModeVerdict` 读同一份 verdicts，`flushUpdates` 与 `turn/metrics` 读同一份 owners），服务只拿到三项窄动作与一个「把这些行记进归属表」的回调，因此仍无运行时门面导入、Host 在「>10」线下。帧簿记（在飞读去重、`chatRowFrames`、`chatListLoaded`、`chatUnlocked`、`subagentRecordFrames`、`MAX_WATCHED`）随服务搬走，门面的 `applyEvent` 仍按到达顺序喂它（`noteChatRowFrame` / `noteAgentLocked` / `noteAgentUnlocked` / `noteSubagentRecord`），`subagents/record` 的折叠（`subagentKey` / `isSubagentDowngrade`）留门面。`writeChoice` 仍只增不减（约束 27），模式切换的记忆写入经 `ChatSessionsHost.writeChoice` 回到 `ChatChoiceService`——单一写者未破。基线：`src/client/store.ts` 2026 → 1597，`tests/store.spec.ts` 1928 → 1129；测试镜像 `tests/store.spec.ts` 69 例 → 44 例 + `chat-choice.spec.ts` 6 例（`the conversation↔agent binding`）+ `chat-sessions.spec.ts` 19 例（subagent lifecycle 2 / observed transcripts 6 / fork 5 / chat-row freshness 6），describe 标题与用例逐字不变。`connection.ts` 未开始。
 
 ## 7. P4：`src/client/panel.tsx` → `src/client/panel/` + `tests/panel.spec.ts` → `tests/panel/`
 

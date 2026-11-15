@@ -7,25 +7,27 @@
  * `src/client/store/` and are re-exported at the bottom of this file, so every
  * existing `./store.ts` import keeps resolving unchanged. The SERVICE clusters
  * (settings writes, the built-in updater, the model catalog, the `/` menu rows,
- * worker detail indexes, the save gate and its banners, the roster write path)
- * live there as classes with a narrow host interface; this class owns the state
- * and delegates to them.
+ * worker detail indexes, the save gate and its banners, the roster write path,
+ * the conversation's ACP sessions and its own picks) live there as classes with
+ * a narrow host interface; this class owns the state and delegates to them.
  *
  * Deliberately framework-free: React binds through `useSyncExternalStore`.
  */
 
 import { DEFAULT_KNOWN_PRESETS } from "./store/presets.ts"
 import type { Block } from "./store/blocks.ts"
-import { foldUpdate, replayChatRowFrames, usageFromUpdate, withSessionReleased } from "./store/blocks.ts"
+import { foldUpdate, usageFromUpdate, withSessionReleased } from "./store/blocks.ts"
 import type { ChatForkOutcome } from "./store/fork.ts"
 import type { PendingPermission } from "./store/permission.ts"
 import { normalizeSaveGateStatus } from "./store/save-gate.ts"
-import type { AcpLogEntry, ChatRowFrame, ChatTranscript, RpcCall, UiState } from "./store/state.ts"
+import type { AcpLogEntry, ChatTranscript, RpcCall, UiState } from "./store/state.ts"
 import { LOG_MAX_ENTRIES } from "./store/state.ts"
 import type { SubagentDetailState } from "./store/subagent.ts"
-import { isSubagentDowngrade, mergeSubagentSnapshot, subagentKey } from "./store/subagent.ts"
+import { isSubagentDowngrade, subagentKey } from "./store/subagent.ts"
 import { AgentAdminService } from "./store/agent-admin.ts"
 import { CatalogService } from "./store/catalog.ts"
+import { ChatChoiceService } from "./store/chat-choice.ts"
+import { ChatSessionsService } from "./store/chat-sessions.ts"
 import { SaveBannersService } from "./store/save-banners.ts"
 import { SettingsService } from "./store/settings.ts"
 import type { AgentCommand } from "./store/skills.ts"
@@ -33,16 +35,13 @@ import { SkillsService } from "./store/skills.ts"
 import { SubagentDetailService } from "./store/subagent-detail.ts"
 import { UpdateService } from "./store/update.ts"
 
-import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesResult, DetectedAgentInfo, IdleReleaseResult, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, AgentSkillEntry, SubagentDetailEntry, SubagentRecord } from '../protocol.ts'
+import type { AcpApprovalDeadlines, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentTestResult, AgentView, ApprovalDeadlinesResult, DetectedAgentInfo, IdleReleaseResult, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, AgentSkillEntry, SubagentDetailEntry } from '../protocol.ts'
 import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO } from '../protocol.ts'
 import { commitFrame, consumeVerdict, invalidateVerdict, markUnsettled, peekVerdict, projectAcpMode, settleFromHost, type AcpVerdict } from './acp-verdict.ts'
-import { modelOffersEffort, modelValueOf } from './route-reasoning.ts'
 
 interface Listener { (): void }
 
 const MAX_BLOCKS = 400
-/** How many observed ACP transcripts stay live at once (insertion-ordered eviction). */
-const MAX_WATCHED = 6
 
 export class AcpStore {
   private state: UiState = {
@@ -100,31 +99,6 @@ export class AcpStore {
   private readonly lastSeq = new Map<string, number>()
   /** Sessions with a finalized turn (dedups the cancel-fallback + late real turn/end pair). */
   private readonly openTurns = new Set<string>()
-  /** In-flight `session/chat-list` reads, keyed by chat session id. */
-  private readonly chatSessionReads = new Map<string, { dropped: boolean; done: Promise<void> }>()
-  /**
-   * Monotonic order plus a short log of chat-row lifecycle frames. Read
-   * starts capture the sequence; the answer replays every later frame over
-   * its row list. Bounded — a read only needs the frames since it started, and
-   * a page that never reconnects cannot grow this without bound.
-   */
-  private chatRowFrameSeq = 0
-  private readonly chatRowFrames: ChatRowFrame[] = []
-  /**
-   * Chat sessions whose list has answered at least once in this page. The
-   * FIRST answer only seeds the lock; a lock appearing on a later answer is a
-   * transition this page actually witnessed, and only that one is announced via
-   * {@link UiState.agentLockReveal}.
-   */
-  private readonly chatListLoaded = new Set<string>()
-  /**
-   * Conversations whose provisional first-turn lock the host rolled back
-   * (`chat/agent-unlocked`, no visible output in the first turn). A
-   * `session/chat-list` read that started BEFORE the rollback can still name
-   * `lockedAgentId`; it must not revive the lock. A new `chat/agent-locked`
-   * frame clears the entry (the user retried and the turn really started).
-   */
-  private readonly chatUnlocked = new Set<string>()
   /**
    * The ACP-mode verdicts this page holds, keyed by chat session id (see
    * {@link AcpVerdict}): `frame` (a committed `agent-preset/selected` frame)
@@ -134,14 +108,6 @@ export class AcpStore {
    * gate's own TTL re-ask: it updates the value, the frame keeps its authority.
    */
   private readonly acpVerdicts = new Map<string, AcpVerdict>()
-  /**
-   * Monotonic order plus a short log of applied `subagents/record` frames: a
-   * `session/chat-list` answer can describe the host as of BEFORE a frame that
-   * landed while the read was in flight, and the answer replays the later
-   * frames over its snapshot.
-   */
-  private subagentRecordSeq = 0
-  private readonly subagentRecordFrames: Array<{ seq: number; dshSessionId: string; record: SubagentRecord }> = []
   /**
    * ACP session id → owning DSH chat session id, learned from chat-list rows
    * and `turn/metrics` frames. Live `session/update` frames carry only the ACP
@@ -169,6 +135,8 @@ export class AcpStore {
   private readonly subagentDetailService: SubagentDetailService
   private readonly saveBannersService: SaveBannersService
   private readonly agentAdminService: AgentAdminService
+  private readonly chatChoiceService: ChatChoiceService
+  private readonly chatSessionsService: ChatSessionsService
 
   constructor(private readonly rpc: RpcCall, private readonly locale: (zh: string, en: string) => string) {
     const call = <T>(endpoint: string, payload: unknown = {}): Promise<T> => this.call<T>(endpoint, payload)
@@ -215,6 +183,28 @@ export class AcpStore {
       probeModels: (agentId, model) => this.probeModels(agentId, model),
       invalidateSeatCatalog: agentId => this.invalidateSeatCatalog(agentId),
     }, this.saveBannersService)
+    this.chatChoiceService = new ChatChoiceService({ call, mutate, state, flashError })
+    this.chatSessionsService = new ChatSessionsService({
+      call,
+      mutate,
+      state,
+      flashError,
+      locale: label,
+      // The verdict book and the owner map stay in this class: the seat gate
+      // reads the same verdicts, and live update folds read the same owners.
+      verdicts: {
+        settleAllowed: (dshSessionId, settleVerdict) => settleVerdict === true
+          || peekVerdict(this.acpVerdicts, dshSessionId)?.kind !== 'frame',
+        commit: (dshSessionId, value) => this.commitHostVerdict(dshSessionId, value),
+        markUnsettled: (dshSessionId) => { markUnsettled(this.acpVerdicts, dshSessionId) },
+      },
+      noteAcpSessionOwners: (dshSessionId, sessions) => {
+        for (const row of sessions) this.acpSessionOwners.set(row.sessionId, dshSessionId)
+      },
+      // The conversation's picks have a single writer; the mode switch records
+      // through the same one.
+      writeChoice: (dshSessionId, update, agentId) => this.chatChoiceService.writeChoice(dshSessionId, update, agentId),
+    })
   }
 
   /**
@@ -694,174 +684,20 @@ export class AcpStore {
     }
   }
 
+  // ---- The conversation's ACP sessions (implementation: store/chat-sessions.ts) ----
+
   /**
    * Load the ACP agent sessions backing one DSH chat session. The composer
    * control calls this per chat session (and again whenever a turn settles, so
    * the binding a fresh conversation just created shows up).
-   */
-  /**
-   * Load the ACP agent sessions backing one DSH chat session. The composer
-   * control calls this per chat session (and again whenever a turn settles, so
-   * the binding a fresh conversation just created shows up).
-   *
-   * `settleVerdict` is the seat gate's own re-ask and the ONLY read allowed to
-   * settle a verdict a frame had already settled (see {@link acpVerdicts}): the
-   * gate holds such a verdict as its only fact source while the session row
-   * stays silent, and a host read is the one place a switch the runtime never
-   * framed can still be learned from. Composer readers pass nothing and keep
-   * the frame's authority.
    */
   loadChatSessions(dshSessionId: string, options?: { settleVerdict?: boolean; force?: boolean }): Promise<void> {
-    // The composer entries (agent-mode control, ACP cluster, occupancy ring)
-    // read this and re-read when a turn settles; one round-trip answers for
-    // all of them instead of racing reads. A caller arriving mid-read waits
-    // for THAT read rather than returning immediately: the slash source's
-    // one-shot "do I have a verdict yet?" ask is only useful if it can
-    // receive the answer of a read already in flight.
-    //
-    // `force` belongs to a caller that knows the host state JUST changed (a
-    // turn started, an explicit resume finished, the stream reconnected). A
-    // read that began before that change still names the old released row,
-    // and the dedup above would otherwise hand this caller that stale answer.
-    // Dropping it first makes this call ask the host again. The dropped read
-    // still resolves for its own caller; `read.dropped` makes it write nothing.
-    if (options?.force === true) this.abandonChatSessionRead(dshSessionId)
-    const inFlight = this.chatSessionReads.get(dshSessionId)
-    if (inFlight !== undefined) return inFlight.done
-    const read: { dropped: boolean; done: Promise<void> } = { dropped: false, done: Promise.resolve() }
-    this.chatSessionReads.set(dshSessionId, read)
-    read.done = this.readChatSessionList(dshSessionId, options, read)
-    return read.done
+    return this.chatSessionsService.loadChatSessions(dshSessionId, options)
   }
 
-  private async readChatSessionList(
-    dshSessionId: string,
-    options: { settleVerdict?: boolean; force?: boolean } | undefined,
-    read: { dropped: boolean },
-  ): Promise<void> {
-    const settle = options?.settleVerdict === true || peekVerdict(this.acpVerdicts, dshSessionId)?.kind !== 'frame'
-    // Captured BEFORE the request: every frame applied after this point is
-    // newer than whatever state the host will answer with.
-    const subagentRecordFramesAtRead = this.subagentRecordSeq
-    const chatRowFramesAtRead = this.chatRowFrameSeq
-    try {
-      const { sessions: listed = [], acpMode, boundAgentId, lockedAgentId, choice } = await this.call<{ sessions: ChatSessionView[]; acpMode?: boolean; boundAgentId?: string; lockedAgentId?: string; choice?: AcpConversationChoice }>('session/chat-list', { dshSessionId, refresh: true })
-      // The host answer can still describe the released row it had when this
-      // read started. Replay the lifecycle frames that landed in the meantime:
-      // a resume's `session/reset` flips the row back to live, a crash's
-      // `session/released` parks it, a close drops it. Without this the late
-      // answer overwrites the frame and the released banner survives a turn
-      // that is already running on a live process.
-      const sessions = replayChatRowFrames(listed, this.chatRowFrames, chatRowFramesAtRead)
-      // A committed `agent-preset/selected` frame may have settled this
-      // session's verdict while the read was in flight; the host answer then
-      // describes the log as of BEFORE that switch and must not overwrite it.
-      if (read.dropped) return
-      // The first answer for a conversation only seeds what is already true: a
-      // lock reported there belongs to an earlier page. A lock that appears on
-      // a LATER answer is the first-turn transition unfolding in front of the
-      // user, and only that one is announced to the hand-off animation.
-      const firstAnswer = !this.chatListLoaded.has(dshSessionId)
-      this.chatListLoaded.add(dshSessionId)
-      // The lock is one-way, so a read that no longer reports one is an older
-      // host half, not an unlock: keep what we already know in that case. The
-      // one explicit unlock is the host's rollback frame, tracked separately.
-      // A read that AGREES there is no lock clears the rollback marker, so a
-      // later legitimate lock (even with its frame missed) is accepted again.
-      if (lockedAgentId === undefined) this.chatUnlocked.delete(dshSessionId)
-      const reportedLock = lockedAgentId !== undefined && this.chatUnlocked.has(dshSessionId)
-        ? undefined
-        : lockedAgentId
-      const chatLockedAgent = reportedLock === undefined
-        ? this.state.chatLockedAgent
-        : { ...this.state.chatLockedAgent, [dshSessionId]: reportedLock }
-      const witnessedLock = !firstAnswer
-        && reportedLock !== undefined
-        && this.state.chatLockedAgent[dshSessionId] === undefined
-      const agentLockReveal = witnessedLock
-        ? { ...this.state.agentLockReveal, [dshSessionId]: (this.state.agentLockReveal[dshSessionId] ?? 0) + 1 }
-        : this.state.agentLockReveal
-      // The plugin's own lifecycle records: REPLACED for this conversation and
-      // refreshed for every other one, then replayed over by the
-      // `subagents/record` frames that landed while this read was in flight
-      // (an in-flight terminal must beat an older snapshot row). Rows of this
-      // conversation also teach the ACP-session→conversation map the live
-      // detail index is scoped by.
-      for (const row of sessions) this.acpSessionOwners.set(row.sessionId, dshSessionId)
-      const subagents = mergeSubagentSnapshot(
-        this.state.subagents,
-        dshSessionId,
-        sessions,
-        this.subagentRecordFrames,
-        subagentRecordFramesAtRead,
-      )
-      this.mutate({
-        chatSessions: sessions,
-        chatSessionsFor: dshSessionId,
-        chatLockedAgent,
-        agentLockReveal,
-        subagents,
-        // The host's binding (intent + live-session fallback) outranks the
-        // optimistic entry this store wrote on the click; a host without the
-        // field (older half) simply leaves the optimistic value standing.
-        ...(boundAgentId === undefined
-          ? {}
-          : { chatBoundAgent: { ...this.state.chatBoundAgent, [dshSessionId]: boundAgentId } }),
-        // The persisted pick (model + thought level) — the host's record,
-        // present before any ACP session exists. Merged over the optimistic
-        // entry so a value a click just wrote is not erased by a read that
-        // started before the click landed.
-        ...(choice === undefined
-          ? {}
-          : { chatChoice: { ...this.state.chatChoice, [dshSessionId]: choice } }),
-        // The seat gate's fallback fact source: absent on an older host half,
-        // which then simply never takes the seat over (the allowed failure).
-        // A frame-settled verdict outranks any read, whenever it lands: the
-        // host's log read can lag a switch by one, and taking the model seat
-        // re-mounts readers, so a stale answer would otherwise regress it.
-        ...(acpMode === undefined || !settle
-          ? {}
-          : { acpMode: this.commitHostVerdict(dshSessionId, acpMode === true) }),
-      })
-      // A read that answered but carried no verdict has NOT settled this
-      // session. The gate's ask ledger is one-shot per id, so unless the id is
-      // retracted here it stays marked "asked" forever and the gate never asks
-      // again — one silent round-trip and the native model seat is permanent
-      // for that session. The gate re-derives this from `hasAcpModeVerdict`
-      // on its next evaluation (every store mutation re-runs it), which is
-      // what makes the fallback recoverable instead of a single coin flip.
-      if (acpMode === undefined && settle) {
-        markUnsettled(this.acpVerdicts, dshSessionId)
-      }
-    } catch {
-      // A host without this surface (older build) has nothing to show; the
-      // control simply renders nothing rather than an error nobody can act on.
-      if (read.dropped) return
-      this.mutate({ chatSessions: [], chatSessionsFor: dshSessionId })
-      if (settle) {
-        markUnsettled(this.acpVerdicts, dshSessionId)
-      }
-    } finally {
-      if (this.chatSessionReads.get(dshSessionId) === read) this.chatSessionReads.delete(dshSessionId)
-    }
-  }
-
-  /**
-   * Abandon the in-flight `session/chat-list` read for one session (or all of
-   * them): a committed `agent-preset/selected` frame carries the authoritative
-   * verdict, and the late answer to an ask that predates the frame describes
-   * the log from before the switch — it must not land in the store.
-   */
+  /** Abandon the in-flight `session/chat-list` read for one session (or every one). */
   abandonChatSessionRead(dshSessionId?: string): void {
-    if (dshSessionId === undefined) {
-      for (const read of this.chatSessionReads.values()) read.dropped = true
-      this.chatSessionReads.clear()
-      return
-    }
-    const read = this.chatSessionReads.get(dshSessionId)
-    if (read === undefined) return
-    read.dropped = true
-    this.chatSessionReads.delete(dshSessionId)
+    this.chatSessionsService.abandonChatSessionRead(dshSessionId)
   }
 
   // ---- Worker detail indexes (implementation: store/subagent-detail.ts) ----
@@ -1022,181 +858,41 @@ export class AcpStore {
    * reports (a rejected switch must not leave an optimistic lie on screen).
    */
   async setChatSessionMode(dshSessionId: string, modeId: string, agentId?: string): Promise<void> {
-    try {
-      await this.call('session/chat-mode-set', { dshSessionId, modeId, ...(agentId === undefined ? {} : { agentId }) })
-      const safeAgent = (agentId && agentId.trim()) || undefined
-      this.writeChoice(dshSessionId, choice => ({ ...choice, mode: modeId }), safeAgent)
-      if (this.state.chatSessionsFor === dshSessionId) {
-        const owner = safeAgent ?? this.state.chatChoice[dshSessionId]?.agentId ?? this.state.chatBoundAgent[dshSessionId] ?? this.state.defaultAgent
-        let changed = false
-        const chatSessions = this.state.chatSessions.map(s => {
-          if (s.agentId !== owner || !s.modes || s.modes.currentModeId === modeId) return s
-          changed = true
-          return { ...s, modes: { ...s.modes, currentModeId: modeId } }
-        })
-        if (changed) this.mutate({ chatSessions })
-      }
-    } catch (error) {
-      this.flashError(error)
-    }
-    await this.loadChatSessions(dshSessionId)
+    return this.chatSessionsService.setChatSessionMode(dshSessionId, modeId, agentId)
   }
 
-  /**
-   * Bring the conversation's released ACP session back on a fresh process —
-   * the released banner's explicit form of the "next message resumes it"
-   * promise (`session/chat-resume`). A failure is reported through the notice
-   * AND rethrown (the `respondPermission` contract), so the banner can pin
-   * the message beside the button the user just pressed; the binding is
-   * re-read either way so the row follows the host's real answer.
-   */
+  /** Bring the conversation's released ACP session back on a fresh process (`session/chat-resume`). */
   async resumeChatSession(dshSessionId: string): Promise<void> {
-    let failure: unknown
-    try {
-      await this.call('session/chat-resume', { dshSessionId })
-    } catch (error) {
-      this.flashError(error)
-      failure = error
-    }
-    // `force`: the host answer this call needs is the one AFTER the resume.
-    // The host's no-op branch (already live) broadcasts no frame at all, so
-    // reusing a read that started before the click would keep the released row.
-    await this.loadChatSessions(dshSessionId, { force: true })
-    if (failure !== undefined) throw failure
+    return this.chatSessionsService.resumeChatSession(dshSessionId)
   }
 
   /**
-   * Branch one conversation (the NTR branch button's click): the fixed
-   * two-stage order — the HOST forks the DSH session tree first (copied
-   * history, `(1)` title, workspace), then the plugin adopts the ACP side via
-   * `session/chat-fork-adopt`, which runs the agent's own `session/fork` so
-   * the child actually remembers the parent context. Host first is structural:
-   * ACP fork has no cut-point parameter and nothing to return to if the host
-   * half failed second (see the plan's §D7).
-   *
-   * Resolves `{ childId }` on success, or `{ failure }` with one actionable
-   * line — the reason is ALSO flashed into the notice banner (a user-action
-   * failure, so the banner is its surface), and the local line is what the
-   * conversation renders beside the button (the user is not on the settings
-   * page). A failed adopt leaves the child an ordinary copied-history
-   * conversation (its first message starts a fresh `session/new` — today's
-   * behavior), never a half-bound one, and NOTHING is opened.
-   *
-   * `forkHost` is the runtime's `sessions.fork` face, resolved structurally by
-   * the entry and injected here: the store stays transport-free.
+   * Branch one conversation: the host forks the DSH session tree, then the
+   * plugin adopts the ACP side (`session/chat-fork-adopt`). Host first is
+   * structural — see `ChatSessionsService.forkChatSession`.
    */
   async forkChatSession(
     dshSessionId: string,
     forkHost: (sessionId: string) => Promise<unknown>,
   ): Promise<ChatForkOutcome> {
-    let childId: unknown
-    try {
-      childId = await forkHost(dshSessionId)
-    } catch (error) {
-      const failure = error instanceof Error ? error.message : String(error)
-      this.flashError(failure)
-      return { failure }
-    }
-    if (typeof childId !== 'string' || childId === '') {
-      const failure = this.locale(
-        '宿主没有返回分支会话，分支未完成。',
-        'The host returned no branched session; the branch did not complete.',
-      )
-      this.flashError(new Error(failure))
-      return { failure }
-    }
-    try {
-      await this.call('session/chat-fork-adopt', { dshSessionId: childId, parentDshSessionId: dshSessionId })
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error)
-      const failure = this.locale(
-        `分支会话已创建，但没有接上 agent 的上下文（${reason}）；在子会话里发送的第一条消息会开启全新会话。`,
-        `The branched session was created but the agent context was not attached (${reason}); its first message will start a fresh session.`,
-      )
-      this.flashError(new Error(failure))
-      return { failure }
-    }
-    return { childId }
+    return this.chatSessionsService.forkChatSession(dshSessionId, forkHost)
   }
 
-  // ---- ACP transcript observation (the conversation's ACP view) ----
+  // ---- ACP transcript observation (implementation: store/chat-sessions.ts) ----
 
-  /**
-   * Start (or refresh) observation of every ACP transcript behind one DSH chat
-   * session. Blocks are rebuilt from scratch — the host buffer is the record,
-   * and this view is the only consumer that needs the raw agent stream.
-   */
+  /** Start (or refresh) observation of every ACP transcript behind one DSH chat session. */
   async loadChatTranscript(dshSessionId: string): Promise<void> {
-    let views: ChatTranscriptView[]
-    try {
-      ({ views } = await this.call<{ views: ChatTranscriptView[] }>(
-        'session/chat-transcript',
-        { dshSessionId },
-      ))
-    } catch {
-      // An older host half (or a session with no ACP binding): nothing to
-      // observe, and no error worth flashing for a read-only side view.
-      return
-    }
-    // Everything this chat session used to have, minus what it still has: a
-    // closed or replaced ACP session must not linger as a ghost tab body.
-    const merged: Record<string, ChatTranscript> = {}
-    for (const [id, record] of Object.entries(this.state.chatTranscripts)) {
-      if (record.owner !== dshSessionId) merged[id] = record
-    }
-    for (const view of views) {
-      const blocks: Block[] = []
-      for (const entry of view.entries) foldUpdate(blocks, entry.update as Record<string, unknown>)
-      merged[view.session.sessionId] = {
-        owner: dshSessionId,
-        session: view.session,
-        blocks,
-        seq: view.entries.length > 0 ? view.entries[view.entries.length - 1]?.seq ?? 0 : 0,
-      }
-    }
-    this.mutate({ chatTranscripts: this.evictTranscripts(merged) })
+    return this.chatSessionsService.loadChatTranscript(dshSessionId)
   }
 
   /** Observed transcript for one ACP session id (undefined → nobody is watching it). */
   transcriptOf(acpSessionId: string): ChatTranscript | undefined {
-    return this.state.chatTranscripts[acpSessionId]
+    return this.chatSessionsService.transcriptOf(acpSessionId)
   }
 
   /** The observed transcript of one chat session (the live binding wins over a released one). */
   chatTranscriptOf(dshSessionId: string): ChatTranscript | undefined {
-    const owned = Object.values(this.state.chatTranscripts).filter(record => record.owner === dshSessionId)
-    return owned.find(record => !record.session.released) ?? owned[0]
-  }
-
-  /** Keep the resident transcript map at its bound, newest insertion first. */
-  private evictTranscripts(map: Record<string, ChatTranscript>): Record<string, ChatTranscript> {
-    const ids = Object.keys(map)
-    if (ids.length <= MAX_WATCHED) return map
-    const out: Record<string, ChatTranscript> = {}
-    for (const id of ids.slice(ids.length - MAX_WATCHED)) {
-      const value = map[id]
-      if (value !== undefined) out[id] = value
-    }
-    return out
-  }
-
-  /** Re-publish an observed transcript's session snapshot (mode / released flips). */
-  private watchedSessionPatch(sessionId: string, session: SessionView): { chatTranscripts?: Record<string, ChatTranscript> } {
-    const current = this.state.chatTranscripts[sessionId]
-    if (current === undefined) return {}
-    return { chatTranscripts: { ...this.state.chatTranscripts, [sessionId]: { ...current, session } } }
-  }
-
-  /** Mirror the running flag onto a transcript the ACP view is showing. */
-  private markWatchedRunning(sessionId: string, running: boolean): void {
-    const current = this.state.chatTranscripts[sessionId]
-    if (current === undefined || current.session.running === running) return
-    this.mutate({
-      chatTranscripts: {
-        ...this.state.chatTranscripts,
-        [sessionId]: { ...current, session: { ...current.session, running } },
-      },
-    })
+    return this.chatSessionsService.chatTranscriptOf(dshSessionId)
   }
 
   async setConfigOption(configId: string, value: string): Promise<void> {
@@ -1321,136 +1017,31 @@ export class AcpStore {
     return this.settingsService.resetIdleRelease()
   }
 
+  // ---- The conversation's own picks (implementation: store/chat-choice.ts) ----
+
   /**
    * Bind one DSH chat session to an ACP agent. This is the plugin's own
    * conversation↔agent mapping: it does NOT write a DSH model route, so it
    * cannot pollute the deployment default model and cannot be refused by the
    * GUI's catalog gate (the retired `session/model-unavailable` failure).
-   *
-   * The mapping is host-side and keyed by chat session id; the browser learns
-   * the binding back through `session/chat-list`.
    */
   async bindChatAgent(dshSessionId: string, agentId: string): Promise<void> {
-    try {
-      await this.call('session/chat-bind', { dshSessionId, agentId })
-      // Optimistic: the host recorded the intent, so the NEXT message runs the
-      // picked agent — but the live-session list (`chatSessions`) cannot show
-      // that until the turn materializes its session. Recording here is what
-      // makes the chip and the picker's checkmark move on the click itself.
-      this.mutate({ chatBoundAgent: { ...this.state.chatBoundAgent, [dshSessionId]: agentId } })
-    } catch (error) {
-      this.flashError(error)
-      throw error
-    }
+    return this.chatChoiceService.bindChatAgent(dshSessionId, agentId)
   }
 
   /** Switch the bound agent's model (`agentId@choice`) for one chat session. */
   async setChatSessionModel(dshSessionId: string, modelId: string, agentId?: string): Promise<void> {
-    try {
-      await this.call('session/chat-model-set', { dshSessionId, modelId })
-      // Optimistic for the same reason the binding is: the host recorded the
-      // pick, and a conversation with no ACP session yet would otherwise show
-      // the agent's default until its first turn created one.
-      const safeAgent = (agentId && agentId.trim()) || undefined
-      const targetAgent = safeAgent ?? (modelId ? splitModelAgentId(modelId) : undefined)
-      // A thought level belongs to the model it was picked on. The host clears
-      // one the new model does not offer (it is the authority); mirror that here
-      // so the chip does not keep naming it during the round-trip. A model the
-      // catalog has no record for counts as "does not offer" — the same
-      // conservative answer the host gives.
-      const owner = targetAgent ?? this.state.chatChoice[dshSessionId]?.agentId ?? this.state.chatBoundAgent[dshSessionId] ?? this.state.defaultAgent
-      const sessions = this.state.chatSessionsFor === dshSessionId ? this.state.chatSessions : []
-      const dropEffort = this.state.chatChoice[dshSessionId]?.modelId !== modelId
-        && !sessions.some(s => !s.released)
-        && !modelOffersEffort(this.state.seatCatalogs[owner ?? ''], modelValueOf(modelId), this.state.chatChoice[dshSessionId]?.effort)
-      this.writeChoice(dshSessionId, choice => {
-        const next = { ...choice, modelId }
-        if (dropEffort) delete next.effort
-        return next
-      }, targetAgent)
-      if (this.state.chatSessionsFor === dshSessionId) {
-        let changed = false
-        const chatSessions = this.state.chatSessions.map(s => {
-          if (s.agentId !== owner) return s
-          if (!dropEffort && s.modelId === modelId) return s
-          if (dropEffort && s.modelId === modelId && s.reasoningEffort === undefined) return s
-          changed = true
-          return { ...s, modelId, ...(dropEffort ? { reasoningEffort: undefined } : {}) }
-        })
-        if (changed) this.mutate({ chatSessions })
-      }
-    } catch (error) {
-      this.flashError(error)
-      throw error
-    }
+    return this.chatChoiceService.setChatSessionModel(dshSessionId, modelId, agentId)
   }
 
   /** Switch the bound agent's reasoning effort for one chat session. */
   async setChatSessionEffort(dshSessionId: string, effort: string | undefined, agentId?: string): Promise<void> {
-    try {
-      await this.call('session/chat-effort-set', {
-        dshSessionId,
-        ...(effort === undefined ? {} : { effort }),
-        ...(agentId === undefined ? {} : { agentId }),
-      })
-      const targetAgent = (agentId && agentId.trim()) || undefined
-      this.writeChoice(dshSessionId, choice => {
-        const { effort: _dropped, ...rest } = choice
-        return effort === undefined ? rest : { ...rest, effort }
-      }, targetAgent)
-      if (this.state.chatSessionsFor === dshSessionId) {
-        const owner = targetAgent ?? this.state.chatChoice[dshSessionId]?.agentId ?? this.state.chatBoundAgent[dshSessionId] ?? this.state.defaultAgent
-        let changed = false
-        const chatSessions = this.state.chatSessions.map(s => {
-          if (s.agentId !== owner || s.reasoningEffort === effort) return s
-          changed = true
-          return { ...s, reasoningEffort: effort }
-        })
-        if (changed) this.mutate({ chatSessions })
-      }
-    } catch (error) {
-      this.flashError(error)
-      throw error
-    }
+    return this.chatChoiceService.setChatSessionEffort(dshSessionId, effort, agentId)
   }
 
   /** Set one of the bound agent's EXTRA config options for one chat session. */
   async setChatSessionConfig(dshSessionId: string, configId: string, value: string | boolean, agentId?: string): Promise<void> {
-    try {
-      await this.call('session/chat-config-set', {
-        dshSessionId,
-        configId,
-        value,
-        ...(agentId === undefined ? {} : { agentId }),
-      })
-      this.writeChoice(dshSessionId, choice => ({
-        ...choice,
-        extraConfigs: { ...choice.extraConfigs, [configId]: value },
-      }), agentId)
-    } catch (error) {
-      this.flashError(error)
-      throw error
-    }
-  }
-
-  /**
-   * Patch one conversation's optimistic pick. The agent half is required by the
-   * record (a model or thought level belongs to an agent). Its owner is the
-   * route the picker used, else the recorded pick, the optimistic binding, or
-   * the plugin default — that last one really serves a never-bound conversation
-   * (the guard routes to it), so waiting for `session/chat-list` would leave the
-   * chip behind the click. Only a conversation with none of those is left alone.
-   */
-  private writeChoice(dshSessionId: string, update: (choice: AcpConversationChoice) => AcpConversationChoice, agentId?: string): void {
-    const current = this.state.chatChoice[dshSessionId]
-    // The plugin default is a real route (the host applies it to a conversation
-    // nobody bound), so an optimistic pick in a fresh conversation belongs to
-    // it — without this the host recorded the pick but the chip waited for the
-    // next `session/chat-list`.
-    const owner = agentId ?? current?.agentId ?? this.state.chatBoundAgent[dshSessionId] ?? this.state.defaultAgent
-    if (owner === undefined) return
-    const next = update({ ...current, agentId: owner })
-    this.mutate({ chatChoice: { ...this.state.chatChoice, [dshSessionId]: { ...next, agentId: owner } } })
+    return this.chatChoiceService.setChatSessionConfig(dshSessionId, configId, value, agentId)
   }
 
   /**
@@ -1496,25 +1087,17 @@ export class AcpStore {
   // ---- Event application ----
 
   /**
-   * One chat-row lifecycle frame, recorded in arrival order. A bounded log is
-   * enough: a `session/chat-list` read only needs the frames since it started.
-   */
-  private pushChatRowFrame(sessionId: string, kind: ChatRowFrame['kind']): void {
-    this.chatRowFrameSeq += 1
-    this.chatRowFrames.push({ seq: this.chatRowFrameSeq, sessionId, kind })
-    if (this.chatRowFrames.length > 256) this.chatRowFrames.shift()
-  }
-
-  /**
    * Feed the replay log BEFORE the switch folds the frame into the snapshot.
    * Live SSE frames and directly injected test frames then take the same path.
+   * The log itself lives in `store/chat-sessions.ts` — its only reader is the
+   * `session/chat-list` answer this facade hands to that service.
    */
   private noteChatRowFrame(event: AcpEvent): void {
     switch (event.type) {
-      case 'session/released': this.pushChatRowFrame(event.sessionId, 'released'); break
-      case 'session/reset': this.pushChatRowFrame(event.sessionId, 'reset'); break
-      case 'session/created': this.pushChatRowFrame(event.sessionId, 'created'); break
-      case 'session/closed': this.pushChatRowFrame(event.sessionId, 'closed'); break
+      case 'session/released': this.chatSessionsService.noteChatRowFrame(event.sessionId, 'released'); break
+      case 'session/reset': this.chatSessionsService.noteChatRowFrame(event.sessionId, 'reset'); break
+      case 'session/created': this.chatSessionsService.noteChatRowFrame(event.sessionId, 'created'); break
+      case 'session/closed': this.chatSessionsService.noteChatRowFrame(event.sessionId, 'closed'); break
     }
   }
 
@@ -1573,7 +1156,7 @@ export class AcpStore {
         this.mutate({
           sessions,
           ...(chatSessions === this.state.chatSessions ? {} : { chatSessions }),
-          ...this.watchedSessionPatch(event.sessionId, event.session),
+          ...this.chatSessionsService.watchedSessionPatch(event.sessionId, event.session),
         })
         return Promise.resolve()
       }
@@ -1652,7 +1235,7 @@ export class AcpStore {
           permissions: this.state.permissions.filter(p => p.sessionId !== event.sessionId),
           // An observed transcript keeps its buffer but flips to released, so
           // the ACP view can say "会恢复" instead of silently looking dead.
-          ...this.watchedSessionPatch(event.sessionId, event.session),
+          ...this.chatSessionsService.watchedSessionPatch(event.sessionId, event.session),
           ...log,
         })
         return Promise.resolve()
@@ -1768,7 +1351,7 @@ export class AcpStore {
         // at the start rather than on the turn-settled list read. It is emitted
         // only on the transition, so it always announces a new ceremony — even
         // if a racing list read already seeded the lock itself.
-        this.chatUnlocked.delete(event.dshSessionId)
+        this.chatSessionsService.noteAgentLocked(event.dshSessionId)
         this.mutate({
           chatLockedAgent: { ...this.state.chatLockedAgent, [event.dshSessionId]: event.agentId },
           chatBoundAgent: { ...this.state.chatBoundAgent, [event.dshSessionId]: event.agentId },
@@ -1780,7 +1363,7 @@ export class AcpStore {
         // The first turn delivered nothing and the host rolled the lock back.
         // The base must return; the failed ACP session is closed host-side, so
         // drop a cached list that still names it and let the next read confirm.
-        this.chatUnlocked.add(event.dshSessionId)
+        this.chatSessionsService.noteAgentUnlocked(event.dshSessionId)
         const chatLockedAgent = { ...this.state.chatLockedAgent }
         delete chatLockedAgent[event.dshSessionId]
         this.mutate({
@@ -1816,7 +1399,7 @@ export class AcpStore {
       }
       case 'turn/start': {
         this.openTurns.add(event.sessionId)
-        this.markWatchedRunning(event.sessionId, true)
+        this.chatSessionsService.markWatchedRunning(event.sessionId, true)
         // Every turn starts AFTER the host (re)materialized the session: a
         // resume keeps its id, a `session/new` changes it. The composer's row
         // list is a cached snapshot, so re-read it once per turn. `force`
@@ -1841,7 +1424,7 @@ export class AcpStore {
         // only the first turn/end per open turn is applied.
         if (!this.openTurns.has(event.sessionId)) return Promise.resolve()
         this.openTurns.delete(event.sessionId)
-        this.markWatchedRunning(event.sessionId, false)
+        this.chatSessionsService.markWatchedRunning(event.sessionId, false)
         if (event.sessionId === this.state.activeSessionId) {
           if (event.error !== undefined) {
             this.state.blocks.push({ kind: 'notice', tone: 'error', text: event.error })
@@ -1866,13 +1449,7 @@ export class AcpStore {
         // status transition of one dispatch. Logged for the chat-list replay
         // (the answer may predate this frame), then folded by key — never by
         // `childId` alone, which can repeat across conversations.
-        this.subagentRecordSeq += 1
-        this.subagentRecordFrames.push({
-          seq: this.subagentRecordSeq,
-          dshSessionId: event.dshSessionId,
-          record: event.record,
-        })
-        if (this.subagentRecordFrames.length > 256) this.subagentRecordFrames.shift()
+        this.chatSessionsService.noteSubagentRecord(event.dshSessionId, event.record)
         const key = subagentKey(event.dshSessionId, event.record.childId)
         const existing = this.state.subagents[key]
         if (isSubagentDowngrade(existing, event.record)) {
@@ -1944,12 +1521,6 @@ function withSessionModes<T extends { sessionId: string; modes?: SessionView['mo
     return { ...row, modes }
   })
   return changed ? next : rows
-}
-
-function splitModelAgentId(modelId: string): string | undefined {
-  const at = modelId.indexOf('@')
-  const agent = at === -1 ? modelId.trim() : (at === 0 ? '' : modelId.slice(0, at).trim())
-  return agent || undefined
 }
 
 /** Last well-formed `usage_update` in one coalesced batch (later ticks win). */
