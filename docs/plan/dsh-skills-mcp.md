@@ -180,7 +180,7 @@ dirname(pluginStateDir()) / skills
 
 ### 6.3 RPC 契约
 
-在 `src/protocol.ts` 增加纯类型契约，在 `src/impl.ts` 增加 `AcpManager` 方法声明、`dispatchRpc` 路由与输入校验：
+在 `src/protocol/` 对应簇（UI 设置类归 `ui.ts` 或 `rpc.ts`，以盘点为准）增加纯类型契约，并把新符号补进 `src/protocol.ts` 桶的再导出块；在 `src/impl.ts`（P2 拆分后为 `src/impl/dispatch.ts`）增加 `AcpManager` 方法声明、`dispatchRpc` 路由与输入校验：
 
 - `ui/skills-mcp`：读取当前值，返回 `{ skillsMcpEnabled: boolean }`。
 - `ui/skills-mcp-set`：接收 `{ skillsMcpEnabled: boolean }`，严格保存并热应用，成功响应返回服务端当前值。
@@ -319,7 +319,7 @@ dirname(pluginStateDir()) / skills
 - `src/bridge/settings-service.ts`：扩展 `PersistedSettings`、`SettingsHost`（含 strict 变体）、`SettingsService` 的读取、恢复（`applySkillsMcpTuning`）、严格写入、失败回滚与热应用。新逻辑的主要落点（远离行数上限）。
 - `src/bridge/persistence-service.ts`：在 `PersistenceService.persistAgents` 写入全局键，沿用 strict 错误语义。
 - `src/bridge/manager.ts`：只做接线——`makeBridge` 注入活读取接缝、启动序列调用 `applySkillsMcpTuning`、两个 RPC 薄委托（仿 `setIdleRelease`）。净增长 ≤ 0（§9.0）。
-- `src/protocol.ts`：新增 `ui/skills-mcp` 与 `ui/skills-mcp-set` 的纯类型契约。
+- `src/protocol/` 对应簇 + `src/protocol.ts` 桶再导出：新增 `ui/skills-mcp` 与 `ui/skills-mcp-set` 的纯类型契约。
 - `src/impl.ts`：扩展 `AcpManager` 和 `dispatchRpc`，校验 payload，返回当前值或错误。
 - `src/client/store.ts`：增加初始读取、开关写入、成功同步、失败回滚与页头错误。
 - `src/client/skills-mcp-preference.tsx`：新增设置组件。
