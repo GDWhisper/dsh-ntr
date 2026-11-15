@@ -70,6 +70,16 @@ export function saveGateIsAvailable(status: SaveGateStatus): boolean {
   return status.gateAvailable === true
 }
 
+/**
+ * Normalise one gate snapshot: a snapshot that does not carry
+ * `gateAvailable: true` is an older/non-wired host, never an idle authority.
+ * Cluster-internal (both the gate reader and the reference-counted reader use
+ * it); the store's public export face does not re-export it.
+ */
+export function normalizeSaveGateStatus(status: SaveGateStatus): SaveGateStatus {
+  return { ...status, gateAvailable: saveGateIsAvailable(status) }
+}
+
 /** `agent-save:<id>` → the agent id; a host-settings label (`settings:…`) → undefined. */
 export function saveGateAgentId(label: string): string | undefined {
   const prefix = 'agent-save:'

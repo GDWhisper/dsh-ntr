@@ -10,6 +10,9 @@ import type { PendingPermission } from "./permission.ts"
 import type { SaveBanner } from "./save-gate.ts"
 import type { SubagentDetailState } from "./subagent.ts"
 
+/** Cap on retained runtime-log lines; older entries fall off the front. */
+export const LOG_MAX_ENTRIES = 200
+
 /**
  * One chat-row lifecycle frame the browser applied. A `session/chat-list`
  * answer describes the host as of BEFORE frames that landed while its read was

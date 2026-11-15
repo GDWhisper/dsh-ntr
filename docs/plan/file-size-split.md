@@ -1,6 +1,6 @@
 # 巨型文件拆分计划（第二轮：三件套 / 设置页 / 协议覆盖 / UI 面）
 
-**状态**：**P0 / P1 / P2 / P3a 已完成，P3b 第一批（leaf 服务）已完成，P3b 其余批次与 P4–P6 未开始**。承接 [bridge-split.md](./archive/bridge-split.md)（第一轮，已完成）的纪律与模式。
+**状态**：**P0 / P1 / P2 / P3a 已完成，P3b 第一批（leaf 服务）与第二批（save-banners / agent-admin）已完成，P3b 其余批次与 P4–P6 未开始**。承接 [bridge-split.md](./archive/bridge-split.md)（第一轮，已完成）的纪律与模式。
 **一句话**：把行数基线里**仍在增长**的存量文件按领域簇拆到 ≤1000 行并删除基线条目；功能面已封闭的文件继续锁着不动。
 
 > 写作约定：代码位置一律用「文件 + 符号名」，不写行号。**本文不锁定任何文件的当前行数**——正式执行前代码仍会变动，行数与符号清单在每个子步开工时以 HEAD 实测重新核对；本文锁定的只有「领域簇划分、归属、顺序、停止条件」。索引登记进 [docs/README.md](../README.md)，待办登记进 [docs/todo.md](../todo.md)。
@@ -139,6 +139,9 @@ impl 几乎全是纯函数 + 小类 + 一个自由函数分发器，按领域机
 **落地记录（P3b 第一批）**：`settings.ts`（Host：`call` / `mutate` / `state` / `flashError`，4 个）、`update.ts`（`call` / `mutate` / `state` / `label`，4 个）、`catalog.ts`（另加 `flashError` / `resync`，6 个）、`skills.ts`（`call` / `mutate` / `state` / `chatAgentFor`，4 个）、`subagent-detail.ts`（`call` / `mutate` / `state`，3 个）五个服务落成，各自持有本来属于类的私有簿记（节流窗、in-flight 去重、`liveSeq`、目录读去重），服务一律只经 `host.mutate` 写快照、**完全不含门面导入**（连 `import type` 都不需要：`UiState` 走 `state.ts`）。`AgentCommand` / `skillRowsKey` / `SKILL_MENU_TTL_MS` / `MAX_SKILL_KEYS` 随 `skills.ts` 迁走，`store.ts` 文件尾原样再导出，外部导入面不变；`AgentSkillEntry` / `SubagentDetailState` / `PermissionTimeoutMode` 等签名类型仍从 `protocol.ts` / 子簇走。
 **`agent-admin` 触发停止条件，留在门面**：`saveAgent` 的失败路径直接写保存横幅簇（`pushSaveBanner` / `bannerRetries` / `clearAgentSaveFailures` / `clearAgentSaveBanners` / `saveGatePatch`），并串 `resync`；`detectAgents` 读写 `detectCounts`，`deleteAgent` 走 `rememberDeletedAgent` + `invalidateSeatCatalog`，`testAgent` / 保存后刷新又调 `resync` / `probeModels` / `loadCachedModels`——实测 Host 回调 13+ 个，越过「>10」的线；提前拆 `save-banners` 会造出 saveAgent ↔ save-banners 的服务间递归。故本批不拆，待 `save-banners.ts` 先落地的那一批再拆 `agent-admin.ts`（届时 `saveAgent` 只经 save-banners 的 Host 面报告失败）。`connection` / `chat-choice` / `chat-sessions` / `save-banners` 四个服务同样留待后续批次。
 测试镜像：`tests/store.spec.ts` 138 例 → 107 例 + `tests/store/` 下 31 例（`settings.spec.ts` 3、`catalog.spec.ts` 9、`update.spec.ts` 8、`skills.spec.ts` 7、`subagent-detail.spec.ts` 4），describe 标题与用例数逐字不变，共享 `makeStore` / `detailOf` 进 `tests/store/harness.ts`；agent-admin 用例（detect / save / delete / test / setDefaultAgent）留原文件。基线同时收紧：`src/client/store.ts` 3217 → 2676，`tests/store.spec.ts` 4001 → 3016。
+
+**落地记录（P3b 第二批）**：`save-banners.ts`（`SaveBannersService`，Host：`call` / `mutate` / `state` / `label` / `flashError` / `logLine` / `retryAgentSave`，7 个）与 `agent-admin.ts`（`AgentAdminService`，Host：`call` / `mutate` / `state` / `label` / `flashError` / `resync` / `probeModels` / `invalidateSeatCatalog`，8 个）落成，第一批记下的 `agent-admin` 障碍按当时的预设解消：横幅行与重试 payload 的簿记全归 `SaveBannersService`，`AgentAdminService` 只经构造参数持有它（`import type`），失败路径调 `clearAgentSaveFailures` / `forgetBannerRetry` / `setBannerRetry` / `pushSaveBanner`；反向（横幅重试 → 保存）走 `SaveBannersHost.retryAgentSave`，由门面接到 `agentAdminService.saveAgent`——无运行时门面导入、无服务间递归，两个 Host 都在「>10」线下。约束 38 的失败常驻 / 成功合成 / 折叠与 `sessionStorage` 关闭记录逐字保留；`LOG_MAX_ENTRIES` 下沉到 `store/state.ts`（服务取用，门面照旧再导出），`normalizeSaveGateStatus` 进 `store/save-gate.ts`（簇内导出、桶不导出，与原私有状态一致）。
+测试镜像：`tests/store.spec.ts` 107 例 → 69 例 + `tests/store/save-banners.spec.ts` 33 例 + `tests/store/agent-admin.spec.ts` 5 例（合计仍 107，describe 标题与用例逐字不变；locale 切换类用例留在原文件，断的是门面 `refreshLocale`）。基线收紧：`src/client/store.ts` 2676 → 2026，`tests/store.spec.ts` 3016 → 1928。
 
 - `tests/store.spec.ts` 按同领域拆；纯函数用例已随 P3a 搬进 `tests/store/`，其余（类驱动）随 P3b 的服务划分迁移。
 
