@@ -306,7 +306,7 @@ dirname(pluginStateDir()) / skills
 
 1. **前置依赖**：[file-size-split.md](./file-size-split.md) 的 P0（基线补紧）与 P1–P4（protocol / impl / store / panel 拆分）必须先完成。新契约、新路由、新 store 状态、新设置组件挂载落在拆分后的文件里。未满足不得开工，不绕门禁。
 2. **manager.ts 与 agent-bridge.ts 零余量且不在 P1–P4**：全部新逻辑进 `mcp.ts` / `settings-service.ts`（两者远离上限）；这两个文件只留接线（活读取接缝注入、RPC 薄委托、启动恢复调用、四个入口的等长替换），所需接线行必须在同提交内以等量既有代码外置抵消，净增长 ≤ 0。做不到就先执行拆分计划 P5 的对应子步，再实施本方案。**严禁**抬基线或新增条目。
-3. **测试只进新文件**：锁定测试文件（`tests/impl.spec.ts`、`tests/store.spec.ts`、`tests/panel.spec.ts`、`tests/bridge.spec.ts`）不新增用例。新用例落点见下方清单。
+3. **测试只进新文件**：锁定测试文件（`tests/impl/`、`tests/store.spec.ts`、`tests/panel.spec.ts`、`tests/bridge.spec.ts`）不新增用例。新用例落点见下方清单。
 4. **门禁盲区自律**：`check:size` 只扫 `src` / `tests` / `presets`，`mcp/` 不在扫描范围；`mcp/skills-server.mjs` 的 ≤1000 行纪律是自设的，必须遵守。
 
 实施时按以下落点修改，不另起平行配置或会话路径：

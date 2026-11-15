@@ -1,6 +1,6 @@
 # 巨型文件拆分计划（第二轮：三件套 / 设置页 / 协议覆盖 / UI 面）
 
-**状态**：**P0 / P1 已完成，P2 进行中（提交 2/3 落地）**。承接 [bridge-split.md](./archive/bridge-split.md)（第一轮，已完成）的纪律与模式。
+**状态**：**P0 / P1 / P2 已完成，P3 未开始**。承接 [bridge-split.md](./archive/bridge-split.md)（第一轮，已完成）的纪律与模式。
 **一句话**：把行数基线里**仍在增长**的存量文件按领域簇拆到 ≤1000 行并删除基线条目；功能面已封闭的文件继续锁着不动。
 
 > 写作约定：代码位置一律用「文件 + 符号名」，不写行号。**本文不锁定任何文件的当前行数**——正式执行前代码仍会变动，行数与符号清单在每个子步开工时以 HEAD 实测重新核对；本文锁定的只有「领域簇划分、归属、顺序、停止条件」。索引登记进 [docs/README.md](../README.md)，待办登记进 [docs/todo.md](../todo.md)。
@@ -100,6 +100,7 @@ impl 几乎全是纯函数 + 小类 + 一个自由函数分发器，按领域机
 
 1. **纯函数簇**：落 13 个文件——上表十二个之外，`image.ts` 一次拆超限（1058 行），再分 `attachments.ts`（附件定位：`normalizeFileUrlToPath` / `resolveImageAttachmentFromContext`，另含簇内导出 `readImageFileFromContext`）与 `image.ts`（MIME / 魔数 / data URL / `resolveImageContent`）。`PendingPermissionFields` / `PendingPermissionView` 是帧构造器的入参，随 `permission.ts` 走；`PendingPermission` 只属账本，随 `runtime.ts` 走，于是两文件之间只剩 `import type`、无反向依赖。`STABLE_SEMVER` 由 `validate.ts` 簇内导出（桶不导出），等 dispatch 迁出时随唯一使用者走。此提交桶仍是 runtime + dispatch 两段原样内联，基线条目 `src/impl.ts` 4182 → 1026；测试未动。
 2. **运行时与分发**：`runtime.ts`（`Transcript` / `EventHub` / `PendingPermission` / `PermissionLedger`）与 `dispatch.ts`（`AcpManager` + `emptySaveGateStatus` / `agentSaveAction` / `dispatchRpc`）逐字搬出，case 清单、校验顺序与错误码不动；`STABLE_SEMVER` 随唯一使用者进 `dispatch.ts` 成私有常量，`validate.ts` 不再导出。桶降到 149 行、纯再导出，基线条目 `src/impl.ts` 已删（≤1000 即删）；测试未动。
+3. **测试镜像**：`tests/impl.spec.ts`（3445 行）拆进 `tests/impl/` 16 个 `.spec.ts` + `harness.ts`（`agentDef` / `fakeManager` 两个 fake），按 `src/impl/` 同名簇映射，用例标题与数量逐字不变（173 / 173，文件名级差异用 vitest JSON reporter 比对确认）。1031 行的 `selectForwardPrompt` 套件按主题一分为三（`forward.spec.ts` 纯选择 3 例、`image.spec.ts` 载荷解析 21 例、`image-attachments.spec.ts` 附件存储 12 例），三处保留同一 describe 标题；`agentRefusalDetail`（导入自 `src/bridge.ts`）落 `refusal.spec.ts`。原文件已删除，基线条目 `tests/impl.spec.ts` 同提交删除；新文件最大 523 行。
 
 ## 6. P3：`src/client/store.ts` → `src/client/store/` + `tests/store.spec.ts` → `tests/store/`
 

@@ -119,4 +119,4 @@ closeAllDispatchActivity  releaseDispatchActivity
 > transcript）加 prompt 槽位，闸门复刻它既冗余又会在宿主新增注入种类时把整轮拒成
 > `blocked`。**严禁**再按 source kind 列黑名单。
 
-`tests/impl.spec.ts` 的 "the retired permission axis" 套件断言其中一部分 helper 已不存在。
+`tests/impl/permission.spec.ts` 的 "the retired permission axis" 套件断言其中一部分 helper 已不存在。

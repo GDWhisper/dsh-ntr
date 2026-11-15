@@ -26,4 +26,4 @@
 
 - `src/impl.ts` · `isAbsolutePath` / `isExtendedLength` / `isUnderPath` / `isWin32Style` / `segmentize` / `collapseSegments` / `joinWithin` / `foldSeparators` / `canonicalizeFsPath` / `resolveSessionCwd`
 - `src/client/acp-ui.tsx` · `isAbsolutePathLike`
-- 测试：`tests/impl.spec.ts` 的 "cross-platform paths (Windows)" 套件（UNC 大小写 realpath fixture、根自身请求、`\\?\` 校阶拒绝）；`tests/acp-view.spec.ts` 的两侧等价样本集
+- 测试：`tests/impl/paths.spec.ts` 的 "cross-platform paths (Windows)" 套件（UNC 大小写 realpath fixture、根自身请求、`\\?\` 校阶拒绝）；`tests/acp-view.spec.ts` 的两侧等价样本集

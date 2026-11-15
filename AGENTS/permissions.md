@@ -83,7 +83,7 @@ ACP `session/request_permission` 原样映射：选项列表 / 名称 / 顺序 /
 - 终帧 `permission/synced` 带**活集合**：断线期间已被解决的询问不在其中，客户端据此丢掉自己还挂着的陈旧卡片（否则 `respond` 只会换来 `unknown_request`）。
 - 所有携带 view 的未决询问都走同一条重放路径（不再有「原生路由不广播、不重放」的例外）。
 
-测试：`tests/impl.spec.ts` 的 "replays only asks that carry a view, as their original request frame"、`tests/store.spec.ts` 的 "re-establishes the pending asks on reconnect and prunes the stale ones"、`tests/bridge.spec.ts` 的 "replays a pending ask with exactly the live frame fields"。
+测试：`tests/impl/runtime.spec.ts` 的 "replays only asks that carry a view, as their original request frame"、`tests/store.spec.ts` 的 "re-establishes the pending asks on reconnect and prunes the stale ones"、`tests/bridge.spec.ts` 的 "replays a pending ask with exactly the live frame fields"。
 
 ### 2.3 取消、撤回与关闭顺序
 
@@ -132,7 +132,7 @@ ACP `session/request_permission` 原样映射：选项列表 / 名称 / 顺序 /
   滑块不许谎报正在生效的数。
 - 浏览器侧只乐观改生效数字，**宿主回包是权威**（写路由原样返回生效中的期限），失败即回滚。
 
-测试：`tests/impl.spec.ts` 的 "gates the settings-page deadline write through the same range as the
+测试：`tests/impl/validate.spec.ts` 的 "gates the settings-page deadline write through the same range as the
 config file" 与 "carries a legacy zero over as the wait mode, never as 不等待"、
 `tests/register.spec.ts` 的 "carries the config file's approval deadlines into the
 settings card"、`tests/bridge.spec.ts` 的 "edits an approval deadline live, persists it, and resets

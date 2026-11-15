@@ -9,7 +9,6 @@
   "src/client/store.ts": 4387,
   "tests/acp-view.spec.ts": 1645,
   "tests/bridge.spec.ts": 1186,
-  "tests/impl.spec.ts": 3445,
   "tests/mock-agent.mjs": 1759,
   "tests/model-seat.spec.ts": 1314,
   "tests/panel.spec.ts": 1173,
