@@ -6,9 +6,8 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
-import { AcpStore } from '../../src/client/store.ts'
 
-describe('AcpStore agent administration (implementation: store/agent-admin.ts)', () => {
+describe('AcpStore agent management', () => {
   it('detectAgents queries endpoint and updates state', async () => {
     const rpcCalls: Array<{ channel: string; endpoint: string; payload: unknown }> = []
     const store = new (await import('../../src/client/store.ts')).AcpStore(
