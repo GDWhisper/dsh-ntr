@@ -4,6 +4,7 @@
 - 来源 Issue：[GDWhisper/dsh-ntr#14](https://github.com/GDWhisper/dsh-ntr/issues/14)
 - 实施范围：内置零依赖、只读、stdio MCP server `dsh-skills`，只提供 `skills_list` 与 `skill_read`。
 - 决策优先级：本文记录最终方案。Issue 中「默认开启」「可配置 `skillsRoot`」等早期提案不采用。
+- 前置依赖：[file-size-split.md](./file-size-split.md) 的 P0–P4 必须先完成（行数棘轮，见 §9.0）；未满足不得开工。
 
 ## 0. 新会话接手协议
 
@@ -15,6 +16,7 @@
 4. 新文件不得超过 1000 行。存量超限文件只能缩短，不能增加行数，不能新增基线条目或抬高基线。
 5. 本次计划文档任务不修改代码、测试、配置、`AGENTS/`、`CHANGELOG.md` 或 `lib/`，不提交。后续实施也应先确认用户要求的提交边界。
 6. 实施完成时同步更新 `AGENTS/state.md`、`AGENTS/protocol.md`、`AGENTS/ui-panel.md`，不修改 `CHANGELOG.md`，不手改或提交 `lib/`。
+7. 确认 §9.0 的前置拆分已完成：读 `docs/plan/file-size-split.md` 的状态与 `scripts/file-size-baseline.json`，并以 HEAD 实测复核受影响文件的行数余量。未满足就停下报告，不绕门禁。
 
 ## 1. 目标与最终行为
 
@@ -56,7 +58,7 @@
 
 本方案中的懒加载只有以下含义：
 
-- `initialize`、`initialized`、`ping` 和静态 `tools/list` 不扫描技能根，不读取技能目录或技能文件。
+- `initialize`、`notifications/initialized`、`ping` 和静态 `tools/list` 不扫描技能根，不读取技能目录或技能文件。
 - 第一次 `skills_list` 才枚举技能根并读取必要的有界元数据。
 - `skill_read` 只解析并读取本次目标，不预先扫描整个技能树，也不要求先调用 `skills_list`。
 - 不建立持久技能缓存，不启动 watcher，不创建定时器。
@@ -91,7 +93,7 @@ dirname(pluginStateDir()) / skills
 - `command` 使用 `process.execPath`，不依赖 PATH 中的 `node`。
 - server 路径以 `import.meta.url` 定位，经 `fileURLToPath` 转为绝对文件路径，再放入 `args`。
 - 路径应同时适用于源码测试和构建后的 `lib/bridge/mcp.js`，最终指向包根目录的 `mcp/skills-server.mjs`。
-- 需要重定向测试状态目录时，通过该 server 的 `env` 传递当前 `pluginStateDir()`，避免 MCP 进程读到另一个技能根。
+- `env` 恒带 `DSH_NTR_STATE_DIR = pluginStateDir()`（不只是测试重定向时）：MCP 进程由 agent 而非插件 spawn，环境继承不保证，显式写入连接配置才能保证 server 与插件读到同一个技能根。
 - 不写文件，不安装 server，不修改任何 agent 原生配置。
 
 `src/bridge/mcp.ts` 的 `toAcpMcpServers` 继续作为唯一的线格式转换点。stdio server 最终不得带 `type: 'stdio'`；`env` 仍转换为 `[{ name, value }]`。
@@ -119,7 +121,11 @@ dirname(pluginStateDir()) / skills
 - `doResumeSession`
 - `forkSession`
 
-每个入口都必须在发出请求时读取同一份当前共享 tuning，并调用同一个 `sessionMcpServers`。不得在 bridge 构造时把开关或合并结果固化，也不得只在部分入口注入。
+每个入口都必须在发出请求时读取当前开关值，并调用同一个 `sessionMcpServers`，不得只在部分入口注入。读取机制固定为**活读取接缝**：
+
+- `AgentBridge` 构造器新增可选参数 `skillsMcpEnabled?: () => boolean`（仿现有 `sessionWorkspace` 接缝的先例），四个入口在请求时经它取值。接缝缺省按 `false`（纯 bridge 测试默认关闭）。
+- `BridgeManager.makeBridge` 注入 `() => this.tuning.skillsMcpEnabled`。`replaceTuning` 是 `Object.assign` 原地改写、对象身份不变，闭包天然看到新值。`preSpawnView` 的视图桥不开会话，可不注入。
+- **严禁**在 bridge 构造时把开关或合并结果拷贝成字段固化，也**严禁**为本开关新增 `SettingsBridge` 热应用通道——那会造成 manager tuning 与 bridge 字段双写同一真相（约束 17）。现有 `applyApprovalDeadlines` / `applyIdleRelease` 是标量快照通道，不适用于本开关。
 
 四个入口最终分别用于：
 
@@ -132,7 +138,7 @@ dirname(pluginStateDir()) / skills
 
 ### 5.3 热应用边界
 
-- 开关写入成功后，只更新 manager 持有的共享 tuning，使后续四个入口看到新值。
+- 开关严格落盘成功后，manager 经现有 `replaceTuning` 原地更新共享 tuning。bridge 的活读取接缝指向同一对象，所有存量 bridge（同一 agent 的多个 bridge 亦然）的下一次请求立即看到新值，无需逐 bridge 扇出，新建 bridge 同样拿到新值。
 - 不调用 `agent/save`，不重启 agent，不中断活动 turn。
 - 不向既有会话补发 MCP 配置，不尝试关闭既有 `dsh-skills` 进程。
 - 「热应用」仅指后续建会话请求立即使用新开关，不指既有会话原地获得或失去工具。
@@ -154,6 +160,8 @@ dirname(pluginStateDir()) / skills
 在 `src/bridge/settings-service.ts` 扩展 `SettingsService`、`PersistedSettings` 和 `SettingsHost`：
 
 - 提供当前值读取与 `setSkillsMcpEnabled` 写入入口。
+- `SettingsHost` 现有 `persistAgents()` 是 tolerant 写入（`setIdleRelease` / `setApprovalDeadlines` 都走它）；本键是用户等待的保存，必须给 `SettingsHost` 增加 strict 变体（如 `persistAgentsStrict()`），路由到 `PersistenceService.persistAgents(true)`。不改动既有 tolerant 写入。
+- 启动恢复仿 `applyDeadlineTuning` / `applyIdleReleaseTuning`：设置服务提供 `applySkillsMcpTuning()`，在 `loadPersistedAgents` 之后把有效值写进共享 tuning。
 - `loadPersistedSettings` 负责恢复 boolean，缺省或非法值恢复为 `false`。
 - `persistedSettings` 负责输出 `skillsMcpEnabled`。
 - 写入使用严格持久化路径，经 manager 到 `PersistenceService.persistAgents` 的 strict 模式。
@@ -231,13 +239,15 @@ dirname(pluginStateDir()) / skills
 
 实现以下 MCP 方法：
 
-- `initialize`：返回 server 信息与 tools 能力，不读取技能目录。
-- `initialized`：按 notification 处理，不响应，不读取技能目录。
+- `initialize`：返回 `protocolVersion`、server 信息与 tools 能力，不读取技能目录。版本协商：server 顶部常量声明支持的协议版本列表（`2025-06-18` / `2025-03-26` / `2024-11-05`）；客户端请求的版本在列表内就原样回传，否则回传列表中的最新版本。
+- `notifications/initialized`：按 notification 处理，不响应，不读取技能目录。
 - `ping`：返回空成功结果，不读取技能目录。
 - `tools/list`：返回静态工具描述与 JSON Schema，不读取技能目录。
 - `tools/call`：只分发 `skills_list` 与 `skill_read`。
 
-未知工具、非法参数和协议错误必须有明确错误结果；不能静默返回成功或空内容。notification 不错误地发送响应。
+错误分两层：工具执行失败（未知工具、非法参数、目标被拒、读取失败）回 `isError: true` 的标准 tool result，错误说明进 `content` 文本；协议层错误回 JSON-RPC error（解析失败 `-32700`、未知方法 `-32601`、非法参数 `-32602`）。不能静默返回成功或空内容。notification 不错误地发送响应。
+
+模块形状：`mcp/skills-server.mjs` 导出纯函数（containment 判定、frontmatter 提取、有界读取等）供测试直接 import；stdio 主循环只在直接运行时启动（`import.meta.url` 与 `process.argv[1]` 的 realpath 一致），被 import 时不启动、不碰 stdin。
 
 ### 8.2 `tools/list` 静态声明
 
@@ -245,7 +255,7 @@ dirname(pluginStateDir()) / skills
 
 `skill_read` 声明以下参数：
 
-- `name`：必填字符串，技能目录名。
+- `name`：必填字符串，技能目录名，必须匹配 `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`（单目录段，允许大小写字母、数字、点、下划线、连字符，不含分隔符）。`skills_list` 与 `skill_read` 共用这一个谓词（见 §8.3），不出现两套规则。
 - `file`：可选字符串，技能目录内的相对文件路径；缺省为 `SKILL.md`。
 - `maxLines`：可选整数，默认 400，最大 2000，最小 1。
 
@@ -254,14 +264,14 @@ dirname(pluginStateDir()) / skills
 ### 8.3 `skills_list`
 
 1. 只枚举技能根的直接子目录，不递归遍历整棵树。
-2. 只有直接子目录中存在可合法读取的 `SKILL.md` 时，才把该项视为技能。
+2. 只有直接子目录中存在可合法读取的 `SKILL.md`、且目录名匹配 §8.2 的同一名称谓词时，才把该项视为技能。名称不匹配的目录跳过并写 stderr——保证「列得出」必然「读得了」。
 3. 返回 `[{ name, description, path }]`：
    - `name` 是用于 `skill_read` 的直接子目录名。
-   - `description` 从 `SKILL.md` 顶部元数据中提取；没有合法描述时返回空字符串。
+   - `description` 从 `SKILL.md` 顶部的 `---` 围栏 frontmatter 中提取顶层 `description` 键；没有合法描述时返回空字符串。
    - `path` 是该 `SKILL.md` 经 `realpath` 得到的规范绝对路径。
-4. 元数据读取也必须有界，不能为了描述无界读取整个文件。
+4. frontmatter 语义与宿主侧 `parseSkillFrontmatter` / `stripFrontmatterQuotes`（`src/impl.ts`）对齐：容忍 BOM 与 CRLF，开围栏必须是文件首行，值做引号剥离；只取顶层 `description`，不解析嵌套块。提取必须有界：最多读文件开头 64 KB 或前 200 行（先到为准，常量集中在 server 顶部）；围栏在界内未闭合、frontmatter 畸形或缺失时，description 记空字符串，**技能仍列入清单**。
 5. 技能根不存在时返回空数组，不把它当成服务器致命错误。
-6. 单个目录、元数据或文件损坏时，跳过该项并写 stderr，不能拖垮整个清单。
+6. 只有 `SKILL.md` 缺失或不可读才把该项排除出清单；目录枚举失败等单项错误跳过并写 stderr，不能拖垮整个清单。frontmatter 损坏不排除技能（见第 4 条）。
 7. 对条目数、单条描述长度和清单序列化后的总输出分别设置固定上限。建议初始常量为 200 条、1000 字符、120000 字符，集中在 server 顶部，不新增用户配置。
 8. 任一上限生效时都要有可识别的截断标记；清单总输出包含标记后仍不得超过其上限。
 9. 返回顺序按 `name` 稳定排序，避免同一文件系统状态下清单抖动。
@@ -269,11 +279,11 @@ dirname(pluginStateDir()) / skills
 
 ### 8.4 `skill_read`
 
-1. `name` 必须匹配 `^[a-z0-9][a-z0-9-]{0,63}$`，再进入路径解析。
+1. `name` 必须匹配 §8.2 的名称谓词，再进入路径解析。
 2. `file` 缺省时读取该技能的 `SKILL.md`；提供时只读取技能目录内的该相对目标。
 3. 禁止 POSIX 或 Windows 绝对路径、盘符路径、UNC 路径、空字节、`..` 穿越和解析后越界。
 4. 对技能根、技能目录和最终目标分别做 `realpath`，再做跨平台 containment 校验。
-5. containment 必须覆盖 Windows 分隔符与大小写语义，以及 POSIX 字节精确语义；不能只用字符串 `startsWith`。
+5. containment 必须覆盖 Windows 分隔符与大小写语义，以及 POSIX 字节精确语义；不能只用字符串 `startsWith`。server 是独立 `.mjs`，这套判定是 `isUnderPath` / `isAbsolutePath`（`src/impl.ts`）之外的第三份手拷贝——按约束 24 的手拷贝纪律，测试必须包含与宿主实现的等价用例（同一组输入、同一判定），不只是语义描述。
 6. 拒绝解析到技能根外的 symlink。技能目录或目标为外部 symlink 时不得读取。
 7. 最终目标必须是普通文件。目录、设备、socket、FIFO 等非普通文件一律拒绝。
 8. 只读取目标文件，不扫描其他技能，不为了读取正文建立全量索引。
@@ -290,23 +300,38 @@ dirname(pluginStateDir()) / skills
 
 ## 9. 修改点清单
 
+### 9.0 前置：行数棘轮（阻断项，先于一切代码）
+
+`npm run check:size` 对基线文件执行「实测 > 锁定即失败」。本方案触碰的存量文件余量参考（开工时以 HEAD 实测复核）：`src/impl.ts`、`src/client/store.ts`、`src/client/panel.tsx`、`src/bridge/manager.ts` 余量 0 行；`src/bridge/agent-bridge.ts`、`src/protocol.ts` 余量 1 行；`tests/impl.spec.ts`、`tests/store.spec.ts`、`tests/panel.spec.ts`、`tests/bridge.spec.ts` 余量 0–1 行。向这些文件净新增必然挂门禁，因此：
+
+1. **前置依赖**：[file-size-split.md](./file-size-split.md) 的 P0（基线补紧）与 P1–P4（protocol / impl / store / panel 拆分）必须先完成。新契约、新路由、新 store 状态、新设置组件挂载落在拆分后的文件里。未满足不得开工，不绕门禁。
+2. **manager.ts 与 agent-bridge.ts 零余量且不在 P1–P4**：全部新逻辑进 `mcp.ts` / `settings-service.ts`（两者远离上限）；这两个文件只留接线（活读取接缝注入、RPC 薄委托、启动恢复调用、四个入口的等长替换），所需接线行必须在同提交内以等量既有代码外置抵消，净增长 ≤ 0。做不到就先执行拆分计划 P5 的对应子步，再实施本方案。**严禁**抬基线或新增条目。
+3. **测试只进新文件**：锁定测试文件（`tests/impl.spec.ts`、`tests/store.spec.ts`、`tests/panel.spec.ts`、`tests/bridge.spec.ts`）不新增用例。新用例落点见下方清单。
+4. **门禁盲区自律**：`check:size` 只扫 `src` / `tests` / `presets`，`mcp/` 不在扫描范围；`mcp/skills-server.mjs` 的 ≤1000 行纪律是自设的，必须遵守。
+
 实施时按以下落点修改，不另起平行配置或会话路径：
 
 - `mcp/skills-server.mjs`：新增零依赖只读 stdio MCP server 与全部文件安全边界。
 - `src/bridge/mcp.ts`：新增 `dshSkillsMcpServer`、`sessionMcpServers`；复用 `toAcpMcpServers`。
-- `src/bridge/agent-bridge.ts`：修改 `openSession`、`probeConfigOptions`、`doResumeSession`、`forkSession`，统一读取当前 tuning 和合并 MCP 列表。
+- `src/bridge/agent-bridge.ts`：构造器加 `skillsMcpEnabled?: () => boolean` 活读取接缝；`openSession`、`probeConfigOptions`、`doResumeSession`、`forkSession` 四处调用点等长替换为经接缝取值的合并列表。净增长受 §9.0 约束。
 - `src/bridge/types.ts`：扩展 `BridgeTuning.skillsMcpEnabled`。
 - `src/bridge/tuning.ts`：在 `DEFAULT_TUNING` 中默认 `skillsMcpEnabled: false`。
-- `src/bridge/settings-service.ts`：扩展 `PersistedSettings`、`SettingsHost`、`SettingsService` 的读取、恢复、严格写入、失败回滚与热应用。
+- `src/bridge/settings-service.ts`：扩展 `PersistedSettings`、`SettingsHost`（含 strict 变体）、`SettingsService` 的读取、恢复（`applySkillsMcpTuning`）、严格写入、失败回滚与热应用。新逻辑的主要落点（远离行数上限）。
 - `src/bridge/persistence-service.ts`：在 `PersistenceService.persistAgents` 写入全局键，沿用 strict 错误语义。
-- `src/bridge/manager.ts`：在 `BridgeManager` 连接设置服务、共享 tuning、启动恢复与 RPC 读写方法。
+- `src/bridge/manager.ts`：只做接线——`makeBridge` 注入活读取接缝、启动序列调用 `applySkillsMcpTuning`、两个 RPC 薄委托（仿 `setIdleRelease`）。净增长 ≤ 0（§9.0）。
 - `src/protocol.ts`：新增 `ui/skills-mcp` 与 `ui/skills-mcp-set` 的纯类型契约。
 - `src/impl.ts`：扩展 `AcpManager` 和 `dispatchRpc`，校验 payload，返回当前值或错误。
 - `src/client/store.ts`：增加初始读取、开关写入、成功同步、失败回滚与页头错误。
 - `src/client/skills-mcp-preference.tsx`：新增设置组件。
 - `src/client/panel.tsx`：在「智能体」页挂载设置组件。
 - `package.json`：在 `files` 中加入 `mcp`，确保发布包包含 server。
-- 测试：新增 server 独立 stdio 测试、合并器纯测试，并扩展现有 RPC、store、panel 与 bridge 集成测试。
+- 测试（全部新文件，不动锁定测试文件）：
+  - `tests/skills-server.spec.ts`：server 独立 stdio 协议测试 + 纯函数测试 + containment / 路径判定与宿主实现的等价测试。
+  - `tests/mcp-merge.spec.ts`：`dshSkillsMcpServer` / `sessionMcpServers` 合并器纯测试。
+  - `tests/bridge/skills-mcp.spec.ts`：四入口一致性集成测试（mock agent 记录请求，复用 `tests/bridge/harness.ts`）。
+  - `tests/skills-mcp-setting.spec.ts`：RPC 校验、严格落盘、失败回滚、启动恢复。
+  - `tests/skills-mcp-store.spec.ts`：store 初始读取、乐观更新、失败回滚。
+  - `tests/skills-mcp-preference.spec.tsx`：设置组件与 panel 挂载（仿 `tests/release-notes.spec.tsx` 先例）。
 - `AGENTS/state.md`：记录配置持久化、同名优先、运行时不回写和四入口一致性。
 - `AGENTS/protocol.md`：记录 ACP/MCP 进程职责、准确懒加载语义和 stdio 行为。
 - `AGENTS/ui-panel.md`：记录设置入口、文案、tooltip 与普通设置保存语义。
@@ -317,10 +342,12 @@ dirname(pluginStateDir()) / skills
 
 按以下顺序完成，每一步先通过对应测试再进入下一步：
 
+0. **前置确认**
+   - 核对拆分计划 P0–P4 已完成（§9.0）；实测受影响文件行数余量。未满足就停下报告，不绕门禁。
 1. **server 与独立 stdio 测试**
-   - 新增 `mcp/skills-server.mjs`。
-   - 先完成协议循环、静态工具声明、路径安全和有界读取。
-   - 用真实 Node 子进程验证 stdio，不依赖 agent。
+   - 新增 `mcp/skills-server.mjs`（纯函数导出 + 直接运行才启动主循环）。
+   - 先完成协议循环（含版本协商）、静态工具声明、路径安全、有界读取与 frontmatter 提取。
+   - 用真实 Node 子进程验证 stdio，不依赖 agent；纯函数与宿主路径原语做等价测试。
 2. **合并器纯测试**
    - 实现 `dshSkillsMcpServer` 与 `sessionMcpServers`。
    - 验证开关、同名优先、输入不变和 ACP stdio 线格式。
@@ -340,6 +367,7 @@ dirname(pluginStateDir()) / skills
 8. **真实 agent 验证**
    - 至少使用真实 CodeBuddy 和另一种 ACP agent。
    - 验证工具可见、清单与读取可用、默认关闭、进程由 agent 启动和回收、开关只影响后续建会话。
+   - 显式检查 `process.execPath` 假设：本方案假定宿主是纯 Node 进程。若宿主是 Electron，`execPath` 是 GUI 二进制，spawn 会失败或弹出窗口（需 `ELECTRON_RUN_AS_NODE`）——发现不满足就停下修订方案，不静默加兼容层。
 
 ## 11. 测试矩阵与验收标准
 
@@ -356,7 +384,8 @@ dirname(pluginStateDir()) / skills
 
 ### 11.2 协议初始化与零目录读取
 
-- 独立 stdio 客户端完成 `initialize`、`initialized`、`ping` 和 `tools/list`。
+- 独立 stdio 客户端完成 `initialize`、`notifications/initialized`、`ping` 和 `tools/list`。
+- `initialize` 版本协商：请求版本在支持列表内原样回传，不在则回传列表最新版；`notifications/initialized` 不产生任何响应帧。
 - 上述方法均不读取技能根或技能文件；用文件系统观测或等效测试证明，而不是只检查返回文本。
 - `tools/list` 只有 `skills_list` 与 `skill_read`，schema 包含 `name`、`file`、`maxLines` 及默认值和上限。
 - 每条 stdout 输出都是单行 JSON-RPC；日志只出现在 stderr。
@@ -367,7 +396,8 @@ dirname(pluginStateDir()) / skills
 - 缺根返回空清单。
 - 只列技能根直接子目录中的 `SKILL.md`，不递归把更深层目录当成新技能。
 - 返回名称、描述和 `SKILL.md` 规范路径，顺序稳定。
-- 单个损坏目录、损坏元数据或不可读技能不会拖垮其他条目。
+- 单个损坏目录或不可读技能不会拖垮其他条目；frontmatter 畸形 / 未闭合 / 缺失的技能仍列入清单，description 为空字符串。
+- 名称谓词一致性：大写 / 下划线 / 点目录名列得出也读得了；非法名称目录被 list 跳过，`skill_read` 同样拒绝。
 - 条目数、描述长度和总输出分别达到上限时有界并带截断标记。
 - 第一次 `skills_list` 才发生技能目录扫描。
 - 新增、删除技能或修改描述后，不重启 server，下一次 `skills_list` 能观察变化。
@@ -395,6 +425,7 @@ dirname(pluginStateDir()) / skills
 - 目标是目录或其他非普通文件时拒绝。
 - Windows 上验证大小写与分隔符语义，POSIX 上验证字节精确 containment。
 - 不能仅凭字符串前缀通过位于兄弟目录的相似前缀路径。
+- server 的 containment / 绝对路径判定与宿主 `isUnderPath` / `isAbsolutePath` 等价测试：同一组输入（含两平台语义）判定逐一相同。
 
 ### 11.6 合并与四入口一致性
 
@@ -405,7 +436,7 @@ dirname(pluginStateDir()) / skills
 - 内置项使用 `process.execPath`，args 指向随包发布且实际存在的 `mcp/skills-server.mjs`。
 - 经 `toAcpMcpServers` 后，stdio 项没有 `type`，env 为 `[{ name, value }]`。
 - `openSession`、`probeConfigOptions`、`doResumeSession`、`forkSession` 在同一开关状态下得到完全一致的 MCP 列表。
-- 开关改变后，后续四个入口立即使用新值；既有活动会话不被重写，agent 不重启。
+- 开关改变后，**存量 bridge**（含同一 agent 的多个 bridge）无需重启，后续四个入口立即使用新值（活读取接缝）；新建 bridge 同样拿到新值；接缝缺省的纯 bridge 默认关闭。既有活动会话不被重写，agent 不重启。
 - 关闭后不保证既有 MCP 进程退出，测试不得把这种不保证误写成回收承诺。
 
 ### 11.7 真实进程与真实 agent
@@ -422,7 +453,8 @@ dirname(pluginStateDir()) / skills
 
 - 相关 Vitest 全部通过。
 - `npm run prepack` 全部通过，包括行数门禁、typecheck、测试和 build。
-- `scripts/file-size-baseline.json` 不新增条目、不抬线；存量文件不增长。
+- 拆分计划 P0–P4 前置已完成；`scripts/file-size-baseline.json` 不新增条目、不抬线；存量文件不增长，`manager.ts` / `agent-bridge.ts` 净增长 ≤ 0。
+- 锁定测试文件零改动；新用例全部在新 spec 文件。`mcp/skills-server.mjs` ≤1000 行（门禁盲区自律）。
 - npm 包文件清单包含 `mcp/skills-server.mjs`，安装包内 server 定位不依赖仓库外路径。
 - 文档、tooltip 和最终说明都不包含「首次工具调用才启动进程」「首次调用前零内存」等错误承诺。
 - 实施提交不包含 `CHANGELOG.md` 或 `lib/` 的手工改动。
@@ -433,9 +465,9 @@ dirname(pluginStateDir()) / skills
 
 1. 两个工具在真实 CodeBuddy 和另一种 ACP agent 中可用，且默认关闭。
 2. 设置页可主动开关，持久化、严格失败回滚、tooltip 和页头错误均符合本文。
-3. 四个 ACP 入口共享当前配置和同一合并器，用户同名 server 优先，agent 定义不被改写。
+3. 四个 ACP 入口经活读取接缝共享当前配置和同一合并器，用户同名 server 优先，agent 定义不被改写，开关不双写。
 4. server 在初始化与静态工具清单阶段不读技能目录，读写行为有界，无 watcher、缓存和定时器。
 5. 路径穿越、绝对路径、外部 symlink 和非普通文件均被拒绝，Windows 与 POSIX 语义均有测试。
-6. 所有相关测试、`npm run prepack`、npm 包含检查和真实 agent 验证通过。
+6. 拆分前置（§9.0）已满足；所有相关测试、`npm run prepack`、npm 包含检查和真实 agent 验证通过。
 7. 三份 `AGENTS/` 文档与代码同次更新，行数门禁未被放宽。
 8. 最终交付如实说明 agent 掌握 MCP 进程生命周期，开关只影响后续建会话，不宣称便携的进程级按需启动。
