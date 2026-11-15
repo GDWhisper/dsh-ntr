@@ -10,7 +10,6 @@
   "tests/bridge.spec.ts": 1186,
   "tests/mock-agent.mjs": 1759,
   "tests/model-seat.spec.ts": 1314,
-  "tests/panel.spec.ts": 1173,
   "tests/store.spec.ts": 1129,
   "tests/update.spec.ts": 1274
 }

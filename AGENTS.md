@@ -105,7 +105,7 @@
 
 ## 测试约定
 
-测试在 [`tests/`](./tests)，`.spec.ts` 命名；其余按模块就近（`panel.spec.ts` 设置页、`update.spec.ts` 更新服务、`acp-guard.spec.ts` preset guard 的步进闸门与路由选择），浏览器侧共享纯逻辑放 `acp-view.spec.ts`，组件 / 模块专属用例就近放同名 `.spec.tsx`（如 `release-notes.spec.tsx`），不要塞进 `tests/impl/`（宿主端纯逻辑镜像）——按簇落同名文件。
+测试在 [`tests/`](./tests)，`.spec.ts` 命名；其余按模块就近（`tests/panel/` 设置页、`update.spec.ts` 更新服务、`acp-guard.spec.ts` preset guard 的步进闸门与路由选择），浏览器侧共享纯逻辑放 `acp-view.spec.ts`，组件 / 模块专属用例就近放同名 `.spec.tsx`（如 `release-notes.spec.tsx`），不要塞进 `tests/impl/`（宿主端纯逻辑镜像）——按簇落同名文件。
 
 - `tests/impl/`：宿主端纯逻辑单测按 `src/impl/` 的簇同名镜像（`validate.spec.ts` / `catalog.spec.ts` / `paths.spec.ts` / `dispatch.spec.ts` …，共享 fake 在 `harness.ts`），无子进程，秒级返回。
 - `register.spec.ts`：Cordis 上下文注册，用 `fakeCtx()` 模拟宿主。

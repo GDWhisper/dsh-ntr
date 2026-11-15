@@ -1,6 +1,6 @@
 # 巨型文件拆分计划（第二轮：三件套 / 设置页 / 协议覆盖 / UI 面）
 
-**状态**：**P0 / P1 / P2 / P3a 已完成，P3b 第一至第三批（leaf 服务 / save-banners + agent-admin / chat-choice + chat-sessions）已完成，P3b 的 `connection` 实测触发停止条件、留在门面（见 §6 记录），P4 组件簇已完成、测试镜像进行中，P5–P6 未开始**。承接 [bridge-split.md](./archive/bridge-split.md)（第一轮，已完成）的纪律与模式。
+**状态**：**P0 / P1 / P2 / P3a 已完成，P3b 第一至第三批（leaf 服务 / save-banners + agent-admin / chat-choice + chat-sessions）已完成，P3b 的 `connection` 实测触发停止条件、留在门面（见 §6 记录），P4 已完成（组件簇 + 测试镜像），P5–P6 未开始**。承接 [bridge-split.md](./archive/bridge-split.md)（第一轮，已完成）的纪律与模式。
 **一句话**：把行数基线里**仍在增长**的存量文件按领域簇拆到 ≤1000 行并删除基线条目；功能面已封闭的文件继续锁着不动。
 
 > 写作约定：代码位置一律用「文件 + 符号名」，不写行号。**本文不锁定任何文件的当前行数**——正式执行前代码仍会变动，行数与符号清单在每个子步开工时以 HEAD 实测重新核对；本文锁定的只有「领域簇划分、归属、顺序、停止条件」。索引登记进 [docs/README.md](../README.md)，待办登记进 [docs/todo.md](../todo.md)。
@@ -188,6 +188,8 @@ impl 几乎全是纯函数 + 小类 + 一个自由函数分发器，按领域机
 4. 跨会话审批镜像原本是 `AcpSettingsSection` 里的一段内联 JSX，按上表落成 `PermissionMirrorCard`（门禁仍是同一句 `permissionLedgerCard(ui).visible`），DOM 与文案逐字不变。
 
 `ensureStyle` 的 `styleMounted` 守卫、`payloadEquals` 的判脏顺序、约束 33 / 34 / 38 的文案与 token 一字未改；`AcpSettingsSection` 的 `ledger` 局部量与内联块随之删除，其余逐字搬移。`npm run prepack` 全绿，用例数不变。
+
+**落地记录（测试镜像，一个提交）**：`tests/panel.spec.ts` 1173 行 → `tests/panel/` 六个 `.spec.ts`（`save-guard` / `navigation` / `editing` / `permissions` / `connection-test` / `release-notes`，按 describe 标题切分）+ `harness.ts`（`mountPanel` / `click` / `category` / `detail` / `textbox` / `payloads` / `expectHiddenButMounted` / `permission`）。describe 标题逐字保留、用例数 63 例不变、用例体与断言零改动；`afterEach(cleanup)` 与 jsdom 环境注解留在各 spec 文件头部（harness 不带副作用，与 `tests/bridge/harness.ts` 同风格）。原文件删除，基线条目同步删除；`tests/panel-fixture.ts` 未动。`npm run prepack` 全绿、全量用例数 1486 不变。
 
 ## 8. P5：协议覆盖（bridge 第二轮 + mock）
 
