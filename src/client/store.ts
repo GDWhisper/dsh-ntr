@@ -28,6 +28,7 @@ import { AgentAdminService } from "./store/agent-admin.ts"
 import { CatalogService } from "./store/catalog.ts"
 import { ChatChoiceService } from "./store/chat-choice.ts"
 import { ChatSessionsService } from "./store/chat-sessions.ts"
+import { LogService } from "./store/log.ts"
 import { SaveBannersService } from "./store/save-banners.ts"
 import { SettingsService } from "./store/settings.ts"
 import type { AgentCommand } from "./store/skills.ts"
@@ -94,8 +95,6 @@ export class AcpStore {
 
   private readonly listeners = new Set<Listener>()
   private source?: EventSource
-  /** Monotonic id source for {@link AcpLogEntry}s (never reset by `clearLogs`). */
-  private logSeq = 0
   private readonly lastSeq = new Map<string, number>()
   /** Sessions with a finalized turn (dedups the cancel-fallback + late real turn/end pair). */
   private readonly openTurns = new Set<string>()
@@ -167,7 +166,7 @@ export class AcpStore {
       state,
       label,
       flashError,
-      logLine: (level, text) => this.logLine(level, text),
+      logLine: (level, text) => this.logService.line(level, text),
       // The banner's "重试"/"强制保存" on a refused save re-runs exactly that
       // payload through the agent-admin service; the banner store never reaches
       // into the roster itself.
@@ -238,31 +237,8 @@ export class AcpStore {
     for (const listener of [...this.listeners]) listener()
   }
 
-  /**
-   * Allocate one runtime-log line. Monotonic across the page, so a service that
-   * builds log rows (the save gate) mints ids from the same sequence.
-   */
-  private logLine(level: 'info' | 'error', text: string, agentId?: string): AcpLogEntry {
-    return {
-      id: ++this.logSeq,
-      at: Date.now(),
-      level,
-      text,
-      ...(agentId === undefined ? {} : { agentId }),
-    }
-  }
-
-  /**
-   * Build the log patch for one line. Does NOT mutate: the caller merges it
-   * into the single `mutate` call it was already making for the same event.
-   */
-  private logPatch(level: 'info' | 'error', text: string, agentId?: string): Pick<UiState, 'logs' | 'logUnread'> {
-    const entry = this.logLine(level, text, agentId)
-    return {
-      logs: [...this.state.logs, entry].slice(-LOG_MAX_ENTRIES),
-      logUnread: this.state.logUnread + 1,
-    }
-  }
+  /** The runtime log's id source and patch builder (see `LogService`). */
+  private readonly logService = new LogService()
 
   // ---- Streaming update coalescing ----
 
@@ -420,7 +396,7 @@ export class AcpStore {
   /** Snapshot refresh used on panel open and after a stream outage. */
   async resync(): Promise<void> {
     try {
-      const [{ agents }, { sessions }, defaultAgentInfo, detectResult, presetResult, tagHaloResult, titlePrefixResult, deadlinesResult, idleReleaseResult, saveGateResult, versionResult] = await Promise.all([
+      const [{ agents }, { sessions }, defaultAgentInfo, detectResult, presetResult, tagHaloResult, titlePrefixResult, skillsMcpResult, deadlinesResult, idleReleaseResult, saveGateResult, versionResult] = await Promise.all([
         this.call<{ agents: AgentView[] }>('agents/list'),
         this.call<{ sessions: SessionView[] }>('sessions/list'),
         // The plugin's OWN default ACP agent — a plugin-private id, not a DSH
@@ -433,6 +409,8 @@ export class AcpStore {
         this.call<{ halo: AcpTagHalo }>('ui/tag-halo').catch(() => ({ halo: { ...DEFAULT_TAG_HALO } })),
         // Host without the endpoint (older half) keeps the local default (on).
         this.call<{ titlePrefix: boolean }>('ui/session-title-prefix').catch(() => ({ titlePrefix: DEFAULT_SESSION_TITLE_PREFIX })),
+        // Absent / older half: stays UNREAD (`undefined`), never a guessed on.
+        this.call<{ skillsMcpEnabled: boolean }>('ui/skills-mcp').catch(() => ({} as { skillsMcpEnabled?: boolean })),
         // `undefined` (older half) hides the deadline card instead of showing a
         // number this browser made up.
         this.call<ApprovalDeadlinesResult>('ui/approval-deadlines').catch(() => ({ deadlines: undefined })),
@@ -464,6 +442,7 @@ export class AcpStore {
         preset: presetResult?.preset ?? undefined,
         tagHalo: tagHaloResult?.halo ?? { ...DEFAULT_TAG_HALO },
         titlePrefix: titlePrefixResult?.titlePrefix ?? DEFAULT_SESSION_TITLE_PREFIX,
+        ...(skillsMcpResult.skillsMcpEnabled === undefined ? {} : { skillsMcpEnabled: skillsMcpResult.skillsMcpEnabled }),
         approvalDeadlines: deadlinesResult.deadlines,
         idleRelease: idleReleaseResult.idleRelease,
         ...(nextSaveGate === undefined ? {} : { saveGate: nextSaveGate }),
@@ -992,6 +971,11 @@ export class AcpStore {
     return this.settingsService.setTitlePrefix(value)
   }
 
+  /** Write the built-in skills MCP switch (optimistic; the host answer is the authority). */
+  async setSkillsMcpEnabled(value: boolean): Promise<void> {
+    return this.settingsService.setSkillsMcp(value)
+  }
+
   /** Write the approval deadline, or drop the persisted override with `reset`. */
   async setApprovalDeadline(ms: number): Promise<void> {
     return this.settingsService.setApprovalDeadline(ms)
@@ -1122,7 +1106,7 @@ export class AcpStore {
             actions: ['dismiss'],
           })
         }
-        this.mutate(this.logPatch(event.level, event.text, event.agentId))
+        this.mutate(this.logService.patch(this.state, event.level, event.text, event.agentId))
         return Promise.resolve()
       }
       case 'agent/status': {
@@ -1187,7 +1171,7 @@ export class AcpStore {
           ...(hadBurst ? { burstStats } : {}),
           permissions: this.state.permissions.filter(p => p.sessionId !== event.sessionId),
           ...(event.reason === 'agent-died'
-            ? this.logPatch('error', this.locale('会话因 agent 进程退出而终止', 'session ended: agent process died'), closingSession?.agentId)
+            ? this.logService.patch(this.state, 'error', this.locale('会话因 agent 进程退出而终止', 'session ended: agent process died'), closingSession?.agentId)
             : {}),
         })
         return Promise.resolve()
@@ -1209,22 +1193,22 @@ export class AcpStore {
         const cause = event.cause ?? 'died'
         let log: Partial<Pick<UiState, 'logs' | 'logUnread'>> = {}
         if (cause === 'workspace') {
-          log = this.logPatch('info', this.locale(
+          log = this.logService.patch(this.state, 'info', this.locale(
             'agent 为切换工作区重启，会话已挂起；再次发送消息将自动恢复。',
             'agent restarted for its workspace; the session is paused and will resume on your next message.',
           ), event.session.agentId)
         } else if (cause === 'resume-failed') {
-          log = this.logPatch('error', this.locale(
+          log = this.logService.patch(this.state, 'error', this.locale(
             '会话恢复失败；再次发送消息将重试恢复。',
             'session resume failed; your next message will retry it.',
           ), event.session.agentId)
         } else if (cause === 'stalled') {
-          log = this.logPatch('error', this.locale(
+          log = this.logService.patch(this.state, 'error', this.locale(
             'agent 未响应卡死的回合，会话已挂起；再次发送消息将自动恢复。',
             'agent did not acknowledge the stalled turn; the session is paused and will resume on your next message.',
           ), event.session.agentId)
         } else if (cause === 'died') {
-          log = this.logPatch('error', this.locale(
+          log = this.logService.patch(this.state, 'error', this.locale(
             'agent 进程已退出，会话已挂起；再次发送消息将自动恢复。',
             'agent process died; the session is paused and will resume on your next message.',
           ), event.session.agentId)

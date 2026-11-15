@@ -163,6 +163,11 @@ const STYLE = `
 .dwa-inline-setting { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-2, #f9fafb); }
 .dwa-inline-setting .dwa-switch { flex-shrink: 0; margin-top: 1px; }
 .dwa-setting-copy { color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
+/* The settings rows' info icon: a real focusable button (keyboard users reach
+   the tooltip through it), drawn as a quiet glyph so it never competes with
+   the row's own label. */
+.dwa-info-btn { flex-shrink: 0; width: 16px; height: 16px; padding: 0; margin-top: 2px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); border-radius: 50%; background: none; color: var(--dsw-alias-label-tertiary, #6b7280); font: inherit; font-size: 10px; line-height: 1; font-style: italic; cursor: help; display: inline-flex; align-items: center; justify-content: center; }
+.dwa-info-btn:hover, .dwa-info-btn:focus-visible { color: var(--dsw-alias-label-primary, #111827); border-color: var(--dsw-alias-label-tertiary, #9ca3af); }
 /* Stacked, not side by side: the rows carry name, id and credit, and a
    half-width pane truncated them at every realistic settings width. Each list
    gets the whole column instead. */

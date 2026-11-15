@@ -160,6 +160,14 @@ export interface UiState {
    */
   titlePrefix: boolean
   /**
+   * Whether the built-in read-only `dsh-skills` MCP server is offered to
+   * agents (settings toggle, default off). Absent until the host answered —
+   * an UNREAD value is never treated as on, and the toggle renders off with
+   * no promise it can keep. Writes land optimistically first; the host answer
+   * is the authority.
+   */
+  skillsMcpEnabled?: boolean
+  /**
    * The approval deadlines in force, as the settings card edits them. Absent on
    * a host half from before the card existed, which hides the card rather than
    * showing a number this browser invented. Writes land optimistically and the

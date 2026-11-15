@@ -31,6 +31,7 @@ import { PermissionMirrorCard } from './panel/permission-mirror.tsx'
 import { PluginUpdateBadge, PluginUpdateCard, updateCardVisible } from './panel/plugin-update.tsx'
 import { partitionAgents, streamText, useUi } from './panel/shared.ts'
 import { ensureStyle } from './panel/styles.ts'
+import { SkillsMcpPreference } from './skills-mcp-preference.tsx'
 
 interface WithStore { acp: AcpStore }
 
@@ -237,6 +238,10 @@ export function AcpSettingsSection(props: WithStore) {
             )
           })}
         </div>
+
+        {/* The built-in read-only MCP every agent may be offered; one switch
+            for the deployment, not a per-agent control. */}
+        <SkillsMcpPreference acp={acp} ui={ui} />
       </section>
 
       <section className="dwa-section" hidden={page !== 'add'} aria-label={acp.label('添加智能体', 'Add agent')}>

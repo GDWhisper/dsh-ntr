@@ -23,6 +23,7 @@
   "files": [
     "lib",
     "src",
+    "mcp",
     "presets",
     "locale",
     "cordis.patch.yml"

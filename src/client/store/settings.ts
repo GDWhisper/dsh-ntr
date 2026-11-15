@@ -20,6 +20,7 @@ import type {
   IdleReleaseResult,
   IdleReleaseSetPayload,
   PermissionTimeoutMode,
+  SkillsMcpResult,
 } from '../../protocol.ts'
 import type { UiState } from './state.ts'
 
@@ -67,6 +68,26 @@ export class SettingsService {
       await this.host.call('ui/session-title-prefix-set', { titlePrefix: value === true })
     } catch (error) {
       this.host.mutate({ titlePrefix: previous })
+      this.host.flashError(error)
+    }
+  }
+
+  /**
+   * Write the built-in skills MCP switch (settings page). Optimistic like
+   * {@link setTitlePrefix}; a failure restores the previous value and flashes
+   * the notice, so the row never claims a state the host refused to persist.
+   * Deliberately NOT part of the save gate: this is not an agent save, the
+   * host applies it to the sessions it creates from now on, and no process is
+   * restarted.
+   */
+  async setSkillsMcp(value: boolean): Promise<void> {
+    const previous = this.host.state().skillsMcpEnabled
+    this.host.mutate({ skillsMcpEnabled: value === true })
+    try {
+      const result = await this.host.call<SkillsMcpResult>('ui/skills-mcp-set', { skillsMcpEnabled: value === true })
+      this.host.mutate({ skillsMcpEnabled: result.skillsMcpEnabled === true })
+    } catch (error) {
+      this.host.mutate({ skillsMcpEnabled: previous })
       this.host.flashError(error)
     }
   }
