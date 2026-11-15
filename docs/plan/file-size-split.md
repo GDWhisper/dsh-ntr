@@ -1,6 +1,6 @@
 # 巨型文件拆分计划（第二轮：三件套 / 设置页 / 协议覆盖 / UI 面）
 
-**状态**：**P0 / P1 / P2 / P3a 已完成，P3b 第一至第三批（leaf 服务 / save-banners + agent-admin / chat-choice + chat-sessions）已完成，P3b 余下（connection）与 P4–P6 未开始**。承接 [bridge-split.md](./archive/bridge-split.md)（第一轮，已完成）的纪律与模式。
+**状态**：**P0 / P1 / P2 / P3a 已完成，P3b 第一至第三批（leaf 服务 / save-banners + agent-admin / chat-choice + chat-sessions）已完成，P3b 的 `connection` 实测触发停止条件、留在门面（见 §6 记录），P4–P6 未开始**。承接 [bridge-split.md](./archive/bridge-split.md)（第一轮，已完成）的纪律与模式。
 **一句话**：把行数基线里**仍在增长**的存量文件按领域簇拆到 ≤1000 行并删除基线条目；功能面已封闭的文件继续锁着不动。
 
 > 写作约定：代码位置一律用「文件 + 符号名」，不写行号。**本文不锁定任何文件的当前行数**——正式执行前代码仍会变动，行数与符号清单在每个子步开工时以 HEAD 实测重新核对；本文锁定的只有「领域簇划分、归属、顺序、停止条件」。索引登记进 [docs/README.md](../README.md)，待办登记进 [docs/todo.md](../todo.md)。
@@ -146,6 +146,18 @@ impl 几乎全是纯函数 + 小类 + 一个自由函数分发器，按领域机
 - `tests/store.spec.ts` 按同领域拆；纯函数用例已随 P3a 搬进 `tests/store/`，其余（类驱动）随 P3b 的服务划分迁移。
 
 **落地记录（P3b 第三批）**：`chat-choice.ts`（`ChatChoiceService`，Host：`call` / `mutate` / `state` / `flashError`，4 个）与 `chat-sessions.ts`（`ChatSessionsService`，Host：`call` / `mutate` / `state` / `flashError` / `locale` / `verdicts{settleAllowed,commit,markUnsettled}` / `noteAcpSessionOwners` / `writeChoice`，8 项）落成。判定账本 `acpVerdicts` 与 ACP→会话归属表 `acpSessionOwners` **留在门面**（座位闸门的 `claimAcpAsk` / `hasAcpModeVerdict` 读同一份 verdicts，`flushUpdates` 与 `turn/metrics` 读同一份 owners），服务只拿到三项窄动作与一个「把这些行记进归属表」的回调，因此仍无运行时门面导入、Host 在「>10」线下。帧簿记（在飞读去重、`chatRowFrames`、`chatListLoaded`、`chatUnlocked`、`subagentRecordFrames`、`MAX_WATCHED`）随服务搬走，门面的 `applyEvent` 仍按到达顺序喂它（`noteChatRowFrame` / `noteAgentLocked` / `noteAgentUnlocked` / `noteSubagentRecord`），`subagents/record` 的折叠（`subagentKey` / `isSubagentDowngrade`）留门面。`writeChoice` 仍只增不减（约束 27），模式切换的记忆写入经 `ChatSessionsHost.writeChoice` 回到 `ChatChoiceService`——单一写者未破。基线：`src/client/store.ts` 2026 → 1597，`tests/store.spec.ts` 1928 → 1129；测试镜像 `tests/store.spec.ts` 69 例 → 44 例 + `chat-choice.spec.ts` 6 例（`the conversation↔agent binding`）+ `chat-sessions.spec.ts` 19 例（subagent lifecycle 2 / observed transcripts 6 / fork 5 / chat-row freshness 6），describe 标题与用例逐字不变。`connection.ts` 未开始。
+
+**`connection` 触发停止条件，留在门面**：`start` / `connectStream` / `resync` / `loadTranscript` / `flushUpdates` / `armUpdateFlush` / `applyEvent` 这一簇的宿主面实测远在「>10」线之上，逐项数下来是 **20+**：
+
+- 读快照与写快照：`state`、`mutate`（**两参**：`blocksChanged` 决定是否复制 `blocks`，裸 `mutate(patch)` 会丢掉这个区分）、`label` / `locale`、`logPatch`；
+- 传输：`call`（`/acp` 信封与 `error.code` 保留）、`new EventSource('/api/acp/stream')`、`requestAnimationFrame` 调度；
+- rescue / 重读：`loadTranscript`（`lastSeq` 水位拒绝倒退）、`loadChatSessions`、`loadAgentCatalog`、`invalidateSeatCatalog`；
+- 横幅簇：`saveBannersService.saveGatePatch` / `pushSaveBanner`、`normalizeSaveGateStatus`；
+- 会话簇六个帧钩子：`noteChatRowFrame` / `watchedSessionPatch` / `markWatchedRunning` / `noteAgentLocked` / `noteAgentUnlocked` / `noteSubagentRecord`；
+- 浏览器侧本类私有的时序状态：`openTurns`、`lastSeq`、`acpSessionOwners`、`burstStats`、`pendingUpdates`、`updateFlushArmed`、`activeSessionId` 与 `blocks` 的**就地 push + `trimBlocks`**；
+- 纯函数：`withSessionUsage` / `withSessionModes`（`flushUpdates` 与 `applyEvent` 的 `session/meta` 共用，任一方向搬走都要新造导出面）。
+
+把这一簇抽成服务，要么把这 20+ 项全塞进一个 Host（越过停止条件），要么把 `lastSeq` / `openTurns` / `acpSessionOwners` / `pendingUpdates` 一起搬家——那四份状态正是 `session/reset`、`session/closed`、`turn/start`、`turn/end` 与折帧互相校验的依据，搬走等于重写事件顺序（约束 23 / 29 的逐字语义），与本轮「纯移动、行为零变化」冲突。故本簇**不拆**，`src/client/store.ts` 保持 1597 行（基线锁在那里）。将来要拆只有两条路：把「一个回合的时序状态」整体下沉成独立的 `TurnLedger` 值对象（连同 `turn/start` / `turn/end` / `session/reset` 一起走），或者承认 `applyEvent` 是这个门面的固有职责、只拆 `flushUpdates` 一族（约 100 行，需新造 `mutate(patch, blocksChanged)`、`ownerOf`、`nextSeq` / `setSeq`、`foldDetail` 四个回调，且 `withSessionUsage` 转为簇内导出）；两条都不在本轮范围内。
 
 ## 7. P4：`src/client/panel.tsx` → `src/client/panel/` + `tests/panel.spec.ts` → `tests/panel/`
 
