@@ -23,7 +23,7 @@ import { AgentBridge } from '../../src/bridge/agent-bridge.ts'
 import { pluginStateDir } from '../../src/bridge/state-paths.ts'
 import { DEFAULT_TUNING } from '../../src/bridge/tuning.ts'
 import type { BridgeTuning } from '../../src/bridge/types.ts'
-import { EventHub } from '../../src/impl.ts'
+import { EventHub, dispatchRpc } from '../../src/impl.ts'
 import type { AcpAgentDef, AcpMcpServerDef } from '../../src/protocol.ts'
 import { MOCK, def as mockDef, normPath, until } from './harness.ts'
 
@@ -58,7 +58,13 @@ afterAll(() => {
   for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
-function agentDef(id: string, log: string, mcpServers: AcpMcpServerDef[] | undefined, idleTimeoutMs?: number): AcpAgentDef {
+function agentDef(
+  id: string,
+  log: string,
+  mcpServers: AcpMcpServerDef[] | undefined,
+  idleTimeoutMs?: number,
+  skillsMcpEnabled?: boolean,
+): AcpAgentDef {
   return {
     ...mockDef,
     id,
@@ -68,6 +74,9 @@ function agentDef(id: string, log: string, mcpServers: AcpMcpServerDef[] | undef
     env: { ...mockDef.env, MOCK_MCP_LOG: log, MOCK_FORK: '1' },
     ...(mcpServers === undefined ? {} : { mcpServers }),
     ...(idleTimeoutMs === undefined ? {} : { idleTimeoutMs }),
+    // Absent stays absent on purpose: the default ("on") must be exercised as
+    // a MISSING field, not as an explicit `true`.
+    ...(skillsMcpEnabled === undefined ? {} : { skillsMcpEnabled }),
   }
 }
 
@@ -76,12 +85,15 @@ function agentDef(id: string, log: string, mcpServers: AcpMcpServerDef[] | undef
  * back) and `park` releases after a short window, which is how the fourth
  * entry — `session/load` on resume — gets driven deterministically.
  */
-function makeHarness(label: string, mcpServers: AcpMcpServerDef[] = USER_SERVERS): SkillsHarness {
+function makeHarness(label: string, mcpServers: AcpMcpServerDef[] = USER_SERVERS, skillsMcpEnabled?: boolean): SkillsHarness {
   const root = mkdtempSync(join(tmpdir(), 'dsh-ntr-skills-mcp-'))
   roots.push(root)
   const log = join(root, `${label}.log`)
   const manager = new BridgeManager(
-    [agentDef(`${label}-main`, log, mcpServers, 0), agentDef(`${label}-park`, log, mcpServers, 300)],
+    [
+      agentDef(`${label}-main`, log, mcpServers, 0, skillsMcpEnabled),
+      agentDef(`${label}-park`, log, mcpServers, 300, skillsMcpEnabled),
+    ],
     new EventHub(),
     500,
     join(root, 'agents.json'),
@@ -242,4 +254,125 @@ describe('dsh-skills MCP on the four session-creating entries', () => {
     const wired = new AgentBridge(def, new EventHub(), 500, () => {}, undefined, undefined, tuningOn, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => true)
     expect(names(wired)).toEqual(['local', 'remote', 'dsh-skills'])
   })
+})
+
+/**
+ * The SECOND level: `AcpAgentDef.skillsMcpEnabled` narrows the master switch
+ * for one agent (AND semantics — `总开关 && def.skillsMcpEnabled !== false`).
+ * Driven through the real RPC and the real agent process, because the whole
+ * point is that the value is read off the SHARED definition at request time.
+ */
+describe('dsh-skills MCP per-agent opt-out', () => {
+  it('an agent that opted out gets no built-in server while the master switch is on — until it opts back in', async () => {
+    const h = makeHarness('optout', USER_SERVERS, false)
+    try {
+      setSkillsSwitch(h.manager, true)
+      const main = 'optout-main'
+      h.manager.bindChatAgent('optout-a', main)
+      await h.manager.getOrCreateDshSession('optout-a', main)
+      await h.manager.probeAgentModels(main)
+      // Create + the probe's throwaway session: the probe is the entry that
+      // would otherwise hand a second, different list to the same process.
+      expect(h.records().map(record => record.method)).toEqual(['session/new', 'session/new'])
+      for (const record of h.records()) expect(record.mcpServers).toEqual(USER_WIRE)
+
+      // The master switch really was on: the per-agent half was the only
+      // reason the built-in stayed away.
+      await expect(dispatchRpc(h.manager, 'agent/set-skills-mcp', { agentId: main, skillsMcpEnabled: true }))
+        .resolves.toEqual({ ok: true, value: { done: true } })
+      await h.manager.getOrCreateDshSession('optout-b', main)
+      expect(h.records().at(-1)?.mcpServers?.at(-1)).toMatchObject({ name: 'dsh-skills' })
+    } finally {
+      await h.close()
+    }
+  }, 60_000)
+
+  it('ignores the per-agent switch while the master switch is off', async () => {
+    const h = makeHarness('masteroff', USER_SERVERS, true)
+    try {
+      const main = 'masteroff-main'
+      h.manager.bindChatAgent('masteroff-a', main)
+      await h.manager.getOrCreateDshSession('masteroff-a', main)
+      // Per-agent explicitly ON, master OFF: the kill-switch wins.
+      expect(h.records().map(record => record.method)).toEqual(['session/new'])
+      expect(h.records()[0].mcpServers).toEqual(USER_WIRE)
+
+      setSkillsSwitch(h.manager, true)
+      await h.manager.getOrCreateDshSession('masteroff-b', main)
+      expect(h.records()[1].mcpServers?.at(-1)).toMatchObject({ name: 'dsh-skills' })
+    } finally {
+      await h.close()
+    }
+  }, 60_000)
+
+  it('treats an absent per-agent field as on', async () => {
+    const h = makeHarness('default-on', USER_SERVERS)
+    try {
+      setSkillsSwitch(h.manager, true)
+      const main = 'default-on-main'
+      h.manager.bindChatAgent('default-on-a', main)
+      await h.manager.getOrCreateDshSession('default-on-a', main)
+      // No migration: every definition written before the second level existed
+      // behaves exactly as it did with the master switch alone.
+      expect(h.records()[0].mcpServers?.at(-1)).toMatchObject({ name: 'dsh-skills' })
+      expect(h.records()[0].mcpServers).toHaveLength(USER_WIRE.length + 1)
+    } finally {
+      await h.close()
+    }
+  }, 60_000)
+
+  it('applies agent/set-skills-mcp to an existing bridge without a restart', async () => {
+    const h = makeHarness('toggle')
+    try {
+      setSkillsSwitch(h.manager, true)
+      const main = 'toggle-main'
+      h.manager.bindChatAgent('toggle-a', main)
+      const first = await h.manager.getOrCreateDshSession('toggle-a', main)
+      expect(h.records()[0].mcpServers?.at(-1)).toMatchObject({ name: 'dsh-skills' })
+
+      await expect(dispatchRpc(h.manager, 'agent/set-skills-mcp', { agentId: main, skillsMcpEnabled: false }))
+        .resolves.toEqual({ ok: true, value: { done: true } })
+
+      // No restart: the same process still serves the session created before
+      // the flip, and nothing was parked waiting for a `session/load`.
+      const view = h.manager.agentViews().find(entry => entry.id === main)
+      expect(view?.state).toBe('ready')
+      expect(view?.liveSessions).toContain(first.sessionId)
+      expect(h.manager.sessions().filter(session => session.agentId === main && session.released === true)).toEqual([])
+
+      // The next session-creating request on that SAME bridge already sees it.
+      await h.manager.getOrCreateDshSession('toggle-b', main)
+      expect(h.records()[1].mcpServers).toEqual(USER_WIRE)
+
+      // And back on, again without a restart.
+      await expect(dispatchRpc(h.manager, 'agent/set-skills-mcp', { agentId: main, skillsMcpEnabled: true }))
+        .resolves.toEqual({ ok: true, value: { done: true } })
+      await h.manager.getOrCreateDshSession('toggle-c', main)
+      expect(h.records()[2].mcpServers).toEqual(h.records()[0].mcpServers)
+    } finally {
+      await h.close()
+    }
+  }, 60_000)
+
+  it('rejects a non-boolean per-agent value without touching the process', async () => {
+    const h = makeHarness('badvalue')
+    try {
+      setSkillsSwitch(h.manager, true)
+      const main = 'badvalue-main'
+      h.manager.bindChatAgent('badvalue-a', main)
+      await h.manager.getOrCreateDshSession('badvalue-a', main)
+      for (const payload of [{ agentId: main }, { agentId: main, skillsMcpEnabled: 'off' }, { skillsMcpEnabled: false }]) {
+        await expect(dispatchRpc(h.manager, 'agent/set-skills-mcp', payload))
+          .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+      }
+      await expect(dispatchRpc(h.manager, 'agent/set-skills-mcp', { agentId: 'nobody', skillsMcpEnabled: false }))
+        .resolves.toMatchObject({ ok: false, error: { code: 'unknown_agent' } })
+      // The refused calls changed nothing: the next create still carries the
+      // built-in server, on the same process.
+      await h.manager.getOrCreateDshSession('badvalue-b', main)
+      expect(h.records()[1].mcpServers?.at(-1)).toMatchObject({ name: 'dsh-skills' })
+    } finally {
+      await h.close()
+    }
+  }, 60_000)
 })

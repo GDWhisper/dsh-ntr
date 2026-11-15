@@ -382,6 +382,11 @@ export class ModelCatalogService {
       agentId,
       exposedModels: [...(def.exposedModels ?? [])],
       autoDiscoverModels: def.autoDiscoverModels !== false,
+      // Carried on the same frame: the settings card patches its copy of the
+      // definition from this event, so a per-agent `dsh-skills` toggle would
+      // otherwise be invisible to an open card (and a later full save would
+      // then write the stale value back).
+      skillsMcpEnabled: def.skillsMcpEnabled !== false,
     })
   }
 

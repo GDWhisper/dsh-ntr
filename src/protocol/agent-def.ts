@@ -95,6 +95,21 @@ export interface AcpAgentDef {
    * servers ON TOP of that.
    */
   mcpServers?: AcpMcpServerDef[]
+  /**
+   * Whether this agent is offered the built-in `dsh-skills` MCP server, ON by
+   * default: unset means "on", so a definition written before the two-level
+   * switch existed needs no migration and the master switch alone reproduces
+   * the earlier behaviour. `false` is the explicit opt-out and the only value
+   * ever stored — the effective condition is
+   * `master switch && skillsMcpEnabled !== false`.
+   *
+   * Flipped from the agent card's lightweight `agent/set-skills-mcp` RPC,
+   * NEVER by `agent/save` (which stops the process): the definition is mutated
+   * in place, so a live bridge's `session/new` / `session/load` / probe / fork
+   * sees the new value on its next request. Existing sessions keep the tools
+   * they were created with.
+   */
+  skillsMcpEnabled?: boolean
 }
 
 /** How an MCP server is reached. `acp` (agent→client `mcp/message`) is NOT supported. */

@@ -44,6 +44,13 @@ export interface AgentForm {
    * silently reshaped; it is parsed on the way out.
    */
   mcpText: string
+  /**
+   * Whether this agent gets the built-in `dsh-skills` MCP server (`false` =
+   * opted out). NOT edited here: the agent card toggles it through the
+   * lightweight RPC. It rides in the form only so a full save carries the
+   * current value instead of wiping it (see `buildPayload`).
+   */
+  skillsMcpEnabled: boolean
 }
 
 function idleText(value: number | undefined): string {
@@ -144,6 +151,9 @@ export function initialForm(detected: DetectedAgentInfo, activeAgent: AgentView 
     // filled in), so re-serializing it reproduces exactly what is stored —
     // that is what keeps the card from being permanently dirty.
     mcpText: config?.mcpServers === undefined ? '' : JSON.stringify(config.mcpServers, null, 2),
+    // On is the default and the only state the file does not spell out, so an
+    // absent field seeds the form as on.
+    skillsMcpEnabled: config?.skillsMcpEnabled !== false,
   }
 }
 
@@ -165,6 +175,9 @@ export function payloadEquals(payload: AgentSavePayload, current: AcpAgentDef): 
   if (exposureKey(payload.exposedModels) !== exposureKey(current.exposedModels)) return false
   if (mcpKey(payload.mcpServers) !== mcpKey(current.mcpServers)) return false
   if ((payload.autoDiscoverModels !== false) !== (current.autoDiscoverModels !== false)) return false
+  // Compared as an effective boolean: absent and `true` are both "on", so a
+  // card that never touched the per-agent switch is not dirty.
+  if ((payload.skillsMcpEnabled !== false) !== (current.skillsMcpEnabled !== false)) return false
   // The per-agent OVERRIDE, compared as stored: an absent field on both sides
   // means "follow the global window" and is not a change; a field on one
   // side only means the user is adding or dropping an override.
@@ -213,6 +226,10 @@ export function buildPayload(form: AgentForm, detected: DetectedAgentInfo, newCu
     // The MCP list is OPTIONAL: absent = the agent connects only to the
     // servers it configures for itself.
     ...(mcpServers === undefined ? {} : { mcpServers }),
+    // Carried so a full save cannot silently re-enable the built-in server:
+    // the host rebuilds the definition from this payload. On is the default,
+    // so only the opt-out is sent (and only that is persisted).
+    ...(form.skillsMcpEnabled ? {} : { skillsMcpEnabled: false }),
   }
   if (form.rootsOpen) {
     if (cwd !== '') payload.cwd = cwd

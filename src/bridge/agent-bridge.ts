@@ -1007,9 +1007,9 @@ export class AgentBridge {
     }
   }
 
-  /** Every session-creating request sends this ONE list, read at request time (AGENTS.md rule 32). */
+  /** Every session-creating request sends this ONE list, read at request time (AGENTS.md rule 32); `dsh-skills` needs the live master switch AND the per-agent opt-out. */
   private mcpServersForSession(): McpServer[] {
-    return toAcpMcpServers(sessionMcpServers(this.def.mcpServers, this.skillsMcpEnabled?.() ?? false))
+    return toAcpMcpServers(sessionMcpServers(this.def.mcpServers, (this.skillsMcpEnabled?.() ?? false) && this.def.skillsMcpEnabled !== false))
   }
 
   /** The body of {@link createSession}; the caller keeps `pendingCreates` for it. */

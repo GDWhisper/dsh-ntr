@@ -363,6 +363,43 @@ export class AgentAdminService {
     this.host.publishCatalog(agentId, false)
   }
 
+  /**
+   * Per-agent opt-out of the built-in `dsh-skills` MCP server (the master
+   * switch stays a global setting; this one narrows it for ONE agent).
+   *
+   * Lightweight like `setExposedModels` — the definition is mutated in place,
+   * which is the WHOLE hot-apply: every live bridge of the agent shares this
+   * object and reads the flag when it assembles the next `session/new` /
+   * `session/load` / probe / fork request, so nothing is restarted and no
+   * running turn is touched. Only the explicit opt-out is written (`true`
+   * clears the key), matching the field's "unset = on" contract.
+   *
+   * STRICTLY persisted, unlike `setExposedModels`: the user is waiting on this
+   * click, so a missing state path or a failed write must fail the request
+   * (`persist_failed`) instead of answering "saved" while the next boot reads
+   * the old value. The in-place edit is rolled back on failure, so no split
+   * state (memory says off, disk says on) survives the throw.
+   */
+  async setSkillsMcp(agentId: string, skillsMcpEnabled: boolean): Promise<void> {
+    const def = this.host.defOf(agentId)
+    if (def === undefined) throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
+    const previous = def.skillsMcpEnabled
+    if (skillsMcpEnabled) delete def.skillsMcpEnabled
+    else def.skillsMcpEnabled = false
+    try {
+      this.host.persistAgents(true)
+    } catch (error) {
+      // The write did not land: restore the field the live bridges read, so the
+      // next request keeps the old answer and the browser's rollback matches.
+      if (previous === undefined) delete def.skillsMcpEnabled
+      else def.skillsMcpEnabled = previous
+      throw error
+    }
+    // Same frame set as `setExposedModels`: the agent's state is republished
+    // and the browser patches its copy of the definition from `agent/exposure`.
+    this.host.publishCatalog(agentId, true)
+  }
+
   async deleteAgent(agentId: string): Promise<void> {
     // Tombstone FIRST, before any await: a save that is already past its
     // generation check must see the delete when it resumes, and every later

@@ -80,6 +80,13 @@ export interface AgentSavePayload {
   /** MCP servers to connect to, in the normalized shape. See {@link AcpAgentDef.mcpServers}. */
   mcpServers?: AcpMcpServerDef[]
   /**
+   * The per-agent `dsh-skills` opt-out. Carried here ONLY so a full save cannot
+   * wipe it: the settings form never edits it (`agent/set-skills-mcp` does),
+   * but `validateAgentDef` rebuilds the definition from this payload, so an
+   * omitted field would silently re-enable the built-in server. Absent = on.
+   */
+  skillsMcpEnabled?: boolean
+  /**
    * How `agent/save` treats live turns. The host is the authority: a caller
    * that omits this gets `confirmationRequired` when the target agent is busy,
    * never an implicit interruption.

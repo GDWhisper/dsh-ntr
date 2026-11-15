@@ -53,14 +53,22 @@ export type AcpEvent =
    */
   | { type: 'catalog/updated'; agentId: string; updatedAt: number }
   /**
-   * One agent's model visibility changed outside `agent/save`: the settings
-   * panel edited `exposedModels`, the auto-discovery switch was flipped, or an
-   * observed catalog contributed newly published models. The browser patches
-   * its copy of the agent definition (the settings card) and re-reads
-   * `agent/catalog` (the composer's seat list). `exposedModels: []` means the
-   * same as unset — no `agentId@choice` variants.
+   * One agent's definition changed outside `agent/save`: the settings panel
+   * edited `exposedModels`, the auto-discovery switch was flipped, the
+   * per-agent `dsh-skills` opt-out was toggled, or an observed catalog
+   * contributed newly published models. The browser patches its copy of the
+   * agent definition (the settings card) and re-reads `agent/catalog` (the
+   * composer's seat list). `exposedModels: []` means the same as unset — no
+   * `agentId@choice` variants; `skillsMcpEnabled` is the RESOLVED per-agent
+   * answer (`!== false`), not the raw optional field.
    */
-  | { type: 'agent/exposure'; agentId: string; exposedModels: string[]; autoDiscoverModels: boolean }
+  | {
+    type: 'agent/exposure'
+    agentId: string
+    exposedModels: string[]
+    autoDiscoverModels: boolean
+    skillsMcpEnabled: boolean
+  }
   /**
    * One outstanding ask, broadcast ONCE when it is created and replayed as-is
    * to every freshly connected client (see `permission/synced`).

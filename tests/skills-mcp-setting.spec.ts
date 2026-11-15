@@ -15,7 +15,7 @@ import { join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
 import { BridgeManager } from '../src/bridge.ts'
 import { EventHub, dispatchRpc } from '../src/impl.ts'
-import type { AcpEvent } from '../src/protocol.ts'
+import type { AcpAgentDef, AcpEvent, DetectedAgentInfo } from '../src/protocol.ts'
 
 const roots: string[] = []
 afterAll(() => {
@@ -42,12 +42,29 @@ function makeRoot(): string {
  * writes; pass one inside a directory that does NOT exist to make every write
  * fail (`writeFileSync` never creates the parent).
  */
-function boot(root: string, statePath = join(root, 'agents.json')): Booted {
+function boot(root: string, statePath = join(root, 'agents.json'), defs: AcpAgentDef[] = []): Booted {
   const hub = new EventHub()
   const events: AcpEvent[] = []
   hub.subscribe(event => { events.push(event) })
-  const manager = new BridgeManager([], hub, 500, statePath, join(root, 'catalog.json'), false)
+  const manager = new BridgeManager(defs, hub, 500, statePath, join(root, 'catalog.json'), false)
   return { manager, events, statePath, close: () => manager.shutdownAll() }
+}
+
+/** A definition with no process behind it: the per-agent switch needs only the def. */
+function def(extra: Partial<AcpAgentDef> = {}): AcpAgentDef {
+  return { id: 'pi', title: 'pi', command: 'pi-acp', args: [], env: {}, allowedCwdRoots: [], ...extra }
+}
+
+/**
+ * The stored per-agent switch as the settings card reads it (`agents/detect`
+ * hands back the shared def): the RESOLVED answer, `undefined` only when the
+ * agent itself is unknown.
+ */
+async function storedSwitch(manager: BridgeManager): Promise<boolean | undefined> {
+  const result = await dispatchRpc(manager, 'agents/detect', {})
+  const agents = (result as { ok: true; value: { agents: DetectedAgentInfo[] } }).value.agents
+  const config = agents.find(info => info.id === 'pi')?.currentConfig
+  return config === undefined ? undefined : config.skillsMcpEnabled !== false
 }
 
 /** The persisted file as plain JSON (only valid once something has written it). */
@@ -197,6 +214,115 @@ describe('the dsh-skills MCP switch as a persisted setting', () => {
         .resolves.toMatchObject({ ok: false, error: { code: 'persist_failed' } })
       await expect(readSwitch(good.manager)).resolves.toEqual({ ok: true, value: { skillsMcpEnabled: true } })
       expect(tuningOf(good.manager)).toBe(true)
+      renameSync(parked, root2)
+      expect(readFileSync(good.statePath, 'utf-8')).toBe(before)
+    } finally {
+      if (existsSync(parked)) renameSync(parked, root2)
+      await good.close()
+    }
+  })
+})
+
+/**
+ * The per-agent half of the two-level switch (`AcpAgentDef.skillsMcpEnabled`,
+ * missing = on). Same discipline as the master switch: a lightweight RPC that
+ * edits the definition IN PLACE and STRICTLY persists it — never `agent/save`,
+ * never a restart — with the edit rolled back when the write cannot land.
+ */
+describe('the per-agent dsh-skills opt-out', () => {
+  it('persists the opt-out on the definition, answers the exposure frame, and never saves or restarts the agent', async () => {
+    const h = boot(makeRoot(), undefined, [def()])
+    try {
+      await expect(dispatchRpc(h.manager, 'agent/set-skills-mcp', { agentId: 'pi', skillsMcpEnabled: false }))
+        .resolves.toEqual({ ok: true, value: { done: true } })
+      const stored = readState(h.statePath) as { agents: Array<Record<string, unknown>> }
+      expect(stored.agents[0]).toMatchObject({ id: 'pi', skillsMcpEnabled: false })
+      expect(await storedSwitch(h.manager)).toBe(false)
+      // The browser patches its open card from this frame; it carries the
+      // RESOLVED value so a stale card cannot write the old one back later.
+      expect(h.events.filter(event => event.type === 'agent/exposure').at(-1))
+        .toMatchObject({ agentId: 'pi', skillsMcpEnabled: false })
+      // A lightweight write: no save frame, no process restart.
+      expect(h.events.filter(event => event.type === 'agent/save')).toEqual([])
+
+      // Back on: the explicit opt-out is the ONLY value ever stored, so `true`
+      // clears the key instead of leaving `skillsMcpEnabled: true` noise.
+      await expect(dispatchRpc(h.manager, 'agent/set-skills-mcp', { agentId: 'pi', skillsMcpEnabled: true }))
+        .resolves.toEqual({ ok: true, value: { done: true } })
+      const cleared = readState(h.statePath) as { agents: Array<Record<string, unknown>> }
+      expect('skillsMcpEnabled' in (cleared.agents[0] ?? {})).toBe(false)
+      expect(await storedSwitch(h.manager)).toBe(true)
+    } finally {
+      await h.close()
+    }
+  })
+
+  it('survives a restart through the validated state file', async () => {
+    const root = makeRoot()
+    const first = boot(root, undefined, [def({ skillsMcpEnabled: false })])
+    await dispatchRpc(first.manager, 'ui/skills-mcp-set', { skillsMcpEnabled: true })
+    await first.close()
+
+    // A restart re-reads the file through `validateAgentDef`; the opt-out must
+    // survive the rebuild (otherwise the second boot silently re-enables it).
+    const second = boot(root, undefined, [])
+    try {
+      const stored = readState(second.statePath) as { agents: Array<{ id: string; skillsMcpEnabled?: boolean }> }
+      expect(stored.agents[0]).toMatchObject({ id: 'pi', skillsMcpEnabled: false })
+      expect(await storedSwitch(second.manager)).toBe(false)
+    } finally {
+      await second.close()
+    }
+  })
+
+  it('rejects a non-boolean or unknown-agent call without writing anything', async () => {
+    const h = boot(makeRoot(), undefined, [def()])
+    try {
+      await dispatchRpc(h.manager, 'agent/set-skills-mcp', { agentId: 'pi', skillsMcpEnabled: false })
+      const before = readFileSync(h.statePath, 'utf-8')
+      for (const payload of [{ agentId: 'pi' }, { agentId: 'pi', skillsMcpEnabled: 'yes' }, { agentId: 'pi', skillsMcpEnabled: 1 }, { skillsMcpEnabled: false }]) {
+        await expect(dispatchRpc(h.manager, 'agent/set-skills-mcp', payload))
+          .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+      }
+      await expect(dispatchRpc(h.manager, 'agent/set-skills-mcp', { agentId: 'nobody', skillsMcpEnabled: false }))
+        .resolves.toMatchObject({ ok: false, error: { code: 'unknown_agent' } })
+      // No coercion, no write: the file is byte-identical and the value is
+      // still the one written above.
+      expect(readFileSync(h.statePath, 'utf-8')).toBe(before)
+      expect(await storedSwitch(h.manager)).toBe(false)
+    } finally {
+      await h.close()
+    }
+  })
+
+  it('rolls the definition back (and leaves the disk alone) when the strict write fails', async () => {
+    // A missing parent directory: the strict write throws `persist_failed`.
+    const root = makeRoot()
+    const broken = boot(root, join(root, 'missing-dir', 'agents.json'), [def({ skillsMcpEnabled: false })])
+    try {
+      await expect(dispatchRpc(broken.manager, 'agent/set-skills-mcp', { agentId: 'pi', skillsMcpEnabled: true }))
+        .resolves.toMatchObject({ ok: false, error: { code: 'persist_failed' } })
+      expect(existsSync(broken.statePath)).toBe(false)
+      // The shared definition the live bridges read was restored, and no frame
+      // claims the new value.
+      expect(await storedSwitch(broken.manager)).toBe(false)
+      expect(broken.events.filter(event => event.type === 'agent/exposure')).toEqual([])
+    } finally {
+      await broken.close()
+    }
+
+    // Same over a file that exists: the state directory disappears under a
+    // running host, and the opt-out flip must not answer "saved".
+    const root2 = makeRoot()
+    const good = boot(root2, undefined, [def({ skillsMcpEnabled: false })])
+    const parked = `${root2}-parked`
+    try {
+      await dispatchRpc(good.manager, 'agent/set-skills-mcp', { agentId: 'pi', skillsMcpEnabled: true })
+      const before = readFileSync(good.statePath, 'utf-8')
+      renameSync(root2, parked)
+      await expect(dispatchRpc(good.manager, 'agent/set-skills-mcp', { agentId: 'pi', skillsMcpEnabled: false }))
+        .resolves.toMatchObject({ ok: false, error: { code: 'persist_failed' } })
+      expect(await storedSwitch(good.manager)).toBe(true)
       renameSync(parked, root2)
       expect(readFileSync(good.statePath, 'utf-8')).toBe(before)
     } finally {

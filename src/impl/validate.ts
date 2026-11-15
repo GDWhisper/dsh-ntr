@@ -371,6 +371,14 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
   const mcpServers = row.mcpServers === undefined
     ? undefined
     : validateMcpServers(row.mcpServers, `agent "${id}" mcpServers`, 'bad_config')
+  // The per-agent `dsh-skills` opt-out: optional boolean, ON by default. Like
+  // `autoDiscoverModels`, only the explicit opt-out is stored — `true` and
+  // absent are the same state, so the file does not carry noise. A present
+  // non-boolean is a config error, never a silent "on".
+  const skillsMcpEnabled = row.skillsMcpEnabled
+  if (skillsMcpEnabled !== undefined && typeof skillsMcpEnabled !== 'boolean') {
+    throw new AcpError('bad_config', `acp: agent "${id}" skillsMcpEnabled must be a boolean`)
+  }
   return {
     id,
     title,
@@ -384,6 +392,7 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
     ...(autoDiscoverModels === false ? { autoDiscoverModels: false } : {}),
     ...(idleTimeoutMs === undefined ? {} : { idleTimeoutMs: idleTimeoutMs as number }),
     ...(mcpServers === undefined ? {} : { mcpServers }),
+    ...(skillsMcpEnabled === false ? { skillsMcpEnabled: false } : {}),
   }
 }
 

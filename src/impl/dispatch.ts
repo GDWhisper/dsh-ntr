@@ -108,6 +108,12 @@ export interface AcpManager {
   setExposedModels?(agentId: string, exposedModels: readonly string[] | undefined): Promise<void>
   /** Toggle auto-discovery of newly published models. Must not restart the agent. */
   setAutoDiscoverModels?(agentId: string, autoDiscoverModels: boolean): Promise<void>
+  /**
+   * Opt ONE agent out of (or back into) the built-in `dsh-skills` MCP server.
+   * In-place definition edit + strict persist: must not restart the agent and
+   * must not go through `agent/save`. See {@link AcpAgentDef.skillsMcpEnabled}.
+   */
+  setSkillsMcp?(agentId: string, skillsMcpEnabled: boolean): Promise<void>
   probeAgentModels?(agentId: string, model?: string): Promise<AgentProbeModelsResult>
   /**
    * The ACP model surface for one agent (the seats' data source): base entry,
@@ -715,6 +721,17 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
           return fail('bad_payload', 'acp: autoDiscoverModels must be a boolean')
         }
         await manager.setAutoDiscoverModels?.(agentId, autoDiscoverModels)
+        return ok({ done: true })
+      }
+      case 'agent/set-skills-mcp': {
+        const agentId = str(body, 'agentId', 64)
+        // Strictly a boolean: the switch is stored as an explicit opt-out, so
+        // a missing / string / null value has no "false-like" reading — it is
+        // bad input and must not write.
+        if (typeof body.skillsMcpEnabled !== 'boolean') {
+          return fail('bad_payload', 'acp: skillsMcpEnabled must be a boolean')
+        }
+        await manager.setSkillsMcp?.(agentId, body.skillsMcpEnabled)
         return ok({ done: true })
       }
       case 'agent/probe-models': {

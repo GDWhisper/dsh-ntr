@@ -1086,6 +1086,11 @@ export class BridgeManager {
     return this.admin.setAutoDiscoverModels(agentId, autoDiscoverModels)
   }
 
+  /** Per-agent `dsh-skills` opt-out; in-place edit, strictly persisted, no restart. */
+  async setSkillsMcp(agentId: string, skillsMcpEnabled: boolean): Promise<void> {
+    return this.admin.setSkillsMcp(agentId, skillsMcpEnabled)
+  }
+
   /** Delete one definition and every pointer into it. */
   async deleteAgent(agentId: string): Promise<void> {
     return this.admin.deleteAgent(agentId)
