@@ -72,7 +72,11 @@ export const MAX_DESCRIPTION_CHARS = 1000
 const LIST_MARKER_RESERVE = 64
 const DESCRIPTION_ELLIPSIS = '…'
 
-/** How much of a `SKILL.md` the frontmatter extraction may read (first of the two wins). */
+/**
+ * How much of a `SKILL.md` the frontmatter extraction may read, in BYTES and in
+ * lines — first of the two wins (see {@link readBoundedText}, which spends the
+ * byte budget exactly).
+ */
 export const FRONTMATTER_MAX_BYTES = 64 * 1024
 export const FRONTMATTER_MAX_LINES = 200
 
@@ -247,17 +251,25 @@ function clipToLimits(text, maxLines, maxChars) {
 }
 
 /**
- * Read at most `maxLines` lines / `maxChars` characters from a file.
+ * Read at most `maxLines` lines / `maxChars` characters / `maxBytes` bytes from
+ * a file.
  *
  * The file is consumed through a file descriptor in {@link READ_CHUNK_BYTES}
  * chunks and the loop stops as soon as a limit is exceeded — so the read cost is
  * the limit plus at most one chunk, never the file size, and a multi-gigabyte
  * file or a single unbounded line cannot be pulled into memory. `bytesRead` is
  * reported so tests can prove that bound instead of trusting a comment.
+ *
+ * `maxBytes` is a BYTE budget, spent exactly: each `read(2)` is capped at what
+ * is left of it, so the file is never read past it. A limit expressed in the
+ * name of bytes (`FRONTMATTER_MAX_BYTES`) must use this and not `maxChars`:
+ * characters are code units, so a CJK- or emoji-heavy file would have been read
+ * three or four times further than the cap says.
  */
 export function readBoundedText(absPath, options = {}) {
   const maxLines = options.maxLines ?? Number.MAX_SAFE_INTEGER
   const maxChars = options.maxChars ?? Number.MAX_SAFE_INTEGER
+  const maxBytes = options.maxBytes ?? Number.MAX_SAFE_INTEGER
   const fd = openSync(absPath, 'r')
   const decoder = new StringDecoder('utf8')
   const buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES)
@@ -265,10 +277,14 @@ export function readBoundedText(absPath, options = {}) {
   let bytesRead = 0
   let newlines = 0
   let stopped = false
+  let reachedEof = false
   try {
-    for (;;) {
-      const read = readSync(fd, buffer, 0, buffer.length, null)
-      if (read === 0) break
+    while (bytesRead < maxBytes) {
+      const read = readSync(fd, buffer, 0, Math.min(buffer.length, maxBytes - bytesRead), null)
+      if (read === 0) {
+        reachedEof = true
+        break
+      }
       bytesRead += read
       const piece = decoder.write(read === buffer.length ? buffer : buffer.subarray(0, read))
       text += piece
@@ -279,15 +295,20 @@ export function readBoundedText(absPath, options = {}) {
       }
     }
     if (!stopped) text += decoder.end()
+    // A file that ends exactly ON the budget is a complete read; telling that
+    // apart from a cut costs one byte, not one chunk.
+    if (!reachedEof && bytesRead >= maxBytes) reachedEof = readSync(fd, buffer, 0, 1, null) === 0
   } finally {
     closeSync(fd)
   }
-  return { ...clipToLimits(text, maxLines, maxChars), bytesRead }
+  // `bytesLimited` means the BYTE budget cut the file short — an EOF right at
+  // the budget read everything there was and is not a truncation.
+  return { ...clipToLimits(text, maxLines, maxChars), bytesRead, bytesLimited: !reachedEof && bytesRead >= maxBytes }
 }
 
-/** The description carried by a `SKILL.md` head (bounded by {@link FRONTMATTER_MAX_BYTES}/{@link FRONTMATTER_MAX_LINES}). */
+/** The description carried by a `SKILL.md` head (bounded by {@link FRONTMATTER_MAX_BYTES} BYTES / {@link FRONTMATTER_MAX_LINES} lines). */
 export function readFrontmatterDescription(absPath) {
-  const head = readBoundedText(absPath, { maxLines: FRONTMATTER_MAX_LINES, maxChars: FRONTMATTER_MAX_BYTES })
+  const head = readBoundedText(absPath, { maxLines: FRONTMATTER_MAX_LINES, maxBytes: FRONTMATTER_MAX_BYTES })
   return skillDescriptionFromFrontmatter(head.text)
 }
 

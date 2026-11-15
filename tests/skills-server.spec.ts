@@ -8,8 +8,8 @@
  * Spec: docs/plan/dsh-skills-mcp.md §8 and §11.2–11.6.
  */
 
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -319,6 +319,32 @@ describe('dsh-skills bounded reads', () => {
     expect(output.length).toBeLessThanOrEqual(server.MAX_OUTPUT_CHARS)
     expect(output).toContain('character limit reached')
   })
+
+  it('spends the frontmatter budget in BYTES, so a multi-byte font cannot stretch it', () => {
+    // 40 000 two-byte characters: 80 000+ bytes of frontmatter, 40 000
+    // characters — a character-counted cap would have read the whole block and
+    // found the closing `---`.
+    const { dir, skills } = tempTree()
+    const wide = `---\ndescription: ${'é'.repeat(40_000)}\n---\n`
+    expect(Buffer.byteLength(wide)).toBeGreaterThan(server.FRONTMATTER_MAX_BYTES)
+    const stretched = writeSkill(skills, 'wide', wide)
+    const read = server.readBoundedText(stretched, { maxLines: server.FRONTMATTER_MAX_LINES, maxBytes: server.FRONTMATTER_MAX_BYTES })
+    expect(read.bytesRead).toBe(server.FRONTMATTER_MAX_BYTES)
+    expect(read.bytesLimited).toBe(true)
+    expect(read.text.length).toBeLessThan(40_000)
+    // The block never closes inside the budget, so there is no description —
+    // proving the cap actually applies instead of trusting the constant.
+    expect(server.readFrontmatterDescription(stretched)).toBe('')
+
+    // A block that fits is still read in full; an EOF exactly at the budget is
+    // a complete read, not a truncation.
+    const small = writeSkill(skills, 'small', frontmatter('small one'))
+    expect(server.readFrontmatterDescription(small)).toBe('small one')
+    const exact = join(dir, 'exact.md')
+    writeFileSync(exact, 'a'.repeat(64))
+    const exactRead = server.readBoundedText(exact, { maxBytes: 64 })
+    expect(exactRead).toMatchObject({ bytesLimited: false, bytesRead: 64, text: 'a'.repeat(64) })
+  })
 })
 
 describe('dsh-skills tool argument validation', () => {
@@ -568,6 +594,34 @@ describe('dsh-skills skills_list', () => {
     } finally {
       await session.close()
     }
+  })
+
+  // 0o000 is the only portable way to make a FILE unreadable without ACLs; it
+  // does nothing for root, and mode bits are not a Windows concept — both are
+  // skipped rather than asserted into a false green.
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('skips a skill whose SKILL.md cannot be read', () => {
+    const { skills } = tempTree()
+    writeSkill(skills, 'alpha', frontmatter('Alpha'))
+    chmodSync(writeSkill(skills, 'blocked', frontmatter('Blocked')), 0o000)
+    const warnings: string[] = []
+    const entries = server.listSkills({ root: skills, warn: (line: string) => warnings.push(line) })
+    // "listed" still implies "readable": the unreadable one is neither.
+    expect(entries.map(entry => entry.name)).toEqual(['alpha'])
+    expect(warnings.join('\n')).toContain('blocked')
+    expect(() => server.readSkill({ name: 'blocked', root: skills })).toThrow()
+  })
+
+  // A FIFO passes `realpath` and would block the whole server on `open(2)` —
+  // the `isFile()` gate in front of every read is what keeps this a refusal.
+  // No FIFO on Windows, so the case only runs where `mkfifo` exists.
+  it.skipIf(process.platform === 'win32')('refuses a SKILL.md that is a FIFO instead of reading it', () => {
+    const { skills } = tempTree()
+    writeSkill(skills, 'alpha', frontmatter('Alpha'))
+    mkdirSync(join(skills, 'pipe'), { recursive: true })
+    execFileSync('mkfifo', [join(skills, 'pipe', 'SKILL.md')])
+    const entries = server.listSkills({ root: skills, warn: () => {} })
+    expect(entries.map(entry => entry.name)).toEqual(['alpha'])
+    expect(() => server.readSkill({ name: 'pipe', root: skills })).toThrow(/not a regular file/)
   })
 })
 
