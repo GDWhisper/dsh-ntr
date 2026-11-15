@@ -471,3 +471,33 @@ dirname(pluginStateDir()) / skills
 6. 拆分前置（§9.0）已满足；所有相关测试、`npm run prepack`、npm 包含检查和真实 agent 验证通过。
 7. 三份 `AGENTS/` 文档与代码同次更新，行数门禁未被放宽。
 8. 最终交付如实说明 agent 掌握 MCP 进程生命周期，开关只影响后续建会话，不宣称便携的进程级按需启动。
+
+## 13. 优化轮：两级开关与 UI 融入（已定稿，待实施）
+
+用户反馈：裸 checkbox 行与设置页无融入感；需要总开关 + 逐 agent 独立开关。决策如下（AND 模型，用户已确认按推荐推进）。
+
+### 13.1 语义
+
+- **总开关**（现 `skillsMcpEnabled` 全局键）是 kill-switch：关 = 任何 agent 都不下发 `dsh-skills`。
+- **per-agent 开关**：`AcpAgentDef.skillsMcpEnabled?: boolean`，**缺省 = 开**（存量定义零迁移意外；总开关一开即今天的行为）。显式 `false` = 排除该 agent。
+- 生效条件：`总开关 && def.skillsMcpEnabled !== false`。总开关关时 per-agent 控件**置灰**并显示一句提示，把 AND 语义画出来。
+- 不采用三态「跟随全局」备选（per-agent 能总关强行开，不像总开关）。
+
+### 13.2 UI 融入
+
+- 总开关升级为 agents 页**带标题的卡**（标题 + 一行说明 + 开关 + 信息图标），放在 agent 列表**上方**；复用现有 section-heading / card 视觉语言；固定文案沿用 §7.2 人话版。
+- per-agent 开关进 `AgentDetails` 的 **MCP 服务器 JSON 块旁**：一行 checkbox「向该 agent 提供 DSH 技能文档（只读）。」（en: "Offer this agent the DSH skill documents (read-only)."），即时生效，**不是表单草稿**。
+- 总开关关时该行置灰 + 提示「总开关已关闭，开启后此选项才生效。」（en: "The master switch is off; this option takes effect once it is on."）。
+
+### 13.3 机制（仿 `set-exposed-models` 先例，不发明新机制）
+
+- 新增轻量 RPC `agent/set-skills-mcp`（`{ agentId, skillsMcpEnabled: boolean }`）：def **原地改**（活 bridge 共享同一对象，下一请求即生效）、**严格落盘**（`persist_failed` 语义）、广播同步 UI；**严禁**走 `agent/save`（会杀活动会话）。
+- `validateAgentDef` 纳入 optional boolean；form 三处（`initialForm` / `buildPayload` / `payloadEquals`）**照 `exposedModels` 的携带方式**同步——表单不编辑它，但 `agent/save` 不得把它冲掉、不得误判脏。
+- 四入口合并条件改为 `sessionMcpServers(def.mcpServers, (活读取接缝() ?? false) && def.skillsMcpEnabled !== false)`；接缝仍只读全局，per-agent 半从活 def 读。
+- 浏览器：store 乐观更新 → 失败回滚 + 页头 notice → 成功采用服务端值（同总开关语义，不进 `acpSaveGate`）。
+
+### 13.4 测试与门禁
+
+- 新用例只进新文件或有余量的镜像文件：per-agent 合并矩阵（总开 agent 关 / 总关 agent 开 / 缺省 = 开 / 切换不重启）进 `tests/bridge/skills-mcp.spec.ts`；RPC 与严格落盘进 `tests/skills-mcp-setting.spec.ts`；form 携带不冲掉进新 `tests/skills-mcp-form.spec.ts`；store 与 UI 进既有 skills spec。
+- 行数：agent-bridge 余量 1（合并条件等长改写）、manager / store 门面有余量（薄委托）；其余落点均远离上限。严禁抬基线。
+- 文档同提交：`AGENTS/state.md`（per-agent 键 + 轻量 RPC）、`AGENTS/ui-panel.md`（卡与行位置、置灰语义）；约束 9 摘要可改写纳入本 RPC（≤150 行）。
