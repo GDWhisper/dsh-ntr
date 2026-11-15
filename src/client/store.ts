@@ -5,7 +5,10 @@
  * The pure halves — transcript folding, save banners, permission asks, fork
  * state, subagent records, known presets and the state shapes — live under
  * `src/client/store/` and are re-exported at the bottom of this file, so every
- * existing `./store.ts` import keeps resolving unchanged.
+ * existing `./store.ts` import keeps resolving unchanged. The leaf SERVICE
+ * clusters (settings writes, the built-in updater, the model catalog, the `/`
+ * menu rows, worker detail indexes) live there as classes with a narrow host
+ * interface; this class owns the state and delegates to them.
  *
  * Deliberately framework-free: React binds through `useSyncExternalStore`.
  */
@@ -18,26 +21,19 @@ import type { PendingPermission } from "./store/permission.ts"
 import type { SaveBanner } from "./store/save-gate.ts"
 import { composeSaveBanners, saveGateIsAvailable, saveGateOutcomeForLabel, saveGateOutcomeSuperseded, saveGateTransitions } from "./store/save-gate.ts"
 import type { AcpLogEntry, ChatRowFrame, ChatTranscript, RpcCall, UiState } from "./store/state.ts"
-import type { LiveSubagentDetailEntry, SubagentDetailState } from "./store/subagent.ts"
-import { MAX_SUBAGENT_DETAIL_WORKERS, boundedDetailEntry, compactDetailValue, isSubagentDowngrade, mergeSubagentSnapshot, subagentKey, subagentToolCallId } from "./store/subagent.ts"
+import type { SubagentDetailState } from "./store/subagent.ts"
+import { isSubagentDowngrade, mergeSubagentSnapshot, subagentKey } from "./store/subagent.ts"
+import { CatalogService } from "./store/catalog.ts"
+import { SettingsService } from "./store/settings.ts"
+import type { AgentCommand } from "./store/skills.ts"
+import { SkillsService } from "./store/skills.ts"
+import { SubagentDetailService } from "./store/subagent-detail.ts"
+import { UpdateService } from "./store/update.ts"
 
-import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentSkillsResult, AgentSkillEntry, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, IdleReleaseResult, IdleReleaseSetPayload, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, SubagentDetailEntry, SubagentDetailResult, SubagentRecord } from '../protocol.ts'
-import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, MAX_SUBAGENT_DETAIL_ENTRIES, pluginReleaseUrl } from '../protocol.ts'
+import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesResult, DetectedAgentInfo, IdleReleaseResult, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, AgentSkillEntry, SubagentDetailEntry, SubagentRecord } from '../protocol.ts'
+import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO } from '../protocol.ts'
 import { commitFrame, consumeVerdict, invalidateVerdict, markUnsettled, peekVerdict, projectAcpMode, settleFromHost, type AcpVerdict } from './acp-verdict.ts'
 import { modelOffersEffort, modelValueOf } from './route-reasoning.ts'
-
-/** One slash command the ACP agent declared, whole row (the menu draws name, description and `input.hint`). */
-export type AgentCommand = NonNullable<ChatSessionView['availableCommands']>[number]
-
-/** How long one `agent/skills` answer stays fresh in the `/` menu; past it the rows read as "not asked yet" again. */
-export const SKILL_MENU_TTL_MS = 60_000
-/** Composite-key cap for the skill rows record, evicted oldest fetch first. */
-export const MAX_SKILL_KEYS = 64
-
-/** The skill-rows record key: the SERVING agent is part of the key, so a binding switch invalidates by mismatch. */
-export function skillRowsKey(dshSessionId: string, agentId: string): string {
-  return `${dshSessionId}\u0000${agentId}`
-}
 
 /** Cap on retained runtime-log lines; older entries fall off the front. */
 export const LOG_MAX_ENTRIES = 200
@@ -86,17 +82,6 @@ interface Listener { (): void }
 const MAX_BLOCKS = 400
 /** How many observed ACP transcripts stay live at once (insertion-ordered eviction). */
 const MAX_WATCHED = 6
-/** How long one version's release notes are reused before asking the host again. */
-const PLUGIN_RELEASE_NOTES_TTL_MS = 10 * 60 * 1000
-/** A body-less answer is retried sooner: the next open may hit a working GitHub. */
-const PLUGIN_RELEASE_NOTES_FAILURE_TTL_MS = 60 * 1000
-
-/**
- * How long a fetched update state stays fresh. The settings panel asks on every
- * mount; without this, every open would hit the registry. A forced check (the
- * card's own button) always goes out.
- */
-const PLUGIN_UPDATE_TTL_MS = 10 * 60 * 1000
 
 export class AcpStore {
   private state: UiState = {
@@ -168,13 +153,6 @@ export class AcpStore {
   /** In-flight `session/chat-list` reads, keyed by chat session id. */
   private readonly chatSessionReads = new Map<string, { dropped: boolean; done: Promise<void> }>()
   /**
-   * In-flight `agent/skills` reads, keyed by chat session id. In-flight join
-   * only — the menu re-polls on every keystroke and one round-trip answers for
-   * all of them; no lifecycle frame can race this read, so no dropped/force
-   * machinery is owed.
-   */
-  private readonly skillReads = new Map<string, Promise<void>>()
-  /**
    * Monotonic order plus a short log of chat-row lifecycle frames. Read
    * starts capture the sequence; the answer replays every later frame over
    * its row list. Bounded — a read only needs the frames since it started, and
@@ -214,8 +192,6 @@ export class AcpStore {
    */
   private subagentRecordSeq = 0
   private readonly subagentRecordFrames: Array<{ seq: number; dshSessionId: string; record: SubagentRecord }> = []
-  /** Store-local order for live-captured detail entries (see {@link LiveSubagentDetailEntry.liveSeq}). */
-  private detailLiveSeq = 0
   /**
    * ACP session id → owning DSH chat session id, learned from chat-list rows
    * and `turn/metrics` frames. Live `session/update` frames carry only the ACP
@@ -228,34 +204,45 @@ export class AcpStore {
    * Kept apart from {@link acpVerdicts} so a held verdict is re-asked per TTL.
    */
   private readonly acpAsked = new Map<string, number>()
-  /** In-flight `agent/catalog` reads, keyed by agent id. */
-  private readonly seatCatalogReads = new Set<string>()
-  /** In-flight `agent/cached-models` reads, keyed by agent id. */
-  private readonly cachedModelReads = new Set<string>()
   /** Counts behind the last successful explicit re-detect, so a locale switch can re-render its summary. */
   private detectCounts: { total: number; installed: number } | undefined
-  /** When {@link UiState.pluginUpdate} was last read from the host (epoch ms). */
-  private pluginUpdateFetchedAt = 0
-  /**
-   * The shared in-flight `plugin/update-check`. The settings section mounts
-   * twice (both entries) and the update popover asks too; without this, two
-   * mounts in the same tick each fire their own registry read.
-   */
-  private pluginUpdateInflight?: Promise<PluginUpdateState | undefined>
-  /** Re-entry guard for `plugin/update-apply` (a double click is one install). */
-  private pluginUpdateApplying = false
-  /**
-   * Update read generation. An apply bumps it so a check that was already in
-   * flight (started before the install) cannot land afterwards and overwrite
-   * the install's verdict with the pre-install `available`.
-   */
-  private pluginUpdateGeneration = 0
-  /** One version's release notes, so reopening the card does not re-read GitHub. */
-  private readonly releaseNotesCache = new Map<string, { at: number; notes: PluginReleaseNotes }>()
-  /** Shared in-flight `plugin/release-notes` reads, keyed by version. */
-  private readonly releaseNotesInflight = new Map<string, Promise<PluginReleaseNotes | undefined>>()
 
-  constructor(private readonly rpc: RpcCall, private readonly locale: (zh: string, en: string) => string) {}
+  /**
+   * The leaf services. Each owns only its own bookkeeping (throttle windows,
+   * in-flight dedup, LRU counters) and writes through the host interface this
+   * class hands it — so `mutate` stays the single writer and every broadcast
+   * keeps the merge/ordering semantics the class had when these were methods.
+   */
+  private readonly settingsService: SettingsService
+  private readonly updateService: UpdateService
+  private readonly catalogService: CatalogService
+  private readonly skillsService: SkillsService
+  private readonly subagentDetailService: SubagentDetailService
+
+  constructor(private readonly rpc: RpcCall, private readonly locale: (zh: string, en: string) => string) {
+    const call = <T>(endpoint: string, payload: unknown = {}): Promise<T> => this.call<T>(endpoint, payload)
+    const mutate = (patch: Partial<UiState>): void => { this.mutate(patch) }
+    const state = (): UiState => this.state
+    const flashError = (error: unknown): void => { this.flashError(error) }
+    const label = (zh: string, en: string): string => this.label(zh, en)
+    this.settingsService = new SettingsService({ call, mutate, state, flashError })
+    this.updateService = new UpdateService({ call, mutate, state, label })
+    this.catalogService = new CatalogService({
+      call,
+      mutate,
+      state,
+      label,
+      flashError,
+      resync: () => this.resync(),
+    })
+    this.skillsService = new SkillsService({
+      call,
+      mutate,
+      state,
+      chatAgentFor: dshSessionId => this.chatAgentFor(dshSessionId),
+    })
+    this.subagentDetailService = new SubagentDetailService({ call, mutate, state })
+  }
 
   /**
    * Whether the active locale draws the Chinese half of a bilingual body.
@@ -393,11 +380,8 @@ export class AcpStore {
 
   /**
    * Append the frames of one batch that belong to an OPEN worker detail index
-   * (see {@link UiState.subagentDetails}). Both filters are required: the
-   * dispatch's own frames (`toolCallId` — raw input and the terminal frame
-   * live there) and the worker's frames
-   * (`_meta["codebuddy.ai/parentToolCallId"]`). Scoped by the ACP session's
-   * owning conversation, never by `childId` alone.
+   * (see {@link UiState.subagentDetails}; the filters live in
+   * `SubagentDetailService.foldSubagentDetailFrames`).
    *
    * Returns the next map, or `undefined` when nothing matched.
    */
@@ -406,26 +390,7 @@ export class AcpStore {
     items: ReadonlyArray<{ seq: number; update: unknown }>,
     currentMap: Record<string, SubagentDetailState>,
   ): Record<string, SubagentDetailState> | undefined {
-    const keys = Object.keys(currentMap)
-    if (keys.length === 0) return undefined
-    let out: Record<string, SubagentDetailState> | undefined
-    for (const item of items) {
-      const update = item.update as Record<string, unknown>
-      if (update === null || typeof update !== 'object') continue
-      const own = typeof update.toolCallId === 'string' && update.toolCallId !== '' ? update.toolCallId : undefined
-      const parent = parentToolCallIdOf(update)
-      if (own === undefined && parent === undefined) continue
-      for (const key of keys) {
-        const detail = (out ?? currentMap)[key]
-        if (detail === undefined || detail.dshSessionId !== owner) continue
-        const toolCallId = subagentToolCallId(detail.childId)
-        if (toolCallId === '') continue
-        if (toolCallId !== own && toolCallId !== parent) continue
-        if (out === undefined) out = { ...currentMap }
-        out[key] = appendSubagentDetailEntry(detail, boundedDetailEntry(item.seq, item.update, ++this.detailLiveSeq))
-      }
-    }
-    return out
+    return this.subagentDetailService.foldSubagentDetailFrames(owner, items, currentMap)
   }
 
   private armUpdateFlush(): void {
@@ -551,158 +516,21 @@ export class AcpStore {
     }
   }
 
-  /**
-   * Read the plugin's update state (`plugin/update-check`). Throttled to ten
-   * minutes unless `force`: the settings panel asks on mount, and every
-   * remount must not hit the registry.
-   *
-   * An older host serves no such endpoint (`unknown endpoint`). That is a
-   * normal degradation, not an error worth a notice: the answer is `undefined`
-   * and the panel simply keeps its update entry hidden.
-   */
+  // ---- Built-in updater (implementation: store/update.ts) ----
+
+  /** Throttled `plugin/update-check` read; `force` bypasses the ten-minute window. */
   async checkPluginUpdate(force = false): Promise<PluginUpdateState | undefined> {
-    // One read for every caller while it is in flight, force included: the
-    // settings page and the popover mounting together must not hit the
-    // registry twice.
-    if (this.pluginUpdateInflight !== undefined) return this.pluginUpdateInflight
-    const current = this.state.pluginUpdate
-    if (!force && current !== undefined && Date.now() - this.pluginUpdateFetchedAt < PLUGIN_UPDATE_TTL_MS) {
-      return current
-    }
-    const generation = this.pluginUpdateGeneration
-    const inflight = this.readPluginUpdate(generation)
-    this.pluginUpdateInflight = inflight
-    try {
-      return await inflight
-    } finally {
-      this.pluginUpdateInflight = undefined
-    }
+    return this.updateService.checkPluginUpdate(force)
   }
 
-  private async readPluginUpdate(generation: number): Promise<PluginUpdateState | undefined> {
-    try {
-      const pluginUpdate = await this.call<PluginUpdateState>('plugin/update-check')
-      // An install started while this read was in flight: its answer is
-      // already stale, and the install's verdict owns the state now.
-      if (generation !== this.pluginUpdateGeneration) return undefined
-      this.pluginUpdateFetchedAt = Date.now()
-      this.mutate({ pluginUpdate })
-      return pluginUpdate
-    } catch {
-      return undefined
-    }
-  }
-
-  /**
-   * Install one exact version (`plugin/update-apply`). The status flips to
-   * `applying` first so the badge answers the click; the host's answer then
-   * becomes the state.
-   *
-   * A failed call does NOT prove the install did not happen: on an HMR host
-   * the update uninstalls the plugin before reinstalling it, which can cut the
-   * response. Whatever the error, the disk may already carry the new version,
-   * so the state becomes `restart-required` (the one neutral verdict for "the
-   * running code is not the disk's") with `installed` dropped (unknown, not a
-   * fact to display) and the notice asks for a reload rather than restoring
-   * `available` and pretending nothing changed.
-   */
+  /** Explicit `plugin/update-apply` install of one exact version (the badge's `applying` flip included). */
   async applyPluginUpdate(version: string): Promise<PluginUpdateState | undefined> {
-    if (this.pluginUpdateApplying) return undefined
-    this.pluginUpdateApplying = true
-    // Any check already in flight predates the install; its answer must not
-    // land on top of the install's verdict.
-    this.pluginUpdateGeneration += 1
-    const previous = this.state.pluginUpdate
-    if (previous !== undefined) {
-      this.mutate({ pluginUpdate: { ...previous, status: 'applying' } })
-    }
-    try {
-      const pluginUpdate = await this.call<PluginUpdateState>('plugin/update-apply', { version })
-      this.pluginUpdateFetchedAt = Date.now()
-      this.mutate({ pluginUpdate })
-      return pluginUpdate
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      // The disk state is UNKNOWN here: the install may have completed before
-      // the response was cut. Keep `latest` for display, drop `installed` so no
-      // surface can claim a disk version we never read, and reset the throttle
-      // so the next check actually asks the host instead of serving this
-      // unknown verdict for ten minutes.
-      const interrupted: PluginUpdateState = previous !== undefined
-        ? { ...previous, status: 'restart-required', installed: undefined, message }
-        : { status: 'restart-required', current: this.state.pluginVersion ?? '?', message }
-      this.pluginUpdateFetchedAt = 0
-      this.mutate({
-        pluginUpdate: interrupted,
-        notice: this.locale(
-          '更新请求已中断；请刷新页面确认当前版本。',
-          'The update request was interrupted. Reload the page to confirm the installed version.',
-        ),
-      })
-      return undefined
-    } finally {
-      // Invalidate reads that STARTED during the install: their "applying"
-      // answer would otherwise land on top of this call's final verdict.
-      this.pluginUpdateGeneration += 1
-      this.pluginUpdateApplying = false
-    }
+    return this.updateService.applyPluginUpdate(version)
   }
 
-  /**
-   * One version's release notes (`plugin/release-notes`), cached per version
-   * for ten minutes (a body-less answer for one minute); `force` skips the
-   * window AND sends `refresh: true` so the host's own cache is bypassed too —
-   * otherwise the card's retry would read the same failure back.
-   *
-   * An older host has no such endpoint, and a transport failure says nothing
-   * about the release: both answer a body-less result carrying the release
-   * PAGE, which this module can derive without a network. That is a normal
-   * degradation, not an error worth a notice — the link still works.
-   *
-   * The host's answer is remote data: a body that is not a string is dropped,
-   * and only an http(s) page becomes a link, so nothing else can reach the
-   * renderer.
-   */
+  /** One version's `plugin/release-notes` preview, cached per version; `force` also bypasses the host cache. */
   async loadPluginReleaseNotes(version: string, force = false): Promise<PluginReleaseNotes | undefined> {
-    if (!force) {
-      const cached = this.releaseNotesCache.get(version)
-      if (cached !== undefined) {
-        const ttl = cached.notes.source === 'none'
-          ? PLUGIN_RELEASE_NOTES_FAILURE_TTL_MS
-          : PLUGIN_RELEASE_NOTES_TTL_MS
-        if (Date.now() - cached.at < ttl) return cached.notes
-      }
-    }
-    const inflight = this.releaseNotesInflight.get(version)
-    if (inflight !== undefined) return inflight
-    const read = (async (): Promise<PluginReleaseNotes> => {
-      const page = pluginReleaseUrl(version)
-      let notes: PluginReleaseNotes
-      try {
-        const value = await this.call<PluginReleaseNotes>(
-          'plugin/release-notes',
-          force ? { version, refresh: true } : { version },
-        )
-        notes = {
-          version,
-          url: typeof value.url === 'string' && /^https?:\/\//i.test(value.url) ? value.url : page,
-          source: value.source === 'github' || value.source === 'changelog' ? value.source : 'none',
-          ...(typeof value.body === 'string' ? { body: value.body } : {}),
-          ...(value.truncated === true ? { truncated: true } : {}),
-          ...(typeof value.message === 'string' ? { message: value.message } : {}),
-        }
-      } catch {
-        notes = { version, url: page, source: 'none' }
-      }
-      this.releaseNotesCache.set(version, { at: Date.now(), notes })
-      return notes
-    })()
-    this.releaseNotesInflight.set(version, read)
-    try {
-      return await read
-    } finally {
-      this.releaseNotesInflight.delete(version)
-    }
+    return this.updateService.loadPluginReleaseNotes(version, force)
   }
 
   async detectAgents(): Promise<void> {
@@ -848,136 +676,36 @@ export class AcpStore {
     }
   }
 
-  /**
-   * Seed one agent's model panes from the host's PERSISTENT catalog cache
-   * (`agent/cached-models`, memory-only: it never spawns).
-   *
-   * The settings card used to learn a catalog only from `agent/probe-models`,
-   * so its panes stayed blank until the user clicked 「检测可用模型」 on every
-   * visit — including the models already configured, which are known from the
-   * agent definition and the on-disk catalog. This read fills both panes on
-   * mount; the probe stays the explicit REFRESH (add what the agent newly
-   * publishes, drop what it stopped advertising).
-   */
+  // ---- Model catalog and ACP seat surface (implementation: store/catalog.ts) ----
+
+  /** Seed one agent's model panes from the host's persisted catalog cache (memory-only; never spawns). */
   async loadCachedModels(agentId: string): Promise<void> {
-    if (this.state.modelCatalogs[agentId] !== undefined || this.cachedModelReads.has(agentId)) return
-    this.cachedModelReads.add(agentId)
-    try {
-      const result = await this.call<AgentProbeModelsResult | null>('agent/cached-models', { agentId })
-      // `null` = this agent never published a catalog. A probe may have landed
-      // while this read was in flight; a fresh probe always wins.
-      if (result === null || result === undefined || this.state.modelCatalogs[agentId] !== undefined) return
-      this.mutate({ modelCatalogs: { ...this.state.modelCatalogs, [agentId]: result } })
-    } catch {
-      // Older host without the endpoint, or an agent deleted meanwhile: the
-      // panes fall back to the selection alone, exactly as before a probe.
-    } finally {
-      this.cachedModelReads.delete(agentId)
-    }
+    return this.catalogService.loadCachedModels(agentId)
   }
 
-  /** Ask the host to probe one agent's model catalog (spawn + throwaway session); `model` fetches just that model's thought levels for the card, without the page notice. */
+  /** Explicit probe (`agent/probe-models`); `model` fetches just that model's thought levels for the card. */
   async probeModels(agentId: string, model?: string): Promise<void> {
-    const previousError = this.state.probeErrors[agentId]
-    this.mutate({
-      probingModels: { ...this.state.probingModels, [agentId]: true },
-      probeErrors: this.clearProbeError(agentId),
-    })
-    try {
-      const result = await this.call<AgentProbeModelsResult>('agent/probe-models', model === undefined ? { agentId } : { agentId, model })
-      // The seat list is a filtered view of the same catalog: drop the cached
-      // one (in the same patch) and re-read below, so a fresh probe lands in an
-      // open conversation too.
-      const seatCatalogs = { ...this.state.seatCatalogs }
-      delete seatCatalogs[agentId]
-      this.mutate({
-        modelCatalogs: { ...this.state.modelCatalogs, [agentId]: result },
-        seatCatalogs,
-        probingModels: { ...this.state.probingModels, [agentId]: false },
-        // A retry after the user fixed the problem must not leave the old
-        // failure pinned at the top of the panel. Only drop the notice when it
-        // is still ours — anything newer belongs to someone else.
-        ...(previousError !== undefined && this.state.notice === previousError ? { notice: undefined } : {}),
-      })
-      void this.loadAgentCatalog(agentId)
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error)
-      const notice = msg.includes('unknown endpoint agent/probe-models')
-        ? this.locale('宿主服务运行着旧版本代码，请在终端重启 dsh web 服务以激活模型检测功能。', 'Host running older version. Please restart dsh web to enable model detection.')
-        : msg
-      this.mutate({
-        ...(model === undefined ? { notice } : {}),
-        probingModels: { ...this.state.probingModels, [agentId]: false },
-        probeErrors: { ...this.state.probeErrors, [agentId]: notice },
-      })
-    }
+    return this.catalogService.probeModels(agentId, model)
   }
 
-  private clearProbeError(agentId: string): Record<string, string> {
-    if (this.state.probeErrors[agentId] === undefined) return this.state.probeErrors
-    const next = { ...this.state.probeErrors }
-    delete next[agentId]
-    return next
-  }
-
-  /**
-   * Read one agent's ACP model surface (`agent/catalog`) — what the composer
-   * chips and the ACP-mode model seat render. Cached per agent, because the
-   * list only changes when the agent's catalog is re-probed or its exposure
-   * filter is edited (both of which drop the cache below), and deduped because
-   * every ACP surface asks for it on mount.
-   *
-   * The host answers from memory, so this is safe to call from a render effect;
-   * a probe it may trigger runs in the background on the host side.
-   */
+  /** Cached, deduped read of one agent's `agent/catalog` (what the composer chips and the model seat render). */
   async loadAgentCatalog(agentId: string): Promise<void> {
-    if (this.state.seatCatalogs[agentId] !== undefined || this.seatCatalogReads.has(agentId)) return
-    this.seatCatalogReads.add(agentId)
-    try {
-      const result = await this.call<AgentCatalogResult>('agent/catalog', { agentId })
-      this.mutate({ seatCatalogs: { ...this.state.seatCatalogs, [agentId]: result } })
-    } catch {
-      // An older host half, or an agent that was deleted meanwhile: the seats
-      // fall back to the roster's own title and the bare agent route, which is
-      // exactly what they show before a catalog exists.
-    } finally {
-      this.seatCatalogReads.delete(agentId)
-    }
+    return this.catalogService.loadAgentCatalog(agentId)
   }
 
   /** Drop one agent's cached seat catalog (its model surface just changed). */
   private invalidateSeatCatalog(agentId: string): void {
-    if (this.state.seatCatalogs[agentId] === undefined) return
-    const next = { ...this.state.seatCatalogs }
-    delete next[agentId]
-    this.mutate({ seatCatalogs: next })
+    this.catalogService.invalidateSeatCatalog(agentId)
   }
 
-  /**
-   * Persist the ACP-seat model filter for one agent. `undefined` clears the
-   * filter — same as an empty list, i.e. no `agentId@choice` variants, only
-   * the agent's base entry. Uses the dedicated lightweight RPC so the agent
-   * process and its live sessions are never restarted.
-   */
+  /** Persist the ACP-seat model filter (lightweight RPC: no process restart). */
   async setExposedModels(agentId: string, exposedModels: string[] | undefined): Promise<void> {
-    try {
-      await this.call('agent/set-exposed-models', {
-        agentId,
-        ...(exposedModels === undefined ? {} : { exposedModels }),
-      })
-      await this.resync()
-      // The seats render the filtered list, so an edited filter has to be
-      // re-read or the open conversation keeps offering the old set.
-      this.invalidateSeatCatalog(agentId)
-      void this.loadAgentCatalog(agentId)
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error)
-      const notice = msg.includes('unknown endpoint agent/set-exposed-models')
-        ? this.locale('宿主服务运行着旧版本代码，请在终端重启 dsh web 服务以启用模型筛选功能。', 'Host running older version. Please restart dsh web to enable model filtering.')
-        : msg
-      this.mutate({ notice })
-      throw error
-    }
+    return this.catalogService.setExposedModels(agentId, exposedModels)
+  }
+
+  /** Persist the auto-discovery switch (lightweight like {@link setExposedModels}). */
+  async setAutoDiscoverModels(agentId: string, autoDiscoverModels: boolean): Promise<void> {
+    return this.catalogService.setAutoDiscoverModels(agentId, autoDiscoverModels)
   }
 
   async deleteAgent(agentId: string): Promise<void> {
@@ -998,24 +726,6 @@ export class AcpStore {
     }
   }
 
-  /**
-   * Persist the auto-discovery switch for one agent. Lightweight like
-   * {@link setExposedModels}: no process restart, and the current selection is
-   * left exactly as it is.
-   */
-  async setAutoDiscoverModels(agentId: string, autoDiscoverModels: boolean): Promise<void> {
-    try {
-      await this.call('agent/set-auto-discover-models', { agentId, autoDiscoverModels })
-      await this.resync()
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error)
-      const notice = msg.includes('unknown endpoint agent/set-auto-discover-models')
-        ? this.locale('宿主服务运行着旧版本代码，请在终端重启 dsh web 服务以启用自动发现功能。', 'Host running older version. Please restart dsh web to enable auto-discovery.')
-        : msg
-      this.mutate({ notice })
-      throw error
-    }
-  }
 
   // ---- Panel lifecycle ----
 
@@ -1294,118 +1004,11 @@ export class AcpStore {
     this.chatSessionReads.delete(dshSessionId)
   }
 
-  /**
-   * Ensure one worker's detail index exists and read its history on demand.
-   *
-   * Creates the index (which is what makes LIVE frames append to it from then
-   * on), moves it to the LRU's recent end, and asks the host for the bounded
-   * history predating the page (`subagents/detail`) — once for CodeBuddy, on
-   * EVERY open of an agy-marked index (no wire frames after creation). Frames
-   * landing during a read are replayed over its answer by their `liveSeq`, so
-   * a slow read cannot erase a terminal frame the page saw. A failed read
-   * leaves the live index alone and retries on the next open.
-   */
+  // ---- Worker detail indexes (implementation: store/subagent-detail.ts) ----
+
+  /** Ensure one worker's detail index exists and read its bounded history on demand. */
   async loadSubagentDetail(dshSessionId: string, childId: string): Promise<void> {
-    const key = subagentKey(dshSessionId, childId)
-    const atRead = this.detailLiveSeq
-    const existing = this.state.subagentDetails[key]
-    const touchedAt = Date.now()
-    const opened: SubagentDetailState = existing === undefined
-      ? { dshSessionId, childId, entries: [], loaded: false, omitted: 0, touchedAt }
-      : { ...existing, touchedAt }
-    // Re-insert so an equal-timestamp tie during LRU eviction keeps this one
-    // (see `withSubagentDetail`).
-    const openedMap = { ...this.state.subagentDetails }
-    delete openedMap[key]
-    openedMap[key] = opened
-    this.mutate({ subagentDetails: this.withSubagentDetail(openedMap, key) })
-    if (opened.loaded && !opened.entries.some(entry => entry.source === 'agy-transcript')) return
-    try {
-      const result = await this.call<SubagentDetailResult>('subagents/detail', { dshSessionId, childId })
-      const current = this.state.subagentDetails[key]
-      if (current === undefined) return
-      // Frames applied while the read was in flight are newer than its answer
-      // in the only sense that matters (the host may not have seen them yet),
-      // so they are replayed over it. A frame the host DID see appears on both
-      // sides; the payload comparison drops that copy (a bare seq is not
-      // enough: a resumed segment restarts its numbering).
-      const hostHistory = new Map<number, Set<string>>()
-      for (const entry of result.entries) {
-        const copy = hostHistory.get(entry.seq) ?? new Set<string>()
-        copy.add(compactDetailValue(entry.update))
-        hostHistory.set(entry.seq, copy)
-      }
-      const live = current.entries.filter(entry => {
-        if ((entry.liveSeq ?? 0) <= atRead) return false
-        return hostHistory.get(entry.seq)?.has(compactDetailValue(entry.update)) !== true
-      })
-      const combined = [...result.entries.map(entry => ({ ...entry })), ...live]
-      const overflow = Math.max(0, combined.length - MAX_SUBAGENT_DETAIL_ENTRIES)
-      this.mutate({
-        subagentDetails: this.withSubagentDetail({
-          ...this.state.subagentDetails,
-          [key]: {
-            ...current,
-            entries: overflow > 0 ? combined.slice(overflow) : combined,
-            loaded: true,
-            omitted: current.omitted + overflow + (result.omitted ?? 0),
-            touchedAt: Date.now(),
-          },
-        }, key),
-      })
-    } catch {
-      // An older host (no endpoint) or a dropped read: the live index stays
-      // usable, and the next open retries the one history read.
-    }
-  }
-
-  /**
-   * Apply the {@link MAX_SUBAGENT_DETAIL_WORKERS} LRU. `protect` is never
-   * evicted (the worker just opened); among the rest the oldest `touchedAt`
-   * goes first.
-   */
-  private withSubagentDetail(
-    map: Record<string, SubagentDetailState>,
-    protect?: string,
-  ): Record<string, SubagentDetailState> {
-    const keys = Object.keys(map)
-    if (keys.length <= MAX_SUBAGENT_DETAIL_WORKERS) return map
-    const removable = keys
-      .filter(key => key !== protect)
-      .sort((a, b) => (map[a]?.touchedAt ?? 0) - (map[b]?.touchedAt ?? 0))
-    const next = { ...map }
-    let excess = keys.length - MAX_SUBAGENT_DETAIL_WORKERS
-    for (const key of removable) {
-      if (excess <= 0) break
-      delete next[key]
-      excess -= 1
-    }
-    return next
-  }
-
-  /**
-   * The slash commands the LIVE ACP session declared for one chat session, as
-   * read by {@link loadChatSessions} (`available_commands_update` →
-   * `session/chat-list`).
-   *
-   * `undefined` covers both "no answer has landed yet" and "there is no live
-   * session (or it has not declared anything)" — in every one of those cases
-   * the caller falls back to the agent-level cache ({@link agentCommands}),
-   * which is what makes `/` list commands before the first message exists.
-   */
-  chatSessionCommands(dshSessionId: string): readonly AgentCommand[] | undefined {
-    if (this.state.chatSessionsFor !== dshSessionId) return undefined
-    return this.state.chatSessions[0]?.availableCommands
-  }
-
-  /**
-   * The slash commands the agent declared in its most recent session, from
-   * `agent/catalog` (host-cached per agent, see `AgentCatalogResult.commands`).
-   * The pre-first-turn source for the `/` menu.
-   */
-  agentCommands(agentId: string | undefined): readonly AgentCommand[] | undefined {
-    if (agentId === undefined) return undefined
-    return this.state.seatCatalogs[agentId]?.commands
+    return this.subagentDetailService.loadSubagentDetail(dshSessionId, childId)
   }
 
   /**
@@ -1427,80 +1030,34 @@ export class AcpStore {
       ?? this.state.defaultAgent
   }
 
+  // ---- The `/` menu's ACP rows (implementation: store/skills.ts) ----
+
   /**
-   * The skill rows the `/` menu's skill source should offer for this
-   * conversation, read against the CURRENT binding. `undefined` means "no
-   * answer in force": nothing fetched yet, the TTL expired, or the agent
-   * changed (composite-key mismatch) — every one of those is a signal to ask
-   * again. Only a successful read of THIS conversation + THIS agent's key
-   * answers `[]` (a real, confirmed-empty menu).
+   * The slash commands the LIVE ACP session declared for one chat session;
+   * `undefined` falls back to {@link agentCommands}.
    */
+  chatSessionCommands(dshSessionId: string): readonly AgentCommand[] | undefined {
+    return this.skillsService.chatSessionCommands(dshSessionId)
+  }
+
+  /** The slash commands the agent declared in its most recent session (`agent/catalog`). */
+  agentCommands(agentId: string | undefined): readonly AgentCommand[] | undefined {
+    return this.skillsService.agentCommands(agentId)
+  }
+
+  /** The skill rows this conversation's `/` menu should offer, read against the CURRENT binding. */
   skillRowsFor(dshSessionId: string): readonly AgentSkillEntry[] | undefined {
-    const agentId = this.chatAgentFor(dshSessionId)
-    if (agentId === undefined) return undefined
-    const entry = this.state.agentSkills[skillRowsKey(dshSessionId, agentId)]
-    if (entry === undefined || Date.now() - entry.at >= SKILL_MENU_TTL_MS) return undefined
-    return entry.rows
+    return this.skillsService.skillRowsFor(dshSessionId)
   }
 
-  /**
-   * Fetch the skill rows for one conversation (the slash skill source's cold
-   * read). Concurrent callers share one read; the entry leaves the map when it
-   * settles so the next caller past the TTL re-asks. A conversation with no
-   * answerable agent reads NOTHING: no state is written and no RPC is sent,
-   * so polling an unbound conversation costs zero network — and once a
-   * binding lands, the next menu poll fetches normally.
-   */
+  /** Fetch one conversation's skill rows (concurrent callers share one read). */
   loadAgentSkills(dshSessionId: string): Promise<void> {
-    const inFlight = this.skillReads.get(dshSessionId)
-    if (inFlight !== undefined) return inFlight
-    const read = this.readAgentSkills(dshSessionId).finally(() => {
-      if (this.skillReads.get(dshSessionId) === read) this.skillReads.delete(dshSessionId)
-    })
-    this.skillReads.set(dshSessionId, read)
-    return read
+    return this.skillsService.loadAgentSkills(dshSessionId)
   }
 
-  private async readAgentSkills(dshSessionId: string): Promise<void> {
-    // "Don't know the agent" is recorded as NOTHING — never as an empty menu.
-    // An empty rows array must stay a real answer, so the mismatch case re-asks
-    // instead of waiting out the TTL with a wrong empty answer.
-    const agentId = this.chatAgentFor(dshSessionId)
-    if (agentId === undefined) return
-    const result = await this.call<AgentSkillsResult>('agent/skills', { dshSessionId, agentId })
-    this.writeAgentSkills(dshSessionId, agentId, result.skills ?? [])
-  }
-
-  /** Commit one `agent/skills` answer under its composite key, applying the {@link MAX_SKILL_KEYS} eviction. */
-  private writeAgentSkills(dshSessionId: string, agentId: string, rows: readonly AgentSkillEntry[]): void {
-    const key = skillRowsKey(dshSessionId, agentId)
-    const next: Record<string, { at: number; rows: readonly AgentSkillEntry[] }> = {
-      ...this.state.agentSkills,
-      [key]: { at: Date.now(), rows },
-    }
-    const keys = Object.keys(next)
-    if (keys.length > MAX_SKILL_KEYS) {
-      const removable = keys.sort((a, b) => (next[a]?.at ?? 0) - (next[b]?.at ?? 0))
-      let excess = keys.length - MAX_SKILL_KEYS
-      for (const removableKey of removable) {
-        if (excess <= 0) break
-        delete next[removableKey]
-        excess -= 1
-      }
-    }
-    this.mutate({ agentSkills: next })
-  }
-
-  /**
-   * The draft text one skill pick inserts, resolved against the CURRENT
-   * binding: a row seen under a since-switched agent is simply unknown here
-   * (the composite key moved), so the pick does nothing rather than insert the
-   * old agent's path.
-   */
+  /** The draft text one skill pick inserts, against the CURRENT binding. */
   skillInsertionFor(dshSessionId: string, token: string): string | undefined {
-    const rows = this.skillRowsFor(dshSessionId)
-    if (rows === undefined) return undefined
-    return rows.find(row => row.token === token)?.insertion
+    return this.skillsService.skillInsertionFor(dshSessionId, token)
   }
 
   /** Fold a host answer in and return the derived projection for the caller's `mutate`. */
@@ -2378,118 +1935,41 @@ export class AcpStore {
     }
   }
 
-  /**
-   * Write the agent tag's halo preference (settings card). The value is
-   * validated host-side; this side writes optimistically first so the tag's
-   * look changes with the click, and reverts to the host answer on a failure.
-   */
+  // ---- Settings writes (implementation: store/settings.ts) ----
+
+  /** Write the agent tag's halo preference (optimistic; the host answer is the authority). */
   async setTagHalo(halo: AcpTagHalo): Promise<void> {
-    const previous = this.state.tagHalo
-    this.mutate({ tagHalo: halo })
-    try {
-      await this.call('ui/tag-halo-set', { halo })
-    } catch (error) {
-      this.mutate({ tagHalo: previous })
-      this.flashError(error)
-    }
+    return this.settingsService.setTagHalo(halo)
   }
 
-  /**
-   * Write the title-prefix toggle (settings page). Optimistic like
-   * {@link setTagHalo}: the row flips with the click and reverts to the host
-   * answer on a failure. The host persists the pick and applies it from the
-   * next title generation on.
-   */
+  /** Write the title-prefix toggle (optimistic, like {@link setTagHalo}). */
   async setTitlePrefix(value: boolean): Promise<void> {
-    const previous = this.state.titlePrefix
-    this.mutate({ titlePrefix: value === true })
-    try {
-      await this.call('ui/session-title-prefix-set', { titlePrefix: value === true })
-    } catch (error) {
-      this.mutate({ titlePrefix: previous })
-      this.flashError(error)
-    }
+    return this.settingsService.setTitlePrefix(value)
   }
 
-  /**
-   * Write the approval deadline (settings card), or drop the persisted override
-   * with `reset` so the `cordis.patch.yml` baseline applies again.
-   *
-   * The host answer — the same route returns the deadlines now in force — is the
-   * authority, so an optimistic write that the host trims (out of range, or
-   * merged with a value this browser did not know about) self-corrects instead
-   * of drifting from what runs.
-   */
+  /** Write the approval deadline, or drop the persisted override with `reset`. */
   async setApprovalDeadline(ms: number): Promise<void> {
-    await this.writeApprovalDeadlines({ permissionTimeoutMs: ms })
+    return this.settingsService.setApprovalDeadline(ms)
   }
 
-  /**
-   * Write the mode: what an expired deadline DOES (`abort` refuses, `auto`
-   * answers with the option the agent's own kinds imply, `wait` never
-   * expires). Same write path as the window, so the host answer stays
-   * the authority.
-   */
+  /** Write what an expired approval deadline DOES (`abort` / `auto` / `wait`). */
   async setApprovalTimeoutMode(mode: PermissionTimeoutMode): Promise<void> {
-    await this.writeApprovalDeadlines({ mode })
+    return this.settingsService.setApprovalTimeoutMode(mode)
   }
 
-  /** Drop the persisted override: the config file (or the built-in default) decides again. */
+  /** Drop the persisted approval-deadline override: the config file (or the built-in default) decides again. */
   async resetApprovalDeadlines(): Promise<void> {
-    await this.writeApprovalDeadlines({ reset: true })
+    return this.settingsService.resetApprovalDeadlines()
   }
 
-  /**
-   * Write the idle-release window (in ms).
-   *
-   * The host answer — the same route returns the window now in force — is
-   * the authority, so an optimistic write that the host trims self-corrects
-   * instead of drifting from what runs.
-   */
+  /** Write the idle-release window (optimistic; the host answer is the authority). */
   async setIdleRelease(idleTimeoutMs: number): Promise<void> {
-    await this.writeIdleRelease({ idleTimeoutMs })
+    return this.settingsService.setIdleRelease(idleTimeoutMs)
   }
 
-  /**
-   * Drop the persisted override: the config file (or the built-in default)
-   * decides again.
-   */
+  /** Drop the persisted idle-release override: the config file (or the built-in default) decides again. */
   async resetIdleRelease(): Promise<void> {
-    await this.writeIdleRelease({ reset: true })
-  }
-
-  private async writeIdleRelease(payload: IdleReleaseSetPayload): Promise<void> {
-    const previous = this.state.idleRelease
-    try {
-      const result = await this.call<IdleReleaseResult>('ui/idle-release-set', payload)
-      this.mutate({ idleRelease: result.idleRelease })
-    } catch (error) {
-      this.mutate({ idleRelease: previous })
-      this.flashError(error)
-    }
-  }
-
-  private async writeApprovalDeadlines(payload: ApprovalDeadlinesSetPayload): Promise<void> {
-    const previous = this.state.approvalDeadlines
-    // Optimistic only where it is safe: the effective numbers and the mode move
-    // now, and the override facts (`configured`) stay as the host last reported
-    // them. A failure restores the whole view.
-    if (previous !== undefined) {
-      this.mutate({
-        approvalDeadlines: {
-          ...previous,
-          ...(payload.permissionTimeoutMs === undefined ? {} : { permissionTimeoutMs: payload.permissionTimeoutMs }),
-          ...(payload.mode === undefined ? {} : { mode: payload.mode }),
-        },
-      })
-    }
-    try {
-      const result = await this.call<ApprovalDeadlinesResult>('ui/approval-deadlines-set', payload)
-      this.mutate({ approvalDeadlines: result.deadlines })
-    } catch (error) {
-      this.mutate({ approvalDeadlines: previous })
-      this.flashError(error)
-    }
+    return this.settingsService.resetIdleRelease()
   }
 
   /**
@@ -3089,30 +2569,6 @@ function withSessionUsage<T extends { sessionId: string; usage?: SessionView['us
   return changed ? next : rows
 }
 
-/** The CodeBuddy worker attribution a live update carries (`parentToolCallId`), if any. */
-function parentToolCallIdOf(update: Record<string, unknown>): string | undefined {
-  const meta = update._meta
-  if (meta === null || typeof meta !== 'object') return undefined
-  const value = (meta as Record<string, unknown>)['codebuddy.ai/parentToolCallId']
-  return typeof value === 'string' && value !== '' ? value : undefined
-}
-
-/** Append one entry to a worker's index, dropping the oldest past the per-worker cap. */
-function appendSubagentDetailEntry(
-  state: SubagentDetailState,
-  entry: LiveSubagentDetailEntry,
-): SubagentDetailState {
-  const entries = [...state.entries, entry]
-  const overflow = entries.length - MAX_SUBAGENT_DETAIL_ENTRIES
-  return {
-    ...state,
-    entries: overflow > 0 ? entries.slice(overflow) : entries,
-    // The marker the panel renders: `omitted > 0` means the index does not
-    // start at the worker's first frame.
-    omitted: state.omitted + Math.max(0, overflow),
-  }
-}
-
 function sameModes(a?: SessionView['modes'], b?: SessionView['modes']): boolean {
   if (a === b) return true
   if (!a || !b) return false
@@ -3202,6 +2658,9 @@ export {
   saveGateOutcomeSuperseded,
   saveGateTransitions,
 } from "./store/save-gate.ts"
+
+export type { AgentCommand } from "./store/skills.ts"
+export { MAX_SKILL_KEYS, SKILL_MENU_TTL_MS, skillRowsKey } from "./store/skills.ts"
 
 export type { AcpLogEntry, ChatRowFrame, ChatTranscript, RpcCall, UiState } from "./store/state.ts"
 

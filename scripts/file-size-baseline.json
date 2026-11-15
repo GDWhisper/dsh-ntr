@@ -6,12 +6,12 @@
   "src/client/index.tsx": 1094,
   "src/client/panel.tsx": 3414,
   "src/client/session-controls.tsx": 1120,
-  "src/client/store.ts": 3217,
+  "src/client/store.ts": 2676,
   "tests/acp-view.spec.ts": 1645,
   "tests/bridge.spec.ts": 1186,
   "tests/mock-agent.mjs": 1759,
   "tests/model-seat.spec.ts": 1314,
   "tests/panel.spec.ts": 1173,
-  "tests/store.spec.ts": 4001,
+  "tests/store.spec.ts": 3016,
   "tests/update.spec.ts": 1274
 }
