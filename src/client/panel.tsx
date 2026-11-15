@@ -201,6 +201,13 @@ export function AcpSettingsSection(props: WithStore) {
         </div>
       )}
 
+      {/* The master switch of the built-in read-only MCP every agent may be
+          offered. Above the roster on purpose: it is the kill-switch the
+          per-agent rows inside each card only narrow. */}
+      <div hidden={page !== 'agents'}>
+        <SkillsMcpPreference acp={acp} ui={ui} />
+      </div>
+
       {/* Keep editors mounted so navigation preserves unsaved values. */}
       <section className="dwa-section" hidden={page !== 'agents'} aria-label={acp.label('已接入的智能体', 'Connected agents')}>
         <div className="dwa-section-heading">
@@ -238,10 +245,6 @@ export function AcpSettingsSection(props: WithStore) {
             )
           })}
         </div>
-
-        {/* The built-in read-only MCP every agent may be offered; one switch
-            for the deployment, not a per-agent control. */}
-        <SkillsMcpPreference acp={acp} ui={ui} />
       </section>
 
       <section className="dwa-section" hidden={page !== 'add'} aria-label={acp.label('添加智能体', 'Add agent')}>

@@ -162,6 +162,12 @@ const STYLE = `
 .dwa-switch { display: inline-flex; align-items: center; gap: 7px; font-size: var(--ntr-font-sm); cursor: pointer; user-select: none; }
 .dwa-inline-setting { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-2, #f9fafb); }
 .dwa-inline-setting .dwa-switch { flex-shrink: 0; margin-top: 1px; }
+/* The 技能 MCP master card: one switch and its info icon, on the card the page
+   already uses for titled blocks above the roster. */
+.dwa-skills-card { display: flex; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+/* The per-agent row with the master switch off: dimmed through opacity (no
+   colour literal), with the disabled input already refusing clicks. */
+.dwa-switch.is-off { opacity: 0.55; cursor: not-allowed; }
 .dwa-setting-copy { color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
 /* The settings rows' info icon: a real focusable button (keyboard users reach
    the tooltip through it), drawn as a quiet glyph so it never competes with

@@ -53,6 +53,8 @@ export interface PanelFixtureOptions {
   /** null simulates an older host without `plugin/release-notes` (the default). */
   pluginReleaseNotes?: PluginReleaseNotes | null
   tagHalo?: AcpTagHalo
+  /** The deployment-wide `dsh-skills` switch; off (the host default) otherwise. */
+  skillsMcp?: boolean
   permissions?: PanelPermissionRequest[]
   /** Hold the first agents/list response to preview/test the loading state. */
   initialResyncGate?: Promise<void>
@@ -142,6 +144,7 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
   let defaultAgentId = options.defaultAgentId === null ? undefined : options.defaultAgentId ?? 'codebuddy'
   let halo = structuredClone<AcpTagHalo>(options.tagHalo ?? { mode: 'breath', speed: 'normal' })
   let titlePrefix = false
+  let skillsMcpEnabled = options.skillsMcp === true
   const preset = options.preset === null ? null : structuredClone<AcpPresetStatus>(options.preset ?? {
     id: 'acp', source: 'dsh-ntr/presets/acp/acp.patch.yml', installed: true,
   })
@@ -224,6 +227,8 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
       const def = definition(event.agentId)
       def.exposedModels = [...event.exposedModels]
       def.autoDiscoverModels = event.autoDiscoverModels
+      if (event.skillsMcpEnabled === false) def.skillsMcpEnabled = false
+      else delete def.skillsMcpEnabled
     }
     // Exercise the private SSE reducer without opening a real transport.
     await (store as unknown as { applyEvent(event: AcpEvent): Promise<void> }).applyEvent(structuredClone(event))
@@ -346,6 +351,14 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
           else def.autoDiscoverModels = false
           return ok({ done: true })
         }
+        case 'agent/set-skills-mcp': {
+          const { agentId, skillsMcpEnabled: value } = payload as { agentId: string; skillsMcpEnabled: boolean }
+          const def = definition(agentId)
+          // The host stores the opt-out only: `true` clears the key.
+          if (value) delete def.skillsMcpEnabled
+          else def.skillsMcpEnabled = false
+          return ok({ done: true })
+        }
         case 'ui/tag-halo': return ok({ halo })
         case 'ui/tag-halo-set':
           halo = structuredClone((payload as TagHaloSetPayload).halo)
@@ -354,6 +367,10 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
         case 'ui/session-title-prefix-set':
           titlePrefix = (payload as SessionTitlePrefixSetPayload).titlePrefix === true
           return ok({ titlePrefix })
+        case 'ui/skills-mcp': return ok({ skillsMcpEnabled })
+        case 'ui/skills-mcp-set':
+          skillsMcpEnabled = (payload as { skillsMcpEnabled: boolean }).skillsMcpEnabled === true
+          return ok({ skillsMcpEnabled })
         case 'ui/approval-deadlines':
           return options.approvalDeadlines === null ? unsupported() : ok({ deadlines: approvalDeadlines() })
         case 'ui/approval-deadlines-set': {

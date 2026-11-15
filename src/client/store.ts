@@ -551,6 +551,11 @@ export class AcpStore {
     return this.catalogService.setAutoDiscoverModels(agentId, autoDiscoverModels)
   }
 
+  /** Toggle one agent's `dsh-skills` opt-out (lightweight: no restart, no save gate). */
+  async setAgentSkillsMcp(agentId: string, skillsMcpEnabled: boolean): Promise<void> {
+    return this.agentAdminService.setAgentSkillsMcp(agentId, skillsMcpEnabled)
+  }
+
   async deleteAgent(agentId: string): Promise<void> {
     return this.agentAdminService.deleteAgent(agentId)
   }
@@ -1276,10 +1281,15 @@ export class AcpStore {
       case 'agent/exposure': {
         // The host changed an agent's model visibility outside `agent/save`:
         // the settings card edited it, the auto-discovery switch was flipped,
-        // or newly published models were appended automatically. Patch the
-        // settings card's copy of the definition AND drop the seat cache — the
-        // variants `agent/catalog` answers are a projection of this filter.
+        // the per-agent `dsh-skills` opt-out was toggled, or newly published
+        // models were appended automatically. Patch the settings card's copy of
+        // the definition AND drop the seat cache — the variants `agent/catalog`
+        // answers are a projection of this filter.
         const exposedModels = event.exposedModels.length === 0 ? undefined : [...event.exposedModels]
+        // The opt-out is carried RESOLVED on the same frame; an older host half
+        // omits it, and a missing field means "not opted out" (the field is
+        // only ever persisted as `false`).
+        const skillsMcpOff = event.skillsMcpEnabled === false
         const detectedAgents = this.state.detectedAgents.map(info =>
           info.id === event.agentId && info.currentConfig !== undefined
             ? {
@@ -1288,6 +1298,7 @@ export class AcpStore {
                   ...info.currentConfig,
                   exposedModels: exposedModels === undefined ? undefined : exposedModels,
                   autoDiscoverModels: event.autoDiscoverModels,
+                  skillsMcpEnabled: skillsMcpOff ? false : undefined,
                 },
               }
             : info)

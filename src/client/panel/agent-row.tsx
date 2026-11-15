@@ -112,6 +112,15 @@ export function AgentRow({
     setForm(prev => ({ ...prev, autoDiscoverModels: serverAutoDiscover }))
   }, [serverAutoDiscover])
 
+  const serverSkillsMcp = detected.currentConfig?.skillsMcpEnabled !== false
+  useEffect(() => {
+    // Same deal for the per-agent `dsh-skills` checkbox: it is edited through
+    // the lightweight RPC, never through this form. Following the host answer
+    // is what stops a later full save from writing the value from before the
+    // click (the payload carries the field so a save cannot enable it either).
+    setForm(prev => ({ ...prev, skillsMcpEnabled: serverSkillsMcp }))
+  }, [serverSkillsMcp])
+
   const trimmedId = form.agentId.trim()
   const idValid = !newCustom || AGENT_ID_PATTERN.test(trimmedId)
   const idTaken = newCustom && trimmedId !== '' && ui.agents.some(a => a.id === trimmedId)
@@ -495,6 +504,7 @@ export function AgentRow({
             testing={testing}
             testResult={testResult}
             showSaveWarning={showSaveWarning}
+            skillsMcpMaster={ui.skillsMcpEnabled === true}
             onUseDefault={handleUseDefault}
             onSave={() => void handleSave()}
             onTest={() => void handleTest()}

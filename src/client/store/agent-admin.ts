@@ -232,6 +232,54 @@ export class AgentAdminService {
     }
   }
 
+  /**
+   * Toggle one agent's `dsh-skills` opt-out (the agent card's checkbox).
+   *
+   * The card writes through the lightweight `agent/set-skills-mcp` RPC, NEVER
+   * `agent/save` — a save stops the child and kills its live sessions, while
+   * this flips a field the agent's live bridges read on their next request.
+   * Optimistic like every other settings write: the checkbox follows the click,
+   * a refused (strict) persist restores the previous answer and flashes the
+   * page notice.
+   *
+   * A success re-reads the roster, like the other lightweight writes: the host
+   * stores the opt-out as "key absent", and its answer — not the optimistic
+   * guess — is what the checkbox and any later save keep.
+   */
+  async setAgentSkillsMcp(agentId: string, skillsMcpEnabled: boolean): Promise<void> {
+    const previous = this.skillsMcpOf(agentId)
+    this.writeSkillsMcp(agentId, skillsMcpEnabled)
+    try {
+      await this.host.call('agent/set-skills-mcp', { agentId, skillsMcpEnabled })
+      await this.host.resync()
+    } catch (error) {
+      this.writeSkillsMcp(agentId, previous)
+      this.host.flashError(error)
+    }
+  }
+
+  /** One agent's per-agent `dsh-skills` answer as the roster copy holds it (`!== false` = offered). */
+  private skillsMcpOf(agentId: string): boolean {
+    const info = this.host.state().detectedAgents.find(entry => entry.id === agentId)
+    return info?.currentConfig?.skillsMcpEnabled !== false
+  }
+
+  /** Patch the roster copy of one agent's flag, in the host's own shape (`true` clears the key). */
+  private writeSkillsMcp(agentId: string, skillsMcpEnabled: boolean): void {
+    this.host.mutate({
+      detectedAgents: this.host.state().detectedAgents.map(info =>
+        info.id === agentId && info.currentConfig !== undefined
+          ? {
+              ...info,
+              currentConfig: {
+                ...info.currentConfig,
+                ...(skillsMcpEnabled ? { skillsMcpEnabled: undefined } : { skillsMcpEnabled: false }),
+              },
+            }
+          : info),
+    })
+  }
+
   /** Record an id the host deleted during this run (session-only tombstone). */
   private rememberDeletedAgent(agentId: string): void {
     if (agentId === '' || this.host.state().deletedAgentIds.includes(agentId)) return
