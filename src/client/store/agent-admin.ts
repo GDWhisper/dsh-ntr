@@ -254,7 +254,10 @@ export class AgentAdminService {
       await this.host.resync()
     } catch (error) {
       this.writeSkillsMcp(agentId, previous)
-      this.host.flashError(error)
+      const msg = error instanceof Error ? error.message : String(error)
+      this.host.flashError(msg.includes('unknown endpoint agent/set-skills-mcp')
+        ? new Error(this.host.label('宿主服务运行着旧版本代码，请在终端重启 dsh web 服务以启用技能开关。', 'Host running older version. Please restart dsh web to enable the skills switch.'))
+        : error)
     }
   }
 

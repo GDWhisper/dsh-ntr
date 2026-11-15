@@ -275,6 +275,10 @@ export class AgentAdminService {
     // below sees that specific competing gesture.
     const deleteGeneration = this.agentDeleteGeneration(def.id)
     this.assertAgentSaveCurrent(def.id, saveGeneration, deleteGeneration)
+    // A queued payload predates per-agent opt-outs: an omitted key inherits a live explicit false.
+    if (def.skillsMcpEnabled === undefined && this.host.defOf(def.id)?.skillsMcpEnabled === false) {
+      def = { ...def, skillsMcpEnabled: false }
+    }
     const defaultWorkspace = ensureDefaultWorkspace()
     const resolvedCwd = def.cwd ?? defaultWorkspace
     // Deduplicated on purpose: the panel pre-fills the same path in several

@@ -173,6 +173,15 @@ describe('the per-agent skills MCP switch in the store', () => {
     expect(store.getSnapshot().saveGate).toEqual(gateBefore)
   })
 
+  it('maps an old host without the endpoint to a plain-language notice and reverts', async () => {
+    const roster = [skillAgent()]
+    const { store } = makeStore(() => 'unknown', roster)
+    await store.resync()
+    await store.setAgentSkillsMcp('codebuddy', false)
+    expect(agentFlag(store.getSnapshot(), 'codebuddy')).toBeUndefined()
+    expect(store.getSnapshot().notice).toBe('宿主服务运行着旧版本代码，请在终端重启 dsh web 服务以启用技能开关。')
+  })
+
   it('syncs the checkbox from the agent/exposure frame, including an older host that omits the field', async () => {
     const roster = [skillAgent()]
     const { store } = makeStore(() => 'unknown', roster)

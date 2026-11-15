@@ -257,6 +257,21 @@ describe('the per-agent dsh-skills opt-out', () => {
     }
   })
 
+  it('a save whose payload omits the key inherits a live opt-out (stale queued form save)', async () => {
+    const h = boot(makeRoot(), undefined, [def()])
+    try {
+      await dispatchRpc(h.manager, 'agent/set-skills-mcp', { agentId: 'pi', skillsMcpEnabled: false })
+      // A form payload built before the opt-out carries no key; the flush must
+      // not resurrect the built-in server.
+      await h.manager.saveAgent?.(def())
+      expect(await storedSwitch(h.manager)).toBe(false)
+      const stored = readState(h.statePath) as { agents: Array<Record<string, unknown>> }
+      expect(stored.agents[0]).toMatchObject({ id: 'pi', skillsMcpEnabled: false })
+    } finally {
+      await h.close()
+    }
+  })
+
   it('survives a restart through the validated state file', async () => {
     const root = makeRoot()
     const first = boot(root, undefined, [def({ skillsMcpEnabled: false })])
