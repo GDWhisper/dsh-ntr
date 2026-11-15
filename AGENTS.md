@@ -100,8 +100,8 @@
 ## 常见任务配方
 
 - **新增 / 修改 ACP RPC**：`src/protocol/` 对应簇加契约（`src/protocol.ts` 只是桶，新符号要同时补进它的再导出块）→ `src/impl/dispatch.ts` 加进 `AcpManager` 并在 `dispatchRpc` 路由 + 校验（新符号同时补进 `src/impl.ts` 桶的再导出块）→ `src/bridge/` 实现调度 → `src/client/store.ts` 加调用并测状态流转。验证：`npx vitest run tests/impl tests/store.spec.ts`。
-- **改 UI 与挂载槽位**：`panel.tsx` / `session-controls.tsx` / `acp-view.tsx` / `permission-dock.tsx` 改组件 → `src/client/index.tsx` 经 `ctx.slots.inject` 管理注册（槽位清单见文件头注释）→ `npx tsdown` 验证 bundle。
-- **扩展配置字段**：`AcpAgentDef` / `AcpPluginConfig`（src/protocol/agent-def.ts）→ `validateAgentDef`（会重建对象，新字段必须纳入且 optional）→ `AgentSavePayload` + panel 的 `initialForm` / `buildPayload` / `payloadEquals` 三处同步 → `cordis.patch.yml`。**宿主只校验不改形状**，否则设置页永远判脏、每次保存都重启 agent。
+- **改 UI 与挂载槽位**：`panel.tsx`（内部组件簇在 `panel/`）/ `session-controls.tsx` / `acp-view.tsx` / `permission-dock.tsx` 改组件 → `src/client/index.tsx` 经 `ctx.slots.inject` 管理注册（槽位清单见文件头注释）→ `npx tsdown` 验证 bundle。
+- **扩展配置字段**：`AcpAgentDef` / `AcpPluginConfig`（src/protocol/agent-def.ts）→ `validateAgentDef`（会重建对象，新字段必须纳入且 optional）→ `AgentSavePayload` + panel 的 `initialForm` / `buildPayload` / `payloadEquals`（同在 `src/client/panel/form.ts`）三处同步 → `cordis.patch.yml`。**宿主只校验不改形状**，否则设置页永远判脏、每次保存都重启 agent。
 
 ## 测试约定
 
@@ -124,7 +124,7 @@
 | [protocol.md](./AGENTS/protocol.md) | 改子进程、超时、取消、卡死收口（无活动看门狗）、崩溃恢复、空闲释放、启动命令、会话分叉、ACP 数据折叠 | 动 `AgentBridge` / `BridgeManager` / `TurnStreamController` 的生命周期、超时或 `session/update` 折叠逻辑 |
 | [subagent-adapters.md](./AGENTS/subagent-adapters.md) | 给新 agent 接子代理事实源，或查 per-agent 适配接缝与抽取触发器 | 新增 per-agent 接缝，或动共享子代理管线（`hasPendingBackgroundWork` / `subagentsDetail` / 明细门禁 / `LiveSession` 状态） |
 | [ui.md](./AGENTS/ui.md) / [conversation-dock.md](./AGENTS/conversation-dock.md) | 改 composer 座位 / 芯片 / 挂牌、mode 控件、NTR 视图、斜杠菜单、消息动作 / 分支按钮；对话内权限卡 / 释放横幅 / 限流横幅读后者 | 动 `src/client/` 的槽位注册、菜单内容或对话面组件 |
-| [ui-panel.md](./AGENTS/ui-panel.md) | 改设置页布局、保存横幅、版本徽标 / 内置更新卡、文案或主题色 | 动 `panel.tsx`、`save-guard-toast.tsx`、`locale.*` 或 CSS token |
+| [ui-panel.md](./AGENTS/ui-panel.md) | 改设置页布局、保存横幅、版本徽标 / 内置更新卡、文案或主题色 | 动 `panel.tsx` / `panel/`、`save-guard-toast.tsx`、`locale.*` 或 CSS token |
 | [permissions.md](./AGENTS/permissions.md) | 改权限映射、审批卡片（对话 dock / 设置镜像）、审批时限、权限座位、fs 围栏 | 动 `handlePermissionRequest` / `PermissionLedger` / 期限配置 / `PermissionDock` |
 | [state.md](./AGENTS/state.md) | 改落盘、会话选择持久化、模型目录 / 可见性、命令缓存、fork 能力位、内置更新、保存门禁 / HMR 防护 | 动 `agents.json` 结构、`agent/catalog`、`absorbCommands`、`AcpSaveGate`、`hmr-guard` 或 `UpdateService` |
 | [host.md](./AGENTS/host.md) | 改宿主接线（通道 / preset / 服务 / 模型 abstain），或**宿主升级后 NTR 报错 / 异常：先读 §5 排查** | 动 `src/index.ts`、`presets/acp/acp.patch.yml`、`package.json` 的 `dsh` 字段；每次因宿主升级做兼容修复后补 §5.2 症状行 |

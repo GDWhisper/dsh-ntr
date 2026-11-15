@@ -4,7 +4,6 @@
   "src/bridge/turn-stream.ts": 2613,
   "src/client/acp-ui.tsx": 1325,
   "src/client/index.tsx": 1094,
-  "src/client/panel.tsx": 3414,
   "src/client/session-controls.tsx": 1120,
   "src/client/store.ts": 1597,
   "tests/acp-view.spec.ts": 1645,

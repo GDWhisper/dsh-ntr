@@ -157,7 +157,7 @@ to the config file"、"adopts a deadline the settings page writes while a sessio
 - **堆叠**：多条询问按**到达顺序、最旧在上**堆叠；容器由 CSS 限高（`min(38vh, 320px)`）并滚动，一串询问不会把 composer 顶出屏幕。
 - **无聊天身份**：永不进入 dock；它们只出现在设置页镜像。
 
-**设置页镜像**（`src/client/panel.tsx` · `permissionLedgerCard`）：只要 `ui.permissions` 非空就渲染可答复的跨会话列表，提示语说明「对话打开时在那边的卡片上回答；这里兜底显示其他会话的询问」。它不再是唯一入口，也不是降级路径——`approvalRouted` / `fellBackFromConversation` 已删除，`agents/list` 不再带审批能力旗标。
+**设置页镜像**（`src/client/panel/permission-mirror.tsx` · `permissionLedgerCard` / `PermissionMirrorCard`）：只要 `ui.permissions` 非空就渲染可答复的跨会话列表，提示语说明「对话打开时在那边的卡片上回答；这里兜底显示其他会话的询问」。它不再是唯一入口，也不是降级路径——`approvalRouted` / `fellBackFromConversation` 已删除，`agents/list` 不再带审批能力旗标。
 
 **设置页没有权限开关**：agent 卡不再提供「权限策略 / 要不要问人」。要不要问由 agent 自己的 mode 决定，问了就一定会到人面前（显式选择 `auto` + `0` 的部署除外，它按 §2.1 代答）。
 
@@ -182,7 +182,7 @@ to the config file"、"adopts a deadline the settings page writes while a sessio
 | 重连重放 | `src/impl.ts` · `permissionRequestFrame` / `permissionReplayFrames` / `PermissionLedger.pendingViews`；`src/index.ts` · `/api/acp/stream` |
 | 超时收场 | `src/bridge/agent-bridge.ts` · `announceExpiredAsk` / `settleExpiredAsk`；`src/bridge/turn-stream.ts` · `TurnStreamController.expiredLine` / `permissionLine`；`src/impl.ts` · `pickAutoOption` / `AUTO_OPTION_KIND_PRIORITY` |
 | 期限与模式热改 | `src/bridge/settings-service.ts` · `approvalDeadlines` / `setApprovalDeadlines` / `setConfiguredApprovalDeadlines` / `applyDeadlineTuning`；`src/bridge/agent-bridge.ts` · `AgentBridge.applyApprovalDeadlines`；`src/impl.ts` · `validateApprovalDeadlines` / `validateApprovalDeadlineMs` / `validatePermissionTimeoutMode`；`src/index.ts` · `apply()` 的原始配置透传 |
-| 期限 UI | `src/client/panel.tsx` · `ApprovalDeadlinesCard` / `DeadlineModeBlock` / `DeadlineSliderBlock` / `deadlineSliderIndex` / `modeText` / `deadlineText` / `approvalDeadlineFacts`；`src/client/store.ts` · `setApprovalDeadline` / `setApprovalTimeoutMode` / `resetApprovalDeadlines` |
+| 期限 UI | `src/client/panel/approval-deadlines-card.tsx` · `ApprovalDeadlinesCard` / `DeadlineModeBlock` / `DeadlineSliderBlock` / `deadlineSliderIndex` / `modeText` / `deadlineText` / `approvalDeadlineFacts`；`src/client/store.ts` · `setApprovalDeadline` / `setApprovalTimeoutMode` / `resetApprovalDeadlines` |
 | fs 围栏 | `src/bridge/agent-bridge.ts` · `handleFsWrite` / `guardFsPath`；`src/impl.ts` · `resolveFsPath` |
-| 设置页镜像 | `src/client/panel.tsx` · `permissionLedgerCard` |
+| 设置页镜像 | `src/client/panel/permission-mirror.tsx` · `permissionLedgerCard` / `PermissionMirrorCard` |
 | 权限座位 | `src/client/model-seat.tsx` · `createPermissionSeatClaim` |

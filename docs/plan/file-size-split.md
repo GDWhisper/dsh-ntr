@@ -1,6 +1,6 @@
 # 巨型文件拆分计划（第二轮：三件套 / 设置页 / 协议覆盖 / UI 面）
 
-**状态**：**P0 / P1 / P2 / P3a 已完成，P3b 第一至第三批（leaf 服务 / save-banners + agent-admin / chat-choice + chat-sessions）已完成，P3b 的 `connection` 实测触发停止条件、留在门面（见 §6 记录），P4–P6 未开始**。承接 [bridge-split.md](./archive/bridge-split.md)（第一轮，已完成）的纪律与模式。
+**状态**：**P0 / P1 / P2 / P3a 已完成，P3b 第一至第三批（leaf 服务 / save-banners + agent-admin / chat-choice + chat-sessions）已完成，P3b 的 `connection` 实测触发停止条件、留在门面（见 §6 记录），P4 组件簇已完成、测试镜像进行中，P5–P6 未开始**。承接 [bridge-split.md](./archive/bridge-split.md)（第一轮，已完成）的纪律与模式。
 **一句话**：把行数基线里**仍在增长**的存量文件按领域簇拆到 ≤1000 行并删除基线条目；功能面已封闭的文件继续锁着不动。
 
 > 写作约定：代码位置一律用「文件 + 符号名」，不写行号。**本文不锁定任何文件的当前行数**——正式执行前代码仍会变动，行数与符号清单在每个子步开工时以 HEAD 实测重新核对；本文锁定的只有「领域簇划分、归属、顺序、停止条件」。索引登记进 [docs/README.md](../README.md)，待办登记进 [docs/todo.md](../todo.md)。
@@ -179,6 +179,15 @@ impl 几乎全是纯函数 + 小类 + 一个自由函数分发器，按领域机
 - `AcpSettingsSection` 主组件与页头 notice 留 `panel.tsx`；`logClock` 等日志辅助随主组件。
 - 风险：样式注入只许一次；`payloadEquals` 判脏语义决定保存是否重启 agent，逐字保留；约束 33 / 34 / 38 的文案与 token 纪律不随迁移改变。
 - `tests/panel.spec.ts` 按同映射拆。
+
+**落地记录（组件簇，一个提交）**：十个簇文件按上表落成，`src/client/panel.tsx` 3414 → 420 行（基线条目已删，≤1000 即删），导出面 11 项逐字不变（`AcpSettingsSection` 留门面，其余在文件尾 `export … from` 再导出，`AgentForm` 只在簇内导出——它本来就是私有类型，进桶会扩大导出面）。四处按实际盘点微调并各留了理由：
+
+1. `armModelIdMarquee` 与 `formatStamp` 进 `model-catalog-block.tsx` 而不是 `agent-row.tsx`：两者的唯一使用者是 `ModelCatalogBlock`，放进行文件会造出 `agent-row ↔ model-catalog-block` 的运行期循环（行文件要渲染模型卡）。
+2. `idleText` / `idleValid` 进 `form.ts`：`initialForm` / `buildPayload` 用它们，`AgentRow` 也要 `idleValid` 判表单完整性；放 `agent-details.tsx` 会让表单簇反过来依赖一个 `.tsx` 组件文件。
+3. `SaveStage`、`AGENT_ID_PATTERN`、`PRESET_IDS`、`DEFAULT_PROBE_RELEASE_MS`、`EXPOSURE_SAVE_DEBOUNCE_MS` 随唯一使用者走（依次 `agent-row.tsx` / `agent-details.tsx` / `model-catalog-block.tsx`）。
+4. 跨会话审批镜像原本是 `AcpSettingsSection` 里的一段内联 JSX，按上表落成 `PermissionMirrorCard`（门禁仍是同一句 `permissionLedgerCard(ui).visible`），DOM 与文案逐字不变。
+
+`ensureStyle` 的 `styleMounted` 守卫、`payloadEquals` 的判脏顺序、约束 33 / 34 / 38 的文案与 token 一字未改；`AcpSettingsSection` 的 `ledger` 局部量与内联块随之删除，其余逐字搬移。`npm run prepack` 全绿，用例数不变。
 
 ## 8. P5：协议覆盖（bridge 第二轮 + mock）
 
