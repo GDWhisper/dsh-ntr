@@ -18,11 +18,6 @@ import { isAbsolutePath } from './paths.ts'
 
 const AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/
 /**
- * The only version shape the update endpoints accept: an exact stable semver.
- * Exported for the RPC dispatcher only — the barrel does not re-export it.
- */
-export const STABLE_SEMVER = /^\d+\.\d+\.\d+$/
-/**
  * npm package name (optionally `@scope/name`, optionally `@version`/`@tag`).
  * Deliberately charset-only (letters, digits, `.`, `_`, `-`, `/`, `@`): this
  * string is handed to `npm install -g` as a spawn argument, and on Windows the

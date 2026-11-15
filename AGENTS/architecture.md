@@ -180,7 +180,7 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 | `src/protocol-subagent.ts` | 子代理记录与详情的契约半区（`SubagentRecord` / `SubagentDetailEntry` / `SubagentDetailPayload` / 上限常量）：纯类型与常量，由 `protocol.ts` 重导出 |
 | `src/subagent-records.ts` | 子代理记录的归一与封顶（`normalizeSubagentRecord` / `capSubagentRecords` / `subagentToolCallId` / `boundSubagentDetailEntry`）：纯函数，由 `impl.ts` 重导出 |
 | `src/usage.ts` | `usage_update` 样本 → 上下文读数（`mergeUsageSample`）：可读样本替换读数，`size <= 0` 的成本帧（CodeBuddy 后台 team member）只并 `cost`、保留上次 `used/size`；纯函数，宿主 `AgentBridge` 与测试共用 |
-| `src/impl.ts` | 纯宿主端逻辑的桶：只有再导出，逻辑本体按簇在 `src/impl/`（`errors` / `validate` / `command-line` / `paths` / `env` / `catalog` / `content` / `image` + `attachments` / `forward` / `permission` / `skills` / `session-log`）；本文档里 `src/impl.ts · 符号` 一律指「经桶定位」，本体在对应簇文件。`Transcript` / `EventHub` / `PermissionLedger` 与 RPC 分发仍声明在桶内 |
+| `src/impl.ts` | 纯宿主端逻辑的桶：只有再导出，逻辑本体按簇在 `src/impl/`（`errors` / `validate` / `command-line` / `paths` / `env` / `catalog` / `content` / `image` + `attachments` / `forward` / `permission` / `skills` / `session-log` / `runtime` 运行时持有者 / `dispatch` RPC 分发）。文档里的 `src/impl.ts · 符号` 一律指「经桶定位」，本体在对应簇：`dispatchRpc` / `AcpManager` → `dispatch.ts`，`Transcript` / `EventHub` / `PermissionLedger` → `runtime.ts`，其余按名字找簇 |
 | `src/bridge/` | 宿主 ↔ ACP 子进程的 stdio 桥：进程、回合、绑定、锁、数据折叠 |
 | `src/skills-scan.ts` | 宿主侧 skill 目录扫描：按 agent 风味（`skillFlavorOf`，`src/impl.ts`）扫 project/global/system 三层目录并解析 SKILL.md，喂给 `agent/skills` RPC（`BridgeManager.agentSkills`，内存 TTL 缓存）；只读文件系统，不 spawn、不落盘 |
 | `src/update.ts` | 内置更新：资格矩阵、registry 探测，把安装委托给宿主 `pluginManager`；不下载、不替换文件、不重启 |

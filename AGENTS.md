@@ -99,7 +99,7 @@
 
 ## 常见任务配方
 
-- **新增 / 修改 ACP RPC**：`src/protocol/` 对应簇加契约（`src/protocol.ts` 只是桶，新符号要同时补进它的再导出块）→ `src/impl.ts` 加进 `AcpManager` 并在 `dispatchRpc` 路由 + 校验 → `src/bridge/` 实现调度 → `src/client/store.ts` 加调用并测状态流转。验证：`npx vitest run tests/impl.spec.ts tests/store.spec.ts`。
+- **新增 / 修改 ACP RPC**：`src/protocol/` 对应簇加契约（`src/protocol.ts` 只是桶，新符号要同时补进它的再导出块）→ `src/impl/dispatch.ts` 加进 `AcpManager` 并在 `dispatchRpc` 路由 + 校验（新符号同时补进 `src/impl.ts` 桶的再导出块）→ `src/bridge/` 实现调度 → `src/client/store.ts` 加调用并测状态流转。验证：`npx vitest run tests/impl.spec.ts tests/store.spec.ts`。
 - **改 UI 与挂载槽位**：`panel.tsx` / `session-controls.tsx` / `acp-view.tsx` / `permission-dock.tsx` 改组件 → `src/client/index.tsx` 经 `ctx.slots.inject` 管理注册（槽位清单见文件头注释）→ `npx tsdown` 验证 bundle。
 - **扩展配置字段**：`AcpAgentDef` / `AcpPluginConfig`（src/protocol/agent-def.ts）→ `validateAgentDef`（会重建对象，新字段必须纳入且 optional）→ `AgentSavePayload` + panel 的 `initialForm` / `buildPayload` / `payloadEquals` 三处同步 → `cordis.patch.yml`。**宿主只校验不改形状**，否则设置页永远判脏、每次保存都重启 agent。
 
