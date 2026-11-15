@@ -304,8 +304,8 @@ dirname(pluginStateDir()) / skills
 
 `npm run check:size` 对基线文件执行「实测 > 锁定即失败」。本方案触碰的存量文件余量参考（开工时以 HEAD 实测复核）：`src/impl.ts`、`src/client/store.ts`、`src/client/panel.tsx`、`src/bridge/manager.ts` 余量 0 行；`src/bridge/agent-bridge.ts`、`src/protocol.ts` 余量 1 行；`tests/impl.spec.ts`、`tests/store.spec.ts`、`tests/panel.spec.ts`、`tests/bridge.spec.ts` 余量 0–1 行。向这些文件净新增必然挂门禁，因此：
 
-1. **前置依赖**：[file-size-split.md](./file-size-split.md) 的 P0（基线补紧）与 P1–P4（protocol / impl / store / panel 拆分）必须先完成。新契约、新路由、新 store 状态、新设置组件挂载落在拆分后的文件里。未满足不得开工，不绕门禁。
-2. **manager.ts 与 agent-bridge.ts 零余量且不在 P1–P4**：全部新逻辑进 `mcp.ts` / `settings-service.ts`（两者远离上限）；这两个文件只留接线（活读取接缝注入、RPC 薄委托、启动恢复调用、四个入口的等长替换），所需接线行必须在同提交内以等量既有代码外置抵消，净增长 ≤ 0。做不到就先执行拆分计划 P5 的对应子步，再实施本方案。**严禁**抬基线或新增条目。
+1. **前置依赖**：[file-size-split.md](./file-size-split.md) 的 P0（基线补紧）与 P1–P4（protocol / impl / store / panel 拆分）必须先完成。新契约、新路由、新 store 状态、新设置组件挂载落在拆分后的文件里。P3 的 connection 簇已按停止条件留在 store 门面（障碍记录见拆分计划 §6 落地记录），属已完成形态，不阻塞本方案。未满足不得开工，不绕门禁。
+2. **manager.ts、agent-bridge.ts 与 store.ts 零余量**：全部新逻辑进 `mcp.ts` / `settings-service.ts` / `src/client/store/settings.ts` + `state.ts`（均远离上限）；这三个文件只留接线（活读取接缝注入、RPC 薄委托、启动恢复调用、四个入口的等长替换、store 门面薄委托），所需接线行必须在同提交内以等量既有代码外置抵消，净增长 ≤ 0。做不到就先执行拆分计划 P5 的对应子步，再实施本方案。**严禁**抬基线或新增条目。
 3. **测试只进新文件**：锁定测试文件（`tests/impl/`、`tests/store.spec.ts`、`tests/panel.spec.ts`、`tests/bridge.spec.ts`）不新增用例。新用例落点见下方清单。
 4. **门禁盲区自律**：`check:size` 只扫 `src` / `tests` / `presets`，`mcp/` 不在扫描范围；`mcp/skills-server.mjs` 的 ≤1000 行纪律是自设的，必须遵守。
 
@@ -321,7 +321,7 @@ dirname(pluginStateDir()) / skills
 - `src/bridge/manager.ts`：只做接线——`makeBridge` 注入活读取接缝、启动序列调用 `applySkillsMcpTuning`、两个 RPC 薄委托（仿 `setIdleRelease`）。净增长 ≤ 0（§9.0）。
 - `src/protocol/` 对应簇 + `src/protocol.ts` 桶再导出：新增 `ui/skills-mcp` 与 `ui/skills-mcp-set` 的纯类型契约。
 - `src/impl.ts`：扩展 `AcpManager` 和 `dispatchRpc`，校验 payload，返回当前值或错误。
-- `src/client/store.ts`：增加初始读取、开关写入、成功同步、失败回滚与页头错误。
+- `src/client/store/settings.ts` + `state.ts`：初始读取、开关写入、成功同步、失败回滚与页头错误的实现主体；`src/client/store.ts` 门面只留薄委托（净增长 ≤ 0，§9.0）。
 - `src/client/skills-mcp-preference.tsx`：新增设置组件。
 - `src/client/panel.tsx`：在「智能体」页挂载设置组件。
 - `package.json`：在 `files` 中加入 `mcp`，确保发布包包含 server。
