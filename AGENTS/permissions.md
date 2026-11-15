@@ -152,7 +152,7 @@ to the config file"、"adopts a deadline the settings page writes while a sessio
 - **过滤**：`permissionsForSession(ui.permissions, dshSessionId)` 只留 `dshSessionId` 等于当前会话的询问。它没有 ACP 模式闸门——帧集合本身就是闸门：普通对话只有在真的有待答询问时才出现这张卡。
 - **选项原样**：按钮按 agent 的 `name` 与顺序渲染，`kind` 不显示（「Always Allow」也照原名出现）。另有一个**取消**键，不带 `optionId`；宿主把它转成 `cancelled`。
 - **键盘**：没有全局 Enter/Esc 处理器；这些是普通的可聚焦按钮，composer 拥有键盘。
-- **倒计时**：`deadlineRemainingLabel`（`src/client/store.ts`）每秒 tick，显示 `12s` / `1m 30s` 这类读数；`wait` 或没有 `deadlineAt` 时不显示；过了期限显示「已超时」而不是负数（期限已经被宿主兑现，倒数会谎称它还在）。
+- **倒计时**：`deadlineRemainingLabel`（`src/client/store/permission.ts`）每秒 tick，显示 `12s` / `1m 30s` 这类读数；`wait` 或没有 `deadlineAt` 时不显示；过了期限显示「已超时」而不是负数（期限已经被宿主兑现，倒数会谎称它还在）。
 - **失败就地显示**：`respondPermission` 会写 store notice 并 rethrow；dock 在卡内用 `role="alert"` 显示错误，不把失败留在用户没打开的设置页。设置页侧吞掉 rethrow（notice 已经写了）。
 - **堆叠**：多条询问按**到达顺序、最旧在上**堆叠；容器由 CSS 限高（`min(38vh, 320px)`）并滚动，一串询问不会把 composer 顶出屏幕。
 - **无聊天身份**：永不进入 dock；它们只出现在设置页镜像。
@@ -178,7 +178,7 @@ to the config file"、"adopts a deadline the settings page writes while a sessio
 | 主题 | 位置 |
 |---|---|
 | 权限请求处理 | `src/bridge/agent-bridge.ts` · `handlePermissionRequest`；`src/bridge/turn-stream.ts` · `permissionToolName`；`src/bridge/shape.ts` · `permissionAskReason` |
-| 对话审批卡 | `src/client/permission-dock.tsx` · `PermissionDock`；`src/client/index.tsx` · `conversation.input.dock` 注册；`src/client/store.ts` · `permissionsForSession` / `deadlineRemainingLabel` |
+| 对话审批卡 | `src/client/permission-dock.tsx` · `PermissionDock`；`src/client/index.tsx` · `conversation.input.dock` 注册；`src/client/store/permission.ts` · `permissionsForSession` / `deadlineRemainingLabel` |
 | 重连重放 | `src/impl.ts` · `permissionRequestFrame` / `permissionReplayFrames` / `PermissionLedger.pendingViews`；`src/index.ts` · `/api/acp/stream` |
 | 超时收场 | `src/bridge/agent-bridge.ts` · `announceExpiredAsk` / `settleExpiredAsk`；`src/bridge/turn-stream.ts` · `TurnStreamController.expiredLine` / `permissionLine`；`src/impl.ts` · `pickAutoOption` / `AUTO_OPTION_KIND_PRIORITY` |
 | 期限与模式热改 | `src/bridge/settings-service.ts` · `approvalDeadlines` / `setApprovalDeadlines` / `setConfiguredApprovalDeadlines` / `applyDeadlineTuning`；`src/bridge/agent-bridge.ts` · `AgentBridge.applyApprovalDeadlines`；`src/impl.ts` · `validateApprovalDeadlines` / `validateApprovalDeadlineMs` / `validatePermissionTimeoutMode`；`src/index.ts` · `apply()` 的原始配置透传 |

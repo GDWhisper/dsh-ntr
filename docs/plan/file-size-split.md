@@ -1,6 +1,6 @@
 # 巨型文件拆分计划（第二轮：三件套 / 设置页 / 协议覆盖 / UI 面）
 
-**状态**：**P0 / P1 / P2 已完成，P3 未开始**。承接 [bridge-split.md](./archive/bridge-split.md)（第一轮，已完成）的纪律与模式。
+**状态**：**P0 / P1 / P2 / P3a 已完成，P3b 与 P4–P6 未开始**。承接 [bridge-split.md](./archive/bridge-split.md)（第一轮，已完成）的纪律与模式。
 **一句话**：把行数基线里**仍在增长**的存量文件按领域簇拆到 ≤1000 行并删除基线条目；功能面已封闭的文件继续锁着不动。
 
 > 写作约定：代码位置一律用「文件 + 符号名」，不写行号。**本文不锁定任何文件的当前行数**——正式执行前代码仍会变动，行数与符号清单在每个子步开工时以 HEAD 实测重新核对；本文锁定的只有「领域簇划分、归属、顺序、停止条件」。索引登记进 [docs/README.md](../README.md)，待办登记进 [docs/todo.md](../todo.md)。
@@ -116,6 +116,8 @@ impl 几乎全是纯函数 + 小类 + 一个自由函数分发器，按领域机
 - `presets.ts`：`DEFAULT_KNOWN_PRESETS`（与 `AGENT_PRESETS` 的手拷贝同步关系不变，约束 7）
 - `state.ts`：`UiState`、`ChatRowFrame`、`ChatTranscript`、`AcpLogEntry`、`RpcCall` 等类型
 
+**落地记录（P3a）**：七个簇文件按上表落成，`PendingPermission` 随 `permission.ts`（`UiState.permissions` 与 `permissionsForSession` 共用），`LiveSubagentDetailEntry` / `SubagentDetailState` 与 `subagentKey` 同簇进 `subagent.ts`，`AgentCommand` / `skillRowsKey` / `SKILL_MENU_TTL_MS` / `MAX_SKILL_KEYS` / `LOG_MAX_ENTRIES` 及 `AcpStore` 的类内私有辅助（`withSessionUsage` / `sameUsage` / `trimBlocks` / `parentToolCallIdOf` / `appendSubagentDetailEntry` / `sameModes` / `withSessionModes` / `splitModelAgentId` / `usageOfBatch` / `normalizeSaveGateStatus`）留在 `store.ts`；`withSessionReleased`（`blocks.ts`）与 `isSubagentDowngrade`（`subagent.ts`）因类与纯函数共用而簇内导出、桶不导出。`state.ts` → `blocks.ts` 是**唯一的类型环**（`ChatRowFrame` 在 `state.ts`、`replayChatRowFrames` 在 `blocks.ts`，只走 `import type`），运行时常量零交叉。`store.ts` 保留类与其余内容，文件尾把 49 个拆出符号逐一再导出，导出面与 HEAD 逐项一致；测试镜像三个（`tests/store/blocks.spec.ts` 11 例、`fork.spec.ts` 2 例、`save-gate.spec.ts` 1 例）从 `tests/store.spec.ts` 原样搬出（152 → 138 + 14，标题与用例数逐字不变），类相关用例留原文件。
+
 **P3b `AcpStore` 类按领域拆服务**（沿用 bridge 的「服务 + Host 回调」模式，Host 预计是 `rpc` / `mutate` / `getSnapshot` / 少量跨域读写）：
 
 | 服务 | 方法簇（代表） |
@@ -134,7 +136,7 @@ impl 几乎全是纯函数 + 小类 + 一个自由函数分发器，按领域机
 - `AcpStore` 保留装配、订阅（`subscribe` / `getSnapshot`）、`UiState` 持有与薄委托；ACP mode 判定（`noteAcpMode` / `hasAcpModeVerdict` / `invalidateAcpMode`）与各 `note*Diag` 留门面。
 - **停止条件**（沿用第一轮）：Host 回调超过 10 个、服务需要运行时导入门面、逐方法比对无法保持调用顺序或失败语义——触发即回退该子步，把障碍写回本文件。
 - 风险：`mutate` 的广播合并时序、`applyEvent` 的事件顺序、保存横幅的失败常驻 / 成功合成语义（约束 38）、`writeChoice` 只增不减（约束 27）。
-- `tests/store.spec.ts` 按同领域拆；纯函数用例随 P3a 先走。
+- `tests/store.spec.ts` 按同领域拆；纯函数用例已随 P3a 搬进 `tests/store/`，其余（类驱动）随 P3b 的服务划分迁移。
 
 ## 7. P4：`src/client/panel.tsx` → `src/client/panel/` + `tests/panel.spec.ts` → `tests/panel/`
 

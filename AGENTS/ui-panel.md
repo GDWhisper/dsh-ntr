@@ -73,7 +73,7 @@
 
 | 主题 | 位置 |
 |---|---|
-| 保存门禁横幅 | `src/client/save-guard-toast.tsx` · `SaveGuardToast` / `saveGuardToastKind`；`src/client/store.ts` · `SaveBanner` / `pushSaveBanner` / `dismissBanner` / `retryBanner` / `forceBanner` / `reportFlushResult` / `saveGateInterruptTargets`；`src/client/index.tsx` · `acp-save-guard-toast` 注册处 |
+| 保存门禁横幅 | `src/client/save-guard-toast.tsx` · `SaveGuardToast` / `saveGuardToastKind`；`src/client/store.ts` · `pushSaveBanner` / `dismissBanner` / `retryBanner` / `forceBanner` / `reportFlushResult`；`src/client/store/save-gate.ts` · `SaveBanner` / `saveGateInterruptTargets`；`src/client/index.tsx` · `acp-save-guard-toast` 注册处 |
 | 文案 | `src/client/index.tsx` · `label` / `LocaleFace` / `browserPrefersZh`；`src/client/store.ts` · `refreshLocale` / `detectSummaryOf` / `prefersZh`；`locale/*.json` |
 | 设置页 | `src/client/panel.tsx` · `AcpSettingsSection` / `AgentRow` / `WorkspaceBlock` / `initialForm` / `buildPayload` / `ApprovalDeadlinesCard` / `approvalDeadlineFacts` / `permissionLedgerCard` / `agentTestHint` / `AgentTestOutcome`；`PluginUpdateBadge` / `PluginUpdateCard` / `updateBadgeText` / `updateCardVisible`；发布说明 `src/client/release-notes.tsx` · `ReleaseNotesSection` / `pickReleaseLanguage` / `releaseNoteVersion`、`src/client/store.ts` · `loadPluginReleaseNotes` / `prefersZh` |
 | 设置对话框 | `src/client/settings-dialog.tsx` · `AcpSettingsDialog`；`src/client/acp-ui.tsx` · `openAcpSettingsDialog` / `closeAcpSettingsDialog` / `useAcpSettingsDialogOpen` |

@@ -1,10 +1,25 @@
 /**
- * Browser-side state store for the ACP panel. Owns: the `/acp` RPC calls, the
- * `/api/acp/stream` EventSource, per-session block folding (raw ACP
- * `session/update` → render blocks), and the pending permission set.
+ * Browser-side state store for the ACP panel: the `AcpStore` class, its `/acp`
+ * RPC calls, the `/api/acp/stream` EventSource and the `UiState` snapshot.
+ *
+ * The pure halves — transcript folding, save banners, permission asks, fork
+ * state, subagent records, known presets and the state shapes — live under
+ * `src/client/store/` and are re-exported at the bottom of this file, so every
+ * existing `./store.ts` import keeps resolving unchanged.
  *
  * Deliberately framework-free: React binds through `useSyncExternalStore`.
  */
+
+import { DEFAULT_KNOWN_PRESETS } from "./store/presets.ts"
+import type { Block } from "./store/blocks.ts"
+import { foldUpdate, replayChatRowFrames, usageFromUpdate, withSessionReleased } from "./store/blocks.ts"
+import type { ChatForkOutcome } from "./store/fork.ts"
+import type { PendingPermission } from "./store/permission.ts"
+import type { SaveBanner } from "./store/save-gate.ts"
+import { composeSaveBanners, saveGateIsAvailable, saveGateOutcomeForLabel, saveGateOutcomeSuperseded, saveGateTransitions } from "./store/save-gate.ts"
+import type { AcpLogEntry, ChatRowFrame, ChatTranscript, RpcCall, UiState } from "./store/state.ts"
+import type { LiveSubagentDetailEntry, SubagentDetailState } from "./store/subagent.ts"
+import { MAX_SUBAGENT_DETAIL_WORKERS, boundedDetailEntry, compactDetailValue, isSubagentDowngrade, mergeSubagentSnapshot, subagentKey, subagentToolCallId } from "./store/subagent.ts"
 
 import type { AcpApprovalDeadlines, AcpConversationChoice, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentSkillsResult, AgentSkillEntry, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, ApprovalDeadlinesSetPayload, ApprovalDeadlinesResult, DetectedAgentInfo, IdleReleaseResult, IdleReleaseSetPayload, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, SubagentDetailEntry, SubagentDetailResult, SubagentRecord } from '../protocol.ts'
 import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, MAX_SUBAGENT_DETAIL_ENTRIES, pluginReleaseUrl } from '../protocol.ts'
@@ -13,205 +28,6 @@ import { modelOffersEffort, modelValueOf } from './route-reasoning.ts'
 
 /** One slash command the ACP agent declared, whole row (the menu draws name, description and `input.hint`). */
 export type AgentCommand = NonNullable<ChatSessionView['availableCommands']>[number]
-
-/**
- * One chat-row lifecycle frame the browser applied. A `session/chat-list`
- * answer describes the host as of BEFORE frames that landed while its read was
- * in flight, so the answer replays them over the row list. Only rows the
- * answer already carries are patched: a `session/created` row the answer
- * never saw belongs to the next read, and appending it here would put another
- * conversation's row into this one's list.
- */
-export interface ChatRowFrame {
-  seq: number
-  sessionId: string
-  kind: 'released' | 'reset' | 'created' | 'closed'
-}
-
-/** The unary RPC face (narrowed `ctx.connection.rpc.call`). */
-export type RpcCall = (channel: string, endpoint: string, payload: unknown) => Promise<
-  | { ok: true; value: unknown }
-  | { ok: false; error: { code: string; message: string } }
->
-
-export type Block =
-  | { kind: 'user'; text: string }
-  | { kind: 'agent'; messageId?: string; text: string }
-  | { kind: 'thought'; text: string }
-  | {
-    kind: 'tool'
-    toolCallId: string
-    title: string
-    status: string
-    toolKind?: string
-    lines: string[]
-    /**
-     * Structured ACP diffs (`content: [{type:'diff'}]`). Kept apart from
-     * {@link lines} because a diff is the one tool payload worth rendering as
-     * a diff: flattening it to `diff <path>` throws away everything that makes
-     * an edit reviewable.
-     */
-    diffs?: Array<{ path: string; oldText: string | null; newText: string }>
-    /** Text items the card cannot render (diff output, an unknown content kind's JSON). */
-    extras?: string[]
-    /**
-     * The call's arguments, as the agent sent them (`rawInput` / `arguments`).
-     * Rendered read-only under the header: the real model's view of "it ran
-     * `ls -la`" is that line, and the old fold dropped it entirely.
-     */
-    input?: string
-    /** The call's other named fields (`kind`, `status`, `locations`, `terminalId`, `meta`), one `key: value` per line. */
-    details?: string[]
-    /** The whole notification this block was last written from, pretty-printed. */
-    raw?: string
-  }
-  | { kind: 'plan'; entries: Array<{ content: string; status: string; priority?: string }> }
-  /**
-   * Any other ACP notification, kept whole: an available-commands list, a mode
-   * change, or a kind newer than this build. `text` is the readable fold and
-   * `raw` the untouched payload — an agent's word the ACP view cannot format is
-   * still an agent's word.
-   */
-  | { kind: 'event'; event: string; text: string; raw?: string; status?: string }
-  | { kind: 'notice'; tone: 'info' | 'error'; text: string }
-
-/**
- * One permission ask waiting for a human. Every field is copied VERBATIM from
- * the host's `permission/request` frame: the host owns what the ask is called
- * (`toolName` / `reason`), which options the agent offered (order included),
- * and whether the ask carries a deadline. The browser does not derive a title
- * from `toolCall` and does not second-guess the agent's option labels.
- */
-export interface PendingPermission {
-  requestId: string
-  /** ACP session id. */
-  sessionId: string
-  /** DSH chat session id; absent for `/acp` RPC-only sessions (settings-only ask). */
-  dshSessionId?: string
-  toolName: string
-  reason?: string
-  options: Array<{ optionId: string; name: string; kind: string }>
-  timeoutMode: PermissionTimeoutMode
-  /** Epoch ms; absent in `wait` mode. */
-  deadlineAt?: number
-}
-
-/** Returned by {@link deadlineRemainingLabel} once the deadline has passed. */
-export const PERMISSION_DEADLINE_EXPIRED = 'expired'
-
-/**
- * The asks that belong to one DSH chat conversation. An ask without a
- * `dshSessionId` belongs to no conversation (an `/acp` RPC-only session), so it
- * is deliberately absent from every conversation's dock and stays in the
- * settings-panel ledger.
- */
-export function permissionsForSession(
-  permissions: readonly PendingPermission[],
-  dshSessionId: string,
-): PendingPermission[] {
-  return permissions.filter(permission => permission.dshSessionId === dshSessionId)
-}
-
-/** The branch button's six states (the NTR message-actions plan, §D4). */
-export type ChatForkState =
-  | 'ready'
-  | 'unsupported'
-  | 'released'
-  | 'busy'
-  | 'notTail'
-  | 'hostUnavailable'
-
-/**
- * The branch click's outcome: the child DSH session id on success, or one
- * actionable failure line (also flashed into the notice banner — the line is
- * the conversation's local copy of the same failure).
- */
-export type ChatForkOutcome = { childId: string } | { failure: string }
-
-/**
- * The branch button's state for one conversation, in the precedence it renders:
- * the host service missing beats everything (nothing can work), then the
- * agent's fork capability, then the session's own state (a parked session
- * before a running one), then the DOM's tail verdict, and only then ready.
- *
- * Every input is a fact someone else owns — the row's `fork` verdict is the
- * host's, `hostFork` is the structural probe of the runtime's `sessions.fork`,
- * `isTail` is read from the host's own `[data-turn-tail]` marker, and
- * `liveRunning` is the SSE-driven running flag (the row's own `running` only
- * refreshes on a chat-list read, so it would answer last turn). `undefined`
- * facts degrade CLOSED: no row and no `fork` verdict both read as not-ready,
- * never as a click-through.
- */
-export function forkStateOf(
-  row: ChatSessionView | undefined,
-  hostFork: boolean,
-  isTail: boolean,
-  liveRunning?: boolean,
-): ChatForkState {
-  if (!hostFork) return 'hostUnavailable'
-  if (row === undefined) return 'released'
-  if (row.fork === undefined) return 'unsupported'
-  if (row.fork.supported !== true) return row.fork.reason ?? 'unsupported'
-  if (liveRunning === true) return 'busy'
-  if (!isTail) return 'notTail'
-  return 'ready'
-}
-
-/**
- * Compact countdown for one ask, or `undefined` when there is nothing to count
- * down (`wait` mode, or a frame without a deadline). Pure so the formatting is
- * testable without a clock: the dock passes `Date.now()` on its tick.
- *
- * Past the deadline the answer is {@link PERMISSION_DEADLINE_EXPIRED} rather
- * than a negative number — the host has already armed the expiry, and a card
- * counting backwards would claim a deadline that no longer exists.
- */
-export function deadlineRemainingLabel(
-  deadlineAt: number | undefined,
-  now: number,
-  mode: PermissionTimeoutMode,
-): string | undefined {
-  if (mode === 'wait' || deadlineAt === undefined) return undefined
-  const remainingMs = deadlineAt - now
-  if (remainingMs <= 0) return PERMISSION_DEADLINE_EXPIRED
-  const seconds = Math.ceil(remainingMs / 1000)
-  if (seconds < 60) return `${String(seconds)}s`
-  const minutes = Math.floor(seconds / 60)
-  const rest = seconds % 60
-  return rest === 0 ? `${String(minutes)}m` : `${String(minutes)}m ${String(rest)}s`
-}
-
-/**
- * One observed ACP transcript, keyed by ACP session id. This is the ACP view
- * tab's data source: the native chat plane can only render text/reasoning
- * (that is the LLM adapter's entire chunk vocabulary), so the real tool calls,
- * plans and diffs live here and nowhere else.
- */
-export interface ChatTranscript {
-  /** The DSH chat session this ACP session belongs to (its refetch address). */
-  owner: string
-  session: SessionView
-  blocks: Block[]
-  /** Highest folded transcript seq (gap detection for the live stream). */
-  seq: number
-}
-
-/** The record/detail index key: one `childId` may repeat across conversations. */
-export function subagentKey(dshSessionId: string, childId: string): string {
-  return `${dshSessionId}\u0000${childId}`
-}
-
-/**
- * The `toolCallId` behind an `acp:<toolCallId>` child id, or '' when it is not
- * one. Hand-copied from `src/impl.ts` (the browser half must not import the
- * Node half); the equivalence is pinned in tests/acp-view.spec.ts.
- */
-export function subagentToolCallId(childId: string): string {
-  return childId.startsWith('acp:') ? childId.slice('acp:'.length) : ''
-}
-
-/** How many workers' detail indexes the browser keeps at once (LRU eviction). */
-export const MAX_SUBAGENT_DETAIL_WORKERS = 64
 
 /** How long one `agent/skills` answer stays fresh in the `/` menu; past it the rows read as "not asked yet" again. */
 export const SKILL_MENU_TTL_MS = 60_000
@@ -223,108 +39,8 @@ export function skillRowsKey(dshSessionId: string, agentId: string): string {
   return `${dshSessionId}\u0000${agentId}`
 }
 
-/** Raw payload budget for one live-captured detail frame; mirrors the host's `ACP_TOOL_RAW_MAX` (equivalence pinned in tests/acp-view.spec.ts). */
-export const SUBAGENT_RAW_MAX = 256_000
-
-/** One raw worker entry in the browser's bounded detail index. */
-export interface LiveSubagentDetailEntry extends SubagentDetailEntry {
-  /**
-   * Store-local monotonic order for LIVE-captured frames (absent on history
-   * read from the host). A `subagents/detail` answer describes the host as of
-   * BEFORE the frames that landed while its read was in flight, so the answer
-   * replays them by this mark — the same discipline `chatRowFrames` uses.
-   */
-  liveSeq?: number
-}
-
-/**
- * The browser's per-worker detail index. Fed by live `session/update` frames
- * (NEWEST {@link MAX_SUBAGENT_DETAIL_ENTRIES} entries, older ones counted in
- * {@link omitted}) and, once per page, by an on-demand `subagents/detail` read
- * for the history that predates the page. Deliberately NOT the folded ACP
- * transcript: `foldUpdate` drops `_meta` and merges adjacent prose across
- * workers, and the NTR view must keep rendering what it renders today.
- */
-export interface SubagentDetailState {
-  dshSessionId: string
-  childId: string
-  entries: LiveSubagentDetailEntry[]
-  /** `subagents/detail` already answered for this worker in this page. */
-  loaded: boolean
-  /** Older entries missing from the index (host cap + local cap); 0 = starts at the first frame. */
-  omitted: number
-  /** LRU clock: when the detail was last opened (or first indexed). */
-  touchedAt: number
-}
-
-/**
- * One line of the settings page's ACP runtime log. Agent-side notices and
- * session-release reasons land here (bounded, append order oldest→newest);
- * failures of the settings page's OWN actions stay in {@link UiState.notice}.
- */
-export interface AcpLogEntry {
-  id: number
-  at: number
-  level: 'info' | 'error'
-  text: string
-  agentId?: string
-}
-
 /** Cap on retained runtime-log lines; older entries fall off the front. */
 export const LOG_MAX_ENTRIES = 200
-
-/**
- * One page-top save banner. Save failures, expiry, rejection, partial force
- * flushes and the HMR reload delay all share this shape so the overlay renders
- * (and screen readers announce) them the same way.
- */
-export type SaveBannerSource =
-  | 'save-failed'
-  | 'save-expired'
-  | 'save-rejected'
-  | 'save-partial'
-  | 'save-cancel-failed'
-  | 'save-cancelled'
-  | 'save-retry-none'
-  | 'save-retry-failed'
-  | 'hmr-delay'
-  | 'save-succeeded'
-export type SaveBannerAction = 'retry' | 'force' | 'dismiss'
-
-export interface SaveBanner {
-  /** Stable identity for dedupe: the same reason replaces, never stacks. */
-  key: string
-  source: SaveBannerSource
-  level: 'error' | 'success'
-  title: string
-  body: string
-  at: number
-  actions: SaveBannerAction[]
-  /** Which gate label the retry/force gesture targets, when applicable. */
-  label?: string
-  /** Success banners disappear on their own; failures persist until closed. */
-  autoDismissMs?: number
-  /**
-   * Gate-sourced failure rows are rebuilt by a page refresh's resync; a row the
-   * user explicitly closed must stay closed. Rows without this flag (direct save
-   * failures, rejection/partial/HMR notices) never cross a refresh at all.
-   */
-  persistAcrossReload?: boolean
-}
-
-/**
- * Add or replace one banner. Failure rows are never dropped by count; only one
- * transient success row is kept among successes. A NEW failure does not evict
- * an existing success receipt: that row owns its own 2.5-second timer, and an
- * error arriving beside it must not cut that timer short.
- */
-export function composeSaveBanners(existing: SaveBanner[], incoming: SaveBanner): SaveBanner[] {
-  const withoutSame = existing.filter(banner => banner.key !== incoming.key)
-  const base = incoming.level === 'success'
-    ? withoutSame.filter(banner => banner.level !== 'success')
-    : withoutSame
-  return [...base, incoming]
-}
 
 /** sessionStorage record of persistent banners the user closed, keyed by row key. */
 const SAVE_BANNER_DISMISSALS_KEY = 'dsh-ntr.save-banner-dismissals'
@@ -361,373 +77,8 @@ function wasClosedAcrossReload(banner: SaveBanner): boolean {
   return readBannerDismissals()[banner.key] === banner.at
 }
 
-/**
- * Whether the host actually runs the save gate. A snapshot without the field
- * (an older host, or a backend that never wired the gate) is NOT an idle
- * authority: its empty `activeSessions` must never be read as "no turn".
- */
-export function saveGateIsAvailable(status: SaveGateStatus): boolean {
-  return status.gateAvailable === true
-}
-
 function normalizeSaveGateStatus(status: SaveGateStatus): SaveGateStatus {
   return { ...status, gateAvailable: saveGateIsAvailable(status) }
-}
-
-/** `agent-save:<id>` → the agent id; a host-settings label (`settings:…`) → undefined. */
-export function saveGateAgentId(label: string): string | undefined {
-  const prefix = 'agent-save:'
-  if (!label.startsWith(prefix)) return undefined
-  const id = label.slice(prefix.length)
-  return id === '' ? undefined : id
-}
-
-/** One agent a forced flush would interrupt, with the number of its live turns. */
-export interface SaveGateInterruptTarget {
-  agentId: string
-  name: string
-  sessions: number
-}
-
-/**
- * Which agents the "save everything now" gesture would interrupt, and how many
- * turns each owes. Reads the gate snapshot first; when it carries no session row
- * for an agent (an older host half, or a not-yet-hydrated window), the browser's
- * own session list supplies the same count — the fallback the settings form
- * already uses (`activeSessionsForSave`). This never assumes host fields beyond
- * `pending` / `activeSessions`; those are the snapshot's public shape.
- */
-export function saveGateInterruptTargets(
-  status: SaveGateStatus,
-  agents: readonly AgentView[],
-  detected: readonly DetectedAgentInfo[],
-  sessions: readonly SessionView[],
-): SaveGateInterruptTarget[] {
-  const ids: string[] = []
-  const add = (id: string): void => {
-    if (!ids.includes(id)) ids.push(id)
-  }
-  for (const entry of status.pending) {
-    const id = saveGateAgentId(entry.label)
-    if (id !== undefined) add(id)
-  }
-  // A host-settings save still interrupts whoever is running: fall back to the
-  // gate's own active-turn rows when no pending label names an agent.
-  if (ids.length === 0) {
-    for (const view of status.activeSessions ?? []) add(view.agentId)
-  }
-  const trustGate = saveGateIsAvailable(status)
-  return ids.map(agentId => {
-    let count = trustGate
-      ? (status.activeSessions ?? []).filter(view => view.agentId === agentId).length
-      : 0
-    if (count === 0) {
-      count = sessions.filter(session =>
-        session.agentId === agentId && session.released !== true && (session.running || session.settled === true),
-      ).length
-    }
-    return {
-      agentId,
-      name: agents.find(agent => agent.id === agentId)?.title
-        ?? detected.find(info => info.id === agentId)?.name
-        ?? agentId,
-      sessions: count,
-    }
-  })
-}
-
-/** The terminal result naming one label, whichever snapshot shape carries it. */
-export function saveGateOutcomeForLabel(
-  status: SaveGateStatus,
-  label: string,
-): SaveGateOutcomeView | undefined {
-  return status.lastOutcomes?.[label]
-    ?? (status.lastOutcome?.label === label ? status.lastOutcome : undefined)
-}
-
-/** A `cancelled` row the host replaced with a newer queued snapshot. */
-export function saveGateOutcomeSuperseded(outcome: SaveGateOutcomeView): boolean {
-  return outcome.superseded === true
-}
-
-/** One terminal label transition, as seen between two gate snapshots. */
-export interface SaveGateOutcomeTransition {
-  label: string
-  outcome: SaveGateOutcomeView
-  /** The label was still queued in the previous snapshot. */
-  wasPending: boolean
-  /** The label is still queued in the new snapshot. */
-  isPending: boolean
-}
-
-/**
- * Compare two gate snapshots. Pure: the SSE path and `resync` both feed this
- * so a page refresh rebuilds the terminal rows it missed. A terminal entry is
- * "new" when its timestamp or status changed; pending additions are reported
- * apart because only the caller knows whether that deserves a log line.
- */
-export function saveGateTransitions(
-  previous: SaveGateStatus | undefined,
-  next: SaveGateStatus,
-): { addedPending: SaveGatePendingView[]; outcomes: SaveGateOutcomeTransition[] } {
-  const previousOutcomes: Record<string, SaveGateOutcomeView> = previous?.lastOutcomes
-    ?? (previous?.lastOutcome === undefined ? {} : { [previous.lastOutcome.label]: previous.lastOutcome })
-  const nextOutcomes: Record<string, SaveGateOutcomeView> = next.lastOutcomes
-    ?? (next.lastOutcome === undefined ? {} : { [next.lastOutcome.label]: next.lastOutcome })
-  const wasPending = new Set((previous?.pending ?? []).map(entry => entry.label))
-  const isPending = new Set(next.pending.map(entry => entry.label))
-  const addedPending = next.pending.filter(entry => !wasPending.has(entry.label))
-  const outcomes: SaveGateOutcomeTransition[] = []
-  for (const [label, outcome] of Object.entries(nextOutcomes)) {
-    const before = previousOutcomes[label]
-    if (before !== undefined && before.at === outcome.at && before.status === outcome.status) continue
-    outcomes.push({ label, outcome, wasPending: wasPending.has(label), isPending: isPending.has(label) })
-  }
-  return { addedPending, outcomes }
-}
-
-export interface UiState {
-  open: boolean
-  /**
-   * Bumped by {@link AcpStore.refreshLocale}. Labels resolve while rendering,
-   * but memoized transcript rows compare props — this counter is what tells
-   * them the language switched.
-   */
-  localeRev: number
-  stream: 'init' | 'live' | 'down'
-  agents: AgentView[]
-  /**
-   * Whether the host has answered `agents/list` at least once in this page.
-   * `agents: []` alone cannot tell "no agent configured" from "not read yet";
-   * a surface that offers a setup entry on an empty roster must wait for this.
-   */
-  agentsLoaded: boolean
-  /**
-   * Agent ids deleted during THIS page's lifetime. The host keeps a tombstone
-   * for the same run, but a client-side copy lets the creation form warn before
-   * a doomed save. Cleared only by a host restart, never by `resync`.
-   */
-  deletedAgentIds: string[]
-  sessions: SessionView[]
-  activeSessionId?: string
-  blocks: Block[]
-  permissions: PendingPermission[]
-  busy: boolean
-  /**
-   * The settings page's one-line banner for its OWN action failures. Agent-side
-   * runtime messages do not land here; they append to {@link logs} instead.
-   */
-  notice?: string
-  /** Page-top save banners; failures stay until dismissed, success auto-hides. */
-  saveBanners: SaveBanner[]
-  /** Agent-side runtime log, append order oldest→newest, capped at {@link LOG_MAX_ENTRIES}. */
-  logs: AcpLogEntry[]
-  /** Lines appended since the user last opened the log; reset by {@link AcpStore.markLogsRead}. */
-  logUnread: number
-  /**
-   * The plugin's OWN default ACP agent (the panel's ★ gesture) — which agent a
-   * new ACP-mode conversation starts on. NOT the deployment default model: that
-   * one is global to every mode, and nothing in this bundle writes it.
-   */
-  defaultAgent?: string
-  detectedAgents: DetectedAgentInfo[]
-  detecting: boolean
-  /**
-   * Outcome of the last explicit re-detect (`重新检测与刷新`). Detection
-   * usually finds exactly what the panel already renders — without this line
-   * the button reads as dead. Set only by an explicit click, not the ambient
-   * resync, and cleared again when that click's detection fails (a stale success
-   * line next to the failure notice reads as if nothing happened).
-   */
-  detectSummary?: string
-  /** Probed model catalogs per agent id (from `agent/probe-models`). */
-  modelCatalogs: Record<string, AgentProbeModelsResult>
-  /**
-   * Per-agent ACP model surfaces (from `agent/catalog`) — the data source for
-   * the conversation-side chips and the ACP-mode model seat. Kept apart from
-   * {@link modelCatalogs} on purpose: that one is the panel's full probe
-   * result (every choice an agent published), while this is the filtered,
-   * ready-to-render list the seats offer.
-   */
-  seatCatalogs: Record<string, AgentCatalogResult>
-  probingModels: Record<string, boolean>
-  /**
-   * Last probe failure per agent id, rendered next to the button that
-   * triggered it. `notice` alone is not enough: it lives at the top of the
-   * settings panel, so a probe failing below the fold (missing cwd, an agent
-   * that never answers, …) reads as a dead button.
-   */
-  probeErrors: Record<string, string>
-  /**
-   * ACP agent sessions backing the chat session the composer control sits in.
-   * Only meaningful together with {@link chatSessionsFor}: the control reads it
-   * by chat session id, so a stale list from another conversation never renders.
-   */
-  chatSessions: ChatSessionView[]
-  /** The DSH chat session id {@link chatSessions} was loaded for. */
-  chatSessionsFor?: string
-  /**
-   * Live burst aggregate per ACP session id, from `turn/metrics`. Absent means
-   * no measured burst yet; a row's persisted `burst` is the reload seed.
-   */
-  burstStats: Record<string, { outputTokens: number; burstMs: number; turnId: string; final: boolean }>
-  /**
-   * The agent tag's halo preference (settings-editable display choice). The
-   * tag reads it per render; the host answer in `resync` is the authority and
-   * a write lands optimistically first.
-   */
-  tagHalo: AcpTagHalo
-  /**
-   * Whether generated NTR session titles carry the `[NTR] ` badge (settings
-   * toggle, default on). Writes land optimistically first; the host answer
-   * is the authority. Only future title generations change — titles the host
-   * already accepted are durable and stay as they are.
-   */
-  titlePrefix: boolean
-  /**
-   * The approval deadlines in force, as the settings card edits them. Absent on
-   * a host half from before the card existed, which hides the card rather than
-   * showing a number this browser invented. Writes land optimistically and the
-   * host answer (returned by the same route) is the authority.
-   */
-  approvalDeadlines?: AcpApprovalDeadlines
-  /**
-   * The idle-release window in force, as the settings page edits it.
-   * Absent on a host half from before the tab existed, which hides the
-   * tab rather than showing a number this browser invented.
-   */
-  idleRelease?: AcpIdleRelease
-  /**
-   * The host's ACP-turn save gate. A pending entry means a profile write is
-   * held until the turn finishes; the toast renders it and offers the explicit
-   * force gesture. Absent from older hosts: the local default reads "idle".
-   */
-  saveGate: SaveGateStatus
-  /**
-   * Per-chat-session "does this conversation run the ACP preset" verdicts, as
-   * reported by `session/chat-list` (host-read from the session log). The
-   * composer surfaces fall back to this when the client runtime's session rows
-   * carry no `agentPreset` (older hosts); a session never asked about is simply
-   * absent.
-   */
-  acpMode: Record<string, boolean>
-  /**
-   * The plugin's OWN lifecycle records for external workers, keyed by
-   * {@link subagentKey} (`dshSessionId + childId`). Live transitions arrive as
-   * `subagents/record` frames; a `session/chat-list` answer carries the
-   * terminal ones, so a reload or a host restart still answers them. The
-   * panel LIST is still joined from the host's own catalog projection — a
-   * catalog row with no record reads `unknown`, never succeeded.
-   */
-  subagents: Record<string, SubagentRecord>
-  /**
-   * Raw per-worker detail indexes (bounded, LRU-capped at
-   * {@link MAX_SUBAGENT_DETAIL_WORKERS}), keyed like {@link subagents}. An
-   * entry exists only once its detail was opened in this page; from then on
-   * live frames append to it, and the first open reads history from
-   * `subagents/detail`.
-   */
-  subagentDetails: Record<string, SubagentDetailState>
-  /**
-   * Agent skill rows for the `/` menu (from `agent/skills`), keyed by
-   * {@link skillRowsKey}. The serving agent is part of the key, so switching
-   * the binding invalidates by mismatch — no invalidation hook needed, the old
-   * agent's rows just stop being looked up. `at` is the fetch time; past
-   * {@link SKILL_MENU_TTL_MS} the rows read as "not asked yet" again. An EMPTY
-   * rows array is a real answer ("this agent has no skills here"), never a
-   * placeholder for "not asked yet" — that case is `undefined` from the reader.
-   */
-  agentSkills: Record<string, { at: number; rows: readonly AgentSkillEntry[] }>
-  /**
-   * Per-chat-session ACP agent binding, as reported by `session/chat-list`'s
-   * `boundAgentId` (the host's intent map plus its live-session fallback): who
-   * serves this conversation's NEXT message. `session/chat-bind` writes the
-   * optimistic entry here the moment the click succeeds — the live session
-   * list cannot reflect a switch until a turn materializes a session for the
-   * new agent, and the chip would otherwise keep naming the previous agent.
-   */
-  chatBoundAgent: Record<string, string>
-  /**
-   * Per-chat-session agent lock, as reported by `chat/agent-locked` (the live
-   * path) or `session/chat-list`'s `lockedAgentId` (the fallback): the first
-   * ACP turn has STARTED, so this conversation belongs to that agent and
-   * cannot be switched. The lock is provisional until that turn shows
-   * something; `chat/agent-unlocked` removes it when it delivers nothing. The
-   * composer hides its agent base and shows a read-only tag for this agent.
-   * The id is kept even when the agent has been deleted from the roster — the
-   * conversation is still locked to it.
-   */
-  chatLockedAgent: Record<string, string>
-  /**
-   * Per-chat-session serial for a lock THIS page saw arrive — bumped by the
-   * `chat/agent-locked` frame (the live path, sent when the first turn starts)
-   * or by a later `session/chat-list` answer that first reports `lockedAgentId`
-   * (the fallback when the frame was missed). A rolled-back first turn followed
-   * by a retry therefore gets a fresh serial, and its ceremony plays again.
-   *
-   * This is the animation's trigger, and the reason it cannot replay on a page
-   * load: a conversation that is already locked when its list is first read
-   * has no entry here. The composer's base and its edge tag
-   * (`agent-lock-anim.ts`) play the shatter/condense hand-off only for a serial
-   * they have not consumed.
-   */
-  agentLockReveal: Record<string, number>
-  /**
-   * The conversation's persisted pick — model and thought level — as reported by
-   * `session/chat-list`'s `choice`, and written optimistically the moment a
-   * picker commits one.
-   *
-   * This is the record that makes a conversation usable BEFORE it has ever run
-   * a turn: without it the model / thought-level chips can only reflect a live
-   * ACP session, which does not exist until the first message has already gone
-   * out on whatever the agent's defaults were.
-   */
-  chatChoice: Record<string, AcpConversationChoice>
-  /**
-   * The model-seat shadow gate's own account of what it last decided, and why
-   * (`src/client/index.tsx`'s `syncAcpMode`). Read-only, human-facing, and
-   * rendered by the ACP view: every branch of that gate ends with the native
-   * model seat either shadowed or not, and without this line the four ways it
-   * can end "not shadowed" are indistinguishable from the outside — which is
-   * exactly how "the ACP base still has not been replaced" became unreadable.
-   */
-  seatDiag: string
-  /**
-   * Diagnostic summary from the permission-seat blanking gate (`conversation.input.permission`).
-   */
-  permissionSeatDiag: string
-  /**
-   * Why slash isolation is not in force, when it is not (`idle` while it is).
-   * Isolation degrades OPEN — an unrecognized source shape leaves the host's
-   * commands in charge — so without this line the only symptom would be a menu
-   * that quietly lists the wrong commands.
-   */
-  slashDiag: string
-  /**
-   * Observed ACP transcripts keyed by ACP session id. Only sessions the
-   * conversation's ACP view asked for are watched (live `session/update`
-   * frames fold straight into them), and the map is capped so a long browsing
-   * session cannot accumulate every transcript it ever looked at.
-   */
-  chatTranscripts: Record<string, ChatTranscript>
-  /**
-   * State of the host's ACP-mode agent preset IN THE HARNESS ROSTER (the entry
-   * the new-session picker shows). `undefined` when the host serves no roster
-   * (`preset/status` answering `null`), in which case the panel hides the block.
-   */
-  preset?: AcpPresetStatus
-  /**
-   * The installed host package's version (`plugin/version`), rendered as the
-   * settings page badge. Absent on a host half without the endpoint, which
-   * hides the badge rather than naming a version this browser invented.
-   */
-  pluginVersion?: string
-  /**
-   * The running version and its update status (`plugin/update-check`). Absent
-   * on a host half without the endpoint, which hides the update entry instead
-   * of offering an install this browser cannot perform.
-   */
-  pluginUpdate?: PluginUpdateState
 }
 
 interface Listener { (): void }
@@ -740,287 +91,12 @@ const PLUGIN_RELEASE_NOTES_TTL_MS = 10 * 60 * 1000
 /** A body-less answer is retried sooner: the next open may hit a working GitHub. */
 const PLUGIN_RELEASE_NOTES_FAILURE_TTL_MS = 60 * 1000
 
-/** Raw JSON budget for one event block; the cut is marked. */
-const RAW_MAX = 256_000
-
 /**
  * How long a fetched update state stays fresh. The settings panel asks on every
  * mount; without this, every open would hit the registry. A forced check (the
  * card's own button) always goes out.
  */
 const PLUGIN_UPDATE_TTL_MS = 10 * 60 * 1000
-
-/** Pretty-printed JSON of an agent message (never throws, cuts only at {@link RAW_MAX} with a marker). */
-export function jsonText(value: unknown): string {
-  let text: string
-  try {
-    text = JSON.stringify(value, null, 2) ?? String(value)
-  } catch {
-    text = String(value)
-  }
-  return text.length > RAW_MAX
-    ? `${text.slice(0, RAW_MAX)}\n… [truncated ${String(text.length - RAW_MAX)} chars]`
-    : text
-}
-
-/**
- * The call's arguments as the agent sent them. Accepts every spelling seen in
- * the wild (`rawInput` / `arguments`, string / object / array) and never
- * invents one: a call with no input gets `undefined`.
- */
-export function toolInputOf(update: Record<string, unknown>): string | undefined {
-  for (const key of ['rawInput', 'arguments'] as const) {
-    const value = update[key]
-    if (typeof value === 'string') {
-      if (value !== '') return value
-      continue
-    }
-    if (Array.isArray(value)) {
-      if (value.length > 0) return JSON.stringify(value, null, 2)
-      continue
-    }
-    if (typeof value === 'object' && value !== null) return JSON.stringify(value, null, 2)
-  }
-  return undefined
-}
-
-/** The call's other named fields, one `key: value` per line. */
-export function toolDetailsOf(update: Record<string, unknown>): string[] {
-  const lines: string[] = []
-  for (const key of ['kind', 'status', 'locations', 'terminalId', 'meta'] as const) {
-    const value = update[key]
-    if (value === undefined || value === null || value === '') continue
-    if (key === 'locations' && Array.isArray(value) && value.length === 0) continue
-    lines.push(`${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`)
-  }
-  return lines
-}
-
-/** Text a `text` / `thinking` chunk's `content` carries (string, object, or array of blocks). */
-function chunkText(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) {
-    return content.map(item => {
-      if (typeof item === 'string') return item
-      if (typeof item === 'object' && item !== null) {
-        const row = item as Record<string, unknown>
-        return typeof row.text === 'string' ? row.text : JSON.stringify(item)
-      }
-      return ''
-    }).join('')
-  }
-  if (typeof content === 'object' && content !== null) {
-    const row = content as Record<string, unknown>
-    if (typeof row.text === 'string') return row.text
-    return JSON.stringify(content)
-  }
-  return ''
-}
-
-/**
- * One tool call's `content`, split into what the card renders as text
- * ({@link lines}), the structured edits it renders as diffs, and everything
- * else as its own readable text ({@link extras}). Nothing is dropped: a diff is
- * ALSO shown as text (header plus `-`/`+` lines) because the model's view of a
- * tool result is text, and a kind this build cannot render becomes its full
- * JSON.
- */
-function splitToolContent(content: unknown): { lines: string[]; diffs?: Array<{ path: string; oldText: string | null; newText: string }>; extras: string[] } {
-  const lines: string[] = []
-  const extras: string[] = []
-  const diffs: Array<{ path: string; oldText: string | null; newText: string }> = []
-  if (!Array.isArray(content)) {
-    if (typeof content === 'string' && content !== '') lines.push(content)
-    return { lines, extras }
-  }
-  for (const item of content) {
-    if (typeof item === 'string') {
-      if (item !== '') lines.push(item)
-      continue
-    }
-    if (typeof item !== 'object' || item === null) continue
-    const row = item as Record<string, unknown>
-    if (row.type === 'content') {
-      const inner = row.content as Record<string, unknown> | undefined
-      if (typeof inner === 'string') {
-        lines.push(inner)
-      } else if (inner?.type === 'text') {
-        lines.push(typeof inner.text === 'string' ? inner.text : JSON.stringify(item))
-      } else if (inner?.type === 'diff' && typeof inner.path === 'string') {
-        const diff = { path: inner.path, oldText: typeof inner.oldText === 'string' ? inner.oldText : null, newText: typeof inner.newText === 'string' ? inner.newText : '' }
-        diffs.push(diff)
-        lines.push(diffText(diff))
-      } else {
-        extras.push(`${String(inner?.type ?? 'content')} ${JSON.stringify(item)}`)
-      }
-      continue
-    }
-    if (row.type === 'diff' && typeof row.path === 'string' && typeof row.newText === 'string') {
-      const diff = { path: row.path, oldText: typeof row.oldText === 'string' ? row.oldText : null, newText: row.newText }
-      diffs.push(diff)
-      lines.push(diffText(diff))
-      continue
-    }
-    if (row.type === 'text' && typeof row.text === 'string') {
-      lines.push(row.text)
-      continue
-    }
-    extras.push(`${String(row.type ?? 'content')} ${JSON.stringify(item)}`)
-  }
-  return { lines, extras, ...(diffs.length === 0 ? {} : { diffs }) }
-}
-
-/** A structured edit as plain text: its path, then `-`/`+` lines with three lines of context. */
-function diffText(diff: { path: string; oldText: string | null; newText: string }): string {
-  const split = (text: string | null): string[] => text === null || text === '' ? [] : (text.endsWith('\n') ? text.slice(0, -1) : text).split('\n')
-  const oldLines = split(diff.oldText)
-  const newLines = split(diff.newText)
-  let head = 0
-  while (head < oldLines.length && head < newLines.length && oldLines[head] === newLines[head]) head++
-  let tail = 0
-  while (
-    tail < oldLines.length - head
-    && tail < newLines.length - head
-    && oldLines[oldLines.length - 1 - tail] === newLines[newLines.length - 1 - tail]
-  ) tail++
-  const out: string[] = [diff.path]
-  for (let i = Math.max(0, head - 3); i < head; i++) out.push(`  ${oldLines[i] ?? ''}`)
-  for (let i = head; i < oldLines.length - tail; i++) out.push(`- ${oldLines[i] ?? ''}`)
-  for (let i = head; i < newLines.length - tail; i++) out.push(`+ ${newLines[i] ?? ''}`)
-  for (let i = oldLines.length - tail; i < oldLines.length; i++) out.push(`  ${oldLines[i] ?? ''}`)
-  return out.join('\n')
-}
-
-/** The readable fold of a notification the view has no card of its own for. */
-export function describeEvent(kind: string, update: Record<string, unknown>): string {
-  if (kind === 'available_commands_update') {
-    const commands = Array.isArray(update.availableCommands) ? update.availableCommands : []
-    return commands.map(command => {
-      const row = (typeof command === 'object' && command !== null ? command : {}) as Record<string, unknown>
-      const name = typeof row.name === 'string' ? row.name : ''
-      const description = typeof row.description === 'string' && row.description !== '' ? ` — ${row.description}` : ''
-      return `${name}${description}`
-    }).join('\n')
-  }
-  if (kind === 'plan') {
-    const entries = Array.isArray(update.entries) ? update.entries : []
-    return entries.map(entry => {
-      const row = (typeof entry === 'object' && entry !== null ? entry : {}) as Record<string, unknown>
-      return `[${String(row.status ?? 'pending')}] ${String(row.content ?? '')}`
-    }).join('\n')
-  }
-  if (kind === 'current_mode_update' && typeof update.currentModeId === 'string') return update.currentModeId
-  return ''
-}
-
-export const DEFAULT_KNOWN_PRESETS: DetectedAgentInfo[] = [
-  {
-    id: 'pi',
-    name: 'Pi Coding Agent',
-    description: 'Automata / Pi Coding Agent with native ACP bridge support',
-    detected: false,
-    defaultCommand: 'pi-acp',
-    defaultArgs: [],
-  },
-  {
-    id: 'omp',
-    name: 'Oh My Pi',
-    description: 'Oh My Pi (pi-based coding agent) — run as `omp acp` over stdio',
-    detected: false,
-    defaultCommand: 'omp',
-    defaultArgs: ['acp'],
-  },
-  // Hand copy of the host's `AGENT_PRESETS` entry (src/bridge.ts): the panel
-  // falls back to this list before the first `agents/detect` round-trip.
-  {
-    id: 'codebuddy',
-    name: 'CodeBuddy Code',
-    description: 'Tencent CodeBuddy Code — run as `codebuddy --acp` over stdio',
-    detected: false,
-    defaultCommand: 'codebuddy',
-    defaultArgs: ['--acp'],
-  },
-  {
-    id: 'claude',
-    name: 'Claude Code',
-    description: 'Claude Agent SDK adapter — run as `npx -y @agentclientprotocol/claude-agent-acp` over stdio',
-    detected: false,
-    defaultCommand: 'npx',
-    defaultArgs: ['-y', '@agentclientprotocol/claude-agent-acp'],
-  },
-  {
-    id: 'codex',
-    name: 'Codex',
-    description: 'OpenAI Codex adapter — run as `npx -y @agentclientprotocol/codex-acp` over stdio',
-    detected: false,
-    defaultCommand: 'npx',
-    defaultArgs: ['-y', '@agentclientprotocol/codex-acp'],
-  },
-  {
-    id: 'gemini',
-    name: 'Gemini CLI',
-    description: 'Google Gemini CLI — run as `gemini --experimental-acp` over stdio',
-    detected: false,
-    defaultCommand: 'gemini',
-    defaultArgs: ['--experimental-acp'],
-  },
-  {
-    id: 'opencode',
-    name: 'OpenCode',
-    description: 'OpenCode — run as `opencode acp` over stdio',
-    detected: false,
-    defaultCommand: 'opencode',
-    defaultArgs: ['acp'],
-  },
-  {
-    id: 'cursor',
-    name: 'Cursor CLI',
-    description: 'Cursor CLI — run as `agent acp` over stdio (legacy alias `cursor-agent acp`)',
-    detected: false,
-    defaultCommand: 'agent',
-    defaultArgs: ['acp'],
-  },
-  {
-    id: 'qwen',
-    name: 'Qwen Code',
-    description: 'Qwen Code — run as `qwen --experimental-acp` over stdio',
-    detected: false,
-    defaultCommand: 'qwen',
-    defaultArgs: ['--experimental-acp'],
-  },
-  {
-    id: 'kiro',
-    name: 'Kiro',
-    description: 'Kiro CLI — run as `kiro-cli acp` over stdio',
-    detected: false,
-    defaultCommand: 'kiro-cli',
-    defaultArgs: ['acp'],
-  },
-  {
-    id: 'qoder',
-    name: 'Qoder',
-    description: 'Qoder CLI — run as `qodercli --acp` over stdio',
-    detected: false,
-    defaultCommand: 'qodercli',
-    defaultArgs: ['--acp'],
-  },
-  {
-    id: 'qoder-cn',
-    name: 'Qoder CN',
-    description: 'Qoder CLI (China) — run as `qoderclicn --acp` over stdio',
-    detected: false,
-    defaultCommand: 'qoderclicn',
-    defaultArgs: ['--acp'],
-  },
-  {
-    id: 'agy',
-    name: 'Antigravity CLI',
-    description: 'Antigravity — run as `agy acp --dangerously-skip-permissions` over stdio',
-    detected: false,
-    defaultCommand: 'agy',
-    defaultArgs: ['acp', '--dangerously-skip-permissions'],
-  },
-]
 
 export class AcpStore {
   private state: UiState = {
@@ -3987,170 +3063,6 @@ export class AcpStore {
   }
 }
 
-/** Merge a raw ACP update into the block list (mutates in place). */
-/**
- * Fold one transcript update into a block list. IMMUTABLE per block: the ACP
- * view memoizes rows on the block object, so an appended chunk replaces the
- * tail block instead of mutating it (array copies stay the caller's job, one
- * per folded batch). Returns whether any block changed — a usage-only tick
- * folds to `false` and the batch skips copying the array.
- *
- * `raw` is a lazy getter: pretty-printing a tool payload costs up to
- * {@link RAW_MAX} characters of JSON per call, and progress ticks restate
- * whole calls at high frequency — the cost is paid once, by the view that
- * actually shows the card, never by the fold loop.
- */
-export function foldUpdate(blocks: Block[], update: Record<string, unknown>): boolean {
-  const kind = String(update.sessionUpdate ?? '')
-  const content = update.content as Record<string, unknown> | undefined
-  switch (kind) {
-    case 'user_message_chunk':
-    case 'agent_message_chunk':
-    case 'agent_thought_chunk': {
-      const targetKind = kind === 'user_message_chunk' ? 'user' : kind === 'agent_message_chunk' ? 'agent' : 'thought'
-      const text = chunkText(content)
-      if (text === '') return false
-      const messageId = typeof update.messageId === 'string' ? update.messageId : undefined
-      const last = blocks[blocks.length - 1]
-      if (targetKind === 'agent' && last?.kind === 'agent' && ((messageId !== undefined && last.messageId === messageId) || (messageId === undefined && last.messageId === undefined))) {
-        blocks[blocks.length - 1] = { ...last, text: last.text + text }
-      } else if (targetKind !== 'agent' && last?.kind === targetKind) {
-        blocks[blocks.length - 1] = { ...last, text: last.text + text }
-      } else if (targetKind === 'agent') {
-        blocks.push({ kind: 'agent', ...(messageId === undefined ? {} : { messageId }), text })
-      } else {
-        blocks.push({ kind: targetKind, text })
-      }
-      return true
-    }
-    case 'tool_call': {
-      let rawOf: string | undefined
-      blocks.push({
-        kind: 'tool',
-        toolCallId: String(update.toolCallId ?? ''),
-        title: String(update.title ?? ''),
-        status: String(update.status ?? 'pending'),
-        ...(typeof update.kind === 'string' ? { toolKind: update.kind } : {}),
-        ...splitToolContent(update.content),
-        ...toolInputFields(update),
-        get raw() { return rawOf ??= jsonText(update) },
-      })
-      return true
-    }
-    case 'tool_call_update': {
-      const id = String(update.toolCallId ?? '')
-      for (let i = blocks.length - 1; i >= 0; i--) {
-        const block = blocks[i]
-        if (block?.kind !== 'tool' || block.toolCallId !== id) continue
-        // An update restates the call in whole, but every field it does NOT
-        // carry keeps the block's previous value (the restatement that only
-        // brings a result must not wipe the arguments the card shows).
-        const parsed = splitToolContent(update.content)
-        const input = toolInputOf(update)
-        const details = toolDetailsOf(update)
-        let rawOf: string | undefined
-        blocks[i] = {
-          kind: 'tool',
-          toolCallId: id,
-          title: typeof update.title === 'string' && update.title !== '' ? update.title : block.title,
-          status: typeof update.status === 'string' ? update.status : block.status,
-          ...(typeof update.kind === 'string' ? { toolKind: update.kind } : block.toolKind === undefined ? {} : { toolKind: block.toolKind }),
-          lines: parsed.lines.length > 0 ? parsed.lines : block.lines,
-          ...(parsed.diffs === undefined
-            ? block.diffs === undefined ? {} : { diffs: block.diffs }
-            : { diffs: parsed.diffs }),
-          ...(parsed.extras.length > 0 ? { extras: parsed.extras } : block.extras === undefined ? {} : { extras: block.extras }),
-          ...(input === undefined ? block.input === undefined ? {} : { input: block.input } : { input }),
-          ...(details.length > 0 ? { details } : block.details === undefined ? {} : { details: block.details }),
-          get raw() { return rawOf ??= jsonText(update) },
-        }
-        return true
-      }
-      // Update for a tool call that rolled out of the transcript window.
-      let rawOf: string | undefined
-      blocks.push({
-        kind: 'tool',
-        toolCallId: id,
-        title: id,
-        status: String(update.status ?? 'completed'),
-        ...splitToolContent(update.content),
-        ...toolInputFields(update),
-        get raw() { return rawOf ??= jsonText(update) },
-      })
-      return true
-    }
-    case 'plan': {
-      const entries = Array.isArray(update.entries)
-        ? (update.entries as Array<Record<string, unknown>>).map(e => ({
-          content: String(e.content ?? ''),
-          status: String(e.status ?? 'pending'),
-          ...(typeof e.priority === 'string' ? { priority: e.priority } : {}),
-        }))
-        : []
-      for (let i = blocks.length - 1; i >= 0; i--) {
-        const block = blocks[i]
-        if (block?.kind !== 'plan') continue
-        blocks[i] = { ...block, entries }
-        return true
-      }
-      blocks.push({ kind: 'plan', entries })
-      return true
-    }
-    default: {
-      // Every remaining notification kind is kept, not dropped: a command list,
-      // a mode change, or a kind newer than this build. Bookkeeping frames that
-      // say nothing new (`config_option_update` / `usage_update` /
-      // `session_info_update`) ride the SessionView snapshot — they are state,
-      // not stream content, and a row per tick would be noise.
-      if (kind === '' || STATE_ONLY_UPDATES.has(kind)) return false
-      let rawOf: string | undefined
-      blocks.push({ kind: 'event', event: kind, text: describeEvent(kind, update), get raw() { return rawOf ??= jsonText(update) } })
-      return true
-    }
-  }
-}
-
-/**
- * The input / detail fields a tool block carries from an update, spread-ready.
- * Kept apart from the content split so `tool_call` and `tool_call_update` share
- * one spelling of "when does a field appear".
- */
-function toolInputFields(update: Record<string, unknown>): Record<string, unknown> {
-  const fields: Record<string, unknown> = {}
-  const input = toolInputOf(update)
-  if (input !== undefined) fields.input = input
-  const details = toolDetailsOf(update)
-  if (details.length > 0) fields.details = details
-  return fields
-}
-
-/** Notifications that update the SessionView snapshot instead of the block stream. */
-export const STATE_ONLY_UPDATES: ReadonlySet<string> = new Set([
-  'config_option_update',
-  'usage_update',
-  'session_info_update',
-])
-
-/**
- * Context occupancy carried by one raw `usage_update` frame. A malformed or
- * degenerate frame (CodeBuddy's cost-only team-member tick is `used: 0, size: 0`)
- * is ignored: the last good sample stays on screen instead of a zeroed meter.
- */
-export function usageFromUpdate(update: Record<string, unknown>): SessionView['usage'] | undefined {
-  const used = update.used
-  const size = update.size
-  if (typeof used !== 'number' || !Number.isFinite(used) || used < 0) return undefined
-  if (typeof size !== 'number' || !Number.isFinite(size) || size <= 0) return undefined
-  const cost = update.cost
-  if (cost !== null && typeof cost === 'object' && !Array.isArray(cost)) {
-    const row = cost as Record<string, unknown>
-    if (typeof row.amount === 'number' && Number.isFinite(row.amount)
-      && typeof row.currency === 'string' && row.currency !== '') {
-      return { used, size, cost: { amount: row.amount, currency: row.currency } }
-    }
-  }
-  return { used, size }
-}
 
 function sameUsage(left: SessionView['usage'], right: SessionView['usage']): boolean {
   if (left === right) return true
@@ -4177,147 +3089,12 @@ function withSessionUsage<T extends { sessionId: string; usage?: SessionView['us
   return changed ? next : rows
 }
 
-/**
- * Flip one chat row's `released` flag (release/resume bookkeeping). The
- * composer's own list (`session/chat-list` rows) has no other live writer —
- * `session/released` must mark it, `session/reset` must un-mark it, or the
- * agent tag's halo and the released banner read yesterday's process state.
- */
-function withSessionReleased<T extends { sessionId: string; released?: boolean }>(
-  rows: T[],
-  sessionId: string,
-  released: boolean,
-): T[] {
-  let changed = false
-  const next = rows.map(row => {
-    if (row.sessionId !== sessionId || (row.released === true) === released) return row
-    changed = true
-    return { ...row, released }
-  })
-  return changed ? next : rows
-}
-
-/**
- * Re-apply the chat-row lifecycle frames that landed AFTER a
- * `session/chat-list` read started. The host answer describes an earlier
- * moment; without this replay a late answer overwrites the `session/reset`
- * flip and the released banner keeps claiming a process that is already back.
- * Only rows the answer carries are patched — a row from another conversation
- * must never enter this conversation's list.
- */
-export function replayChatRowFrames(
-  rows: readonly ChatSessionView[],
-  frames: readonly ChatRowFrame[],
-  afterSeq: number,
-): ChatSessionView[] {
-  let next: ChatSessionView[] = [...rows]
-  for (const frame of frames) {
-    if (frame.seq <= afterSeq) continue
-    switch (frame.kind) {
-      case 'closed':
-        next = next.filter(row => row.sessionId !== frame.sessionId)
-        break
-      case 'released':
-        next = withSessionReleased(next, frame.sessionId, true)
-        break
-      case 'reset':
-      case 'created':
-        next = withSessionReleased(next, frame.sessionId, false)
-        break
-    }
-  }
-  return next
-}
-
-/**
- * A terminal record is never downgraded by a stale non-terminal frame: the
- * worker already reported, and the panel must not start claiming it is
- * running again. Everything else is last-wins (frames arrive in order).
- */
-function isSubagentDowngrade(existing: SubagentRecord | undefined, incoming: SubagentRecord): boolean {
-  return existing !== undefined && existing.endedAt !== undefined && incoming.endedAt === undefined
-}
-
-/**
- * Merge a `session/chat-list` answer's worker records for ONE conversation
- * into the store's keyed map, then replay the `subagents/record` frames that
- * landed while the read was in flight. Other conversations' records are left
- * untouched. A terminal record is never replaced by a non-terminal one: a
- * stale snapshot row must not revive a worker that already reported.
- */
-export function mergeSubagentSnapshot(
-  current: Readonly<Record<string, SubagentRecord>>,
-  dshSessionId: string,
-  rows: readonly ChatSessionView[],
-  frames: ReadonlyArray<{ seq: number; dshSessionId: string; record: SubagentRecord }>,
-  afterSeq: number,
-): Record<string, SubagentRecord> {
-  const next: Record<string, SubagentRecord> = { ...current }
-  for (const key of Object.keys(next)) {
-    if (next[key]?.dshSessionId === dshSessionId) delete next[key]
-  }
-  // One conversation can have several rows; the same record may appear on
-  // each, so merge by `dshSessionId + childId`.
-  for (const row of rows) {
-    for (const record of row.subagents ?? []) {
-      if (record.dshSessionId !== dshSessionId) continue
-      next[subagentKey(dshSessionId, record.childId)] = record
-    }
-  }
-  for (const frame of frames) {
-    if (frame.seq <= afterSeq || frame.dshSessionId !== dshSessionId) continue
-    const key = subagentKey(dshSessionId, frame.record.childId)
-    const existing = next[key]
-    if (isSubagentDowngrade(existing, frame.record)) continue
-    next[key] = frame.record
-  }
-  return next
-}
-
 /** The CodeBuddy worker attribution a live update carries (`parentToolCallId`), if any. */
 function parentToolCallIdOf(update: Record<string, unknown>): string | undefined {
   const meta = update._meta
   if (meta === null || typeof meta !== 'object') return undefined
   const value = (meta as Record<string, unknown>)['codebuddy.ai/parentToolCallId']
   return typeof value === 'string' && value !== '' ? value : undefined
-}
-
-/**
- * Compact serialized form of one detail payload (never throws): the store
- * bounds and de-duplicates with it, the detail view renders payloads that
- * have no dedicated renderer with it (constraint 29).
- */
-export function compactDetailValue(value: unknown): string {
-  try {
-    return JSON.stringify(value) ?? String(value)
-  } catch {
-    return String(value)
-  }
-}
-
-/**
- * Bound ONE live detail frame the same way the host's read does: over-budget
- * payloads become a MARKED cut, never a silent drop and never an unbounded
- * state object (constraint 29). Exported for the equivalence test pinning it
- * to the host's `boundSubagentDetailEntry` (tests/acp-view.spec.ts).
- */
-export function boundedDetailEntry(seq: number, update: unknown, liveSeq: number): LiveSubagentDetailEntry {
-  const text = compactDetailValue(update)
-  if (text.length <= SUBAGENT_RAW_MAX) return { seq, update, liveSeq }
-  const kind = update !== null && typeof update === 'object'
-    ? (update as { sessionUpdate?: unknown }).sessionUpdate
-    : undefined
-  const cut = text.length - SUBAGENT_RAW_MAX
-  return {
-    seq,
-    update: {
-      sessionUpdate: typeof kind === 'string' ? kind : 'unknown',
-      truncated: true,
-      text: `${text.slice(0, SUBAGENT_RAW_MAX)}\n… [truncated ${String(cut)} chars]`,
-    },
-    truncatedChars: cut,
-    liveSeq,
-  }
 }
 
 /** Append one entry to a worker's index, dropping the oldest past the per-worker cap. */
@@ -4385,3 +3162,56 @@ function usageOfBatch(items: ReadonlyArray<{ update: unknown }>): SessionView['u
 function trimBlocks(blocks: Block[]): void {
   if (blocks.length > MAX_BLOCKS) blocks.splice(0, blocks.length - MAX_BLOCKS)
 }
+
+// ---- Pure functions and types moved out of this file (split plan P3a) ----
+// Re-exported so every existing `./store.ts` import keeps resolving unchanged.
+
+export type { Block } from "./store/blocks.ts"
+export {
+  STATE_ONLY_UPDATES,
+  describeEvent,
+  foldUpdate,
+  jsonText,
+  replayChatRowFrames,
+  toolDetailsOf,
+  toolInputOf,
+  usageFromUpdate,
+} from "./store/blocks.ts"
+
+export type { ChatForkOutcome, ChatForkState } from "./store/fork.ts"
+export { forkStateOf } from "./store/fork.ts"
+
+export type { PendingPermission } from "./store/permission.ts"
+export { PERMISSION_DEADLINE_EXPIRED, deadlineRemainingLabel, permissionsForSession } from "./store/permission.ts"
+
+export { DEFAULT_KNOWN_PRESETS } from "./store/presets.ts"
+
+export type {
+  SaveBanner,
+  SaveBannerAction,
+  SaveBannerSource,
+  SaveGateInterruptTarget,
+  SaveGateOutcomeTransition,
+} from "./store/save-gate.ts"
+export {
+  composeSaveBanners,
+  saveGateAgentId,
+  saveGateInterruptTargets,
+  saveGateIsAvailable,
+  saveGateOutcomeForLabel,
+  saveGateOutcomeSuperseded,
+  saveGateTransitions,
+} from "./store/save-gate.ts"
+
+export type { AcpLogEntry, ChatRowFrame, ChatTranscript, RpcCall, UiState } from "./store/state.ts"
+
+export type { LiveSubagentDetailEntry, SubagentDetailState } from "./store/subagent.ts"
+export {
+  MAX_SUBAGENT_DETAIL_WORKERS,
+  SUBAGENT_RAW_MAX,
+  boundedDetailEntry,
+  compactDetailValue,
+  mergeSubagentSnapshot,
+  subagentKey,
+  subagentToolCallId,
+} from "./store/subagent.ts"

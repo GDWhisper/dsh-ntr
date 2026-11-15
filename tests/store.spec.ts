@@ -1,147 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
-import { AcpStore, composeSaveBanners, foldUpdate, forkStateOf, permissionsForSession, replayChatRowFrames, saveGateTransitions, skillRowsKey, subagentKey, SKILL_MENU_TTL_MS, type Block, type RpcCall, type SaveBanner, type SubagentDetailState } from '../src/client/store.ts'
+import { AcpStore, composeSaveBanners, permissionsForSession, replayChatRowFrames, skillRowsKey, subagentKey, SKILL_MENU_TTL_MS, type RpcCall, type SaveBanner, type SubagentDetailState } from '../src/client/store.ts'
 import { acpModeFromPresetEvent, stagedIsAcpMode } from '../src/client/acp-ui.tsx'
 import { resolveHostFork } from '../src/client/branch-action.tsx'
 import { releasedBannerVisible } from '../src/client/released-banner.tsx'
 import type { AcpAgentDef, AgentSkillEntry, ChatSessionView, DetectedAgentInfo, SubagentRecord } from '../src/protocol.ts'
-
-function fold(...updates: Array<Record<string, unknown>>): Block[] {
-  const blocks: Block[] = []
-  for (const update of updates) foldUpdate(blocks, update)
-  return blocks
-}
-
-describe('foldUpdate', () => {
-  it('merges same-messageId agent chunks and starts a new block on a new id', () => {
-    const blocks = fold(
-      { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'Hello ' } },
-      { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'world' } },
-      { sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'next' } },
-    )
-    expect(blocks).toEqual([
-      { kind: 'agent', messageId: 'm1', text: 'Hello world' },
-      { kind: 'agent', messageId: 'm2', text: 'next' },
-    ])
-  })
-
-  it('merges message-less chunks into the previous same-kind block', () => {
-    const blocks = fold(
-      { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'a' } },
-      { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'b' } },
-      { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'think' } },
-    )
-    expect(blocks.map(b => b.kind)).toEqual(['user', 'thought'])
-    expect(blocks[0]).toMatchObject({ text: 'ab' })
-  })
-
-  it('replaces blocks immutably: appended chunks swap the tail object, untouched rows keep their identity', () => {
-    // The ACP view memoizes rows on the block object; a mutated tail would
-    // look unchanged to React and the streamed text would never re-render.
-    const blocks: Block[] = []
-    foldUpdate(blocks, { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'one' } })
-    const firstRef = blocks[0]
-    foldUpdate(blocks, { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: ' two' } })
-    expect(blocks[0]).not.toBe(firstRef)
-    expect(blocks[0]).toMatchObject({ text: 'one two' })
-    foldUpdate(blocks, { sessionUpdate: 'agent_message_chunk', messageId: 'm2', content: { type: 'text', text: 'next' } })
-    expect(blocks[0]).toBe(blocks[0]) // the untouched earlier row keeps its identity
-    expect(blocks[0]).toMatchObject({ text: 'one two' })
-  })
-
-  it('answers whether anything changed, and keeps raw lazy until a view reads it', () => {
-    // Usage ticks fold to `false`: the batch then skips copying the blocks
-    // array entirely (the coalescing flush keys off this return value).
-    const blocks: Block[] = []
-    expect(foldUpdate(blocks, { sessionUpdate: 'usage_update', used: 1, size: 2 })).toBe(false)
-    expect(foldUpdate(blocks, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hi' } })).toBe(true)
-    expect(foldUpdate(blocks, { sessionUpdate: 'config_option_update', configOptions: [] })).toBe(false)
-
-    // `raw` is a lazy getter: folding a tool card costs no JSON, and reading
-    // it once caches the pretty-print for the view's later renders.
-    const toolBlocks: Block[] = []
-    foldUpdate(toolBlocks, { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'Bash', rawInput: '{"cmd":"ls"}' })
-    const card = toolBlocks[0] as Extract<Block, { kind: 'tool' }>
-    const raw = card.raw
-    expect(raw).toContain('"toolCallId": "t1"')
-    expect(card.raw).toBe(raw)
-  })
-
-  it('keeps a non-text chunk as its payload instead of a placeholder', () => {
-    const blocks = fold({ sessionUpdate: 'agent_message_chunk', content: { type: 'image', data: 'x', mimeType: 'image/png' } })
-    expect(blocks[0]).toMatchObject({ kind: 'agent' })
-    expect((blocks[0] as { text: string }).text).toContain('image/png')
-  })
-
-  it('reads a chunk whose content is an object or an array of blocks', () => {
-    const blocks = fold(
-      { sessionUpdate: 'agent_thought_chunk', content: { text: 'nested' } },
-      { sessionUpdate: 'agent_message_chunk', content: 'plain string' },
-      { sessionUpdate: 'agent_message_chunk', messageId: 'm', content: [{ text: 'a' }, { text: 'b' }] },
-    )
-    expect(blocks.map(block => (block as { text: string }).text)).toEqual(['nested', 'plain string', 'ab'])
-  })
-
-  it('creates and merges tool cards by toolCallId, including content lines and arguments', () => {
-    const blocks = fold(
-      { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'run', kind: 'execute', status: 'pending', rawInput: '{"cmd":"ls"}' },
-      { sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'in_progress' },
-      { sessionUpdate: 'tool_call_update', toolCallId: 't1', title: 'run ls', status: 'completed', content: [{ type: 'content', content: { type: 'text', text: 'file1\nfile2' } }] },
-    )
-    expect(blocks).toHaveLength(1)
-    expect(blocks[0]).toMatchObject({
-      kind: 'tool',
-      toolCallId: 't1',
-      title: 'run ls',
-      status: 'completed',
-      toolKind: 'execute',
-      lines: ['file1\nfile2'],
-      input: '{"cmd":"ls"}',
-    })
-  })
-
-  it('keeps diffs as text AND as a diff, and an unknown content kind as its JSON', () => {
-    const blocks = fold({
-      sessionUpdate: 'tool_call',
-      toolCallId: 't2',
-      title: 'edit',
-      content: [
-        { type: 'diff', path: '/w/a.ts', oldText: 'one\ntwo\n', newText: 'one\nTWO\n' },
-        { type: 'terminal', terminalId: 'term-7' },
-      ],
-    })
-    const card = blocks[0] as Extract<Block, { kind: 'tool' }>
-    expect(card.diffs).toEqual([{ path: '/w/a.ts', oldText: 'one\ntwo\n', newText: 'one\nTWO\n' }])
-    expect(card.lines.join('\n')).toContain('- two')
-    expect(card.lines.join('\n')).toContain('+ TWO')
-    expect((card.extras ?? []).join('\n')).toContain('term-7')
-    expect(card.raw).toContain('term-7')
-  })
-
-  it('materializes an update-only tool card when the original rolled out of the window', () => {
-    const blocks = fold({ sessionUpdate: 'tool_call_update', toolCallId: 'ghost', status: 'completed' })
-    expect(blocks[0]).toMatchObject({ kind: 'tool', toolCallId: 'ghost', status: 'completed' })
-  })
-
-  it('replaces the plan in place', () => {
-    const blocks = fold(
-      { sessionUpdate: 'plan', entries: [{ content: 'a', status: 'pending' }] },
-      { sessionUpdate: 'plan', entries: [{ content: 'a', status: 'completed' }] },
-    )
-    expect(blocks).toHaveLength(1)
-    expect(blocks[0]).toMatchObject({ kind: 'plan', entries: [{ content: 'a', status: 'completed' }] })
-  })
-
-  it('records a notification it has no card for as an event, and skips state-only frames', () => {
-    expect(fold({ sessionUpdate: 'usage_update', used: 1, size: 2 })).toEqual([])
-    expect(fold({ sessionUpdate: 'config_option_update', configOptions: [] })).toEqual([])
-    const events = fold(
-      { sessionUpdate: 'current_mode_update', currentModeId: 'plan' },
-      { sessionUpdate: 'something_new', payload: { deep: true } },
-    )
-    expect(events[0]).toMatchObject({ kind: 'event', event: 'current_mode_update', text: 'plan' })
-    expect((events[1] as { raw: string }).raw).toContain('"deep"')
-  })
-})
 
 describe('AcpStore agent management', () => {
   it('detectAgents queries endpoint and updates state', async () => {
@@ -2759,46 +2621,6 @@ describe('AcpStore plugin updates', () => {
 })
 
 /**
- * The NTR branch button's state machine (the message-actions plan §D4). Every
- * input is a fact someone else owns — the row's `fork` verdict is the host's,
- * `hostFork` is the runtime probe, `isTail` is the host's own DOM marker — so
- * the mapping is pure precedence, and `undefined` facts degrade CLOSED.
- */
-describe('forkStateOf (the NTR branch button state machine)', () => {
-  const readyRow: ChatSessionView = { agentId: 'pi', sessionId: 's1', fork: { supported: true } }
-
-  it('maps the six states in the precedence they render', () => {
-    expect(forkStateOf(readyRow, true, true)).toBe('ready')
-    // The runtime has no `sessions.fork` face: nothing can work, ever.
-    expect(forkStateOf(readyRow, false, true)).toBe('hostUnavailable')
-    // No row: the conversation's ACP session is parked (or was never read) —
-    // degrade to released, never to a click-through.
-    expect(forkStateOf(undefined, true, true)).toBe('released')
-    // A row from a host half that predates the fork field: unsupported.
-    expect(forkStateOf({ agentId: 'pi', sessionId: 's1' }, true, true)).toBe('unsupported')
-    // The host's verdict is the authority; its reason rides through.
-    expect(forkStateOf({ agentId: 'pi', sessionId: 's1', fork: { supported: false, reason: 'unsupported' } }, true, true)).toBe('unsupported')
-    expect(forkStateOf({ agentId: 'pi', sessionId: 's1', fork: { supported: false, reason: 'released' } }, true, true)).toBe('released')
-    expect(forkStateOf({ agentId: 'pi', sessionId: 's1', fork: { supported: false, reason: 'busy' } }, true, true)).toBe('busy')
-    // `false` with no reason: a host half that predates reasons (treat as
-    // unsupported, never as a click-through).
-    expect(forkStateOf({ agentId: 'pi', sessionId: 's1', fork: { supported: false } }, true, true)).toBe('unsupported')
-    // History rows gray out even when everything else is fine.
-    expect(forkStateOf(readyRow, true, false)).toBe('notTail')
-  })
-
-  it('answers busy from the live running flag even when the row says ready', () => {
-    // The row's own `running` only refreshes on a chat-list read; the
-    // SSE-driven live flag is the fresher fact, and a running turn is not
-    // forkable (the adopt refuses mid-turn parents too).
-    expect(forkStateOf(readyRow, true, true, true)).toBe('busy')
-    expect(forkStateOf(readyRow, true, true, false)).toBe('ready')
-    // An absent live flag is no fact at all: the row's ready stands.
-    expect(forkStateOf(readyRow, true, true, undefined)).toBe('ready')
-  })
-})
-
-/**
  * The branch click (the message-actions plan §D5): the HOST forks the DSH tree
  * first (the injected `forkHost` face), then the plugin adopts the ACP side via
  * `session/chat-fork-adopt`. A failure at either stage is flashed to the notice
@@ -3850,28 +3672,6 @@ describe('save banners', () => {
     expect(store.getSnapshot().saveBanners.some(row => row.key === 'save-succeeded')).toBe(true)
     store.dismissBanner('save-succeeded', at)
     expect(store.getSnapshot().saveBanners.some(row => row.key === 'save-succeeded')).toBe(false)
-  })
-
-  it('compares gate snapshots by label and terminal status, not by a browser clock', () => {
-    const idle = { canSave: true, activeTurns: 0, activeSessions: [], pending: [], timeoutMs: 600_000 }
-    const pending = {
-      ...idle,
-      canSave: false,
-      activeTurns: 1,
-      pending: [{ id: 'save-1', label: 'agent-save:pi', queuedAt: 1 }],
-    }
-    const settled = {
-      ...idle,
-      lastOutcomes: { 'agent-save:pi': { at: 5, status: 'failed' as const, label: 'agent-save:pi', message: 'x' } },
-    }
-    const first = saveGateTransitions(undefined, pending)
-    expect(first.addedPending).toHaveLength(1)
-    expect(first.outcomes).toEqual([])
-    const second = saveGateTransitions(pending, settled)
-    expect(second.outcomes).toEqual([
-      { label: 'agent-save:pi', outcome: settled.lastOutcomes['agent-save:pi'], wasPending: true, isPending: false },
-    ])
-    expect(saveGateTransitions(settled, settled).outcomes).toEqual([])
   })
 
   it('does not resync or probe a save the host cancelled because the agent vanished', async () => {

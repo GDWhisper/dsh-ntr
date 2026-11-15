@@ -33,7 +33,7 @@
 
 ### 配置、目录与状态（7–9、21、27、28、32）
 
-7. **agent 定义必须过 `validateAgentDef` / `saveAgent`**：严格校验 command / id / args，自动施加 `allowedCwdRoots`；默认工作区取 `defaultAgentWorkspace()`，**严禁把 `process.cwd()` 塞进 roots**（宿主启动目录可能是 `$HOME`）。预设 `AGENT_PRESETS`（bridge/state-paths.ts）与 `DEFAULT_KNOWN_PRESETS`（client/store.ts）是手拷贝，必须同步。→ [state.md §2](./AGENTS/state.md)
+7. **agent 定义必须过 `validateAgentDef` / `saveAgent`**：严格校验 command / id / args，自动施加 `allowedCwdRoots`；默认工作区取 `defaultAgentWorkspace()`，**严禁把 `process.cwd()` 塞进 roots**（宿主启动目录可能是 `$HOME`）。预设 `AGENT_PRESETS`（bridge/state-paths.ts）与 `DEFAULT_KNOWN_PRESETS`（client/store/presets.ts）是手拷贝，必须同步。→ [state.md §2](./AGENTS/state.md)
 8. **【旧隔离前提已退役】ACP 模型不进 DSH 模型目录，模型面只走 `agent/catalog`**：`listModels('acp')` 返回空。`agent/catalog` 纯内存、**绝不 spawn**；探测只允许四种有手势来源（设置页按钮或模型菜单「刷新目录」/ 该 agent 自己的 session new·load / 思考卡片的「获取」按钮 / 旧缓存被顺带修好）；变体按需、`exposedModels` 只做可见性过滤、目录变化必须广播 `catalog/updated`。→ [state.md §4](./AGENTS/state.md)
 9. **可见性筛选走轻量 RPC**：`agent/set-exposed-models` / `set-auto-discover-models` 原地改、不重启进程（`agent/save` 会杀全部活动会话）；自动发现只追加「相对上一份目录新增」的模型；任何变更都广播 `agent/exposure`。→ [state.md §5](./AGENTS/state.md)
 21. **NTR preset 只能由 bundle patch 声明**：`package.json` 的 `dsh.bundle.patch` + `presets/acp/acp.patch.yml`。**严禁**再往 `~/.dsh/.agent-presets/` 复制文件，**严禁**新增「安装 / 修复 preset」入口；声明内插件名按 profile 基准解析，本地插件只能经包名子路径 `dsh-ntr/acp-guard` 引用；面板读宿主 roster。→ [host.md §2](./AGENTS/host.md)
@@ -109,7 +109,7 @@
 
 - `tests/impl/`：宿主端纯逻辑单测按 `src/impl/` 的簇同名镜像（`validate.spec.ts` / `catalog.spec.ts` / `paths.spec.ts` / `dispatch.spec.ts` …，共享 fake 在 `harness.ts`），无子进程，秒级返回。
 - `register.spec.ts`：Cordis 上下文注册，用 `fakeCtx()` 模拟宿主。
-- `store.spec.ts`：前端状态机与消息块折叠。
+- `store.spec.ts`：前端状态机（`AcpStore` 类）；纯函数 / 类型的用例按 `src/client/store/` 的簇同名镜像进 `tests/store/`（`blocks.spec.ts` / `fork.spec.ts` / `save-gate.spec.ts` …），describe 标题与用例数随簇迁移不变。
 - `bridge.spec.ts` + `tests/bridge/*.spec.ts`：集成测试，用真实子进程跑 `tests/mock-agent.mjs` 验证 stdio ACP 全链路；共享 harness 在 `tests/bridge/harness.ts`。
 - `acp-view.spec.ts`：浏览器半区纯函数（diff / 空状态 / codec / 路径等价 / 审批期限事实）。
 - `session-controls.spec.ts`：composer 芯片与菜单**说了什么**（`agentBaseChip` / `describeRoute` / `menuFor`）。
