@@ -11,6 +11,7 @@ import {
   type ClientConnection,
   type ContentBlock,
   type InitializeResponse,
+  type McpServer,
   type PermissionOption,
   type RequestPermissionResponse,
   type SessionNotification,
@@ -76,7 +77,7 @@ import {
 import type { LiveSession } from './turn-stream.ts'
 import { assertLifecycle, beginTurnSlot, freshSessionFacts, hasPromptSlot, isSettling, lifecycleOf, markClosed, markLive, markParked, openTurnSlot, releasePromptSlot, settleTurnSlot } from './session-lifecycle.ts'
 import { permissionAskReason, snapshot } from './shape.ts'
-import { toAcpMcpServers } from './mcp.ts'
+import { sessionMcpServers, toAcpMcpServers } from './mcp.ts'
 import { DEFAULT_TUNING } from './tuning.ts'
 import {
   FS_MAX_READ_BYTES,
@@ -87,6 +88,7 @@ import {
   STALE_START_KILL_BUDGET_MS,
   STDERR_TAIL_LINES,
   TEST_EXIT_GRACE_MS,
+  fsRequestError,
 } from './agent-bridge-limits.ts'
 export { SHUTDOWN_BUDGET_MS, TEST_EXIT_GRACE_MS } from './agent-bridge-limits.ts'
 
@@ -285,6 +287,8 @@ export class AgentBridge {
      * agents (see `SubagentService.trackAgyDispatch`).
      */
     private readonly onSessionAgyDispatch?: (session: LiveSession, update: SessionUpdate) => void,
+    /** Live `dsh-skills` switch, read per request (see `mcpServersForSession`); absent → off. */
+    private readonly skillsMcpEnabled?: () => boolean,
   ) {
     const merged = { ...DEFAULT_TUNING, ...tuning }
     this.startupTimeoutMs = merged.startupTimeoutMs
@@ -451,7 +455,7 @@ export class AgentBridge {
    * @returns whether the slot was claimed, and why not when it was not.
    */
   async claimTurn(session: LiveSession): Promise<{ ok: true } | { ok: false; reason: 'busy' | 'unsettled' }> {
-    if (this.promptSlotHeld(session)) return { ok: false, reason: 'busy' }
+    if (hasPromptSlot(session)) return { ok: false, reason: 'busy' }
     const pending = session.turnSlot?.promise
     if (pending === undefined) return { ok: true }
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -471,13 +475,8 @@ export class AgentBridge {
     if (isSettling(session)) return { ok: false, reason: 'unsettled' }
     // Re-checked after the wait: another turn may have claimed the slot while
     // this one was waiting on the gate.
-    if (this.promptSlotHeld(session)) return { ok: false, reason: 'busy' }
+    if (hasPromptSlot(session)) return { ok: false, reason: 'busy' }
     return { ok: true }
-  }
-
-  /** Whether a turn currently holds the agent prompt slot (see `turnSlot`). */
-  private promptSlotHeld(session: LiveSession): boolean {
-    return hasPromptSlot(session)
   }
 
   /**
@@ -1008,13 +1007,18 @@ export class AgentBridge {
     }
   }
 
+  /** Every session-creating request sends this ONE list, read at request time (AGENTS.md rule 32). */
+  private mcpServersForSession(): McpServer[] {
+    return toAcpMcpServers(sessionMcpServers(this.def.mcpServers, this.skillsMcpEnabled?.() ?? false))
+  }
+
   /** The body of {@link createSession}; the caller keeps `pendingCreates` for it. */
   private async openSession(cwd: string | undefined, extraRoots: readonly string[]): Promise<LiveSession> {
     const conn = this.conn
     if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
     const resolved = resolveSessionCwd(this.def, cwd, p => realpathSync(p), extraRoots)
     const result = await this.withStartupTimeout(
-      conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: toAcpMcpServers(this.def.mcpServers) }),
+      conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: this.mcpServersForSession() }),
       'session/new',
     )
     // An empty `configOptions` answer is a non-answer — see `usableConfigOptions`.
@@ -1085,7 +1089,7 @@ export class AgentBridge {
       if (conn === undefined) throw new AcpError('agent_unreachable', 'acp: connection is not open')
       const resolved = resolveSessionCwd(this.def, undefined, p => realpathSync(p))
       const result = await this.withStartupTimeout(
-        conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: toAcpMcpServers(this.def.mcpServers) }),
+        conn.agent.request(methods.agent.session.new, { cwd: resolved, mcpServers: this.mcpServersForSession() }),
         'session/new',
       )
       probeSession = result.sessionId
@@ -1151,7 +1155,7 @@ export class AgentBridge {
         conn.agent.request(methods.agent.session.fork, {
           sessionId: parent.acpSessionId,
           cwd: resolved,
-          mcpServers: toAcpMcpServers(this.def.mcpServers),
+          mcpServers: this.mcpServersForSession(),
         }),
         'session/fork',
       )
@@ -1454,7 +1458,7 @@ export class AgentBridge {
       // too — a parked session must not carry a stuck window into its retry.
       session.loadingHistory = true
       const result = await this.withStartupTimeout(
-        conn.agent.request(methods.agent.session.load, { sessionId: session.acpSessionId, cwd: resolved, mcpServers: toAcpMcpServers(this.def.mcpServers) }),
+        conn.agent.request(methods.agent.session.load, { sessionId: session.acpSessionId, cwd: resolved, mcpServers: this.mcpServersForSession() }),
         'session/load',
       ).finally(() => { session.loadingHistory = false })
       if (this.onCatalog !== undefined && usableConfigOptions(result.configOptions)) {
@@ -2201,9 +2205,4 @@ export class AgentBridge {
         break
     }
   }
-}
-
-/** A JSON-RPC internal error for fs requests: actionable text in `message`, mirrored into `data` (see AGENTS.md rule 5). */
-function fsRequestError(message: string): RequestError {
-  return new RequestError(-32603, message, { message })
 }

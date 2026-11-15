@@ -4,6 +4,8 @@
  * constants — to keep that file inside the size ratchet.
  */
 
+import { RequestError } from '@agentclientprotocol/sdk'
+
 export const STDERR_TAIL_LINES = 40
 /** Single fs/read_text_file answer cap — agents reading huge files must page via `line`/`limit`. */
 export const FS_MAX_READ_BYTES = 2 * 1024 * 1024
@@ -49,3 +51,13 @@ export const TEST_EXIT_GRACE_MS = 250
  * whole disposal, escalation included, never exceeds 4s.
  */
 export const SHUTDOWN_BUDGET_MS = 4_000
+
+/**
+ * A JSON-RPC internal error for `fs/read_text_file` / `fs/write_text_file`
+ * answers: actionable text in `message`, mirrored into `data` so an agent that
+ * only logs `error.data` still sees WHY the request was refused (AGENTS.md rule
+ * 5). Moved here with the other `agent-bridge.ts` extras.
+ */
+export function fsRequestError(message: string): RequestError {
+  return new RequestError(-32603, message, { message })
+}

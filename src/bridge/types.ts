@@ -286,6 +286,16 @@ export interface BridgeTuning {
    * Only a deployment tuning key (no settings control).
    */
   backgroundHoldWorkerPhase?: boolean
+  /**
+   * Whether every session-creating request also declares the built-in
+   * `dsh-skills` MCP server (see `sessionMcpServers` in `bridge/mcp.ts`).
+   *
+   * Read at REQUEST time through `AgentBridge`'s seam, never copied into a
+   * bridge: one live tuning object, so a rewrite reaches every existing bridge
+   * (and every process of a multi-process agent) without a restart, which is
+   * what makes the setting hot. Default `false`.
+   */
+  skillsMcpEnabled?: boolean
 }
 
 /**
