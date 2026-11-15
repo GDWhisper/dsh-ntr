@@ -1,6 +1,6 @@
 # 巨型文件拆分计划（第二轮：三件套 / 设置页 / 协议覆盖 / UI 面）
 
-**状态**：**P0 / P1 已完成，P2 未开始**。承接 [bridge-split.md](./archive/bridge-split.md)（第一轮，已完成）的纪律与模式。
+**状态**：**P0 / P1 已完成，P2 进行中（提交 1/3 落地）**。承接 [bridge-split.md](./archive/bridge-split.md)（第一轮，已完成）的纪律与模式。
 **一句话**：把行数基线里**仍在增长**的存量文件按领域簇拆到 ≤1000 行并删除基线条目；功能面已封闭的文件继续锁着不动。
 
 > 写作约定：代码位置一律用「文件 + 符号名」，不写行号。**本文不锁定任何文件的当前行数**——正式执行前代码仍会变动，行数与符号清单在每个子步开工时以 HEAD 实测重新核对；本文锁定的只有「领域簇划分、归属、顺序、停止条件」。索引登记进 [docs/README.md](../README.md)，待办登记进 [docs/todo.md](../todo.md)。
@@ -95,6 +95,10 @@ impl 几乎全是纯函数 + 小类 + 一个自由函数分发器，按领域机
 - `src/impl.ts` 保留为桶。`tests/impl.spec.ts` 按同一领域映射拆进 `tests/impl/`，共享 helper 独立成 harness 文件；用例标题与数量不变。
 - 风险：`paths.ts` 与浏览器手拷贝 `isAbsolutePathLike` 的等价测试必须保持绿；`dispatch.ts` 的校验顺序与错误码逐字保留；约束 5（`error.data` 优先）所在函数不丢。
 - 子步建议：先纯函数簇（validate / command-line / paths / env / catalog / content / image / forward / permission / skills / session-log），再 runtime，最后 dispatch；每个簇一次提交一次审核。
+
+**落地记录**（三个提交）：
+
+1. **纯函数簇**：落 13 个文件——上表十二个之外，`image.ts` 一次拆超限（1058 行），再分 `attachments.ts`（附件定位：`normalizeFileUrlToPath` / `resolveImageAttachmentFromContext`，另含簇内导出 `readImageFileFromContext`）与 `image.ts`（MIME / 魔数 / data URL / `resolveImageContent`）。`PendingPermissionFields` / `PendingPermissionView` 是帧构造器的入参，随 `permission.ts` 走；`PendingPermission` 只属账本，随 `runtime.ts` 走，于是两文件之间只剩 `import type`、无反向依赖。`STABLE_SEMVER` 由 `validate.ts` 簇内导出（桶不导出），等 dispatch 迁出时随唯一使用者走。此提交桶仍是 runtime + dispatch 两段原样内联，基线条目 `src/impl.ts` 4182 → 1026；测试未动。
 
 ## 6. P3：`src/client/store.ts` → `src/client/store/` + `tests/store.spec.ts` → `tests/store/`
 
