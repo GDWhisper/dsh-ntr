@@ -8,7 +8,6 @@
   "src/client/session-controls.tsx": 1120,
   "src/client/store.ts": 4387,
   "src/impl.ts": 4182,
-  "src/protocol.ts": 1644,
   "tests/acp-view.spec.ts": 1645,
   "tests/bridge.spec.ts": 1186,
   "tests/impl.spec.ts": 3445,

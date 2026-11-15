@@ -94,12 +94,12 @@
 - **禁止修改 [`lib/`](./lib)**：构建产物，`npm run build` 全量覆盖，CI 自己 build，不提交。
 - **禁止在 [`tsdown.config.mjs`](./tsdown.config.mjs) 取消 external**：`react`、`react-dom`、`react/jsx-runtime`、`@deepseek-ai/cordis`、`@deepseek-ai/dsh-client-ui-slots` 必须由运行时提供，打包进去会破坏 context。
 - **子进程环境按「同级 agent」处理**：默认继承完整宿主环境，再由 agent 自己的 `env` 按键覆盖（`src/impl.ts` · `childEnv`）。**严禁**重新引入隐式凭据过滤——依赖环境变量认证的 agent（如 pi 的自定义供应商）会静默丢掉整个供应商；将来要最小权限必须做成显式 per-agent 开关。
-- **模块纯度**：`src/protocol.ts` 是纯类型契约与纯常量 / 纯函数，**严禁**引入 Node 专属库、有副作用的运行时代码或 ACP SDK 运行时值；`src/impl.ts` **严禁** Node 内置模块与 SDK，必须由 `tests/impl.spec.ts` 覆盖；`src/client/` **严禁** Node 内置模块或 ACP SDK，通信只走 RPC / SSE。
+- **模块纯度**：`src/protocol.ts` 是契约桶（只有再导出），契约本体按簇在 `src/protocol/`，两者都只准纯类型 / 纯常量 / 纯函数，**严禁**引入 Node 专属库、有副作用的运行时代码或 ACP SDK 运行时值；`src/impl.ts` **严禁** Node 内置模块与 SDK，必须由 `tests/impl.spec.ts` 覆盖；`src/client/` **严禁** Node 内置模块或 ACP SDK，通信只走 RPC / SSE。
 - **文件行数棘轮门禁**：`npm run check:size`（prepack 第一道）硬卡——新文件 ≤1000 行；存量超限文件锁在 [file-size-baseline.json](./scripts/file-size-baseline.json) 的当前行数，只许缩不许长（缩到 ≤1000 即删条目），**严禁**新增条目或抬线；单文件超 500 行或单次会话净增 200 行，收尾必须向用户报告行数与增长原因。
 
 ## 常见任务配方
 
-- **新增 / 修改 ACP RPC**：`src/protocol.ts` 加契约 → `src/impl.ts` 加进 `AcpManager` 并在 `dispatchRpc` 路由 + 校验 → `src/bridge/` 实现调度 → `src/client/store.ts` 加调用并测状态流转。验证：`npx vitest run tests/impl.spec.ts tests/store.spec.ts`。
+- **新增 / 修改 ACP RPC**：`src/protocol/` 对应簇加契约（`src/protocol.ts` 只是桶，新符号要同时补进它的再导出块）→ `src/impl.ts` 加进 `AcpManager` 并在 `dispatchRpc` 路由 + 校验 → `src/bridge/` 实现调度 → `src/client/store.ts` 加调用并测状态流转。验证：`npx vitest run tests/impl.spec.ts tests/store.spec.ts`。
 - **改 UI 与挂载槽位**：`panel.tsx` / `session-controls.tsx` / `acp-view.tsx` / `permission-dock.tsx` 改组件 → `src/client/index.tsx` 经 `ctx.slots.inject` 管理注册（槽位清单见文件头注释）→ `npx tsdown` 验证 bundle。
 - **扩展配置字段**：`AcpAgentDef` / `AcpPluginConfig`（protocol.ts）→ `validateAgentDef`（会重建对象，新字段必须纳入且 optional）→ `AgentSavePayload` + panel 的 `initialForm` / `buildPayload` / `payloadEquals` 三处同步 → `cordis.patch.yml`。**宿主只校验不改形状**，否则设置页永远判脏、每次保存都重启 agent。
 

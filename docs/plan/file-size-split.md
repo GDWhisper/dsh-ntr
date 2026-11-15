@@ -1,6 +1,6 @@
 # 巨型文件拆分计划（第二轮：三件套 / 设置页 / 协议覆盖 / UI 面）
 
-**状态**：**未开始，计划待执行**。承接 [bridge-split.md](./archive/bridge-split.md)（第一轮，已完成）的纪律与模式。
+**状态**：**P0 / P1 已完成，P2 未开始**。承接 [bridge-split.md](./archive/bridge-split.md)（第一轮，已完成）的纪律与模式。
 **一句话**：把行数基线里**仍在增长**的存量文件按领域簇拆到 ≤1000 行并删除基线条目；功能面已封闭的文件继续锁着不动。
 
 > 写作约定：代码位置一律用「文件 + 符号名」，不写行号。**本文不锁定任何文件的当前行数**——正式执行前代码仍会变动，行数与符号清单在每个子步开工时以 HEAD 实测重新核对；本文锁定的只有「领域簇划分、归属、顺序、停止条件」。索引登记进 [docs/README.md](../README.md)，待办登记进 [docs/todo.md](../todo.md)。
@@ -47,6 +47,8 @@
 - 只改 JSON，不改代码；`npm run check:size` 通过后单独提交 `chore(acp):`。
 - 此后每个子步收尾都重复本动作（约束 2.1），不再单列阶段。
 
+**执行结果**：6 条按实测收紧（`src/bridge/agent-bridge.ts` / `src/bridge/turn-stream.ts` / `src/client/index.tsx` / `src/client/session-controls.tsx` / `src/protocol.ts` / `tests/mock-agent.mjs`），其余条目实测 = 锁定值；没有文件降到 ≤1000，故未删条目（`src/protocol.ts` 的条目在 P1 收尾时删除）。
+
 ## 4. P1：`src/protocol.ts` → `src/protocol/`
 
 纯类型最安全，先建立「目录 + 桶」约定。建议簇（开工时以导出面盘点为准）：
@@ -66,6 +68,8 @@
 - `src/protocol.ts` 保留为桶；文件内现有 `export type { … }` 再导出块逐字保留去向。
 - 风险：类型循环引用（`import type` 允许成环，但运行时常量不行）；`pluginReleaseUrl` 等纯函数随 `update.ts` 走，保持纯度。
 - 验收：tsc 全绿即基本成立；导出面逐一核对；基线删条目。
+
+**落地记录**：按导出面盘点定成 11 个文件——上表九个之外，`rpc.ts` 装不下的一半（模型目录的 `AcpAgentCatalog*` / `AgentCatalog*`）落 `catalog.ts`，LLM adapter 契约（`Llm*` / `StreamChunk` / `Generate*` / `LlmAdapterLike`）落 `llm.ts`；`AcpConversationChoice` 随 `session/chat-list` 的 `choice` 进 `chat.ts`，`PermissionTimeoutMode` 与审批时限 / 空闲释放 / 标签光晕 / 标题前缀一起进 `ui.ts`。子文件之间只有 `import type`，运行时常量零交叉，桶是唯一对外入口。
 
 ## 5. P2：`src/impl.ts` → `src/impl/` + `tests/impl.spec.ts` → `tests/impl/`
 

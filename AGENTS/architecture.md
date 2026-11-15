@@ -176,7 +176,7 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 | 位置 | 是什么 |
 |---|---|
 | `src/index.ts` | Cordis 插件宿主入口：挂载 `/acp` RPC 通道与 `/api/acp/stream` SSE 路由，接线可选宿主服务 |
-| `src/protocol.ts` | 前后端共享契约（纯类型）；严禁 Node 专属库或运行时代码 |
+| `src/protocol.ts` | 前后端共享契约的桶：只有再导出，不含声明；契约本体按簇在 `src/protocol/`（`agent-def` / `views` / `events` / `save-gate` / `chat` / `rpc` / `catalog` / `llm` / `update` / `skills` / `ui`），纯类型与常量，严禁 Node 专属库或运行时代码 |
 | `src/protocol-subagent.ts` | 子代理记录与详情的契约半区（`SubagentRecord` / `SubagentDetailEntry` / `SubagentDetailPayload` / 上限常量）：纯类型与常量，由 `protocol.ts` 重导出 |
 | `src/subagent-records.ts` | 子代理记录的归一与封顶（`normalizeSubagentRecord` / `capSubagentRecords` / `subagentToolCallId` / `boundSubagentDetailEntry`）：纯函数，由 `impl.ts` 重导出 |
 | `src/usage.ts` | `usage_update` 样本 → 上下文读数（`mergeUsageSample`）：可读样本替换读数，`size <= 0` 的成本帧（CodeBuddy 后台 team member）只并 `cost`、保留上次 `used/size`；纯函数，宿主 `AgentBridge` 与测试共用 |
