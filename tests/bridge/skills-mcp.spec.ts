@@ -19,7 +19,9 @@ import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { afterAll, describe, expect, it } from 'vitest'
 import { BridgeManager } from '../../src/bridge.ts'
+import { AgentBridge } from '../../src/bridge/agent-bridge.ts'
 import { pluginStateDir } from '../../src/bridge/state-paths.ts'
+import { DEFAULT_TUNING } from '../../src/bridge/tuning.ts'
 import type { BridgeTuning } from '../../src/bridge/types.ts'
 import { EventHub } from '../../src/impl.ts'
 import type { AcpAgentDef, AcpMcpServerDef } from '../../src/protocol.ts'
@@ -227,4 +229,17 @@ describe('dsh-skills MCP on the four session-creating entries', () => {
       await h.close()
     }
   }, 30_000)
+
+  it('a bare bridge without the seam stays off even when tuning says on', () => {
+    const def = { ...mockDef, mcpServers: USER_SERVERS }
+    const tuningOn = { ...DEFAULT_TUNING, skillsMcpEnabled: true }
+    const names = (bridge: AgentBridge) =>
+      (bridge as unknown as { mcpServersForSession(): Array<{ name: string }> }).mcpServersForSession().map(server => server.name)
+    // No seam (a direct consumer / legacy construction point): the flag is OFF
+    // regardless of tuning — the seam is the only truth, never a copied field.
+    const bare = new AgentBridge(def, new EventHub(), 500, () => {}, undefined, undefined, tuningOn)
+    expect(names(bare)).toEqual(['local', 'remote'])
+    const wired = new AgentBridge(def, new EventHub(), 500, () => {}, undefined, undefined, tuningOn, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => true)
+    expect(names(wired)).toEqual(['local', 'remote', 'dsh-skills'])
+  })
 })
