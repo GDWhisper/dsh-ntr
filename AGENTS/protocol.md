@@ -23,7 +23,7 @@
 
 **四处必须是同一份列表**：实测 codebuddy 把这些服务器放进 agent **进程级**的作用域，而不是会话级 —— 同进程里先建一个带注入的会话、再建一个 `mcpServers: []` 的会话，后者会把作用域换成空的，前者的 MCP 工具随之消失（agent 日志 `serverManager.delete("injected")`）。目录探测恰恰复用同一条连接建会话，所以探测若发空列表，用户在设置页点一次「检测可用模型」就会静默剥掉正在聊的会话的 MCP 工具。
 
-线格式由 `toAcpMcpServers` 一次性转换：**stdio 那条不带 `type`**（带了 agent 会静默丢弃），http/sse 带 `type`；`env` / `headers` 是 `[{name,value}]` 数组。四个入口传的都是 `AgentBridge.mcpServersForSession` 的产物——`sessionMcpServers`（`src/bridge/mcp.ts`）合并用户配置与内置 `dsh-skills` 后的新数组，开关在**请求时**经活读取接缝取值（见 [state.md §2](./state.md) / [state.md §2.2](./state.md)）。
+线格式由 `toAcpMcpServers` 一次性转换：**stdio 那条不带 `type`**（带了 agent 会静默丢弃），http/sse 带 `type`；`env` / `headers` 是 `[{name,value}]` 数组。四个入口传的都是 `AgentBridge.mcpServersForSession` 的产物——`sessionMcpServers`（`src/bridge/mcp.ts`）合并用户配置与内置 `dsh-skills` 后的新数组，开关在**请求时**经活读取接缝取值（总开关半；per-agent 半在同一次读里从活 def 取 `skillsMcpEnabled !== false`，见 [state.md §2](./state.md) / [state.md §2.2](./state.md)）。
 
 ### 内置 `dsh-skills` MCP（进程归属与懒加载语义）
 
