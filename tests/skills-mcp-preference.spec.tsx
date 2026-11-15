@@ -18,8 +18,8 @@ import { createPanelFixture } from './panel-fixture.ts'
 
 afterEach(cleanup)
 
-const EXPLANATION = '让 agent 通过只读 MCP 列出并读取 DSH 技能。'
-const DETAIL = '仅读取 DSH 技能目录，不桥接宿主工具。首次调用前不扫描技能；agent 仍可能随会话启动并保留 MCP 进程，开关仅影响后续建会话。'
+const EXPLANATION = '让 agent 查阅你的 DSH 技能文档（只读）。'
+const DETAIL = '开启后，agent 可以查阅你的 DSH 技能文档：只读、不改文件，也不会获得 DSH 的其他能力。技能内容等 agent 用到时才读取，平时不扫描。开关只对新对话生效；旧对话里已在运行的辅助进程，不保证随关闭立刻退出。'
 
 /** Only the write surface this component uses; nothing else is reached. */
 function fakeStore(enabled?: boolean) {

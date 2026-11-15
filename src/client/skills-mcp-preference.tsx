@@ -17,14 +17,14 @@ import type { AcpStore, UiState } from './store.ts'
 
 /** The one-line row copy (fixed wording, see the plan). */
 const EXPLANATION = [
-  '让 agent 通过只读 MCP 列出并读取 DSH 技能。',
-  'Let agents list and read DSH skills through a read-only MCP.',
+  '让 agent 查阅你的 DSH 技能文档（只读）。',
+  'Let agents read your DSH skill documents (read-only).',
 ] as const
 
 /** The info tooltip: what it reads, and when the switch takes effect. */
 const DETAIL = [
-  '仅读取 DSH 技能目录，不桥接宿主工具。首次调用前不扫描技能；agent 仍可能随会话启动并保留 MCP 进程，开关仅影响后续建会话。',
-  'Reads only the DSH skills directory; host tools are never bridged. Skills are not scanned before the first call; the agent may still start with a session and keep the MCP process, and the switch only affects sessions created afterwards.',
+  '开启后，agent 可以查阅你的 DSH 技能文档：只读、不改文件，也不会获得 DSH 的其他能力。技能内容等 agent 用到时才读取，平时不扫描。开关只对新对话生效；旧对话里已在运行的辅助进程，不保证随关闭立刻退出。',
+  'When on, agents can read your DSH skill documents: read-only, no file changes, and no other DSH abilities. Content is read only when an agent asks for it; nothing is scanned up front. The switch applies to new conversations; a helper process already running in an older one may not exit the moment you turn it off.',
 ] as const
 
 export function SkillsMcpPreference(props: { acp: AcpStore; ui: UiState }) {
