@@ -249,6 +249,11 @@ export class PersistenceService {
         ...(persistedSettings.defaultAgentId === undefined ? {} : { defaultAgentId: persistedSettings.defaultAgentId }),
         tagHalo: persistedSettings.tagHalo,
         sessionTitlePrefix: persistedSettings.sessionTitlePrefix,
+        // The built-in skills MCP switch: absent while never written, so a
+        // deployment that never touched it keeps its state file unchanged.
+        ...(persistedSettings.skillsMcpEnabled === undefined
+          ? {}
+          : { skillsMcpEnabled: persistedSettings.skillsMcpEnabled }),
         agents,
         // The settings page's approval deadlines. Absent while none was ever
         // written, so a fresh deployment's state file stays exactly as it was.

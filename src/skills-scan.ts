@@ -20,7 +20,7 @@
  * `agent/skills` dispatch path. Worst case (every cap maxed: 5000 skills × a
  * 64 KiB head read + 2000-entry directory listings) would stall the host event
  * loop for a noticeable moment — real skill counts are tens, so a scan costs
- * milliseconds, and the TTL cache in `BridgeManager.agentSkills` keeps the
+ * milliseconds, and the TTL cache in `SkillsService.agentSkills` keeps the
  * repeat cost at zero.
  */
 

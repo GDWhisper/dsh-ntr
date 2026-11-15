@@ -74,6 +74,15 @@ export interface SettingsHost {
   replaceTuning(next: Required<BridgeTuning>): void
   /** Rewrite `agents.json` after a persisted preference changed. */
   persistAgents(): void
+  /**
+   * Rewrite `agents.json` and FAIL when the file cannot be written
+   * (`PersistenceService.persistAgents(true)`).
+   *
+   * The tolerant {@link persistAgents} is right for a preference a boot can
+   * re-derive; a value the user is WAITING on must not answer "saved" after a
+   * silent write failure — the next boot would load the old value back.
+   */
+  persistAgentsStrict(): void
 }
 
 /** The settings half of the `agents.json` payload, in its persisted key order. */
@@ -81,6 +90,11 @@ export interface PersistedSettings {
   defaultAgentId?: string
   tagHalo: AcpTagHalo
   sessionTitlePrefix: boolean
+  /**
+   * The built-in `dsh-skills` MCP switch. Absent while the user never wrote it,
+   * so a fresh deployment's state file stays exactly what it was.
+   */
+  skillsMcpEnabled?: boolean
   approvalDeadlines?: ApprovalDeadlinePatch
   idleRelease?: { idleTimeoutMs: number }
 }
@@ -98,6 +112,19 @@ export class SettingsService {
    * so flipping the switch never rewrites existing rows.
    */
   private sessionTitlePrefixEnabled = DEFAULT_SESSION_TITLE_PREFIX
+  /**
+   * The built-in `dsh-skills` MCP switch (persisted; see `persistedSettings`).
+   * `undefined` means the user never wrote it, which runs as OFF — the same
+   * value the fresh-deployment default has, kept apart only so the state file
+   * stays absent-until-written like every other key here.
+   *
+   * The switch reaches the agent through the shared tuning, read at REQUEST
+   * time (see `AgentBridge`'s seam): turning it on affects the NEXT
+   * `session/new` / `session/load` / `session/fork` / probe request only. The
+   * agent owns the MCP process, so an already running one is not promised to
+   * stop when the switch goes off.
+   */
+  private skillsMcpEnabledSetting?: boolean
   /**
    * What `cordis.patch.yml` asked for — ONLY if it actually named the key.
    * This is the deployment baseline, kept apart from {@link deadlineOverride}
@@ -298,6 +325,57 @@ export class SettingsService {
     // same persisted-with-the-registry story as every other settings toggle.
     this.sessionTitlePrefixEnabled = value === true
     this.host.persistAgents()
+  }
+
+  /** Whether the built-in `dsh-skills` MCP server is offered to agents (default off). */
+  skillsMcpEnabled(): boolean {
+    return this.skillsMcpEnabledSetting === true
+  }
+
+  /**
+   * Write the built-in skills MCP switch.
+   *
+   * STRICTLY persisted first, then hot-applied: the user is waiting on this
+   * click, so a missing state path or a failed write must fail the request
+   * (`persist_failed`) instead of leaving "disk says off, tuning says on".
+   * The in-memory preference is written before the file (that is what the file
+   * serializes) and restored on failure, so no split state survives a throw.
+   *
+   * Nothing else happens on success: no `agent/save`, no process restart, no
+   * interruption of a running turn — see `applySkillsMcpTuning`.
+   */
+  async setSkillsMcpEnabled(value: boolean): Promise<void> {
+    if (typeof value !== 'boolean') {
+      throw new AcpError('bad_payload', 'acp: skillsMcpEnabled must be a boolean')
+    }
+    const previous = this.skillsMcpEnabledSetting
+    this.skillsMcpEnabledSetting = value
+    try {
+      this.host.persistAgentsStrict()
+    } catch (error) {
+      // The write did not land: the value that runs stays the old one, so the
+      // browser's rollback and the host agree.
+      this.skillsMcpEnabledSetting = previous
+      throw error
+    }
+    this.applySkillsMcpTuning()
+  }
+
+  /**
+   * Push the switch into the shared tuning object the bridges read at request
+   * time.
+   *
+   * The rewrite is the whole hot-apply: every bridge's seam reads the SAME
+   * object (`replaceTuning` mutates in place), so the next session-creating
+   * request sees the new value without a restart and without a per-bridge
+   * fan-out. Bridges are deliberately NOT told anything here — an existing
+   * session is not rewritten.
+   *
+   * Public because the manager's boot path replays the persisted value after
+   * loading the registry (see `BridgeManager`'s constructor).
+   */
+  applySkillsMcpTuning(): void {
+    this.host.replaceTuning({ ...this.host.currentTuning(), skillsMcpEnabled: this.skillsMcpEnabled() })
   }
 
   /**
@@ -521,6 +599,12 @@ export class SettingsService {
     const storedTitlePrefix = parsed.sessionTitlePrefix
     this.sessionTitlePrefixEnabled =
       typeof storedTitlePrefix === 'boolean' ? storedTitlePrefix : DEFAULT_SESSION_TITLE_PREFIX
+    // The built-in skills MCP switch: default OFF on every unreadable shape.
+    // A hand-edited string / number / object must not turn the server on; an
+    // absent key runs off too, and only a real boolean is adopted as-is (so an
+    // explicit `false` survives the round trip instead of becoming "unset").
+    const storedSkillsMcp = parsed.skillsMcpEnabled
+    this.skillsMcpEnabledSetting = typeof storedSkillsMcp === 'boolean' ? storedSkillsMcp : undefined
     // The settings page's approval-deadline override. Re-validated on every
     // boot because the state file is user- and version-editable: an unreadable
     // value must not poison the deadline, and a value the validator accepts
@@ -581,6 +665,9 @@ export class SettingsService {
       ...(this.defaultAgentId === undefined ? {} : { defaultAgentId: this.defaultAgentId }),
       tagHalo: this.tagHaloSetting,
       sessionTitlePrefix: this.sessionTitlePrefixEnabled,
+      ...(this.skillsMcpEnabledSetting === undefined
+        ? {}
+        : { skillsMcpEnabled: this.skillsMcpEnabledSetting }),
       ...(Object.keys(this.deadlineOverride).length === 0
         ? {}
         : { approvalDeadlines: { ...this.deadlineOverride } }),

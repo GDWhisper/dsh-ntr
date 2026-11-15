@@ -38,6 +38,15 @@ export type SessionTitlePrefixResult = { titlePrefix: boolean }
 /** `ui/session-title-prefix-set`: write the toggle. */
 export interface SessionTitlePrefixSetPayload { titlePrefix: boolean }
 
+/**
+ * `ui/skills-mcp`: whether the built-in read-only `dsh-skills` MCP server is
+ * offered to agents. Default off; the answer is the value the host would use
+ * for the NEXT session it creates (the switch never touches a live process).
+ */
+export type SkillsMcpResult = { skillsMcpEnabled: boolean }
+/** `ui/skills-mcp-set`: write the switch. Strictly a boolean, strict persist. */
+export interface SkillsMcpSetPayload { skillsMcpEnabled: boolean }
+
 /** The approval deadline the settings page can edit, by field name. ONE window. */
 export type ApprovalDeadlineKey = 'permissionTimeoutMs'
 

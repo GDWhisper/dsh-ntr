@@ -1,4 +1,3 @@
-import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { existsSync, readFileSync } from 'node:fs'
 import {
@@ -12,7 +11,6 @@ import {
   parseCatalogOptions,
   randomUUID,
   selectForwardPrompt,
-  skillFlavorOf,
   extractSessionTitlePlaceholder,
   isAbsolutePath,
   splitAdapterModelId,
@@ -29,7 +27,6 @@ import type {
 } from '../protocol.ts'
 import { SESSION_TITLE_PREFIX } from '../protocol.ts'
 import type { AcpSaveGate } from '../save-gate.ts'
-import { scanSkillDirs } from '../skills-scan.ts'
 import type { UpdateService } from '../update.ts'
 import {
   bridgeKey,
@@ -84,14 +81,10 @@ import { ChatChoiceService } from './chat-choice-service.ts'
 import { AgentAdminService } from './agent-admin-service.ts'
 import { SessionRegistryService } from './session-registry-service.ts'
 import { PersistenceService } from './persistence-service.ts'
+import { SkillsService } from './skills-service.ts'
 import { SessionBootService } from './session-boot-service.ts'
 import { describeError } from './errors.ts'
 import { hasPromptSlot, lifecycleOf } from './session-lifecycle.ts'
-
-/** How long one `agent/skills` scan answer stays fresh; the browser re-asks past it. */
-const SKILL_SCAN_TTL_MS = 60_000
-/** Cached `agent/skills` answers (agent × workspace), evicted oldest-first. */
-const SKILL_SCAN_CACHE_MAX = 32
 
 /** Routes host session ids to their owning bridge. */
 export class BridgeManager {
@@ -151,12 +144,8 @@ export class BridgeManager {
    * order and its "absent while never written" rules have ONE owner.
    */
   private readonly persistence: PersistenceService
-  /**
-   * `agent/skills` answers, keyed `agentId\0workspaceRoot`, TTL'd by
-   * {@link SKILL_SCAN_TTL_MS}. Memory-only: the scan is a pure fs read, so a
-   * fresh boot re-scans and nothing is owed to `agents.json`.
-   */
-  private readonly skillCache = new Map<string, { at: number; result: AgentSkillsResult }>()
+  /** `agent/skills` answers (see `SkillsService`): the per-agent + workspace scan cache. */
+  private readonly skills: SkillsService
   /**
    * Tuning in force, defaults applied. The approval deadline and the idle
    * window are rewritten IN PLACE by `SettingsService` (through the host's
@@ -354,6 +343,12 @@ export class BridgeManager {
       bridgeOwning: (agentId, sessionId) => this.bridgeOwning(agentId, sessionId),
       disposeTurnStreamsOf: match => { this.disposeTurnStreamsOf(match) },
     })
+    // The `/` menu's skill rows (see `SkillsService`) need the agent definition
+    // and the conversation's workspace root; both arrive as closures.
+    this.skills = new SkillsService({
+      defOf: agentId => this.defsMap.get(agentId),
+      workspaceRoot: dshSessionId => chatWorkspaceRoot(this.sessionWorkspaceResolver, dshSessionId),
+    })
     // One Antigravity store-root resolution for BOTH transcript features (the
     // late-output watch and the subagent poll): production reads the launch
     // command line, tests inject the probe seam.
@@ -401,6 +396,7 @@ export class BridgeManager {
       currentTuning: () => this.tuning,
       replaceTuning: next => { Object.assign(this.tuning, next) },
       persistAgents: () => this.persistence.persistAgents(),
+      persistAgentsStrict: () => { this.persistence.persistAgents(true) },
     })
     // The chat-choice cluster (see `ChatChoiceService`) needs the roster, the
     // catalog reads, the session set, the holder of a session, the two lock
@@ -526,13 +522,11 @@ export class BridgeManager {
     }, configStoragePath, this.transcriptMax)
     this.persistence.loadPersistedAgents()
     this.catalog.loadPersistedCatalogs()
-    // A persisted deadline override must reach the tuning the bridges are built
-    // from, not just the settings card's readout.
+    // Persisted overrides must reach the tuning the bridges are built from,
+    // not just the settings cards' readout.
     this.settings.applyDeadlineTuning()
-    // The same for the idle-release window: a persisted override must
-    // reach the tuning the bridges are built from, not just the
-    // settings card's readout.
     this.settings.applyIdleReleaseTuning()
+    this.settings.applySkillsMcpTuning()
     // The request-path rewrite falls back to this default for a conversation
     // the user never bound explicitly — the same agent the composer chip shows.
     routeBindingRegistry().defaultModel = this.settings.defaultAgent()
@@ -664,47 +658,9 @@ export class BridgeManager {
     return this.subagents.subagentsDetail(dshSessionId, childId)
   }
 
-  /**
-   * The agent skills one conversation can use (`agent/skills`, the `/` menu's
-   * skill rows): flavor from the agent's command line, one filesystem scan
-   * over that flavor's skill dirs, TTL-cached in memory per agent + workspace.
-   *
-   * Deliberately NOT persisted (the structural difference from
-   * `absorbCommands`, which must survive restarts because commands can only be
-   * DECLARED by a live session): a scan is a pure fs read with no spawn
-   * dependency, so a reboot simply re-scans on the first ask, and no
-   * `model-catalog.json` shape or schema bump is owed. No SSE frame either —
-   * the browser re-asks past the TTL. Unknown agent → empty answer, the same
-   * contract `subagentsDetail` keeps.
-   */
+  /** The agent skills one conversation can use (`agent/skills`; see `SkillsService`). */
   async agentSkills(dshSessionId: string, agentId: string): Promise<AgentSkillsResult> {
-    const def = this.defsMap.get(agentId)
-    if (def === undefined) return { skills: [] }
-    const workspaceRoot = chatWorkspaceRoot(this.sessionWorkspaceResolver, dshSessionId)
-    const key = `${agentId}\u0000${workspaceRoot ?? ''}`
-    const hit = this.skillCache.get(key)
-    if (hit !== undefined && Date.now() - hit.at < SKILL_SCAN_TTL_MS) return hit.result
-    const flavor = skillFlavorOf(def.command, def.args)
-    const result = scanSkillDirs(flavor, workspaceRoot, homedir())
-    // Cache eviction is insertion-order based (oldest timestamp wins), like the
-    // browser half's prune: 32 agents × workspaces is far beyond any roster.
-    while (this.skillCache.size >= SKILL_SCAN_CACHE_MAX) {
-      let oldestKey: string | undefined
-      let oldestAt = Number.POSITIVE_INFINITY
-      for (const [key, value] of this.skillCache) {
-        if (value.at < oldestAt) {
-          oldestAt = value.at
-          oldestKey = key
-        }
-      }
-      if (oldestKey === undefined) break
-      this.skillCache.delete(oldestKey)
-    }
-    // `truncated` is absent on the wire when nothing was cut — the marker is
-    // news, the normal case is not.
-    const answer: AgentSkillsResult = { skills: result.skills, ...(result.truncated ? { truncated: true } : {}) }
-    this.skillCache.set(key, { at: Date.now(), result: answer })
-    return answer
+    return this.skills.agentSkills(dshSessionId, agentId)
   }
 
   /**
@@ -1243,6 +1199,16 @@ export class BridgeManager {
   /** Write the approval deadline or mode (hot; see `SettingsService`). */
   async setApprovalDeadlines(patch: ApprovalDeadlinePatch, reset = false): Promise<void> {
     return this.settings.setApprovalDeadlines(patch, reset)
+  }
+
+  /** Whether the built-in `dsh-skills` MCP server is offered (see `SettingsService`). */
+  skillsMcpEnabled(): boolean {
+    return this.settings.skillsMcpEnabled()
+  }
+
+  /** Write the skills MCP switch: strict persist first, then hot-apply (see `SettingsService`). */
+  async setSkillsMcpEnabled(value: boolean): Promise<void> {
+    return this.settings.setSkillsMcpEnabled(value)
   }
 
   /**

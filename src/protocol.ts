@@ -142,6 +142,8 @@ export type {
   PermissionTimeoutMode,
   SessionTitlePrefixResult,
   SessionTitlePrefixSetPayload,
+  SkillsMcpResult,
+  SkillsMcpSetPayload,
   TagHaloResult,
   TagHaloSetPayload,
 } from './protocol/ui.ts'

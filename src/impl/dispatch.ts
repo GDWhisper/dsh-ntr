@@ -62,6 +62,14 @@ export interface AcpManager {
   /** Write the title-prefix toggle (persisted with the agent registry). */
   setSessionTitlePrefix?(value: boolean): Promise<void>
   /**
+   * Whether the built-in read-only `dsh-skills` MCP server is offered to
+   * agents (default off). Applies to sessions created from now on; a live
+   * process keeps whatever list it was started with.
+   */
+  skillsMcpEnabled?(): boolean
+  /** Write the skills MCP switch: strict persist, then hot-apply. */
+  setSkillsMcpEnabled?(value: boolean): Promise<void>
+  /**
    * The approval deadline in force, with the facts that explain an override
    * (the `cordis.patch.yml` baseline it outranks). `undefined` on a host half
    * from before the card existed, which hides the settings card instead of
@@ -650,6 +658,19 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         if (typeof body.titlePrefix !== 'boolean') throw new AcpError('bad_payload', 'acp: titlePrefix must be boolean')
         await manager.setSessionTitlePrefix?.(body.titlePrefix)
         return ok({ titlePrefix: manager.sessionTitlePrefix?.() ?? DEFAULT_SESSION_TITLE_PREFIX })
+      }
+      case 'ui/skills-mcp':
+        // Absent on a host half from before the switch existed: off, never a
+        // guessed "on" (an unread value must not advertise an MCP server).
+        return ok({ skillsMcpEnabled: manager.skillsMcpEnabled?.() === true })
+      case 'ui/skills-mcp-set': {
+        // Strictly a boolean: a missing / string / object value must not be
+        // coerced into a write (there is no "false-like" here, only bad input).
+        if (typeof body.skillsMcpEnabled !== 'boolean') {
+          throw new AcpError('bad_payload', 'acp: skillsMcpEnabled must be boolean')
+        }
+        await manager.setSkillsMcpEnabled?.(body.skillsMcpEnabled)
+        return ok({ skillsMcpEnabled: manager.skillsMcpEnabled?.() === true })
       }
       case 'ui/approval-deadlines':
         // Absent on a host half from before the card existed: the browser then
