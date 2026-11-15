@@ -110,6 +110,7 @@
 - `tests/impl/`：宿主端纯逻辑单测按 `src/impl/` 的簇同名镜像（`validate.spec.ts` / `catalog.spec.ts` / `paths.spec.ts` / `dispatch.spec.ts` …，共享 fake 在 `harness.ts`），无子进程，秒级返回。
 - `register.spec.ts`：Cordis 上下文注册，用 `fakeCtx()` 模拟宿主。
 - `store.spec.ts`：前端状态机（`AcpStore` 类）；纯函数 / 类型的用例按 `src/client/store/` 的簇同名镜像进 `tests/store/`（`blocks.spec.ts` / `fork.spec.ts` / `save-gate.spec.ts` …），describe 标题与用例数随簇迁移不变。
+- `tests/panel/`：设置页用例按 `src/client/panel/` 的簇镜像（`editing.spec.ts` / `save-guard.spec.ts` / `permissions.spec.ts` …，共享 fake 在 `harness.ts`），describe 标题与用例数随簇迁移不变。
 - `bridge.spec.ts` + `tests/bridge/*.spec.ts`：集成测试，用真实子进程跑 `tests/mock-agent.mjs` 验证 stdio ACP 全链路；共享 harness 在 `tests/bridge/harness.ts`。
 - `acp-view.spec.ts`：浏览器半区纯函数（diff / 空状态 / codec / 路径等价 / 审批期限事实）。
 - `session-controls.spec.ts`：composer 芯片与菜单**说了什么**（`agentBaseChip` / `describeRoute` / `menuFor`）。
