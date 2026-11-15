@@ -23,7 +23,16 @@
 
 **四处必须是同一份列表**：实测 codebuddy 把这些服务器放进 agent **进程级**的作用域，而不是会话级 —— 同进程里先建一个带注入的会话、再建一个 `mcpServers: []` 的会话，后者会把作用域换成空的，前者的 MCP 工具随之消失（agent 日志 `serverManager.delete("injected")`）。目录探测恰恰复用同一条连接建会话，所以探测若发空列表，用户在设置页点一次「检测可用模型」就会静默剥掉正在聊的会话的 MCP 工具。
 
-线格式由 `toAcpMcpServers` 一次性转换：**stdio 那条不带 `type`**（带了 agent 会静默丢弃），http/sse 带 `type`；`env` / `headers` 是 `[{name,value}]` 数组。
+线格式由 `toAcpMcpServers` 一次性转换：**stdio 那条不带 `type`**（带了 agent 会静默丢弃），http/sse 带 `type`；`env` / `headers` 是 `[{name,value}]` 数组。四个入口传的都是 `AgentBridge.mcpServersForSession` 的产物——`sessionMcpServers`（`src/bridge/mcp.ts`）合并用户配置与内置 `dsh-skills` 后的新数组，开关在**请求时**经活读取接缝取值（见 [state.md §2](./state.md) / [state.md §2.2](./state.md)）。
+
+### 内置 `dsh-skills` MCP（进程归属与懒加载语义）
+
+`dsh-ntr` 是 ACP client，只在建会话请求里**传**连接配置；对端 agent 是 MCP client，**掌握** `dsh-skills` 进程的生命周期（是否启动、何时启动、是否常驻、何时回收）。插件不管理这个子进程，也不提供跨 agent 的进程控制抽象。ACP 配置无法便携地表达「首次 `tools/call` 才启动进程」，所以开关只决定**后续**建会话声明什么：不回收既有进程、不给既有会话补发配置，关闭也不等于进程退出。
+
+- **懒加载只约束文件系统**：`initialize` / `notifications/initialized` / `ping` / 静态 `tools/list` 一律不碰技能根；第一次 `skills_list` 才枚举（只技能根的直接子目录），`skill_read` 只解析本次目标、不要求先 list。没有 watcher、定时器与持久缓存，每次调用重读当前磁盘，新增 / 删除 / 改文在下一次调用可见。**严禁**把这套行为写成「首次调用前零进程 / 零内存 / 真正按需启动进程」——懒加载只减少技能文件系统读取。
+- **stdio 行为**：换行分隔的 JSON-RPC 2.0；stdout 每行恰好一帧且只有帧（banner / 调试文本一律进 stderr），stdin EOF 即退出（不挂事件循环）。`initialize` 的版本协商按 server 顶部 `SUPPORTED_PROTOCOL_VERSIONS`（`2025-06-18` / `2025-03-26` / `2024-11-05`）：请求版本在列表内原样回传，否则回列表最新。解析失败 `-32700`、未知方法 `-32601`、非法参数 `-32602`；工具级失败（未知工具、非法参数、目标被拒、读取失败）回 `isError: true` 的 tool result，**绝不**静默返回空成功。notification 不产生响应帧。
+- **技能根与内置连接**：技能根恒为 `dirname(pluginStateDir()) / skills`（默认部署即宿主的 `~/.dsh/skills`；**没有** `skillsRoot` 配置）；`dshSkillsMcpServer` 用 `process.execPath` 作 command（PATH 里可能没有 agent 能找到的 node）、经 `import.meta.url` 定位包根 `mcp/skills-server.mjs`（`src/bridge/mcp.ts` 与 `lib/bridge/mcp.js` 同深度），并把 `DSH_NTR_STATE_DIR = pluginStateDir()` **无条件**写进 `env`——子进程由 agent spawn、继承的是 agent 的环境，只有显式值能保证 server 与插件推导出同一个技能根。
+- **路径判定是第三份手拷贝**：server 是独立 `.mjs`，不能 import `src/impl/paths.ts`，`isAbsolutePath` / `isUnderPath` 按约束 24 手拷贝，并由等价用例钉住（同一组输入两平台判定逐一相同）；定位只经 `realpath` + containment，外部 symlink 与非普通文件一律拒绝——**不许**单边「优化」任一份。
 
 ### 进程归属与错误码（A1）
 
@@ -235,6 +244,6 @@ coordinator 用 `Agent` 工具派发 detached worker、说「已派…」，随�
 | 数据折叠 | `src/impl.ts` · `acpContentRows` / `formatAcpDiff` / `dumpJson` / `describeUnhandledUpdate` / `acpToolCallFromUpdate` / `acpToolCallDelta` / `Transcript` / `coalescibleStateKind` |
 | tok/s 聚合 | `src/tps.ts` · `TurnTpsTracker`；`src/bridge/turn-stream.ts` · `TurnStreamController.trackTps` / `finalizeTps`；`src/bridge/turn-watchdog-service.ts` · `TurnWatchdogService.noteSessionBurst`（manager 同名转发）；`src/protocol/events.ts` · `turn/metrics`；`src/protocol/views.ts` · `SessionBurst`；`src/client/activity-pill.tsx` · `createActivityPillClaim` |
 | 启动命令 | `src/impl.ts` · `validateAgentDef` / `splitCommandLine`；`src/bridge/process.ts` · `quoteLegacyCommand`；`src/bridge/types.ts` · `StartAttempt`；`src/bridge/test-failure.ts` · `classifyTestFailure`；`src/bridge/agent-bridge.ts` · `AgentBridge.awaitStartChildExit`；`src/bridge/agent-admin-service.ts` · `AgentAdminService.testAgent` |
-| MCP 下发 | `src/bridge/mcp.ts` · `toAcpMcpServers`（线格式转换）；`src/impl.ts` · `validateMcpServers`（配置校验）；面板三处同步见 `src/client/panel/form.ts` · `initialForm` / `buildPayload` / `payloadEquals` |
+| MCP 下发 | `src/bridge/mcp.ts` · `toAcpMcpServers`（线格式转换）/ `sessionMcpServers`（唯一运行时合并器）/ `dshSkillsMcpServer` / `DSH_SKILLS_MCP_NAME`；`src/bridge/agent-bridge.ts` · `skillsMcpEnabled` 活读取接缝 / `mcpServersForSession`；内置 server `mcp/skills-server.mjs`（§1）；`src/impl.ts` · `validateMcpServers`（配置校验）；面板三处同步见 `src/client/panel/form.ts` · `initialForm` / `buildPayload` / `payloadEquals` |
 | Antigravity 补发 | `src/bridge/agy-transcript.ts` · `isAntigravityAgent` / `agyStoreRoot` / `agyTranscriptPaths` / `parseTranscriptStep` / `lateAnswerText` / `AgyTranscriptTail`；`src/bridge/agy-late-output.ts` · `AgyLateOutputService.arm` / `poll` / `disarm`；`src/bridge/live-session.ts` · `LiveSession.lateEcho` / `pendingLateEcho` / `lastTurnAnswerText` / `knownToolCalls` / `turnToolCalls`；`src/bridge/turn-stream.ts` · `applyEchoGuard` / `clearAmbientState`；`src/bridge/subagent-service.ts` · `SubagentService.deliverLateReport` / `wakeChatWithBackgroundReport`；`src/bridge/manager.ts` · `armLateOutputWatch` / `lateEchoTuning`；子代理轮询 `src/bridge/agy-subagent-poll.ts` · `AgySubagentPollService.arm` / `disarm` / `prune`；`src/bridge/agy-transcript.ts` · `isAgyChildReport` / `agyChildProgress` / `foldAgyOpenToolSteps`；`src/bridge/live-session.ts` · `LiveSession.stopAgyPoll`；`src/bridge/subagent-service.ts` · `SubagentService.disarmAgyPoll`（§6.4） |
 | 会话分叉 | `src/bridge/agent-bridge.ts` · `AgentBridge.forkSession` / `pendingForks`；`src/bridge/session-registry-service.ts` · `SessionRegistryService.adoptForkedSession`；`src/bridge/catalog-service.ts` · `noteForkCapability` / `canForkNow` / `forkCaps`；`src/impl.ts` · `dispatchRpc`（`session/chat-fork-adopt` 分支）；`src/client/store/chat-sessions.ts` · `forkChatSession`；`src/client/store/fork.ts` · `forkStateOf` |

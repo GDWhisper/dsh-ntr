@@ -1,6 +1,6 @@
 # DSH 技能只读 MCP 实施计划
 
-- 状态：待实施
+- 状态：已实施，待真机验收（步骤 0–7 已完成，步骤 8 真机待做）
 - 来源 Issue：[GDWhisper/dsh-ntr#14](https://github.com/GDWhisper/dsh-ntr/issues/14)
 - 实施范围：内置零依赖、只读、stdio MCP server `dsh-skills`，只提供 `skills_list` 与 `skill_read`。
 - 决策优先级：本文记录最终方案。Issue 中「默认开启」「可配置 `skillsRoot`」等早期提案不采用。
@@ -342,29 +342,29 @@ dirname(pluginStateDir()) / skills
 
 按以下顺序完成，每一步先通过对应测试再进入下一步：
 
-0. **前置确认**
+0. **前置确认**（已完成）
    - 核对拆分计划 P0–P4 已完成（§9.0）；实测受影响文件行数余量。未满足就停下报告，不绕门禁。
-1. **server 与独立 stdio 测试**
+1. **server 与独立 stdio 测试**（已完成）
    - 新增 `mcp/skills-server.mjs`（纯函数导出 + 直接运行才启动主循环）。
    - 先完成协议循环（含版本协商）、静态工具声明、路径安全、有界读取与 frontmatter 提取。
    - 用真实 Node 子进程验证 stdio，不依赖 agent；纯函数与宿主路径原语做等价测试。
-2. **合并器纯测试**
+2. **合并器纯测试**（已完成）
    - 实现 `dshSkillsMcpServer` 与 `sessionMcpServers`。
    - 验证开关、同名优先、输入不变和 ACP stdio 线格式。
-3. **四个入口**
+3. **四个入口**（已完成）
    - 把 `openSession`、`probeConfigOptions`、`doResumeSession`、`forkSession` 切到同一当前配置和同一合并器。
    - 用 mock agent 记录四次请求的 `mcpServers`。
-4. **配置与 UI**
+4. **配置与 UI**（已完成）
    - 接入 tuning、持久化、严格 RPC、store 回滚和设置页组件。
    - 验证保存失败不进入 agent 保存流程。
-5. **相关 Vitest**
+5. **相关 Vitest**（已完成）
    - 运行本次新增测试及直接受影响的现有测试。
    - 不因局部改动无目的扩大到无关测试或外部服务。
-6. **完整仓库验证**
+6. **完整仓库验证**（已完成，`npm run prepack` 全绿）
    - 运行 `npm run prepack`，覆盖行数门禁、typecheck、仓库测试与 build。
-7. **发布包验证**
+7. **发布包验证**（已完成）
    - 检查 npm pack 文件清单，确认 `mcp/skills-server.mjs` 被包含，且运行路径不依赖未发布的源码文件。
-8. **真实 agent 验证**
+8. **真实 agent 验证**（真机待做）
    - 至少使用真实 CodeBuddy 和另一种 ACP agent。
    - 验证工具可见、清单与读取可用、默认关闭、进程由 agent 启动和回收、开关只影响后续建会话。
    - 显式检查 `process.execPath` 假设：本方案假定宿主是纯 Node 进程。若宿主是 Electron，`execPath` 是 GUI 二进制，spawn 会失败或弹出窗口（需 `ELECTRON_RUN_AS_NODE`）——发现不满足就停下修订方案，不静默加兼容层。
