@@ -54,7 +54,7 @@
   - 状态：已完成 / 已归档；细节见文内
 - [待办清单](./todo.md)
   - 本仓唯一的待办清单：只留尚未落地的项，用户确认完结即删（结论并入 AGENTS.md 对应约束，不留「已落地」历史）
-  - 当前四项：Antigravity 子代理面板真机验收（方案见 [docs/plan/antigravity-subagent-panel.md](./plan/antigravity-subagent-panel.md)）；巨型文件拆分第二轮（方案见 [docs/plan/file-size-split.md](./plan/file-size-split.md)）；自制子智能体展示（方案见 [docs/plan/subagent-panel.md](./plan/subagent-panel.md)）；宿主被强杀后残留的 ACP agent 进程（方案见 [docs/plan/backlog](./plan/backlog/README.md)）
+  - 当前三项：Antigravity 子代理面板真机验收（方案见 [docs/plan/antigravity-subagent-panel.md](./plan/antigravity-subagent-panel.md)）；巨型文件拆分第二轮（方案见 [docs/plan/file-size-split.md](./plan/file-size-split.md)）；自制子智能体展示（方案见 [docs/plan/subagent-panel.md](./plan/subagent-panel.md)）。另有暂缓方案在 [backlog](./plan/backlog/README.md)，不进待办清单
 - [发版手册](../AGENTS/release.md)
   - agent 操作文档（由根 AGENTS.md 索引）：版本与 tag 规则、发布前检查，从提交到 npm 发布与 GitHub Release 的完整命令
   - release note 与 [`CHANGELOG.md`](../CHANGELOG.md) 的写法：面向用户、只写能感知到的变化与确定性净改动，不写根因与内部机制
