@@ -12,7 +12,7 @@ describe('AcpSettingsSection navigation', () => {
   it('starts with collapsed agents, no creation form, and no model cache read or probe', async () => {
     const fixture = await mountPanel()
     const nav = screen.getByRole('navigation', { name: 'NTR 设置分类' })
-    expect(within(nav).getAllByRole('button').map(button => button.textContent)).toEqual(['智能体', '审批时限', '进程管理', '对话外观', '日志'])
+    expect(within(nav).getAllByRole('button').map(button => button.textContent)).toEqual(['智能体', '技能', '审批时限', '进程管理', '对话外观', '日志'])
     expect(within(nav).getByRole('button', { name: '智能体', pressed: true })).toBeDefined()
     expect(screen.getByRole('region', { name: '已接入的智能体' })).toBeDefined()
     expect(screen.getByRole('button', { name: '管理 CodeBuddy', expanded: false })).toBeDefined()
@@ -276,7 +276,7 @@ describe('AcpSettingsSection navigation', () => {
   it('omits the approval category on a host without its RPC, without losing permission answers', async () => {
     await mountPanel({ approvalDeadlines: null, permissions: [permission()] })
     const nav = screen.getByRole('navigation', { name: 'NTR 设置分类' })
-    expect(within(nav).getAllByRole('button').map(button => button.textContent)).toEqual(['智能体', '进程管理', '对话外观', '日志'])
+    expect(within(nav).getAllByRole('button').map(button => button.textContent)).toEqual(['智能体', '技能', '进程管理', '对话外观', '日志'])
     expect(screen.queryByRole('slider', { name: '等待时长', hidden: true })).toBeNull()
     await category('对话外观')
     expect(screen.getByRole('button', { name: 'Always Allow' })).toBeDefined()

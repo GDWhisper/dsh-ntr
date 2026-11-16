@@ -24,7 +24,7 @@
 2. server 只暴露两个工具：
    - `skills_list`：列出可用 DSH 技能及其描述和规范路径。
    - `skill_read`：读取指定技能的 `SKILL.md` 或技能目录内的指定附加文件。
-3. 功能默认关闭。用户只能在设置页「智能体」页主动开启。
+3. 功能默认关闭。用户只能在设置页「技能」页主动开启。
 4. 开关旁提供信息图标。图标使用宿主 `Tooltip`，说明进程、扫描和生效边界。
 5. 只通过 ACP `mcpServers` 连接配置向 agent 提供 server。不生成或修改 CodeBuddy 等其他 agent 的原生 MCP 配置。
 6. 不默认把技能正文注入提示词。agent 自行决定何时列出和读取技能。
@@ -200,21 +200,33 @@ dirname(pluginStateDir()) / skills
 ### 7.1 组件与位置
 
 - 新增 `src/client/skills-mcp-preference.tsx`，承载开关、说明和信息图标。
-- 在 `src/client/panel.tsx` 的「智能体」页挂载，不放入对话面，不新增逐 agent 控件。
+- 在 `src/client/panel.tsx` 新增独立的「技能」页挂载，**不放「智能体」页**（那页管理智能体，部署级能力开关不占它），不放入对话面，不为总开关新增逐 agent 控件（§13 后来补的逐 agent 行不归本节描述）。
 - 开关只调用 store 的设置方法，不直接改 agent 定义，不调用 `agent/save`。
 - 保存失败由设置页页头显示，不使用 agent 保存浮层。
 
 ### 7.2 文案
 
-控件说明固定为：
+分区标题与控件说明固定为：
 
-> 让 agent 查阅你的 DSH 技能文档（只读）。
+> 标题：DSH 技能发现
+>
+> 智能体可以读取你装在 DSH 里的技能说明（只读）。
+
+总开关标签固定为「对所有智能体开放」；per-agent 开关标签固定为「对这个智能体开放」。两句挂在同一个分区名（DSH 技能发现）下，只换主语，读起来是一对范围，不是两句相似的话。
+
+per-agent 行常驻一句（总开关开时）：
+
+> 这一项控制「DSH 技能发现」提供的技能服务，与手填的 MCP 服务器无关。关闭只影响这个智能体，其他智能体仍可读取。
+
+总开关关闭时该句替换为：
+
+> 「技能」页的「DSH 技能发现」处于关闭状态，打开后这一项才生效。
 
 开关旁信息图标的 tooltip 固定为：
 
-> 开启后，agent 可以查阅你的 DSH 技能文档：只读、不改文件，也不会获得 DSH 的其他能力。技能内容等 agent 用到时才读取，平时不扫描。开关只对新对话生效；旧对话里已在运行的辅助进程，不保证随关闭立刻退出。
+> 技能说明只在智能体用到时读取，平时不扫描。开关只对新建或重新加载的对话生效；旧对话保持关闭前的状态。
 
-文案不得改写成「首次调用才启动进程」「首次调用前零内存」或「关闭后立即停止 MCP」。
+文案不得改写成「首次调用才启动进程」「首次调用前零内存」或「关闭后立即停止 MCP」。本版是用户可读性重写：原「让 agent 查阅你的 DSH 技能文档」「向该 agent 提供 DSH 技能文档」「总开关已关闭，开启后此选项才生效」被换掉，原因是同一个东西在界面上有三个名字（技能 MCP / DSH 技能 / DSH 技能文档），两个开关的句式几乎相同，AND 关系没有可见说明。「只对新对话生效」后改为「只对新建或重新加载的对话生效」：released 会话经 `session/load` 复活时会重新拿到 MCP 列表（AGENTS.md 约束 10），原表述对这类老对话不准确。总开关另起独立的「技能」页：用户指出「智能体」页是管理智能体的地方，一个部署级能力开关混在 agent 列表里没有归处；门禁句随之改为点名所在页（「技能」页的「DSH 技能发现」），不再说「上方」——master 挪页后，「上方」指向空处。
 
 ### 7.3 宿主 UI 约束
 
@@ -323,7 +335,7 @@ dirname(pluginStateDir()) / skills
 - `src/impl.ts`：扩展 `AcpManager` 和 `dispatchRpc`，校验 payload，返回当前值或错误。
 - `src/client/store/settings.ts` + `state.ts`：初始读取、开关写入、成功同步、失败回滚与页头错误的实现主体；`src/client/store.ts` 门面只留薄委托（净增长 ≤ 0，§9.0）。
 - `src/client/skills-mcp-preference.tsx`：新增设置组件。
-- `src/client/panel.tsx`：在「智能体」页挂载设置组件。
+- `src/client/panel.tsx`：在独立的「技能」页挂载设置组件。
 - `package.json`：在 `files` 中加入 `mcp`，确保发布包包含 server。
 - 测试（全部新文件，不动锁定测试文件）：
   - `tests/skills-server.spec.ts`：server 独立 stdio 协议测试 + 纯函数测试 + containment / 路径判定与宿主实现的等价测试。
@@ -485,9 +497,9 @@ dirname(pluginStateDir()) / skills
 
 ### 13.2 UI 融入
 
-- 总开关升级为 agents 页**带标题的卡**（标题 + 一行说明 + 开关 + 信息图标），放在 agent 列表**上方**；复用现有 section-heading / card 视觉语言；固定文案沿用 §7.2 人话版。
-- per-agent 开关进 `AgentDetails` 的 **MCP 服务器 JSON 块旁**：一行 checkbox「向该 agent 提供 DSH 技能文档（只读）。」（en: "Offer this agent the DSH skill documents (read-only)."），即时生效，**不是表单草稿**。
-- 总开关关时该行置灰 + 提示「总开关已关闭，开启后此选项才生效。」（en: "The master switch is off; this option takes effect once it is on."）。
+- 总开关升级为**独立「技能」页上带标题的卡**（标题「DSH 技能发现」+ 一行说明 + 开关「对所有智能体开放」+ 信息图标）；「智能体」页管理智能体，部署级 kill-switch 不占那一页（曾放在 agent 列表上方，用户指出那页是管智能体的地方）。复用现有 section-heading / card 视觉语言；固定文案沿用 §7.2 人话版。
+- per-agent 开关进 `AgentDetails` 的 **MCP 服务器 JSON 块旁**：一行 checkbox「对这个智能体开放」，下方常驻一句范围说明（§7.2），即时生效，**不是表单草稿**。常驻句是后来补的：没有它，这一行挂在「额外追加给智能体的 MCP 服务器」提示下面，会被读成手填 JSON 列表里某个服务器的开关。
+- 总开关关时该行置灰 + 常驻句替换为门禁句「「技能」页的「DSH 技能发现」处于关闭状态，打开后这一项才生效。」——总开关不在本页，句子点名它所在的页，不说「上方」。
 
 ### 13.3 机制（仿 `set-exposed-models` 先例，不发明新机制）
 

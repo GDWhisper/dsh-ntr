@@ -44,7 +44,7 @@ const NEW_AGENT_SEED: DetectedAgentInfo = {
   defaultArgs: [],
 }
 
-type SettingsPage = 'agents' | 'add' | 'approvals' | 'processes' | 'appearance' | 'logs' | 'diagnostics'
+type SettingsPage = 'agents' | 'skills' | 'add' | 'approvals' | 'processes' | 'appearance' | 'logs' | 'diagnostics'
 
 /**
  * Local wall-clock `HH:MM:SS` for one runtime-log line. Hand-built on purpose:
@@ -158,6 +158,7 @@ export function AcpSettingsSection(props: WithStore) {
       )}
       <nav className="dwa-tabs" aria-label={acp.label('NTR 设置分类', 'NTR settings categories')}>
         <button type="button" aria-pressed={page === 'agents'} onClick={() => setPage('agents')}>{acp.label('智能体', 'Agents')}</button>
+        <button type="button" aria-pressed={page === 'skills'} onClick={() => setPage('skills')}>{acp.label('技能', 'Skills')}</button>
         {ui.approvalDeadlines !== undefined && <button type="button" aria-pressed={page === 'approvals'} onClick={() => setPage('approvals')}>{acp.label('审批时限', 'Approval deadlines')}</button>}
         {ui.idleRelease !== undefined && <button type="button" aria-pressed={page === 'processes'} onClick={() => setPage('processes')}>{acp.label('进程管理', 'Processes')}</button>}
         <button type="button" aria-pressed={page === 'appearance'} onClick={() => setPage('appearance')}>{acp.label('对话外观', 'Appearance')}</button>
@@ -202,11 +203,10 @@ export function AcpSettingsSection(props: WithStore) {
       )}
 
       {/* The master switch of the built-in read-only MCP every agent may be
-          offered. Above the roster on purpose: it is the kill-switch the
-          per-agent rows inside each card only narrow. */}
-      <div hidden={page !== 'agents'}>
-        <SkillsMcpPreference acp={acp} ui={ui} />
-      </div>
+          offered. Its own page on purpose: the agents page manages agents,
+          and this is one deployment-wide capability, not one of them. The
+          per-agent rows inside each card narrow it from the other side. */}
+      {page === 'skills' && <SkillsMcpPreference acp={acp} ui={ui} />}
 
       {/* Keep editors mounted so navigation preserves unsaved values. */}
       <section className="dwa-section" hidden={page !== 'agents'} aria-label={acp.label('已接入的智能体', 'Connected agents')}>

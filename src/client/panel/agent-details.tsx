@@ -308,9 +308,10 @@ export function AgentDetails({
             'Additional MCP servers for the agent; its own configuration is unchanged.',
           )}
         </span>
-        {/* Beside the list it narrows: the per-agent half of the 技能 MCP
+        {/* Beside the list it narrows: the per-agent half of the DSH 技能发现
             switch. It applies on the click (lightweight RPC, no restart), so it
-            is deliberately outside the form draft above. */}
+            is deliberately outside the form draft above; the note under it is
+            what severs it from the hand-written JSON block above. */}
         {isConfigured && (
           <AgentSkillsMcpRow
             acp={acp}

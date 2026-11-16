@@ -1,50 +1,79 @@
 /**
- * The built-in `dsh-skills` MCP switches (settings page → 智能体).
+ * The built-in `dsh-skills` MCP switches (settings page → 技能 / 智能体).
  *
  * TWO levels, one AND: the master switch is a deployment-wide kill-switch, and
  * the per-agent row only narrows it (docs/plan/dsh-skills-mcp.md §13.1). The
  * server they gate is read-only and identical for every agent, and every
- * session-creating call hands it over the same way. The two facts a user needs
- * before flipping a switch live in the master card's info tooltip rather than
- * the row, because the settings page's copy budget is one line per control
- * (AGENTS.md rule 33).
+ * session-creating call hands it over the same way.
  *
- * Both strings are fixed by docs/plan/dsh-skills-mcp.md §7.2: the tooltip must
- * NOT be rewritten into a promise that the process is lazily started or stops
- * the moment the switch flips.
+ * Copy discipline (AGENTS.md rule 33: one line per control): ONE shared object
+ * — 「DSH 技能发现」, named once in the section title — and two switches that
+ * say who they cover (「所有智能体」 / 「这个智能体」), so the pair reads as a
+ * scope pair instead of two look-alike sentences. The AND is drawn, not
+ * assumed: while the master is on the row keeps a standing note (what it
+ * gates, and how far one agent's off reaches); while it is off the note names
+ * the gate instead.
+ *
+ * The tooltip carries the two facts that change a decision (lazy reads, new
+ * conversations only). Both strings stay clear of "starts the process on first
+ * call" / "stops the moment the switch flips" (docs/plan/dsh-skills-mcp.md
+ * §7.2): the mechanism is described, never promised.
  */
 import { Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { AcpStore, UiState } from './store.ts'
 
-/** The one-line card copy (fixed wording, see the plan). */
+/** The one-line card copy: what the thing is, and that it is read-only. */
 const EXPLANATION = [
-  '让 agent 查阅你的 DSH 技能文档（只读）。',
-  'Let agents read your DSH skill documents (read-only).',
+  '智能体可以读取你装在 DSH 里的技能说明（只读）。',
+  'Agents can read the skills installed in DSH (read-only).',
 ] as const
 
 /** The info tooltip: what it reads, and when the switch takes effect. */
 const DETAIL = [
-  '开启后，agent 可以查阅你的 DSH 技能文档：只读、不改文件，也不会获得 DSH 的其他能力。技能内容等 agent 用到时才读取，平时不扫描。开关只对新对话生效；旧对话里已在运行的辅助进程，不保证随关闭立刻退出。',
-  'When on, agents can read your DSH skill documents: read-only, no file changes, and no other DSH abilities. Content is read only when an agent asks for it; nothing is scanned up front. The switch applies to new conversations; a helper process already running in an older one may not exit the moment you turn it off.',
+  '技能说明只在智能体用到时读取，平时不扫描。开关只对新建或重新加载的对话生效；旧对话保持关闭前的状态。',
+  'Skill content is read only when an agent asks for it; nothing is scanned up front. Applies to new or reloaded conversations; older ones keep the state they had.',
 ] as const
 
-/** The per-agent row's fixed copy (§13.2). */
+/** The master switch's label: the scope half of the pair. */
+const MASTER_LABEL = [
+  '对所有智能体开放',
+  'Open to all agents',
+] as const
+
+/** The per-agent row's label: the other scope half. */
 const AGENT_COPY = [
-  '向该 agent 提供 DSH 技能文档（只读）。',
-  'Offer this agent the DSH skill documents (read-only).',
-] as const
-
-/** Shown BESIDE the greyed per-agent row: the AND, drawn as a sentence. */
-const AGENT_MASTER_OFF = [
-  '总开关已关闭，开启后此选项才生效。',
-  'The master switch is off; this option takes effect once it is on.',
+  '对这个智能体开放',
+  'Open to this agent',
 ] as const
 
 /**
- * The master switch, as a titled card above the agent list (§13.2).
+ * Shown BESIDE the per-agent row while the master is on: what the row gates
+ * (the built-in service, NOT the hand-written JSON list above it), and the
+ * reach of one agent's opt-out. Without it the row sits under the MCP block
+ * looking like a switch for one of those servers.
+ */
+const AGENT_NOTE = [
+  '这一项控制「DSH 技能发现」提供的技能服务，与手填的 MCP 服务器无关。关闭只影响这个智能体，其他智能体仍可读取。',
+  'The DSH Skill Discovery service is separate from the MCP servers you list above. Turning it off affects this agent only; the others can still read.',
+] as const
+
+/**
+ * Shown BESIDE the greyed per-agent row: the AND, drawn as a sentence.
  *
- * It sits directly above the roster it gates, so the order of the two levels
- * reads top-down: master first, per-agent rows inside each agent's card.
+ * It names the card and the page that holds it — the master is no longer on
+ * this page, so "above" would point at nothing.
+ */
+const AGENT_MASTER_OFF = [
+  '「技能」页的「DSH 技能发现」处于关闭状态，打开后这一项才生效。',
+  'The DSH Skill Discovery switch on the Skills page is off; this option applies once it is on.',
+] as const
+
+/**
+ * The master switch, as a titled card on the 「技能」 page (§13.2).
+ *
+ * It owns a page of its own: the agents page manages agents, and this is one
+ * deployment-wide capability, not an agent. The per-agent rows narrow it from
+ * inside each agent's card, and the gate sentence they carry names this page.
  */
 export function SkillsMcpPreference(props: { acp: AcpStore; ui: UiState }) {
   const { acp, ui } = props
@@ -55,7 +84,7 @@ export function SkillsMcpPreference(props: { acp: AcpStore; ui: UiState }) {
     <section className="dwa-section">
       <div className="dwa-section-heading">
         <div>
-          <h3 className="dwa-section-title">{acp.label('技能 MCP', 'Skills MCP')}</h3>
+          <h3 className="dwa-section-title">{acp.label('DSH 技能发现', 'DSH Skill Discovery')}</h3>
           <p className="dwa-section-copy">{acp.label(EXPLANATION[0], EXPLANATION[1])}</p>
         </div>
       </div>
@@ -67,7 +96,7 @@ export function SkillsMcpPreference(props: { acp: AcpStore; ui: UiState }) {
             onChange={event => void acp.setSkillsMcpEnabled(event.target.checked)}
             style={{ margin: 0, accentColor: 'var(--dsw-alias-state-business-primary, #2563eb)' }}
           />
-          {acp.label('DSH 技能', 'DSH skills')}
+          {acp.label(MASTER_LABEL[0], MASTER_LABEL[1])}
         </label>
         <Tooltip label={acp.label(DETAIL[0], DETAIL[1])} side="top">
           {/* A real button, so keyboard users can focus it; the host Tooltip
@@ -75,7 +104,7 @@ export function SkillsMcpPreference(props: { acp: AcpStore; ui: UiState }) {
           <button
             type="button"
             className="dwa-info-btn"
-            aria-label={acp.label('关于 DSH 技能 MCP', 'About the DSH skills MCP')}
+            aria-label={acp.label('关于 DSH 技能发现', 'About DSH Skill Discovery')}
           >
             i
           </button>
@@ -96,7 +125,7 @@ export function SkillsMcpPreference(props: { acp: AcpStore; ui: UiState }) {
  *
  * `enabled` is the host's resolved per-agent answer (`!== false`: the field is
  * only ever persisted as an explicit opt-out). With the master switch off the
- * row is greyed and disabled, with one sentence naming why.
+ * row is greyed and disabled, and the note names the gate instead of the scope.
  */
 export function AgentSkillsMcpRow(props: {
   acp: AcpStore
@@ -119,7 +148,11 @@ export function AgentSkillsMcpRow(props: {
         />
         {acp.label(AGENT_COPY[0], AGENT_COPY[1])}
       </label>
-      {!masterOn && <span className="dwa-hint">{acp.label(AGENT_MASTER_OFF[0], AGENT_MASTER_OFF[1])}</span>}
+      <span className="dwa-hint">
+        {masterOn
+          ? acp.label(AGENT_NOTE[0], AGENT_NOTE[1])
+          : acp.label(AGENT_MASTER_OFF[0], AGENT_MASTER_OFF[1])}
+      </span>
     </div>
   )
 }
