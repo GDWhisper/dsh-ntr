@@ -10,6 +10,7 @@ import {
   ACP_TOOL_CALL_NAME,
   appendExternalSubagentCatalog,
   buildAdapterModelId,
+  BOOKKEEPING_UPDATES,
   describeUnhandledUpdate,
   updateContentToText,
   canonicalizeFsPath,
@@ -1829,6 +1830,13 @@ describe('ACP tool-call notifications → tool-call stream chunks', () => {
     expect(describeUnhandledUpdate('current_mode_update', { currentModeId: 'plan' })).toBe('current_mode_update: plan')
     expect(describeUnhandledUpdate('brand_new_kind', { sessionUpdate: 'brand_new_kind', extra: [1, 2] }))
       .toContain('"extra": [')
+  })
+
+  it("treats the agent's echo of the person's own prompt as bookkeeping", () => {
+    // Antigravity 1.5.x re-sends the person's prompt as `user_message_chunk`
+    // before it answers. Left out of the set, the stream spoke the echo's whole
+    // JSON into the chat bubble.
+    expect(BOOKKEEPING_UPDATES.has('user_message_chunk')).toBe(true)
   })
 })
 

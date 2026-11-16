@@ -1516,7 +1516,7 @@ export const BOOKKEEPING_UPDATES: ReadonlySet<string> = new Set([
   'config_option_update',
   'available_commands_update',
   'session_info_update',
-  'usage_update',
+  'usage_update', 'user_message_chunk', // Antigravity 1.5.x echoes the person's own prompt back before answering
 ])
 
 /**
