@@ -7,7 +7,6 @@ import type { AcpStore } from '../store.ts'
 import type { ActiveTurnView, DetectedAgentInfo } from '../../protocol.ts'
 import type { AgentForm } from './form.ts'
 import type { AgentTestOutcome } from './permission-mirror.tsx'
-import { AgentSkillsMcpRow } from '../skills-mcp-preference.tsx'
 
 /**
  * Hand copy of `DEFAULT_TUNING.probeIdleTimeoutMs` (src/bridge.ts). A process
@@ -47,7 +46,6 @@ export function AgentDetails({
   testing,
   testResult,
   showSaveWarning,
-  skillsMcpMaster,
   onUseDefault,
   onSave,
   onTest,
@@ -82,8 +80,6 @@ export function AgentDetails({
   testing: boolean
   testResult?: AgentTestOutcome
   showSaveWarning: boolean
-  /** The deployment-wide `dsh-skills` switch; off greys the per-agent row out. */
-  skillsMcpMaster: boolean
   onUseDefault: () => void
   onSave: () => void
   onTest: () => void
@@ -308,18 +304,6 @@ export function AgentDetails({
             'Additional MCP servers for the agent; its own configuration is unchanged.',
           )}
         </span>
-        {/* Beside the list it narrows: the per-agent half of the DSH 技能发现
-            switch. It applies on the click (lightweight RPC, no restart), so it
-            is deliberately outside the form draft above; the note under it is
-            what severs it from the hand-written JSON block above. */}
-        {isConfigured && (
-          <AgentSkillsMcpRow
-            acp={acp}
-            agentId={detected.id}
-            enabled={detected.currentConfig?.skillsMcpEnabled !== false}
-            masterOn={skillsMcpMaster}
-          />
-        )}
       </div>
       </div>
 

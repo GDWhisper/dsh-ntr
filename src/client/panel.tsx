@@ -77,6 +77,15 @@ export function AcpSettingsSection(props: WithStore) {
     if (page === 'logs' && ui.logUnread > 0) acp.markLogsRead()
   }, [acp, page, ui.logUnread])
   const { configured, available } = partitionAgents(ui.detectedAgents, ui.agents)
+  // The 技能 page lists the same agents the 智能体 page does, in the same order,
+  // under the master switch they are narrowed by. The name follows the roster's
+  // own precedence (live title → saved definition → preset), so the two pages
+  // never spell one agent two ways.
+  const skillsAgents = configured.map(({ info }) => ({
+    id: info.id,
+    name: ui.agents.find(agent => agent.id === info.id)?.title ?? info.currentConfig?.title ?? info.name,
+    enabled: info.currentConfig?.skillsMcpEnabled !== false,
+  }))
   const selected = addTarget ?? available[0] ?? NEW_AGENT_SEED
   const openAdd = (): void => {
     setAddOpen(true)
@@ -203,10 +212,10 @@ export function AcpSettingsSection(props: WithStore) {
       )}
 
       {/* The master switch of the built-in read-only MCP every agent may be
-          offered. Its own page on purpose: the agents page manages agents,
-          and this is one deployment-wide capability, not one of them. The
-          per-agent rows inside each card narrow it from the other side. */}
-      {page === 'skills' && <SkillsMcpPreference acp={acp} ui={ui} />}
+          offered, with the per-agent opt-outs listed under it. Its own page on
+          purpose: the agents page manages agents, and this is one
+          deployment-wide capability, not one of them. */}
+      {page === 'skills' && <SkillsMcpPreference acp={acp} ui={ui} agents={skillsAgents} />}
 
       {/* Keep editors mounted so navigation preserves unsaved values. */}
       <section className="dwa-section" hidden={page !== 'agents'} aria-label={acp.label('已接入的智能体', 'Connected agents')}>

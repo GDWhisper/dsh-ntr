@@ -164,11 +164,20 @@ const STYLE = `
 .dwa-inline-setting .dwa-switch { flex-shrink: 0; margin-top: 1px; }
 /* The DSH 技能发现 master card: one switch and its info icon, reusing the
    section-heading + card visual language. It owns the 技能 page, so nothing
-   here is positioned relative to the agent roster. */
+   here is positioned relative to the agent roster; the per-agent list below it
+   is a separate block, not part of this card. */
 .dwa-skills-card { display: flex; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
-/* The per-agent row with the master switch off: dimmed through opacity (no
-   colour literal), with the disabled input already refusing clicks. */
-.dwa-switch.is-off { opacity: 0.55; cursor: not-allowed; }
+/* The per-agent opt-outs listed under the master card: the same row visual
+   language the other settings rows use, so the list reads as the card's
+   continuation instead of a second section with its own heading. */
+.dwa-skills-agents { margin-top: 12px; }
+/* The row's right side: the switch plus a fixed-width warning slot beside it,
+   so a warning appearing changes colour only, never the layout. */
+.dwa-skills-row-control { display: inline-flex; align-items: center; gap: 8px; }
+/* The red exclamation that pops when a row is touched while the master switch
+   is off. Host alias token for the colour (constraint 34); the same circled
+   glyph shape as the info icon, in danger ink so it reads as a warning. */
+.dwa-skills-warn { flex: none; width: 18px; height: 18px; padding: 0; border: 1px solid var(--ntr-danger); border-radius: 50%; background: none; color: var(--ntr-danger); font: inherit; font-size: 12px; font-weight: 700; line-height: 1; cursor: help; display: inline-flex; align-items: center; justify-content: center; }
 .dwa-setting-copy { color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
 /* The settings rows' info icon: a real focusable button (keyboard users reach
    the tooltip through it), drawn as a quiet glyph so it never competes with

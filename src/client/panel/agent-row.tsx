@@ -504,7 +504,6 @@ export function AgentRow({
             testing={testing}
             testResult={testResult}
             showSaveWarning={showSaveWarning}
-            skillsMcpMaster={ui.skillsMcpEnabled === true}
             onUseDefault={handleUseDefault}
             onSave={() => void handleSave()}
             onTest={() => void handleTest()}
