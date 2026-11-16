@@ -18,12 +18,13 @@
  * A row is never greyed and never disabled: the per-agent answer is a plain
  * setting, and the host resolves it (`!== false`) whatever the master says. To
  * keep the AND legible without a standing sentence (constraint 33: one line per
- * control), a row pops ONE red warning the moment the user touches it while the
- * master is already off, and forgets it as soon as the master comes back on — so
- * flipping the master never warns on its own, in either direction. The warning
- * holds a fixed-width slot and hides with `visibility`, so appearing must not
- * reflow the list, and while hidden it stays out of the tab order and the
- * accessibility tree.
+ * control), a row pops a red warning the moment the user turns it ON while the
+ * master is already off, and forgets it as soon as the master comes back on
+ * — so flipping the master never warns on its own, in either direction. Turning
+ * a row OFF never warns: opting out is what the master already forces. The
+ * warning holds a fixed-width slot and hides with `visibility`, so appearing
+ * must not reflow the list, and while hidden it stays out of the tab order and
+ * the accessibility tree.
  *
  * The tooltip carries the two facts that change a decision (lazy reads, new
  * conversations only). Both strings stay clear of "starts the process on first
@@ -61,11 +62,12 @@ function agentSwitchLabel(acp: AcpStore, name: string): string {
 }
 
 /**
- * The warning a row pops when the user touches it while the master is off.
+ * The warning a row pops when the user turns it ON while the master is off.
  *
  * One sentence, same role the old standing note had: it says the AND, without
- * living on the row all the time. It names the switch, not a page — the rows
- * now sit under it, so "above" would be redundant.
+ * living on the row all the time. Opting a row OUT pops nothing — and retires
+ * one that is showing — because that answer needs no master. It names the
+ * switch, not a page: the rows now sit under it, so "above" would be redundant.
  */
 const MASTER_OFF_WARNING = [
   '总开关目前处于关闭状态，开启后生效。',
@@ -181,7 +183,7 @@ export function SkillsMcpPreference(props: {
  * `enabled` is the host's resolved per-agent answer (`!== false`: the field is
  * only ever persisted as an explicit opt-out). The checkbox stays clickable
  * with the master off; the warning is what draws the AND, and only ever in
- * response to a click on THIS row made while the master is already off.
+ * response to turning THIS row ON while the master is already off.
  */
 export function AgentSkillsMcpRow(props: {
   acp: AcpStore
@@ -194,11 +196,14 @@ export function AgentSkillsMcpRow(props: {
   masterOn: boolean
 }) {
   const { acp, agentId, name, enabled, masterOn } = props
-  // One pop per row, and only ever armed by a click the master was ALREADY off
-  // for. A click made while the master is on is an ordinary setting change, so
-  // it must not arm anything — otherwise flipping the master off would warn on
-  // its own. The effect then forgets the pop the moment the master comes back
-  // on, so a later flip off starts silent too.
+  // One pop per row, and only ever for the click that turns the row ON while
+  // the master is already off — that is the one action waiting on the master.
+  // Turning a row OFF needs no reminder: opting out is the answer the master
+  // already forces, so it also retires a pop that is showing. A click made
+  // while the master is on is an ordinary setting change, so it must not arm
+  // anything — otherwise flipping the master off would warn on its own. The
+  // effect then forgets the pop the moment the master comes back on, so a
+  // later flip off starts silent too.
   const [touched, setTouched] = useState(false)
   useEffect(() => {
     if (masterOn) setTouched(false)
@@ -213,7 +218,7 @@ export function AgentSkillsMcpRow(props: {
           checked={enabled}
           label={agentSwitchLabel(acp, name)}
           onChange={checked => {
-            if (!masterOn) setTouched(true)
+            setTouched(checked && !masterOn)
             void acp.setAgentSkillsMcp(agentId, checked)
           }}
         />

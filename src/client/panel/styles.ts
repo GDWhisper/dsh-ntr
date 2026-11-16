@@ -196,7 +196,7 @@ const STYLE = `
 /* The row's right side: the switch plus a fixed-width warning slot beside it,
    so a warning appearing changes colour only, never the layout. */
 .dwa-skills-row-control { display: inline-flex; align-items: center; gap: 8px; }
-/* The red exclamation that pops when a row is touched while the master switch
+/* The red exclamation that pops when a row is turned ON while the master switch
    is off. Host alias token for the colour (constraint 34); the same circled
    glyph shape as the info icon, in danger ink so it reads as a warning. */
 .dwa-skills-warn { flex: none; width: 18px; height: 18px; padding: 0; border: 1px solid var(--ntr-danger); border-radius: 50%; background: none; color: var(--ntr-danger); font: inherit; font-size: 12px; font-weight: 700; line-height: 1; cursor: help; display: inline-flex; align-items: center; justify-content: center; }

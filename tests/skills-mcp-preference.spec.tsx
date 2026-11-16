@@ -246,10 +246,10 @@ describe('the skills page agent list', () => {
 })
 
 describe('the per-agent row with the master switch off', () => {
-  it('warns only once the user touches the row, and forgets it when the master is on', () => {
+  it('warns only once the user turns the row on, and forgets it when the master is on', () => {
     const { acp } = fakeStore(false)
     const view = render(createElement(AgentSkillsMcpRow, {
-      acp, agentId: 'codebuddy', name: 'CodeBuddy', enabled: true, masterOn: false,
+      acp, agentId: 'codebuddy', name: 'CodeBuddy', enabled: false, masterOn: false,
     }))
     const warning = (): HTMLElement | null => screen.queryByRole('button', { name: MASTER_OFF })
     // The master being off says nothing on its own.
@@ -262,7 +262,7 @@ describe('the per-agent row with the master switch off', () => {
     expect(warning()).not.toBeNull()
     // Master back on: the warning goes, and a later flip off starts silent again.
     const row = (masterOn: boolean) => createElement(AgentSkillsMcpRow, {
-      acp, agentId: 'codebuddy', name: 'CodeBuddy', enabled: false, masterOn,
+      acp, agentId: 'codebuddy', name: 'CodeBuddy', enabled: true, masterOn,
     })
     view.rerender(row(true))
     expect(warning()).toBeNull()
@@ -270,18 +270,43 @@ describe('the per-agent row with the master switch off', () => {
     expect(warning()).toBeNull()
   })
 
+  it('says nothing when the user opts a row out, and retires a pop that is showing', () => {
+    const { acp, setAgentSkillsMcp } = fakeStore(false)
+    const view = render(createElement(AgentSkillsMcpRow, {
+      acp, agentId: 'codebuddy', name: 'CodeBuddy', enabled: true, masterOn: false,
+    }))
+    const box = screen.getByRole('checkbox', { name: rowBox('CodeBuddy') }) as HTMLInputElement
+    // Opting out is the answer the master already forces, so it waits on
+    // nothing: no reminder, and the write goes through all the same.
+    act(() => { fireEvent.click(box) })
+    expect(setAgentSkillsMcp).toHaveBeenCalledWith('codebuddy', false)
+    expect(screen.queryByRole('button', { name: MASTER_OFF })).toBeNull()
+    // Turning it back on is the action that waits on the master, so that warns.
+    view.rerender(createElement(AgentSkillsMcpRow, {
+      acp, agentId: 'codebuddy', name: 'CodeBuddy', enabled: false, masterOn: false,
+    }))
+    act(() => { fireEvent.click(box) })
+    expect(screen.queryByRole('button', { name: MASTER_OFF })).not.toBeNull()
+    // …and opting out again retires the pop instead of leaving it stale.
+    view.rerender(createElement(AgentSkillsMcpRow, {
+      acp, agentId: 'codebuddy', name: 'CodeBuddy', enabled: true, masterOn: false,
+    }))
+    act(() => { fireEvent.click(box) })
+    expect(screen.queryByRole('button', { name: MASTER_OFF })).toBeNull()
+  })
+
   it('never arms the warning from a click made while the master is on', () => {
     const { acp, setAgentSkillsMcp } = fakeStore(true)
     const view = render(createElement(AgentSkillsMcpRow, {
-      acp, agentId: 'codebuddy', name: 'CodeBuddy', enabled: true, masterOn: true,
+      acp, agentId: 'codebuddy', name: 'CodeBuddy', enabled: false, masterOn: true,
     }))
     const box = screen.getByRole('checkbox', { name: rowBox('CodeBuddy') }) as HTMLInputElement
     act(() => { fireEvent.click(box) })
     // The write still goes through — only the warning is withheld.
-    expect(setAgentSkillsMcp).toHaveBeenCalledWith('codebuddy', false)
+    expect(setAgentSkillsMcp).toHaveBeenCalledWith('codebuddy', true)
     expect(screen.queryByRole('button', { name: MASTER_OFF })).toBeNull()
     view.rerender(createElement(AgentSkillsMcpRow, {
-      acp, agentId: 'codebuddy', name: 'CodeBuddy', enabled: false, masterOn: false,
+      acp, agentId: 'codebuddy', name: 'CodeBuddy', enabled: true, masterOn: false,
     }))
     expect(screen.queryByRole('button', { name: MASTER_OFF })).toBeNull()
   })
@@ -289,7 +314,7 @@ describe('the per-agent row with the master switch off', () => {
   it('never warns while the master switch is on', () => {
     const { acp } = fakeStore(true)
     render(createElement(AgentSkillsMcpRow, {
-      acp, agentId: 'codebuddy', name: 'CodeBuddy', enabled: true, masterOn: true,
+      acp, agentId: 'codebuddy', name: 'CodeBuddy', enabled: false, masterOn: true,
     }))
     expect(screen.queryByRole('button', { name: MASTER_OFF })).toBeNull()
     // A click while the master is on is an ordinary setting change, not a warning.
