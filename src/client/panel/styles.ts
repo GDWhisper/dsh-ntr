@@ -160,13 +160,35 @@ const STYLE = `
 .dwa-chip-active { border-color: var(--ntr-accent); background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 8%, transparent); color: var(--dsw-alias-state-business-primary, #2563eb); font-weight: 550; }
 .dwa-chip-list { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin: 0 0 12px; }
 .dwa-switch { display: inline-flex; align-items: center; gap: 7px; font-size: var(--ntr-font-sm); cursor: pointer; user-select: none; }
+/* The capsule switch (DSH 技能发现, both levels): a track with a knob that
+   slides. The real checkbox covers the track and stays transparent, so the
+   pointer, the keyboard and assistive tech keep the platform's own behaviour;
+   the track and the knob are plain spans. Colours are host alias tokens
+   (constraint 34), and the global reduced-motion rule already kills the two
+   transitions below. The off track uses a LABEL token rather than a border one
+   on purpose: the white knob is what says "off", and it needs 3:1 against the
+   track (WCAG 1.4.11) — the border greys are lighter than that. */
+.dwa-pill { position: relative; display: inline-flex; flex: none; cursor: pointer; }
+.dwa-pill input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.dwa-pill-track { display: inline-flex; align-items: center; box-sizing: border-box; width: 34px; height: 20px; padding: 2px; border-radius: 999px; background: var(--dsw-alias-label-tertiary, #6b7280); transition: background 0.15s ease; }
+.dwa-pill-knob { width: 16px; height: 16px; border-radius: 50%; background: var(--dsw-alias-bg-layer-1, #fff); transition: transform 0.15s ease; }
+.dwa-pill input:checked + .dwa-pill-track { background: var(--ntr-accent); }
+.dwa-pill input:checked + .dwa-pill-track .dwa-pill-knob { transform: translateX(14px); }
+/* The input is transparent, so its own outline would be too: the ring goes on
+   the track the user actually sees. */
+.dwa-pill input:focus-visible + .dwa-pill-track { outline: 2px solid var(--ntr-accent); outline-offset: 2px; }
 .dwa-inline-setting { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-2, #f9fafb); }
 .dwa-inline-setting .dwa-switch { flex-shrink: 0; margin-top: 1px; }
-/* The DSH 技能发现 master card: one switch and its info icon, reusing the
-   section-heading + card visual language. It owns the 技能 page, so nothing
-   here is positioned relative to the agent roster; the per-agent list below it
-   is a separate block, not part of this card. */
-.dwa-skills-card { display: flex; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+/* The DSH 技能发现 master card: one row — the capability and its one-line copy
+   on the left, the switch on the right. It owns the 技能 page, so nothing here
+   is positioned relative to the agent roster; the per-agent list below it is a
+   separate block, not part of this card. */
+.dwa-skills-card { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.dwa-skills-card-text { min-width: 0; }
+/* The switch's side of the card: centred, so the info icon loses the top margin
+   it needed when the card stacked its contents. */
+.dwa-skills-card-control { display: inline-flex; align-items: center; gap: 10px; flex: none; }
+.dwa-skills-card-control .dwa-info-btn { margin-top: 0; }
 /* The per-agent opt-outs listed under the master card: the same row visual
    language the other settings rows use, so the list reads as the card's
    continuation instead of a second section with its own heading. */
@@ -282,6 +304,11 @@ const STYLE = `
   .dwa-model-toolbar-actions { width: 100%; }
   .dwa-model-search { flex: 1 1 auto; width: auto; }
   .dwa-preference-row { align-items: flex-start; flex-direction: column; }
+  /* The 技能 rows are the one exception: a name and a 34px pill fit side by
+     side at any width the panel realistically gets, and the pill never
+     deforms, so a long agent name wraps on its own side instead of pushing the
+     switch onto a second line. */
+  .dwa-skills-agents .dwa-preference-row { flex-direction: row; align-items: center; }
   .dwa-default-hint { align-items: flex-start; flex-direction: column; }
   /* The slider's scale: up to eight rungs with full unit words ("15 分钟")
      need a smaller face before they can collide on a narrow panel. The rung

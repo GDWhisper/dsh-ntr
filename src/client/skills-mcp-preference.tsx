@@ -8,8 +8,12 @@
  *
  * BOTH levels live on the 技能 page, and only there: the 智能体 page manages
  * agents, and an agent's card no longer carries this switch (the user asked for
- * one place to manage it). The rows therefore sit directly under the master
- * card, always read next to the gate they are narrowed by.
+ * one place to manage it). Both levels are the same control — a capsule switch —
+ * and neither spells itself out in visible text. The master card reads as ONE
+ * row (the capability and its one-line copy on the left, the switch on the
+ * right), and each per-agent row continues it on ONE line (the agent's name on
+ * the left, its own switch on the right). The layout carries the meaning; every
+ * input keeps an accessible name so assistive tech still gets one.
  *
  * A row is never greyed and never disabled: the per-agent answer is a plain
  * setting, and the host resolves it (`!== false`) whatever the master says. To
@@ -26,14 +30,14 @@
  * call" / "stops the moment the switch flips" (docs/plan/dsh-skills-mcp.md
  * §7.2): the mechanism is described, never promised.
  */
-import { useEffect, useId, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { AcpStore, UiState } from './store.ts'
 
 /** The one-line card copy: what the thing is, and that it is read-only. */
 const EXPLANATION = [
-  '智能体可以读取你装在 DSH 里的技能说明（只读）。',
-  'Agents can read the skills installed in DSH (read-only).',
+  '智能体可以获取 DSH 原生技能列表（只读，按需发现）。',
+  'Agents can fetch the built-in DSH skill list (read-only, discovered on demand).',
 ] as const
 
 /** The info tooltip: what it reads, and when the switch takes effect. */
@@ -42,17 +46,19 @@ const DETAIL = [
   'Skill content is read only when an agent asks for it; nothing is scanned up front. Applies to new or reloaded conversations; older ones keep the state they had.',
 ] as const
 
-/** The master switch's label: the scope half of the pair. */
+/** The master switch's accessible name: its scope half, which no row spells out. */
 const MASTER_LABEL = [
   '对所有智能体开放',
   'Open to all agents',
 ] as const
 
-/** The per-agent row's label: the other scope half. */
-const AGENT_COPY = [
-  '对这个智能体开放',
-  'Open to this agent',
-] as const
+/**
+ * A per-agent row's accessible name: the scope half over that agent. One
+ * function, so the wording the docs pin as a rule has a single home.
+ */
+function agentSwitchLabel(acp: AcpStore, name: string): string {
+  return acp.label(`对 ${name} 开放`, `Open to ${name}`)
+}
 
 /**
  * The warning a row pops when the user touches it while the master is off.
@@ -65,6 +71,38 @@ const MASTER_OFF_WARNING = [
   '总开关目前处于关闭状态，开启后生效。',
   'The master switch is off; this takes effect once you turn it on.',
 ] as const
+
+/**
+ * The capsule switch both levels use: a track with a knob that slides.
+ *
+ * The real checkbox covers the track and stays transparent, so the pointer, the
+ * keyboard and assistive tech all get the platform's own behaviour — a pill is
+ * a look, not a new control. The track and the knob are plain spans, which is
+ * what keeps it cheap: no state to hold, no ARIA to keep in sync.
+ */
+function PillSwitch(props: {
+  checked: boolean
+  onChange: (checked: boolean) => void
+  /** The accessible name: no row spells its switch out in visible text. */
+  label: string
+}) {
+  const { checked, onChange, label } = props
+  return (
+    // `title` is the hover explanation the removed label text used to carry; the
+    // `aria-label` stays the accessible name, and the two do not conflict.
+    <label className="dwa-pill" title={label}>
+      <input
+        type="checkbox"
+        checked={checked}
+        aria-label={label}
+        onChange={event => onChange(event.target.checked)}
+      />
+      <span className="dwa-pill-track" aria-hidden="true">
+        <span className="dwa-pill-knob" />
+      </span>
+    </label>
+  )
+}
 
 /**
  * The master switch, as a titled card on the 「技能」 page (§13.2), with the
@@ -87,33 +125,31 @@ export function SkillsMcpPreference(props: {
   const masterOn = ui.skillsMcpEnabled === true
   return (
     <section className="dwa-section">
-      <div className="dwa-section-heading">
-        <div>
+      {/* One row: what the capability is on the left, its switch on the right.
+          The info icon sits beside the switch it explains. */}
+      <div className="dwa-card dwa-skills-card">
+        <div className="dwa-skills-card-text">
           <h3 className="dwa-section-title">{acp.label('DSH 技能发现', 'DSH Skill Discovery')}</h3>
           <p className="dwa-section-copy">{acp.label(EXPLANATION[0], EXPLANATION[1])}</p>
         </div>
-      </div>
-      <div className="dwa-card dwa-skills-card">
-        <label className="dwa-switch">
-          <input
-            type="checkbox"
+        <div className="dwa-skills-card-control">
+          <Tooltip label={acp.label(DETAIL[0], DETAIL[1])} side="top">
+            {/* A real button, so keyboard users can focus it; the host Tooltip
+                clones this child and shows the label on focus / hover. */}
+            <button
+              type="button"
+              className="dwa-info-btn"
+              aria-label={acp.label('关于 DSH 技能发现', 'About DSH Skill Discovery')}
+            >
+              i
+            </button>
+          </Tooltip>
+          <PillSwitch
             checked={masterOn}
-            onChange={event => void acp.setSkillsMcpEnabled(event.target.checked)}
-            style={{ margin: 0, accentColor: 'var(--dsw-alias-state-business-primary, #2563eb)' }}
+            label={acp.label(MASTER_LABEL[0], MASTER_LABEL[1])}
+            onChange={checked => void acp.setSkillsMcpEnabled(checked)}
           />
-          {acp.label(MASTER_LABEL[0], MASTER_LABEL[1])}
-        </label>
-        <Tooltip label={acp.label(DETAIL[0], DETAIL[1])} side="top">
-          {/* A real button, so keyboard users can focus it; the host Tooltip
-              clones this child and shows the label on focus / hover. */}
-          <button
-            type="button"
-            className="dwa-info-btn"
-            aria-label={acp.label('关于 DSH 技能发现', 'About DSH Skill Discovery')}
-          >
-            i
-          </button>
-        </Tooltip>
+        </div>
       </div>
       {agents.length > 0 && (
         <div className="dwa-skills-agents">
@@ -158,11 +194,6 @@ export function AgentSkillsMcpRow(props: {
   masterOn: boolean
 }) {
   const { acp, agentId, name, enabled, masterOn } = props
-  // The row's name and its switch label together are the input's accessible
-  // name: a bare list has no surrounding agent card to say which agent a row
-  // belongs to, so every checkbox would otherwise read 「对这个智能体开放」.
-  const nameId = useId()
-  const copyId = useId()
   // One pop per row, and only ever armed by a click the master was ALREADY off
   // for. A click made while the master is on is an ordinary setting change, so
   // it must not arm anything — otherwise flipping the master off would warn on
@@ -176,21 +207,16 @@ export function AgentSkillsMcpRow(props: {
   const warningText = acp.label(MASTER_OFF_WARNING[0], MASTER_OFF_WARNING[1])
   return (
     <div className="dwa-preference-row">
-      <span className="dwa-preference-label" id={nameId}>{name}</span>
+      <span className="dwa-preference-label">{name}</span>
       <span className="dwa-skills-row-control">
-        <label className="dwa-switch">
-          <input
-            type="checkbox"
-            checked={enabled}
-            aria-labelledby={`${nameId} ${copyId}`}
-            onChange={event => {
-              if (!masterOn) setTouched(true)
-              void acp.setAgentSkillsMcp(agentId, event.target.checked)
-            }}
-            style={{ margin: 0, accentColor: 'var(--dsw-alias-state-business-primary, #2563eb)' }}
-          />
-          <span id={copyId}>{acp.label(AGENT_COPY[0], AGENT_COPY[1])}</span>
-        </label>
+        <PillSwitch
+          checked={enabled}
+          label={agentSwitchLabel(acp, name)}
+          onChange={checked => {
+            if (!masterOn) setTouched(true)
+            void acp.setAgentSkillsMcp(agentId, checked)
+          }}
+        />
         {/* Always mounted: the slot keeps its width so the row never reflows,
             and `visibility` (not `display`) keeps it out of the tab order and
             the accessibility tree until it warns. A real button, so the host

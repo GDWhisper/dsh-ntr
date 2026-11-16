@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 /**
  * The settings page's two `dsh-skills` MCP switches: the fixed copy, the
- * focusable info icon behind the host `Tooltip`, the write each one sends, and
- * where each one lives (BOTH levels on the 技能 page — the master card, then the
- * per-agent opt-outs listed under it; no agent card carries the switch any more).
+ * focusable info icon behind the host `Tooltip`, the capsule switch both levels
+ * share, the write each one sends, and where each one lives (BOTH levels on the
+ * 技能 page — the master card, then the per-agent opt-outs listed under it; no
+ * agent card carries the switch any more).
  *
  * Copy is asserted VERBATIM against docs/plan/dsh-skills-mcp.md §7.2 and §13.2 —
  * the tooltip may not be reworded into "starts the process on first call" or
@@ -22,17 +23,18 @@ afterEach(cleanup)
 
 const TITLE = 'DSH 技能发现'
 const MASTER_LABEL = '对所有智能体开放'
-const EXPLANATION = '智能体可以读取你装在 DSH 里的技能说明（只读）。'
+const EXPLANATION = '智能体可以获取 DSH 原生技能列表（只读，按需发现）。'
 const DETAIL = '技能说明只在智能体用到时读取，平时不扫描。开关只对新建或重新加载的对话生效；旧对话保持关闭前的状态。'
 const AGENT_COPY = '对这个智能体开放'
 const MASTER_OFF = '总开关目前处于关闭状态，开启后生效。'
 
 /**
- * A row's checkbox is named by the agent AND the shared label (`aria-labelledby`
- * over the name span plus the copy span): without it every row in the list would
- * read 「对这个智能体开放」 and no screen reader could tell them apart.
+ * A row's switch is named by the scope copy over that agent: no row spells the
+ * copy out in visible text any more, so without the name every switch in the
+ * list would read as a bare agent name and no screen reader could tell what it
+ * does.
  */
-const rowBox = (agent: string) => `${agent} ${AGENT_COPY}`
+const rowBox = (agent: string) => `对 ${agent} 开放`
 
 /** Only the write surfaces these components use; nothing else is reached. */
 function fakeStore(master?: boolean) {
@@ -59,12 +61,23 @@ async function openSkillsPage(store: AcpStore): Promise<void> {
 }
 
 describe('the skills MCP master card', () => {
-  it('is a titled card with the fixed one-line copy, and sends the toggle to the store', async () => {
+  it('is one row: the capability and its copy on the left, the switch on the right', async () => {
     const { acp, ui, setSkillsMcpEnabled } = fakeStore(false)
     render(createElement(SkillsMcpPreference, { acp, ui, agents: [] }))
-    expect(screen.getByRole('heading', { name: TITLE })).toBeTruthy()
-    expect(screen.getByText(EXPLANATION)).toBeTruthy()
-    const toggle = screen.getByRole('checkbox', { name: MASTER_LABEL }) as HTMLInputElement
+    const card = skillsSection().querySelector('.dwa-skills-card') as HTMLElement
+    // The left half names the capability and says what it does, on one line.
+    const text = card.querySelector('.dwa-skills-card-text') as HTMLElement
+    expect(within(text).getByRole('heading', { name: TITLE })).toBeTruthy()
+    expect(within(text).getByText(EXPLANATION)).toBeTruthy()
+    // The right half is the switch and the icon that explains it — and the
+    // visible label text is gone: the layout carries the meaning now.
+    const control = card.querySelector('.dwa-skills-card-control') as HTMLElement
+    expect(control.querySelector('.dwa-info-btn')).toBeTruthy()
+    expect(control.querySelector('.dwa-pill')).toBeTruthy()
+    expect(within(card).queryByText(MASTER_LABEL)).toBeNull()
+    // The switch itself: a real checkbox, off, and it writes on click.
+    const toggle = within(card).getByRole('checkbox', { name: MASTER_LABEL }) as HTMLInputElement
+    expect(toggle.type).toBe('checkbox')
     expect(toggle.checked).toBe(false)
     await act(async () => { fireEvent.click(toggle) })
     expect(setSkillsMcpEnabled).toHaveBeenCalledTimes(1)
@@ -75,6 +88,21 @@ describe('the skills MCP master card', () => {
     const { acp, ui } = fakeStore(undefined)
     render(createElement(SkillsMcpPreference, { acp, ui, agents: [] }))
     expect((screen.getByRole('checkbox', { name: MASTER_LABEL }) as HTMLInputElement).checked).toBe(false)
+  })
+
+  it('draws the switch as a capsule: a track, a knob, and a checkbox over both', () => {
+    const { acp, ui } = fakeStore(true)
+    render(createElement(SkillsMcpPreference, { acp, ui, agents: [] }))
+    const pill = screen.getByRole('checkbox', { name: MASTER_LABEL }).closest('.dwa-pill') as HTMLElement
+    // The track carries the knob; the real checkbox covers the whole pill, so
+    // pointer, keyboard and assistive tech keep the platform's own behaviour.
+    const track = pill.querySelector('.dwa-pill-track') as HTMLElement
+    expect(track.querySelector('.dwa-pill-knob')).toBeTruthy()
+    const box = within(pill).getByRole('checkbox') as HTMLInputElement
+    expect(box.checked).toBe(true)
+    // The sibling order is the CSS's contract: `.dwa-pill input:checked +
+    // .dwa-pill-track` and the focus-ring rule both hang off it.
+    expect(box.nextElementSibling).toBe(track)
   })
 
   it('puts the mechanism in the host Tooltip behind a focusable button', async () => {
@@ -100,7 +128,7 @@ describe('the skills MCP master card', () => {
     // …and an agent's 「高级」 page no longer holds the per-agent switch.
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: '管理 CodeBuddy' })) })
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: '高级' })) })
-    expect(screen.queryByRole('checkbox', { name: AGENT_COPY })).toBeNull()
+    expect(screen.queryByRole('checkbox', { name: rowBox('CodeBuddy') })).toBeNull()
     // The 技能 page carries the master card with its copy and info button.
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: '技能' })) })
     expect(screen.getByRole('heading', { name: TITLE })).toBeTruthy()
@@ -125,8 +153,8 @@ describe('the skills page agent list', () => {
     // The order is the roster's own, so the two pages never disagree.
     expect([...list.querySelectorAll('.dwa-preference-label')].map(node => node.textContent))
       .toEqual(['pi', 'CodeBuddy'])
-    // Two rows, one checkbox each, and each one named by its own agent: in a
-    // bare list the surrounding card no longer says which agent a row belongs to.
+    // Two rows, one switch each, and each one named by its own agent: in a
+    // bare list the surrounding card no longer says which agent a row is.
     expect(within(section).getByRole('checkbox', { name: rowBox('pi') })).toBeTruthy()
     expect(within(section).getByRole('checkbox', { name: rowBox('CodeBuddy') })).toBeTruthy()
     // The warning slot is always mounted and hidden with `visibility`: it keeps
@@ -140,6 +168,34 @@ describe('the skills page agent list', () => {
     expect(within(section).queryByRole('button', { name: MASTER_OFF })).toBeNull()
   })
 
+  it('keeps each row to the name and its switch, with no label text', async () => {
+    const fixture = createPanelFixture()
+    await fixture.ready
+    await openSkillsPage(fixture.store)
+    const list = skillsList(skillsSection()) as HTMLElement
+    const rows = [...list.querySelectorAll('.dwa-preference-row')]
+    expect(rows).toHaveLength(2)
+    for (const row of rows) {
+      const line = row as HTMLElement
+      // Left: the name. Right: the capsule switch. The scope copy is gone.
+      expect(line.querySelector('.dwa-preference-label')).toBeTruthy()
+      expect(line.querySelector('.dwa-pill')).toBeTruthy()
+      expect(within(line).queryByText(AGENT_COPY)).toBeNull()
+    }
+  })
+
+  it('gives both levels the same capsule switch', async () => {
+    const fixture = createPanelFixture({ skillsMcp: true })
+    await fixture.ready
+    await openSkillsPage(fixture.store)
+    const section = skillsSection()
+    // One track per level: the master, plus one under it per agent.
+    expect(section.querySelectorAll('.dwa-pill-track')).toHaveLength(3)
+    for (const pill of section.querySelectorAll('.dwa-pill')) {
+      expect((pill as HTMLElement).querySelector('.dwa-pill-knob')).toBeTruthy()
+    }
+  })
+
   it('is just the master card when no agent is added', async () => {
     const fixture = createPanelFixture({ agents: [] })
     await fixture.ready
@@ -148,7 +204,7 @@ describe('the skills page agent list', () => {
     // No empty-state copy and no add entry: an empty roster is the 智能体 page's
     // business, so this page shows the master switch and stops.
     expect(skillsList(section)).toBeNull()
-    expect(within(section).queryByRole('checkbox', { name: AGENT_COPY })).toBeNull()
+    expect(within(section).queryByRole('checkbox', { name: rowBox('CodeBuddy') })).toBeNull()
     expect(within(section).queryByText(AGENT_COPY)).toBeNull()
     expect(within(section).getByRole('checkbox', { name: MASTER_LABEL })).toBeTruthy()
   })
@@ -166,7 +222,7 @@ describe('the skills page agent list', () => {
       .toEqual([{ agentId: 'pi', skillsMcpEnabled: false }])
     // A plain setting: no agent save was issued along the way.
     expect(fixture.calls.some(call => call.endpoint === 'agent/save')).toBe(false)
-    // The host's re-read answer is what the checkbox keeps.
+    // The host's re-read answer is what the switch keeps.
     expect((within(section).getByRole('checkbox', { name: rowBox('pi') }) as HTMLInputElement).checked).toBe(false)
   })
 
@@ -201,7 +257,7 @@ describe('the per-agent row with the master switch off', () => {
     const box = screen.getByRole('checkbox', { name: rowBox('CodeBuddy') }) as HTMLInputElement
     // A row the user may still act on: no `disabled`, no dimming class.
     expect(box.disabled).toBe(false)
-    expect(box.className).toBe('')
+    expect(box.className).not.toMatch(/is-off|dim|disabled/)
     act(() => { fireEvent.click(box) })
     expect(warning()).not.toBeNull()
     // Master back on: the warning goes, and a later flip off starts silent again.
