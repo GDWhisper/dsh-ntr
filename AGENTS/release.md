@@ -158,16 +158,19 @@ EOF
 
 `.github/workflows/publish-npm.yml`，push `v*` tag 触发：
 
-1. `npm ci` → `npm run prepack`（行数门禁 + typecheck + tests + build）
+1. 装 `npm@latest`、`npm ci` → `npm run prepack`（行数门禁 + typecheck + tests + build）
 2. 校验 `tag == v` + `package.json` version
 3. `npm publish --access public --provenance`
 4. 等 registry 可见后 `npm dist-tag add … latest`
 5. 请求 npmmirror 同步
 
+发布走 npm Trusted Publishing（OIDC），**不需要 `NPM_TOKEN`**：凭据由 GitHub runner 临时签发。前提是 npm 包设置页的 Trusted Publisher 绑定了 `GDWhisper/dsh-ntr` + `publish-npm.yml`，并勾上 “Allow npm publish” 与 “Allow npm dist-tag”；绑定后 2 天内必须完成一次发布，否则配置失效。workflow 用 Node 24 并装 `npm@latest`（发布要求 ≥ 11.5.1，dist-tag 要求 ≥ 11.21.0）。本机 `npm publish` 不走这条路，也不要再用长期 token 补发布。
+
 也支持手动 `workflow_dispatch`：**必须勾 `dry_run`**，它只做 rehearsal；不勾会用当前 `main` 的版本号真的发布。
 
 ## 失败时
 
+- publish 报 `404 Not Found - PUT https://registry.npmjs.org/...`：npm 把认证失败伪装成 404，先核对 Trusted Publisher 的仓库 / workflow 文件名与本次运行完全一致、且已勾 “Allow npm publish”，不要当成包名或包内容问题。
 - **publish 之前失败**（typecheck / test / build / tag 校验）：修好后删 tag 重打：
   ```sh
   git push origin :v0.1.6
