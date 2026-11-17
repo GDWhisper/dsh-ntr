@@ -63,7 +63,10 @@ export interface SubagentRecord {
   /**
    * The terminal frame's `tool_call_update.content`, VERBATIM: a string, an
    * object or an array all survive (constraint 29). Absent means the agent
-   * gave no reason — the panel says so rather than guessing.
+   * gave no reason — the panel says so rather than guessing. The agy failure
+   * path stores the parent report's extracted `content=` payload instead (a
+   * string, see `agySystemFailureText`): agy reports worker death in its own
+   * transcript, never on a wire terminal frame.
    */
   error?: unknown
   /** Per-worker counters: wire updates, worker tool calls, worker text chars. */

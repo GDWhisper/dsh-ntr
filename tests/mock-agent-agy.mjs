@@ -24,7 +24,9 @@
  * Variants: AGY_DISPATCHLATE (result lands after the turn response),
  * AGY_DISPATCHSLOW (result after 1.2s, so a test can cancel first),
  * AGY_DISPATCHNORESULT (no result at all), AGY_DISPATCHTWO (two dispatches),
- * AGY_DISPATCHBARE (rawInput without Role / TypeName).
+ * AGY_DISPATCHBARE (rawInput without Role / TypeName),
+ * AGY_DISPATCHWIRELESS (completed result with NO content — agy 1.5.5's real
+ * wire shape; the conversationId must be recovered from the parent transcript).
  * Under MOCK_AGY_STORE the in-turn variants also write the child's brain
  * transcript (task 2): the file appears with its first step at creation-result
  * time, then a scenario marker schedules the rest —
@@ -35,7 +37,11 @@
  * GENERIC work at steps 3–5, the parent report only afterwards — the row
  * must stay running until the report), AGY_DISPATCHOPENTOOL (a RUNNING
  * tool step, then silence), AGY_DISPATCHNOFILE (no child file at all; only
- * the parent report lands), AGY_DISPATCHSILENT / plain (the first step is
+ * the parent report lands), AGY_DISPATCHFAIL (child ERROR_MESSAGE steps, then
+ * the parent's sender=system failure report — the measured death shape),
+ * AGY_DISPATCHFAILWIRELESS (wireless result + creation step and failure report
+ * in ONE write — the same-batch recovery regression),
+ * AGY_DISPATCHSILENT / plain (the first step is
  * the whole story). AGY_DISPATCHTWO also scripts the SECOND child's own
  * transcript (an open tool step, then silence): the first child finishes
  * via its report while the sibling stays running.
@@ -76,18 +82,44 @@ function agyDispatchCall(toolCallId, role) {
 }
 
 /** The creation result: `completed` means CREATED, never "child finished". */
-function agyDispatchResult(toolCallId, sessionId, suffix) {
+function agyDispatchResult(toolCallId, sessionId, suffix, wireless = false) {
   const childId = `agy-child-${sessionId}-${suffix}`
   const text = `Created the following subagent:\n${JSON.stringify({
     conversationId: childId,
     logAbsoluteUri: `file:///mock/brain/${childId}/.system_generated/logs/transcript.jsonl`,
     workspaceUris: [],
   })}`
+  // agy 1.5.5's real completed frame carries NO usable content (measured:
+  // session-a12ff72b). The creation payload lives only in the parent
+  // transcript's GENERIC step; `wireless` reproduces that wire shape.
   return {
     sessionUpdate: 'tool_call_update',
     toolCallId,
     status: 'completed',
-    content: [{ type: 'content', content: { type: 'text', text } }],
+    ...(wireless ? {} : { content: [{ type: 'content', content: { type: 'text', text } }] }),
+  }
+}
+
+/**
+ * The parent-transcript GENERIC creation step agy writes beside the wire
+ * result. The poll recovers the conversationId from here when the wire frame
+ * carries no content. Uses the parent step counter so indices stay ordered.
+ */
+function agyCreationStep(sessionId, childId) {
+  if (AGY_STORE === undefined) return
+  try {
+    ensureAgyTranscript(sessionId)
+    const index = (agyParentStep.get(sessionId) ?? 0) + 1
+    agyParentStep.set(sessionId, index)
+    const content = `Created the following subagent:\n${JSON.stringify({
+      conversationId: childId,
+      logAbsoluteUri: `file:///mock/brain/${childId}/.system_generated/logs/transcript.jsonl`,
+      workspaceUris: [],
+    })}`
+    const dir = join(AGY_STORE, 'brain', sessionId, '.system_generated', 'logs')
+    appendFileSync(join(dir, 'transcript_full.jsonl'), agyStepLine(index, 'GENERIC', 'DONE', content, 'MODEL'))
+  } catch {
+    // Best effort: a transcript write never changes the agent's answer.
   }
 }
 
@@ -144,11 +176,29 @@ function agyChildScript(sessionId, text) {
   const childId = `agy-child-${sessionId}-1`
   // The parent file must exist for the report tail (even with no child file).
   ensureAgyTranscript(sessionId)
+  // agy writes the creation payload to the parent transcript beside the wire
+  // result; the poll recovers the conversationId from here (agy 1.5.5's wire
+  // frame carries no content).
+  agyCreationStep(sessionId, childId)
   const report = () => {
     try {
       const index = (agyParentStep.get(sessionId) ?? 0) + 1
       agyParentStep.set(sessionId, index)
       const content = `[Message] timestamp=${new Date().toISOString()} sender=${childId} priority=MESSAGE_PRIORITY_HIGH content=License migration complete.`
+      const dir = join(AGY_STORE, 'brain', sessionId, '.system_generated', 'logs')
+      appendFileSync(join(dir, 'transcript_full.jsonl'), agyStepLine(index, 'SYSTEM_MESSAGE', 'DONE', content, 'SYSTEM'))
+    } catch {
+      // Best effort.
+    }
+  }
+  // The measured FAILURE report (session-a12ff72b): sender=system, body names
+  // the child and says it encountered an error. The authoritative failure
+  // signal the poll terminalizes `failed` on.
+  const failureReport = () => {
+    try {
+      const index = (agyParentStep.get(sessionId) ?? 0) + 1
+      agyParentStep.set(sessionId, index)
+      const content = `[Message] timestamp=${new Date().toISOString()} sender=system priority=MESSAGE_PRIORITY_HIGH content=The subagent License Migrator (self) with id "${childId}" encountered an error and has either stopped or failed to start execution: agent executor error: request failed: EOF`
       const dir = join(AGY_STORE, 'brain', sessionId, '.system_generated', 'logs')
       appendFileSync(join(dir, 'transcript_full.jsonl'), agyStepLine(index, 'SYSTEM_MESSAGE', 'DONE', content, 'SYSTEM'))
     } catch {
@@ -177,7 +227,7 @@ function agyChildScript(sessionId, text) {
     }
   }
   const toolCalls = [{ name: 'run_command', args: { CommandLine: 'ls -la' } }]
-  if (text.includes('AGY_DISPATCHREPORT') || text.includes('AGY_DISPATCHTWO')) {
+  if (text.includes('AGY_DISPATCHREPORT') || text.includes('AGY_DISPATCHTWO') || text.includes('AGY_DISPATCHWIRELESS')) {
     setTimeout(() => child(2, 'GENERIC', 'RUNNING', '', { tool_calls: toolCalls }), 300)
     // Both completion signals in the SAME write: the plugin must count one.
     setTimeout(() => {
@@ -205,6 +255,20 @@ function agyChildScript(sessionId, text) {
     }, 650)
   } else if (text.includes('AGY_DISPATCHOPENTOOL')) {
     setTimeout(() => child(2, 'GENERIC', 'RUNNING', '', { tool_calls: [{ name: 'run_command', args: { CommandLine: 'sleep 100' } }] }), 300)
+  } else if (text.includes('AGY_DISPATCHFAILWIRELESS')) {
+    // Wireless creation result + the creation step and failure report in the
+    // SAME write (one poll batch): the poll must claim the recovered id BEFORE
+    // matching the report, or the report is consumed blind and lost (P1-1).
+    child(2, 'ERROR_MESSAGE', 'DONE', '', { error: 'API error: EOF', source: 'SYSTEM' })
+    failureReport()
+  } else if (text.includes('AGY_DISPATCHFAIL')) {
+    // The child dies on a network EOF (measured): ERROR_MESSAGE steps, then the
+    // parent's sender=system failure report. No DONE planner ever lands.
+    setTimeout(() => child(2, 'ERROR_MESSAGE', 'DONE', '', { error: 'API error (attempt 1): EOF', source: 'SYSTEM' }), 300)
+    setTimeout(() => {
+      child(3, 'ERROR_MESSAGE', 'DONE', '', { error: 'API error (attempt 2): EOF', source: 'SYSTEM' })
+      failureReport()
+    }, 600)
   }
   // AGY_DISPATCHSILENT / plain: the first step is the whole story.
   // The second dispatch's OWN child transcript (AGY_DISPATCHTWO): an open
@@ -216,6 +280,7 @@ function agyChildScript(sessionId, text) {
     try {
       mkdirSync(siblingDir, { recursive: true })
       appendFileSync(siblingFile, agyStepLine(1, 'USER_INPUT', 'DONE', 'audit the headers', 'SYSTEM'))
+      agyCreationStep(sessionId, siblingId)
       setTimeout(() => {
         try {
           appendFileSync(siblingFile, agyStepLine(2, 'GENERIC', 'RUNNING', '', 'MODEL', { tool_calls: [{ name: 'run_command', args: { CommandLine: 'sleep 100' } }] }))
@@ -279,7 +344,7 @@ export async function agyPrompt(send, sessionId, text, cancelWait) {
     } else {
       await sleep(120)
     }
-    await send(agyDispatchResult(AGY_DISPATCH_ID, sessionId, '1'))
+    await send(agyDispatchResult(AGY_DISPATCH_ID, sessionId, '1', text.includes('AGY_DISPATCHWIRELESS') || text.includes('AGY_DISPATCHFAILWIRELESS')))
     if (text.includes('AGY_DISPATCHTWO')) await send(agyDispatchResult(AGY_DISPATCH_ID_TWO, sessionId, '2'))
     // The child's transcript evidence (task 2) starts at the creation result.
     agyChildScript(sessionId, text)

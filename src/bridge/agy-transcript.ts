@@ -9,11 +9,12 @@
  *
  * The format is PRIVATE to Antigravity and has no contract: every read is
  * bounded, every parse failure returns `undefined`, and no function throws to
- * its caller. The late-output watch consumes only `PLANNER_RESPONSE` steps;
- * the subagent poll (task 2 of docs/plan/antigravity-subagent-panel.md) also
- * reads `SYSTEM_MESSAGE` reports and `GENERIC` tool steps — every derivation
- * stays fail-open, and an `ERROR` step is a runtime tool failure, never a
- * terminal failure (the real failure shape is unmeasured).
+ * its caller. The late-output watch consumes `PLANNER_RESPONSE` answers and
+ * surfaces the measured background-failure report; the subagent poll (task 2
+ * of docs/plan/antigravity-subagent-panel.md) also reads `SYSTEM_MESSAGE`
+ * reports, `GENERIC` creation steps and the measured failure shape — every
+ * derivation stays fail-open. A child `ERROR` tool step is a runtime tool
+ * failure, never a terminal failure on its own.
  */
 import { homedir } from 'node:os'
 import { closeSync, openSync, readSync, statSync } from 'node:fs'
@@ -212,6 +213,53 @@ export function parseAgyConversationId(text: string): string | undefined {
   return typeof id === 'string' && SESSION_ID_PATTERN.test(id) ? id : undefined
 }
 
+/** Whole-second form of a transcript timestamp; `undefined` when unusable. */
+export function transcriptStepSecond(createdAt: string | undefined): number | undefined {
+  if (createdAt === undefined) return undefined
+  const parsed = Date.parse(createdAt)
+  if (!Number.isFinite(parsed)) return undefined
+  return Math.floor(parsed / 1_000)
+}
+
+/** One creation payload recovered from a PARENT-transcript `GENERIC` step. */
+export interface AgyCreation {
+  stepIndex: number
+  childId: string
+  /** Whole-second `created_at`; `undefined` when the line carries no usable date. */
+  second?: number
+}
+
+/**
+ * The creation evidence the WIRE no longer carries. agy 1.5.5's completed
+ * `invoke_subagent` frame has no usable `content` (measured: session-a12ff72b
+ * left both dispatch records without a `childConversationId`, blinding the
+ * whole poll). The same `Created the following subagent: { … }` payload IS
+ * written to the parent transcript as a `GENERIC` step, so the poll recovers
+ * the id from there. Only the measured creation prefix qualifies — a `GENERIC`
+ * tool result that merely echoes some JSON with a `conversationId` key is NOT a
+ * creation (same marker discipline as {@link agySystemFailureText}). Same
+ * parser as the wire result; anything unreadable returns `undefined`.
+ */
+export function parseAgyCreation(step: TranscriptStep): AgyCreation | undefined {
+  if (step.type !== 'GENERIC') return undefined
+  if (!step.content.includes('Created the following subagent:')) return undefined
+  const childId = parseAgyConversationId(step.content)
+  if (childId === undefined) return undefined
+  const second = transcriptStepSecond(step.createdAt)
+  return { stepIndex: step.stepIndex, childId, ...(second === undefined ? {} : { second }) }
+}
+
+/**
+ * The `sender=` token of a `SYSTEM_MESSAGE` step, or `undefined` for any other
+ * step / unreadable sender. Shared by the completion and failure recognizers
+ * so the two never drift on the message envelope.
+ */
+export function agyMessageSender(step: TranscriptStep): string | undefined {
+  if (step.type !== 'SYSTEM_MESSAGE') return undefined
+  const match = /(?:^|\s)sender=(\S+)/.exec(step.content)
+  return match === null ? undefined : match[1]
+}
+
 /**
  * Whether one PARENT-transcript step is the report that finishes a child: a
  * `SYSTEM_MESSAGE` whose `sender=` token names the child's conversationId.
@@ -222,9 +270,36 @@ export function parseAgyConversationId(text: string): string | undefined {
  * other sender (a prefix included), any other step type is not a report.
  */
 export function isAgyChildReport(step: TranscriptStep, childConversationId: string): boolean {
-  if (step.type !== 'SYSTEM_MESSAGE' || childConversationId === '') return false
-  const match = /(?:^|\s)sender=(\S+)/.exec(step.content)
-  return match !== null && match[1] === childConversationId
+  return childConversationId !== '' && agyMessageSender(step) === childConversationId
+}
+
+/**
+ * The measured BACKGROUND-FAILURE report (session-a12ff72b): a `SYSTEM_MESSAGE`
+ * with `sender=system` whose body names a child and says it `encountered an
+ * error`. Measured body: `The subagent <label> (<type>) with id "<childId>"
+ * encountered an error and has either stopped or failed to start execution:
+ * <error>`. Returns the human-readable `content=` payload, or `undefined` when
+ * the step is not this shape.
+ *
+ * With a `childConversationId` the id must appear QUOTED in the body (the poll
+ * matches one specific dispatch). Without it the body must still carry the
+ * `with id "` marker (the session-level late-output watch knows no child id,
+ * but must not fire on an unrelated system notice). Fail-open: a different
+ * sender, a missing marker or an empty payload is not a failure.
+ */
+export function agySystemFailureText(step: TranscriptStep, childConversationId?: string): string | undefined {
+  if (agyMessageSender(step) !== 'system') return undefined
+  const content = step.content
+  if (!content.includes('encountered an error')) return undefined
+  if (childConversationId !== undefined) {
+    if (childConversationId === '' || !content.includes(`"${childConversationId}"`)) return undefined
+  } else if (!content.includes('with id "')) {
+    return undefined
+  }
+  const marker = ' content='
+  const at = content.indexOf(marker)
+  const payload = (at >= 0 ? content.slice(at + marker.length) : content).trim()
+  return payload === '' ? undefined : payload
 }
 
 /**
@@ -238,8 +313,10 @@ export function isAgyChildReport(step: TranscriptStep, childConversationId: stri
  * candidate. The caller must ALSO require a quiet window (`agyLateOutputQuietMs`,
  * no new steps) before terminalizing — this fold is pure and clock-free. A
  * `RUNNING` response means the child still works; `ERROR` steps are runtime
- * tool failures and never derive a terminal failure (the real failure shape
- * is unmeasured — callers must not guess one). Pure and fail-open.
+ * tool failures and never derive a terminal failure on their own — the
+ * authoritative failure is the parent's `sender=system` report (see
+ * {@link agySystemFailureText}), which the poll reads separately. Pure and
+ * fail-open.
  */
 export function agyChildProgress(
   steps: readonly TranscriptStep[],

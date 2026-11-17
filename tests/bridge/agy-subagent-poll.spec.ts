@@ -435,4 +435,71 @@ describe('Antigravity subagent transcript polling', () => {
     expect(recordFrames(subject.events, since).filter(frame => frame.status === 'completed')).toHaveLength(1)
     expect(unexpectedSubagentFrames(subject.events, since)).toEqual([])
   }, 30_000)
+
+  it('recovers the conversationId from the parent creation step when the wire result has no content', async () => {
+    // agy 1.5.5's completed creation frame carries no usable content
+    // (session-a12ff72b). The id lives only in the parent GENERIC creation
+    // step; without recovery the whole poll flies blind (no tail, no activity
+    // extension, no completion match) and the row ends unknown at the ceiling.
+    const subject = harness()
+    const dshSessionId = 'dsh-agy-poll-wireless'
+    const since = subject.events.length
+    await runTurn(subject, dshSessionId, 'AGY_DISPATCHWIRELESS please')
+    await until(() => recordFrames(subject.events, since).some(frame => frame.status === 'completed'))
+    const frames = recordFrames(subject.events, since)
+    // pending (wire result, no id) → running (recovered) → completed (report).
+    expect(frames.map(frame => frame.status)).toEqual(['pending', 'running', 'completed'])
+    const completed = frames.at(-1)!
+    expect(completed.childConversationId).toMatch(/^agy-child-/)
+    // The recovered id built the child tail: its steps moved the counters.
+    expect(completed.counts.toolCalls).toBeGreaterThanOrEqual(1)
+    expect(completed.counts.updates).toBeGreaterThanOrEqual(4)
+    expect(persisted(subject)?.[dshSessionId]?.[0]?.childConversationId).toMatch(/^agy-child-/)
+    expect(unexpectedSubagentFrames(subject.events, since)).toEqual([])
+    await until(() => armedCount(subject) === 0)
+  }, 30_000)
+
+  it('the measured sender=system failure report terminalizes failed with the error payload', async () => {
+    const subject = harness()
+    const dshSessionId = 'dsh-agy-poll-fail'
+    const since = subject.events.length
+    await runTurn(subject, dshSessionId, 'AGY_DISPATCHFAIL please')
+    await until(() => recordFrames(subject.events, since).some(frame => frame.status === 'failed'))
+    const frames = recordFrames(subject.events, since)
+    expect(frames.map(frame => frame.status)).toEqual(['pending', 'running', 'failed'])
+    const failed = frames.at(-1)!
+    expect(failed.endedAt).toBeDefined()
+    expect(String(failed.error)).toContain('encountered an error')
+    expect(failed.childConversationId).toMatch(/^agy-child-/)
+    // ONE error-level notice names the worker and the reason (settings log).
+    const notices = subject.events.slice(since).filter(event => event.type === 'agent/notice')
+    expect(notices).toHaveLength(1)
+    expect(notices[0]).toMatchObject({ level: 'error' })
+    expect(String((notices[0] as { text: string }).text)).toContain('failed')
+    expect(persisted(subject)?.[dshSessionId]?.[0]?.status).toBe('failed')
+    expect(unexpectedSubagentFrames(subject.events, since)).toEqual([])
+    await until(() => armedCount(subject) === 0)
+  }, 30_000)
+
+  it('a creation step and failure report in ONE batch still terminalize failed (wireless)', async () => {
+    // The creation step and the failure report land in the SAME readNew batch
+    // (wireless result, both written synchronously). The poll must claim the
+    // recovered id BEFORE matching reports: readNew consumes incrementally, so
+    // a report skipped for a missing childId never returns — and the failure
+    // direction has no child-transcript fallback (P1-1 regression).
+    const subject = harness()
+    const dshSessionId = 'dsh-agy-poll-failwireless'
+    const since = subject.events.length
+    await runTurn(subject, dshSessionId, 'AGY_DISPATCHFAILWIRELESS please')
+    await until(() => recordFrames(subject.events, since).some(frame => frame.status === 'failed'))
+    const frames = recordFrames(subject.events, since)
+    expect(frames.map(frame => frame.status)).toEqual(['pending', 'running', 'failed'])
+    const failed = frames.at(-1)!
+    expect(failed.childConversationId).toMatch(/^agy-child-/)
+    expect(String(failed.error)).toContain('encountered an error')
+    const notices = subject.events.slice(since).filter(event => event.type === 'agent/notice')
+    expect(notices).toHaveLength(1)
+    expect(unexpectedSubagentFrames(subject.events, since)).toEqual([])
+    await until(() => armedCount(subject) === 0)
+  }, 30_000)
 })

@@ -11,7 +11,11 @@
  * exist). This service arms one read-only watch per session with pending
  * agy dispatches, tails each running child's transcript (activity, counters,
  * open tool steps, the DONE fallback) and the parent transcript (reports),
- * and drives the dispatch records to their terminal states.
+ * and drives the dispatch records to their terminal states. The creation
+ * result's conversationId is recovered from the parent's `GENERIC` creation
+ * step when the wire frame carries no usable content (agy 1.5.5, measured),
+ * and the measured `sender=system` failure report drives a dispatch to
+ * `failed` (session-a12ff72b).
  *
  * It NEVER closes a turn, kills a process or alters `running`: past the
  * silence windows a dispatch ends `unknown` and stops pinning the idle
@@ -23,15 +27,30 @@ import { existsSync } from 'node:fs'
 import {
   AgyTranscriptTail,
   agyChildProgress,
+  agySystemFailureText,
   agyTranscriptPaths,
   foldAgyOpenToolSteps,
   isAgyChildReport,
+  parseAgyCreation,
+  type AgyCreation,
   type TranscriptStep,
 } from './agy-transcript.ts'
 import { dispatchWithinWindows } from './turn-stream.ts'
 import { lifecycleOf } from './session-lifecycle.ts'
 import type { LiveSession } from './turn-stream.ts'
 import type { BackgroundDispatch, BridgeTuning } from './types.ts'
+
+/**
+ * Creation-recovery time gate (seconds). The wire's completed creation frame
+ * no longer carries the conversationId (agy 1.5.5, measured), so the poll
+ * claims it from the parent transcript's `GENERIC` creation step instead. The
+ * step is dated the SAME second as the dispatch in the field; the slack covers
+ * clock skew / second truncation, the window covers a slow spawn. A creation
+ * outside the gate is left for another dispatch (or dropped as history) rather
+ * than risk a cross-claim.
+ */
+const CREATION_CLAIM_SLACK_S = 2
+const CREATION_CLAIM_WINDOW_S = 60
 
 /** The external capabilities the poll needs (manager closures, no import back). */
 export interface AgySubagentPollWiring {
@@ -48,8 +67,11 @@ export interface AgySubagentPollWiring {
 
 /** What the poll service needs from its owning service, injected. */
 export interface AgySubagentPollDeps extends AgySubagentPollWiring {
-  /** Write one dispatch's terminal state, announce + persist (one transition). */
-  terminalize(session: LiveSession, toolCallId: string, status: 'completed' | 'unknown'): void
+  /**
+   * Write one dispatch's terminal state, announce + persist (one transition).
+   * `error` carries the measured failure payload for a `failed` terminal.
+   */
+  terminalize(session: LiveSession, toolCallId: string, status: 'completed' | 'failed' | 'unknown', error?: string): void
   /** Memory-only record refresh while the child keeps working (no persist). */
   noteActivity(session: LiveSession, dispatch: BackgroundDispatch): void
 }
@@ -71,6 +93,8 @@ interface SessionWatch {
   readonly storeRoot?: string
   parentTail?: AgyTranscriptTail
   readonly children: Map<string, ChildWatch>
+  /** Unclaimed creation payloads read from the parent transcript (step order). */
+  readonly creations: AgyCreation[]
   pollTimer?: ReturnType<typeof setInterval>
   /** Cleared by disarm so a late tick can never touch a new state. */
   finished: boolean
@@ -106,6 +130,7 @@ export class AgySubagentPollService {
         session,
         storeRoot: this.deps.storeRoot(session),
         children: new Map(),
+        creations: [],
         finished: false,
         stop: () => { this.disarmWatch(created) },
       }
@@ -151,7 +176,41 @@ export class AgySubagentPollService {
     }
     const now = Date.now()
     const quietMs = Math.max(0, this.deps.tuning().agyLateOutputQuietMs)
-    // 1. Child transcripts: activity, counters, open tool steps, DONE fallback.
+    // 1. Parent transcript FIRST: creation recovery and the authoritative
+    //    completion / failure reports. Recovering a childId here lets the child
+    //    loop below tail that child in the SAME tick.
+    const parentTail = this.ensureParentTail(watch)
+    if (parentTail !== undefined) {
+      const batch = parentTail.readNew()
+      // Creations BEFORE reports: a creation step and its child's report can
+      // land in the SAME batch (the first tick reads from the beginning; a fast
+      // failure writes both within one poll cadence). `readNew` consumes
+      // incrementally — a report skipped for a missing childId never returns,
+      // and the failure direction has no child-transcript fallback. Claim ids
+      // first, then match reports against the very same batch.
+      for (const step of batch) {
+        const creation = parseAgyCreation(step)
+        if (creation !== undefined) this.noteCreation(watch, session, creation)
+      }
+      this.claimCreations(watch, session)
+      for (const step of batch) {
+        if (step.type !== 'SYSTEM_MESSAGE') continue
+        for (const dispatch of live) {
+          // A terminal row is history: the second signal of the same finish
+          // (both may land in one tick) never counts a completion twice.
+          if (dispatch.terminal !== undefined) continue
+          const childId = dispatch.childConversationId
+          if (childId === undefined) continue
+          if (isAgyChildReport(step, childId)) {
+            this.deps.terminalize(session, dispatch.toolCallId, 'completed')
+            continue
+          }
+          const failure = agySystemFailureText(step, childId)
+          if (failure !== undefined) this.deps.terminalize(session, dispatch.toolCallId, 'failed', failure)
+        }
+      }
+    }
+    // 2. Child transcripts: activity, counters, open tool steps, DONE fallback.
     for (const dispatch of live) {
       if (dispatch.terminal !== undefined) continue
       const child = this.ensureChildTail(watch, dispatch)
@@ -181,23 +240,6 @@ export class AgySubagentPollService {
       }
       if (steps.length > 0) this.deps.noteActivity(session, dispatch)
     }
-    // 2. Parent reports: the AUTHORITATIVE signal for children still running
-    //    (a child whose file never appeared can still complete this way).
-    const parentTail = this.ensureParentTail(watch)
-    if (parentTail !== undefined) {
-      for (const step of parentTail.readNew()) {
-        if (step.type !== 'SYSTEM_MESSAGE') continue
-        for (const dispatch of live) {
-          // A terminal row is history: the second signal of the same finish
-          // (both may land in one tick) never counts a completion twice.
-          if (dispatch.terminal !== undefined) continue
-          const childId = dispatch.childConversationId
-          if (childId !== undefined && isAgyChildReport(step, childId)) {
-            this.deps.terminalize(session, dispatch.toolCallId, 'completed')
-          }
-        }
-      }
-    }
     // 3. The silence ceiling: the SAME two-tier window the idle clock reads.
     //    Past it the dispatch ends `unknown` and stops pinning the process —
     //    never a turn force-finalize, never a kill (constraint 23).
@@ -209,6 +251,79 @@ export class AgySubagentPollService {
       }
     }
     this.reconcile(watch)
+  }
+
+  /**
+   * Keep one unclaimed creation payload. An id any dispatch already carries
+   * (live OR terminal) is history, never re-claimed; so is a duplicate step.
+   */
+  private noteCreation(watch: SessionWatch, session: LiveSession, creation: AgyCreation): void {
+    const dispatches = session.agyDispatches
+    if (dispatches !== undefined) {
+      for (const dispatch of dispatches.values()) {
+        if (dispatch.childConversationId === creation.childId) return
+      }
+    }
+    if (watch.creations.some(row => row.childId === creation.childId)) return
+    watch.creations.push(creation)
+  }
+
+  /**
+   * Hand unclaimed creation payloads to the dispatches whose wire result said
+   * `completed` (CREATED) but carried no conversationId. Oldest eligible
+   * dispatch first, each claiming the first creation inside its own timestamp
+   * window `[startedAt-2s, +60s]`. The drop gate uses the oldest LIVE dispatch
+   * (pending included, not just eligible): a creation older than that is
+   * history no live row can claim. A creation too old for one eligible dispatch
+   * but inside a still-pending sibling's window is KEPT (the sibling claims it
+   * once its wire result lands); one too NEW waits for a later dispatch. An
+   * undated payload cannot be gated and is never claimed (fail closed, like the
+   * late-output watch).
+   *
+   * Seam (documented, narrow): agy creates children in wire order, so order +
+   * time gate the common case. A dispatch the wire marked `completed` whose
+   * child nonetheless failed to START (no creation step of its own) could claim
+   * a sibling's payload inside the window. The failure report still names the
+   * real child: if a row holds that id the failure lands on it (mismatched
+   * detail); if the failed child's id never appeared in any creation step, no
+   * row holds it and the failed terminal is lost (the claimant completes via
+   * the sibling's report). Fail-open direction, never a wrong `failed`.
+   */
+  private claimCreations(watch: SessionWatch, session: LiveSession): void {
+    if (watch.creations.length === 0) return
+    const dispatches = session.agyDispatches
+    if (dispatches === undefined) return
+    const live = [...dispatches.values()].filter(dispatch => dispatch.terminal === undefined)
+    if (live.length === 0) return
+    const eligible = live
+      .filter(dispatch => dispatch.childConversationId === undefined && dispatch.status === 'completed')
+      .sort((a, b) => a.startedAt - b.startedAt)
+    if (eligible.length === 0) return
+    const oldestLiveSecond = Math.floor(Math.min(...live.map(dispatch => dispatch.startedAt)) / 1_000)
+    watch.creations.sort((a, b) => a.stepIndex - b.stepIndex)
+    // Drop only what NO live dispatch can claim (history / a terminal blind
+    // row's creation); keep everything a pending sibling might still want.
+    while (watch.creations.length > 0) {
+      const head = watch.creations[0]!
+      if (head.second === undefined || head.second < oldestLiveSecond - CREATION_CLAIM_SLACK_S) {
+        watch.creations.shift()
+        continue
+      }
+      break
+    }
+    for (const dispatch of eligible) {
+      const startedSecond = Math.floor(dispatch.startedAt / 1_000)
+      const index = watch.creations.findIndex(creation => creation.second !== undefined
+        && creation.second >= startedSecond - CREATION_CLAIM_SLACK_S
+        && creation.second <= startedSecond + CREATION_CLAIM_WINDOW_S)
+      if (index < 0) continue
+      const creation = watch.creations[index]!
+      watch.creations.splice(index, 1)
+      dispatch.childConversationId = creation.childId
+      this.ensureChildTail(watch, dispatch)
+      // pending → running is a status transition: announce + persist it.
+      this.deps.noteActivity(session, dispatch)
+    }
   }
 
   /** The dispatches a teardown has not ended yet (pending included). */

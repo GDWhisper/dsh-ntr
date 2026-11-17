@@ -147,11 +147,12 @@ export class AgySubagentTracker {
    * Write the terminal state onto every unfinished agy dispatch of a session
    * going away (close / release / force reset / process death), or of a turn
    * the user cancelled / that failed (`onlyIds`), or of ONE dispatch the
-   * transcript poll finished (`completed` / `unknown`, a single-id set).
+   * transcript poll finished (`completed` / `failed` / `unknown`, a single-id
+   * set).
    * Returns the rows to announce + persist; the caller batches them with the
    * CodeBuddy rows so one teardown is one state-file write.
    */
-  terminalize(session: LiveSession, status: 'completed' | 'cancelled' | 'unknown', onlyIds?: ReadonlySet<string>): SubagentRecord[] {
+  terminalize(session: LiveSession, status: 'completed' | 'failed' | 'cancelled' | 'unknown', onlyIds?: ReadonlySet<string>): SubagentRecord[] {
     const dispatches = session.agyDispatches
     if (dispatches === undefined) return []
     const dshSessionId = session.dshSessionId

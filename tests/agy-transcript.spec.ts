@@ -10,7 +10,9 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   AgyTranscriptTail,
   agyChildProgress,
+  agyMessageSender,
   agyStoreRoot,
+  agySystemFailureText,
   agyTranscriptPaths,
   foldAgyOpenToolSteps,
   isAgyChildReport,
@@ -18,7 +20,9 @@ import {
   lateAnswerText,
   lateAnswerThought,
   parseAgyConversationId,
+  parseAgyCreation,
   parseTranscriptStep,
+  transcriptStepSecond,
   type TranscriptStep,
 } from '../src/bridge/agy-transcript.ts'
 import { applyEchoGuard } from '../src/bridge/agy-echo-guard.ts'
@@ -457,6 +461,94 @@ describe('subagent completion: parent report signal', () => {
     // The child's own "Message sent to …" GENERIC step is NOT a signal.
     expect(isAgyChildReport(reportStep('child-42', { type: 'GENERIC' }), 'child-42')).toBe(false)
     expect(isAgyChildReport(reportStep('child-42', { type: 'PLANNER_RESPONSE' }), 'child-42')).toBe(false)
+  })
+})
+
+describe('creation recovery from the parent GENERIC step', () => {
+  /** The measured creation step (session-a12ff72b): pretty-printed payload. */
+  function creationStep(childId: string, overrides: Partial<TranscriptStep> = {}): TranscriptStep {
+    return {
+      stepIndex: 8,
+      type: 'GENERIC',
+      status: 'DONE',
+      createdAt: '2026-11-17T07:38:14Z',
+      content: `Created At: 2026-11-17T15:38:14+08:00\nCreated the following subagent:\n{\n  "conversationId":  "${childId}",\n  "logAbsoluteUri":  "file:///C:/store/brain/${childId}/.system_generated/logs/transcript.jsonl",\n  "workspaceUris":  [\n    "file:///G:/Codes/sylva"\n  ]\n}\nThe subagent will send you a message when it has completed its task.`,
+      ...overrides,
+    }
+  }
+
+  it('recovers the conversationId and the whole-second timestamp', () => {
+    const creation = parseAgyCreation(creationStep('850da60d-da50-4c6e-892b-7e571d654b53'))
+    expect(creation?.childId).toBe('850da60d-da50-4c6e-892b-7e571d654b53')
+    expect(creation?.stepIndex).toBe(8)
+    expect(creation?.second).toBe(Math.floor(Date.parse('2026-11-17T07:38:14Z') / 1_000))
+  })
+
+  it('ignores a GENERIC tool result with no creation payload', () => {
+    expect(parseAgyCreation(creationStep('x', { content: 'Command exited with code 0.' }))).toBeUndefined()
+    expect(parseAgyCreation(creationStep('x', { type: 'PLANNER_RESPONSE' }))).toBeUndefined()
+  })
+
+  it('ignores a GENERIC step that echoes creation JSON without the measured prefix', () => {
+    // A tool result may quote some JSON with a conversationId key; only the
+    // measured `Created the following subagent:` prefix qualifies (P2-2).
+    expect(parseAgyCreation(creationStep('child-1', { content: 'tool output: {"conversationId":"child-1"}' }))).toBeUndefined()
+  })
+
+  it('carries no second when the step is undated (fail closed for the gate)', () => {
+    const creation = parseAgyCreation(creationStep('child-1', { createdAt: undefined }))
+    expect(creation?.childId).toBe('child-1')
+    expect(creation?.second).toBeUndefined()
+  })
+
+  it('transcriptStepSecond folds to whole seconds and rejects junk', () => {
+    expect(transcriptStepSecond('2026-11-17T07:38:14Z')).toBe(Math.floor(Date.parse('2026-11-17T07:38:14Z') / 1_000))
+    expect(transcriptStepSecond(undefined)).toBeUndefined()
+    expect(transcriptStepSecond('not a date')).toBeUndefined()
+  })
+})
+
+describe('background failure: the measured sender=system report', () => {
+  /** The measured failure body (session-a12ff72b, parent transcript step 10). */
+  function failureStep(childId: string, overrides: Partial<TranscriptStep> = {}): TranscriptStep {
+    return {
+      stepIndex: 10,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: `[Message] timestamp=2026-11-17T08:08:26Z sender=system priority=MESSAGE_PRIORITY_HIGH content=The subagent Hover Occlusion Fixer (self) with id "${childId}" encountered an error and has either stopped or failed to start execution: agent executor error: request failed: EOF`,
+      ...overrides,
+    }
+  }
+
+  it('extracts the content= payload for the named child', () => {
+    const text = agySystemFailureText(failureStep('850da60d'), '850da60d')
+    expect(text).toContain('Hover Occlusion Fixer')
+    expect(text).toContain('encountered an error')
+    expect(text).toContain('EOF')
+    // The envelope (timestamp / sender / priority) is stripped.
+    expect(text).not.toContain('sender=')
+    expect(text?.startsWith('The subagent')).toBe(true)
+  })
+
+  it('without a child id still requires the with-id marker (session-level watch)', () => {
+    expect(agySystemFailureText(failureStep('850da60d'))).toContain('encountered an error')
+    // A system notice that is not a child failure does not fire.
+    const other = failureStep('x', { content: '[Message] sender=system content=The system encountered an error elsewhere' })
+    expect(agySystemFailureText(other)).toBeUndefined()
+  })
+
+  it('rejects another child, a completion report and a non-system sender', () => {
+    expect(agySystemFailureText(failureStep('850da60d'), 'other-child')).toBeUndefined()
+    // sender=<childId> is a COMPLETION report, never a failure.
+    const completion = failureStep('850da60d', { content: '[Message] sender=850da60d content=done' })
+    expect(agySystemFailureText(completion, '850da60d')).toBeUndefined()
+    expect(agySystemFailureText(failureStep('850da60d', { type: 'ERROR_MESSAGE' }), '850da60d')).toBeUndefined()
+  })
+
+  it('agyMessageSender reads the token only from SYSTEM_MESSAGE steps', () => {
+    expect(agyMessageSender(failureStep('x'))).toBe('system')
+    expect(agyMessageSender(failureStep('x', { type: 'GENERIC' }))).toBeUndefined()
+    expect(agyMessageSender({ stepIndex: 1, type: 'SYSTEM_MESSAGE', status: 'DONE', content: 'no sender' })).toBeUndefined()
   })
 })
 

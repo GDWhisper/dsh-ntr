@@ -11,7 +11,7 @@ import { join } from 'node:path'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { afterAll, describe, expect, it, vi } from 'vitest'
 import {
-  AcpLlmAdapter, BACKGROUND_REPORT_FORM, BACKGROUND_REPORT_SOURCE, BridgeManager,
+  AcpLlmAdapter, BACKGROUND_FAILURE_WAKE_TEXT, BACKGROUND_REPORT_FORM, BACKGROUND_REPORT_SOURCE, BridgeManager,
   type BridgeTuning,
 } from '../src/bridge.ts'
 import { EventHub, dispatchRpc } from '../src/impl.ts'
@@ -210,6 +210,35 @@ describe('AGY-LATE: Antigravity transcript late output', () => {
     expect(String(wake?.source?.report)).toContain('AGY-LATE-ANSWER AGY_LATE please')
     // The watch delivered; the agent itself saw exactly ONE prompt.
     expect(promptCount(harness.prompts)).toBe(1)
+  }, 30_000)
+
+  it('surfaces a background failure as a wake without arming the echo guard', async () => {
+    const dshSessionId = 'dsh-agy-late-failure'
+    const wakes: GenerateMessage[] = []
+    const { harness } = harnessWithResolver(dshSessionId, wakes)
+    await hostLoopTurn(harness.adapter, {
+      provider: 'acp',
+      model: 'agy-late',
+      sessionId: dshSessionId,
+      messages: [userText('AGY_DISPATCHFAIL please')],
+    })
+    await until(() => wakes.length === 1, 10_000)
+    const wake = wakes[0]
+    expect(wake?.role).toBe('user')
+    expect(wake?.source?.kind).toBe(BACKGROUND_REPORT_SOURCE)
+    expect(wake?.source?.form).toBe(BACKGROUND_REPORT_FORM)
+    expect((wake?.content as Array<{ text: string }>)[0]?.text).toBe(BACKGROUND_FAILURE_WAKE_TEXT)
+    expect(String(wake?.source?.report)).toContain('encountered an error')
+    expect(String(wake?.source?.report)).toContain('EOF')
+    // The wake replays locally: the agent saw exactly ONE prompt (the dispatch).
+    expect(promptCount(harness.prompts)).toBe(1)
+    // No echo guard: agy never replays a failure it did not write as a planner
+    // step, so neither the pending nor the committed record may be armed.
+    const seam = harness.manager as unknown as { registry: { sessionAt(id: string, agentId: string): { pendingLateEcho?: unknown; lateEcho?: unknown } | undefined } }
+    const live = seam.registry.sessionAt(dshSessionId, 'agy-late')
+    expect(live).toBeDefined()
+    expect(live?.pendingLateEcho).toBeUndefined()
+    expect(live?.lateEcho).toBeUndefined()
   }, 30_000)
 
   it('keeps the agent echo of the user prompt out of the answer mirror', async () => {

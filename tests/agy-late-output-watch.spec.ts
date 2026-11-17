@@ -35,6 +35,7 @@ interface WatchHarness {
   session: LiveSession
   file: string
   deliveries: string[]
+  failures: string[]
   setBusy(busy: boolean): void
   cleanup(): void
 }
@@ -54,6 +55,7 @@ function watchHarness(overrides: Partial<BridgeTuning> = {}): WatchHarness {
   appendFileSync(file, `${JSON.stringify({ step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'seed' })}\n`)
 
   const deliveries: string[] = []
+  const failures: string[] = []
   let busy = false
   const session = {
     sessionId: 'acp-session-1',
@@ -78,7 +80,11 @@ function watchHarness(overrides: Partial<BridgeTuning> = {}): WatchHarness {
     host: {
       defOf: () => def,
       isBusy: () => busy,
-      deliver: (_session, text) => { deliveries.push(text); return true },
+      deliver: (_session, text, _thought, failure) => {
+        if (failure === true) failures.push(text)
+        else deliveries.push(text)
+        return true
+      },
     },
   })
   return {
@@ -86,6 +92,7 @@ function watchHarness(overrides: Partial<BridgeTuning> = {}): WatchHarness {
     session,
     file,
     deliveries,
+    failures,
     setBusy: next => { busy = next },
     cleanup: () => { service.disarm(session); rmSync(workspace, { recursive: true, force: true }) },
   }
@@ -168,6 +175,67 @@ describe('AGY-WATCH: idle window and hard ceiling', () => {
     h.service.arm(h.session, Date.now())
     h.setBusy(true)
     await until(() => h.service.armedCount === 0)
+    expect(h.deliveries).toHaveLength(0)
+  })
+
+  /** The measured sender=system failure report (session-a12ff72b). */
+  function appendFailure(file: string, childId = 'child-9'): void {
+    appendStep(file, 'SYSTEM_MESSAGE', `[Message] timestamp=${new Date().toISOString()} sender=system priority=MESSAGE_PRIORITY_HIGH content=The subagent Worker (self) with id "${childId}" encountered an error and has either stopped or failed to start execution: agent executor error: request failed: EOF`)
+  }
+
+  it('surfaces a measured failure when no answer arrives', async () => {
+    const h = harness({ agyLateOutputMaxMs: 5_000, agyLateOutputQuietMs: 30 })
+    h.service.arm(h.session, Date.now())
+    appendFailure(h.file)
+    await until(() => h.failures.length === 1)
+    expect(h.failures[0]).toContain('encountered an error')
+    expect(h.failures[0]).toContain('EOF')
+    expect(h.deliveries).toHaveLength(0)
+    expect(h.service.armedCount).toBe(0)
+  })
+
+  it('a late answer still wins over a failure report', async () => {
+    const h = harness({ agyLateOutputMaxMs: 5_000, agyLateOutputQuietMs: 60 })
+    h.service.arm(h.session, Date.now())
+    appendFailure(h.file)
+    // The answer lands inside the quiet window: it wins, no failure delivery.
+    await sleep(20)
+    appendStep(h.file, 'PLANNER_RESPONSE', 'recovered answer')
+    await until(() => h.deliveries.length === 1)
+    expect(h.deliveries[0]).toBe('recovered answer')
+    expect(h.failures).toHaveLength(0)
+  })
+
+  it('surfaces a failure even when the only answer is the turn own late write', async () => {
+    // The turn's own answer (already shown) is not NEW information; a failure
+    // report in the same window still is, and must surface (P2-3).
+    const h = harness({ agyLateOutputMaxMs: 5_000, agyLateOutputQuietMs: 30 })
+    ;(h.session as unknown as { lastTurnAnswerText?: string }).lastTurnAnswerText = 'already shown'
+    h.service.arm(h.session, Date.now())
+    appendStep(h.file, 'PLANNER_RESPONSE', 'already shown')
+    appendFailure(h.file)
+    await until(() => h.failures.length === 1)
+    expect(h.deliveries).toHaveLength(0)
+    expect(h.service.armedCount).toBe(0)
+  })
+
+  it('the idle deadline surfaces a failure that never went quiet on its own', async () => {
+    // Quiet is long; only the idle deadline settles the watch. The failure
+    // payload still surfaces (settle's failure branch).
+    const h = harness({ agyLateOutputMaxMs: 120, agyLateOutputQuietMs: 5_000 })
+    h.service.arm(h.session, Date.now())
+    appendFailure(h.file)
+    await until(() => h.failures.length === 1)
+    expect(h.failures[0]).toContain('encountered an error')
+    expect(h.service.armedCount).toBe(0)
+  })
+
+  it('a non-failure system notice does not surface as a failure', async () => {
+    const h = harness({ agyLateOutputMaxMs: 150, agyLateOutputQuietMs: 30 })
+    h.service.arm(h.session, Date.now())
+    appendStep(h.file, 'SYSTEM_MESSAGE', '[Message] sender=system content=ordinary progress note')
+    await until(() => h.service.armedCount === 0)
+    expect(h.failures).toHaveLength(0)
     expect(h.deliveries).toHaveLength(0)
   })
 })

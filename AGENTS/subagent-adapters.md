@@ -8,7 +8,7 @@
 面板契约共享：`SubagentRecord` 六态（`childId = acp:<toolCallId>`）、catalog external 行、明细条目、`agents.json` 的 `subagents` 键。事实源按 agent 分：
 
 - **CodeBuddy**：wire `_meta`（`codebuddy.ai/toolName` / `isBackground` / `parentToolCallId`）驱动识别 / hold / 收口——**回合耦合**（约束 23 的 dispatches / ambient 家族就在 `turn-stream.ts`）。
-- **agy**：wire 无任何生命周期帧，私有 brain transcript 是事实源——**纯观察**（detached，永不 hold 回合）。
+- **agy**：wire 无任何生命周期帧（1.5.5 的创建结果帧甚至不带 content），私有 brain transcript 是事实源——**纯观察**（detached，永不 hold 回合）。`conversationId` 由父 transcript 的 GENERIC 创建步恢复（`parseAgyCreation`，时间窗认领）；完成认 `sender=<childId>` 报告，失败认 `sender=system` 的 `encountered an error` 报告（`agySystemFailureText`）→ `failed` + 一条 error notice；late-output watch 无答案时把失败投递成对话 wake（`deliverLateFailure`，不挂回声守卫）。
 
 两者不对称：统一接口**不得**把 CodeBuddy 的回合语义拖进观察型适配器。行为契约见 [protocol.md §6.3 / §6.4](./protocol.md)、落盘见 [state.md §1](./state.md)、明细 UI 见 [ui.md §4.3](./ui.md)。
 

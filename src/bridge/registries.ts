@@ -231,6 +231,14 @@ export const BACKGROUND_REPORT_FORM = 'notice'
 export const BACKGROUND_WAKE_TEXT = 'Background task completed.'
 
 /**
+ * The visible text of a FAILURE wake (see {@link BACKGROUND_WAKE_TEXT}). The
+ * preset guard matches the wake by kind + form only and never reads this text,
+ * so it needs no hand-copy there. The failure report itself follows as the
+ * assistant message the adapter replay yields.
+ */
+export const BACKGROUND_FAILURE_WAKE_TEXT = 'Background task failed.'
+
+/**
  * What the adapter answers a wake whose `source.report` the host pipeline
  * lost. One fixed, neutral English line, answered LOCALLY (no `session/prompt`
  * — and never a fall-through to the forward picker: that would re-send the

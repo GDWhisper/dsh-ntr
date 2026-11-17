@@ -14,7 +14,7 @@ export { ACP_PRESET_ID, AGENT_PRESETS, defaultAgentWorkspace, ensureDefaultWorks
 export type { AgentPreset } from './bridge/state-paths.ts'
 export { detectHostAgents, ensureAgentExecutable, findExecutable, killProcessTree, npmInstallGlobal, windowsShimLaunch } from './bridge/process.ts'
 export type { ExecutableResolution, ShimLaunch } from './bridge/process.ts'
-export { ACP_ROUTE_BINDING_KEY, BACKGROUND_REPORT_FORM, BACKGROUND_REPORT_LOST_TEXT, BACKGROUND_REPORT_SOURCE, backgroundReportOf, recordAcpToolOutput, releaseAllToolOutputWaiters, routeBindingRegistry, waitForToolOutput } from './bridge/registries.ts'
+export { ACP_ROUTE_BINDING_KEY, BACKGROUND_FAILURE_WAKE_TEXT, BACKGROUND_REPORT_FORM, BACKGROUND_REPORT_LOST_TEXT, BACKGROUND_REPORT_SOURCE, backgroundReportOf, recordAcpToolOutput, releaseAllToolOutputWaiters, routeBindingRegistry, waitForToolOutput } from './bridge/registries.ts'
 export type { AcpRouteBindingRegistry, BackgroundWake } from './bridge/registries.ts'
 export { AsyncQueue } from './bridge/async-queue.ts'
 export { permissionToolName } from './bridge/turn-stream.ts'

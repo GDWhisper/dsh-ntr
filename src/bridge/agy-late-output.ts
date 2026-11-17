@@ -6,7 +6,10 @@
  * flight, and it sends no `session/update` in that window: the answer lands
  * only in its private transcript. This service arms a bounded transcript
  * watch when a chat turn closes, waits for the new `PLANNER_RESPONSE` to go
- * quiet, and hands its text to {@link SubagentService.deliverLateReport}.
+ * quiet, and hands its text to {@link SubagentService.deliverLateReport}. When
+ * no answer comes but the measured background-failure report does, it surfaces
+ * that failure instead of disarming silently (session-a12ff72b: a worker died
+ * on a network EOF and the user saw nothing for 40 minutes).
  *
  * Two clocks bound the watch. The IDLE window (`agyLateOutputMaxMs`) is pushed
  * forward by EVERY new transcript step — a `SYSTEM_MESSAGE` / `GENERIC` / tool
@@ -24,9 +27,11 @@
 import { existsSync } from 'node:fs'
 import {
   AgyTranscriptTail,
+  agySystemFailureText,
   agyTranscriptPaths,
   lateAnswerText,
   lateAnswerThought,
+  transcriptStepSecond,
   type TranscriptStep,
 } from './agy-transcript.ts'
 import type { AcpAgentDef } from '../protocol.ts'
@@ -42,6 +47,8 @@ interface LateWatch {
   /** Highest `step_index` at arm time: nothing at or below it is a late answer. */
   baselineStepIndex: number
   readonly steps: TranscriptStep[]
+  /** The measured background-failure payload, when a failure report arrived. */
+  failureText?: string
   pollTimer?: ReturnType<typeof setInterval>
   quietTimer?: ReturnType<typeof setTimeout>
   /** Idle deadline: pushed forward by every new step (see `armIdleDeadline`). */
@@ -68,17 +75,13 @@ export interface AgyLateOutputDeps {
     defOf(agentId: string): AcpAgentDef | undefined
     /** Whether the session is running a turn or holding the agent's prompt slot. */
     isBusy(session: LiveSession): boolean
-    /** Hand one late answer (and its thinking) to the chat plane; false when nothing accepted it. */
-    deliver(session: LiveSession, text: string, thought?: string): boolean
+    /**
+     * Hand one late payload to the chat plane; false when nothing accepted it.
+     * `failure` selects the failure wake (no echo guard: agy never replays a
+     * failure it did not write as a planner step); otherwise it is an answer.
+     */
+    deliver(session: LiveSession, text: string, thought?: string, failure?: boolean): boolean
   }
-}
-
-/** Whole-second form of a transcript timestamp; `undefined` when unusable. */
-function stepSecond(createdAt: string | undefined): number | undefined {
-  if (createdAt === undefined) return undefined
-  const parsed = Date.parse(createdAt)
-  if (!Number.isFinite(parsed)) return undefined
-  return Math.floor(parsed / 1_000)
 }
 
 /**
@@ -183,6 +186,14 @@ export class AgyLateOutputService {
     // deadline out, even for a non-answer step (a subagent report or a tool
     // frame). Only the hard ceiling is immune to this extension.
     this.armIdleDeadline(watch)
+    // The measured failure report (sender=system) is session-level evidence a
+    // background worker died: keep its payload so a quiet with no answer can
+    // surface it instead of disarming silently.
+    let sawFailure = false
+    for (const step of steps) {
+      const failure = agySystemFailureText(step)
+      if (failure !== undefined) { watch.failureText = failure; sawFailure = true }
+    }
     const floorSecond = Math.floor(watch.closedAt / 1_000)
     const candidates = steps.filter(step => {
       // Only planner responses are kept: fewer bytes held, and no sub-agent
@@ -191,12 +202,17 @@ export class AgyLateOutputService {
       if (step.stepIndex <= watch.baselineStepIndex) return false
       // A line with NO timestamp cannot be told apart from history: fail
       // closed. A line that reaches us through this filter is new AND dated.
-      const second = stepSecond(step.createdAt)
+      const second = transcriptStepSecond(step.createdAt)
       return second !== undefined && second >= floorSecond
     })
-    if (candidates.length === 0) return
-    watch.steps.push(...candidates)
-    this.armQuiet(watch)
+    if (candidates.length > 0) {
+      watch.steps.push(...candidates)
+      this.armQuiet(watch)
+    } else if (sawFailure) {
+      // No answer yet, but a failure arrived: run the same quiet window so a
+      // late answer that still follows wins, and a quiet failure surfaces.
+      this.armQuiet(watch)
+    }
   }
 
   /** Restart the quiet window; every new step extends it. */
@@ -216,11 +232,19 @@ export class AgyLateOutputService {
     if (watch.finished) return
     const text = lateAnswerText(watch.steps)
     if (text.trim() === '') {
-      // Background tool frames only: the answer may still follow.
+      // No answer: a measured failure surfaces now; otherwise the answer may
+      // still follow (background tool frames only), so keep waiting.
+      if (watch.failureText !== undefined) {
+        this.deliver(watch, watch.failureText, undefined, true)
+        this.disarmWatch(watch)
+      }
       return
     }
     if (this.isOwnTurnAnswer(watch.session, text)) {
-      // The turn's own answer, written late: nothing to announce.
+      // The turn's own answer, written late: nothing to announce. A failure
+      // report in the same window is still NEW information — surface it before
+      // standing down ("answer wins" means a real new answer, not this echo).
+      if (watch.failureText !== undefined) this.deliver(watch, watch.failureText, undefined, true)
       this.disarmWatch(watch)
       return
     }
@@ -241,15 +265,19 @@ export class AgyLateOutputService {
 
   /**
    * A clock elapsed (idle window or hard ceiling): deliver whatever arrived
-   * when the session is idle, then stop. An empty buffer disarms silently —
-   * the answer, if any, is still in the transcript for the next prompt.
+   * when the session is idle, then stop. An answer wins over a failure; with
+   * neither, disarm silently — the answer, if any, is still in the transcript
+   * for the next prompt.
    */
   private settle(watch: LateWatch): void {
     if (watch.finished) return
     const session = watch.session
+    const servable = lifecycleOf(session) === 'live' && !this.deps.host.isBusy(session)
     const text = lateAnswerText(watch.steps)
-    if (text.trim() !== '' && lifecycleOf(session) === 'live' && !this.deps.host.isBusy(session)) {
+    if (text.trim() !== '' && servable) {
       this.deliver(watch, text, lateAnswerThought(watch.steps))
+    } else if (watch.failureText !== undefined && servable) {
+      this.deliver(watch, watch.failureText, undefined, true)
     }
     this.disarmWatch(watch)
   }
@@ -266,11 +294,13 @@ export class AgyLateOutputService {
     return foldWhitespace(shown) === foldWhitespace(text)
   }
 
-  /** Hand one answer over. A session the host no longer accepts throws nothing. */
-  private deliver(watch: LateWatch, text: string, thought?: string): void {
-    if (this.isOwnTurnAnswer(watch.session, text)) return
+  /** Hand one payload over. A session the host no longer accepts throws nothing. */
+  private deliver(watch: LateWatch, text: string, thought?: string, failure = false): void {
+    // A failure is new text the turn never showed; only an answer can be the
+    // turn's own late write.
+    if (!failure && this.isOwnTurnAnswer(watch.session, text)) return
     try {
-      this.deps.host.deliver(watch.session, text, thought)
+      this.deps.host.deliver(watch.session, text, thought, failure)
     } catch {
       // Fail-open: a delivery path must never throw into a timer.
     }

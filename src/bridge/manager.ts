@@ -372,7 +372,7 @@ export class BridgeManager {
       host: {
         defOf: agentId => this.defsMap.get(agentId),
         isBusy: session => session.running || hasPromptSlot(session),
-        deliver: (session, text, thought) => this.subagents.deliverLateReport(session, text, thought),
+        deliver: (session, text, thought, failure) => failure === true ? this.subagents.deliverLateFailure(session, text) : this.subagents.deliverLateReport(session, text, thought),
       },
     })
     // The settings / tuning cluster (see `SettingsService`) needs the live

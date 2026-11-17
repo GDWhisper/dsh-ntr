@@ -33,7 +33,7 @@
 
 - `agy.exe`（226 MB，字符串未压缩）grep 计数：`parentToolCallId` / `isBackground` / `subagentType` / `unsolicitedTurn` **全 0**，`invoke_subagent` 90 处。CodeBuddy 那套 `_meta` 键 agy 根本不带。
 - 派发是一个普通工具调用：DSH 日志折叠成 `name: dsh_ntr__acp_tool_call`、`arguments: "Run invoke_subagent\n{…}"`。标题来自 ACP `toolCall.title`（`src/bridge/turn-stream.ts` · `permissionToolName` 先读 `title`），agy 设 `title = "Run invoke_subagent"`；`rawInput` 形如 `{ Model: "inherit", Prompt: "…", Role: "License Migrator", TypeName: "self" }`。
-- 派发工具调用**立即返回**：`tool/result` 在调用后约 5 秒到达，内容是「Created the following subagent: { conversationId, logAbsoluteUri, workspaceUris }」。**这不是子代理完成**，只是「已创建」。子代理完成在 wire 上**没有任何帧**（无 prompt 在飞时 agy 不发 `session/update`，见 late-output §1）。
+- 派发工具调用**立即返回**：`tool/result` 在调用后约 5 秒到达，内容是「Created the following subagent: { conversationId, logAbsoluteUri, workspaceUris }」。**这不是子代理完成**，只是「已创建」。子代理完成在 wire 上**没有任何帧**（无 prompt 在飞时 agy 不发 `session/update`，见 late-output §1）。**版本差异（session-a12ff72b 实测，agy 1.5.5）**：完成帧 `tool_call_update` 实测**不带可用 content**，创建 JSON 只落在父 transcript 的 GENERIC 步；wire content 解析（`parseAgyConversationId`）保留作早版本路径，轮询另经 `parseAgyCreation` 从父 transcript 恢复 id（时间窗认领），否则整条轮询致盲、派发只能到点归 `unknown`。
 - `initialize` 实测（探针，认证前握手）：`agentCapabilities.loadSession = true`，`sessionCapabilities` 含 `resume / close / load / list / additionalDirectories`（**无 fork**），`_meta.antigravity = { tier: true, systemPrompt: { append: true } }`；`authMethods` 为 `oauth-personal / oauth-business / gemini-api-key / agent-platform`。**新 ACP 连接需要 `authenticate`（交互式 OAuth）**；插件不调它，靠 agy 缓存 token 自动认证。因此 wire 抓帧必须 ride 一个**已认证**的会话（实现时在用户正常会话里抓），不能由探针自行发起 OAuth。
 
 ### 2.2 私有 transcript 留了完整证据
@@ -42,11 +42,12 @@
 
 | 证据 | 形状 | 用途 |
 |---|---|---|
-| 派发结果（父 transcript `GENERIC` 步，也在 wire 的 tool 结果里） | `Created the following subagent:\n{ "conversationId": "<childId>", "logAbsoluteUri": "file:///…/brain/<childId>/.system_generated/logs/transcript.jsonl", "workspaceUris": […] }` | 拿子代理 `conversationId`；路径可由 `agyTranscriptPaths(storeRoot, childId)` 复用推出，不必解析 URI |
+| 派发结果（父 transcript `GENERIC` 步；早版本也在 wire 的 tool 结果里，1.5.5 实测 wire 无 content） | `Created the following subagent:\n{ "conversationId": "<childId>", "logAbsoluteUri": "file:///…/brain/<childId>/.system_generated/logs/transcript.jsonl", "workspaceUris": […] }` | 拿子代理 `conversationId`；路径可由 `agyTranscriptPaths(storeRoot, childId)` 复用推出，不必解析 URI |
 | 子代理报告（父 transcript `SYSTEM_MESSAGE` 步） | `[Message] timestamp=<ISO> sender=<childId> priority=MESSAGE_PRIORITY_HIGH content=<报告正文>` | 子代理完成的信号 + 报告正文；`sender` 对齐 childId |
+| 子代理失败报告（父 transcript `SYSTEM_MESSAGE` 步，session-a12ff72b 实测） | `[Message] timestamp=<ISO> sender=system priority=MESSAGE_PRIORITY_HIGH content=The subagent <label> (<type>) with id "<childId>" encountered an error and has either stopped or failed to start execution: <error>` | 子代理终态失败的权威信号；`sender=system`（不是 childId），正文引号含 childId，`agySystemFailureText` 取 `content=` 载荷 → `failed` |
 | 子代理自己的 brain transcript | `brain/<childId>/.system_generated/logs/transcript.jsonl`，108 步（License Migrator）/ 18 步（Git Committer），含 `USER_INPUT` / `PLANNER_RESPONSE` / `GENERIC` / `SYSTEM_MESSAGE` | 运行中证据（步骤流）、明细、终态（最后一条 `PLANNER_RESPONSE` DONE） |
 
-**失败信号（实测，关键区分）**：`status === 'ERROR'` 的 `GENERIC` 步是**运行中的工具错误**（`error` 字段带原因，如「target content not found in the file」），**不是子代理终态失败**——子代理 `ecfb4b3b` 有 6 个 ERROR 步仍以 `PLANNER_RESPONSE` DONE 成功收尾。所以子代理终态要看**最后一条 `PLANNER_RESPONSE`**：DONE = 成功；真正的终态失败形状（最后一步 ERROR / 无 DONE 答复）尚未抓到失败案例，确认前归 `unknown`（§12.3）。
+**失败信号（实测，关键区分）**：`status === 'ERROR'` 的 `GENERIC` 步是**运行中的工具错误**（`error` 字段带原因，如「target content not found in the file」），**不是子代理终态失败**——子代理 `ecfb4b3b` 有 6 个 ERROR 步仍以 `PLANNER_RESPONSE` DONE 成功收尾。所以子代理终态要看**最后一条 `PLANNER_RESPONSE`**：DONE = 成功。**终态失败形状已实测补齐**（session-a12ff72b：Fixer 死于网络 EOF）：子 transcript 以 `ERROR_MESSAGE` 步收尾、无 DONE，父 transcript 收到 `sender=system` 的失败报告（正文 `with id "<childId>" encountered an error …`，见上表）。**取父 `sender=system` 失败报告为权威失败信号**（`agySystemFailureText`）→ `failed` + error 载荷 + 一条 error notice；子 `ERROR_MESSAGE` 收尾单独不推导终态，父报告缺席时仍由静默上限归 `unknown`。late-output watch 无答案时把同一失败投递成对话 wake（`deliverLateFailure`，不挂回声守卫）。
 
 **完成信号（实测）**：子代理收尾时依次写「`Message sent to "<父conversationId>"`」的 `GENERIC` 步 + 最后一条 `PLANNER_RESPONSE` DONE（自述「已回传主代理」）；父 transcript 同时刻收到 `sender=<childId>` 的 `SYSTEM_MESSAGE`（报告正文）。三者同秒到达。**取父 transcript 的 `SYSTEM_MESSAGE(sender=childId)` 为权威完成信号**（它就是报告投递本身），子代理最后 `PLANNER_RESPONSE` DONE 作兜底；二者去重，不重复计完成。
 

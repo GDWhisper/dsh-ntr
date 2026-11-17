@@ -24,6 +24,7 @@ import {
 import type { SubagentDetailEntry, SubagentDetailResult, SubagentRecord } from '../protocol.ts'
 import { MAX_SUBAGENT_DETAIL_ENTRIES } from '../protocol.ts'
 import {
+  BACKGROUND_FAILURE_WAKE_TEXT,
   BACKGROUND_REPORT_FORM,
   BACKGROUND_REPORT_MAX,
   BACKGROUND_REPORT_SOURCE,
@@ -94,7 +95,7 @@ export class SubagentService {
     if (agyPoll !== undefined) {
       this.agyPoll = new AgySubagentPollService({
         ...agyPoll,
-        terminalize: (session, toolCallId, status) => { this.terminalizeAgyDispatch(session, toolCallId, status) },
+        terminalize: (session, toolCallId, status, error) => { this.terminalizeAgyDispatch(session, toolCallId, status, error) },
         noteActivity: (session, dispatch) => { this.agy.refresh(session, dispatch) },
       })
     }
@@ -458,13 +459,31 @@ export class SubagentService {
 
   /**
    * One agy dispatch reached a terminal state from its transcripts (the poll
-   * service's completion / silence-ceiling decision). Same write rule as the
-   * teardown batch: one announce, one state-file write, terminal never
+   * service's completion / failure / silence-ceiling decision). Same write rule
+   * as the teardown batch: one announce, one state-file write, terminal never
    * overwritten — the second completion signal of the same finish is a no-op.
+   * A `failed` terminal also keeps the measured error payload on the record and
+   * logs ONE notice (the conversation wake is the late-output watch's job).
    */
-  private terminalizeAgyDispatch(session: LiveSession, toolCallId: string, status: 'completed' | 'unknown'): void {
+  private terminalizeAgyDispatch(session: LiveSession, toolCallId: string, status: 'completed' | 'failed' | 'unknown', error?: string): void {
+    if (status === 'failed' && error !== undefined) {
+      const dispatch = session.agyDispatches?.get(toolCallId)
+      if (dispatch !== undefined) dispatch.error = error
+    }
     const records = this.agy.terminalize(session, status, new Set([toolCallId]))
-    if (records.length > 0) this.noteSubagentRecords(records, { announce: true, persist: true })
+    if (records.length > 0) {
+      this.noteSubagentRecords(records, { announce: true, persist: true })
+      if (status === 'failed') {
+        const label = records[0]?.label ?? toolCallId
+        const reason = error === undefined ? 'unknown error' : error.length > 500 ? `${error.slice(0, 500)}…` : error
+        this.host.hub.broadcast({
+          type: 'agent/notice',
+          agentId: session.agentId,
+          level: 'error',
+          text: `acp: background worker "${label}" failed: ${reason}`,
+        })
+      }
+    }
     this.agyPoll?.prune(session)
   }
 
@@ -718,6 +737,30 @@ export class SubagentService {
   }
 
   /**
+   * Surface a measured background FAILURE as a conversation wake (the
+   * late-output watch's no-answer path). Same delivery family as a late answer
+   * — the adapter replays the report LOCALLY, no `session/prompt` — so it works
+   * even while the agent's network is down. Deliberately NO `pendingLateEcho`:
+   * agy never replays a failure it did not write as a planner step, so arming
+   * the echo guard would only leave a dead key for the next turn.
+   */
+  deliverLateFailure(session: LiveSession, text: string): boolean {
+    if (lifecycleOf(session) !== 'live') return false
+    if (session.running || hasPromptSlot(session)) return false
+    const agent = this.wakeAgentFor(session)
+    if (agent === undefined) return false
+    if (text.trim() === '') return false
+    const report = text.length > BACKGROUND_REPORT_MAX
+      ? `${text.slice(0, BACKGROUND_REPORT_MAX)}\n[truncated by dsh-ntr: failure report exceeded ${String(BACKGROUND_REPORT_MAX)} characters]`
+      : text
+    this.wakeChatWithBackgroundReport(session, agent, report, {
+      lateOutput: true,
+      wakeText: BACKGROUND_FAILURE_WAKE_TEXT,
+    })
+    return true
+  }
+
+  /**
    * Drop one report record — its timer, and the session slot only when the
    * slot still holds THIS record (a newer run's record must survive).
    */
@@ -757,8 +800,9 @@ export class SubagentService {
     session: LiveSession,
     agent: DshAgentLike,
     report: string,
-    options?: { lateOutput?: boolean; onFailure?: () => void },
+    options?: { lateOutput?: boolean; onFailure?: () => void; wakeText?: string },
   ): void {
+    const wakeText = options?.wakeText ?? BACKGROUND_WAKE_TEXT
     const wakeNotice = (error: unknown): void => {
       // "late output" names the Antigravity transcript path, so a failure is
       // never mistaken for a CodeBuddy drain report (constraint 29: the failure
@@ -778,11 +822,11 @@ export class SubagentService {
       const result = agent.followup?.({
         id: randomUUID(),
         role: 'user',
-        content: [{ type: 'text', text: BACKGROUND_WAKE_TEXT }],
+        content: [{ type: 'text', text: wakeText }],
         source: {
           kind: BACKGROUND_REPORT_SOURCE,
           form: BACKGROUND_REPORT_FORM,
-          summary: BACKGROUND_WAKE_TEXT,
+          summary: wakeText,
           report,
         },
       })
