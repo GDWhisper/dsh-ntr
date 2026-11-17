@@ -2,6 +2,44 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [0.4.6] - 2026-11-17
+
+这一版让 NTR 会话里的 agent 可以读取本机 DSH 技能，并新增控制这个能力的开关。
+
+### 新增
+
+- **acp**：NTR 会话里的 agent 可以列出并读取本机的 DSH 技能；技能文档按需读取且有长度上限，读取过程只读、不改任何文件。([9ac6839](https://github.com/GDWhisper/dsh-ntr/commit/9ac6839))
+- **acp**：设置页新增技能发现的总开关，默认关闭；每个 agent 还可单独关闭，改动立即生效，不必重启进程。([75bae4a](https://github.com/GDWhisper/dsh-ntr/commit/75bae4a))
+
+### 改进
+
+- **client**：设置页左侧的 NTR 入口图标改为双环图标。([b9434d1](https://github.com/GDWhisper/dsh-ntr/commit/b9434d1))
+
+### 修复
+
+- **acp**：工具执行期间，宿主的「准备中」一行直接显示具体操作，不必等到工具结束。([9bad9a7](https://github.com/GDWhisper/dsh-ntr/commit/9bad9a7))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.4.5...v0.4.6
+
+---
+
+This release lets agents in NTR conversations read the DSH skills on this machine, behind a new switch that controls the capability.
+
+### Added
+
+- **acp**: agents in NTR conversations can list and read the DSH skills on this machine; skill documents are read on demand with a size cap, and reading never changes a file. ([9ac6839](https://github.com/GDWhisper/dsh-ntr/commit/9ac6839))
+- **acp**: the settings page gains a master switch for skill discovery, off by default; each agent can also opt out on its own, and a change applies without restarting the process. ([75bae4a](https://github.com/GDWhisper/dsh-ntr/commit/75bae4a))
+
+### Improved
+
+- **client**: the NTR entry in the settings nav uses a double-ring glyph. ([b9434d1](https://github.com/GDWhisper/dsh-ntr/commit/b9434d1))
+
+### Fixed
+
+- **acp**: while a tool runs, the host's preparing row shows the operation instead of waiting for the call to finish. ([9bad9a7](https://github.com/GDWhisper/dsh-ntr/commit/9bad9a7))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.4.5...v0.4.6
+
 ## [0.4.5] - 2026-11-14
 
 这一版把 Antigravity 的子代理接入子智能体面板，并修正后台报告、上下文占用与思考档位显示中几处丢信息的问题。
