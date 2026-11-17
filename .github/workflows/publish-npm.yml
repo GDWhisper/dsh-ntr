@@ -58,11 +58,11 @@ jobs:
         if: ${{ !inputs.dry_run }}
         run: |
           VERSION="$(node -p "require('./package.json').version")"
-          for _ in $(seq 1 30); do
-            npm view "dsh-ntr@$VERSION" version >/dev/null 2>&1 && break
+          for _ in $(seq 1 90); do
+            npm view --prefer-online "dsh-ntr@$VERSION" version >/dev/null 2>&1 && break
             sleep 10
           done
-          npm view "dsh-ntr@$VERSION" version >/dev/null 2>&1 || {
+          npm view --prefer-online "dsh-ntr@$VERSION" version >/dev/null 2>&1 || {
             echo "::error::dsh-ntr@$VERSION never became available on the registry"
             exit 1
           }
