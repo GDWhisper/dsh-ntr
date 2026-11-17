@@ -39,12 +39,11 @@ import {
   PERMISSION_SEAT_KEY,
 } from './model-seat.tsx'
 import type { ModelSeatClaim, SeatSlots } from './model-seat.tsx'
-import {
-  acpModeFromPresetEvent, ACP_PRESET_ID, rowAgentPreset, stagedIsAcpMode, stagedSessionOf,
-} from './acp-ui.tsx'
+import { acpModeFromPresetEvent, ACP_PRESET_ID, rowAgentPreset, stagedIsAcpMode, stagedSessionOf } from './acp-ui.tsx'
 import type { AcpChatInjected, AcpHostForkFace, AcpSessionFace, AcpSessionsSnapshot, SessionListSource } from './acp-ui.tsx'
 import { createSlashIsolation, slashAcpVerdict } from './slash-isolation.ts'
 import type { SlashSource } from './slash-isolation.ts'
+import { SETTINGS_NAV_LABEL, installSettingsNavIcon } from './settings-nav-icon.ts'
 
 export const name = 'dsh-ntr-client'
 export const inject = ['slots', 'connection']
@@ -292,9 +291,10 @@ export function apply(ctx: Context): void {
     name: 'settings.section',
     id: 'acp-agents',
     order: 120,
-    label: () => 'NTR',
+    label: () => SETTINGS_NAV_LABEL,
     inject: () => ({ acp: store }),
   }, AcpSettingsSection)), 'dsh-ntr: settings section')
+  ctx.effect(() => installSettingsNavIcon(), 'dsh-ntr: settings nav icon')
 
   // The same NTR settings, opened from the composer when the agent roster is
   // empty (the agent base's picker action). It rides the frame's overlay layer
