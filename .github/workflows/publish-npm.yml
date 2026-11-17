@@ -25,8 +25,14 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '22.12.0'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: '24'
+
+      # Trusted publishing needs npm >= 11.5.1; dist-tag management needs
+      # >= 11.21.0. The token path is gone: npm exchanges the workflow's OIDC
+      # token instead, so the npmjs.com trusted publisher must name this repo
+      # and this workflow file.
+      - name: Upgrade npm for trusted publishing
+        run: npm install -g npm@latest
 
       - name: Install dependencies
         run: npm ci
@@ -47,8 +53,6 @@ jobs:
       - name: Publish
         if: ${{ !inputs.dry_run }}
         run: npm publish --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Pin latest to the version just published
         if: ${{ !inputs.dry_run }}
@@ -63,8 +67,6 @@ jobs:
             exit 1
           }
           npm dist-tag add "dsh-ntr@$VERSION" latest
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       # npmmirror caches packuments indefinitely; without this, a stale "latest"
       # (e.g. an early placeholder release) keeps resolving for CN users.
