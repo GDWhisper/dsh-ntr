@@ -4,14 +4,16 @@
  * ratchet; the host keeps one call and this module owns the wire shape.
  *
  * MOCK_AGY_STORE=<dir>: the Antigravity transcript shape (see
- * docs/plan/antigravity-late-output.md). An "AGY_LATE" prompt answers normally;
+ * docs/plan/archive/antigravity-late-output.md). An "AGY_LATE" prompt answers normally;
  * `agyLateAnswer` then schedules one second after the TURN RESPONSE a
  * `PLANNER_RESPONSE` append to
  * `<dir>/brain/<sessionId>/.system_generated/logs/transcript_full.jsonl`, with
  * NO `session/update` — exactly how agy reports work finished after `end_turn`.
- * "AGY_REPLAY" makes the next prompt replay that text before its own answer
- * (agy flushes the backlog when a prompt arrives); the `AGY_REPLAY_PARTIAL`
- * variant sends only the first half and ends the turn.
+ * "AGY_REPLAY" makes the next prompt replay that step's thinking AND text
+ * before its own answer (agy flushes the backlog when a prompt arrives); the
+ * `AGY_REPLAY_PARTIAL` variant sends only the first half of the text and ends
+ * the turn; `AGY_REPLAY_THOUGHT_ONLY` ends it after the thinking alone;
+ * `AGY_REPLAY_HOLD` holds the half prefix open for a cancel.
  * "AGY_ECHO" opens the turn with a `user_message_chunk` echo of the user's own
  * text (agy sends one on every prompt); the answer mirror must not repeat it.
  *
@@ -52,6 +54,8 @@ const AGY_DISPATCH_ID = 'agy_dispatch_1'
 const AGY_DISPATCH_ID_TWO = 'agy_dispatch_2'
 const agyStepIndex = new Map()
 const agyLateAnswers = new Map()
+/** Thinking of the late step, replayed beside its content (measured agy shape). */
+const agyLateThoughts = new Map()
 /** Answer text waiting for its turn's response (`agyLateAnswer`). */
 const agyPendingLate = new Map()
 
@@ -290,9 +294,22 @@ export async function agyPrompt(send, sessionId, text, cancelWait) {
     // agy also replays the PREVIOUS turn's completed tool frame. The id was
     // seen in a completed turn, so the client must open no second card.
     await send({ sessionUpdate: 'tool_call_update', toolCallId: AGY_CALL_ID, status: 'completed' })
-    const partial = text.includes('AGY_REPLAY_PARTIAL')
+    const lateThought = agyLateThoughts.get(sessionId)
+    if (lateThought !== undefined) {
+      await send({ sessionUpdate: 'agent_thought_chunk', messageId: 'm-agy-replay-thought', content: { type: 'text', text: lateThought } })
+    }
+    // The flush can end the turn with ONLY the thinking replayed: no visible
+    // block and no card, so no segment is on air at close — the client must
+    // still retire the echo record there.
+    if (text.includes('AGY_REPLAY_THOUGHT_ONLY')) return true
+    const partial = text.includes('AGY_REPLAY_PARTIAL') || text.includes('AGY_REPLAY_HOLD')
     const replay = partial ? lateAnswer.slice(0, Math.ceil(lateAnswer.length / 2)) : lateAnswer
     await send({ sessionUpdate: 'agent_message_chunk', messageId: 'm-agy-replay', content: { type: 'text', text: replay } })
+    // The turn stays open mid-prefix so a cancel can close it segment-less.
+    if (text.includes('AGY_REPLAY_HOLD')) {
+      await sleep(1500)
+      return true
+    }
     // The turn ends in the middle of a strict prefix of the replayed answer:
     // the client must flush what it held instead of dropping it.
     if (partial) return true
@@ -303,6 +320,7 @@ export async function agyPrompt(send, sessionId, text, cancelWait) {
     // this turn's response: `agyLateAnswer` owns the anchor and the write.
     const answer = `AGY-LATE-ANSWER ${text}`
     agyLateAnswers.set(sessionId, answer)
+    agyLateThoughts.set(sessionId, `AGY-LATE-THOUGHT ${text}`)
     agyPendingLate.set(sessionId, answer)
   }
   return false
@@ -325,12 +343,14 @@ export function agyLateAnswer(sessionId) {
       try {
         const dir = join(AGY_STORE, 'brain', sessionId, '.system_generated', 'logs')
         mkdirSync(dir, { recursive: true })
+        const thought = agyLateThoughts.get(sessionId)
         const line = JSON.stringify({
           step_index: stepIndex,
           type: 'PLANNER_RESPONSE',
           status: 'DONE',
           created_at: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
           content: answer,
+          ...(thought === undefined ? {} : { thinking: thought }),
         })
         appendFileSync(join(dir, 'transcript_full.jsonl'), `${line}\n`)
       } catch {

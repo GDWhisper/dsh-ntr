@@ -115,6 +115,13 @@ export class BridgeRpcService {
     // A new turn owns the session from here: any reclaim marker named an
     // earlier generation and must not suppress THIS turn's settle.
     session.reclaimedTurnSeq = undefined
+    // This prompt consumes Antigravity's backlog flush on the RAW face (no
+    // controller folds it): the committed echo guard's one replay chance is
+    // spent here, so retire it — a dead key must not swallow the next chat
+    // turn's real answer. The transcript still shows the replay. If runPrompt
+    // later refuses and the flush never happened, the record is NOT restored:
+    // a visible duplicate beats a dead key silently eating an answer.
+    session.lateEcho = undefined
     this.host.watchdog.armStallTimer()
     const turnId = randomUUID()
     const promptText = typeof prompt === 'string'

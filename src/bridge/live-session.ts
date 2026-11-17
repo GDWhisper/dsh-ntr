@@ -196,25 +196,34 @@ export interface LiveSession {
    */
   quotaRefusal?: { message: string; at: number }
   /**
-   * The answer Antigravity's own transcript reported late, after the turn
-   * closed, and when it was delivered (see `docs/plan/antigravity-late-output.md`).
+   * The late step Antigravity's own transcript reported after the turn closed
+   * (see `docs/plan/archive/antigravity-late-output.md`): `text` is its content,
+   * `thought` its thinking, `at` the wake replay that committed the record.
    *
-   * The agent replays that text on the NEXT prompt (it sends no update while
-   * no prompt is in flight), so the echo guard in `TurnStreamController`
-   * swallows exactly this text once. Written only when
-   * `BridgeManager.streamPrompt` actually replays the pending report — a wake
-   * skipped by the background-report FIFO must NOT write it, or the replayed
-   * answer would be swallowed twice.
+   * The agent replays that step on the NEXT prompt (it sends no update while
+   * no prompt is in flight), so `ReplayEchoGuard` swallows exactly this replay
+   * once, per kind. The record's lifetime is EVENT-BOUND — it dies at the next
+   * turn's close or a lifecycle boundary, never on a wall-clock window: the
+   * replay comes with the next prompt whenever the user sends it. Written only
+   * when `BridgeManager.streamPrompt` actually replays the pending report — a
+   * wake skipped by the background-report FIFO must NOT write it, or the
+   * replayed answer would be swallowed twice. Each key is consumed on its own;
+   * the record dies when both are gone. The `/acp` RPC prompt retires it at
+   * claim time too: that prompt consumes the flush on the raw face.
    */
-  lateEcho?: { text: string; at: number }
+  lateEcho?: { text?: string; thought?: string; at: number }
   /**
    * A late report handed to the chat plane that no step has replayed yet.
    * `streamPrompt` matches its `report` against the report it is about to
    * yield and converts it into {@link LiveSession.lateEcho}, whose `text` is
    * the UNMARKED truncated prefix (`guard`): the echo guard's deduplication key
-   * must match the agent's replay, never our truncation marker.
+   * must match the agent's replay, never our truncation marker. `thought` rides
+   * along untruncated — it is never delivered, only matched. Known narrow seam
+   * (accepted): an `/acp` prompt may consume the flush BEFORE the wake replays;
+   * the commit then arms the guard for exactly one chat turn (the next
+   * `closeTurn` retires it), and only a byte-identical answer could be eaten.
    */
-  pendingLateEcho?: { guard: string; report: string; at: number }
+  pendingLateEcho?: { guard: string; report: string; at: number; thought?: string }
   /**
    * The visible answer text of the turn that just closed, kept to recognise
    * the agent writing the SAME answer late: a candidate equal to it is this

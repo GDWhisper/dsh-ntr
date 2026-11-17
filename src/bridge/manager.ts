@@ -181,16 +181,6 @@ export class BridgeManager {
    */
   private readonly boot: SessionBootService
 
-  /**
-   * The echo guard's window (see {@link BridgeTuning.agyLateOutputEchoMs}): a
-   * delivered late answer stays eligible for deduplication this long, because
-   * the agent may replay it on a prompt that comes minutes later. Read from
-   * the CURRENT tuning at each use, like every other live window.
-   */
-  get lateEchoTuning(): { echoMs: number } {
-    return { echoMs: this.tuning.agyLateOutputEchoMs }
-  }
-
   /** Start watching a closed chat turn's transcript (see `AgyLateOutputService.arm`). */
   armLateOutputWatch(session: LiveSession, closedAt: number): void {
     this.lateOutput.arm(session, closedAt)
@@ -364,7 +354,6 @@ export class BridgeManager {
       sessions: () => this.registry.sessions(),
       persistAgents: () => this.persistence.persistAgents(),
       ambientTuning: () => this.ambientTuning,
-      lateEchoMs: () => this.tuning.agyLateOutputEchoMs,
     }, {
       storeRoot: session => {
         const def = this.defsMap.get(session.agentId)
@@ -383,7 +372,7 @@ export class BridgeManager {
       host: {
         defOf: agentId => this.defsMap.get(agentId),
         isBusy: session => session.running || hasPromptSlot(session),
-        deliver: (session, text) => this.subagents.deliverLateReport(session, text),
+        deliver: (session, text, thought) => this.subagents.deliverLateReport(session, text, thought),
       },
     })
     // The settings / tuning cluster (see `SettingsService`) needs the live
@@ -1223,7 +1212,7 @@ export class BridgeManager {
    */
   private readonly subagents: SubagentService
   /**
-   * The Antigravity transcript watch (see `docs/plan/antigravity-late-output.md`):
+   * The Antigravity transcript watch (see `docs/plan/archive/antigravity-late-output.md`):
    * armed by a chat turn that ended on its own, disarmed at every lifecycle
    * boundary and by the bridge teardown. It only DELIVERS; it never closes a
    * turn, kills a process or changes `running`.
@@ -1372,14 +1361,11 @@ export class BridgeManager {
         const late = this.registry.sessionAt(options.sessionId, agentId)
         if (late !== undefined) {
           const pending = late.pendingLateEcho
-          // Lazy expiry: a record older than the guard window can never match
-          // a replay, and committing it would only swallow an unrelated answer.
-          if (pending !== undefined && Date.now() - pending.at > this.tuning.agyLateOutputEchoMs) {
-            late.pendingLateEcho = undefined
-          } else if (pending !== undefined && pending.report === text) {
+          if (pending !== undefined && pending.report === text) {
             // The guard key is the UNMARKED truncated prefix: the agent replays
-            // the original answer, never our truncation marker.
-            late.lateEcho = { text: pending.guard, at: Date.now() }
+            // the original answer, never our truncation marker. The record is
+            // event-bound from here: the next turn's close retires it.
+            late.lateEcho = { text: pending.guard, thought: pending.thought, at: Date.now() }
             late.pendingLateEcho = undefined
           }
         }

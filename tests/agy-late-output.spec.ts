@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
-import { afterAll, describe, expect, it } from 'vitest'
+import { afterAll, describe, expect, it, vi } from 'vitest'
 import {
   AcpLlmAdapter, BACKGROUND_REPORT_FORM, BACKGROUND_REPORT_SOURCE, BridgeManager,
   type BridgeTuning,
@@ -76,7 +76,7 @@ async function hostLoopTurn(
 }
 
 /**
- * Antigravity transcript late output (docs/plan/antigravity-late-output.md):
+ * Antigravity transcript late output (docs/plan/archive/antigravity-late-output.md):
  * `agy acp` finishes work AFTER `end_turn` without sending any
  * `session/update`. The mock writes the answer only into its own transcript, so
  * the manager's file watch is the only way the chat can hear it, and the next
@@ -86,6 +86,13 @@ describe('AGY-LATE: Antigravity transcript late output', () => {
   function textOf(chunks: readonly StreamChunk[]): string {
     return chunks
       .filter((chunk): chunk is Extract<StreamChunk, { type: 'text-delta' }> => chunk.type === 'text-delta')
+      .map(chunk => chunk.text)
+      .join('')
+  }
+
+  function thoughtOf(chunks: readonly StreamChunk[]): string {
+    return chunks
+      .filter((chunk): chunk is Extract<StreamChunk, { type: 'reasoning-delta' }> => chunk.type === 'reasoning-delta')
       .map(chunk => chunk.text)
       .join('')
   }
@@ -138,7 +145,6 @@ describe('AGY-LATE: Antigravity transcript late output', () => {
         agyLateOutputPollMs: 25,
         agyLateOutputQuietMs: 40,
         agyLateOutputMaxMs: 5_000,
-        agyLateOutputEchoMs: 60_000,
         ...options.tuning,
       },
       { isAgent: () => true, storeRoot: () => store },
@@ -327,6 +333,8 @@ describe('AGY-LATE: Antigravity transcript late output', () => {
     const answered = textOf(next.chunks)
     expect(answered).toContain('MOCK: echo AGY_REPLAY please')
     expect(answered).not.toContain('AGY-LATE-ANSWER')
+    // The replayed thinking is the late step's own: swallowed beside its text.
+    expect(thoughtOf(next.chunks)).not.toContain('AGY-LATE-THOUGHT')
     // The old answer is on screen exactly once: in the wake step, never again.
     const all = `${first}${replayed}${answered}`
     expect(all.split('AGY-LATE-ANSWER').length - 1).toBe(1)
@@ -384,6 +392,7 @@ describe('AGY-LATE: Antigravity transcript late output', () => {
     // strict prefix the guard held must be emitted, never dropped.
     expect(answered).toContain('AGY-LATE-ANSWER ')
     expect(answered.split('AGY-LATE-ANSWER').length - 1).toBe(1)
+    expect(thoughtOf(chunks)).not.toContain('AGY-LATE-THOUGHT')
   }, 30_000)
 
   it('leaves lateEcho unset when a real user message outranks the wake', async () => {
@@ -415,5 +424,134 @@ describe('AGY-LATE: Antigravity transcript late output', () => {
     const answered = textOf(chunks)
     expect(answered).toContain('AGY-LATE-ANSWER AGY_LATE please')
     expect(answered).toContain('MOCK: echo AGY_REPLAY please')
+    // No commit happened, so the replayed thinking shows too (fail-open).
+    expect(thoughtOf(chunks)).toContain('AGY-LATE-THOUGHT')
+  }, 30_000)
+
+  it('swallows the replay when the next prompt arrives long after the delivery', async () => {
+    const dshSessionId = 'dsh-agy-late-slow-reply'
+    const wakes: GenerateMessage[] = []
+    const { harness } = harnessWithResolver(dshSessionId, wakes)
+    await firstLateTurn(harness, dshSessionId)
+    await until(() => wakes.length === 1, 10_000)
+    const wake = wakes[0]
+    if (wake === undefined) return
+    await wakeStep(harness, dshSessionId, [userText('AGY_LATE please'), wake])
+    // The field incident (session-a12ff72b): the person replied 24 minutes
+    // after the delivery. The replay binds to the NEXT PROMPT, not to a
+    // wall-clock window, so the guard must still swallow it whole.
+    const realNow = Date.now
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + 24 * 60_000)
+    try {
+      const { chunks } = await hostLoopTurn(harness.adapter, {
+        provider: 'acp',
+        model: 'agy-late',
+        sessionId: dshSessionId,
+        messages: [userText('AGY_REPLAY please')],
+      })
+      const answered = textOf(chunks)
+      expect(answered).toContain('MOCK: echo AGY_REPLAY please')
+      expect(answered).not.toContain('AGY-LATE-ANSWER')
+      expect(thoughtOf(chunks)).not.toContain('AGY-LATE-THOUGHT')
+    } finally {
+      clock.mockRestore()
+    }
+  }, 30_000)
+
+  it('retires the echo record when the turn closes with no segment on air', async () => {
+    const dshSessionId = 'dsh-agy-late-segmentless'
+    const wakes: GenerateMessage[] = []
+    const { harness } = harnessWithResolver(dshSessionId, wakes)
+    await firstLateTurn(harness, dshSessionId)
+    await until(() => wakes.length === 1, 10_000)
+    const wake = wakes[0]
+    if (wake === undefined) return
+    await wakeStep(harness, dshSessionId, [userText('AGY_LATE please'), wake])
+    await new Promise(resolve => setTimeout(resolve, 5))
+    // The flush replays only the thinking and ends the turn: nothing visible,
+    // no card, so no segment is on air at close. The thought key is consumed;
+    // the text key must NOT stay armed past this turn.
+    const silent = await hostLoopTurn(harness.adapter, {
+      provider: 'acp',
+      model: 'agy-late',
+      sessionId: dshSessionId,
+      messages: [userText('AGY_REPLAY_THOUGHT_ONLY please')],
+    })
+    expect(thoughtOf(silent.chunks)).not.toContain('AGY-LATE-THOUGHT')
+    expect(textOf(silent.chunks)).not.toContain('AGY-LATE-ANSWER')
+
+    const next = await hostLoopTurn(harness.adapter, {
+      provider: 'acp',
+      model: 'agy-late',
+      sessionId: dshSessionId,
+      messages: [userText('AGY_REPLAY please')],
+    })
+    // The record retired at the segment-less close: this replay is unguarded
+    // and must show (fail-open), never be swallowed by a dead key.
+    expect(textOf(next.chunks)).toContain('AGY-LATE-ANSWER AGY_LATE please')
+  }, 30_000)
+
+  it('retires the echo record when a cancel closes the turn segment-less', async () => {
+    const dshSessionId = 'dsh-agy-late-cancel'
+    const wakes: GenerateMessage[] = []
+    const { harness } = harnessWithResolver(dshSessionId, wakes)
+    await firstLateTurn(harness, dshSessionId)
+    await until(() => wakes.length === 1, 10_000)
+    const wake = wakes[0]
+    if (wake === undefined) return
+    await wakeStep(harness, dshSessionId, [userText('AGY_LATE please'), wake])
+    await new Promise(resolve => setTimeout(resolve, 5))
+    // Cancel while the guard holds a strict prefix: the abort finishes the
+    // on-air segment, so the close runs with no segment — the record must
+    // still retire (a cancel discards the held bytes, not the next turn).
+    const abort = new AbortController()
+    const heldTurn = hostLoopTurn(harness.adapter, {
+      provider: 'acp',
+      model: 'agy-late',
+      sessionId: dshSessionId,
+      messages: [userText('AGY_REPLAY_HOLD please')],
+    }, 8, abort.signal)
+    await new Promise(resolve => setTimeout(resolve, 400))
+    abort.abort()
+    const held = await heldTurn
+    expect(textOf(held.chunks)).not.toContain('AGY-LATE-ANSWER')
+
+    const next = await hostLoopTurn(harness.adapter, {
+      provider: 'acp',
+      model: 'agy-late',
+      sessionId: dshSessionId,
+      messages: [userText('AGY_REPLAY please')],
+    })
+    expect(textOf(next.chunks)).toContain('AGY-LATE-ANSWER AGY_LATE please')
+  }, 30_000)
+
+  it('retires the echo record when an /acp prompt consumes the flush', async () => {
+    const dshSessionId = 'dsh-agy-late-rpc-flush'
+    const wakes: GenerateMessage[] = []
+    const { harness } = harnessWithResolver(dshSessionId, wakes)
+    await firstLateTurn(harness, dshSessionId)
+    await until(() => wakes.length === 1, 10_000)
+    const wake = wakes[0]
+    if (wake === undefined) return
+    await wakeStep(harness, dshSessionId, [userText('AGY_LATE please'), wake])
+    await new Promise(resolve => setTimeout(resolve, 5))
+    // The RPC face has no controller: its prompt consumes the flush on the raw
+    // transcript, so the committed guard must retire at claim time.
+    const acpSessionId = harness.events.find(event => 'sessionId' in event)?.sessionId
+    expect(acpSessionId).toBeDefined()
+    if (acpSessionId === undefined) return
+    const sent = await dispatchRpc(harness.manager, 'session/prompt', { sessionId: acpSessionId, text: 'AGY_REPLAY please' })
+    expect(sent.ok).toBe(true)
+    if (!sent.ok) return
+    const turnId = (sent.value as { turnId: string }).turnId
+    await until(() => harness.events.some(event => event.type === 'turn/end' && event.turnId === turnId), 10_000)
+
+    const next = await hostLoopTurn(harness.adapter, {
+      provider: 'acp',
+      model: 'agy-late',
+      sessionId: dshSessionId,
+      messages: [userText('AGY_REPLAY please')],
+    })
+    expect(textOf(next.chunks)).toContain('AGY-LATE-ANSWER AGY_LATE please')
   }, 30_000)
 })

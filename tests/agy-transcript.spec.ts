@@ -1,6 +1,6 @@
 /**
  * Unit coverage for Antigravity's transcript reader (P1 of
- * docs/plan/antigravity-late-output.md): path rules, incremental reads and
+ * docs/plan/archive/antigravity-late-output.md): path rules, incremental reads and
  * answer extraction. The echo guard's four states are pinned here too (P3).
  */
 import { mkdtempSync, rmSync, statSync, writeFileSync, appendFileSync } from 'node:fs'
@@ -16,11 +16,12 @@ import {
   isAgyChildReport,
   isAntigravityAgent,
   lateAnswerText,
+  lateAnswerThought,
   parseAgyConversationId,
   parseTranscriptStep,
   type TranscriptStep,
 } from '../src/bridge/agy-transcript.ts'
-import { applyEchoGuard } from '../src/bridge/turn-stream.ts'
+import { applyEchoGuard } from '../src/bridge/agy-echo-guard.ts'
 import { validateConfig } from '../src/impl.ts'
 import type { AcpAgentDef } from '../src/protocol.ts'
 
@@ -169,6 +170,12 @@ describe('late answer extraction', () => {
 
   it('returns an empty string for no steps', () => {
     expect(lateAnswerText([])).toBe('')
+  })
+
+  it('reads the thinking of the same step the text comes from', () => {
+    expect(lateAnswerThought([step(1, 'first', { thinking: 'one' }), step(2, 'second', { thinking: 'two' })])).toBe('two')
+    expect(lateAnswerThought([step(1, 'first')])).toBeUndefined()
+    expect(lateAnswerThought([])).toBeUndefined()
   })
 })
 

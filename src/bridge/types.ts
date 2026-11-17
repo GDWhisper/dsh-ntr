@@ -239,7 +239,7 @@ export interface BridgeTuning {
   ambientStaleMs?: number
   /**
    * Total switch for the Antigravity transcript late-output path (see
-   * docs/plan/antigravity-late-output.md). Default on: only an automatically
+   * docs/plan/archive/antigravity-late-output.md). Default on: only an automatically
    * recognised `agy acp` session arms a watch, and the transcript format is
    * private, so a deployment that does not trust it can turn the feature off
    * with one key.
@@ -270,12 +270,6 @@ export interface BridgeTuning {
    * the watch). Default 0.
    */
   agyLateOutputCeilingMs?: number
-  /**
-   * How long a delivered late answer stays eligible for the echo guard — the
-   * agent replays it on the next prompt, which may come minutes later. Default
-   * 600000 ms.
-   */
-  agyLateOutputEchoMs?: number
   /**
    * Hold the turn across the WORKER phase too (the pre-2026-11 behaviour).
    *

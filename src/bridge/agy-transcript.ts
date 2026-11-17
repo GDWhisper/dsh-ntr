@@ -1,6 +1,6 @@
 /**
  * Read-only access to Antigravity's OWN transcript (see
- * docs/plan/antigravity-late-output.md).
+ * docs/plan/archive/antigravity-late-output.md).
  *
  * `agy acp` does not send a `session/update` when no `session/prompt` is in
  * flight: work it finishes after `end_turn` lands only in a JSONL file under
@@ -161,12 +161,27 @@ export function parseTranscriptStep(line: string): TranscriptStep | undefined {
  * not answers, and are deliberately ignored.
  */
 export function lateAnswerText(steps: readonly TranscriptStep[]): string {
+  return latestPlannerStep(steps)?.content ?? ''
+}
+
+/**
+ * The thinking of the same step {@link lateAnswerText} delivers: agy replays it
+ * beside the content at the next prompt's start, and the echo guard matches it
+ * byte-for-byte (measured). `undefined` when the step carries no thinking —
+ * the guard then passes thought chunks through untouched.
+ */
+export function lateAnswerThought(steps: readonly TranscriptStep[]): string | undefined {
+  return latestPlannerStep(steps)?.thinking
+}
+
+/** The LAST finished planner response with content, or `undefined`. */
+function latestPlannerStep(steps: readonly TranscriptStep[]): TranscriptStep | undefined {
   let latest: TranscriptStep | undefined
   for (const step of steps) {
     if (step.type !== 'PLANNER_RESPONSE' || step.status !== 'DONE' || step.content.trim() === '') continue
     if (latest === undefined || step.stepIndex > latest.stepIndex) latest = step
   }
-  return latest?.content ?? ''
+  return latest
 }
 
 /**

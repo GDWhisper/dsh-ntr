@@ -29,5 +29,4 @@ export const DEFAULT_TUNING: Required<BridgeTuning> = {
   agyLateOutputQuietMs: 1_500,
   agyLateOutputMaxMs: 1_800_000,
   agyLateOutputCeilingMs: 0,
-  agyLateOutputEchoMs: 600_000,
 }

@@ -50,8 +50,6 @@ export interface SubagentHost {
   persistAgents(): void
   /** The ambient quiet / ceiling windows (see `BridgeTuning.ambientQuietMs`). */
   ambientTuning(): { quietMs: number; maxMs: number }
-  /** How long a delivered late answer stays eligible for the echo guard. */
-  lateEchoMs(): number
 }
 
 export class SubagentService {
@@ -679,7 +677,7 @@ export class SubagentService {
 
   /**
    * Hand an answer Antigravity finished AFTER its turn closed to the chat plane
-   * (see `docs/plan/antigravity-late-output.md`). Unlike an idle drain report,
+   * (see `docs/plan/archive/antigravity-late-output.md`). Unlike an idle drain report,
    * this text never reached the transcript view of a turn: the agent will
    * replay it on the next prompt, which is why the delivery also records
    * {@link LiveSession.pendingLateEcho}.
@@ -689,27 +687,24 @@ export class SubagentService {
    * (`/acp`, headless, an unmounted resolver), or an empty answer — and the
    * answer is still in the transcript file.
    */
-  deliverLateReport(session: LiveSession, text: string): boolean {
+  deliverLateReport(session: LiveSession, text: string, thought?: string): boolean {
     if (lifecycleOf(session) !== 'live') return false
     if (session.running || hasPromptSlot(session)) return false
     const agent = this.wakeAgentFor(session)
     if (agent === undefined) return false
     if (text.trim() === '') return false
-    // A record older than the guard window can never match a replay: drop it
-    // before writing this answer's record (lazy expiry — no timer).
-    const previous = session.pendingLateEcho
-    if (previous !== undefined && Date.now() - previous.at > this.host.lateEchoMs()) {
-      session.pendingLateEcho = undefined
-    }
     // `guard` is the unmarked prefix the echo guard matches against the agent's
     // replay; `report` is the text actually delivered, truncation marker
-    // included. They differ only when the answer is cut.
+    // included. They differ only when the answer is cut. `thought` rides along
+    // for the guard's thought key; the record lives until the wake replay
+    // commits it, a newer delivery replaces it, or a lifecycle boundary clears
+    // it — never on a wall-clock window (the replay binds to the next prompt).
     const truncated = text.length > BACKGROUND_REPORT_MAX
     const guard = truncated ? text.slice(0, BACKGROUND_REPORT_MAX) : text
     const report = truncated
       ? `${guard}\n[truncated by dsh-ntr: late output exceeded ${String(BACKGROUND_REPORT_MAX)} characters]`
       : text
-    const record = { guard, report, at: Date.now() }
+    const record = { guard, report, at: Date.now(), thought }
     session.pendingLateEcho = record
     this.wakeChatWithBackgroundReport(session, agent, report, {
       lateOutput: true,

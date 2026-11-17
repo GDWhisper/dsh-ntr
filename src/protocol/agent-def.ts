@@ -302,7 +302,7 @@ export interface AcpPluginConfig {
   turnStallTickMs?: number
   /**
    * Total switch for the Antigravity transcript late-output path (see
-   * docs/plan/antigravity-late-output.md).
+   * docs/plan/archive/antigravity-late-output.md).
    *
    * Default ON, and only an AUTOMATICALLY recognised `agy acp` session arms a
    * watch: the agent id is user-editable, so recognition reads the launch

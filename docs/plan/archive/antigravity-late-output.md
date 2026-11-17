@@ -2,6 +2,8 @@
 
 **状态**：已完成 / 已归档。
 
+**已被取代的细节**：下文描述的 echo guard 挂钟窗口（`agyLateOutputEchoMs`）已删除；守卫改为事件绑定（活到下一轮收口 / 生命周期边界），且思考与正文各持一键。现行设计见 `src/bridge/agy-echo-guard.ts` 与 [AGENTS/protocol.md](../../../AGENTS/protocol.md) §6。
+
 本文件是 [docs/todo.md](../../todo.md) 里「Antigravity 后台结果不推送」的实施方案。先读 [AGENTS.md](../../../AGENTS.md)、[AGENTS/protocol.md](../../../AGENTS/protocol.md) 的 §6.2 / §6.3，再读本文件。
 
 本版已按对抗审核结论修订（6 条阻塞 + 12 条建议），设计细节以本文件为准。

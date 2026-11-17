@@ -110,7 +110,7 @@
         #                              Must outlast a silent subagent run.
         # agyLateOutputCeilingMs: 0  # absolute hard cap from arm time, never
         #                              extended by activity (0 = no ceiling).
-        #                              The poll / quiet / echo windows stay
+        #                              The poll / quiet windows stay
         #                              internal tuning keys.
         # idleTimeoutMs: 1800000     # how long a chat process may sit idle before
         #                              it is released (parked, then resumed by the

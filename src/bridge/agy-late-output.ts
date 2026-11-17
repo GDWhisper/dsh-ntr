@@ -1,6 +1,6 @@
 /**
  * Deliver Antigravity's post-turn output as a background report (see
- * docs/plan/antigravity-late-output.md).
+ * docs/plan/archive/antigravity-late-output.md).
  *
  * After `end_turn` the agent keeps working without a `session/prompt` in
  * flight, and it sends no `session/update` in that window: the answer lands
@@ -26,6 +26,7 @@ import {
   AgyTranscriptTail,
   agyTranscriptPaths,
   lateAnswerText,
+  lateAnswerThought,
   type TranscriptStep,
 } from './agy-transcript.ts'
 import type { AcpAgentDef } from '../protocol.ts'
@@ -67,8 +68,8 @@ export interface AgyLateOutputDeps {
     defOf(agentId: string): AcpAgentDef | undefined
     /** Whether the session is running a turn or holding the agent's prompt slot. */
     isBusy(session: LiveSession): boolean
-    /** Hand one late answer to the chat plane; false when nothing accepted it. */
-    deliver(session: LiveSession, text: string): boolean
+    /** Hand one late answer (and its thinking) to the chat plane; false when nothing accepted it. */
+    deliver(session: LiveSession, text: string, thought?: string): boolean
   }
 }
 
@@ -126,11 +127,6 @@ export class AgyLateOutputService {
     if (storeRoot === undefined) return
     const paths = agyTranscriptPaths(storeRoot, session.acpSessionId)
     if (paths.length === 0) return
-    // An echo record older than the guard window can never match a replay:
-    // drop it at the one moment a new watch starts.
-    if (session.lateEcho !== undefined && Date.now() - session.lateEcho.at > tuning.agyLateOutputEchoMs) {
-      session.lateEcho = undefined
-    }
     // One watch per session: a new turn supersedes the previous one.
     this.disarm(session)
     // Both candidates must ALREADY exist: a tail built on a missing file has a
@@ -228,7 +224,7 @@ export class AgyLateOutputService {
       this.disarmWatch(watch)
       return
     }
-    this.deliver(watch, text)
+    this.deliver(watch, text, lateAnswerThought(watch.steps))
     this.disarmWatch(watch)
   }
 
@@ -253,7 +249,7 @@ export class AgyLateOutputService {
     const session = watch.session
     const text = lateAnswerText(watch.steps)
     if (text.trim() !== '' && lifecycleOf(session) === 'live' && !this.deps.host.isBusy(session)) {
-      this.deliver(watch, text)
+      this.deliver(watch, text, lateAnswerThought(watch.steps))
     }
     this.disarmWatch(watch)
   }
@@ -271,10 +267,10 @@ export class AgyLateOutputService {
   }
 
   /** Hand one answer over. A session the host no longer accepts throws nothing. */
-  private deliver(watch: LateWatch, text: string): void {
+  private deliver(watch: LateWatch, text: string, thought?: string): void {
     if (this.isOwnTurnAnswer(watch.session, text)) return
     try {
-      this.deps.host.deliver(watch.session, text)
+      this.deps.host.deliver(watch.session, text, thought)
     } catch {
       // Fail-open: a delivery path must never throw into a timer.
     }

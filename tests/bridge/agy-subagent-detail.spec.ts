@@ -74,7 +74,6 @@ function serviceWith(options: { storeRoot?: string; sessions?: LiveSession[] } =
     sessions: () => sessions,
     persistAgents: () => {},
     ambientTuning: () => ({ quietMs: 1_000, maxMs: 5_000 }),
-    lateEchoMs: () => 1_000,
   }, options.storeRoot === undefined ? undefined : {
     storeRoot: () => options.storeRoot,
     tuning: () => ({ agyLateOutputPollMs: 1_000 }) as unknown as Required<BridgeTuning>,
@@ -256,7 +255,6 @@ describe('agy subagent detail: the child brain transcript read', () => {
       sessions: () => sessions,
       persistAgents: () => {},
       ambientTuning: () => ({ quietMs: 1_000, maxMs: 5_000 }),
-      lateEchoMs: () => 1_000,
     }, {
       storeRoot: candidate => (candidate.agentId === 'agy' ? root : undefined),
       tuning: () => ({ agyLateOutputPollMs: 1_000 }) as unknown as Required<BridgeTuning>,
