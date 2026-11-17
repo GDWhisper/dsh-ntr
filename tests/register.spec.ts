@@ -699,7 +699,7 @@ describe('acp-guard preset row', () => {
     const command = 'pwsh -NoProfile -Command Get-ChildItem C:/repo -Recurse | Select-String "TODO_42"'
     const snapshot = acpToolCallFromUpdate({ toolCallId: 'pwsh-card-1', title: command })!
     expect(snapshot.name).toBe(ACP_TOOL_CALL_NAME)
-    expect(snapshot.argsRaw).toContain(command)
+    expect((JSON.parse(snapshot.argsRaw) as { description: string }).description).toBe(command)
 
     const tools = toolsServiceOf()
     const ctx = guardCtx({ tools })

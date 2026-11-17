@@ -20,19 +20,41 @@ import {
 describe('ACP tool-call notifications → tool-call stream chunks', () => {
   it('folds an announcement into a snapshot: constant name, full title preserved in args', () => {
     // The name is a fixed plugin constant, NEVER the agent's own title; the
-    // title is folded into argsRaw so it is not silently dropped (constraint 29).
+    // title lands in the args `description` so it is not silently dropped
+    // (constraint 29) and the host preparing row can read it live.
     expect(acpToolCallFromUpdate({ toolCallId: ' c1 ', title: 'Bash', rawInput: '{"cmd":"ls"}' }))
-      .toEqual({ callId: 'c1', name: ACP_TOOL_CALL_NAME, title: 'Bash', argsRaw: 'Bash\n{"cmd":"ls"}' })
+      .toEqual({ callId: 'c1', name: ACP_TOOL_CALL_NAME, title: 'Bash', argsRaw: '{"description":"Bash","input":{"cmd":"ls"}}' })
     // A long command-string title survives IN FULL when the agent disclosed no
     // separate input: the exact case the constant-name fix must not lose.
     const command = "pwsh -NoProfile -Command Get-ChildItem -Recurse | Select-String 'SECRET_PATTERN_XYZ'"
-    expect(acpToolCallFromUpdate({ toolCallId: 'c1', title: command }))
-      .toEqual({ callId: 'c1', name: ACP_TOOL_CALL_NAME, title: command, argsRaw: command })
+    const snapshot = acpToolCallFromUpdate({ toolCallId: 'c1', title: command })!
+    expect(snapshot.name).toBe(ACP_TOOL_CALL_NAME)
+    expect(snapshot.title).toBe(command)
+    expect((JSON.parse(snapshot.argsRaw) as { description: string }).description).toBe(command)
     // No id is not a tool call; no title and no input are legal ACP — an
     // honest empty card, not a fabricated placeholder. The empty name is also
     // what lets the bridge skip a bare status-only update as a phantom card.
     expect(acpToolCallFromUpdate({ title: 'no id' })).toBeUndefined()
     expect(acpToolCallFromUpdate({ toolCallId: 'c2' })).toEqual({ callId: 'c2', name: '', title: '', argsRaw: '' })
+  })
+
+  it('produces arguments the host preparing row can read: valid JSON with a leading description', () => {
+    // Host contract (dsh-client-ui-tool `argumentSummary`, the `others` variant
+    // an unknown tool name lands on): while a tool runs the preparing row shows
+    // ONLY `args.text("description")` parsed from the argument JSON — the raw
+    // body is gated behind `phase !== "preparing"`. The old `title\n{json}` text
+    // was not valid JSON, so the host read no field and the row fell back to the
+    // bare tool name: the operation stayed invisible until the tool finished.
+    const snapshot = acpToolCallFromUpdate({ toolCallId: 'c1', title: 'Bash', rawInput: { command: 'ls -la' } })!
+    const parsed = JSON.parse(snapshot.argsRaw) as Record<string, unknown>
+    expect(parsed.description).toBe('Bash')
+    // description must be the FIRST key so the lazy JSON scanner reads it early.
+    expect(Object.keys(parsed)[0]).toBe('description')
+    // The disclosed input survives verbatim under `input` (constraint 29).
+    expect(parsed.input).toEqual({ command: 'ls -la' })
+    // A title-less call still surfaces the operation from its own input.
+    const noTitle = acpToolCallFromUpdate({ toolCallId: 'c2', rawInput: { command: 'git status' } })!
+    expect((JSON.parse(noTitle.argsRaw) as Record<string, unknown>).description).toBe('git status')
   })
 
   it('reads only the two live statuses as "output may still arrive"', () => {
@@ -64,19 +86,20 @@ describe('ACP tool-call notifications → tool-call stream chunks', () => {
     expect(acpToolCallArgsOf({ toolCallId: 'c' })).toBe('')
   })
 
-  it('emits deltas only for true prefix extensions; replacements move the snapshot for the closing block', () => {
+  it('moves the snapshot on a restatement; the closing block carries the whole JSON payload', () => {
     // The accumulator CONCATENATES `argumentsDelta`, while ACP restates the
-    // whole input: only a real prefix extension can become a delta. The title
-    // stays folded into the body across the extension, so it is never dropped.
-    let snapshot = acpToolCallFromUpdate({ toolCallId: 't1', title: 'first tool', rawInput: '{"cmd":"' })!
-    expect(acpToolCallDelta(snapshot, { toolCallId: 't1', rawInput: '{"cmd":"ls -la"}' }))
-      .toEqual([{ kind: 'args', text: 'ls -la"}' }])
-    expect(snapshot.argsRaw).toBe('first tool\n{"cmd":"ls -la"}')
-    // A rewrite (not an extension) has no honest delta: the snapshot moves,
-    // and the closing `block-end` replaces the block wholesale.
-    snapshot = acpToolCallFromUpdate({ toolCallId: 't1', rawInput: '{"cmd":""}' })!
+    // whole input. The args are a JSON object (`description` + `input`), so a
+    // restatement that fills in the input is a replacement, not a prefix
+    // extension: no honest delta exists, the snapshot moves, and the closing
+    // `block-end` replaces the block wholesale. The operation label stays in
+    // `description` throughout, so the preparing row reads it from the first frame.
+    const snapshot = acpToolCallFromUpdate({ toolCallId: 't1', title: 'first tool', rawInput: '{"cmd":"' })!
     expect(acpToolCallDelta(snapshot, { toolCallId: 't1', rawInput: '{"cmd":"ls -la"}' })).toEqual([])
-    expect(snapshot.argsRaw).toBe('{"cmd":"ls -la"}')
+    expect(snapshot.argsRaw).toBe('{"description":"first tool","input":{"cmd":"ls -la"}}')
+    // A rewrite (not an extension) likewise moves the snapshot for the close.
+    const second = acpToolCallFromUpdate({ toolCallId: 't1', rawInput: '{"cmd":""}' })!
+    expect(acpToolCallDelta(second, { toolCallId: 't1', rawInput: '{"cmd":"ls -la"}' })).toEqual([])
+    expect(second.argsRaw).toBe('{"description":"ls -la","input":{"cmd":"ls -la"}}')
   })
 
   it('never emits a raw title as a name delta; the constant name stays and the rewritten command is preserved', () => {
@@ -90,7 +113,7 @@ describe('ACP tool-call notifications → tool-call stream chunks', () => {
     expect(deltas.every(delta => delta.kind !== 'name')).toBe(true)
     expect(snapshot.name).toBe(ACP_TOOL_CALL_NAME)
     expect(snapshot.title).toBe(rewritten)
-    expect(snapshot.argsRaw).toBe(rewritten)
+    expect((JSON.parse(snapshot.argsRaw) as { description: string }).description).toBe(rewritten)
     // A title-less update keeps the already-preserved title (no silent drop).
     const after = acpToolCallDelta(snapshot, { toolCallId: 't1', rawInput: '{"cmd":"ls"}' })
     expect(after.every(delta => delta.kind !== 'name')).toBe(true)
@@ -108,7 +131,7 @@ describe('ACP tool-call notifications → tool-call stream chunks', () => {
     const deltas = acpToolCallDelta(snapshot, { toolCallId: 'c2', title: 'Bash', rawInput: 'ls' })
     expect(snapshot.name).toBe(ACP_TOOL_CALL_NAME)
     expect(deltas).toContainEqual({ kind: 'name', name: ACP_TOOL_CALL_NAME })
-    expect(deltas).toContainEqual({ kind: 'args', text: 'Bash\nls' })
+    expect(deltas).toContainEqual({ kind: 'args', text: '{"description":"Bash","input":"ls"}' })
 
     // Subsequent updates do NOT re-emit the name delta
     const after = acpToolCallDelta(snapshot, { toolCallId: 'c2', rawInput: 'ls -la' })
@@ -123,7 +146,7 @@ describe('ACP tool-call notifications → tool-call stream chunks', () => {
     })
     expect(contentSnap.name).toBe(ACP_TOOL_CALL_NAME)
     expect(contentDeltas).toContainEqual({ kind: 'name', name: ACP_TOOL_CALL_NAME })
-    expect(contentDeltas).toContainEqual({ kind: 'args', text: 'output' })
+    expect(contentDeltas).toContainEqual({ kind: 'args', text: '{"description":"output"}' })
   })
 
   it('recognizes the continuation steps of a card-bearing turn, and only those', () => {

@@ -560,14 +560,14 @@ interface BackgroundHold {
  * open call's arguments before the block is settled.
  *
  * The settling rule (`docs/acp-convergence.md` §1.8) cuts a segment at the
- * next non-tool event, which for a long-running tool means the agent's next
- * words — typically AFTER the tool finished. The host's live "preparing" row
- * only advances on `argumentsDelta`, and an ACP update restates its input in
- * whole, so the real command otherwise appears only when the segment closes.
- * A short quiet window closes the tool-call BLOCK (not the segment): the row
- * settles its arguments and shows the real command while the agent still
- * executes the tool, and the segment stays open for the host-side settle,
- * watchdog and continuation semantics.
+ * next non-tool event — for a long-running tool, the agent's next words come
+ * only AFTER it finished. The host's "preparing" row reads the operation from
+ * the args JSON's `description`: the first delta carries the announce's args,
+ * but an ACP restatement is a whole replacement no concatenating
+ * `argumentsDelta` can express, so it otherwise reaches the row only at segment
+ * close. A short quiet window closes the tool-call BLOCK (not the segment): the
+ * `block-end` re-settles the row's args so the restated operation shows while
+ * the tool still runs; host-side settle, watchdog and continuation are unchanged.
  *
  * Long enough to batch the announce → rewrite burst observed on
  * CodeBuddy (all within the same tick or two), short enough to read as live.
@@ -1916,13 +1916,13 @@ export class TurnStreamController {
   /**
    * Settle the open tool card's BLOCK once the agent goes quiet.
    *
-   * Why this exists: the host's live "preparing" row only advances on
-   * `argumentsDelta`; an ACP update restates its input in whole, which the
-   * concatenating accumulator cannot express. Waiting for the next non-tool
-   * event therefore delays the real command until the agent speaks again, and
-   * a long-running tool speaks only after it finished. Closing the block on a
-   * short quiet window lets the row settle its arguments (the real command)
-   * while the tool still runs.
+   * Why this exists: the host's live "preparing" row reads the operation from
+   * the args JSON's `description`. The first delta carries the announce's args,
+   * but an ACP restatement is a whole replacement the concatenating accumulator
+   * cannot express as a delta. Waiting for the next non-tool event therefore
+   * delays a restated operation until the agent speaks again, and a long-running
+   * tool speaks only after it finished. Closing the block on a short quiet window
+   * re-settles the row's args (the restated operation) while the tool still runs.
    *
    * The SEGMENT stays open: the card is still its last block, the host still
    * settles the message (and executes the card) on the next non-tool event,

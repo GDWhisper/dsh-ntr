@@ -466,19 +466,19 @@ describe('ACP bridge over stdio (mock agent)', () => {
     // The t1 restatement REWROTE its input (`{"cmd":""}` → `{"cmd":"ls -la"}`)
     // — a replacement, not a prefix extension, so no concatenating delta can
     // express it: the snapshot moves and the closing `block-end` replaces the
-    // block wholesale (which is what the settled card shows). The t2 input
-    // arrives serialized from its object form.
+    // block wholesale. The args are a JSON object (`description` + `input`) the
+    // host preparing row reads; the t2 input arrives serialized from its object.
     const t1Deltas = chunks
       .filter((c): c is Extract<StreamChunk, { type: 'tool-call-delta' }> => c.type === 'tool-call-delta' && (c as { id: string }).id === 't1')
       .map(c => c.argumentsDelta).join('')
-    expect(t1Deltas).toBe('first tool\n{"cmd":""}')
+    expect(t1Deltas).toBe('{"description":"first tool","input":{"cmd":""}}')
     const t1Card = chunks.find((c): c is Extract<StreamChunk, { type: 'block-end' }> =>
       c.type === 'block-end' && (c.block as { type?: string; id?: string }).type === 'tool-call' && (c.block as { id?: string }).id === 't1')
-    expect((t1Card?.block as { arguments?: string } | undefined)?.arguments).toBe('first tool\n{"cmd":"ls -la"}')
+    expect((t1Card?.block as { arguments?: string } | undefined)?.arguments).toBe('{"description":"first tool","input":{"cmd":"ls -la"}}')
     const t2Args = chunks
       .filter((c): c is Extract<StreamChunk, { type: 'tool-call-delta' }> => c.type === 'tool-call-delta' && (c as { id: string }).id === 't2')
       .map(c => c.argumentsDelta).join('')
-    expect(t2Args).toBe('second tool\n{"path":"a.md"}')
+    expect(t2Args).toBe('{"description":"second tool","input":{"path":"a.md"}}')
 
     // …and the answer is still there, in the continuation step after the
     // cards' step.

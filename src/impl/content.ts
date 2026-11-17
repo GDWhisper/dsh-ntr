@@ -33,8 +33,9 @@ import { ACP_TOOL_RAW_MAX } from '../subagent-records.ts'
  * often a whole shell command, and a card whose name resolves to a REAL host
  * tool would let `tools/execute` run the agent-supplied arguments in the host
  * process, bypassing this plugin's permission ledger (the guard's fail-closed
- * check is the backstop). The title is preserved in `argsRaw` instead, which
- * the host renders as the card body (`bodyRaw` / `formatToolBody`).
+ * check is the backstop). The operation is preserved in `argsRaw` instead — a
+ * JSON object whose `description` field the host's live preparing row reads
+ * (`argumentSummary` / `formatToolBody`).
  *
  * Hand-copied as `ACP_TOOL_CALL_NAME` in `presets/acp/acp-guard.mjs` (a separate
  * module instance the Loader mounts without imports).
@@ -48,15 +49,16 @@ export const ACP_TOOL_CALL_NAME = 'dsh_ntr__acp_tool_call'
  * Chat renderer's grouping key. `name` is the fixed ACP_TOOL_CALL_NAME (empty
  * only for a content-less status-only update, which the bridge skips as a
  * phantom card). `title` is the agent's own label, often a whole command;
- * `argsRaw` is that title folded in front of whatever `rawInput` / `arguments`
- * the agent disclosed, so nothing is dropped when the name became a constant.
+ * `argsRaw` is a JSON object carrying that label in `description` and the
+ * disclosed input under `input`, so nothing is dropped when the name became a
+ * constant and the host's preparing row can read the operation live.
  */
 export interface AcpToolCallSnapshot {
   callId: string
   name: string
   /** The agent's own `title` label (kept so title-less updates don't drop it). */
   title: string
-  /** Accumulated body text: the title plus the disclosed arguments. */
+  /** JSON argument payload: `description` (the operation) plus `input` (verbatim). */
   argsRaw: string
 }
 
@@ -66,17 +68,57 @@ export type AcpToolCallDelta =
   | { kind: 'args'; text: string }
 
 /**
- * Fold the agent's `title` label in front of the disclosed argument text.
+ * Build the card's argument payload as a JSON object the host's live preparing
+ * row can actually read.
  *
- * Both the creating and the updating path use this, so the title - frequently
- * a whole pwsh command - is preserved in `argsRaw` (constraint 29: no silent
- * drop) instead of being lost when the card name became a constant, and an
- * input-prefix extension is still recognizable across updates. No truncation:
- * the full text is kept (a cut would need a marker).
+ * The host classifies the constant card name as an unknown tool (the `others`
+ * variant) and, while the tool runs, renders ONLY a one-line summary parsed from
+ * a `description` field (`argumentSummary` reads `args.text("description")`); it
+ * never shows the raw body during preparing. So the operation label goes into
+ * `description` — the FIRST key, readable as soon as the JSON lands — and the
+ * agent's disclosed input is preserved as a structured copy under `input`
+ * (constraint 29: no silent drop; the verbatim text stays in the ACP transcript
+ * via `toolInputOf`). The old `title\n{json}` text was not valid JSON, so the host read
+ * no field and the preparing row fell back to the bare tool name: the operation
+ * was invisible until the tool finished. Both the creating and the updating path
+ * use this, so a rewritten title still lands in `description`. No truncation: the
+ * full text is kept (a cut would need a marker).
  */
-function foldTitleIntoArgs(title: string, args: string): string {
-  if (title === '') return args
-  return args === '' ? title : `${title}\n${args}`
+function acpToolArgsJson(title: string, args: string): string {
+  const parsed = args === '' ? undefined : parseJson(args)
+  const description = operationLabel(title, args, parsed)
+  if (description === undefined && args === '') return ''
+  const payload: Record<string, unknown> = {}
+  if (description !== undefined) payload.description = description
+  if (args !== '') payload.input = parsed === undefined ? args : parsed
+  return JSON.stringify(payload)
+}
+
+/**
+ * The operation label for `description`: the agent's own title first (often a
+ * whole command), else a label derived from the disclosed input — its own
+ * `description`, else its first string field (the host's settled-summary
+ * heuristic), else the input text itself. Undefined when nothing was disclosed.
+ */
+function operationLabel(title: string, args: string, parsed: unknown): string | undefined {
+  if (title !== '') return title
+  if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+    const record = parsed as Record<string, unknown>
+    if (typeof record.description === 'string' && record.description !== '') return record.description
+    for (const value of Object.values(record)) {
+      if (typeof value === 'string' && value !== '') return value
+    }
+  }
+  return args === '' ? undefined : args
+}
+
+/** Parsed JSON, or undefined when the text is not valid JSON (a fragment or plain text). */
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -114,7 +156,7 @@ export function acpToolCallFromUpdate(update: Record<string, unknown>): AcpToolC
   const callId = typeof update.toolCallId === 'string' ? update.toolCallId.trim() : ''
   if (callId === '') return undefined
   const title = typeof update.title === 'string' && update.title !== '' ? update.title : ''
-  const argsRaw = foldTitleIntoArgs(title, acpToolCallArgsOf(update))
+  const argsRaw = acpToolArgsJson(title, acpToolCallArgsOf(update))
   // A content-less status-only update keeps an empty name: the bridge's
   // phantom-card guard relies on (name === '' && argsRaw === '') to skip it.
   // Every real card gets the fixed constant, never the agent's own title.
@@ -151,8 +193,8 @@ export function acpToolCallDelta(
   // The card name is a fixed constant. Agents (codebuddy among them) rewrite
   // `title` mid-call, so emitting that raw text as a name delta would re-inject
   // a long shell command as a host tool name. Emit NO name delta; the (possibly
-  // rewritten) title is preserved in the args body instead, folded in front of
-  // the disclosed input for BOTH this path and acpToolCallFromUpdate.
+  // rewritten) title is preserved in the args `description` instead, for BOTH
+  // this path and acpToolCallFromUpdate.
   const incoming = typeof update.title === 'string' && update.title !== '' ? update.title : ''
   const args = acpToolCallArgsOf(update)
   if (incoming === '' && args === '') {
@@ -165,15 +207,16 @@ export function acpToolCallDelta(
           snapshot.name = ACP_TOOL_CALL_NAME
           deltas.push({ kind: 'name', name: ACP_TOOL_CALL_NAME })
         }
-        deltas.push({ kind: 'args', text })
-        snapshot.argsRaw = text
+        const json = acpToolArgsJson(text, '')
+        deltas.push({ kind: 'args', text: json })
+        snapshot.argsRaw = json
       }
     }
     return deltas
   }
   const title = incoming !== '' ? incoming : snapshot.title
   snapshot.title = title
-  const next = foldTitleIntoArgs(title, args)
+  const next = acpToolArgsJson(title, args)
   if (snapshot.name !== ACP_TOOL_CALL_NAME) {
     snapshot.name = ACP_TOOL_CALL_NAME
     deltas.push({ kind: 'name', name: ACP_TOOL_CALL_NAME })

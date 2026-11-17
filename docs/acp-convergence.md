@@ -273,13 +273,31 @@ callId 显式断块；同 callId 重发的 `tool_call` 按更新折叠。
    （agent 未确认取消前不解开 `settled` 闸门）跨段成立；段间事件只记账
    （工具输出唤醒等待者），游标不动，下一段重放补齐。
 
-**卡片块的静默结算（2026-11-08，现行）**：切段点仍是「下一条非 tool 事件」，
+**卡片参数的可见形状（2026-11-17，现行）**：宿主把保留名卡片归为未知工具
+（`dsh-client-ui-tool` 的 `others` 变体），工具运行中（`preparing` 阶段）**只**
+渲染一行从参数 JSON 解析出的摘要——`argumentSummary` 读 `args.text("description")`；
+原始正文被 `toolRowModel` gate 在 `phase !== "preparing"` 之后，运行中根本不显示。
+因此卡片参数必须是**合法 JSON 且 `description` 前置**承载操作文本：`acpToolArgsJson`
+（src/impl/content.ts）把 title 放进 `description`（无 title 时退到 input 自己的
+`description` / 首个字符串字段），原始 `rawInput`/`arguments` 结构化保留在 `input`
+字段（约束 29：不丢数据；逐字原文另由 ACP 视图 `toolInputOf` 保留）。旧的 `title\n{json}` 文本不是合法 JSON，`PartialArguments` 首字符即
+fail，preparing 行读不出任何字段、退化成裸工具名 `dsh_ntr__acp_tool_call`——这就是
+「工具调用过程中不显示实际操作」的根因。回归用例：`tests/impl/content.spec.ts`
+「produces arguments the host preparing row can read」。
+
+**卡片块的静默结算（2026-11-08）**：切段点仍是「下一条非 tool 事件」，
 但卡片参数披露后 agent 连续静默 `CARD_SETTLE_QUIET_MS`（500ms）时，
-`TurnStreamController.armCardSettle` 只发该卡的 `block-end`，**不结束段**。
-宿主的实时 preparing 行据此在工具仍运行时就显示真实命令（`applyDelta` 的
-block-end 会把整包 `arguments` 落到 `args.settle`），而消息落定、卡片交给宿主
-执行、看门狗（段仍开着）与续跑时机全部不变。参数为空时不结算（agent 可能
-还没披露），静默窗也用于批处理 announce → rewrite 的重述突发。
+`TurnStreamController.armCardSettle` 只发该卡的 `block-end`，**不结束段**
+（`applyDelta` 的 block-end 会把整包 `arguments` 落到 `args.settle`）。消息落定、
+卡片交给宿主执行、看门狗（段仍开着）与续跑时机全部不变。参数为空时不结算
+（agent 可能还没披露），静默窗也用于批处理 announce → rewrite 的重述突发。
+**订正（2026-11-17）**：原记录把「显示真实命令」归因于静默结算本身，漏了前提——
+旧参数 `title\n{json}` 不是合法 JSON，preparing 行根本读不出任何字段（见上条），
+所以无论是否 settle 都只显示裸工具名。修复是参数的 JSON `description` 形状：首帧
+`tool-call-delta` 即带 announce 已知的操作；而 ACP 重述是整包替换、拼接 delta 表达
+不了，**迟到重述仍要靠这次静默结算的 `block-end`（`settle` 可重复）刷新运行中的行**。
+二者各管一段：首帧给 announce 已知操作，静默结算让重述在运行中可见，段尾 `block-end`
+最终整包替换。静默结算的职责不变，只是参数可读了才真正生效。
 
 结算只关块、**不清快照**（`SegmentState.cardSettled`）：同一 callId 的迟到参数
 重述仍折进快照，但**不再发 `tool-call-delta`**——宿主视图已 `settle` 成 sealed，

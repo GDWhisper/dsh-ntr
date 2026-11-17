@@ -95,13 +95,14 @@ describe("a segmented turn interleaves like a native multi-step turn (isolated m
     const firstStarts = first.filter(c => c.type === 'block-start').map(c => (c as { blockType: string }).blockType)
     expect(firstStarts.at(-1)).toBe('tool-call')
     expect(firstStarts.slice(0, -1)).toEqual(['reasoning', 'text'])
-    // The name is the fixed constant and the card's arguments are the agent's
-    // own title; the tool's real output lives in the shared output registry
+    // The name is the fixed constant and the card's arguments are a JSON object
+    // whose `description` carries the agent's own title (read live by the host
+    // preparing row); the tool's real output lives in the shared output registry
     // (asserted below), not in the card body.
     const cardArgs = first
       .filter((c): c is Extract<StreamChunk, { type: 'tool-call-delta' }> => c.type === 'tool-call-delta')
       .map(c => c.argumentsDelta).join('')
-    expect(cardArgs).toBe('fake tool')
+    expect(cardArgs).toBe('{"description":"fake tool"}')
 
     // Step 2 (the continuation) carries the post-call answer and NO card: the
     // turn's last settled message is tool-free, so the loop completes here.
