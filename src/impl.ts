@@ -62,6 +62,7 @@ export type { AcpContentRow, AcpDiffPayload, AcpToolCallDelta, AcpToolCallSnapsh
 export {
   ACP_TOOL_CALL_NAME,
   BOOKKEEPING_UPDATES,
+  USER_ECHO_UPDATES,
   acpContentRows,
   acpToolCallArgsOf,
   acpToolCallDelta,

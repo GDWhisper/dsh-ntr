@@ -405,16 +405,30 @@ export const BOOKKEEPING_UPDATES: ReadonlySet<string> = new Set([
 ])
 
 /**
+ * Content kinds that echo the user's own message back at the host: agy sends
+ * one `user_message_chunk` at the start of every prompt and replays queued
+ * ones after a resume. The host already renders that user message, so the
+ * native stream drops the echo whole — folding it would dump its raw JSON
+ * into the assistant bubble — while the ACP view still maps the kind to a
+ * `user` entry (`foldUpdate`), so nothing is lost. An explicit destination,
+ * not the forbidden default drop. Kept OUT of `BOOKKEEPING_UPDATES`: that
+ * set's contract is routine state, and an echo is content.
+ */
+export const USER_ECHO_UPDATES: ReadonlySet<string> = new Set([
+  'user_message_chunk',
+])
+
+/**
  * Human-readable text of an ACP notification this build has no card of its own
  * for. The text is what the native chat stream shows and what the guard answers
  * the host loop's execution of that card with, so it must carry the payload —
  * a plan's entries, an unknown kind's whole JSON — rather than only a name.
  *
- * The routine bookkeeping kinds (`current_mode_update`, `available_commands_update`,
- * and the rest of `BOOKKEEPING_UPDATES`) never reach this function on the live
- * path: `streamPrompt` drops them before it announces a kind inline — it is the
- * only caller. The two branches below that name them are a defensive fallback
- * for a direct caller, NOT a live route into the chat stream.
+ * The routine bookkeeping kinds (`BOOKKEEPING_UPDATES`) and the user-echo
+ * kinds (`USER_ECHO_UPDATES`) never reach this function on the live path:
+ * `TurnStreamController.foldInto` excludes them before it announces a kind
+ * inline — it is the only caller. The two branches below that name them are a
+ * defensive fallback for a direct caller, NOT a live route into the chat stream.
  */
 export function describeUnhandledUpdate(kind: string, update: Record<string, unknown>): string {
   const label = kind === '' ? 'session update' : kind

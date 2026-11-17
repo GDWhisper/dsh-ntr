@@ -1,5 +1,5 @@
 import {
-  BOOKKEEPING_UPDATES,
+  BOOKKEEPING_UPDATES, USER_ECHO_UPDATES,
   EventHub,
   acpToolCallDelta,
   acpToolCallFromUpdate,
@@ -2473,7 +2473,7 @@ export class TurnStreamController {
       // quiet window, instead of waiting for the next non-tool event.
       this.armCardSettle(seg)
       return true
-    } else if (!BOOKKEEPING_UPDATES.has(kind)) {
+    } else if (!BOOKKEEPING_UPDATES.has(kind) && !USER_ECHO_UPDATES.has(kind)) {
       const text = describeUnhandledUpdate(kind, update)
       if (this.announcedKinds.get(kind) === text) return true
       if (seg.hasCard) {

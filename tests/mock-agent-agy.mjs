@@ -12,6 +12,8 @@
  * "AGY_REPLAY" makes the next prompt replay that text before its own answer
  * (agy flushes the backlog when a prompt arrives); the `AGY_REPLAY_PARTIAL`
  * variant sends only the first half and ends the turn.
+ * "AGY_ECHO" opens the turn with a `user_message_chunk` echo of the user's own
+ * text (agy sends one on every prompt); the answer mirror must not repeat it.
  *
  * "AGY_DISPATCH" prompts script the `invoke_subagent` wire shape (task 1 of
  * docs/plan/antigravity-subagent-panel.md): an ordinary tool call titled
@@ -232,6 +234,12 @@ function agyChildScript(sessionId, text) {
  * `agyLateAnswer`. `cancelWait` is the host's cancel-waiter factory.
  */
 export async function agyPrompt(send, sessionId, text, cancelWait) {
+  // agy echoes the user's own prompt as a `user_message_chunk` at the start of
+  // every turn. The chat plane already shows that message, so the client must
+  // drop the echo instead of folding its raw JSON into the answer.
+  if (text.includes('AGY_ECHO')) {
+    await send({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text } })
+  }
   if (text.includes('AGY_DISPATCH')) {
     const role = text.includes('AGY_DISPATCHBARE') ? undefined : 'License Migrator'
     await send(agyDispatchCall(AGY_DISPATCH_ID, role))
