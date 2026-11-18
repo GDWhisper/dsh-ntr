@@ -787,7 +787,7 @@ function modelSection(context: MenuContext): AcpMenuSection | undefined {
   // directory by picking this row. The host's `agent/probe-models` may start
   // or reuse that agent's process.
   const refresh: AcpMenuItem = {
-    id: REFRESH_CATALOG_ITEM,
+    id: REFRESH_CATALOG_ITEM, pinned: true,
     label: context.probing === true
       ? acp.label('正在检测…', 'Detecting…')
       : acp.label('刷新目录', 'Refresh list'),
@@ -1105,8 +1105,8 @@ export function AcpSessionMenu(props: AcpClusterProps) {
   }
 
   return (
-    <AcpMenu
-      model={model}
+    <AcpMenu key={menu.kind}
+      model={model} label={acp.label}
       anchor={menu.trigger}
       onPick={(itemId, sectionId) => {
         if (busy) return

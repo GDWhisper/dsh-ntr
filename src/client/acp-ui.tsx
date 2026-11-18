@@ -28,7 +28,7 @@
  */
 
 import type { CSSProperties, ReactNode } from 'react'
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import { useSyncExternalStore } from 'react'
 import type { AcpStore, UiState } from './store.ts'
 
 // ---- Host-facing structural types ----
@@ -594,6 +594,12 @@ export interface AcpMenuItem {
    * whose check IS the current value, whose `id` is the value a click sets.
    */
   checkbox?: boolean
+  /**
+   * Action row that must survive the menu's render cap and query filtering
+   * (the model picker's `刷新目录`). Pinned rows take no part in matching or
+   * counting.
+   */
+  pinned?: boolean
 }
 
 /** One titled block of rows. */
@@ -604,149 +610,13 @@ export interface AcpMenuSection {
   items: readonly AcpMenuItem[]
 }
 
-/** Props of the picker shell rendered into `conversation.input.overlay`. */
-export interface AcpMenuProps {
-  /** Menu model; `undefined` renders nothing (closed). */
-  model?: {
-    title: string
-    note?: string
-    sections: readonly AcpMenuSection[]
-    error?: string
-    loading?: boolean
-  }
-  /** The control that opened the menu; the popup docks above it (see `placeMenu`). */
-  anchor?: HTMLElement | null
-  onPick(itemId: string, sectionId: string): void
-  onClose(): void
-}
-
 /**
- * Pure popup placement, viewport coordinates: the menu docks with its right
- * edge under the trigger's, `gap`px above it — and only then clamps to the
- * viewport (flip below when the top has no room, slide left at the right edge).
- * Separated from the DOM measurement so the geometry stays testable.
+ * The picker shell lives in `acp-menu.tsx` (its in-menu search pushed this
+ * kit past its size budget). Re-exported as a VALUE so the existing imports
+ * keep working; the module imports only types from here, so there is no
+ * runtime cycle. `placeMenu` rides along for the existing geometry tests.
  */
-export function placeMenu(
-  trigger: { left: number; right: number; top: number; bottom: number },
-  menu: { width: number; height: number },
-  viewport: { width: number; height: number },
-  gap = 8,
-): { x: number; y: number } {
-  const x = Math.min(
-    Math.max(gap, trigger.right - menu.width),
-    Math.max(gap, viewport.width - menu.width - gap),
-  )
-  const above = trigger.top - menu.height - gap
-  let y = above >= gap ? above : trigger.bottom + gap
-  if (y + menu.height > viewport.height - gap) {
-    y = Math.max(gap, viewport.height - menu.height - gap)
-  }
-  return { x, y }
-}
-
-/**
- * The picker shell. It rides the composer's overlay anchor (the card's top
- * edge) — the seat the platform reserves for menus, so the popup is never
- * clipped by the card's own scrollport — and then docks itself to the control
- * that opened it (`anchor`): the seat or a chip is a dropdown trigger, and a
- * menu that materializes elsewhere on the card reads as "nothing happened".
- */
-export function AcpMenu({ model, anchor, onPick, onClose }: AcpMenuProps) {
-  const rootRef = useRef<HTMLDivElement>(null)
-  useLayoutEffect(() => {
-    const node = rootRef.current
-    if (node === null || model === undefined) return
-    const place = (): void => {
-      try {
-        if (anchor === undefined || anchor === null || !anchor.isConnected) {
-          node.style.transform = ''
-          return
-        }
-        const menuRect = node.getBoundingClientRect()
-        const triggerRect = anchor.getBoundingClientRect()
-        const { x, y } = placeMenu(
-          triggerRect,
-          menuRect,
-          { width: window.innerWidth, height: window.innerHeight },
-        )
-        // Translate from wherever CSS parked the popup: the offset parent is
-        // the platform's zero-height overlay anchor, so plain left/top would
-        // need its exact geometry — measuring the delta needs none.
-        node.style.transform = 'none'
-        const base = node.getBoundingClientRect()
-        node.style.transform = `translate(${x - base.left}px, ${y - base.top}px)`
-      } catch { /* placement must never break the menu */ }
-    }
-    place()
-    window.addEventListener('resize', place)
-    return () => { window.removeEventListener('resize', place) }
-  }, [model, anchor])
-  useEffect(() => {
-    if (model === undefined) return
-    const onKey = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') {
-        event.stopPropagation()
-        onClose()
-      }
-    }
-    const onPointerDown = (event: PointerEvent): void => {
-      if (!(event.target instanceof Node)) return
-      if (rootRef.current?.contains(event.target)) return
-      // Clicking the composer card itself must not close the menu (the chips
-      // live there); everything else outside does.
-      if (rootRef.current?.closest('[data-composer-card]')?.contains(event.target) === true) return
-      onClose()
-    }
-    document.addEventListener('keydown', onKey, true)
-    document.addEventListener('pointerdown', onPointerDown, true)
-    return () => {
-      document.removeEventListener('keydown', onKey, true)
-      document.removeEventListener('pointerdown', onPointerDown, true)
-    }
-  }, [model, onClose])
-
-  if (model === undefined) return null
-  return (
-    <div ref={rootRef} className="ntr-acp-menu" role="menu" aria-label={model.title}>
-      <div className="ntr-acp-menu-head">
-        <span className="ntr-acp-menu-title">{model.title}</span>
-        {model.loading && <span className="ntr-acp-menu-spin" aria-hidden>…</span>}
-      </div>
-      {model.note !== undefined && <div className="ntr-acp-menu-note">{model.note}</div>}
-      {model.error !== undefined && <div className="ntr-acp-menu-error">{model.error}</div>}
-      <div className="ntr-acp-menu-body">
-        {model.sections.map(section => (
-          <div key={section.id} className="ntr-acp-menu-section">
-            {section.title !== undefined && <div className="ntr-acp-menu-section-title">{section.title}</div>}
-            {section.note !== undefined && <div className="ntr-acp-menu-note">{section.note}</div>}
-            {section.items.map(item => (
-              <button
-                key={`${section.id}/${item.id}`}
-                type="button"
-                role={item.checkbox === true ? 'menuitemcheckbox' : 'menuitemradio'}
-                aria-checked={item.active === true}
-                className={`ntr-acp-menu-item${item.active === true ? ' is-active' : ''}`}
-                disabled={item.disabled === true}
-                onClick={() => { onPick(item.id, section.id) }}
-              >
-                {item.dot !== undefined && <span className="ntr-acp-dot" style={{ background: item.dot }} aria-hidden />}
-                {item.checkbox === true && (
-                  <span className={`ntr-acp-check${item.active === true ? ' is-on' : ''}`} aria-hidden>{item.active === true ? '✓' : ''}</span>
-                )}
-                <span className="ntr-acp-menu-item-label">{item.label}</span>
-                {item.active === true && item.checkbox !== true && <span className="ntr-acp-tick" aria-hidden>✓</span>}
-                {item.detail !== undefined && <span className="ntr-acp-menu-item-detail">{item.detail}</span>}
-              </button>
-            ))}
-          </div>
-        ))}
-        {model.sections.every(section => section.items.length === 0) && (
-          <div className="ntr-acp-menu-empty">—</div>
-        )}
-      </div>
-    </div>
-  )
-}
+export { AcpMenu, placeMenu } from './acp-menu.tsx'
 
 // ---- Chips ----
 
@@ -973,6 +843,9 @@ const STYLE = `
 .ntr-acp-menu-spin { opacity: 0.5; }
 .ntr-acp-menu-note { padding: 0 10px 6px; font-size: 11px; color: var(--dsw-alias-label-secondary, #6b7280); line-height: 1.5; }
 .ntr-acp-menu-error { margin: 0 10px 6px; padding: 6px 8px; border-radius: 6px; background: color-mix(in srgb, var(--dsw-alias-state-error-primary, #b91c1c) 12%, transparent); color: var(--dsw-alias-state-error-primary, #b91c1c); font-size: 11px; }
+.ntr-acp-menu-search { margin: 0 10px 6px; padding: 5px 8px; font: inherit; font-size: 12px; color: inherit; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); border-radius: 6px; background: var(--dsw-alias-bg-layer-2, #f3f4f6); }
+.ntr-acp-menu-search:focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary, #2563eb); outline-offset: 1px; }
+.ntr-acp-menu-hint { padding: 6px 10px 8px; font-size: 11px; color: var(--dsw-alias-label-secondary, #6b7280); text-align: center; }
 .ntr-acp-menu-body { overflow: auto; padding: 0 4px 6px; }
 .ntr-acp-menu-section { display: flex; flex-direction: column; padding-top: 4px; }
 .ntr-acp-menu-section-title { padding: 6px 8px 4px; font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--dsw-alias-label-secondary, #6b7280); }
