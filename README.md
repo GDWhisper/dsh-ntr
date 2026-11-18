@@ -194,7 +194,7 @@ agent 要动敏感的东西时会问你。询问卡出现在对话里、聊天�
 
 **模型列表太长或太短？**
 
-模型芯片的菜单没有搜索框，所以模型是**按需勾选**的。去设置页那张卡片里勾你想看的。不勾就没有那些条目，避免几百个模型刷屏。
+模型芯片的菜单没有搜索框。默认所有上报模型都可选；觉得太多，就去设置页那张卡片里做减法，取消勾选的条目不再出现。
 
 **为什么 NTR 标签页里没有我发的消息？**
 
@@ -266,7 +266,7 @@ agent 的真实输出始终在 NTR 标签页。dsh-ntr 0.3.9 及更早版本聊�
         allowedCwdRoots: [~/.dsh/dsh-ntr/workspaces]
 ```
 
-可选的 agent 字段：`npmPackage`（PATH 里找不到时自动 `npm install -g`）、`exposedModels`（NTR 座位菜单列哪些变体）、`idleTimeoutMs`（聊天进程的空闲释放窗口，`0` = 永不释放，默认 30 分钟）、`mcpServers`（额外交给 agent 连接的 MCP 服务器）。插件级还有 `transcriptMaxEntries`（会话事件缓冲上限，默认 600）与 `probeModelsOnBoot`（保留字段，启动时已不再为每个 agent 探测，见 `bootstrapCatalogs` 的注释）。可靠性超时与重试的默认值（`startupTimeoutMs`、`cancelFallbackMs`、`staleCancelRetryDelayMs`、`staleCancelMaxRetries`、`permissionTimeoutMs`、`permissionTimeoutMode`，以及卡死看门狗的 `turnStallMs` / `turnStallToolMs` / `turnStallTickMs`）见 [AGENTS.md](./AGENTS.md) 约束 12、13 与 23；设置页能改的都在设置页改，看门狗三个键只在配置文件里（`turnStallMs: 0` 关闭整个看门狗）。
+可选的 agent 字段：`npmPackage`（PATH 里找不到时自动 `npm install -g`）、`exposedModels`（NTR 座位菜单列哪些变体：不写 = 全部上报模型可用；显式 `[]` = 只保留当前模型）、`idleTimeoutMs`（聊天进程的空闲释放窗口，`0` = 永不释放，默认 30 分钟）、`mcpServers`（额外交给 agent 连接的 MCP 服务器）。插件级还有 `transcriptMaxEntries`（会话事件缓冲上限，默认 600）与 `probeModelsOnBoot`（保留字段，启动时已不再为每个 agent 探测，见 `bootstrapCatalogs` 的注释）。可靠性超时与重试的默认值（`startupTimeoutMs`、`cancelFallbackMs`、`staleCancelRetryDelayMs`、`staleCancelMaxRetries`、`permissionTimeoutMs`、`permissionTimeoutMode`，以及卡死看门狗的 `turnStallMs` / `turnStallToolMs` / `turnStallTickMs`）见 [AGENTS.md](./AGENTS.md) 约束 12、13 与 23；设置页能改的都在设置页改，看门狗三个键只在配置文件里（`turnStallMs: 0` 关闭整个看门狗）。
 
 `mcpServers` 是**插件自己的形状**（每条必带 `name` 与 `transport`），不是 ACP 线格式——线格式里 stdio 那条不带 `type`，照线格式手写会被 agent 静默丢弃：
 

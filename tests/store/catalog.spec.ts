@@ -162,6 +162,16 @@ describe('AcpStore agent management', () => {
       autoDiscoverModels: true,
     })
     expect(reads).toBe(1)
+
+    // An ABSENT field is the default-open state and must CLEAR the explicit
+    // filter — the object spread must not keep the previous array.
+    await (store as unknown as { applyEvent(event: unknown): Promise<void> }).applyEvent({
+      type: 'agent/exposure',
+      agentId: 'pi',
+      autoDiscoverModels: true,
+    })
+    expect(store.getSnapshot().detectedAgents.find(info => info.id === 'pi')?.currentConfig?.exposedModels).toBeUndefined()
+    expect(reads).toBe(2)
   })
 
   it('loadAgentCatalog stays quiet when the host has no catalog surface', async () => {

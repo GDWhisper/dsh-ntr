@@ -337,8 +337,10 @@ export class AgentAdminService {
   /**
    * Lightweight model-visibility update: mutates the def in place (the live
    * bridge shares the same object, so nothing needs restarting), persists, and
-   * republishes status. `undefined` clears the filter, which — being the same
-   * as `[]` — leaves only the agent's base entry in the ACP seats.
+   * republishes status. `undefined` DELETES the field, which is the
+   * default-open state — every published model is offered. An explicit array,
+   * including `[]`, is the user's narrowing: empty leaves only the agent's
+   * base / currently-in-force row in the ACP seats.
    */
   async setExposedModels(agentId: string, exposedModels: readonly string[] | undefined): Promise<void> {
     const def = this.host.defOf(agentId)

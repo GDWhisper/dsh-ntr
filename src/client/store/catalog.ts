@@ -151,10 +151,12 @@ export class CatalogService {
   }
 
   /**
-   * Persist the ACP-seat model filter for one agent. `undefined` clears the
-   * filter — same as an empty list, i.e. no `agentId@choice` variants, only
-   * the agent's base entry. Uses the dedicated lightweight RPC so the agent
-   * process and its live sessions are never restarted.
+   * Persist the ACP-seat model filter for one agent. `undefined` DELETES the
+   * field — the default-open state, where every model the agent publishes is
+   * offered. An explicit array (including `[]`, which lists nothing but the
+   * base / currently-in-force row) is the user's narrowing. Uses the dedicated
+   * lightweight RPC so the agent process and its live sessions are never
+   * restarted.
    */
   async setExposedModels(agentId: string, exposedModels: string[] | undefined): Promise<void> {
     try {

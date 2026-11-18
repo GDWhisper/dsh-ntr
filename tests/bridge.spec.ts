@@ -190,10 +190,10 @@ describe('ACP bridge over stdio (mock agent)', () => {
     // where no ACP agent is behind the route at all.
     expect(await adapter.listModels('acp')).toEqual([])
 
-    // The agent's own surface is the plugin's `agent/catalog`. Exposing choices
-    // is the only way `agent@choice` variants appear there (via the lightweight
-    // RPC — no restart), and clearing is the same as never setting.
-    expect(await dispatchRpc(manager, 'agent/set-exposed-models', { agentId: 'mock', exposedModels: ['mock-model-a', 'mock-model-b'] }))
+    // The agent's own surface is the plugin's `agent/catalog`. Narrowing is a
+    // lightweight RPC (no restart); unset is the DEFAULT-OPEN state, so every
+    // model the agent publishes is offered once the filter is reset.
+    expect(await dispatchRpc(manager, 'agent/set-exposed-models', { agentId: 'mock', exposedModels: ['mock-model-a'] }))
       .toEqual({ ok: true, value: { done: true } })
     const exposed = await dispatchRpc(manager, 'agent/catalog', { agentId: 'mock' })
     if (!exposed.ok) throw new Error('agent/catalog failed')
@@ -203,11 +203,11 @@ describe('ACP bridge over stdio (mock agent)', () => {
     // checked row in the picker says which model is running (user report,
     // 2026-10-18). Mock is on `mock-model-a`.
     expect(seat.base).toMatchObject({ id: 'mock', name: 'Mock · Mock Model A' })
-    expect(seat.variants.map(variant => variant.id)).toEqual(['mock@mock-model-a', 'mock@mock-model-b'])
+    expect(seat.variants.map(variant => variant.id)).toEqual(['mock@mock-model-a'])
     expect(await dispatchRpc(manager, 'agent/set-exposed-models', { agentId: 'mock' })).toEqual({ ok: true, value: { done: true } })
-    const cleared = await dispatchRpc(manager, 'agent/catalog', { agentId: 'mock' })
-    if (!cleared.ok) throw new Error('agent/catalog failed')
-    expect((cleared.value as AgentCatalogResult).variants).toEqual([])
+    const reopened = await dispatchRpc(manager, 'agent/catalog', { agentId: 'mock' })
+    if (!reopened.ok) throw new Error('agent/catalog failed')
+    expect((reopened.value as AgentCatalogResult).variants.map(variant => variant.id)).toEqual(['mock@mock-model-a', 'mock@mock-model-b'])
 
     const resolved = await adapter.resolveModel('acp', 'mock')
     expect(resolved).toEqual(expect.objectContaining({ provider: 'acp', id: 'mock', name: 'Mock' }))

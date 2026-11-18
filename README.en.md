@@ -194,7 +194,7 @@ Check the Test button in Settings. It runs a full handshake on the host side and
 
 **Model list too long or too short?**
 
-The model chip's menu has no search box, so models are **opt-in**. Check the ones you want on that settings card. Unchecked ones simply don't appear, sparing you a wall of hundreds of models.
+The model chip's menu has no search box. By default every model the agent publishes is offered; if that is too many, narrow the list on that settings card — unchecked models no longer appear.
 
 **Why don't my messages appear in the NTR tab?**
 
@@ -266,7 +266,7 @@ Mount it in your profile's `cordis.patch.yml`. When `cwd` / `allowedCwdRoots` ar
         allowedCwdRoots: [~/.dsh/dsh-ntr/workspaces]
 ```
 
-Optional agent fields: `npmPackage` (auto `npm install -g` when not found on PATH), `exposedModels` (which variants the NTR seat menu lists), `idleTimeoutMs` (idle-release window for chat processes; `0` = never release, default 30 minutes), `mcpServers` (extra MCP servers handed to the agent). Plugin-level there are also `transcriptMaxEntries` (per-conversation event buffer cap, default 600) and `probeModelsOnBoot` (kept for compatibility; boot-time per-agent probing no longer happens — see the comment on `bootstrapCatalogs`). Reliability timeouts and retries (`startupTimeoutMs`, `cancelFallbackMs`, `staleCancelRetryDelayMs`, `staleCancelMaxRetries`, `permissionTimeoutMs`, `permissionTimeoutMode`, plus the stall watchdog's `turnStallMs` / `turnStallToolMs` / `turnStallTickMs`) are covered by [AGENTS.md](./AGENTS.md) constraints 12, 13 and 23; anything editable in the Settings page should be edited there — the three watchdog keys live in the config file only (`turnStallMs: 0` disables the whole watchdog).
+Optional agent fields: `npmPackage` (auto `npm install -g` when not found on PATH), `exposedModels` (which variants the NTR seat menu lists: unset = every published model; explicit `[]` = only the current model), `idleTimeoutMs` (idle-release window for chat processes; `0` = never release, default 30 minutes), `mcpServers` (extra MCP servers handed to the agent). Plugin-level there are also `transcriptMaxEntries` (per-conversation event buffer cap, default 600) and `probeModelsOnBoot` (kept for compatibility; boot-time per-agent probing no longer happens — see the comment on `bootstrapCatalogs`). Reliability timeouts and retries (`startupTimeoutMs`, `cancelFallbackMs`, `staleCancelRetryDelayMs`, `staleCancelMaxRetries`, `permissionTimeoutMs`, `permissionTimeoutMode`, plus the stall watchdog's `turnStallMs` / `turnStallToolMs` / `turnStallTickMs`) are covered by [AGENTS.md](./AGENTS.md) constraints 12, 13 and 23; anything editable in the Settings page should be edited there — the three watchdog keys live in the config file only (`turnStallMs: 0` disables the whole watchdog).
 
 `mcpServers` uses the plugin's OWN shape (every entry carries a `name` and a `transport`), not the ACP wire shape — the wire's stdio entry has no `type`, and an entry written in the wire shape is silently dropped by the agent:
 

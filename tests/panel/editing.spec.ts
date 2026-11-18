@@ -133,8 +133,10 @@ describe('AcpSettingsSection editing', () => {
     const fixture = await mountPanel()
     await click(screen.getByRole('button', { name: '管理 CodeBuddy' }))
     await click(screen.getByRole('button', { name: /Claude Sonnet 4/ }))
+    // Selecting every published model collapses back to the unset default-open
+    // state (`exposedModels` absent), not to an explicit full list.
     await waitFor(() => expect(payloads(fixture, 'agent/set-exposed-models')).toEqual([
-      { agentId: 'codebuddy', exposedModels: ['deepseek-v3', 'claude-sonnet-4'] },
+      { agentId: 'codebuddy' },
     ]))
     await click(screen.getByRole('button', { name: '清空' }))
     await waitFor(() => expect(payloads(fixture, 'agent/set-exposed-models').at(-1)).toEqual({ agentId: 'codebuddy', exposedModels: [] }))
@@ -168,5 +170,23 @@ describe('AcpSettingsSection editing', () => {
     expect(screen.queryByRole('button', { name: '快速' })).toBeNull()
     expect(payloads(fixture, 'agent/save')).toEqual([])
     expect(payloads(fixture, 'agent/probe-models')).toEqual([])
+  })
+
+  it('shows every published model as selected when exposedModels is unset', async () => {
+    // Issue #23: a fresh agent carries no filter, so the default-open rule must
+    // fill the card with the whole catalog instead of an empty selection.
+    const fixture = await mountPanel({
+      agents: [{
+        id: 'codebuddy', title: 'CodeBuddy', command: 'codebuddy', args: ['--acp'],
+        cwd: '/workspace/ntr-demo', allowedCwdRoots: ['/workspace/ntr-demo'],
+      }],
+    })
+    await click(screen.getByRole('button', { name: '管理 CodeBuddy' }))
+    await detail('模型')
+    expect(screen.getByText('已选 2/2')).toBeDefined()
+    for (const row of screen.getAllByRole('button', { name: /DeepSeek V3/ })) {
+      expect(row.className).toContain('is-on')
+    }
+    expect(payloads(fixture, 'agent/set-exposed-models')).toEqual([])
   })
 })

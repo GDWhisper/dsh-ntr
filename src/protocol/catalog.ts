@@ -123,7 +123,11 @@ export interface AgentCatalogResult {
    * model was in force.
    */
   base: { id: string; name: string; description?: string }
-  /** The `agentId@choice` variants this agent exposes (`exposedModels` applied). */
+  /**
+   * The `agentId@choice` variants this agent exposes (`exposedModels` applied).
+   * An UNSET filter is the default-open state, so this carries every published
+   * choice then; an explicit array — including `[]` — is the user's narrowing.
+   */
   variants: Array<{ id: string; name: string; description?: string }>
   /**
    * The agent-level `thought_level` slot: the last observed model's levels,
@@ -183,4 +187,20 @@ export interface AgentCatalogResult {
   probed: boolean
   /** When the cached catalog was last refreshed. */
   updatedAt?: number
+}
+
+/**
+ * The model values the ACP seats offer for one agent.
+ *
+ * Unset `exposedModels` is the DEFAULT-OPEN state: every model the agent
+ * publishes is offered, so a freshly configured agent's chip menu works on
+ * first use. An explicit array — including the empty one — is the user's
+ * narrowing (empty = only the base / currently-in-force row). Host and
+ * settings card must agree on this one rule, so it lives here.
+ */
+export function effectiveExposedModels(
+  exposedModels: readonly string[] | undefined,
+  catalogValues: readonly string[],
+): string[] {
+  return exposedModels === undefined ? [...catalogValues] : [...exposedModels]
 }

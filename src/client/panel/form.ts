@@ -161,8 +161,9 @@ export function initialForm(detected: DetectedAgentInfo, activeAgent: AgentView 
  * Equivalence test between the form payload and what is already persisted.
  * Order-insensitive on purpose: `env` is a map and `args`/`allowedCwdRoots`
  * keep their order, but a reordered allow-list is not a change worth warning
- * about; `exposedModels === undefined` means "offer no variants", which is the
- * same state as an empty list.
+ * about; `exposedModels === undefined` is the default-open state (every
+ * published model offered), which is NOT the same as an explicit `[]`
+ * (nothing listed) — `buildPayload` keeps that difference.
  */
 export function payloadEquals(payload: AgentSavePayload, current: AcpAgentDef): boolean {
   if (payload.command !== current.command) return false

@@ -876,8 +876,8 @@ function modelSection(context: MenuContext): AcpMenuSection | undefined {
     title: acp.label(`${route.agentTitle ?? 'agent'} 的模型`, `Models of ${route.agentTitle ?? 'the agent'}`),
     note: catalog.variants.length === 0
       ? acp.label(
-        'agent 自己上报的模型目录；这里只列出它当前用的模型，其余可在「设置 → NTR」里勾选可见。',
-        "The agent's own model directory; only the model it is on is offered here — enable more in Settings → NTR.",
+        'agent 自己上报的模型目录；当前没有额外可见的模型，可在「设置 → NTR」里调整可见范围。',
+        "The agent's own model directory; no additional models are visible — adjust the range in Settings → NTR.",
       )
       : acp.label(
         'agent 自己上报的模型目录；勾选的那条就是这条会话正在用的模型。',

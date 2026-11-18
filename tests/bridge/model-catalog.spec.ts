@@ -1,5 +1,5 @@
 import { tmpdir } from 'node:os'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { afterAll, describe, expect, it } from 'vitest'
 import { AcpLlmAdapter, BridgeManager } from '../../src/bridge.ts'
 import { type AcpAgentDef, type AcpEvent, type StreamChunk } from '../../src/protocol.ts'
@@ -52,11 +52,11 @@ describe('model catalog (isolated manager)', () => {
     expect(probe.catalog.thought?.choices.map(c => c.value)).toEqual(['off', 'high'])
     expect(probe.catalog.thought?.currentValue).toBe('high')
 
-    // Variants are opt-in (an unexposed catalog would flood the seats' menus —
-    // pi publishes 500 choices): a probe alone offers the base entry.
+    // Default-open: an UNSET `exposedModels` offers every model the agent
+    // publishes, so a freshly configured agent's chip menu works first use.
     const probed = catalogManager.agentCatalog('mock')
     expect(probed.probed).toBe(true)
-    expect(probed.variants).toEqual([])
+    expect(probed.variants.map(variant => variant.id)).toEqual(['mock@mock-model-a', 'mock@mock-model-b'])
     // The agent's own reasoning metadata rides the same read.
     expect(probed.reasoning?.efforts.map(e => e.id)).toEqual(['off', 'high'])
     expect(probed.reasoning?.defaultEffort).toBe('high')
@@ -119,15 +119,16 @@ describe('model catalog (isolated manager)', () => {
   })
 
   it('narrows the ACP seats via setExposedModels; hidden variants still resolve', async () => {
-    // Unset and empty are the same state: no variants, only the base entry
-    // (the agent's own default model), which is never filtered out.
+    // Unset is the default-open state: every published model is offered.
     await catalogManager.setExposedModels('mock', undefined)
-    expect(catalogManager.agentCatalog('mock').variants).toEqual([])
+    expect(catalogManager.agentCatalog('mock').variants.map(v => v.id))
+      .toEqual(['mock@mock-model-a', 'mock@mock-model-b'])
 
     await catalogManager.setExposedModels('mock', ['mock-model-b'])
     expect(catalogManager.agentCatalog('mock').variants.map(v => v.id)).toEqual(['mock@mock-model-b'])
 
-    // An empty filter leaves just the base entry too.
+    // An explicit empty filter means the user narrowed it to nothing: only the
+    // base / currently-in-force row remains.
     await catalogManager.setExposedModels('mock', [])
     expect(catalogManager.agentCatalog('mock').variants).toEqual([])
 
@@ -138,10 +139,108 @@ describe('model catalog (isolated manager)', () => {
     await expect(catalogManager.setExposedModels('ghost', ['x'])).rejects.toThrow(/not configured/)
   }, 30_000)
 
+  it('defaults an unset exposedModels to every published model, and never freezes the catalog', async () => {
+    const openCatalogPath = `${tmpdir()}/acp-catalog-open-${Date.now()}.json`
+    const openAgentsPath = `${tmpdir()}/acp-agents-open-${Date.now()}.json`
+    writeFileSync(openCatalogPath, JSON.stringify({
+      version: 2,
+      agents: {
+        mock: {
+          catalog: {
+            model: {
+              configId: 'model',
+              name: 'Model',
+              currentValue: 'mock-model-a',
+              choices: [
+                { value: 'mock-model-a', name: 'Mock Model A' },
+                { value: 'mock-model-b', name: 'Mock Model B' },
+              ],
+            },
+          },
+          updatedAt: 1,
+        },
+      },
+    }), 'utf-8')
+    const openHub = new EventHub()
+    // The definition says nothing about `exposedModels`: DEFAULT-OPEN. (`def`
+    // is shared with the suite, so drop whatever a previous test left on it.)
+    const openDef: AcpAgentDef = { ...def }
+    delete openDef.exposedModels
+    const open = new BridgeManager([openDef], openHub, 500, openAgentsPath, openCatalogPath)
+    try {
+      // 1. Unset offers every model the agent publishes.
+      expect(open.agentCatalog('mock').variants.map(v => v.id))
+        .toEqual(['mock@mock-model-a', 'mock@mock-model-b'])
+
+      // 2. An explicit empty array lists nothing (base row only).
+      await open.setExposedModels('mock', [])
+      expect(open.agentCatalog('mock').variants).toEqual([])
+
+      // 3. Resetting to unset DELETES the field and re-opens the list.
+      await open.setExposedModels('mock', undefined)
+      expect(open.agentCatalog('mock').variants.map(v => v.id))
+        .toEqual(['mock@mock-model-a', 'mock@mock-model-b'])
+      const stored = JSON.parse(readFileSync(openAgentsPath, 'utf-8')) as {
+        agents: Array<Record<string, unknown>>
+      }
+      expect('exposedModels' in (stored.agents[0] ?? {})).toBe(false)
+    } finally {
+      await open.shutdownAll()
+    }
+
+    // 4. Auto-discovery must never freeze the directory into the definition
+    // while the filter is unset: the default already offers new models.
+    const growCatalogPath = `${tmpdir()}/acp-catalog-grow-${Date.now()}.json`
+    const growAgentsPath = `${tmpdir()}/acp-agents-grow-${Date.now()}.json`
+    writeFileSync(growCatalogPath, JSON.stringify({
+      version: 2,
+      agents: {
+        mock: {
+          catalog: {
+            model: {
+              configId: 'model',
+              name: 'Model',
+              currentValue: 'mock-model-a',
+              choices: [{ value: 'mock-model-a', name: 'Mock Model A' }],
+            },
+          },
+          updatedAt: 1,
+        },
+      },
+    }), 'utf-8')
+    const growHub = new EventHub()
+    const growDef: AcpAgentDef = { ...def }
+    delete growDef.exposedModels
+    const grow = new BridgeManager([growDef], growHub, 500, growAgentsPath, growCatalogPath)
+    try {
+      expect(grow.agentCatalog('mock').variants.map(v => v.id)).toEqual(['mock@mock-model-a'])
+      // A real session publishes {A, B}: B is new relative to the baseline.
+      const start = await dispatchRpc(grow, 'session/start', { agentId: 'mock' })
+      expect(start.ok).toBe(true)
+      expect(grow.agentCatalog('mock').variants.map(v => v.id))
+        .toEqual(['mock@mock-model-a', 'mock@mock-model-b'])
+      // The discovery path never appended, so it never wrote the field — and if
+      // the file was not written at all, nothing was frozen either.
+      if (existsSync(growAgentsPath)) {
+        const storedGrow = JSON.parse(readFileSync(growAgentsPath, 'utf-8')) as {
+          agents: Array<Record<string, unknown>>
+        }
+        expect('exposedModels' in (storedGrow.agents[0] ?? {})).toBe(false)
+      }
+    } finally {
+      await grow.shutdownAll()
+    }
+  }, 30_000)
+
   it('reloads a persisted catalog into a fresh manager without probing', async () => {
     const reloaded = new BridgeManager([def], hub, 500, undefined, catalogPath)
-    // Nothing exposed yet, so the base entry is the whole surface…
-    expect(reloaded.agentCatalog('mock')).toMatchObject({ probed: true, variants: [] })
+    // A previous test may have left an explicit empty filter; reset to unset,
+    // which is the default-open state.
+    await reloaded.setExposedModels('mock', undefined)
+    // …so every published model is offered straight off the disk cache.
+    expect(reloaded.agentCatalog('mock')).toMatchObject({ probed: true })
+    expect(reloaded.agentCatalog('mock').variants.map(v => v.id))
+      .toEqual(['mock@mock-model-a', 'mock@mock-model-b'])
     // …and the panel's own read answers from the same disk cache: this is what
     // fills the model panes on mount, before (and without) a probe.
     const cached = reloaded.cachedAgentModels('mock')

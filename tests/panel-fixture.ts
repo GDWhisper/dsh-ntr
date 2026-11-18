@@ -201,7 +201,7 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
     return {
       agentId, title,
       base: { id: agentId, name: currentModel === undefined ? title : `${title} · ${currentModel.name}` },
-      variants: choices.filter(choice => def.exposedModels?.includes(choice.value)).map(choice => ({
+      variants: choices.filter(choice => def.exposedModels === undefined || def.exposedModels.includes(choice.value)).map(choice => ({
         id: `${agentId}@${encodeURIComponent(choice.value)}`, name: choice.name, description: choice.description,
       })),
       currentModel, probed: result != null, updatedAt: result?.updatedAt,
@@ -225,7 +225,9 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
     if (event.type === 'agent/status') states.set(event.agentId, event.state)
     if (event.type === 'agent/exposure') {
       const def = definition(event.agentId)
-      def.exposedModels = [...event.exposedModels]
+      // Unset is the default-open state: the field is absent, not an empty list.
+      if (event.exposedModels === undefined) delete def.exposedModels
+      else def.exposedModels = [...event.exposedModels]
       def.autoDiscoverModels = event.autoDiscoverModels
       if (event.skillsMcpEnabled === false) def.skillsMcpEnabled = false
       else delete def.skillsMcpEnabled
@@ -340,7 +342,8 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
         case 'agent/set-exposed-models': {
           const { agentId, exposedModels } = payload as AgentExposedModelsPayload
           const def = definition(agentId)
-          if (exposedModels === undefined || exposedModels.length === 0) delete def.exposedModels
+          // Unset → default-open (no field); explicit `[]` → nothing listed.
+          if (exposedModels === undefined) delete def.exposedModels
           else def.exposedModels = [...exposedModels]
           return ok({ done: true })
         }

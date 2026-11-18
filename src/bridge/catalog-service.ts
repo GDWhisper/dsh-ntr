@@ -32,6 +32,7 @@ import type {
   LlmResolvedModelInfo,
   SessionView,
 } from '../protocol.ts'
+import { effectiveExposedModels } from '../protocol.ts'
 import { isPerSessionAgent } from './identity.ts'
 import { legacyFallback, pluginStateDir, stateDirExplicit } from './state-paths.ts'
 
@@ -354,10 +355,17 @@ export class ModelCatalogService {
    * (`before === undefined`), so it adds nothing; the user can still add the
    * whole list with one click in the settings card. Discovery is ON unless the
    * agent definition explicitly opts out with `autoDiscoverModels: false`.
+   *
+   * An UNSET `exposedModels` is the default-open state: every published model
+   * is offered anyway, so appending here would only freeze the whole catalog
+   * into `agents.json`. Appending therefore only applies to a user-narrowed
+   * list.
    */
   private autoExposeNewModels(agentId: string, next: AcpAgentCatalog, before: AcpAgentCatalog | undefined): boolean {
     const def = this.host.defOf(agentId)
     if (def === undefined || def.autoDiscoverModels === false || before === undefined) return false
+    // Unset is default-open — new models are listed without being appended.
+    if (def.exposedModels === undefined) return false
     // A different model-slot identity is a corrected reading, not newly added
     // models. Diffing across it would expose an entire real catalog the first
     // time a parser fix replaces a mislabelled slot (Qoder CN).
@@ -380,7 +388,10 @@ export class ModelCatalogService {
     this.host.hub.broadcast({
       type: 'agent/exposure',
       agentId,
-      exposedModels: [...(def.exposedModels ?? [])],
+      // Only an explicit filter is carried: an absent field means the
+      // default-open state, which the browser must be able to tell apart from
+      // an explicit `[]` (nothing listed).
+      ...(def.exposedModels === undefined ? {} : { exposedModels: [...def.exposedModels] }),
       autoDiscoverModels: def.autoDiscoverModels !== false,
       // Carried on the same frame: the settings card patches its copy of the
       // definition from this event, so a per-agent `dsh-skills` toggle would
@@ -541,11 +552,12 @@ export class ModelCatalogService {
    * global provider catalog with no per-session seam and every session would
    * then be offered ACP agents as if they were just another model.
    *
-   * Variants are opt-in: an agent with no `exposedModels` (or an empty list)
-   * offers only its base entry. Offering the whole catalog by default is not a
-   * feature — these menus have no search, and a real agent publishes hundreds
-   * of choices (pi: 500, omp: 581), so "everything by default" is a list storm
-   * the user cannot navigate. The base entry is never filtered out.
+   * The filter is DEFAULT-OPEN: an agent with no `exposedModels` offers every
+   * model it publishes, so a freshly configured agent's chip menu works on
+   * first use. An explicit array — including `[]` — is the user's narrowing
+   * (empty = base / currently-in-force row only). The base entry is never
+   * filtered out. The one rule lives in `effectiveExposedModels`, shared with
+   * the settings card so the two can never disagree.
    *
    * Pure memory — NEVER spawns and NEVER starts a probe. This is a RENDER path:
    * the composer entries call it on every store change, so anything that spawns
@@ -563,10 +575,11 @@ export class ModelCatalogService {
     const entry = this.catalogs.get(agentId)
     // NO `ensureCatalog` HERE — see the note above. Reading must stay pure
     // memory, even for a stale or absent entry.
-    const exposed = def.exposedModels
+    const choices = entry?.catalog.model?.choices ?? []
+    const offered = new Set(effectiveExposedModels(def.exposedModels, choices.map(choice => choice.value)))
     const variants: AgentCatalogResult['variants'] = []
-    for (const choice of entry?.catalog.model?.choices ?? []) {
-      if (exposed === undefined || !exposed.includes(choice.value)) continue
+    for (const choice of choices) {
+      if (!offered.has(choice.value)) continue
       variants.push({
         id: buildAdapterModelId(def.id, choice.value),
         // The MODEL name alone, not `<agent> · <model>`: the picker already

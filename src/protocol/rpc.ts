@@ -176,6 +176,6 @@ export interface AgentTestResult {
 
 export interface AgentExposedModelsPayload {
   agentId: string
-  /** Absent → clear the filter (expose no variants); array (even empty) → expose exactly these. */
+  /** Absent → reset to the default-open state (every published model); array (even empty) → exactly these (empty = none listed). */
   exposedModels?: string[]
 }

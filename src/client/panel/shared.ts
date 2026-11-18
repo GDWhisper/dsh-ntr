@@ -45,12 +45,14 @@ export function streamText(stream: 'init' | 'live' | 'down', acp: AcpStore): str
 }
 
 /**
- * Canonical comparable form of an exposure filter. Unset and empty mean the
- * same thing host-side (no `agentId@choice` variants), so they share a key —
- * treating them as different would leave a row permanently dirty.
+ * Canonical comparable form of an exposure filter. Unset (`undefined`) is the
+ * default-open state — every published model is offered — while an explicit
+ * `[]` lists nothing; the two are NOT equivalent, or "select all" could never
+ * return to the default and a save would be misjudged as dirty.
  */
 export function exposureKey(exposed: readonly string[] | undefined): string {
-  return exposed === undefined || exposed.length === 0 ? 'none' : `set:${exposed.join('\u0000')}`
+  if (exposed === undefined) return 'all'
+  return exposed.length === 0 ? 'none' : `set:${exposed.join('\u0000')}`
 }
 
 export function sameStringArray(a: readonly string[], b: readonly string[]): boolean {

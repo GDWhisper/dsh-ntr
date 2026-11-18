@@ -159,6 +159,8 @@ export type {
   AgentProbeModelsResult,
 } from './protocol/catalog.ts'
 
+export { effectiveExposedModels } from './protocol/catalog.ts'
+
 export type {
   GenerateMessage,
   GenerateMessageSource,

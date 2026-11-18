@@ -1279,13 +1279,13 @@ export class AcpStore {
         return this.loadAgentCatalog(event.agentId)
       }
       case 'agent/exposure': {
-        // The host changed an agent's model visibility outside `agent/save`:
-        // the settings card edited it, the auto-discovery switch was flipped,
-        // the per-agent `dsh-skills` opt-out was toggled, or newly published
-        // models were appended automatically. Patch the settings card's copy of
-        // the definition AND drop the seat cache — the variants `agent/catalog`
-        // answers are a projection of this filter.
-        const exposedModels = event.exposedModels.length === 0 ? undefined : [...event.exposedModels]
+        // The host changed an agent's model visibility outside `agent/save`.
+        // Patch the settings card's copy AND drop the seat cache — the variants
+        // `agent/catalog` answers are a projection of this filter. Absent means
+        // the unset default-open state (every published model is offered),
+        // which is NOT the same as an explicit `[]` (nothing listed); the
+        // settings card needs that difference to show the right empty copy.
+        const exposedModels = event.exposedModels === undefined ? undefined : [...event.exposedModels]
         // The opt-out is carried RESOLVED on the same frame; an older host half
         // omits it, and a missing field means "not opted out" (the field is
         // only ever persisted as `false`).
@@ -1296,7 +1296,7 @@ export class AcpStore {
                 ...info,
                 currentConfig: {
                   ...info.currentConfig,
-                  exposedModels: exposedModels === undefined ? undefined : exposedModels,
+                  exposedModels,
                   autoDiscoverModels: event.autoDiscoverModels,
                   skillsMcpEnabled: skillsMcpOff ? false : undefined,
                 },

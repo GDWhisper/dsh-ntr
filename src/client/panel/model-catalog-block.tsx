@@ -6,6 +6,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { AcpStore } from '../store.ts'
 import type { AcpCatalogChoice, DetectedAgentInfo } from '../../protocol.ts'
+import { effectiveExposedModels } from '../../protocol.ts'
 import { useUi } from './shared.ts'
 
 /** How long a chip edit is coalesced before the lightweight exposure RPC fires. */
@@ -38,10 +39,11 @@ function armModelIdMarquee(row: HTMLElement): void {
 /**
  * Model / thought-level catalog display plus the native-selector visibility
  * filter, as a two-pane transfer list: every known model on the left, the
- * selection that reaches the NTR surfaces on the right. Variants are still
- * opt-in — an empty selection is a legitimate state (base entry only) — and
- * edits save themselves (debounced), so there is no apply button and no second
- * dirty state to lose track of.
+ * selection that reaches the NTR surfaces on the right. Unset is the
+ * default-open state (every published model is offered), and an explicitly
+ * empty selection is a legitimate state (base entry only) — edits save
+ * themselves (debounced), so there is no apply button and no second dirty
+ * state to lose track of.
  *
  * The panes are ALWAYS shown, never gated on a probe: the right side comes from
  * the agent definition (`exposedModels`) and the left from the host's persisted
@@ -139,7 +141,7 @@ export function ModelCatalogBlock({
   }
 
   /** Persist selection edits after a short idle — several clicks coalesce into one call. */
-  const queueExposure = (next: string[]): void => {
+  const queueExposure = (next: string[] | undefined): void => {
     pending.current = next
     hasPending.current = true
     if (timer.current !== undefined) clearTimeout(timer.current)
@@ -171,9 +173,10 @@ export function ModelCatalogBlock({
     : modelChoices.filter(choice =>
       choice.name.toLowerCase().includes(query) || choice.value.toLowerCase().includes(query))
 
-  // Unset means "nothing selected", not "everything": an unset filter and an
-  // empty one are the same host-side state (base entry only).
-  const basis = exposed ?? []
+  // Unset means DEFAULT-OPEN: every model the agent publishes is offered. An
+  // explicit array — including `[]` — is the user's narrowing. The same rule
+  // lives in `effectiveExposedModels`, shared with the host.
+  const basis = effectiveExposedModels(exposed, modelChoices.map(choice => choice.value))
   const selected = new Set(basis)
   // Right pane = selection in catalog order, then any selected value the last
   // probe no longer lists (still saved and still usable — hiding it would make
@@ -185,8 +188,15 @@ export function ModelCatalogBlock({
   const selectedInCatalog = basis.filter(value => modelChoices.some(choice => choice.value === value)).length
 
   const apply = (next: string[]): void => {
-    onExposedChange(next)
-    queueExposure(next)
+    // Selecting every published model IS the unset default: collapse it so a
+    // later agent catalog addition keeps flowing in, and the form matches the
+    // persisted definition (no spurious dirty state).
+    const wholeCatalog = modelChoices.length > 0
+      && next.length === modelChoices.length
+      && modelChoices.every(choice => next.includes(choice.value))
+    const value = wholeCatalog ? undefined : next
+    onExposedChange(value)
+    queueExposure(value)
   }
 
   const toggleChoice = (value: string): void => {
@@ -229,12 +239,14 @@ export function ModelCatalogBlock({
       ))
   }
 
-  const selectionBadge = modelChoices.length > 0
-    ? acp.label(
-      `已选 ${String(selectedInCatalog)}/${String(modelChoices.length)}`,
-      `Selected ${String(selectedInCatalog)}/${String(modelChoices.length)}`,
-    )
-    : acp.label(`已选 ${String(basis.length)}`, `Selected ${String(basis.length)}`)
+  const selectionBadge = exposed === undefined && modelChoices.length === 0
+    ? acp.label('默认全部', 'All by default')
+    : modelChoices.length > 0
+      ? acp.label(
+        `已选 ${String(selectedInCatalog)}/${String(modelChoices.length)}`,
+        `Selected ${String(selectedInCatalog)}/${String(modelChoices.length)}`,
+      )
+      : acp.label(`已选 ${String(basis.length)}`, `Selected ${String(basis.length)}`)
 
   // Freshness of the cached list (a probe that finds nothing new keeps the old
   // stamp by design — see `detect`), superseded by the click's own outcome.
@@ -275,8 +287,8 @@ export function ModelCatalogBlock({
         <label
           className="dwa-switch"
           title={acp.label(
-            'Agent 新发布的模型会自动加入右侧已选列表；首次检测到的目录只作为基线，不会一次性全选。',
-            'Models the agent newly publishes are added to the selected list; the first observed catalog is only a baseline and is not selected wholesale.',
+            'Agent 新发布的模型会自动加入已选列表。默认「全部可用」时新模型本来就会列出；这条只在已手动收窄后生效。首次检测到的目录只作为基线，不会把整份目录写进配置。',
+            'Models the agent newly publishes are added to the selected list. While the list is left unset (all models), new models are offered anyway; this only matters after you narrow the list. The first observed catalog is only a baseline and is never written into the definition wholesale.',
           )}
         >
           <input
@@ -288,7 +300,7 @@ export function ModelCatalogBlock({
           {acp.label('自动发现新模型', 'Auto-discover new models')}
         </label>
         <span className="dwa-setting-copy">
-          {acp.label('新增模型自动加入已选列表，现有勾选不受影响。', 'New models join the selected list automatically; existing picks are untouched.')}
+          {acp.label('已收窄列表时，新增模型自动加入已选；默认全部可用状态不受影响。', 'After you narrow the list, new models join the selection automatically; the unset default already offers them.')}
         </span>
       </div>
       {saveError !== undefined && <div className="dwa-error" style={{ marginTop: 4 }}>{saveError}</div>}
@@ -310,8 +322,8 @@ export function ModelCatalogBlock({
               className="dwa-hint"
               style={{ marginLeft: 6, fontWeight: 400 }}
               title={acp.label(
-                'NTR 模式下的对话只列出这里勾选的模型；未勾选的仍可用——正在生效的那个也会以「· 当前」列出来，其余不列出。',
-                'The NTR surfaces only list what is checked here; unchecked models still work, and the one currently in force is still listed with a "· current" row — the rest are not offered.',
+                '未手动设置时默认全部模型可用；取消勾选即开始收窄。NTR 菜单只列出这里勾选的模型，未勾选的仍可用——正在生效的那个也会以「· 当前」列出来。',
+                'Left unset, every model the agent publishes is offered; unchecking narrows the list. NTR menus list only what is checked here; unchecked models still work, and the one in force is still listed as current.',
               )}
             >
               {acp.label('仅影响菜单可见性', 'Menu visibility only')}
@@ -443,7 +455,15 @@ export function ModelCatalogBlock({
             <div className="dwa-model-list">
               {selectedChoices.length === 0 && (
                 <span className="dwa-hint dwa-model-empty">
-                  {acp.label('尚未选择模型，从「全部模型」中加入。', 'No models selected. Add from All models.')}
+                  {exposed === undefined
+                    ? acp.label(
+                      '未设置筛选：默认全部可用。读取到模型目录后可在此收窄。',
+                      'No filter set — every model is offered by default. Narrow the list once the catalog is read.',
+                    )
+                    : acp.label(
+                      '已清空：菜单只保留当前模型。从「全部模型」中加入。',
+                      'Cleared — only the model currently in use is listed. Add from All models.',
+                    )}
                 </span>
               )}
               {selectedChoices.map(choice => (

@@ -44,10 +44,13 @@ export interface AcpAgentDef {
   /**
    * Which probed `category: model` choices this agent offers as `agentId@choice`
    * variants in the plugin's own ACP seats (the chips/picker in the chat
-   * composer and the ACP-mode model seat). Those menus have no search, so the
-   * full catalog is a list storm nobody can navigate: a real pi agent publishes
-   * 500 choices, omp 581. Variants are **opt-in** — unset or empty offers none
-   * of them, and only the listed choice values are added. The bare `agentId`
+   * composer and the ACP-mode model seat). Those menus have no search, so a
+   * full catalog can be a list storm nobody can navigate: a real pi agent
+   * publishes 500 choices, omp 581. The rule is DEFAULT-OPEN: unset means every
+   * model the agent publishes is offered, so a freshly configured agent's chip
+   * menu works on first use. An explicit array — including the empty one — is
+   * the user's narrowing: `[]` leaves only the base / currently-in-force row,
+   * and a non-empty list offers exactly those values. The bare `agentId`
    * entry (the agent's own default model) is always offered regardless, so an
    * agent is never unreachable. Filtering only affects listing — hidden
    * variants still resolve and stream (see `agent/catalog`).
@@ -61,7 +64,10 @@ export interface AcpAgentDef {
    * agent NEWLY publishes (present in an observed catalog but absent from the
    * one known before it) is appended to `exposedModels` automatically. It never
    * touches models the user already had selected, and the very first catalog
-   * observation is a baseline (nothing is "new" yet). `false` is the explicit
+   * observation is a baseline (nothing is "new" yet). When `exposedModels` is
+   * unset (default-open), nothing is appended at all: every model is already
+   * offered, and appending would freeze the whole catalog into the definition.
+   * `false` is the explicit
    * opt-out and the only value persisted; unset means "on". Flipped from the
    * settings card's lightweight `agent/set-auto-discover-models` RPC — never by
    * `agent/save`, which restarts the process for connection changes.

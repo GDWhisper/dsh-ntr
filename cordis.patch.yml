@@ -149,7 +149,7 @@
         #   - id: pi
         #     command: pi-acp
         #     npmPackage: pi-acp        # auto `npm install -g` when command is missing from PATH
-        #     exposedModels: [model-a, model-b]   # opt-in `agent@choice` variants; unset/[] = base entry only
+        #     exposedModels: [model-a, model-b]   # unset = every published model; [] = base/current row only
         #     idleTimeoutMs: 1800000     # release a chat process once it has been idle
         #                                #   this long (ms) with NO live session
         #                                #   (0 = never; unset = follow the plugin-level

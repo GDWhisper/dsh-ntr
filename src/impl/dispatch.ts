@@ -104,7 +104,7 @@ export interface AcpManager {
    * May trigger the def's npm auto-install.
    */
   testAgent?(def: AcpAgentDef): Promise<AgentTestResult>
-  /** Update which probed model choices the ACP seats offer; `undefined` clears the filter. Must not restart the agent. */
+  /** Update which probed model choices the ACP seats offer; `undefined` resets to default-open (all published models). Must not restart the agent. */
   setExposedModels?(agentId: string, exposedModels: readonly string[] | undefined): Promise<void>
   /** Toggle auto-discovery of newly published models. Must not restart the agent. */
   setAutoDiscoverModels?(agentId: string, autoDiscoverModels: boolean): Promise<void>
@@ -703,6 +703,10 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
       case 'agent/set-exposed-models': {
         const agentId = str(body, 'agentId', 64)
         const raw = body.exposedModels
+        // Absent → reset to the default-open state (every published model is
+        // offered); an explicit array — including `[]` — is the user's
+        // narrowing (empty = only the base / currently-in-force row). The two
+        // are different states and must never be merged here.
         if (raw === undefined) {
           await manager.setExposedModels?.(agentId, undefined)
           return ok({ done: true })

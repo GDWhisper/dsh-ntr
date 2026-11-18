@@ -58,14 +58,16 @@ export type AcpEvent =
    * per-agent `dsh-skills` opt-out was toggled, or an observed catalog
    * contributed newly published models. The browser patches its copy of the
    * agent definition (the settings card) and re-reads `agent/catalog` (the
-   * composer's seat list). `exposedModels: []` means the same as unset — no
-   * `agentId@choice` variants; `skillsMcpEnabled` is the RESOLVED per-agent
-   * answer (`!== false`), not the raw optional field.
+   * composer's seat list). An ABSENT `exposedModels` means the filter is unset
+   * (default-open: every published model is offered); `[]` means the user
+   * explicitly narrowed it to nothing (base row only). `skillsMcpEnabled` is
+   * the RESOLVED per-agent answer (`!== false`), not the raw optional field.
    */
   | {
     type: 'agent/exposure'
     agentId: string
-    exposedModels: string[]
+    /** Unset = default-open (never narrowed); `[]` = explicitly nothing listed. */
+    exposedModels?: string[]
     autoDiscoverModels: boolean
     skillsMcpEnabled: boolean
   }
