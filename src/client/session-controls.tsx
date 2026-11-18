@@ -744,21 +744,23 @@ function agentSection(context: MenuContext): AcpMenuSection {
   }))
   if (items.length === 0) {
     // The base stays on an empty roster (see `agentBaseHasData`), so this menu
-    // is the setup surface: a status row that says what is missing, then an
-    // ACTION row that opens the NTR settings. The action is a row of its own
-    // because a disabled status row cannot be the way forward.
+    // is the setup surface: a status row that says what is missing.
     items.push({
       id: 'none',
       label: acp.label('还没有配置 NTR agent', 'No NTR agent configured yet'),
       detail: acp.label('添加并启用一个 agent 后即可开始对话', 'Add and enable an agent to start'),
       disabled: true,
     })
-    items.push({
-      id: OPEN_SETTINGS_ITEM,
-      label: acp.label('打开 NTR 设置', 'Open NTR settings'),
-      detail: acp.label('添加或启用 agent', 'Add or enable an agent'),
-    })
   }
+  // Pinned so it rides the action bar, not the selectable rows: Enter must
+  // never open settings by accident. Always available — this picker is where
+  // a missing or new agent is noticed.
+  items.push({
+    id: OPEN_SETTINGS_ITEM,
+    label: acp.label('打开 NTR 设置', 'Open NTR settings'),
+    detail: acp.label('添加或启用 agent', 'Add or enable an agent'),
+    pinned: true,
+  })
   return {
     id: 'agent',
     items,
@@ -879,10 +881,7 @@ function modelSection(context: MenuContext): AcpMenuSection | undefined {
         'agent 自己上报的模型目录；当前没有额外可见的模型，可在「设置 → NTR」里调整可见范围。',
         "The agent's own model directory; no additional models are visible — adjust the range in Settings → NTR.",
       )
-      : acp.label(
-        'agent 自己上报的模型目录；勾选的那条就是这条会话正在用的模型。',
-        "The agent's own model directory; the checked row is the model this conversation is running.",
-      ),
+      : undefined,
     items: rows,
   }
 }
@@ -1106,7 +1105,7 @@ export function AcpSessionMenu(props: AcpClusterProps) {
 
   return (
     <AcpMenu key={menu.kind}
-      model={model} label={acp.label}
+      model={model} label={acp.label} searchable={menu.kind === 'model' || menu.kind === 'agent'}
       anchor={menu.trigger}
       onPick={(itemId, sectionId) => {
         if (busy) return

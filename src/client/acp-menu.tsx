@@ -2,7 +2,8 @@
  * The composer picker shell (`conversation.input.overlay`), split out of
  * `acp-ui.tsx` to stay within its size budget. It owns the popup's placement,
  * its dismissal gestures, and — for menus with more rows than a person can
- * scan — an in-menu search box with a bounded render window.
+ * scan — an in-menu search box. The list keeps every row and scrolls inside a
+ * fixed-height body, so the scrollbar reaches the rows a query does not name.
  *
  * The module is deliberately store-free: it imports only TYPES from
  * `acp-ui.tsx`, so `acp-ui.tsx` can re-export `AcpMenu` as a value without a
@@ -19,9 +20,6 @@ import type { AcpMenuItem, AcpMenuSection } from './acp-ui.tsx'
 /** Row count above which the picker grows its search box. */
 export const MENU_SEARCH_THRESHOLD = 30
 
-/** Maximum rows the picker renders at once (pinned rows may push it higher). */
-export const MENU_CAP = 40
-
 /** Props of the picker shell rendered into `conversation.input.overlay`. */
 export interface AcpMenuProps {
   /** Menu model; `undefined` renders nothing (closed). */
@@ -34,6 +32,12 @@ export interface AcpMenuProps {
   }
   /** The control that opened the menu; the popup docks above it (see `placeMenu`). */
   anchor?: HTMLElement | null
+  /**
+   * Force the search box on regardless of row count. The model axis passes
+   * this: even a narrowed list scrolls, and its rows are the ones people scan
+   * for a name.
+   */
+  searchable?: boolean
   onPick(itemId: string, sectionId: string): void
   onClose(): void
   /** Bilingual resolver (`acp.label`); the browser locale is the fallback. */
@@ -92,49 +96,6 @@ export function filterMenuSections(
   return kept
 }
 
-/** The render window after capping, plus the counts the hint line needs. */
-export interface CappedMenuSections {
-  sections: readonly AcpMenuSection[]
-  /** Rows in the input sections. */
-  total: number
-  /** Rows actually rendered. */
-  shown: number
-  /** Rows left out by the cap. */
-  hidden: number
-}
-
-/**
- * Bound the rows the picker paints. `pinned` and `active` rows lead the order
- * (pinned first), so they survive truncation when possible; a menu with more
- * active rows than the cap keeps all of them. With `pinnedFree`, pinned rows
- * are always kept and do not count against `cap` — the query mode, where the
- * `M more` hint speaks about matches alone.
- */
-export function capMenuSections(
-  sections: readonly AcpMenuSection[],
-  cap: number = MENU_CAP,
-  pinnedFree = false,
-): CappedMenuSections {
-  const rows: { section: number; item: number; value: AcpMenuItem }[] = []
-  sections.forEach((section, sectionIndex) => {
-    section.items.forEach((value, itemIndex) => { rows.push({ section: sectionIndex, item: itemIndex, value }) })
-  })
-  const rank = (item: AcpMenuItem): number => item.pinned === true ? 0 : item.active === true ? 1 : 2
-  const ordered = rows
-    .map((row, index) => ({ row, index }))
-    .sort((a, b) => rank(a.row.value) - rank(b.row.value) || a.index - b.index)
-  const pinned = rows.filter(row => row.value.pinned === true).length
-  const priority = rows.filter(row => row.value.pinned === true || row.value.active === true).length
-  const limit = pinnedFree ? pinned + Math.max(0, cap) : Math.max(cap, priority)
-  const kept = new Set(ordered.slice(0, limit).map(entry => `${entry.row.section}:${entry.row.item}`))
-  const out: AcpMenuSection[] = []
-  sections.forEach((section, sectionIndex) => {
-    const items = section.items.filter((_, itemIndex) => kept.has(`${sectionIndex}:${itemIndex}`))
-    if (items.length > 0) out.push({ ...section, items })
-  })
-  return { sections: out, total: rows.length, shown: kept.size, hidden: rows.length - kept.size }
-}
-
 /** Browser-locale fallback for the shell's bilingual pairs. */
 function browserLabel(zh: string, en: string): string {
   if (typeof navigator === 'undefined') return zh
@@ -151,10 +112,10 @@ const NO_SECTIONS: readonly AcpMenuSection[] = []
  * menu that materializes elsewhere on the card reads as "nothing happened".
  *
  * Long menus (more rows than {@link MENU_SEARCH_THRESHOLD}) grow a search box
- * above the list and paint at most {@link MENU_CAP} rows; short menus keep
+ * above the list. Every row is rendered and the body scrolls; short menus keep
  * their previous appearance and behavior.
  */
-export function AcpMenu({ model, anchor, onPick, onClose, label = browserLabel }: AcpMenuProps) {
+export function AcpMenu({ model, anchor, searchable: forceSearch, onPick, onClose, label = browserLabel }: AcpMenuProps) {
   const rootRef = useRef<HTMLDivElement>(null)
   const bodyRef = useRef<HTMLDivElement>(null)
   const searchRef = useRef<HTMLInputElement>(null)
@@ -167,44 +128,51 @@ export function AcpMenu({ model, anchor, onPick, onClose, label = browserLabel }
   }
   const sections = model?.sections ?? NO_SECTIONS
   const open = model !== undefined
-  // `pinned` rows are fixed actions (e.g. "refresh the directory"), not
-  // selectable entries: they drive neither the search threshold nor `N items`.
+  // `pinned` rows are fixed actions (e.g. "refresh the directory") and
+  // `disabled` rows are status lines: neither drives the search threshold nor
+  // `N items`.
   const selectableTotal = useMemo(
     () => sections.reduce(
-      (count, section) => count + section.items.filter(item => item.pinned !== true).length,
+      (count, section) => count + section.items.filter(item => item.pinned !== true && item.disabled !== true).length,
       0,
     ),
     [sections],
   )
-  const searchable = selectableTotal > MENU_SEARCH_THRESHOLD
-  // `useMemo` deps are exactly the section list and the query: the filter and
-  // the cap are pure, so the render window only moves when one of them does.
+  const showSearch = (forceSearch ?? selectableTotal > MENU_SEARCH_THRESHOLD) && selectableTotal > 0
+  // `useMemo` deps are exactly the section list and the query: the filter is
+  // pure, so a section only changes when one of them does.
   const view = useMemo(() => {
     const filtered = filterMenuSections(sections, query)
-    const capped = capMenuSections(filtered, MENU_CAP, query.trim() !== '')
     const matching = filtered.reduce(
       (count, section) => count + section.items.filter(item => item.pinned !== true).length,
       0,
     )
-    return { ...capped, matching }
+    return { sections: filtered, matching }
   }, [sections, query])
-  // The row Enter / ArrowDown starts from: the first enabled row of the
-  // RENDERED window, so truncated-away rows are never activated.
+  // The row Enter / ArrowDown starts from: the first enabled entry. Pinned
+  // rows are fixed actions in the menu's action bar, never a pick target —
+  // Enter must not fire "refresh the directory" on a query the user narrowed.
   const firstPick = useMemo(() => {
-    const enabled: { item: AcpMenuItem; sectionId: string }[] = []
     for (const section of view.sections) {
       for (const item of section.items) {
-        if (item.disabled !== true) enabled.push({ item, sectionId: section.id })
+        if (item.pinned !== true && item.disabled !== true) {
+          return { item, sectionId: section.id }
+        }
       }
     }
-    // A query picks the first MATCH, never a pinned action that happens to sit
-    // above it in the menu (e.g. "refresh the directory").
-    if (query.trim() !== '') {
-      const match = enabled.find(entry => entry.item.pinned !== true)
-      if (match !== undefined) return match
+    return undefined
+  }, [view])
+  // Pinned rows are hoisted out of the list into the action bar above it: they
+  // are commands about the list (e.g. "re-read the model list"), not entries.
+  const pinnedActions = useMemo(() => {
+    const out: { item: AcpMenuItem; sectionId: string }[] = []
+    for (const section of view.sections) {
+      for (const item of section.items) {
+        if (item.pinned === true) out.push({ item, sectionId: section.id })
+      }
     }
-    return enabled[0]
-  }, [view, query])
+    return out
+  }, [view])
 
   useLayoutEffect(() => {
     const node = rootRef.current
@@ -276,14 +244,14 @@ export function AcpMenu({ model, anchor, onPick, onClose, label = browserLabel }
     }
     if (didAutoFocus.current) return
     didAutoFocus.current = true
-    if (searchable) searchRef.current?.focus()
+    if (showSearch) searchRef.current?.focus()
   }, [open])
 
   // Shrinking below the threshold unmounts the box; a leftover query would
   // keep filtering the list with no visible way to clear it.
   useEffect(() => {
-    if (!searchable && queryRef.current !== '') setQueryValue('')
-  }, [searchable])
+    if (!showSearch && queryRef.current !== '') setQueryValue('')
+  }, [showSearch])
 
   if (model === undefined) return null
 
@@ -329,8 +297,10 @@ export function AcpMenu({ model, anchor, onPick, onClose, label = browserLabel }
 
   const hint = query.trim() === ''
     ? label(`共 ${selectableTotal} 项，输入关键词筛选`, `${selectableTotal} items — type to filter`)
-    : label(`还有 ${view.hidden} 项，继续输入以缩小范围`, `${view.hidden} more — keep typing to narrow`)
-  const empty = view.sections.length === 0
+    : label(`匹配 ${view.matching} 项`, `${view.matching} matches`)
+  // An empty list means no selectable rows; a menu with only pinned actions
+  // still shows its action bar, not a placeholder row.
+  const empty = view.sections.every(section => section.items.every(item => item.pinned === true))
 
   return (
     <div ref={rootRef} className="ntr-acp-menu">
@@ -338,7 +308,7 @@ export function AcpMenu({ model, anchor, onPick, onClose, label = browserLabel }
         <span className="ntr-acp-menu-title">{model.title}</span>
         {model.loading && <span className="ntr-acp-menu-spin" aria-hidden>…</span>}
       </div>
-      {searchable && (
+      {showSearch && (
         <input
           ref={searchRef}
           type="search"
@@ -352,34 +322,57 @@ export function AcpMenu({ model, anchor, onPick, onClose, label = browserLabel }
       )}
       {model.note !== undefined && <div className="ntr-acp-menu-note">{model.note}</div>}
       {model.error !== undefined && <div className="ntr-acp-menu-error">{model.error}</div>}
-      {/* Outside the scrollport: the cap hint must stay visible without scrolling. */}
-      {view.hidden > 0 && <div className="ntr-acp-menu-hint">{hint}</div>}
+      {/* Outside the scrollport: the cap hint and the fixed actions must stay
+          visible without scrolling. Neither present → no line at all. */}
+      {(pinnedActions.length > 0 || showSearch) && (
+        <div className="ntr-acp-menu-actions">
+          {showSearch && <span className="ntr-acp-menu-hint">{hint}</span>}
+          {pinnedActions.map(({ item, sectionId }) => (
+            <button
+              key={`${sectionId}/${item.id}`}
+              type="button"
+              className="ntr-acp-menu-action"
+              disabled={item.disabled === true}
+              title={item.detail}
+              onClick={() => { onPick(item.id, sectionId) }}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+      )}
       <div ref={bodyRef} className="ntr-acp-menu-body" role="menu" aria-label={model.title} onKeyDown={onBodyKeyDown}>
-        {view.sections.map(section => (
-          <div key={section.id} className="ntr-acp-menu-section">
-            {section.title !== undefined && <div className="ntr-acp-menu-section-title">{section.title}</div>}
-            {section.note !== undefined && <div className="ntr-acp-menu-note">{section.note}</div>}
-            {section.items.map(item => (
-              <button
-                key={`${section.id}/${item.id}`}
-                type="button"
-                role={item.checkbox === true ? 'menuitemcheckbox' : 'menuitemradio'}
-                aria-checked={item.active === true}
-                className={`ntr-acp-menu-item${item.active === true ? ' is-active' : ''}`}
-                disabled={item.disabled === true}
-                onClick={() => { onPick(item.id, section.id) }}
-              >
-                {item.dot !== undefined && <span className="ntr-acp-dot" style={{ background: item.dot }} aria-hidden />}
-                {item.checkbox === true && (
-                  <span className={`ntr-acp-check${item.active === true ? ' is-on' : ''}`} aria-hidden>{item.active === true ? '✓' : ''}</span>
-                )}
-                <span className="ntr-acp-menu-item-label">{item.label}</span>
-                {item.active === true && item.checkbox !== true && <span className="ntr-acp-tick" aria-hidden>✓</span>}
-                {item.detail !== undefined && <span className="ntr-acp-menu-item-detail">{item.detail}</span>}
-              </button>
-            ))}
-          </div>
-        ))}
+        {view.sections.map(section => {
+          // Pinned rows live in the action bar; a section left with none of
+          // its own rows would only render a title over blank space.
+          const visible = section.items.filter(item => item.pinned !== true)
+          if (visible.length === 0) return null
+          return (
+            <div key={section.id} className="ntr-acp-menu-section">
+              {section.title !== undefined && <div className="ntr-acp-menu-section-title">{section.title}</div>}
+              {section.note !== undefined && <div className="ntr-acp-menu-note">{section.note}</div>}
+              {visible.map(item => (
+                <button
+                  key={`${section.id}/${item.id}`}
+                  type="button"
+                  role={item.checkbox === true ? 'menuitemcheckbox' : 'menuitemradio'}
+                  aria-checked={item.active === true}
+                  className={`ntr-acp-menu-item${item.active === true ? ' is-active' : ''}`}
+                  disabled={item.disabled === true}
+                  onClick={() => { onPick(item.id, section.id) }}
+                >
+                  {item.dot !== undefined && <span className="ntr-acp-dot" style={{ background: item.dot }} aria-hidden />}
+                  {item.checkbox === true && (
+                    <span className={`ntr-acp-check${item.active === true ? ' is-on' : ''}`} aria-hidden>{item.active === true ? '✓' : ''}</span>
+                  )}
+                  <span className="ntr-acp-menu-item-label">{item.label}</span>
+                  {item.active === true && item.checkbox !== true && <span className="ntr-acp-tick" aria-hidden>✓</span>}
+                  {item.detail !== undefined && <span className="ntr-acp-menu-item-detail">{item.detail}</span>}
+                </button>
+              ))}
+            </div>
+          )
+        })}
         {query.trim() !== '' && view.matching === 0 && (
           <div className="ntr-acp-menu-empty">{label('没有匹配项', 'No matching items')}</div>
         )}

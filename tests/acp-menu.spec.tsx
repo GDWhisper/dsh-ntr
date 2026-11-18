@@ -1,18 +1,16 @@
 // @vitest-environment jsdom
 /**
- * The composer picker's in-menu search: threshold, render cap, matching,
- * Escape staging and the keyboard hop between the search box and the rows.
- * The component is mounted bare (no store, no provider); a null anchor makes
- * the placement effect a no-op.
+ * The composer picker's in-menu search: threshold, scrolling long lists,
+ * matching, Escape staging and the keyboard hop between the search box and the
+ * rows. The component is mounted bare (no store, no provider); a null anchor
+ * makes the placement effect a no-op.
  */
 
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   AcpMenu,
-  MENU_CAP,
   MENU_SEARCH_THRESHOLD,
-  capMenuSections,
   filterMenuSections,
 } from '../src/client/acp-menu.tsx'
 import type { AcpMenuItem, AcpMenuSection } from '../src/client/acp-ui.tsx'
@@ -57,7 +55,7 @@ function menu(sections: AcpMenuSection[], onPick = vi.fn(), onClose = vi.fn()) {
   )
 }
 
-/** The menu's rows, pinned / disabled rows included. */
+/** The menu's selectable rows; pinned rows render as actions, not rows. */
 function rows(): HTMLElement[] {
   return screen.queryAllByRole('menuitemradio').concat(screen.queryAllByRole('menuitemcheckbox'))
 }
@@ -72,6 +70,21 @@ describe('AcpMenu search visibility', () => {
   it('keeps short menus unchanged (no search box)', () => {
     renderMenu([section('s', items(MENU_SEARCH_THRESHOLD - 1))])
     expect(screen.queryByRole('searchbox')).toBeNull()
+  })
+
+  it('shows the box when the model axis forces it, even below the threshold', () => {
+    // A narrowed model list still scrolls and is the menu people scan by name.
+    render(
+      <AcpMenu
+        model={{ title: 'Test menu', sections: [section('s', items(5))] }}
+        anchor={null}
+        searchable
+        label={zh => zh}
+        onPick={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    )
+    expect(screen.getByRole('searchbox')).toBeTruthy()
   })
 
   it('draws the line exactly at the threshold', () => {
@@ -117,14 +130,16 @@ describe('AcpMenu search visibility', () => {
   })
 })
 
-describe('AcpMenu render cap (empty query)', () => {
-  it('caps 200 rows at 40 while keeping the active and pinned rows visible', () => {
+describe('AcpMenu long list', () => {
+  it('renders every row and leaves the scroll window to the body', () => {
     const pinned: AcpMenuItem = { id: 'refresh', label: 'Refresh list', pinned: true }
     const rowsInMenu = items(199, index => (index === 150 ? { active: true } : {}))
     rowsInMenu.push(pinned)
     renderMenu([section('s', rowsInMenu)])
 
-    expect(rows().length).toBeLessThanOrEqual(MENU_CAP)
+    // No truncation: the body scrolls, so the scrollbar reaches every row.
+    expect(rows()).toHaveLength(199)
+    expect(screen.getByRole('menu').className).toBe('ntr-acp-menu-body')
     expect(screen.getByText('Model 150')).toBeTruthy()
     expect(screen.getByText('Refresh list')).toBeTruthy()
     expect(screen.getByText('共 199 项，输入关键词筛选')).toBeTruthy()
@@ -159,16 +174,58 @@ describe('AcpMenu query filtering', () => {
     expect(screen.getByText('没有匹配项')).toBeTruthy()
   })
 
-  it('truncates matches beyond the cap and reports the remainder', () => {
+  it('filters every match and reports the match count', () => {
     const pinned: AcpMenuItem = { id: 'refresh', label: 'Refresh list', pinned: true }
     renderMenu([section('s', [...items(200), pinned])])
     const input = screen.getByRole('searchbox')
 
     fireEvent.change(input, { target: { value: 'model' } })
-    // The pinned row does not count against the cap: 40 matches + refresh.
-    expect(rows()).toHaveLength(MENU_CAP + 1)
+    // Every match stays in the list; the body scrolls through them.
+    expect(rows()).toHaveLength(200)
     expect(screen.getByText('Refresh list')).toBeTruthy()
-    expect(screen.getByText('还有 160 项，继续输入以缩小范围')).toBeTruthy()
+    expect(screen.getByText('匹配 200 项')).toBeTruthy()
+  })
+})
+
+describe('AcpMenu pinned actions', () => {
+  const pinned: AcpMenuItem = {
+    id: 'refresh',
+    label: 'Refresh list',
+    detail: 're-read the model list',
+    pinned: true,
+  }
+
+  it('renders a pinned row as an action outside the list and picks it on click', () => {
+    const onPick = vi.fn()
+    renderMenu([section('s', [...items(3), pinned])], onPick)
+
+    const button = screen.getByRole('button', { name: 'Refresh list' })
+    const menu = screen.getByRole('menu')
+    expect(menu.contains(button)).toBe(false)
+    expect(menu.previousElementSibling).toBe(button.parentElement)
+    expect(button.getAttribute('title')).toBe('re-read the model list')
+    expect(rows()).toHaveLength(3)
+
+    fireEvent.click(button)
+    expect(onPick).toHaveBeenCalledWith('refresh', 's')
+  })
+
+  it('renders a probing pinned action as a disabled button', () => {
+    renderMenu([section('s', [{ ...pinned, disabled: true }])])
+    expect(screen.getByRole('button', { name: 'Refresh list' }).hasAttribute('disabled')).toBe(true)
+  })
+
+  it('shares one row with the total hint when both are present', () => {
+    renderMenu([section('s', [...items(MENU_SEARCH_THRESHOLD + 1), pinned])])
+    const hint = screen.getByText(`共 ${MENU_SEARCH_THRESHOLD + 1} 项，输入关键词筛选`)
+    const button = screen.getByRole('button', { name: 'Refresh list' })
+    expect(hint.parentElement).toBe(button.parentElement)
+    expect(hint.parentElement?.className).toBe('ntr-acp-menu-actions')
+  })
+
+  it('draws no action row when there is neither a hint nor a pinned action', () => {
+    renderMenu([section('s', items(3))])
+    expect(document.querySelector('.ntr-acp-menu-actions')).toBeNull()
   })
 })
 
@@ -196,6 +253,19 @@ describe('AcpMenu keyboard', () => {
     expect(onPick).toHaveBeenCalledWith('m-0', 's')
   })
 
+  it('Enter and ArrowDown never start on a pinned action', () => {
+    const onPick = vi.fn()
+    const pinned: AcpMenuItem = { id: 'refresh', label: 'Refresh list', pinned: true }
+    renderMenu([section('s', [pinned, ...items(31)])], onPick)
+    const input = screen.getByRole('searchbox')
+
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    expect(document.activeElement).toBe(rows()[0])
+
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onPick).toHaveBeenCalledWith('m-0', 's')
+  })
+
   it('prefers a matching row over a pinned action when Enter is pressed', () => {
     const onPick = vi.fn()
     const pinned: AcpMenuItem = { id: 'refresh', label: 'Refresh list', pinned: true }
@@ -208,7 +278,7 @@ describe('AcpMenu keyboard', () => {
 
   it('Enter skips a disabled first row and ignores an IME composition', () => {
     const onPick = vi.fn()
-    renderMenu([section('s', items(31, index => (index === 0 ? { disabled: true } : {})))], onPick)
+    renderMenu([section('s', items(MENU_SEARCH_THRESHOLD + 2, index => (index === 0 ? { disabled: true } : {})))], onPick)
     const input = screen.getByRole('searchbox')
 
     fireEvent.keyDown(input, { key: 'Enter', isComposing: true })
@@ -244,23 +314,8 @@ describe('AcpMenu keyboard', () => {
   })
 })
 
-describe('capMenuSections / filterMenuSections', () => {
+describe('filterMenuSections', () => {
   const pinned: AcpMenuItem = { id: 'refresh', label: 'Refresh list', pinned: true }
-
-  it('caps the rows and keeps pinned rows inside the window', () => {
-    const capped = capMenuSections([section('s', [...items(50), pinned])], 10)
-    expect(capped.total).toBe(51)
-    expect(capped.shown).toBe(10)
-    expect(capped.hidden).toBe(41)
-    expect(capped.sections[0]?.items).toHaveLength(10)
-    expect(capped.sections[0]?.items.some(item => item.pinned === true)).toBe(true)
-  })
-
-  it('does not charge pinned rows against the cap in query mode', () => {
-    const capped = capMenuSections([section('s', [pinned, ...items(50)])], 10, true)
-    expect(capped.sections[0]?.items).toHaveLength(11)
-    expect(capped.hidden).toBe(40)
-  })
 
   it('keeps pinned rows out of matching and drops empty sections', () => {
     const sections = [

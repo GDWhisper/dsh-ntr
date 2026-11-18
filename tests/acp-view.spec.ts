@@ -358,7 +358,7 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
     const agents: AgentView[] = (['ready', 'starting', 'error', 'stopped'] as const)
       .map((state, index) => ({ ...agent, id: `agent-${index}`, state }))
     const menu = menuFor('agent', { ...base, agents, route: routed })
-    expect(menu.sections[0]?.items.map(item => item.dot)).toEqual([
+    expect(menu.sections[0]?.items.filter(item => item.pinned !== true).map(item => item.dot)).toEqual([
       'var(--dsw-alias-state-success-primary, #22c55e)',
       'var(--dsw-alias-state-warn-primary, #eab308)',
       'var(--dsw-alias-state-error-primary, #ef4444)',
@@ -587,7 +587,7 @@ describe('ACP composer picker (agent / its models / its thought level)', () => {
 
   it('keeps the single-axis pickers header-shaped as before', () => {
     const model = menuFor('model', { ...base, route: routed })
-    expect(model.note).toBeDefined()
+    expect(model.note).toBeUndefined()
     expect(model.sections.map(s => s.id)).toEqual(['model'])
     expect(model.sections[0]?.title).toBeUndefined()
     expect(model.sections[0]?.items[0]).toMatchObject({ id: 'pi', label: 'Pi · 默认' })

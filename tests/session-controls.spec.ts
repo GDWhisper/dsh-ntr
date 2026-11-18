@@ -128,6 +128,12 @@ describe('the agent base chip names only an agent that serves the conversation',
     const menu = menuFor('agent', { acp, agents: roster, route: describeRoute(roster, undefined, undefined) })
     expect(menu.sections[0]?.items.every(item => item.active !== true)).toBe(true)
   })
+
+  it('keeps the settings action pinned on a non-empty roster', () => {
+    const menu = menuFor('agent', { acp, agents: roster, route: describeRoute(roster, bound, undefined, catalog) })
+    expect(menu.sections[0]?.items.find(item => item.id === OPEN_SETTINGS_ITEM))
+      .toMatchObject({ label: '打开 NTR 设置', pinned: true })
+  })
 })
 
 describe('an empty agent roster keeps the base and offers the settings entry', () => {
