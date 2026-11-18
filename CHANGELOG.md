@@ -2,6 +2,46 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [0.4.7] - 2026-11-18
+
+这一版集中修正 Antigravity 会话中回复混入回显内容与子代理失败静默的问题，并让输入区的长菜单可以搜索和滚动。
+
+### 新增
+
+- **client**：输入区的长菜单支持按名称、详情与标识搜索；条目在列表内滚动而不被截断，刷新目录与打开设置固定在列表上方，agent 菜单同样支持搜索。([58ae524](https://github.com/GDWhisper/dsh-ntr/commit/58ae524))
+
+### 改进
+
+- **acp**：未单独设置模型列表的 agent 默认展示全部已发布模型，新添加的 agent 首次打开模型菜单即可选用。([09e17ed](https://github.com/GDWhisper/dsh-ntr/commit/09e17ed))
+
+### 修复
+
+- **acp**：助手回复不再混入用户消息的回显内容。([129c175](https://github.com/GDWhisper/dsh-ntr/commit/129c175))
+- **acp**：上一轮的回答与思考不会在用户稍后发消息时重复出现。([04d172b](https://github.com/GDWhisper/dsh-ntr/commit/04d172b))
+- **acp**：Antigravity 后台子代理失败时给出错误提示，不再静默消失；子代理的工作过程与完成状态恢复跟踪。([d0a345a](https://github.com/GDWhisper/dsh-ntr/commit/d0a345a))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.4.6...v0.4.7
+
+---
+
+This release fixes echoes leaking into Antigravity conversations and silent subagent failures, and makes long composer menus searchable and scrollable.
+
+### Added
+
+- **client**: long composer menus are searchable by label, detail, and id; entries scroll inside the list instead of being truncated, the refresh and settings actions stay pinned above it, and the agent menu gets the same search box. ([58ae524](https://github.com/GDWhisper/dsh-ntr/commit/58ae524))
+
+### Improved
+
+- **acp**: agents without a model list of their own offer every published model by default, so a newly added agent's model menu works on first use. ([09e17ed](https://github.com/GDWhisper/dsh-ntr/commit/09e17ed))
+
+### Fixed
+
+- **acp**: the assistant reply no longer folds in the agent's user-message echo. ([129c175](https://github.com/GDWhisper/dsh-ntr/commit/129c175))
+- **acp**: the previous answer and its thinking no longer reappear when the user replies later. ([04d172b](https://github.com/GDWhisper/dsh-ntr/commit/04d172b))
+- **acp**: a failed Antigravity background subagent surfaces an error notice instead of disappearing silently, and its work and completion are tracked again. ([d0a345a](https://github.com/GDWhisper/dsh-ntr/commit/d0a345a))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.4.6...v0.4.7
+
 ## [0.4.6] - 2026-11-17
 
 这一版让 NTR 会话里的 agent 可以读取本机 DSH 技能，并新增控制这个能力的开关。
