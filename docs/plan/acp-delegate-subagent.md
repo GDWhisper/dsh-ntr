@@ -211,7 +211,7 @@ delegate:
 
 | 行 | 控件 | 文案（一行，约束 33） | 取值 |
 |---|---|---|---|
-| 子代理委派 | 四档滑块（关闭 / 开启 / 引导增强 / 强制模式） | 按档提示（off/on 为与按档警告同形状的横幅）：off 黑字中性底「子代理功能关闭，当前NTR不作为原生dsh的子代理工具」；on 绿字浅绿底「NTR将作为子代理工具注册进原生dsh会话中，下一轮对话生效」；enhanced/force 保留阶梯句「关闭 = 不注册本工具；其余档位决定引导强度，下一轮对话生效。」 | off / on / enhanced / force |
+| 子代理委派 | 四档滑块（关闭 / 开启 / 引导增强 / 强制模式） | 按档提示（off/on 为与按档警告同形状的横幅）：off 黑字中性底「子代理功能关闭，当前NTR不作为原生dsh的子代理工具」；on 绿字浅绿底「NTR将作为子代理工具注册进原生dsh会话中，下一轮对话生效」；enhanced/force 无阶梯句（原阶梯句全档删除），只留各自 warn/danger 横幅 | off / on / enhanced / force |
 | 权限 | 三档互斥按钮（`dwa-seg`） | 委派期间的审批请求如何作答。 | 自动代答 / 直接拒绝 / 人工确认 |
 | 单次时限 | 滑块（共享阶梯 `DELEGATE_TIMEOUT_MS`） | 超时后中止子代理并报错。 | 1 分钟 … 1 小时 |
 | 返回上限 | 滑块（共享阶梯 `DELEGATE_OUTPUT_CHARS`） | 超出部分截断并留标记。 | 4 千 … 20 万字符 |
@@ -219,7 +219,7 @@ delegate:
 - **阶梯共享**（`src/protocol/ui.ts`）：浏览器只出阶梯上的值、宿主只收阶梯上的值——与 `IDLE_RELEASE_MS` 同一条纪律（三处强制：RPC 写入 validate、重启读盘过滤、滑块只取阶梯），滑块能出的值一定是宿主会跑的值。引导四档（`DELEGATE_GUIDANCE`）同纪律。
 - **off-ladder 显示规则**（照 `IdleReleaseCard` 的写法，仅数值滑块）：部署写的值不在阶梯上时**照原值运行**，读数打印精确数字、滑块停在最近档——卡片不许谎报正在生效的数。
 - **引导滑块写「实时」**：即时 RPC（不进 `agent/save` 表单），乐观更新 + 失败回滚 + 采纳宿主回值一律由 store 做（仿 `setSkillsMcp`）；写入触发 `sync()`——off 摘除工具，on/enhanced/force 重注册对账描述，force 另对账 per-agent 掩码（§5.3 / §5.4）。在飞委派不受影响。
-- **按档说明**（生效值时常驻，按档警告 precedent 见审批时限 auto 档的「请谨慎选择」）：`enhanced` → 滑块下方一行 **warning 色**横幅（宿主 `state-warn-primary` 前景 / `state-warn-tertiary` 底，约束 34，严禁写死黄色；覆盖事实的警告色同款）：「该档位会增强工具描述，引导大模型优先使用本工具。」`force` → 一行 **danger 色**横幅（`state-error-primary` / `interactive-bg-hover-danger`）：「强制模式会屏蔽 DSH 的原生 subagent 能力，请谨慎开启。」`off` / `on` 各有一条与按档警告同形状（`.dwa-deadline-warn`）的横幅提示（`guidanceHint`）：off 用 `label-primary` 黑字 + `bg-layer-2` 中性底说功能关闭、不作为原生 dsh 子代理工具；on 用 `state-success-primary` 绿字 + `state-success-tertiary` 底说将注册进原生 dsh 会话、下一轮对话生效。遮哪些工具、保留什么进 `AGENTS/`，不进 UI（约束 33）。
+- **按档说明**（生效值时常驻，按档警告 precedent 见审批时限 auto 档的「请谨慎选择」）：`enhanced` → 滑块下方一行 **warning 色**横幅（宿主 `state-warn-primary` 前景 / `state-warn-tertiary` 底，约束 34，严禁写死黄色；覆盖事实的警告色同款）：「该档位会增强工具描述，引导大模型优先使用本工具。」`force` → 一行 **danger 色**横幅（`state-error-primary` / `interactive-bg-hover-danger`）：「强制模式会屏蔽 DSH 的原生 subagent 能力，请谨慎开启。」`off` / `on` 各有一条与按档警告同形状（`.dwa-deadline-warn`）的横幅提示（`guidanceHint`）：off 用 `label-primary` 黑字 + `bg-layer-2` 中性底说功能关闭、不作为原生 dsh 子代理工具；on 用 `state-success-primary` 绿字 + `state-success-tertiary` 底说将注册进原生 dsh 会话、下一轮对话生效；enhanced/force 不再显示阶梯句，原阶梯句全档删除。遮哪些工具、保留什么进 `AGENTS/`，不进 UI（约束 33）。
 - **权限三档是「委派自己的策略」**，不是主会话的审批策略：它住在新「子代理」页，由 §4.2 的会话级接缝支撑，不动 `ui/approval-deadlines` 那一套，也不给对话面板加任何开关。（约束 14 的「设置页没有权限策略开关」管的是审批管线；这里是委派自己的一个选项，两者不共享状态，谁也改不了谁。）
 - 一个控件一行字（约束 33），机制解释留在代码注释与 `AGENTS/`。
 
@@ -420,7 +420,7 @@ delegate:
 
 ### §11.4 已知限制
 
-- **旧宿主降级模式的设置卡旗标缺口**：register 无 disposer 时常驻注册，`toolAvailable` 恒 true，guidance=off 卡片仍显示「关闭 = 不注册本工具」静态文案、无降级旗标——与 §5.3「不能让设置卡假装请求头已经干净」有张力。根因是 §5.3 的 UI 契约只有 toolAvailable / restrictAvailable 两旗标、无降级位（**方案内部缺口**）。当前按契约办事 + README 写明「请求头那一行等宿主重启才消失」；阶段 2 可考虑补一个降级旗标。
+- **旧宿主降级模式的设置卡旗标缺口**：register 无 disposer 时常驻注册，`toolAvailable` 恒 true，guidance=off 卡片只有 off 档横幅、无降级旗标——与 §5.3「不能让设置卡假装请求头已经干净」有张力。根因是 §5.3 的 UI 契约只有 toolAvailable / restrictAvailable 两旗标、无降级位（**方案内部缺口**）。当前按契约办事 + README 写明「请求头那一行等宿主重启才消失」；阶段 2 可考虑补一个降级旗标。
 - **workflow 系统提示段落悬空**：force 遮 workflow 后其「Use the workflow tool ONLY when…」段落无门控仍残留（§5.4 接受）；subagent / subagent_fork 段落有门控自动消失。宿主若提供 section 剥离接缝再补。
 - **force 名单漂移**：deny 名单 = 默认 `{subagent, subagent_fork, workflow}` ∩ 活清单（`tools.get` 可见性近似 restrictableNames）；部署经 `toolName` 改名会漏遮（§8 风险）；scope-local 漂移走 restrict 抛错 → notice → 继续其余 agent。
 - **permissions.md 越 200 行**：188 → 205（新增 §2.5），触发单篇 >200 拆分阈值；delegate 同主题触及 5 份 AGENTS/ + AGENTS.md（≥3 篇阈值）。拆分留待后续维护，本任务未扩范围。

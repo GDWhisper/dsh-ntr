@@ -15,8 +15,8 @@
  * renders no reset buttons (the reset RPC stays a store/host contract).
  * The guidance row's hint is per-rung ({@link guidanceHint}): off and on a
  * banner in the warn-box shape (neutral primary-label fact / success-green
- * confirmation), enhanced/force the ladder sentence plus their own warn
- * boxes.
+ * confirmation); enhanced/force only their own warn boxes. The old ladder
+ * sentence is removed from every rung.
  *
  * Colors follow constraint 34 through host alias tokens. The host theme has
  * no `state-warning-*` / `state-danger-*` family (verified against the shipped
@@ -103,15 +103,15 @@ function delegateOverrideNote<K extends DelegateSettingKey>(
  * shape as the per-rung warnings (`.dwa-deadline-warn`: tinted background,
  * colored left border): off a neutral fact in the primary label color on a
  * layer background, on a success-green confirmation that the tool registers
- * next turn. enhanced / force keep the plain ladder sentence — their warn
- * boxes below carry the caution. Colors are host alias tokens only
- * (constraint 34, state-*-primary foreground on state-*-tertiary background);
- * literals sit in the var() fallbacks.
+ * next turn. enhanced / force return undefined — their warn boxes below are
+ * the only note; the old ladder sentence is gone from every rung. Colors are
+ * host alias tokens only (constraint 34, state-*-primary foreground on
+ * state-*-tertiary background); literals sit in the var() fallbacks.
  */
 function guidanceHint(guidance: DelegateGuidance, acp: AcpStore): {
   text: string
-  box?: { color: string; background: string; borderLeftColor: string }
-} {
+  box: { color: string; background: string; borderLeftColor: string }
+} | undefined {
   if (guidance === 'off') return {
     text: acp.label(
       '子代理功能关闭，当前NTR不作为原生dsh的子代理工具',
@@ -134,12 +134,7 @@ function guidanceHint(guidance: DelegateGuidance, acp: AcpStore): {
       borderLeftColor: 'var(--dsw-alias-state-success-primary, #16a34a)',
     },
   }
-  return {
-    text: acp.label(
-      '关闭 = 不注册本工具；其余档位决定引导强度，下一轮对话生效。',
-      'Off = the tool is not registered; the other rungs set guidance strength, effective next turn.',
-    ),
-  }
+  return undefined
 }
 
 /**
@@ -229,9 +224,9 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
               <span key={rung}>{guidanceText(rung, acp)}</span>
             ))}
           </div>
-          <div className={hint.box === undefined ? 'dwa-preference-copy' : 'dwa-deadline-warn'} style={hint.box}>
-            {hint.text}
-          </div>
+          {hint !== undefined && (
+            <div className="dwa-deadline-warn" style={hint.box}>{hint.text}</div>
+          )}
           {delegate.guidance === 'enhanced' && (
             <div
               className="dwa-deadline-warn"

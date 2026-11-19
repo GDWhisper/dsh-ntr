@@ -122,14 +122,18 @@ describe('SubagentCard', () => {
     expect(screen.queryByText(/关闭 = 不注册本工具/)).toBeNull()
   })
 
-  it('keeps the ladder sentence uncolored on enhanced and force', async () => {
+  it('removes the ladder sentence on every rung, keeping only the warn boxes', async () => {
     await mountDelegate({ ...BASE, guidance: 'enhanced' })
     await category('子代理')
-    const copy = screen.getByText('关闭 = 不注册本工具；其余档位决定引导强度，下一轮对话生效。')
-    expect(copy.className).toContain('dwa-preference-copy')
-    expect(copy.getAttribute('style')).toBeNull()
+    expect(screen.queryByText(/关闭 = 不注册本工具/)).toBeNull()
     expect(screen.queryByText(/子代理功能关闭/)).toBeNull()
     expect(screen.queryByText(/NTR将作为子代理工具注册/)).toBeNull()
+    expect(screen.getByText('该档位会增强工具描述，引导大模型优先使用本工具。')).toBeDefined()
+    cleanup()
+    await mountDelegate({ ...BASE, guidance: 'force' })
+    await category('子代理')
+    expect(screen.queryByText(/关闭 = 不注册本工具/)).toBeNull()
+    expect(screen.getByText('强制模式会屏蔽 DSH 的原生 subagent 能力，请谨慎开启。')).toBeDefined()
   })
 
   it('writes the picked permission rung', async () => {
