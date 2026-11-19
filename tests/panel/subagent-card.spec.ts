@@ -188,6 +188,12 @@ describe('SubagentCard', () => {
     expect(screen.queryByText(/宿主未提供工具遮蔽服务/)).toBeNull()
   })
 
+  it('shows no missing-service warning while off on a capable host', async () => {
+    await mountDelegate({ ...BASE, guidance: 'off', toolAvailable: true })
+    await category('子代理')
+    expect(screen.queryByText(/宿主未提供工具服务/)).toBeNull()
+  })
+
   it('reports the force degradation only while force is picked', async () => {
     await mountDelegate({ ...BASE, guidance: 'force', restrictAvailable: false })
     await category('子代理')

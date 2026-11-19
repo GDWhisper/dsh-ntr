@@ -415,7 +415,7 @@ delegate:
 
 - **transcript 兜底读移到 close 之前**：`bridge-rpc-service.ts · closeSession` 删记录、transcript 对已删 id 抛 `unknown_session`，close 后读兜底必死（§4 步骤 6 旧顺序修正为 正常结束 → 兜底 → close → 解订阅）。
 - **`permission/resolved` 不订阅计数**：到期路径 expired 与 resolved 同发（约束 13），数 resolved 会双计；abort 档数 request 到达（= 自己的答复）；ask 档人工作答不进 footer（§3 尾注未要求）。permissions.md §2.5 登记理由。
-- **收口 / 注册状态单一字面量联合**（约束 17）：`DelegateSettle = 'pending' | 'ended' | 'timed-out' | 'aborted' | 'prompt-error'`（`settle` 首写生效，队列 promise / 定时器 / 监听器等排程句柄不压单值，state.md §10 例外）；`RegistrationState = 'off' | 'active' | 'degraded'`（`toolAvailable = state !== 'off'`，degraded 仍 true）。
+- **收口 / 注册状态单一字面量联合**（约束 17）：`DelegateSettle = 'pending' | 'ended' | 'timed-out' | 'aborted' | 'prompt-error'`（`settle` 首写生效，队列 promise / 定时器 / 监听器等排程句柄不压单值，state.md §10 例外）；`RegistrationState = 'off' | 'active' | 'degraded' | 'failed'`（`toolAvailable` 报告宿主能力：tools 探针通过且非 failed，与注册状态分离；off 在正常宿主仍 true，口径见 ui-panel.md）。
 - **`AcpDelegatePolicy` 唯一权威定义**落 `protocol/ui.ts`，live-session / rpc / manager / delegate-service 四处 import（消除 Data Clump，单一真相）。
 
 ### §11.4 已知限制

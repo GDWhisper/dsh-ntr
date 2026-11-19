@@ -15,9 +15,10 @@
  * registration is permanent — the tool stays in the request header until the
  * host restarts — and the wrapped execute answers `off` from the LIVE config
  * with a disabled text instead. The switch still works; the header line does
- * not disappear. `toolAvailable` keeps reporting the truth (the tool IS still
- * registered), and the settings card must say so rather than pretend the
- * header is clean.
+ * not disappear. `toolAvailable` reports host capability (the tools service
+ * answers the probe and the last register did not fail), never the guidance
+ * rung: `off` on a capable host stays true so the card never claims a missing
+ * service the host actually has.
  *
  * DI discipline: no manager import; the ctx face is a minimal probe-friendly
  * interface (the `reserveVirtualTool` precedent in presets/acp/acp-guard.mjs).
@@ -58,9 +59,10 @@ function excludesNtr(ctx: { agent?: unknown }): boolean {
  * The ONE registration discriminator (constraint 17 / AGENTS/state.md §10):
  * `off` = not registered, `active` = registered with a disposer, `degraded` =
  * the old host's permanent registration (no disposer; execute intercepts
- * `off`). A string-literal union, never independent booleans.
+ * `off`), `failed` = the last register threw (a later sync retries).
+ * A string-literal union, never independent booleans.
  */
-export type RegistrationState = 'off' | 'active' | 'degraded'
+export type RegistrationState = 'off' | 'active' | 'degraded' | 'failed'
 
 export class AcpDelegateRegistration {
   private disposer: (() => void) | undefined
@@ -76,8 +78,13 @@ export class AcpDelegateRegistration {
     notify?: (text: string) => void
   }) {}
 
-  /** Whether the tool is currently registered on the host (truth, not wish). */
-  get toolAvailable(): boolean { return this.state !== 'off' }
+  /**
+   * Whether the host offers a usable tools service and the last register did
+   * not fail — NOT whether the tool is currently registered. `off` on a
+   * capable host stays true: the missing-service warning must never fire
+   * just because the user turned the switch off.
+   */
+  get toolAvailable(): boolean { return this.state !== 'failed' && this.tools() !== undefined }
 
   /** Whether per-agent masking is usable (force degrades to enhanced if not). */
   get restrictAvailable(): boolean { return this.deps.forceMask.available }
@@ -97,7 +104,7 @@ export class AcpDelegateRegistration {
       return
     }
     const signature = `${guidance}:${String(timeoutMs)}`
-    if (this.state === 'off' || this.signature !== signature) {
+    if (this.state === 'off' || this.state === 'failed' || this.signature !== signature) {
       this.unRegister()
       this.register(guidance, timeoutMs)
     }
@@ -144,7 +151,7 @@ export class AcpDelegateRegistration {
         this.state = 'degraded'
       }
     } catch (error) {
-      this.state = 'off'
+      this.state = 'failed'
       this.disposer = undefined
       this.notify(`acp_delegate: tool registration failed: ${messageOf(error)}`)
     }

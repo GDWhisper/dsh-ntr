@@ -443,13 +443,14 @@ function fakeToolsCtx(mode: 'disposer' | 'none' | 'throw' = 'disposer') {
   let disposerCalls = 0
   let injectCallback: (() => void) | undefined
   let tools: unknown
+  let liveMode = mode
   const install = () => {
     tools = {
       get: (name: string) => registered.find(row => row.definition.name === name)?.definition,
       register: (definition: { name: string; description: string; timeoutMs: number; execute: AcpDelegateExecute }, options?: { when?: (ctx: { agent?: unknown }) => boolean }) => {
-        if (mode === 'throw') throw new TypeError('output.render is required')
+        if (liveMode === 'throw') throw new TypeError('output.render is required')
         registered.push({ definition, options })
-        if (mode === 'none') return undefined
+        if (liveMode === 'none') return undefined
         return () => {
           disposerCalls += 1
           const index = registered.findIndex(row => row.definition === definition)
@@ -462,7 +463,7 @@ function fakeToolsCtx(mode: 'disposer' | 'none' | 'throw' = 'disposer') {
     get: (name: string) => (name === 'tools' ? tools : undefined),
     inject: (_names: string[], callback: () => void) => { injectCallback = callback },
   }
-  return { ctx, registered, install, disposerCalls: () => disposerCalls, fireInject: () => { injectCallback?.() }, injectArmed: () => injectCallback !== undefined }
+  return { ctx, registered, install, setMode: (next: 'disposer' | 'none' | 'throw') => { liveMode = next }, disposerCalls: () => disposerCalls, fireInject: () => { injectCallback?.() }, injectArmed: () => injectCallback !== undefined }
 }
 
 function makeRegistration(ctx: DelegateRegistrationCtx) {
@@ -487,7 +488,8 @@ describe('acp_delegate registration sync', () => {
     const { registration, config, mask } = makeRegistration(tools.ctx)
     registration.sync()
     expect(tools.registered).toHaveLength(0)
-    expect(registration.toolAvailable).toBe(false)
+    // Capable host: off must not claim a missing tool service.
+    expect(registration.toolAvailable).toBe(true)
     for (const guidance of ['on', 'enhanced', 'force'] as const) {
       config.guidance = guidance
       registration.sync()
@@ -513,7 +515,7 @@ describe('acp_delegate registration sync', () => {
     registration.sync()
     registration.sync()
     expect(tools.disposerCalls()).toBe(1)
-    expect(registration.toolAvailable).toBe(false)
+    expect(registration.toolAvailable).toBe(true) // service offered; off is a user choice, not a host gap
     expect(mask.clear).toHaveBeenCalled()
   })
 
@@ -604,8 +606,28 @@ describe('acp_delegate registration sync', () => {
     registration.dispose()
     registration.dispose()
     expect(tools.disposerCalls()).toBe(1)
-    expect(registration.toolAvailable).toBe(false)
+    expect(registration.toolAvailable).toBe(true) // availability is host capability, not registration
     expect(mask.clear).toHaveBeenCalled()
+  })
+
+  it('off without a tools service still reports toolAvailable=false', () => {
+    const tools = fakeToolsCtx() // never installed
+    const { registration } = makeRegistration(tools.ctx)
+    registration.sync()
+    expect(registration.toolAvailable).toBe(false)
+  })
+
+  it('a failed register recovers on the next sync once the host heals', () => {
+    const tools = fakeToolsCtx('throw')
+    tools.install()
+    const { registration, config } = makeRegistration(tools.ctx)
+    config.guidance = 'on'
+    registration.sync()
+    expect(registration.toolAvailable).toBe(false)
+    tools.setMode('disposer')
+    registration.sync()
+    expect(tools.registered).toHaveLength(1)
+    expect(registration.toolAvailable).toBe(true)
   })
 
   it('restrictAvailable mirrors the force mask probe', () => {
