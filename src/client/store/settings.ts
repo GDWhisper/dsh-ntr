@@ -37,8 +37,8 @@ import type { UiState } from './state.ts'
 /**
  * The built-in baseline a delegate reset falls back to when the config file
  * names no value for the key — the same split the idle-release card keeps.
- * Shared with the subagent card so its reset button and this write path
- * agree on what "default" means.
+ * The reset RPC's built-in baseline (the subagent card renders no reset
+ * buttons); this write path and the host agree on what "default" means.
  */
 export const DELEGATE_DEFAULTS: Pick<AcpDelegateSettings, DelegateSettingKey> = {
   guidance: DEFAULT_DELEGATE_GUIDANCE,

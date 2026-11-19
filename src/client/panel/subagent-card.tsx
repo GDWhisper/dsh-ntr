@@ -11,8 +11,12 @@
  *
  * Writes are immediate RPCs (never an `agent/save` form): the store moves the
  * picked key optimistically, adopts the host answer as the authority, and
- * reverts on a failure. Each row carries its own override fact and its own
- * reset, which appears only when something is really overridden.
+ * reverts on a failure. Each row carries its own override fact; the card
+ * renders no reset buttons (the reset RPC stays a store/host contract).
+ * The guidance row's hint is per-rung ({@link guidanceHint}): off and on a
+ * banner in the warn-box shape (neutral primary-label fact / success-green
+ * confirmation), enhanced/force the ladder sentence plus their own warn
+ * boxes.
  *
  * Colors follow constraint 34 through host alias tokens. The host theme has
  * no `state-warning-*` / `state-danger-*` family (verified against the shipped
@@ -23,7 +27,6 @@
 import { DELEGATE_GUIDANCE, DELEGATE_OUTPUT_CHARS, DELEGATE_TIMEOUT_MS } from '../../protocol.ts'
 import type { AcpDelegateSettings, DelegateGuidance, DelegatePermissionMode, DelegateSettingKey } from '../../protocol.ts'
 import type { AcpStore, UiState } from '../store.ts'
-import { DELEGATE_DEFAULTS } from '../store/settings.ts'
 
 /** The permission rungs, in the order a user reads them: answer, refuse, ask. */
 const DELEGATE_PERMISSION_MODES: readonly DelegatePermissionMode[] = ['auto', 'abort', 'ask']
@@ -96,25 +99,47 @@ function delegateOverrideNote<K extends DelegateSettingKey>(
 }
 
 /**
- * A row's reset — only when the running value really differs from the
- * baseline it would return to (the config file's value, else the built-in
- * default). A baseline that agrees with the running value is not an override,
- * and a reset for it would be a button that does nothing.
+ * The guidance row's hint, per rung. `off` and `on` render as the same banner
+ * shape as the per-rung warnings (`.dwa-deadline-warn`: tinted background,
+ * colored left border): off a neutral fact in the primary label color on a
+ * layer background, on a success-green confirmation that the tool registers
+ * next turn. enhanced / force keep the plain ladder sentence — their warn
+ * boxes below carry the caution. Colors are host alias tokens only
+ * (constraint 34, state-*-primary foreground on state-*-tertiary background);
+ * literals sit in the var() fallbacks.
  */
-function DelegateReset(props: { acp: AcpStore; delegate: AcpDelegateSettings; setting: DelegateSettingKey }) {
-  const { acp, delegate, setting } = props
-  const configured = delegate.configured?.[setting]
-  const baseline = configured ?? DELEGATE_DEFAULTS[setting]
-  if (delegate[setting] === baseline) return null
-  return (
-    <div className="dwa-deadline-reset">
-      <button type="button" className="dwa-btn dwa-btn-secondary" onClick={() => void acp.resetDelegateSetting(setting)}>
-        {configured === undefined
-          ? acp.label('恢复默认值', 'Restore default')
-          : acp.label('恢复配置文件的值', 'Use config file value')}
-      </button>
-    </div>
-  )
+function guidanceHint(guidance: DelegateGuidance, acp: AcpStore): {
+  text: string
+  box?: { color: string; background: string; borderLeftColor: string }
+} {
+  if (guidance === 'off') return {
+    text: acp.label(
+      '子代理功能关闭，当前NTR不作为原生dsh的子代理工具',
+      'Subagents are off; NTR does not act as a native DSH subagent tool.',
+    ),
+    box: {
+      color: 'var(--dsw-alias-label-primary, #111827)',
+      background: 'var(--dsw-alias-bg-layer-2, #f3f4f6)',
+      borderLeftColor: 'var(--dsw-alias-label-primary, #111827)',
+    },
+  }
+  if (guidance === 'on') return {
+    text: acp.label(
+      'NTR将作为子代理工具注册进原生dsh会话中，下一轮对话生效',
+      'NTR registers as a subagent tool in native DSH sessions, effective next turn.',
+    ),
+    box: {
+      color: 'var(--dsw-alias-state-success-primary, #16a34a)',
+      background: 'var(--dsw-alias-state-success-tertiary, #dcfce7)',
+      borderLeftColor: 'var(--dsw-alias-state-success-primary, #16a34a)',
+    },
+  }
+  return {
+    text: acp.label(
+      '关闭 = 不注册本工具；其余档位决定引导强度，下一轮对话生效。',
+      'Off = the tool is not registered; the other rungs set guidance strength, effective next turn.',
+    ),
+  }
 }
 
 /**
@@ -171,6 +196,7 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
   const permissionNote = delegateOverrideNote(delegate, 'permissionMode', value => permissionText(value, acp), acp)
   const timeoutNote = delegateOverrideNote(delegate, 'timeoutMs', value => delegateTimeoutText(value, acp), acp)
   const charsNote = delegateOverrideNote(delegate, 'maxOutputChars', value => delegateCharsText(value, acp), acp)
+  const hint = guidanceHint(delegate.guidance, acp)
   return (
     <section className="dwa-section">
       <div className="dwa-section-heading">
@@ -203,11 +229,8 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
               <span key={rung}>{guidanceText(rung, acp)}</span>
             ))}
           </div>
-          <div className="dwa-preference-copy">
-            {acp.label(
-              '关闭 = 不注册本工具；其余档位决定引导强度，下一轮对话生效。',
-              'Off = the tool is not registered; the other rungs set guidance strength, effective next turn.',
-            )}
+          <div className={hint.box === undefined ? 'dwa-preference-copy' : 'dwa-deadline-warn'} style={hint.box}>
+            {hint.text}
           </div>
           {delegate.guidance === 'enhanced' && (
             <div
@@ -245,7 +268,6 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
             <div className="dwa-deadline-flag">⚠ {acp.label('宿主未提供工具遮蔽服务，强制模式暂按引导增强生效', 'The host offers no tool masking; force mode acts as enhanced for now.')}</div>
           )}
           {guidanceNote !== undefined && <div className="dwa-deadline-flag">⚠ {guidanceNote}</div>}
-          <DelegateReset acp={acp} delegate={delegate} setting="guidance" />
         </div>
         <div className="dwa-preference-block">
           <div className="dwa-preference-label">{acp.label('权限', 'Permissions')}</div>
@@ -265,7 +287,6 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
             {acp.label('委派期间的审批请求如何作答。', 'How permission asks inside a delegation are answered.')}
           </div>
           {permissionNote !== undefined && <div className="dwa-deadline-flag">⚠ {permissionNote}</div>}
-          <DelegateReset acp={acp} delegate={delegate} setting="permissionMode" />
         </div>
         <div className="dwa-preference-block">
           <div className="dwa-preference-label">{acp.label('单次时限', 'Time limit')}</div>
@@ -280,7 +301,6 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
             {acp.label('超时后中止子代理并报错。', 'Past this, the subagent is aborted and the call errors.')}
           </div>
           {timeoutNote !== undefined && <div className="dwa-deadline-flag">⚠ {timeoutNote}</div>}
-          <DelegateReset acp={acp} delegate={delegate} setting="timeoutMs" />
         </div>
         <div className="dwa-preference-block">
           <div className="dwa-preference-label">{acp.label('返回上限', 'Answer cap')}</div>
@@ -295,7 +315,6 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
             {acp.label('超出部分截断并留标记。', 'Anything beyond the cap is truncated with a marker.')}
           </div>
           {charsNote !== undefined && <div className="dwa-deadline-flag">⚠ {charsNote}</div>}
-          <DelegateReset acp={acp} delegate={delegate} setting="maxOutputChars" />
         </div>
       </div>
     </section>

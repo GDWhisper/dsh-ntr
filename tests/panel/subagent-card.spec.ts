@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
-// The subagent card: gating, the four-rung guidance switch, per-rung notes in
-// host tokens, the permission rungs, off-ladder readouts, per-row override
-// facts / resets, and the availability facts. The shared panel fixture
+// The subagent card: gating, the four-rung guidance switch, per-rung hints
+// and notes in host tokens, the permission rungs, off-ladder readouts,
+// per-row override facts (no reset buttons), and the availability facts.
+// The shared panel fixture
 // predates `ui/delegate`, so the two routes are answered by a wrapper here
 // while every other endpoint keeps the fixture's behavior.
 import { createElement } from 'react'
@@ -9,8 +10,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, describe, expect, it } from 'vitest'
 import { AcpSettingsSection } from '../../src/client/panel.tsx'
 import { AcpStore, type RpcCall } from '../../src/client/store.ts'
-import { DELEGATE_DEFAULTS } from '../../src/client/store/settings.ts'
-import type { AcpDelegateSettings, DelegateSetPayload, DelegateSettingKey } from '../../src/protocol.ts'
+import type { AcpDelegateSettings, DelegateSetPayload } from '../../src/protocol.ts'
 import { createPanelFixture, type PanelRpcCall } from '../panel-fixture.ts'
 import { category, click, mountPanel } from './harness.ts'
 
@@ -25,10 +25,6 @@ function writes(calls: PanelRpcCall[], endpoint: string): unknown[] {
   return calls.filter(call => call.endpoint === endpoint).map(call => call.payload)
 }
 
-/** Reset one key the way the host does: the baseline (config file, else default). */
-function resetKey<K extends DelegateSettingKey>(next: AcpDelegateSettings, key: K, baseline: AcpDelegateSettings): void {
-  next[key] = baseline[key]
-}
 
 async function mountDelegate(seed: AcpDelegateSettings, options: { failWrite?: boolean } = {}) {
   const base = createPanelFixture()
@@ -49,8 +45,6 @@ async function mountDelegate(seed: AcpDelegateSettings, options: { failWrite?: b
         ...(patch.timeoutMs === undefined ? {} : { timeoutMs: patch.timeoutMs }),
         ...(patch.maxOutputChars === undefined ? {} : { maxOutputChars: patch.maxOutputChars }),
       }
-      const baseline: AcpDelegateSettings = { ...current, ...DELEGATE_DEFAULTS, ...current.configured }
-      for (const key of patch.reset ?? []) resetKey(next, key, baseline)
       current = next
       return { ok: true, value: { delegate: structuredClone(current) } }
     }
@@ -75,7 +69,7 @@ describe('SubagentCard', () => {
     const { store, calls } = await mountDelegate(BASE)
     await category('子代理')
     expect(screen.getByRole('heading', { name: '子代理' })).toBeDefined()
-    // off/on carry no per-rung note.
+    // off/on carry no enhanced/force warning text; their banners are checked below.
     expect(screen.queryByText(/该档位会增强工具描述/)).toBeNull()
     expect(screen.queryByText(/强制模式会屏蔽/)).toBeNull()
     const slider = screen.getByRole('slider', { name: '子代理委派' }) as HTMLInputElement
@@ -109,6 +103,33 @@ describe('SubagentCard', () => {
     expect(note.getAttribute('style')).toContain('--dsw-alias-state-error-primary')
     expect(note.getAttribute('style')).toContain('--dsw-alias-interactive-bg-hover-danger')
     expect(screen.queryByText(/该档位会增强工具描述/)).toBeNull()
+  })
+
+  it('shows the off hint as a neutral banner and the on hint as a success banner', async () => {
+    await mountDelegate(BASE)
+    await category('子代理')
+    const offHint = screen.getByText('子代理功能关闭，当前NTR不作为原生dsh的子代理工具')
+    expect(offHint.className).toContain('dwa-deadline-warn')
+    expect(offHint.getAttribute('style')).toContain('--dsw-alias-label-primary')
+    expect(offHint.getAttribute('style')).toContain('--dsw-alias-bg-layer-2')
+    expect(screen.queryByText(/关闭 = 不注册本工具/)).toBeNull()
+    fireEvent.change(screen.getByRole('slider', { name: '子代理委派' }), { target: { value: '1' } })
+    const onHint = await screen.findByText('NTR将作为子代理工具注册进原生dsh会话中，下一轮对话生效')
+    expect(onHint.className).toContain('dwa-deadline-warn')
+    expect(onHint.getAttribute('style')).toContain('--dsw-alias-state-success-primary')
+    expect(onHint.getAttribute('style')).toContain('--dsw-alias-state-success-tertiary')
+    expect(screen.queryByText('子代理功能关闭，当前NTR不作为原生dsh的子代理工具')).toBeNull()
+    expect(screen.queryByText(/关闭 = 不注册本工具/)).toBeNull()
+  })
+
+  it('keeps the ladder sentence uncolored on enhanced and force', async () => {
+    await mountDelegate({ ...BASE, guidance: 'enhanced' })
+    await category('子代理')
+    const copy = screen.getByText('关闭 = 不注册本工具；其余档位决定引导强度，下一轮对话生效。')
+    expect(copy.className).toContain('dwa-preference-copy')
+    expect(copy.getAttribute('style')).toBeNull()
+    expect(screen.queryByText(/子代理功能关闭/)).toBeNull()
+    expect(screen.queryByText(/NTR将作为子代理工具注册/)).toBeNull()
   })
 
   it('writes the picked permission rung', async () => {
@@ -145,35 +166,18 @@ describe('SubagentCard', () => {
     expect((screen.getByRole('slider', { name: '返回上限' }) as HTMLInputElement).value).toBe('1')
   })
 
-  it('shows the config-file facts and resets only the rows really overridden', async () => {
-    const { store, calls } = await mountDelegate({
+  it('shows the config-file facts on the rows really overridden, without reset buttons', async () => {
+    await mountDelegate({
       ...BASE, guidance: 'force', timeoutMs: 900_000, configured: { guidance: 'on', timeoutMs: 300_000 },
     })
     await category('子代理')
     expect(screen.getByText(/配置文件要求：开启/).className).toContain('dwa-deadline-flag')
     expect(screen.getByText(/配置文件要求：5 分钟/).className).toContain('dwa-deadline-flag')
-    const resets = screen.getAllByRole('button', { name: '恢复配置文件的值' })
-    expect(resets).toHaveLength(2)
+    expect(screen.queryByRole('button', { name: '恢复配置文件的值' })).toBeNull()
     expect(screen.queryByRole('button', { name: '恢复默认值' })).toBeNull()
-    await click(resets[0])
-    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ reset: ['guidance'] }]))
-    expect(store.getSnapshot().delegate?.guidance).toBe('on')
-    expect(screen.queryByText(/配置文件要求：开启/)).toBeNull()
-    // The timeout row keeps its own override and its own reset.
-    expect(screen.getAllByRole('button', { name: '恢复配置文件的值' })).toHaveLength(1)
-    expect(screen.getByText(/配置文件要求：5 分钟/)).toBeDefined()
   })
 
-  it('restores the built-in default when the config file names nothing', async () => {
-    const { store, calls } = await mountDelegate({ ...BASE, guidance: 'on' })
-    await category('子代理')
-    expect(screen.queryByText(/配置文件要求/)).toBeNull()
-    await click(screen.getByRole('button', { name: '恢复默认值' }))
-    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ reset: ['guidance'] }]))
-    expect(store.getSnapshot().delegate?.guidance).toBe('off')
-  })
-
-  it('offers no reset when the running value agrees with the baseline', async () => {
+  it('offers no reset buttons and no override facts when nothing is overridden', async () => {
     await mountDelegate({ ...BASE, guidance: 'on', configured: { guidance: 'on' } })
     await category('子代理')
     expect(screen.queryByText(/配置文件要求/)).toBeNull()
