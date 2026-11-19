@@ -27,6 +27,7 @@
 import { DELEGATE_GUIDANCE, DELEGATE_OUTPUT_CHARS, DELEGATE_TIMEOUT_MS } from '../../protocol.ts'
 import type { AcpDelegateSettings, DelegateGuidance, DelegatePermissionMode, DelegateSettingKey } from '../../protocol.ts'
 import type { AcpStore, UiState } from '../store.ts'
+import { tickLeft } from './shared.ts'
 
 /** The permission rungs, in the order a user reads them: answer, refuse, ask. */
 const DELEGATE_PERMISSION_MODES: readonly DelegatePermissionMode[] = ['auto', 'abort', 'ask']
@@ -168,8 +169,8 @@ function DelegateNumberSlider(props: {
         }}
       />
       <div className="dwa-deadline-ticks">
-        {ladder.map(rung => (
-          <span key={rung}>{text(rung)}</span>
+        {ladder.map((rung, i) => (
+          <span key={rung} style={{ left: tickLeft(i, ladder.length) }}>{text(rung)}</span>
         ))}
       </div>
     </>
@@ -220,8 +221,8 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
             }}
           />
           <div className="dwa-deadline-ticks">
-            {DELEGATE_GUIDANCE.map(rung => (
-              <span key={rung}>{guidanceText(rung, acp)}</span>
+            {DELEGATE_GUIDANCE.map((rung, i) => (
+              <span key={rung} style={{ left: tickLeft(i, DELEGATE_GUIDANCE.length) }}>{guidanceText(rung, acp)}</span>
             ))}
           </div>
           {hint !== undefined && (

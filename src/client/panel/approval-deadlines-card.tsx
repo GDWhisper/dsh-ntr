@@ -4,6 +4,7 @@
  * actually outranking the deployment baseline.
  */
 import type { AcpStore, UiState } from '../store.ts'
+import { tickLeft } from './shared.ts'
 import type { AcpApprovalDeadlines, PermissionTimeoutMode } from '../../protocol.ts'
 
 /**
@@ -241,8 +242,8 @@ function DeadlineSliderBlock(props: {
             }}
           />
           <div className="dwa-deadline-ticks">
-            {ladder.map(rung => (
-              <span key={rung}>{deadlineText(rung, acp)}</span>
+            {ladder.map((rung, i) => (
+              <span key={rung} style={{ left: tickLeft(i, ladder.length) }}>{deadlineText(rung, acp)}</span>
             ))}
           </div>
         </>

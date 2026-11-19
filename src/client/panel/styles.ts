@@ -270,8 +270,12 @@ const STYLE = `
 .dwa-deadline-value { margin-top: 8px; font-size: 20px; font-weight: 600; }
 .dwa-deadline-range { width: 100%; margin-top: 6px; accent-color: var(--ntr-accent); }
 .dwa-deadline-range:disabled { opacity: 0.4; }
-.dwa-deadline-ticks { display: flex; justify-content: space-between; margin-top: 2px; color: var(--ntr-muted); font-size: 10px; }
-.dwa-deadline-ticks > span { white-space: nowrap; }
+/* Tick labels center on the exact rung fraction (inline left from tickLeft);
+   space-between drifted them off the track when label widths differed. */
+.dwa-deadline-ticks { position: relative; height: 1.5em; margin-top: 2px; color: var(--ntr-muted); font-size: 10px; }
+.dwa-deadline-ticks > span { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; }
+.dwa-deadline-ticks > span:first-child { transform: none; }
+.dwa-deadline-ticks > span:last-child { transform: translateX(-100%); }
 /* The facts that make a number here meaningless, in warning ink rather than
    the muted gray every other hint uses: the value the config file is
    outranking, on the row it belongs to. */
@@ -311,9 +315,9 @@ const STYLE = `
   .dwa-skills-agents .dwa-preference-row { flex-direction: row; align-items: center; }
   .dwa-default-hint { align-items: flex-start; flex-direction: column; }
   /* The slider's scale: up to eight rungs with full unit words ("15 分钟")
-     need a smaller face before they can collide on a narrow panel. The rung
-     count follows the mode (自动推进 adds 不等待), and the row is a flex
-     space-between, so a shorter scale just spreads wider. */
+     need a smaller face before they can collide on a narrow panel. Labels
+     sit at fixed rung fractions (tickLeft), so a shorter scale does not
+     spread wider — the smaller face is what keeps neighbors apart. */
   .dwa-deadline-ticks { font-size: 9px; }
 }
 @media (prefers-reduced-motion: reduce) {

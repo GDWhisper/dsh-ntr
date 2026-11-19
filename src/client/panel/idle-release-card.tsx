@@ -4,6 +4,7 @@
  */
 import { IDLE_RELEASE_MS } from '../../protocol.ts'
 import type { AcpStore, UiState } from '../store.ts'
+import { tickLeft } from './shared.ts'
 
 /**
  * The idle-release window, as the settings page edits it.
@@ -75,8 +76,8 @@ export function IdleReleaseCard(props: { acp: AcpStore; ui: UiState }) {
             }}
           />
           <div className="dwa-deadline-ticks">
-            {IDLE_RELEASE_MS.filter((_, i) => i % 2 === 0).map(ms => (
-              <span key={ms}>{idleWindowText(ms, acp)}</span>
+            {IDLE_RELEASE_MS.map((ms, i) => i % 2 === 0 && (
+              <span key={ms} style={{ left: tickLeft(i, IDLE_RELEASE_MS.length) }}>{idleWindowText(ms, acp)}</span>
             ))}
           </div>
           <div className="dwa-preference-copy">

@@ -51,6 +51,8 @@ describe('AcpSettingsSection permissions', () => {
     slider = screen.getByRole('slider', { name: '等待时长' }) as HTMLInputElement
     expect(slider.value).toBe(slider.min)
     expect(fixture.store.getSnapshot().approvalDeadlines).toMatchObject({ mode: 'abort', permissionTimeoutMs: 30_000 })
+    // Tick labels sit on the exact rung fractions (abort ladder: 7 rungs).
+    expect(screen.getByText('15 分钟', { selector: '.dwa-deadline-ticks span' }).style.left).toBe('50%')
     // Switching back must restore the ZERO, not keep the abort floor: a mode
     // write carries no window, and the host keeps the user's raw pick.
     await click(screen.getByRole('button', { name: '自动推进' }))

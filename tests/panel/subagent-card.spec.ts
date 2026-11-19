@@ -136,6 +136,19 @@ describe('SubagentCard', () => {
     expect(screen.getByText('强制模式会屏蔽 DSH 的原生 subagent 能力，请谨慎开启。')).toBeDefined()
   })
 
+  it('centers tick labels on the exact rung fractions', async () => {
+    await mountDelegate(BASE)
+    await category('子代理')
+    const guidanceLefts = ['关闭', '开启', '引导增强', '强制模式'].map(name =>
+      Number.parseFloat(screen.getByText(name, { selector: '.dwa-deadline-ticks span' }).style.left))
+    expect(guidanceLefts[0]).toBe(0)
+    expect(guidanceLefts[1]).toBeCloseTo(100 / 3, 6)
+    expect(guidanceLefts[2]).toBeCloseTo(200 / 3, 6)
+    expect(guidanceLefts[3]).toBe(100)
+    expect(screen.getByText('5 分钟', { selector: '.dwa-deadline-ticks span' }).style.left).toBe('20%')
+    expect(screen.getByText('20 万字符', { selector: '.dwa-deadline-ticks span' }).style.left).toBe('100%')
+  })
+
   it('writes the picked permission rung', async () => {
     const { store, calls } = await mountDelegate(BASE)
     await category('子代理')

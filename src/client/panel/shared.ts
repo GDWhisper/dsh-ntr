@@ -133,3 +133,12 @@ export function persistedDef(detected: DetectedAgentInfo, activeAgent: AgentView
     env: {},
   }
 }
+
+/**
+ * A slider tick label's left offset: the exact rung fraction i/(n-1). The
+ * label centers on its rung (first/last stay flush via CSS); space-between
+ * drifted the middle labels off the track whenever label widths differed.
+ */
+export function tickLeft(index: number, count: number): string {
+  return `${(index / (count - 1)) * 100}%`
+}
