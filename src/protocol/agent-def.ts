@@ -7,7 +7,7 @@
  * runtime values (type-only SDK imports are erased at build time).
  */
 
-import type { PermissionTimeoutMode } from './ui.ts'
+import type { DelegateGuidance, DelegatePermissionMode, PermissionTimeoutMode } from './ui.ts'
 
 // ---- Configuration (host side, from the profile layer) ----
 
@@ -150,6 +150,29 @@ export type AcpMcpServerDef =
     /** Extra request headers (e.g. authorization). */
     headers?: Record<string, string>
   }
+
+/**
+ * The deployment baseline for `acp_delegate` (the `delegate` key of
+ * `cordis.patch.yml`). Two layers, the same shape as the idle-release and
+ * approval-deadline knobs: the value here is the baseline, and a settings-page
+ * override persisted in `agents.json` (`delegate`) outranks it per key; a
+ * reset returns to this baseline, or to the built-in default when the file
+ * names no key. Both layers hot-apply — no host restart, no new session; the
+ * change lands on the next step of existing conversations.
+ *
+ * `guidance` defaults to `off`: the tool is NOT registered, so every
+ * deployment's request header is unchanged until someone opts in.
+ */
+export interface AcpDelegateConfig {
+  /** The guidance rung; doubles as the registration switch (`off` = not registered). */
+  guidance?: DelegateGuidance
+  /** The delegation's own permission policy (not the main conversation's approval). */
+  permissionMode?: DelegatePermissionMode
+  /** Single-delegation window: an integer in [1000, 3600000] ms (off-ladder allowed). */
+  timeoutMs?: number
+  /** Folded-answer cap: an integer in [1000, 200000] chars (off-ladder allowed). */
+  maxOutputChars?: number
+}
 
 export interface AcpPluginConfig {
   agents: AcpAgentDef[]
@@ -329,4 +352,12 @@ export interface AcpPluginConfig {
    * activity never extends it. `0` = no ceiling. A deployment key. Default 0.
    */
   agyLateOutputCeilingMs?: number
+  /**
+   * The `acp_delegate` deployment baseline (see {@link AcpDelegateConfig}).
+   * Two layers: this baseline plus the settings-page override persisted in
+   * `agents.json`; both hot-apply without a restart. `guidance` defaults to
+   * `off` — the tool is not registered until a deployment or the settings
+   * page opts in.
+   */
+  delegate?: AcpDelegateConfig
 }

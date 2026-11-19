@@ -8,8 +8,8 @@
  * APIs, no ACP SDK runtime values.
  */
 
-import type { AcpAgentDef, AcpMcpServerDef, AcpPluginConfig, AcpTagHalo, ApprovalDeadlineKey, PermissionTimeoutMode } from '../protocol.ts'
-import { DEFAULT_IDLE_TIMEOUT_MS, IDLE_RELEASE_MS } from '../protocol.ts'
+import type { AcpAgentDef, AcpDelegateConfig, AcpMcpServerDef, AcpPluginConfig, AcpTagHalo, ApprovalDeadlineKey, DelegateGuidance, DelegatePermissionMode, DelegateSetPayload, DelegateSettingKey, PermissionTimeoutMode } from '../protocol.ts'
+import { DEFAULT_IDLE_TIMEOUT_MS, DELEGATE_OUTPUT_CHARS, DELEGATE_TIMEOUT_MS, IDLE_RELEASE_MS } from '../protocol.ts'
 import { splitCommandLine } from './command-line.ts'
 import { AcpError } from './errors.ts'
 import { isAbsolutePath } from './paths.ts'
@@ -186,6 +186,127 @@ export function validatePermissionTimeoutMode(raw: unknown, code: 'bad_config' |
     throw new AcpError(code, 'acp: permissionTimeoutMode must be one of "abort", "auto", "wait"')
   }
   return raw
+}
+
+/**
+ * Validate the delegation guidance rung a write asks for. Four values, and
+ * the list is the whole vocabulary: the rung doubles as the registration
+ * switch (`off` = the tool is not registered). Anything else is a typo, not a
+ * new rung.
+ */
+export function validateDelegateGuidance(raw: unknown, code: 'bad_config' | 'bad_payload'): DelegateGuidance {
+  if (raw !== 'off' && raw !== 'on' && raw !== 'enhanced' && raw !== 'force') {
+    throw new AcpError(code, 'acp: delegate.guidance must be one of "off", "on", "enhanced", "force"')
+  }
+  return raw
+}
+
+/**
+ * Validate the delegation's OWN permission policy. Three values — auto-answer,
+ * refuse, or wait for a human — and nothing else. This is the delegated
+ * session's policy, never the main conversation's approval mode.
+ */
+export function validateDelegatePermissionMode(raw: unknown, code: 'bad_config' | 'bad_payload'): DelegatePermissionMode {
+  if (raw !== 'auto' && raw !== 'abort' && raw !== 'ask') {
+    throw new AcpError(code, 'acp: delegate.permissionMode must be one of "auto", "abort", "ask"')
+  }
+  return raw
+}
+
+/**
+ * Validate the single-delegation window the settings page writes.
+ *
+ * The window is expressed in MILLISECONDS on the shared ladder
+ * ({@link DELEGATE_TIMEOUT_MS}), so a value the slider can produce is always a
+ * value the host runs — the same one-ladder rule the idle-release card
+ * follows. The deployment baseline is held to a WIDER range (see
+ * {@link validateDelegateConfig}).
+ */
+export function validateDelegateMs(raw: unknown, code: 'bad_config' | 'bad_payload'): number {
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || !DELEGATE_TIMEOUT_MS.includes(raw)) {
+    throw new AcpError(code, `acp: delegate.timeoutMs must be one of ${DELEGATE_TIMEOUT_MS.join(', ')}`)
+  }
+  return raw
+}
+
+/**
+ * Validate the folded-answer output cap the settings page writes, on the
+ * shared {@link DELEGATE_OUTPUT_CHARS} ladder (the same one-ladder rule as
+ * {@link validateDelegateMs}).
+ */
+export function validateDelegateOutputChars(raw: unknown, code: 'bad_config' | 'bad_payload'): number {
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || !DELEGATE_OUTPUT_CHARS.includes(raw)) {
+    throw new AcpError(code, `acp: delegate.maxOutputChars must be one of ${DELEGATE_OUTPUT_CHARS.join(', ')}`)
+  }
+  return raw
+}
+
+/**
+ * Validate the `delegate` deployment baseline (`cordis.patch.yml`).
+ *
+ * Absent / null means "name nothing": the built-in defaults decide. The
+ * numeric range is deliberately WIDER than the settings ladder — a deployment
+ * may name any integer in [1000, 3600000] ms / [1000, 200000] chars and an
+ * off-ladder value runs as-is (the same explicit design as the idle-release
+ * baseline). Unknown keys are ignored; only the keys actually named are
+ * returned, so the baseline never invents a fact the file did not state.
+ */
+export function validateDelegateConfig(raw: unknown): AcpDelegateConfig {
+  if (raw === null || raw === undefined) return {}
+  if (typeof raw !== 'object') throw new AcpError('bad_config', 'acp: delegate must be an object')
+  const row = raw as Record<string, unknown>
+  const out: AcpDelegateConfig = {}
+  if (row.guidance !== undefined) out.guidance = validateDelegateGuidance(row.guidance, 'bad_config')
+  if (row.permissionMode !== undefined) out.permissionMode = validateDelegatePermissionMode(row.permissionMode, 'bad_config')
+  if (row.timeoutMs !== undefined) {
+    const timeoutMs = row.timeoutMs
+    if (typeof timeoutMs !== 'number' || !Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 3_600_000) {
+      throw new AcpError('bad_config', 'acp: delegate.timeoutMs must be an integer in [1000, 3600000]')
+    }
+    out.timeoutMs = timeoutMs
+  }
+  if (row.maxOutputChars !== undefined) {
+    const maxOutputChars = row.maxOutputChars
+    if (typeof maxOutputChars !== 'number' || !Number.isInteger(maxOutputChars) || maxOutputChars < 1_000 || maxOutputChars > 200_000) {
+      throw new AcpError('bad_config', 'acp: delegate.maxOutputChars must be an integer in [1000, 200000]')
+    }
+    out.maxOutputChars = maxOutputChars
+  }
+  return out
+}
+
+/**
+ * Validate a settings-page delegation write. Omitted keys are simply absent
+ * from the result — the manager merges, so a card that only moved the guidance
+ * must not reset the window. The numeric keys accept only ladder rungs (the
+ * deployment's wider range is not a door the browser can write through).
+ * `reset` names the keys whose persisted override is dropped; a key cannot be
+ * both written and reset in one call.
+ */
+export function validateDelegateSettings(raw: unknown): DelegateSetPayload {
+  if (raw === null || typeof raw !== 'object') throw new AcpError('bad_payload', 'acp: delegate settings must be an object')
+  const row = raw as Record<string, unknown>
+  const out: DelegateSetPayload = {}
+  if (row.guidance !== undefined) out.guidance = validateDelegateGuidance(row.guidance, 'bad_payload')
+  if (row.permissionMode !== undefined) out.permissionMode = validateDelegatePermissionMode(row.permissionMode, 'bad_payload')
+  if (row.timeoutMs !== undefined) out.timeoutMs = validateDelegateMs(row.timeoutMs, 'bad_payload')
+  if (row.maxOutputChars !== undefined) out.maxOutputChars = validateDelegateOutputChars(row.maxOutputChars, 'bad_payload')
+  if (row.reset !== undefined) {
+    if (!Array.isArray(row.reset)) throw new AcpError('bad_payload', 'acp: delegate reset must be an array of setting keys')
+    const reset: DelegateSettingKey[] = []
+    for (const key of row.reset as unknown[]) {
+      if (key !== 'guidance' && key !== 'permissionMode' && key !== 'timeoutMs' && key !== 'maxOutputChars') {
+        throw new AcpError('bad_payload', 'acp: delegate reset entries must be one of "guidance", "permissionMode", "timeoutMs", "maxOutputChars"')
+      }
+      if (reset.includes(key)) continue
+      if (out[key] !== undefined) {
+        throw new AcpError('bad_payload', `acp: delegate key "${key}" cannot be both written and reset in one call`)
+      }
+      reset.push(key)
+    }
+    out.reset = reset
+  }
+  return out
 }
 
 
@@ -516,6 +637,7 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
     turnStallToolMs,
     turnStallTickMs,
     idleTimeoutMs,
+    delegate: validateDelegateConfig(value.delegate),
     ...(agyLateOutput === undefined ? {} : { agyLateOutput }),
     ...(agyLateOutputMaxMs === undefined ? {} : { agyLateOutputMaxMs }),
     ...(agyLateOutputCeilingMs === undefined ? {} : { agyLateOutputCeilingMs }),

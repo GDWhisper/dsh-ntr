@@ -4,7 +4,7 @@
  * (split plan P3a), which re-exports it unchanged.
  */
 
-import type { AcpApprovalDeadlines, AcpConversationChoice, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSkillEntry, AgentView, ChatSessionView, DetectedAgentInfo, PluginUpdateState, SaveGateStatus, SessionView, SubagentRecord } from "../../protocol.ts"
+import type { AcpApprovalDeadlines, AcpConversationChoice, AcpDelegateSettings, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSkillEntry, AgentView, ChatSessionView, DetectedAgentInfo, PluginUpdateState, SaveGateStatus, SessionView, SubagentRecord } from "../../protocol.ts"
 import type { Block } from "./blocks.ts"
 import type { PendingPermission } from "./permission.ts"
 import type { SaveBanner } from "./save-gate.ts"
@@ -180,6 +180,13 @@ export interface UiState {
    * tab rather than showing a number this browser invented.
    */
   idleRelease?: AcpIdleRelease
+  /**
+   * The `acp_delegate` settings in force, as the subagent card edits them.
+   * Absent on a host half from before the card existed, which hides the page
+   * rather than showing a number this browser invented. Writes land
+   * optimistically and the host answer (same route) is the authority.
+   */
+  delegate?: AcpDelegateSettings
   /**
    * The host's ACP-turn save gate. A pending entry means a profile write is
    * held until the turn finishes; the toast renders it and offers the explicit

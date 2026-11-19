@@ -23,6 +23,7 @@
 
 export type {
   AcpAgentDef,
+  AcpDelegateConfig,
   AcpMcpServerDef,
   AcpMcpTransport,
   AcpPluginConfig,
@@ -131,12 +132,19 @@ export { PLUGIN_REPO, pluginReleaseUrl } from './protocol/update.ts'
 
 export type {
   AcpApprovalDeadlines,
+  AcpDelegatePolicy,
+  AcpDelegateSettings,
   AcpIdleRelease,
   AcpTagHalo,
   ApprovalDeadlineKey,
   ApprovalDeadlinePatch,
   ApprovalDeadlinesResult,
   ApprovalDeadlinesSetPayload,
+  DelegateGuidance,
+  DelegatePermissionMode,
+  DelegateResult,
+  DelegateSetPayload,
+  DelegateSettingKey,
   IdleReleaseResult,
   IdleReleaseSetPayload,
   PermissionTimeoutMode,
@@ -148,7 +156,20 @@ export type {
   TagHaloSetPayload,
 } from './protocol/ui.ts'
 
-export { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, IDLE_RELEASE_MS, SESSION_TITLE_PREFIX } from './protocol/ui.ts'
+export {
+  DEFAULT_DELEGATE_GUIDANCE,
+  DEFAULT_DELEGATE_OUTPUT_CHARS,
+  DEFAULT_DELEGATE_PERMISSION_MODE,
+  DEFAULT_DELEGATE_TIMEOUT_MS,
+  DEFAULT_IDLE_TIMEOUT_MS,
+  DEFAULT_SESSION_TITLE_PREFIX,
+  DEFAULT_TAG_HALO,
+  DELEGATE_GUIDANCE,
+  DELEGATE_OUTPUT_CHARS,
+  DELEGATE_TIMEOUT_MS,
+  IDLE_RELEASE_MS,
+  SESSION_TITLE_PREFIX,
+} from './protocol/ui.ts'
 
 export type {
   AcpAgentCatalog,

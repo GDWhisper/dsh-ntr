@@ -1862,10 +1862,10 @@ export class AgentBridge {
     // An ask is the agent speaking, not silence: the stall watchdog measures
     // from here, and the pending ask exempts the session anyway.
     session.lastAgentActivityAt = Date.now()
-    // The deadline and the mode are read ONCE, here: an ask that started under
-    // one pair keeps it, even if the settings page rewrites them mid-flight.
-    const mode = this.permissionTimeoutMode
-    const timeoutMs = this.permissionTimeoutMs
+    // Read ONCE at ask start: a delegation policy on THIS session outranks the
+    // bridge knobs; the pair then sticks even if settings rewrite mid-flight.
+    const mode = session.permissionPolicy?.mode ?? this.permissionTimeoutMode
+    const timeoutMs = session.permissionPolicy?.windowMs ?? this.permissionTimeoutMs
     // 不等待（0）只属自动推进：请求到达即按那一档收场，不建 ledger 条目、不发卡
     // ——问都来不及问。超时中止没有这一档（它会立刻拒绝每一问，agent 在每个门口
     // 都停住），它的窗口最短是真实等待。
@@ -1953,7 +1953,7 @@ export class AgentBridge {
     timeoutMs: number,
   ): PermissionOutcome {
     const picked = mode === 'auto'
-      ? pickAutoOption(options.map(option => ({ optionId: option.optionId, name: option.name, kind: option.kind })))
+      ? pickAutoOption(options.map(option => ({ optionId: option.optionId, name: option.name, kind: option.kind })), session.permissionPolicy?.preferOnce === true)
       : undefined
     const outcome: PermissionOutcome = picked === undefined
       ? { outcome: 'cancelled' }

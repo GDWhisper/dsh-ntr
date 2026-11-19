@@ -23,6 +23,7 @@ import type {
   AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSaveResult, AgentSkillsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions,
   LlmResolvedModelInfo,
   AcpIdleRelease, ActiveTurnView, ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, SaveGateFlushResult, SaveGateStatus, SessionView, StreamChunk,
+  AcpDelegateConfig, AcpDelegatePolicy, AcpDelegateSettings, DelegateGuidance, DelegatePermissionMode, DelegateSetPayload,
   SubagentDetailResult, SubagentRecord,
 } from '../protocol.ts'
 import { SESSION_TITLE_PREFIX } from '../protocol.ts'
@@ -88,18 +89,9 @@ import { hasPromptSlot, lifecycleOf } from './session-lifecycle.ts'
 
 /** Routes host session ids to their owning bridge. */
 export class BridgeManager {
-  /**
-   * Bridge registry + lifecycle cluster (see `BridgeRegistryService`): the
-   * process table, the stop gate, the status aggregate and the teardown paths.
-   * `makeBridge` stays here (it wires the manager's callbacks into every
-   * `AgentBridge`); the service reaches it through host callbacks.
-   */
+  /** Bridge registry + lifecycle cluster (see `BridgeRegistryService`): the process table, the stop gate, the status aggregate and the teardown paths; `makeBridge` stays here (it wires the manager's callbacks into every `AgentBridge`) and the service reaches it through host callbacks. */
   private readonly bridgeRegistry: BridgeRegistryService
-  /**
-   * The service's OWN Map instances under the historical field names: tests
-   * read them through the manager and patch `Map.prototype.set` on the
-   * instance, so these must stay getters onto the same maps, never copies.
-   */
+  /** The service's OWN Map instances under the historical field names: tests read them through the manager and patch `Map.prototype.set` on the instance, so these must stay getters onto the same maps, never copies. */
   private get bridges(): Map<string, AgentBridge> {
     return this.bridgeRegistry.bridges
   }
@@ -109,31 +101,15 @@ export class BridgeManager {
   private readonly defsMap = new Map<string, AcpAgentDef>()
   /** Model catalog + probe cluster; owns the catalog file and fork capability cache. */
   private readonly catalog: ModelCatalogService
-  /**
-   * Settings + tuning cluster; owns the persisted preferences, the status cards
-   * and the hot application of both tuning windows (see `SettingsService`).
-   */
+  /** Settings + tuning cluster; owns the persisted preferences, the status cards and the hot application of both tuning windows (see `SettingsService`). */
   private readonly settings: SettingsService
-  /**
-   * Chat-choice cluster: the conversation's bottom-bar selection, the
-   * request-path route pin and the ACP-mode verdict cache (see
-   * `ChatChoiceService`). It operates on the session registry's pick map
-   * (passed by reference).
-   */
+  /** The entry-wired `acp_delegate` registration seam: sync reconciles the tool registration + force mask; the availability getters feed `delegateSettings`. */
+  private delegateRegistration?: { sync(): void; readonly toolAvailable: boolean; readonly restrictAvailable: boolean }
+  /** Chat-choice cluster: the conversation's bottom-bar selection, the request-path route pin and the ACP-mode verdict cache (see `ChatChoiceService`); it operates on the session registry's pick map (passed by reference). */
   private readonly choices: ChatChoiceService
-  /**
-   * Chat-session registry + conversation binding + first-turn lock (see
-   * `SessionRegistryService`): the DSH session records, the persisted picks
-   * and the lock helpers. The process table and the start / resume / retry
-   * flows stay here; the service reaches them through host callbacks.
-   */
+  /** Chat-session registry + conversation binding + first-turn lock (see `SessionRegistryService`): the DSH session records, the persisted picks and the lock helpers; the process table and the start / resume / retry flows stay here and the service reaches them through host callbacks. */
   private readonly registry: SessionRegistryService
-  /**
-   * Agent-definition administration + the save gate (see `AgentAdminService`):
-   * the delete tombstones, the delete / save generations and the `save/*` gate
-   * state machine. The registry (`defsMap`) and the bridge table stay here and
-   * reach the service as host callbacks.
-   */
+  /** Agent-definition administration + the save gate (see `AgentAdminService`): the delete tombstones, the delete / save generations and the `save/*` gate state machine; the registry (`defsMap`) and the bridge table stay here and reach the service as host callbacks. */
   private readonly admin: AgentAdminService
   /** Archive-release cluster (see `ArchiveReleaseService`); its entry points stay on the manager. */
   private readonly archive: ArchiveReleaseService
@@ -386,6 +362,7 @@ export class BridgeManager {
       replaceTuning: next => { Object.assign(this.tuning, next) },
       persistAgents: () => this.persistence.persistAgents(),
       persistAgentsStrict: () => { this.persistence.persistAgents(true) },
+      syncDelegateRegistration: () => { this.delegateRegistration?.sync() },
     })
     // The chat-choice cluster (see `ChatChoiceService`) needs the roster, the
     // catalog reads, the session set, the holder of a session, the two lock
@@ -516,6 +493,9 @@ export class BridgeManager {
     this.settings.applyDeadlineTuning()
     this.settings.applyIdleReleaseTuning()
     this.settings.applySkillsMcpTuning()
+    // Delegate boot replay: a no-op until the entry wires the registration
+    // seam; the entry's ctx.effect then performs the real first sync.
+    this.settings.applyDelegateTuning()
     // The request-path rewrite falls back to this default for a conversation
     // the user never bound explicitly — the same agent the composer chip shows.
     routeBindingRegistry().defaultModel = this.settings.defaultAgent()
@@ -1194,6 +1174,20 @@ export class BridgeManager {
   async setApprovalDeadlines(patch: ApprovalDeadlinePatch, reset = false): Promise<void> {
     return this.settings.setApprovalDeadlines(patch, reset)
   }
+
+  // ---- delegate face (settings + session policy; the registration seam is wired by the entry) ----
+
+  delegateSettings(): AcpDelegateSettings | undefined { const s = this.settings.delegateSettings(); return { ...s, toolAvailable: this.delegateRegistration?.toolAvailable ?? false, restrictAvailable: this.delegateRegistration?.restrictAvailable ?? false } }
+
+  setDelegateSettings(patch: DelegateSetPayload): Promise<void> { return this.settings.setDelegateSettings(patch) }
+
+  setConfiguredDelegate(config: AcpDelegateConfig | undefined): void { this.settings.setConfiguredDelegate(config) }
+
+  delegateConfig(): { guidance: DelegateGuidance; permissionMode: DelegatePermissionMode; timeoutMs: number; maxOutputChars: number } { const { guidance, permissionMode, timeoutMs, maxOutputChars } = this.settings.delegateSettings(); return { guidance, permissionMode, timeoutMs, maxOutputChars } }
+
+  setPermissionPolicy(sessionId: string, policy: AcpDelegatePolicy): void { this.rpc.setPermissionPolicy(sessionId, policy) }
+
+  setDelegateRegistration(reg: { sync(): void; readonly toolAvailable: boolean; readonly restrictAvailable: boolean }): void { this.delegateRegistration = reg }
 
   /** Whether the built-in `dsh-skills` MCP server is offered (see `SettingsService`). */
   skillsMcpEnabled(): boolean {

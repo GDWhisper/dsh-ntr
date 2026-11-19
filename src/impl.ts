@@ -26,6 +26,12 @@ export {
   validateApprovalDeadlineMs,
   validateApprovalDeadlines,
   validateConfig,
+  validateDelegateConfig,
+  validateDelegateGuidance,
+  validateDelegateMs,
+  validateDelegateOutputChars,
+  validateDelegatePermissionMode,
+  validateDelegateSettings,
   validateIdleReleaseMs,
   validateMcpServers,
   validatePermissionTimeoutMode,
@@ -95,6 +101,7 @@ export { SESSION_TITLE_PLACEHOLDER_MAX, extractSessionTitlePlaceholder, selectFo
 export type { PendingPermissionFields, PendingPermissionView } from './impl/permission.ts'
 export {
   AUTO_OPTION_KIND_PRIORITY,
+  DELEGATE_AUTO_KIND_PRIORITY,
   permissionReplayFrames,
   permissionRequestFrame,
   permissionToolKind,

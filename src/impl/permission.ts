@@ -17,6 +17,12 @@ import type { AcpEvent, PermissionOptionView, PermissionTimeoutMode } from '../p
  */
 export const AUTO_OPTION_KIND_PRIORITY = ['allow_always', 'allow_once', 'reject_once', 'reject_always'] as const
 
+/**
+ * Delegation-only priority: `allow_once` first. On a shared (non-A1) process
+ * the agent's `allow_always` memory may outlive the delegated session and
+ * loosen the main conversation's later asks; the narrower grant cannot.
+ */
+export const DELEGATE_AUTO_KIND_PRIORITY = ['allow_once', 'allow_always', 'reject_once', 'reject_always'] as const
 
 /**
  * The option an expired deadline answers with in `auto` mode.
@@ -28,15 +34,19 @@ export const AUTO_OPTION_KIND_PRIORITY = ['allow_always', 'allow_once', 'reject_
  * whatever it is — an agent may offer only a custom kind, and refusing to
  * answer at all would hang the turn.
  *
+ * `preferOnce` is delegation-only ({@link DELEGATE_AUTO_KIND_PRIORITY}): a
+ * shared-process delegate must not hand the agent an `allow_always` memory
+ * that outlives its session. The default keeps the main session's priority.
+ *
  * `undefined` means NO option could be read (no options, or none with a usable
  * id). The caller then degrades to `abort`: guessing an option is worse than
  * refusing, and hanging is worse than either. OmniTerm dev picks the same way
  * (`pick_auto_option`, `src/acp/permission.rs`).
  */
-export function pickAutoOption(options: readonly PermissionOptionView[]): PermissionOptionView | undefined {
+export function pickAutoOption(options: readonly PermissionOptionView[], preferOnce = false): PermissionOptionView | undefined {
   const usable = (option: PermissionOptionView): PermissionOptionView | undefined =>
     option.optionId === '' ? undefined : option
-  for (const kind of AUTO_OPTION_KIND_PRIORITY) {
+  for (const kind of (preferOnce ? DELEGATE_AUTO_KIND_PRIORITY : AUTO_OPTION_KIND_PRIORITY)) {
     const hit = options.find(option => option.kind === kind)
     const picked = hit === undefined ? undefined : usable(hit)
     if (picked !== undefined) return picked

@@ -36,7 +36,7 @@ import { SkillsService } from "./store/skills.ts"
 import { SubagentDetailService } from "./store/subagent-detail.ts"
 import { UpdateService } from "./store/update.ts"
 
-import type { AcpApprovalDeadlines, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentTestResult, AgentView, ApprovalDeadlinesResult, DetectedAgentInfo, IdleReleaseResult, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, AgentSkillEntry, SubagentDetailEntry } from '../protocol.ts'
+import type { AcpApprovalDeadlines, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentTestResult, AgentView, ApprovalDeadlinesResult, DelegateResult, DelegateSetPayload, DelegateSettingKey, DetectedAgentInfo, IdleReleaseResult, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, AgentSkillEntry, SubagentDetailEntry } from '../protocol.ts'
 import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO } from '../protocol.ts'
 import { commitFrame, consumeVerdict, invalidateVerdict, markUnsettled, peekVerdict, projectAcpMode, settleFromHost, type AcpVerdict } from './acp-verdict.ts'
 
@@ -396,7 +396,7 @@ export class AcpStore {
   /** Snapshot refresh used on panel open and after a stream outage. */
   async resync(): Promise<void> {
     try {
-      const [{ agents }, { sessions }, defaultAgentInfo, detectResult, presetResult, tagHaloResult, titlePrefixResult, skillsMcpResult, deadlinesResult, idleReleaseResult, saveGateResult, versionResult] = await Promise.all([
+      const [{ agents }, { sessions }, defaultAgentInfo, detectResult, presetResult, tagHaloResult, titlePrefixResult, skillsMcpResult, deadlinesResult, idleReleaseResult, delegateResult, saveGateResult, versionResult] = await Promise.all([
         this.call<{ agents: AgentView[] }>('agents/list'),
         this.call<{ sessions: SessionView[] }>('sessions/list'),
         // The plugin's OWN default ACP agent — a plugin-private id, not a DSH
@@ -417,6 +417,7 @@ export class AcpStore {
         // `undefined` (older half) hides the tab instead of showing a
         // number this browser made up.
         this.call<IdleReleaseResult>('ui/idle-release').catch(() => ({ idleRelease: undefined })),
+        this.call<DelegateResult>('ui/delegate').catch(() => ({ delegate: undefined })),
         // The save gate is optional: an older host answers an unknown endpoint
         // and the local idle default stays in force.
         this.call<{ status: SaveGateStatus }>('save/status').catch(() => null),
@@ -445,6 +446,7 @@ export class AcpStore {
         ...(skillsMcpResult.skillsMcpEnabled === undefined ? {} : { skillsMcpEnabled: skillsMcpResult.skillsMcpEnabled }),
         approvalDeadlines: deadlinesResult.deadlines,
         idleRelease: idleReleaseResult.idleRelease,
+        delegate: delegateResult.delegate,
         ...(nextSaveGate === undefined ? {} : { saveGate: nextSaveGate }),
         // A refresh must rebuild the terminal rows it missed, not only the
         // gate snapshot: the SSE frame that produced them is gone.
@@ -1005,6 +1007,9 @@ export class AcpStore {
   async resetIdleRelease(): Promise<void> {
     return this.settingsService.resetIdleRelease()
   }
+  // Delegate writes (optimistic; the host answer is the authority). One-line bodies: this file sits at its size ratchet.
+  async setDelegateSettings(patch: DelegateSetPayload): Promise<void> { return this.settingsService.setDelegateSettings(patch) }
+  async resetDelegateSetting(key: DelegateSettingKey): Promise<void> { return this.settingsService.resetDelegateSetting(key) }
 
   // ---- The conversation's own picks (implementation: store/chat-choice.ts) ----
 

@@ -145,6 +145,7 @@ The tab is read-only: it sends no messages, cancels no tasks, launches no proces
 - **Test button**: launches a one-shot process with the current form values to do a handshake — nothing saved, nothing registered. Good for validating before you commit a config change.
 - **Workspace directory**: the directory the agent works in.
 - **Models visible in conversations**: when an agent reports hundreds of models, check here which ones appear in the model chip's menu. Unchecked ones still work; they're just not listed.
+- **“Subagents” tab**: the four deployment-wide parameters of `acp_delegate` — guidance (doubles as the registration switch) / permissions / time limit / answer cap, all hot; the whole tab is hidden when the host half lacks the RPC.
 
 ### Your workspace
 
@@ -242,6 +243,7 @@ Not a plugin issue: it's DSH's chat display setting. By default, the host's "Rep
 - **Slash commands belong to the agent**: in NTR conversations, `/` pops the agent's own declared commands; DSH's same-named commands don't hijack your input.
 - **Reconnect**: after a browser refresh or a network drop, history backfills in order. If the agent process crashed, the next message recovers it when the agent declares `session/load`.
 - **Idle release**: agent processes with no activity exit automatically after an idle window, freeing memory; idle conversations are parked and resumed by the next message via `session/load` (agents that do not declare `session/load` still need no live conversation before their process is released). The window is adjusted in the settings page under “Processes” (1-60 minutes, 30 by default); a single agent can override it in its own “Advanced” section.
+- **Native-model delegation (`acp_delegate`)**: a DSH native model can hand a self-contained task to a configured ACP agent via `acp_delegate`, run it in that agent's own process, and collect the answer; off by default — enable it and tune guidance / permissions / time limit / answer cap in the settings page's “Subagents” tab (plan: [docs/plan/acp-delegate-subagent.md](./docs/plan/acp-delegate-subagent.md)). On an old host whose `tools.register` returns no disposer, registration degrades to permanent: guidance off is still intercepted at execute time (answering the disabled text), but the request-header line only disappears after a host restart.
 - **Windows works**: npm-globally-installed agents launch and get reaped correctly on Windows, leaving no stray background processes.
 
 ---

@@ -11,7 +11,14 @@ import {
   validateAgentDef,
   validateApprovalDeadlines,
   validateConfig,
+  validateDelegateConfig,
+  validateDelegateGuidance,
+  validateDelegateMs,
+  validateDelegateOutputChars,
+  validateDelegatePermissionMode,
+  validateDelegateSettings,
 } from '../../src/impl.ts'
+import { DELEGATE_GUIDANCE, DELEGATE_OUTPUT_CHARS, DELEGATE_TIMEOUT_MS } from '../../src/protocol.ts'
 
 describe('validateConfig', () => {
   it('applies defaults', () => {
@@ -313,5 +320,116 @@ describe('validateAgentDef', () => {
   it('bounds the MCP server list', () => {
     const many = Array.from({ length: 40 }, (_, i) => ({ name: `s${String(i)}`, transport: 'stdio', command: 'x' }))
     expect(() => validateAgentDef({ id: 'pi', command: 'x', mcpServers: many })).toThrow(/at most/)
+  })
+})
+
+describe('delegate config validation', () => {
+  /** Assert a validator rejects with the given AcpError code (the config door vs the payload door). */
+  function expectCode(fn: () => unknown, code: 'bad_config' | 'bad_payload'): void {
+    let error: unknown
+    try { fn() } catch (caught) { error = caught }
+    expect(error).toBeInstanceOf(AcpError)
+    expect((error as AcpError).code).toBe(code)
+  }
+
+  it('defaults an absent deployment baseline to {}', () => {
+    expect(validateDelegateConfig(undefined)).toEqual({})
+    expect(validateDelegateConfig(null)).toEqual({})
+    expect(validateDelegateConfig({})).toEqual({})
+    // The plugin config carries the same empty baseline when the file names nothing.
+    expect(validateConfig({ agents: [] }).delegate).toEqual({})
+  })
+
+  it('accepts only the four guidance rungs', () => {
+    for (const rung of DELEGATE_GUIDANCE) {
+      expect(validateDelegateGuidance(rung, 'bad_config')).toBe(rung)
+      expect(validateDelegateGuidance(rung, 'bad_payload')).toBe(rung)
+    }
+    for (const bad of ['ON', 'enabled', '', 1, null, undefined]) {
+      expectCode(() => validateDelegateGuidance(bad, 'bad_config'), 'bad_config')
+      expectCode(() => validateDelegateGuidance(bad, 'bad_payload'), 'bad_payload')
+      expect(() => validateDelegateGuidance(bad, 'bad_payload')).toThrow(/"off", "on", "enhanced", "force"/)
+    }
+    expect(validateDelegateConfig({ guidance: 'force' })).toEqual({ guidance: 'force' })
+    expectCode(() => validateDelegateConfig({ guidance: 'maybe' }), 'bad_config')
+    expect(validateConfig({ agents: [], delegate: { guidance: 'enhanced' } }).delegate).toEqual({ guidance: 'enhanced' })
+  })
+
+  it('accepts only the three delegation permission modes', () => {
+    for (const mode of ['auto', 'abort', 'ask'] as const) {
+      expect(validateDelegatePermissionMode(mode, 'bad_config')).toBe(mode)
+      expect(validateDelegatePermissionMode(mode, 'bad_payload')).toBe(mode)
+    }
+    // `wait` is the MAIN conversation's approval mode, not a delegation rung.
+    for (const bad of ['wait', 'maybe', '', 1, null]) {
+      expectCode(() => validateDelegatePermissionMode(bad, 'bad_config'), 'bad_config')
+      expectCode(() => validateDelegatePermissionMode(bad, 'bad_payload'), 'bad_payload')
+    }
+    expect(validateDelegateConfig({ permissionMode: 'ask' })).toEqual({ permissionMode: 'ask' })
+    expectCode(() => validateDelegateConfig({ permissionMode: 'wait' }), 'bad_config')
+  })
+
+  it('holds the deployment numbers to the wide range, off-ladder included', () => {
+    // Off-ladder but in range: the deployment value runs as-is.
+    expect(validateDelegateConfig({ timeoutMs: 123_456 })).toEqual({ timeoutMs: 123_456 })
+    expect(validateDelegateConfig({ maxOutputChars: 12_345 })).toEqual({ maxOutputChars: 12_345 })
+    // The range edges are inclusive.
+    expect(validateDelegateConfig({ timeoutMs: 1_000 })).toEqual({ timeoutMs: 1_000 })
+    expect(validateDelegateConfig({ timeoutMs: 3_600_000 })).toEqual({ timeoutMs: 3_600_000 })
+    expect(validateDelegateConfig({ maxOutputChars: 1_000 })).toEqual({ maxOutputChars: 1_000 })
+    expect(validateDelegateConfig({ maxOutputChars: 200_000 })).toEqual({ maxOutputChars: 200_000 })
+    // Out of range / non-integers fail loudly at boot.
+    for (const bad of [999, 3_600_001, -1, 1.5, '600000', null]) {
+      expectCode(() => validateDelegateConfig({ timeoutMs: bad }), 'bad_config')
+    }
+    for (const bad of [999, 200_001, -1, 1.5, '20000', null]) {
+      expectCode(() => validateDelegateConfig({ maxOutputChars: bad }), 'bad_config')
+    }
+    expectCode(() => validateDelegateConfig('nope'), 'bad_config')
+  })
+
+  it('accepts only ladder rungs on the settings-page write', () => {
+    for (const rung of DELEGATE_TIMEOUT_MS) {
+      expect(validateDelegateMs(rung, 'bad_payload')).toBe(rung)
+    }
+    for (const rung of DELEGATE_OUTPUT_CHARS) {
+      expect(validateDelegateOutputChars(rung, 'bad_payload')).toBe(rung)
+    }
+    // In range for the DEPLOYMENT but off the ladder: the browser cannot write it.
+    expectCode(() => validateDelegateMs(123_456, 'bad_payload'), 'bad_payload')
+    expectCode(() => validateDelegateOutputChars(12_345, 'bad_payload'), 'bad_payload')
+    expect(validateDelegateSettings({ timeoutMs: 600_000, maxOutputChars: 20_000 })).toEqual({ timeoutMs: 600_000, maxOutputChars: 20_000 })
+    expectCode(() => validateDelegateSettings({ timeoutMs: 123_456 }), 'bad_payload')
+    expectCode(() => validateDelegateSettings({ maxOutputChars: 12_345 }), 'bad_payload')
+    for (const bad of [0, -1, 1.5, '600000', null]) {
+      expectCode(() => validateDelegateSettings({ timeoutMs: bad }), 'bad_payload')
+      expectCode(() => validateDelegateSettings({ maxOutputChars: bad }), 'bad_payload')
+    }
+  })
+
+  it('validates reset: the four keys, deduped, never both written and reset', () => {
+    expect(validateDelegateSettings({ reset: ['guidance', 'timeoutMs'] })).toEqual({ reset: ['guidance', 'timeoutMs'] })
+    expect(validateDelegateSettings({ reset: ['guidance', 'guidance'] })).toEqual({ reset: ['guidance'] })
+    expect(validateDelegateSettings({ reset: [] })).toEqual({ reset: [] })
+    // A reset alongside a DIFFERENT key's write is legal.
+    expect(validateDelegateSettings({ guidance: 'on', reset: ['timeoutMs'] })).toEqual({ guidance: 'on', reset: ['timeoutMs'] })
+    for (const bad of [['bogus'], ['guidance', 1], [null], 'guidance', true, {}]) {
+      expectCode(() => validateDelegateSettings({ reset: bad }), 'bad_payload')
+    }
+    // The same key cannot be both written and reset in one call.
+    expectCode(() => validateDelegateSettings({ guidance: 'on', reset: ['guidance'] }), 'bad_payload')
+    expectCode(() => validateDelegateSettings({ timeoutMs: 600_000, reset: ['timeoutMs'] }), 'bad_payload')
+  })
+
+  it('ignores unknown keys and returns only the keys present', () => {
+    expect(validateDelegateConfig({ guidance: 'on', bogus: 1 })).toEqual({ guidance: 'on' })
+    expect(validateDelegateSettings({ guidance: 'on', bogusKey: 5 })).toEqual({ guidance: 'on' })
+    expect(validateDelegateSettings({})).toEqual({})
+    expectCode(() => validateDelegateSettings(null), 'bad_payload')
+    expectCode(() => validateDelegateSettings('nope'), 'bad_payload')
+    // The config door carries the validated baseline through validateConfig.
+    expect(validateConfig({ agents: [], delegate: { guidance: 'on', timeoutMs: 123_456, bogus: true } }).delegate)
+      .toEqual({ guidance: 'on', timeoutMs: 123_456 })
+    expectCode(() => validateConfig({ agents: [], delegate: { guidance: 'maybe' } }), 'bad_config')
   })
 })

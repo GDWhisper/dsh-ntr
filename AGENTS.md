@@ -20,7 +20,7 @@
 
 ## 硬约束（摘要）
 
-> 39 条编号全部有效；每条是规则摘要，细节与「为什么」在箭头指向的文档。
+> 40 条编号全部有效；每条是规则摘要，细节与「为什么」在箭头指向的文档。
 
 ### 构建与入口（1–6）
 
@@ -51,13 +51,13 @@
 26. **启动命令是一整条命令行；Windows 生成壳必须经 `cmd.exe`**：`codebuddy --acp` 整条粘贴是正确用法；`.cmd` 壳严禁直接 spawn（`EINVAL`），走 `windowsShimLaunch`（`cmd.exe /d /s /c` + `windowsVerbatimArguments` + 外层引号）；回收走 `killProcessTree`。→ [protocol.md §7](./AGENTS/protocol.md)
 29. **ACP 下发的数据不许静默丢弃**：每种 `session/update` kind 都要有去处；`content` / `rawInput` / `arguments` 的字符串、对象、数组都算有值；diff 同时保留结构与文本；超限只截断且留标记；无卡片的通知每种类一行、变了才重发。→ [protocol.md §8](./AGENTS/protocol.md)
 
-### 权限（13–15）
+### 权限（13–15、40）
 
 13. **审批只有一条管线：插件自己接住每一问并广播 `permission/request`**：`handlePermissionRequest` 建 `PermissionLedger` 条目（`auto` + `0` 到达即收场：不建条目、不发帧），**严禁再走宿主 `ctx.approval`，也不读宿主 approval policy**——旧路由会收下问题却不渲染，默认 `wait` 又没有期限，turn 就挂在完全不可见的地方。到点**就地收场**：`abort` 拒绝 / `auto` 按 option **kind 优先级**代答（挑不出合法选项则降级 `abort`）/ `wait`（**默认**）不设期限。
     只有一个等待窗口 `permissionTimeoutMs`（默认 300s；`0` = 不等待，**只属 `auto`**；`abort` 的 0 抬到 30s）；模式与窗口在询问开始时读一次；`ui/approval-deadlines` 热改，覆盖落 `agents.json` 的 `approvalDeadlines` 并压过 `cordis.patch.yml`。到点留痕**恰一条** `agent/notice` + `permission/expired`（再一条 `permission/resolved`）；SSE 连接按快照用同一个 `permissionRequestFrame` 重放未决项（字段逐字节一致）+ `permission/synced`；`signal` 撤回、`session/cancel`、`closeSession`（await `session/close` **之前**）都必须 `settlePermissions`。→ [permissions.md](./AGENTS/permissions.md) / [retired.md](./AGENTS/retired.md)
-14. **审批 UI 归对话，设置页只做镜像与配置**：`PermissionDock` 挂 `conversation.input.dock`，按 `dshSessionId` 过滤、与 composer 卡同宽居中、选项原样原序（含 Always Allow）、单独取消键答 `cancelled`、没有全局 Enter/Esc、按到达顺序堆叠并由 CSS 限高；设置页只要 `ui.permissions` 非空就渲染可答复的跨会话镜像（没有聊天身份的询问只有这里能答），**没有权限策略开关**。
-    时限卡只有两个控件——三档互斥按钮（整宽、文字不折行）+ 一根时长滑块（「不等待」只在 `auto` 档，`abort` 从 30 秒起；`wait` 不画滑块，读数「一直等待」），并有一句话把两者说成一套；覆盖事实挂被覆盖的那一行，重置按钮只有真覆盖才出现。agent mode 控件在 `conversation.input.left`，不写可见标签、选项不依赖活会话、自带 ACP 闸门；agent 卡详情常挂载，工作区保存语义固定。→ [permissions.md](./AGENTS/permissions.md) / [conversation-dock.md](./AGENTS/conversation-dock.md)
+14. **审批 UI 归对话，设置页只做镜像与配置**：`PermissionDock` 挂 `conversation.input.dock`，按 `dshSessionId` 过滤、与 composer 卡同宽居中、选项原样原序（含 Always Allow）、单独取消键答 `cancelled`、没有全局 Enter/Esc、按到达顺序堆叠并由 CSS 限高；设置页只要 `ui.permissions` 非空就渲染可答复的跨会话镜像（没有聊天身份的询问只有这里能答），**没有权限策略开关**。时限卡只有两个控件（三档互斥按钮整宽不折行 + 一根时长滑块）并有一句话说成一套：「不等待」只在 `auto`、`abort` 从 30 秒起、`wait` 不画滑块读数「一直等待」；覆盖事实挂被覆盖的那一行、重置只有真覆盖才出现；agent mode 控件在 `conversation.input.left`，不写可见标签、选项不依赖活会话、自带 ACP 闸门；agent 卡详情常挂载、工作区保存语义固定（机制细节见 [permissions.md §2.4](./AGENTS/permissions.md) / [ui-panel.md §8](./AGENTS/ui-panel.md) / [ui.md §4](./AGENTS/ui.md)）。→ [permissions.md](./AGENTS/permissions.md) / [conversation-dock.md](./AGENTS/conversation-dock.md)
 15. **【裁决部分已退役】工作区即侧栏路径**：聊天会话的 `session/new` / `session/load` cwd 与子进程 `spawnCwd` 都必须是 DSH 会话自己的工作区，并以 `extraRoots` 传入（create 与 resume 都要）；prompt 严格等于用户文本、不叙述任何边界；agent 的 mode 只经 `session/chat-list` / `chat-mode-set` 与 `agent/catalog` 上报；DSH Access mode 裁决整条已删除。→ [architecture.md §4](./AGENTS/architecture.md) / [retired.md](./AGENTS/retired.md)
+40. **acp_delegate 是一次性宿主工具委派，不是子会话**：原生模型经全局层 `tools.register` 把自成一体的任务交给 `agents.json` 的 ACP agent（一委派 = 新会话 + 一条 prompt + 收尾 close），注册 `when` 按 `agentPreset !== 'acp'`（`excludesNtr`）把 NTR 会话从声明与派发双排除（零污染）；引导档 `delegate.guidance` 兼注册开关（off 不注册 / on 基础描述 / enhanced 追加 MUST 句 / force 经 per-agent `agent.ctx.tools.restrict({deny})` 遮 `subagent`·`subagent_fork`·`workflow`，名单按活清单交集、控制面保留、restrict 不可用降级 enhanced 并如实上报），`timeoutMs` / `guidance` 变更重注册；权限走会话级接缝 `LiveSession.permissionPolicy`（auto{auto,0} / abort{abort,30000} / ask{wait,0}，默认 auto；非 A1 auto 用 `preferOnce` 防 `allow_always` 跨会话泄漏），bridge 字段不碰、主会话审批不改；答复经 hub 增量折叠（seq 去重、跳 `parentToolCallId`、cap 截断），不双写子代理面板；四键两层热生效。→ [permissions.md](./AGENTS/permissions.md) / [architecture.md](./AGENTS/architecture.md) / [ui-panel.md](./AGENTS/ui-panel.md) / [state.md](./AGENTS/state.md) / [protocol.md](./AGENTS/protocol.md)
 
 ### 转发、preset 与绑定（16–17、22）
 
@@ -121,13 +121,13 @@
 
 | 文档 | 何时读取 | 何时维护 |
 |---|---|---|
-| [architecture.md](./AGENTS/architecture.md) | 改消息走向、会话绑定、工作区、preset 外壳、agent 锁定、默认 agent，或要目录 / 术语索引 | 动了 `src/bridge/manager.ts` 的 `streamPrompt` / 绑定 / 锁定、`presets/acp/acp-guard.mjs`、或新增顶层源文件 |
-| [protocol.md](./AGENTS/protocol.md) | 改子进程、超时、取消、卡死收口（无活动看门狗）、崩溃恢复、空闲释放、启动命令、会话分叉、ACP 数据折叠 | 动 `AgentBridge` / `BridgeManager` / `TurnStreamController` 的生命周期、超时或 `session/update` 折叠逻辑 |
+| [architecture.md](./AGENTS/architecture.md) | 改消息走向、会话绑定、工作区、preset 外壳、agent 锁定、默认 agent，或要目录 / 术语索引 | 动了 `src/bridge/manager.ts` 的 `streamPrompt` / 绑定 / 锁定、`presets/acp/acp-guard.mjs`、`acp_delegate` 宿主工具委派、或新增顶层源文件 |
+| [protocol.md](./AGENTS/protocol.md) | 改子进程、超时、取消、卡死收口（无活动看门狗）、崩溃恢复、空闲释放、启动命令、会话分叉、ACP 数据折叠 | 动 `AgentBridge` / `BridgeManager` / `TurnStreamController` 的生命周期、超时、`session/update` 折叠逻辑或 `ui/delegate` |
 | [subagent-adapters.md](./AGENTS/subagent-adapters.md) | 给新 agent 接子代理事实源，或查 per-agent 适配接缝与抽取触发器 | 新增 per-agent 接缝，或动共享子代理管线（`hasPendingBackgroundWork` / `subagentsDetail` / 明细门禁 / `LiveSession` 状态） |
 | [ui.md](./AGENTS/ui.md) / [conversation-dock.md](./AGENTS/conversation-dock.md) | 改 composer 座位 / 芯片 / 挂牌、mode 控件、NTR 视图、斜杠菜单、消息动作 / 分支按钮；对话内权限卡 / 释放横幅 / 限流横幅读后者 | 动 `src/client/` 的槽位注册、菜单内容或对话面组件 |
-| [ui-panel.md](./AGENTS/ui-panel.md) | 改设置页布局、保存横幅、版本徽标 / 内置更新卡、文案或主题色 | 动 `panel.tsx` / `panel/`、`save-guard-toast.tsx`、`locale.*` 或 CSS token |
-| [permissions.md](./AGENTS/permissions.md) | 改权限映射、审批卡片（对话 dock / 设置镜像）、审批时限、权限座位、fs 围栏 | 动 `handlePermissionRequest` / `PermissionLedger` / 期限配置 / `PermissionDock` |
-| [state.md](./AGENTS/state.md) | 改落盘、会话选择持久化、模型目录 / 可见性、命令缓存、fork 能力位、内置更新、保存门禁 / HMR 防护 | 动 `agents.json` 结构、`agent/catalog`、`absorbCommands`、`AcpSaveGate`、`hmr-guard` 或 `UpdateService` |
+| [ui-panel.md](./AGENTS/ui-panel.md) | 改设置页布局、保存横幅、版本徽标 / 内置更新卡、文案或主题色 | 动 `panel.tsx` / `panel/`（含「子代理」页）、`save-guard-toast.tsx`、`locale.*` 或 CSS token |
+| [permissions.md](./AGENTS/permissions.md) | 改权限映射、审批卡片（对话 dock / 设置镜像）、审批时限、权限座位、fs 围栏 | 动 `handlePermissionRequest` / `PermissionLedger` / 期限配置 / `PermissionDock` / 委派会话级策略接缝（`permissionPolicy` / `preferOnce`） |
+| [state.md](./AGENTS/state.md) | 改落盘、会话选择持久化、模型目录 / 可见性、命令缓存、fork 能力位、内置更新、保存门禁 / HMR 防护 | 动 `agents.json` 结构（含 `delegate` 键）、`agent/catalog`、`absorbCommands`、`AcpSaveGate`、`hmr-guard`、`UpdateService` 或 `applyDelegateTuning` |
 | [host.md](./AGENTS/host.md) | 改宿主接线（通道 / preset / 服务 / 模型 abstain），或**宿主升级后 NTR 报错 / 异常：先读 §5 排查** | 动 `src/index.ts`、`presets/acp/acp.patch.yml`、`package.json` 的 `dsh` 字段；每次因宿主升级做兼容修复后补 §5.2 症状行 |
 | [paths.md](./AGENTS/paths.md) | 改任何路径判定 / 比较 / 规范化，或 Windows 上遇到 `bad_cwd` / `cwd_denied` | 动 `isAbsolutePath` / `isUnderPath` / `canonicalizeFsPath` 或浏览器 `isAbsolutePathLike` |
 | [retired.md](./AGENTS/retired.md) | 想恢复某个旧机制、看到幽灵符号，或不确定某符号是否已删 | 又退役一条轴时，把旧符号追加进幽灵清单 |

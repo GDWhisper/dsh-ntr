@@ -136,6 +136,13 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 
 原「权限裁决也进 preset」的实现已退役：权限原样映射，见 [permissions.md](./permissions.md)。
 
+**宿主工具 → agent 委派（`acp_delegate`）**：与上面「宿主 MCP 不经此路」方向不同的一条接缝——委派是插件**主动**起 ACP 会话跑任务再收答复，不是把宿主工具暴露给对端 agent。
+
+- 工具经全局层 `ctx.tools.register` 注册（`src/bridge/delegate-service.ts` · `acpDelegateToolDefinition`），**原生模型**（非 NTR 会话）在它自己的工具清单里看到它；一次调用 = 一条新 ACP 会话 + 一条 prompt + 收尾 close（`AcpDelegateService.execute`），答复增量折叠后返回发起对话。不注入、不打断主对话。
+- 注册 `when`（`src/bridge/delegate-registration.ts` · `excludesNtr`）读 `agent.session.header.agentPreset !== ACP_PRESET_ID`，把 NTR 会话从**声明与派发**双排除——NTR 请求头根本不含此工具（零污染）；对端 agent 看不到、也指定不了宿主工具。
+- **不写 `subagents/record` / 外部 catalog**：宿主本来就在原生对话里渲染这次工具调用及其结果，再塞面板行是双写同一件事（阶段 2 再议，[subagent-adapters.md](./subagent-adapters.md)）。
+- 三个委派模块（`delegate-service` / `delegate-registration` / `delegate-force-mask`）都不 import manager，能力经 `src/index.ts` 的闭包注入（与 `subagent-service.ts` 同纪律）；force 档的 per-agent 遮蔽名单是 `DELEGATE_FORCE_DENY_CANDIDATES`（`subagent` / `subagent_fork` / `workflow`）∩ 该 agent 活清单（`AcpDelegateForceMask`，控制面工具保留，`agent/created` / `agent/disposed` 跟随）；权限走会话级接缝（[permissions.md §2.5](./permissions.md)），四键设置见 [ui-panel.md §8](./ui-panel.md) / [state.md §1](./state.md)。
+
 ## 6. 默认 agent
 
 - 插件自己的默认 agent 是**插件私有状态**：`defaultAgentId`，存在 `~/.dsh/dsh-ntr/agents.json`，RPC `default/agent` / `default/agent-set`，面板 ★。删除 agent 必须同时清空该指针。

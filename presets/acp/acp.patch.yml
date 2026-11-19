@@ -28,6 +28,9 @@
 #   - `tool-*` rows: the agent's tools live in its own process. Advertising DSH
 #     tools would be dead weight (the bridge never emits a DSH tool call), and
 #     the agent's own tool calls are not DSH tool calls.
+#     The global-layer `acp_delegate` tool is excluded from NTR by its
+#     registration `when` (`agentPreset !== 'acp'`, both declaration and
+#     dispatch): zero header pollution; the peer still cannot see or name it.
 #   - `agent-instructions`: AGENTS.md/CLAUDE.md digests are harness context.
 #   - `tool-skill` / `skill-filesystem`: same, plus the `<available_skills>` dump.
 #   - `plan-mode` / `tool-todo` / `tool-goal`: harness state machines this

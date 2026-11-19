@@ -11,8 +11,8 @@
  */
 
 import type {
-  AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AcpEvent, ActiveTurnView, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSaveResult, AgentSkillsResult, AgentTestResult,
-  AgentView, ApprovalDeadlinePatch, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, RpcResult,
+  AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpDelegateSettings, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AcpEvent, ActiveTurnView, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSaveResult, AgentSkillsResult, AgentTestResult,
+  AgentView, ApprovalDeadlinePatch, ChatSessionView, ChatTranscriptView, DelegateSetPayload, DetectedAgentInfo, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, RpcResult,
   SaveGateFlushResult, SaveGateStatus, SubagentDetailResult,
 } from '../protocol.ts'
 import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, pluginReleaseUrl } from '../protocol.ts'
@@ -20,7 +20,7 @@ import { subagentToolCallId } from '../subagent-records.ts'
 import { AcpError } from './errors.ts'
 import type { PromptContentBlock } from './image.ts'
 import {
-  normalizeExposedModels, validateAgentDef, validateApprovalDeadlines, validateIdleReleaseMs, validatePermissionTimeoutMode, validateTagHalo,
+  normalizeExposedModels, validateAgentDef, validateApprovalDeadlines, validateDelegateSettings, validateIdleReleaseMs, validatePermissionTimeoutMode, validateTagHalo,
 } from './validate.ts'
 
 // ---- RPC surface ----
@@ -95,6 +95,20 @@ export interface AcpManager {
    * the running bridges without a restart.
    */
   setIdleRelease?(idleTimeoutMs: number | undefined, reset?: boolean): Promise<void>
+  /**
+   * The delegation settings in force (the `acp_delegate` card), with the
+   * deployment-baseline facts an override outranks and the host's capability
+   * flags. `undefined` on a host half from before the card existed, which
+   * hides the settings tab instead of showing a number this browser invented.
+   */
+  delegateSettings?(): AcpDelegateSettings | undefined
+  /**
+   * Write delegation settings (omitted keys keep their value), or drop the
+   * persisted overrides for the keys named in `reset` so the deployment
+   * baseline (or the built-in default) applies again. Applies to the running
+   * bridges without a restart.
+   */
+  setDelegateSettings?(patch: DelegateSetPayload): Promise<void>
   detectAgents?(): Promise<DetectedAgentInfo[]>
   saveAgent?(def: AcpAgentDef, mode?: AgentSaveMode): Promise<AgentSaveResult>
   deleteAgent?(agentId: string): Promise<void>
@@ -699,6 +713,15 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         const idleTimeoutMs = reset ? undefined : validateIdleReleaseMs(body.idleTimeoutMs, 'bad_payload')
         await manager.setIdleRelease?.(idleTimeoutMs, reset)
         return ok({ idleRelease: manager.idleRelease?.() })
+      }
+      case 'ui/delegate':
+        // Absent on a host half from before the card existed: the browser then
+        // renders nothing rather than a number it cannot trust.
+        return ok({ delegate: manager.delegateSettings?.() })
+      case 'ui/delegate-set': {
+        const patch = validateDelegateSettings(body)
+        await manager.setDelegateSettings?.(patch)
+        return ok({ delegate: manager.delegateSettings?.() })
       }
       case 'agent/set-exposed-models': {
         const agentId = str(body, 'agentId', 64)

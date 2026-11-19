@@ -32,6 +32,7 @@ import { PluginUpdateBadge, PluginUpdateCard, updateCardVisible } from './panel/
 import { partitionAgents, streamText, useUi } from './panel/shared.ts'
 import { ensureStyle } from './panel/styles.ts'
 import { SkillsMcpPreference } from './skills-mcp-preference.tsx'
+import { SubagentCard } from './panel/subagent-card.tsx'
 
 interface WithStore { acp: AcpStore }
 
@@ -44,7 +45,7 @@ const NEW_AGENT_SEED: DetectedAgentInfo = {
   defaultArgs: [],
 }
 
-type SettingsPage = 'agents' | 'skills' | 'add' | 'approvals' | 'processes' | 'appearance' | 'logs' | 'diagnostics'
+type SettingsPage = 'agents' | 'skills' | 'add' | 'approvals' | 'processes' | 'subagents' | 'appearance' | 'logs' | 'diagnostics'
 
 /**
  * Local wall-clock `HH:MM:SS` for one runtime-log line. Hand-built on purpose:
@@ -170,6 +171,7 @@ export function AcpSettingsSection(props: WithStore) {
         <button type="button" aria-pressed={page === 'skills'} onClick={() => setPage('skills')}>{acp.label('技能', 'Skills')}</button>
         {ui.approvalDeadlines !== undefined && <button type="button" aria-pressed={page === 'approvals'} onClick={() => setPage('approvals')}>{acp.label('审批时限', 'Approval deadlines')}</button>}
         {ui.idleRelease !== undefined && <button type="button" aria-pressed={page === 'processes'} onClick={() => setPage('processes')}>{acp.label('进程管理', 'Processes')}</button>}
+        {ui.delegate !== undefined && <button type="button" aria-pressed={page === 'subagents'} onClick={() => setPage('subagents')}>{acp.label('子代理', 'Subagents')}</button>}
         <button type="button" aria-pressed={page === 'appearance'} onClick={() => setPage('appearance')}>{acp.label('对话外观', 'Appearance')}</button>
         <button type="button" aria-pressed={page === 'logs'} onClick={() => setPage('logs')}>
           {acp.label('日志', 'Logs')}
@@ -313,6 +315,7 @@ export function AcpSettingsSection(props: WithStore) {
 
       <div hidden={page !== 'approvals'}><ApprovalDeadlinesCard acp={acp} ui={ui} /></div>
       <div hidden={page !== 'processes'}><IdleReleaseCard acp={acp} ui={ui} /></div>
+      <div hidden={page !== 'subagents'}><SubagentCard acp={acp} ui={ui} /></div>
 
       <section className="dwa-section" hidden={page !== 'appearance'} aria-label={acp.label('对话外观', 'Appearance')}>
         <div className="dwa-section-heading">

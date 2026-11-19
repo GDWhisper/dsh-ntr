@@ -8,7 +8,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { ConnectionRpcHandler, HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
-import { ACP_PRESET_ID, AcpLlmAdapter, BridgeManager, PLUGIN_VERSION, type DshAgentLike } from './bridge.ts'
+import { ACP_PRESET_ID, AcpLlmAdapter, AcpDelegateForceMask, AcpDelegateRegistration, AcpDelegateService, BridgeManager, PLUGIN_VERSION, type DshAgentLike } from './bridge.ts'
 import { appendExternalSubagentCatalog, EventHub, dispatchRpc, permissionReplayFrames, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
 import { ArchiveReleaseTracker, archiveActivityFrames } from './archive-release.ts'
 import type { SessionActivityLike } from './archive-release.ts'
@@ -308,6 +308,38 @@ export function apply(ctx: Context, config?: unknown): void {
   // "the file says nothing, so 30 minutes applies".
   const configuredIdleTimeoutMs = typeof rawConfig.idleTimeoutMs === 'number' ? rawConfig.idleTimeoutMs : undefined
   manager.setConfiguredIdleRelease(configuredIdleTimeoutMs)
+  // The delegate baseline: `validateDelegateConfig` keeps only the keys the
+  // patch file names, so the settings page's picks outrank it per key.
+  manager.setConfiguredDelegate(resolved.delegate)
+  // acp_delegate (docs/plan/acp-delegate-subagent.md): one self-contained task
+  // per call to a configured ACP agent, in its OWN process. The three modules
+  // never import the manager — every capability arrives as a closure here.
+  const delegateNotify = (text: string): void => { manager.hub.broadcast({ type: 'agent/notice', agentId: manager.defaultAgent() ?? 'acp', level: 'info', text }) }
+  const delegateForceMask = new AcpDelegateForceMask({ ctx, notify: delegateNotify })
+  const delegateService = new AcpDelegateService({
+    hub: manager.hub,
+    agents: () => manager.agentViews(),
+    defaultAgent: () => manager.defaultAgent(),
+    delegateConfig: () => manager.delegateConfig(),
+    startSession: (agentId, cwd) => manager.startSession(agentId, cwd),
+    setPermissionPolicy: (sessionId, policy) => manager.setPermissionPolicy(sessionId, policy),
+    prompt: (sessionId, text) => manager.prompt(sessionId, text),
+    cancel: sessionId => manager.cancel(sessionId),
+    closeSession: sessionId => manager.closeSession(sessionId),
+    respondPermission: (requestId, optionId) => manager.respondPermission(requestId, optionId),
+    transcript: (sessionId, afterSeq) => manager.transcript(sessionId, afterSeq),
+  })
+  const delegateRegistration = new AcpDelegateRegistration({ ctx, service: delegateService, config: () => manager.delegateConfig(), forceMask: delegateForceMask, notify: delegateNotify })
+  manager.setDelegateRegistration(delegateRegistration)
+  // Registration lifecycle: this initial sync is the REAL first registration
+  // (the manager's boot replay ran before the seam was wired); unload / HMR
+  // disposes the tool insertion and every force mask. Late tools / agents
+  // services are handled inside registration / forceMask (probe + ctx.inject).
+  ctx.effect(() => {
+    delegateRegistration.sync()
+    return () => { delegateRegistration.dispose() }
+  }, 'dsh-ntr: acp delegate registration')
+
   // Boot hook kept only so this entry point's shape does not change:
   // `bootstrapCatalogs` is intentionally empty — boot never spawns an agent,
   // in any environment and for any `probeModelsOnBoot` value. Catalogs fill

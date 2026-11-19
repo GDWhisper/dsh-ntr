@@ -14,15 +14,43 @@
  */
 
 import type {
+  AcpDelegateSettings,
   AcpTagHalo,
   ApprovalDeadlinesResult,
   ApprovalDeadlinesSetPayload,
+  DelegateResult,
+  DelegateSetPayload,
+  DelegateSettingKey,
   IdleReleaseResult,
   IdleReleaseSetPayload,
   PermissionTimeoutMode,
   SkillsMcpResult,
 } from '../../protocol.ts'
+import {
+  DEFAULT_DELEGATE_GUIDANCE,
+  DEFAULT_DELEGATE_OUTPUT_CHARS,
+  DEFAULT_DELEGATE_PERMISSION_MODE,
+  DEFAULT_DELEGATE_TIMEOUT_MS,
+} from '../../protocol.ts'
 import type { UiState } from './state.ts'
+
+/**
+ * The built-in baseline a delegate reset falls back to when the config file
+ * names no value for the key — the same split the idle-release card keeps.
+ * Shared with the subagent card so its reset button and this write path
+ * agree on what "default" means.
+ */
+export const DELEGATE_DEFAULTS: Pick<AcpDelegateSettings, DelegateSettingKey> = {
+  guidance: DEFAULT_DELEGATE_GUIDANCE,
+  permissionMode: DEFAULT_DELEGATE_PERMISSION_MODE,
+  timeoutMs: DEFAULT_DELEGATE_TIMEOUT_MS,
+  maxOutputChars: DEFAULT_DELEGATE_OUTPUT_CHARS,
+}
+
+/** Reset one key optimistically to the baseline the reset restores. */
+function resetDelegateKey<K extends DelegateSettingKey>(next: AcpDelegateSettings, key: K, baseline: AcpDelegateSettings): void {
+  next[key] = baseline[key]
+}
 
 /** What the settings service needs from the store, injected. */
 export interface SettingsHost {
@@ -139,6 +167,23 @@ export class SettingsService {
     await this.writeIdleRelease({ reset: true })
   }
 
+  /**
+   * Write the `acp_delegate` settings (subagent card). Only the keys the
+   * patch names move; omitted keys keep their current value, so moving the
+   * guidance never resets the window. Immediate RPC — not an agent save.
+   */
+  async setDelegateSettings(patch: DelegateSetPayload): Promise<void> {
+    await this.writeDelegate(patch)
+  }
+
+  /**
+   * Drop ONE persisted delegate override: the config file (or the built-in
+   * default) decides again for that key alone.
+   */
+  async resetDelegateSetting(key: DelegateSettingKey): Promise<void> {
+    await this.writeDelegate({ reset: [key] })
+  }
+
   private async writeIdleRelease(payload: IdleReleaseSetPayload): Promise<void> {
     const previous = this.host.state().idleRelease
     try {
@@ -169,6 +214,39 @@ export class SettingsService {
       this.host.mutate({ approvalDeadlines: result.deadlines })
     } catch (error) {
       this.host.mutate({ approvalDeadlines: previous })
+      this.host.flashError(error)
+    }
+  }
+
+  /**
+   * The one delegate write path, optimistic like {@link writeApprovalDeadlines}:
+   * the value keys the payload names move now, a reset key falls back to the
+   * baseline it restores, and the override facts (`configured`) plus the
+   * availability facts stay as the host last reported them. The host answer —
+   * the same route returns the settings now in force — is the authority; a
+   * failure restores the whole previous view and flashes the notice.
+   */
+  private async writeDelegate(payload: DelegateSetPayload): Promise<void> {
+    const previous = this.host.state().delegate
+    if (previous !== undefined) {
+      const next: AcpDelegateSettings = {
+        ...previous,
+        ...(payload.guidance === undefined ? {} : { guidance: payload.guidance }),
+        ...(payload.permissionMode === undefined ? {} : { permissionMode: payload.permissionMode }),
+        ...(payload.timeoutMs === undefined ? {} : { timeoutMs: payload.timeoutMs }),
+        ...(payload.maxOutputChars === undefined ? {} : { maxOutputChars: payload.maxOutputChars }),
+      }
+      // The baseline a reset restores: the config file's value where it names
+      // one, else the built-in default.
+      const baseline: AcpDelegateSettings = { ...previous, ...DELEGATE_DEFAULTS, ...previous.configured }
+      for (const key of payload.reset ?? []) resetDelegateKey(next, key, baseline)
+      this.host.mutate({ delegate: next })
+    }
+    try {
+      const result = await this.host.call<DelegateResult>('ui/delegate-set', payload)
+      this.host.mutate({ delegate: result.delegate })
+    } catch (error) {
+      this.host.mutate({ delegate: previous })
       this.host.flashError(error)
     }
   }

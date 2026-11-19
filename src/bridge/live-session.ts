@@ -4,7 +4,7 @@
  * keep that file inside the size ratchet; the shape is unchanged.
  */
 import type { Transcript } from '../impl.ts'
-import type { SessionView } from '../protocol.ts'
+import type { AcpDelegatePolicy, SessionView } from '../protocol.ts'
 import type { DrainLedger } from './drain-record.ts'
 import type { BackgroundDispatch, BackgroundReport } from './types.ts'
 import type { TurnStreamController } from './turn-stream.ts'
@@ -107,6 +107,11 @@ export interface LiveSession {
    * `/acp` RPC have no chat session, so their asks stay on the settings panel.
    */
   dshSessionId?: string
+  /**
+   * Delegation-only session policy (`acp_delegate`'s three rungs); absent =
+   * use the bridge-level approval knobs. Never written for a chat session.
+   */
+  permissionPolicy?: AcpDelegatePolicy
   /**
    * True when this chat session runs on the ACP-mode agent preset, re-resolved
    * every turn. It is a report for the browser surfaces (which conversation are

@@ -6,7 +6,7 @@
 
 `pluginStateDir()`（`~/.dsh/dsh-ntr`）下只有三样东西：
 
-- `agents.json` —— agent 注册表 + 默认 agent + 每会话选择 + 每聊天会话的会话记录（`chatSessions`，见 §3.1）+ 外部子代理生命周期记录（`subagents`，`dshSessionId → SubagentRecord[]`：只在状态迁移落盘、每会话 200 条上限、加载时按 `chatSessions` / `conversations` prune 孤儿键、显式关闭 / force reset 立即删键；agy 派发记录另带可选 `childConversationId`（brain conversationId，只用于读子代理 transcript、不当 catalog 主键，往返不丢，CodeBuddy 行不带），见 [protocol.md §6.3](./protocol.md)）+ 插件私有偏好（`tagHalo`，经 `ui/tag-halo` RPC 读写；`sessionTitlePrefix`，经 `ui/session-title-prefix-set` 读写，是设置页「对话外观」挑的标题前缀开关（默认开），见 [architecture.md §2.1](./architecture.md)；`approvalDeadlines`，经 `ui/approval-deadlines-set` 读写，见 [permissions.md §2.4](./permissions.md)；`idleRelease`，经 `ui/idle-release-set` 读写，是设置页「进程管理」挑的空闲释放窗口，见 [protocol.md §5](./protocol.md)；`skillsMcpEnabled`，经 `ui/skills-mcp-set` 读写，是设置页「技能」页的内置 `dsh-skills` MCP 开关（默认关，见 §2.2））
+- `agents.json` —— agent 注册表 + 默认 agent + 每会话选择 + 每聊天会话的会话记录（`chatSessions`，见 §3.1）+ 外部子代理生命周期记录（`subagents`，`dshSessionId → SubagentRecord[]`：只在状态迁移落盘、每会话 200 条上限、加载时按 `chatSessions` / `conversations` prune 孤儿键、显式关闭 / force reset 立即删键；agy 派发记录另带可选 `childConversationId`（brain conversationId，只用于读子代理 transcript、不当 catalog 主键，往返不丢，CodeBuddy 行不带），见 [protocol.md §6.3](./protocol.md)）+ 插件私有偏好（`tagHalo`，经 `ui/tag-halo` RPC 读写；`sessionTitlePrefix`，经 `ui/session-title-prefix-set` 读写，是设置页「对话外观」挑的标题前缀开关（默认开），见 [architecture.md §2.1](./architecture.md)；`approvalDeadlines`，经 `ui/approval-deadlines-set` 读写，见 [permissions.md §2.4](./permissions.md)；`idleRelease`，经 `ui/idle-release-set` 读写，是设置页「进程管理」挑的空闲释放窗口，见 [protocol.md §5](./protocol.md)；`delegate`，经 `ui/delegate-set` 读写，是设置页「子代理」页挑的 `acp_delegate` 四键覆盖（只存用户真改过的键，逐键阶梯 / 词表过滤重启读盘，见下「delegate 键与启动顺序」与 [protocol.md §1](./protocol.md)）；`skillsMcpEnabled`，经 `ui/skills-mcp-set` 读写，是设置页「技能」页的内置 `dsh-skills` MCP 开关（默认关，见 §2.2））
 - `model-catalog.json` —— 模型目录 + agent 最近一次声明的斜杠命令 + agent 的 fork 能力位（最后已知，见 §3.2）
 - `workspaces/` —— 默认执行工作区
 
@@ -17,6 +17,8 @@
 **迁移**：`migrateLegacyState` 启动时把老位置搬进新目录，只搬本插件自己创建的那三个东西；目标已存在则不动（用户在新位置改过的状态不被陈旧文件覆盖）；失败也留得下老文件可读（`legacyFallback`）。工作区目录用 rename 而非 copy。
 
 **迁移必须成对**：搬目录与改写 agent 里记录的绝对路径是一件事。`cwd` / `allowedCwdRoots` 原样存盘，而 `resolveSessionCwd` 对不存在的 cwd 直接 `bad_cwd`——只搬目录不改写，每个已保存 agent 下次启动就失败。`rewriteLegacyWorkspaceRoots` 负责改写，且**必须回写磁盘**（`loadPersistedAgents` 改了就要 `persistAgents()`），否则纠错只活在内存，磁盘上仍是死路径。
+
+**`delegate` 键与启动顺序**：`agents.json` 的 `delegate` 只存用户真改过的覆盖（逐键：`guidance` 词表、`permissionMode` 三档、两个数值键阶梯），重启读盘逐键重校验，off-ladder / 手改值丢弃、基线重新决定（仿 `idleRelease`）；用户没写过时键不出现。`BridgeManager` 构造器在 `applyDeadlineTuning` / `applyIdleReleaseTuning` / `applySkillsMcpTuning` 之后调 `applyDelegateTuning`——生效值读时计算、没有 tuning 对象可改写，宿主回调 `syncDelegateRegistration` 就是全部应用；这次 boot replay 在注册接缝接线前是 no-op，**真实初次注册由 `src/index.ts` 的 `ctx.effect`（`registration.sync()`）兜底**，卸载 / HMR 经同一 effect 的 `dispose()`。
 
 ## 2. agent 注册表与校验
 
@@ -55,7 +57,7 @@
 - **per-agent 半只走轻量 RPC `agent/set-skills-mcp`**（`{ agentId, skillsMcpEnabled: boolean }`，仿 `set-exposed-models`）：`AgentAdminService.setSkillsMcp` 原地改活 def —— 每个活 bridge 共享同一对象并在下一个 `session/new` / `session/load` / 探测 / 分叉请求里重新读它，**这就是全部热应用**；**严格落盘**（失败回滚字段后抛 `persist_failed`，不留下内存与磁盘一旧一新），成功才 `publishCatalog`（`agent/status` + `agent/exposure`）。**严禁**走 `agent/save`（会杀全部活动会话），非 boolean 回 `bad_payload` 且不写盘。`agent/exposure` 帧里的 `skillsMcpEnabled` 是**已解析答案**（`!== false`，不是原始可选字段）；旧宿主不发该字段时浏览器读成「未否决」。
 - **先落盘、后运行态**：`SettingsService.setSkillsMcpEnabled` 经 `SettingsHost.persistAgentsStrict`（→ `PersistenceService.persistAgents(true)`）严格写入，**成功之后**才由 `applySkillsMcpTuning` 写共享 tuning；无可用状态路径或写盘失败抛 `persist_failed`，内存偏好回滚到旧值——磁盘与 tuning 不允许一旧一新。「先写内存再写盘」只是因为文件序列化的就是内存值，失败必须整体回滚。`ui/skills-mcp-set` 的非 boolean 回 `bad_payload`，磁盘与运行态都不动。
 - **热应用就是原地改写共享 tuning**：`replaceTuning` 是 `Object.assign`，tuning 对象身份不变，bridge 的活读取闭包下一次请求自然看到新值（存量 bridge 与新建 bridge 一致）。**严禁**为本开关再加一条按 bridge 扇出的热应用通道——那会把同一真相双写（约束 17）；也不调 `agent/save`、不重启 agent、不中断回合，存量会话不被重写。per-agent 半不缓存：每次请求从活 def 读，同理不需要扇出。
-- **启动顺序**：`loadPersistedAgents` → `applyDeadlineTuning` / `applyIdleReleaseTuning` / `applySkillsMcpTuning`（`BridgeManager` 构造器里，持久值必须进运行 tuning 而不只是设置卡读数）。
+- **启动顺序**：`loadPersistedAgents` → `applyDeadlineTuning` / `applyIdleReleaseTuning` / `applySkillsMcpTuning` / `applyDelegateTuning`（`BridgeManager` 构造器里，持久值必须进运行 tuning 而不只是设置卡读数；delegate 的 boot replay 与真实初次注册见 §1「delegate 键与启动顺序」）。
 
 ## 3. 会话选择持久化
 

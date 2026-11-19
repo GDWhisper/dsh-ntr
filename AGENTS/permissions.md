@@ -145,6 +145,22 @@ to the config file"、"adopts a deadline the settings page writes while a sessio
 `tests/acp-view.spec.ts` 的 `deadlineSliderIndex`（不等待是最左一档）、
 `tests/store.spec.ts` 的 "reads the approval deadlines on resync and writes one back optimistically"。
 
+### 2.5 委派会话的权限策略（`acp_delegate`）
+
+`acp_delegate`（宿主工具委派，[architecture.md §5](./architecture.md)）起的子会话**没有 `dshSessionId`**，对话审批卡不出现；也不能靠服务层代答——bridge 级 `auto` + `0` 到达即收场、根本不广播 `permission/request`，服务层拦不到。所以委派有自己的**会话级**策略，主会话审批一字不改。
+
+- **接缝**：`LiveSession.permissionPolicy?`（`{ mode, windowMs, preferOnce? }`，`src/bridge/live-session.ts`）只写在委派自己的 `sessionId` 上（`BridgeRpcService.setPermissionPolicy`，prompt 之前；无独立 RPC 面）。`handlePermissionRequest` 的两行读取原地改写为 `session.permissionPolicy?.mode ?? this.permissionTimeoutMode`（窗口同理），询问开始读一次；auto+0 分支、`deadlineAt`、帧、定时器全部复用现有路径。`announceExpiredAsk` 把 `session.permissionPolicy?.preferOnce === true` 传给 `pickAutoOption` 第二参。**bridge 级字段一个字节不碰**（`applyApprovalDeadlines` / `setApprovalDeadlines` 不动），非 A1 共用 bridge 也不串档。
+- **三档映射**（`delegate.permissionMode` → 会话策略，`delegate-service.ts` · `policyFor`）：
+
+| `permissionMode` | 会话策略 | 行为 |
+|---|---|---|
+| `auto`（默认） | `{auto, 0}`（非 A1 带 `preferOnce`） | 到达即代答，不建 ledger、不发帧，只留 `agent/notice` + `permission/expired` |
+| `abort` | `{abort, 30000}` | 帧到达，服务立即 `respondPermission(requestId, undefined)`（= cancelled），跑赢 30s 定时器 |
+| `ask` | `{wait, 0}` | 不代答，留在设置页镜像等人；到 `delegate.timeoutMs` 由工具失败退出 |
+
+- **计数来源**：服务只数 `permission/expired` 的 outcome（`selected` = 自动代答，其余 = 拒绝）加 abort 档自己的答复；**不数 `permission/resolved`**——它是每条结算的通用帧，数它会与 expired 双计。footer 写「拒绝 N 个审批 / 自动代答 M 个」。
+- **`preferOnce` 是委派专属**：`pickAutoOption(options, preferOnce)` 第二参为真时改用 `DELEGATE_AUTO_KIND_PRIORITY`（`allow_once → allow_always → reject_once → reject_always`）；主会话 auto 档的 `AUTO_OPTION_KIND_PRIORITY`（`allow_always` 优先）一字不改。非 A1 委派用 `allow_once` 优先（`preferOnce = !isPerSessionAgent(agentId)`）：共用进程上 agent 对 `allow_always` 的记忆可能活过委派会话、间接放宽主会话后续审批，窄授权不会。**`allow_always` 的记忆作用域宿主无知识**——它属对端 agent 自治（agent 依赖，插件无法核实也无法约束），所以插件侧只保证自己不递出宽授权；A1 ephemeral 进程随 close 死亡、无泄漏，仍 `allow_always` 优先。「不放宽既有审批」只在插件侧成立，这是登记在案的结论。
+
 ## 3. 审批 UI
 
 **对话 dock 卡**（`src/client/permission-dock.tsx` · `PermissionDock`；注册在 `src/client/index.tsx` 的 `conversation.input.dock`）：主入口，session-scoped，排在 composer 卡上方。槽位本身是整列宽，卡片套宿主 InputBar 的宽度公式（`--dsh-composer-side-clearance` + `--dsh-composer-card-max-width`），与输入框同宽居中。
@@ -186,3 +202,4 @@ to the config file"、"adopts a deadline the settings page writes while a sessio
 | fs 围栏 | `src/bridge/agent-bridge.ts` · `handleFsWrite` / `guardFsPath`；`src/impl.ts` · `resolveFsPath` |
 | 设置页镜像 | `src/client/panel/permission-mirror.tsx` · `permissionLedgerCard` / `PermissionMirrorCard` |
 | 权限座位 | `src/client/model-seat.tsx` · `createPermissionSeatClaim` |
+| 委派会话策略（§2.5） | `src/bridge/live-session.ts` · `LiveSession.permissionPolicy`；`src/bridge/bridge-rpc-service.ts` · `setPermissionPolicy`；`src/bridge/delegate-service.ts` · `policyFor` / `AcpDelegatePolicy`；`src/impl/permission.ts` · `pickAutoOption` / `DELEGATE_AUTO_KIND_PRIORITY` |

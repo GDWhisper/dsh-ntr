@@ -27,18 +27,30 @@ import {
 import type { RosterPresetRow } from '../impl.ts'
 import type {
   AcpApprovalDeadlines,
+  AcpDelegateConfig,
+  AcpDelegateSettings,
   AcpIdleRelease,
   AcpPresetStatus,
   AcpTagHalo,
   ApprovalDeadlineKey,
   ApprovalDeadlinePatch,
+  DelegateGuidance,
+  DelegateSetPayload,
+  DelegateSettingKey,
   PermissionTimeoutMode,
   PluginReleaseNotes,
   PluginUpdateState,
 } from '../protocol.ts'
 import {
+  DEFAULT_DELEGATE_GUIDANCE,
+  DEFAULT_DELEGATE_OUTPUT_CHARS,
+  DEFAULT_DELEGATE_PERMISSION_MODE,
+  DEFAULT_DELEGATE_TIMEOUT_MS,
   DEFAULT_SESSION_TITLE_PREFIX,
   DEFAULT_TAG_HALO,
+  DELEGATE_GUIDANCE,
+  DELEGATE_OUTPUT_CHARS,
+  DELEGATE_TIMEOUT_MS,
   IDLE_RELEASE_MS,
   pluginReleaseUrl,
 } from '../protocol.ts'
@@ -83,6 +95,13 @@ export interface SettingsHost {
    * silent write failure — the next boot would load the old value back.
    */
   persistAgentsStrict(): void
+  /**
+   * Reconcile the delegate tool registration + force mask after a delegate
+   * write / boot replay. Optional because the registration seam is wired by
+   * the manager entry: until that closure lands, a delegate write still
+   * persists and the boot replay simply has nothing to reconcile yet.
+   */
+  syncDelegateRegistration?(): void
 }
 
 /** The settings half of the `agents.json` payload, in its persisted key order. */
@@ -97,6 +116,11 @@ export interface PersistedSettings {
   skillsMcpEnabled?: boolean
   approvalDeadlines?: ApprovalDeadlinePatch
   idleRelease?: { idleTimeoutMs: number }
+  /**
+   * The settings page's delegate picks. Absent while the user never wrote one,
+   * so a fresh deployment's state file stays exactly what it was.
+   */
+  delegate?: Partial<AcpDelegateConfig>
 }
 
 export class SettingsService {
@@ -188,6 +212,22 @@ export class SettingsService {
    * constructed with (the deployment baseline, or the built-in 30 minutes).
    */
   private baselineIdleTimeoutMs: number
+  /**
+   * The delegate keys the settings page picked, persisted with the agent
+   * registry (`agents.json`'s `delegate`). Only keys the user actually wrote
+   * are stored, each merged OVER {@link configuredDelegate} per key exactly
+   * like {@link idleReleaseOverride} over the idle baseline: a UI pick is what
+   * runs, and `cordis.patch.yml` becomes the value the reset button returns to.
+   */
+  private delegateOverride: Partial<AcpDelegateConfig> = {}
+  /**
+   * The delegate keys `cordis.patch.yml` names — ONLY the keys it actually
+   * contains (the host entry passes `validateDelegateConfig`'s output). The
+   * deployment baseline, kept apart from the override so the settings card can
+   * say "the file asks for `enhanced`, the value set here wins"; empty when the
+   * file says nothing, in which case the built-in DEFAULT_DELEGATE_* apply.
+   */
+  private configuredDelegate: AcpDelegateConfig = {}
 
   /** Host-side reader of the harness preset roster (`ctx.agentPresets`), for `presetStatus`. */
   private presetRosterReader?: () => Promise<readonly RosterPresetRow[] | undefined>
@@ -507,6 +547,72 @@ export class SettingsService {
   }
 
   /**
+   * Declare the deployment baseline for the delegate settings — the keys
+   * `cordis.patch.yml` names, passed as `validateDelegateConfig`'s output (only
+   * the keys the file actually contains). Kept separate from the override so
+   * the card can say "the file asks for `enhanced`, the value set here wins";
+   * a key the file never names resets to the built-in default instead. Called
+   * once by the host entry; the boot replay reconciles via `applyDelegateTuning`.
+   */
+  setConfiguredDelegate(config: AcpDelegateConfig | undefined): void {
+    this.configuredDelegate = config ?? {}
+  }
+
+  /**
+   * The delegate settings in force, plus the deployment-baseline facts that
+   * explain a value the user did not pick. Effective values resolve per key:
+   * settings-page override → deployment baseline → built-in default.
+   *
+   * `configured` carries only the keys the config file actually names, so the
+   * card stays silent about a plain default (the same conditional fact the
+   * idle-release card reports). `toolAvailable` / `restrictAvailable` are NOT
+   * filled here: the manager wraps this read with its registration probes.
+   */
+  delegateSettings(): Omit<AcpDelegateSettings, 'toolAvailable' | 'restrictAvailable'> {
+    const settings: Omit<AcpDelegateSettings, 'toolAvailable' | 'restrictAvailable'> = {
+      guidance: this.delegateOverride.guidance ?? this.configuredDelegate.guidance ?? DEFAULT_DELEGATE_GUIDANCE,
+      permissionMode: this.delegateOverride.permissionMode ?? this.configuredDelegate.permissionMode ?? DEFAULT_DELEGATE_PERMISSION_MODE,
+      timeoutMs: this.delegateOverride.timeoutMs ?? this.configuredDelegate.timeoutMs ?? DEFAULT_DELEGATE_TIMEOUT_MS,
+      maxOutputChars: this.delegateOverride.maxOutputChars ?? this.configuredDelegate.maxOutputChars ?? DEFAULT_DELEGATE_OUTPUT_CHARS,
+    }
+    if (Object.keys(this.configuredDelegate).length > 0) settings.configured = { ...this.configuredDelegate }
+    return settings
+  }
+
+  /**
+   * Write delegate settings (omitted keys keep their value), or drop the
+   * persisted overrides named by `reset` so the deployment baseline — or the
+   * built-in default — decides again. Values arrive validated by the dispatch
+   * layer (`validateDelegateSettings`), so they are stored as-is.
+   *
+   * HOT: after the state-file write the host reconciles the tool registration
+   * and the force mask, so the change lands on the next step of existing
+   * conversations without a host restart (the `setIdleRelease` order: rewrite
+   * the override, persist, then apply — here the apply IS the reconciliation).
+   */
+  async setDelegateSettings(patch: DelegateSetPayload): Promise<void> {
+    const reset: readonly DelegateSettingKey[] = patch.reset ?? []
+    for (const key of reset) delete this.delegateOverride[key]
+    if (patch.guidance !== undefined) this.delegateOverride.guidance = patch.guidance
+    if (patch.permissionMode !== undefined) this.delegateOverride.permissionMode = patch.permissionMode
+    if (patch.timeoutMs !== undefined) this.delegateOverride.timeoutMs = patch.timeoutMs
+    if (patch.maxOutputChars !== undefined) this.delegateOverride.maxOutputChars = patch.maxOutputChars
+    this.host.persistAgents()
+    this.host.syncDelegateRegistration?.()
+  }
+
+  /**
+   * Reconcile the delegate registration from the values in force (boot replay
+   * after the persisted override loads). Effective values are computed at read
+   * time, so there is no tuning object to rewrite — the host callback does the
+   * whole apply. Public because the manager's boot path calls it, mirroring
+   * `applyIdleReleaseTuning`.
+   */
+  applyDelegateTuning(): void {
+    this.host.syncDelegateRegistration?.()
+  }
+
+  /**
    * Write the approval deadline, or the mode (omitted keys keep their value),
    * or drop the persisted override with `reset` so the config-file baseline —
    * or the built-in default — applies again.
@@ -653,6 +759,27 @@ export class SettingsService {
     } catch {
       this.idleReleaseOverride = undefined
     }
+    // The settings page's delegate picks. Re-validated per key on every boot
+    // because the state file is user- and version-editable: an off-ladder or
+    // hand-edited value is dropped and the baseline decides again, never
+    // poisoning the registration (the same ladder filter the idle window uses).
+    try {
+      const raw = (parsed.delegate as Record<string, unknown> | undefined) ?? {}
+      const next: Partial<AcpDelegateConfig> = {}
+      const guidance = raw.guidance
+      if (typeof guidance === 'string' && (DELEGATE_GUIDANCE as readonly string[]).includes(guidance)) {
+        next.guidance = guidance as DelegateGuidance
+      }
+      const mode = raw.permissionMode
+      if (mode === 'auto' || mode === 'abort' || mode === 'ask') next.permissionMode = mode
+      const timeoutMs = raw.timeoutMs
+      if (typeof timeoutMs === 'number' && DELEGATE_TIMEOUT_MS.includes(timeoutMs)) next.timeoutMs = timeoutMs
+      const maxOutputChars = raw.maxOutputChars
+      if (typeof maxOutputChars === 'number' && DELEGATE_OUTPUT_CHARS.includes(maxOutputChars)) next.maxOutputChars = maxOutputChars
+      this.delegateOverride = next
+    } catch {
+      this.delegateOverride = {}
+    }
   }
 
   /**
@@ -674,6 +801,9 @@ export class SettingsService {
       ...(this.idleReleaseOverride === undefined
         ? {}
         : { idleRelease: { idleTimeoutMs: this.idleReleaseOverride } }),
+      ...(Object.keys(this.delegateOverride).length === 0
+        ? {}
+        : { delegate: { ...this.delegateOverride } }),
     }
   }
 }

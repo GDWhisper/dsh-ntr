@@ -52,6 +52,15 @@
 - **返回校验**：id 非空（`fork_failed`）；id ≠ 父且不撞本连接已注册的会话（`fork_id_conflict`）——撞了拒绝注册，否则父会话的 `session/update`、审批询问会被路由进子会话。错误码全集：`parent_not_live` / `turn_in_flight` / `id_conflict` / `fork_unsupported` / `fork_failed` / `fork_id_conflict`，以及共享路径的 `agent_unreachable`（连接未开）、`agent_timeout`（`withStartupTimeout`）、`bad_cwd` / `cwd_denied` / `no_cwd`（`resolveSessionCwd`）与 `unknown_agent`（`bridge()` 查不到 agent）。
 - **all-or-nothing**：任何一步失败都不写子会话的任何绑定（choice / 锁 / 索引 / 记录全不写），子会话首条消息走原 `session/new`——等价于没有分叉功能时的行为，不留下半接管的会话；失败原因经 `flashError` 进设置页横幅（约束 38）。成功才写 choice = 父 choice 拷贝 + `locked: true`（经 `patchChatChoice`，[state.md §3.2](./state.md)）、广播 `session/meta`、浏览器 `openSession` 打开子会话。
 
+### 委派设置（`ui/delegate` / `ui/delegate-set`）
+
+`acp_delegate` 的四键设置走插件自己的轻量 RPC（`src/impl/dispatch.ts`，仿 `ui/approval-deadlines` 那组），不是 ACP 线方法：
+
+- **`ui/delegate`（读）**：回 `{ delegate?: AcpDelegateSettings }`——生效四键 + `configured`（部署基线里真写了的键）+ `toolAvailable` / `restrictAvailable`（manager 用注册探针包 settings 的读数）。旧宿主半区没有这个端点 / manager 缺成员时 `delegate` 为 `undefined`，浏览器据此隐藏整张「子代理」卡（[ui-panel.md §8](./ui-panel.md)），不显示自己编的数。
+- **`ui/delegate-set`（写）**：`validateDelegateSettings` 逐键校验后写覆盖、落盘、`syncDelegateRegistration` 对账注册与掩码，**写后重读**回同一份 `{ delegate }`（仿 `approval-deadlines-set`，宿主回包是权威）。省略的键保持原值；`reset` 按键删持久化覆盖（基线 / 内置默认重新决定），同一键不得在一次调用里既写又重置。
+- **词表与阶梯**：`guidance` 只收四档（`DELEGATE_GUIDANCE`）、`permissionMode` 只收三档（auto / abort / ask）、数值键只收阶梯值（`validateDelegateMs` / `validateDelegateOutputChars`），非法回 `bad_payload`。**部署验证宽于阶梯是既有显式设计**（`idleRelease` precedent，仅数值键）：`validateDelegateConfig` 收 [1000, 3600000] / [1000, 200000] 的任意整数，off-ladder 照原值运行，重启读盘按阶梯过滤（[state.md §1](./state.md)）。
+- 权限三档的会话级映射与计数见 [permissions.md §2.5](./permissions.md)；工具注册 / 摘除与 force 掩码的热对账见 `src/bridge/delegate-registration.ts` · `AcpDelegateRegistration.sync`。
+
 ## 2. 进程死亡 ≠ 会话销毁
 
 本节的会话生命周期（阶段 5，`src/bridge/session-lifecycle.ts` · `SessionLifecycle`）同样把状态收敛成单一显式判别字段，适用 [state.md · 状态表示纪律](./state.md) 的正向要求与严禁清单。

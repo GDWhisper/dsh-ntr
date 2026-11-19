@@ -9,6 +9,7 @@
 import type { ContentBlock } from '@agentclientprotocol/sdk'
 import type { EventHub } from '../impl.ts'
 import { AcpError, randomUUID } from '../impl.ts'
+import type { AcpDelegatePolicy } from '../protocol.ts'
 import type { BridgeRegistryService } from './bridge-registry-service.ts'
 import { describeError } from './errors.ts'
 import { isPerSessionAgent, type BridgeScope } from './identity.ts'
@@ -233,6 +234,13 @@ export class BridgeRpcService {
       }
     }
     throw new AcpError('unknown_session', `acp: no live session ${sessionId}`)
+  }
+
+  /** Delegation-only session policy (`LiveSession.permissionPolicy`); set before the first prompt, no RPC face of its own. */
+  setPermissionPolicy(sessionId: string, policy: AcpDelegatePolicy): void {
+    const live = this.host.bridgeRegistry.tryLocate(sessionId)
+    if (live === undefined) throw new AcpError('unknown_session', `acp: no live session ${sessionId}`)
+    live.session.permissionPolicy = policy
   }
 
   async setMode(sessionId: string, modeId: string): Promise<void> {

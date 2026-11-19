@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest'
 import {
   AcpError,
   canonicalizeFsPath,
+  DELEGATE_AUTO_KIND_PRIORITY,
   pickAutoOption,
   resolveFsPath,
 } from '../../src/impl.ts'
@@ -41,6 +42,34 @@ describe('pickAutoOption (what `auto` mode answers with)', () => {
     // An option with no id cannot be answered with — it would be a reply the
     // agent cannot match.
     expect(pickAutoOption([opt('', 'allow_always')])).toBeUndefined()
+  })
+})
+
+describe('pickAutoOption preferOnce (the delegation-only priority)', () => {
+  const opt = (optionId: string, kind: string, name = optionId): PermissionOptionView => ({ optionId, name, kind })
+
+  it('puts allow_once before allow_always when preferOnce is true', () => {
+    // A shared (non-A1) process may keep the agent's allow_always memory past
+    // the delegated session; the narrower grant cannot leak into the main one.
+    expect(DELEGATE_AUTO_KIND_PRIORITY).toEqual(['allow_once', 'allow_always', 'reject_once', 'reject_always'])
+    expect(pickAutoOption([opt('a0', 'allow_always'), opt('a1', 'allow_once')], true)?.optionId).toBe('a1')
+  })
+
+  it('keeps allow_always first by default and with preferOnce=false', () => {
+    const options = [opt('a1', 'allow_once'), opt('a0', 'allow_always')]
+    expect(pickAutoOption(options)?.optionId).toBe('a0')
+    expect(pickAutoOption(options, false)?.optionId).toBe('a0')
+  })
+
+  it('falls back to allow_always when the agent offers no allow_once', () => {
+    expect(pickAutoOption([opt('r1', 'reject_once'), opt('a0', 'allow_always')], true)?.optionId).toBe('a0')
+  })
+
+  it('leaves the reject rungs and the nothing-to-answer fallback unchanged', () => {
+    expect(pickAutoOption([opt('r2', 'reject_always'), opt('r1', 'reject_once')], true)?.optionId).toBe('r1')
+    expect(pickAutoOption([opt('c1', 'custom_kind')], true)?.optionId).toBe('c1')
+    expect(pickAutoOption([], true)).toBeUndefined()
+    expect(pickAutoOption([opt('', 'allow_once')], true)).toBeUndefined()
   })
 })
 

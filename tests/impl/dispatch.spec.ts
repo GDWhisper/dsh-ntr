@@ -12,7 +12,7 @@ import {
   agentSaveAction,
 } from '../../src/impl.ts'
 import type { AcpManager } from '../../src/impl.ts'
-import type { AcpAgentDef, AgentProbeModelsResult } from '../../src/protocol.ts'
+import type { AcpAgentDef, AcpDelegateSettings, AgentProbeModelsResult, DelegateSetPayload } from '../../src/protocol.ts'
 import { fakeManager } from './harness.ts'
 
 describe('dispatchRpc', () => {
@@ -474,5 +474,82 @@ describe('dispatchRpc', () => {
     const huge = 'x'.repeat((1 << 20) + 1)
     const result = await dispatchRpc(manager, 'session/prompt', { sessionId: 'S', text: huge })
     expect(result.ok).toBe(false)
+  })
+
+  it('routes ui/delegate: undefined on a host half without the card', async () => {
+    const manager = fakeManager()
+    // Absent on a host half from before the card existed: the browser hides
+    // the tab rather than showing a number it invented.
+    await expect(dispatchRpc(manager, 'ui/delegate', {})).resolves.toEqual({ ok: true, value: { delegate: undefined } })
+    const settings: AcpDelegateSettings = {
+      guidance: 'on',
+      permissionMode: 'auto',
+      timeoutMs: 600_000,
+      maxOutputChars: 20_000,
+      configured: { guidance: 'off' },
+      toolAvailable: true,
+      restrictAvailable: true,
+    }
+    await expect(dispatchRpc({ ...manager, delegateSettings: () => settings }, 'ui/delegate', {}))
+      .resolves.toEqual({ ok: true, value: { delegate: settings } })
+  })
+
+  it('routes ui/delegate-set: validates every field, writes, then re-reads', async () => {
+    const manager = fakeManager()
+    const settings: AcpDelegateSettings = {
+      guidance: 'enhanced',
+      permissionMode: 'auto',
+      timeoutMs: 600_000,
+      maxOutputChars: 20_000,
+      toolAvailable: true,
+      restrictAvailable: true,
+    }
+    const withDelegate = {
+      ...manager,
+      delegateSettings: () => settings,
+      setDelegateSettings: async (patch: DelegateSetPayload) => { manager.calls.push(['setDelegateSettings', patch]) },
+    }
+    // A legal write reaches the manager, and the answer is the RE-READ snapshot
+    // (the same write-then-read shape as ui/approval-deadlines-set).
+    await expect(dispatchRpc(withDelegate, 'ui/delegate-set', { guidance: 'enhanced', timeoutMs: 300_000 }))
+      .resolves.toEqual({ ok: true, value: { delegate: settings } })
+    expect(manager.calls).toContainEqual(['setDelegateSettings', { guidance: 'enhanced', timeoutMs: 300_000 }])
+    // Only the touched keys travel; reset travels as the key list.
+    await expect(dispatchRpc(withDelegate, 'ui/delegate-set', { reset: ['guidance', 'timeoutMs'] })).resolves.toMatchObject({ ok: true })
+    expect(manager.calls).toContainEqual(['setDelegateSettings', { reset: ['guidance', 'timeoutMs'] }])
+    // An unknown key is dropped rather than persisted into state.
+    await expect(dispatchRpc(withDelegate, 'ui/delegate-set', { bogusKey: 5 })).resolves.toMatchObject({ ok: true })
+    expect(manager.calls).toContainEqual(['setDelegateSettings', {}])
+    // Field-by-field validation: nothing illegal reaches the manager.
+    for (const bad of ['maybe', 'ON', 1, null]) {
+      await expect(dispatchRpc(withDelegate, 'ui/delegate-set', { guidance: bad }))
+        .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    }
+    // `wait` is the main conversation's approval mode, not a delegation rung.
+    for (const bad of ['wait', 'maybe', 1, null]) {
+      await expect(dispatchRpc(withDelegate, 'ui/delegate-set', { permissionMode: bad }))
+        .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    }
+    // Off-ladder numbers are refused even when the deployment range would take them.
+    for (const bad of [0, -1, 1.5, 123_456, '600000']) {
+      await expect(dispatchRpc(withDelegate, 'ui/delegate-set', { timeoutMs: bad }))
+        .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+      await expect(dispatchRpc(withDelegate, 'ui/delegate-set', { maxOutputChars: bad }))
+        .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    }
+    for (const bad of ['guidance', true, ['bogus'], ['guidance', 1]]) {
+      await expect(dispatchRpc(withDelegate, 'ui/delegate-set', { reset: bad }))
+        .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    }
+    // The same key cannot be both written and reset in one call.
+    await expect(dispatchRpc(withDelegate, 'ui/delegate-set', { guidance: 'on', reset: ['guidance'] }))
+      .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    expect(manager.calls.filter(([kind]) => kind === 'setDelegateSettings')).toHaveLength(3)
+    // A host half without the writer still validates and answers the re-read
+    // (undefined here): the optional member is a no-op, never a crash.
+    await expect(dispatchRpc(manager, 'ui/delegate-set', { guidance: 'on' }))
+      .resolves.toEqual({ ok: true, value: { delegate: undefined } })
+    await expect(dispatchRpc(manager, 'ui/delegate-set', { guidance: 'maybe' }))
+      .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
   })
 })

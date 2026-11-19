@@ -265,6 +265,11 @@ export class PersistenceService {
         ...(persistedSettings.idleRelease === undefined
           ? {}
           : { idleRelease: persistedSettings.idleRelease }),
+        // The settings page's delegate picks. Absent while none was ever
+        // written, so a fresh deployment's state file stays as it was.
+        ...(persistedSettings.delegate === undefined
+          ? {}
+          : { delegate: persistedSettings.delegate }),
         // The per-conversation picks: agent + model + thought level + mode +
         // extra config values chosen in the composer, including for
         // conversations with no live session yet.
