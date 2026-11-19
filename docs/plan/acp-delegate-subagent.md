@@ -1,6 +1,6 @@
 # `acp_delegate`：把 NTR 里配置的 ACP agent 变成原生模型的子代理
 
-> 状态：**阶段 1 已实现**（见 CHANGELOG / 提交）。本文保留方案推导；定稿与方案的三处偏离见修订行。
+> 状态：**阶段 1 已实现并提交**（`7fdb029`）。本文保留方案推导；定稿与方案的三处偏离见修订行，完整进展 / 偏离补遗 / 已知限制 / 门禁事实见 §11。
 > 修订：已吸收独立审查（运行时语义 / 宿主契约 / 设置基础设施三路 39 项核查 + 原生委派工具形态 8 项核查）结论，§2/§3/§4/§5/§6/§7/§8 按证据重写；引导做成四档滑块（关闭 / 开启 / 引导增强 / 强制模式，兼注册开关，合并原 enabled），强制档经 per-agent `tools.restrict` 遮原生委派工具；拍板见 §10 记录 5–10。定稿三偏离（实现按此，正文推导不改）：① 零污染——注册 `when`（`excludesNtr`，`agentPreset !== 'acp'`）把 `acp_delegate` 从 NTR 会话的声明与派发双排除，NTR 请求头根本不含此工具（§4.1「进请求头但到不了对端」是旧说法）；② `preferOnce`——非 A1 委派 auto 档 `allow_once` 优先（`pickAutoOption` 第二参），防 `allow_always` 共用进程跨会话泄漏，A1 与主会话优先级不变（§4.2）；③ 颜色 token 定稿真名——宿主只有 `state-warn-*` / `state-error-*` 族，enhanced 用 `state-warn-primary` / `state-warn-tertiary`，force 用 `state-error-primary` / `interactive-bg-hover-danger`（§5.2 的旧 token 拼写不存在，只落 fallback）。
 > 前置阅读：[AGENTS/architecture.md](../../AGENTS/architecture.md) §1（归属模型）、§5（preset 外壳）；
 > [AGENTS/subagent-adapters.md](../../AGENTS/subagent-adapters.md)（现有「子代理」只是**观察** ACP agent 自己的子代理）。
@@ -389,3 +389,49 @@ delegate:
 8. **答复折叠走 hub 增量累积**（审查后新增）：环形缓冲默认 600 条会淘汰 `agent_message_chunk`，turn/end 后一次读 transcript 丢早期文本。订阅 `session/update` 累积、seq 去重；turn/end 按 sessionId 匹配（看门狗 `turnId` 可能为 `''`、error-only）。
 9. **引导四档滑块，合并注册开关**（用户增补，三轮迭代）：UI 标签 **关闭 / 开启 / 引导增强 / 强制模式**，内部值 `off | on | enhanced | force`。`off` = 不注册工具（原 `enabled` 键取消，同一真相不双写，约束 17）；`on` = 注册基础描述；`enhanced` = 追加 MUST 句「需要派发子代理时，必须使用本工具，优先于任何原生子代理/委派工具」（软约束），滑到该档出**黄字**「该档位会增强工具描述，引导大模型优先使用本工具。」（warning token，约束 34）；`force` = 增强描述 + 真遮原生工具（记录 10），出**红字**「强制模式会屏蔽 DSH 的原生 subagent 能力，请谨慎开启。」（danger token）。按档说明生效值时常驻，precedent 见审批时限 auto 档警告。工具描述是模型可见契约字段（`schemas()` 下发 name/description/parameters，已核实），无需提示词注入。
 10. **强制档经 per-agent `tools.restrict`**（宿主核实后定）：没有全局 deny（restrict 要求 scoped ctx，全局调用抛错）；经 `ctx.agents.get(id).ctx.tools.restrict({deny})` 逐 agent 施加（`applyChildOverrides` 先例），名单 = 默认 `{subagent, subagent_fork, workflow}` ∩ 该 agent `restrictableNames`（NTR 交集空自然跳过），生命周期事件跟随，离开 force 全撤。控制面工具保留（观测/续聊不砍）；deny 不碰服务运行时。workflow 系统提示段落无门控、被遮后悬空——本期接受并登记。restrict 不可用降级 enhanced + `restrictAvailable: false` 如实上报。
+
+## §11 实现进展与限制（阶段 1 定稿）
+
+> 本节记录阶段 1 落地结果，供阶段 2/3 与后续维护接手。代码位置用「文件 + 符号名」引用（不写行号）。
+
+### §11.1 提交与验证
+
+- 提交 `7fdb029` `feat(acp): add acp_delegate tool to delegate tasks to configured ACP agents`（43 文件，+3746/-67，10 新文件）。前缀按仓库惯例：feature 为主、AGENTS/ 文档随提交（纪律 3）用 `feat(acp):`；纯文档提交才 `docs(agents):`（历史先例 `09e17ed` / `fe0d4de` 均 feat 且触及 AGENTS.md）。
+- `npm run prepack` 四门禁全绿：check:size、typecheck、vitest（105 文件 1721 通过 | 2 既有 skip）、build（CJS 工厂 696kB）。
+- 独立双轴审核（Standards + Spec，独立上下文并行）：Standards 无硬违规；Spec 忠实实现、无 scope creep、无实现错误。
+- 审核必修项已修并附**变异验证**：收口状态收敛单一 `DelegateSettle` 联合、注册状态收敛 `RegistrationState` 联合（约束 17 / state.md §10）；`AcpDelegatePolicy` 单一权威定义；README 补旧宿主降级说明。变异互换 timed-out/aborted 分支 → 2 例红 → 还原绿；降级拦截条件变异 → 1 例红 → 还原绿。
+
+### §11.2 落地清单
+
+- **委派核心**：`src/bridge/delegate-service.ts`（`AcpDelegateService` / `AcpDelegateHost` / `acpDelegateToolDefinition` / `DelegateSettle`）、`delegate-registration.ts`（`AcpDelegateRegistration` / `RegistrationState` / `excludesNtr`）、`delegate-force-mask.ts`（`AcpDelegateForceMask` / `DELEGATE_FORCE_DENY_CANDIDATES`）。
+- **会话级权限接缝**：`live-session.ts · permissionPolicy` + `bridge-rpc-service.ts · setPermissionPolicy` + `agent-bridge.ts · handlePermissionRequest`（两行原地改写）/ `announceExpiredAsk`（preferOnce 透传）+ `impl/permission.ts · pickAutoOption`（第二参）/ `DELEGATE_AUTO_KIND_PRIORITY`。
+- **设置层与接线**：`settings-service.ts`（delegateSettings / setDelegateSettings / setConfiguredDelegate / applyDelegateTuning）+ `persistence-service.ts`（delegate 键）+ `manager.ts`（delegate face 薄委托）+ `index.ts`（构造三模块 + `ctx.effect`）。
+- **契约层**：`protocol/ui.ts`（delegate 类型 / 阶梯 / 默认 + `AcpDelegatePolicy`）、`protocol/agent-def.ts`（`AcpDelegateConfig` + `AcpPluginConfig.delegate`）、`impl/validate.ts`（validateDelegate*）、`impl/dispatch.ts`（ui/delegate / ui/delegate-set）。
+- **浏览器半**：`client/panel/subagent-card.tsx`（`SubagentCard`）+ `panel.tsx` 导航门控 + `store/state.ts · UiState.delegate` + `store.ts` facade/resync + `store/settings.ts`（setDelegateSettings / resetDelegateSetting / writeDelegate）。
+- **测试**：`tests/delegate.spec.ts`（33）、`tests/bridge/delegate-force.spec.ts`（6）、`delegate-permission.spec.ts`（5）、`delegate-settings.spec.ts`（7）、`tests/panel/subagent-card.spec.ts`（13）、`tests/store/settings.spec.ts`（+2）、`tests/impl/{validate,dispatch,permission}.spec.ts` 追加。
+- **文档**：AGENTS.md 约束 40（权限组 13–15、40）+ AGENTS/{architecture,permissions,protocol,state,ui-panel}.md + cordis.patch.yml + presets/acp/acp.patch.yml + README 双语。
+
+### §11.3 定稿偏离补遗（修订行三处之外）
+
+- **transcript 兜底读移到 close 之前**：`bridge-rpc-service.ts · closeSession` 删记录、transcript 对已删 id 抛 `unknown_session`，close 后读兜底必死（§4 步骤 6 旧顺序修正为 正常结束 → 兜底 → close → 解订阅）。
+- **`permission/resolved` 不订阅计数**：到期路径 expired 与 resolved 同发（约束 13），数 resolved 会双计；abort 档数 request 到达（= 自己的答复）；ask 档人工作答不进 footer（§3 尾注未要求）。permissions.md §2.5 登记理由。
+- **收口 / 注册状态单一字面量联合**（约束 17）：`DelegateSettle = 'pending' | 'ended' | 'timed-out' | 'aborted' | 'prompt-error'`（`settle` 首写生效，队列 promise / 定时器 / 监听器等排程句柄不压单值，state.md §10 例外）；`RegistrationState = 'off' | 'active' | 'degraded'`（`toolAvailable = state !== 'off'`，degraded 仍 true）。
+- **`AcpDelegatePolicy` 唯一权威定义**落 `protocol/ui.ts`，live-session / rpc / manager / delegate-service 四处 import（消除 Data Clump，单一真相）。
+
+### §11.4 已知限制
+
+- **旧宿主降级模式的设置卡旗标缺口**：register 无 disposer 时常驻注册，`toolAvailable` 恒 true，guidance=off 卡片仍显示「关闭 = 不注册本工具」静态文案、无降级旗标——与 §5.3「不能让设置卡假装请求头已经干净」有张力。根因是 §5.3 的 UI 契约只有 toolAvailable / restrictAvailable 两旗标、无降级位（**方案内部缺口**）。当前按契约办事 + README 写明「请求头那一行等宿主重启才消失」；阶段 2 可考虑补一个降级旗标。
+- **workflow 系统提示段落悬空**：force 遮 workflow 后其「Use the workflow tool ONLY when…」段落无门控仍残留（§5.4 接受）；subagent / subagent_fork 段落有门控自动消失。宿主若提供 section 剥离接缝再补。
+- **force 名单漂移**：deny 名单 = 默认 `{subagent, subagent_fork, workflow}` ∩ 活清单（`tools.get` 可见性近似 restrictableNames）；部署经 `toolName` 改名会漏遮（§8 风险）；scope-local 漂移走 restrict 抛错 → notice → 继续其余 agent。
+- **permissions.md 越 200 行**：188 → 205（新增 §2.5），触发单篇 >200 拆分阈值；delegate 同主题触及 5 份 AGENTS/ + AGENTS.md（≥3 篇阈值）。拆分留待后续维护，本任务未扩范围。
+
+### §11.5 行数与门禁事实
+
+- 锁定文件合规：manager.ts **1897**≤1903（净 -6，压缩 6 处 JSDoc）、agent-bridge.ts **2208**≤2209（净 0）、store.ts **1597**=1597（净 +5 触顶，零余量）。AGENTS.md **150**=150（净 0，约束 14 折行合并腾行）。
+- 新文件均 ≤1000：delegate-service 404 / delegate-registration 193 / delegate-force-mask 149 / subagent-card 303 / tests/delegate.spec 617。
+- 超 500 行存量：settings-service 809 / dispatch 791 / index 704 / validate 645。
+
+### §11.6 后续
+
+- 阶段 2（子代理面板行）/ 阶段 3（可续委派）按 §9 待看阶段 1 观感再定，**未实现**。
+- 候选维护项（非本阶段范围）：permissions.md 拆分（>200）、降级旗标（§11.4）、workflow 悬空段落剥离接缝。
