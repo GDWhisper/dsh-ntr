@@ -202,7 +202,7 @@ export function validateDelegateGuidance(raw: unknown, code: 'bad_config' | 'bad
 }
 
 /**
- * Validate the single-delegation window, shared by the settings-page write
+ * Validate the single-delegation silence window, shared by the settings-page write
  * ({@link validateDelegateSettings}) and the deployment baseline
  * ({@link validateDelegateConfig}). Any integer in [1000, 86400000] ms
  * (1 second to 24 hours) runs as-is — there is no ladder; the card prints the

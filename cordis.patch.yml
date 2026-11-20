@@ -146,8 +146,13 @@
         #                              # subagent / subagent_fork / workflow tools per
         #                              # agent (no restrict → degrades to enhanced,
         #                              # reported honestly via restrictAvailable).
-        #   timeoutMs: 2400000         # single-delegation window [1000, 86400000] ms;
-        #                              # default follows the global background-task long
+        #   timeoutMs: 2400000         # single-delegation SILENCE window [1000, 86400000] ms:
+        #                              # aborted + errored after this much silence with no new
+        #                              # output; any session/update of THIS session (tool
+        #                              # progress frames included) or permission settlement
+        #                              # renews it — one rolling silence window; the host keeps
+        #                              # a fixed 24h absolute backstop from call start.
+        #                              # Default follows the global background-task long
         #                              # window (backgroundTaskToolMs, 0 → backgroundTaskMaxMs).
         #                              # Hand-filled minutes in the card; an off-grid
         #                              # deployment value runs as-is. The delegation's session

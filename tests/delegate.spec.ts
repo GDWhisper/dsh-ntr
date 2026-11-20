@@ -20,6 +20,7 @@ function chunk(text: string, meta?: Record<string, unknown>) {
   return { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text }, ...(meta === undefined ? {} : { _meta: meta }) }
 }
 const tick = () => new Promise(resolve => setTimeout(resolve, 10))
+const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
 function makeHost() {
   const sinks = new Set<(event: AcpEvent) => void>()
@@ -162,12 +163,12 @@ describe('acp_delegate execute semantics', () => {
     expect(f.calls.startSession).toHaveLength(0)
   })
 
-  it('internal timeout: no turn/end → throws, cancel + close called, self-settles', async () => {
+  it('silence timeout: no events after the prompt → throws "of silence", cancel + close called, self-settles', async () => {
     const f = makeHost()
     f.config.timeoutMs = 40
     f.onPrompt(() => new Promise(() => {})) // the prompt never answers, no turn/end ever
     const started = Date.now()
-    await expect(new AcpDelegateService(f.host).execute({ task: 'x', agent: 'alpha' }, {})).rejects.toThrow('acp_delegate: timed out after 40ms')
+    await expect(new AcpDelegateService(f.host).execute({ task: 'x', agent: 'alpha' }, {})).rejects.toThrow('acp_delegate: timed out after 40ms of silence')
     expect(Date.now() - started).toBeLessThan(2_000) // settled without waiting for a turn/end after close
     expect(f.calls.cancel).toEqual(['session-1'])
     expect(f.calls.close).toEqual(['session-1'])
@@ -376,6 +377,109 @@ describe('acp_delegate execute semantics', () => {
 })
 
 /**
+ * The rolling silence window: only silence counts, activity of THIS session
+ * renews it (any session/update kind, permission settlements), and settlement
+ * disarms it for good. Same short-real-window timing as the rest of this file
+ * (generous margins); fake timers only where the assertion must inspect the
+ * timer queue itself (no re-arm after settle).
+ */
+describe('acp_delegate silence window', () => {
+  /** Run one open turn (prompt answers, no turn/end) and capture its outcome. */
+  function openTurn(f: Fake) {
+    f.onPrompt(async () => ({ turnId: 't' }))
+    let finished = false
+    const outcome = new AcpDelegateService(f.host).execute({ task: 'x', agent: 'alpha' }, {}).then(
+      () => { finished = true; return '' },
+      (error: unknown) => { finished = true; return error instanceof Error ? error.message : String(error) },
+    )
+    return { outcome, stillPending: () => !finished }
+  }
+
+  it('activity renews: an agent_message_chunk keeps it alive past the original deadline, silence then fires', async () => {
+    const f = makeHost()
+    f.config.timeoutMs = 150
+    const { outcome, stillPending } = openTurn(f)
+    await wait(80)
+    f.emit({ type: 'session/update', sessionId: 'session-1', seq: 1, update: chunk('still working') })
+    await wait(80) // t≈160 — past the ORIGINAL 150ms deadline; the renewal kept it alive
+    expect(stillPending()).toBe(true)
+    expect(await outcome).toBe('acp_delegate: timed out after 150ms of silence') // silence from t≈80 fires at ≈230
+    expect(f.calls.cancel).toEqual(['session-1'])
+    expect(f.calls.close).toEqual(['session-1'])
+    expect(f.sinkCount()).toBe(0)
+  })
+
+  it('activity renews: a tool_call_update progress frame is activity too, not just message chunks', async () => {
+    const f = makeHost()
+    f.config.timeoutMs = 150
+    const { outcome, stillPending } = openTurn(f)
+    await wait(80)
+    f.emit({ type: 'session/update', sessionId: 'session-1', seq: 1, update: { sessionUpdate: 'tool_call_update', toolCallId: 'call-1', status: 'in_progress' } })
+    await wait(80) // past the original deadline again — the tool frame renewed it
+    expect(stillPending()).toBe(true)
+    expect(await outcome).toBe('acp_delegate: timed out after 150ms of silence')
+  })
+
+  it('activity renews: a permission/expired settlement of this session', async () => {
+    const f = makeHost()
+    f.config.timeoutMs = 150
+    const { outcome, stillPending } = openTurn(f)
+    await wait(80)
+    f.emit({ type: 'permission/expired', sessionId: 'session-1', toolCall: {}, timeoutMs: 0, outcome: { outcome: 'selected', optionId: 'allow_once' } })
+    await wait(80)
+    expect(stillPending()).toBe(true)
+    expect(await outcome).toBe('acp_delegate: timed out after 150ms of silence')
+  })
+
+  it('another session\'s events never renew this window', async () => {
+    const f = makeHost()
+    f.config.timeoutMs = 150
+    const started = Date.now()
+    const { outcome } = openTurn(f)
+    await wait(60)
+    f.emit({ type: 'session/update', sessionId: 'session-other', seq: 1, update: chunk('noise') })
+    await wait(60) // t≈120
+    f.emit({ type: 'permission/expired', sessionId: 'session-other', toolCall: {}, timeoutMs: 0, outcome: { outcome: 'selected', optionId: 'allow_once' } })
+    expect(await outcome).toBe('acp_delegate: timed out after 150ms of silence')
+    // A foreign renewal at t≈120 would have pushed the deadline to ≈270ms.
+    expect(Date.now() - started).toBeLessThan(225)
+  })
+
+  it('late events after settlement never re-arm: no dangling timer, no second settle', async () => {
+    vi.useFakeTimers()
+    try {
+      const f = makeHost()
+      f.config.timeoutMs = 1_000
+      // Park the cleanup at cancel so late events arrive BEFORE the finally
+      // unsubscribe: they reach the live sink, and the outcome guard — not the
+      // unsubscribe — must be what refuses the re-arm.
+      let releaseCancel!: () => void
+      const gate = new Promise<void>(resolve => { releaseCancel = resolve })
+      const originalCancel = f.host.cancel
+      f.host.cancel = async (sessionId) => { await gate; await originalCancel(sessionId) }
+      const outcome = new AcpDelegateService(f.host).execute({ task: 'x', agent: 'alpha' }, {}).then(
+        () => 'resolved',
+        (error: unknown) => (error instanceof Error ? error.message : String(error)),
+      )
+      await vi.advanceTimersByTimeAsync(1_000) // silence fires; cleanup parks at the gate
+      expect(f.sinkCount()).toBe(1) // still subscribed mid-cleanup
+      expect(f.calls.cancel).toHaveLength(0) // parked inside cancel, before it records
+      f.emit({ type: 'session/update', sessionId: 'session-1', seq: 9, update: chunk('late') })
+      f.emit({ type: 'permission/expired', sessionId: 'session-1', toolCall: {}, timeoutMs: 0, outcome: { outcome: 'cancelled' } })
+      expect(vi.getTimerCount()).toBe(0) // the guard refused to re-arm after settle
+      releaseCancel()
+      expect(await outcome).toBe('acp_delegate: timed out after 1000ms of silence')
+      expect(vi.getTimerCount()).toBe(0) // nothing dangling after the run either
+      expect(f.calls.cancel).toEqual(['session-1'])
+      expect(f.calls.close).toEqual(['session-1'])
+      expect(f.sinkCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+/**
  * Workspace inheritance (plan §3, user ruling): an omitted cwd inherits the
  * CALLING DSH session's workspace (`exec.agent.session.header.cwd` — the same
  * root the chat path trusts); an explicit cwd is validated against the agent's
@@ -448,7 +552,7 @@ describe('acp_delegate workspace inheritance', () => {
   })
 
   it('the cwd parameter description states inheritance and the fence', () => {
-    const definition = acpDelegateToolDefinition({ guidance: 'on', timeoutMs: 1_000, execute: async () => ({ text: '', agent: '' }) })
+    const definition = acpDelegateToolDefinition({ guidance: 'on', execute: async () => ({ text: '', agent: '' }) })
     const cwd = (definition.parameters.properties as Record<string, { description: string }>).cwd
     expect(cwd.description).toContain('省略 = 继承调用会话工作区')
     expect(cwd.description).toContain('allowedCwdRoots')
@@ -458,8 +562,8 @@ describe('acp_delegate workspace inheritance', () => {
 describe('acp_delegate tool definition (register-ready)', () => {
   const execute: AcpDelegateExecute = async () => ({ text: 'ok', agent: 'a' })
 
-  it('has the fixed shape: name, required task, render, +30s budget, lossless JSON', () => {
-    const definition = acpDelegateToolDefinition({ guidance: 'on', timeoutMs: 600_000, execute })
+  it('has the fixed shape: name, required task, render, fixed 24h backstop budget, lossless JSON', () => {
+    const definition = acpDelegateToolDefinition({ guidance: 'on', execute })
     expect(definition.name).toBe('acp_delegate')
     expect(definition.parameters.required).toEqual(['task'])
     expect(Object.keys(definition.parameters.properties as Record<string, unknown>)).toEqual(['task', 'agent', 'cwd'])
@@ -467,7 +571,9 @@ describe('acp_delegate tool definition (register-ready)', () => {
     expect(definition.output.render({}, { text: 'hi' })).toEqual([{ type: 'text', text: 'hi' }])
     expect(definition.output.render({}, undefined)).toEqual([{ type: 'text', text: '' }])
     expect(definition.output.schema.required).toEqual(['text'])
-    expect(definition.timeoutMs).toBe(630_000)
+    // The host budget is the FIXED 24h absolute backstop — never the configured
+    // silence window plus a grace (the window is read live per execute).
+    expect(definition.timeoutMs).toBe(86_400_000)
     expect(definition.execute).toBe(execute)
     expect(JSON.parse(JSON.stringify(definition.parameters))).toEqual(definition.parameters)
     expect(JSON.parse(JSON.stringify(definition.output.schema))).toEqual(definition.output.schema)
@@ -475,20 +581,22 @@ describe('acp_delegate tool definition (register-ready)', () => {
 
   it('composes the description by guidance rung', () => {
     for (const guidance of ['off', 'on'] as const) {
-      const definition = acpDelegateToolDefinition({ guidance, timeoutMs: 1_000, execute })
+      const definition = acpDelegateToolDefinition({ guidance, execute })
       expect(definition.description).toContain('把一件自成一体的任务交给一个已配置的外部 ACP agent')
       expect(definition.description).not.toContain('必须使用本工具')
+      expect(definition.timeoutMs).toBe(86_400_000) // the backstop is rung-independent too
     }
     for (const guidance of ['enhanced', 'force'] as const) {
-      const definition = acpDelegateToolDefinition({ guidance, timeoutMs: 1_000, execute })
+      const definition = acpDelegateToolDefinition({ guidance, execute })
       expect(definition.description).toContain('需要派发子代理时，必须使用本工具，优先于任何原生子代理/委派工具。')
+      expect(definition.timeoutMs).toBe(86_400_000)
     }
   })
 
   it('execute returns the report text with the footer', async () => {
     const f = makeHost()
     happyPrompt(f, 'done')
-    const definition = acpDelegateToolDefinition({ guidance: 'on', timeoutMs: 600_000, execute: new AcpDelegateService(f.host).execute })
+    const definition = acpDelegateToolDefinition({ guidance: 'on', execute: new AcpDelegateService(f.host).execute })
     const value = await definition.execute({ task: 'x', agent: 'alpha' }, {})
     expect(value.text).toContain('done')
     expect(value.text).toContain('— acp_delegate · alpha · cwd=/agent-default · end_turn')
@@ -583,7 +691,7 @@ describe('acp_delegate registration sync', () => {
     expect(mask.clear).toHaveBeenCalled()
   })
 
-  it('re-registers on guidance or timeoutMs change (description and budget bake in)', () => {
+  it('re-registers on guidance or timeoutMs change; the budget stays the fixed 24h backstop', () => {
     const tools = fakeToolsCtx()
     tools.install()
     const { registration, config } = makeRegistration(tools.ctx)
@@ -597,8 +705,9 @@ describe('acp_delegate registration sync', () => {
     expect(tools.registered[0].definition.description).toContain('必须使用本工具')
     config.timeoutMs = 300_000
     registration.sync()
-    expect(tools.disposerCalls()).toBe(2)
-    expect(tools.registered[0].definition.timeoutMs).toBe(330_000)
+    expect(tools.disposerCalls()).toBe(2) // the settings signature still re-registers on a window change
+    // The configured silence window never bakes into the host budget.
+    expect(tools.registered[0].definition.timeoutMs).toBe(86_400_000)
   })
 
   it('when excludes NTR sessions and never throws on odd shapes', () => {

@@ -228,7 +228,7 @@ export interface AcpStartSessionOpts {
 export const DEFAULT_DELEGATE_GUIDANCE: DelegateGuidance = 'off'
 
 /**
- * The single-delegation window bounds, in MILLISECONDS — the ONE source shared
+ * The single-delegation silence-window bounds, in MILLISECONDS — the ONE source shared
  * by the host validator (`validateDelegateMs`), the persisted-read filter
  * (`SettingsService.loadPersistedSettings`) and the browser's minute-input
  * guard. 1 second … 24 hours. The built-in DEFAULT is deliberately NOT a
@@ -259,8 +259,10 @@ export interface AcpDelegateSettings {
    * The window a RESET returns to: the deployment baseline when the config
    * file names one, else the global background-task long window (the built-in
    * default — the same split {@link AcpIdleRelease.defaultIdleTimeoutMs} keeps).
+   * ABSENT on an older host half: the card then offers no reset rather than
+   * inventing a baseline (mixed-version guard — never fabricate the old half).
    */
-  defaultTimeoutMs: number
+  defaultTimeoutMs?: number
   /** Deployment baseline facts: only keys cordis.patch.yml actually names. */
   configured?: Partial<Pick<AcpDelegateSettings, DelegateSettingKey>>
   toolAvailable: boolean

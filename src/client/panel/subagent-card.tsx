@@ -1,7 +1,8 @@
 /**
  * The subagent card: the `acp_delegate` tool's deployment-wide parameters —
  * one guidance rung that doubles as the registration switch, and one
- * single-delegation timeout window. The delegation's session permission policy
+ * single-delegation silence window (activity renews it; only silence aborts).
+ * The delegation's session permission policy
  * is always auto-answer (there is no knob for it here); the main conversation's
  * approval settings are untouched.
  *
@@ -11,7 +12,8 @@
  * off-grid value is never rounded to a lie — and a commit writes
  * `round(minutes * 60000)` only within [1000, 86400000] ms. Its reset button
  * mirrors the IdleReleaseCard rule: it appears only when the window really
- * overrides the host-reported `defaultTimeoutMs`.
+ * overrides the host-reported `defaultTimeoutMs` — an older host half that
+ * reports no baseline gets no reset (nothing to invent one from).
  *
  * Writes are immediate RPCs (never an `agent/save` form): the store moves the
  * picked key optimistically, adopts the host answer as the authority, and
@@ -116,7 +118,7 @@ function guidanceHint(guidance: DelegateGuidance, acp: AcpStore): {
 }
 
 /**
- * The single-delegation window as a hand-filled MINUTE input. The display value
+ * The single-delegation silence window as a hand-filled MINUTE input. The display value
  * is the exact `ms / 60000` (no trailing zeros); a commit (blur or Enter) writes
  * `round(minutes * 60000)` only when it lands in [1000, 86400000] ms — an
  * empty, non-numeric or out-of-range draft snaps back to the value in force.
@@ -165,7 +167,9 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
   const hint = guidanceHint(delegate.guidance, acp)
   // A reset is only honest when something is actually being overridden — the
   // same rule the idle-release card keeps (baseline = host defaultTimeoutMs).
-  const overridden = delegate.timeoutMs !== delegate.defaultTimeoutMs
+  // An older host half reports no defaultTimeoutMs: there is no baseline to
+  // compare against, so no reset appears rather than a fabricated one.
+  const overridden = delegate.defaultTimeoutMs !== undefined && delegate.timeoutMs !== delegate.defaultTimeoutMs
   const resetLabel = delegate.configured?.timeoutMs === undefined
     ? acp.label('恢复默认值', 'Restore default')
     : acp.label('恢复配置文件的值', 'Use config file value')
@@ -251,8 +255,8 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
           />
           <div className="dwa-preference-copy">
             {acp.label(
-              '超时后中止子代理并报错；默认跟随全局，可手填覆盖。',
-              'Past this, the subagent is aborted and the call errors; defaults to the global window, hand-fill to override.',
+              '持续无新产出达到该时长即中止并报错；默认跟随全局，可手填覆盖。',
+              'Aborts and errors after this much silence with no new output; defaults to the global window, hand-fill to override.',
             )}
           </div>
           {timeoutNote !== undefined && <div className="dwa-deadline-flag">⚠ {timeoutNote}</div>}

@@ -18,6 +18,7 @@
  * module stays free of Node APIs; time and events come from the host seams.
  */
 import type { AcpEvent, AcpDelegatePolicy, AcpStartSessionOpts, DelegateGuidance } from '../protocol.ts'
+import { DELEGATE_TIMEOUT_MAX_MS } from '../protocol.ts'
 import { isAbsolutePath } from '../impl.ts'
 import { isPerSessionAgent } from './identity.ts'
 import { chunkTextOf, codebuddyMetaOf } from './turn-stream.ts'
@@ -125,12 +126,14 @@ function autoPolicyFor(agentId: string): AcpDelegatePolicy {
  * The register-ready tool definition (compiled JSON Schema + `output.render`,
  * the verified `virtualToolDefinition` shape — NOT the `defineTool` DSL).
  *
- * The guidance rung bakes into the description and the budget into `timeoutMs`
- * (+30s cooperative grace over the internal window); hot changes re-register
- * through `AcpDelegateRegistration`. `off` still builds the base description —
- * the builder never judges `off`; registration decides whether to register.
+ * The guidance rung bakes into the description; hot changes re-register
+ * through `AcpDelegateRegistration`. The host budget is the FIXED 24h absolute
+ * backstop (`DELEGATE_TIMEOUT_MAX_MS`), independent of the configured silence
+ * window — that window is read live per execute, never baked in here. `off`
+ * still builds the base description — the builder never judges `off`;
+ * registration decides whether to register.
  */
-export function acpDelegateToolDefinition(opts: { guidance: DelegateGuidance; timeoutMs: number; execute: AcpDelegateExecute }): {
+export function acpDelegateToolDefinition(opts: { guidance: DelegateGuidance; execute: AcpDelegateExecute }): {
   name: string
   description: string
   parameters: Record<string, unknown>
@@ -166,9 +169,13 @@ export function acpDelegateToolDefinition(opts: { guidance: DelegateGuidance; ti
       },
       render: (_args: unknown, value: unknown) => [{ type: 'text', text: String((value as { text?: unknown } | null | undefined)?.text ?? '') }],
     },
-    // Cooperative budget: the host aborts the derived signal at this deadline
-    // and only replaces the result with TOOL_TIMEOUT after execute settles.
-    timeoutMs: opts.timeoutMs + 30_000,
+    // Host cooperative budget: a FIXED 24h absolute backstop from execute
+    // start — a runaway loop that keeps producing output never goes silent,
+    // so the rolling silence window alone cannot stop it. At the deadline the
+    // host aborts the derived signal and only replaces the result with
+    // TOOL_TIMEOUT after execute settles. Normal termination is the internal
+    // silence window's job (read live per execute, not baked in here).
+    timeoutMs: DELEGATE_TIMEOUT_MAX_MS,
     execute: opts.execute,
   }
 }
@@ -357,17 +364,43 @@ export class AcpDelegateService {
       if (chunk === '') return
       text += chunk
     }
+    // ---- rolling silence window (step 7) ----
+    // ONE window, renewed by activity — the same idea as the main session's
+    // turn watchdog (constraint 23): only silence counts toward the timeout.
+    // Every hub event of THIS session re-arms it: any `session/update` kind
+    // (tool_call / tool_call_update progress frames included, not just message
+    // chunks) and `permission/expired` settlements. The main session escalates
+    // to a longer tier for a fully silent OPEN tool call; delegation
+    // deliberately keeps a SINGLE window — tool progress frames renew it, so
+    // a working agent is never cut off mid-task BY THE SILENCE WINDOW. The
+    // host's fixed 24h absolute backstop from execute start still applies
+    // (acpDelegateToolDefinition) against runaway loops that never go silent.
+    // Never add a second window.
+    let silenceTimer: ReturnType<typeof setTimeout> | undefined
+    const touchSilence = (): void => {
+      // After settlement a late event must not re-arm: no dangling timer may
+      // fire a second settle (first cause wins).
+      if (outcome !== 'pending') return
+      if (silenceTimer !== undefined) clearTimeout(silenceTimer)
+      silenceTimer = setTimeout(() => { settle('timed-out') }, config.timeoutMs)
+    }
     // Subscribe BEFORE the prompt so no chunk of the turn can slip past.
     const unsubscribe = this.host.hub.subscribe(event => {
       switch (event.type) {
         case 'session/update':
-          if (event.sessionId === sessionId) collect(event.seq, event.update)
+          if (event.sessionId !== sessionId) return
+          // ANY kind is activity and renews the window; collect() below keeps
+          // only the answer text.
+          touchSilence()
+          collect(event.seq, event.update)
           return
         // No `permission/request` case: the policy is auto+0, so the bridge
         // answers every ask in place and never broadcasts a request frame.
         // The fold counts only the settlement outcomes below.
         case 'permission/expired':
           if (event.sessionId !== sessionId) return
+          // A settled ask is activity too — it renews the silence window.
+          touchSilence()
           // `selected` = auto-answered; anything else (the degraded abort when
           // no legal option can be picked) = refused. `permission/resolved` is
           // NOT counted — it is the generic per-settlement frame and would
@@ -388,13 +421,14 @@ export class AcpDelegateService {
       }
     })
 
-    // ---- step 7: prompt, then wait on turn/end / timeout / abort ----
+    // ---- step 7: prompt, then wait on turn/end / silence / abort ----
     const onAbort = () => { settle('aborted') }
     signal?.addEventListener('abort', onAbort, { once: true })
     if (isAborted(signal)) onAbort()
-    // The internal window starts when the prompt goes out, ahead of the
-    // host's +30s cooperative budget.
-    const timer = setTimeout(() => { settle('timed-out') }, config.timeoutMs)
+    // Arm the silence window BEFORE the prompt goes out (a prompt that never
+    // answers is silence too); activity renews it. The host's fixed 24h
+    // absolute backstop still runs from execute start, outside this window.
+    touchSilence()
     try {
       // A rejected prompt (turn_in_flight, agent died, …) settles the wait
       // too; its error surfaces after the bounded cleanup below.
@@ -403,17 +437,17 @@ export class AcpDelegateService {
         (error: unknown) => { settle('prompt-error', error) },
       )
       await endSignal
-      clearTimeout(timer)
+      clearTimeout(silenceTimer)
       signal?.removeEventListener('abort', onAbort)
       if (outcome !== 'ended') {
         // Self-settling failure path: cancel THEN close, and never wait for a
         // turn/end afterwards (close does not emit one). Each cleanup step is
         // awaited once, bounded by the host's own close/cancel races, so the
-        // whole settlement lands inside the +30s grace.
+        // whole settlement lands well inside the host's fixed 24h backstop.
         try { await this.host.cancel(sessionId) } catch { /* bounded cleanup */ }
         await closeQuietly()
         if (outcome === 'aborted') throw new Error('acp_delegate: aborted')
-        if (outcome === 'timed-out') throw new Error(`acp_delegate: timed out after ${String(config.timeoutMs)}ms`)
+        if (outcome === 'timed-out') throw new Error(`acp_delegate: timed out after ${String(config.timeoutMs)}ms of silence`)
         throw new Error(`acp_delegate: ${messageOf(promptFailure)}`)
       }
       // Step 9: text fallback — read the transcript ONCE, before close (close
@@ -437,7 +471,7 @@ export class AcpDelegateService {
       if (turnError !== undefined) result.error = turnError
       return result
     } finally {
-      clearTimeout(timer)
+      clearTimeout(silenceTimer)
       signal?.removeEventListener('abort', onAbort)
       unsubscribe()
     }

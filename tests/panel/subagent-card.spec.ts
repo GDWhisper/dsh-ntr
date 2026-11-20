@@ -2,7 +2,8 @@
 // The subagent card: gating, the four-rung guidance switch, per-rung hints
 // and notes in host tokens, the hand-filled minute timeout input (no permission
 // row, no ladder), off-grid readouts, per-row override facts, a reset that
-// appears only when the window really overrides the baseline, and the
+// appears only when the window really overrides the baseline (an older host
+// half reporting no baseline gets no reset — the mixed-version guard), and the
 // availability facts. The shared panel fixture predates `ui/delegate`, so the
 // two routes are answered by a wrapper here while every other endpoint keeps
 // the fixture's behavior.
@@ -46,7 +47,7 @@ async function mountDelegate(seed: AcpDelegateSettings, options: { failWrite?: b
       }
       // A reset returns to the configured baseline, else the host default.
       for (const key of patch.reset ?? []) {
-        if (key === 'timeoutMs') next = { ...next, timeoutMs: current.configured?.timeoutMs ?? current.defaultTimeoutMs }
+        if (key === 'timeoutMs') next = { ...next, timeoutMs: current.configured?.timeoutMs ?? current.defaultTimeoutMs ?? next.timeoutMs }
         if (key === 'guidance') next = { ...next, guidance: current.configured?.guidance ?? 'off' }
       }
       current = next
@@ -231,6 +232,16 @@ describe('SubagentCard', () => {
     await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ reset: ['timeoutMs'] }]))
     expect(store.getSnapshot().delegate?.timeoutMs).toBe(2_400_000)
     await waitFor(() => expect(screen.queryByRole('button', { name: '恢复默认值' })).toBeNull())
+  })
+
+  it('offers no reset on an older host half that reports no defaultTimeoutMs (mixed-version guard)', async () => {
+    // The old half reports the running window but no baseline: the card must
+    // not invent one, so no reset appears even though the value looks changed.
+    await mountDelegate({ guidance: 'off', timeoutMs: 5_400_000, toolAvailable: true, restrictAvailable: true })
+    await category('子代理')
+    expect(screen.getByText('90 分钟', { selector: '.dwa-deadline-value' })).toBeDefined()
+    expect(screen.queryByRole('button', { name: '恢复默认值' })).toBeNull()
+    expect(screen.queryByRole('button', { name: '恢复配置文件的值' })).toBeNull()
   })
 
   it('reports a missing tool service as a fact beside the switch', async () => {

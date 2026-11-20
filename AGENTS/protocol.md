@@ -58,7 +58,7 @@
 
 - **`ui/delegate`（读）**：回 `{ delegate?: AcpDelegateSettings }`——生效两键 + `defaultTimeoutMs`（重置去处）+ `configured`（部署基线里真写了的键）+ `toolAvailable` / `restrictAvailable`（manager 用注册探针包 settings 的读数）。旧宿主半区没有这个端点 / manager 缺成员时 `delegate` 为 `undefined`，浏览器据此隐藏整张「子代理」卡（[ui-panel.md §8](./ui-panel.md)），不显示自己编的数。
 - **`ui/delegate-set`（写）**：`validateDelegateSettings` 逐键校验后写覆盖、落盘、`syncDelegateRegistration` 对账注册与掩码，**写后重读**回同一份 `{ delegate }`（仿 `approval-deadlines-set`，宿主回包是权威）。省略的键保持原值；`reset` 按键删持久化覆盖（基线 / 内置默认重新决定），同一键不得在一次调用里既写又重置。
-- **词表与范围**：`guidance` 只收四档（`DELEGATE_GUIDANCE`）、`timeoutMs` 收 [1000, 86400000] 的任意整数（`validateDelegateMs`，设置写与部署基线 `validateDelegateConfig` 同范围），非法回 `bad_payload`；off-grid 照原值运行，重启读盘按范围过滤、退役键静默丢弃（[state.md §1](./state.md)）。`timeoutMs` 内置默认跟随全局后台长窗（`backgroundTaskToolMs`，`0` 回落 `backgroundTaskMaxMs`），不是常量。
+- **词表与范围**：`guidance` 只收四档（`DELEGATE_GUIDANCE`）、`timeoutMs` 收 [1000, 86400000] 的任意整数（`validateDelegateMs`，设置写与部署基线 `validateDelegateConfig` 同范围），非法回 `bad_payload`；off-grid 照原值运行，重启读盘按范围过滤、退役键静默丢弃（[state.md §1](./state.md)）。`timeoutMs` 是**滚动静默窗**（`delegate-service.ts` · `touchSilence`）：本会话任何 `session/update`（含 tool_call / tool_call_update 进度帧）与 `permission/expired` 都 clear+重新 arm，持续无新产出达该时长才 `timed-out`（报错带 `of silence`）；settle 后迟到事件不再 arm。与主会话看门狗同思路、刻意**单窗**（主会话对完全静默的开放工具调用另有加档，委派不加第二窗）。宿主工具预算是**固定 24 小时绝对兜底**（`DELEGATE_TIMEOUT_MAX_MS`，自 execute 起算，防持续产出的失控循环；到点 abort 派生 signal、execute settle 后才替换 TOOL_TIMEOUT），静默窗才是正常中止，配置静默窗不 bake 进注册预算。内置默认跟随全局后台长窗（`backgroundTaskToolMs`，`0` 回落 `backgroundTaskMaxMs`），不是常量。
 - 恒 auto 的会话级策略与计数见 [permissions.md §2.5](./permissions.md)；工具注册 / 摘除与 force 掩码的热对账见 `src/bridge/delegate-registration.ts` · `AcpDelegateRegistration.sync`。
 
 ## 2. 进程死亡 ≠ 会话销毁
