@@ -14,10 +14,9 @@ import {
   validateDelegateConfig,
   validateDelegateGuidance,
   validateDelegateMs,
-  validateDelegatePermissionMode,
   validateDelegateSettings,
 } from '../../src/impl.ts'
-import { DELEGATE_GUIDANCE, DELEGATE_TIMEOUT_MS } from '../../src/protocol.ts'
+import { DELEGATE_GUIDANCE } from '../../src/protocol.ts'
 
 describe('validateConfig', () => {
   it('applies defaults', () => {
@@ -354,47 +353,47 @@ describe('delegate config validation', () => {
     expect(validateConfig({ agents: [], delegate: { guidance: 'enhanced' } }).delegate).toEqual({ guidance: 'enhanced' })
   })
 
-  it('accepts only the three delegation permission modes', () => {
-    for (const mode of ['auto', 'abort', 'ask'] as const) {
-      expect(validateDelegatePermissionMode(mode, 'bad_config')).toBe(mode)
-      expect(validateDelegatePermissionMode(mode, 'bad_payload')).toBe(mode)
-    }
-    // `wait` is the MAIN conversation's approval mode, not a delegation rung.
-    for (const bad of ['wait', 'maybe', '', 1, null]) {
-      expectCode(() => validateDelegatePermissionMode(bad, 'bad_config'), 'bad_config')
-      expectCode(() => validateDelegatePermissionMode(bad, 'bad_payload'), 'bad_payload')
-    }
-    expect(validateDelegateConfig({ permissionMode: 'ask' })).toEqual({ permissionMode: 'ask' })
-    expectCode(() => validateDelegateConfig({ permissionMode: 'wait' }), 'bad_config')
+  it('silently drops the retired permission key from a persisted baseline', () => {
+    // The retired delegation permission key, spelled dynamically so the ghost
+    // symbol does not reappear literally in source (see AGENTS/retired.md).
+    const retired = ['permission', 'Mode'].join('')
+    // An old file that named the retired key validates clean: the rebuild only
+    // recognizes the known keys, so the retired one is dropped, not rejected.
+    expect(validateDelegateConfig({ [retired]: 'ask' })).toEqual({})
+    expect(validateDelegateConfig({ guidance: 'on', [retired]: 'auto' })).toEqual({ guidance: 'on' })
+    expect(validateConfig({ agents: [], delegate: { [retired]: 'ask' } }).delegate).toEqual({})
+    // The settings write drops it too (unknown keys never reach the manager).
+    expect(validateDelegateSettings({ [retired]: 'ask' })).toEqual({})
   })
 
-  it('holds the deployment numbers to the wide range, off-ladder included', () => {
-    // Off-ladder but in range: the deployment value runs as-is.
+  it('holds the deployment window to [1000, 86400000], off-grid included', () => {
+    // Off-grid but in range: the deployment value runs as-is.
     expect(validateDelegateConfig({ timeoutMs: 123_456 })).toEqual({ timeoutMs: 123_456 })
-    // The range edges are inclusive.
+    // The range edges are inclusive (1 second … 24 hours).
     expect(validateDelegateConfig({ timeoutMs: 1_000 })).toEqual({ timeoutMs: 1_000 })
-    expect(validateDelegateConfig({ timeoutMs: 3_600_000 })).toEqual({ timeoutMs: 3_600_000 })
+    expect(validateDelegateConfig({ timeoutMs: 86_400_000 })).toEqual({ timeoutMs: 86_400_000 })
     // Out of range / non-integers fail loudly at boot.
-    for (const bad of [999, 3_600_001, -1, 1.5, '600000', null]) {
+    for (const bad of [999, 86_400_001, -1, 1.5, '600000', null]) {
       expectCode(() => validateDelegateConfig({ timeoutMs: bad }), 'bad_config')
     }
     expectCode(() => validateDelegateConfig('nope'), 'bad_config')
   })
 
-  it('accepts only ladder rungs on the settings-page write', () => {
-    for (const rung of DELEGATE_TIMEOUT_MS) {
-      expect(validateDelegateMs(rung, 'bad_payload')).toBe(rung)
-    }
-    // In range for the DEPLOYMENT but off the ladder: the browser cannot write it.
-    expectCode(() => validateDelegateMs(123_456, 'bad_payload'), 'bad_payload')
-    expect(validateDelegateSettings({ timeoutMs: 600_000 })).toEqual({ timeoutMs: 600_000 })
-    expectCode(() => validateDelegateSettings({ timeoutMs: 123_456 }), 'bad_payload')
-    for (const bad of [0, -1, 1.5, '600000', null]) {
+  it('accepts the same [1000, 86400000] range on the settings-page write', () => {
+    // The minute input writes round(minutes*60000); any in-range integer passes,
+    // off-grid included (there is no ladder anymore).
+    expect(validateDelegateMs(123_456, 'bad_payload')).toBe(123_456)
+    expect(validateDelegateMs(1_000, 'bad_payload')).toBe(1_000)
+    expect(validateDelegateMs(86_400_000, 'bad_payload')).toBe(86_400_000)
+    expect(validateDelegateSettings({ timeoutMs: 5_400_000 })).toEqual({ timeoutMs: 5_400_000 })
+    expect(validateDelegateSettings({ timeoutMs: 123_456 })).toEqual({ timeoutMs: 123_456 })
+    for (const bad of [999, 86_400_001, 0, -1, 1.5, '600000', null]) {
+      expectCode(() => validateDelegateMs(bad, 'bad_payload'), 'bad_payload')
       expectCode(() => validateDelegateSettings({ timeoutMs: bad }), 'bad_payload')
     }
   })
 
-  it('validates reset: the three keys, deduped, never both written and reset', () => {
+  it('validates reset: the two keys, deduped, never both written and reset', () => {
     expect(validateDelegateSettings({ reset: ['guidance', 'timeoutMs'] })).toEqual({ reset: ['guidance', 'timeoutMs'] })
     expect(validateDelegateSettings({ reset: ['guidance', 'guidance'] })).toEqual({ reset: ['guidance'] })
     expect(validateDelegateSettings({ reset: [] })).toEqual({ reset: [] })
@@ -403,6 +402,8 @@ describe('delegate config validation', () => {
     for (const bad of [['bogus'], ['guidance', 1], [null], 'guidance', true, {}]) {
       expectCode(() => validateDelegateSettings({ reset: bad }), 'bad_payload')
     }
+    // The retired permission key is no longer part of the reset vocabulary.
+    expectCode(() => validateDelegateSettings({ reset: [['permission', 'Mode'].join('')] }), 'bad_payload')
     // The same key cannot be both written and reset in one call.
     expectCode(() => validateDelegateSettings({ guidance: 'on', reset: ['guidance'] }), 'bad_payload')
     expectCode(() => validateDelegateSettings({ timeoutMs: 600_000, reset: ['timeoutMs'] }), 'bad_payload')

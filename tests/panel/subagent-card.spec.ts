@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 // The subagent card: gating, the four-rung guidance switch, per-rung hints
-// and notes in host tokens, the permission rungs, off-ladder readouts,
-// per-row override facts (no reset buttons), and the availability facts.
-// The shared panel fixture
-// predates `ui/delegate`, so the two routes are answered by a wrapper here
-// while every other endpoint keeps the fixture's behavior.
+// and notes in host tokens, the hand-filled minute timeout input (no permission
+// row, no ladder), off-grid readouts, per-row override facts, a reset that
+// appears only when the window really overrides the baseline, and the
+// availability facts. The shared panel fixture predates `ui/delegate`, so the
+// two routes are answered by a wrapper here while every other endpoint keeps
+// the fixture's behavior.
 import { createElement } from 'react'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -17,7 +18,7 @@ import { category, click, mountPanel } from './harness.ts'
 afterEach(cleanup)
 
 const BASE: AcpDelegateSettings = {
-  guidance: 'off', permissionMode: 'auto', timeoutMs: 600_000,
+  guidance: 'off', timeoutMs: 2_400_000, defaultTimeoutMs: 2_400_000,
   toolAvailable: true, restrictAvailable: true,
 }
 
@@ -38,11 +39,15 @@ async function mountDelegate(seed: AcpDelegateSettings, options: { failWrite?: b
     if (channel === '/acp' && endpoint === 'ui/delegate-set') {
       if (options.failWrite === true) return { ok: false, error: { code: 'bad_payload', message: 'no' } }
       const patch = structuredClone(payload) as DelegateSetPayload
-      const next: AcpDelegateSettings = {
+      let next: AcpDelegateSettings = {
         ...current,
         ...(patch.guidance === undefined ? {} : { guidance: patch.guidance }),
-        ...(patch.permissionMode === undefined ? {} : { permissionMode: patch.permissionMode }),
         ...(patch.timeoutMs === undefined ? {} : { timeoutMs: patch.timeoutMs }),
+      }
+      // A reset returns to the configured baseline, else the host default.
+      for (const key of patch.reset ?? []) {
+        if (key === 'timeoutMs') next = { ...next, timeoutMs: current.configured?.timeoutMs ?? current.defaultTimeoutMs }
+        if (key === 'guidance') next = { ...next, guidance: current.configured?.guidance ?? 'off' }
       }
       current = next
       return { ok: true, value: { delegate: structuredClone(current) } }
@@ -135,7 +140,7 @@ describe('SubagentCard', () => {
     expect(screen.getByText('强制模式会屏蔽 DSH 的原生 subagent 能力，请谨慎开启。')).toBeDefined()
   })
 
-  it('centers tick labels on the exact rung fractions', async () => {
+  it('centers the guidance tick labels on the exact rung fractions', async () => {
     await mountDelegate(BASE)
     await category('子代理')
     const guidanceLefts = ['关闭', '开启', '引导增强', '强制模式'].map(name =>
@@ -144,55 +149,88 @@ describe('SubagentCard', () => {
     expect(guidanceLefts[1]).toBeCloseTo(100 / 3, 6)
     expect(guidanceLefts[2]).toBeCloseTo(200 / 3, 6)
     expect(guidanceLefts[3]).toBe(100)
-    expect(screen.getByText('5 分钟', { selector: '.dwa-deadline-ticks span' }).style.left).toBe('20%')
-    expect(screen.getByText('1 小时', { selector: '.dwa-deadline-ticks span' }).style.left).toBe('100%')
   })
 
-  it('writes the picked permission rung', async () => {
-    const { store, calls } = await mountDelegate(BASE)
+  it('renders no permission row — the delegation policy is always auto', async () => {
+    await mountDelegate(BASE)
     await category('子代理')
-    await click(screen.getByRole('button', { name: '直接拒绝' }))
-    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ permissionMode: 'abort' }]))
-    expect(store.getSnapshot().delegate?.permissionMode).toBe('abort')
-    expect(screen.getByRole('button', { name: '直接拒绝' }).className).toBe('is-on')
-    await click(screen.getByRole('button', { name: '人工确认' }))
-    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toHaveLength(2))
-    expect(writes(calls, 'ui/delegate-set')[1]).toEqual({ permissionMode: 'ask' })
-    expect(store.getSnapshot().delegate?.permissionMode).toBe('ask')
+    expect(screen.queryByRole('button', { name: '自动代答' })).toBeNull()
+    expect(screen.queryByRole('button', { name: '直接拒绝' })).toBeNull()
+    expect(screen.queryByRole('button', { name: '人工确认' })).toBeNull()
+    expect(screen.queryByText('权限', { selector: '.dwa-preference-label' })).toBeNull()
+    expect(screen.queryByText(/委派期间的审批请求如何作答/)).toBeNull()
   })
 
-  it('writes the picked timeout rung', async () => {
+  it('writes a hand-filled minute value as round(minutes*60000)', async () => {
     const { calls } = await mountDelegate(BASE)
     await category('子代理')
-    expect(screen.getByText('10 分钟', { selector: '.dwa-deadline-value' })).toBeDefined()
-    fireEvent.change(screen.getByRole('slider', { name: '单次时限' }), { target: { value: '5' } })
-    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ timeoutMs: 3_600_000 }]))
+    const input = screen.getByRole('spinbutton', { name: '单次时限' }) as HTMLInputElement
+    // The display value is the exact ms/60000 with no trailing zeros.
+    expect(input.value).toBe('40')
+    fireEvent.change(input, { target: { value: '90' } })
+    fireEvent.blur(input)
+    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ timeoutMs: 5_400_000 }]))
   })
 
-  it('prints an off-ladder value exactly and parks the slider on the nearest rung', async () => {
+  it('commits a hand-filled minute value on Enter as round(minutes*60000)', async () => {
+    const { calls } = await mountDelegate(BASE)
+    await category('子代理')
+    const input = screen.getByRole('spinbutton', { name: '单次时限' }) as HTMLInputElement
+    fireEvent.change(input, { target: { value: '90' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ timeoutMs: 5_400_000 }]))
+  })
+
+  it('snaps an empty, non-numeric or out-of-range draft back on blur, without writing', async () => {
+    const { calls } = await mountDelegate(BASE)
+    await category('子代理')
+    const input = screen.getByRole('spinbutton', { name: '单次时限' }) as HTMLInputElement
+    // 0 minutes → 0 ms (below the 1 s floor); 1500 minutes → 25 h (above the 24 h ceiling).
+    for (const bad of ['', 'abc', '0', '1500']) {
+      fireEvent.change(input, { target: { value: bad } })
+      fireEvent.blur(input)
+      // The draft returns to the exact value in force (40 minutes); no RPC fires.
+      await waitFor(() => expect(input.value).toBe('40'))
+    }
+    expect(writes(calls, 'ui/delegate-set')).toEqual([])
+  })
+
+  it('prints an off-grid window exactly, with no slider to round it', async () => {
     await mountDelegate({ ...BASE, timeoutMs: 700_000 })
     await category('子代理')
     expect(screen.getByText('700 秒', { selector: '.dwa-deadline-value' })).toBeDefined()
-    expect((screen.getByRole('slider', { name: '单次时限' }) as HTMLInputElement).value).toBe('2')
+    expect(screen.queryByRole('slider', { name: '单次时限' })).toBeNull()
   })
 
-  it('shows the config-file facts on the rows really overridden, without reset buttons', async () => {
-    await mountDelegate({
-      ...BASE, guidance: 'force', timeoutMs: 900_000, configured: { guidance: 'on', timeoutMs: 300_000 },
+  it('shows the config-file facts on the rows really overridden, with a reset back to the file value', async () => {
+    const { calls } = await mountDelegate({
+      ...BASE, guidance: 'force', timeoutMs: 900_000, defaultTimeoutMs: 300_000,
+      configured: { guidance: 'on', timeoutMs: 300_000 },
     })
     await category('子代理')
     expect(screen.getByText(/配置文件要求：开启/).className).toContain('dwa-deadline-flag')
     expect(screen.getByText(/配置文件要求：5 分钟/).className).toContain('dwa-deadline-flag')
-    expect(screen.queryByRole('button', { name: '恢复配置文件的值' })).toBeNull()
-    expect(screen.queryByRole('button', { name: '恢复默认值' })).toBeNull()
+    // The window overrides the baseline → a reset labelled to the config value appears.
+    await click(screen.getByRole('button', { name: '恢复配置文件的值' }))
+    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ reset: ['timeoutMs'] }]))
   })
 
-  it('offers no reset buttons and no override facts when nothing is overridden', async () => {
+  it('offers no reset button and no override facts when nothing is overridden', async () => {
     await mountDelegate({ ...BASE, guidance: 'on', configured: { guidance: 'on' } })
     await category('子代理')
     expect(screen.queryByText(/配置文件要求/)).toBeNull()
     expect(screen.queryByRole('button', { name: '恢复配置文件的值' })).toBeNull()
     expect(screen.queryByRole('button', { name: '恢复默认值' })).toBeNull()
+  })
+
+  it('resetting the window restores the baseline and hides the reset button', async () => {
+    const { store, calls } = await mountDelegate({ ...BASE, timeoutMs: 5_400_000 })
+    await category('子代理')
+    expect(screen.getByText('90 分钟', { selector: '.dwa-deadline-value' })).toBeDefined()
+    await click(screen.getByRole('button', { name: '恢复默认值' }))
+    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ reset: ['timeoutMs'] }]))
+    expect(store.getSnapshot().delegate?.timeoutMs).toBe(2_400_000)
+    await waitFor(() => expect(screen.queryByRole('button', { name: '恢复默认值' })).toBeNull())
   })
 
   it('reports a missing tool service as a fact beside the switch', async () => {

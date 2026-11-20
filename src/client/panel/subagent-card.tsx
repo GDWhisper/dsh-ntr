@@ -1,22 +1,24 @@
 /**
  * The subagent card: the `acp_delegate` tool's deployment-wide parameters —
- * one guidance rung that doubles as the registration switch, the delegation's
- * OWN permission policy and one timeout window.
+ * one guidance rung that doubles as the registration switch, and one
+ * single-delegation timeout window. The delegation's session permission policy
+ * is always auto-answer (there is no knob for it here); the main conversation's
+ * approval settings are untouched.
  *
- * ONE ladder per knob, shared with the host half ({@link DELEGATE_GUIDANCE},
- * {@link DELEGATE_TIMEOUT_MS}): every rung a
- * slider can produce is a value the host runs. A numeric value the deployment
- * named off its ladder still runs as configured — the readout prints the exact
- * number and the thumb parks on the nearest rung (the IdleReleaseCard rule).
+ * The guidance rung is a shared ladder ({@link DELEGATE_GUIDANCE}): every rung
+ * the slider offers is a value the host runs. The timeout is a hand-filled
+ * MINUTE input (no ladder): the readout prints the exact window in force — an
+ * off-grid value is never rounded to a lie — and a commit writes
+ * `round(minutes * 60000)` only within [1000, 86400000] ms. Its reset button
+ * mirrors the IdleReleaseCard rule: it appears only when the window really
+ * overrides the host-reported `defaultTimeoutMs`.
  *
  * Writes are immediate RPCs (never an `agent/save` form): the store moves the
  * picked key optimistically, adopts the host answer as the authority, and
- * reverts on a failure. Each row carries its own override fact; the card
- * renders no reset buttons (the reset RPC stays a store/host contract).
+ * reverts on a failure. Each row carries its own override fact.
  * The guidance row's hint is per-rung ({@link guidanceHint}): off and on a
  * banner in the warn-box shape (neutral primary-label fact / success-green
- * confirmation); enhanced/force only their own warn boxes. The old ladder
- * sentence is removed from every rung.
+ * confirmation); enhanced/force only their own warn boxes.
  *
  * Colors follow constraint 34 through host alias tokens. The host theme has
  * no `state-warning-*` / `state-danger-*` family (verified against the shipped
@@ -24,13 +26,11 @@
  * the force rung `state-error-primary` on `interactive-bg-hover-danger` — the
  * host's own danger background. Literals sit only in `var()` fallbacks.
  */
-import { DELEGATE_GUIDANCE, DELEGATE_TIMEOUT_MS } from '../../protocol.ts'
-import type { AcpDelegateSettings, DelegateGuidance, DelegatePermissionMode, DelegateSettingKey } from '../../protocol.ts'
+import { useEffect, useState } from 'react'
+import { DELEGATE_GUIDANCE, DELEGATE_TIMEOUT_MAX_MS, DELEGATE_TIMEOUT_MIN_MS } from '../../protocol.ts'
+import type { AcpDelegateSettings, DelegateGuidance, DelegateSettingKey } from '../../protocol.ts'
 import type { AcpStore, UiState } from '../store.ts'
 import { tickLeft } from './shared.ts'
-
-/** The permission rungs, in the order a user reads them: answer, refuse, ask. */
-const DELEGATE_PERMISSION_MODES: readonly DelegatePermissionMode[] = ['auto', 'abort', 'ask']
 
 /** The guidance rung's label — one formatter, so readout, ticks and notes agree. */
 function guidanceText(guidance: DelegateGuidance, acp: AcpStore): string {
@@ -40,17 +40,10 @@ function guidanceText(guidance: DelegateGuidance, acp: AcpStore): string {
   return acp.label('强制模式', 'Force')
 }
 
-/** The permission rung's label. */
-function permissionText(mode: DelegatePermissionMode, acp: AcpStore): string {
-  if (mode === 'auto') return acp.label('自动代答', 'Auto-answer')
-  if (mode === 'abort') return acp.label('直接拒绝', 'Refuse')
-  return acp.label('人工确认', 'Ask me')
-}
-
 /**
- * `10 分钟` / `1 小时` / `45 秒` — the readout and the tick label, one
- * formatter. Exact at every value: an off-ladder window prints its real
- * number (down to the second) instead of rounding to a rung it is not.
+ * `40 分钟` / `1 小时` / `45 秒` — the exact readout, one formatter. Exact at
+ * every value: an off-grid window prints its real number (down to the second)
+ * instead of rounding to a value it is not.
  */
 function delegateTimeoutText(ms: number, acp: AcpStore): string {
   if (ms % 3_600_000 === 0) return acp.label(`${String(ms / 3_600_000)} 小时`, `${String(ms / 3_600_000)}h`)
@@ -59,21 +52,12 @@ function delegateTimeoutText(ms: number, acp: AcpStore): string {
 }
 
 /**
- * The rung nearest a value that is not on the ladder — used only to park the
- * thumb; the readout always prints the exact value. A tie goes to the first
- * (smaller) rung, the same rule nearestIdleRung keeps.
+ * The minute input's display value: `ms / 60000` exactly, with no trailing
+ * zeros (JS number-to-string strips them). An off-grid window keeps its exact
+ * fractional minutes rather than rounding to a lie.
  */
-function nearestDelegateRung(ladder: readonly number[], value: number): number {
-  let best = ladder[0]
-  let bestDistance = Number.POSITIVE_INFINITY
-  for (const rung of ladder) {
-    const distance = Math.abs(rung - value)
-    if (distance < bestDistance) {
-      bestDistance = distance
-      best = rung
-    }
-  }
-  return best
+function minutesText(ms: number): string {
+  return String(ms / 60_000)
 }
 
 /**
@@ -98,9 +82,9 @@ function delegateOverrideNote<K extends DelegateSettingKey>(
  * colored left border): off a neutral fact in the primary label color on a
  * layer background, on a success-green confirmation that the tool registers
  * next turn. enhanced / force return undefined — their warn boxes below are
- * the only note; the old ladder sentence is gone from every rung. Colors are
- * host alias tokens only (constraint 34, state-*-primary foreground on
- * state-*-tertiary background); literals sit in the var() fallbacks.
+ * the only note. Colors are host alias tokens only (constraint 34,
+ * state-*-primary foreground on state-*-tertiary background); literals sit in
+ * the var() fallbacks.
  */
 function guidanceHint(guidance: DelegateGuidance, acp: AcpStore): {
   text: string
@@ -132,49 +116,44 @@ function guidanceHint(guidance: DelegateGuidance, acp: AcpStore): {
 }
 
 /**
- * One numeric ladder slider: the exact readout, the thumb (parked on the
- * nearest rung when the value is off the ladder) and the tick labels.
+ * The single-delegation window as a hand-filled MINUTE input. The display value
+ * is the exact `ms / 60000` (no trailing zeros); a commit (blur or Enter) writes
+ * `round(minutes * 60000)` only when it lands in [1000, 86400000] ms — an
+ * empty, non-numeric or out-of-range draft snaps back to the value in force.
+ * The draft re-syncs whenever the authoritative window changes (host answer /
+ * reset), so the input never claims a number that is not running.
  */
-function DelegateNumberSlider(props: {
-  name: string
-  value: number
-  ladder: readonly number[]
-  text: (value: number) => string
-  onPick: (value: number) => void
-}) {
-  const { name, value, ladder, text, onPick } = props
-  const index = ladder.indexOf(value)
-  const shown = index >= 0 ? value : nearestDelegateRung(ladder, value)
+function DelegateTimeoutInput(props: { ms: number; name: string; onCommit: (ms: number) => void }) {
+  const { ms, name, onCommit } = props
+  const [draft, setDraft] = useState(() => minutesText(ms))
+  useEffect(() => { setDraft(minutesText(ms)) }, [ms])
+  const commit = () => {
+    const minutes = Number(draft)
+    if (draft.trim() === '' || !Number.isFinite(minutes)) { setDraft(minutesText(ms)); return }
+    const next = Math.round(minutes * 60_000)
+    if (next < DELEGATE_TIMEOUT_MIN_MS || next > DELEGATE_TIMEOUT_MAX_MS || next === ms) { setDraft(minutesText(ms)); return }
+    onCommit(next)
+  }
   return (
-    <>
-      <div className="dwa-deadline-value">{text(value)}</div>
-      <input
-        className="dwa-deadline-range"
-        type="range"
-        min={0}
-        max={ladder.length - 1}
-        step={1}
-        value={index >= 0 ? index : ladder.indexOf(shown)}
-        aria-label={name}
-        onChange={event => {
-          const next = ladder[Number(event.target.value)]
-          if (next !== undefined && next !== value) onPick(next)
-        }}
-      />
-      <div className="dwa-deadline-ticks">
-        {ladder.map((rung, i) => (
-          <span key={rung} style={{ left: tickLeft(i, ladder.length) }}>{text(rung)}</span>
-        ))}
-      </div>
-    </>
+    <input
+      className="dwa-input"
+      type="number"
+      step="any"
+      value={draft}
+      aria-label={name}
+      onChange={event => setDraft(event.target.value)}
+      onBlur={commit}
+      onKeyDown={event => { if (event.key === 'Enter') commit() }}
+    />
   )
 }
 
 /**
- * The subagent card. Three rows, one sentence each; the guidance rung carries
+ * The subagent card. Two rows, one sentence each; the guidance rung carries
  * its per-rung note (enhanced warns, force warns harder) and the availability
  * facts the host reported, so a switch that cannot take effect says so instead
- * of pretending the request header changed.
+ * of pretending the request header changed. The timeout row offers a reset
+ * only when the window really overrides the baseline.
  */
 export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
   const { acp, ui } = props
@@ -182,9 +161,14 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
   // Older host half: no card rather than a number this browser invented.
   if (delegate === undefined) return null
   const guidanceNote = delegateOverrideNote(delegate, 'guidance', value => guidanceText(value, acp), acp)
-  const permissionNote = delegateOverrideNote(delegate, 'permissionMode', value => permissionText(value, acp), acp)
   const timeoutNote = delegateOverrideNote(delegate, 'timeoutMs', value => delegateTimeoutText(value, acp), acp)
   const hint = guidanceHint(delegate.guidance, acp)
+  // A reset is only honest when something is actually being overridden — the
+  // same rule the idle-release card keeps (baseline = host defaultTimeoutMs).
+  const overridden = delegate.timeoutMs !== delegate.defaultTimeoutMs
+  const resetLabel = delegate.configured?.timeoutMs === undefined
+    ? acp.label('恢复默认值', 'Restore default')
+    : acp.label('恢复配置文件的值', 'Use config file value')
   return (
     <section className="dwa-section">
       <div className="dwa-section-heading">
@@ -258,37 +242,27 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
           {guidanceNote !== undefined && <div className="dwa-deadline-flag">⚠ {guidanceNote}</div>}
         </div>
         <div className="dwa-preference-block">
-          <div className="dwa-preference-label">{acp.label('权限', 'Permissions')}</div>
-          <div className="dwa-seg dwa-seg-wide">
-            {DELEGATE_PERMISSION_MODES.map(option => (
-              <button
-                key={option}
-                type="button"
-                className={delegate.permissionMode === option ? 'is-on' : ''}
-                onClick={() => void acp.setDelegateSettings({ permissionMode: option })}
-              >
-                {permissionText(option, acp)}
-              </button>
-            ))}
-          </div>
-          <div className="dwa-preference-copy">
-            {acp.label('委派期间的审批请求如何作答。', 'How permission asks inside a delegation are answered.')}
-          </div>
-          {permissionNote !== undefined && <div className="dwa-deadline-flag">⚠ {permissionNote}</div>}
-        </div>
-        <div className="dwa-preference-block">
           <div className="dwa-preference-label">{acp.label('单次时限', 'Time limit')}</div>
-          <DelegateNumberSlider
+          <div className="dwa-deadline-value">{delegateTimeoutText(delegate.timeoutMs, acp)}</div>
+          <DelegateTimeoutInput
+            ms={delegate.timeoutMs}
             name={acp.label('单次时限', 'Time limit')}
-            value={delegate.timeoutMs}
-            ladder={DELEGATE_TIMEOUT_MS}
-            text={ms => delegateTimeoutText(ms, acp)}
-            onPick={ms => void acp.setDelegateSettings({ timeoutMs: ms })}
+            onCommit={ms => void acp.setDelegateSettings({ timeoutMs: ms })}
           />
           <div className="dwa-preference-copy">
-            {acp.label('超时后中止子代理并报错。', 'Past this, the subagent is aborted and the call errors.')}
+            {acp.label(
+              '超时后中止子代理并报错；默认跟随全局，可手填覆盖。',
+              'Past this, the subagent is aborted and the call errors; defaults to the global window, hand-fill to override.',
+            )}
           </div>
           {timeoutNote !== undefined && <div className="dwa-deadline-flag">⚠ {timeoutNote}</div>}
+          {overridden && (
+            <div className="dwa-deadline-reset">
+              <button type="button" className="dwa-btn dwa-btn-secondary" onClick={() => void acp.resetDelegateSetting('timeoutMs')}>
+                {resetLabel}
+              </button>
+            </div>
+          )}
         </div>
       </div>
     </section>

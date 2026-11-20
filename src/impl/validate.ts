@@ -8,8 +8,8 @@
  * APIs, no ACP SDK runtime values.
  */
 
-import type { AcpAgentDef, AcpDelegateConfig, AcpMcpServerDef, AcpPluginConfig, AcpTagHalo, ApprovalDeadlineKey, DelegateGuidance, DelegatePermissionMode, DelegateSetPayload, DelegateSettingKey, PermissionTimeoutMode } from '../protocol.ts'
-import { DEFAULT_IDLE_TIMEOUT_MS, DELEGATE_TIMEOUT_MS, IDLE_RELEASE_MS } from '../protocol.ts'
+import type { AcpAgentDef, AcpDelegateConfig, AcpMcpServerDef, AcpPluginConfig, AcpTagHalo, ApprovalDeadlineKey, DelegateGuidance, DelegateSetPayload, DelegateSettingKey, PermissionTimeoutMode } from '../protocol.ts'
+import { DEFAULT_IDLE_TIMEOUT_MS, DELEGATE_TIMEOUT_MAX_MS, DELEGATE_TIMEOUT_MIN_MS, IDLE_RELEASE_MS } from '../protocol.ts'
 import { splitCommandLine } from './command-line.ts'
 import { AcpError } from './errors.ts'
 import { isAbsolutePath } from './paths.ts'
@@ -202,29 +202,15 @@ export function validateDelegateGuidance(raw: unknown, code: 'bad_config' | 'bad
 }
 
 /**
- * Validate the delegation's OWN permission policy. Three values — auto-answer,
- * refuse, or wait for a human — and nothing else. This is the delegated
- * session's policy, never the main conversation's approval mode.
- */
-export function validateDelegatePermissionMode(raw: unknown, code: 'bad_config' | 'bad_payload'): DelegatePermissionMode {
-  if (raw !== 'auto' && raw !== 'abort' && raw !== 'ask') {
-    throw new AcpError(code, 'acp: delegate.permissionMode must be one of "auto", "abort", "ask"')
-  }
-  return raw
-}
-
-/**
- * Validate the single-delegation window the settings page writes.
- *
- * The window is expressed in MILLISECONDS on the shared ladder
- * ({@link DELEGATE_TIMEOUT_MS}), so a value the slider can produce is always a
- * value the host runs — the same one-ladder rule the idle-release card
- * follows. The deployment baseline is held to a WIDER range (see
- * {@link validateDelegateConfig}).
+ * Validate the single-delegation window, shared by the settings-page write
+ * ({@link validateDelegateSettings}) and the deployment baseline
+ * ({@link validateDelegateConfig}). Any integer in [1000, 86400000] ms
+ * (1 second to 24 hours) runs as-is — there is no ladder; the card prints the
+ * exact number and the minute input writes `round(minutes * 60000)`.
  */
 export function validateDelegateMs(raw: unknown, code: 'bad_config' | 'bad_payload'): number {
-  if (typeof raw !== 'number' || !Number.isInteger(raw) || !DELEGATE_TIMEOUT_MS.includes(raw)) {
-    throw new AcpError(code, `acp: delegate.timeoutMs must be one of ${DELEGATE_TIMEOUT_MS.join(', ')}`)
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < DELEGATE_TIMEOUT_MIN_MS || raw > DELEGATE_TIMEOUT_MAX_MS) {
+    throw new AcpError(code, `acp: delegate.timeoutMs must be an integer in [${String(DELEGATE_TIMEOUT_MIN_MS)}, ${String(DELEGATE_TIMEOUT_MAX_MS)}]`)
   }
   return raw
 }
@@ -233,11 +219,10 @@ export function validateDelegateMs(raw: unknown, code: 'bad_config' | 'bad_paylo
  * Validate the `delegate` deployment baseline (`cordis.patch.yml`).
  *
  * Absent / null means "name nothing": the built-in defaults decide. The
- * numeric range is deliberately WIDER than the settings ladder — a deployment
- * may name any integer in [1000, 3600000] ms and an off-ladder value runs
- * as-is (the same explicit design as the idle-release baseline). Unknown keys
- * are ignored; only the keys actually named are returned, so the baseline
- * never invents a fact the file did not state.
+ * numeric key accepts any integer in [1000, 86400000] ms — the same range the
+ * settings-page write accepts. Unknown keys (including retired ones left over
+ * from an older file) are silently dropped: only the keys actually named are
+ * returned, so the baseline never invents a fact the file did not state.
  */
 export function validateDelegateConfig(raw: unknown): AcpDelegateConfig {
   if (raw === null || raw === undefined) return {}
@@ -245,38 +230,29 @@ export function validateDelegateConfig(raw: unknown): AcpDelegateConfig {
   const row = raw as Record<string, unknown>
   const out: AcpDelegateConfig = {}
   if (row.guidance !== undefined) out.guidance = validateDelegateGuidance(row.guidance, 'bad_config')
-  if (row.permissionMode !== undefined) out.permissionMode = validateDelegatePermissionMode(row.permissionMode, 'bad_config')
-  if (row.timeoutMs !== undefined) {
-    const timeoutMs = row.timeoutMs
-    if (typeof timeoutMs !== 'number' || !Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 3_600_000) {
-      throw new AcpError('bad_config', 'acp: delegate.timeoutMs must be an integer in [1000, 3600000]')
-    }
-    out.timeoutMs = timeoutMs
-  }
+  if (row.timeoutMs !== undefined) out.timeoutMs = validateDelegateMs(row.timeoutMs, 'bad_config')
   return out
 }
 
 /**
  * Validate a settings-page delegation write. Omitted keys are simply absent
  * from the result — the manager merges, so a card that only moved the guidance
- * must not reset the window. The numeric keys accept only ladder rungs (the
- * deployment's wider range is not a door the browser can write through).
- * `reset` names the keys whose persisted override is dropped; a key cannot be
- * both written and reset in one call.
+ * must not reset the window. `timeoutMs` accepts any integer in
+ * [1000, 86400000]. `reset` names the keys whose persisted override is dropped;
+ * a key cannot be both written and reset in one call.
  */
 export function validateDelegateSettings(raw: unknown): DelegateSetPayload {
   if (raw === null || typeof raw !== 'object') throw new AcpError('bad_payload', 'acp: delegate settings must be an object')
   const row = raw as Record<string, unknown>
   const out: DelegateSetPayload = {}
   if (row.guidance !== undefined) out.guidance = validateDelegateGuidance(row.guidance, 'bad_payload')
-  if (row.permissionMode !== undefined) out.permissionMode = validateDelegatePermissionMode(row.permissionMode, 'bad_payload')
   if (row.timeoutMs !== undefined) out.timeoutMs = validateDelegateMs(row.timeoutMs, 'bad_payload')
   if (row.reset !== undefined) {
     if (!Array.isArray(row.reset)) throw new AcpError('bad_payload', 'acp: delegate reset must be an array of setting keys')
     const reset: DelegateSettingKey[] = []
     for (const key of row.reset as unknown[]) {
-      if (key !== 'guidance' && key !== 'permissionMode' && key !== 'timeoutMs') {
-        throw new AcpError('bad_payload', 'acp: delegate reset entries must be one of "guidance", "permissionMode", "timeoutMs"')
+      if (key !== 'guidance' && key !== 'timeoutMs') {
+        throw new AcpError('bad_payload', 'acp: delegate reset entries must be one of "guidance", "timeoutMs"')
       }
       if (reset.includes(key)) continue
       if (out[key] !== undefined) {

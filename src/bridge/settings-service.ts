@@ -43,12 +43,11 @@ import type {
 } from '../protocol.ts'
 import {
   DEFAULT_DELEGATE_GUIDANCE,
-  DEFAULT_DELEGATE_PERMISSION_MODE,
-  DEFAULT_DELEGATE_TIMEOUT_MS,
   DEFAULT_SESSION_TITLE_PREFIX,
   DEFAULT_TAG_HALO,
   DELEGATE_GUIDANCE,
-  DELEGATE_TIMEOUT_MS,
+  DELEGATE_TIMEOUT_MAX_MS,
+  DELEGATE_TIMEOUT_MIN_MS,
   IDLE_RELEASE_MS,
   pluginReleaseUrl,
 } from '../protocol.ts'
@@ -223,7 +222,8 @@ export class SettingsService {
    * contains (the host entry passes `validateDelegateConfig`'s output). The
    * deployment baseline, kept apart from the override so the settings card can
    * say "the file asks for `enhanced`, the value set here wins"; empty when the
-   * file says nothing, in which case the built-in DEFAULT_DELEGATE_* apply.
+   * file says nothing, in which case the built-in defaults apply (guidance
+   * `off`; the timeout follows the global background-task long window).
    */
   private configuredDelegate: AcpDelegateConfig = {}
 
@@ -561,16 +561,26 @@ export class SettingsService {
    * explain a value the user did not pick. Effective values resolve per key:
    * settings-page override → deployment baseline → built-in default.
    *
+   * The timeout's built-in default is NOT a constant: it follows the global
+   * background-task long window (`backgroundTaskToolMs`, falling back to
+   * `backgroundTaskMaxMs` when that is `0` — the same rule
+   * `TurnWatchdogService.backgroundTuning` uses). `defaultTimeoutMs` reports
+   * the reset target (deployment baseline ?? that global window), mirroring
+   * `AcpIdleRelease.defaultIdleTimeoutMs`.
+   *
    * `configured` carries only the keys the config file actually names, so the
    * card stays silent about a plain default (the same conditional fact the
    * idle-release card reports). `toolAvailable` / `restrictAvailable` are NOT
    * filled here: the manager wraps this read with its registration probes.
    */
   delegateSettings(): Omit<AcpDelegateSettings, 'toolAvailable' | 'restrictAvailable'> {
+    const tuning = this.host.currentTuning()
+    const globalWindow = tuning.backgroundTaskToolMs > 0 ? tuning.backgroundTaskToolMs : tuning.backgroundTaskMaxMs
+    const baselineTimeoutMs = this.configuredDelegate.timeoutMs ?? globalWindow
     const settings: Omit<AcpDelegateSettings, 'toolAvailable' | 'restrictAvailable'> = {
       guidance: this.delegateOverride.guidance ?? this.configuredDelegate.guidance ?? DEFAULT_DELEGATE_GUIDANCE,
-      permissionMode: this.delegateOverride.permissionMode ?? this.configuredDelegate.permissionMode ?? DEFAULT_DELEGATE_PERMISSION_MODE,
-      timeoutMs: this.delegateOverride.timeoutMs ?? this.configuredDelegate.timeoutMs ?? DEFAULT_DELEGATE_TIMEOUT_MS,
+      timeoutMs: this.delegateOverride.timeoutMs ?? baselineTimeoutMs,
+      defaultTimeoutMs: baselineTimeoutMs,
     }
     if (Object.keys(this.configuredDelegate).length > 0) settings.configured = { ...this.configuredDelegate }
     return settings
@@ -591,7 +601,6 @@ export class SettingsService {
     const reset: readonly DelegateSettingKey[] = patch.reset ?? []
     for (const key of reset) delete this.delegateOverride[key]
     if (patch.guidance !== undefined) this.delegateOverride.guidance = patch.guidance
-    if (patch.permissionMode !== undefined) this.delegateOverride.permissionMode = patch.permissionMode
     if (patch.timeoutMs !== undefined) this.delegateOverride.timeoutMs = patch.timeoutMs
     this.host.persistAgents()
     this.host.syncDelegateRegistration?.()
@@ -756,9 +765,10 @@ export class SettingsService {
       this.idleReleaseOverride = undefined
     }
     // The settings page's delegate picks. Re-validated per key on every boot
-    // because the state file is user- and version-editable: an off-ladder or
+    // because the state file is user- and version-editable: an out-of-range or
     // hand-edited value is dropped and the baseline decides again, never
-    // poisoning the registration (the same ladder filter the idle window uses).
+    // poisoning the registration. Retired keys are silently dropped — only the
+    // known keys are rebuilt.
     try {
       const raw = (parsed.delegate as Record<string, unknown> | undefined) ?? {}
       const next: Partial<AcpDelegateConfig> = {}
@@ -766,10 +776,8 @@ export class SettingsService {
       if (typeof guidance === 'string' && (DELEGATE_GUIDANCE as readonly string[]).includes(guidance)) {
         next.guidance = guidance as DelegateGuidance
       }
-      const mode = raw.permissionMode
-      if (mode === 'auto' || mode === 'abort' || mode === 'ask') next.permissionMode = mode
       const timeoutMs = raw.timeoutMs
-      if (typeof timeoutMs === 'number' && DELEGATE_TIMEOUT_MS.includes(timeoutMs)) next.timeoutMs = timeoutMs
+      if (typeof timeoutMs === 'number' && Number.isInteger(timeoutMs) && timeoutMs >= DELEGATE_TIMEOUT_MIN_MS && timeoutMs <= DELEGATE_TIMEOUT_MAX_MS) next.timeoutMs = timeoutMs
       this.delegateOverride = next
     } catch {
       this.delegateOverride = {}

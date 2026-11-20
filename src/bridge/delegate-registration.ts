@@ -5,8 +5,8 @@
  * budget: `off` removes the tool (a clean request header), the other rungs
  * register the register-ready definition, and any `(guidance, timeoutMs)`
  * change re-registers because both bake into the definition the host ships in
- * `schemas()`. `permissionMode` is NOT part of the signature — execute reads
- * it live, no re-registration needed.
+ * `schemas()`. The session permission policy is always auto and is read live
+ * by execute, so it never participates in the signature.
  *
  * The `when` predicate excludes NTR sessions (`agentPreset === 'acp'`) from
  * BOTH declaration and dispatch: zero pollution of the ACP request header.

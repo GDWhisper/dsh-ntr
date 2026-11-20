@@ -142,7 +142,6 @@ export type {
   ApprovalDeadlinesResult,
   ApprovalDeadlinesSetPayload,
   DelegateGuidance,
-  DelegatePermissionMode,
   DelegateResult,
   DelegateSetPayload,
   DelegateSettingKey,
@@ -159,13 +158,12 @@ export type {
 
 export {
   DEFAULT_DELEGATE_GUIDANCE,
-  DEFAULT_DELEGATE_PERMISSION_MODE,
-  DEFAULT_DELEGATE_TIMEOUT_MS,
   DEFAULT_IDLE_TIMEOUT_MS,
   DEFAULT_SESSION_TITLE_PREFIX,
   DEFAULT_TAG_HALO,
   DELEGATE_GUIDANCE,
-  DELEGATE_TIMEOUT_MS,
+  DELEGATE_TIMEOUT_MAX_MS,
+  DELEGATE_TIMEOUT_MIN_MS,
   IDLE_RELEASE_MS,
   SESSION_TITLE_PREFIX,
 } from './protocol/ui.ts'

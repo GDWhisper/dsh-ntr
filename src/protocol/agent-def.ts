@@ -7,7 +7,7 @@
  * runtime values (type-only SDK imports are erased at build time).
  */
 
-import type { DelegateGuidance, DelegatePermissionMode, PermissionTimeoutMode } from './ui.ts'
+import type { DelegateGuidance, PermissionTimeoutMode } from './ui.ts'
 
 // ---- Configuration (host side, from the profile layer) ----
 
@@ -166,9 +166,7 @@ export type AcpMcpServerDef =
 export interface AcpDelegateConfig {
   /** The guidance rung; doubles as the registration switch (`off` = not registered). */
   guidance?: DelegateGuidance
-  /** The delegation's own permission policy (not the main conversation's approval). */
-  permissionMode?: DelegatePermissionMode
-  /** Single-delegation window: an integer in [1000, 3600000] ms (off-ladder allowed). */
+  /** Single-delegation window: an integer in [1000, 86400000] ms. */
   timeoutMs?: number
 }
 

@@ -194,24 +194,15 @@ export const DELEGATE_GUIDANCE = ['off', 'on', 'enhanced', 'force'] as const
 export type DelegateGuidance = (typeof DELEGATE_GUIDANCE)[number]
 
 /**
- * The delegation's OWN session-level permission policy: how a permission ask
- * raised INSIDE a delegated session is answered. It is NOT the main
- * conversation's approval policy (that one lives on `ui/approval-deadlines`
- * and neither side can change the other). The three rungs map to session
- * policies: `auto` → `{auto, 0}` (answer on arrival, the agent continues),
- * `abort` → `{abort, 30000}` (refuse on arrival), `ask` → `{wait, 0}` (wait
- * for a human).
- */
-export type DelegatePermissionMode = 'auto' | 'abort' | 'ask'
-
-/**
- * The session-level policy shape a delegation runs under (plan §4.2) — the ONE
+ * The session-level policy shape a delegation runs under — the ONE
  * authoritative definition, shared by the delegate service, `LiveSession`, the
- * RPC seam and the manager. It is set on the delegated `sessionId` BEFORE the
- * prompt and never writes a bridge-level field, so the main conversation's
- * approval settings stay byte-for-byte. `preferOnce` asks the auto answer to
- * prefer `allow_once` over `allow_always` on a shared (non-A1) process, where
- * an `allow_always` memory could leak into the main session's later asks.
+ * RPC seam and the manager. A delegation ALWAYS runs `{auto, 0}` (answer on
+ * arrival, the agent continues); there is no permission-mode knob. It is set
+ * on the delegated `sessionId` BEFORE the prompt and never writes a
+ * bridge-level field, so the main conversation's approval settings stay
+ * byte-for-byte. `preferOnce` asks the auto answer to prefer `allow_once` over
+ * `allow_always` on a shared (non-A1) process, where an `allow_always` memory
+ * could leak into the main session's later asks.
  */
 export interface AcpDelegatePolicy { mode: PermissionTimeoutMode; windowMs: number; preferOnce?: boolean }
 
@@ -233,27 +224,22 @@ export interface AcpStartSessionOpts {
   alignSpawnCwd?: boolean
 }
 
-/**
- * The single-delegation timeout ladder, in MILLISECONDS.
- *
- * ONE ladder, shared by both halves: the browser snaps its slider to these
- * values and the settings-page write accepts only these values, so a window
- * the slider can produce is always a window the host runs. The DEPLOYMENT
- * validation is deliberately wider than the ladder: `timeoutMs` may name any
- * integer in [1000, 3600000] and an off-ladder value runs as-is (the card
- * prints the exact number and parks the slider on the nearest rung).
- */
-export const DELEGATE_TIMEOUT_MS: readonly number[] = [60_000, 300_000, 600_000, 900_000, 1_800_000, 3_600_000]
-
 /** Built-in default: off — no deployment's request header changes by default. */
 export const DEFAULT_DELEGATE_GUIDANCE: DelegateGuidance = 'off'
-/** Built-in default: auto-answer delegation asks (delegation = get it done). */
-export const DEFAULT_DELEGATE_PERMISSION_MODE: DelegatePermissionMode = 'auto'
-/** Built-in default single-delegation window: 10 minutes. */
-export const DEFAULT_DELEGATE_TIMEOUT_MS = 600_000
+
+/**
+ * The single-delegation window bounds, in MILLISECONDS — the ONE source shared
+ * by the host validator (`validateDelegateMs`), the persisted-read filter
+ * (`SettingsService.loadPersistedSettings`) and the browser's minute-input
+ * guard. 1 second … 24 hours. The built-in DEFAULT is deliberately NOT a
+ * constant here: it follows the global background-task long window (see
+ * `SettingsService.delegateSettings` / {@link AcpDelegateSettings.defaultTimeoutMs}).
+ */
+export const DELEGATE_TIMEOUT_MIN_MS = 1_000
+export const DELEGATE_TIMEOUT_MAX_MS = 86_400_000
 
 /** The delegate setting a write may name, by field name. */
-export type DelegateSettingKey = 'guidance' | 'permissionMode' | 'timeoutMs'
+export type DelegateSettingKey = 'guidance' | 'timeoutMs'
 
 /**
  * What the settings page's delegation card shows: the values in force, plus
@@ -268,8 +254,13 @@ export type DelegateSettingKey = 'guidance' | 'permissionMode' | 'timeoutMs'
  */
 export interface AcpDelegateSettings {
   guidance: DelegateGuidance
-  permissionMode: DelegatePermissionMode
   timeoutMs: number
+  /**
+   * The window a RESET returns to: the deployment baseline when the config
+   * file names one, else the global background-task long window (the built-in
+   * default — the same split {@link AcpIdleRelease.defaultIdleTimeoutMs} keeps).
+   */
+  defaultTimeoutMs: number
   /** Deployment baseline facts: only keys cordis.patch.yml actually names. */
   configured?: Partial<Pick<AcpDelegateSettings, DelegateSettingKey>>
   toolAvailable: boolean
@@ -284,12 +275,11 @@ export type DelegateResult = { delegate?: AcpDelegateSettings }
 /**
  * `ui/delegate-set`: write delegation settings. Omitted keys keep their
  * current value — a card that only moved the guidance must not reset the
- * window. Only ladder values pass for the numeric keys; the guidance and
- * permission rungs are the whole vocabulary.
+ * window. `timeoutMs` accepts any integer in [1000, 86400000]; the guidance
+ * rungs are the whole vocabulary.
  */
 export interface DelegateSetPayload {
   guidance?: DelegateGuidance
-  permissionMode?: DelegatePermissionMode
   timeoutMs?: number
   /** Drop the persisted overrides for these keys; baseline/default decides again. */
   reset?: readonly DelegateSettingKey[]

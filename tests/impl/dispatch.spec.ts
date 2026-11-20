@@ -483,8 +483,8 @@ describe('dispatchRpc', () => {
     await expect(dispatchRpc(manager, 'ui/delegate', {})).resolves.toEqual({ ok: true, value: { delegate: undefined } })
     const settings: AcpDelegateSettings = {
       guidance: 'on',
-      permissionMode: 'auto',
       timeoutMs: 600_000,
+      defaultTimeoutMs: 2_400_000,
       configured: { guidance: 'off' },
       toolAvailable: true,
       restrictAvailable: true,
@@ -497,8 +497,8 @@ describe('dispatchRpc', () => {
     const manager = fakeManager()
     const settings: AcpDelegateSettings = {
       guidance: 'enhanced',
-      permissionMode: 'auto',
       timeoutMs: 600_000,
+      defaultTimeoutMs: 2_400_000,
       toolAvailable: true,
       restrictAvailable: true,
     }
@@ -523,13 +523,12 @@ describe('dispatchRpc', () => {
       await expect(dispatchRpc(withDelegate, 'ui/delegate-set', { guidance: bad }))
         .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     }
-    // `wait` is the main conversation's approval mode, not a delegation rung.
-    for (const bad of ['wait', 'maybe', 1, null]) {
-      await expect(dispatchRpc(withDelegate, 'ui/delegate-set', { permissionMode: bad }))
-        .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
-    }
-    // Off-ladder numbers are refused even when the deployment range would take them.
-    for (const bad of [0, -1, 1.5, 123_456, '600000']) {
+    // The retired permission key is no longer part of the reset vocabulary.
+    const retired = ['permission', 'Mode'].join('')
+    await expect(dispatchRpc(withDelegate, 'ui/delegate-set', { reset: [retired] }))
+      .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    // Out-of-range / non-integer numbers are refused (the range is [1000, 86400000]).
+    for (const bad of [999, 86_400_001, 0, -1, 1.5, '600000']) {
       await expect(dispatchRpc(withDelegate, 'ui/delegate-set', { timeoutMs: bad }))
         .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     }

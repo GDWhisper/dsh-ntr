@@ -17,7 +17,7 @@
  * manager — every capability arrives through {@link AcpDelegateHost}. The
  * module stays free of Node APIs; time and events come from the host seams.
  */
-import type { AcpEvent, AcpDelegatePolicy, AcpStartSessionOpts, DelegateGuidance, DelegatePermissionMode } from '../protocol.ts'
+import type { AcpEvent, AcpDelegatePolicy, AcpStartSessionOpts, DelegateGuidance } from '../protocol.ts'
 import { isAbsolutePath } from '../impl.ts'
 import { isPerSessionAgent } from './identity.ts'
 import { chunkTextOf, codebuddyMetaOf } from './turn-stream.ts'
@@ -36,7 +36,7 @@ export interface AcpDelegateHost {
   /** The plugin-private default agent id, when one is set. */
   defaultAgent(): string | undefined
   /** The LIVE delegate settings — execute reads them per call (hot config). */
-  delegateConfig(): { guidance: DelegateGuidance; permissionMode: DelegatePermissionMode; timeoutMs: number }
+  delegateConfig(): { guidance: DelegateGuidance; timeoutMs: number }
   /**
    * Open a fresh session on the agent's process (A1 gets its own child).
    * Delegation ALWAYS passes opts: the cwd is validated before any spawn, the
@@ -53,8 +53,6 @@ export interface AcpDelegateHost {
   cancel(sessionId: string): Promise<void>
   /** Close the session; the RPC layer throws `unknown_session` for a gone id. */
   closeSession(sessionId: string): Promise<void>
-  /** Answer a pending ask; `optionId` undefined = cancelled. */
-  respondPermission(requestId: string, optionId?: string): void
   /** The raw transcript — the text fallback ONLY, never the primary fold. */
   transcript(sessionId: string, afterSeq?: number): { session: unknown; entries: Array<{ seq: number; update: unknown }> }
 }
@@ -111,11 +109,16 @@ function isUnknownSession(error: unknown): boolean {
   return error instanceof Error && error.message.includes('unknown_session')
 }
 
-/** The three-rung mapping of plan §4.2 (session policy, never bridge fields). */
-function policyFor(mode: DelegatePermissionMode, agentId: string): AcpDelegatePolicy {
-  if (mode === 'auto') return { mode: 'auto', windowMs: 0, preferOnce: !isPerSessionAgent(agentId) }
-  if (mode === 'abort') return { mode: 'abort', windowMs: 30_000 }
-  return { mode: 'wait', windowMs: 0 }
+/**
+ * The delegation's session policy is ALWAYS auto-answer-on-arrival (`{auto, 0}`)
+ * — the permission-mode axis is retired, so there is nothing to choose. The
+ * bridge answers in place (no ledger entry, no `permission/request` frame);
+ * `preferOnce` keeps a shared (non-A1) process from memorizing `allow_always`
+ * across sessions, while an A1 ephemeral process dies with the session and
+ * keeps the default priority.
+ */
+function autoPolicyFor(agentId: string): AcpDelegatePolicy {
+  return { mode: 'auto', windowMs: 0, preferOnce: !isPerSessionAgent(agentId) }
 }
 
 /**
@@ -305,8 +308,9 @@ export class AcpDelegateService {
     const closeQuietly = async (): Promise<void> => {
       try { await closeOnce() } catch { /* cleanup never masks the primary failure */ }
     }
-    // Step 5: the session policy MUST land before the prompt (§4.2).
-    const policy = policyFor(config.permissionMode, agentId)
+    // Step 5: the session policy MUST land before the prompt. It is always
+    // auto-answer-on-arrival; the bridge settles asks in place.
+    const policy = autoPolicyFor(agentId)
     try {
       this.host.setPermissionPolicy(sessionId, policy)
     } catch (error) {
@@ -359,18 +363,15 @@ export class AcpDelegateService {
         case 'session/update':
           if (event.sessionId === sessionId) collect(event.seq, event.update)
           return
-        case 'permission/request':
-          if (event.sessionId !== sessionId) return
-          // abort: answer cancelled on arrival, beating the 30s timer. auto+0
-          // never broadcasts this frame (the bridge answers in place); ask
-          // leaves the ask for a human.
-          if (policy.mode === 'abort') {
-            refused += 1
-            try { this.host.respondPermission(event.requestId, undefined) } catch { /* unknown_request: already settled */ }
-          }
-          return
+        // No `permission/request` case: the policy is auto+0, so the bridge
+        // answers every ask in place and never broadcasts a request frame.
+        // The fold counts only the settlement outcomes below.
         case 'permission/expired':
           if (event.sessionId !== sessionId) return
+          // `selected` = auto-answered; anything else (the degraded abort when
+          // no legal option can be picked) = refused. `permission/resolved` is
+          // NOT counted — it is the generic per-settlement frame and would
+          // double-count against expired.
           if (event.outcome.outcome === 'selected') autoAnswered += 1
           else refused += 1
           return

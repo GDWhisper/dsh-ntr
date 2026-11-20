@@ -73,9 +73,16 @@
 
 ### 委派返回上限（`maxOutputChars` / 「返回上限」滑块）
 
-- **退役**：`maxOutputChars` / `DELEGATE_OUTPUT_CHARS` / `DEFAULT_DELEGATE_OUTPUT_CHARS` / `validateDelegateOutputChars` / `delegateCharsText`，设置页「子代理」卡的「返回上限 / Answer cap」滑块行，以及折叠里的 cap / `truncated` / 截断标记。委派设置只剩三键（引导档 / 权限 / 单次时限）。
+- **退役**：`maxOutputChars` / `DELEGATE_OUTPUT_CHARS` / `DEFAULT_DELEGATE_OUTPUT_CHARS` / `validateDelegateOutputChars` / `delegateCharsText`，设置页「子代理」卡的「返回上限 / Answer cap」滑块行，以及折叠里的 cap / `truncated` / 截断标记。委派设置只剩两键（引导档 / 单次时限）。
 - **为什么死**：截断保留开头、丢掉结尾，而结论通常在最后——上限恰恰切掉最有用的结论、留下前面的絮叨，信息失真会让主代理据此做错决定、写错代码。它也防不了死循环：循环归单次时限管，超时整段文本丢弃，上限在那条路上什么都没做。
 - **仍然有效**：折叠完整累加每条 `agent_message_chunk`（保留 seq 去重与跳 `parentToolCallId`）；旧 `agents.json` / `cordis.patch.yml` 残留的 `maxOutputChars` 被静默忽略（`validateDelegateConfig` 重建对象、不收未知键）。**不要**照 [docs/plan/acp-delegate-subagent.md](../docs/plan/acp-delegate-subagent.md) 把上限重建回来——那份方案记录的是退役前的形态。见 [ui-panel.md §8](./ui-panel.md) 与 [protocol.md §1](./protocol.md)。
+
+### 委派权限档轴（`delegate.permissionMode`）与单次时限刻度条
+
+- **退役**：`DelegatePermissionMode` / `DEFAULT_DELEGATE_PERMISSION_MODE` / `validateDelegatePermissionMode` / `delegate.permissionMode` 键（auto / abort / ask 三档），设置页「子代理」卡的「权限」三档互斥行，以及 `policyFor` 的三档映射；单次时限的刻度条 `DELEGATE_TIMEOUT_MS` / `DEFAULT_DELEGATE_TIMEOUT_MS` / `DelegateNumberSlider` / `nearestDelegateRung`。
+- **为什么死**：委派是一次性宿主工具委派，「把事做完」是它的唯一语义——auto{auto,0} 是默认也是唯一合理行为，abort / ask 两档没有真实使用场景，只让设置页多一行用户猜不出与主会话审批关系的旋钮。刻度条则把连续窗口硬切成六档，off-grid 值还得「停最近档」圆整撒谎。
+- **仍然有效**：会话级接缝 `LiveSession.permissionPolicy` / `setPermissionPolicy`（prompt 前落地）保留，策略恒 `{auto, 0}`，非 A1 用 `preferOnce`（`autoPolicyFor`）；主会话审批管线（`approvalDeadlines` / `PermissionTimeoutMode` / `handlePermissionRequest`）一字不改。单次时限改手填分钟输入框，范围 [1000, 86400000]，默认跟随全局后台长窗（`backgroundTaskToolMs`，`0` 回落 `backgroundTaskMaxMs`），`defaultTimeoutMs` 镜像重置去处；旧持久化 `permissionMode` 被 `validateDelegateConfig` / 重启读盘静默丢弃。见 [permissions.md §2.5](./permissions.md) / [ui-panel.md §8](./ui-panel.md) / [protocol.md §1](./protocol.md)。
+- **不要照方案恢复**：[docs/plan/acp-delegate-subagent.md](../docs/plan/acp-delegate-subagent.md) 仍描述旧三档与刻度条，那是退役前的形态，**严禁**据此重建权限档或滑块。
 
 ## 为什么不读 `modelSelection`
 
@@ -108,6 +115,9 @@ broadcastDispatchActivity  openDispatchActivity  closeDispatchActivity
 closeAllDispatchActivity  releaseDispatchActivity
 maxOutputChars  DELEGATE_OUTPUT_CHARS  DEFAULT_DELEGATE_OUTPUT_CHARS
 validateDelegateOutputChars  delegateCharsText
+DelegatePermissionMode  DEFAULT_DELEGATE_PERMISSION_MODE  validateDelegatePermissionMode
+DELEGATE_TIMEOUT_MS  DEFAULT_DELEGATE_TIMEOUT_MS  DelegateNumberSlider  nearestDelegateRung
+delegate.permissionMode
 ```
 
 > 工具卡路径的符号（`isAcpToolContinuation` / `recordAcpToolOutput` /

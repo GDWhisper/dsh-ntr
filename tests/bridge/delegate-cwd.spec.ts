@@ -40,7 +40,6 @@ describe('acp_delegate workspace inheritance (mock agent)', () => {
     prompt: (sessionId, text) => manager.prompt(sessionId, text),
     cancel: sessionId => manager.cancel(sessionId),
     closeSession: sessionId => manager.closeSession(sessionId),
-    respondPermission: (requestId, optionId) => manager.respondPermission(requestId, optionId),
     transcript: (sessionId, afterSeq) => manager.transcript(sessionId, afterSeq),
   })
   const execWithWs = { agent: { session: { header: { cwd: workspace } } } }
@@ -113,7 +112,6 @@ describe('acp_delegate workspace inheritance (mock agent)', () => {
       prompt: (sessionId, text) => escManager.prompt(sessionId, text),
       cancel: sessionId => escManager.cancel(sessionId),
       closeSession: sessionId => escManager.closeSession(sessionId),
-      respondPermission: (requestId, optionId) => escManager.respondPermission(requestId, optionId),
       transcript: (sessionId, afterSeq) => escManager.transcript(sessionId, afterSeq),
     })
     try {

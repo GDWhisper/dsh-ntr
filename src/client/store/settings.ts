@@ -28,21 +28,20 @@ import type {
 } from '../../protocol.ts'
 import {
   DEFAULT_DELEGATE_GUIDANCE,
-  DEFAULT_DELEGATE_PERMISSION_MODE,
-  DEFAULT_DELEGATE_TIMEOUT_MS,
 } from '../../protocol.ts'
 import type { UiState } from './state.ts'
 
 /**
- * The built-in baseline a delegate reset falls back to when the config file
- * names no value for the key — the same split the idle-release card keeps.
- * The reset RPC's built-in baseline (the subagent card renders no reset
- * buttons); this write path and the host agree on what "default" means.
+ * The built-in baseline a delegate reset falls back to OPTIMISTICALLY when the
+ * config file names no value for the key. `timeoutMs` mirrors the built-in
+ * global background-task long window (40 minutes); the host-reported
+ * `defaultTimeoutMs` is the authority and corrects this placeholder on the
+ * write's answer — the same optimistic-then-authority split the idle-release
+ * card keeps.
  */
 export const DELEGATE_DEFAULTS: Pick<AcpDelegateSettings, DelegateSettingKey> = {
   guidance: DEFAULT_DELEGATE_GUIDANCE,
-  permissionMode: DEFAULT_DELEGATE_PERMISSION_MODE,
-  timeoutMs: DEFAULT_DELEGATE_TIMEOUT_MS,
+  timeoutMs: 2_400_000,
 }
 
 /** Reset one key optimistically to the baseline the reset restores. */
@@ -230,7 +229,6 @@ export class SettingsService {
       const next: AcpDelegateSettings = {
         ...previous,
         ...(payload.guidance === undefined ? {} : { guidance: payload.guidance }),
-        ...(payload.permissionMode === undefined ? {} : { permissionMode: payload.permissionMode }),
         ...(payload.timeoutMs === undefined ? {} : { timeoutMs: payload.timeoutMs }),
       }
       // The baseline a reset restores: the config file's value where it names

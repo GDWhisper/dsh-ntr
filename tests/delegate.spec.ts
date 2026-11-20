@@ -8,7 +8,7 @@ import {
 } from '../src/bridge/delegate-service.ts'
 import { AcpDelegateRegistration, type DelegateRegistrationCtx } from '../src/bridge/delegate-registration.ts'
 import type { AcpDelegateForceMask } from '../src/bridge/delegate-force-mask.ts'
-import type { AcpEvent, AcpStartSessionOpts, DelegateGuidance, DelegatePermissionMode } from '../src/protocol.ts'
+import type { AcpEvent, AcpStartSessionOpts, DelegateGuidance } from '../src/protocol.ts'
 
 /**
  * The delegation core (docs/plan/acp-delegate-subagent.md §7.1): one fake
@@ -34,7 +34,7 @@ function makeHost() {
     respond: [] as Array<{ requestId: string; optionId?: string }>,
     transcript: [] as Array<{ sessionId: string; afterSeq?: number }>,
   }
-  const config = { guidance: 'on' as DelegateGuidance, permissionMode: 'auto' as DelegatePermissionMode, timeoutMs: 600_000 }
+  const config = { guidance: 'on' as DelegateGuidance, timeoutMs: 600_000 }
   const agents = [{ id: 'alpha', title: 'Alpha' }, { id: 'beta', title: 'Beta' }, { id: 'codebuddy', title: 'CodeBuddy' }]
   let defaultAgentId: string | undefined = 'alpha'
   let nextSession = 0
@@ -65,7 +65,6 @@ function makeHost() {
     },
     async cancel(sessionId) { order.push('cancel'); calls.cancel.push(sessionId) },
     async closeSession(sessionId) { order.push('close'); calls.close.push(sessionId) },
-    respondPermission(requestId, optionId) { calls.respond.push({ requestId, optionId }) },
     transcript(sessionId, afterSeq) {
       order.push('transcript')
       calls.transcript.push({ sessionId, afterSeq })
@@ -111,7 +110,6 @@ describe('acp_delegate execute semantics', () => {
 
   it('auto: policy {auto,0,preferOnce} and counts permission/expired outcomes', async () => {
     const f = makeHost()
-    f.config.permissionMode = 'auto'
     f.onPrompt(async (sessionId) => {
       f.emit({ type: 'permission/expired', sessionId, toolCall: {}, timeoutMs: 0, outcome: { outcome: 'selected', optionId: 'allow_once' }, optionName: 'Allow once' })
       f.emit({ type: 'permission/expired', sessionId, toolCall: {}, timeoutMs: 0, outcome: { outcome: 'cancelled' } })
@@ -132,35 +130,20 @@ describe('acp_delegate execute semantics', () => {
     expect(f.calls.policy[0].policy).toEqual({ mode: 'auto', windowMs: 0, preferOnce: false })
   })
 
-  it('abort: policy {abort,30000}, answers cancelled on the request frame, swallows unknown_request', async () => {
+  it('policy is always auto: the service never answers a request frame itself', async () => {
     const f = makeHost()
-    f.config.permissionMode = 'abort'
     f.onPrompt(async (sessionId) => {
-      f.emit({ type: 'permission/request', requestId: 'req-1', sessionId, toolCall: {}, toolName: 'fs/write', options: [], timeoutMode: 'abort' })
+      // The permission-mode axis is retired: even if a request frame somehow
+      // arrives, the service does not answer it — the policy is auto+0 and the
+      // bridge settles every ask in place (no frame is broadcast in practice).
+      f.emit({ type: 'permission/request', requestId: 'req-1', sessionId, toolCall: {}, toolName: 'fs/write', options: [], timeoutMode: 'auto' })
       f.emit({ type: 'turn/end', sessionId, turnId: 't', stopReason: 'end_turn' })
       return { turnId: 't' }
     })
     const result = await new AcpDelegateService(f.host).execute({ task: 'x', agent: 'alpha' }, {})
-    expect(f.calls.policy[0].policy).toEqual({ mode: 'abort', windowMs: 30_000 })
-    expect(f.calls.respond).toEqual([{ requestId: 'req-1', optionId: undefined }])
-    expect(result.text).toContain('拒绝 1 个审批')
-    // An already-settled ask answers unknown_request: swallowed, still counted.
-    f.host.respondPermission = () => { throw new Error('unknown_request') }
-    const second = await new AcpDelegateService(f.host).execute({ task: 'y', agent: 'alpha' }, {})
-    expect(second.text).toContain('拒绝 1 个审批')
-  })
-
-  it('ask: policy {wait,0} and never answers for the human', async () => {
-    const f = makeHost()
-    f.config.permissionMode = 'ask'
-    f.onPrompt(async (sessionId) => {
-      f.emit({ type: 'permission/request', requestId: 'req-1', sessionId, toolCall: {}, toolName: 'fs/write', options: [], timeoutMode: 'wait' })
-      f.emit({ type: 'turn/end', sessionId, turnId: 't', stopReason: 'end_turn' })
-      return { turnId: 't' }
-    })
-    await new AcpDelegateService(f.host).execute({ task: 'x', agent: 'alpha' }, {})
-    expect(f.calls.policy[0].policy).toEqual({ mode: 'wait', windowMs: 0 })
+    expect(f.calls.policy[0].policy).toEqual({ mode: 'auto', windowMs: 0, preferOnce: true })
     expect(f.calls.respond).toHaveLength(0)
+    expect(result.text).not.toContain('拒绝')
   })
 
   it('rejects an unknown agent without creating a session, listing configured ids', async () => {

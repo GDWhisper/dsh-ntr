@@ -135,7 +135,7 @@
         #                              # persist in the plugin's own state file and
         #                              # OUTRANK this file per key (the card shows what
         #                              # this file asks for and offers a reset back to
-        #                              # it). All three are hot — no host restart.
+        #                              # it). Both are hot — no host restart.
         #                              # Defaults shown; an absent block keeps the
         #                              # built-in defaults.
         #   guidance: off              # off | on | enhanced | force — doubles as the
@@ -146,13 +146,12 @@
         #                              # subagent / subagent_fork / workflow tools per
         #                              # agent (no restrict → degrades to enhanced,
         #                              # reported honestly via restrictAvailable).
-        #   permissionMode: auto       # auto | abort | ask — the delegation's OWN
-        #                              # session-level policy (auto{auto,0} /
-        #                              # abort{abort,30000} / ask{wait,0}); never the
-        #                              # main conversation's approval settings.
-        #   timeoutMs: 600000          # single-delegation window [1000, 3600000];
-        #                              # slider rungs 60000…3600000, an off-ladder
-        #                              # deployment value runs as-is.
+        #   timeoutMs: 2400000         # single-delegation window [1000, 86400000] ms;
+        #                              # default follows the global background-task long
+        #                              # window (backgroundTaskToolMs, 0 → backgroundTaskMaxMs).
+        #                              # Hand-filled minutes in the card; an off-grid
+        #                              # deployment value runs as-is. The delegation's session
+        #                              # policy is always auto — there is no permissionMode key.
         # ACP 模式 (agent preset) is declared by this package's own bundle
         # patch list (package.json `dsh.bundle.patch` → presets/acp/acp.patch.yml),
         # so it needs no install step and has no config knob. The settings card

@@ -23,7 +23,7 @@ import type {
   AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSaveResult, AgentSkillsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions,
   LlmResolvedModelInfo,
   AcpIdleRelease, ActiveTurnView, ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, SaveGateFlushResult, SaveGateStatus, SessionView, StreamChunk,
-  AcpDelegateConfig, AcpDelegatePolicy, AcpDelegateSettings, AcpStartSessionOpts, DelegateGuidance, DelegatePermissionMode, DelegateSetPayload,
+  AcpDelegateConfig, AcpDelegatePolicy, AcpDelegateSettings, AcpStartSessionOpts, DelegateGuidance, DelegateSetPayload,
   SubagentDetailResult, SubagentRecord,
 } from '../protocol.ts'
 import { SESSION_TITLE_PREFIX } from '../protocol.ts'
@@ -1183,7 +1183,7 @@ export class BridgeManager {
 
   setConfiguredDelegate(config: AcpDelegateConfig | undefined): void { this.settings.setConfiguredDelegate(config) }
 
-  delegateConfig(): { guidance: DelegateGuidance; permissionMode: DelegatePermissionMode; timeoutMs: number } { const { guidance, permissionMode, timeoutMs } = this.settings.delegateSettings(); return { guidance, permissionMode, timeoutMs } }
+  delegateConfig(): { guidance: DelegateGuidance; timeoutMs: number } { const { guidance, timeoutMs } = this.settings.delegateSettings(); return { guidance, timeoutMs } }
 
   setPermissionPolicy(sessionId: string, policy: AcpDelegatePolicy): void { this.rpc.setPermissionPolicy(sessionId, policy) }
 

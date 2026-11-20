@@ -326,7 +326,6 @@ export function apply(ctx: Context, config?: unknown): void {
     prompt: (sessionId, text) => manager.prompt(sessionId, text),
     cancel: sessionId => manager.cancel(sessionId),
     closeSession: sessionId => manager.closeSession(sessionId),
-    respondPermission: (requestId, optionId) => manager.respondPermission(requestId, optionId),
     transcript: (sessionId, afterSeq) => manager.transcript(sessionId, afterSeq),
   })
   const delegateRegistration = new AcpDelegateRegistration({ ctx, service: delegateService, config: () => manager.delegateConfig(), forceMask: delegateForceMask, notify: delegateNotify })

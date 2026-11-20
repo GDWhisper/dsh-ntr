@@ -29,7 +29,6 @@ export {
   validateDelegateConfig,
   validateDelegateGuidance,
   validateDelegateMs,
-  validateDelegatePermissionMode,
   validateDelegateSettings,
   validateIdleReleaseMs,
   validateMcpServers,

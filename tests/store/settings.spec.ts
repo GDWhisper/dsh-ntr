@@ -169,11 +169,11 @@ describe('AcpStore agent management', () => {
     let release!: () => void
     const gate = new Promise<void>(resolve => { release = resolve })
     const seed = {
-      guidance: 'on', permissionMode: 'ask', timeoutMs: 900_000,
+      guidance: 'on', timeoutMs: 900_000, defaultTimeoutMs: 2_400_000,
       configured: { guidance: 'off', timeoutMs: 300_000 }, toolAvailable: true, restrictAvailable: true,
     }
     // The host answer differs from the optimistic value: it is the authority.
-    const answer = { ...seed, guidance: 'enhanced', permissionMode: 'abort', timeoutMs: 600_000 }
+    const answer = { ...seed, guidance: 'enhanced', timeoutMs: 600_000 }
     const store = new AcpStore(
       async (_channel, endpoint, payload) => {
         if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
@@ -186,31 +186,26 @@ describe('AcpStore agent management', () => {
       (zh) => zh,
     )
     await store.resync()
-    expect(store.getSnapshot().delegate).toMatchObject({ guidance: 'on', permissionMode: 'ask', timeoutMs: 900_000 })
+    expect(store.getSnapshot().delegate).toMatchObject({ guidance: 'on', timeoutMs: 900_000 })
 
     // Only the touched key travels, and it moves before the host answers.
     const write = store.setDelegateSettings({ guidance: 'force' })
-    expect(store.getSnapshot().delegate).toMatchObject({ guidance: 'force', permissionMode: 'ask', timeoutMs: 900_000 })
+    expect(store.getSnapshot().delegate).toMatchObject({ guidance: 'force', timeoutMs: 900_000 })
     expect(sent).toEqual([{ guidance: 'force' }])
     release()
     await write
-    expect(store.getSnapshot().delegate).toMatchObject({ guidance: 'enhanced', permissionMode: 'abort', timeoutMs: 600_000 })
+    expect(store.getSnapshot().delegate).toMatchObject({ guidance: 'enhanced', timeoutMs: 600_000 })
 
     // A reset is per key: the optimistic fallback is the config file's value…
     const resetWindow = store.resetDelegateSetting('timeoutMs')
     expect(store.getSnapshot().delegate?.timeoutMs).toBe(300_000)
     expect(sent[1]).toEqual({ reset: ['timeoutMs'] })
     await resetWindow
-    // …and the built-in default where the file names nothing.
-    const resetMode = store.resetDelegateSetting('permissionMode')
-    expect(store.getSnapshot().delegate?.permissionMode).toBe('auto')
-    expect(sent[2]).toEqual({ reset: ['permissionMode'] })
-    await resetMode
     expect(store.getSnapshot().delegate).toMatchObject(answer)
   })
 
   it('reverts a refused delegate write and keeps the card hidden on an older host', async () => {
-    const seed = { guidance: 'on', permissionMode: 'auto', timeoutMs: 600_000, toolAvailable: true, restrictAvailable: true }
+    const seed = { guidance: 'on', timeoutMs: 600_000, defaultTimeoutMs: 2_400_000, toolAvailable: true, restrictAvailable: true }
     const failing = new AcpStore(
       async (_channel, endpoint) => {
         if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
