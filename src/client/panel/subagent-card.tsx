@@ -1,10 +1,10 @@
 /**
  * The subagent card: the `acp_delegate` tool's deployment-wide parameters —
  * one guidance rung that doubles as the registration switch, the delegation's
- * OWN permission policy, one timeout window and one folded-answer cap.
+ * OWN permission policy and one timeout window.
  *
  * ONE ladder per knob, shared with the host half ({@link DELEGATE_GUIDANCE},
- * {@link DELEGATE_TIMEOUT_MS}, {@link DELEGATE_OUTPUT_CHARS}): every rung a
+ * {@link DELEGATE_TIMEOUT_MS}): every rung a
  * slider can produce is a value the host runs. A numeric value the deployment
  * named off its ladder still runs as configured — the readout prints the exact
  * number and the thumb parks on the nearest rung (the IdleReleaseCard rule).
@@ -24,7 +24,7 @@
  * the force rung `state-error-primary` on `interactive-bg-hover-danger` — the
  * host's own danger background. Literals sit only in `var()` fallbacks.
  */
-import { DELEGATE_GUIDANCE, DELEGATE_OUTPUT_CHARS, DELEGATE_TIMEOUT_MS } from '../../protocol.ts'
+import { DELEGATE_GUIDANCE, DELEGATE_TIMEOUT_MS } from '../../protocol.ts'
 import type { AcpDelegateSettings, DelegateGuidance, DelegatePermissionMode, DelegateSettingKey } from '../../protocol.ts'
 import type { AcpStore, UiState } from '../store.ts'
 import { tickLeft } from './shared.ts'
@@ -56,13 +56,6 @@ function delegateTimeoutText(ms: number, acp: AcpStore): string {
   if (ms % 3_600_000 === 0) return acp.label(`${String(ms / 3_600_000)} 小时`, `${String(ms / 3_600_000)}h`)
   if (ms % 60_000 === 0) return acp.label(`${String(ms / 60_000)} 分钟`, `${String(ms / 60_000)}m`)
   return acp.label(`${String(ms / 1000)} 秒`, `${String(ms / 1000)}s`)
-}
-
-/** `4 千字符` / `2 万字符` / `12345 字符` — exact at every value, same rule. */
-function delegateCharsText(chars: number, acp: AcpStore): string {
-  if (chars % 10_000 === 0) return acp.label(`${String(chars / 10_000)} 万字符`, `${String(chars / 1000)}k chars`)
-  if (chars % 1000 === 0) return acp.label(`${String(chars / 1000)} 千字符`, `${String(chars / 1000)}k chars`)
-  return acp.label(`${String(chars)} 字符`, `${String(chars)} chars`)
 }
 
 /**
@@ -178,7 +171,7 @@ function DelegateNumberSlider(props: {
 }
 
 /**
- * The subagent card. Four rows, one sentence each; the guidance rung carries
+ * The subagent card. Three rows, one sentence each; the guidance rung carries
  * its per-rung note (enhanced warns, force warns harder) and the availability
  * facts the host reported, so a switch that cannot take effect says so instead
  * of pretending the request header changed.
@@ -191,7 +184,6 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
   const guidanceNote = delegateOverrideNote(delegate, 'guidance', value => guidanceText(value, acp), acp)
   const permissionNote = delegateOverrideNote(delegate, 'permissionMode', value => permissionText(value, acp), acp)
   const timeoutNote = delegateOverrideNote(delegate, 'timeoutMs', value => delegateTimeoutText(value, acp), acp)
-  const charsNote = delegateOverrideNote(delegate, 'maxOutputChars', value => delegateCharsText(value, acp), acp)
   const hint = guidanceHint(delegate.guidance, acp)
   return (
     <section className="dwa-section">
@@ -297,20 +289,6 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
             {acp.label('超时后中止子代理并报错。', 'Past this, the subagent is aborted and the call errors.')}
           </div>
           {timeoutNote !== undefined && <div className="dwa-deadline-flag">⚠ {timeoutNote}</div>}
-        </div>
-        <div className="dwa-preference-block">
-          <div className="dwa-preference-label">{acp.label('返回上限', 'Answer cap')}</div>
-          <DelegateNumberSlider
-            name={acp.label('返回上限', 'Answer cap')}
-            value={delegate.maxOutputChars}
-            ladder={DELEGATE_OUTPUT_CHARS}
-            text={chars => delegateCharsText(chars, acp)}
-            onPick={chars => void acp.setDelegateSettings({ maxOutputChars: chars })}
-          />
-          <div className="dwa-preference-copy">
-            {acp.label('超出部分截断并留标记。', 'Anything beyond the cap is truncated with a marker.')}
-          </div>
-          {charsNote !== undefined && <div className="dwa-deadline-flag">⚠ {charsNote}</div>}
         </div>
       </div>
     </section>

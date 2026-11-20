@@ -36,7 +36,7 @@ export interface AcpDelegateHost {
   /** The plugin-private default agent id, when one is set. */
   defaultAgent(): string | undefined
   /** The LIVE delegate settings — execute reads them per call (hot config). */
-  delegateConfig(): { guidance: DelegateGuidance; permissionMode: DelegatePermissionMode; timeoutMs: number; maxOutputChars: number }
+  delegateConfig(): { guidance: DelegateGuidance; permissionMode: DelegatePermissionMode; timeoutMs: number }
   /**
    * Open a fresh session on the agent's process (A1 gets its own child).
    * Delegation ALWAYS passes opts: the cwd is validated before any spawn, the
@@ -320,7 +320,6 @@ export class AcpDelegateService {
 
     // ---- incremental fold state (step 6) ----
     let text = ''
-    let truncated = false
     const seenSeq = new Set<number>()
     let refused = 0
     let autoAnswered = 0
@@ -341,26 +340,17 @@ export class AcpDelegateService {
       promptFailure = failure
       resolveEnd()
     }
-    const cap = config.maxOutputChars
     // Shared by the live fold and the transcript fallback: seq dedupe, skip
-    // the agent's OWN subagent prose (parentToolCallId), cap with a marker.
+    // the agent's OWN subagent prose (parentToolCallId), accumulate in full.
     const collect = (seq: number, update: unknown): void => {
       if (seenSeq.has(seq)) return
       seenSeq.add(seq)
-      if (truncated) return
       if (typeof update !== 'object' || update === null) return
       const row = update as Record<string, unknown>
       if (row.sessionUpdate !== 'agent_message_chunk') return
       if (codebuddyMetaOf(update)?.parentToolCallId !== undefined) return
       const chunk = chunkTextOf(row.content)
       if (chunk === '') return
-      if (text.length + chunk.length > cap) {
-        const room = cap - text.length
-        if (room > 0) text += chunk.slice(0, room)
-        text += `\n…[truncated at ${String(cap)} chars]`
-        truncated = true
-        return
-      }
       text += chunk
     }
     // Subscribe BEFORE the prompt so no chunk of the turn can slip past.

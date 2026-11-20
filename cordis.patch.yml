@@ -131,11 +131,11 @@
         #                              # native model hands one self-contained task
         #                              # to a configured ACP agent (one fresh session
         #                              # + one prompt + close). The settings page's
-        #                              # 「子代理」 tab edits these four keys; its picks
+        #                              # 「子代理」 tab edits these three keys; its picks
         #                              # persist in the plugin's own state file and
         #                              # OUTRANK this file per key (the card shows what
         #                              # this file asks for and offers a reset back to
-        #                              # it). All four are hot — no host restart.
+        #                              # it). All three are hot — no host restart.
         #                              # Defaults shown; an absent block keeps the
         #                              # built-in defaults.
         #   guidance: off              # off | on | enhanced | force — doubles as the
@@ -153,9 +153,6 @@
         #   timeoutMs: 600000          # single-delegation window [1000, 3600000];
         #                              # slider rungs 60000…3600000, an off-ladder
         #                              # deployment value runs as-is.
-        #   maxOutputChars: 20000      # folded-answer cap [1000, 200000]; beyond it
-        #                              # the text is truncated with a marker. Slider
-        #                              # rungs 4000…200000, same off-ladder rule.
         # ACP 模式 (agent preset) is declared by this package's own bundle
         # patch list (package.json `dsh.bundle.patch` → presets/acp/acp.patch.yml),
         # so it needs no install step and has no config knob. The settings card

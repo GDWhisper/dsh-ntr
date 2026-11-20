@@ -71,6 +71,12 @@
 - **退役**：`AcpDefaultModelGuard` / `reconcileDefaultModel` / `lastNativeRoute` / `settleAcpRoute` / `watchRoute` / `routeAttempts` / `routeNotices` / `acpRouteTarget` / `selectAcpRoute` / `setDefaultModelGuard` / `wireDefaultModelGuard`；RPC `model/get-default` / `model/set-default` / `model/reconcile-default`。
 - **仍然有效**：`defaultAgentId`（插件私有状态）；`session/chat-bind` / `chat-model-set` / `chat-effort-set` / `chat-mode-set`；删除 agent 清空默认指针；严禁 `directory.select` / `selectModel`。见 [architecture.md §3、§6](./architecture.md) 与 [state.md §3](./state.md)。
 
+### 委派返回上限（`maxOutputChars` / 「返回上限」滑块）
+
+- **退役**：`maxOutputChars` / `DELEGATE_OUTPUT_CHARS` / `DEFAULT_DELEGATE_OUTPUT_CHARS` / `validateDelegateOutputChars` / `delegateCharsText`，设置页「子代理」卡的「返回上限 / Answer cap」滑块行，以及折叠里的 cap / `truncated` / 截断标记。委派设置只剩三键（引导档 / 权限 / 单次时限）。
+- **为什么死**：截断保留开头、丢掉结尾，而结论通常在最后——上限恰恰切掉最有用的结论、留下前面的絮叨，信息失真会让主代理据此做错决定、写错代码。它也防不了死循环：循环归单次时限管，超时整段文本丢弃，上限在那条路上什么都没做。
+- **仍然有效**：折叠完整累加每条 `agent_message_chunk`（保留 seq 去重与跳 `parentToolCallId`）；旧 `agents.json` / `cordis.patch.yml` 残留的 `maxOutputChars` 被静默忽略（`validateDelegateConfig` 重建对象、不收未知键）。**不要**照 [docs/plan/acp-delegate-subagent.md](../docs/plan/acp-delegate-subagent.md) 把上限重建回来——那份方案记录的是退役前的形态。见 [ui-panel.md §8](./ui-panel.md) 与 [protocol.md §1](./protocol.md)。
+
 ## 为什么不读 `modelSelection`
 
 宿主 wire view 是 `next = pending ?? lastUsed`：`lastUsed` 由每条 `request/header` 写入（「这个会话跑过一轮」），投影又在页面加载时由宿主投影块经 `ProjectionValueStore.seed()` 种入——读 `next` 等于「永不路由任何用过的会话」。而 `pending` 虽然是真实的用户选择，**但不携带模式**：实测会话 `940a8365` 在标准模式下 `/model` 选了 `tokimi/mimo-v2.6-flash`，再切到 NTR 模式，跨模式的 `pending` 被旧逻辑放行，`request/header` 发往原生 provider，而 system prompt 已是 ACP preset 的无工具版本——**模式与内核脱钩**。这是本项目走错方向最完整的一份记录，不要重走。
@@ -100,6 +106,8 @@ subagents/update  activeSubagents  subagentFrames  subagentFrameSeq
 mergeSubagentStatuses  activeCatalogChildIds  BackgroundDispatch.activity
 broadcastDispatchActivity  openDispatchActivity  closeDispatchActivity
 closeAllDispatchActivity  releaseDispatchActivity
+maxOutputChars  DELEGATE_OUTPUT_CHARS  DEFAULT_DELEGATE_OUTPUT_CHARS
+validateDelegateOutputChars  delegateCharsText
 ```
 
 > 工具卡路径的符号（`isAcpToolContinuation` / `recordAcpToolOutput` /

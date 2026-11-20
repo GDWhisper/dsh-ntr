@@ -485,7 +485,6 @@ describe('dispatchRpc', () => {
       guidance: 'on',
       permissionMode: 'auto',
       timeoutMs: 600_000,
-      maxOutputChars: 20_000,
       configured: { guidance: 'off' },
       toolAvailable: true,
       restrictAvailable: true,
@@ -500,7 +499,6 @@ describe('dispatchRpc', () => {
       guidance: 'enhanced',
       permissionMode: 'auto',
       timeoutMs: 600_000,
-      maxOutputChars: 20_000,
       toolAvailable: true,
       restrictAvailable: true,
     }
@@ -533,8 +531,6 @@ describe('dispatchRpc', () => {
     // Off-ladder numbers are refused even when the deployment range would take them.
     for (const bad of [0, -1, 1.5, 123_456, '600000']) {
       await expect(dispatchRpc(withDelegate, 'ui/delegate-set', { timeoutMs: bad }))
-        .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
-      await expect(dispatchRpc(withDelegate, 'ui/delegate-set', { maxOutputChars: bad }))
         .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     }
     for (const bad of ['guidance', true, ['bogus'], ['guidance', 1]]) {

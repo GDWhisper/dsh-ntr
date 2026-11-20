@@ -9,7 +9,7 @@
  */
 
 import type { AcpAgentDef, AcpDelegateConfig, AcpMcpServerDef, AcpPluginConfig, AcpTagHalo, ApprovalDeadlineKey, DelegateGuidance, DelegatePermissionMode, DelegateSetPayload, DelegateSettingKey, PermissionTimeoutMode } from '../protocol.ts'
-import { DEFAULT_IDLE_TIMEOUT_MS, DELEGATE_OUTPUT_CHARS, DELEGATE_TIMEOUT_MS, IDLE_RELEASE_MS } from '../protocol.ts'
+import { DEFAULT_IDLE_TIMEOUT_MS, DELEGATE_TIMEOUT_MS, IDLE_RELEASE_MS } from '../protocol.ts'
 import { splitCommandLine } from './command-line.ts'
 import { AcpError } from './errors.ts'
 import { isAbsolutePath } from './paths.ts'
@@ -230,26 +230,14 @@ export function validateDelegateMs(raw: unknown, code: 'bad_config' | 'bad_paylo
 }
 
 /**
- * Validate the folded-answer output cap the settings page writes, on the
- * shared {@link DELEGATE_OUTPUT_CHARS} ladder (the same one-ladder rule as
- * {@link validateDelegateMs}).
- */
-export function validateDelegateOutputChars(raw: unknown, code: 'bad_config' | 'bad_payload'): number {
-  if (typeof raw !== 'number' || !Number.isInteger(raw) || !DELEGATE_OUTPUT_CHARS.includes(raw)) {
-    throw new AcpError(code, `acp: delegate.maxOutputChars must be one of ${DELEGATE_OUTPUT_CHARS.join(', ')}`)
-  }
-  return raw
-}
-
-/**
  * Validate the `delegate` deployment baseline (`cordis.patch.yml`).
  *
  * Absent / null means "name nothing": the built-in defaults decide. The
  * numeric range is deliberately WIDER than the settings ladder — a deployment
- * may name any integer in [1000, 3600000] ms / [1000, 200000] chars and an
- * off-ladder value runs as-is (the same explicit design as the idle-release
- * baseline). Unknown keys are ignored; only the keys actually named are
- * returned, so the baseline never invents a fact the file did not state.
+ * may name any integer in [1000, 3600000] ms and an off-ladder value runs
+ * as-is (the same explicit design as the idle-release baseline). Unknown keys
+ * are ignored; only the keys actually named are returned, so the baseline
+ * never invents a fact the file did not state.
  */
 export function validateDelegateConfig(raw: unknown): AcpDelegateConfig {
   if (raw === null || raw === undefined) return {}
@@ -264,13 +252,6 @@ export function validateDelegateConfig(raw: unknown): AcpDelegateConfig {
       throw new AcpError('bad_config', 'acp: delegate.timeoutMs must be an integer in [1000, 3600000]')
     }
     out.timeoutMs = timeoutMs
-  }
-  if (row.maxOutputChars !== undefined) {
-    const maxOutputChars = row.maxOutputChars
-    if (typeof maxOutputChars !== 'number' || !Number.isInteger(maxOutputChars) || maxOutputChars < 1_000 || maxOutputChars > 200_000) {
-      throw new AcpError('bad_config', 'acp: delegate.maxOutputChars must be an integer in [1000, 200000]')
-    }
-    out.maxOutputChars = maxOutputChars
   }
   return out
 }
@@ -290,13 +271,12 @@ export function validateDelegateSettings(raw: unknown): DelegateSetPayload {
   if (row.guidance !== undefined) out.guidance = validateDelegateGuidance(row.guidance, 'bad_payload')
   if (row.permissionMode !== undefined) out.permissionMode = validateDelegatePermissionMode(row.permissionMode, 'bad_payload')
   if (row.timeoutMs !== undefined) out.timeoutMs = validateDelegateMs(row.timeoutMs, 'bad_payload')
-  if (row.maxOutputChars !== undefined) out.maxOutputChars = validateDelegateOutputChars(row.maxOutputChars, 'bad_payload')
   if (row.reset !== undefined) {
     if (!Array.isArray(row.reset)) throw new AcpError('bad_payload', 'acp: delegate reset must be an array of setting keys')
     const reset: DelegateSettingKey[] = []
     for (const key of row.reset as unknown[]) {
-      if (key !== 'guidance' && key !== 'permissionMode' && key !== 'timeoutMs' && key !== 'maxOutputChars') {
-        throw new AcpError('bad_payload', 'acp: delegate reset entries must be one of "guidance", "permissionMode", "timeoutMs", "maxOutputChars"')
+      if (key !== 'guidance' && key !== 'permissionMode' && key !== 'timeoutMs') {
+        throw new AcpError('bad_payload', 'acp: delegate reset entries must be one of "guidance", "permissionMode", "timeoutMs"')
       }
       if (reset.includes(key)) continue
       if (out[key] !== undefined) {

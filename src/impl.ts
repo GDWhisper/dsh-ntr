@@ -29,7 +29,6 @@ export {
   validateDelegateConfig,
   validateDelegateGuidance,
   validateDelegateMs,
-  validateDelegateOutputChars,
   validateDelegatePermissionMode,
   validateDelegateSettings,
   validateIdleReleaseMs,

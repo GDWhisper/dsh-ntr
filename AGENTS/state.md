@@ -6,7 +6,7 @@
 
 `pluginStateDir()`（`~/.dsh/dsh-ntr`）下只有三样东西：
 
-- `agents.json` —— agent 注册表 + 默认 agent + 每会话选择 + 每聊天会话的会话记录（`chatSessions`，见 §3.1）+ 外部子代理生命周期记录（`subagents`，`dshSessionId → SubagentRecord[]`：只在状态迁移落盘、每会话 200 条上限、加载时按 `chatSessions` / `conversations` prune 孤儿键、显式关闭 / force reset 立即删键；agy 派发记录另带可选 `childConversationId`（brain conversationId，只用于读子代理 transcript、不当 catalog 主键，往返不丢，CodeBuddy 行不带），见 [protocol.md §6.3](./protocol.md)）+ 插件私有偏好（`tagHalo`，经 `ui/tag-halo` RPC 读写；`sessionTitlePrefix`，经 `ui/session-title-prefix-set` 读写，是设置页「对话外观」挑的标题前缀开关（默认开），见 [architecture.md §2.1](./architecture.md)；`approvalDeadlines`，经 `ui/approval-deadlines-set` 读写，见 [permissions.md §2.4](./permissions.md)；`idleRelease`，经 `ui/idle-release-set` 读写，是设置页「进程管理」挑的空闲释放窗口，见 [protocol.md §5](./protocol.md)；`delegate`，经 `ui/delegate-set` 读写，是设置页「子代理」页挑的 `acp_delegate` 四键覆盖（只存用户真改过的键，逐键阶梯 / 词表过滤重启读盘，见下「delegate 键与启动顺序」与 [protocol.md §1](./protocol.md)）；`skillsMcpEnabled`，经 `ui/skills-mcp-set` 读写，是设置页「技能」页的内置 `dsh-skills` MCP 开关（默认关，见 §2.2））
+- `agents.json` —— agent 注册表 + 默认 agent + 每会话选择 + 每聊天会话的会话记录（`chatSessions`，见 §3.1）+ 外部子代理生命周期记录（`subagents`，`dshSessionId → SubagentRecord[]`：只在状态迁移落盘、每会话 200 条上限、加载时按 `chatSessions` / `conversations` prune 孤儿键、显式关闭 / force reset 立即删键；agy 派发记录另带可选 `childConversationId`（brain conversationId，只用于读子代理 transcript、不当 catalog 主键，往返不丢，CodeBuddy 行不带），见 [protocol.md §6.3](./protocol.md)）+ 插件私有偏好（`tagHalo`，经 `ui/tag-halo` RPC 读写；`sessionTitlePrefix`，经 `ui/session-title-prefix-set` 读写，是设置页「对话外观」挑的标题前缀开关（默认开），见 [architecture.md §2.1](./architecture.md)；`approvalDeadlines`，经 `ui/approval-deadlines-set` 读写，见 [permissions.md §2.4](./permissions.md)；`idleRelease`，经 `ui/idle-release-set` 读写，是设置页「进程管理」挑的空闲释放窗口，见 [protocol.md §5](./protocol.md)；`delegate`，经 `ui/delegate-set` 读写，是设置页「子代理」页挑的 `acp_delegate` 三键覆盖（只存用户真改过的键，逐键阶梯 / 词表过滤重启读盘，见下「delegate 键与启动顺序」与 [protocol.md §1](./protocol.md)）；`skillsMcpEnabled`，经 `ui/skills-mcp-set` 读写，是设置页「技能」页的内置 `dsh-skills` MCP 开关（默认关，见 §2.2））
 - `model-catalog.json` —— 模型目录 + agent 最近一次声明的斜杠命令 + agent 的 fork 能力位（最后已知，见 §3.2）
 - `workspaces/` —— 默认执行工作区
 
@@ -18,7 +18,7 @@
 
 **迁移必须成对**：搬目录与改写 agent 里记录的绝对路径是一件事。`cwd` / `allowedCwdRoots` 原样存盘，而 `resolveSessionCwd` 对不存在的 cwd 直接 `bad_cwd`——只搬目录不改写，每个已保存 agent 下次启动就失败。`rewriteLegacyWorkspaceRoots` 负责改写，且**必须回写磁盘**（`loadPersistedAgents` 改了就要 `persistAgents()`），否则纠错只活在内存，磁盘上仍是死路径。
 
-**`delegate` 键与启动顺序**：`agents.json` 的 `delegate` 只存用户真改过的覆盖（逐键：`guidance` 词表、`permissionMode` 三档、两个数值键阶梯），重启读盘逐键重校验，off-ladder / 手改值丢弃、基线重新决定（仿 `idleRelease`）；用户没写过时键不出现。`BridgeManager` 构造器在 `applyDeadlineTuning` / `applyIdleReleaseTuning` / `applySkillsMcpTuning` 之后调 `applyDelegateTuning`——生效值读时计算、没有 tuning 对象可改写，宿主回调 `syncDelegateRegistration` 就是全部应用；这次 boot replay 在注册接缝接线前是 no-op，**真实初次注册由 `src/index.ts` 的 `ctx.effect`（`registration.sync()`）兜底**，卸载 / HMR 经同一 effect 的 `dispose()`。
+**`delegate` 键与启动顺序**：`agents.json` 的 `delegate` 只存用户真改过的覆盖（逐键：`guidance` 词表、`permissionMode` 三档、数值键阶梯），重启读盘逐键重校验，off-ladder / 手改值丢弃、基线重新决定（仿 `idleRelease`）；用户没写过时键不出现。`BridgeManager` 构造器在 `applyDeadlineTuning` / `applyIdleReleaseTuning` / `applySkillsMcpTuning` 之后调 `applyDelegateTuning`——生效值读时计算、没有 tuning 对象可改写，宿主回调 `syncDelegateRegistration` 就是全部应用；这次 boot replay 在注册接缝接线前是 no-op，**真实初次注册由 `src/index.ts` 的 `ctx.effect`（`registration.sync()`）兜底**，卸载 / HMR 经同一 effect 的 `dispose()`。
 
 ## 2. agent 注册表与校验
 

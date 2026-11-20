@@ -4,7 +4,6 @@ import { DEFAULT_TUNING } from '../../src/bridge/tuning.ts'
 import type { BridgeTuning } from '../../src/bridge/types.ts'
 import {
   DEFAULT_DELEGATE_GUIDANCE,
-  DEFAULT_DELEGATE_OUTPUT_CHARS,
   DEFAULT_DELEGATE_PERMISSION_MODE,
   DEFAULT_DELEGATE_TIMEOUT_MS,
 } from '../../src/protocol.ts'
@@ -41,7 +40,6 @@ describe('delegate settings (settings layer)', () => {
       guidance: 'on',
       permissionMode: DEFAULT_DELEGATE_PERMISSION_MODE,
       timeoutMs: 120_000,
-      maxOutputChars: DEFAULT_DELEGATE_OUTPUT_CHARS,
       configured: { guidance: 'on', timeoutMs: 120_000 },
     })
     await settings.setDelegateSettings({ guidance: 'force', timeoutMs: 900_000 })
@@ -49,7 +47,6 @@ describe('delegate settings (settings layer)', () => {
       guidance: 'force',
       permissionMode: DEFAULT_DELEGATE_PERMISSION_MODE,
       timeoutMs: 900_000,
-      maxOutputChars: DEFAULT_DELEGATE_OUTPUT_CHARS,
       configured: { guidance: 'on', timeoutMs: 120_000 },
     })
     // Omitted keys keep their value; the service never fills the manager's probes.
@@ -64,16 +61,15 @@ describe('delegate settings (settings layer)', () => {
     const { host } = fakeHost()
     const settings = new SettingsService(host)
     settings.setConfiguredDelegate({ guidance: 'enhanced', permissionMode: 'abort' })
-    await settings.setDelegateSettings({ guidance: 'force', timeoutMs: 60_000, maxOutputChars: 4_000 })
+    await settings.setDelegateSettings({ guidance: 'force', timeoutMs: 60_000 })
     await settings.setDelegateSettings({ reset: ['guidance'] })
     expect(settings.delegateSettings()).toMatchObject({ guidance: 'enhanced', timeoutMs: 60_000 })
     // The deployment never named the numeric keys: reset returns to the defaults.
-    await settings.setDelegateSettings({ reset: ['timeoutMs', 'maxOutputChars', 'permissionMode'] })
+    await settings.setDelegateSettings({ reset: ['timeoutMs', 'permissionMode'] })
     expect(settings.delegateSettings()).toMatchObject({
       guidance: 'enhanced',
       permissionMode: 'abort',
       timeoutMs: DEFAULT_DELEGATE_TIMEOUT_MS,
-      maxOutputChars: DEFAULT_DELEGATE_OUTPUT_CHARS,
     })
     // No baseline at all: every reset lands on the built-in default.
     const bare = new SettingsService(fakeHost().host)
@@ -87,9 +83,9 @@ describe('delegate settings (settings layer)', () => {
     const { host } = fakeHost()
     const settings = new SettingsService(host)
     settings.setConfiguredDelegate({ guidance: 'on' })
-    await settings.setDelegateSettings({ guidance: 'enhanced', permissionMode: 'ask', timeoutMs: 1_800_000, maxOutputChars: 50_000 })
+    await settings.setDelegateSettings({ guidance: 'enhanced', permissionMode: 'ask', timeoutMs: 1_800_000 })
     const snapshot = settings.persistedSettings()
-    expect(snapshot.delegate).toEqual({ guidance: 'enhanced', permissionMode: 'ask', timeoutMs: 1_800_000, maxOutputChars: 50_000 })
+    expect(snapshot.delegate).toEqual({ guidance: 'enhanced', permissionMode: 'ask', timeoutMs: 1_800_000 })
 
     // A fresh service over the serialized snapshot is a DSH restart: the pick
     // is still in force because it was persisted with the agent registry.
@@ -103,20 +99,18 @@ describe('delegate settings (settings layer)', () => {
     const { host } = fakeHost()
     const settings = new SettingsService(host)
     settings.setConfiguredDelegate({ guidance: 'on', timeoutMs: 120_000 })
-    settings.loadPersistedSettings({ delegate: { guidance: 'bogus', permissionMode: 'wait', timeoutMs: 12_345, maxOutputChars: 999 } })
+    settings.loadPersistedSettings({ delegate: { guidance: 'bogus', permissionMode: 'wait', timeoutMs: 12_345 } })
     expect(settings.delegateSettings()).toMatchObject({
       guidance: 'on',
       permissionMode: DEFAULT_DELEGATE_PERMISSION_MODE,
       timeoutMs: 120_000,
-      maxOutputChars: DEFAULT_DELEGATE_OUTPUT_CHARS,
     })
     // One legal key survives beside illegal siblings; the rest fall back.
-    settings.loadPersistedSettings({ delegate: { guidance: 'force', timeoutMs: 600_000, permissionMode: 'nope', maxOutputChars: 1 } })
+    settings.loadPersistedSettings({ delegate: { guidance: 'force', timeoutMs: 600_000, permissionMode: 'nope' } })
     expect(settings.delegateSettings()).toMatchObject({
       guidance: 'force',
       timeoutMs: 600_000,
       permissionMode: DEFAULT_DELEGATE_PERMISSION_MODE,
-      maxOutputChars: DEFAULT_DELEGATE_OUTPUT_CHARS,
     })
     // A hand-edited non-object is dropped without throwing; an absent key clears the override.
     settings.loadPersistedSettings({ delegate: 'force' })
@@ -151,7 +145,6 @@ describe('delegate settings (settings layer)', () => {
       guidance: DEFAULT_DELEGATE_GUIDANCE,
       permissionMode: DEFAULT_DELEGATE_PERMISSION_MODE,
       timeoutMs: DEFAULT_DELEGATE_TIMEOUT_MS,
-      maxOutputChars: DEFAULT_DELEGATE_OUTPUT_CHARS,
     })
   })
 

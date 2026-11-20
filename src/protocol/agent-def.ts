@@ -170,8 +170,6 @@ export interface AcpDelegateConfig {
   permissionMode?: DelegatePermissionMode
   /** Single-delegation window: an integer in [1000, 3600000] ms (off-ladder allowed). */
   timeoutMs?: number
-  /** Folded-answer cap: an integer in [1000, 200000] chars (off-ladder allowed). */
-  maxOutputChars?: number
 }
 
 export interface AcpPluginConfig {

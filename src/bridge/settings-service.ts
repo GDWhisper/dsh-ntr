@@ -43,13 +43,11 @@ import type {
 } from '../protocol.ts'
 import {
   DEFAULT_DELEGATE_GUIDANCE,
-  DEFAULT_DELEGATE_OUTPUT_CHARS,
   DEFAULT_DELEGATE_PERMISSION_MODE,
   DEFAULT_DELEGATE_TIMEOUT_MS,
   DEFAULT_SESSION_TITLE_PREFIX,
   DEFAULT_TAG_HALO,
   DELEGATE_GUIDANCE,
-  DELEGATE_OUTPUT_CHARS,
   DELEGATE_TIMEOUT_MS,
   IDLE_RELEASE_MS,
   pluginReleaseUrl,
@@ -573,7 +571,6 @@ export class SettingsService {
       guidance: this.delegateOverride.guidance ?? this.configuredDelegate.guidance ?? DEFAULT_DELEGATE_GUIDANCE,
       permissionMode: this.delegateOverride.permissionMode ?? this.configuredDelegate.permissionMode ?? DEFAULT_DELEGATE_PERMISSION_MODE,
       timeoutMs: this.delegateOverride.timeoutMs ?? this.configuredDelegate.timeoutMs ?? DEFAULT_DELEGATE_TIMEOUT_MS,
-      maxOutputChars: this.delegateOverride.maxOutputChars ?? this.configuredDelegate.maxOutputChars ?? DEFAULT_DELEGATE_OUTPUT_CHARS,
     }
     if (Object.keys(this.configuredDelegate).length > 0) settings.configured = { ...this.configuredDelegate }
     return settings
@@ -596,7 +593,6 @@ export class SettingsService {
     if (patch.guidance !== undefined) this.delegateOverride.guidance = patch.guidance
     if (patch.permissionMode !== undefined) this.delegateOverride.permissionMode = patch.permissionMode
     if (patch.timeoutMs !== undefined) this.delegateOverride.timeoutMs = patch.timeoutMs
-    if (patch.maxOutputChars !== undefined) this.delegateOverride.maxOutputChars = patch.maxOutputChars
     this.host.persistAgents()
     this.host.syncDelegateRegistration?.()
   }
@@ -774,8 +770,6 @@ export class SettingsService {
       if (mode === 'auto' || mode === 'abort' || mode === 'ask') next.permissionMode = mode
       const timeoutMs = raw.timeoutMs
       if (typeof timeoutMs === 'number' && DELEGATE_TIMEOUT_MS.includes(timeoutMs)) next.timeoutMs = timeoutMs
-      const maxOutputChars = raw.maxOutputChars
-      if (typeof maxOutputChars === 'number' && DELEGATE_OUTPUT_CHARS.includes(maxOutputChars)) next.maxOutputChars = maxOutputChars
       this.delegateOverride = next
     } catch {
       this.delegateOverride = {}

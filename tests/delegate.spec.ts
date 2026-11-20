@@ -34,7 +34,7 @@ function makeHost() {
     respond: [] as Array<{ requestId: string; optionId?: string }>,
     transcript: [] as Array<{ sessionId: string; afterSeq?: number }>,
   }
-  const config = { guidance: 'on' as DelegateGuidance, permissionMode: 'auto' as DelegatePermissionMode, timeoutMs: 600_000, maxOutputChars: 20_000 }
+  const config = { guidance: 'on' as DelegateGuidance, permissionMode: 'auto' as DelegatePermissionMode, timeoutMs: 600_000 }
   const agents = [{ id: 'alpha', title: 'Alpha' }, { id: 'beta', title: 'Beta' }, { id: 'codebuddy', title: 'CodeBuddy' }]
   let defaultAgentId: string | undefined = 'alpha'
   let nextSession = 0
@@ -251,22 +251,21 @@ describe('acp_delegate execute semantics', () => {
     expect(result.text).not.toContain('DUPLICATE')
   })
 
-  it('truncates at maxOutputChars and leaves a marker', async () => {
+  it('returns an over-cap answer in full: no truncation, no marker (regression guard)', async () => {
     const f = makeHost()
-    f.config.maxOutputChars = 50
+    // 240k chars — far beyond the retired 200000-char cap: every chunk must survive.
+    const head = 'H'.repeat(120_000)
+    const tail = 'T'.repeat(120_000)
     f.onPrompt(async (sessionId) => {
-      f.emit({ type: 'session/update', sessionId, seq: 1, update: chunk('a'.repeat(30)) })
-      f.emit({ type: 'session/update', sessionId, seq: 2, update: chunk('b'.repeat(40)) })
-      f.emit({ type: 'session/update', sessionId, seq: 3, update: chunk('c'.repeat(10)) })
+      f.emit({ type: 'session/update', sessionId, seq: 1, update: chunk(head) })
+      f.emit({ type: 'session/update', sessionId, seq: 2, update: chunk(tail) })
       f.emit({ type: 'turn/end', sessionId, turnId: 't', stopReason: 'end_turn' })
       return { turnId: 't' }
     })
     const result = await new AcpDelegateService(f.host).execute({ task: 'x', agent: 'alpha' }, {})
-    expect(result.text).toContain('[truncated at 50 chars]')
-    expect(result.text).not.toContain('ccc')
     const body = result.text.split('\n\n— acp_delegate')[0]
-    expect(body.length).toBeLessThanOrEqual(50 + '\n…[truncated at 50 chars]'.length)
-    expect(body.startsWith('a'.repeat(30) + 'b'.repeat(20))).toBe(true)
+    expect(body).toBe(head + tail)
+    expect(result.text).not.toContain('truncated')
   })
 
   it('empty live text: reads the transcript ONCE before close, same extraction rules', async () => {

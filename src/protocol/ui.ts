@@ -245,25 +245,15 @@ export interface AcpStartSessionOpts {
  */
 export const DELEGATE_TIMEOUT_MS: readonly number[] = [60_000, 300_000, 600_000, 900_000, 1_800_000, 3_600_000]
 
-/**
- * The folded-answer output cap ladder, in CHARACTERS. Same one-ladder rule as
- * {@link DELEGATE_TIMEOUT_MS}: the deployment may name any integer in
- * [1000, 200000] (off-ladder runs as-is), the settings-page write accepts only
- * a rung. Anything beyond the cap is truncated with a marker.
- */
-export const DELEGATE_OUTPUT_CHARS: readonly number[] = [4_000, 8_000, 20_000, 50_000, 100_000, 200_000]
-
 /** Built-in default: off — no deployment's request header changes by default. */
 export const DEFAULT_DELEGATE_GUIDANCE: DelegateGuidance = 'off'
 /** Built-in default: auto-answer delegation asks (delegation = get it done). */
 export const DEFAULT_DELEGATE_PERMISSION_MODE: DelegatePermissionMode = 'auto'
 /** Built-in default single-delegation window: 10 minutes. */
 export const DEFAULT_DELEGATE_TIMEOUT_MS = 600_000
-/** Built-in default folded-answer cap: 20 thousand characters. */
-export const DEFAULT_DELEGATE_OUTPUT_CHARS = 20_000
 
 /** The delegate setting a write may name, by field name. */
-export type DelegateSettingKey = 'guidance' | 'permissionMode' | 'timeoutMs' | 'maxOutputChars'
+export type DelegateSettingKey = 'guidance' | 'permissionMode' | 'timeoutMs'
 
 /**
  * What the settings page's delegation card shows: the values in force, plus
@@ -280,7 +270,6 @@ export interface AcpDelegateSettings {
   guidance: DelegateGuidance
   permissionMode: DelegatePermissionMode
   timeoutMs: number
-  maxOutputChars: number
   /** Deployment baseline facts: only keys cordis.patch.yml actually names. */
   configured?: Partial<Pick<AcpDelegateSettings, DelegateSettingKey>>
   toolAvailable: boolean
@@ -302,7 +291,6 @@ export interface DelegateSetPayload {
   guidance?: DelegateGuidance
   permissionMode?: DelegatePermissionMode
   timeoutMs?: number
-  maxOutputChars?: number
   /** Drop the persisted overrides for these keys; baseline/default decides again. */
   reset?: readonly DelegateSettingKey[]
 }

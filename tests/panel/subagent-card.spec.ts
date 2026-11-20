@@ -17,7 +17,7 @@ import { category, click, mountPanel } from './harness.ts'
 afterEach(cleanup)
 
 const BASE: AcpDelegateSettings = {
-  guidance: 'off', permissionMode: 'auto', timeoutMs: 600_000, maxOutputChars: 20_000,
+  guidance: 'off', permissionMode: 'auto', timeoutMs: 600_000,
   toolAvailable: true, restrictAvailable: true,
 }
 
@@ -43,7 +43,6 @@ async function mountDelegate(seed: AcpDelegateSettings, options: { failWrite?: b
         ...(patch.guidance === undefined ? {} : { guidance: patch.guidance }),
         ...(patch.permissionMode === undefined ? {} : { permissionMode: patch.permissionMode }),
         ...(patch.timeoutMs === undefined ? {} : { timeoutMs: patch.timeoutMs }),
-        ...(patch.maxOutputChars === undefined ? {} : { maxOutputChars: patch.maxOutputChars }),
       }
       current = next
       return { ok: true, value: { delegate: structuredClone(current) } }
@@ -146,7 +145,7 @@ describe('SubagentCard', () => {
     expect(guidanceLefts[2]).toBeCloseTo(200 / 3, 6)
     expect(guidanceLefts[3]).toBe(100)
     expect(screen.getByText('5 分钟', { selector: '.dwa-deadline-ticks span' }).style.left).toBe('20%')
-    expect(screen.getByText('20 万字符', { selector: '.dwa-deadline-ticks span' }).style.left).toBe('100%')
+    expect(screen.getByText('1 小时', { selector: '.dwa-deadline-ticks span' }).style.left).toBe('100%')
   })
 
   it('writes the picked permission rung', async () => {
@@ -162,25 +161,19 @@ describe('SubagentCard', () => {
     expect(store.getSnapshot().delegate?.permissionMode).toBe('ask')
   })
 
-  it('writes the picked timeout and cap rungs', async () => {
+  it('writes the picked timeout rung', async () => {
     const { calls } = await mountDelegate(BASE)
     await category('子代理')
     expect(screen.getByText('10 分钟', { selector: '.dwa-deadline-value' })).toBeDefined()
-    expect(screen.getByText('2 万字符', { selector: '.dwa-deadline-value' })).toBeDefined()
     fireEvent.change(screen.getByRole('slider', { name: '单次时限' }), { target: { value: '5' } })
     await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ timeoutMs: 3_600_000 }]))
-    fireEvent.change(screen.getByRole('slider', { name: '返回上限' }), { target: { value: '0' } })
-    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toHaveLength(2))
-    expect(writes(calls, 'ui/delegate-set')[1]).toEqual({ maxOutputChars: 4_000 })
   })
 
   it('prints an off-ladder value exactly and parks the slider on the nearest rung', async () => {
-    await mountDelegate({ ...BASE, timeoutMs: 700_000, maxOutputChars: 12_345 })
+    await mountDelegate({ ...BASE, timeoutMs: 700_000 })
     await category('子代理')
     expect(screen.getByText('700 秒', { selector: '.dwa-deadline-value' })).toBeDefined()
     expect((screen.getByRole('slider', { name: '单次时限' }) as HTMLInputElement).value).toBe('2')
-    expect(screen.getByText('12345 字符', { selector: '.dwa-deadline-value' })).toBeDefined()
-    expect((screen.getByRole('slider', { name: '返回上限' }) as HTMLInputElement).value).toBe('1')
   })
 
   it('shows the config-file facts on the rows really overridden, without reset buttons', async () => {

@@ -1183,7 +1183,7 @@ export class BridgeManager {
 
   setConfiguredDelegate(config: AcpDelegateConfig | undefined): void { this.settings.setConfiguredDelegate(config) }
 
-  delegateConfig(): { guidance: DelegateGuidance; permissionMode: DelegatePermissionMode; timeoutMs: number; maxOutputChars: number } { const { guidance, permissionMode, timeoutMs, maxOutputChars } = this.settings.delegateSettings(); return { guidance, permissionMode, timeoutMs, maxOutputChars } }
+  delegateConfig(): { guidance: DelegateGuidance; permissionMode: DelegatePermissionMode; timeoutMs: number } { const { guidance, permissionMode, timeoutMs } = this.settings.delegateSettings(); return { guidance, permissionMode, timeoutMs } }
 
   setPermissionPolicy(sessionId: string, policy: AcpDelegatePolicy): void { this.rpc.setPermissionPolicy(sessionId, policy) }
 

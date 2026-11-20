@@ -28,7 +28,6 @@ import type {
 } from '../../protocol.ts'
 import {
   DEFAULT_DELEGATE_GUIDANCE,
-  DEFAULT_DELEGATE_OUTPUT_CHARS,
   DEFAULT_DELEGATE_PERMISSION_MODE,
   DEFAULT_DELEGATE_TIMEOUT_MS,
 } from '../../protocol.ts'
@@ -44,7 +43,6 @@ export const DELEGATE_DEFAULTS: Pick<AcpDelegateSettings, DelegateSettingKey> = 
   guidance: DEFAULT_DELEGATE_GUIDANCE,
   permissionMode: DEFAULT_DELEGATE_PERMISSION_MODE,
   timeoutMs: DEFAULT_DELEGATE_TIMEOUT_MS,
-  maxOutputChars: DEFAULT_DELEGATE_OUTPUT_CHARS,
 }
 
 /** Reset one key optimistically to the baseline the reset restores. */
@@ -234,7 +232,6 @@ export class SettingsService {
         ...(payload.guidance === undefined ? {} : { guidance: payload.guidance }),
         ...(payload.permissionMode === undefined ? {} : { permissionMode: payload.permissionMode }),
         ...(payload.timeoutMs === undefined ? {} : { timeoutMs: payload.timeoutMs }),
-        ...(payload.maxOutputChars === undefined ? {} : { maxOutputChars: payload.maxOutputChars }),
       }
       // The baseline a reset restores: the config file's value where it names
       // one, else the built-in default.

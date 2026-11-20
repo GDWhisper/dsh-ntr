@@ -169,7 +169,7 @@ describe('AcpStore agent management', () => {
     let release!: () => void
     const gate = new Promise<void>(resolve => { release = resolve })
     const seed = {
-      guidance: 'on', permissionMode: 'ask', timeoutMs: 900_000, maxOutputChars: 20_000,
+      guidance: 'on', permissionMode: 'ask', timeoutMs: 900_000,
       configured: { guidance: 'off', timeoutMs: 300_000 }, toolAvailable: true, restrictAvailable: true,
     }
     // The host answer differs from the optimistic value: it is the authority.
@@ -210,7 +210,7 @@ describe('AcpStore agent management', () => {
   })
 
   it('reverts a refused delegate write and keeps the card hidden on an older host', async () => {
-    const seed = { guidance: 'on', permissionMode: 'auto', timeoutMs: 600_000, maxOutputChars: 20_000, toolAvailable: true, restrictAvailable: true }
+    const seed = { guidance: 'on', permissionMode: 'auto', timeoutMs: 600_000, toolAvailable: true, restrictAvailable: true }
     const failing = new AcpStore(
       async (_channel, endpoint) => {
         if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
