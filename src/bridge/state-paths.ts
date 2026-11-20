@@ -279,14 +279,6 @@ export const AGENT_PRESETS: AgentPreset[] = [
     defaultArgs: ['-y', '@agentclientprotocol/codex-acp'],
   },
   {
-    id: 'gemini',
-    name: 'Gemini CLI',
-    description: 'Google Gemini CLI — run as `gemini --experimental-acp` over stdio',
-    executables: ['gemini'],
-    defaultCommand: 'gemini',
-    defaultArgs: ['--experimental-acp'],
-  },
-  {
     id: 'opencode',
     name: 'OpenCode',
     description: 'OpenCode — run as `opencode acp` over stdio',

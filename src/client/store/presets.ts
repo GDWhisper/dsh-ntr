@@ -52,14 +52,6 @@ export const DEFAULT_KNOWN_PRESETS: DetectedAgentInfo[] = [
     defaultArgs: ['-y', '@agentclientprotocol/codex-acp'],
   },
   {
-    id: 'gemini',
-    name: 'Gemini CLI',
-    description: 'Google Gemini CLI — run as `gemini --experimental-acp` over stdio',
-    detected: false,
-    defaultCommand: 'gemini',
-    defaultArgs: ['--experimental-acp'],
-  },
-  {
     id: 'opencode',
     name: 'OpenCode',
     description: 'OpenCode — run as `opencode acp` over stdio',
