@@ -158,8 +158,10 @@ function joinWithin(base: string, rel: string): string {
  * @param requested - browser-supplied cwd (optional; `''`/undefined → default).
  * @param realpath - platform realpath (injected; throws if the path is unusable).
  * @param extraRoots - roots trusted on top of the agent's own ones, for THIS
- *   session only. The one caller that matters is a chat session, whose cwd is
- *   the workspace the user picked in the DSH sidebar: that directory is never in
+ *   session only. Two callers matter, both anchored on a workspace the USER
+ *   picked: a chat session (its cwd is the DSH sidebar workspace) and an
+ *   `acp_delegate` delegation (the calling session's workspace, inherited when
+ *   cwd is omitted or fencing an explicit cwd). That directory is never in
  *   the agent's configured allow-list (the plugin's own sandbox dir is), yet it
  *   is the session's declared workspace — the root the fs guard confines reads
  *   and writes to. `/acp`-RPC sessions pass none and keep `allowedCwdRoots` as
@@ -256,10 +258,11 @@ export function canonicalizeFsPath(sessionCwd: string, requested: string, realpa
  * agent's request with that error instead of touching the disk.
  *
  * The containment is UNCONDITIONAL — there is deliberately no access-mode layer
- * here. The one caller (`guardFsPath` in src/bridge.ts) always passes the
- * agent's own `allowedCwdRoots` plus the session cwd as a hard cap; a DSH
- * access mode such as `danger-full-access` never reaches this path and never
- * lifts the cap.
+ * here. The one caller (`guardFsPath` in src/bridge/agent-bridge.ts) always
+ * passes the agent's own `allowedCwdRoots` plus the session cwd as a hard cap
+ * (the session cwd IS where the chat path's / the delegation's extra root
+ * landed); a DSH access mode such as `danger-full-access` never reaches this
+ * path and never lifts the cap.
  */
 export function resolveFsPath(sessionCwd: string, roots: readonly string[], requested: string, realpath: (p: string) => string): string {
   const full = canonicalizeFsPath(sessionCwd, requested, realpath)

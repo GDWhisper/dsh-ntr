@@ -216,6 +216,24 @@ export type DelegatePermissionMode = 'auto' | 'abort' | 'ask'
 export interface AcpDelegatePolicy { mode: PermissionTimeoutMode; windowMs: number; preferOnce?: boolean }
 
 /**
+ * The delegate-only `startSession` options — the ONE authoritative shape shared
+ * by the delegate service's host seam, the manager and the RPC service. The
+ * `/acp` RPC face never passes them: without opts the legacy path runs verbatim
+ * (roots-only fence, no spawn alignment). With opts the cwd is validated BEFORE
+ * any process starts, so a refused cwd never spawns a throwaway child.
+ *
+ * `extraRoots` are roots trusted for THIS session only, on top of the agent's
+ * `allowedCwdRoots` — the same authorization the chat path uses: the calling
+ * DSH session's workspace is a directory the USER picked, never a root the
+ * model invented. `alignSpawnCwd` additionally runs the agent PROCESS in the
+ * validated session cwd (agents like codebuddy fix their workspace at spawn).
+ */
+export interface AcpStartSessionOpts {
+  extraRoots?: readonly string[]
+  alignSpawnCwd?: boolean
+}
+
+/**
  * The single-delegation timeout ladder, in MILLISECONDS.
  *
  * ONE ladder, shared by both halves: the browser snaps its slider to these

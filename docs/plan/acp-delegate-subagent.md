@@ -1,6 +1,7 @@
 # `acp_delegate`：把 NTR 里配置的 ACP agent 变成原生模型的子代理
 
 > 状态：**阶段 1 已实现并提交**（`7fdb029`）。本文保留方案推导；定稿与方案的三处偏离见修订行，完整进展 / 偏离补遗 / 已知限制 / 门禁事实见 §11。
+> 修订（2026-11-20，用户裁决）：推翻 §3 旧「委派不继承主工作区」设计——省略 cwd 继承调用会话工作区，显式 cwd 按「agent roots + 会话工作区」围栏校验，spawn 对齐、先校验后 spawn、拿不到会话工作区时降级不报错；§3 / §4 / §7 / §8 的 cwd 语义按此重写，推导正文保留旧说法处以本修订为准。
 > 修订：已吸收独立审查（运行时语义 / 宿主契约 / 设置基础设施三路 39 项核查 + 原生委派工具形态 8 项核查）结论，§2/§3/§4/§5/§6/§7/§8 按证据重写；引导做成四档滑块（关闭 / 开启 / 引导增强 / 强制模式，兼注册开关，合并原 enabled），强制档经 per-agent `tools.restrict` 遮原生委派工具；拍板见 §10 记录 5–10。定稿三偏离（实现按此，正文推导不改）：① 零污染——注册 `when`（`excludesNtr`，`agentPreset !== 'acp'`）把 `acp_delegate` 从 NTR 会话的声明与派发双排除，NTR 请求头根本不含此工具（§4.1「进请求头但到不了对端」是旧说法）；② `preferOnce`——非 A1 委派 auto 档 `allow_once` 优先（`pickAutoOption` 第二参），防 `allow_always` 共用进程跨会话泄漏，A1 与主会话优先级不变（§4.2）；③ 颜色 token 定稿真名——宿主只有 `state-warn-*` / `state-error-*` 族，enhanced 用 `state-warn-primary` / `state-warn-tertiary`，force 用 `state-error-primary` / `interactive-bg-hover-danger`（§5.2 的旧 token 拼写不存在，只落 fallback）。
 > 前置阅读：[AGENTS/architecture.md](../../AGENTS/architecture.md) §1（归属模型）、§5（preset 外壳）；
 > [AGENTS/subagent-adapters.md](../../AGENTS/subagent-adapters.md)（现有「子代理」只是**观察** ACP agent 自己的子代理）。
@@ -45,7 +46,7 @@
     properties: {
       task:  { type: 'string', description: '完整任务描述（子代理看不到本会话上下文）' },
       agent: { type: 'string', description: '已配置的 agent id；省略 = 插件默认 agent' },
-      cwd:   { type: 'string', description: '工作目录，必须在该 agent 已配置的 allowedCwdRoots 内；省略 = 该 agent 的默认工作区' },
+      cwd:   { type: 'string', description: '工作目录；省略 = 继承调用会话工作区；显式指定须在该工作区或该 agent 的 allowedCwdRoots 内' },
     },
     required: ['task'],
   },
@@ -79,14 +80,23 @@
 ```text
 <子代理最后答复；空则写「(the agent returned no text)」>
 
-— acp_delegate · <agentId> · <stopReason 或 error> · 拒绝 N 个审批 / 自动代答 M 个（有才写）
+— acp_delegate · <agentId> · cwd=<resolved 工作目录> · <stopReason 或 error> · 拒绝 N 个审批 / 自动代答 M 个（有才写）
 ```
 
 `execute` 内一律 `throw new Error('acp_delegate: …')`：宿主把异常归一成 `isError` 结果给模型，不崩进程。
 
 **超时是协作式的**（宿主 `dsh-tool-call-timeout-policy` 已核实）：到点把派生 signal abort，**等 execute settle 之后**才把结果替换成 `TOOL_TIMEOUT`——工具不 observe `exec.signal`、不 settle，宿主就一直等。所以 `execute` 必须监听 `exec.signal` 并及时收口（§4 步骤 6）；内部时限从 prompt 发出起算，先于宿主预算（+30s 宽限）触发，cancel + close 有界（`session/close` 5s race），能在宽限内 settle。宿主对 `timeoutMs` 只校验正有限数（上限约 24.8 天），3630000 接受。
 
-**cwd 是硬围栏**：RPC `createSession` 不传 `extraRoots`，`resolveSessionCwd` 按 `allowedCwdRoots` 校验——越界 `cwd_denied`、非绝对/不存在 `bad_cwd`、定义无 cwd `no_cwd`。原生会话的工作区通常**不在** agent 的 roots 里：模型传了会报错，错误文案带 agent id，用户需在 agent 卡把该目录加进 roots。**不为模型请求放宽围栏**（聊天会话的 extraRoots 是人选的工作区，委派 cwd 是模型选的，两者授权来源不同）。
+**cwd 语义（2026-11-20 用户裁决，推翻旧「委派不继承主工作区」设计）**：
+
+- **省略 cwd → 继承调用会话工作区**：读 `exec.agent?.session?.header?.cwd`（宿主 ToolRunContext 携带的 Agent 与 `when` 谓词同源同一实例；header cwd = 人在侧栏选的项目工作区，**不是** `working_directory` 的生效 cd——与约束 15 / `chatWorkspaceRoot` 既定语义一致）。仅当非空字符串且 `isAbsolutePath` 才接受。
+- **显式 cwd → 围栏 = `allowedCwdRoots` + `extraRoots=[调用会话工作区]`**：主工作区及其子目录可指定（限定子代理在该目录干活），agent roots 内的目录照旧。校验管线不变（`resolveSessionCwd`），**不是豁免**；两者之外 → `cwd_denied`、非绝对/不存在 → `bad_cwd`、定义无 cwd → `no_cwd`，错误文案带 agent id。
+- **授权理由**：会话工作区是**人选的**，与聊天路径 extraRoots 同源授权；模型只是在人选的根里挑目录。旧设计把「委派 cwd 是模型选的」当成与聊天 extraRoots 完全不同的授权来源，导致继承对不在白名单的主工作区必然失败，违背用户需求。extraRoots 只加这一个根，**不为任意模型请求放宽围栏**。
+- **spawn 对齐**：委派路径一律 `alignSpawnCwd: true`——进程目录与校验后的会话目录对齐（`createSession(resolved, extraRoots, resolved)`），修复实测「CodeBuddy shell 用进程目录」问题。每会话 agent（A1）新进程直接落在该目录；共享进程 agent 复用 `ensureReady` 的 quiet-restart 搬迁。
+- **先校验后 spawn**：带 opts 的 `startSession` 先 `resolveSessionCwd` 校验再 `createSession`——被拒 cwd 不再产生一次性进程。无 opts 的 `/acp` RPC 原路径逐字保留（roots-only 围栏、无 spawn 对齐），仅返回值补加法字段 `cwd`。
+- **降级**：拿不到会话工作区（无 `exec.agent` / 无 `header.cwd` / 相对路径 / 非字符串）→ `effectiveCwd = args.cwd ?? undefined`（`resolveSessionCwd` 回落 `def.cwd`），`extraRoots = []`，不报错；spawn 对齐仍生效（对齐到校验后的目录）。
+- **footer 带 cwd**：报告行在 agent id 之后、终态之前追加 `· cwd=<resolved>`，让主代理确知子代理在哪干活。
+- **fs 围栏同款**：extraRoots 经 `resolveSessionCwd` 消费后落成 `session.cwd`，`guardFsPath` 按 `allowedCwdRoots + session.cwd` 围栏——与聊天路径同一条链（聊天的 extraRoots 就是会话 cwd 本身，`LiveSession` 不另存 extraRoots）。省略 cwd 时继承工作区内的相对路径读写放行；显式子目录 cwd 把 fs 限定在该目录。
 
 **为什么只需要三个参数**：权限策略、超时、输出上限、引导档都是部署级设置（§5），不该由模型自己给自己授权。
 
@@ -99,7 +109,7 @@ interface AcpDelegateHost {
   hub: EventHub   // subscribe(sink) → 退订函数；事件名是 AcpEvent 联合的 type 字面量，无常量表
   agents(): readonly { id: string; title: string }[]   // AgentView.title 必填
   defaultAgent(): string | undefined
-  startSession(agentId, cwd): Promise<{ sessionId: string }>
+  startSession(agentId, cwd, opts?: { extraRoots?: readonly string[]; alignSpawnCwd?: boolean }): Promise<{ sessionId: string; cwd: string }>  // 委派恒带 opts；cwd 为 resolved 目录
   setPermissionPolicy(sessionId, policy: { mode: 'auto' | 'abort' | 'wait'; windowMs: number }): void  // 新接缝
   prompt(sessionId, text): Promise<{ turnId: string }>
   cancel(sessionId): Promise<void>
@@ -114,7 +124,7 @@ interface AcpDelegateHost {
 单次委派：
 
 1. **解析 agent**：`agent` 省略 → `defaultAgent()`；否则按 id 查 `agents()`；查不到就报错并**列出已配置 id**（模型下一轮能自我纠正）。
-2. `startSession(agentId, cwd)` —— 走 `/acp` 同一个 `startSession`：A1（`isPerSessionAgent`，写死集合 `['codebuddy']`）拿 `{ kind: 'ephemeral', token: randomUUID() }`，其它 agent 经 `bridgeKey` 折叠到裸 `agentId` 的唯一进程。cwd 校验见 §3。
+2. `startSession(agentId, effectiveCwd, { extraRoots, alignSpawnCwd: true })` —— 走 `/acp` 同一个 `startSession` 但带 opts：**先** `resolveSessionCwd` 校验**再** `createSession`（被拒 cwd 不 spawn），进程目录对齐校验后的会话目录。A1（`isPerSessionAgent`，写死集合 `['codebuddy']`）拿 `{ kind: 'ephemeral', token: randomUUID() }`，其它 agent 经 `bridgeKey` 折叠到裸 `agentId` 的唯一进程。effectiveCwd / extraRoots 的计算与降级见 §3。
 3. **设会话权限策略**（§4.2 接缝，必须在 prompt 前）：`auto` → `{auto, 0}`；`abort` → `{abort, 30000}`；`ask` → `{wait, 0}`。
 4. **订阅 hub**，按 `sessionId` 过滤五种事件：`session/update`（增量折叠）、`permission/request`（abort 就地作答）、`permission/expired` 与 `permission/resolved`（计数）、`turn/end`（终态）。
 5. `prompt(sessionId, task)` → `{turnId}`；**按 sessionId 等 turn/end**——委派会话只有一轮，任何 turn/end 即终态。看门狗对无 controller 的会话走 `finalizeTurn`，广播 **`turnId: ''` 且只有 error、没有 stopReason**（`INACTIVITY_TIMEOUT` 只是 settle code，从不进 payload），按 turnId 匹配会挂死；error 进 footer。文本**从 `session/update` 增量累积**：`agent_message_chunk` 经 `chunkTextOf(update.content)` 取文本，跳过 `codebuddyMetaOf(update).parentToolCallId`（agent 自己的子代理在说话；实际键是 `codebuddy.ai/parentToolCallId`，其它 agent 命名空间未覆盖，按 per-agent 接缝纪律登记），按 seq 去重，达 `maxOutputChars` 停止追加并留截断标记。**不在 turn/end 后一次读 transcript**：环形缓冲默认 600 条，`agent_message_chunk` 无淘汰保护，长任务早期文本会被挤掉；transcript 只作兜底。
@@ -322,7 +332,7 @@ delegate:
    - 看门狗收口：`turnId: ''` + error-only 的 turn/end → footer 带 error，不挂死；
    - 长文本：>600 条 update 的回合，早期 `agent_message_chunk` 不丢（增量累积）；`parentToolCallId` chunk 被跳过；超 `maxOutputChars` 截断留标记；
    - 并发：同非 A1 agent 第二个委派排队（不报错），不同 agent 并行；排队期间宿主预算到点 → signal 离队；
-   - `cwd` 越界：`cwd_denied` 原样传回模型；
+   - 工作区继承（2026-11-20 裁决，`tests/delegate.spec.ts` 继承簇 + `tests/bridge/delegate-cwd.spec.ts` 集成）：省略 cwd + exec 带 `header.cwd` → `startSession` 收到会话工作区 + `extraRoots=[它]` + `alignSpawnCwd=true`，footer 带 resolved cwd；显式子目录（不在 agent roots）放行且 fs 限定在该目录；越界 `cwd_denied` 带 agent id 且**不 spawn**；无 agent / 无 header.cwd / 相对路径 → 降级（`extraRoots=[]`、agent 默认 cwd）；无 opts 的 `/acp` 旧路径行为不变（返回值加法 cwd）；继承工作区内 fs 相对路径读写放行、根外拒绝；
    - `agent` 省略 → 用 `defaultAgent()`；无默认且有多个 → 报错要求指定；
    - 工具定义形状：register-ready JSON Schema（`parameters.required == ['task']`）、`output.render` 存在、`name === 'acp_delegate'`、`execute` 返回 `text` 带尾注；
    - 引导四档：`off` → 不注册（`tools.get` 缺席）；`on` → 基础描述（无引导句）；`enhanced` → 含「必须使用本工具」句；`force` → 描述同 enhanced 且掩码施加；档位切换 → 重注册。
@@ -365,7 +375,7 @@ delegate:
 | 共用 bridge 权限抢占 | 主会话 auto+0 / abort 违反委派三档 | 会话级策略接缝（§4.2），两行原地改写、净 0；bridge 字段不碰 |
 | 环形缓冲丢文本 | 长任务答复残缺 | hub `session/update` 增量累积（§4 步骤 5），transcript 仅兜底 |
 | agent 侧并发不支持 | 共用进程两条 prompt 互相干扰 | per-agentId 串行队列（防御性，§4.4）；主聊天与委派的并发 agent 依赖，写进文档 |
-| cwd 越界 | 模型传原生工作区被拒 | `cwd_denied` 文案带 agent id；description 写明 roots 白名单；不放宽围栏（§3） |
+| cwd 越界 | 模型传 roots 与会话工作区之外的目录 | `cwd_denied` 文案带 agent id；围栏 = roots + 调用会话工作区（人选的，与聊天 extraRoots 同源），先校验后 spawn、被拒不产生进程；description 写明继承与白名单；不为任意模型请求放宽围栏（§3） |
 | `allow_always` 跨会话 | 非 A1 共用进程间接放宽主会话审批 | 实现前 per-agent 核作用域；必要时非 A1 改 `allow_once` 优先；写进 permissions.md（§4.2） |
 | 排队吃预算 | 后一个委派在队列里超时 | 内部时限 prompt 起算；宿主预算到点 signal 离队抛错，模型可重试（§4.4） |
 | 错误地共享/关闭主会话 | 主链路回归 | scope 恒为 `ephemeral`（A1）/ 裸 agent key（非 A1），只关自己那一个 `sessionId`；RPC close 对已删除 id 抛 `unknown_session`，服务层吞；close 不补发 turn/end，等待自结算 |

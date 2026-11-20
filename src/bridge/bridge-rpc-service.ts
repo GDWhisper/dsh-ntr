@@ -6,10 +6,11 @@
  * cluster needs arrives through {@link BridgeRpcHost}, so this module never
  * imports `manager.ts` or `bridge.ts`. The manager keeps same-named delegates.
  */
+import { realpathSync } from 'node:fs'
 import type { ContentBlock } from '@agentclientprotocol/sdk'
 import type { EventHub } from '../impl.ts'
-import { AcpError, randomUUID } from '../impl.ts'
-import type { AcpDelegatePolicy } from '../protocol.ts'
+import { AcpError, randomUUID, resolveSessionCwd } from '../impl.ts'
+import type { AcpDelegatePolicy, AcpStartSessionOpts } from '../protocol.ts'
 import type { BridgeRegistryService } from './bridge-registry-service.ts'
 import { describeError } from './errors.ts'
 import { isPerSessionAgent, type BridgeScope } from './identity.ts'
@@ -45,14 +46,31 @@ export interface BridgeRpcHost {
 export class BridgeRpcService {
   constructor(private readonly host: BridgeRpcHost) {}
 
-  async startSession(agentId: string, cwd: string | undefined): Promise<{ sessionId: string }> {
+  async startSession(agentId: string, cwd: string | undefined, opts?: AcpStartSessionOpts): Promise<{ sessionId: string; cwd: string }> {
     // A1: an `/acp` session gets its own process. The token is only the bridge
     // key; later lookups find the session by the id it was registered with.
     const scope: BridgeScope = isPerSessionAgent(agentId)
       ? { kind: 'ephemeral', token: randomUUID() }
       : { kind: 'agent' }
-    const session = await this.host.bridgeRegistry.bridgeFor(agentId, scope).createSession(cwd)
-    return { sessionId: session.sessionId }
+    if (opts === undefined) {
+      // The legacy `/acp` path, verbatim: roots-only fence inside openSession,
+      // no spawn alignment. `cwd` is additive on the answer (the resolved
+      // session directory), never a behaviour change.
+      const session = await this.host.bridgeRegistry.bridgeFor(agentId, scope).createSession(cwd)
+      return { sessionId: session.sessionId, cwd: session.cwd }
+    }
+    // The delegated path (plan §3): validate BEFORE any spawn — `bridgeFor` is
+    // pure bookkeeping, so a refused cwd (`cwd_denied` / `bad_cwd` / `no_cwd`,
+    // thrown verbatim for the delegate layer to wrap with the agent id) never
+    // starts a throwaway process. The extra roots are the CALLING session's
+    // workspace (user-picked, the chat path's same authorization); the fence
+    // itself is unchanged. `alignSpawnCwd` then runs the agent PROCESS in the
+    // validated directory — agents like codebuddy fix their workspace at spawn.
+    const bridge = this.host.bridgeRegistry.bridgeFor(agentId, scope)
+    const extraRoots = opts.extraRoots ?? []
+    const resolved = resolveSessionCwd(bridge.def, cwd, p => realpathSync(p), extraRoots)
+    const session = await bridge.createSession(resolved, extraRoots, opts.alignSpawnCwd === true ? resolved : undefined)
+    return { sessionId: session.sessionId, cwd: session.cwd }
   }
 
   async prompt(sessionId: string, prompt: string | ContentBlock[]): Promise<{ turnId: string }> {

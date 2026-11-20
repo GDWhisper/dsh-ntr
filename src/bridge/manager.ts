@@ -23,7 +23,7 @@ import type {
   AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSaveResult, AgentSkillsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions,
   LlmResolvedModelInfo,
   AcpIdleRelease, ActiveTurnView, ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, SaveGateFlushResult, SaveGateStatus, SessionView, StreamChunk,
-  AcpDelegateConfig, AcpDelegatePolicy, AcpDelegateSettings, DelegateGuidance, DelegatePermissionMode, DelegateSetPayload,
+  AcpDelegateConfig, AcpDelegatePolicy, AcpDelegateSettings, AcpStartSessionOpts, DelegateGuidance, DelegatePermissionMode, DelegateSetPayload,
   SubagentDetailResult, SubagentRecord,
 } from '../protocol.ts'
 import { SESSION_TITLE_PREFIX } from '../protocol.ts'
@@ -1077,8 +1077,8 @@ export class BridgeManager {
    * `bridge-rpc-service.ts`. `dispatchRpc` and the tests call these on the
    * manager, so their names and signatures stay put.
    */
-  async startSession(agentId: string, cwd: string | undefined): Promise<{ sessionId: string }> {
-    return this.rpc.startSession(agentId, cwd)
+  async startSession(agentId: string, cwd: string | undefined, opts?: AcpStartSessionOpts): Promise<{ sessionId: string; cwd: string }> {
+    return this.rpc.startSession(agentId, cwd, opts)
   }
 
   async prompt(sessionId: string, prompt: string | ContentBlock[]): Promise<{ turnId: string }> {

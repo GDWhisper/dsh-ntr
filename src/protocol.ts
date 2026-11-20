@@ -135,6 +135,7 @@ export type {
   AcpDelegatePolicy,
   AcpDelegateSettings,
   AcpIdleRelease,
+  AcpStartSessionOpts,
   AcpTagHalo,
   ApprovalDeadlineKey,
   ApprovalDeadlinePatch,

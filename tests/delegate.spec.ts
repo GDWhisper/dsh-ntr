@@ -8,7 +8,7 @@ import {
 } from '../src/bridge/delegate-service.ts'
 import { AcpDelegateRegistration, type DelegateRegistrationCtx } from '../src/bridge/delegate-registration.ts'
 import type { AcpDelegateForceMask } from '../src/bridge/delegate-force-mask.ts'
-import type { AcpEvent, DelegateGuidance, DelegatePermissionMode } from '../src/protocol.ts'
+import type { AcpEvent, AcpStartSessionOpts, DelegateGuidance, DelegatePermissionMode } from '../src/protocol.ts'
 
 /**
  * The delegation core (docs/plan/acp-delegate-subagent.md §7.1): one fake
@@ -26,7 +26,7 @@ function makeHost() {
   const emit = (event: AcpEvent) => { for (const sink of [...sinks]) sink(event) }
   const order: string[] = []
   const calls = {
-    startSession: [] as Array<{ agentId: string; cwd?: string }>,
+    startSession: [] as Array<{ agentId: string; cwd?: string; opts?: AcpStartSessionOpts }>,
     policy: [] as Array<{ sessionId: string; policy: AcpDelegatePolicy }>,
     prompt: [] as Array<{ sessionId: string; text: string }>,
     cancel: [] as string[],
@@ -39,20 +39,22 @@ function makeHost() {
   let defaultAgentId: string | undefined = 'alpha'
   let nextSession = 0
   const transcripts = new Map<string, Array<{ seq: number; update: unknown }>>()
-  let onStart: ((agentId: string, cwd?: string) => Promise<{ sessionId: string }>) | undefined
+  let onStart: ((agentId: string, cwd?: string, opts?: AcpStartSessionOpts) => Promise<{ sessionId: string; cwd: string }>) | undefined
   let onPrompt: ((sessionId: string, text: string) => Promise<{ turnId: string }>) | undefined
   const host: AcpDelegateHost = {
     hub: { subscribe(sink) { sinks.add(sink); return () => { sinks.delete(sink) } } },
     agents: () => agents,
     defaultAgent: () => defaultAgentId,
     delegateConfig: () => ({ ...config }),
-    async startSession(agentId, cwd) {
+    async startSession(agentId, cwd, opts) {
       order.push('start')
-      calls.startSession.push({ agentId, ...(cwd === undefined ? {} : { cwd }) })
-      if (onStart !== undefined) return onStart(agentId, cwd)
+      calls.startSession.push({ agentId, ...(cwd === undefined ? {} : { cwd }), ...(opts === undefined ? {} : { opts }) })
+      if (onStart !== undefined) return onStart(agentId, cwd, opts)
       const sessionId = `session-${String(++nextSession)}`
       if (!transcripts.has(sessionId)) transcripts.set(sessionId, [])
-      return { sessionId }
+      // The real host answers with the RESOLVED cwd; the fake echoes the
+      // request, falling back to the agent default the way resolveSessionCwd does.
+      return { sessionId, cwd: cwd ?? '/agent-default' }
     },
     setPermissionPolicy(sessionId, policy) { order.push('policy'); calls.policy.push({ sessionId, policy }) },
     async prompt(sessionId, text) {
@@ -95,11 +97,11 @@ describe('acp_delegate execute semantics', () => {
     const f = makeHost()
     happyPrompt(f, 'Hello world')
     const result = await new AcpDelegateService(f.host).execute({ task: 'do it', agent: 'alpha' }, {})
-    expect(f.calls.startSession).toEqual([{ agentId: 'alpha' }])
+    expect(f.calls.startSession).toEqual([{ agentId: 'alpha', opts: { extraRoots: [], alignSpawnCwd: true } }])
     expect(f.order.indexOf('policy')).toBeLessThan(f.order.indexOf('prompt'))
     expect(f.calls.prompt).toEqual([{ sessionId: 'session-1', text: 'do it' }])
     expect(result.text).toContain('Hello world')
-    expect(result.text).toContain('— acp_delegate · alpha · end_turn')
+    expect(result.text).toContain('— acp_delegate · alpha · cwd=/agent-default · end_turn')
     expect(result.agent).toBe('alpha')
     expect(result.stopReason).toBe('end_turn')
     expect(result.error).toBeUndefined()
@@ -391,6 +393,86 @@ describe('acp_delegate execute semantics', () => {
   })
 })
 
+/**
+ * Workspace inheritance (plan §3, user ruling): an omitted cwd inherits the
+ * CALLING DSH session's workspace (`exec.agent.session.header.cwd` — the same
+ * root the chat path trusts); an explicit cwd is validated against the agent's
+ * roots PLUS that workspace. No usable header cwd degrades to the old
+ * behaviour without an error. The fence itself stays the bridge's pipeline.
+ */
+describe('acp_delegate workspace inheritance', () => {
+  const WS = 'M:/Coding/main-project'
+  const execWithWs = { agent: { session: { header: { cwd: WS } } } }
+
+  it('omitted cwd inherits the session workspace: cwd + extraRoots + alignSpawnCwd, footer reports it', async () => {
+    const f = makeHost()
+    happyPrompt(f, 'done')
+    const result = await new AcpDelegateService(f.host).execute({ task: 'x', agent: 'alpha' }, execWithWs)
+    expect(f.calls.startSession).toEqual([{ agentId: 'alpha', cwd: WS, opts: { extraRoots: [WS], alignSpawnCwd: true } }])
+    expect(result.text).toContain(`— acp_delegate · alpha · cwd=${WS} · end_turn`)
+  })
+
+  it('explicit cwd keeps its own directory and carries the session workspace as the ONE extra root', async () => {
+    const f = makeHost()
+    happyPrompt(f)
+    const sub = `${WS}/packages/sub`
+    const result = await new AcpDelegateService(f.host).execute({ task: 'x', agent: 'alpha', cwd: sub }, execWithWs)
+    expect(f.calls.startSession).toEqual([{ agentId: 'alpha', cwd: sub, opts: { extraRoots: [WS], alignSpawnCwd: true } }])
+    expect(result.text).toContain(`cwd=${sub}`)
+  })
+
+  it('A1 (codebuddy) inherits the same way, straight through without a queue', async () => {
+    const f = makeHost()
+    happyPrompt(f)
+    await new AcpDelegateService(f.host).execute({ task: 'x', agent: 'codebuddy' }, execWithWs)
+    expect(f.calls.startSession).toEqual([{ agentId: 'codebuddy', cwd: WS, opts: { extraRoots: [WS], alignSpawnCwd: true } }])
+  })
+
+  it('the footer reports the RESOLVED cwd the host answered, not the requested spelling', async () => {
+    const f = makeHost()
+    happyPrompt(f)
+    f.onStart(async () => ({ sessionId: 'session-resolved', cwd: 'M:/Coding/main-project-canonical' }))
+    const result = await new AcpDelegateService(f.host).execute({ task: 'x', agent: 'alpha' }, { agent: { session: { header: { cwd: 'M:\\Coding\\main-project' } } } })
+    expect(f.calls.startSession[0].cwd).toBe('M:\\Coding\\main-project')
+    expect(result.text).toContain('— acp_delegate · alpha · cwd=M:/Coding/main-project-canonical · end_turn')
+  })
+
+  it('degrades without a usable header cwd: missing/odd shapes never throw, extraRoots stay empty', async () => {
+    const execs = [
+      {},
+      { agent: {} },
+      { agent: { session: {} } },
+      { agent: { session: { header: {} } } },
+      { agent: { session: { header: { cwd: 'relative/path' } } } },
+      { agent: { session: { header: { cwd: '' } } } },
+      { agent: { session: { header: { cwd: 42 } } } },
+      { agent: 'primitive' },
+      { agent: { session: null } },
+    ]
+    for (const exec of execs) {
+      const f = makeHost()
+      happyPrompt(f)
+      const result = await new AcpDelegateService(f.host).execute({ task: 'x', agent: 'alpha' }, exec as never)
+      expect(f.calls.startSession).toEqual([{ agentId: 'alpha', opts: { extraRoots: [], alignSpawnCwd: true } }])
+      expect(result.text).toContain('cwd=/agent-default')
+    }
+  })
+
+  it('a degraded explicit cwd still passes through with an empty extra-root list', async () => {
+    const f = makeHost()
+    happyPrompt(f)
+    await new AcpDelegateService(f.host).execute({ task: 'x', agent: 'alpha', cwd: '/some/other/dir' }, {})
+    expect(f.calls.startSession).toEqual([{ agentId: 'alpha', cwd: '/some/other/dir', opts: { extraRoots: [], alignSpawnCwd: true } }])
+  })
+
+  it('the cwd parameter description states inheritance and the fence', () => {
+    const definition = acpDelegateToolDefinition({ guidance: 'on', timeoutMs: 1_000, execute: async () => ({ text: '', agent: '' }) })
+    const cwd = (definition.parameters.properties as Record<string, { description: string }>).cwd
+    expect(cwd.description).toContain('省略 = 继承调用会话工作区')
+    expect(cwd.description).toContain('allowedCwdRoots')
+  })
+})
+
 describe('acp_delegate tool definition (register-ready)', () => {
   const execute: AcpDelegateExecute = async () => ({ text: 'ok', agent: 'a' })
 
@@ -427,7 +509,7 @@ describe('acp_delegate tool definition (register-ready)', () => {
     const definition = acpDelegateToolDefinition({ guidance: 'on', timeoutMs: 600_000, execute: new AcpDelegateService(f.host).execute })
     const value = await definition.execute({ task: 'x', agent: 'alpha' }, {})
     expect(value.text).toContain('done')
-    expect(value.text).toContain('— acp_delegate · alpha · end_turn')
+    expect(value.text).toContain('— acp_delegate · alpha · cwd=/agent-default · end_turn')
     expect(definition.output.render({}, value)).toEqual([{ type: 'text', text: value.text }])
   })
 })

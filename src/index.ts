@@ -321,7 +321,7 @@ export function apply(ctx: Context, config?: unknown): void {
     agents: () => manager.agentViews(),
     defaultAgent: () => manager.defaultAgent(),
     delegateConfig: () => manager.delegateConfig(),
-    startSession: (agentId, cwd) => manager.startSession(agentId, cwd),
+    startSession: (agentId, cwd, opts) => manager.startSession(agentId, cwd, opts),
     setPermissionPolicy: (sessionId, policy) => manager.setPermissionPolicy(sessionId, policy),
     prompt: (sessionId, text) => manager.prompt(sessionId, text),
     cancel: sessionId => manager.cancel(sessionId),

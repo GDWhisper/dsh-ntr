@@ -113,6 +113,7 @@
 - 同一个工作区还必须作为 `spawnCwd` 传进 `AgentBridge.ensureReady`，让子进程自己的 cwd 也落在那里（`safeSpawnCwd`；`createSession` 第 3 参与 `doResumeSession` 两处都传）。有类 agent（实测 codebuddy）在进程启动那一刻就把 workspace 定死，`session/new` 的 cwd 对它太晚。
 - 为搬工作区的就地重启只允许在 `isQuiet()` 时发生，且必须先广播 `agent/notice`；有 live session 的 bridge 不为搬工作区重启（卡死回收会重启进程，那是另一条路径，见 [protocol.md §6.1](./protocol.md)）。
 - 探测（`probeConfigOptions`）、`agent/test`、`/acp` RPC 会话背后没有 DSH 会话，仍用 `def.cwd`。
+- **`acp_delegate` 委派会话继承调用会话的工作区**（2026-11-20 用户裁决）：省略 cwd 时取 `exec.agent.session.header.cwd`（与聊天 `chatWorkspaceRoot` 同源——人选的会话项目工作区），经 `startSession` opts 作为 `extraRoots` 与 `spawnCwd` 传入，先校验后 spawn；显式 cwd 按「agent roots + 会话工作区」围栏校验。拿不到会话工作区时降级 `def.cwd` + roots-only 围栏，不报错。无 opts 的 `/acp` RPC 保持旧行为。细节见 §5 委派节与 [plan §3](../docs/plan/acp-delegate-subagent.md)。
 
 ## 5. NTR preset 外壳
 
@@ -139,6 +140,7 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 **宿主工具 → agent 委派（`acp_delegate`）**：与上面「宿主 MCP 不经此路」方向不同的一条接缝——委派是插件**主动**起 ACP 会话跑任务再收答复，不是把宿主工具暴露给对端 agent。
 
 - 工具经全局层 `ctx.tools.register` 注册（`src/bridge/delegate-service.ts` · `acpDelegateToolDefinition`），**原生模型**（非 NTR 会话）在它自己的工具清单里看到它；一次调用 = 一条新 ACP 会话 + 一条 prompt + 收尾 close（`AcpDelegateService.execute`），答复增量折叠后返回发起对话。不注入、不打断主对话。
+- **工作区继承**（`delegate-service.ts` · `sessionWorkspaceOf`）：省略 cwd 继承调用 DSH 会话的工作区（`exec.agent?.session?.header?.cwd`，仅非空绝对路径接受；与聊天 extraRoots 同源授权——工作区是人选的，不是模型发明的根）；显式 cwd 须在该工作区或 agent roots 内，围栏 = `allowedCwdRoots` + 会话工作区这一个 extra root，校验管线不变。委派恒带 `alignSpawnCwd: true`（进程目录对齐校验后的会话目录，修复 codebuddy shell 用进程目录的问题）；带 opts 的 `startSession`（`bridge-rpc-service.ts`）先 `resolveSessionCwd` 校验再 `createSession`，被拒 cwd 不 spawn，返回 `{ sessionId, cwd }`，footer 在 agent id 后带 `· cwd=<resolved>`。拿不到会话工作区 → 降级 agent 默认 + roots-only 围栏，不报错。fs 围栏与聊天同款：extraRoots 落成 `session.cwd`，`guardFsPath` 按 roots + `session.cwd` 消费（`LiveSession` 不另存 extraRoots）。
 - 注册 `when`（`src/bridge/delegate-registration.ts` · `excludesNtr`）读 `agent.session.header.agentPreset !== ACP_PRESET_ID`，把 NTR 会话从**声明与派发**双排除——NTR 请求头根本不含此工具（零污染）；对端 agent 看不到、也指定不了宿主工具。
 - **不写 `subagents/record` / 外部 catalog**：宿主本来就在原生对话里渲染这次工具调用及其结果，再塞面板行是双写同一件事（阶段 2 再议，[subagent-adapters.md](./subagent-adapters.md)）。
 - 三个委派模块（`delegate-service` / `delegate-registration` / `delegate-force-mask`）都不 import manager，能力经 `src/index.ts` 的闭包注入（与 `subagent-service.ts` 同纪律）；force 档的 per-agent 遮蔽名单是 `DELEGATE_FORCE_DENY_CANDIDATES`（`subagent` / `subagent_fork` / `workflow`）∩ 该 agent 活清单（`AcpDelegateForceMask`，控制面工具保留，`agent/created` / `agent/disposed` 跟随）；权限走会话级接缝（[permissions.md §2.5](./permissions.md)），四键设置见 [ui-panel.md §8](./ui-panel.md) / [state.md §1](./state.md)。
@@ -172,7 +174,7 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 | 工具卡快照 / delta / 输出注册 | `src/impl.ts` · `acpToolCallFromUpdate` / `acpToolCallDelta` / `acpToolCallArgsOf` / `isFinalToolCallStatus`；`src/bridge/registries.ts` · `recordAcpToolOutput` / `waitForToolOutput`；详见 [protocol.md](./protocol.md) |
 | 绑定 RPC | `src/impl.ts` · `dispatchRpc('session/chat-*')`；`src/bridge/session-registry-service.ts` · `bindChatAgent`；`src/bridge/chat-choice-service.ts` · `setChatSessionModel` / `setChatSessionEffort` / `setChatSessionMode` |
 | 路由选择 / 老宿主请求改写 | `presets/acp/acp-guard.mjs` · `selectBoundRoute` / `agent/request`；`src/bridge/chat-choice-service.ts` · `conversationRouteModel` |
-| 工作区 | `src/index.ts` · `wireWorkspace`；`src/bridge/state-paths.ts` · `chatWorkspaceRoot`；`src/bridge/session-boot-service.ts` · `SessionBootService.getOrCreateDshSession`（manager 同名转发）；`src/bridge/agent-bridge.ts` · `doResumeSession` |
+| 工作区 | `src/index.ts` · `wireWorkspace`；`src/bridge/state-paths.ts` · `chatWorkspaceRoot`；`src/bridge/session-boot-service.ts` · `SessionBootService.getOrCreateDshSession`（manager 同名转发）；`src/bridge/agent-bridge.ts` · `doResumeSession`；委派继承：`src/bridge/delegate-service.ts` · `sessionWorkspaceOf`、`src/bridge/bridge-rpc-service.ts` · `startSession`（opts 路径） |
 | 锁定 | `src/bridge/session-registry-service.ts` · `lockedAgentFor` / `lockChatAgent` / `rollbackFirstTurn`；`src/bridge/live-session.ts` · `provisionalLock` |
 | 桥注册表 / 生命周期 | `src/bridge/bridge-registry-service.ts` · `bridgeFor` / `pruneBridge` / `stopAgent` / `shutdownAll`（manager 保留同名转发与 `bridges` / `bridgeScopes` getter） |
 | 会话启动 / resume | `src/bridge/session-boot-service.ts` · `SessionBootService`（`getOrCreateDshSession` / `resumeChatSession` / `prepareStalledSession` / `reclaimChatPrompt`，manager 保留同名转发；`waitForSettleGate` 仅服务内部使用） |

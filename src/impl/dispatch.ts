@@ -31,7 +31,7 @@ const STABLE_SEMVER = /^\d+\.\d+\.\d+$/
 /** The bridge-manager face the dispatcher talks to (interface keeps dispatch pure-testable). */
 export interface AcpManager {
   agentViews(): AgentView[]
-  startSession(agentId: string, cwd: string | undefined): Promise<{ sessionId: string }>
+  startSession(agentId: string, cwd: string | undefined): Promise<{ sessionId: string; cwd?: string }>
   prompt(sessionId: string, prompt: string | PromptContentBlock[]): Promise<{ turnId: string }>
   cancel(sessionId: string): Promise<void>
   closeSession(sessionId: string): Promise<void>
@@ -396,6 +396,8 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         return ok(await manager.testAgent(validateAgentDef(body)))
       }
       case 'session/start':
+        // The whole answer rides through (`ok` picks no fields): the manager's
+        // additive `cwd` (the resolved session directory) reaches the wire.
         return ok(await manager.startSession(str(body, 'agentId', 64), optionalStr(body, 'cwd', 4096)))
       case 'session/prompt': {
         let promptInput: string | PromptContentBlock[]
