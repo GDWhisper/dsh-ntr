@@ -1,0 +1,187 @@
+/**
+ * Markdown `file://` link normalization for DSH's chat renderer: strips local
+ * `file://` / `file://localhost` prefixes into plain paths so links open in
+ * DSH's file sidebar, preserves code spans / fenced blocks / remote hosts /
+ * other schemes, and produces identical output regardless of chunk splits.
+ */
+
+import { describe, expect, it } from 'vitest'
+import { MarkdownFileLinkRewriter, normalizeMarkdownFileLinks, rewriteStreamFileLinks } from '../../src/impl.ts'
+import type { StreamChunk } from '../../src/protocol.ts'
+
+function streamByChunks(chunks: string[]): string {
+  const rewriter = new MarkdownFileLinkRewriter()
+  let out = ''
+  for (const chunk of chunks) out += rewriter.push(chunk)
+  out += rewriter.flush()
+  return out
+}
+
+async function collect(stream: AsyncIterable<StreamChunk>): Promise<StreamChunk[]> {
+  const out: StreamChunk[] = []
+  for await (const chunk of stream) out.push(chunk)
+  return out
+}
+
+async function* chunksOf(items: StreamChunk[]): AsyncIterable<StreamChunk> {
+  for (const item of items) yield item
+}
+
+describe('Markdown file:// link normalization', () => {
+  it('rewrites POSIX file:/// and file://localhost/ links and preserves line anchors', () => {
+    expect(normalizeMarkdownFileLinks('See [config.ts](file:///Users/gai/proj/src/config.ts)'))
+      .toBe('See [config.ts](/Users/gai/proj/src/config.ts)')
+    expect(normalizeMarkdownFileLinks('Lines [config.ts](file:///Users/gai/proj/src/config.ts#L10-L20) and [a.md](FILE://LOCALHOST/tmp/a.md:5)'))
+      .toBe('Lines [config.ts](/Users/gai/proj/src/config.ts#L10-L20) and [a.md](/tmp/a.md:5)')
+    expect(normalizeMarkdownFileLinks('Encoded [my doc](file:///Users/gai/my%20doc.md#L3)'))
+      .toBe('Encoded [my doc](/Users/gai/my%20doc.md#L3)')
+    expect(normalizeMarkdownFileLinks('Image ![shot](file:///Users/gai/shot.png)'))
+      .toBe('Image ![shot](/Users/gai/shot.png)')
+  })
+
+  it('rewrites Windows drive paths without a leading slash', () => {
+    expect(normalizeMarkdownFileLinks('[app.ts](file:///C:/Users/dev/app.ts#L12)'))
+      .toBe('[app.ts](C:/Users/dev/app.ts#L12)')
+    expect(normalizeMarkdownFileLinks('[app.ts](file:///c:/Users/dev/app.ts)'))
+      .toBe('[app.ts](c:/Users/dev/app.ts)')
+    expect(normalizeMarkdownFileLinks('[app.ts](file://localhost/D:/work/app.ts)'))
+      .toBe('[app.ts](D:/work/app.ts)')
+    expect(normalizeMarkdownFileLinks('[app.ts](file:///C%3A/Users/dev/app.ts)'))
+      .toBe('[app.ts](C%3A/Users/dev/app.ts)')
+  })
+
+  it('supports CommonMark angle-bracketed destinations', () => {
+    expect(normalizeMarkdownFileLinks('[notes](<file:///Users/gai/my notes.md>)'))
+      .toBe('[notes](</Users/gai/my notes.md>)')
+    expect(normalizeMarkdownFileLinks('[notes](<file:///C:/my notes.md>)'))
+      .toBe('[notes](<C:/my notes.md>)')
+    expect(normalizeMarkdownFileLinks('[notes](<file://localhost/Users/gai/my notes.md>)'))
+      .toBe('[notes](</Users/gai/my notes.md>)')
+  })
+
+  it('leaves non-local file hosts, other URL schemes, and plain paths untouched', () => {
+    const cases = [
+      '[unc](file://fileserver/share/doc.txt)',
+      '[remote](file://local/path/doc.txt)',
+      '[web](https://example.com/file:///Users/a)',
+      '[http](http://localhost:3000/a)',
+      '[vscode](vscode://file/Users/gai/a.ts)',
+      '[dsh](dsh-resource://file/session/s1/a.ts)',
+      '[plain](/Users/gai/a.ts#L1)',
+      '[rel](src/index.ts#L10-L20)',
+      '[win](C:/Users/dev/a.ts)',
+    ]
+    for (const input of cases) {
+      expect(normalizeMarkdownFileLinks(input)).toBe(input)
+    }
+  })
+
+  it('does not rewrite links inside inline code spans or fenced code blocks', () => {
+    const input = [
+      'Inline `[a](file:///Users/a.ts)` and ``[b](file:///Users/b.ts)`` then [c](file:///Users/c.ts).',
+      '```markdown',
+      '[inside-backtick](file:///Users/d.ts)',
+      '```not-a-closing-fence',
+      '[still-inside](file:///Users/e.ts)',
+      '```',
+      'After backtick fence: [f](file:///Users/f.ts)',
+      '   ~~~md',
+      '[inside-tilde](file:///Users/g.ts)',
+      '   ~~~',
+      'After tilde fence: [h](file:///C:/Users/h.ts)',
+      '```[inline-three](file:///Users/i.ts)``` and [j](file:///Users/j.ts)',
+    ].join('\n')
+
+    const expected = [
+      'Inline `[a](file:///Users/a.ts)` and ``[b](file:///Users/b.ts)`` then [c](/Users/c.ts).',
+      '```markdown',
+      '[inside-backtick](file:///Users/d.ts)',
+      '```not-a-closing-fence',
+      '[still-inside](file:///Users/e.ts)',
+      '```',
+      'After backtick fence: [f](/Users/f.ts)',
+      '   ~~~md',
+      '[inside-tilde](file:///Users/g.ts)',
+      '   ~~~',
+      'After tilde fence: [h](C:/Users/h.ts)',
+      '```[inline-three](file:///Users/i.ts)``` and [j](/Users/j.ts)',
+    ].join('\n')
+
+    expect(normalizeMarkdownFileLinks(input)).toBe(expected)
+  })
+
+  it('handles adversarial prefixes and preserves truncated tails on flush', () => {
+    expect(normalizeMarkdownFileLinks('[x](](file:///Users/a.ts)')).toBe('[x](](/Users/a.ts)')
+    expect(normalizeMarkdownFileLinks('[x](file://foo](file:///Users/a.ts)')).toBe('[x](file://foo](/Users/a.ts)')
+    expect(normalizeMarkdownFileLinks('[x](file://](file:///Users/a.ts)')).toBe('[x](file://](/Users/a.ts)')
+    expect(normalizeMarkdownFileLinks('trailing ](file:')).toBe('trailing ](file:')
+    expect(normalizeMarkdownFileLinks('trailing ](file:///')).toBe('trailing ](file:///')
+    expect(normalizeMarkdownFileLinks('[root](file:///)')).toBe('[root](/)')
+    expect(normalizeMarkdownFileLinks('[weird](file:///a:b/c)')).toBe('[weird](/a:b/c)')
+  })
+
+  it('produces identical output under every 1-char and 2-part chunk split', () => {
+    const sample = [
+      'Check [a.ts](file:///Users/gai/a.ts#L1-L5), [b.ts](file:///C:/proj/b.ts),',
+      '[c.ts](file://localhost/Users/gai/c.ts), [d](<file:///Users/my file.md>),',
+      '[unc](file://server/share/x.txt), and `[code](file:///keep.ts)`.',
+      '```ts',
+      'const link = "[keep](file:///inside.ts)"',
+      '```',
+      'Done: [e.ts](file:///D%3A/e.ts) and tail ](file:',
+    ].join('\n')
+
+    const expected = normalizeMarkdownFileLinks(sample)
+    expect(streamByChunks([...sample])).toBe(expected)
+
+    for (let cut = 1; cut < sample.length; cut++) {
+      expect(streamByChunks([sample.slice(0, cut), sample.slice(cut)])).toBe(expected)
+    }
+  })
+})
+
+describe('rewriteStreamFileLinks', () => {
+  it('rewrites split text-delta and reasoning-delta chunks and matching block-end blocks', async () => {
+    const raw: StreamChunk[] = [
+      { type: 'block-start', index: 0, blockType: 'reasoning' },
+      { type: 'reasoning-delta', index: 0, text: 'Inspecting [a.ts](file:' },
+      { type: 'reasoning-delta', index: 0, text: '///Users/gai/a.ts#L4)' },
+      { type: 'block-end', index: 0, block: { type: 'reasoning', text: 'Inspecting [a.ts](file:///Users/gai/a.ts#L4)' } },
+      { type: 'block-start', index: 1, blockType: 'text' },
+      { type: 'text-delta', index: 1, text: 'Updated [b.ts](file:///C:/work/' },
+      { type: 'text-delta', index: 1, text: 'b.ts) and tail ](file:' },
+      { type: 'block-end', index: 1, block: { type: 'text', text: 'Updated [b.ts](file:///C:/work/b.ts) and tail ](file:' } },
+      { type: 'block-start', index: 2, blockType: 'tool-call' },
+      { type: 'tool-call-delta', index: 2, id: 'c1', name: 'dsh_ntr__acp_tool_call', argumentsDelta: '{"description":"[keep](file:///x)"}' },
+      { type: 'block-end', index: 2, block: { type: 'tool-call', id: 'c1', name: 'dsh_ntr__acp_tool_call', arguments: '{"description":"[keep](file:///x)"}' } },
+      { type: 'usage', usage: { inputTokens: 0, outputTokens: 12 } },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ]
+
+    const out = await collect(rewriteStreamFileLinks(chunksOf(raw)))
+
+    const reasoningDeltas = out.filter(c => c.type === 'reasoning-delta').map(c => c.text).join('')
+    const reasoningEnd = out.find(c => c.type === 'block-end' && c.index === 0)
+    expect(reasoningDeltas).toBe('Inspecting [a.ts](/Users/gai/a.ts#L4)')
+    expect(reasoningEnd).toEqual({
+      type: 'block-end',
+      index: 0,
+      block: { type: 'reasoning', text: 'Inspecting [a.ts](/Users/gai/a.ts#L4)' },
+    })
+
+    const textDeltas = out.filter(c => c.type === 'text-delta').map(c => c.text).join('')
+    const textEnd = out.find(c => c.type === 'block-end' && c.index === 1)
+    expect(textDeltas).toBe('Updated [b.ts](C:/work/b.ts) and tail ](file:')
+    expect(textEnd).toEqual({
+      type: 'block-end',
+      index: 1,
+      block: { type: 'text', text: 'Updated [b.ts](C:/work/b.ts) and tail ](file:' },
+    })
+
+    // Tool-call blocks pass through untouched.
+    const toolDelta = out.find(c => c.type === 'tool-call-delta')
+    const toolEnd = out.find(c => c.type === 'block-end' && c.index === 2)
+    expect(toolDelta).toEqual(raw[9])
+    expect(toolEnd).toEqual(raw[10])
+  })
+})

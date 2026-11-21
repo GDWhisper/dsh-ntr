@@ -1,3 +1,4 @@
+import { rewriteStreamFileLinks } from '../impl.ts'
 import type {
   GenerateOptions,
   LlmAdapterLike,
@@ -56,6 +57,7 @@ export class AcpLlmAdapter implements LlmAdapterLike {
   }
 
   stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    return this.manager.streamPrompt(options)
+    const raw = this.manager.streamPrompt(options)
+    return options.purpose === undefined ? rewriteStreamFileLinks(raw) : raw
   }
 }
