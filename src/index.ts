@@ -8,7 +8,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { ConnectionRpcHandler, HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
-import { ACP_PRESET_ID, AcpLlmAdapter, AcpDelegateForceMask, AcpDelegateRegistration, AcpDelegateService, BridgeManager, PLUGIN_VERSION, type DshAgentLike } from './bridge.ts'
+import { ACP_PRESET_ID, AcpLlmAdapter, AcpDelegateForceMask, AcpDelegateRegistration, AcpDelegateService, AcpSubagentProvider, BridgeManager, PLUGIN_VERSION, type DshAgentLike, type DelegateForceMaskCtx, type DelegateSubagentsLike } from './bridge.ts'
 import { appendExternalSubagentCatalog, EventHub, dispatchRpc, permissionReplayFrames, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
 import { ArchiveReleaseTracker, archiveActivityFrames } from './archive-release.ts'
 import type { SessionActivityLike } from './archive-release.ts'
@@ -311,11 +311,12 @@ export function apply(ctx: Context, config?: unknown): void {
   // The delegate baseline: `validateDelegateConfig` keeps only the keys the
   // patch file names, so the settings page's picks outrank it per key.
   manager.setConfiguredDelegate(resolved.delegate)
-  // acp_delegate (docs/plan/acp-delegate-subagent.md): one self-contained task
-  // per call to a configured ACP agent, in its OWN process. The three modules
+  // acp_delegate (docs/plan/acp-delegate-native-subagent.md): one self-contained
+  // task per call to a configured ACP agent, in its OWN process. The modules
   // never import the manager — every capability arrives as a closure here.
   const delegateNotify = (text: string): void => { manager.hub.broadcast({ type: 'agent/notice', agentId: manager.defaultAgent() ?? 'acp', level: 'info', text }) }
-  const delegateForceMask = new AcpDelegateForceMask({ ctx, notify: delegateNotify })
+  // Type-only cast: cordis 4.1.0's Context.on generic overloads don't unify with the mask's structural face; its runtime probes (typeof on + try/catch) guard every call.
+  const delegateForceMask = new AcpDelegateForceMask({ ctx: ctx as unknown as DelegateForceMaskCtx, notify: delegateNotify })
   const delegateService = new AcpDelegateService({
     hub: manager.hub,
     agents: () => manager.agentViews(),
@@ -328,7 +329,46 @@ export function apply(ctx: Context, config?: unknown): void {
     closeSession: sessionId => manager.closeSession(sessionId),
     transcript: (sessionId, afterSeq) => manager.transcript(sessionId, afterSeq),
   })
-  const delegateRegistration = new AcpDelegateRegistration({ ctx, service: delegateService, config: () => manager.delegateConfig(), forceMask: delegateForceMask, notify: delegateNotify })
+  /**
+   * The optional native subagent seam (`ctx.subagents`, host 0.2.2+). Probed
+   * structurally and NEVER injected at the top level: an old host without it
+   * keeps the legacy synchronous delegate shell. When present, the plugin
+   * registers the `acp` provider (effect-scoped disposer) and the tool
+   * registers the async activation shell; the seam is re-judged on every
+   * registration sync and on late arrival.
+   */
+  const probeSubagents = (): DelegateSubagentsLike | undefined => {
+    let raw: unknown
+    try { raw = typeof ctx.get === 'function' ? ctx.get('subagents') : undefined } catch { return undefined }
+    if (raw === null || typeof raw !== 'object') return undefined
+    const service = raw as Partial<DelegateSubagentsLike>
+    if (typeof service.registerProvider !== 'function' || typeof service.startActivation !== 'function') return undefined
+    return service as DelegateSubagentsLike
+  }
+  const delegateProvider = new AcpSubagentProvider({ service: delegateService })
+  let providerDisposer: (() => void) | undefined
+  const wireSubagentProvider = (): void => {
+    if (providerDisposer !== undefined) return
+    const subagents = probeSubagents()
+    if (subagents === undefined) return
+    try {
+      const disposer = subagents.registerProvider(delegateProvider)
+      providerDisposer = typeof disposer === 'function' ? disposer as () => void : () => {}
+    } catch (error) {
+      delegateNotify(`acp: subagent provider registration failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  // Provider registration runs BEFORE the tool registration's first sync: a
+  // native shell whose provider is not registered yet would answer NO_PROVIDER.
+  ctx.effect(() => {
+    wireSubagentProvider()
+    return () => {
+      const disposer = providerDisposer
+      providerDisposer = undefined
+      try { disposer?.() } catch { /* teardown never throws */ }
+    }
+  }, 'dsh-ntr: acp subagent provider')
+  const delegateRegistration = new AcpDelegateRegistration({ ctx, service: delegateService, config: () => manager.delegateConfig(), forceMask: delegateForceMask, notify: delegateNotify, subagents: probeSubagents })
   manager.setDelegateRegistration(delegateRegistration)
   // Registration lifecycle: this initial sync is the REAL first registration
   // (the manager's boot replay ran before the seam was wired); unload / HMR
@@ -338,6 +378,13 @@ export function apply(ctx: Context, config?: unknown): void {
     delegateRegistration.sync()
     return () => { delegateRegistration.dispose() }
   }, 'dsh-ntr: acp delegate registration')
+  if (typeof ctx.inject === 'function') {
+    // Late subagent seam: register the provider AND re-judge the tool shell.
+    ctx.inject(['subagents'], () => {
+      wireSubagentProvider()
+      delegateRegistration.sync()
+    })
+  }
 
   // Boot hook kept only so this entry point's shape does not change:
   // `bootstrapCatalogs` is intentionally empty — boot never spawns an agent,

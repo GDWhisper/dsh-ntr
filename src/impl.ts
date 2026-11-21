@@ -40,6 +40,17 @@ export {
 
 export { quoteCommandToken, splitCommandLine, tokenizeCommandLine } from './impl/command-line.ts'
 
+// ---- Native delegation label routing + diagnostic bounding ----
+
+export {
+  DELEGATE_LABEL_SUMMARY_MAX,
+  DIAGNOSTIC_TRUNCATION_SUFFIX,
+  MAX_DELEGATE_DIAGNOSTIC_BYTES,
+  agentIdFromDelegateLabel,
+  delegateLabel,
+  truncateDelegateDiagnostic,
+} from './impl/delegate-label.ts'
+
 // ---- Workspace guard ----
 
 export { canonicalizeFsPath, isAbsolutePath, isUnderPath, resolveFsPath, resolveSessionCwd } from './impl/paths.ts'

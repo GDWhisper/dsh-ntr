@@ -1,14 +1,22 @@
 /**
- * Hot registration of `acp_delegate` (docs/plan/acp-delegate-subagent.md §5.3).
+ * Hot registration of `acp_delegate` (docs/plan/acp-delegate-native-subagent.md §5).
  *
- * `sync()` reconciles the ONE registration against the live guidance rung and
- * budget: `off` removes the tool (a clean request header), the other rungs
- * register the register-ready definition, and any `(guidance, timeoutMs)`
- * change re-registers — guidance bakes into the description the host ships in
- * `schemas()`; the window stays in the signature so a tuning change still
- * reconciles, while the host budget is the fixed 24h backstop and the silence
- * window is read live per execute. The session permission policy is always
- * auto and is read live by execute, so it never participates in the signature.
+ * `sync()` reconciles the ONE registration against the live guidance rung,
+ * budget AND subagent-seam presence: `off` removes the tool (a clean request
+ * header), the other rungs register the register-ready definition, and any
+ * `(guidance, timeoutMs, shell)` change re-registers — guidance bakes into the
+ * description the host ships in `schemas()`; the window stays in the signature
+ * so a tuning change still reconciles, while the host budget is the fixed 24h
+ * backstop and the silence window is read live per run. The session permission
+ * policy is always auto and is read live by the core, so it never participates
+ * in the signature.
+ *
+ * SHELL SELECTION (plan §5): when the host offers the `ctx.subagents` seam the
+ * tool registers the NATIVE async shell (immediate activation receipt, the
+ * answer arrives as the host's settlement notification); without it the LEGACY
+ * synchronous shell (folded full text) registers instead. The seam is re-probed
+ * on every sync, so a guidance hot-reload re-judges it, and a late-arriving
+ * subagents service re-syncs through the inject seam.
  *
  * The `when` predicate excludes NTR sessions (`agentPreset === 'acp'`) from
  * BOTH declaration and dispatch: zero pollution of the ACP request header.
@@ -16,18 +24,19 @@
  * DEGRADATION (old host whose `tools.register` returns no disposer): the
  * registration is permanent — the tool stays in the request header until the
  * host restarts — and the wrapped execute answers `off` from the LIVE config
- * with a disabled text instead. The switch still works; the header line does
- * not disappear. `toolAvailable` reports host capability (the tools service
- * answers the probe and the last register did not fail), never the guidance
- * rung: `off` on a capable host stays true so the card never claims a missing
- * service the host actually has.
+ * with a disabled receipt in the registered shell's shape. The switch still
+ * works; the header line does not disappear. `toolAvailable` reports host
+ * capability (the tools service answers the probe and the last register did
+ * not fail), never the guidance rung: `off` on a capable host stays true so
+ * the card never claims a missing service the host actually has.
  *
  * DI discipline: no manager import; the ctx face is a minimal probe-friendly
  * interface (the `reserveVirtualTool` precedent in presets/acp/acp-guard.mjs).
  */
 import type { DelegateGuidance } from '../protocol.ts'
 import { ACP_PRESET_ID } from './state-paths.ts'
-import { acpDelegateToolDefinition, type AcpDelegateExecute, type AcpDelegateService } from './delegate-service.ts'
+import { acpDelegateToolDefinition, type AcpDelegateActivationExecute, type AcpDelegateExecute, type AcpDelegateService } from './delegate-service.ts'
+import { acpDelegateActivationExecute, type DelegateSubagentsLike } from './delegate-provider.ts'
 import type { AcpDelegateForceMask } from './delegate-force-mask.ts'
 
 /** The minimal ctx face this registration needs (fake-friendly). */
@@ -71,6 +80,9 @@ export class AcpDelegateRegistration {
   private state: RegistrationState = 'off'
   private signature = ''
   private injectArmed = false
+  private subagentsInjectArmed = false
+  /** The shell the LAST register baked in — the degraded `off` intercept answers in its shape. */
+  private native = false
 
   constructor(private readonly deps: {
     ctx: DelegateRegistrationCtx
@@ -78,6 +90,8 @@ export class AcpDelegateRegistration {
     config: () => { guidance: DelegateGuidance; timeoutMs: number }
     forceMask: AcpDelegateForceMask
     notify?: (text: string) => void
+    /** The optional native-seam probe; absent (or undefined) selects the legacy shell. */
+    subagents?: () => DelegateSubagentsLike | undefined
   }) {}
 
   /**
@@ -91,12 +105,12 @@ export class AcpDelegateRegistration {
   /** Whether per-agent masking is usable (force degrades to enhanced if not). */
   get restrictAvailable(): boolean { return this.deps.forceMask.available }
 
-  /** Idempotent reconciliation against the live config. */
+  /** Idempotent reconciliation against the live config and seam presence. */
   sync(): void {
     const { guidance, timeoutMs } = this.deps.config()
     if (this.state === 'degraded') {
       // Permanent registration: only the mask reconciles; the execute wrapper
-      // reads the live guidance and answers `off` with the disabled text.
+      // reads the live guidance and answers `off` with the disabled receipt.
       this.reconcileMask(guidance)
       return
     }
@@ -105,10 +119,11 @@ export class AcpDelegateRegistration {
       this.deps.forceMask.clear()
       return
     }
-    const signature = `${guidance}:${String(timeoutMs)}`
+    const subagents = this.deps.subagents?.()
+    const signature = `${guidance}:${String(timeoutMs)}:${subagents === undefined ? 'legacy' : 'native'}`
     if (this.state === 'off' || this.state === 'failed' || this.signature !== signature) {
       this.unRegister()
-      this.register(guidance, timeoutMs)
+      this.register(guidance, timeoutMs, subagents)
     }
     this.reconcileMask(guidance)
   }
@@ -124,25 +139,38 @@ export class AcpDelegateRegistration {
     else this.deps.forceMask.clear()
   }
 
-  private register(guidance: DelegateGuidance, timeoutMs: number): void {
+  private register(guidance: DelegateGuidance, timeoutMs: number, subagents: DelegateSubagentsLike | undefined): void {
     const tools = this.tools()
     if (tools === undefined) {
       this.armInject()
       return
     }
-    const execute: AcpDelegateExecute = async (args, exec) => {
-      // Degraded old host only: the registration cannot be removed, so `off`
-      // is answered here from the LIVE config. In normal mode the tool is
-      // unregistered on `off` and this branch never runs.
-      if (this.state === 'degraded' && this.deps.config().guidance === 'off') {
-        return { text: 'acp_delegate is disabled', agent: '' }
+    this.native = subagents !== undefined
+    // A late-arriving subagents service must re-judge the shell even when the
+    // guidance and window never change.
+    if (subagents === undefined) this.armSubagentsInject()
+    const activation = this.native
+      ? acpDelegateActivationExecute({ service: this.deps.service, subagents: subagents as DelegateSubagentsLike })
+      : undefined
+    const execute: AcpDelegateExecute | AcpDelegateActivationExecute = activation !== undefined
+      ? async (args, exec) => {
+        // Degraded host only: the registration cannot be removed, so `off` is
+        // answered here from the LIVE config in the registered shell's shape.
+        if (this.state === 'degraded' && this.deps.config().guidance === 'off') {
+          return { kind: 'error', error: 'acp_delegate is disabled' }
+        }
+        return activation(args, exec)
       }
-      return this.deps.service.execute(args, exec)
-    }
+      : async (args, exec) => {
+        if (this.state === 'degraded' && this.deps.config().guidance === 'off') {
+          return { text: 'acp_delegate is disabled', agent: '' }
+        }
+        return this.deps.service.execute(args, exec)
+      }
     try {
-      const definition = acpDelegateToolDefinition({ guidance, execute })
+      const definition = acpDelegateToolDefinition({ guidance, execute, mode: this.native ? 'native' : 'legacy' })
       const outcome = tools.register(definition, { when: excludesNtr })
-      this.signature = `${guidance}:${String(timeoutMs)}`
+      this.signature = `${guidance}:${String(timeoutMs)}:${this.native ? 'native' : 'legacy'}`
       if (typeof outcome === 'function') {
         this.disposer = outcome as () => void
         this.state = 'active'
@@ -193,6 +221,19 @@ export class AcpDelegateRegistration {
       inject.call(this.deps.ctx, ['tools'], () => { this.sync() })
     } catch {
       this.injectArmed = false
+    }
+  }
+
+  /** Late-arriving subagents seam: re-judge the shell once it loads. */
+  private armSubagentsInject(): void {
+    if (this.subagentsInjectArmed) return
+    const inject = this.deps.ctx.inject
+    if (typeof inject !== 'function') return
+    this.subagentsInjectArmed = true
+    try {
+      inject.call(this.deps.ctx, ['subagents'], () => { this.sync() })
+    } catch {
+      this.subagentsInjectArmed = false
     }
   }
 

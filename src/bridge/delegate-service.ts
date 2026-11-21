@@ -1,23 +1,33 @@
 /**
  * `acp_delegate`: hand one self-contained task to a configured external ACP
- * agent, run it in that agent's OWN process, and return its final answer
- * (docs/plan/acp-delegate-subagent.md §3 / §4).
+ * agent and run it in that agent's OWN process
+ * (docs/plan/acp-delegate-native-subagent.md §2 / §4 / §5).
  *
  * One delegation = one fresh ACP session + one `session/prompt` + a bounded
  * teardown. The session inherits the CALLING DSH session's workspace when
  * `cwd` is omitted (an explicit cwd must sit inside that workspace or the
- * agent's own roots; plan §3). The answer is folded INCREMENTALLY from the hub's `session/update`
- * stream (the transcript ring evicts early chunks on long turns, so it is only
- * a fallback), permission asks are answered by the delegation's OWN
- * session-level policy (§4.2 — the bridge-level fields are never touched), and
- * non-A1 agents serialize their delegations through a defensive per-agent
- * queue (§4.4 — the plugin does not bet on the agent's concurrency support).
+ * agent's own roots). The answer is folded INCREMENTALLY from the hub's
+ * `session/update` stream (the transcript ring evicts early chunks on long
+ * turns, so it is only a fallback), permission asks are answered by the
+ * delegation's OWN session-level policy (the bridge-level fields are never
+ * touched), and non-A1 agents serialize their delegations through a defensive
+ * per-agent queue (the plugin does not bet on the agent's concurrency support).
+ *
+ * TWO shells share ONE core: `begin()` starts a run and returns a handle whose
+ * `result` promise settles with the terminal facts (never rejects); the legacy
+ * synchronous `execute` awaits it and reports the folded full text (old hosts
+ * without the subagent seam), while the native provider
+ * (bridge/delegate-provider.ts) maps the same settlement onto the host's
+ * `SubagentResult` and returns immediately. The rolling silence window lives
+ * in the core; the fixed 24h absolute backstop is the host tool budget on the
+ * legacy shell and an OPTIONAL built-in timer (`absoluteBudgetMs`) on the
+ * native one, where no tool budget covers the detached run.
  *
  * DI discipline (same as `subagent-service.ts`): the service never imports the
  * manager — every capability arrives through {@link AcpDelegateHost}. The
  * module stays free of Node APIs; time and events come from the host seams.
  */
-import type { AcpEvent, AcpDelegatePolicy, AcpStartSessionOpts, DelegateGuidance } from '../protocol.ts'
+import type { AcpEvent, AcpDelegatePolicy, AcpDelegateAsyncOutput, AcpStartSessionOpts, DelegateGuidance } from '../protocol.ts'
 import { DELEGATE_TIMEOUT_MAX_MS } from '../protocol.ts'
 import { isAbsolutePath } from '../impl.ts'
 import { isPerSessionAgent } from './identity.ts'
@@ -36,14 +46,14 @@ export interface AcpDelegateHost {
   agents(): readonly { id: string; title: string }[]
   /** The plugin-private default agent id, when one is set. */
   defaultAgent(): string | undefined
-  /** The LIVE delegate settings — execute reads them per call (hot config). */
+  /** The LIVE delegate settings — a run reads them at its start (hot config). */
   delegateConfig(): { guidance: DelegateGuidance; timeoutMs: number }
   /**
    * Open a fresh session on the agent's process (A1 gets its own child).
    * Delegation ALWAYS passes opts: the cwd is validated before any spawn, the
    * calling session's workspace rides along as the one extra root, and the
    * process runs in the validated cwd. Resolves with the session id AND the
-   * canonical cwd the session actually landed on (the footer reports it).
+   * canonical cwd the session actually landed on (the report names it).
    */
   startSession(agentId: string, cwd?: string, opts?: AcpStartSessionOpts): Promise<{ sessionId: string; cwd: string }>
   /** Set the session-level permission policy; must land BEFORE the prompt. */
@@ -58,31 +68,48 @@ export interface AcpDelegateHost {
   transcript(sessionId: string, afterSeq?: number): { session: unknown; entries: Array<{ seq: number; update: unknown }> }
 }
 
-/** The tool's return value: the folded report plus the terminal facts. */
+/** The LEGACY tool return value: the folded report plus the terminal facts. */
 export interface AcpDelegateResult { text: string; agent: string; stopReason?: string; error?: string }
 
 /**
- * The register-ready execute shape. `exec.signal` is the host's abort seam;
- * `exec.agent` is the CALLING session's agent (the same instance the `when`
- * predicate sees), read through optional chaining only — its session header
- * cwd is the workspace the delegation inherits when `args.cwd` is omitted.
- * Structural on purpose: no host package import, and every level may be
- * missing on an old host (the service then degrades to the agent default).
+ * The host's execute context, structural on purpose: no host package import,
+ * and every level may be missing on an old host (the service then degrades to
+ * the agent default). `exec.agent` is the CALLING session's live agent — the
+ * native shell forwards it verbatim as the activation parent, and the core
+ * reads only its session header cwd (the workspace the delegation inherits).
  */
-export type AcpDelegateExecute = (
-  args: unknown,
-  exec: { signal?: AbortSignal; agent?: { session?: { header?: { cwd?: string } } } },
-) => Promise<AcpDelegateResult>
+export interface AcpDelegateExecContext {
+  signal?: AbortSignal
+  agent?: { session?: { header?: { cwd?: string } } }
+}
 
-/** The base description every guidance rung shares (plan §3). */
+/** The register-ready LEGACY execute shape (synchronous full-text report). */
+export type AcpDelegateExecute = (args: unknown, exec: AcpDelegateExecContext) => Promise<AcpDelegateResult>
+
+/** The register-ready NATIVE execute shape (immediate activation receipt). */
+export type AcpDelegateActivationExecute = (args: unknown, exec: AcpDelegateExecContext) => Promise<AcpDelegateAsyncOutput>
+
+/** The base description every LEGACY guidance rung shares. */
 const BASE_DESCRIPTION = '把一件自成一体的任务交给一个已配置的外部 ACP agent，在它自己的进程里执行，'
   + '并返回它最后给出的答复。适合需要另一套工具/另一套上下文的独立子任务；'
   + '返回的是被动汇报，不是可继续对话的子会话。'
-/** The MUST sentence `enhanced` / `force` append (a soft constraint). */
+/** The LEGACY MUST sentence `enhanced` / `force` append (a soft constraint). */
 const GUIDANCE_SENTENCE = '需要派发子代理时，必须使用本工具，优先于任何原生子代理/委派工具。'
+/** The NATIVE base description: immediate name, settlement notification later. */
+const NATIVE_BASE_DESCRIPTION = '把一件自成一体的任务交给一个已配置的外部 ACP agent，在它自己的进程里执行。'
+  + '本工具立即返回子代理的 name，不等待答复；子代理完成后，宿主会把它的结算通知送达本会话。'
+  + '适合需要另一套工具/另一套上下文的独立子任务；派发后必须结束当前回合等待通知。'
+  + '这是一次性委派，不是可继续对话的子会话。'
+/** The NATIVE MUST sentence: the same priority, plus the end-the-turn duty. */
+const NATIVE_GUIDANCE_SENTENCE = '需要派发子代理时，必须使用本工具，优先于任何原生子代理/委派工具；派发后立即结束回合，等待宿主的结算通知，不要轮询或追问结果。'
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** Keep the ONE error vocabulary: every surfaced message carries the prefix. */
+function prefixed(message: string): string {
+  return message.startsWith('acp_delegate:') ? message : `acp_delegate: ${message}`
 }
 
 /** Read the abort flag without TS narrowing it across the awaits below. */
@@ -99,7 +126,7 @@ function isAborted(signal: AbortSignal | undefined): boolean {
  * `undefined` and the delegation degrades to the agent's own default without
  * an error. Optional chaining throughout: the host shape is not ours to trust.
  */
-function sessionWorkspaceOf(exec: { agent?: { session?: { header?: { cwd?: string } } } }): string | undefined {
+function sessionWorkspaceOf(exec: AcpDelegateExecContext): string | undefined {
   const cwd = exec.agent?.session?.header?.cwd
   return typeof cwd === 'string' && cwd !== '' && isAbsolutePath(cwd) ? cwd : undefined
 }
@@ -126,24 +153,33 @@ function autoPolicyFor(agentId: string): AcpDelegatePolicy {
  * The register-ready tool definition (compiled JSON Schema + `output.render`,
  * the verified `virtualToolDefinition` shape — NOT the `defineTool` DSL).
  *
- * The guidance rung bakes into the description; hot changes re-register
- * through `AcpDelegateRegistration`. The host budget is the FIXED 24h absolute
- * backstop (`DELEGATE_TIMEOUT_MAX_MS`), independent of the configured silence
- * window — that window is read live per execute, never baked in here. `off`
- * still builds the base description — the builder never judges `off`;
+ * `mode` selects the shell's wording and output contract: `legacy` (default)
+ * describes the synchronous full-text report; `native` describes the immediate
+ * activation receipt whose answer arrives as the host's settlement
+ * notification. The guidance rung bakes into the description; hot changes
+ * re-register through `AcpDelegateRegistration`. The host budget is the FIXED
+ * 24h absolute backstop (`DELEGATE_TIMEOUT_MAX_MS`) — on the legacy shell it
+ * bounds execute itself; on the native shell execute returns at once and the
+ * core's built-in `absoluteBudgetMs` timer bounds the detached run instead.
+ * `off` still builds the base description — the builder never judges `off`;
  * registration decides whether to register.
  */
-export function acpDelegateToolDefinition(opts: { guidance: DelegateGuidance; execute: AcpDelegateExecute }): {
+export function acpDelegateToolDefinition(opts: {
+  guidance: DelegateGuidance
+  execute: AcpDelegateExecute | AcpDelegateActivationExecute
+  mode?: 'legacy' | 'native'
+}): {
   name: string
   description: string
   parameters: Record<string, unknown>
   output: { schema: Record<string, unknown>; render: (args: unknown, value: unknown) => Array<{ type: 'text'; text: string }> }
   timeoutMs: number
-  execute: AcpDelegateExecute
+  execute: AcpDelegateExecute | AcpDelegateActivationExecute
 } {
-  const description = opts.guidance === 'enhanced' || opts.guidance === 'force'
-    ? BASE_DESCRIPTION + GUIDANCE_SENTENCE
-    : BASE_DESCRIPTION
+  const native = opts.mode === 'native'
+  const base = native ? NATIVE_BASE_DESCRIPTION : BASE_DESCRIPTION
+  const sentence = native ? NATIVE_GUIDANCE_SENTENCE : GUIDANCE_SENTENCE
+  const description = opts.guidance === 'enhanced' || opts.guidance === 'force' ? base + sentence : base
   return {
     name: 'acp_delegate',
     description,
@@ -156,65 +192,130 @@ export function acpDelegateToolDefinition(opts: { guidance: DelegateGuidance; ex
       },
       required: ['task'],
     },
-    output: {
-      schema: {
-        type: 'object',
-        properties: {
-          text: { type: 'string' },
-          agent: { type: 'string' },
-          stopReason: { type: 'string' },
-          error: { type: 'string' },
+    output: native
+      ? {
+        schema: {
+          type: 'object',
+          properties: {
+            kind: { type: 'string', enum: ['activation', 'error'] },
+            name: { type: 'string' },
+            agent: { type: 'string' },
+            error: { type: 'string' },
+          },
+          required: ['kind'],
         },
-        required: ['text'],
+        render: (_args: unknown, value: unknown) => {
+          const row = (typeof value === 'object' && value !== null ? value : {}) as { kind?: unknown; name?: unknown; agent?: unknown; error?: unknown; text?: unknown }
+          if (row.kind === 'activation') {
+            return [{ type: 'text', text: `已委派给 ACP agent ${String(row.agent ?? '')}：子代理 ${String(row.name ?? '')} 已在后台开始执行。请结束当前回合；完成后宿主会把它的答复作为通知送达本会话。` }]
+          }
+          if (row.kind === 'error') return [{ type: 'text', text: `acp_delegate 委派失败：${String(row.error ?? '')}` }]
+          return [{ type: 'text', text: String(row.text ?? '') }]
+        },
+      }
+      : {
+        schema: {
+          type: 'object',
+          properties: {
+            text: { type: 'string' },
+            agent: { type: 'string' },
+            stopReason: { type: 'string' },
+            error: { type: 'string' },
+          },
+          required: ['text'],
+        },
+        render: (_args: unknown, value: unknown) => [{ type: 'text', text: String((value as { text?: unknown } | null | undefined)?.text ?? '') }],
       },
-      render: (_args: unknown, value: unknown) => [{ type: 'text', text: String((value as { text?: unknown } | null | undefined)?.text ?? '') }],
-    },
-    // Host cooperative budget: a FIXED 24h absolute backstop from execute
-    // start — a runaway loop that keeps producing output never goes silent,
-    // so the rolling silence window alone cannot stop it. At the deadline the
-    // host aborts the derived signal and only replaces the result with
-    // TOOL_TIMEOUT after execute settles. Normal termination is the internal
-    // silence window's job (read live per execute, not baked in here).
+    // Host cooperative budget: a FIXED 24h absolute backstop. On the legacy
+    // shell it runs from execute start — a runaway loop that keeps producing
+    // output never goes silent, so the rolling silence window alone cannot
+    // stop it. On the native shell execute returns immediately and the core's
+    // built-in absolute timer (absoluteBudgetMs) carries the same bound.
     timeoutMs: DELEGATE_TIMEOUT_MAX_MS,
     execute: opts.execute,
   }
 }
 
 /**
- * run()'s settlement discriminator (constraint 17 / AGENTS/state.md §10): ONE
- * explicit string-literal union, first cause wins — a later cause never
+ * The core's settlement discriminator (constraint 17 / AGENTS/state.md §10):
+ * ONE explicit string-literal union, first cause wins — a later cause never
  * overwrites it. The coexisting scheduling handles (queue promise, timer,
  * abort listener) stay handles: §10's exception covers them, not this outcome.
  */
 type DelegateSettle = 'pending' | 'ended' | 'timed-out' | 'aborted' | 'prompt-error'
 
+/** The terminal facts of one delegation run — the shells' shared vocabulary. */
+export interface AcpDelegateSettlement {
+  outcome: Exclude<DelegateSettle, 'pending'>
+  agent: string
+  /** The folded answer text WITHOUT any footer; '' when none was produced. */
+  text: string
+  /** The resolved session cwd; absent when no session ever started. */
+  cwd?: string
+  stopReason?: string
+  turnError?: string
+  /** The full `acp_delegate: …` failure message for a non-ended outcome. */
+  error?: string
+  refused: number
+  autoAnswered: number
+}
+
 /**
- * One delegation run, end to end (plan §4 steps 1–6). Every failure surfaces
- * as `Error('acp_delegate: …')` — the host normalizes a thrown execute into an
- * `isError` tool result for the model; the process never crashes.
+ * One started delegation: the result promise NEVER rejects (every path —
+ * completion, silence timeout, abort, dispose, even an unexpected core bug —
+ * settles it), and `dispose` is idempotent, settling a pending run `aborted`.
+ * The native provider maps this onto the host's never-reject `SubagentRun`;
+ * the legacy shell awaits it and reports or throws.
+ */
+export interface AcpDelegateRunHandle {
+  readonly agentId: string
+  readonly result: Promise<AcpDelegateSettlement>
+  dispose(): Promise<void>
+}
+
+/** The resolved call facts, before any session or queue work. */
+export interface AcpDelegateResolved {
+  agentId: string
+  task: string
+  /** args.cwd ?? the calling session workspace; undefined degrades to the agent default. */
+  cwd: string | undefined
+  /** The calling session workspace as the ONE extra root (empty when absent). */
+  extraRoots: readonly string[]
+}
+
+/**
+ * The delegation core plus its two shells. Every failure surfaces with the
+ * `acp_delegate: …` vocabulary — the legacy shell throws it (the host
+ * normalizes a thrown execute into an `isError` tool result), the native
+ * settlement carries it as diagnostic; the process never crashes.
  */
 export class AcpDelegateService {
   /**
-   * Defensive per-agent serial queues (§4.4): non-A1 delegations to the SAME
-   * agent id chain on one promise; different agents run in parallel; A1
-   * (one process per delegation) never queues. A tail never rejects, so one
-   * failed delegation does not poison the chain behind it.
+   * Defensive per-agent serial queues: non-A1 delegations to the SAME agent
+   * id chain on one promise; different agents run in parallel; A1 (one process
+   * per delegation) never queues. A tail never rejects, so one failed
+   * delegation does not poison the chain behind it.
    */
   private readonly queues = new Map<string, Promise<void>>()
 
   constructor(private readonly host: AcpDelegateHost) {}
 
+  /** The LEGACY synchronous shell: await the core, report the folded text. */
   execute: AcpDelegateExecute = async (args, exec) => {
     try {
-      return await this.delegate(args, exec)
+      return legacyReport(await this.begin(args, exec).result)
     } catch (error) {
-      if (error instanceof Error && error.message.startsWith('acp_delegate:')) throw error
-      throw new Error(`acp_delegate: ${messageOf(error)}`)
+      throw new Error(prefixed(messageOf(error)))
     }
   }
 
-  /** Steps 1–3: parse, resolve (no session yet), then queue or run. */
-  private async delegate(args: unknown, exec: { signal?: AbortSignal; agent?: { session?: { header?: { cwd?: string } } } }): Promise<AcpDelegateResult> {
+  /**
+   * Steps 1–3 without any side effect: parse, resolve the agent, compute the
+   * effective cwd and extra roots. Throws the foreseeable `acp_delegate: …`
+   * errors (bad task, unknown agent, no default) — the native execute calls
+   * this BEFORE startActivation so refusals never mint a catalog row.
+   */
+  resolve(args: unknown, exec: AcpDelegateExecContext): AcpDelegateResolved {
     const row = (typeof args === 'object' && args !== null ? args : {}) as Record<string, unknown>
     const task = row.task
     if (typeof task !== 'string' || task.trim() === '') throw new Error('acp_delegate: task must be a non-empty string')
@@ -223,31 +324,109 @@ export class AcpDelegateService {
     const cwd = row.cwd
     if (cwd !== undefined && typeof cwd !== 'string') throw new Error('acp_delegate: cwd must be a string')
     const agentId = this.resolveAgent(agentArg)
-    const signal = exec.signal
-    // Workspace inheritance (plan §3): an omitted cwd inherits the CALLING
-    // session's workspace; that workspace is also the one extra root an
-    // explicit cwd is validated against (the user picked it — the same
-    // authorization the chat path's extraRoots carry, never a model-invented
-    // root). Without a usable header cwd the delegation degrades to the old
-    // behaviour: args.cwd ?? the agent default, roots-only fence, no error.
+    // Workspace inheritance: an omitted cwd inherits the CALLING session's
+    // workspace; that workspace is also the one extra root an explicit cwd is
+    // validated against (the user picked it — the same authorization the chat
+    // path's extraRoots carry, never a model-invented root). Without a usable
+    // header cwd the delegation degrades to args.cwd ?? the agent default,
+    // roots-only fence, no error.
     const sessionCwd = sessionWorkspaceOf(exec)
-    const effectiveCwd = cwd ?? sessionCwd
-    const extraRoots = sessionCwd === undefined ? [] : [sessionCwd]
-    // A1: one child process per delegation — naturally parallel, no queue.
-    if (isPerSessionAgent(agentId)) return this.run(agentId, task, effectiveCwd, extraRoots, signal)
-    const previous = this.queues.get(agentId) ?? Promise.resolve()
+    return {
+      agentId,
+      task,
+      cwd: cwd ?? sessionCwd,
+      extraRoots: sessionCwd === undefined ? [] : [sessionCwd],
+    }
+  }
+
+  /**
+   * Start one delegation run and return its handle IMMEDIATELY (the native
+   * provider's entry). Validation errors throw synchronously — a clean
+   * failure before any resource exists. `absoluteBudgetMs` arms the built-in
+   * absolute backstop timer (the native shell passes the fixed 24h; the legacy
+   * shell omits it and keeps the host tool budget instead).
+   */
+  begin(args: unknown, exec: AcpDelegateExecContext, opts?: { absoluteBudgetMs?: number }): AcpDelegateRunHandle {
+    const resolved = this.resolve(args, exec)
+    const agentId = resolved.agentId
+    // ONE internal abort channel: the outer exec/request signal forwards into
+    // it, and dispose drives it too. The host detaches exec.signal after
+    // publication (native seam), so the run must own its cancellation.
+    const controller = new AbortController()
+    const signal = controller.signal
+    const outer = exec.signal
+    const forward = (): void => { controller.abort() }
+    if (outer !== undefined) {
+      if (outer.aborted) controller.abort()
+      else outer.addEventListener('abort', forward, { once: true })
+    }
+    let resolveResult!: (settlement: AcpDelegateSettlement) => void
+    const result = new Promise<AcpDelegateSettlement>(resolve => { resolveResult = resolve })
+    let published = false
+    // External causes (dispose / absolute expiry) requested BEFORE the run
+    // installs its settle — buffered, then drained in order at bind time.
+    const pending: Array<{ cause: 'aborted' | 'timed-out'; failure?: unknown }> = []
+    let fire: ((cause: 'aborted' | 'timed-out', failure?: unknown) => void) | undefined
+    let budgetTimer: ReturnType<typeof setTimeout> | undefined
+    const publish = (settlement: AcpDelegateSettlement): void => {
+      if (published) return
+      published = true
+      clearTimeout(budgetTimer)
+      outer?.removeEventListener('abort', forward)
+      resolveResult(settlement)
+    }
+    const requestCause = (cause: 'aborted' | 'timed-out', failure?: unknown): void => {
+      // Fire (or buffer) the cause FIRST, then abort: the abort-driven settle
+      // is a no-op once a cause won, so an expiry is never misread as an abort.
+      if (fire !== undefined) fire(cause, failure)
+      else pending.push({ cause, failure })
+      controller.abort()
+    }
+    if (opts?.absoluteBudgetMs !== undefined) {
+      const budgetMs = opts.absoluteBudgetMs
+      budgetTimer = setTimeout(() => {
+        requestCause('timed-out', new Error(`acp_delegate: timed out after ${String(budgetMs)}ms absolute budget`))
+      }, budgetMs)
+    }
     const execution = (async () => {
-      await this.waitQueued(previous, signal)
-      return this.run(agentId, task, effectiveCwd, extraRoots, signal)
+      try {
+        // A1: one child process per delegation — naturally parallel, no queue.
+        if (!isPerSessionAgent(agentId)) {
+          const previous = this.queues.get(agentId) ?? Promise.resolve()
+          await this.waitQueued(previous, signal)
+        }
+        const settlement = await this.run(resolved, signal, {
+          bind: fn => {
+            fire = fn
+            for (const cause of pending) fn(cause.cause, cause.failure)
+            pending.length = 0
+          },
+        })
+        publish(settlement)
+      } catch (error) {
+        // The queue wait's abort (or an unexpected core bug) lands here: a
+        // buffered external cause outranks the queue-abort message, so an
+        // expiry while queued still settles timed-out, never aborted.
+        const buffered = pending[0]
+        const outcome = buffered?.cause ?? (isAborted(signal) ? 'aborted' : 'prompt-error')
+        const message = buffered?.failure !== undefined ? messageOf(buffered.failure) : messageOf(error)
+        publish({ outcome, agent: agentId, text: '', refused: 0, autoAnswered: 0, error: prefixed(message) })
+      }
     })()
-    // The tail settles (never rejects) when this execution settles, so the
-    // next waiter proceeds even after a failure or a queue-abort.
-    const tail = execution.then(() => {}, () => {})
-    this.queues.set(agentId, tail)
-    try {
-      return await execution
-    } finally {
-      if (this.queues.get(agentId) === tail) this.queues.delete(agentId)
+    if (!isPerSessionAgent(agentId)) {
+      // The tail settles (never rejects) when this execution settles, so the
+      // next waiter proceeds even after a failure or a queue-abort.
+      const tail = execution.then(() => {}, () => {})
+      this.queues.set(agentId, tail)
+      void tail.then(() => { if (this.queues.get(agentId) === tail) this.queues.delete(agentId) })
+    }
+    return {
+      agentId,
+      result,
+      dispose: async () => {
+        requestCause('aborted')
+        await result
+      },
     }
   }
 
@@ -269,67 +448,33 @@ export class AcpDelegateService {
   }
 
   /**
-   * The queue wait observes `exec.signal`: the host budget runs from execute
+   * The queue wait observes the run's signal: the budget runs from the call
    * start, so a delegation whose turn in the queue never comes leaves the
-   * queue and throws instead of burning the whole budget silently (§4.4).
+   * queue and throws instead of burning the whole budget silently.
    */
-  private async waitQueued(previous: Promise<void>, signal: AbortSignal | undefined): Promise<void> {
+  private async waitQueued(previous: Promise<void>, signal: AbortSignal): Promise<void> {
     if (isAborted(signal)) throw new Error('acp_delegate: aborted while queued')
     await new Promise<void>((resolve, reject) => {
-      const onAbort = () => { reject(new Error('acp_delegate: aborted while queued')) }
-      signal?.addEventListener('abort', onAbort, { once: true })
-      const done = () => { signal?.removeEventListener('abort', onAbort); resolve() }
+      const onAbort = (): void => { reject(new Error('acp_delegate: aborted while queued')) }
+      signal.addEventListener('abort', onAbort, { once: true })
+      const done = (): void => { signal.removeEventListener('abort', onAbort); resolve() }
       // A failed predecessor must not fail the waiter: the queue drains on.
       previous.then(done, done)
     })
   }
 
-  /** Steps 4–10: session, policy, fold, prompt, bounded settlement, report. */
-  private async run(agentId: string, task: string, cwd: string | undefined, extraRoots: readonly string[], signal: AbortSignal | undefined): Promise<AcpDelegateResult> {
-    if (isAborted(signal)) throw new Error('acp_delegate: aborted')
+  /**
+   * Steps 4–10: session, policy, fold, prompt, bounded settlement. Resolves
+   * the terminal facts; the first settlement cause wins and every later event
+   * is a no-op. Only an unexpected bug (or a close failure after a normal end)
+   * throws — the launcher flattens it into a prompt-error settlement.
+   */
+  private async run(resolved: AcpDelegateResolved, signal: AbortSignal, external: {
+    bind(fn: (cause: 'aborted' | 'timed-out', failure?: unknown) => void): void
+  }): Promise<AcpDelegateSettlement> {
+    const { agentId, task, cwd, extraRoots } = resolved
     const config = this.host.delegateConfig()
-    let sessionId: string
-    let resolvedCwd: string
-    try {
-      // Opts ALWAYS ride along (plan §3): the bridge validates the cwd BEFORE
-      // any spawn and aligns the agent process with the validated session cwd
-      // (codebuddy fixes its workspace at process start). The degraded path
-      // passes an empty extraRoots list — roots-only fence, same validation.
-      const started = await this.host.startSession(agentId, cwd, { extraRoots, alignSpawnCwd: true })
-      sessionId = started.sessionId
-      resolvedCwd = started.cwd
-    } catch (error) {
-      // cwd_denied / bad_cwd / no_cwd pass through verbatim, with the agent id.
-      throw new Error(`acp_delegate: ${messageOf(error)} (agent ${agentId})`)
-    }
-    let closed = false
-    const closeOnce = async (): Promise<void> => {
-      if (closed) return
-      closed = true
-      try {
-        await this.host.closeSession(sessionId)
-      } catch (error) {
-        if (!isUnknownSession(error)) throw error
-      }
-    }
-    const closeQuietly = async (): Promise<void> => {
-      try { await closeOnce() } catch { /* cleanup never masks the primary failure */ }
-    }
-    // Step 5: the session policy MUST land before the prompt. It is always
-    // auto-answer-on-arrival; the bridge settles asks in place.
-    const policy = autoPolicyFor(agentId)
-    try {
-      this.host.setPermissionPolicy(sessionId, policy)
-    } catch (error) {
-      await closeQuietly()
-      throw error
-    }
-    if (isAborted(signal)) {
-      await closeQuietly()
-      throw new Error('acp_delegate: aborted')
-    }
-
-    // ---- incremental fold state (step 6) ----
+    // ---- settlement machinery (synchronous, before any await) ----
     let text = ''
     const seenSeq = new Set<number>()
     let refused = 0
@@ -342,14 +487,49 @@ export class AcpDelegateService {
     let promptFailure: unknown
     let resolveEnd!: () => void
     const endSignal = new Promise<void>(resolve => { resolveEnd = resolve })
-    // First cause wins: the guard turns every later cause into a no-op, so the
-    // settlement below reads ONE discriminator, never flag-check order. The
-    // failure payload rides along and is only written by the winning cause.
     const settle = (cause: Exclude<DelegateSettle, 'pending'>, failure?: unknown): void => {
       if (outcome !== 'pending') return
       outcome = cause
       promptFailure = failure
       resolveEnd()
+    }
+    external.bind(settle)
+    let sessionId: string | undefined
+    let resolvedCwd: string | undefined
+    let closed = false
+    let promptSent = false
+    let silenceTimer: ReturnType<typeof setTimeout> | undefined
+    let unsubscribe: (() => void) | undefined
+    const onAbort = (): void => { settle('aborted') }
+    const closeOnce = async (): Promise<void> => {
+      if (closed || sessionId === undefined) return
+      closed = true
+      try {
+        await this.host.closeSession(sessionId)
+      } catch (error) {
+        if (!isUnknownSession(error)) throw error
+      }
+    }
+    const closeQuietly = async (): Promise<void> => {
+      try { await closeOnce() } catch { /* cleanup never masks the primary failure */ }
+    }
+    // ---- rolling silence window ----
+    // ONE window, renewed by activity — the same idea as the main session's
+    // turn watchdog (constraint 23): only silence counts toward the timeout.
+    // Every hub event of THIS session re-arms it: any `session/update` kind
+    // (tool_call / tool_call_update progress frames included, not just message
+    // chunks) and `permission/expired` settlements. Delegation deliberately
+    // keeps a SINGLE window — tool progress frames renew it, so a working
+    // agent is never cut off mid-task BY THE SILENCE WINDOW. The fixed 24h
+    // absolute backstop (the host tool budget on the legacy shell, the core's
+    // absoluteBudgetMs timer on the native one) still applies against runaway
+    // loops that never go silent. Never add a second window.
+    const touchSilence = (): void => {
+      // After settlement a late event must not re-arm: no dangling timer may
+      // fire a second settle (first cause wins).
+      if (outcome !== 'pending') return
+      if (silenceTimer !== undefined) clearTimeout(silenceTimer)
+      silenceTimer = setTimeout(() => { settle('timed-out') }, config.timeoutMs)
     }
     // Shared by the live fold and the transcript fallback: seq dedupe, skip
     // the agent's OWN subagent prose (parentToolCallId), accumulate in full.
@@ -364,116 +544,160 @@ export class AcpDelegateService {
       if (chunk === '') return
       text += chunk
     }
-    // ---- rolling silence window (step 7) ----
-    // ONE window, renewed by activity — the same idea as the main session's
-    // turn watchdog (constraint 23): only silence counts toward the timeout.
-    // Every hub event of THIS session re-arms it: any `session/update` kind
-    // (tool_call / tool_call_update progress frames included, not just message
-    // chunks) and `permission/expired` settlements. The main session escalates
-    // to a longer tier for a fully silent OPEN tool call; delegation
-    // deliberately keeps a SINGLE window — tool progress frames renew it, so
-    // a working agent is never cut off mid-task BY THE SILENCE WINDOW. The
-    // host's fixed 24h absolute backstop from execute start still applies
-    // (acpDelegateToolDefinition) against runaway loops that never go silent.
-    // Never add a second window.
-    let silenceTimer: ReturnType<typeof setTimeout> | undefined
-    const touchSilence = (): void => {
-      // After settlement a late event must not re-arm: no dangling timer may
-      // fire a second settle (first cause wins).
-      if (outcome !== 'pending') return
-      if (silenceTimer !== undefined) clearTimeout(silenceTimer)
-      silenceTimer = setTimeout(() => { settle('timed-out') }, config.timeoutMs)
-    }
-    // Subscribe BEFORE the prompt so no chunk of the turn can slip past.
-    const unsubscribe = this.host.hub.subscribe(event => {
-      switch (event.type) {
-        case 'session/update':
-          if (event.sessionId !== sessionId) return
-          // ANY kind is activity and renews the window; collect() below keeps
-          // only the answer text.
-          touchSilence()
-          collect(event.seq, event.update)
-          return
-        // No `permission/request` case: the policy is auto+0, so the bridge
-        // answers every ask in place and never broadcasts a request frame.
-        // The fold counts only the settlement outcomes below.
-        case 'permission/expired':
-          if (event.sessionId !== sessionId) return
-          // A settled ask is activity too — it renews the silence window.
-          touchSilence()
-          // `selected` = auto-answered; anything else (the degraded abort when
-          // no legal option can be picked) = refused. `permission/resolved` is
-          // NOT counted — it is the generic per-settlement frame and would
-          // double-count against expired.
-          if (event.outcome.outcome === 'selected') autoAnswered += 1
-          else refused += 1
-          return
-        case 'turn/end':
-          // Match by sessionId, ANY turnId: the watchdog finalizes a
-          // controller-less session with turnId '' and an error-only frame.
-          if (event.sessionId !== sessionId || outcome !== 'pending') return
-          stopReason = event.stopReason
-          turnError = event.error
-          settle('ended')
-          return
-        default:
-          return
-      }
-    })
-
-    // ---- step 7: prompt, then wait on turn/end / silence / abort ----
-    const onAbort = () => { settle('aborted') }
-    signal?.addEventListener('abort', onAbort, { once: true })
-    if (isAborted(signal)) onAbort()
-    // Arm the silence window BEFORE the prompt goes out (a prompt that never
-    // answers is silence too); activity renews it. The host's fixed 24h
-    // absolute backstop still runs from execute start, outside this window.
-    touchSilence()
     try {
-      // A rejected prompt (turn_in_flight, agent died, …) settles the wait
-      // too; its error surfaces after the bounded cleanup below.
-      void this.host.prompt(sessionId, task).then(
-        () => {},
-        (error: unknown) => { settle('prompt-error', error) },
-      )
+      if (isAborted(signal)) settle('aborted')
+      if (outcome === 'pending') {
+        try {
+          // Opts ALWAYS ride along: the bridge validates the cwd BEFORE any
+          // spawn and aligns the agent process with the validated session cwd
+          // (codebuddy fixes its workspace at process start). The degraded
+          // path passes an empty extraRoots list — roots-only fence, same
+          // validation.
+          const started = await this.host.startSession(agentId, cwd, { extraRoots, alignSpawnCwd: true })
+          sessionId = started.sessionId
+          resolvedCwd = started.cwd
+        } catch (error) {
+          // cwd_denied / bad_cwd / no_cwd pass through verbatim, with the agent id.
+          settle('prompt-error', new Error(`acp_delegate: ${messageOf(error)} (agent ${agentId})`))
+        }
+      }
+      if (outcome === 'pending' && sessionId !== undefined) {
+        // The session policy MUST land before the prompt. It is always
+        // auto-answer-on-arrival; the bridge settles asks in place.
+        try {
+          this.host.setPermissionPolicy(sessionId, autoPolicyFor(agentId))
+        } catch (error) {
+          settle('prompt-error', error)
+        }
+        if (isAborted(signal)) settle('aborted')
+      }
+      if (outcome === 'pending' && sessionId !== undefined) {
+        // Subscribe BEFORE the prompt so no chunk of the turn can slip past.
+        unsubscribe = this.host.hub.subscribe(event => {
+          switch (event.type) {
+            case 'session/update':
+              if (event.sessionId !== sessionId) return
+              // ANY kind is activity and renews the window; collect() keeps
+              // only the answer text.
+              touchSilence()
+              collect(event.seq, event.update)
+              return
+            // No `permission/request` case: the policy is auto+0, so the bridge
+            // answers every ask in place and never broadcasts a request frame.
+            case 'permission/expired':
+              if (event.sessionId !== sessionId) return
+              // A settled ask is activity too — it renews the silence window.
+              touchSilence()
+              // `selected` = auto-answered; anything else (the degraded abort
+              // when no legal option can be picked) = refused.
+              if (event.outcome.outcome === 'selected') autoAnswered += 1
+              else refused += 1
+              return
+            case 'turn/end':
+              // Match by sessionId, ANY turnId: the watchdog finalizes a
+              // controller-less session with turnId '' and an error-only frame.
+              if (event.sessionId !== sessionId || outcome !== 'pending') return
+              stopReason = event.stopReason
+              turnError = event.error
+              settle('ended')
+              return
+            default:
+              return
+          }
+        })
+        signal.addEventListener('abort', onAbort, { once: true })
+        if (isAborted(signal)) onAbort()
+        // Arm the silence window BEFORE the prompt goes out (a prompt that
+        // never answers is silence too); activity renews it.
+        touchSilence()
+        promptSent = true
+        // A rejected prompt (turn_in_flight, agent died, …) settles the wait
+        // too; its error surfaces after the bounded cleanup below.
+        void this.host.prompt(sessionId, task).then(
+          () => {},
+          (error: unknown) => { settle('prompt-error', error) },
+        )
+      }
       await endSignal
       clearTimeout(silenceTimer)
-      signal?.removeEventListener('abort', onAbort)
+      signal.removeEventListener('abort', onAbort)
       if (outcome !== 'ended') {
-        // Self-settling failure path: cancel THEN close, and never wait for a
-        // turn/end afterwards (close does not emit one). Each cleanup step is
-        // awaited once, bounded by the host's own close/cancel races, so the
-        // whole settlement lands well inside the host's fixed 24h backstop.
-        try { await this.host.cancel(sessionId) } catch { /* bounded cleanup */ }
+        // Self-settling failure path: cancel (only a dispatched prompt can be
+        // cancelled) THEN close, and never wait for a turn/end afterwards
+        // (close does not emit one). Each cleanup step is awaited once,
+        // bounded by the host's own close/cancel races.
+        if (sessionId !== undefined) {
+          if (promptSent) { try { await this.host.cancel(sessionId) } catch { /* bounded cleanup */ } }
+          await closeQuietly()
+        }
+      } else if (sessionId !== undefined) {
+        // Text fallback — read the transcript ONCE, before close (close
+        // deletes the record; a later read would only throw unknown_session).
+        if (text === '') {
+          try {
+            const dump = this.host.transcript(sessionId, 0)
+            for (const entry of dump.entries) collect(entry.seq, entry.update)
+          } catch { /* fail-open: the placeholder reports the empty answer */ }
+        }
+        // Normal end: close exactly once, then unsubscribe in finally.
+        await closeOnce()
+      }
+    } catch (error) {
+      if (outcome === 'ended') {
+        // A close failure after a normal end surfaces like the legacy shell
+        // always did: the launcher flattens it into a prompt-error settlement.
+        clearTimeout(silenceTimer)
+        signal.removeEventListener('abort', onAbort)
+        throw error
+      }
+      settle('prompt-error', error)
+      clearTimeout(silenceTimer)
+      signal.removeEventListener('abort', onAbort)
+      if (sessionId !== undefined) {
+        if (promptSent) { try { await this.host.cancel(sessionId) } catch { /* bounded cleanup */ } }
         await closeQuietly()
-        if (outcome === 'aborted') throw new Error('acp_delegate: aborted')
-        if (outcome === 'timed-out') throw new Error(`acp_delegate: timed out after ${String(config.timeoutMs)}ms of silence`)
-        throw new Error(`acp_delegate: ${messageOf(promptFailure)}`)
       }
-      // Step 9: text fallback — read the transcript ONCE, before close (close
-      // deletes the record; a later read would only throw unknown_session).
-      if (text === '') {
-        try {
-          const dump = this.host.transcript(sessionId, 0)
-          for (const entry of dump.entries) collect(entry.seq, entry.update)
-        } catch { /* fail-open: the placeholder below reports the empty answer */ }
-      }
-      // Step 8 (normal end): close exactly once, then unsubscribe in finally.
-      await closeOnce()
-      // Step 10: the report the model reads. The resolved cwd sits between the
-      // agent id and the terminal fact, so the caller knows WHERE the work ran.
-      const body = text === '' ? '(the agent returned no text)' : text
-      let footer = `\n\n— acp_delegate · ${agentId} · cwd=${resolvedCwd} · ${stopReason ?? turnError ?? 'unknown'}`
-      if (refused > 0) footer += ` · 拒绝 ${String(refused)} 个审批`
-      if (autoAnswered > 0) footer += ` · 自动代答 ${String(autoAnswered)} 个`
-      const result: AcpDelegateResult = { text: body + footer, agent: agentId }
-      if (stopReason !== undefined) result.stopReason = stopReason
-      if (turnError !== undefined) result.error = turnError
-      return result
     } finally {
       clearTimeout(silenceTimer)
-      signal?.removeEventListener('abort', onAbort)
-      unsubscribe()
+      signal.removeEventListener('abort', onAbort)
+      unsubscribe?.()
     }
+    const settlement: AcpDelegateSettlement = {
+      outcome: outcome === 'pending' ? 'prompt-error' : outcome,
+      agent: agentId,
+      text,
+      refused,
+      autoAnswered,
+    }
+    if (resolvedCwd !== undefined) settlement.cwd = resolvedCwd
+    if (stopReason !== undefined) settlement.stopReason = stopReason
+    if (turnError !== undefined) settlement.turnError = turnError
+    if (settlement.outcome === 'aborted') settlement.error = 'acp_delegate: aborted'
+    else if (settlement.outcome === 'timed-out') {
+      settlement.error = promptFailure !== undefined
+        ? prefixed(messageOf(promptFailure))
+        : `acp_delegate: timed out after ${String(config.timeoutMs)}ms of silence`
+    } else if (settlement.outcome === 'prompt-error') {
+      settlement.error = prefixed(messageOf(promptFailure))
+    }
+    return settlement
   }
+}
+
+/**
+ * The LEGACY report: the folded body plus the footer the model reads. The
+ * resolved cwd sits between the agent id and the terminal fact, so the caller
+ * knows WHERE the work ran. Non-ended outcomes throw the settlement's message
+ * — byte-identical to the pre-split synchronous service.
+ */
+function legacyReport(settlement: AcpDelegateSettlement): AcpDelegateResult {
+  if (settlement.outcome !== 'ended') throw new Error(settlement.error ?? `acp_delegate: ${settlement.outcome}`)
+  const body = settlement.text === '' ? '(the agent returned no text)' : settlement.text
+  let footer = `\n\n— acp_delegate · ${settlement.agent} · cwd=${settlement.cwd ?? ''} · ${settlement.stopReason ?? settlement.turnError ?? 'unknown'}`
+  if (settlement.refused > 0) footer += ` · 拒绝 ${String(settlement.refused)} 个审批`
+  if (settlement.autoAnswered > 0) footer += ` · 自动代答 ${String(settlement.autoAnswered)} 个`
+  const result: AcpDelegateResult = { text: body + footer, agent: settlement.agent }
+  if (settlement.stopReason !== undefined) result.stopReason = settlement.stopReason
+  if (settlement.turnError !== undefined) result.error = settlement.turnError
+  return result
 }

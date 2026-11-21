@@ -12,6 +12,8 @@
 
 两者不对称：统一接口**不得**把 CodeBuddy 的回合语义拖进观察型适配器。行为契约见 [protocol.md §6.3 / §6.4](./protocol.md)、落盘见 [state.md §1](./state.md)、明细 UI 见 [ui.md §4.3](./ui.md)。
 
+**边界：`acp_delegate` 不属本家族**。宿主工具委派走原生子代理链的外部激活独立路径（`src/bridge/delegate-provider.ts` · `AcpSubagentProvider`，[architecture.md §5](./architecture.md)）：不写 `subagents/record`、不进下方接缝表、不适用第三家抽取触发器。native 迁移对 CodeBuddy / agy 的 worker 管线**零改动**。
+
 ## 2. 现行纪律（保持）
 
 - **专属逻辑进专属模块**：`agy-subagents.ts` · `AgySubagentTracker`、`agy-subagent-poll.ts` · `AgySubagentPollService`、`agy-subagent-detail.ts` · `readAgyChildDetail`、`subagent-detail-agy.tsx` · `AgyStepStream`；agy 读取原语集中在 `agy-transcript.ts`。

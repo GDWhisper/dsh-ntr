@@ -131,6 +131,12 @@ export type {
 export { PLUGIN_REPO, pluginReleaseUrl } from './protocol/update.ts'
 
 export type {
+  AcpDelegateActivationOutput,
+  AcpDelegateAsyncOutput,
+  AcpDelegateErrorOutput,
+} from './protocol/delegate.ts'
+
+export type {
   AcpApprovalDeadlines,
   AcpDelegatePolicy,
   AcpDelegateSettings,

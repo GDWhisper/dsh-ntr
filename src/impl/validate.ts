@@ -16,7 +16,8 @@ import { isAbsolutePath } from './paths.ts'
 
 // ---- Config validation ----
 
-const AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/
+/** Agent ids never contain ':' or ' ', which delegate-label routing relies on. */
+export const AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/
 /**
  * npm package name (optionally `@scope/name`, optionally `@version`/`@tag`).
  * Deliberately charset-only (letters, digits, `.`, `_`, `-`, `/`, `@`): this

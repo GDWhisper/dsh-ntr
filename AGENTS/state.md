@@ -18,7 +18,7 @@
 
 **迁移必须成对**：搬目录与改写 agent 里记录的绝对路径是一件事。`cwd` / `allowedCwdRoots` 原样存盘，而 `resolveSessionCwd` 对不存在的 cwd 直接 `bad_cwd`——只搬目录不改写，每个已保存 agent 下次启动就失败。`rewriteLegacyWorkspaceRoots` 负责改写，且**必须回写磁盘**（`loadPersistedAgents` 改了就要 `persistAgents()`），否则纠错只活在内存，磁盘上仍是死路径。
 
-**`delegate` 键与启动顺序**：`agents.json` 的 `delegate` 只存用户真改过的覆盖（逐键：`guidance` 词表、`timeoutMs` 范围 [1000, 86400000]），重启读盘逐键重校验，超范围 / 手改值与退役键丢弃、基线重新决定（仿 `idleRelease`；`timeoutMs` 基线 = 配置文件值 ?? 全局后台长窗，`defaultTimeoutMs` 镜像它）；用户没写过时键不出现。`BridgeManager` 构造器在 `applyDeadlineTuning` / `applyIdleReleaseTuning` / `applySkillsMcpTuning` 之后调 `applyDelegateTuning`——生效值读时计算、没有 tuning 对象可改写，宿主回调 `syncDelegateRegistration` 就是全部应用；这次 boot replay 在注册接缝接线前是 no-op，**真实初次注册由 `src/index.ts` 的 `ctx.effect`（`registration.sync()`）兜底**，卸载 / HMR 经同一 effect 的 `dispose()`。
+**`delegate` 键与启动顺序**：`agents.json` 的 `delegate` 只存用户真改过的覆盖（逐键：`guidance` 词表、`timeoutMs` 范围 [1000, 86400000]），重启读盘逐键重校验，超范围 / 手改值与退役键丢弃、基线重新决定（仿 `idleRelease`；`timeoutMs` 基线 = 配置文件值 ?? 全局后台长窗，`defaultTimeoutMs` 镜像它）；用户没写过时键不出现。**原生迁移不改键形状**：仍只有 `guidance` / `timeoutMs` 两键，**不新增 `agents.json` 键**——native 的目录行 / 结算记录归宿主单一事实源，插件不自写（[architecture.md §5](./architecture.md)）。`BridgeManager` 构造器在 `applyDeadlineTuning` / `applyIdleReleaseTuning` / `applySkillsMcpTuning` 之后调 `applyDelegateTuning`——生效值读时计算、没有 tuning 对象可改写，宿主回调 `syncDelegateRegistration` 就是全部应用；这次 boot replay 在注册接缝接线前是 no-op，**真实初次注册由 `src/index.ts` 的 `ctx.effect`（`registration.sync()`）兜底**，卸载 / HMR 经同一 effect 的 `dispose()`。
 
 ## 2. agent 注册表与校验
 

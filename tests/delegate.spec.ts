@@ -3,94 +3,19 @@ import {
   AcpDelegateService,
   acpDelegateToolDefinition,
   type AcpDelegateExecute,
-  type AcpDelegateHost,
-  type AcpDelegatePolicy,
 } from '../src/bridge/delegate-service.ts'
 import { AcpDelegateRegistration, type DelegateRegistrationCtx } from '../src/bridge/delegate-registration.ts'
-import type { AcpDelegateForceMask } from '../src/bridge/delegate-force-mask.ts'
-import type { AcpEvent, AcpStartSessionOpts, DelegateGuidance } from '../src/protocol.ts'
+import type { DelegateGuidance } from '../src/protocol.ts'
+import { chunk, fakeMask, fakeToolsCtx, happyPrompt, makeHost, tick, wait, type Fake } from './delegate-harness.ts'
 
 /**
  * The delegation core (docs/plan/acp-delegate-subagent.md §7.1): one fake
  * in-memory host with a programmable prompt hook drives every runtime branch —
- * no child process, millisecond-scale.
+ * no child process, millisecond-scale. The fake lives in delegate-harness.ts,
+ * shared with the provider and native-shell suites. These cases pin the LEGACY
+ * synchronous shell (the old-host fallback); the native async shell is pinned
+ * by delegate-native.spec.ts and delegate-provider.spec.ts.
  */
-
-function chunk(text: string, meta?: Record<string, unknown>) {
-  return { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text }, ...(meta === undefined ? {} : { _meta: meta }) }
-}
-const tick = () => new Promise(resolve => setTimeout(resolve, 10))
-const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
-
-function makeHost() {
-  const sinks = new Set<(event: AcpEvent) => void>()
-  const emit = (event: AcpEvent) => { for (const sink of [...sinks]) sink(event) }
-  const order: string[] = []
-  const calls = {
-    startSession: [] as Array<{ agentId: string; cwd?: string; opts?: AcpStartSessionOpts }>,
-    policy: [] as Array<{ sessionId: string; policy: AcpDelegatePolicy }>,
-    prompt: [] as Array<{ sessionId: string; text: string }>,
-    cancel: [] as string[],
-    close: [] as string[],
-    respond: [] as Array<{ requestId: string; optionId?: string }>,
-    transcript: [] as Array<{ sessionId: string; afterSeq?: number }>,
-  }
-  const config = { guidance: 'on' as DelegateGuidance, timeoutMs: 600_000 }
-  const agents = [{ id: 'alpha', title: 'Alpha' }, { id: 'beta', title: 'Beta' }, { id: 'codebuddy', title: 'CodeBuddy' }]
-  let defaultAgentId: string | undefined = 'alpha'
-  let nextSession = 0
-  const transcripts = new Map<string, Array<{ seq: number; update: unknown }>>()
-  let onStart: ((agentId: string, cwd?: string, opts?: AcpStartSessionOpts) => Promise<{ sessionId: string; cwd: string }>) | undefined
-  let onPrompt: ((sessionId: string, text: string) => Promise<{ turnId: string }>) | undefined
-  const host: AcpDelegateHost = {
-    hub: { subscribe(sink) { sinks.add(sink); return () => { sinks.delete(sink) } } },
-    agents: () => agents,
-    defaultAgent: () => defaultAgentId,
-    delegateConfig: () => ({ ...config }),
-    async startSession(agentId, cwd, opts) {
-      order.push('start')
-      calls.startSession.push({ agentId, ...(cwd === undefined ? {} : { cwd }), ...(opts === undefined ? {} : { opts }) })
-      if (onStart !== undefined) return onStart(agentId, cwd, opts)
-      const sessionId = `session-${String(++nextSession)}`
-      if (!transcripts.has(sessionId)) transcripts.set(sessionId, [])
-      // The real host answers with the RESOLVED cwd; the fake echoes the
-      // request, falling back to the agent default the way resolveSessionCwd does.
-      return { sessionId, cwd: cwd ?? '/agent-default' }
-    },
-    setPermissionPolicy(sessionId, policy) { order.push('policy'); calls.policy.push({ sessionId, policy }) },
-    async prompt(sessionId, text) {
-      order.push('prompt')
-      calls.prompt.push({ sessionId, text })
-      if (onPrompt !== undefined) return onPrompt(sessionId, text)
-      return { turnId: `turn-${sessionId}` }
-    },
-    async cancel(sessionId) { order.push('cancel'); calls.cancel.push(sessionId) },
-    async closeSession(sessionId) { order.push('close'); calls.close.push(sessionId) },
-    transcript(sessionId, afterSeq) {
-      order.push('transcript')
-      calls.transcript.push({ sessionId, afterSeq })
-      const entries = transcripts.get(sessionId) ?? []
-      return { session: {}, entries: entries.filter(entry => entry.seq > (afterSeq ?? 0)) }
-    },
-  }
-  return {
-    host, emit, calls, order, config, transcripts,
-    sinkCount: () => sinks.size,
-    setDefault: (id: string | undefined) => { defaultAgentId = id },
-    onStart: (fn: typeof onStart) => { onStart = fn },
-    onPrompt: (fn: typeof onPrompt) => { onPrompt = fn },
-  }
-}
-type Fake = ReturnType<typeof makeHost>
-
-/** The standard happy path: chunks fold incrementally, close exactly once. */
-function happyPrompt(f: Fake, answer = 'the answer') {
-  f.onPrompt(async (sessionId) => {
-    f.emit({ type: 'session/update', sessionId, seq: 1, update: chunk(answer) })
-    f.emit({ type: 'turn/end', sessionId, turnId: 'turn-1', stopReason: 'end_turn' })
-    return { turnId: 'turn-1' }
-  })
-}
 
 describe('acp_delegate execute semantics', () => {
   it('runs one delegation: session → policy → prompt(task) → fold → close once', async () => {
@@ -605,38 +530,6 @@ describe('acp_delegate tool definition (register-ready)', () => {
 })
 
 // ---- registration (§5.3) ----
-
-function fakeMask() {
-  return { apply: vi.fn(), clear: vi.fn(), available: true } as unknown as AcpDelegateForceMask & { apply: ReturnType<typeof vi.fn>; clear: ReturnType<typeof vi.fn> }
-}
-
-function fakeToolsCtx(mode: 'disposer' | 'none' | 'throw' = 'disposer') {
-  const registered: Array<{ definition: { name: string; description: string; timeoutMs: number; execute: AcpDelegateExecute }; options?: { when?: (ctx: { agent?: unknown }) => boolean } }> = []
-  let disposerCalls = 0
-  let injectCallback: (() => void) | undefined
-  let tools: unknown
-  let liveMode = mode
-  const install = () => {
-    tools = {
-      get: (name: string) => registered.find(row => row.definition.name === name)?.definition,
-      register: (definition: { name: string; description: string; timeoutMs: number; execute: AcpDelegateExecute }, options?: { when?: (ctx: { agent?: unknown }) => boolean }) => {
-        if (liveMode === 'throw') throw new TypeError('output.render is required')
-        registered.push({ definition, options })
-        if (liveMode === 'none') return undefined
-        return () => {
-          disposerCalls += 1
-          const index = registered.findIndex(row => row.definition === definition)
-          if (index >= 0) registered.splice(index, 1)
-        }
-      },
-    }
-  }
-  const ctx: DelegateRegistrationCtx = {
-    get: (name: string) => (name === 'tools' ? tools : undefined),
-    inject: (_names: string[], callback: () => void) => { injectCallback = callback },
-  }
-  return { ctx, registered, install, setMode: (next: 'disposer' | 'none' | 'throw') => { liveMode = next }, disposerCalls: () => disposerCalls, fireInject: () => { injectCallback?.() }, injectArmed: () => injectCallback !== undefined }
-}
 
 function makeRegistration(ctx: DelegateRegistrationCtx) {
   const f = makeHost()

@@ -391,7 +391,7 @@ delegate:
 
 1. ~~**权限默认档**~~ → **已定：`auto`**。理由见 §4.2：子会话没有 `dshSessionId`，对话里的审批卡不出现，`ask` 实际是挂到超时；频繁索取权限打断发起方，违背「委派 = 交给它办完」。`abort` / `ask` 保留为可选档。三档由**会话级策略接缝**支撑（记录 6），在任何 bridge 配置下成立；auto 走 bridge 现有 auto+0 路径，计数听 `permission/expired`。
 2. ~~**注册默认**~~ → **已定：`guidance: off`**。默认不注册，任何部署的请求头零变化（连 `preset-acp` 那份也不多一行）；要用的在设置页「子代理」滑到开启及以上，或在 `cordis.patch.yml` 写 `delegate.guidance: on`（两者同一套两层取值）。
-3. ~~**是否要阶段 2 的面板行**~~ → **已定：本阶段不做**。先把阶段 1 做出来看原生效果：委派只在原生对话的 `acp_delegate` 工具卡上可见（task / agent / 返回文本），子代理面板不动。看完实际观感再决定要不要补一行 `acp-delegate:<toolCallId>`；那份成本已在 §4.3 / §9 写好，随时可以接着做。
+3. ~~**是否要阶段 2 的面板行**~~ → **已定：本阶段不做**。先把阶段 1 做出来看原生效果：委派只在原生对话的 `acp_delegate` 工具卡上可见（task / agent / 返回文本），子代理面板不动。看完实际观感再决定要不要补一行 `acp-delegate:<toolCallId>`；那份成本已在 §4.3 / §9 写好，随时可以接着做。**后续：阶段 2 自绘面板补行构想已被原生接缝方案取代**——[acp-delegate-native-subagent.md](./acp-delegate-native-subagent.md) 把 `acp_delegate` 迁到宿主原生子代理链外部激活，宿主自带 external 成员行（禁用叶子），插件不自写 catalog / record。
 4. ~~**要不要做前端**~~ → **已定：做，且四个键全在设置页**（§5.2）。新增「子代理」页：引导四档滑块（兼注册开关）/ 权限三档 / 单次时限 / 返回上限，两层取值（部署基线 + 设置页覆盖）+ 重置，全部热生效；`guidance: off` 摘除工具，其余档注册；`timeoutMs` / `guidance` 变更触发重注册与 force 掩码对账（§5.3）。生效时机 = 现有会话下一 step，无需新会话（宿主每 step 重组请求头 + 清单 diff 提示）；滑块行文案写明「下一轮对话生效」。
 5. **键族命名 `delegate`**（审查后新增）：`agents.json` 已有 `subagents`（复数，worker 记录）、RPC 已有 `subagents/record`，单数 `subagent` 易混。配置键 / RPC / 类型 / 阶梯常量统一 `delegate` 前缀；页面标签仍「子代理 / Subagents」。
 6. **权限走会话级接缝**（审查后新增）：`LiveSession.permissionPolicy?`，`handlePermissionRequest` 两行读取原地改写为 `session ?? bridge`（agent-bridge.ts 净 0）。委派三档映射 `{auto, 0}` / `{abort, 30000}` / `{wait, 0}`；bridge 字段不碰，主会话审批一字不改。否定「只靠服务层代答」：bridge auto+0 不发帧，服务层拦不到。
@@ -443,5 +443,5 @@ delegate:
 
 ### §11.6 后续
 
-- 阶段 2（子代理面板行）/ 阶段 3（可续委派）按 §9 待看阶段 1 观感再定，**未实现**。
+- 阶段 2（子代理面板行）**已被原生接缝方案取代**：[acp-delegate-native-subagent.md](./acp-delegate-native-subagent.md) 把 `acp_delegate` 迁到宿主原生子代理链的一次性外部激活（异步返回 name、宿主结算通知送达、宿主自带 external 成员行，插件不自写 catalog / record），已实施待用户验收；本文的同步壳保留为无 `ctx.subagents` 接缝老宿主的回落（措辞/行为逐字节不变）。阶段 3（可续委派）仍未实现——native 一次性叶子按宿主设计不可续聊。
 - 候选维护项（非本阶段范围）：permissions.md 拆分（>200）、降级旗标（§11.4）、workflow 悬空段落剥离接缝。

@@ -36,7 +36,8 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 - `sandboxPolicy` / `sessions` —— 工作区根解析（`wireWorkspace` 注入 `BridgeManager.setSessionWorkspaceResolver`，解析结果只有 `{ workspaceRoot }`，不含任何 mode / approval 语义）
 - `sessions.append` / `subagent/catalog` —— detached ACP worker 的外部子代理目录事实（`wireSubagentCatalog` → `appendExternalSubagentCatalog`）：只写 `mode: 'external'`，无子会话 / activity / continuation；宿主没有该事件时 `append` 抛错即静默跳过。它写进宿主 session log，不落 `~/.dsh/dsh-ntr/`。
 - `agentPresets` —— preset roster（`wirePresetRoster`）
-- `agents` —— idle background drain 的唤醒入口（`wireChatAgent` → `BridgeManager.setDshAgentResolver`）：`ctx.get('agents').list()` 按 `agent.session.id` 找到该聊天的 agent，调用 `agent.followup(...)` 注入一条隐藏唤醒消息；宿主没有该注册表或 `list` / `followup` 缺失时退回「drain 只进 transcript」。这是**唯一的** `agents` 调用点，与审批无关（见下方第 43 行说明）。
+- `agents` —— idle background drain 的唤醒入口（`wireChatAgent` → `BridgeManager.setDshAgentResolver`）：`ctx.get('agents').list()` 按 `agent.session.id` 找到该聊天的 agent，调用 `agent.followup(...)` 注入一条隐藏唤醒消息；宿主没有该注册表或 `list` / `followup` 缺失时退回「drain 只进 transcript」。这是**唯一的** `agents` 调用点，与审批无关（见下方「宿主审批服务不再是协作方」说明）。
+- `subagents` —— 原生子代理接缝（`probeSubagents` 结构化探针：`registerProvider` + `startActivation` 双在才认）：在场时注册 `acp` provider（`wireSubagentProvider`，effect 作用域 disposer，先于工具首次 sync）并让 `acp_delegate` 走 native 异步壳；缺席回落 legacy 同步壳（措辞/行为逐字节不变）。迟到经 `ctx.inject(['subagents'])` 重判壳位与 provider。宿主 0.2.2-rc.5+（`@deepseek-ai/dsh-subagent`），契约与裁决见 [architecture.md §5](./architecture.md)。
 - 浏览器侧 `sessions` —— 经 `service<T>(name)` 在调用点惰性解析（见 [ui.md](./ui.md)）
 
 服务缺失必须是**可用性下降**，不是加载失败；可选服务迟到时由 `ctx.inject` 补挂，不得让插件整体不激活。
@@ -58,6 +59,8 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 
 **版本分叉**：有 `agent.model.select` 的宿主（0.2.2+）在 step preparation 前固定路由，guard 用 `agent.model.select()` 写入；没有的宿主（0.2.1-）继续走 `agent/request` 改写。排查先看这一条属于哪边。
 
+**类型墙同步流程（宿主升级时）**：原生子代理接缝的类型来自四个显式 devDep——`@deepseek-ai/dsh-subagent` / `dsh-llm` / `dsh-session` / `dsh-agent` 精确锁 `0.2.2-rc.5`（与运行宿主同版），另 `@deepseek-ai/cordis` 锁 `4.1.0`。仓 `.npmrc` 设 `legacy-peer-deps=true`：两代 DSH 类型包共存（0.1.5-rc.x client/host 家族 + 0.2.2-rc.5 subagent 家族），exact-pin 的 peer 树互相冲突（如 dsh-brand 0.1.5-rc.2 vs 0.2.2-rc.5），而插件对它们**零运行时 value import**（全 type-only，运行时全走 ctx），故 peer 解析可安全忽略（与宿主 profile 的 pnpm `autoInstallPeers=false` 同姿态）。**升级宿主必须同步 bump 这四个类型包并复核 peer 树**（typecheck 会报断链）；npm 自动 peer 安装在 legacy-peer-deps 下失效，直接引用到的类型包（含测试库的 peer，如 `@testing-library/dom`）必须显式补 devDep，不能指望自动装上。
+
 ### 5.1 植入点（宿主契约面）
 
 | # | 植入点 | 依赖的宿主契约 | 我们这一侧 |
@@ -73,6 +76,7 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 | 9 | 子代理目录投影 | `conversation.session.header.actions` 的 list 条目 id `subagent-catalog`（宿主组件 + `inject` 的 `openChild` / `openChildAside` / `refreshProjection` + `locale` / `order`）；`useSessions(s => s.projectionsBySession)` → `[sessionId].values.subagentCatalog`（数组，每行 `{ id, createdAt?, label?, mode: 'external' }`）；`useSessionStatus` 原样透传 | `src/client/subagent-activity.tsx` · `createSubagentCatalogClaim` / `SubagentCatalogOccupant`；`src/client/subagent-panel.tsx` · `readSubagentCatalogProjection` / `OwnSubagentCatalog` / `SubagentDetailDialog` |
 | 10 | 持久消息来源（V4） | `dsh-session-persistence-jsonl` 的 `assertV4MessageSources`：解释性消息槽要求 `source.kind` 非空且不是 `plugin`（旧 V3 `plugin` 只在迁移时改写成 `plugin:<name>`）；`form: 'notice'` 的 `summary` 是宿主上下文行的一行摘要，缺失时界面退回 opaque 字段列表 | `src/bridge/manager.ts` · `wakeChatWithBackgroundReport`；`src/bridge/registries.ts` · `BACKGROUND_REPORT_SOURCE` / `BACKGROUND_REPORT_FORM`；`presets/acp/acp-guard.mjs` · `isBackgroundWake` |
 | 11 | 归档释放 | `workspace/session-activity` waterfall（`{ sessionId }`，listener 调 `next()` 并返回 `SessionActivity[]`）；`workspace/session-stop` parallel；`domain/changed` 的 `workspace` 领域全局写入（`table === ''`、`key === ''`、`value.archivedSessionIds`） | `src/index.ts` · archive release 接线；`src/archive-release.ts`；`src/bridge/manager.ts` · `archiveActivityFacts` / `cancelArchivedSession` / `releaseArchivedSession` |
+| 12 | 原生子代理接缝 | `ctx.subagents.registerProvider(provider)` / `startActivation(spec)`；`SubagentProvider`（name / capabilities / start；无 `prepareContinuable` = 一次性叶子）；`delivery:'parent'` 的结算通知先于 `activation.result` 解析；共享每根 8 容量槽；`interrupt_agent` 对 external 有效；类型 devDep 锁 0.2.2-rc.5（§5 类型墙） | `src/index.ts` · `probeSubagents` / `wireSubagentProvider`；`src/bridge/delegate-provider.ts` · `AcpSubagentProvider` / `acpDelegateActivationExecute` |
 
 非宿主面：ACP 协议与 `session/update` 词表在 `@agentclientprotocol/sdk`，升级依赖时看 SDK 类型，不走本表。
 
@@ -96,6 +100,7 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 | 审批卡 / 释放横幅不出现 | `conversation.input.dock`、`session/update` 折叠 | dock 槽位或事件形状变化 |
 | 归档 NTR 会话后进程仍驻留、设置页状态不掉 | `ctx.on('workspace/session-activity')` / `workspace/session-stop` / `domain/changed` 是否收到；`releaseArchivedSession` 的返回 | 宿主把归档写入换到别的领域或事件，或该宿主没有这些事件（fail-open：归档照常，仅不释放）；agent 不支持 `loadSession` 时按设计保留进程 |
 | 内置更新不可用 | `pluginManager` 方法面 | 服务或方法签名变化 |
+| `acp_delegate` 报 `NO_PROVIDER`（宿主 HMR / 接缝替换后） | `src/index.ts` · `wireSubagentProvider` 的 `providerDisposer` 标志 | 接缝被宿主 HMR 替换后旧注册随旧服务消失，但插件 fiber 未拆除、标志不重置，重判被挡 → 新服务无 provider。明示错误、无悬空、失败安全；本分支暂缓重注册（[计划 §11](../docs/plan/acp-delegate-native-subagent.md)），重载插件即恢复 |
 | 保留名工具卡首现 `unknown tool` +「已添加工具」成对（旧版按不同工具名刷屏；现在只剩回落路径与升级前已存活的会话可能看到） | guard 是否在挂载时把保留名预注册进 preset 这一代的 scope；宿主 pre-step 是否冻结 `ResolvedToolSet`（`ctx.tools.resolve()` 快照，新宿主）vs `tools/execute` 里实时解析（0.2.1-rc.5 无快照） | 挂载早于本会话首份请求头时 schema 已进请求头，不再有首现噪音；只有挂载时 `tools` 服务未就绪或挂载注册失败、回落到执行阶段惰性注册时才复现（首现记 `unknown tool`、下次 `buildRequest()` 清单 diff 写 `tool-addition`）；升级 / HMR 前已存在的会话下一份请求头仍可能补记一次。guard 撞真实工具仍 fail-closed（`tools.get` 命中即返错、不 `return next()`） |
 | Auto 权限档下每个 ACP 工具卡都失败（红色错误），宿主日志出现 `auto-review` 的模型调用 / 辅助调用拒绝 | guard 挂载预注册是否让 schema 进了请求头；Auto 的自动审查要调会话模型判风险；adapter 的 `purpose` 闸门与匿名辅助调用拒绝 | 挂载预注册后 schema 闸门能过，但 Auto 的宿主实验性自动审查还要调用会话模型判风险，而 NTR 会话的模型是外部 ACP agent。插件不能把宿主这段内部提示转发给 agent：adapter 在 `purpose` 闸门之后、建 ACP 会话之前拒收既无 `purpose` 也无 `sessionId` 的匿名辅助调用（0.2.2 的 `purpose: "auto-review"` 由既有闸门拒成 `unsupported_purpose`），审查得不出结论，宿主拒绝每一张卡；agent 自己的执行继续。**不是插件能修好的**——指引是改用非 Auto 权限档 |
 
