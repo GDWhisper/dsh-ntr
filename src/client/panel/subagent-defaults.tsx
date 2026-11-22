@@ -88,19 +88,32 @@ export function isStaleValue(value: string | undefined, choices: AcpCatalogChoic
 }
 
 /**
- * The process-own default NAME one axis's「默认」option spells out in
+ * The row text ONE catalog choice spells — the single source shared by the
+ * axis dropdown's ordinary rows and the「默认」parentheses. The agent's own
+ * description rides along (consumption multipliers live there), so same-name
+ * variants stay distinguishable; no description → the bare name.
+ */
+export function choiceLabel(choice: AcpCatalogChoice): string {
+  return choice.description === undefined ? choice.name : `${choice.name} · ${choice.description}`
+}
+
+/**
+ * The process-own default LABEL one axis's「默认」option spells out in
  * parentheses, read from the slot's `currentValue` — the same fact the whole
  * UI treats as the agent process's own current default. `undefined` = nothing
  * to name (unread catalog, missing / boolean slot, no current value), so the
  * option stays plain「默认」. The effort axis reads the SAME effective-model
- * slot as `axisChoices`. A value absent from `choices` — or a choice with an
- * empty name — falls back to the raw value; descriptions never ride along.
+ * slot as `axisChoices`. A hit spells the SAME `choiceLabel` text as that
+ * choice's ordinary row (`listed: true`), so the parentheses match a row
+ * verbatim. A value absent from `choices` — or a choice with an empty name —
+ * falls back to the raw value with `listed: false` (the option marks it
+ * 「目录未列出」); no alias mapping is ever guessed.
  */
-export function resolvedAxisDefaultName(
+export function resolvedAxisDefaultLabel(
   catalog: AcpAgentCatalog | undefined,
   axis: 'model' | 'effort' | 'mode',
   modelValue: string | undefined,
-): string | undefined {
+): { text: string; listed: boolean } | undefined {
   const slot = axis === 'effort'
     ? thoughtOptionForModel(catalog, modelValue)
     : axis === 'model' ? catalog?.model : catalog?.mode
@@ -108,7 +121,9 @@ export function resolvedAxisDefaultName(
   const value = slot.currentValue
   if (value === null || value === '') return undefined
   const choice = slot.choices.find(candidate => candidate.value === value)
-  return choice !== undefined && choice.name !== '' ? choice.name : value
+  return choice !== undefined && choice.name !== ''
+    ? { text: choiceLabel(choice), listed: true }
+    : { text: value, listed: false }
 }
 
 /** Canonical equality of two per-agent entries (absent axis = follow default). */
@@ -133,11 +148,11 @@ function AxisSelect(props: {
   axis: 'model' | 'effort' | 'mode'
   value: string | undefined
   choices: AcpCatalogChoice[] | undefined
-  /** Resolved process-own default name; undefined keeps the option plain「默认」. */
-  defaultName?: string
+  /** Resolved process-own default label; undefined keeps the option plain「默认」. */
+  defaultLabel?: { text: string; listed: boolean }
   onChange: (value: string | undefined) => void
 }) {
-  const { acp, title, axis, value, choices, defaultName, onChange } = props
+  const { acp, title, axis, value, choices, defaultLabel, onChange } = props
   const axisName = axis === 'model' ? acp.label('模型', 'Model')
     : axis === 'effort' ? acp.label('思考等级', 'Thought level')
       : acp.label('模式', 'Mode')
@@ -155,13 +170,15 @@ function AxisSelect(props: {
         onChange={event => onChange(event.target.value === '' ? undefined : event.target.value)}
       >
         <option value="">
-          {defaultName === undefined ? acp.label('默认', 'Default') : acp.label(`默认（${defaultName}）`, `Default (${defaultName})`)}
+          {defaultLabel === undefined ? acp.label('默认', 'Default')
+            : defaultLabel.listed ? acp.label(`默认（${defaultLabel.text}）`, `Default (${defaultLabel.text})`)
+              : acp.label(`默认（${defaultLabel.text} · 目录未列出）`, `Default (${defaultLabel.text} · not listed)`)}
         </option>
         {(choices ?? []).map(choice => (
           // The agent's own description rides along (consumption multipliers live
           // there) — the same fact the chat model menu shows as the row detail.
           <option key={choice.value} value={choice.value}>
-            {choice.description === undefined ? choice.name : `${choice.name} · ${choice.description}`}
+            {choiceLabel(choice)}
           </option>
         ))}
         {kept && (
@@ -210,9 +227,9 @@ function AgentDefaultsRow(props: { acp: AcpStore; ui: UiState; delegate: AcpDele
         {acp.label('委派该智能体时的默认选择；「默认」跟随智能体进程自身。', 'Defaults when delegating to this agent; "Default" follows the agent process itself.')}
       </div>
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 8 }}>
-        <AxisSelect acp={acp} title={title} axis="model" value={entry?.model} choices={axisChoices(catalog, 'model', entry?.model)} defaultName={resolvedAxisDefaultName(catalog, 'model', entry?.model)} onChange={value => writeAxis('model', value)} />
-        <AxisSelect acp={acp} title={title} axis="effort" value={entry?.effort} choices={axisChoices(catalog, 'effort', entry?.model)} defaultName={resolvedAxisDefaultName(catalog, 'effort', entry?.model)} onChange={value => writeAxis('effort', value)} />
-        <AxisSelect acp={acp} title={title} axis="mode" value={entry?.mode} choices={axisChoices(catalog, 'mode', entry?.model)} defaultName={resolvedAxisDefaultName(catalog, 'mode', entry?.model)} onChange={value => writeAxis('mode', value)} />
+        <AxisSelect acp={acp} title={title} axis="model" value={entry?.model} choices={axisChoices(catalog, 'model', entry?.model)} defaultLabel={resolvedAxisDefaultLabel(catalog, 'model', entry?.model)} onChange={value => writeAxis('model', value)} />
+        <AxisSelect acp={acp} title={title} axis="effort" value={entry?.effort} choices={axisChoices(catalog, 'effort', entry?.model)} defaultLabel={resolvedAxisDefaultLabel(catalog, 'effort', entry?.model)} onChange={value => writeAxis('effort', value)} />
+        <AxisSelect acp={acp} title={title} axis="mode" value={entry?.mode} choices={axisChoices(catalog, 'mode', entry?.model)} defaultLabel={resolvedAxisDefaultLabel(catalog, 'mode', entry?.model)} onChange={value => writeAxis('mode', value)} />
       </div>
       {entry?.model === undefined && (
         <div className="dwa-preference-copy">

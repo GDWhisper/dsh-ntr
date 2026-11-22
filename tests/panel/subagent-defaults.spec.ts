@@ -11,7 +11,7 @@ import { createElement } from 'react'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 import { AcpSettingsSection } from '../../src/client/panel.tsx'
-import { axisChoices, resolvedAxisDefaultName, thoughtOptionForModel } from '../../src/client/panel/subagent-defaults.tsx'
+import { axisChoices, choiceLabel, resolvedAxisDefaultLabel, thoughtOptionForModel } from '../../src/client/panel/subagent-defaults.tsx'
 import { AcpStore, type RpcCall } from '../../src/client/store.ts'
 import { displayDelegateLabel as browserDisplayDelegateLabel, subagentPanelRows } from '../../src/client/subagent-panel.tsx'
 import { ModelCatalogService, type CatalogHost } from '../../src/bridge/catalog-service.ts'
@@ -541,7 +541,14 @@ describe('thoughtOptionForModel — equivalence with the host read rule', () => 
   })
 })
 
-describe('resolvedAxisDefaultName — the process default the 默认 option names', () => {
+describe('choiceLabel — one row text for rows and parentheses alike', () => {
+  it('spells name · description when present, the bare name otherwise', () => {
+    expect(choiceLabel({ value: 'hy4flash-free', name: 'Hy4 flash', description: 'x0.00 credits' })).toBe('Hy4 flash · x0.00 credits')
+    expect(choiceLabel({ value: 'plain', name: 'Plain' })).toBe('Plain')
+  })
+})
+
+describe('resolvedAxisDefaultLabel — the process default the 默认 option spells', () => {
   const slot = (currentValue: string | null, choices: AcpCatalogChoice[] = [], kind?: 'boolean'): AcpCatalogOption => ({
     configId: 'slot', name: 'Slot', currentValue, choices, ...(kind === undefined ? {} : { kind }),
   })
@@ -558,42 +565,42 @@ describe('resolvedAxisDefaultName — the process default the 默认 option name
 
   it('returns undefined on every axis while the catalog is unread', () => {
     for (const axis of ['model', 'effort', 'mode'] as const) {
-      expect(resolvedAxisDefaultName(undefined, axis, undefined)).toBeUndefined()
-      expect(resolvedAxisDefaultName(undefined, axis, 'm1')).toBeUndefined()
+      expect(resolvedAxisDefaultLabel(undefined, axis, undefined)).toBeUndefined()
+      expect(resolvedAxisDefaultLabel(undefined, axis, 'm1')).toBeUndefined()
     }
   })
 
   it('returns undefined when the axis slot is missing', () => {
-    expect(resolvedAxisDefaultName({}, 'model', undefined)).toBeUndefined()
-    expect(resolvedAxisDefaultName({}, 'mode', undefined)).toBeUndefined()
-    expect(resolvedAxisDefaultName({}, 'effort', undefined)).toBeUndefined()
+    expect(resolvedAxisDefaultLabel({}, 'model', undefined)).toBeUndefined()
+    expect(resolvedAxisDefaultLabel({}, 'mode', undefined)).toBeUndefined()
+    expect(resolvedAxisDefaultLabel({}, 'effort', undefined)).toBeUndefined()
     // A read catalog whose picked model was never observed has no effort evidence.
-    expect(resolvedAxisDefaultName({ model: slot('m1', [modelOne]) }, 'effort', 'm2')).toBeUndefined()
+    expect(resolvedAxisDefaultLabel({ model: slot('m1', [modelOne]) }, 'effort', 'm2')).toBeUndefined()
   })
 
   it('returns undefined for a null or empty currentValue', () => {
     for (const current of [null, '']) {
-      expect(resolvedAxisDefaultName({ model: slot(current, [modelOne]) }, 'model', undefined)).toBeUndefined()
-      expect(resolvedAxisDefaultName({ mode: slot(current) }, 'mode', undefined)).toBeUndefined()
-      expect(resolvedAxisDefaultName({ thought: slot(current) }, 'effort', undefined)).toBeUndefined()
+      expect(resolvedAxisDefaultLabel({ model: slot(current, [modelOne]) }, 'model', undefined)).toBeUndefined()
+      expect(resolvedAxisDefaultLabel({ mode: slot(current) }, 'mode', undefined)).toBeUndefined()
+      expect(resolvedAxisDefaultLabel({ thought: slot(current) }, 'effort', undefined)).toBeUndefined()
     }
   })
 
-  it('names the choice the currentValue hits — never its description', () => {
-    expect(resolvedAxisDefaultName(knownCatalog.catalog, 'model', undefined)).toBe('Model One')
-    expect(resolvedAxisDefaultName(knownCatalog.catalog, 'mode', undefined)).toBe('Mode One')
+  it('names the choice the currentValue hits — the same label its row spells', () => {
+    expect(resolvedAxisDefaultLabel(knownCatalog.catalog, 'model', undefined)).toEqual({ text: 'Model One · x0.5 credits', listed: true })
+    expect(resolvedAxisDefaultLabel(knownCatalog.catalog, 'mode', undefined)).toEqual({ text: 'Mode One', listed: true })
   })
 
-  it('falls back to the raw value when no choice matches or the matched name is empty', () => {
-    expect(resolvedAxisDefaultName({ model: slot('ghost', [modelOne]) }, 'model', undefined)).toBe('ghost')
-    expect(resolvedAxisDefaultName({ model: slot('m1', [{ value: 'm1', name: '' }]) }, 'model', undefined)).toBe('m1')
+  it('falls back to the raw value (listed:false) when no choice matches or the matched name is empty', () => {
+    expect(resolvedAxisDefaultLabel({ model: slot('ghost', [modelOne]) }, 'model', undefined)).toEqual({ text: 'ghost', listed: false })
+    expect(resolvedAxisDefaultLabel({ model: slot('m1', [{ value: 'm1', name: '' }]) }, 'model', undefined)).toEqual({ text: 'm1', listed: false })
   })
 
   it('returns undefined for a boolean toggle slot', () => {
     const toggle = slot('true', [], 'boolean')
-    expect(resolvedAxisDefaultName({ model: toggle }, 'model', undefined)).toBeUndefined()
-    expect(resolvedAxisDefaultName({ mode: toggle }, 'mode', undefined)).toBeUndefined()
-    expect(resolvedAxisDefaultName({ thought: toggle }, 'effort', undefined)).toBeUndefined()
+    expect(resolvedAxisDefaultLabel({ model: toggle }, 'model', undefined)).toBeUndefined()
+    expect(resolvedAxisDefaultLabel({ mode: toggle }, 'mode', undefined)).toBeUndefined()
+    expect(resolvedAxisDefaultLabel({ thought: toggle }, 'effort', undefined)).toBeUndefined()
   })
 
   it('effort reads the same effective-model slot as axisChoices', () => {
@@ -602,21 +609,23 @@ describe('resolvedAxisDefaultName — the process default the 默认 option name
     const model = slot('m1', [modelOne, { value: 'm2', name: 'Model Two' }])
     const mapped: AcpAgentCatalog = { model, thoughtByModel: { m1: levels1, m2: levels2 } }
     // No pick (or an empty one) describes the catalog's current model m1.
-    expect(resolvedAxisDefaultName(mapped, 'effort', undefined)).toBe('Level One')
-    expect(resolvedAxisDefaultName(mapped, 'effort', '')).toBe('Level One')
+    expect(resolvedAxisDefaultLabel(mapped, 'effort', undefined)).toEqual({ text: 'Level One', listed: true })
+    expect(resolvedAxisDefaultLabel(mapped, 'effort', '')).toEqual({ text: 'Level One', listed: true })
     // An explicit m2 uses its own record.
-    expect(resolvedAxisDefaultName(mapped, 'effort', 'm2')).toBe('Level Two')
+    expect(resolvedAxisDefaultLabel(mapped, 'effort', 'm2')).toEqual({ text: 'Level Two', listed: true })
     // Observed without the axis → nothing to name.
-    expect(resolvedAxisDefaultName({ model, thoughtByModel: { m1: levels1, m2: null } }, 'effort', 'm2')).toBeUndefined()
+    expect(resolvedAxisDefaultLabel({ model, thoughtByModel: { m1: levels1, m2: null } }, 'effort', 'm2')).toBeUndefined()
     // Legacy catalog without the map: only the named current model keeps the slot.
     const legacy: AcpAgentCatalog = { model, thought: levels1 }
-    expect(resolvedAxisDefaultName(legacy, 'effort', undefined)).toBe('Level One')
-    expect(resolvedAxisDefaultName(legacy, 'effort', 'm1')).toBe('Level One')
-    expect(resolvedAxisDefaultName(legacy, 'effort', 'm2')).toBeUndefined()
-    // The named default is always one of the axis's own known choices.
+    expect(resolvedAxisDefaultLabel(legacy, 'effort', undefined)).toEqual({ text: 'Level One', listed: true })
+    expect(resolvedAxisDefaultLabel(legacy, 'effort', 'm1')).toEqual({ text: 'Level One', listed: true })
+    expect(resolvedAxisDefaultLabel(legacy, 'effort', 'm2')).toBeUndefined()
+    // The named default is always one of the axis's own known choices, and the
+    // parentheses spell that choice's row label verbatim.
     for (const pick of [undefined, 'm1', 'm2']) {
-      const name = resolvedAxisDefaultName(mapped, 'effort', pick)
-      expect((axisChoices(mapped, 'effort', pick) ?? []).some(choice => choice.name === name)).toBe(true)
+      const label = resolvedAxisDefaultLabel(mapped, 'effort', pick)
+      expect(label?.listed).toBe(true)
+      expect((axisChoices(mapped, 'effort', pick) ?? []).some(choice => choiceLabel(choice) === label?.text)).toBe(true)
     }
   })
 
@@ -625,12 +634,12 @@ describe('resolvedAxisDefaultName — the process default the 默认 option name
     await category('子代理')
     const model = axisSelect('模型', 'CodeBuddy')
     await waitFor(() => expect(optionValues(model)).toContain('m1'))
-    for (const [axis, name] of [['模型', 'Model One'], ['思考等级', 'Level One'], ['模式', 'Mode One']] as const) {
+    for (const [axis, text] of [['模型', 'Model One · x0.5 credits'], ['思考等级', 'Level One'], ['模式', 'Mode One']] as const) {
       const select = axisSelect(axis, 'CodeBuddy')
-      const option = within(select).getByRole('option', { name: `默认（${name}）` }) as HTMLOptionElement
+      const option = within(select).getByRole('option', { name: `默认（${text}）` }) as HTMLOptionElement
       expect(option.value).toBe('')
-      // Exactly the name in parentheses — no description, no extra decoration.
-      expect(option.textContent).toBe(`默认（${name}）`)
+      // The parentheses spell the SAME label as the hit choice's own row.
+      expect(option.textContent).toBe(`默认（${text}）`)
     }
   })
 
@@ -647,13 +656,118 @@ describe('resolvedAxisDefaultName — the process default the 默认 option name
     }
   })
 
-  it('the English locale spells Default (X) with the same resolved name', async () => {
+  it('the English locale spells Default (X) with the same resolved label', async () => {
     await mountDefaults({ ...BASE }, { catalogs: { codebuddy: knownCatalog }, locale: (zh, en) => en })
     await click(within(screen.getByRole('navigation', { name: 'NTR settings categories' })).getByRole('button', { name: 'Subagents' }))
     const model = screen.getByRole('combobox', { name: 'Model · CodeBuddy' }) as HTMLSelectElement
     await waitFor(() => expect(optionValues(model)).toContain('m1'))
-    const option = within(model).getByRole('option', { name: 'Default (Model One)' }) as HTMLOptionElement
+    const option = within(model).getByRole('option', { name: 'Default (Model One · x0.5 credits)' }) as HTMLOptionElement
     expect(option.value).toBe('')
-    expect(option.textContent).toBe('Default (Model One)')
+    expect(option.textContent).toBe('Default (Model One · x0.5 credits)')
+  })
+
+  // The real cached shape: same-name variants told apart ONLY by description,
+  // and a process currentValue (hy4free) absent from the choice list.
+  const hy4Catalog = (currentValue: string): AgentProbeModelsResult => ({
+    agentId: 'codebuddy', updatedAt: 1,
+    catalog: {
+      model: {
+        configId: 'model', name: 'Model', currentValue,
+        choices: [
+          { value: 'hy4std', name: 'Hy4 std', description: 'x0.01 credits' },
+          { value: 'hy4flash-free', name: 'Hy4 flash', description: 'x0.00 credits' },
+          { value: 'hy4flash', name: 'Hy4 flash', description: 'x0.03 credits' },
+        ],
+      },
+    },
+  })
+
+  it('the parentheses match the hit row verbatim, description included', async () => {
+    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: hy4Catalog('hy4flash-free') } })
+    await category('子代理')
+    const model = axisSelect('模型', 'CodeBuddy')
+    await waitFor(() => expect(optionValues(model)).toContain('hy4flash-free'))
+    const option = within(model).getByRole('option', { name: '默认（Hy4 flash · x0.00 credits）' }) as HTMLOptionElement
+    expect(option.value).toBe('')
+    expect(option.textContent).toBe('默认（Hy4 flash · x0.00 credits）')
+    const row = within(model).getByRole('option', { name: 'Hy4 flash · x0.00 credits' }) as HTMLOptionElement
+    expect(row.value).toBe('hy4flash-free')
+    expect(option.textContent).toBe(`默认（${row.textContent}）`)
+  })
+
+  it('same-name variants: currentValue pointing at the SECOND choice carries its description', async () => {
+    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: hy4Catalog('hy4flash') } })
+    await category('子代理')
+    const model = axisSelect('模型', 'CodeBuddy')
+    await waitFor(() => expect(optionValues(model)).toContain('hy4flash'))
+    const option = within(model).getByRole('option', { name: '默认（Hy4 flash · x0.03 credits）' }) as HTMLOptionElement
+    expect(option.textContent).toBe('默认（Hy4 flash · x0.03 credits）')
+    expect(within(model).queryByRole('option', { name: '默认（Hy4 flash · x0.00 credits）' })).toBeNull()
+  })
+
+  it('a hit without a description spells the bare name in parentheses', async () => {
+    const catalog: AgentProbeModelsResult = { agentId: 'codebuddy', updatedAt: 1, catalog: { model: slot('plain', [{ value: 'plain', name: 'Plain' }]) } }
+    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: catalog } })
+    await category('子代理')
+    const model = axisSelect('模型', 'CodeBuddy')
+    await waitFor(() => expect(optionValues(model)).toContain('plain'))
+    expect((within(model).getByRole('option', { name: '默认（Plain）' }) as HTMLOptionElement).textContent).toBe('默认（Plain）')
+  })
+
+  it('a currentValue outside the choices spells the raw value marked 目录未列出 — no alias guessed', async () => {
+    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: hy4Catalog('hy4free') } })
+    await category('子代理')
+    const model = axisSelect('模型', 'CodeBuddy')
+    await waitFor(() => expect(optionValues(model)).toContain('hy4flash-free'))
+    const option = within(model).getByRole('option', { name: '默认（hy4free · 目录未列出）' }) as HTMLOptionElement
+    expect(option.value).toBe('')
+    expect(option.textContent).toBe('默认（hy4free · 目录未列出）')
+  })
+
+  it('the English locale marks the unlisted value "not listed"', async () => {
+    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: hy4Catalog('hy4free') }, locale: (zh, en) => en })
+    await click(within(screen.getByRole('navigation', { name: 'NTR settings categories' })).getByRole('button', { name: 'Subagents' }))
+    const model = screen.getByRole('combobox', { name: 'Model · CodeBuddy' }) as HTMLSelectElement
+    await waitFor(() => expect(optionValues(model)).toContain('hy4flash-free'))
+    const option = within(model).getByRole('option', { name: 'Default (hy4free · not listed)' }) as HTMLOptionElement
+    expect(option.value).toBe('')
+    expect(option.textContent).toBe('Default (hy4free · not listed)')
+  })
+
+  it('boolean slots and null/empty currentValue keep the option plain 默认', async () => {
+    const catalog: AgentProbeModelsResult = {
+      agentId: 'codebuddy', updatedAt: 1,
+      catalog: {
+        model: slot('true', [], 'boolean'),
+        thought: slot(null, [{ value: 'e1', name: 'Level One' }]),
+        mode: slot('', [{ value: 'o1', name: 'Mode One' }]),
+      },
+    }
+    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: catalog } })
+    await category('子代理')
+    // The mode row proves the catalog settled (a boolean model slot renders nothing).
+    await waitFor(() => expect(optionValues(axisSelect('模式', 'CodeBuddy'))).toContain('o1'))
+    for (const axis of ['模型', '思考等级', '模式'] as const) {
+      const option = within(axisSelect(axis, 'CodeBuddy')).getByRole('option', { name: '默认' }) as HTMLOptionElement
+      expect(option.value).toBe('')
+      expect(option.textContent).toBe('默认')
+    }
+  })
+
+  it('effort parentheses carry the description through the thoughtByModel path', async () => {
+    const catalog: AgentProbeModelsResult = {
+      agentId: 'codebuddy', updatedAt: 1,
+      catalog: {
+        model: slot('m1', [{ value: 'm1', name: 'Model One' }]),
+        thoughtByModel: { m1: slot('deep', [{ value: 'deep', name: 'Deep', description: 'deeper thinking' }]) },
+      },
+    }
+    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: catalog } })
+    await category('子代理')
+    const effort = axisSelect('思考等级', 'CodeBuddy')
+    await waitFor(() => expect(optionValues(effort)).toContain('deep'))
+    const option = within(effort).getByRole('option', { name: '默认（Deep · deeper thinking）' }) as HTMLOptionElement
+    expect(option.value).toBe('')
+    expect(option.textContent).toBe('默认（Deep · deeper thinking）')
   })
 })
