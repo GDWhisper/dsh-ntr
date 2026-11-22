@@ -47,6 +47,7 @@ import {
   SUBAGENT_TICK_MS,
 } from './acp-view.tsx'
 import type { Translate } from './acp-view.tsx'
+import { AGENT_ID_PATTERN } from './agent-id.ts'
 import type { AcpStore } from './store.ts'
 import type { SubagentRecord, SubagentStatus } from '../protocol.ts'
 
@@ -56,13 +57,11 @@ const MENU_VIEWPORT_MARGIN = 16
 const MENU_MAX_WIDTH = 336
 
 // ---- Hand-copied from src/impl/delegate-label.ts (displayDelegateLabel) ----
-// The browser half must not pull host-plane modules into the bundle (same deal
-// as splitAcpModelId in acp-ui.tsx), so the carrier-strip is duplicated here and
-// pinned to the host by an equivalence test. A delegation label can carry the
-// explicit model/effort/mode picks in a `⟦m=…&e=…&o=…⟧` carrier; the panel's
-// title shows the label WITHOUT that routing carrier. Display fails open: a
-// malformed (or absent) carrier passes through verbatim, exactly like the host.
-const DELEGATE_AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/
+// The browser half must not pull host-plane modules into the bundle, so the
+// carrier-strip is duplicated here (an equivalence test pins it to the host);
+// the agent-id charset rides the SHARED ./agent-id.ts copy (tests/agent-id.spec.ts).
+// A label's `⟦m=…&e=…&o=…⟧` carrier carries explicit model/effort/mode picks; the
+// title strips it. Display fails open: a malformed/absent carrier passes through.
 const DELEGATE_CARRIER_OPEN = '⟦'
 const DELEGATE_CARRIER_CLOSE = '⟧'
 /** Strict carrier parse: only a fully legal prefix yields an agent id. */
@@ -72,7 +71,7 @@ function parseDelegateCarrierPrefix(prefix: string): { agentId: string } | undef
   if (prefix[open - 1] !== ' ') return undefined
   if (!prefix.endsWith(DELEGATE_CARRIER_CLOSE) || prefix.indexOf(DELEGATE_CARRIER_CLOSE) !== prefix.length - 1) return undefined
   const agentId = prefix.slice(0, open - 1)
-  if (!DELEGATE_AGENT_ID_PATTERN.test(agentId)) return undefined
+  if (!AGENT_ID_PATTERN.test(agentId)) return undefined
   const payload = prefix.slice(open + 1, prefix.length - 1)
   if (payload === '') return undefined
   let lastKey = -1

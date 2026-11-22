@@ -10,6 +10,7 @@
  */
 import { useEffect, useRef, useState } from 'react'
 import { formatCommandLine, isAbsolutePathLike, splitCommandLine } from '../acp-ui.tsx'
+import { AGENT_ID_PATTERN } from '../agent-id.ts'
 import {
   DEFAULT_KNOWN_PRESETS,
   saveGateIsAvailable,
@@ -25,13 +26,6 @@ import { ModelCatalogBlock } from './model-catalog-block.tsx'
 import type { AgentTestOutcome } from './permission-mirror.tsx'
 import { agentTestHint } from './permission-mirror.tsx'
 import { exposureKey, persistedDef, stateVisual, useUi } from './shared.ts'
-
-/**
- * Mirrors `AGENT_ID_PATTERN` in impl.ts — the client cannot import host-side
- * modules, so this copy must stay in sync (same deal as the preset copies,
- * constraint 7).
- */
-const AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/
 
 /** Preset ids (drives the「自定义」badge); mirrors AGENT_PRESETS via store copies. */
 const PRESET_IDS = new Set(DEFAULT_KNOWN_PRESETS.map(preset => preset.id))

@@ -67,7 +67,7 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 
 ### 3.2 codec 手拷贝
 
-`splitAcpModelId`（`src/client/acp-ui.tsx`）是宿主 `splitAdapterModelId` 的手拷贝（浏览器半区不得 import 宿主平面模块，`protocol.ts` 又只能是纯类型）。改其一必须同步另一处，`tests/acp-view.spec.ts` 用同一样本集做等价断言。`isAbsolutePathLike` 与宿主 `isAbsolutePath` 同理（见 [paths.md](./paths.md)）。
+`splitAcpModelId`（`src/client/acp-ui.tsx`）是宿主 `splitAdapterModelId` 的手拷贝（浏览器半区不得 import 宿主平面模块，`protocol.ts` 又只能是纯类型）。改其一必须同步另一处，`tests/acp-view.spec.ts` 用同一样本集做等价断言。`isAbsolutePathLike` 与宿主 `isAbsolutePath` 同理（见 [paths.md](./paths.md)）。`AGENT_ID_PATTERN` 的客户端拷贝收敛在 `src/client/agent-id.ts`（`agent-row.tsx` / `subagent-panel.tsx` 共享，禁第二份字面量），宿主原值在 `src/impl/validate.ts`，等价钉在 `tests/agent-id.spec.ts`。
 
 ### 3.3 高级底座
 
