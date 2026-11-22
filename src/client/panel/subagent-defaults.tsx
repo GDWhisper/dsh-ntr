@@ -130,7 +130,11 @@ function AxisSelect(props: {
       >
         <option value="">{acp.label('默认', 'Default')}</option>
         {(choices ?? []).map(choice => (
-          <option key={choice.value} value={choice.value}>{choice.name}</option>
+          // The agent's own description rides along (consumption multipliers live
+          // there) — the same fact the chat model menu shows as the row detail.
+          <option key={choice.value} value={choice.value}>
+            {choice.description === undefined ? choice.name : `${choice.name} · ${choice.description}`}
+          </option>
         ))}
         {kept && (
           <option value={value} style={stale ? { color: WARN_FG } : undefined}>

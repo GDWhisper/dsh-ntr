@@ -177,6 +177,33 @@ describe('SubagentDefaults — per-agent axes', () => {
     expect(writes(calls, 'agent/probe-models')).toEqual([])
   })
 
+  it('model options carry the agent description (consumption multiplier), distinguishing same-name variants', async () => {
+    await mountDefaults({ ...BASE }, {
+      catalogs: {
+        codebuddy: {
+          catalog: {
+            model: {
+              configId: 'model', name: 'Model', currentValue: 'hy4-flash',
+              choices: [
+                { value: 'hy4-flash', name: 'Hy4 flash', description: '消耗倍率 0.3x' },
+                { value: 'hy4-flash-pro', name: 'Hy4 flash', description: '消耗倍率 1x' },
+                { value: 'plain', name: 'Plain' },
+              ],
+            },
+          },
+        },
+      },
+    })
+    await category('子代理')
+    const model = axisSelect('模型', 'CodeBuddy')
+    await waitFor(() => expect(optionValues(model)).toContain('hy4-flash'))
+    expect(optionValues(model)).toEqual(['', 'hy4-flash', 'hy4-flash-pro', 'plain'])
+    expect(within(model).getByRole('option', { name: 'Hy4 flash · 消耗倍率 0.3x' })).toBeDefined()
+    expect(within(model).getByRole('option', { name: 'Hy4 flash · 消耗倍率 1x' })).toBeDefined()
+    // No description → the bare name, no separator.
+    expect(within(model).getByRole('option', { name: 'Plain' })).toBeDefined()
+  })
+
   it('setting a model writes the whole entry with that axis', async () => {
     const { store, calls } = await mountDefaults({ ...BASE })
     await category('子代理')
