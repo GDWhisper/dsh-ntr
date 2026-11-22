@@ -11,13 +11,13 @@ import { createElement } from 'react'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 import { AcpSettingsSection } from '../../src/client/panel.tsx'
-import { thoughtOptionForModel } from '../../src/client/panel/subagent-defaults.tsx'
+import { axisChoices, resolvedAxisDefaultName, thoughtOptionForModel } from '../../src/client/panel/subagent-defaults.tsx'
 import { AcpStore, type RpcCall } from '../../src/client/store.ts'
 import { displayDelegateLabel as browserDisplayDelegateLabel, subagentPanelRows } from '../../src/client/subagent-panel.tsx'
 import { ModelCatalogService, type CatalogHost } from '../../src/bridge/catalog-service.ts'
 import { EventHub } from '../../src/impl.ts'
 import { delegateLabel, displayDelegateLabel as hostDisplayDelegateLabel } from '../../src/impl/delegate-label.ts'
-import type { AcpAgentCatalog, AcpAgentDef, AcpCatalogOption, AcpDelegateSettings, AgentProbeModelsResult, DelegateSetPayload, SubagentRecord } from '../../src/protocol.ts'
+import type { AcpAgentCatalog, AcpAgentDef, AcpCatalogChoice, AcpCatalogOption, AcpDelegateSettings, AgentProbeModelsResult, DelegateSetPayload, SubagentRecord } from '../../src/protocol.ts'
 import { createPanelFixture, type PanelRpcCall } from '../panel-fixture.ts'
 import { category, click, mountPanel } from './harness.ts'
 
@@ -33,7 +33,7 @@ function writes(calls: PanelRpcCall[], endpoint: string): unknown[] {
 }
 
 /** Mount the settings section with a delegate view the wrapper keeps authoritative. */
-async function mountDefaults(seed: AcpDelegateSettings, options: { failWrite?: boolean; catalogs?: Record<string, AgentProbeModelsResult | null> } = {}) {
+async function mountDefaults(seed: AcpDelegateSettings, options: { failWrite?: boolean; catalogs?: Record<string, AgentProbeModelsResult | null>; locale?: (zh: string, en: string) => string } = {}) {
   const base = createPanelFixture(options.catalogs === undefined ? {} : { catalogs: options.catalogs })
   let current = structuredClone(seed)
   const calls: PanelRpcCall[] = []
@@ -69,7 +69,7 @@ async function mountDefaults(seed: AcpDelegateSettings, options: { failWrite?: b
     }
     return base.rpc(channel, endpoint, payload)
   }
-  const store = new AcpStore(rpc, zh => zh)
+  const store = new AcpStore(rpc, options.locale ?? (zh => zh))
   await store.resync()
   render(createElement(AcpSettingsSection, { acp: store }))
   return { store, calls }
@@ -538,5 +538,122 @@ describe('thoughtOptionForModel — equivalence with the host read rule', () => 
       [{ model: modelSlot(null), thought: levelsA }, undefined, 'null current model falls back to the agent-level slot'],
     ]
     for (const [catalog, modelValue, why] of samples) expectEquivalent(catalog, modelValue, why)
+  })
+})
+
+describe('resolvedAxisDefaultName — the process default the 默认 option names', () => {
+  const slot = (currentValue: string | null, choices: AcpCatalogChoice[] = [], kind?: 'boolean'): AcpCatalogOption => ({
+    configId: 'slot', name: 'Slot', currentValue, choices, ...(kind === undefined ? {} : { kind }),
+  })
+  const modelOne: AcpCatalogChoice = { value: 'm1', name: 'Model One', description: 'x0.5 credits' }
+  // One read catalog naming a default on every axis (effort via the legacy slot).
+  const knownCatalog: AgentProbeModelsResult = {
+    agentId: 'codebuddy', updatedAt: 1,
+    catalog: {
+      model: { configId: 'model', name: 'Model', currentValue: 'm1', choices: [modelOne, { value: 'm2', name: 'Model Two' }] },
+      thought: { configId: 'thought_level', name: 'Thinking', currentValue: 'e1', choices: [{ value: 'e1', name: 'Level One' }] },
+      mode: { configId: 'mode', name: 'Mode', currentValue: 'o1', choices: [{ value: 'o1', name: 'Mode One' }] },
+    },
+  }
+
+  it('returns undefined on every axis while the catalog is unread', () => {
+    for (const axis of ['model', 'effort', 'mode'] as const) {
+      expect(resolvedAxisDefaultName(undefined, axis, undefined)).toBeUndefined()
+      expect(resolvedAxisDefaultName(undefined, axis, 'm1')).toBeUndefined()
+    }
+  })
+
+  it('returns undefined when the axis slot is missing', () => {
+    expect(resolvedAxisDefaultName({}, 'model', undefined)).toBeUndefined()
+    expect(resolvedAxisDefaultName({}, 'mode', undefined)).toBeUndefined()
+    expect(resolvedAxisDefaultName({}, 'effort', undefined)).toBeUndefined()
+    // A read catalog whose picked model was never observed has no effort evidence.
+    expect(resolvedAxisDefaultName({ model: slot('m1', [modelOne]) }, 'effort', 'm2')).toBeUndefined()
+  })
+
+  it('returns undefined for a null or empty currentValue', () => {
+    for (const current of [null, '']) {
+      expect(resolvedAxisDefaultName({ model: slot(current, [modelOne]) }, 'model', undefined)).toBeUndefined()
+      expect(resolvedAxisDefaultName({ mode: slot(current) }, 'mode', undefined)).toBeUndefined()
+      expect(resolvedAxisDefaultName({ thought: slot(current) }, 'effort', undefined)).toBeUndefined()
+    }
+  })
+
+  it('names the choice the currentValue hits — never its description', () => {
+    expect(resolvedAxisDefaultName(knownCatalog.catalog, 'model', undefined)).toBe('Model One')
+    expect(resolvedAxisDefaultName(knownCatalog.catalog, 'mode', undefined)).toBe('Mode One')
+  })
+
+  it('falls back to the raw value when no choice matches or the matched name is empty', () => {
+    expect(resolvedAxisDefaultName({ model: slot('ghost', [modelOne]) }, 'model', undefined)).toBe('ghost')
+    expect(resolvedAxisDefaultName({ model: slot('m1', [{ value: 'm1', name: '' }]) }, 'model', undefined)).toBe('m1')
+  })
+
+  it('returns undefined for a boolean toggle slot', () => {
+    const toggle = slot('true', [], 'boolean')
+    expect(resolvedAxisDefaultName({ model: toggle }, 'model', undefined)).toBeUndefined()
+    expect(resolvedAxisDefaultName({ mode: toggle }, 'mode', undefined)).toBeUndefined()
+    expect(resolvedAxisDefaultName({ thought: toggle }, 'effort', undefined)).toBeUndefined()
+  })
+
+  it('effort reads the same effective-model slot as axisChoices', () => {
+    const levels1 = slot('e1', [{ value: 'e1', name: 'Level One' }])
+    const levels2 = slot('e2', [{ value: 'e2', name: 'Level Two' }])
+    const model = slot('m1', [modelOne, { value: 'm2', name: 'Model Two' }])
+    const mapped: AcpAgentCatalog = { model, thoughtByModel: { m1: levels1, m2: levels2 } }
+    // No pick (or an empty one) describes the catalog's current model m1.
+    expect(resolvedAxisDefaultName(mapped, 'effort', undefined)).toBe('Level One')
+    expect(resolvedAxisDefaultName(mapped, 'effort', '')).toBe('Level One')
+    // An explicit m2 uses its own record.
+    expect(resolvedAxisDefaultName(mapped, 'effort', 'm2')).toBe('Level Two')
+    // Observed without the axis → nothing to name.
+    expect(resolvedAxisDefaultName({ model, thoughtByModel: { m1: levels1, m2: null } }, 'effort', 'm2')).toBeUndefined()
+    // Legacy catalog without the map: only the named current model keeps the slot.
+    const legacy: AcpAgentCatalog = { model, thought: levels1 }
+    expect(resolvedAxisDefaultName(legacy, 'effort', undefined)).toBe('Level One')
+    expect(resolvedAxisDefaultName(legacy, 'effort', 'm1')).toBe('Level One')
+    expect(resolvedAxisDefaultName(legacy, 'effort', 'm2')).toBeUndefined()
+    // The named default is always one of the axis's own known choices.
+    for (const pick of [undefined, 'm1', 'm2']) {
+      const name = resolvedAxisDefaultName(mapped, 'effort', pick)
+      expect((axisChoices(mapped, 'effort', pick) ?? []).some(choice => choice.name === name)).toBe(true)
+    }
+  })
+
+  it('the 默认 option spells the resolved process default in parentheses when the catalog is known', async () => {
+    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: knownCatalog } })
+    await category('子代理')
+    const model = axisSelect('模型', 'CodeBuddy')
+    await waitFor(() => expect(optionValues(model)).toContain('m1'))
+    for (const [axis, name] of [['模型', 'Model One'], ['思考等级', 'Level One'], ['模式', 'Mode One']] as const) {
+      const select = axisSelect(axis, 'CodeBuddy')
+      const option = within(select).getByRole('option', { name: `默认（${name}）` }) as HTMLOptionElement
+      expect(option.value).toBe('')
+      // Exactly the name in parentheses — no description, no extra decoration.
+      expect(option.textContent).toBe(`默认（${name}）`)
+    }
+  })
+
+  it('the 默认 option stays plain 默认 while the catalog is unread', async () => {
+    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: null } })
+    await category('子代理')
+    // The fetch gesture proves the memory-only read settled as missing.
+    await screen.findByRole('button', { name: '获取目录' })
+    for (const axis of ['模型', '思考等级', '模式'] as const) {
+      const select = axisSelect(axis, 'CodeBuddy')
+      const option = within(select).getByRole('option', { name: '默认' }) as HTMLOptionElement
+      expect(option.value).toBe('')
+      expect(option.textContent).toBe('默认')
+    }
+  })
+
+  it('the English locale spells Default (X) with the same resolved name', async () => {
+    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: knownCatalog }, locale: (zh, en) => en })
+    await click(within(screen.getByRole('navigation', { name: 'NTR settings categories' })).getByRole('button', { name: 'Subagents' }))
+    const model = screen.getByRole('combobox', { name: 'Model · CodeBuddy' }) as HTMLSelectElement
+    await waitFor(() => expect(optionValues(model)).toContain('m1'))
+    const option = within(model).getByRole('option', { name: 'Default (Model One)' }) as HTMLOptionElement
+    expect(option.value).toBe('')
+    expect(option.textContent).toBe('Default (Model One)')
   })
 })
