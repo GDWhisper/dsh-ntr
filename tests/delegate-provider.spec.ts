@@ -9,7 +9,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { ResolvedSubagentStartRequest, SubagentResult } from '@deepseek-ai/dsh-subagent'
 import { ACP_SUBAGENT_PROVIDER, AcpSubagentProvider } from '../src/bridge/delegate-provider.ts'
 import { AcpDelegateService, type AcpDelegateRunHandle } from '../src/bridge/delegate-service.ts'
-import { delegateLabel } from '../src/impl.ts'
+import { MAX_DELEGATE_DIAGNOSTIC_BYTES, delegateLabel } from '../src/impl.ts'
 import { DELEGATE_TIMEOUT_MAX_MS } from '../src/protocol.ts'
 import { chunk, configOptionsOf, happyPrompt, makeHost, modesOf, tick } from './delegate-harness.ts'
 
@@ -353,6 +353,35 @@ describe('AcpSubagentProvider degradation notes', () => {
     const result = await run.result
     expect(result.stopReason).toBe('aborted')
     expect(result.diagnostic).toBe('agent「alpha」的默认思考等级「ghost-e」不受当前模型支持，本次不设置')
+  })
+
+  it('a long turnError cannot eat the notes: they survive whole inside the bounded diagnostic', async () => {
+    const { f, provider } = makeProvider()
+    f.config.agentDefaults = { alpha: { mode: 'ghost-o' } }
+    f.liveOptions.set('session-1', { modes: modesOf('default') })
+    f.onPrompt(async (sessionId) => {
+      f.emit({ type: 'turn/end', sessionId, turnId: '', error: 'x'.repeat(20_000) })
+      return { turnId: 'real' }
+    })
+    const result = await (await provider.start(makeRequest().request)).result
+    expect(result.stopReason).toBe('completed')
+    const notes = 'agent「alpha」不再提供默认模式「ghost-o」，本次使用启动模式'
+    expect(result.diagnostic?.endsWith(`\n${notes}`)).toBe(true)
+    expect(result.diagnostic).toContain('[diagnostic truncated]')
+    expect(new TextEncoder().encode(result.diagnostic ?? '').byteLength).toBeLessThanOrEqual(MAX_DELEGATE_DIAGNOSTIC_BYTES)
+  })
+
+  it('a long prompt failure also keeps the notes whole', async () => {
+    const { f, provider } = makeProvider()
+    f.config.agentDefaults = { alpha: { mode: 'ghost-o' } }
+    f.liveOptions.set('session-1', { modes: modesOf('default') })
+    f.onPrompt(async () => { throw new Error('y'.repeat(20_000)) })
+    const result = await (await provider.start(makeRequest().request)).result
+    expect(result.stopReason).toBe('error')
+    const notes = 'agent「alpha」不再提供默认模式「ghost-o」，本次使用启动模式'
+    expect(result.diagnostic?.endsWith(`\n${notes}`)).toBe(true)
+    expect(result.diagnostic).toContain('[diagnostic truncated]')
+    expect(new TextEncoder().encode(result.diagnostic ?? '').byteLength).toBeLessThanOrEqual(MAX_DELEGATE_DIAGNOSTIC_BYTES)
   })
 })
 

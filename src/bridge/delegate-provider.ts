@@ -36,7 +36,7 @@ import type {
   SubagentRun,
 } from '@deepseek-ai/dsh-subagent'
 import { randomUUID } from '../ids.ts'
-import { agentIdFromDelegateLabel, delegateChoicesFromLabel, delegateLabel, truncateDelegateDiagnostic } from '../impl.ts'
+import { agentIdFromDelegateLabel, delegateChoicesFromLabel, delegateLabel, mergeDelegateDiagnostic, truncateDelegateDiagnostic } from '../impl.ts'
 import { DELEGATE_TIMEOUT_MAX_MS } from '../protocol.ts'
 import type {
   AcpDelegateActivationExecute,
@@ -83,12 +83,13 @@ function outputBlocksOf(text: string): Array<{ type: 'text'; text: string }> {
 /**
  * Merge the diagnostic parts (the failure detail and the degradation notes)
  * into ONE bounded diagnostic; undefined when nothing is present. The notes
- * ride along on every outcome — a stale-default degradation must reach the
- * parent even when the turn itself also reported an error.
+ * reserve their own byte budget (impl/delegate-label.ts ·
+ * mergeDelegateDiagnostic) so a long turnError can never eat them — a
+ * stale-default degradation must reach the parent even when the turn itself
+ * also reported an error.
  */
-function diagnosticOf(...parts: Array<string | undefined>): string | undefined {
-  const text = parts.filter((part): part is string => part !== undefined && part !== '').join('\n')
-  return text === '' ? undefined : truncateDelegateDiagnostic(text)
+function diagnosticOf(turnError: string | undefined, notes: string | undefined): string | undefined {
+  return mergeDelegateDiagnostic(turnError, notes)
 }
 
 /**
@@ -112,7 +113,7 @@ function resultOfSettlement(settlement: AcpDelegateSettlement): SubagentResult {
     }
     case 'aborted': {
       const result: SubagentResult = { output: outputBlocksOf(settlement.text), stopReason: 'aborted' }
-      const diagnostic = diagnosticOf(settlement.notes)
+      const diagnostic = diagnosticOf(undefined, settlement.notes)
       return diagnostic === undefined ? result : { ...result, diagnostic }
     }
     case 'timed-out':

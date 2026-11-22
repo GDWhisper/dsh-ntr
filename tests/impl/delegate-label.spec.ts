@@ -9,12 +9,14 @@ import { describe, expect, it } from 'vitest'
 import { settleRunResult } from '@deepseek-ai/dsh-subagent/src/out-of-process.ts'
 import {
   DELEGATE_LABEL_SUMMARY_MAX,
+  DELEGATE_NOTES_RESERVE_BYTES,
   DIAGNOSTIC_TRUNCATION_SUFFIX,
   MAX_DELEGATE_DIAGNOSTIC_BYTES,
   agentIdFromDelegateLabel,
   delegateChoicesFromLabel,
   delegateLabel,
   displayDelegateLabel,
+  mergeDelegateDiagnostic,
   truncateDelegateDiagnostic,
 } from '../../src/impl/delegate-label.ts'
 import { AGENT_ID_PATTERN } from '../../src/impl/validate.ts'
@@ -275,5 +277,118 @@ describe('truncateDelegateDiagnostic ≡ host 0.2.2-rc.5 semantics', () => {
     const bounded = truncateDelegateDiagnostic('a'.repeat(20_000))
     // 4096 - 23 suffix bytes = 4073 body bytes for pure ASCII.
     expect(bounded).toBe('a'.repeat(4_073) + DIAGNOSTIC_TRUNCATION_SUFFIX)
+  })
+})
+
+describe('mergeDelegateDiagnostic — the notes reserve a budget', () => {
+  const bytesOf = (text: string): number => utf8.encode(text).byteLength
+  const suffixBytes = utf8.encode(DIAGNOSTIC_TRUNCATION_SUFFIX).byteLength
+
+  it('both absent (undefined or empty) reads as undefined', () => {
+    expect(mergeDelegateDiagnostic(undefined, undefined)).toBeUndefined()
+    expect(mergeDelegateDiagnostic('', '')).toBeUndefined()
+    expect(mergeDelegateDiagnostic(undefined, '')).toBeUndefined()
+    expect(mergeDelegateDiagnostic('', undefined)).toBeUndefined()
+  })
+
+  it('a single part is exactly truncateDelegateDiagnostic of that part', () => {
+    expect(mergeDelegateDiagnostic(undefined, 'note')).toBe('note')
+    expect(mergeDelegateDiagnostic('err', undefined)).toBe('err')
+    expect(mergeDelegateDiagnostic('', 'note')).toBe('note')
+    expect(mergeDelegateDiagnostic('err', '')).toBe('err')
+    const long = 'x'.repeat(20_000)
+    expect(mergeDelegateDiagnostic(long, undefined)).toBe(truncateDelegateDiagnostic(long))
+    expect(mergeDelegateDiagnostic(undefined, long)).toBe(truncateDelegateDiagnostic(long))
+    expect(mergeDelegateDiagnostic(long, '')).toBe(truncateDelegateDiagnostic(long))
+    expect(mergeDelegateDiagnostic('', long)).toBe(truncateDelegateDiagnostic(long))
+  })
+
+  it('both fit: the verbatim turnError\\nnotes join, no marker', () => {
+    expect(mergeDelegateDiagnostic('err', 'note')).toBe('err\nnote')
+    const error = 'e'.repeat(3_000)
+    const notes = 'n'.repeat(DELEGATE_NOTES_RESERVE_BYTES)
+    expect(mergeDelegateDiagnostic(error, notes)).toBe(`${error}\n${notes}`)
+    expect(mergeDelegateDiagnostic(error, notes)).not.toContain('[diagnostic truncated]')
+  })
+
+  it('a long turnError cannot eat the notes: they survive whole at the tail', () => {
+    const notes = 'degradation note'
+    const merged = mergeDelegateDiagnostic('x'.repeat(20_000), notes) as string
+    expect(merged.endsWith(`\n${notes}`)).toBe(true)
+    expect(bytesOf(merged)).toBeLessThanOrEqual(MAX_DELEGATE_DIAGNOSTIC_BYTES)
+    // The error spent exactly the remainder beside the notes + separator.
+    const budget = MAX_DELEGATE_DIAGNOSTIC_BYTES - bytesOf(notes) - 1
+    expect(merged).toBe('x'.repeat(budget - suffixBytes) + DIAGNOSTIC_TRUNCATION_SUFFIX + '\n' + notes)
+  })
+
+  it('over-long notes cap at the reserve WITH the marker; the error keeps the remainder', () => {
+    const merged = mergeDelegateDiagnostic('short error', 'n'.repeat(5_000)) as string
+    const boundedNotes = 'n'.repeat(DELEGATE_NOTES_RESERVE_BYTES - suffixBytes) + DIAGNOSTIC_TRUNCATION_SUFFIX
+    expect(merged).toBe(`short error\n${boundedNotes}`)
+    expect(bytesOf(boundedNotes)).toBe(DELEGATE_NOTES_RESERVE_BYTES)
+    expect(bytesOf(merged)).toBeLessThanOrEqual(MAX_DELEGATE_DIAGNOSTIC_BYTES)
+  })
+
+  it('both long: notes cap at the reserve, error takes the rest, total is exactly the cap', () => {
+    const merged = mergeDelegateDiagnostic('e'.repeat(20_000), 'n'.repeat(5_000)) as string
+    const boundedNotes = 'n'.repeat(DELEGATE_NOTES_RESERVE_BYTES - suffixBytes) + DIAGNOSTIC_TRUNCATION_SUFFIX
+    const errorBudget = MAX_DELEGATE_DIAGNOSTIC_BYTES - DELEGATE_NOTES_RESERVE_BYTES - 1
+    expect(merged).toBe('e'.repeat(errorBudget - suffixBytes) + DIAGNOSTIC_TRUNCATION_SUFFIX + '\n' + boundedNotes)
+    expect(bytesOf(merged)).toBe(MAX_DELEGATE_DIAGNOSTIC_BYTES)
+  })
+
+  it('notes at exactly the reserve pass verbatim; one byte over truncates', () => {
+    const exact = 'n'.repeat(DELEGATE_NOTES_RESERVE_BYTES)
+    expect(mergeDelegateDiagnostic('err', exact)).toBe(`err\n${exact}`)
+    const merged = mergeDelegateDiagnostic('err', 'n'.repeat(DELEGATE_NOTES_RESERVE_BYTES + 1)) as string
+    expect(merged.endsWith(DIAGNOSTIC_TRUNCATION_SUFFIX)).toBe(true)
+    expect(bytesOf(merged.slice('err\n'.length))).toBe(DELEGATE_NOTES_RESERVE_BYTES)
+  })
+
+  it('the turnError exactly at its budget stays verbatim (total exactly the cap)', () => {
+    const notes = 'note'
+    const error = 'e'.repeat(MAX_DELEGATE_DIAGNOSTIC_BYTES - bytesOf(notes) - 1)
+    const merged = mergeDelegateDiagnostic(error, notes) as string
+    expect(merged).toBe(`${error}\n${notes}`)
+    expect(bytesOf(merged)).toBe(MAX_DELEGATE_DIAGNOSTIC_BYTES)
+    expect(merged).not.toContain('[diagnostic truncated]')
+  })
+
+  it('cuts never split a UTF-8 sequence — neither the notes reserve nor the error remainder', () => {
+    // 4-byte sequences astride the 1024-byte notes cut: walk back to the boundary.
+    const merged = mergeDelegateDiagnostic('err', 'a'.repeat(1_000) + '𝕏'.repeat(100)) as string
+    const notesPart = merged.slice('err\n'.length)
+    expect(notesPart).toBe('a'.repeat(1_000) + DIAGNOSTIC_TRUNCATION_SUFFIX)
+    expect(notesPart).not.toContain('\uFFFD')
+    expect(bytesOf(notesPart)).toBeLessThanOrEqual(DELEGATE_NOTES_RESERVE_BYTES)
+    // 3-byte sequences astride the error remainder cut.
+    const merged2 = mergeDelegateDiagnostic('中'.repeat(3_000), 'notes') as string
+    expect(merged2).not.toContain('\uFFFD')
+    expect(merged2.endsWith('\nnotes')).toBe(true)
+    const prefixBytes = MAX_DELEGATE_DIAGNOSTIC_BYTES - bytesOf('notes') - 1 - suffixBytes
+    const aligned = prefixBytes - (prefixBytes % 3)
+    expect(merged2).toBe('中'.repeat(aligned / 3) + DIAGNOSTIC_TRUNCATION_SUFFIX + '\nnotes')
+    expect(bytesOf(merged2)).toBeLessThanOrEqual(MAX_DELEGATE_DIAGNOSTIC_BYTES)
+  })
+
+  it('every merge stays within the total cap and keeps the notes tail across a length matrix', () => {
+    const lengths = [0, 1, 100, 1_024, 1_025, 3_000, 4_096, 20_000]
+    for (const errorLen of lengths) {
+      for (const notesLen of lengths) {
+        const merged = mergeDelegateDiagnostic('e'.repeat(errorLen), 'n'.repeat(notesLen))
+        if (errorLen === 0 && notesLen === 0) {
+          expect(merged).toBeUndefined()
+          continue
+        }
+        const text = merged as string
+        expect(bytesOf(text)).toBeLessThanOrEqual(MAX_DELEGATE_DIAGNOSTIC_BYTES)
+        if (notesLen > 0) {
+          // Alone, the notes get the full cap; merged, they get the reserve.
+          const reserve = errorLen === 0 ? MAX_DELEGATE_DIAGNOSTIC_BYTES : DELEGATE_NOTES_RESERVE_BYTES
+          const tail = notesLen <= reserve ? 'n'.repeat(notesLen) : DIAGNOSTIC_TRUNCATION_SUFFIX
+          expect(text.endsWith(tail), `error=${errorLen} notes=${notesLen}`).toBe(true)
+        }
+      }
+    }
   })
 })

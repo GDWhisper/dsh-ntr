@@ -29,7 +29,9 @@
  * bytes INCLUDING the `\n[diagnostic truncated]` suffix, never splitting a
  * UTF-8 sequence. Equivalence tests run the host's own settlement normalizer
  * against this function so a host upgrade that drifts the semantics fails
- * loudly instead of silently changing the wire.
+ * loudly instead of silently changing the wire. `mergeDelegateDiagnostic` is
+ * the plugin's OWN merge policy on top of that primitive: the notes reserve a
+ * byte budget so a long turnError can never eat them.
  *
  * Pure logic only — no Node APIs, no SDK; TextEncoder/TextDecoder are globals.
  */
@@ -41,6 +43,12 @@ export const DELEGATE_LABEL_SUMMARY_MAX = 80
 
 /** Maximum UTF-8 size of a provider-authored diagnostic (host contract). */
 export const MAX_DELEGATE_DIAGNOSTIC_BYTES = 4_096
+
+/**
+ * UTF-8 byte budget the degradation notes RESERVE inside a merged diagnostic
+ * (plugin policy, not a host fact): a long turnError must never eat the notes.
+ */
+export const DELEGATE_NOTES_RESERVE_BYTES = 1_024
 
 /** The host's exact truncation marker (hand copy — pinned by equivalence tests). */
 export const DIAGNOSTIC_TRUNCATION_SUFFIX = '\n[diagnostic truncated]'
@@ -190,14 +198,51 @@ export function displayDelegateLabel(label: string): string {
  * fits BESIDE the suffix and ends on a sequence boundary, then the suffix.
  */
 export function truncateDelegateDiagnostic(diagnostic: string): string {
-  const bytes = utf8Encoder.encode(diagnostic)
-  if (bytes.byteLength <= MAX_DELEGATE_DIAGNOSTIC_BYTES) return diagnostic
+  return truncateUtf8Diagnostic(diagnostic, MAX_DELEGATE_DIAGNOSTIC_BYTES)
+}
+
+/**
+ * The truncation algorithm above, parameterized by byte budget (the notes
+ * reserve and the turnError remainder need smaller limits). Same marker, same
+ * boundary walk-back; the exported host-equivalent behavior lives in
+ * {@link truncateDelegateDiagnostic} and must stay byte-identical.
+ */
+function truncateUtf8Diagnostic(text: string, limitBytes: number): string {
+  const bytes = utf8Encoder.encode(text)
+  if (bytes.byteLength <= limitBytes) return text
   const suffixBytes = utf8Encoder.encode(DIAGNOSTIC_TRUNCATION_SUFFIX).byteLength
-  let prefixBytes = MAX_DELEGATE_DIAGNOSTIC_BYTES - suffixBytes
+  let prefixBytes = limitBytes - suffixBytes
   // Walk back off any UTF-8 continuation byte (10xxxxxx) so the cut never
   // lands inside a multi-byte sequence.
   while (((bytes[prefixBytes] as number) & 0b1100_0000) === 0b1000_0000) {
     prefixBytes -= 1
   }
   return utf8Decoder.decode(bytes.subarray(0, prefixBytes)) + DIAGNOSTIC_TRUNCATION_SUFFIX
+}
+
+/**
+ * Merge the failure detail and the degradation notes into ONE bounded
+ * diagnostic with a RESERVED notes budget (plugin policy — the host only
+ * truncates, it does not merge). A long turnError must never eat the notes:
+ * a stale-default degradation has to reach the parent even when the turn
+ * itself also reported an error. Pinned by tests/impl/delegate-label.spec.ts:
+ *
+ * - both absent (undefined or '') → undefined;
+ * - only one present → truncateDelegateDiagnostic(that part);
+ * - both present → the notes keep up to DELEGATE_NOTES_RESERVE_BYTES (longer
+ *   notes truncate to that budget WITH the marker), the turnError gets the
+ *   remainder of MAX_DELEGATE_DIAGNOSTIC_BYTES after the notes' ACTUAL bytes
+ *   and the '\n' separator, truncated UTF-8-safely with the marker when over
+ *   budget. The merged total never exceeds MAX_DELEGATE_DIAGNOSTIC_BYTES.
+ *   When everything fits, the output is the verbatim `turnError\nnotes` join.
+ */
+export function mergeDelegateDiagnostic(turnError: string | undefined, notes: string | undefined): string | undefined {
+  const error = turnError === undefined || turnError === '' ? undefined : turnError
+  const note = notes === undefined || notes === '' ? undefined : notes
+  if (note === undefined) return error === undefined ? undefined : truncateDelegateDiagnostic(error)
+  if (error === undefined) return truncateDelegateDiagnostic(note)
+  const boundedNotes = truncateUtf8Diagnostic(note, DELEGATE_NOTES_RESERVE_BYTES)
+  const separator = '\n'
+  const errorBudget = MAX_DELEGATE_DIAGNOSTIC_BYTES - utf8Encoder.encode(boundedNotes).byteLength - utf8Encoder.encode(separator).byteLength
+  return truncateUtf8Diagnostic(error, errorBudget) + separator + boundedNotes
 }

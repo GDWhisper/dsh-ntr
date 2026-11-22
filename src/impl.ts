@@ -45,12 +45,14 @@ export { quoteCommandToken, splitCommandLine, tokenizeCommandLine } from './impl
 export type { DelegateLabelChoices } from './impl/delegate-label.ts'
 export {
   DELEGATE_LABEL_SUMMARY_MAX,
+  DELEGATE_NOTES_RESERVE_BYTES,
   DIAGNOSTIC_TRUNCATION_SUFFIX,
   MAX_DELEGATE_DIAGNOSTIC_BYTES,
   agentIdFromDelegateLabel,
   delegateChoicesFromLabel,
   delegateLabel,
   displayDelegateLabel,
+  mergeDelegateDiagnostic,
   truncateDelegateDiagnostic,
 } from './impl/delegate-label.ts'
 
