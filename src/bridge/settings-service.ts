@@ -21,6 +21,7 @@ import {
   acpPresetStatusFromRoster,
   normalizeApprovalWindow,
   validateApprovalDeadlines,
+  validateDelegateConfig,
   validatePermissionTimeoutMode,
   validateTagHalo,
 } from '../impl.ts'
@@ -335,9 +336,24 @@ export class SettingsService {
    * Drop the default pointer when its target is deleted: the registry would
    * otherwise keep naming a ghost. Called by the manager's delete path, which
    * performs its own strict registry write afterwards.
+   *
+   * The delegate per-agent override entry dies with the agent, but the
+   * delegate `defaultAgent` POINTER is kept (keep+mark design: the browser
+   * derives the stale mark against the live directory, and the runtime
+   * degrades a stale pointer with a note — never a silent persisted edit).
    */
   forgetAgent(agentId: string): void {
     if (this.defaultAgentId === agentId) this.defaultAgentId = undefined
+    const entries = this.delegateOverride.agentDefaults
+    if (entries !== undefined && agentId in entries) {
+      const next = { ...entries }
+      delete next[agentId]
+      // Same empty-map hygiene as setDelegateSettings: forgetting the LAST
+      // entry drops the key entirely, never a persisted `agentDefaults: {}`.
+      // A {} ENTRY among survivors is a valid override and stays.
+      if (Object.keys(next).length === 0) delete this.delegateOverride.agentDefaults
+      else this.delegateOverride.agentDefaults = next
+    }
   }
 
   /** The agent tag's halo preference (composer display, plugin-private). */
@@ -582,6 +598,20 @@ export class SettingsService {
       timeoutMs: this.delegateOverride.timeoutMs ?? baselineTimeoutMs,
       defaultTimeoutMs: baselineTimeoutMs,
     }
+    // The default-agent facts: the override in force (unfiltered — a stale
+    // pointer is a runtime degradation, not a persistence edit), the global
+    // default as a display fact, and the resolution the card's「当前：X」shows.
+    const defaultAgent = this.delegateOverride.defaultAgent ?? this.configuredDelegate.defaultAgent
+    if (defaultAgent !== undefined) settings.defaultAgent = defaultAgent
+    const globalDefaultAgent = this.defaultAgent()
+    if (globalDefaultAgent !== undefined) settings.globalDefaultAgent = globalDefaultAgent
+    const resolvedDefaultAgent = defaultAgent ?? globalDefaultAgent
+    if (resolvedDefaultAgent !== undefined) settings.resolvedDefaultAgent = resolvedDefaultAgent
+    // Per-agent choice defaults: override entries merged OVER the baseline
+    // (a stored {} entry shadows the baseline for that agent). Stale entries
+    // stay listed — the runtime marks them, it never deletes a preference.
+    const agentDefaults = { ...this.configuredDelegate.agentDefaults, ...this.delegateOverride.agentDefaults }
+    if (Object.keys(agentDefaults).length > 0) settings.agentDefaults = agentDefaults
     if (Object.keys(this.configuredDelegate).length > 0) settings.configured = { ...this.configuredDelegate }
     return settings
   }
@@ -602,6 +632,23 @@ export class SettingsService {
     for (const key of reset) delete this.delegateOverride[key]
     if (patch.guidance !== undefined) this.delegateOverride.guidance = patch.guidance
     if (patch.timeoutMs !== undefined) this.delegateOverride.timeoutMs = patch.timeoutMs
+    if (patch.defaultAgent !== undefined) this.delegateOverride.defaultAgent = patch.defaultAgent
+    if (patch.agentDefaults !== undefined) {
+      // Per-agent WHOLE-ENTRY replacement: {} is a valid all-default override
+      // that shadows the baseline, null deletes the entry (baseline decides
+      // again). Entries are copied so a later payload never aliases state.
+      const next = { ...(this.delegateOverride.agentDefaults ?? {}) }
+      for (const [agentId, entry] of Object.entries(patch.agentDefaults)) {
+        if (entry === null) delete next[agentId]
+        else next[agentId] = { ...entry }
+      }
+      // Empty-map hygiene: deleting the LAST entry (or an empty payload over
+      // no override) drops the key entirely — a persisted `agentDefaults: {}`
+      // would be a ghost override. A {} ENTRY is untouched: it is a valid
+      // all-default override, only the empty MAP is residue.
+      if (Object.keys(next).length === 0) delete this.delegateOverride.agentDefaults
+      else this.delegateOverride.agentDefaults = next
+    }
     this.host.persistAgents()
     this.host.syncDelegateRegistration?.()
   }
@@ -778,6 +825,18 @@ export class SettingsService {
       }
       const timeoutMs = raw.timeoutMs
       if (typeof timeoutMs === 'number' && Number.isInteger(timeoutMs) && timeoutMs >= DELEGATE_TIMEOUT_MIN_MS && timeoutMs <= DELEGATE_TIMEOUT_MAX_MS) next.timeoutMs = timeoutMs
+      // The new choice keys re-validate through the SAME shape gate the
+      // config-file door uses, each key independently so one unreadable key
+      // cannot drop its sibling. Stale-but-legal values survive (keep+mark):
+      // only shape is checked here, never the catalog or the agent list.
+      try {
+        const fresh = validateDelegateConfig({ defaultAgent: raw.defaultAgent })
+        if (fresh.defaultAgent !== undefined) next.defaultAgent = fresh.defaultAgent
+      } catch { /* unreadable pointer: the baseline decides again */ }
+      try {
+        const fresh = validateDelegateConfig({ agentDefaults: raw.agentDefaults })
+        if (fresh.agentDefaults !== undefined) next.agentDefaults = fresh.agentDefaults
+      } catch { /* unreadable map: the baseline decides again */ }
       this.delegateOverride = next
     } catch {
       this.delegateOverride = {}
@@ -805,7 +864,16 @@ export class SettingsService {
         : { idleRelease: { idleTimeoutMs: this.idleReleaseOverride } }),
       ...(Object.keys(this.delegateOverride).length === 0
         ? {}
-        : { delegate: { ...this.delegateOverride } }),
+        : {
+          delegate: {
+            ...this.delegateOverride,
+            // The nested map is copied one level deep: entries are replaced
+            // wholesale on every write, so this snapshot never aliases state.
+            ...(this.delegateOverride.agentDefaults === undefined
+              ? {}
+              : { agentDefaults: { ...this.delegateOverride.agentDefaults } }),
+          },
+        }),
     }
   }
 }

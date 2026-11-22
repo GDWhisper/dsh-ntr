@@ -13,6 +13,15 @@
  * touched), and non-A1 agents serialize their delegations through a defensive
  * per-agent queue (the plugin does not bet on the agent's concurrency support).
  *
+ * The four customization axes (agent/model/effort/mode) resolve per axis as
+ * explicit tool argument > configured per-agent default > unset; validation
+ * is the LIVE session/new answer ONLY (impl/delegate-choices.ts plans the
+ * writes, mode before model, effort against the refreshed options). A stale
+ * configured value degrades silently with one merged notice + settlement
+ * notes; a stale explicit agent/model/mode fails the run; effort is never
+ * fatal. A write RPC that throws is a runtime failure (error settlement, no
+ * fallback), and a fallback NEVER rewrites the persisted configuration.
+ *
  * TWO shells share ONE core: `begin()` starts a run and returns a handle whose
  * `result` promise settles with the terminal facts (never rejects); the legacy
  * synchronous `execute` awaits it and reports the folded full text (old hosts
@@ -27,10 +36,12 @@
  * manager — every capability arrives through {@link AcpDelegateHost}. The
  * module stays free of Node APIs; time and events come from the host seams.
  */
-import type { AcpEvent, AcpDelegatePolicy, AcpDelegateAsyncOutput, AcpStartSessionOpts, DelegateGuidance } from '../protocol.ts'
+import type { AcpEvent, AcpDelegateAgentDefaults, AcpDelegatePolicy, AcpDelegateAsyncOutput, AcpStartSessionOpts, DelegateGuidance } from '../protocol.ts'
 import { DELEGATE_TIMEOUT_MAX_MS } from '../protocol.ts'
-import { isAbsolutePath } from '../impl.ts'
+import { isAbsolutePath, planDelegateEffort, planDelegateModeAndModel } from '../impl.ts'
+import type { DelegateChoiceSet, DelegateChoiceWrite, DelegateLiveOptions } from '../impl.ts'
 import { isPerSessionAgent } from './identity.ts'
+import { describeError } from './errors.ts'
 import { chunkTextOf, codebuddyMetaOf } from './turn-stream.ts'
 
 // The policy shape is authoritative in protocol/ui.ts (one definition for the
@@ -47,7 +58,7 @@ export interface AcpDelegateHost {
   /** The plugin-private default agent id, when one is set. */
   defaultAgent(): string | undefined
   /** The LIVE delegate settings — a run reads them at its start (hot config). */
-  delegateConfig(): { guidance: DelegateGuidance; timeoutMs: number }
+  delegateConfig(): { guidance: DelegateGuidance; timeoutMs: number; defaultAgent?: string; agentDefaults: Record<string, AcpDelegateAgentDefaults> }
   /**
    * Open a fresh session on the agent's process (A1 gets its own child).
    * Delegation ALWAYS passes opts: the cwd is validated before any spawn, the
@@ -58,6 +69,25 @@ export interface AcpDelegateHost {
   startSession(agentId: string, cwd?: string, opts?: AcpStartSessionOpts): Promise<{ sessionId: string; cwd: string }>
   /** Set the session-level permission policy; must land BEFORE the prompt. */
   setPermissionPolicy(sessionId: string, policy: AcpDelegatePolicy): void
+  /**
+   * The session's LIVE `session/new` options (configOptions + modes) — the
+   * ONLY validation authority for the choice axes (never the catalog).
+   * `undefined` for a session that cannot be located.
+   */
+  sessionOptions(sessionId: string): DelegateLiveOptions | undefined
+  /** The mode-axis write: switch the session's working mode. */
+  setMode(sessionId: string, modeId: string): Promise<void>
+  /**
+   * The model/effort-axis write: set one config option. The bridge folds the
+   * authoritative answer back into the session snapshot (constraint 4), so a
+   * later {@link sessionOptions} read sees the refreshed option set.
+   */
+  setConfigOption(sessionId: string, configId: string, value: string): Promise<void>
+  /**
+   * One merged degradation note per run (the settings-page log), filed under
+   * the DELEGATED agent (`agentId`) — never the global default; optional.
+   */
+  notify?(text: string, agentId?: string): void
   /** Dispatch one prompt; resolves with the turn id once sent. */
   prompt(sessionId: string, text: string): Promise<{ turnId: string }>
   /** Ask the agent to stop the running turn (cooperative). */
@@ -69,7 +99,7 @@ export interface AcpDelegateHost {
 }
 
 /** The LEGACY tool return value: the folded report plus the terminal facts. */
-export interface AcpDelegateResult { text: string; agent: string; stopReason?: string; error?: string }
+export interface AcpDelegateResult { text: string; agent: string; stopReason?: string; error?: string; notes?: string }
 
 /**
  * The host's execute context, structural on purpose: no host package import,
@@ -187,8 +217,11 @@ export function acpDelegateToolDefinition(opts: {
       type: 'object',
       properties: {
         task: { type: 'string', description: '完整任务描述（子代理看不到本会话上下文）' },
-        agent: { type: 'string', description: '已配置的 agent id；省略 = 插件默认 agent' },
+        agent: { type: 'string', description: '已配置的 agent id；省略 = 子代理设置的默认 agent（未设置则跟随全局默认）' },
         cwd: { type: 'string', description: '工作目录；省略 = 继承调用会话工作区；显式指定须在该工作区或该 agent 的 allowedCwdRoots 内' },
+        model: { type: 'string', description: '模型 id；省略 = 子代理设置中该 agent 的默认模型；显式指定而 agent 不提供时报错' },
+        effort: { type: 'string', description: '思考等级；省略 = 子代理设置默认；不支持时自动丢弃并留痕' },
+        mode: { type: 'string', description: '工作模式 id；省略 = 子代理设置默认；显式指定而 agent 不提供时报错' },
       },
       required: ['task'],
     },
@@ -256,6 +289,12 @@ export interface AcpDelegateSettlement {
   turnError?: string
   /** The full `acp_delegate: …` failure message for a non-ended outcome. */
   error?: string
+  /**
+   * The merged degradation notes (agent-axis fallback + stale choice axes),
+   * one Chinese line each joined into a single text; absent when nothing
+   * degraded. The same text went to `host.notify` exactly once.
+   */
+  notes?: string
   refused: number
   autoAnswered: number
 }
@@ -281,6 +320,14 @@ export interface AcpDelegateResolved {
   cwd: string | undefined
   /** The calling session workspace as the ONE extra root (empty when absent). */
   extraRoots: readonly string[]
+  /** The EXPLICIT per-call choice axes (validated non-empty strings). */
+  choices: DelegateChoiceSet
+  /**
+   * Agent-axis degradation notes (a stale delegate default falling back to
+   * the global default); empty when nothing degraded. The choice axes add
+   * their planner notes at run time.
+   */
+  notes: string[]
 }
 
 /**
@@ -323,7 +370,14 @@ export class AcpDelegateService {
     if (agentArg !== undefined && typeof agentArg !== 'string') throw new Error('acp_delegate: agent must be a string')
     const cwd = row.cwd
     if (cwd !== undefined && typeof cwd !== 'string') throw new Error('acp_delegate: cwd must be a string')
-    const agentId = this.resolveAgent(agentArg)
+    const choices: DelegateChoiceSet = {}
+    for (const key of ['model', 'effort', 'mode'] as const) {
+      const value = row[key]
+      if (value === undefined) continue
+      if (typeof value !== 'string' || value === '') throw new Error(`acp_delegate: ${key} must be a non-empty string`)
+      choices[key] = value
+    }
+    const { agentId, notes } = this.resolveAgent(agentArg)
     // Workspace inheritance: an omitted cwd inherits the CALLING session's
     // workspace; that workspace is also the one extra root an explicit cwd is
     // validated against (the user picked it — the same authorization the chat
@@ -336,6 +390,8 @@ export class AcpDelegateService {
       task,
       cwd: cwd ?? sessionCwd,
       extraRoots: sessionCwd === undefined ? [] : [sessionCwd],
+      choices,
+      notes,
     }
   }
 
@@ -430,21 +486,35 @@ export class AcpDelegateService {
     }
   }
 
-  /** Step 2: resolve the agent id; errors list the configured ids. */
-  private resolveAgent(agentArg: string | undefined): string {
+  /**
+   * Step 2: resolve the agent id; errors list the configured ids. The chain:
+   * explicit arg (must be configured) → the delegate default-agent setting
+   * (ONLY while still configured; a deleted target degrades one level with a
+   * note) → the plugin-global default (already filtered for deleted agents)
+   * → the no-default error. A stale delegate default with no global fallback
+   * is the plain no-default error — no note without a fallback to name.
+   */
+  private resolveAgent(agentArg: string | undefined): { agentId: string; notes: string[] } {
     const configured = this.host.agents()
     const ids = configured.map(agent => agent.id).join(', ')
-    if (agentArg === undefined) {
-      const fallback = this.host.defaultAgent()
-      if (fallback === undefined) {
-        throw new Error(`acp_delegate: no default agent configured; name one explicitly (configured: ${ids})`)
+    if (agentArg !== undefined) {
+      if (!configured.some(agent => agent.id === agentArg)) {
+        throw new Error(`acp_delegate: unknown agent "${agentArg}" (configured: ${ids})`)
       }
-      return fallback
+      return { agentId: agentArg, notes: [] }
     }
-    if (!configured.some(agent => agent.id === agentArg)) {
-      throw new Error(`acp_delegate: unknown agent "${agentArg}" (configured: ${ids})`)
+    const delegateDefault = this.host.delegateConfig().defaultAgent
+    if (delegateDefault !== undefined && configured.some(agent => agent.id === delegateDefault)) {
+      return { agentId: delegateDefault, notes: [] }
     }
-    return agentArg
+    const fallback = this.host.defaultAgent()
+    if (fallback !== undefined) {
+      return {
+        agentId: fallback,
+        notes: delegateDefault === undefined ? [] : [`默认 agent「${delegateDefault}」已失效，改用全局默认「${fallback}」`],
+      }
+    }
+    throw new Error(`acp_delegate: no default agent configured; name one explicitly (configured: ${ids})`)
   }
 
   /**
@@ -464,6 +534,16 @@ export class AcpDelegateService {
   }
 
   /**
+   * Apply one planned choice write through the host's existing RPC face.
+   * The bridge folds a config-option answer back into the session snapshot
+   * (constraint 4), which is what makes the effort re-read authoritative.
+   */
+  private async applyChoiceWrite(sessionId: string, write: DelegateChoiceWrite): Promise<void> {
+    if (write.kind === 'mode') await this.host.setMode(sessionId, write.modeId)
+    else await this.host.setConfigOption(sessionId, write.configId, write.value)
+  }
+
+  /**
    * Steps 4–10: session, policy, fold, prompt, bounded settlement. Resolves
    * the terminal facts; the first settlement cause wins and every later event
    * is a no-op. Only an unexpected bug (or a close failure after a normal end)
@@ -474,6 +554,9 @@ export class AcpDelegateService {
   }): Promise<AcpDelegateSettlement> {
     const { agentId, task, cwd, extraRoots } = resolved
     const config = this.host.delegateConfig()
+    // Degradation trail: the agent-axis notes from resolve plus the choice
+    // planners' notes, merged into ONE notice and settlement fact at the end.
+    const notes: string[] = [...resolved.notes]
     // ---- settlement machinery (synchronous, before any await) ----
     let text = ''
     const seenSeq = new Set<number>()
@@ -568,6 +651,40 @@ export class AcpDelegateService {
           this.host.setPermissionPolicy(sessionId, autoPolicyFor(agentId))
         } catch (error) {
           settle('prompt-error', error)
+        }
+        if (isAborted(signal)) settle('aborted')
+      }
+      if (outcome === 'pending' && sessionId !== undefined) {
+        // The four choice axes, validated against the LIVE session/new answer
+        // (never the catalog): explicit arg > configured per-agent default >
+        // unset. A stale EXPLICIT model/mode is fatal (nothing applied, no
+        // prompt); a stale CONFIGURED value degrades to unset with a note;
+        // effort is never fatal. Mode writes precede model writes, and the
+        // effort plan re-reads the REFRESHED options after the model write
+        // (a model switch can change which efforts exist). A write RPC that
+        // throws is a RUNTIME failure — error settlement, never a fallback.
+        const configured = config.agentDefaults[agentId] ?? {}
+        const explicit = resolved.choices
+        let live = this.host.sessionOptions(sessionId) ?? {}
+        const plan = planDelegateModeAndModel({ agentId, explicit, configured, live })
+        notes.push(...plan.notes)
+        if (plan.fatal !== undefined) {
+          settle('prompt-error', new Error(plan.fatal))
+        } else {
+          try {
+            for (const write of plan.writes) {
+              if (outcome !== 'pending') break
+              await this.applyChoiceWrite(sessionId, write)
+            }
+            if (outcome === 'pending' && (explicit.effort ?? configured.effort) !== undefined) {
+              live = this.host.sessionOptions(sessionId) ?? {}
+              const effortPlan = planDelegateEffort({ agentId, explicit, configured, live })
+              notes.push(...effortPlan.notes)
+              if (effortPlan.write !== undefined) await this.applyChoiceWrite(sessionId, effortPlan.write)
+            }
+          } catch (error) {
+            settle('prompt-error', new Error(describeError(error)))
+          }
         }
         if (isAborted(signal)) settle('aborted')
       }
@@ -680,6 +797,13 @@ export class AcpDelegateService {
     } else if (settlement.outcome === 'prompt-error') {
       settlement.error = prefixed(messageOf(promptFailure))
     }
+    if (notes.length > 0) {
+      // ONE merged notice per run, and the same text on the settlement so
+      // both shells can report it. The note belongs to the DELEGATED agent,
+      // not the global default. A broken sink never masks the outcome.
+      settlement.notes = notes.join('；')
+      try { this.host.notify?.(settlement.notes, agentId) } catch { /* the trail is best-effort */ }
+    }
     return settlement
   }
 }
@@ -696,8 +820,10 @@ function legacyReport(settlement: AcpDelegateSettlement): AcpDelegateResult {
   let footer = `\n\n— acp_delegate · ${settlement.agent} · cwd=${settlement.cwd ?? ''} · ${settlement.stopReason ?? settlement.turnError ?? 'unknown'}`
   if (settlement.refused > 0) footer += ` · 拒绝 ${String(settlement.refused)} 个审批`
   if (settlement.autoAnswered > 0) footer += ` · 自动代答 ${String(settlement.autoAnswered)} 个`
+  if (settlement.notes !== undefined) footer += `\n备注：${settlement.notes}`
   const result: AcpDelegateResult = { text: body + footer, agent: settlement.agent }
   if (settlement.stopReason !== undefined) result.stopReason = settlement.stopReason
   if (settlement.turnError !== undefined) result.error = settlement.turnError
+  if (settlement.notes !== undefined) result.notes = settlement.notes
   return result
 }

@@ -8,7 +8,7 @@
  * APIs, no ACP SDK runtime values.
  */
 
-import type { AcpAgentDef, AcpDelegateConfig, AcpMcpServerDef, AcpPluginConfig, AcpTagHalo, ApprovalDeadlineKey, DelegateGuidance, DelegateSetPayload, DelegateSettingKey, PermissionTimeoutMode } from '../protocol.ts'
+import type { AcpAgentDef, AcpDelegateAgentDefaults, AcpDelegateConfig, AcpMcpServerDef, AcpPluginConfig, AcpTagHalo, ApprovalDeadlineKey, DelegateGuidance, DelegateSetPayload, DelegateSettingKey, PermissionTimeoutMode } from '../protocol.ts'
 import { DEFAULT_IDLE_TIMEOUT_MS, DELEGATE_TIMEOUT_MAX_MS, DELEGATE_TIMEOUT_MIN_MS, IDLE_RELEASE_MS } from '../protocol.ts'
 import { splitCommandLine } from './command-line.ts'
 import { AcpError } from './errors.ts'
@@ -217,6 +217,69 @@ export function validateDelegateMs(raw: unknown, code: 'bad_config' | 'bad_paylo
 }
 
 /**
+ * Validate the delegation default-agent override: a legal agent id, nothing
+ * else. Shape only — whether the agent still exists is a runtime fact the
+ * settings card marks, not a persistence gate.
+ */
+function validateDelegateDefaultAgent(raw: unknown, code: 'bad_config' | 'bad_payload', context: string): string {
+  if (typeof raw !== 'string' || !AGENT_ID_PATTERN.test(raw)) {
+    throw new AcpError(code, `acp: ${context} must be a legal agent id`)
+  }
+  return raw
+}
+
+/**
+ * One per-agent defaults entry: an object whose optional model/effort/mode
+ * values are NON-EMPTY strings. Shape only — a value the agent no longer
+ * offers is a stale preference that stays persisted (the runtime degrades it
+ * with a note), so there is deliberately NO catalog check here. Unknown keys
+ * are dropped by the rebuild, like every other door in this file.
+ */
+function validateDelegateDefaultsEntry(raw: unknown, code: 'bad_config' | 'bad_payload', context: string): AcpDelegateAgentDefaults {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new AcpError(code, `acp: ${context} must be an object with optional non-empty model/effort/mode strings`)
+  }
+  const row = raw as Record<string, unknown>
+  const out: AcpDelegateAgentDefaults = {}
+  for (const key of ['model', 'effort', 'mode'] as const) {
+    const value = row[key]
+    if (value === undefined) continue
+    if (typeof value !== 'string' || value === '') {
+      throw new AcpError(code, `acp: ${context}.${key} must be a non-empty string`)
+    }
+    out[key] = value
+  }
+  return out
+}
+
+/**
+ * The per-agent defaults map: every KEY must be a legal agent id. The
+ * settings-write door additionally accepts a `null` entry (delete that
+ * agent's override); the deployment-baseline door does not — a config file
+ * names facts, it does not issue deletions.
+ */
+function validateDelegateDefaultsMap(raw: unknown, code: 'bad_config' | 'bad_payload', context: string, allowNull: false): Record<string, AcpDelegateAgentDefaults>
+function validateDelegateDefaultsMap(raw: unknown, code: 'bad_config' | 'bad_payload', context: string, allowNull: true): Record<string, AcpDelegateAgentDefaults | null>
+function validateDelegateDefaultsMap(raw: unknown, code: 'bad_config' | 'bad_payload', context: string, allowNull: boolean): Record<string, AcpDelegateAgentDefaults | null> {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new AcpError(code, `acp: ${context} must be an object keyed by agent id`)
+  }
+  const out: Record<string, AcpDelegateAgentDefaults | null> = {}
+  for (const [agentId, entry] of Object.entries(raw as Record<string, unknown>)) {
+    if (!AGENT_ID_PATTERN.test(agentId)) {
+      throw new AcpError(code, `acp: ${context} key "${agentId}" is not a legal agent id`)
+    }
+    if (entry === null) {
+      if (!allowNull) throw new AcpError(code, `acp: ${context}["${agentId}"] must be an object (null deletion is a settings-write only)`)
+      out[agentId] = null
+      continue
+    }
+    out[agentId] = validateDelegateDefaultsEntry(entry, code, `${context}["${agentId}"]`)
+  }
+  return out
+}
+
+/**
  * Validate the `delegate` deployment baseline (`cordis.patch.yml`).
  *
  * Absent / null means "name nothing": the built-in defaults decide. The
@@ -232,6 +295,8 @@ export function validateDelegateConfig(raw: unknown): AcpDelegateConfig {
   const out: AcpDelegateConfig = {}
   if (row.guidance !== undefined) out.guidance = validateDelegateGuidance(row.guidance, 'bad_config')
   if (row.timeoutMs !== undefined) out.timeoutMs = validateDelegateMs(row.timeoutMs, 'bad_config')
+  if (row.defaultAgent !== undefined) out.defaultAgent = validateDelegateDefaultAgent(row.defaultAgent, 'bad_config', 'delegate.defaultAgent')
+  if (row.agentDefaults !== undefined) out.agentDefaults = validateDelegateDefaultsMap(row.agentDefaults, 'bad_config', 'delegate.agentDefaults', false)
   return out
 }
 
@@ -239,8 +304,10 @@ export function validateDelegateConfig(raw: unknown): AcpDelegateConfig {
  * Validate a settings-page delegation write. Omitted keys are simply absent
  * from the result — the manager merges, so a card that only moved the guidance
  * must not reset the window. `timeoutMs` accepts any integer in
- * [1000, 86400000]. `reset` names the keys whose persisted override is dropped;
- * a key cannot be both written and reset in one call.
+ * [1000, 86400000]. `defaultAgent` is a legal agent id; `agentDefaults` merges
+ * per-agent entries where `null` deletes the entry and `{}` is a valid
+ * all-default override. `reset` names the keys whose persisted override is
+ * dropped; a key cannot be both written and reset in one call.
  */
 export function validateDelegateSettings(raw: unknown): DelegateSetPayload {
   if (raw === null || typeof raw !== 'object') throw new AcpError('bad_payload', 'acp: delegate settings must be an object')
@@ -248,12 +315,14 @@ export function validateDelegateSettings(raw: unknown): DelegateSetPayload {
   const out: DelegateSetPayload = {}
   if (row.guidance !== undefined) out.guidance = validateDelegateGuidance(row.guidance, 'bad_payload')
   if (row.timeoutMs !== undefined) out.timeoutMs = validateDelegateMs(row.timeoutMs, 'bad_payload')
+  if (row.defaultAgent !== undefined) out.defaultAgent = validateDelegateDefaultAgent(row.defaultAgent, 'bad_payload', 'delegate.defaultAgent')
+  if (row.agentDefaults !== undefined) out.agentDefaults = validateDelegateDefaultsMap(row.agentDefaults, 'bad_payload', 'delegate.agentDefaults', true)
   if (row.reset !== undefined) {
     if (!Array.isArray(row.reset)) throw new AcpError('bad_payload', 'acp: delegate reset must be an array of setting keys')
     const reset: DelegateSettingKey[] = []
     for (const key of row.reset as unknown[]) {
-      if (key !== 'guidance' && key !== 'timeoutMs') {
-        throw new AcpError('bad_payload', 'acp: delegate reset entries must be one of "guidance", "timeoutMs"')
+      if (key !== 'guidance' && key !== 'timeoutMs' && key !== 'defaultAgent' && key !== 'agentDefaults') {
+        throw new AcpError('bad_payload', 'acp: delegate reset entries must be one of "guidance", "timeoutMs", "defaultAgent", "agentDefaults"')
       }
       if (reset.includes(key)) continue
       if (out[key] !== undefined) {

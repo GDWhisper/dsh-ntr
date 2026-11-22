@@ -420,4 +420,69 @@ describe('delegate config validation', () => {
       .toEqual({ guidance: 'on', timeoutMs: 123_456 })
     expectCode(() => validateConfig({ agents: [], delegate: { guidance: 'maybe' } }), 'bad_config')
   })
+
+  it('validates defaultAgent as a legal agent id on both doors', () => {
+    expect(validateDelegateConfig({ defaultAgent: 'codebuddy' })).toEqual({ defaultAgent: 'codebuddy' })
+    expect(validateDelegateSettings({ defaultAgent: 'a1.b-c_d' })).toEqual({ defaultAgent: 'a1.b-c_d' })
+    expect(validateConfig({ agents: [], delegate: { defaultAgent: 'pi' } }).delegate).toEqual({ defaultAgent: 'pi' })
+    // Empty string, illegal charset, overlong, non-strings: refused loudly.
+    for (const bad of ['', 'Bad Id', 'has:colon', '-lead', 'a'.repeat(65), 42, null, true]) {
+      expectCode(() => validateDelegateConfig({ defaultAgent: bad }), 'bad_config')
+      expectCode(() => validateDelegateSettings({ defaultAgent: bad }), 'bad_payload')
+    }
+  })
+
+  it('accepts per-agent defaults records keyed by legal agent ids (shape only)', () => {
+    const defaults = { pi: { model: 'gpt-5', effort: 'high', mode: 'ask' }, omp: { model: 'ghost-model' } }
+    expect(validateDelegateConfig({ agentDefaults: defaults })).toEqual({ agentDefaults: defaults })
+    expect(validateDelegateSettings({ agentDefaults: defaults })).toEqual({ agentDefaults: defaults })
+    expect(validateDelegateConfig({ agentDefaults: {} })).toEqual({ agentDefaults: {} })
+    expect(validateDelegateSettings({ agentDefaults: {} })).toEqual({ agentDefaults: {} })
+    // An entry with no keys is a valid all-default override (it shadows the baseline).
+    expect(validateDelegateConfig({ agentDefaults: { pi: {} } })).toEqual({ agentDefaults: { pi: {} } })
+    expect(validateDelegateSettings({ agentDefaults: { pi: {} } })).toEqual({ agentDefaults: { pi: {} } })
+    // Stale values are NOT catalog-checked: persistence keeps them, the runtime marks them.
+    expect(validateDelegateConfig({ agentDefaults: { pi: { model: 'no-such-model', effort: 'ultra', mode: 'ghost' } } }).agentDefaults)
+      .toEqual({ pi: { model: 'no-such-model', effort: 'ultra', mode: 'ghost' } })
+    // The rebuild keeps only the three known keys, like every other door here.
+    expect(validateDelegateConfig({ agentDefaults: { pi: { model: 'x', bogus: 1 } } })).toEqual({ agentDefaults: { pi: { model: 'x' } } })
+    expect(validateDelegateSettings({ agentDefaults: { pi: { mode: 'ask', bogus: 1 } } })).toEqual({ agentDefaults: { pi: { mode: 'ask' } } })
+  })
+
+  it('rejects malformed per-agent defaults records on both doors', () => {
+    for (const bad of ['nope', 42, null, []]) {
+      expectCode(() => validateDelegateConfig({ agentDefaults: bad }), 'bad_config')
+      expectCode(() => validateDelegateSettings({ agentDefaults: bad }), 'bad_payload')
+    }
+    // Illegal keys are refused, not dropped.
+    for (const key of ['Bad Id', 'has:colon', '', '-lead', 'a'.repeat(65)]) {
+      expectCode(() => validateDelegateConfig({ agentDefaults: { [key]: {} } }), 'bad_config')
+      expectCode(() => validateDelegateSettings({ agentDefaults: { [key]: {} } }), 'bad_payload')
+    }
+    // Illegal entries: empty strings, non-strings, non-objects.
+    for (const entry of [{ model: '' }, { effort: '' }, { mode: '' }, { model: 42 }, { effort: null }, 'x', 42, []]) {
+      expectCode(() => validateDelegateConfig({ agentDefaults: { pi: entry } }), 'bad_config')
+      expectCode(() => validateDelegateSettings({ agentDefaults: { pi: entry } }), 'bad_payload')
+    }
+    // null deletion is a settings-write only; the baseline names facts.
+    expectCode(() => validateDelegateConfig({ agentDefaults: { pi: null } }), 'bad_config')
+  })
+
+  it('accepts null deletion and {} shadow entries on the settings write', () => {
+    expect(validateDelegateSettings({ agentDefaults: { pi: null } })).toEqual({ agentDefaults: { pi: null } })
+    expect(validateDelegateSettings({ agentDefaults: { pi: {}, omp: null, x: { mode: 'ask' } } }))
+      .toEqual({ agentDefaults: { pi: {}, omp: null, x: { mode: 'ask' } } })
+  })
+
+  it('extends reset to the new keys, with the same write/reset exclusivity', () => {
+    expect(validateDelegateSettings({ reset: ['defaultAgent', 'agentDefaults'] })).toEqual({ reset: ['defaultAgent', 'agentDefaults'] })
+    expect(validateDelegateSettings({ reset: ['guidance', 'timeoutMs', 'defaultAgent', 'agentDefaults', 'defaultAgent'] }))
+      .toEqual({ reset: ['guidance', 'timeoutMs', 'defaultAgent', 'agentDefaults'] })
+    // A reset alongside a DIFFERENT key's write is legal.
+    expect(validateDelegateSettings({ defaultAgent: 'pi', reset: ['agentDefaults'] })).toEqual({ defaultAgent: 'pi', reset: ['agentDefaults'] })
+    expect(validateDelegateSettings({ agentDefaults: { pi: null }, reset: ['defaultAgent'] })).toEqual({ agentDefaults: { pi: null }, reset: ['defaultAgent'] })
+    // The same key cannot be both written and reset in one call.
+    expectCode(() => validateDelegateSettings({ defaultAgent: 'pi', reset: ['defaultAgent'] }), 'bad_payload')
+    expectCode(() => validateDelegateSettings({ agentDefaults: { pi: {} }, reset: ['agentDefaults'] }), 'bad_payload')
+  })
 })

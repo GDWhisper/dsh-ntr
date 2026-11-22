@@ -3,12 +3,26 @@
  * (docs/plan/acp-delegate-native-subagent.md §2 / §6).
  *
  * `ResolvedSubagentStartRequest` has no custom fields, so the per-call agent
- * choice rides in the display label: `<agentId>: <task first-line summary>`.
- * Agent ids (validate.ts · AGENT_ID_PATTERN) contain neither ':' nor ' ', so
- * the FIRST `': '` split is unambiguous. The label is a display field doubling
- * as a routing carrier — the encode/decode pair below is the ONE place that
- * knows the format, pinned by round-trip equivalence tests; a format change
- * must touch both functions together.
+ * choice AND the explicit model/effort/mode picks ride in the display label.
+ * Two formats, one carrier grammar:
+ *
+ * - no choices: `<agentId>: <task first-line summary>` (byte-identical to the
+ *   original format — an activation without picks must not change the wire);
+ * - with choices: `<agentId> ⟦m=<enc>&e=<enc>&o=<enc>⟧: <summary>` — only the
+ *   keys actually present are written, in the FIXED order m, e, o, each value
+ *   `encodeURIComponent`-encoded.
+ *
+ * Agent ids (validate.ts · AGENT_ID_PATTERN) contain neither ':' nor ' ', and
+ * a canonical carrier contains no raw ': ' either (encodeURIComponent escapes
+ * ':', ' ', '&', '=', '⟦', '⟧'), so the FIRST `': '` is always the separator
+ * the encoder wrote: task text can never reach the prefix, and a summary that
+ * itself looks like `⟦m=…⟧` or contains ': ' cannot forge a choice. The label
+ * is a display field doubling as a routing carrier — the encode/decode family
+ * below is the ONE place that knows the format, pinned by round-trip and
+ * injection tests; a format change must touch every function here together.
+ * `displayDelegateLabel` strips a STRICTLY legal carrier for the plugin's own
+ * subagent panel; malformed carriers pass through untouched (routing fails
+ * closed, display fails open).
  *
  * The diagnostic truncation is a hand copy of the host 0.2.2-rc.5 semantics
  * (`dsh-subagent/src/out-of-process.ts · limitSubagentDiagnostic`): ≤4096 UTF-8
@@ -35,32 +49,138 @@ const utf8Encoder = new TextEncoder()
 const utf8Decoder = new TextDecoder()
 
 /**
- * Encode the per-call agent choice into the activation label. The summary is
- * the task's first line, trimmed and clipped to {@link DELEGATE_LABEL_SUMMARY_MAX}
- * code points (never splitting a surrogate pair); an empty first line still
- * yields a decodable `<agentId>: ` label.
+ * The explicit per-call choice axes a delegation label can carry —
+ * structurally the planner's `DelegateChoiceSet`. Persisted values are
+ * non-empty strings (validate.ts gates them); the codec treats an empty
+ * string like an absent key so its output is ALWAYS strictly parseable.
  */
-export function delegateLabel(agentId: string, task: string): string {
+export interface DelegateLabelChoices {
+  model?: string
+  effort?: string
+  mode?: string
+}
+
+const CARRIER_OPEN = '⟦'
+const CARRIER_CLOSE = '⟧'
+
+/**
+ * Encode the per-call agent choice (and optional explicit picks) into the
+ * activation label. The summary is the task's first line, trimmed and clipped
+ * to {@link DELEGATE_LABEL_SUMMARY_MAX} code points (never splitting a
+ * surrogate pair); an empty first line still yields a decodable label.
+ * Without choices the output is byte-identical to the original
+ * `<agentId>: <summary>` format; with any present key the carrier
+ * `⟦m=…&e=…&o=…⟧` rides between the id and the separator (fixed key order,
+ * only present keys, encodeURIComponent values).
+ */
+export function delegateLabel(agentId: string, task: string, choices?: DelegateLabelChoices): string {
   const firstLine = task.split(/\r?\n/, 1)[0] ?? ''
   const summary = firstLine.trim()
   const points = Array.from(summary)
   const clipped = points.length > DELEGATE_LABEL_SUMMARY_MAX
     ? `${points.slice(0, DELEGATE_LABEL_SUMMARY_MAX).join('')}…`
     : summary
-  return `${agentId}: ${clipped}`
+  const carrier = encodeChoiceCarrier(choices)
+  return carrier === undefined
+    ? `${agentId}: ${clipped}`
+    : `${agentId} ${CARRIER_OPEN}${carrier}${CARRIER_CLOSE}: ${clipped}`
+}
+
+/** The carrier payload, or undefined when no axis is present. */
+function encodeChoiceCarrier(choices: DelegateLabelChoices | undefined): string | undefined {
+  if (choices === undefined) return undefined
+  const parts: string[] = []
+  if (choices.model !== undefined && choices.model !== '') parts.push(`m=${encodeURIComponent(choices.model)}`)
+  if (choices.effort !== undefined && choices.effort !== '') parts.push(`e=${encodeURIComponent(choices.effort)}`)
+  if (choices.mode !== undefined && choices.mode !== '') parts.push(`o=${encodeURIComponent(choices.mode)}`)
+  return parts.length > 0 ? parts.join('&') : undefined
+}
+
+/**
+ * STRICT carrier parse of a label prefix: the whole prefix must be exactly
+ * `<agentId> ⟦<payload>⟧` — one space before a single `⟦`, a single `⟧` as
+ * the last character, a legal agent id, and a payload of `key=encoded`
+ * segments joined by '&': keys from {m,e,o}, each at most once, in ascending
+ * m<e<o order, every value non-empty and CANONICALLY encodeURIComponent-ed
+ * (decode must succeed and re-encode identically). Anything else is
+ * `undefined` — a malformed carrier never routes and never yields choices.
+ */
+function parseCarrierPrefix(prefix: string): { agentId: string; choices: DelegateLabelChoices } | undefined {
+  const open = prefix.indexOf(CARRIER_OPEN)
+  if (open <= 0 || prefix.indexOf(CARRIER_OPEN, open + 1) !== -1) return undefined
+  if (prefix[open - 1] !== ' ') return undefined
+  if (!prefix.endsWith(CARRIER_CLOSE) || prefix.indexOf(CARRIER_CLOSE) !== prefix.length - 1) return undefined
+  const agentId = prefix.slice(0, open - 1)
+  if (!AGENT_ID_PATTERN.test(agentId)) return undefined
+  const payload = prefix.slice(open + 1, prefix.length - 1)
+  if (payload === '') return undefined
+  const choices: DelegateLabelChoices = {}
+  let lastKey = -1
+  for (const segment of payload.split('&')) {
+    // 'm=x' is the shortest legal segment; the key is exactly one character.
+    if (segment.length < 3 || segment[1] !== '=') return undefined
+    const key = segment[0] === 'm' ? 0 : segment[0] === 'e' ? 1 : segment[0] === 'o' ? 2 : -1
+    if (key === -1 || key <= lastKey) return undefined
+    lastKey = key
+    const encoded = segment.slice(2)
+    let decoded: string
+    try {
+      decoded = decodeURIComponent(encoded)
+    } catch {
+      return undefined
+    }
+    if (encodeURIComponent(decoded) !== encoded) return undefined
+    if (key === 0) choices.model = decoded
+    else if (key === 1) choices.effort = decoded
+    else choices.mode = decoded
+  }
+  return { agentId, choices }
 }
 
 /**
  * Decode the agent id from an activation label: the text before the FIRST
- * `': '`, accepted only when it is a legal agent id. Anything else (missing
- * separator, illegal charset, empty prefix) reads as `undefined` — the
- * provider then fails the start cleanly instead of guessing an agent.
+ * `': '`. Without a carrier it must be a legal agent id outright; with a
+ * carrier (`⟦` in the prefix) the agent part AND the carrier syntax must both
+ * be strictly legal. Anything else (missing separator, illegal charset,
+ * empty prefix, malformed carrier) reads as `undefined` — the provider then
+ * fails the start cleanly instead of guessing an agent.
  */
 export function agentIdFromDelegateLabel(label: string): string | undefined {
   const separator = label.indexOf(': ')
   if (separator <= 0) return undefined
-  const agentId = label.slice(0, separator)
-  return AGENT_ID_PATTERN.test(agentId) ? agentId : undefined
+  const prefix = label.slice(0, separator)
+  if (!prefix.includes(CARRIER_OPEN)) return AGENT_ID_PATTERN.test(prefix) ? prefix : undefined
+  return parseCarrierPrefix(prefix)?.agentId
+}
+
+/**
+ * Decode the explicit choice axes from an activation label: `undefined` when
+ * the prefix carries no carrier OR the carrier is malformed; the decoded
+ * values when it is strictly legal. Task text after the first `': '` is never
+ * consulted, so a summary cannot inject choices.
+ */
+export function delegateChoicesFromLabel(label: string): DelegateLabelChoices | undefined {
+  const separator = label.indexOf(': ')
+  if (separator <= 0) return undefined
+  const prefix = label.slice(0, separator)
+  if (!prefix.includes(CARRIER_OPEN)) return undefined
+  return parseCarrierPrefix(prefix)?.choices
+}
+
+/**
+ * The label as the plugin's own subagent panel should show it: a strictly
+ * legal carrier is stripped back to `<agentId>: <summary>`; anything without
+ * a carrier — including a MALFORMED one — passes through verbatim (display
+ * fails open where routing fails closed).
+ */
+export function displayDelegateLabel(label: string): string {
+  const separator = label.indexOf(': ')
+  if (separator <= 0) return label
+  const prefix = label.slice(0, separator)
+  if (!prefix.includes(CARRIER_OPEN)) return label
+  const parsed = parseCarrierPrefix(prefix)
+  if (parsed === undefined) return label
+  return `${parsed.agentId}: ${label.slice(separator + 2)}`
 }
 
 /**

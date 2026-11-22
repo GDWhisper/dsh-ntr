@@ -36,7 +36,7 @@ import type {
   SubagentRun,
 } from '@deepseek-ai/dsh-subagent'
 import { randomUUID } from '../ids.ts'
-import { agentIdFromDelegateLabel, delegateLabel, truncateDelegateDiagnostic } from '../impl.ts'
+import { agentIdFromDelegateLabel, delegateChoicesFromLabel, delegateLabel, truncateDelegateDiagnostic } from '../impl.ts'
 import { DELEGATE_TIMEOUT_MAX_MS } from '../protocol.ts'
 import type {
   AcpDelegateActivationExecute,
@@ -81,6 +81,17 @@ function outputBlocksOf(text: string): Array<{ type: 'text'; text: string }> {
 }
 
 /**
+ * Merge the diagnostic parts (the failure detail and the degradation notes)
+ * into ONE bounded diagnostic; undefined when nothing is present. The notes
+ * ride along on every outcome — a stale-default degradation must reach the
+ * parent even when the turn itself also reported an error.
+ */
+function diagnosticOf(...parts: Array<string | undefined>): string | undefined {
+  const text = parts.filter((part): part is string => part !== undefined && part !== '').join('\n')
+  return text === '' ? undefined : truncateDelegateDiagnostic(text)
+}
+
+/**
  * Map one core settlement onto the host's terminal result (plan §4):
  * ended → completed, aborted → aborted, timed-out / prompt-error → error with
  * the failure detail as a bounded diagnostic. Partial folded text rides along
@@ -96,18 +107,20 @@ function resultOfSettlement(settlement: AcpDelegateSettlement): SubagentResult {
       const text = settlement.text === '' ? '(the agent returned no text)' : settlement.text
       const result: SubagentResult = { output: [{ type: 'text', text }], stopReason: 'completed' }
       // A watchdog error-only turn/end still carries the agent's failure detail.
-      return settlement.turnError === undefined
-        ? result
-        : { ...result, diagnostic: truncateDelegateDiagnostic(settlement.turnError) }
+      const diagnostic = diagnosticOf(settlement.turnError, settlement.notes)
+      return diagnostic === undefined ? result : { ...result, diagnostic }
     }
-    case 'aborted':
-      return { output: outputBlocksOf(settlement.text), stopReason: 'aborted' }
+    case 'aborted': {
+      const result: SubagentResult = { output: outputBlocksOf(settlement.text), stopReason: 'aborted' }
+      const diagnostic = diagnosticOf(settlement.notes)
+      return diagnostic === undefined ? result : { ...result, diagnostic }
+    }
     case 'timed-out':
     case 'prompt-error':
       return {
         output: outputBlocksOf(settlement.text),
         stopReason: 'error',
-        diagnostic: truncateDelegateDiagnostic(settlement.error ?? `acp_delegate: ${settlement.outcome}`),
+        diagnostic: diagnosticOf(settlement.error ?? `acp_delegate: ${settlement.outcome}`, settlement.notes) as string,
       }
   }
 }
@@ -151,9 +164,10 @@ export class AcpSubagentProvider implements SubagentProvider {
     // calling workspace from request.parent's session header (extra roots);
     // request.cwd is already absolute (the host resolved it). The built-in
     // 24h absolute timer replaces the legacy host tool budget, which cannot
-    // cover a run detached from its tool call.
+    // cover a run detached from its tool call. The explicit choice axes ride
+    // in the label carrier (a malformed one already failed the id decode).
     const handle = this.deps.service.begin(
-      { task, agent: agentId, cwd: request.cwd },
+      { task, agent: agentId, cwd: request.cwd, ...(delegateChoicesFromLabel(request.label ?? '') ?? {}) },
       { signal: request.signal, agent: request.parent },
       { absoluteBudgetMs: DELEGATE_TIMEOUT_MAX_MS },
     )
@@ -210,7 +224,7 @@ export function acpDelegateActivationExecute(deps: {
       }
       const spec: SubagentActivationSpec = {
         provider: ACP_SUBAGENT_PROVIDER,
-        label: delegateLabel(resolved.agentId, resolved.task),
+        label: delegateLabel(resolved.agentId, resolved.task, resolved.choices),
         prompt: [{ type: 'text', text: resolved.task }],
         // The exact live calling agent — the host's authorization checks
         // identity, not a copy. exec.agent IS that instance at runtime.

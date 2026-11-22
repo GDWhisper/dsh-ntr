@@ -12,8 +12,9 @@ import { describe, expect, it } from 'vitest'
 import { AcpSubagentProvider, acpDelegateActivationExecute, type DelegateSubagentsLike } from '../src/bridge/delegate-provider.ts'
 import { AcpDelegateRegistration, type DelegateRegistrationCtx } from '../src/bridge/delegate-registration.ts'
 import { AcpDelegateService, acpDelegateToolDefinition } from '../src/bridge/delegate-service.ts'
+import { delegateLabel } from '../src/impl.ts'
 import type { AcpDelegateAsyncOutput, DelegateGuidance } from '../src/protocol.ts'
-import { fakeMask, fakeSubagentsService, fakeToolsCtx, happyPrompt, makeHost, tick } from './delegate-harness.ts'
+import { configOptionsOf, fakeMask, fakeSubagentsService, fakeToolsCtx, happyPrompt, makeHost, modesOf, tick } from './delegate-harness.ts'
 
 const execWithAgent = { agent: { session: { header: { cwd: 'M:/Coding/main-project' } } }, signal: new AbortController().signal }
 
@@ -284,5 +285,72 @@ describe('acp_delegate registration shell selection', () => {
     expect(when!({ agent: { session: { header: { agentPreset: 'acp' } } } })).toBe(false)
     expect(when!({ agent: { session: { header: { agentPreset: 'standard' } } } })).toBe(true)
     expect(when!({})).toBe(true)
+  })
+})
+
+// ---- four-axis customization: the label carrier end to end (T2) ----
+
+describe('acp_delegate native choice carrier (execute → start → begin)', () => {
+  it('execute encodes the explicit choices into the activation label; the prompt stays the task', async () => {
+    const f = makeHost()
+    const { service, specs } = fakeSubagentsService({ hangResult: true })
+    const execute = acpDelegateActivationExecute({ service: new AcpDelegateService(f.host), subagents: service })
+    const choices = { model: 'm2', effort: 'high', mode: 'strict' }
+    const value = await execute({ task: 'do it', agent: 'alpha', ...choices }, execWithAgent)
+    expect(value).toMatchObject({ kind: 'activation', agent: 'alpha' })
+    expect(specs[0].label).toBe(delegateLabel('alpha', 'do it', choices))
+    expect(specs[0].label).toBe('alpha ⟦m=m2&e=high&o=strict⟧: do it')
+    expect(specs[0].prompt).toEqual([{ type: 'text', text: 'do it' }])
+    // No choices: the label stays byte-identical to the original format.
+    await execute({ task: 'plain', agent: 'alpha' }, execWithAgent)
+    expect(specs[1].label).toBe('alpha: plain')
+  })
+
+  it('the full chain applies the carried choices as writes before the prompt', async () => {
+    const f = makeHost()
+    f.liveOptions.set('session-1', { configOptions: configOptionsOf(['m1', 'm2'], ['high', 'low']), modes: modesOf('default', 'strict') })
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    f.onPrompt(async (sessionId) => {
+      await gate
+      f.emit({ type: 'session/update', sessionId, seq: 1, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'chosen answer' } } })
+      f.emit({ type: 'turn/end', sessionId, turnId: 't', stopReason: 'end_turn' })
+      return { turnId: 't' }
+    })
+    const { service, receipts } = fakeSubagentsService()
+    service.registerProvider(new AcpSubagentProvider({ service: new AcpDelegateService(f.host) }))
+    const execute = acpDelegateActivationExecute({ service: new AcpDelegateService(f.host), subagents: service })
+    const value = await execute({ task: 'do it', agent: 'alpha', model: 'm2', effort: 'low', mode: 'strict' }, execWithAgent)
+    expect(value).toMatchObject({ kind: 'activation', name: 'agent-1' })
+    await tick()
+    // The provider decoded the carrier and the core applied every axis in order.
+    expect(f.calls.setMode).toEqual([{ sessionId: 'session-1', modeId: 'strict' }])
+    expect(f.calls.setConfig).toEqual([
+      { sessionId: 'session-1', configId: 'model', value: 'm2' },
+      { sessionId: 'session-1', configId: 'thought', value: 'low' },
+    ])
+    expect(f.order.lastIndexOf('setConfig')).toBeLessThan(f.order.indexOf('prompt'))
+    expect(f.calls.prompt).toEqual([{ sessionId: 'session-1', text: 'do it' }])
+    release()
+    const result = await receipts[0].result
+    expect(result).toEqual({ output: [{ type: 'text', text: 'chosen answer' }], stopReason: 'completed' })
+    expect(f.notices).toEqual([]) // every pick was live: nothing degraded
+  })
+
+  it('a stale explicit choice in the carrier settles error through the host notification path', async () => {
+    const f = makeHost()
+    f.liveOptions.set('session-1', { configOptions: configOptionsOf(['m1']), modes: modesOf('default') })
+    const { service, receipts } = fakeSubagentsService()
+    service.registerProvider(new AcpSubagentProvider({ service: new AcpDelegateService(f.host) }))
+    const execute = acpDelegateActivationExecute({ service: new AcpDelegateService(f.host), subagents: service })
+    // Pre-validation passes (the shape is legal); the LIVE check at run time
+    // is what refuses — the activation exists, its result carries the error.
+    const value = await execute({ task: 'do it', agent: 'alpha', model: 'ghost' }, execWithAgent)
+    expect(value).toMatchObject({ kind: 'activation' })
+    const result = await receipts[0].result
+    expect(result.stopReason).toBe('error')
+    expect(result.diagnostic).toContain('does not offer model "ghost"')
+    expect(f.calls.prompt).toHaveLength(0)
+    expect(f.calls.close).toEqual(['session-1'])
   })
 })

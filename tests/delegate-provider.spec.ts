@@ -9,8 +9,9 @@ import { describe, expect, it, vi } from 'vitest'
 import type { ResolvedSubagentStartRequest, SubagentResult } from '@deepseek-ai/dsh-subagent'
 import { ACP_SUBAGENT_PROVIDER, AcpSubagentProvider } from '../src/bridge/delegate-provider.ts'
 import { AcpDelegateService, type AcpDelegateRunHandle } from '../src/bridge/delegate-service.ts'
+import { delegateLabel } from '../src/impl.ts'
 import { DELEGATE_TIMEOUT_MAX_MS } from '../src/protocol.ts'
-import { chunk, happyPrompt, makeHost, tick } from './delegate-harness.ts'
+import { chunk, configOptionsOf, happyPrompt, makeHost, modesOf, tick } from './delegate-harness.ts'
 
 const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
@@ -298,5 +299,100 @@ describe('AcpSubagentProvider clean start failures (no catalog row, slot release
     expect(result.diagnostic).toContain('cwd_denied')
     expect(result.diagnostic).toContain('(agent alpha)')
     expect(f.calls.prompt).toHaveLength(0)
+  })
+})
+
+// ---- four-axis customization: notes in the diagnostic, label carrier (T2) ----
+
+describe('AcpSubagentProvider degradation notes', () => {
+  it('a completed run with stale configured defaults carries the notes as diagnostic', async () => {
+    const { f, provider } = makeProvider()
+    f.config.agentDefaults = { alpha: { model: 'ghost-m' } }
+    f.liveOptions.set('session-1', { configOptions: configOptionsOf(['m1']) })
+    happyPrompt(f, 'answer with a note')
+    const result = await (await provider.start(makeRequest().request)).result
+    expect(result.stopReason).toBe('completed')
+    expect(result.output).toEqual([{ type: 'text', text: 'answer with a note' }])
+    expect(result.diagnostic).toBe('agent「alpha」不再提供默认模型「ghost-m」，本次使用 agent 自身默认模型')
+    expect(f.notices).toHaveLength(1)
+  })
+
+  it('turnError and notes merge into ONE bounded diagnostic', async () => {
+    const { f, provider } = makeProvider()
+    f.config.agentDefaults = { alpha: { mode: 'ghost-o' } }
+    f.liveOptions.set('session-1', { modes: modesOf('default') })
+    f.onPrompt(async (sessionId) => {
+      f.emit({ type: 'turn/end', sessionId, turnId: '', error: 'agent went silent (inactivity timeout)' })
+      return { turnId: 'real' }
+    })
+    const result = await (await provider.start(makeRequest().request)).result
+    expect(result.stopReason).toBe('completed')
+    expect(result.diagnostic).toBe('agent went silent (inactivity timeout)\nagent「alpha」不再提供默认模式「ghost-o」，本次使用启动模式')
+  })
+
+  it('an error outcome keeps BOTH the failure and the notes', async () => {
+    const { f, provider } = makeProvider()
+    f.config.agentDefaults = { alpha: { mode: 'ghost-o' } }
+    f.liveOptions.set('session-1', { configOptions: configOptionsOf(['m1']), modes: modesOf('default') })
+    const { request } = makeRequest({ label: delegateLabel('alpha', 'do it', { model: 'ghost-m' }) })
+    const result = await (await provider.start(request)).result
+    expect(result.stopReason).toBe('error')
+    expect(result.diagnostic).toBe('acp_delegate: agent "alpha" does not offer model "ghost-m" (available: m1)\nagent「alpha」不再提供默认模式「ghost-o」，本次使用启动模式')
+    expect(f.calls.prompt).toHaveLength(0)
+  })
+
+  it('an aborted run still reports its degradation notes', async () => {
+    const { f, provider } = makeProvider()
+    f.config.agentDefaults = { alpha: { effort: 'ghost-e' } }
+    f.liveOptions.set('session-1', { configOptions: configOptionsOf(['m1'], ['high']) })
+    f.onPrompt(() => new Promise(() => {}))
+    const { request, controller } = makeRequest()
+    const run = await provider.start(request)
+    await tick()
+    controller.abort()
+    const result = await run.result
+    expect(result.stopReason).toBe('aborted')
+    expect(result.diagnostic).toBe('agent「alpha」的默认思考等级「ghost-e」不受当前模型支持，本次不设置')
+  })
+})
+
+describe('AcpSubagentProvider label choice carrier', () => {
+  it('explicit choices ride the label into begin losslessly (encode → decode → write)', async () => {
+    const { f, provider } = makeProvider()
+    f.liveOptions.set('session-1', { configOptions: configOptionsOf(['m1', 'a b&c=d'], ['high', 'low']), modes: modesOf('default', 'strict') })
+    happyPrompt(f)
+    // Values that NEED encodeURIComponent: the carrier must round-trip them.
+    const choices = { model: 'a b&c=d', effort: 'low', mode: 'strict' }
+    const { request } = makeRequest({ label: delegateLabel('alpha', 'do it', choices) })
+    const result = await (await provider.start(request)).result
+    expect(result.stopReason).toBe('completed')
+    expect(f.calls.setMode).toEqual([{ sessionId: 'session-1', modeId: 'strict' }])
+    expect(f.calls.setConfig).toEqual([
+      { sessionId: 'session-1', configId: 'model', value: 'a b&c=d' },
+      { sessionId: 'session-1', configId: 'thought', value: 'low' },
+    ])
+  })
+
+  it('a partial carrier carries only its own axes', async () => {
+    const { f, provider } = makeProvider()
+    f.liveOptions.set('session-1', { configOptions: configOptionsOf(['m1', 'm2']) })
+    happyPrompt(f)
+    const { request } = makeRequest({ label: delegateLabel('alpha', 'do it', { model: 'm2' }) })
+    await (await provider.start(request)).result
+    expect(f.calls.setMode).toEqual([])
+    expect(f.calls.setConfig).toEqual([{ sessionId: 'session-1', configId: 'model', value: 'm2' }])
+  })
+
+  it('a malformed carrier fails the start cleanly — no agent guess, no choices', async () => {
+    const { f, provider } = makeProvider()
+    for (const label of [
+      'alpha ⟦m=x&bad=1⟧: task', // illegal key
+      'alpha ⟦e=low&m=x⟧: task', // out-of-order keys
+      'alpha ⟦m=%ZZ⟧: task', // broken encoding
+      'alpha ⟦m=x⟧ extra: task', // carrier not the whole prefix
+    ]) {
+      await expect(provider.start(makeRequest({ label }).request)).rejects.toThrow('label carries no agent id')
+    }
+    expect(f.calls.startSession).toHaveLength(0)
   })
 })

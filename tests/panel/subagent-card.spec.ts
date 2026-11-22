@@ -44,12 +44,29 @@ async function mountDelegate(seed: AcpDelegateSettings, options: { failWrite?: b
         ...current,
         ...(patch.guidance === undefined ? {} : { guidance: patch.guidance }),
         ...(patch.timeoutMs === undefined ? {} : { timeoutMs: patch.timeoutMs }),
+        ...(patch.defaultAgent === undefined ? {} : { defaultAgent: patch.defaultAgent }),
+      }
+      if (patch.agentDefaults !== undefined) {
+        const merged = { ...(current.agentDefaults ?? {}) }
+        for (const [id, entry] of Object.entries(patch.agentDefaults)) {
+          if (entry === null) delete merged[id]
+          else merged[id] = entry
+        }
+        next = { ...next, agentDefaults: merged }
       }
       // A reset returns to the configured baseline, else the host default.
       for (const key of patch.reset ?? []) {
         if (key === 'timeoutMs') next = { ...next, timeoutMs: current.configured?.timeoutMs ?? current.defaultTimeoutMs ?? next.timeoutMs }
         if (key === 'guidance') next = { ...next, guidance: current.configured?.guidance ?? 'off' }
+        if (key === 'defaultAgent') next = { ...next, defaultAgent: current.configured?.defaultAgent }
+        if (key === 'agentDefaults') next = { ...next, agentDefaults: current.configured?.agentDefaults ?? {} }
       }
+      // Host view hygiene (delegateSettingsView): an empty map is NO key.
+      if (next.agentDefaults !== undefined && Object.keys(next.agentDefaults).length === 0) {
+        next = { ...next }
+        delete next.agentDefaults
+      }
+      next = { ...next, resolvedDefaultAgent: next.defaultAgent ?? next.globalDefaultAgent }
       current = next
       return { ok: true, value: { delegate: structuredClone(current) } }
     }
@@ -274,5 +291,18 @@ describe('SubagentCard', () => {
     await waitFor(() => expect(store.getSnapshot().notice).toBe('no'))
     expect(store.getSnapshot().delegate?.guidance).toBe('off')
     expect(screen.getByText('关闭', { selector: '.dwa-deadline-value' })).toBeDefined()
+  })
+
+  it('mounts the delegation-defaults section and writes a per-agent default through the card', async () => {
+    const { store, calls } = await mountDelegate({ ...BASE, globalDefaultAgent: 'codebuddy', resolvedDefaultAgent: 'codebuddy' })
+    await category('子代理')
+    expect(screen.getByText('委派默认')).toBeDefined()
+    expect((screen.getByRole('combobox', { name: '默认智能体' }) as HTMLSelectElement).value).toBe('')
+    const model = screen.getByRole('combobox', { name: '模型 · CodeBuddy' }) as HTMLSelectElement
+    await waitFor(() => expect(Array.from(model.options).map(option => option.value)).toContain('claude-sonnet-4'))
+    fireEvent.change(model, { target: { value: 'claude-sonnet-4' } })
+    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ agentDefaults: { codebuddy: { model: 'claude-sonnet-4' } } }]))
+    expect(store.getSnapshot().delegate?.agentDefaults?.codebuddy).toEqual({ model: 'claude-sonnet-4' })
+    expect(writes(calls, 'agent/save')).toEqual([])
   })
 })

@@ -238,8 +238,21 @@ export const DEFAULT_DELEGATE_GUIDANCE: DelegateGuidance = 'off'
 export const DELEGATE_TIMEOUT_MIN_MS = 1_000
 export const DELEGATE_TIMEOUT_MAX_MS = 86_400_000
 
+/**
+ * Per-agent delegation defaults for the three choice axes. Every value is a
+ * NON-EMPTY string; an absent key means "follow the agent process's own
+ * default" (the axis is simply not written). These are persisted preferences:
+ * a value the agent no longer offers stays stored and is marked stale at
+ * runtime — validation checks shape only, never the catalog.
+ */
+export interface AcpDelegateAgentDefaults {
+  model?: string
+  effort?: string
+  mode?: string
+}
+
 /** The delegate setting a write may name, by field name. */
-export type DelegateSettingKey = 'guidance' | 'timeoutMs'
+export type DelegateSettingKey = 'guidance' | 'timeoutMs' | 'defaultAgent' | 'agentDefaults'
 
 /**
  * What the settings page's delegation card shows: the values in force, plus
@@ -256,6 +269,21 @@ export interface AcpDelegateSettings {
   guidance: DelegateGuidance
   timeoutMs: number
   /**
+   * The delegation default-agent override in force; `undefined` = follow the
+   * global default agent. Optional so pre-existing fakes keep validating.
+   */
+  defaultAgent?: string
+  /** The current global default agent — a display fact, never an override. */
+  globalDefaultAgent?: string
+  /** `defaultAgent ?? globalDefaultAgent`: what the card's「当前：X」shows. */
+  resolvedDefaultAgent?: string
+  /**
+   * The per-agent choice defaults in force (override merged over baseline);
+   * `undefined` reads as `{}`. Stale entries stay listed — the runtime marks
+   * them, it never silently deletes a persisted preference.
+   */
+  agentDefaults?: Record<string, AcpDelegateAgentDefaults>
+  /**
    * The window a RESET returns to: the deployment baseline when the config
    * file names one, else the global background-task long window (the built-in
    * default — the same split {@link AcpIdleRelease.defaultIdleTimeoutMs} keeps).
@@ -263,7 +291,11 @@ export interface AcpDelegateSettings {
    * inventing a baseline (mixed-version guard — never fabricate the old half).
    */
   defaultTimeoutMs?: number
-  /** Deployment baseline facts: only keys cordis.patch.yml actually names. */
+  /**
+   * Deployment baseline facts: only keys cordis.patch.yml actually names —
+   * including `defaultAgent` / `agentDefaults` once the file names them (the
+   * Pick follows {@link DelegateSettingKey}, so the new keys ride along).
+   */
   configured?: Partial<Pick<AcpDelegateSettings, DelegateSettingKey>>
   toolAvailable: boolean
   restrictAvailable: boolean
@@ -278,11 +310,22 @@ export type DelegateResult = { delegate?: AcpDelegateSettings }
  * `ui/delegate-set`: write delegation settings. Omitted keys keep their
  * current value — a card that only moved the guidance must not reset the
  * window. `timeoutMs` accepts any integer in [1000, 86400000]; the guidance
- * rungs are the whole vocabulary.
+ * rungs are the whole vocabulary. `defaultAgent` sets an explicit override;
+ * `agentDefaults` merges per-agent entries (a `null` entry DELETES that
+ * agent's override, an `{}` entry is a valid all-default override that masks
+ * the baseline). `reset` accepts every {@link DelegateSettingKey}.
  */
 export interface DelegateSetPayload {
   guidance?: DelegateGuidance
   timeoutMs?: number
+  /** Set the explicit delegation default-agent override (a legal agent id). */
+  defaultAgent?: string
+  /**
+   * Per-agent choice overrides to merge into the persisted map: `null`
+   * deletes the entry (baseline decides again), `{}` stores an explicit
+   * all-default override that SHADOWS the baseline for that agent.
+   */
+  agentDefaults?: Record<string, AcpDelegateAgentDefaults | null>
   /** Drop the persisted overrides for these keys; baseline/default decides again. */
   reset?: readonly DelegateSettingKey[]
 }

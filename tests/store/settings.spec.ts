@@ -236,3 +236,143 @@ describe('AcpStore agent management', () => {
     expect(older.getSnapshot().delegate).toBeUndefined()
   })
 })
+
+// T3: the delegation-defaults axes (defaultAgent / agentDefaults) ride the same
+// optimistic-then-authority write path. These pin the optimistic merge, the new
+// reset baselines, and the whole-view revert on a refused write.
+describe('AcpStore delegate defaults writes', () => {
+  const BASE = { guidance: 'on', timeoutMs: 900_000, defaultTimeoutMs: 2_400_000, toolAvailable: true, restrictAvailable: true }
+
+  /** A store whose `ui/delegate-set` answers via `onSet` (recording payloads). */
+  function makeDelegateStore(seed: Record<string, unknown>, onSet: (payload: any) => any) {
+    const sent: Array<Record<string, unknown>> = []
+    const store = new AcpStore(
+      async (_channel, endpoint, payload) => {
+        if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
+        if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
+        if (endpoint === 'ui/delegate') return { ok: true, value: { delegate: seed } }
+        if (endpoint === 'ui/delegate-set') { sent.push(payload as Record<string, unknown>); return onSet(payload) }
+        return { ok: true, value: {} }
+      },
+      (zh) => zh,
+    )
+    return { store, sent }
+  }
+  const echo = (seed: Record<string, unknown>) => (payload: any) => {
+    let next: any = { ...seed }
+    if (payload.defaultAgent !== undefined) next.defaultAgent = payload.defaultAgent
+    if (payload.agentDefaults !== undefined) {
+      const merged = { ...(seed.agentDefaults ?? {}) }
+      for (const [id, entry] of Object.entries(payload.agentDefaults)) {
+        if (entry === null) delete merged[id]
+        else merged[id] = entry
+      }
+      next.agentDefaults = merged
+    }
+    for (const key of payload.reset ?? []) {
+      if (key === 'defaultAgent') next.defaultAgent = seed.configured?.defaultAgent
+      if (key === 'agentDefaults') next.agentDefaults = seed.configured?.agentDefaults ?? {}
+    }
+    // Host view hygiene (delegateSettingsView): an empty map is NO key.
+    if (next.agentDefaults !== undefined && Object.keys(next.agentDefaults).length === 0) delete next.agentDefaults
+    next.resolvedDefaultAgent = next.defaultAgent ?? seed.globalDefaultAgent
+    return { ok: true, value: { delegate: next } }
+  }
+
+  it('merges defaultAgent and agentDefaults optimistically, then adopts the host answer', async () => {
+    const seed = { ...BASE, globalDefaultAgent: 'pi', resolvedDefaultAgent: 'pi', agentDefaults: {} }
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const answer = { ...seed, defaultAgent: 'codebuddy', resolvedDefaultAgent: 'codebuddy', agentDefaults: { codebuddy: { model: 'm1' } } }
+    const { store, sent } = makeDelegateStore(seed, async () => { await gate; return { ok: true, value: { delegate: answer } } })
+    await store.resync()
+
+    const write = store.setDelegateSettings({ defaultAgent: 'codebuddy', agentDefaults: { codebuddy: { model: 'm1' } } })
+    // Optimistic: the override and the derived「当前：X」move before the answer.
+    expect(store.getSnapshot().delegate?.defaultAgent).toBe('codebuddy')
+    expect(store.getSnapshot().delegate?.resolvedDefaultAgent).toBe('codebuddy')
+    expect(store.getSnapshot().delegate?.agentDefaults).toEqual({ codebuddy: { model: 'm1' } })
+    expect(sent).toEqual([{ defaultAgent: 'codebuddy', agentDefaults: { codebuddy: { model: 'm1' } } }])
+    release()
+    await write
+    expect(store.getSnapshot().delegate).toMatchObject(answer)
+  })
+
+  it('merges per-agent entries by replacement: {} shadows, null deletes, absent keys stay', async () => {
+    const seed = { ...BASE, agentDefaults: { a: { model: 'm' }, b: { mode: 'x' } } }
+    const { store, sent } = makeDelegateStore(seed, echo(seed))
+    await store.resync()
+    await store.setDelegateSettings({ agentDefaults: { a: null, b: {}, c: { effort: 'high' } } })
+    expect(sent).toEqual([{ agentDefaults: { a: null, b: {}, c: { effort: 'high' } } }])
+    expect(store.getSnapshot().delegate?.agentDefaults).toEqual({ b: {}, c: { effort: 'high' } })
+  })
+
+  it('reset defaultAgent returns to the configured baseline, else follows the global default', async () => {
+    const configured = { ...BASE, globalDefaultAgent: 'pi', defaultAgent: 'pi', resolvedDefaultAgent: 'pi', configured: { defaultAgent: 'codebuddy' } }
+    const withFile = makeDelegateStore(configured, echo(configured))
+    await withFile.store.resync()
+    await withFile.store.resetDelegateSetting('defaultAgent')
+    expect(withFile.sent).toEqual([{ reset: ['defaultAgent'] }])
+    expect(withFile.store.getSnapshot().delegate?.defaultAgent).toBe('codebuddy')
+    expect(withFile.store.getSnapshot().delegate?.resolvedDefaultAgent).toBe('codebuddy')
+
+    const noFile = { ...BASE, globalDefaultAgent: 'pi', defaultAgent: 'codebuddy', resolvedDefaultAgent: 'codebuddy' }
+    const bare = makeDelegateStore(noFile, echo(noFile))
+    await bare.store.resync()
+    await bare.store.resetDelegateSetting('defaultAgent')
+    expect(bare.store.getSnapshot().delegate?.defaultAgent).toBeUndefined()
+    expect(bare.store.getSnapshot().delegate?.resolvedDefaultAgent).toBe('pi')
+  })
+
+  it('reset agentDefaults returns to the configured map, else no map key', async () => {
+    const configured = { ...BASE, agentDefaults: { a: { model: 'm' } }, configured: { agentDefaults: { a: { mode: 'x' } } } }
+    const withFile = makeDelegateStore(configured, echo(configured))
+    await withFile.store.resync()
+    await withFile.store.resetDelegateSetting('agentDefaults')
+    expect(withFile.sent).toEqual([{ reset: ['agentDefaults'] }])
+    expect(withFile.store.getSnapshot().delegate?.agentDefaults).toEqual({ a: { mode: 'x' } })
+
+    const noFile = { ...BASE, agentDefaults: { a: { model: 'm' } } }
+    const bare = makeDelegateStore(noFile, echo(noFile))
+    await bare.store.resync()
+    await bare.store.resetDelegateSetting('agentDefaults')
+    // The host view omits an empty map — the optimistic view must not invent
+    // an `agentDefaults: {}` key the host would never report.
+    expect(bare.store.getSnapshot().delegate?.agentDefaults).toBeUndefined()
+    expect(Object.hasOwn(bare.store.getSnapshot().delegate ?? {}, 'agentDefaults')).toBe(false)
+  })
+
+  it('deleting the last entry drops the agentDefaults key optimistically (host parity)', async () => {
+    const seed = { ...BASE, agentDefaults: { a: { model: 'm' } } }
+    const { store, sent } = makeDelegateStore(seed, echo(seed))
+    await store.resync()
+    const write = store.setDelegateSettings({ agentDefaults: { a: null } })
+    // Before the host answers: the optimistic view already has the host shape.
+    expect(store.getSnapshot().delegate?.agentDefaults).toBeUndefined()
+    expect(Object.hasOwn(store.getSnapshot().delegate ?? {}, 'agentDefaults')).toBe(false)
+    expect(sent).toEqual([{ agentDefaults: { a: null } }])
+    await write
+    expect(Object.hasOwn(store.getSnapshot().delegate ?? {}, 'agentDefaults')).toBe(false)
+  })
+
+  it('a lone {} entry is a valid all-default override and keeps its key', async () => {
+    const seed = { ...BASE, agentDefaults: { a: { model: 'm' }, b: { mode: 'x' } } }
+    const { store } = makeDelegateStore(seed, echo(seed))
+    await store.resync()
+    await store.setDelegateSettings({ agentDefaults: { a: {}, b: null } })
+    // The {} ENTRY survives (it shadows the baseline); only an empty MAP
+    // loses the key — the two must not be conflated.
+    expect(store.getSnapshot().delegate?.agentDefaults).toEqual({ a: {} })
+    expect(Object.hasOwn(store.getSnapshot().delegate ?? {}, 'agentDefaults')).toBe(true)
+  })
+
+  it('reverts the whole delegate view when a defaults write is refused', async () => {
+    const seed = { ...BASE, globalDefaultAgent: 'pi', defaultAgent: 'codebuddy', resolvedDefaultAgent: 'codebuddy', agentDefaults: { a: { model: 'm' } } }
+    const { store } = makeDelegateStore(seed, () => ({ ok: false, error: { code: 'bad_payload', message: 'no' } }))
+    await store.resync()
+    await store.setDelegateSettings({ defaultAgent: 'pi', agentDefaults: { a: null } })
+    expect(store.getSnapshot().delegate).toEqual(seed)
+    expect(store.getSnapshot().notice).toBe('no')
+  })
+})

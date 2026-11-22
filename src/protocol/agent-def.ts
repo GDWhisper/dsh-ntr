@@ -7,7 +7,7 @@
  * runtime values (type-only SDK imports are erased at build time).
  */
 
-import type { DelegateGuidance, PermissionTimeoutMode } from './ui.ts'
+import type { AcpDelegateAgentDefaults, DelegateGuidance, PermissionTimeoutMode } from './ui.ts'
 
 // ---- Configuration (host side, from the profile layer) ----
 
@@ -168,6 +168,13 @@ export interface AcpDelegateConfig {
   guidance?: DelegateGuidance
   /** Single-delegation window: an integer in [1000, 86400000] ms. */
   timeoutMs?: number
+  /** Deployment-baseline delegation default agent (a legal agent id). */
+  defaultAgent?: string
+  /**
+   * Deployment-baseline per-agent choice defaults. Shape-validated only: a
+   * value the agent no longer offers persists and is marked stale at runtime.
+   */
+  agentDefaults?: Record<string, AcpDelegateAgentDefaults>
 }
 
 export interface AcpPluginConfig {

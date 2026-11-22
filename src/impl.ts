@@ -42,14 +42,22 @@ export { quoteCommandToken, splitCommandLine, tokenizeCommandLine } from './impl
 
 // ---- Native delegation label routing + diagnostic bounding ----
 
+export type { DelegateLabelChoices } from './impl/delegate-label.ts'
 export {
   DELEGATE_LABEL_SUMMARY_MAX,
   DIAGNOSTIC_TRUNCATION_SUFFIX,
   MAX_DELEGATE_DIAGNOSTIC_BYTES,
   agentIdFromDelegateLabel,
+  delegateChoicesFromLabel,
   delegateLabel,
+  displayDelegateLabel,
   truncateDelegateDiagnostic,
 } from './impl/delegate-label.ts'
+
+// ---- Native delegation choice planning (pure; live session/new is the authority) ----
+
+export type { DelegateChoiceSet, DelegateChoiceWrite, DelegateLiveOptions } from './impl/delegate-choices.ts'
+export { planDelegateEffort, planDelegateModeAndModel } from './impl/delegate-choices.ts'
 
 // ---- Workspace guard ----
 

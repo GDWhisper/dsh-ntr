@@ -14,6 +14,7 @@
  */
 
 import type {
+  AcpDelegateAgentDefaults,
   AcpDelegateSettings,
   AcpTagHalo,
   ApprovalDeadlinesResult,
@@ -37,16 +38,41 @@ import type { UiState } from './state.ts'
  * global background-task long window (40 minutes); the host-reported
  * `defaultTimeoutMs` is the authority and corrects this placeholder on the
  * write's answer — the same optimistic-then-authority split the idle-release
- * card keeps.
+ * card keeps. `defaultAgent` resets to "follow the global default" (undefined)
+ * and `agentDefaults` to "no per-agent overrides" ({}); both keys must be
+ * PRESENT here so the baseline spread clears the running override before the
+ * config file's value (if any) lands on top.
  */
 export const DELEGATE_DEFAULTS: Pick<AcpDelegateSettings, DelegateSettingKey> = {
   guidance: DEFAULT_DELEGATE_GUIDANCE,
   timeoutMs: 2_400_000,
+  defaultAgent: undefined,
+  agentDefaults: {},
 }
 
 /** Reset one key optimistically to the baseline the reset restores. */
 function resetDelegateKey<K extends DelegateSettingKey>(next: AcpDelegateSettings, key: K, baseline: AcpDelegateSettings): void {
   next[key] = baseline[key]
+}
+
+/**
+ * Optimistic merge of the per-agent delegation overrides: each named entry
+ * REPLACES that agent's whole entry — `{}` is a valid all-default override
+ * that shadows the baseline — and a `null` entry deletes it so the baseline
+ * decides again (the `ui/delegate-set` contract). Absent keys keep their value.
+ * The result may be an empty map; the view builder then drops the key entirely
+ * (the host reports no `agentDefaults` key for an empty map).
+ */
+export function mergeDelegateAgentDefaults(
+  current: Record<string, AcpDelegateAgentDefaults> | undefined,
+  patch: Record<string, AcpDelegateAgentDefaults | null>,
+): Record<string, AcpDelegateAgentDefaults> {
+  const next = { ...current }
+  for (const [agentId, entry] of Object.entries(patch)) {
+    if (entry === null) delete next[agentId]
+    else next[agentId] = entry
+  }
+  return next
 }
 
 /** What the settings service needs from the store, injected. */
@@ -230,11 +256,27 @@ export class SettingsService {
         ...previous,
         ...(payload.guidance === undefined ? {} : { guidance: payload.guidance }),
         ...(payload.timeoutMs === undefined ? {} : { timeoutMs: payload.timeoutMs }),
+        ...(payload.defaultAgent === undefined ? {} : { defaultAgent: payload.defaultAgent }),
+        ...(payload.agentDefaults === undefined
+          ? {}
+          : { agentDefaults: mergeDelegateAgentDefaults(previous.agentDefaults, payload.agentDefaults) }),
       }
       // The baseline a reset restores: the config file's value where it names
       // one, else the built-in default.
       const baseline: AcpDelegateSettings = { ...previous, ...DELEGATE_DEFAULTS, ...previous.configured }
       for (const key of payload.reset ?? []) resetDelegateKey(next, key, baseline)
+      // Empty-map hygiene, mirroring the host view: a map with no entries is
+      // NO key (`delegateSettingsView` omits it), so deleting the last entry —
+      // or resetting to a baseline that names none — must not leave an
+      // `agentDefaults: {}` the host would never report. A stored `{}` ENTRY
+      // is a valid all-default override and keeps its key.
+      if (next.agentDefaults !== undefined && Object.keys(next.agentDefaults).length === 0) delete next.agentDefaults
+      // The「当前：X」display fact is derived from the override it names; keep
+      // it consistent with the optimistic defaultAgent (the host answer stays
+      // the authority). Only recompute when this write touches that axis.
+      if (payload.defaultAgent !== undefined || (payload.reset ?? []).includes('defaultAgent')) {
+        next.resolvedDefaultAgent = next.defaultAgent ?? next.globalDefaultAgent
+      }
       this.host.mutate({ delegate: next })
     }
     try {

@@ -73,7 +73,7 @@
 
 ### 委派返回上限（`maxOutputChars` / 「返回上限」滑块）
 
-- **退役**：`maxOutputChars` / `DELEGATE_OUTPUT_CHARS` / `DEFAULT_DELEGATE_OUTPUT_CHARS` / `validateDelegateOutputChars` / `delegateCharsText`，设置页「子代理」卡的「返回上限 / Answer cap」滑块行，以及折叠里的 cap / `truncated` / 截断标记。委派设置只剩两键（引导档 / 单次时限）。
+- **退役**：`maxOutputChars` / `DELEGATE_OUTPUT_CHARS` / `DEFAULT_DELEGATE_OUTPUT_CHARS` / `validateDelegateOutputChars` / `delegateCharsText`，设置页「子代理」卡的「返回上限 / Answer cap」滑块行，以及折叠里的 cap / `truncated` / 截断标记。委派设置的返回上限退役；键形状其后随四轴定制扩为四键（引导档 / 单次时限 / 默认 agent / per-agent 默认，见 [state.md §1](./state.md)）。
 - **为什么死**：截断保留开头、丢掉结尾，而结论通常在最后——上限恰恰切掉最有用的结论、留下前面的絮叨，信息失真会让主代理据此做错决定、写错代码。它也防不了死循环：循环归单次时限管，超时整段文本丢弃，上限在那条路上什么都没做。
 - **仍然有效**：折叠完整累加每条 `agent_message_chunk`（保留 seq 去重与跳 `parentToolCallId`）；旧 `agents.json` / `cordis.patch.yml` 残留的 `maxOutputChars` 被静默忽略（`validateDelegateConfig` 重建对象、不收未知键）。**不要**照 [docs/plan/acp-delegate-subagent.md](../docs/plan/acp-delegate-subagent.md) 把上限重建回来——那份方案记录的是退役前的形态。见 [ui-panel.md §8](./ui-panel.md) 与 [protocol.md §1](./protocol.md)。
 

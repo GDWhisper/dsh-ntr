@@ -13,13 +13,37 @@ import type { AcpDelegateExecute, AcpDelegateHost, AcpDelegatePolicy } from '../
 import type { DelegateSubagentsLike } from '../src/bridge/delegate-provider.ts'
 import type { DelegateRegistrationCtx } from '../src/bridge/delegate-registration.ts'
 import type { AcpDelegateForceMask } from '../src/bridge/delegate-force-mask.ts'
-import type { AcpEvent, AcpStartSessionOpts, DelegateGuidance } from '../src/protocol.ts'
+import type { DelegateLiveOptions } from '../src/impl.ts'
+import type { AcpDelegateAgentDefaults, AcpEvent, AcpStartSessionOpts, DelegateGuidance } from '../src/protocol.ts'
 
 export function chunk(text: string, meta?: Record<string, unknown>) {
   return { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text }, ...(meta === undefined ? {} : { _meta: meta }) }
 }
 export const tick = () => new Promise(resolve => setTimeout(resolve, 10))
 export const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+
+/**
+ * A spec-shaped `configOptions` payload for the fake live session options:
+ * a `model` selector and a `thought_level` selector, each present only when
+ * its choice list is given (an absent list = the axis is not published).
+ */
+export function configOptionsOf(models?: string[], efforts?: string[]): unknown[] {
+  return [
+    ...(models === undefined ? [] : [{
+      configId: 'model', name: 'Model', type: 'select', category: 'model', currentValue: models[0],
+      options: models.map(value => ({ value, name: value })),
+    }]),
+    ...(efforts === undefined ? [] : [{
+      configId: 'thought', name: 'Thought Level', type: 'select', category: 'thought_level', currentValue: efforts[0],
+      options: efforts.map(value => ({ value, name: value })),
+    }]),
+  ]
+}
+
+/** The session mode list shape `DelegateLiveOptions.modes` expects. */
+export function modesOf(...ids: string[]): { availableModes: Array<{ id: string }> } {
+  return { availableModes: ids.map(id => ({ id })) }
+}
 
 export function makeHost() {
   const sinks = new Set<(event: AcpEvent) => void>()
@@ -33,14 +57,29 @@ export function makeHost() {
     close: [] as string[],
     respond: [] as Array<{ requestId: string; optionId?: string }>,
     transcript: [] as Array<{ sessionId: string; afterSeq?: number }>,
+    setMode: [] as Array<{ sessionId: string; modeId: string }>,
+    setConfig: [] as Array<{ sessionId: string; configId: string; value: string }>,
+    options: [] as string[],
   }
-  const config = { guidance: 'on' as DelegateGuidance, timeoutMs: 600_000 }
+  const config = {
+    guidance: 'on' as DelegateGuidance,
+    timeoutMs: 600_000,
+    defaultAgent: undefined as string | undefined,
+    agentDefaults: {} as Record<string, AcpDelegateAgentDefaults>,
+  }
   const agents = [{ id: 'alpha', title: 'Alpha' }, { id: 'beta', title: 'Beta' }, { id: 'codebuddy', title: 'CodeBuddy' }]
   let defaultAgentId: string | undefined = 'alpha'
   let nextSession = 0
   const transcripts = new Map<string, Array<{ seq: number; update: unknown }>>()
+  /** The LIVE session/new options per session — the choice validation authority. */
+  const liveOptions = new Map<string, DelegateLiveOptions>()
+  const notices: string[] = []
+  /** Every notify call with its attribution — the delegated agent id (H1). */
+  const noticeCalls: Array<{ text: string; agentId?: string }> = []
   let onStart: ((agentId: string, cwd?: string, opts?: AcpStartSessionOpts) => Promise<{ sessionId: string; cwd: string }>) | undefined
   let onPrompt: ((sessionId: string, text: string) => Promise<{ turnId: string }>) | undefined
+  let onSetMode: ((sessionId: string, modeId: string) => Promise<void>) | undefined
+  let onSetConfigOption: ((sessionId: string, configId: string, value: string) => Promise<void>) | undefined
   const host: AcpDelegateHost = {
     hub: { subscribe(sink) { sinks.add(sink); return () => { sinks.delete(sink) } } },
     agents: () => agents,
@@ -57,6 +96,22 @@ export function makeHost() {
       return { sessionId, cwd: cwd ?? '/agent-default' }
     },
     setPermissionPolicy(sessionId, policy) { order.push('policy'); calls.policy.push({ sessionId, policy }) },
+    sessionOptions(sessionId) {
+      order.push('options')
+      calls.options.push(sessionId)
+      return liveOptions.get(sessionId)
+    },
+    async setMode(sessionId, modeId) {
+      order.push('setMode')
+      calls.setMode.push({ sessionId, modeId })
+      if (onSetMode !== undefined) await onSetMode(sessionId, modeId)
+    },
+    async setConfigOption(sessionId, configId, value) {
+      order.push('setConfig')
+      calls.setConfig.push({ sessionId, configId, value })
+      if (onSetConfigOption !== undefined) await onSetConfigOption(sessionId, configId, value)
+    },
+    notify(text, agentId) { notices.push(text); noticeCalls.push({ text, agentId }) },
     async prompt(sessionId, text) {
       order.push('prompt')
       calls.prompt.push({ sessionId, text })
@@ -73,11 +128,13 @@ export function makeHost() {
     },
   }
   return {
-    host, emit, calls, order, config, transcripts,
+    host, emit, calls, order, config, transcripts, liveOptions, notices, noticeCalls,
     sinkCount: () => sinks.size,
     setDefault: (id: string | undefined) => { defaultAgentId = id },
     onStart: (fn: typeof onStart) => { onStart = fn },
     onPrompt: (fn: typeof onPrompt) => { onPrompt = fn },
+    onSetMode: (fn: typeof onSetMode) => { onSetMode = fn },
+    onSetConfigOption: (fn: typeof onSetConfigOption) => { onSetConfigOption = fn },
   }
 }
 export type Fake = ReturnType<typeof makeHost>

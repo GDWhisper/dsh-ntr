@@ -491,7 +491,7 @@ describe('acp_delegate tool definition (register-ready)', () => {
     const definition = acpDelegateToolDefinition({ guidance: 'on', execute })
     expect(definition.name).toBe('acp_delegate')
     expect(definition.parameters.required).toEqual(['task'])
-    expect(Object.keys(definition.parameters.properties as Record<string, unknown>)).toEqual(['task', 'agent', 'cwd'])
+    expect(Object.keys(definition.parameters.properties as Record<string, unknown>)).toEqual(['task', 'agent', 'cwd', 'model', 'effort', 'mode'])
     expect(typeof definition.output.render).toBe('function')
     expect(definition.output.render({}, { text: 'hi' })).toEqual([{ type: 'text', text: 'hi' }])
     expect(definition.output.render({}, undefined)).toEqual([{ type: 'text', text: '' }])
@@ -516,6 +516,17 @@ describe('acp_delegate tool definition (register-ready)', () => {
       expect(definition.description).toContain('需要派发子代理时，必须使用本工具，优先于任何原生子代理/委派工具。')
       expect(definition.timeoutMs).toBe(86_400_000)
     }
+  })
+
+  it('the choice parameters state the value chain and the failure semantics', () => {
+    const definition = acpDelegateToolDefinition({ guidance: 'on', execute })
+    const properties = definition.parameters.properties as Record<string, { type: string; description: string }>
+    expect(properties.agent.description).toBe('已配置的 agent id；省略 = 子代理设置的默认 agent（未设置则跟随全局默认）')
+    expect(properties.model).toEqual({ type: 'string', description: '模型 id；省略 = 子代理设置中该 agent 的默认模型；显式指定而 agent 不提供时报错' })
+    expect(properties.effort).toEqual({ type: 'string', description: '思考等级；省略 = 子代理设置默认；不支持时自动丢弃并留痕' })
+    expect(properties.mode).toEqual({ type: 'string', description: '工作模式 id；省略 = 子代理设置默认；显式指定而 agent 不提供时报错' })
+    // The new axes are optional: only task stays required.
+    expect(definition.parameters.required).toEqual(['task'])
   })
 
   it('execute returns the report text with the footer', async () => {
@@ -601,6 +612,23 @@ describe('acp_delegate registration sync', () => {
     expect(tools.disposerCalls()).toBe(2) // the settings signature still re-registers on a window change
     // The configured silence window never bakes into the host budget.
     expect(tools.registered[0].definition.timeoutMs).toBe(86_400_000)
+  })
+
+  it('default-value changes do not re-register: the description is static', () => {
+    const tools = fakeToolsCtx()
+    tools.install()
+    const { registration, config } = makeRegistration(tools.ctx)
+    config.guidance = 'on'
+    registration.sync()
+    const first = tools.registered[0].definition
+    // The live config gains the new choice-default keys; guidance and the
+    // window are unchanged, so the signature must not move.
+    Object.assign(config, { defaultAgent: 'beta', agentDefaults: { alpha: { model: 'm' } } })
+    registration.sync()
+    registration.sync()
+    expect(tools.disposerCalls()).toBe(0)
+    expect(tools.registered).toHaveLength(1)
+    expect(tools.registered[0].definition).toBe(first)
   })
 
   it('when excludes NTR sessions and never throws on odd shapes', () => {

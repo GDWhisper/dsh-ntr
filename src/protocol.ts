@@ -138,6 +138,7 @@ export type {
 
 export type {
   AcpApprovalDeadlines,
+  AcpDelegateAgentDefaults,
   AcpDelegatePolicy,
   AcpDelegateSettings,
   AcpIdleRelease,

@@ -314,7 +314,7 @@ export function apply(ctx: Context, config?: unknown): void {
   // acp_delegate (docs/plan/acp-delegate-native-subagent.md): one self-contained
   // task per call to a configured ACP agent, in its OWN process. The modules
   // never import the manager — every capability arrives as a closure here.
-  const delegateNotify = (text: string): void => { manager.hub.broadcast({ type: 'agent/notice', agentId: manager.defaultAgent() ?? 'acp', level: 'info', text }) }
+  const delegateNotify = (text: string, agentId?: string): void => { manager.hub.broadcast({ type: 'agent/notice', agentId: agentId ?? manager.defaultAgent() ?? 'acp', level: 'info', text }) }
   // Type-only cast: cordis 4.1.0's Context.on generic overloads don't unify with the mask's structural face; its runtime probes (typeof on + try/catch) guard every call.
   const delegateForceMask = new AcpDelegateForceMask({ ctx: ctx as unknown as DelegateForceMaskCtx, notify: delegateNotify })
   const delegateService = new AcpDelegateService({
@@ -324,6 +324,10 @@ export function apply(ctx: Context, config?: unknown): void {
     delegateConfig: () => manager.delegateConfig(),
     startSession: (agentId, cwd, opts) => manager.startSession(agentId, cwd, opts),
     setPermissionPolicy: (sessionId, policy) => manager.setPermissionPolicy(sessionId, policy),
+    sessionOptions: sessionId => manager.sessionOptions(sessionId),
+    setMode: (sessionId, modeId) => manager.setMode(sessionId, modeId),
+    setConfigOption: (sessionId, configId, value) => manager.setConfigOption(sessionId, configId, value),
+    notify: delegateNotify,
     prompt: (sessionId, text) => manager.prompt(sessionId, text),
     cancel: sessionId => manager.cancel(sessionId),
     closeSession: sessionId => manager.closeSession(sessionId),

@@ -1,0 +1,515 @@
+// @vitest-environment jsdom
+// T3: the delegation-defaults section of the subagent card — the default-agent
+// picker and the per-agent model/effort/mode defaults. Covers option rendering
+// (default / configured / catalog values), client-derived stale + deleted marks
+// (kept, never auto-cleared), the unread-vs-read-but-absent staleness split,
+// override facts + reset visibility, the write payloads (set / {} all-default /
+// null delete / reset keys), failure revert, the memory-only catalog read + the
+// explicit fetch gesture, and the hand-copies pinned to the host
+// (displayDelegateLabel title strip, thoughtOptionForModel read rule).
+import { createElement } from 'react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { afterEach, describe, expect, it } from 'vitest'
+import { AcpSettingsSection } from '../../src/client/panel.tsx'
+import { thoughtOptionForModel } from '../../src/client/panel/subagent-defaults.tsx'
+import { AcpStore, type RpcCall } from '../../src/client/store.ts'
+import { displayDelegateLabel as browserDisplayDelegateLabel, subagentPanelRows } from '../../src/client/subagent-panel.tsx'
+import { ModelCatalogService, type CatalogHost } from '../../src/bridge/catalog-service.ts'
+import { EventHub } from '../../src/impl.ts'
+import { delegateLabel, displayDelegateLabel as hostDisplayDelegateLabel } from '../../src/impl/delegate-label.ts'
+import type { AcpAgentCatalog, AcpAgentDef, AcpCatalogOption, AcpDelegateSettings, AgentProbeModelsResult, DelegateSetPayload, SubagentRecord } from '../../src/protocol.ts'
+import { createPanelFixture, type PanelRpcCall } from '../panel-fixture.ts'
+import { category, click, mountPanel } from './harness.ts'
+
+afterEach(cleanup)
+
+const BASE: AcpDelegateSettings = {
+  guidance: 'on', timeoutMs: 2_400_000, defaultTimeoutMs: 2_400_000,
+  toolAvailable: true, restrictAvailable: true,
+}
+
+function writes(calls: PanelRpcCall[], endpoint: string): unknown[] {
+  return calls.filter(call => call.endpoint === endpoint).map(call => call.payload)
+}
+
+/** Mount the settings section with a delegate view the wrapper keeps authoritative. */
+async function mountDefaults(seed: AcpDelegateSettings, options: { failWrite?: boolean; catalogs?: Record<string, AgentProbeModelsResult | null> } = {}) {
+  const base = createPanelFixture(options.catalogs === undefined ? {} : { catalogs: options.catalogs })
+  let current = structuredClone(seed)
+  const calls: PanelRpcCall[] = []
+  const rpc: RpcCall = async (channel, endpoint, payload) => {
+    calls.push({ channel, endpoint, payload: structuredClone(payload) })
+    if (channel === '/acp' && endpoint === 'ui/delegate') return { ok: true, value: { delegate: structuredClone(current) } }
+    if (channel === '/acp' && endpoint === 'ui/delegate-set') {
+      if (options.failWrite === true) return { ok: false, error: { code: 'bad_payload', message: 'no' } }
+      const patch = structuredClone(payload) as DelegateSetPayload
+      const next: AcpDelegateSettings = { ...current }
+      if (patch.guidance !== undefined) next.guidance = patch.guidance
+      if (patch.timeoutMs !== undefined) next.timeoutMs = patch.timeoutMs
+      if (patch.defaultAgent !== undefined) next.defaultAgent = patch.defaultAgent
+      if (patch.agentDefaults !== undefined) {
+        const merged = { ...(current.agentDefaults ?? {}) }
+        for (const [id, entry] of Object.entries(patch.agentDefaults)) {
+          if (entry === null) delete merged[id]
+          else merged[id] = entry
+        }
+        next.agentDefaults = merged
+      }
+      for (const key of patch.reset ?? []) {
+        if (key === 'defaultAgent') next.defaultAgent = current.configured?.defaultAgent
+        if (key === 'agentDefaults') next.agentDefaults = current.configured?.agentDefaults ?? {}
+        if (key === 'guidance') next.guidance = current.configured?.guidance ?? 'off'
+        if (key === 'timeoutMs') next.timeoutMs = current.configured?.timeoutMs ?? current.defaultTimeoutMs ?? next.timeoutMs
+      }
+      // Host view hygiene (delegateSettingsView): an empty map is NO key.
+      if (next.agentDefaults !== undefined && Object.keys(next.agentDefaults).length === 0) delete next.agentDefaults
+      next.resolvedDefaultAgent = next.defaultAgent ?? next.globalDefaultAgent
+      current = next
+      return { ok: true, value: { delegate: structuredClone(current) } }
+    }
+    return base.rpc(channel, endpoint, payload)
+  }
+  const store = new AcpStore(rpc, zh => zh)
+  await store.resync()
+  render(createElement(AcpSettingsSection, { acp: store }))
+  return { store, calls }
+}
+
+/** The default-agent picker (its aria-label is the visible row title). */
+function defaultAgentSelect(): HTMLSelectElement {
+  return screen.getByRole('combobox', { name: '默认智能体' }) as HTMLSelectElement
+}
+function axisSelect(axis: '模型' | '思考等级' | '模式', title: string): HTMLSelectElement {
+  return screen.getByRole('combobox', { name: `${axis} · ${title}` }) as HTMLSelectElement
+}
+function optionValues(select: HTMLSelectElement): string[] {
+  return Array.from(select.options).map(option => option.value)
+}
+
+describe('SubagentDefaults — default agent', () => {
+  it('offers 默认（当前：X） plus every configured agent, and selects 默认 when no override', async () => {
+    await mountDefaults({ ...BASE, globalDefaultAgent: 'codebuddy', resolvedDefaultAgent: 'codebuddy' })
+    await category('子代理')
+    const select = defaultAgentSelect()
+    expect(select.value).toBe('')
+    expect(optionValues(select)).toEqual(['', 'codebuddy', 'pi'])
+    expect(screen.getByRole('option', { name: '默认（当前：codebuddy）' })).toBeDefined()
+    expect(screen.getByRole('option', { name: 'CodeBuddy' })).toBeDefined()
+    expect(screen.getByRole('option', { name: 'pi' })).toBeDefined()
+  })
+
+  it('says 默认（未设置） when neither a resolved nor a global default exists', async () => {
+    await mountDefaults({ ...BASE })
+    await category('子代理')
+    expect(screen.getByRole('option', { name: '默认（未设置）' })).toBeDefined()
+  })
+
+  it('names the visible「设为默认智能体」control and says 智能体 without Agent drift', async () => {
+    await mountDefaults({ ...BASE, globalDefaultAgent: 'codebuddy', resolvedDefaultAgent: 'codebuddy' })
+    await category('子代理')
+    // The copy names the ModelCatalogBlock button verbatim (constraint 33).
+    expect(screen.getByText('委派未指明智能体时使用；「默认」跟随「设为默认智能体」的选择。')).toBeDefined()
+    // One such row per configured agent, all in the same terminology.
+    expect(screen.getAllByText('委派该智能体时的默认选择；「默认」跟随智能体进程自身。')).toHaveLength(2)
+    const section = screen.getByText('委派默认').closest('.dwa-section-heading')?.parentElement
+    expect(section?.textContent ?? '').not.toContain('Agent')
+  })
+
+  it('picking an agent writes {defaultAgent:id} immediately', async () => {
+    const { store, calls } = await mountDefaults({ ...BASE, globalDefaultAgent: 'codebuddy', resolvedDefaultAgent: 'codebuddy' })
+    await category('子代理')
+    fireEvent.change(defaultAgentSelect(), { target: { value: 'pi' } })
+    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ defaultAgent: 'pi' }]))
+    expect(store.getSnapshot().delegate?.defaultAgent).toBe('pi')
+    expect(writes(calls, 'agent/save')).toEqual([])
+  })
+
+  it('picking 默认 writes reset:[defaultAgent]', async () => {
+    const { calls } = await mountDefaults({ ...BASE, defaultAgent: 'pi', resolvedDefaultAgent: 'pi', globalDefaultAgent: 'codebuddy' })
+    await category('子代理')
+    expect(defaultAgentSelect().value).toBe('pi')
+    fireEvent.change(defaultAgentSelect(), { target: { value: '' } })
+    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ reset: ['defaultAgent'] }]))
+  })
+
+  it('keeps a deleted default agent as a warning-colored selected option, never clears it', async () => {
+    const { store } = await mountDefaults({ ...BASE, defaultAgent: 'ghost', resolvedDefaultAgent: 'ghost', globalDefaultAgent: 'codebuddy' })
+    await category('子代理')
+    const select = defaultAgentSelect()
+    expect(select.value).toBe('ghost')
+    const option = screen.getByRole('option', { name: 'ghost（已删除）' }) as HTMLOptionElement
+    expect(option.value).toBe('ghost')
+    expect(option.getAttribute('style')).toContain('--dsw-alias-state-warn-primary')
+    expect(store.getSnapshot().delegate?.defaultAgent).toBe('ghost')
+  })
+
+  it('shows the config-file fact and a reset only when the default really overrides it', async () => {
+    const { calls } = await mountDefaults({ ...BASE, defaultAgent: 'pi', resolvedDefaultAgent: 'pi', globalDefaultAgent: 'codebuddy', configured: { defaultAgent: 'codebuddy' } })
+    await category('子代理')
+    const note = screen.getByText(/配置文件要求：codebuddy/)
+    expect(note.className).toContain('dwa-deadline-flag')
+    await click(screen.getByRole('button', { name: '恢复配置文件的值' }))
+    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ reset: ['defaultAgent'] }]))
+  })
+
+  it('no override fact and no reset when the effective default matches the config', async () => {
+    await mountDefaults({ ...BASE, defaultAgent: 'codebuddy', resolvedDefaultAgent: 'codebuddy', configured: { defaultAgent: 'codebuddy' } })
+    await category('子代理')
+    expect(screen.queryByText(/配置文件要求/)).toBeNull()
+    expect(screen.queryByRole('button', { name: '恢复配置文件的值' })).toBeNull()
+  })
+})
+
+describe('SubagentDefaults — per-agent axes', () => {
+  it('renders model/effort/mode selects from the memory-only catalog', async () => {
+    const { calls } = await mountDefaults({ ...BASE })
+    await category('子代理')
+    const model = axisSelect('模型', 'CodeBuddy')
+    await waitFor(() => expect(optionValues(model)).toContain('deepseek-v3'))
+    expect(optionValues(model)).toEqual(['', 'deepseek-v3', 'claude-sonnet-4'])
+    // codebuddy's agent-level thought slot describes its current model.
+    expect(optionValues(axisSelect('思考等级', 'CodeBuddy'))).toEqual(['', 'medium', 'high'])
+    // No mode option published → only 默认.
+    expect(optionValues(axisSelect('模式', 'CodeBuddy'))).toEqual([''])
+    // The catalog read is the memory-only route, never a probe on mount.
+    expect(screen.queryByRole('button', { name: '获取目录' })).toBeNull()
+    expect(writes(calls, 'agent/cached-models').length).toBeGreaterThan(0)
+    expect(writes(calls, 'agent/probe-models')).toEqual([])
+  })
+
+  it('setting a model writes the whole entry with that axis', async () => {
+    const { store, calls } = await mountDefaults({ ...BASE })
+    await category('子代理')
+    const model = axisSelect('模型', 'CodeBuddy')
+    await waitFor(() => expect(optionValues(model)).toContain('claude-sonnet-4'))
+    fireEvent.change(model, { target: { value: 'claude-sonnet-4' } })
+    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ agentDefaults: { codebuddy: { model: 'claude-sonnet-4' } } }]))
+    expect(store.getSnapshot().delegate?.agentDefaults?.codebuddy).toEqual({ model: 'claude-sonnet-4' })
+  })
+
+  it('clearing the last axis stores an {} all-default override (shadows the baseline)', async () => {
+    const { calls } = await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3' } } })
+    await category('子代理')
+    const model = axisSelect('模型', 'CodeBuddy')
+    await waitFor(() => expect(model.value).toBe('deepseek-v3'))
+    fireEvent.change(model, { target: { value: '' } })
+    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ agentDefaults: { codebuddy: {} } }]))
+  })
+
+  it('keeps the other axes when one changes', async () => {
+    const { calls } = await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3', mode: 'ask' } } })
+    await category('子代理')
+    const effort = axisSelect('思考等级', 'CodeBuddy')
+    await waitFor(() => expect(optionValues(effort)).toContain('high'))
+    fireEvent.change(effort, { target: { value: 'high' } })
+    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ agentDefaults: { codebuddy: { model: 'deepseek-v3', mode: 'ask', effort: 'high' } } }]))
+  })
+
+  it('marks a stale model and mode as warning-colored kept options, never auto-clears', async () => {
+    const catalog: AgentProbeModelsResult = {
+      agentId: 'codebuddy', updatedAt: 1,
+      catalog: {
+        model: { configId: 'model', name: 'Model', currentValue: 'm1', choices: [{ value: 'm1', name: 'M1' }, { value: 'm2', name: 'M2' }] },
+        mode: { configId: 'mode', name: 'Mode', currentValue: 'o1', choices: [{ value: 'o1', name: 'O1' }, { value: 'o2', name: 'O2' }] },
+      },
+    }
+    const { store } = await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'gone', mode: 'lost' } } }, { catalogs: { codebuddy: catalog } })
+    await category('子代理')
+    const model = axisSelect('模型', 'CodeBuddy')
+    await waitFor(() => expect(optionValues(model)).toContain('gone'))
+    for (const [axis, value] of [['模型', 'gone'], ['模式', 'lost']] as const) {
+      const select = axisSelect(axis, 'CodeBuddy')
+      expect(select.value).toBe(value)
+      const option = within(select).getByRole('option', { name: `${value}（已失效）` }) as HTMLOptionElement
+      expect(option.getAttribute('style')).toContain('--dsw-alias-state-warn-primary')
+    }
+    expect(store.getSnapshot().delegate?.agentDefaults?.codebuddy).toEqual({ model: 'gone', mode: 'lost' })
+  })
+
+  it('marks a stale effort against the selected model’s known levels', async () => {
+    const catalog: AgentProbeModelsResult = {
+      agentId: 'codebuddy', updatedAt: 1,
+      catalog: {
+        model: { configId: 'model', name: 'Model', currentValue: 'm1', choices: [{ value: 'm1', name: 'M1' }] },
+        thought: { configId: 'thought_level', name: 'Thinking', currentValue: 'e1', choices: [{ value: 'e1', name: 'E1' }, { value: 'e2', name: 'E2' }] },
+      },
+    }
+    const { store } = await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'm1', effort: 'nope' } } }, { catalogs: { codebuddy: catalog } })
+    await category('子代理')
+    const effort = axisSelect('思考等级', 'CodeBuddy')
+    await waitFor(() => expect(optionValues(effort)).toContain('nope'))
+    expect(effort.value).toBe('nope')
+    const option = within(effort).getByRole('option', { name: 'nope（已失效）' }) as HTMLOptionElement
+    expect(option.getAttribute('style')).toContain('--dsw-alias-state-warn-primary')
+    expect(store.getSnapshot().delegate?.agentDefaults?.codebuddy).toEqual({ model: 'm1', effort: 'nope' })
+  })
+
+  it('keeps a persisted value plain (not stale) while its catalog axis is unread', async () => {
+    // pi publishes no thought slot and no mode: with no evidence of staleness the
+    // kept values stay plain, and the missing catalog offers the fetch gesture.
+    const { store } = await mountDefaults({ ...BASE, agentDefaults: { pi: { effort: 'x', mode: 'y' } } }, { catalogs: { pi: null } })
+    await category('子代理')
+    const effort = axisSelect('思考等级', 'pi')
+    await waitFor(() => expect(optionValues(effort)).toContain('x'))
+    expect(within(effort).getByRole('option', { name: 'x' })).toBeDefined()
+    expect(within(effort).queryByRole('option', { name: 'x（已失效）' })).toBeNull()
+    const mode = axisSelect('模式', 'pi')
+    expect(within(mode).getByRole('option', { name: 'y' })).toBeDefined()
+    expect(within(mode).queryByRole('option', { name: 'y（已失效）' })).toBeNull()
+    const block = effort.closest('.dwa-preference-block') as HTMLElement
+    expect(within(block).getByRole('button', { name: '获取目录' })).toBeDefined()
+    expect(store.getSnapshot().delegate?.agentDefaults?.pi).toEqual({ effort: 'x', mode: 'y' })
+  })
+
+  it('marks kept model/mode values stale when the catalog is read but the axes are absent', async () => {
+    // The catalog WAS read (an entry exists) but publishes no model/mode slot:
+    // that is evidence the kept values no longer exist — warning-colored and
+    // kept, with no fetch gesture (there is nothing left to fetch).
+    const catalog: AgentProbeModelsResult = { agentId: 'codebuddy', updatedAt: 1, catalog: {} }
+    const { store } = await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'gone', mode: 'lost' } } }, { catalogs: { codebuddy: catalog } })
+    await category('子代理')
+    const model = axisSelect('模型', 'CodeBuddy')
+    await waitFor(() => expect(optionValues(model)).toContain('gone'))
+    for (const [axis, value] of [['模型', 'gone'], ['模式', 'lost']] as const) {
+      const select = axisSelect(axis, 'CodeBuddy')
+      expect(select.value).toBe(value)
+      const option = within(select).getByRole('option', { name: `${value}（已失效）` }) as HTMLOptionElement
+      expect(option.getAttribute('style')).toContain('--dsw-alias-state-warn-primary')
+    }
+    const block = model.closest('.dwa-preference-block') as HTMLElement
+    expect(within(block).queryByRole('button', { name: '获取目录' })).toBeNull()
+    expect(store.getSnapshot().delegate?.agentDefaults?.codebuddy).toEqual({ model: 'gone', mode: 'lost' })
+  })
+
+  it('marks a kept effort stale when the selected model was observed without the axis (null)', async () => {
+    // The effort axis already separates the two states via the per-model null:
+    // read-but-absent levels mark the kept value, exactly like model/mode do.
+    const catalog: AgentProbeModelsResult = {
+      agentId: 'codebuddy', updatedAt: 1,
+      catalog: {
+        model: { configId: 'model', name: 'Model', currentValue: 'm1', choices: [{ value: 'm1', name: 'M1' }] },
+        thoughtByModel: { m1: null },
+      },
+    }
+    const { store } = await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'm1', effort: 'x' } } }, { catalogs: { codebuddy: catalog } })
+    await category('子代理')
+    const effort = axisSelect('思考等级', 'CodeBuddy')
+    await waitFor(() => expect(optionValues(effort)).toContain('x'))
+    expect(effort.value).toBe('x')
+    const option = within(effort).getByRole('option', { name: 'x（已失效）' }) as HTMLOptionElement
+    expect(option.getAttribute('style')).toContain('--dsw-alias-state-warn-primary')
+    expect(store.getSnapshot().delegate?.agentDefaults?.codebuddy).toEqual({ model: 'm1', effort: 'x' })
+  })
+
+  it('effort options follow the selected model via thoughtByModel', async () => {
+    const catalog: AgentProbeModelsResult = {
+      agentId: 'codebuddy', updatedAt: 1,
+      catalog: {
+        model: { configId: 'model', name: 'Model', currentValue: 'm-a', choices: [{ value: 'm-a', name: 'Model A' }, { value: 'm-b', name: 'Model B' }] },
+        thought: { configId: 'thought_level', name: 'Thinking', currentValue: 'low', choices: [{ value: 'low', name: 'Low' }] },
+        thoughtByModel: {
+          'm-a': { configId: 'thought_level', name: 'Thinking', currentValue: 'low', choices: [{ value: 'low', name: 'Low' }] },
+          'm-b': { configId: 'thought_level', name: 'Thinking', currentValue: 'high', choices: [{ value: 'high', name: 'High' }, { value: 'max', name: 'Max' }] },
+        },
+      },
+    }
+    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: catalog } })
+    await category('子代理')
+    const effort = axisSelect('思考等级', 'CodeBuddy')
+    const block = axisSelect('模型', 'CodeBuddy').closest('.dwa-preference-block') as HTMLElement
+    // model=默认 → the catalog current model (m-a) levels.
+    await waitFor(() => expect(optionValues(effort)).toEqual(['', 'low']))
+    expect(within(block).getByText('等级作用于运行时实际模型，不支持会自动丢弃。')).toBeDefined()
+    // Pick m-b → its own levels, and the model=默认 hint goes away on this row.
+    fireEvent.change(axisSelect('模型', 'CodeBuddy'), { target: { value: 'm-b' } })
+    await waitFor(() => expect(optionValues(axisSelect('思考等级', 'CodeBuddy'))).toEqual(['', 'high', 'max']))
+    expect(within(block).queryByText('等级作用于运行时实际模型，不支持会自动丢弃。')).toBeNull()
+  })
+
+  it('shows the per-agent config-file fact and a reset that deletes the override entry', async () => {
+    const { calls } = await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'claude-sonnet-4' } }, configured: { agentDefaults: { codebuddy: { model: 'deepseek-v3' } } } })
+    await category('子代理')
+    await waitFor(() => expect(optionValues(axisSelect('模型', 'CodeBuddy'))).toContain('claude-sonnet-4'))
+    expect(screen.getByText(/配置文件要求：模型 deepseek-v3/).className).toContain('dwa-deadline-flag')
+    await click(screen.getByRole('button', { name: '恢复配置文件的值' }))
+    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ agentDefaults: { codebuddy: null } }]))
+  })
+
+  it('no per-agent reset when the entry matches the config baseline', async () => {
+    await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3' } }, configured: { agentDefaults: { codebuddy: { model: 'deepseek-v3' } } } })
+    await category('子代理')
+    await waitFor(() => expect(optionValues(axisSelect('模型', 'CodeBuddy'))).toContain('deepseek-v3'))
+    expect(screen.queryByText(/配置文件要求/)).toBeNull()
+    expect(screen.queryByRole('button', { name: '恢复配置文件的值' })).toBeNull()
+  })
+
+  it('offers 获取目录 only when the catalog is missing, and probes on click', async () => {
+    const { calls } = await mountDefaults({ ...BASE }, { catalogs: { codebuddy: null } })
+    await category('子代理')
+    const button = await screen.findByRole('button', { name: '获取目录' })
+    await click(button)
+    await waitFor(() => expect(writes(calls, 'agent/probe-models')).toEqual([{ agentId: 'codebuddy' }]))
+  })
+
+  it('reverts the whole delegate view when a defaults write is refused', async () => {
+    const seed: AcpDelegateSettings = { ...BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3' } } }
+    const { store } = await mountDefaults(seed, { failWrite: true })
+    await category('子代理')
+    const model = axisSelect('模型', 'CodeBuddy')
+    await waitFor(() => expect(model.value).toBe('deepseek-v3'))
+    fireEvent.change(model, { target: { value: 'claude-sonnet-4' } })
+    await waitFor(() => expect(store.getSnapshot().notice).toBe('no'))
+    expect(store.getSnapshot().delegate?.agentDefaults).toEqual({ codebuddy: { model: 'deepseek-v3' } })
+    expect(model.value).toBe('deepseek-v3')
+  })
+})
+
+describe('SubagentDefaults — gating', () => {
+  it('renders nothing on a host without the delegate RPC', async () => {
+    await mountPanel()
+    expect(screen.queryByRole('combobox', { name: '默认智能体' })).toBeNull()
+    expect(screen.queryByText('委派默认')).toBeNull()
+  })
+})
+
+describe('displayDelegateLabel — title strips the routing carrier', () => {
+  it('the browser hand-copy matches the host for legal and malformed carriers', () => {
+    const samples = [
+      delegateLabel('codebuddy', 'do it'),
+      delegateLabel('codebuddy', 'do it', { model: 'gpt-5', effort: 'high', mode: 'ask' }),
+      delegateLabel('a1.b-c_d', '中文任务: 带冒号', { model: 'm/a b', effort: '低', mode: 'o&x' }),
+      delegateLabel('pi', '🚀 launch', { mode: 'plan' }),
+      'codebuddy: plain no carrier',
+      'no separator here',
+      '',
+      'codebuddy ⟦m=x⟧ extra: task',          // malformed: text after carrier
+      'codebuddy: ⟦m=fake⟧ task',             // carrier in the task, not the prefix
+      'codebuddy ⟦m=x&e=y&o=z&m=w⟧: task',    // duplicate key
+      'codebuddy ⟦e=y&m=x⟧: task',            // out-of-order keys
+      'codebuddy ⟦m=%ZZ⟧: task',              // bad encoding
+      'BAD ID ⟦m=x⟧: task',                   // illegal agent id
+    ]
+    for (const label of samples) {
+      expect(browserDisplayDelegateLabel(label), label).toBe(hostDisplayDelegateLabel(label))
+    }
+  })
+
+  it('subagentPanelRows shows the label without the carrier (projection and record rows)', () => {
+    const label = delegateLabel('codebuddy', 'do it', { model: 'gpt-5', effort: 'high', mode: 'ask' })
+    const projectionRows = [{ id: 'acp:t1', createdAt: 10, label }]
+    const rows = subagentPanelRows(projectionRows, [])
+    expect(rows[0].title).toBe('codebuddy: do it')
+
+    const record: SubagentRecord = {
+      childId: 'acp:t2', dshSessionId: 'chat-1', toolCallId: 't2', label,
+      status: 'completed', startedAt: 1, lastActivityAt: 2, endedAt: 3,
+      counts: { updates: 1, toolCalls: 0, textChars: 0 },
+    }
+    const recordRows = subagentPanelRows([], [record])
+    expect(recordRows[0].title).toBe('codebuddy: do it')
+  })
+})
+
+describe('thoughtOptionForModel — equivalence with the host read rule', () => {
+  // The browser hand-copy must make the SAME decision as the host's
+  // `ModelCatalogService.modelReasoning` on the same catalog + model value.
+  // The host answers with reasoning info while the browser keeps the raw
+  // option, so an option answer is compared against the host's OWN projection
+  // of that option (a catalog whose thought slot IS the option, asked with no
+  // model runs exactly `reasoningFromOption(thought) ?? null`) — never against
+  // a second hand-copy of either rule.
+  const agent: AcpAgentDef = { id: 'mock', title: 'Mock', command: process.execPath, args: [] }
+  function hostFor(): CatalogHost {
+    return {
+      defOf: id => (id === agent.id ? agent : undefined),
+      isAgentDeleted: () => false,
+      bridgeForProbe: () => ({ probeConfigOptions: async () => undefined }),
+      releaseProbe: () => {},
+      liveForkCapability: () => undefined,
+      patchDef: () => {},
+      persistAgents: () => {},
+      hub: new EventHub(),
+    }
+  }
+  function seed(service: ModelCatalogService, catalog: AcpAgentCatalog | undefined): void {
+    // The same private-map seam tests/bridge/chat-picks.spec.ts uses: the read
+    // rule runs on the EXACT catalog shape, with no parser in between.
+    const internal = service as unknown as { catalogs: Map<string, { catalog: AcpAgentCatalog; updatedAt: number }> }
+    if (catalog === undefined) internal.catalogs.delete(agent.id)
+    else internal.catalogs.set(agent.id, { catalog, updatedAt: 0 })
+  }
+  const service = new ModelCatalogService(hostFor())
+
+  const levelsA: AcpCatalogOption = {
+    configId: 'effort', name: 'Effort', currentValue: 'high',
+    choices: [{ value: 'off', name: 'Off' }, { value: 'high', name: 'High', description: 'deeper' }],
+  }
+  const levelsB: AcpCatalogOption = { configId: 'effort', name: 'Effort', currentValue: 'max', choices: [{ value: 'max', name: 'Max' }] }
+  const toggle: AcpCatalogOption = { configId: 'effort', name: 'Effort', kind: 'boolean', currentValue: 'true', choices: [] }
+  const duplicated: AcpCatalogOption = {
+    configId: 'effort', name: 'Effort', currentValue: 'high',
+    choices: [{ value: 'high', name: 'High' }, { value: 'high', name: 'High again' }, { value: 'low', name: 'Low' }],
+  }
+  const modelSlot = (current: string | null): AcpCatalogOption => ({
+    configId: 'model', name: 'Model', currentValue: current,
+    choices: [{ value: 'm-a', name: 'A' }, { value: 'm-b', name: 'B' }],
+  })
+
+  function expectEquivalent(catalog: AcpAgentCatalog | undefined, modelValue: string | undefined, why: string): void {
+    seed(service, catalog)
+    const host = service.modelReasoning(agent.id, modelValue)
+    const browser = thoughtOptionForModel(catalog, modelValue)
+    if (browser === undefined) { expect(host, why).toBeUndefined(); return }
+    if (browser === null) { expect(host, why).toBeNull(); return }
+    const projector = new ModelCatalogService(hostFor())
+    seed(projector, { thought: browser })
+    expect(host, why).toEqual(projector.modelReasoning(agent.id))
+  }
+
+  it('matches the host decision across per-model, empty, legacy, absent and prototype-key samples', () => {
+    const legacy = { model: modelSlot('m-a'), thought: levelsA }
+    const mapped = { model: modelSlot('m-a'), thought: levelsA, thoughtByModel: { 'm-a': levelsA, 'm-b': null } }
+    const samples: Array<[AcpAgentCatalog | undefined, string | undefined, string]> = [
+      // Unread catalog: no evidence either way.
+      [undefined, undefined, 'unread catalog, no model picked'],
+      [undefined, 'm-a', 'unread catalog, model named'],
+      // Read but nothing published.
+      [{}, undefined, 'read empty catalog, no model picked'],
+      [{}, 'm-a', 'read empty catalog, model absent'],
+      // Legacy catalog (no per-model map): the named model keeps the slot.
+      [legacy, undefined, 'legacy, no pick describes the current model'],
+      [legacy, 'm-a', 'legacy, current model named'],
+      [legacy, 'm-b', 'legacy, another model is unknown'],
+      [legacy, '', 'legacy, empty pick falls back to the current model'],
+      [{ model: modelSlot('m-a') }, 'm-a', 'legacy without a thought slot stays unknown'],
+      [{ model: modelSlot('m-a') }, undefined, 'no thought slot, no pick'],
+      [{ thought: levelsA }, undefined, 'thought slot without a model slot, no pick'],
+      [{ thought: levelsA }, 'm-a', 'thought slot alone describes no named model'],
+      // Per-model records.
+      [mapped, 'm-a', 'per-model levels present'],
+      [mapped, 'm-b', 'per-model null = observed without the axis'],
+      [mapped, undefined, 'no pick describes the current model’s record'],
+      [mapped, 'm-c', 'model absent from the map'],
+      [{ model: modelSlot('m-a'), thought: levelsA, thoughtByModel: { 'm-b': levelsB } }, 'm-a', 'map present but the current model unrecorded falls back to the legacy slot'],
+      [{ model: modelSlot('m-a'), thought: levelsA, thoughtByModel: { 'm-b': levelsB } }, 'm-b', 'recorded model other than the current one'],
+      [{ model: modelSlot('m-a'), thoughtByModel: { 'm-a': levelsA } }, 'm-a', 'map without an agent-level thought slot'],
+      [{ thoughtByModel: { 'm-a': levelsA } }, 'm-a', 'map without a model slot, model named'],
+      [{ thoughtByModel: { 'm-a': levelsA } }, undefined, 'map without a model slot, no pick'],
+      // Empty choices (a boolean toggle publishes no levels).
+      [{ model: modelSlot('m-a'), thoughtByModel: { 'm-a': toggle } }, 'm-a', 'per-model empty choices'],
+      [{ thought: toggle }, undefined, 'agent-level empty choices'],
+      // Projection details: duplicate values dedupe, descriptions ride along.
+      [{ model: modelSlot('m-a'), thoughtByModel: { 'm-a': duplicated } }, 'm-a', 'duplicate choice values and descriptions'],
+      // hasOwnProperty boundaries: prototype names are not records…
+      [{ model: modelSlot('m-a'), thoughtByModel: { toString: levelsB } }, 'toString', 'own prototype-named key is a real record'],
+      [{ model: modelSlot('m-a'), thoughtByModel: {} }, 'toString', 'empty map must not read Object.prototype.toString'],
+      [{ model: modelSlot('m-a'), thoughtByModel: {} }, 'constructor', 'empty map must not read Object.prototype.constructor'],
+      [{ model: modelSlot('m-a'), thoughtByModel: {} }, 'hasOwnProperty', 'empty map must not read Object.prototype.hasOwnProperty'],
+      [{ model: modelSlot('m-a'), thoughtByModel: Object.create({ 'm-x': levelsB }) as Record<string, AcpCatalogOption | null> }, 'm-x', 'inherited entry is not an own record'],
+      [{ model: modelSlot('m-a'), thoughtByModel: { 'm-a': undefined } as unknown as Record<string, AcpCatalogOption | null> }, 'm-a', 'own undefined value reads as observed-without-axis'],
+      // currentValue null names no model.
+      [{ model: modelSlot(null), thought: levelsA }, undefined, 'null current model falls back to the agent-level slot'],
+    ]
+    for (const [catalog, modelValue, why] of samples) expectEquivalent(catalog, modelValue, why)
+  })
+})

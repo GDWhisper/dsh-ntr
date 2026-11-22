@@ -16,6 +16,7 @@ import {
   splitAdapterModelId,
 } from '../impl.ts'
 import type {
+  DelegateLiveOptions,
   PendingPermissionView,
   RosterPresetRow,
 } from '../impl.ts'
@@ -23,7 +24,7 @@ import type {
   AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSaveResult, AgentSkillsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions,
   LlmResolvedModelInfo,
   AcpIdleRelease, ActiveTurnView, ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, SaveGateFlushResult, SaveGateStatus, SessionView, StreamChunk,
-  AcpDelegateConfig, AcpDelegatePolicy, AcpDelegateSettings, AcpStartSessionOpts, DelegateGuidance, DelegateSetPayload,
+  AcpDelegateAgentDefaults, AcpDelegateConfig, AcpDelegatePolicy, AcpDelegateSettings, AcpStartSessionOpts, DelegateGuidance, DelegateSetPayload,
   SubagentDetailResult, SubagentRecord,
 } from '../protocol.ts'
 import { SESSION_TITLE_PREFIX } from '../protocol.ts'
@@ -1183,7 +1184,9 @@ export class BridgeManager {
 
   setConfiguredDelegate(config: AcpDelegateConfig | undefined): void { this.settings.setConfiguredDelegate(config) }
 
-  delegateConfig(): { guidance: DelegateGuidance; timeoutMs: number } { const { guidance, timeoutMs } = this.settings.delegateSettings(); return { guidance, timeoutMs } }
+  delegateConfig(): { guidance: DelegateGuidance; timeoutMs: number; defaultAgent?: string; agentDefaults: Record<string, AcpDelegateAgentDefaults> } { const { guidance, timeoutMs, defaultAgent, agentDefaults } = this.settings.delegateSettings(); return { guidance, timeoutMs, ...(defaultAgent === undefined ? {} : { defaultAgent }), agentDefaults: agentDefaults ?? {} } }
+
+  sessionOptions(sessionId: string): DelegateLiveOptions | undefined { const session = this.bridgeRegistry.tryLocate(sessionId)?.session; return session === undefined ? undefined : { configOptions: session.configOptions, ...(session.modes === undefined ? {} : { modes: { availableModes: session.modes.availableModes ?? [] } }) } }
 
   setPermissionPolicy(sessionId: string, policy: AcpDelegatePolicy): void { this.rpc.setPermissionPolicy(sessionId, policy) }
 

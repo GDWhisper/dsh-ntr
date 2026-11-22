@@ -55,6 +55,50 @@ const MENU_VIEWPORT_MARGIN = 16
 /** Widest the dropdown grows; the same cap the host's catalog popover uses. */
 const MENU_MAX_WIDTH = 336
 
+// ---- Hand-copied from src/impl/delegate-label.ts (displayDelegateLabel) ----
+// The browser half must not pull host-plane modules into the bundle (same deal
+// as splitAcpModelId in acp-ui.tsx), so the carrier-strip is duplicated here and
+// pinned to the host by an equivalence test. A delegation label can carry the
+// explicit model/effort/mode picks in a `⟦m=…&e=…&o=…⟧` carrier; the panel's
+// title shows the label WITHOUT that routing carrier. Display fails open: a
+// malformed (or absent) carrier passes through verbatim, exactly like the host.
+const DELEGATE_AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/
+const DELEGATE_CARRIER_OPEN = '⟦'
+const DELEGATE_CARRIER_CLOSE = '⟧'
+/** Strict carrier parse: only a fully legal prefix yields an agent id. */
+function parseDelegateCarrierPrefix(prefix: string): { agentId: string } | undefined {
+  const open = prefix.indexOf(DELEGATE_CARRIER_OPEN)
+  if (open <= 0 || prefix.indexOf(DELEGATE_CARRIER_OPEN, open + 1) !== -1) return undefined
+  if (prefix[open - 1] !== ' ') return undefined
+  if (!prefix.endsWith(DELEGATE_CARRIER_CLOSE) || prefix.indexOf(DELEGATE_CARRIER_CLOSE) !== prefix.length - 1) return undefined
+  const agentId = prefix.slice(0, open - 1)
+  if (!DELEGATE_AGENT_ID_PATTERN.test(agentId)) return undefined
+  const payload = prefix.slice(open + 1, prefix.length - 1)
+  if (payload === '') return undefined
+  let lastKey = -1
+  for (const segment of payload.split('&')) {
+    if (segment.length < 3 || segment[1] !== '=') return undefined
+    const key = segment[0] === 'm' ? 0 : segment[0] === 'e' ? 1 : segment[0] === 'o' ? 2 : -1
+    if (key === -1 || key <= lastKey) return undefined
+    lastKey = key
+    const encoded = segment.slice(2)
+    let decoded: string
+    try { decoded = decodeURIComponent(encoded) } catch { return undefined }
+    if (encodeURIComponent(decoded) !== encoded) return undefined
+  }
+  return { agentId }
+}
+/** The label as the panel shows it: a strictly legal carrier is stripped. */
+export function displayDelegateLabel(label: string): string {
+  const separator = label.indexOf(': ')
+  if (separator <= 0) return label
+  const prefix = label.slice(0, separator)
+  if (!prefix.includes(DELEGATE_CARRIER_OPEN)) return label
+  const parsed = parseDelegateCarrierPrefix(prefix)
+  if (parsed === undefined) return label
+  return `${parsed.agentId}: ${label.slice(separator + 2)}`
+}
+
 /** The host's `useSessions` selector hook, narrowed to what this panel calls. */
 type SessionsHook = (selector: (state: unknown) => unknown) => unknown
 
@@ -176,10 +220,11 @@ export function subagentPanelRows(
     seen.add(entry.id)
     const record = byChild.get(entry.id)
     // The projection label wins when it says something; an empty one falls
-    // back to the record's own fallback label.
-    const label = entry.label !== undefined && entry.label.trim() !== ''
+    // back to the record's own fallback label. Either way the routing carrier
+    // is stripped for display (the picks are not part of the worker's name).
+    const label = displayDelegateLabel(entry.label !== undefined && entry.label.trim() !== ''
       ? entry.label
-      : record?.label ?? ''
+      : record?.label ?? '')
     rows.push({
       childId: entry.id,
       title: subagentTitle({ type: record?.type, label, childId: entry.id }),
@@ -197,7 +242,7 @@ export function subagentPanelRows(
     if (seen.has(record.childId)) continue
     rows.push({
       childId: record.childId,
-      title: subagentTitle(record),
+      title: subagentTitle({ type: record.type, label: displayDelegateLabel(record.label), childId: record.childId }),
       status: record.status,
       startedAt: record.startedAt,
       ...(record.endedAt === undefined ? {} : { endedAt: record.endedAt }),

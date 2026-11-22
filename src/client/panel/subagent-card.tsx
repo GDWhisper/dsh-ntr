@@ -33,6 +33,7 @@ import { DELEGATE_GUIDANCE, DELEGATE_TIMEOUT_MAX_MS, DELEGATE_TIMEOUT_MIN_MS } f
 import type { AcpDelegateSettings, DelegateGuidance, DelegateSettingKey } from '../../protocol.ts'
 import type { AcpStore, UiState } from '../store.ts'
 import { tickLeft } from './shared.ts'
+import { SubagentDefaults } from './subagent-defaults.tsx'
 
 /** The guidance rung's label — one formatter, so readout, ticks and notes agree. */
 function guidanceText(guidance: DelegateGuidance, acp: AcpStore): string {
@@ -269,6 +270,8 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
           )}
         </div>
       </div>
+      {/* Delegation-only defaults (default agent + per-agent model/effort/mode). */}
+      <SubagentDefaults acp={acp} ui={ui} />
     </section>
   )
 }
