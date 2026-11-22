@@ -10,5 +10,6 @@
 | [codebuddy-single-process-http-acp.md](./codebuddy-single-process-http-acp.md) | CodeBuddy 单进程 + 多条 HTTP ACP 连接（A2）：用 streamable-http 承载多会话，内存换复杂度 | 未决策 |
 | [agent-scoped-session-lookup.md](./agent-scoped-session-lookup.md) | 会话查找按 agent 过滤：`find` / `tryLocate` / `locateOrResume` 只按 `sessionId` 遍历，A1 放大进程数后的防御性收紧 | 未决策 |
 | [a1-close-during-resume.md](./a1-close-during-resume.md) | A1 恢复在途时关闭会话：`closeSession` 在 `session/load` 窗口内找不到 holder，返回 `unknown_session` | 未决策 |
+| [delegate-customization-followups.md](./delegate-customization-followups.md) | 四轴委派定制后续：载体显示接缝（D）/ 服务簇拆分（E）/ 写入相超时（F）/ 细节文档拆分（G） | 未决策 |
 
 状态取值只有三个：**未决策**（还没人拍板）、**待验证**（有意向，先做实验）、**已否决**（结论是不做，保留记录免得下次重新论证）。

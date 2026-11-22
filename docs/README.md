@@ -50,6 +50,9 @@
 - [方案：A1 恢复在途时关闭会话返回 `unknown_session`（暂缓）](./plan/backlog/a1-close-during-resume.md)
   - 为什么 / 怎么做：`closeSession` 先用 `tryLocate` 再 `dropReleased`，恢复在途的记录只存在于 `resuming`，两个查找都看不到；修复路径是登记 close intent，在 `sessions.set` 之前落定，验收要求恰好一条 `session/closed`
   - 状态：未决策、当前不改；启动条件见文内，索引见 [backlog](./plan/backlog/README.md)
+- [方案：四轴委派定制后续（暂缓）](./plan/backlog/delegate-customization-followups.md)
+  - 为什么 / 怎么做：四轴定制（`1fe1998`）审核登记的四项债——载体在宿主 UI 可见（依赖宿主 display 接缝）、两个服务文件逼近千行上限（触发式拆分）、选择写入相无超时（需 A/B/C 共识）、三篇细节文档超 200 行（索引预算只剩 1 格）；每项含现状符号、障碍与验收口径
+  - 状态：未决策、当前不启动；触发条件见文内，索引见 [backlog](./plan/backlog/README.md)
 - [方案：Antigravity 后台结果补发（transcript 方案）（已完成 / 已归档）](./plan/archive/antigravity-late-output.md)
   - 状态：已完成 / 已归档；细节见文内
 - [待办清单](./todo.md)
