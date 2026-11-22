@@ -605,14 +605,11 @@ export class TurnStreamController {
   /**
    * Updates the session's background drain already streamed while this turn's
    * OWN request id was still unknown. They are NOT folded on arrival: a drain
-   * tick that lands before the prompt response could otherwise teach the turn
-   * the drain's id (`noteTurnRequestId`) and mix the drain's text into the
-   * user's answer. Withheld here (cursor already advanced — the transcript
-   * keeps a copy) until the response decides what this turn is:
-   * - a normal turn (response carries a conversation id) discards them — they
-   *   were never this turn's answer;
-   * - a steered turn flushes them into the segment, in order, once
-   *   `awaitAmbient` marks the segment ambient (tool cards suppressed).
+   * tick could otherwise teach the turn the drain's id (`noteTurnRequestId`)
+   * and mix the drain's text into the user's answer. Withheld here until the
+   * response decides: a normal turn (response carries a conversation id)
+   * discards them — they were never this turn's answer; a steered turn flushes
+   * them into the segment, in order, once `awaitAmbient` marks it ambient.
    */
   private readonly pendingAmbientUpdates: PendingAmbientUpdate[] = []
   private pendingAmbientChars = 0
@@ -798,10 +795,14 @@ export class TurnStreamController {
     for (const entry of entries) {
       if (seg.finished) break
       const update = entry.update as Record<string, unknown>
-      // The same split the live path makes: a background drain's prose is not
-      // this turn's answer, even when it landed while no step was open. The
-      // record (tool outputs) still goes in; the cursor moves past it.
+      // The live path's splits, mirrored: a drain's prose parked between steps
+      // is still not this turn's answer (foreign ids; ambient-owned, id unknown).
       if (this.isForeignAmbientText(update)) {
+        this.recordWithoutSegment(update)
+        this.cursorSeq = entry.seq
+        continue
+      }
+      if (!seg.ambient && this.turnRequestId === undefined && this.isAmbientOwned(update)) {
         this.recordWithoutSegment(update)
         this.cursorSeq = entry.seq
         continue
@@ -1432,11 +1433,8 @@ export class TurnStreamController {
   }
 
   /**
-   * Withhold one background-drain update until the prompt response says what
-   * this turn is. The cursor advances past it anyway: it is already in the
-   * transcript, and replaying it into a later segment would emit it twice.
-   * Bounded (see `PENDING_AMBIENT_MAX_*`) — the transcript still keeps every
-   * entry the buffer drops.
+   * Withhold one drain update until the prompt response says what this turn is.
+   * Bounded (`PENDING_AMBIENT_MAX_*`); the transcript keeps every dropped entry.
    */
   private bufferAmbientUpdate(seq: number, update: Record<string, unknown>): void {
     const chars = JSON.stringify(update).length
@@ -1558,11 +1556,14 @@ export class TurnStreamController {
     for (const entry of this.session.transcript.since(this.cursorSeq)) {
       if (seg.finished) break
       const update = entry.update as Record<string, unknown>
-      // The same split the live path makes: a background drain's text in the
-      // tail is not this turn's answer. Record what the registry needs (tool
-      // outputs), move the cursor past it, and do NOT fold it — otherwise the
-      // deferred read smuggles the drain's prose into a normal turn.
+      // The live path's splits, mirrored: the tail's drain prose is not this
+      // turn's answer; record what the registry needs, never fold it.
       if (this.isForeignAmbientText(update)) {
+        this.recordWithoutSegment(update)
+        this.cursorSeq = entry.seq
+        continue
+      }
+      if (!seg.ambient && this.turnRequestId === undefined && this.isAmbientOwned(update)) {
         this.recordWithoutSegment(update)
         this.cursorSeq = entry.seq
         continue
@@ -2041,16 +2042,15 @@ export class TurnStreamController {
         return
       }
       // The turn's OWN request id is still unknown and this update belongs to
-      // the background drain: folding it now could make the drain's tick teach
-      // `noteTurnRequestId` the drain's id, mixing the drain's text into the
-      // user's answer. Withhold it until the prompt response decides what this
-      // turn is (see `pendingAmbientUpdates`); the cursor moves on because the
-      // transcript already holds the entry.
+      // the background drain: folding it now could teach `noteTurnRequestId` the
+      // drain's id, mixing its text into the answer. Withhold until the response
+      // decides (see `pendingAmbientUpdates`); advance past it only when nothing
+      // is left unconsumed behind it — jumping a parked frame loses its text for good.
       if (this.turnRequestId === undefined
         && this.awaitingAmbient === undefined
         && this.isAmbientOwned(update)) {
         this.bufferAmbientUpdate(typed.seq, update)
-        this.cursorSeq = typed.seq
+        if (typed.seq === this.cursorSeq + 1) this.cursorSeq = typed.seq
         return
       }
       // Live-only burst accounting runs BEFORE the segment cursor: prose that
