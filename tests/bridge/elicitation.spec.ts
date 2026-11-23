@@ -46,7 +46,14 @@ describe('handleBridgeElicitationRequest', () => {
     let touched = 0
 
     const pending = handleBridgeElicitationRequest(
-      { hub, elicitations, sessionByAcpId: id => (id === 'acp-s1' ? session : undefined), touch: () => { touched += 1 } },
+      {
+        agentId: 'mock-agent',
+        elicitationTimeoutMs: 0,
+        hub,
+        elicitations,
+        sessionByAcpId: id => (id === 'acp-s1' ? session : undefined),
+        touch: () => { touched += 1 },
+      },
       {
         mode: 'form',
         sessionId: 'acp-s1',
@@ -64,6 +71,7 @@ describe('handleBridgeElicitationRequest', () => {
     const req = events.find((e): e is Extract<AcpEvent, { type: 'elicitation/request' }> => e.type === 'elicitation/request')
     expect(req).toBeDefined()
     expect(req?.dshSessionId).toBe('dsh-s1')
+    expect(req?.deadlineAt).toBeUndefined()
     expect(req?.fields[0]?.kind).toBe('single-select')
 
     elicitations.respond(req!.requestId, { action: 'accept', content: { mode: 'safe' } })
@@ -82,7 +90,7 @@ describe('handleBridgeElicitationRequest', () => {
     const ac = new AbortController()
 
     const pending = handleBridgeElicitationRequest(
-      { hub, elicitations, sessionByAcpId: () => session, touch: () => undefined },
+      { agentId: 'mock-agent', elicitationTimeoutMs: 300_000, hub, elicitations, sessionByAcpId: () => session, touch: () => undefined },
       {
         mode: 'form',
         sessionId: 'acp-s1',
@@ -100,10 +108,17 @@ describe('handleBridgeElicitationRequest', () => {
     expect(events.some(e => e.type === 'elicitation/resolved' && e.action === 'cancel')).toBe(true)
   })
 
-  it('declines unsupported URL elicitation mode and cancels unknown sessions', async () => {
+  it('cancels unsupported URL elicitation mode and unknown sessions', async () => {
     const hub = new EventHub()
     const elicitations = new ElicitationLedger()
-    const host = { hub, elicitations, sessionByAcpId: () => undefined, touch: () => undefined }
+    const host = {
+      agentId: 'mock-agent',
+      elicitationTimeoutMs: 300_000,
+      hub,
+      elicitations,
+      sessionByAcpId: () => undefined,
+      touch: () => undefined,
+    }
 
     const urlRes = await handleBridgeElicitationRequest(host, {
       mode: 'url',
@@ -112,7 +127,7 @@ describe('handleBridgeElicitationRequest', () => {
       url: 'https://example.test/auth',
       message: 'Open URL',
     })
-    expect(urlRes).toEqual({ action: 'decline' })
+    expect(urlRes).toEqual({ action: 'cancel' })
 
     const unknownRes = await handleBridgeElicitationRequest(host, {
       mode: 'form',
@@ -121,6 +136,43 @@ describe('handleBridgeElicitationRequest', () => {
       requestedSchema: { type: 'object', properties: {} },
     })
     expect(unknownRes).toEqual({ action: 'cancel' })
+  })
+
+  it('cancels and broadcasts agent/notice + elicitation/resolved when elicitationTimeoutMs expires', async () => {
+    const hub = new EventHub()
+    const elicitations = new ElicitationLedger()
+    const events: AcpEvent[] = []
+    hub.subscribe(e => { events.push(e) })
+    const session = fakeSession()
+
+    const pending = handleBridgeElicitationRequest(
+      {
+        agentId: 'mock-agent',
+        elicitationTimeoutMs: 40,
+        hub,
+        elicitations,
+        sessionByAcpId: () => session,
+        touch: () => undefined,
+      },
+      {
+        mode: 'form',
+        sessionId: 'acp-s1',
+        message: 'Timed question',
+        requestedSchema: { type: 'object', properties: {} },
+      },
+    )
+
+    const req = events.find((e): e is Extract<AcpEvent, { type: 'elicitation/request' }> => e.type === 'elicitation/request')
+    expect(req?.deadlineAt).toBeTypeOf('number')
+
+    const result = await pending
+    expect(result).toEqual({ action: 'cancel' })
+    expect(elicitations.pendingViews()).toHaveLength(0)
+    expect(events.some(e => e.type === 'elicitation/resolved' && e.requestId === req!.requestId && e.action === 'cancel')).toBe(true)
+    const notice = events.find((e): e is Extract<AcpEvent, { type: 'agent/notice' }> => e.type === 'agent/notice')
+    expect(notice).toMatchObject({ agentId: 'mock-agent', level: 'info' })
+    expect(notice?.text).toContain('timed out')
+    expect(notice?.text).toContain('cancelled')
   })
 })
 

@@ -10,10 +10,9 @@
  * `../impl.ts` import keeps resolving through it.
  */
 
-import { randomUUID } from '../ids.ts'
 import type { AcpEvent, PermissionOutcome } from '../protocol.ts'
-import type { PendingPermissionFields, PendingPermissionView } from './permission.ts'
-import { AcpError } from './errors.ts'
+import type { PendingPermissionFields } from './permission.ts'
+import { PendingRequestLedger, type PendingRequestEntry } from './pending-request.ts'
 
 // ---- Transcript ----
 
@@ -101,83 +100,13 @@ export class EventHub {
 
 // ---- Permission ledger ----
 
-export interface PendingPermission {
-  requestId: string
-  sessionId: string
-  resolve: (outcome: PermissionOutcome) => void
-  /**
-   * The ask as the browser was shown it, kept for the REPLAY a reconnecting
-   * client receives (see `permissionReplayFrames`). Absent on entries created
-   * without a view — those still answer, they just cannot be re-shown.
-   */
-  view?: PendingPermissionFields
-}
+export type PendingPermission = PendingRequestEntry<PendingPermissionFields, PermissionOutcome>
 
-export class PermissionLedger {
-  private readonly pending = new Map<string, PendingPermission>()
-
-  create(sessionId: string, executor: (outcome: PermissionOutcome) => void, view?: PendingPermission['view']): string {
-    const requestId = randomUUID()
-    this.pending.set(requestId, { requestId, sessionId, resolve: executor, ...(view === undefined ? {} : { view }) })
-    return requestId
-  }
-
-  respond(requestId: string, outcome: PermissionOutcome): true {
-    const entry = this.pending.get(requestId)
-    if (entry === undefined) throw new AcpError('unknown_request', `acp: no pending permission ${requestId}`)
-    this.pending.delete(requestId)
-    entry.resolve(outcome)
-    return true
-  }
-
-  has(requestId: string): boolean {
-    return this.pending.has(requestId)
-  }
-
-  settleFor(predicate: (p: { requestId: string; sessionId: string }) => boolean): string[] {
-    const settled: string[] = []
-    for (const [id, entry] of [...this.pending]) {
-      if (!predicate(entry)) continue
-      this.pending.delete(id)
-      entry.resolve({ outcome: 'cancelled' })
-      settled.push(id)
-    }
-    return settled
-  }
-
-  sessionIds(): Array<{ requestId: string; sessionId: string }> {
-    return [...this.pending.values()].map(e => ({ requestId: e.requestId, sessionId: e.sessionId }))
-  }
-
-  /**
-   * Whether ANY outstanding ask belongs to `sessionId`, a HOST session id
-   * (`LiveSession.sessionId`) — NOT the ACP protocol session id. Used by the
-   * stall watchdog: a turn blocked on a human is not a silent turn, so the
-   * session with a pending permission must not be finalized as stalled.
-   */
-  hasPendingFor(sessionId: string): boolean {
-    for (const entry of this.pending.values()) {
-      if (entry.sessionId === sessionId) return true
-    }
-    return false
-  }
-
-  /**
-   * Outstanding asks WITH the view the browser was shown, for the reconnect
-   * replay. Entries created without a view are skipped: replaying a frame the
-   * client cannot render (no title, no options) would show an unanswerable
-   * card, which is worse than showing nothing.
-   */
-  pendingViews(): PendingPermissionView[] {
-    const views: PendingPermissionView[] = []
-    for (const entry of this.pending.values()) {
-      if (entry.view === undefined) continue
-      views.push({
-        requestId: entry.requestId,
-        sessionId: entry.sessionId,
-        ...entry.view,
-      })
-    }
-    return views
+export class PermissionLedger extends PendingRequestLedger<PendingPermissionFields, PermissionOutcome> {
+  constructor() {
+    super({
+      kind: 'permission',
+      cancelOutcome: () => ({ outcome: 'cancelled' }),
+    })
   }
 }

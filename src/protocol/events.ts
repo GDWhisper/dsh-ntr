@@ -149,7 +149,10 @@ export type AcpEvent =
       message: string
       title?: string
       description?: string
+      /** Ordered form fields derived from requestedSchema. */
       fields: ElicitationFieldView[]
+      /** Epoch ms when the elicitation expires and auto-cancels; absent when unbounded. */
+      deadlineAt?: number
     }
   | { type: 'elicitation/resolved'; requestId: string; sessionId: string; action: 'accept' | 'decline' | 'cancel' }
   | { type: 'elicitation/synced'; requestIds: string[] }

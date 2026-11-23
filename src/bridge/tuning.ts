@@ -4,6 +4,7 @@ import { DEFAULT_IDLE_TIMEOUT_MS } from '../protocol.ts'
 export const DEFAULT_TUNING: Required<BridgeTuning> = {
   startupTimeoutMs: 60_000,
   permissionTimeoutMs: 300_000,
+  elicitationTimeoutMs: 300_000,
   permissionTimeoutMode: 'wait',
   cancelFallbackMs: 15_000,
   staleCancelRetryDelayMs: 600,

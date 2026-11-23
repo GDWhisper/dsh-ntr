@@ -6,7 +6,7 @@
  */
 
 import { createElement } from 'react'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ElicitationDock } from '../src/client/elicitation-dock.tsx'
 import type { AcpStore, PendingElicitation, UiState } from '../src/client/store.ts'
@@ -108,13 +108,27 @@ describe('ElicitationDock', () => {
     })
   })
 
-  it('sends decline and cancel actions', () => {
+  it('renders deadline countdown and sends both decline and cancel actions', async () => {
     const { acp, respond } = fakeStore([
-      { requestId: 'req-7', sessionId: 's1', dshSessionId: 'chat-1', message: 'Optional input', fields: [] },
+      {
+        requestId: 'req-7',
+        sessionId: 's1',
+        dshSessionId: 'chat-1',
+        message: 'Optional input',
+        fields: [],
+        deadlineAt: Date.now() + 65_000,
+      },
     ])
     render(createElement(ElicitationDock, { acp, sessionId: 'chat-1' }))
+    expect(screen.getByText(/left/)).toBeTruthy()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Decline' }))
-    expect(respond).toHaveBeenCalledWith('req-7', { action: 'decline' })
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Decline' }))
+    })
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    })
+    expect(respond).toHaveBeenNthCalledWith(1, 'req-7', { action: 'decline' })
+    expect(respond).toHaveBeenNthCalledWith(2, 'req-7', { action: 'cancel' })
   })
 })

@@ -12,6 +12,12 @@ import type {
   ElicitationFieldView,
   PendingElicitationView,
 } from '../../protocol.ts'
+import {
+  pendingForSession,
+  removePendingRequest,
+  syncPendingRequests,
+  upsertPendingRequest,
+} from './pending.ts'
 
 export type PendingElicitation = PendingElicitationView
 
@@ -23,7 +29,7 @@ export function elicitationsForSession(
   elicitations: readonly PendingElicitation[],
   dshSessionId: string,
 ): PendingElicitation[] {
-  return elicitations.filter(item => item.dshSessionId === dshSessionId)
+  return pendingForSession(elicitations, dshSessionId)
 }
 
 /**
@@ -45,15 +51,14 @@ export function reduceElicitationEvent(
         ...(event.title === undefined ? {} : { title: event.title }),
         ...(event.description === undefined ? {} : { description: event.description }),
         fields: event.fields,
+        ...(event.deadlineAt === undefined ? {} : { deadlineAt: event.deadlineAt }),
       }
-      return [...current.filter(e => e.requestId !== event.requestId), entry]
+      return upsertPendingRequest(current, entry)
     }
     case 'elicitation/resolved':
-      return current.filter(e => e.requestId !== event.requestId)
-    case 'elicitation/synced': {
-      const live = new Set(event.requestIds)
-      return current.filter(e => live.has(e.requestId))
-    }
+      return removePendingRequest(current, event.requestId)
+    case 'elicitation/synced':
+      return syncPendingRequests(current, event.requestIds)
     default:
       return undefined
   }
@@ -98,6 +103,12 @@ export function buildElicitationContent(
     }
     if (field.kind === 'multi-select') {
       const selected = Array.isArray(raw) ? raw : []
+      if (field.options !== undefined && field.options.length > 0) {
+        const allowed = new Set(field.options.map(o => o.value))
+        if (selected.some(v => !allowed.has(v))) {
+          return { ok: false, error: label(`「${field.title}」包含无效选项`, `"${field.title}" contains an invalid option`) }
+        }
+      }
       if (field.required && selected.length === 0) {
         return { ok: false, error: label(`请至少选择一项：${field.title}`, `Select at least one option for "${field.title}"`) }
       }
@@ -144,6 +155,11 @@ export function buildElicitationContent(
         ) }
       }
       continue
+    }
+    if (field.kind === 'single-select' && field.options !== undefined && field.options.length > 0) {
+      if (!field.options.some(o => o.value === text)) {
+        return { ok: false, error: label(`请选择「${field.title}」提供的有效选项`, `Choose a valid option for "${field.title}"`) }
+      }
     }
     if (field.minLength !== undefined && text.length < field.minLength) {
       return { ok: false, error: label(`「${field.title}」至少需要 ${String(field.minLength)} 个字符`, `"${field.title}" must be at least ${String(field.minLength)} characters`) }

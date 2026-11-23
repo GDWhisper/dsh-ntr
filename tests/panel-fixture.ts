@@ -24,6 +24,7 @@ import type {
 } from '../src/protocol.ts'
 
 export type PanelPermissionRequest = Extract<AcpEvent, { type: 'permission/request' }>
+type PanelElicitationRequest = Extract<AcpEvent, { type: 'elicitation/request' }>
 
 export interface PanelRpcCall {
   channel: string
@@ -141,6 +142,7 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
   const catalogs = structuredClone({ ...EXAMPLE_CATALOGS, ...options.catalogs })
   const calls: PanelRpcCall[] = []
   const pending = new Map<string, PanelPermissionRequest>()
+  const pendingElicitations = new Map<string, PanelElicitationRequest>()
   const states = new Map<string, AgentView['state']>()
   let firstAgentRead = true
   let defaultAgentId = options.defaultAgentId === null ? undefined : options.defaultAgentId ?? 'codebuddy'
@@ -223,6 +225,11 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
     if (event.type === 'permission/resolved') pending.delete(event.requestId)
     if (event.type === 'permission/synced') {
       for (const id of pending.keys()) if (!event.requestIds.includes(id)) pending.delete(id)
+    }
+    if (event.type === 'elicitation/request') pendingElicitations.set(event.requestId, structuredClone(event))
+    if (event.type === 'elicitation/resolved') pendingElicitations.delete(event.requestId)
+    if (event.type === 'elicitation/synced') {
+      for (const id of pendingElicitations.keys()) if (!event.requestIds.includes(id)) pendingElicitations.delete(id)
     }
     if (event.type === 'agent/status') states.set(event.agentId, event.state)
     if (event.type === 'agent/exposure') {
@@ -419,6 +426,13 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
           }
           const outcome: PermissionOutcome = optionId === undefined ? { outcome: 'cancelled' } : { outcome: 'selected', optionId }
           await applyEvent({ type: 'permission/resolved', requestId, sessionId: ask.sessionId, outcome })
+          return ok({ done: true })
+        }
+        case 'elicitation/respond': {
+          const { requestId, action } = payload as { requestId: string; action: 'accept' | 'decline' | 'cancel' }
+          const ask = pendingElicitations.get(requestId)
+          if (ask === undefined) return ok({ done: false })
+          await applyEvent({ type: 'elicitation/resolved', requestId, sessionId: ask.sessionId, action })
           return ok({ done: true })
         }
         default: return unsupported()

@@ -965,15 +965,16 @@ const STYLE = `
    formula so each ask lines up with the input box instead of spanning the
    column. The list owns a bounded height and scrolls so a burst of asks cannot
    push the composer off screen. */
-.ntr-permission-dock {
+.ntr-pending-dock {
   box-sizing: border-box;
   width: calc(100% - var(--dsh-composer-side-clearance, 16px) - var(--dsh-composer-side-clearance, 16px));
   max-width: var(--dsh-composer-card-max-width, 920px);
   margin: 0 auto;
-  display: flex; flex-direction: column; gap: 6px;
-  max-height: min(38vh, 320px); overflow-y: auto;
+  display: flex; flex-direction: column;
+  overflow-y: auto;
   font-size: 12px; line-height: 1.5;
 }
+.ntr-permission-dock { gap: 6px; max-height: min(38vh, 320px); }
 .ntr-permission-card { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); border-left: 3px solid var(--dsw-alias-state-warn-primary, #d97706); border-radius: 10px; background: var(--dsw-alias-bg-layer-1, #fff); }
 .ntr-permission-head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 .ntr-permission-tool { flex: none; font-weight: 600; }
@@ -988,18 +989,11 @@ const STYLE = `
 .ntr-permission-cancel { margin-left: auto; color: var(--dsw-alias-label-secondary, #6b7280); }
 .ntr-permission-error { padding: 4px 8px; border-radius: 6px; background: color-mix(in srgb, var(--dsw-alias-state-error-primary, #b91c1c) 12%, transparent); color: var(--dsw-alias-state-error-primary, #b91c1c); font-size: 11px; word-break: break-word; }
 /* ---- Elicitation form dock (conversation.input.dock, elicitation-dock.tsx) ---- */
-.ntr-elicit-dock {
-  box-sizing: border-box;
-  width: calc(100% - var(--dsh-composer-side-clearance, 16px) - var(--dsh-composer-side-clearance, 16px));
-  max-width: var(--dsh-composer-card-max-width, 920px);
-  margin: 0 auto;
-  display: flex; flex-direction: column; gap: 8px;
-  max-height: min(46vh, 420px); overflow-y: auto;
-  font-size: 12px; line-height: 1.5;
-}
+.ntr-elicit-dock { gap: 8px; max-height: min(46vh, 420px); }
 .ntr-elicit-card { display: flex; flex-direction: column; gap: 10px; padding: 10px 12px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); border-left: 3px solid var(--dsw-alias-state-business-primary, #2563eb); border-radius: 10px; background: var(--dsw-alias-bg-layer-1, #fff); }
 .ntr-elicit-head { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.ntr-elicit-title { font-weight: 600; color: var(--dsw-alias-label-primary, inherit); word-break: break-word; }
+.ntr-elicit-head-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; min-width: 0; }
+.ntr-elicit-title { flex: 1; min-width: 0; font-weight: 600; color: var(--dsw-alias-label-primary, inherit); word-break: break-word; }
 .ntr-elicit-desc { color: var(--dsw-alias-label-secondary, #6b7280); word-break: break-word; }
 .ntr-elicit-fields { display: flex; flex-direction: column; gap: 10px; }
 .ntr-elicit-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }

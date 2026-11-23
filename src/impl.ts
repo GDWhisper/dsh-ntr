@@ -133,6 +133,11 @@ export {
   pickAutoOption,
 } from './impl/permission.ts'
 
+// ---- Shared pending human-input ledger ----
+
+export type { PendingRequestEntry, PendingRequestLedgerOptions } from './impl/pending-request.ts'
+export { PendingRequestLedger, pendingReplayFrames } from './impl/pending-request.ts'
+
 // ---- ACP form elicitation ----
 
 export type { ParsedElicitationForm, PendingElicitationEntry } from './impl/elicitation.ts'

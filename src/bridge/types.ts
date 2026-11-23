@@ -77,6 +77,12 @@ export interface BridgeTuning {
    */
   permissionTimeoutMs?: number
   /**
+   * How long an ACP form elicitation (`elicitation/create`) may sit
+   * unanswered before timing out and settling as `cancel` (+ `agent/notice`).
+   * Default 300000 ms; `0` disables the deadline.
+   */
+  elicitationTimeoutMs?: number
+  /**
    * What an EXPIRED approval deadline does. `wait` (default) never expires
    * the ask at all; `abort` refuses it; `auto` answers it with the option the
    * agent's own kinds imply and lets the agent continue.

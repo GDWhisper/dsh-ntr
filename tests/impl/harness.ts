@@ -32,6 +32,7 @@ export function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } 
     setMode: async (id, m) => { calls.push(['mode', { id, m }]) },
     setConfigOption: async (id, c, v) => { calls.push(['config', { id, c, v }]) },
     respondPermission: (r, o) => { calls.push(['perm', { r, o }]) },
+    respondElicitation: (r, o) => { calls.push(['elicit', { r, o }]) },
     transcript: (id) => ({ session: { id }, entries: [] }),
     sessions: () => [],
     stopAgent: async id => { calls.push(['stop', id]) },
