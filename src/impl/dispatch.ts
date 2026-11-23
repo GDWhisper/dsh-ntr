@@ -12,11 +12,12 @@
 
 import type {
   AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpDelegateSettings, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AcpEvent, ActiveTurnView, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSaveResult, AgentSkillsResult, AgentTestResult,
-  AgentView, ApprovalDeadlinePatch, ChatSessionView, ChatTranscriptView, DelegateSetPayload, DetectedAgentInfo, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, RpcResult,
+  AgentView, ApprovalDeadlinePatch, ChatSessionView, ChatTranscriptView, DelegateSetPayload, DetectedAgentInfo, ElicitationOutcome, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, RpcResult,
   SaveGateFlushResult, SaveGateStatus, SubagentDetailResult,
 } from '../protocol.ts'
 import { DEFAULT_MODE_MAX, DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, pluginReleaseUrl } from '../protocol.ts'
 import { subagentToolCallId } from '../subagent-records.ts'
+import { validateElicitationOutcome } from './elicitation.ts'
 import { AcpError } from './errors.ts'
 import type { PromptContentBlock } from './image.ts'
 import {
@@ -38,6 +39,7 @@ export interface AcpManager {
   setMode(sessionId: string, modeId: string): Promise<void>
   setConfigOption(sessionId: string, configId: string, value: string | boolean): Promise<void>
   respondPermission(requestId: string, optionId: string | undefined): void
+  respondElicitation?(requestId: string, outcome: ElicitationOutcome): void
   transcript(sessionId: string, afterSeq: number | undefined): { session: unknown; entries: Array<{ seq: number; update: unknown }> }
   sessions(): unknown[]
   stopAgent(agentId: string): Promise<void>
@@ -449,6 +451,13 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
       }
       case 'permission/respond':
         return ok({ done: manager.respondPermission(str(body, 'requestId', 64), optionalStr(body, 'optionId', 128)) })
+      case 'elicitation/respond': {
+        const requestId = str(body, 'requestId', 64)
+        const outcome = validateElicitationOutcome(body.action, body.content)
+        if (manager.respondElicitation === undefined) throw new AcpError('unsupported', 'acp: elicitation is not available on this host')
+        manager.respondElicitation(requestId, outcome)
+        return ok({ done: true })
+      }
       case 'transcript/get': {
         const after = body.afterSeq
         if (after !== undefined && typeof after !== 'number') throw new AcpError('bad_payload', 'acp: afterSeq must be a number')
