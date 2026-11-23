@@ -75,6 +75,8 @@ export interface SessionRegistryHost {
   patchChatChoice(dshSessionId: string, patch: Partial<AcpConversationChoice>): void
   /** Re-apply a conversation's recorded pick to a freshly created / forked session. */
   applyChatChoice(session: LiveSession): Promise<void>
+  /** Apply the agent's new-chat default mode when the conversation has no mode pick. */
+  applyAgentDefaultMode(session: LiveSession): Promise<void>
   /** Put a conversation's pick back on the request path after a lock rollback. */
   syncConversationRoute(dshSessionId: string): void
   /** Rewrite `agents.json` after a record or pick changed. */
@@ -323,6 +325,11 @@ export class SessionRegistryService {
     // what the composer shows — a forked session starts on the agent-side
     // state the fork copied, and the record must match what runs.
     await this.host.applyChatChoice(session)
+    // A pick-less parent forks onto the agent-side mode it copied; the child is
+    // a NEW conversation, so the configured default fills the same gap a fresh
+    // session would. Without this, the child would flip to the default on its
+    // first resume — a silent mid-conversation mode change.
+    await this.host.applyAgentDefaultMode(session)
     // Re-publish so the browser's list and the composer's occupancy ring see
     // the child immediately (with its just-bound choice mirrors).
     this.host.hub.broadcast({ type: 'session/meta', sessionId: session.sessionId, session: snapshot(session) })

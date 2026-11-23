@@ -15,7 +15,7 @@ import type {
   AgentView, ApprovalDeadlinePatch, ChatSessionView, ChatTranscriptView, DelegateSetPayload, DetectedAgentInfo, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, RpcResult,
   SaveGateFlushResult, SaveGateStatus, SubagentDetailResult,
 } from '../protocol.ts'
-import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, pluginReleaseUrl } from '../protocol.ts'
+import { DEFAULT_MODE_MAX, DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, pluginReleaseUrl } from '../protocol.ts'
 import { subagentToolCallId } from '../subagent-records.ts'
 import { AcpError } from './errors.ts'
 import type { PromptContentBlock } from './image.ts'
@@ -128,6 +128,8 @@ export interface AcpManager {
    * must not go through `agent/save`. See {@link AcpAgentDef.skillsMcpEnabled}.
    */
   setSkillsMcp?(agentId: string, skillsMcpEnabled: boolean): Promise<void>
+  /** Per-agent default chat mode; `undefined` / blank clears it. */
+  setDefaultMode?(agentId: string, defaultMode?: string): Promise<void>
   probeAgentModels?(agentId: string, model?: string): Promise<AgentProbeModelsResult>
   /**
    * The ACP model surface for one agent (the seats' data source): base entry,
@@ -761,6 +763,13 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
           return fail('bad_payload', 'acp: skillsMcpEnabled must be a boolean')
         }
         await manager.setSkillsMcp?.(agentId, body.skillsMcpEnabled)
+        return ok({ done: true })
+      }
+      case 'agent/set-default-mode': {
+        const agentId = str(body, 'agentId', 64)
+        // An absent / empty field is the explicit "follow the agent" answer,
+        // not bad input: the control sends `''` when the user clears it.
+        await manager.setDefaultMode?.(agentId, optionalStr(body, 'defaultMode', DEFAULT_MODE_MAX))
         return ok({ done: true })
       }
       case 'agent/probe-models': {

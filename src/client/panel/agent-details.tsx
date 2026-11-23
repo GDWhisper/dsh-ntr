@@ -5,6 +5,7 @@
 import { formatCommandLine, splitCommandLine } from '../acp-ui.tsx'
 import type { AcpStore } from '../store.ts'
 import type { ActiveTurnView, DetectedAgentInfo } from '../../protocol.ts'
+import { AgentDefaultMode } from './agent-default-mode.tsx'
 import type { AgentForm } from './form.ts'
 import type { AgentTestOutcome } from './permission-mirror.tsx'
 
@@ -237,6 +238,8 @@ export function AgentDetails({
           </span>
         </div>
       </div>
+
+      {!newCustom && isConfigured && <AgentDefaultMode acp={acp} agentId={detected.id} />}
 
       <div className="dwa-form-row" style={{ flexDirection: 'column', gap: 6 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>

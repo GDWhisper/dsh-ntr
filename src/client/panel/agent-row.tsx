@@ -115,6 +115,13 @@ export function AgentRow({
     setForm(prev => ({ ...prev, skillsMcpEnabled: serverSkillsMcp }))
   }, [serverSkillsMcp])
 
+  const serverDefaultMode = detected.currentConfig?.defaultMode ?? ''
+  useEffect(() => {
+    // The default mode is another lightweight-RPC field: carry the host answer
+    // in the form so a later full save preserves it rather than clearing it.
+    setForm(prev => (prev.defaultMode === serverDefaultMode ? prev : { ...prev, defaultMode: serverDefaultMode }))
+  }, [serverDefaultMode])
+
   const trimmedId = form.agentId.trim()
   const idValid = !newCustom || AGENT_ID_PATTERN.test(trimmedId)
   const idTaken = newCustom && trimmedId !== '' && ui.agents.some(a => a.id === trimmedId)

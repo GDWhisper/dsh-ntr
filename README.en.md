@@ -119,7 +119,7 @@ When the agent wants to touch something sensitive, it asks you. The ask appears 
 
 Every agent asks differently: some offer a set of options, some only allow/deny, some attach the exact command they are about to run. The plugin presents these as-is, and never pre-decides for you.
 
-**Permission modes are defined by the agent.** Each agent puts its own mode list (e.g. `Always Ask`, `Accept Edits`, `Plan`, `Bypass Permissions`) in the composer's tool row; the option text is exactly what the agent sent. Switch a mode, and the agent decides accordingly when to ask you. The plugin adds no permission tier of its own, and doesn't translate mode names.
+**Permission modes are defined by the agent.** Each agent puts its own mode list (e.g. `Always Ask`, `Accept Edits`, `Plan`, `Bypass Permissions`) in the composer's tool row; the option text is exactly what the agent sent. Switch a mode, and the agent decides accordingly when to ask you. The plugin adds no permission tier of its own, and doesn't translate mode names. To fix the starting point for new conversations, set "Default Mode (new conversations)" under the agent's Advanced tab in Settings; it only fills conversations with no pick, and existing ones keep their own choice.
 
 > **Note**: DSH's own "Access mode" (read-only / workspace write / full) has no power over external agents. The agent lives in its own process; DSH's file sandbox can't reach it. What actually applies is the agent's own permission mode, plus the approvals it sends you.
 

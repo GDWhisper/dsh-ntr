@@ -32,7 +32,7 @@ import type {
   SaveGateFlushResult,
   SaveGateStatus,
 } from '../protocol.ts'
-import { DEFAULT_SAVE_GATE_TIMEOUT_MS } from '../protocol.ts'
+import { DEFAULT_MODE_MAX, DEFAULT_SAVE_GATE_TIMEOUT_MS } from '../protocol.ts'
 import type { AcpSaveGate } from '../save-gate.ts'
 import { SaveGateAborted } from '../save-gate.ts'
 import { AgentBridge, TEST_EXIT_GRACE_MS } from './agent-bridge.ts'
@@ -279,6 +279,13 @@ export class AgentAdminService {
     if (def.skillsMcpEnabled === undefined && this.host.defOf(def.id)?.skillsMcpEnabled === false) {
       def = { ...def, skillsMcpEnabled: false }
     }
+    // Same rule for the default chat mode. The lightweight RPC is usable while
+    // a save is queued, and an older browser bundle does not carry the field;
+    // an omitted key inherits the live value. Clearing it is the RPC's job.
+    const liveDefaultMode = this.host.defOf(def.id)?.defaultMode
+    if (def.defaultMode === undefined && liveDefaultMode !== undefined) {
+      def = { ...def, defaultMode: liveDefaultMode }
+    }
     const defaultWorkspace = ensureDefaultWorkspace()
     const resolvedCwd = def.cwd ?? defaultWorkspace
     // Deduplicated on purpose: the panel pre-fills the same path in several
@@ -403,6 +410,34 @@ export class AgentAdminService {
     }
     // Same frame set as `setExposedModels`: the agent's state is republished
     // and the browser patches its copy of the definition from `agent/exposure`.
+    this.host.publishCatalog(agentId, true)
+  }
+
+  /**
+   * Set (or clear, with `undefined` / a blank string) the mode a NEW chat
+   * conversation starts on. In-place and strictly persisted, exactly like
+   * `setSkillsMcp`: the whole hot-apply is the mutated definition, which every
+   * live bridge shares and the next `session/new` reads, so nothing restarts.
+   * Existing conversations keep their recorded picks; this value is a fallback
+   * for conversations that never picked one.
+   */
+  async setDefaultMode(agentId: string, defaultMode?: string): Promise<void> {
+    const def = this.host.defOf(agentId)
+    if (def === undefined) throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
+    const normalized = defaultMode === undefined || defaultMode.trim() === '' ? undefined : defaultMode.trim()
+    if (normalized !== undefined && normalized.length > DEFAULT_MODE_MAX) {
+      throw new AcpError('bad_payload', `acp: defaultMode must be at most ${String(DEFAULT_MODE_MAX)} chars`)
+    }
+    const previous = def.defaultMode
+    if (normalized === undefined) delete def.defaultMode
+    else def.defaultMode = normalized
+    try {
+      this.host.persistAgents(true)
+    } catch (error) {
+      if (previous === undefined) delete def.defaultMode
+      else def.defaultMode = previous
+      throw error
+    }
     this.host.publishCatalog(agentId, true)
   }
 

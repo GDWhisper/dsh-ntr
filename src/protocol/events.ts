@@ -70,6 +70,8 @@ export type AcpEvent =
     exposedModels?: string[]
     autoDiscoverModels: boolean
     skillsMcpEnabled: boolean
+    /** New-chat default mode; absent = follow the agent's own initial mode. */
+    defaultMode?: string
   }
   /**
    * One outstanding ask, broadcast ONCE when it is created and replayed as-is

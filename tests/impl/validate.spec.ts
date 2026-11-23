@@ -243,6 +243,14 @@ describe('validateAgentDef', () => {
     expect(() => validateAgentDef({ id: 'pi', command: 'x', autoDiscoverModels: 'yes' })).toThrow(/autoDiscoverModels/)
   })
 
+  it('accepts a trimmed defaultMode and stores no empty entry', () => {
+    expect(validateAgentDef({ id: 'pi', command: 'x', defaultMode: ' strict ' }).defaultMode).toBe('strict')
+    expect('defaultMode' in validateAgentDef({ id: 'pi', command: 'x' })).toBe(false)
+    expect('defaultMode' in validateAgentDef({ id: 'pi', command: 'x', defaultMode: '   ' })).toBe(false)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', defaultMode: 7 })).toThrow(/defaultMode/)
+    expect(() => validateAgentDef({ id: 'pi', command: 'x', defaultMode: 'x'.repeat(129) })).toThrow(/defaultMode/)
+  })
+
   it('accepts, trims, and drops npmPackage; rejects invalid package names', () => {
     expect(validateAgentDef({ id: 'pi', command: 'x', npmPackage: ' @mariozechner/pi-acp ' }).npmPackage).toBe('@mariozechner/pi-acp')
     expect(validateAgentDef({ id: 'pi', command: 'x', npmPackage: 'omp@latest' }).npmPackage).toBe('omp@latest')

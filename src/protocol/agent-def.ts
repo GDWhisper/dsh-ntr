@@ -102,6 +102,21 @@ export interface AcpAgentDef {
    */
   mcpServers?: AcpMcpServerDef[]
   /**
+   * The agent's own mode (`session/set_mode` id) that a NEW chat conversation
+   * starts on when the conversation has no explicit pick. Unset = follow the
+   * agent's own initial mode. This is a FALLBACK, never a written pick: the
+   * conversation's recorded choice always outranks it, and `acp_delegate` has
+   * its own per-agent defaults (`AcpDelegateAgentDefaults.mode`).
+   *
+   * Read at session creation / resume (`ChatChoiceService`), so the composer's
+   * pre-first-message value and the first turn's actual mode agree. A value the
+   * live session no longer offers is skipped with one notice and the field is
+   * kept, never rewritten. Edited through the settings card's lightweight
+   * `agent/set-default-mode` RPC; a full `agent/save` carries the field so it
+   * cannot be cleared, but never edits it.
+   */
+  defaultMode?: string
+  /**
    * Whether this agent is offered the built-in `dsh-skills` MCP server, ON by
    * default: unset means "on", so a definition written before the two-level
    * switch existed needs no migration and the master switch alone reproduces

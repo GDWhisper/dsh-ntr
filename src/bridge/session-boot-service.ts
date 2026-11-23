@@ -79,6 +79,9 @@ export class SessionBootService {
     if (this.host.registry.hasChoice(dshSessionId)) this.host.choices.syncConversationRoute(dshSessionId)
     else routeBindingRegistry().conversations.set(dshSessionId, resumed.modelId ?? target.agentId)
     await this.host.choices.applyChatChoice(resumed)
+    // Same fallback as the lazy path: a conversation that never picked a mode
+    // starts on the agent's configured default instead of its own initial one.
+    await this.host.choices.applyAgentDefaultMode(resumed)
     resumed.provisionalLock = false
   }
 
@@ -151,6 +154,7 @@ export class SessionBootService {
       // ...and the persisted pick (model / thought level) is re-applied to the
       // freshly loaded session, whose config comes back at the agent's defaults.
       await this.host.choices.applyChatChoice(resumed)
+      await this.host.choices.applyAgentDefaultMode(resumed)
       // A RESUMED session had context before this call; a lock written here is
       // not provisional even if the conversation record was missing it.
       resumed.provisionalLock = false
@@ -205,6 +209,10 @@ export class SessionBootService {
     // `session/new` answered with the agent's defaults; without this the first
     // turn would run on them and the pick would only take effect afterwards.
     await this.host.choices.applyChatChoice(session)
+    // Seeding above normally records the displayed default as this turn's pick.
+    // This covers the catalog-less / no-mode-seed path, and any conversation
+    // that reached the create path without a pick record.
+    await this.host.choices.applyAgentDefaultMode(session)
     if (dshSessionId !== undefined) {
       // The first ACP session is the moment the conversation's context starts
       // belonging to this agent. The lock is PROVISIONAL until this turn shows

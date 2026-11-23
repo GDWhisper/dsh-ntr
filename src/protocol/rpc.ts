@@ -80,6 +80,13 @@ export interface AgentSavePayload {
   /** MCP servers to connect to, in the normalized shape. See {@link AcpAgentDef.mcpServers}. */
   mcpServers?: AcpMcpServerDef[]
   /**
+   * The agent's default chat mode. Carried ONLY so a full save cannot wipe it:
+   * the settings card edits it through `agent/set-default-mode`, but
+   * `validateAgentDef` rebuilds the definition from this payload, so an
+   * omitted field would silently clear it. Absent = follow the agent itself.
+   */
+  defaultMode?: string
+  /**
    * The per-agent `dsh-skills` opt-out. Carried here ONLY so a full save cannot
    * wipe it: the settings form never edits it (`agent/set-skills-mcp` does),
    * but `validateAgentDef` rebuilds the definition from this payload, so an

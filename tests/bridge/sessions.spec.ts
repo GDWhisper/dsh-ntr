@@ -745,6 +745,32 @@ describe('conversation fork adoption (isolated manager)', () => {
     }
   }, 30_000)
 
+  it('applies the configured default mode to a pick-less fork', async () => {
+    const gm = new BridgeManager(
+      [forkDef({ MOCK_FORK: '1' }, 'forkdefault')],
+      forkHub,
+      500,
+      join(forkRoot, 'default-fork-agents.json'),
+    )
+    try {
+      // The parent runs BEFORE the default exists, so its pick has no mode.
+      gm.bindChatAgent('dsh-fork-default-parent', 'forkdefault')
+      await turn(gm, 'dsh-fork-default-parent', 'forkdefault')
+      expect(gm.chatChoice('dsh-fork-default-parent')?.mode).toBeUndefined()
+
+      // Setting the default mid-conversation leaves that pick alone; the fork
+      // is a NEW conversation with no pick, so the adopt must apply it now.
+      await gm.setDefaultMode('forkdefault', 'strict')
+      const adopt = await gm.adoptForkedSession('dsh-fork-default-child', 'dsh-fork-default-parent')
+      expect(adopt.acpSessionId).not.toBe('')
+      // The fork copies the agent-side 'default'; without the fallback the
+      // child would only flip to 'strict' on its next resume.
+      expect(gm.chatSessions('dsh-fork-default-child')[0]?.modes?.currentModeId).toBe('strict')
+    } finally {
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
   it('refuses to adopt from a released parent with zero fork requests', async () => {
     const logPath = join(forkRoot, 'released-fork.log')
     const gm = new BridgeManager([forkDef({ MOCK_FORK: '1', MOCK_FORK_LOG: logPath }, 'forkrel')], forkHub, 500, join(forkRoot, 'released-agents.json'))

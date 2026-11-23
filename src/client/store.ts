@@ -558,10 +558,12 @@ export class AcpStore {
     return this.agentAdminService.setAgentSkillsMcp(agentId, skillsMcpEnabled)
   }
 
+  /** Set one agent's default chat mode (lightweight: no restart, no save gate). */
+  async setAgentDefaultMode(agentId: string, defaultMode?: string): Promise<void> { return this.agentAdminService.setAgentDefaultMode(agentId, defaultMode) }
+
   async deleteAgent(agentId: string): Promise<void> {
     return this.agentAdminService.deleteAgent(agentId)
   }
-
 
   // ---- Panel lifecycle ----
 
@@ -965,7 +967,6 @@ export class AcpStore {
     return this.agentAdminService.setDefaultAgent(agentId)
   }
 
-
   // ---- Settings writes (implementation: store/settings.ts) ----
 
   /** Write the agent tag's halo preference (optimistic; the host answer is the authority). */
@@ -1295,18 +1296,18 @@ export class AcpStore {
         // omits it, and a missing field means "not opted out" (the field is
         // only ever persisted as `false`).
         const skillsMcpOff = event.skillsMcpEnabled === false
-        const detectedAgents = this.state.detectedAgents.map(info =>
-          info.id === event.agentId && info.currentConfig !== undefined
-            ? {
-                ...info,
-                currentConfig: {
-                  ...info.currentConfig,
-                  exposedModels,
-                  autoDiscoverModels: event.autoDiscoverModels,
-                  skillsMcpEnabled: skillsMcpOff ? false : undefined,
-                },
-              }
-            : info)
+        const detectedAgents = this.state.detectedAgents.map(info => {
+          if (info.id !== event.agentId || info.currentConfig === undefined) return info
+          const currentConfig = {
+            ...info.currentConfig,
+            exposedModels,
+            autoDiscoverModels: event.autoDiscoverModels,
+            skillsMcpEnabled: skillsMcpOff ? false : undefined,
+          }
+          if (event.defaultMode === undefined) delete currentConfig.defaultMode
+          else currentConfig.defaultMode = event.defaultMode
+          return { ...info, currentConfig }
+        })
         this.invalidateSeatCatalog(event.agentId)
         this.mutate({ detectedAgents })
         return this.loadAgentCatalog(event.agentId)
@@ -1468,7 +1469,6 @@ export class AcpStore {
     }
   }
 }
-
 
 function sameUsage(left: SessionView['usage'], right: SessionView['usage']): boolean {
   if (left === right) return true

@@ -62,6 +62,7 @@ export function fakeManager(): AcpManager & { calls: Array<[string, unknown]> } 
     },
     setExposedModels: async (id, exposed) => { calls.push(['setExposedModels', { id, exposed }]) },
     setAutoDiscoverModels: async (id, autoDiscoverModels) => { calls.push(['setAutoDiscoverModels', { id, autoDiscoverModels }]) },
+    setDefaultMode: async (id, defaultMode) => { calls.push(['setDefaultMode', id, defaultMode]) },
     probeAgentModels: async agentId => {
       calls.push(['probe', agentId])
       return { agentId, catalog: { model: { configId: 'model', name: 'Model', currentValue: 'a', choices: [{ value: 'a', name: 'A' }] } }, updatedAt: 1 }

@@ -417,6 +417,15 @@ describe('dispatchRpc', () => {
     await expect(dispatchRpc(manager, 'agent/set-auto-discover-models', { agentId: 'pi', autoDiscoverModels: 'yes' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     await expect(dispatchRpc(manager, 'agent/set-auto-discover-models', { agentId: 'pi' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
     await expect(dispatchRpc(manager, 'agent/set-auto-discover-models', { autoDiscoverModels: true })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    // The default chat mode is a per-agent preference on the same lightweight
+    // surface; an empty string is the explicit "follow the agent" answer.
+    await expect(dispatchRpc(manager, 'agent/set-default-mode', { agentId: 'pi', defaultMode: 'strict' })).resolves.toEqual({ ok: true, value: { done: true } })
+    expect(manager.calls).toContainEqual(['setDefaultMode', 'pi', 'strict'])
+    await expect(dispatchRpc(manager, 'agent/set-default-mode', { agentId: 'pi', defaultMode: '' })).resolves.toEqual({ ok: true, value: { done: true } })
+    expect(manager.calls).toContainEqual(['setDefaultMode', 'pi', undefined])
+    await expect(dispatchRpc(manager, 'agent/set-default-mode', { agentId: 'pi', defaultMode: 7 })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc(manager, 'agent/set-default-mode', { agentId: 'pi', defaultMode: 'x'.repeat(129) })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    await expect(dispatchRpc(manager, 'agent/set-default-mode', { defaultMode: 'strict' })).resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
   })
 
   it('routes session/chat-fork-adopt to the manager and normalizes a bad payload', async () => {

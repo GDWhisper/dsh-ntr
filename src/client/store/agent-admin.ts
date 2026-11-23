@@ -261,6 +261,47 @@ export class AgentAdminService {
     }
   }
 
+  /**
+   * Set (or clear) one agent's default chat mode. Same lightweight contract as
+   * `setAgentSkillsMcp`: optimistic roster patch, host RPC, authoritative
+   * resync; a refused (strict) persist restores the previous value and flashes
+   * the page notice.
+   */
+  async setAgentDefaultMode(agentId: string, defaultMode?: string): Promise<void> {
+    const previous = this.defaultModeOf(agentId)
+    this.writeDefaultMode(agentId, defaultMode)
+    try {
+      // An empty string is the explicit "follow the agent" answer; the host
+      // treats it as a clear (`optionalStr` returns undefined).
+      await this.host.call('agent/set-default-mode', { agentId, defaultMode: defaultMode ?? '' })
+      await this.host.resync()
+    } catch (error) {
+      this.writeDefaultMode(agentId, previous)
+      const msg = error instanceof Error ? error.message : String(error)
+      this.host.flashError(msg.includes('unknown endpoint agent/set-default-mode')
+        ? new Error(this.host.label('宿主服务运行着旧版本代码，请在终端重启 dsh web 服务以启用默认模式。', 'Host running older version. Please restart dsh web to enable the default mode.'))
+        : error)
+    }
+  }
+
+  /** One agent's raw default mode from the roster copy. */
+  private defaultModeOf(agentId: string): string | undefined {
+    return this.host.state().detectedAgents.find(info => info.id === agentId)?.currentConfig?.defaultMode
+  }
+
+  /** Patch the roster copy of one agent's default mode (absent = follow the agent). */
+  private writeDefaultMode(agentId: string, defaultMode: string | undefined): void {
+    this.host.mutate({
+      detectedAgents: this.host.state().detectedAgents.map(info => {
+        if (info.id !== agentId || info.currentConfig === undefined) return info
+        const currentConfig = { ...info.currentConfig }
+        if (defaultMode === undefined || defaultMode === '') delete currentConfig.defaultMode
+        else currentConfig.defaultMode = defaultMode
+        return { ...info, currentConfig }
+      }),
+    })
+  }
+
   /** One agent's per-agent `dsh-skills` answer as the roster copy holds it (`!== false` = offered). */
   private skillsMcpOf(agentId: string): boolean {
     const info = this.host.state().detectedAgents.find(entry => entry.id === agentId)

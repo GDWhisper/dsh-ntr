@@ -15,11 +15,11 @@ describe('idle release (isolated manager)', () => {
     return predicate()
   }
 
-  function idleManager(id: string, tuning: BridgeTuning, overrides: Partial<AcpAgentDef> = {}): { hub: EventHub; events: AcpEvent[]; manager: BridgeManager } {
+  function idleManager(id: string, tuning: BridgeTuning, overrides: Partial<AcpAgentDef> = {}, storage?: string): { hub: EventHub; events: AcpEvent[]; manager: BridgeManager } {
     const hub = new EventHub()
     const events: AcpEvent[] = []
     hub.subscribe(event => { events.push(event) })
-    const manager = new BridgeManager([{ ...def, id, ...overrides }], hub, 500, undefined, undefined, false, tuning)
+    const manager = new BridgeManager([{ ...def, id, ...overrides }], hub, 500, storage, undefined, false, tuning)
     return { hub, events, manager }
   }
 
@@ -174,6 +174,29 @@ describe('idle release (isolated manager)', () => {
       const promptResumed = await manager.getOrCreateDshSession('dsh-idle-pick', 'idle-pick')
       expect(promptResumed.modes?.currentModeId).toBe(originalMode)
       expect(manager.chatSessions('dsh-idle-pick')[0]?.modes?.currentModeId).toBe(originalMode)
+    } finally {
+      await manager.shutdownAll()
+    }
+  }, 30_000)
+
+  it('applies the configured default mode when a pick-less conversation resumes', async () => {
+    const { manager } = idleManager(
+      'idle-default-mode',
+      { idleTimeoutMs: 200 },
+      {},
+      `${tmpdir()}/acp-idle-default-mode-${Date.now()}.json`,
+    )
+    try {
+      await manager.getOrCreateDshSession('dsh-idle-default-mode', 'idle-default-mode')
+      expect(await waitUntil(() => manager.agentViews()[0]?.state === 'stopped')).toBe(true)
+      // No explicit pick was ever recorded for this conversation.
+      expect(manager.chatChoice('dsh-idle-default-mode')?.mode).toBeUndefined()
+
+      // Setting the default AFTER the conversation ran still reaches the
+      // fallback path: the next resume applies it because no pick outranks it.
+      await manager.setDefaultMode('idle-default-mode', 'strict')
+      await manager.resumeChatSession('dsh-idle-default-mode')
+      expect(manager.chatSessions('dsh-idle-default-mode')[0]?.modes?.currentModeId).toBe('strict')
     } finally {
       await manager.shutdownAll()
     }

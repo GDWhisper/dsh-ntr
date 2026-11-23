@@ -98,9 +98,13 @@ export function modeInForce(
   target: { released?: boolean; modes?: { currentModeId?: string } } | undefined,
   persisted: string | undefined,
   fallback?: string,
+  configuredDefault?: string,
 ): string {
   const live = target !== undefined && target.released !== true ? target.modes?.currentModeId : undefined
-  return live ?? persisted ?? target?.modes?.currentModeId ?? fallback ?? ''
+  // A configured default is newer intent than the mode a parked row was
+  // captured on: the next resume will apply it (`applyAgentDefaultMode`), so
+  // showing the parked value would promise something else for the next turn.
+  return live ?? persisted ?? configuredDefault ?? target?.modes?.currentModeId ?? fallback ?? ''
 }
 
 export function AcpComposerMode({ acp, sessionId, useSession }: ComposerModeProps) {
@@ -178,10 +182,22 @@ export function AcpComposerMode({ acp, sessionId, useSession }: ComposerModeProp
   const persisted = ui.chatChoice[dshSessionId]?.agentId === agentId
     ? ui.chatChoice[dshSessionId]?.mode
     : undefined
+  // The agent's configured NEW-chat default outranks the catalog's volatile
+  // observation; a recorded pick and a live/parked session still win (see
+  // `modeInForce`). It is shown only when the list actually offers it — a
+  // stale value stays a settings-page warning, never a select value with no
+  // matching option.
+  const configuredDefault = agentId === undefined
+    ? undefined
+    : ui.detectedAgents.find(info => info.id === agentId)?.currentConfig?.defaultMode
+  const shownDefault = configuredDefault !== undefined && modes.some(mode => mode.id === configuredDefault)
+    ? configuredDefault
+    : undefined
   const current = modeInForce(
     target,
     persisted,
     catalog?.mode?.currentValue ?? modes[0]?.id,
+    shownDefault,
   )
 
   return (

@@ -34,6 +34,12 @@ export interface AgentForm {
   exposed?: string[]
   /** Auto-append models the agent newly publishes to {@link exposed}. */
   autoDiscoverModels: boolean
+  /**
+   * The agent's default chat mode. Edited through the lightweight
+   * `agent/set-default-mode` RPC, not through this form; it rides here only so
+   * a full save carries the current value instead of wiping it.
+   */
+  defaultMode: string
   /** Raw text of the idle-release window in ms ('' = host default, '0' = never). */
   idleStr: string
   /**
@@ -142,6 +148,7 @@ export function initialForm(detected: DetectedAgentInfo, activeAgent: AgentView 
     envRows: Object.entries(config?.env ?? {}).map(([key, value]) => ({ key, value })),
     exposed: config?.exposedModels === undefined ? undefined : [...config.exposedModels],
     autoDiscoverModels: config?.autoDiscoverModels !== false,
+    defaultMode: config?.defaultMode ?? '',
     // The agent's OWN override only. The host's resolved value is NOT
     // written back here: it would freeze the global window into this
     // agent's definition, and the global slider would then never reach it.
@@ -175,6 +182,7 @@ export function payloadEquals(payload: AgentSavePayload, current: AcpAgentDef): 
   if (!sameStringMap(payload.env ?? {}, current.env ?? {})) return false
   if (exposureKey(payload.exposedModels) !== exposureKey(current.exposedModels)) return false
   if (mcpKey(payload.mcpServers) !== mcpKey(current.mcpServers)) return false
+  if ((payload.defaultMode ?? '') !== (current.defaultMode ?? '')) return false
   if ((payload.autoDiscoverModels !== false) !== (current.autoDiscoverModels !== false)) return false
   // Compared as an effective boolean: absent and `true` are both "on", so a
   // card that never touched the per-agent switch is not dirty.
@@ -227,6 +235,8 @@ export function buildPayload(form: AgentForm, detected: DetectedAgentInfo, newCu
     // The MCP list is OPTIONAL: absent = the agent connects only to the
     // servers it configures for itself.
     ...(mcpServers === undefined ? {} : { mcpServers }),
+    // Carried so a full save cannot clear the value the RPC wrote.
+    ...(form.defaultMode.trim() === '' ? {} : { defaultMode: form.defaultMode.trim() }),
     // Carried so a full save cannot silently re-enable the built-in server:
     // the host rebuilds the definition from this payload. On is the default,
     // so only the opt-out is sent (and only that is persisted).

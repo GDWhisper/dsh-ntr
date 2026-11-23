@@ -233,6 +233,8 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
       def.autoDiscoverModels = event.autoDiscoverModels
       if (event.skillsMcpEnabled === false) def.skillsMcpEnabled = false
       else delete def.skillsMcpEnabled
+      if (event.defaultMode === undefined) delete def.defaultMode
+      else def.defaultMode = event.defaultMode
     }
     // Exercise the private SSE reducer without opening a real transport.
     await (store as unknown as { applyEvent(event: AcpEvent): Promise<void> }).applyEvent(structuredClone(event))
@@ -362,6 +364,14 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
           // The host stores the opt-out only: `true` clears the key.
           if (value) delete def.skillsMcpEnabled
           else def.skillsMcpEnabled = false
+          return ok({ done: true })
+        }
+        case 'agent/set-default-mode': {
+          const { agentId, defaultMode } = payload as { agentId: string; defaultMode?: string }
+          const def = definition(agentId)
+          // Empty / absent is the explicit "follow the agent" answer.
+          if (defaultMode === undefined || defaultMode === '') delete def.defaultMode
+          else def.defaultMode = defaultMode
           return ok({ done: true })
         }
         case 'ui/tag-halo': return ok({ halo })

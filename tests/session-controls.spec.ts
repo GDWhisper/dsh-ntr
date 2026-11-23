@@ -393,6 +393,11 @@ describe('a parked session row yields to the conversation pick, so a pre-switch 
     expect(modeInForce(undefined, 'edits')).toBe('edits')
     expect(modeInForce(undefined, undefined, 'first')).toBe('first')
     expect(modeInForce(undefined, undefined)).toBe('')
+    // A configured new-chat default outranks a parked row (the next resume
+    // applies it), while a LIVE session still reflects what the agent runs.
+    expect(modeInForce({ released: true, modes: { currentModeId: 'plan' } }, undefined, 'catalog', 'bypass')).toBe('bypass')
+    expect(modeInForce({ modes: { currentModeId: 'plan' } }, undefined, 'catalog', 'bypass')).toBe('plan')
+    expect(modeInForce(undefined, undefined, 'catalog', 'bypass')).toBe('bypass')
   })
 })
 

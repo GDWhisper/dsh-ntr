@@ -555,6 +555,47 @@ export class ChatChoiceService {
   }
 
   /**
+   * Apply the agent's configured NEW-chat default mode to a conversation that
+   * has no mode in its pick.
+   *
+   * Runs after `applyChatChoice` on both boot paths, so an explicit pick — or
+   * the value the create path seeded from the composer — always wins. This is
+   * a fallback, never written back as a pick: a conversation that later picks
+   * its own mode owns that choice, and changing the agent default afterwards
+   * leaves it alone. Best effort: a value the live session no longer offers is
+   * skipped with one warning (the persisted field is kept).
+   */
+  async applyAgentDefaultMode(session: LiveSession): Promise<void> {
+    const dshSessionId = session.dshSessionId
+    if (dshSessionId === undefined) return
+    const choice = this.picks.get(dshSessionId)
+    if (choice !== undefined && (choice.agentId !== session.agentId || choice.mode !== undefined)) return
+    const defaultMode = this.host.defOf(session.agentId)?.defaultMode
+    if (defaultMode === undefined || defaultMode === '') return
+    if (session.modes?.currentModeId === defaultMode) return
+    const offered = session.modes?.availableModes ?? []
+    if (offered.length > 0 && !offered.some(mode => mode.id === defaultMode)) {
+      this.host.hub.broadcast({
+        type: 'agent/notice',
+        agentId: session.agentId,
+        level: 'error',
+        text: `acp: the configured default mode "${defaultMode}" is not offered by agent "${session.agentId}"; keeping its own`,
+      })
+      return
+    }
+    try {
+      await this.host.bridgeForSession(session).setMode(session, defaultMode)
+    } catch (error) {
+      this.host.hub.broadcast({
+        type: 'agent/notice',
+        agentId: session.agentId,
+        level: 'error',
+        text: `acp: failed to apply default mode "${defaultMode}": ${describeError(error)}`,
+      })
+    }
+  }
+
+  /**
    * Switch one chat-bound session's ACP mode.
    *
    * A released session is deliberately NOT resumed for it (user decision,
@@ -760,7 +801,11 @@ export class ChatChoiceService {
    */
   displayedChatDefaults(agentId: string): DisplayedChatDefaults | undefined {
     const catalog = this.host.catalogFor(agentId)
-    if (catalog === undefined) return undefined
+    // The configured new-chat default is a deliberate fact, so it outranks the
+    // catalog's volatile "last mode some session reported". It survives an
+    // unread catalog: the mode axis needs no option list to be captured.
+    const defaultMode = this.host.defOf(agentId)?.defaultMode
+    if (catalog === undefined) return defaultMode === undefined ? undefined : { mode: defaultMode }
     const out: DisplayedChatDefaults = {}
     const model = catalog.model?.currentValue
     if (model !== null && model !== undefined && model !== '') {
@@ -770,13 +815,13 @@ export class ChatChoiceService {
     // `defaultEffort` only when the current value is one of the agent's levels.
     const effort = this.host.reasoningMeta(agentId)?.defaultEffort
     if (effort !== undefined) out.effort = effort
-    // The mode select's pre-first-message value is the catalog's last-known
-    // mode (the agent's own answer from another session), and `session/new`
-    // starts on whatever the agent itself defaults to. Without capturing it,
-    // a conversation whose select reads "Bypass Permissions" would run its
-    // first turn on "Always Ask" — the same display/run split the model and
-    // thought level are seeded for.
-    const mode = catalog.mode?.currentValue
+    // The mode select's pre-first-message value is the configured default,
+    // else the catalog's last-known mode (the agent's own answer from another
+    // session). `session/new` starts on whatever the agent itself defaults to;
+    // without capturing the shown value, a conversation whose select reads
+    // "Bypass Permissions" would run its first turn on "Always Ask" — the
+    // same display/run split the model and thought level are seeded for.
+    const mode = defaultMode ?? catalog.mode?.currentValue
     if (mode !== null && mode !== undefined && mode !== '') out.mode = mode
     const extraConfigs: Record<string, string | boolean> = {}
     for (const option of catalog.extras ?? []) {

@@ -9,7 +9,7 @@
  */
 
 import type { AcpAgentDef, AcpDelegateAgentDefaults, AcpDelegateConfig, AcpMcpServerDef, AcpPluginConfig, AcpTagHalo, ApprovalDeadlineKey, DelegateGuidance, DelegateSetPayload, DelegateSettingKey, PermissionTimeoutMode } from '../protocol.ts'
-import { DEFAULT_IDLE_TIMEOUT_MS, DELEGATE_DESCRIPTION_MAX, DELEGATE_TIMEOUT_MAX_MS, DELEGATE_TIMEOUT_MIN_MS, IDLE_RELEASE_MS } from '../protocol.ts'
+import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_MODE_MAX, DELEGATE_DESCRIPTION_MAX, DELEGATE_TIMEOUT_MAX_MS, DELEGATE_TIMEOUT_MIN_MS, IDLE_RELEASE_MS } from '../protocol.ts'
 import { splitCommandLine } from './command-line.ts'
 import { AcpError } from './errors.ts'
 import { isAbsolutePath } from './paths.ts'
@@ -533,6 +533,20 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
   const mcpServers = row.mcpServers === undefined
     ? undefined
     : validateMcpServers(row.mcpServers, `agent "${id}" mcpServers`, 'bad_config')
+  // Default chat mode: optional, agent-defined id. Blank means "not written"
+  // (the file stores no empty entry), so a config that clears it needs no
+  // sentinel. Shape only — the live session is the authority that decides
+  // whether the agent still offers it.
+  const defaultModeRaw = row.defaultMode
+  if (defaultModeRaw !== undefined && typeof defaultModeRaw !== 'string') {
+    throw new AcpError('bad_config', `acp: agent "${id}" defaultMode must be a string`)
+  }
+  const defaultMode = typeof defaultModeRaw === 'string' && defaultModeRaw.trim() !== ''
+    ? defaultModeRaw.trim()
+    : undefined
+  if (defaultMode !== undefined && defaultMode.length > DEFAULT_MODE_MAX) {
+    throw new AcpError('bad_config', `acp: agent "${id}" defaultMode must be at most ${String(DEFAULT_MODE_MAX)} chars`)
+  }
   // The per-agent `dsh-skills` opt-out: optional boolean, ON by default. Like
   // `autoDiscoverModels`, only the explicit opt-out is stored — `true` and
   // absent are the same state, so the file does not carry noise. A present
@@ -554,6 +568,7 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
     ...(autoDiscoverModels === false ? { autoDiscoverModels: false } : {}),
     ...(idleTimeoutMs === undefined ? {} : { idleTimeoutMs: idleTimeoutMs as number }),
     ...(mcpServers === undefined ? {} : { mcpServers }),
+    ...(defaultMode === undefined ? {} : { defaultMode }),
     ...(skillsMcpEnabled === false ? { skillsMcpEnabled: false } : {}),
   }
 }

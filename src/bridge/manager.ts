@@ -241,6 +241,7 @@ export class BridgeManager {
       forkSession: (agentId, parent, childDshSessionId) => this.bridge(agentId).forkSession(parent, childDshSessionId),
       patchChatChoice: (dshSessionId, patch) => { this.choices.patchChatChoice(dshSessionId, patch) },
       applyChatChoice: session => this.choices.applyChatChoice(session),
+      applyAgentDefaultMode: session => this.choices.applyAgentDefaultMode(session),
       syncConversationRoute: dshSessionId => { this.choices.syncConversationRoute(dshSessionId) },
       persistAgents: () => this.persistence.persistAgents(),
       closeSessionHolder: session => {
@@ -1055,6 +1056,11 @@ export class BridgeManager {
   /** Per-agent `dsh-skills` opt-out; in-place edit, strictly persisted, no restart. */
   async setSkillsMcp(agentId: string, skillsMcpEnabled: boolean): Promise<void> {
     return this.admin.setSkillsMcp(agentId, skillsMcpEnabled)
+  }
+
+  /** Per-agent default chat mode; in-place edit, strictly persisted, no restart. */
+  async setDefaultMode(agentId: string, defaultMode?: string): Promise<void> {
+    return this.admin.setDefaultMode(agentId, defaultMode)
   }
 
   /** Delete one definition and every pointer into it. */
