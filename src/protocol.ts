@@ -87,6 +87,16 @@ export type {
   PendingElicitationFields,
   PendingElicitationView,
 } from './protocol/elicitation.ts'
+export {
+  MAX_ELICITATION_DESC_CHARS,
+  MAX_ELICITATION_FIELD_NAME_CHARS,
+  MAX_ELICITATION_FIELDS,
+  MAX_ELICITATION_MESSAGE_CHARS,
+  MAX_ELICITATION_OPTION_LABEL_CHARS,
+  MAX_ELICITATION_OPTION_VALUE_CHARS,
+  MAX_ELICITATION_OPTIONS,
+  MAX_ELICITATION_TITLE_CHARS,
+} from './protocol/elicitation.ts'
 
 export type {
   AgentDetectResult,

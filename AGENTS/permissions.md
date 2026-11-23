@@ -157,7 +157,7 @@ to the config file"、"adopts a deadline the settings page writes while a sessio
 - **堆叠**：多条询问按**到达顺序、最旧在上**堆叠；容器由 CSS 限高（`min(38vh, 320px)`）并滚动，一串询问不会把 composer 顶出屏幕。
 - **无聊天身份**：永不进入 dock；它们只出现在设置页镜像。
 
-**设置页镜像**（`src/client/panel/permission-mirror.tsx` · `permissionLedgerCard` / `PermissionMirrorCard`）：只要 `ui.permissions` 非空就渲染可答复的跨会话列表，提示语说明「对话打开时在那边的卡片上回答；这里兜底显示其他会话的询问」。它不再是唯一入口，也不是降级路径——`approvalRouted` / `fellBackFromConversation` 已删除，`agents/list` 不再带审批能力旗标。
+**设置页镜像**（`src/client/panel/permission-mirror.tsx` · `permissionLedgerCard` / `PermissionMirrorCard`）：只要 `ui.permissions` 或 `ui.elicitations` 非空就渲染「待处理权限与提问」可答复跨会话列表，提示语说明「对话打开时在那边的卡片上回答；这里兜底显示其他会话的询问」。它不再是唯一入口，也不是降级路径——`approvalRouted` / `fellBackFromConversation` 已删除，`agents/list` 不再带审批能力旗标。
 
 **设置页没有权限开关**：agent 卡不再提供「权限策略 / 要不要问人」。要不要问由 agent 自己的 mode 决定，问了就一定会到人面前（显式选择 `auto` + `0` 的部署除外，它按 §2.1 代答）。
 
@@ -173,16 +173,22 @@ to the config file"、"adopts a deadline the settings page writes while a sessio
 2. **持有的判定不是永久的**：投影行沉默时（宿主行不带 `agentPreset`），`session/chat-list` 判定是唯一事实源，而它原本每会话只问一次。没有 `agent-preset/selected` 帧宣告的切换（`remote` 面缺席或运行时不转发）会把会话永久钉在 NTR 模式。现行：行沉默且持有判定时按 `ACP_MODE_VERDICT_TTL_MS`（`src/client/index.tsx`，默认 2000ms）带节流地重问，并由一个自备定时器触发；重问经 `loadChatSessions(..., { settleVerdict: true })` 显式获准覆盖 frame 权威——frame 对作曲面读取仍然永远优先（宿主日志读可能比切换慢一格），闸门自己的重问是唯一例外。
 3. **帧路径随服务迟到而补挂**：`remote.$on('agent-preset/selected')` 改由 `attach()` 解析（`internal/service` 重跑），本包先于网关加载时不再整页失去这条唯一活事实源。
 
+## 5. 表单提问（`elicitation/create`）
+
+`AgentBridge` 在 ACP `initialize` 声明 `clientCapabilities.elicitation.form = {}`，由 `handleBridgeElicitationRequest`（`src/bridge/elicitation-bridge.ts`）接住 `elicitation/create`（非 `form` 模式回 `cancel`）；与审批共享纯账本 `PendingRequestLedger` / `pendingReplayFrames`（`src/impl/pending-request.ts` → `ElicitationLedger` / `elicitationReplayFrames`）。入口处按协议上限（`MAX_ELICITATION_*`：`message` 2000、`title` 200、`description` 500、20 字段、50 选项）截断或限制，响应经 `validateElicitationOutcome`（服务端 `ElicitationLedger.respond` 复核）拒绝未声明字段与枚举外选项，校验失败保留 pending。默认期限 `elicitationTimeoutMs = 300_000`（未显式配置时跟随非零 `permissionTimeoutMs`；`0` 不设限），到期结算 `cancel` 并广播 `agent/notice` + `elicitation/resolved`；`signal` 撤回、`session/cancel`、`closeSession`、`releaseAll` 同走 `settlePermissions` 清理。
+
 ## 代码索引
 
 | 主题 | 位置 |
 |---|---|
+| 共享待答账本 | `src/impl/pending-request.ts` · `PendingRequestLedger` / `pendingReplayFrames` |
 | 权限请求处理 | `src/bridge/agent-bridge.ts` · `handlePermissionRequest`；`src/bridge/turn-stream.ts` · `permissionToolName`；`src/bridge/shape.ts` · `permissionAskReason` |
-| 对话审批卡 | `src/client/permission-dock.tsx` · `PermissionDock`；`src/client/index.tsx` · `conversation.input.dock` 注册；`src/client/store/permission.ts` · `permissionsForSession` / `deadlineRemainingLabel` |
-| 重连重放 | `src/impl.ts` · `permissionRequestFrame` / `permissionReplayFrames` / `PermissionLedger.pendingViews`；`src/index.ts` · `/api/acp/stream` |
-| 超时收场 | `src/bridge/agent-bridge.ts` · `announceExpiredAsk` / `settleExpiredAsk`；`src/bridge/turn-stream.ts` · `TurnStreamController.expiredLine` / `permissionLine`；`src/impl.ts` · `pickAutoOption` / `AUTO_OPTION_KIND_PRIORITY` |
-| 期限与模式热改 | `src/bridge/settings-service.ts` · `approvalDeadlines` / `setApprovalDeadlines` / `setConfiguredApprovalDeadlines` / `applyDeadlineTuning`；`src/bridge/agent-bridge.ts` · `AgentBridge.applyApprovalDeadlines`；`src/impl.ts` · `validateApprovalDeadlines` / `validateApprovalDeadlineMs` / `validatePermissionTimeoutMode`；`src/index.ts` · `apply()` 的原始配置透传 |
-| 期限 UI | `src/client/panel/approval-deadlines-card.tsx` · `ApprovalDeadlinesCard` / `DeadlineModeBlock` / `DeadlineSliderBlock` / `deadlineSliderIndex` / `modeText` / `deadlineText` / `approvalDeadlineFacts`；`src/client/store.ts` · `setApprovalDeadline` / `setApprovalTimeoutMode` / `resetApprovalDeadlines` |
+| 表单提问处理 | `src/bridge/elicitation-bridge.ts` · `handleBridgeElicitationRequest`；`src/impl/elicitation.ts` · `parseElicitationForm` / `validateElicitationOutcome` / `ElicitationLedger` / `elicitationRequestFrame` / `elicitationReplayFrames` |
+| 对话审批与表单卡 | `src/client/pending-dock.tsx` · `PendingDockShell` / `DeadlineBadge` / `useDeadlineClock`；`src/client/permission-dock.tsx` · `PermissionDock`；`src/client/elicitation-dock.tsx` · `ElicitationDock` / `ElicitationAskCard`；`src/client/index.tsx` · `conversation.input.dock` 注册 |
+| 重连重放 | `src/impl.ts` · `permissionRequestFrame` / `permissionReplayFrames` / `elicitationRequestFrame` / `elicitationReplayFrames`；`src/index.ts` · `/api/acp/stream` |
+| 超时收场 | `src/bridge/agent-bridge.ts` · `announceExpiredAsk` / `settleExpiredAsk`；`src/bridge/elicitation-bridge.ts` · `elicitationTimeoutMs` 到期逻辑；`src/impl.ts` · `pickAutoOption` |
+| 期限与模式热改 | `src/bridge/settings-service.ts` · `approvalDeadlines` / `applyDeadlineTuning`；`src/bridge/agent-bridge.ts` · `applyApprovalDeadlines`；`src/impl.ts` · `validateApprovalDeadlines` / `validateApprovalDeadlineMs` / `validatePermissionTimeoutMode` |
+| 期限 UI | `src/client/panel/approval-deadlines-card.tsx` · `ApprovalDeadlinesCard` / `DeadlineModeBlock` / `DeadlineSliderBlock`；`src/client/store.ts` · `setApprovalDeadline` / `setApprovalTimeoutMode` / `resetApprovalDeadlines` |
 | fs 围栏 | `src/bridge/agent-bridge.ts` · `handleFsWrite` / `guardFsPath`；`src/impl.ts` · `resolveFsPath` |
 | 设置页镜像 | `src/client/panel/permission-mirror.tsx` · `permissionLedgerCard` / `PermissionMirrorCard` |
 | 权限座位 | `src/client/model-seat.tsx` · `createPermissionSeatClaim` |

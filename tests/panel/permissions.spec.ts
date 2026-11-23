@@ -28,7 +28,37 @@ describe('AcpSettingsSection permissions', () => {
     expect(payloads(fixture, 'permission/respond')).toEqual([
       { requestId: 'ask-edit', optionId: 'always' }, { requestId: 'ask-cancel' },
     ])
-    expect(screen.queryByText('待处理权限请求')).toBeNull()
+    expect(screen.queryByText('待处理权限与提问')).toBeNull()
+  })
+
+  it('mirrors pending elicitation forms in Settings and submits answers', async () => {
+    const fixture = await mountPanel()
+    await category('智能体')
+    await act(async () => {
+      await fixture.applyEvent({
+        type: 'elicitation/request',
+        requestId: 'elicit-mirror-1',
+        sessionId: 'acp-preview',
+        dshSessionId: 'other-chat',
+        message: 'Select deploy target',
+        fields: [
+          {
+            name: 'target',
+            kind: 'single-select',
+            title: 'Target',
+            required: true,
+            options: [{ value: 'staging', label: 'Staging' }],
+          },
+        ],
+      })
+    })
+    expect(screen.getByText('待处理权限与提问')).toBeDefined()
+    await click(screen.getByRole('radio', { name: 'Staging' }))
+    await click(screen.getByRole('button', { name: '提交' }))
+    expect(payloads(fixture, 'elicitation/respond')).toEqual([
+      { requestId: 'elicit-mirror-1', action: 'accept', content: { target: 'staging' } },
+    ])
+    expect(screen.queryByText('待处理权限与提问')).toBeNull()
   })
 
   it('draws no slider for default wait, offers zero for auto, and starts abort at a real wait', async () => {

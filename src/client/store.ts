@@ -19,6 +19,7 @@ import type { Block } from "./store/blocks.ts"
 import { foldUpdate, usageFromUpdate, withSessionReleased } from "./store/blocks.ts"
 import type { ChatForkOutcome } from "./store/fork.ts"
 import { reduceElicitationEvent } from "./store/elicitation.ts"
+import { removePendingRequest, syncPendingRequests, upsertPendingRequest } from "./store/pending.ts"
 import type { PendingPermission } from "./store/permission.ts"
 import { normalizeSaveGateStatus } from "./store/save-gate.ts"
 import type { AcpLogEntry, ChatTranscript, RpcCall, UiState } from "./store/state.ts"
@@ -1318,17 +1319,16 @@ export class AcpStore {
           ...(event.deadlineAt === undefined ? {} : { deadlineAt: event.deadlineAt }),
         }
         this.mutate({
-          permissions: [...this.state.permissions.filter(p => p.requestId !== event.requestId), permission],
+          permissions: upsertPendingRequest(this.state.permissions, permission),
         })
         return Promise.resolve()
       }
       case 'permission/resolved': {
-        this.mutate({ permissions: this.state.permissions.filter(p => p.requestId !== event.requestId) })
+        this.mutate({ permissions: removePendingRequest(this.state.permissions, event.requestId) })
         return Promise.resolve()
       }
       case 'permission/synced': {
-        const live = new Set(event.requestIds)
-        this.mutate({ permissions: this.state.permissions.filter(p => live.has(p.requestId)) })
+        this.mutate({ permissions: syncPendingRequests(this.state.permissions, event.requestIds) })
         return Promise.resolve()
       }
       case 'elicitation/request':

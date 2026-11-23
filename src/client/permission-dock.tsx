@@ -23,13 +23,10 @@
  * settings-panel ledger, the cross-session mirror.
  */
 
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { ensureAcpStyle, useUi } from './acp-ui.tsx'
-import {
-  deadlineRemainingLabel,
-  PERMISSION_DEADLINE_EXPIRED,
-  permissionsForSession,
-} from './store.ts'
+import { DeadlineBadge, PendingDockShell, useDeadlineClock } from './pending-dock.tsx'
+import { permissionsForSession } from './store.ts'
 import type { AcpStore, PendingPermission } from './store.ts'
 
 export interface PermissionDockProps {
@@ -38,33 +35,23 @@ export interface PermissionDockProps {
   sessionId: string
 }
 
-/** Tick interval for the countdown (seconds are all the label shows). */
-const COUNTDOWN_TICK_MS = 1000
-
 export function PermissionDock({ acp, sessionId }: PermissionDockProps) {
   ensureAcpStyle()
   const ui = useUi(acp)
   const dshSessionId = String(sessionId)
   const pending = permissionsForSession(ui.permissions, dshSessionId)
   const counting = pending.some(ask => ask.timeoutMode !== 'wait' && ask.deadlineAt !== undefined)
-  const [now, setNow] = useState(() => Date.now())
-  useEffect(() => {
-    if (!counting) return
-    setNow(Date.now())
-    const timer = setInterval(() => { setNow(Date.now()) }, COUNTDOWN_TICK_MS)
-    return () => { clearInterval(timer) }
-  }, [counting])
+  const now = useDeadlineClock(counting)
   if (pending.length === 0) return null
   return (
-    <div
+    <PendingDockShell
       className="ntr-permission-dock"
-      role="region"
-      aria-label={acp.label('待处理的权限请求', 'Pending permission requests')}
+      ariaLabel={acp.label('待处理的权限请求', 'Pending permission requests')}
     >
       {pending.map(permission => (
         <PermissionAskCard key={permission.requestId} acp={acp} permission={permission} now={now} />
       ))}
-    </div>
+    </PendingDockShell>
   )
 }
 
@@ -72,8 +59,6 @@ function PermissionAskCard(props: { acp: AcpStore; permission: PendingPermission
   const { acp, permission, now } = props
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
-  const remaining = deadlineRemainingLabel(permission.deadlineAt, now, permission.timeoutMode)
-  const expired = remaining === PERMISSION_DEADLINE_EXPIRED
   const respond = (optionId?: string): void => {
     if (busy) return
     setBusy(true)
@@ -94,13 +79,7 @@ function PermissionAskCard(props: { acp: AcpStore; permission: PendingPermission
         {permission.reason !== undefined && (
           <span className="ntr-permission-reason" title={permission.reason}>{permission.reason}</span>
         )}
-        {remaining !== undefined && (
-          <span className={`ntr-permission-deadline${expired ? ' is-expired' : ''}`}>
-            {expired
-              ? acp.label('已超时', 'expired')
-              : acp.label(`剩余 ${remaining}`, `${remaining} left`)}
-          </span>
-        )}
+        <DeadlineBadge acp={acp} deadlineAt={permission.deadlineAt} now={now} mode={permission.timeoutMode} />
       </div>
       <div className="ntr-permission-actions">
         {permission.options.map(option => (

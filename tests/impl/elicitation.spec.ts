@@ -15,7 +15,15 @@ import {
   validateElicitationOutcome,
 } from '../../src/impl.ts'
 import type { AcpManager } from '../../src/impl.ts'
-import type { ElicitationOutcome } from '../../src/protocol.ts'
+import {
+  MAX_ELICITATION_DESC_CHARS,
+  MAX_ELICITATION_FIELDS,
+  MAX_ELICITATION_MESSAGE_CHARS,
+  MAX_ELICITATION_OPTION_LABEL_CHARS,
+  MAX_ELICITATION_OPTIONS,
+  MAX_ELICITATION_TITLE_CHARS,
+  type ElicitationOutcome,
+} from '../../src/protocol.ts'
 
 describe('ACP form elicitation parsing and validation', () => {
   it('parses all ACP form property schemas into normalized field views', () => {
@@ -219,17 +227,59 @@ describe('ACP form elicitation parsing and validation', () => {
     expect(() => validateElicitationOutcome('accept', { pick: 'a', count: 1.5 }, parsed.fields)).toThrow(AcpError)
     expect(() => validateElicitationOutcome('accept', { pick: 'a', count: 5 }, parsed.fields)).toThrow(AcpError)
     expect(() => validateElicitationOutcome('accept', { pick: 'a', count: 1, multi: ['x', 'y', 'z'] }, parsed.fields)).toThrow(AcpError)
+    expect(() => validateElicitationOutcome('accept', { pick: 'c', count: 2 }, parsed.fields)).toThrow(/invalid option/)
+    expect(() => validateElicitationOutcome('accept', { pick: 'a', count: 2, multi: ['bogus'] }, parsed.fields)).toThrow(/invalid option/)
+    expect(() => validateElicitationOutcome('accept', { pick: 'a', count: 2, extra: 'nope' }, parsed.fields)).toThrow(/unexpected elicitation field/)
     expect(() => validateElicitationOutcome('bogus', {}, parsed.fields)).toThrow(AcpError)
+  })
+
+  it('bounds overlong text, field counts, and option counts from agent schemas', () => {
+    const properties: Record<string, unknown> = {}
+    for (let i = 0; i < MAX_ELICITATION_FIELDS + 5; i++) {
+      properties[`f${String(i)}`] = i === 0
+        ? {
+            type: 'string',
+            title: 'T'.repeat(MAX_ELICITATION_TITLE_CHARS + 20),
+            description: 'D'.repeat(MAX_ELICITATION_DESC_CHARS + 20),
+            oneOf: Array.from({ length: MAX_ELICITATION_OPTIONS + 5 }, (_, j) => ({
+              const: `v${String(j)}`,
+              title: 'L'.repeat(MAX_ELICITATION_OPTION_LABEL_CHARS + 20),
+            })),
+          }
+        : { type: 'string' }
+    }
+    const parsed = parseElicitationForm({
+      mode: 'form',
+      sessionId: 'acp-1',
+      message: 'M'.repeat(MAX_ELICITATION_MESSAGE_CHARS + 50),
+      requestedSchema: {
+        type: 'object',
+        title: 'S'.repeat(MAX_ELICITATION_TITLE_CHARS + 10),
+        description: 'B'.repeat(MAX_ELICITATION_DESC_CHARS + 10),
+        properties,
+      },
+    })!
+
+    expect(parsed.message.length).toBe(MAX_ELICITATION_MESSAGE_CHARS)
+    expect(parsed.message.endsWith('…')).toBe(true)
+    expect(parsed.title?.length).toBe(MAX_ELICITATION_TITLE_CHARS)
+    expect(parsed.description?.length).toBe(MAX_ELICITATION_DESC_CHARS)
+    expect(parsed.fields).toHaveLength(MAX_ELICITATION_FIELDS)
+    expect(parsed.fields[0]?.title.length).toBe(MAX_ELICITATION_TITLE_CHARS)
+    expect(parsed.fields[0]?.description?.length).toBe(MAX_ELICITATION_DESC_CHARS)
+    expect(parsed.fields[0]?.options).toHaveLength(MAX_ELICITATION_OPTIONS)
+    expect(parsed.fields[0]?.options?.[0]?.label.length).toBe(MAX_ELICITATION_OPTION_LABEL_CHARS)
   })
 })
 
 describe('ElicitationLedger, replay frames, and RPC dispatch', () => {
-  it('tracks pending asks, replays identically, responds once, and settles on session close', () => {
+  it('tracks pending asks, replays identically with deadlineAt, responds once, and keeps entries on validation errors', () => {
     const ledger = new ElicitationLedger()
     const received: ElicitationOutcome[] = []
     const view = {
       dshSessionId: 'dsh-1',
       message: 'Pick one',
+      deadlineAt: 1_700_000_000_000,
       fields: [{ name: 'choice', kind: 'single-select' as const, title: 'Choice', required: true, options: [{ value: 'a', label: 'A' }] }],
     }
     const id1 = ledger.create('s1', outcome => { received.push(outcome) }, view)
@@ -239,9 +289,14 @@ describe('ElicitationLedger, replay frames, and RPC dispatch', () => {
     expect(ledger.hasPendingFor('s9')).toBe(false)
 
     const liveFrame = elicitationRequestFrame({ requestId: id1, sessionId: 's1', ...view })
+    expect(liveFrame).toMatchObject({ deadlineAt: 1_700_000_000_000 })
     const replay = elicitationReplayFrames(ledger.pendingViews())
     expect(replay[0]).toEqual(liveFrame)
     expect(replay.at(-1)).toEqual({ type: 'elicitation/synced', requestIds: [id1, id2] })
+
+    // Invalid option leaves the ask pending so the caller can retry with a valid one.
+    expect(() => ledger.respond(id1, { action: 'accept', content: { choice: 'z' } })).toThrow(/invalid option/)
+    expect(ledger.has(id1)).toBe(true)
 
     ledger.respond(id1, { action: 'accept', content: { choice: 'a' } })
     expect(received[0]).toEqual({ action: 'accept', content: { choice: 'a' } })

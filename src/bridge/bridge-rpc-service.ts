@@ -247,22 +247,30 @@ export class BridgeRpcService {
   }
 
   respondPermission(requestId: string, optionId: string | undefined): void {
-    for (const bridge of this.host.bridgeRegistry.bridges.values()) {
-      const owner = bridge.permissions.sessionIds().find(p => p.requestId === requestId)
-      if (owner === undefined) continue
+    this.respondInBridges(requestId, 'permission', bridge => {
+      if (!bridge.permissions.has(requestId)) return false
       bridge.permissions.respond(requestId, optionId === undefined ? { outcome: 'cancelled' } : { outcome: 'selected', optionId })
-      return
-    }
-    throw new AcpError('unknown_request', `acp: no pending permission ${requestId}`)
+      return true
+    })
   }
 
   respondElicitation(requestId: string, outcome: ElicitationOutcome): void {
-    for (const bridge of this.host.bridgeRegistry.bridges.values()) {
-      if (!bridge.elicitations.has(requestId)) continue
+    this.respondInBridges(requestId, 'elicitation', bridge => {
+      if (!bridge.elicitations.has(requestId)) return false
       bridge.elicitations.respond(requestId, outcome)
-      return
+      return true
+    })
+  }
+
+  private respondInBridges(
+    requestId: string,
+    kind: string,
+    tryRespond: (bridge: import('./agent-bridge.ts').AgentBridge) => boolean,
+  ): void {
+    for (const bridge of this.host.bridgeRegistry.bridges.values()) {
+      if (tryRespond(bridge)) return
     }
-    throw new AcpError('unknown_request', `acp: no pending elicitation ${requestId}`)
+    throw new AcpError('unknown_request', `acp: no pending ${kind} ${requestId}`)
   }
 
   transcript(sessionId: string, afterSeq: number | undefined): { session: unknown; entries: Array<{ seq: number; update: unknown }> } {

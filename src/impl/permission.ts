@@ -9,6 +9,7 @@
  */
 
 import type { AcpEvent, PermissionOptionView, PermissionTimeoutMode } from '../protocol.ts'
+import { pendingReplayFrames } from './pending-request.ts'
 
 /**
  * The order `auto` mode picks an option in, by the kind the agent declared:
@@ -135,6 +136,9 @@ export function permissionRequestFrame(view: PendingPermissionView): AcpEvent {
  * `respond` would answer `unknown_request`.
  */
 export function permissionReplayFrames(pending: readonly PendingPermissionView[]): AcpEvent[] {
-  const requests: AcpEvent[] = pending.map(permissionRequestFrame)
-  return [...requests, { type: 'permission/synced', requestIds: pending.map(p => p.requestId) }]
+  return pendingReplayFrames(
+    pending,
+    permissionRequestFrame,
+    requestIds => ({ type: 'permission/synced', requestIds }),
+  )
 }

@@ -444,6 +444,14 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
   // `abort` a zero window would refuse every ask on arrival — the agent stops
   // at every gate — so it becomes the shortest real wait.
   const effectivePermissionTimeoutMs = normalizeApprovalWindow(permissionTimeoutMode, permissionTimeoutMs)
+  const elicitationTimeoutMs = value.elicitationTimeoutMs === undefined
+    ? undefined
+    : validateApprovalDeadlineMs(
+      value.elicitationTimeoutMs,
+      'elicitationTimeoutMs',
+      'bad_config',
+      '(0 = no deadline)',
+    )
   // The chat-process idle-release window (the settings page edits it).
   // Same shape as the per-agent field: 0 = never release, otherwise an
   // integer number of milliseconds.
@@ -509,6 +517,7 @@ export function validateConfig(raw: unknown): AcpPluginConfig {
     startupTimeoutMs,
     permissionTimeoutMs: effectivePermissionTimeoutMs,
     permissionTimeoutMode,
+    ...(elicitationTimeoutMs === undefined ? {} : { elicitationTimeoutMs }),
     cancelFallbackMs,
     staleCancelRetryDelayMs,
     staleCancelMaxRetries,

@@ -39,7 +39,7 @@ export interface AcpManager {
   setMode(sessionId: string, modeId: string): Promise<void>
   setConfigOption(sessionId: string, configId: string, value: string | boolean): Promise<void>
   respondPermission(requestId: string, optionId: string | undefined): void
-  respondElicitation?(requestId: string, outcome: ElicitationOutcome): void
+  respondElicitation(requestId: string, outcome: ElicitationOutcome): void
   transcript(sessionId: string, afterSeq: number | undefined): { session: unknown; entries: Array<{ seq: number; update: unknown }> }
   sessions(): unknown[]
   stopAgent(agentId: string): Promise<void>
@@ -436,7 +436,6 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
       case 'elicitation/respond': {
         const requestId = str(body, 'requestId', 64)
         const outcome = validateElicitationOutcome(body.action, body.content)
-        if (manager.respondElicitation === undefined) throw new AcpError('unsupported', 'acp: elicitation is not available on this host')
         manager.respondElicitation(requestId, outcome)
         return ok({ done: true })
       }

@@ -7,17 +7,25 @@
  * APIs, no ACP SDK runtime values.
  */
 
-import { randomUUID } from '../ids.ts'
-import type {
-  AcpEvent,
-  ElicitationContentValue,
-  ElicitationFieldView,
-  ElicitationOption,
-  ElicitationOutcome,
-  PendingElicitationFields,
-  PendingElicitationView,
+import {
+  MAX_ELICITATION_DESC_CHARS,
+  MAX_ELICITATION_FIELD_NAME_CHARS,
+  MAX_ELICITATION_FIELDS,
+  MAX_ELICITATION_MESSAGE_CHARS,
+  MAX_ELICITATION_OPTION_LABEL_CHARS,
+  MAX_ELICITATION_OPTION_VALUE_CHARS,
+  MAX_ELICITATION_OPTIONS,
+  MAX_ELICITATION_TITLE_CHARS,
+  type AcpEvent,
+  type ElicitationContentValue,
+  type ElicitationFieldView,
+  type ElicitationOption,
+  type ElicitationOutcome,
+  type PendingElicitationFields,
+  type PendingElicitationView,
 } from '../protocol.ts'
 import { AcpError } from './errors.ts'
+import { PendingRequestLedger, pendingReplayFrames, type PendingRequestEntry } from './pending-request.ts'
 
 export interface ParsedElicitationForm {
   acpSessionId: string
@@ -32,6 +40,15 @@ function nonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() !== '' ? value : undefined
 }
 
+function truncateWithEllipsis(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text
+}
+
+function cappedText(value: unknown, max: number): string | undefined {
+  const s = nonEmptyString(value)
+  return s === undefined ? undefined : truncateWithEllipsis(s, max)
+}
+
 function finiteNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
@@ -40,14 +57,16 @@ function parseEnumOptions(raw: unknown): ElicitationOption[] | undefined {
   if (!Array.isArray(raw) || raw.length === 0) return undefined
   const out: ElicitationOption[] = []
   for (const item of raw) {
+    if (out.length >= MAX_ELICITATION_OPTIONS) break
     if (typeof item !== 'object' || item === null || Array.isArray(item)) continue
     const row = item as Record<string, unknown>
-    if (typeof row.const !== 'string') continue
-    const title = typeof row.title === 'string' && row.title !== '' ? row.title : row.const
-    const description = nonEmptyString(row.description)
+    if (typeof row.const !== 'string' || row.const.length > MAX_ELICITATION_OPTION_VALUE_CHARS) continue
+    const rawLabel = typeof row.title === 'string' && row.title !== '' ? row.title : row.const
+    const label = truncateWithEllipsis(rawLabel, MAX_ELICITATION_OPTION_LABEL_CHARS)
+    const description = cappedText(row.description, MAX_ELICITATION_DESC_CHARS)
     out.push({
       value: row.const,
-      label: title,
+      label,
       ...(description === undefined ? {} : { description }),
     })
   }
@@ -59,12 +78,13 @@ function parsePlainEnum(raw: unknown, rawNames?: unknown): ElicitationOption[] |
   const names = Array.isArray(rawNames) ? rawNames : undefined
   const out: ElicitationOption[] = []
   for (let i = 0; i < raw.length; i++) {
+    if (out.length >= MAX_ELICITATION_OPTIONS) break
     const value = raw[i]
-    if (typeof value !== 'string') continue
-    const label = names !== undefined && typeof names[i] === 'string' && names[i] !== ''
+    if (typeof value !== 'string' || value.length > MAX_ELICITATION_OPTION_VALUE_CHARS) continue
+    const rawLabel = names !== undefined && typeof names[i] === 'string' && names[i] !== ''
       ? (names[i] as string)
       : value
-    out.push({ value, label })
+    out.push({ value, label: truncateWithEllipsis(rawLabel, MAX_ELICITATION_OPTION_LABEL_CHARS) })
   }
   return out.length > 0 ? out : undefined
 }
@@ -72,8 +92,9 @@ function parsePlainEnum(raw: unknown, rawNames?: unknown): ElicitationOption[] |
 function parseField(name: string, raw: unknown, required: boolean): ElicitationFieldView {
   const row = (typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>
   const type = typeof row.type === 'string' ? row.type : 'string'
-  const title = nonEmptyString(row.title) ?? name
-  const description = nonEmptyString(row.description)
+  const title = cappedText(row.title, MAX_ELICITATION_TITLE_CHARS)
+    ?? truncateWithEllipsis(name, MAX_ELICITATION_TITLE_CHARS)
+  const description = cappedText(row.description, MAX_ELICITATION_DESC_CHARS)
   const base = {
     name,
     title,
@@ -160,20 +181,27 @@ export function parseElicitationForm(raw: unknown): ParsedElicitationForm | unde
   if (row.mode !== 'form') return undefined
   const acpSessionId = nonEmptyString(row.sessionId)
   if (acpSessionId === undefined) return undefined
-  const message = typeof row.message === 'string' ? row.message : ''
+  const message = typeof row.message === 'string'
+    ? truncateWithEllipsis(row.message, MAX_ELICITATION_MESSAGE_CHARS)
+    : ''
   const toolCallId = nonEmptyString(row.toolCallId)
   const schema = (typeof row.requestedSchema === 'object' && row.requestedSchema !== null && !Array.isArray(row.requestedSchema)
     ? row.requestedSchema
     : {}) as Record<string, unknown>
-  const title = nonEmptyString(schema.title)
-  const description = nonEmptyString(schema.description)
+  const title = cappedText(schema.title, MAX_ELICITATION_TITLE_CHARS)
+  const description = cappedText(schema.description, MAX_ELICITATION_DESC_CHARS)
   const requiredSet = new Set(
     Array.isArray(schema.required) ? schema.required.filter((v): v is string => typeof v === 'string') : [],
   )
   const properties = (typeof schema.properties === 'object' && schema.properties !== null && !Array.isArray(schema.properties)
     ? schema.properties
     : {}) as Record<string, unknown>
-  const fields = Object.entries(properties).map(([name, prop]) => parseField(name, prop, requiredSet.has(name)))
+  const fields: ElicitationFieldView[] = []
+  for (const [name, prop] of Object.entries(properties)) {
+    if (fields.length >= MAX_ELICITATION_FIELDS) break
+    if (name === '' || name.length > MAX_ELICITATION_FIELD_NAME_CHARS) continue
+    fields.push(parseField(name, prop, requiredSet.has(name)))
+  }
   return {
     acpSessionId,
     ...(toolCallId === undefined ? {} : { toolCallId }),
@@ -193,8 +221,8 @@ function isValidContentValue(value: unknown): value is ElicitationContentValue {
 
 /**
  * Validate a browser-submitted elicitation response (`accept` / `decline` /
- * `cancel`). When `fields` are supplied, also enforces required fields and
- * per-field type/range constraints.
+ * `cancel`). When `fields` are supplied, rejects undeclared keys, enforces
+ * required fields, type/range constraints, and enum option membership.
  */
 export function validateElicitationOutcome(
   action: unknown,
@@ -217,6 +245,12 @@ export function validateElicitationOutcome(
     normalized[key] = value
   }
   if (fields !== undefined) {
+    const fieldByName = new Map(fields.map(f => [f.name, f]))
+    for (const key of Object.keys(normalized)) {
+      if (!fieldByName.has(key)) {
+        throw new AcpError('bad_payload', `acp: unexpected elicitation field "${key}"`)
+      }
+    }
     for (const field of fields) {
       const val = normalized[field.name]
       if (val === undefined) {
@@ -231,6 +265,12 @@ export function validateElicitationOutcome(
         }
         if (field.required && val.trim() === '') {
           throw new AcpError('bad_payload', `acp: field "${field.title}" is required`)
+        }
+        if (field.kind === 'single-select' && field.options !== undefined && field.options.length > 0) {
+          const allowed = new Set(field.options.map(o => o.value))
+          if (!allowed.has(val)) {
+            throw new AcpError('bad_payload', `acp: invalid option for "${field.title}"`)
+          }
         }
         if (field.minLength !== undefined && val.length < field.minLength) {
           throw new AcpError('bad_payload', `acp: field "${field.title}" must be at least ${String(field.minLength)} characters`)
@@ -259,6 +299,14 @@ export function validateElicitationOutcome(
         if (!Array.isArray(val)) {
           throw new AcpError('bad_payload', `acp: field "${field.title}" must be an array of strings`)
         }
+        if (field.options !== undefined && field.options.length > 0) {
+          const allowed = new Set(field.options.map(o => o.value))
+          for (const item of val) {
+            if (!allowed.has(item)) {
+              throw new AcpError('bad_payload', `acp: invalid option for "${field.title}"`)
+            }
+          }
+        }
         if (field.required && val.length === 0) {
           throw new AcpError('bad_payload', `acp: select at least one option for "${field.title}"`)
         }
@@ -286,74 +334,31 @@ export function elicitationRequestFrame(view: PendingElicitationView): AcpEvent 
     ...(view.title === undefined ? {} : { title: view.title }),
     ...(view.description === undefined ? {} : { description: view.description }),
     fields: view.fields,
+    ...(view.deadlineAt === undefined ? {} : { deadlineAt: view.deadlineAt }),
   }
 }
 
 /** Snapshot replay frames for a newly connected SSE client, ending with `elicitation/synced`. */
 export function elicitationReplayFrames(pending: readonly PendingElicitationView[]): AcpEvent[] {
-  const requests: AcpEvent[] = pending.map(elicitationRequestFrame)
-  return [...requests, { type: 'elicitation/synced', requestIds: pending.map(p => p.requestId) }]
+  return pendingReplayFrames(
+    pending,
+    elicitationRequestFrame,
+    requestIds => ({ type: 'elicitation/synced', requestIds }),
+  )
 }
 
-export interface PendingElicitationEntry {
-  requestId: string
-  sessionId: string
-  resolve: (outcome: ElicitationOutcome) => void
-  view: PendingElicitationFields
-}
+export type PendingElicitationEntry = PendingRequestEntry<PendingElicitationFields, ElicitationOutcome>
 
 /** Host ledger tracking in-flight `elicitation/create` requests across a bridge. */
-export class ElicitationLedger {
-  private readonly pending = new Map<string, PendingElicitationEntry>()
-
-  create(sessionId: string, executor: (outcome: ElicitationOutcome) => void, view: PendingElicitationFields): string {
-    const requestId = randomUUID()
-    this.pending.set(requestId, { requestId, sessionId, resolve: executor, view })
-    return requestId
-  }
-
-  respond(requestId: string, outcome: ElicitationOutcome): true {
-    const entry = this.pending.get(requestId)
-    if (entry === undefined) throw new AcpError('unknown_request', `acp: no pending elicitation ${requestId}`)
-    const validated = outcome.action === 'accept'
-      ? validateElicitationOutcome('accept', outcome.content, entry.view.fields)
-      : outcome
-    this.pending.delete(requestId)
-    entry.resolve(validated)
-    return true
-  }
-
-  has(requestId: string): boolean {
-    return this.pending.has(requestId)
-  }
-
-  settleFor(predicate: (entry: { requestId: string; sessionId: string }) => boolean): string[] {
-    const settled: string[] = []
-    for (const [id, entry] of [...this.pending]) {
-      if (!predicate(entry)) continue
-      this.pending.delete(id)
-      entry.resolve({ action: 'cancel' })
-      settled.push(id)
-    }
-    return settled
-  }
-
-  sessionIds(): Array<{ requestId: string; sessionId: string }> {
-    return [...this.pending.values()].map(e => ({ requestId: e.requestId, sessionId: e.sessionId }))
-  }
-
-  hasPendingFor(sessionId: string): boolean {
-    for (const entry of this.pending.values()) {
-      if (entry.sessionId === sessionId) return true
-    }
-    return false
-  }
-
-  pendingViews(): PendingElicitationView[] {
-    const out: PendingElicitationView[] = []
-    for (const entry of this.pending.values()) {
-      out.push({ requestId: entry.requestId, sessionId: entry.sessionId, ...entry.view })
-    }
-    return out
+export class ElicitationLedger extends PendingRequestLedger<PendingElicitationFields, ElicitationOutcome> {
+  constructor() {
+    super({
+      kind: 'elicitation',
+      cancelOutcome: () => ({ action: 'cancel' }),
+      normalizeOutcome: (outcome, view) =>
+        outcome.action === 'accept'
+          ? validateElicitationOutcome('accept', outcome.content, view?.fields)
+          : outcome,
+    })
   }
 }

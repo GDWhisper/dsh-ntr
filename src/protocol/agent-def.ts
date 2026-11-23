@@ -200,6 +200,16 @@ export interface AcpPluginConfig {
    */
   permissionTimeoutMs?: number
   /**
+   * How long an ACP form elicitation ask (`elicitation/create`) may sit
+   * unanswered before timing out. On expiry the host settles the request as
+   * `cancel`, broadcasts `elicitation/resolved` and one `agent/notice`, and
+   * releases the waiting agent turn.
+   *
+   * Default 300000 ms (5 minutes, matching the permission deadline window).
+   * `0` disables the elicitation deadline.
+   */
+  elicitationTimeoutMs?: number
+  /**
    * How long a chat process may sit idle before it is released (parked, then
    * resumed by the next message). In MILLISECONDS; default 1800000 (30 min).
    *
