@@ -11,7 +11,7 @@ import { createElement } from 'react'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 import { AcpSettingsSection } from '../../src/client/panel.tsx'
-import { axisChoices, choiceLabel, resolvedAxisDefaultLabel, thoughtOptionForModel } from '../../src/client/panel/subagent-defaults.tsx'
+import { axisChoices, CHOICE_LABEL_MAX, CHOICE_OPTION_MAX, choiceLabel, clipChoiceText, resolvedAxisDefaultLabel, textColumns, thoughtOptionForModel } from '../../src/client/panel/subagent-defaults.tsx'
 import { AcpStore, type RpcCall } from '../../src/client/store.ts'
 import { displayDelegateLabel as browserDisplayDelegateLabel, subagentPanelRows } from '../../src/client/subagent-panel.tsx'
 import { ModelCatalogService, type CatalogHost } from '../../src/bridge/catalog-service.ts'
@@ -546,6 +546,40 @@ describe('choiceLabel — one row text for rows and parentheses alike', () => {
     expect(choiceLabel({ value: 'hy4flash-free', name: 'Hy4 flash', description: 'x0.00 credits' })).toBe('Hy4 flash · x0.00 credits')
     expect(choiceLabel({ value: 'plain', name: 'Plain' })).toBe('Plain')
   })
+
+  // User report, 2026-11-23: a native <select> sizes its popup to the widest
+  // option, so one agent's paragraph-long mode description pushed the list past
+  // the dialog. Every row is capped in COLUMNS (wide CJK counts double).
+  const AUTO = 'An AI reviewer checks each action that would otherwise ask for approval and approves or denies it. A failed review blocks only that action; it never falls back to a prompt or leaves auto mode.'
+
+  it('caps a long description at CHOICE_LABEL_MAX columns, cutting on a word boundary', () => {
+    const full = `Auto · ${AUTO}`
+    const label = choiceLabel({ value: 'auto', name: 'Auto', description: AUTO })
+    expect(textColumns(label)).toBeLessThanOrEqual(CHOICE_LABEL_MAX)
+    expect(label.endsWith('…')).toBe(true)
+    // The retained part is the untouched head of the full row…
+    expect(full.startsWith(label.slice(0, -1))).toBe(true)
+    // …and the cut lands right after a space, never inside a word.
+    expect(full.charAt(label.length - 1)).toBe(' ')
+  })
+
+  it('counts East Asian wide characters as two columns so CJK descriptions cap too', () => {
+    expect(textColumns('模式')).toBe(4)
+    // Emoji ride the same rule and are never split off their surrogate pair:
+    // a code-unit slice would keep half of the second emoji at this budget.
+    expect(textColumns('😀')).toBe(2)
+    expect(clipChoiceText('😀😀😀😀', 4)).toBe('😀…')
+    const description = '这是一段很长的说明文字，用来确认中文说明也会按显示宽度封顶，不会把下拉列表撑宽。'
+    const label = choiceLabel({ value: 'm', name: '模型', description })
+    expect(textColumns(label)).toBeLessThanOrEqual(CHOICE_LABEL_MAX)
+    expect(label.endsWith('…')).toBe(true)
+  })
+
+  it('leaves a row that already fits untouched — no ellipsis, no trimming', () => {
+    const short = 'x0.00 credits'
+    expect(clipChoiceText(`Hy4 flash · ${short}`)).toBe(`Hy4 flash · ${short}`)
+    expect(clipChoiceText('短说明')).toBe('短说明')
+  })
 })
 
 describe('resolvedAxisDefaultLabel — the process default the 默认 option spells', () => {
@@ -714,14 +748,20 @@ describe('resolvedAxisDefaultLabel — the process default the 默认 option spe
     expect((within(model).getByRole('option', { name: '默认（Plain）' }) as HTMLOptionElement).textContent).toBe('默认（Plain）')
   })
 
-  it('a currentValue outside the choices spells the raw value marked 目录未列出 — no alias guessed', async () => {
+  it('a currentValue outside the choices spells the raw value marked 未在列表中 — no alias guessed', async () => {
     await mountDefaults({ ...BASE }, { catalogs: { codebuddy: hy4Catalog('hy4free') } })
     await category('子代理')
     const model = axisSelect('模型', 'CodeBuddy')
     await waitFor(() => expect(optionValues(model)).toContain('hy4flash-free'))
-    const option = within(model).getByRole('option', { name: '默认（hy4free · 目录未列出）' }) as HTMLOptionElement
+    const option = within(model).getByRole('option', { name: '默认（hy4free，未在列表中）' }) as HTMLOptionElement
     expect(option.value).toBe('')
-    expect(option.textContent).toBe('默认（hy4free · 目录未列出）')
+    expect(option.textContent).toBe('默认（hy4free，未在列表中）')
+    // The row's one visible line stays one line; the why lives in the hover
+    // title instead (constraint 33).
+    const hint = model.closest('label')?.title ?? ''
+    expect(hint).toContain('hy4free')
+    expect(hint).toContain('没有说明可显示')
+    expect(screen.queryByText(/没有说明可显示/)).toBeNull()
   })
 
   it('the English locale marks the unlisted value "not listed"', async () => {
@@ -729,9 +769,71 @@ describe('resolvedAxisDefaultLabel — the process default the 默认 option spe
     await click(within(screen.getByRole('navigation', { name: 'NTR settings categories' })).getByRole('button', { name: 'Subagents' }))
     const model = screen.getByRole('combobox', { name: 'Model · CodeBuddy' }) as HTMLSelectElement
     await waitFor(() => expect(optionValues(model)).toContain('hy4flash-free'))
-    const option = within(model).getByRole('option', { name: 'Default (hy4free · not listed)' }) as HTMLOptionElement
+    const option = within(model).getByRole('option', { name: 'Default (hy4free, not listed)' }) as HTMLOptionElement
     expect(option.value).toBe('')
-    expect(option.textContent).toBe('Default (hy4free · not listed)')
+    expect(option.textContent).toBe('Default (hy4free, not listed)')
+  })
+
+  it('an unlisted raw value is budgeted together with the English wrapper and marker', async () => {
+    const longId = `model-${'x'.repeat(80)}`
+    const catalog: AgentProbeModelsResult = {
+      agentId: 'codebuddy', updatedAt: 1,
+      catalog: { model: slot(longId, [{ value: 'm1', name: 'Model One' }]) },
+    }
+    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: catalog }, locale: (zh, en) => en })
+    await click(within(screen.getByRole('navigation', { name: 'NTR settings categories' })).getByRole('button', { name: 'Subagents' }))
+    const model = screen.getByRole('combobox', { name: 'Model · CodeBuddy' }) as HTMLSelectElement
+    await waitFor(() => expect(optionValues(model)).toContain('m1'))
+    const fallback = Array.from(model.options).find(option => option.value === '') as HTMLOptionElement
+    expect(fallback.textContent?.endsWith(', not listed)')).toBe(true)
+    // The English wrapper (10) is the widest one, and the marker's 12 columns
+    // come out of the same budget — the row lands exactly on the option cap.
+    expect(textColumns(fallback.textContent ?? '')).toBe(CHOICE_OPTION_MAX)
+  })
+
+  it('a long stale kept value is budgeted together with its 已失效 marker', async () => {
+    const longId = `stale-${'y'.repeat(80)}`
+    const catalog: AgentProbeModelsResult = {
+      agentId: 'codebuddy', updatedAt: 1,
+      catalog: { model: slot('m1', [{ value: 'm1', name: 'Model One' }]) },
+    }
+    await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: longId } } }, { catalogs: { codebuddy: catalog } })
+    await category('子代理')
+    const model = axisSelect('模型', 'CodeBuddy')
+    await waitFor(() => expect(optionValues(model)).toContain('m1'))
+    const kept = Array.from(model.options).find(option => option.value === longId) as HTMLOptionElement
+    expect(kept.textContent?.endsWith('（已失效）')).toBe(true)
+    expect(textColumns(kept.textContent ?? '')).toBe(CHOICE_OPTION_MAX)
+    for (const option of Array.from(model.options)) {
+      expect(textColumns(option.textContent ?? '')).toBeLessThanOrEqual(CHOICE_OPTION_MAX)
+    }
+  })
+
+  it('a paragraph-long mode description is capped in the row and in the 默认 parentheses', async () => {
+    const auto = 'An AI reviewer checks each action that would otherwise ask for approval and approves or denies it. A failed review blocks only that action; it never falls back to a prompt or leaves auto mode.'
+    const catalog: AgentProbeModelsResult = {
+      agentId: 'codebuddy', updatedAt: 1,
+      catalog: {
+        mode: slot('auto', [
+          { value: 'default', name: 'Always Ask', description: 'Prompts for permission on first use of each tool' },
+          { value: 'auto', name: 'Auto', description: auto },
+        ]),
+      },
+    }
+    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: catalog } })
+    await category('子代理')
+    const mode = axisSelect('模式', 'CodeBuddy')
+    await waitFor(() => expect(optionValues(mode)).toContain('auto'))
+    const row = Array.from(mode.options).find(option => option.value === 'auto') as HTMLOptionElement
+    expect(textColumns(row.textContent ?? '')).toBeLessThanOrEqual(CHOICE_LABEL_MAX)
+    expect(row.textContent?.endsWith('…')).toBe(true)
+    const fallback = Array.from(mode.options).find(option => option.value === '') as HTMLOptionElement
+    expect(fallback.textContent).toBe(`默认（${row.textContent}）`)
+    // The popup sizes to the WIDEST option, decoration included — so the 默认
+    // row (wrapper + row) must fit the same budget as an ordinary row.
+    for (const option of Array.from(mode.options)) {
+      expect(textColumns(option.textContent ?? '')).toBeLessThanOrEqual(CHOICE_OPTION_MAX)
+    }
   })
 
   it('boolean slots and null/empty currentValue keep the option plain 默认', async () => {

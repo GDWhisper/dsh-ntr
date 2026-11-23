@@ -88,13 +88,104 @@ export function isStaleValue(value: string | undefined, choices: AcpCatalogChoic
 }
 
 /**
+ * The copy the「默认」option wraps a row in, plus the markers the unlisted and
+ * stale rows append. Held once and reused by the width budget below, so a
+ * wording change cannot silently break the cap.
+ */
+const OPTION_COPY = {
+  defaultOpen: { zh: '默认（', en: 'Default (' },
+  defaultClose: { zh: '）', en: ')' },
+  unlisted: { zh: '，未在列表中', en: ', not listed' },
+  stale: { zh: '（已失效）', en: ' (stale)' },
+} as const
+
+/** Columns one string occupies: East Asian wide and emoji code points take two. */
+export function textColumns(text: string): number {
+  let columns = 0
+  for (const character of text) columns += wideCharacter(character) ? 2 : 1
+  return columns
+}
+
+function wideCharacter(character: string): boolean {
+  const code = character.codePointAt(0) ?? 0
+  return (code >= 0x1100 && code <= 0x115f) // Hangul Jamo
+    || (code >= 0x2e80 && code <= 0xa4cf) // CJK radicals … Yi
+    || (code >= 0xac00 && code <= 0xd7a3) // Hangul syllables
+    || (code >= 0xf900 && code <= 0xfaff) // CJK compatibility ideographs
+    || (code >= 0xfe30 && code <= 0xfe4f) // CJK compatibility forms
+    || (code >= 0xff00 && code <= 0xff60) // Fullwidth forms
+    || (code >= 0xffe0 && code <= 0xffe6)
+    || (code >= 0x1f300 && code <= 0x1faff) // Emoji
+}
+
+/**
+ * The widest a RENDERED option may get, in text columns — the number a native
+ * `<select>` popup sizes itself to (it has no CSS cap of any kind). One agent's
+ * paragraph-long mode description pushed the list past the dialog (user
+ * report, 2026-11-23). 56 columns stays inside the panel's own content width.
+ *
+ * The popup sizes to the WIDEST option, and the「默认」row carries decoration
+ * around an ordinary row, so the row budget is what remains after that.
+ */
+export const CHOICE_OPTION_MAX = 56
+
+/** Widest「默认」decoration across both locales, measured from the copy above. */
+const DEFAULT_WRAPPER_COLUMNS = Math.max(
+  textColumns(OPTION_COPY.defaultOpen.zh) + textColumns(OPTION_COPY.defaultClose.zh),
+  textColumns(OPTION_COPY.defaultOpen.en) + textColumns(OPTION_COPY.defaultClose.en),
+)
+/** Widest unlisted marker across both locales. */
+const UNLISTED_MARK_COLUMNS = Math.max(textColumns(OPTION_COPY.unlisted.zh), textColumns(OPTION_COPY.unlisted.en))
+/** Widest stale marker across both locales. */
+const STALE_MARK_COLUMNS = Math.max(textColumns(OPTION_COPY.stale.zh), textColumns(OPTION_COPY.stale.en))
+
+/**
+ * Widest row text: {@link CHOICE_OPTION_MAX} less the「默认」wrapper, so the
+ * default row (and every marked row) stays inside the popup budget too.
+ */
+export const CHOICE_LABEL_MAX = CHOICE_OPTION_MAX - DEFAULT_WRAPPER_COLUMNS
+
+/** Widest raw value the unlisted「默认」row may spell — marker and wrapper budgeted. */
+const UNLISTED_VALUE_MAX = CHOICE_OPTION_MAX - DEFAULT_WRAPPER_COLUMNS - UNLISTED_MARK_COLUMNS
+
+/** Widest raw value a stale kept row may spell — the stale marker budgeted. */
+const STALE_VALUE_MAX = CHOICE_OPTION_MAX - STALE_MARK_COLUMNS
+
+/**
+ * Cut one label at `max` columns, preferring the last word that still fits —
+ * the last space is used only when it leaves at least 14 columns of row, so
+ * the tail is not thrown away for a two-word sliver. `…` marks the cut, cut
+ * points stay on code-point boundaries, and rows that already fit come back
+ * untouched ("name · description" rows and camelCase model names included).
+ */
+export function clipChoiceText(text: string, max: number = CHOICE_LABEL_MAX): string {
+  if (textColumns(text) <= max) return text
+  let columns = 0
+  let end = 0
+  for (const character of text) {
+    const width = wideCharacter(character) ? 2 : 1
+    // One column is reserved for the ellipsis.
+    if (columns + width > max - 1) break
+    columns += width
+    end += character.length
+  }
+  let head = text.slice(0, end)
+  const space = head.lastIndexOf(' ')
+  if (space >= 0 && textColumns(head.slice(0, space)) >= max - 14) head = head.slice(0, space)
+  return `${head.trimEnd()}…`
+}
+
+/**
  * The row text ONE catalog choice spells — the single source shared by the
  * axis dropdown's ordinary rows and the「默认」parentheses. The agent's own
  * description rides along (consumption multipliers live there), so same-name
- * variants stay distinguishable; no description → the bare name.
+ * variants stay distinguishable; no description → the bare name. The row is
+ * capped at {@link CHOICE_LABEL_MAX} columns so a long description cannot
+ * widen the native list (see {@link CHOICE_OPTION_MAX}'s note).
  */
 export function choiceLabel(choice: AcpCatalogChoice): string {
-  return choice.description === undefined ? choice.name : `${choice.name} · ${choice.description}`
+  const row = choice.description === undefined ? choice.name : `${choice.name} · ${choice.description}`
+  return clipChoiceText(row)
 }
 
 /**
@@ -107,7 +198,9 @@ export function choiceLabel(choice: AcpCatalogChoice): string {
  * choice's ordinary row (`listed: true`), so the parentheses match a row
  * verbatim. A value absent from `choices` — or a choice with an empty name —
  * falls back to the raw value with `listed: false` (the option marks it
- * 「目录未列出」); no alias mapping is ever guessed.
+ * 「未在列表中」, and the control's hover title explains why no description is
+ * available); no alias mapping is ever guessed, and the raw fallback is capped
+ * like every other row so one long id cannot widen the list either.
  */
 export function resolvedAxisDefaultLabel(
   catalog: AcpAgentCatalog | undefined,
@@ -123,7 +216,28 @@ export function resolvedAxisDefaultLabel(
   const choice = slot.choices.find(candidate => candidate.value === value)
   return choice !== undefined && choice.name !== ''
     ? { text: choiceLabel(choice), listed: true }
-    : { text: value, listed: false }
+    // The marker's columns come out of the same option budget, so the「默认」
+    // row cannot become the widest row and widen the popup after all.
+    : { text: clipChoiceText(value, UNLISTED_VALUE_MAX), listed: false }
+}
+
+/** The「默认」option's text for one resolved process default, in the active locale. */
+function defaultOptionText(acp: AcpStore, label: { text: string; listed: boolean }): string {
+  const { defaultOpen, defaultClose, unlisted } = OPTION_COPY
+  // Clamped HERE as well, not only by `resolvedAxisDefaultLabel`: the budget
+  // belongs to the rendering point, so a future caller cannot widen the popup.
+  const text = label.listed
+    ? clipChoiceText(label.text, CHOICE_LABEL_MAX)
+    : clipChoiceText(label.text, UNLISTED_VALUE_MAX)
+  const middle = label.listed ? text : `${text}${unlisted.zh}`
+  const middleEn = label.listed ? text : `${text}${unlisted.en}`
+  return acp.label(`${defaultOpen.zh}${middle}${defaultClose.zh}`, `${defaultOpen.en}${middleEn}${defaultClose.en}`)
+}
+
+/** The kept-row text of a value the catalog no longer offers, in the active locale. */
+function staleValueText(acp: AcpStore, text: string): string {
+  const { stale } = OPTION_COPY
+  return acp.label(`${text}${stale.zh}`, `${text}${stale.en}`)
 }
 
 /** Canonical equality of two per-agent entries (absent axis = follow default). */
@@ -160,8 +274,18 @@ function AxisSelect(props: {
   // A persisted value the known list omits stays selectable; an unread catalog
   // keeps it plain (no staleness evidence yet).
   const kept = value !== undefined && !(choices ?? []).some(choice => choice.value === value)
+  // An agent can report a current value it never lists (CodeBuddy reports
+  // `hy4free` while offering `hy4flash-free`), so there is no description for
+  // it. The marker says that in plain words; the hover title explains why
+  // without spending one of the row's copy lines (constraint 33).
+  const unlistedHint = defaultLabel === undefined || defaultLabel.listed
+    ? undefined
+    : acp.label(
+      `${defaultLabel.text} 是智能体报告的当前值，但它自己的列表里没有这一项，所以没有说明可显示。`,
+      `${defaultLabel.text} is what the agent reports as current, but the agent's own list does not include it, so no description is available.`,
+    )
   return (
-    <label style={{ display: 'flex', flexDirection: 'column', gap: 4, flex: '1 1 150px', minWidth: 150 }}>
+    <label title={unlistedHint} style={{ display: 'flex', flexDirection: 'column', gap: 4, flex: '1 1 150px', minWidth: 150 }}>
       <span className="dwa-form-label">{axisName}</span>
       <select
         className="dwa-select"
@@ -170,9 +294,7 @@ function AxisSelect(props: {
         onChange={event => onChange(event.target.value === '' ? undefined : event.target.value)}
       >
         <option value="">
-          {defaultLabel === undefined ? acp.label('默认', 'Default')
-            : defaultLabel.listed ? acp.label(`默认（${defaultLabel.text}）`, `Default (${defaultLabel.text})`)
-              : acp.label(`默认（${defaultLabel.text} · 目录未列出）`, `Default (${defaultLabel.text} · not listed)`)}
+          {defaultLabel === undefined ? acp.label('默认', 'Default') : defaultOptionText(acp, defaultLabel)}
         </option>
         {(choices ?? []).map(choice => (
           // The agent's own description rides along (consumption multipliers live
@@ -183,7 +305,7 @@ function AxisSelect(props: {
         ))}
         {kept && (
           <option value={value} style={stale ? { color: WARN_FG } : undefined}>
-            {stale ? acp.label(`${value}（已失效）`, `${value} (stale)`) : value}
+            {stale ? staleValueText(acp, clipChoiceText(value, STALE_VALUE_MAX)) : clipChoiceText(value)}
           </option>
         )}
       </select>
