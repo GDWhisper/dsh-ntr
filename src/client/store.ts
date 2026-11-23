@@ -18,6 +18,7 @@ import { DEFAULT_KNOWN_PRESETS } from "./store/presets.ts"
 import type { Block } from "./store/blocks.ts"
 import { foldUpdate, usageFromUpdate, withSessionReleased } from "./store/blocks.ts"
 import type { ChatForkOutcome } from "./store/fork.ts"
+import { reduceElicitationEvent } from "./store/elicitation.ts"
 import type { PendingPermission } from "./store/permission.ts"
 import { normalizeSaveGateStatus } from "./store/save-gate.ts"
 import type { AcpLogEntry, ChatTranscript, RpcCall, UiState } from "./store/state.ts"
@@ -36,7 +37,7 @@ import { SkillsService } from "./store/skills.ts"
 import { SubagentDetailService } from "./store/subagent-detail.ts"
 import { UpdateService } from "./store/update.ts"
 
-import type { AcpApprovalDeadlines, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentTestResult, AgentView, ApprovalDeadlinesResult, DelegateResult, DelegateSetPayload, DelegateSettingKey, DetectedAgentInfo, IdleReleaseResult, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, AgentSkillEntry, SubagentDetailEntry } from '../protocol.ts'
+import type { AcpApprovalDeadlines, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentTestResult, AgentView, ApprovalDeadlinesResult, DelegateResult, DelegateSetPayload, DelegateSettingKey, DetectedAgentInfo, ElicitationOutcome, IdleReleaseResult, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, AgentSkillEntry, SubagentDetailEntry } from '../protocol.ts'
 import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO } from '../protocol.ts'
 import { commitFrame, consumeVerdict, invalidateVerdict, markUnsettled, peekVerdict, projectAcpMode, settleFromHost, type AcpVerdict } from './acp-verdict.ts'
 
@@ -55,6 +56,7 @@ export class AcpStore {
     sessions: [],
     blocks: [],
     permissions: [],
+    elicitations: [],
     busy: false,
     saveBanners: [],
     logs: [],
@@ -893,21 +895,13 @@ export class AcpStore {
     }
   }
 
-  /**
-   * Answer one ask (`optionId` absent = cancel it). A failure is reported
-   * through the store's notice — the settings panel renders that — AND
-   * rethrown, so the conversation dock can pin the message next to the card
-   * that failed instead of leaving it on a settings page the user may not
-   * have open. Callers that cannot show it (the settings panel) swallow it
-   * after the notice.
-   */
   async respondPermission(requestId: string, optionId?: string): Promise<void> {
-    try {
-      await this.call('permission/respond', { requestId, ...(optionId === undefined ? {} : { optionId }) })
-    } catch (error) {
-      this.flashError(error)
-      throw error
-    }
+    try { await this.call('permission/respond', { requestId, ...(optionId === undefined ? {} : { optionId }) }) }
+    catch (error) { this.flashError(error); throw error }
+  }
+  async respondElicitation(requestId: string, outcome: ElicitationOutcome): Promise<void> {
+    try { await this.call('elicitation/respond', { requestId, ...outcome }) }
+    catch (error) { this.flashError(error); throw error }
   }
 
   async stopAgent(agentId: string): Promise<void> {
@@ -1181,6 +1175,7 @@ export class AcpStore {
           ...(chatSessions.length !== this.state.chatSessions.length ? { chatSessions } : {}),
           ...(hadBurst ? { burstStats } : {}),
           permissions: this.state.permissions.filter(p => p.sessionId !== event.sessionId),
+          elicitations: this.state.elicitations.filter(e => e.sessionId !== event.sessionId),
           ...(event.reason === 'agent-died'
             ? this.logService.patch(this.state, 'error', this.locale('会话因 agent 进程退出而终止', 'session ended: agent process died'), closingSession?.agentId)
             : {}),
@@ -1228,6 +1223,7 @@ export class AcpStore {
           sessions,
           ...(chatSessions !== this.state.chatSessions ? { chatSessions } : {}),
           permissions: this.state.permissions.filter(p => p.sessionId !== event.sessionId),
+          elicitations: this.state.elicitations.filter(e => e.sessionId !== event.sessionId),
           // An observed transcript keeps its buffer but flips to released, so
           // the ACP view can say "会恢复" instead of silently looking dead.
           ...this.chatSessionsService.watchedSessionPatch(event.sessionId, event.session),
@@ -1337,13 +1333,15 @@ export class AcpStore {
         return Promise.resolve()
       }
       case 'permission/synced': {
-        // Terminator of the reconnect replay: the host just re-sent every
-        // outstanding ask, and this set is the authoritative live list. Drop
-        // anything this client still holds from before the disconnect — an ask
-        // resolved while it was away is gone host-side, and answering it would
-        // only earn `unknown_request`.
         const live = new Set(event.requestIds)
         this.mutate({ permissions: this.state.permissions.filter(p => live.has(p.requestId)) })
+        return Promise.resolve()
+      }
+      case 'elicitation/request':
+      case 'elicitation/resolved':
+      case 'elicitation/synced': {
+        const elicitations = reduceElicitationEvent(this.state.elicitations, event)
+        if (elicitations !== undefined) this.mutate({ elicitations })
         return Promise.resolve()
       }
       case 'chat/agent-locked': {
@@ -1559,6 +1557,8 @@ export { forkStateOf } from "./store/fork.ts"
 
 export type { PendingPermission } from "./store/permission.ts"
 export { PERMISSION_DEADLINE_EXPIRED, deadlineRemainingLabel, permissionsForSession } from "./store/permission.ts"
+export type { ElicitationBuildResult, ElicitationDraft, PendingElicitation } from "./store/elicitation.ts"
+export { buildElicitationContent, elicitationsForSession, initialElicitationDraft, reduceElicitationEvent } from "./store/elicitation.ts"
 
 export { DEFAULT_KNOWN_PRESETS } from "./store/presets.ts"
 

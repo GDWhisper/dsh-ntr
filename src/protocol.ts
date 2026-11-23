@@ -79,6 +79,17 @@ export type {
 } from './protocol/events.ts'
 
 export type {
+  ElicitationContentValue,
+  ElicitationFieldKind,
+  ElicitationFieldView,
+  ElicitationOption,
+  ElicitationOutcome,
+  ElicitationRespondPayload,
+  PendingElicitationFields,
+  PendingElicitationView,
+} from './protocol/elicitation.ts'
+
+export type {
   AgentDetectResult,
   AgentExposedModelsPayload,
   AgentIdPayload,

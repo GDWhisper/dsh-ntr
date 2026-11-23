@@ -3,61 +3,25 @@ import { dirname } from 'node:path'
 import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { Readable, Writable } from 'node:stream'
 import {
-  client,
-  methods,
-  ndJsonStream,
-  PROTOCOL_VERSION,
-  RequestError,
-  type ClientConnection,
-  type ContentBlock,
-  type InitializeResponse,
-  type McpServer,
-  type PermissionOption,
-  type RequestPermissionResponse,
-  type SessionNotification,
-  type SessionUpdate,
+  client, methods, ndJsonStream, PROTOCOL_VERSION, RequestError,
+  type ClientConnection, type ContentBlock, type InitializeResponse, type McpServer,
+  type PermissionOption, type RequestPermissionResponse, type SessionNotification, type SessionUpdate,
 } from '@agentclientprotocol/sdk'
 import {
-  AcpError,
-  PermissionLedger,
-  Transcript,
-  childEnv,
-  normalizeApprovalWindow,
-  parseCatalogOptions,
-  permissionRequestFrame,
-  pickAutoOption,
-  randomUUID,
-  resolveFsPath,
-  resolveSessionCwd,
-  usableConfigOptions,
+  AcpError, ElicitationLedger, PermissionLedger, Transcript, childEnv, normalizeApprovalWindow,
+  parseCatalogOptions, permissionRequestFrame, pickAutoOption, randomUUID, resolveFsPath,
+  resolveSessionCwd, usableConfigOptions,
 } from '../impl.ts'
 import type { EventHub } from '../impl.ts'
 import type {
-  AcpAgentDef,
-  AcpReleaseCause,
-  AgentView,
-  PermissionOutcome,
-  PermissionOptionView,
-  PermissionTimeoutMode,
-  SessionView,
+  AcpAgentDef, AcpReleaseCause, AgentView, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, SessionView,
 } from '../protocol.ts'
 import { mergeUsageSample } from '../usage.ts'
-import {
-  PLUGIN_VERSION,
-  isPerSessionAgent,
-  perSessionLaunchArgs,
-  perSessionLaunchEnv,
-} from './identity.ts'
+import { PLUGIN_VERSION, isPerSessionAgent, perSessionLaunchArgs, perSessionLaunchEnv } from './identity.ts'
 import type { BridgeState, BridgeTuning, SessionWorkspaceResolver, StartAttempt } from './types.ts'
 import { chatWorkspaceRoot, safeSpawnCwd } from './state-paths.ts'
-import {
-  disposeChild,
-  ensureAgentExecutable,
-  findExecutable,
-  trackAgentChild,
-  waitForChildExit,
-  windowsShimLaunch,
-} from './process.ts'
+import { disposeChild, ensureAgentExecutable, findExecutable, trackAgentChild, waitForChildExit, windowsShimLaunch } from './process.ts'
+import { handleBridgeElicitationRequest } from './elicitation-bridge.ts'
 import {
   activeDrain,
   chunkTextOf,
@@ -136,6 +100,7 @@ export class AgentBridge {
   /** Inflight `session/load` resumes, shared so concurrent prompts don't double-resume. */
   private readonly resuming = new Map<string, Promise<LiveSession>>()
   readonly permissions = new PermissionLedger()
+  readonly elicitations = new ElicitationLedger()
   private readonly startupTimeoutMs: number
   /**
    * The ONE approval deadline, and the mode it settles with. Neither is
@@ -563,6 +528,7 @@ export class AgentBridge {
       || this.pendingCommands.size > 0
       || this.resuming.size > 0
       || this.permissions.sessionIds().length > 0
+      || this.elicitations.sessionIds().length > 0
       || this.starting !== undefined) return true
     for (const session of this.sessions.values()) {
       if (session.running || isSettling(session)) return true
@@ -609,6 +575,7 @@ export class AgentBridge {
       if (sessionId !== session.sessionId) return true
     }
     if (this.permissions.sessionIds().some(entry => entry.sessionId !== session.sessionId)) return true
+    if (this.elicitations.sessionIds().some(entry => entry.sessionId !== session.sessionId)) return true
     for (const other of this.sessions.values()) {
       if (other === session) continue
       if (other.running || isSettling(other)) return true
@@ -857,6 +824,14 @@ export class AgentBridge {
       .onRequest(methods.client.session.requestPermission, async ctx => {
         return this.handlePermissionRequest(ctx.params.sessionId, ctx.params.toolCall, ctx.params.options, ctx.signal)
       })
+      .onRequest(methods.client.elicitation.create, async ctx => {
+        return handleBridgeElicitationRequest({
+          hub: this.hub,
+          elicitations: this.elicitations,
+          sessionByAcpId: id => this.acpIndex.get(id),
+          touch: () => { this.touch() },
+        }, ctx.params, ctx.signal)
+      })
       .onRequest(methods.client.fs.readTextFile, async ctx => this.handleFsRead(ctx.params))
       .onRequest(methods.client.fs.writeTextFile, async ctx => this.handleFsWrite(ctx.params))
     const conn = app.connect(stream)
@@ -877,6 +852,7 @@ export class AgentBridge {
         clientCapabilities: {
           fs: { readTextFile: true, writeTextFile: true },
           terminal: false,
+          elicitation: { form: {} },
           session: { configOptions: { boolean: {} } },
         },
         clientInfo: { name: 'dsh-ntr', title: 'DSH NTR', version: PLUGIN_VERSION },
@@ -2008,6 +1984,7 @@ export class AgentBridge {
 
   private settlePermissions(session: LiveSession): void {
     this.permissions.settleFor(p => p.sessionId === session.sessionId)
+    this.elicitations.settleFor(e => e.sessionId === session.sessionId)
   }
 
   /** `fs/read_text_file` for agents that fetch workspace content through the

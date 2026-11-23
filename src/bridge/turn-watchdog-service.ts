@@ -12,7 +12,7 @@
  * tests introspect it through the manager.
  */
 import type { EventHub, PendingPermissionView } from '../impl.ts'
-import type { ActiveTurnView } from '../protocol.ts'
+import type { ActiveTurnView, PendingElicitationView } from '../protocol.ts'
 import type { AgentBridge } from './agent-bridge.ts'
 import type { LiveSession, TurnStreamController } from './turn-stream.ts'
 import { isSettling, lifecycleOf } from './session-lifecycle.ts'
@@ -125,8 +125,8 @@ export class TurnWatchdogService {
         if (session.running) anyRunning = true
         if (!session.running || lifecycleOf(session) !== 'live') continue
         // A question is on the table: the agent is waiting on a human, not
-        // stuck, and that wait is the permission deadline's business.
-        if (bridge.permissions.hasPendingFor(session.sessionId)) continue
+        // stuck, and that wait is the permission deadline's / elicitation's business.
+        if (bridge.permissions.hasPendingFor(session.sessionId) || bridge.elicitations.hasPendingFor(session.sessionId)) continue
         // The controller this turn is streaming through. A chat turn is indexed
         // by chat id (its continuation steps look it up that way) AND attached
         // to the session; an EPHEMERAL turn has no chat id and therefore only
@@ -190,6 +190,12 @@ export class TurnWatchdogService {
   pendingPermissionViews(): PendingPermissionView[] {
     const views: PendingPermissionView[] = []
     for (const bridge of this.host.bridges()) views.push(...bridge.permissions.pendingViews())
+    return views
+  }
+
+  pendingElicitationViews(): PendingElicitationView[] {
+    const views: PendingElicitationView[] = []
+    for (const bridge of this.host.bridges()) views.push(...bridge.elicitations.pendingViews())
     return views
   }
 

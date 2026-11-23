@@ -48,10 +48,12 @@ export class ArchiveReleaseService {
     }
     for (const session of this.deps.registry.sessionsOf(dshSessionId)) {
       if (lifecycleOf(session) === 'closed') continue
+      const owning = this.deps.bridgeOwning(session.agentId, session.sessionId)
       const active = session.running
         || isSettling(session)
         || hasPromptSlot(session)
-        || this.deps.bridgeOwning(session.agentId, session.sessionId)?.permissions.hasPendingFor(session.sessionId) === true
+        || owning?.permissions.hasPendingFor(session.sessionId) === true
+        || owning?.elicitations.hasPendingFor(session.sessionId) === true
       if (!active) continue
       facts.set(session.acpSessionId, { acpSessionId: session.acpSessionId })
     }
@@ -76,6 +78,7 @@ export class ArchiveReleaseService {
         || isSettling(session)
         || hasPromptSlot(session)
         || bridge.permissions.hasPendingFor(session.sessionId)
+        || bridge.elicitations.hasPendingFor(session.sessionId)
       if (!active) continue
       void bridge.cancel(session)
     }

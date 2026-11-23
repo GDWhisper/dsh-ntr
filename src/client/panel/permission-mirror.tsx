@@ -5,6 +5,7 @@
  */
 import type { AcpStore, UiState } from '../store.ts'
 import type { Translate } from '../acp-view.tsx'
+import { ElicitationAskCard } from '../elicitation-dock.tsx'
 import type { AgentTestResult } from '../../protocol.ts'
 
 /**
@@ -17,8 +18,8 @@ import type { AgentTestResult } from '../../protocol.ts'
  * pending entry with no conversation card would otherwise have no answer
  * surface anywhere.
  */
-export function permissionLedgerCard(ui: Pick<UiState, 'permissions'>): { visible: boolean } {
-  return { visible: ui.permissions.length > 0 }
+export function permissionLedgerCard(ui: Pick<UiState, 'permissions'> & Partial<Pick<UiState, 'elicitations'>>): { visible: boolean } {
+  return { visible: ui.permissions.length > 0 || (ui.elicitations?.length ?? 0) > 0 }
 }
 
 /**
@@ -155,6 +156,11 @@ export function PermissionMirrorCard(props: { acp: AcpStore; ui: UiState }) {
           <button type="button" className="dwa-btn dwa-btn-quiet" onClick={() => { void acp.respondPermission(permission.requestId).catch(() => undefined) }}>
             {acp.label('取消', 'Cancel')}
           </button>
+        </div>
+      ))}
+      {ui.elicitations.map(elicitation => (
+        <div key={elicitation.requestId} style={{ marginTop: 8 }}>
+          <ElicitationAskCard acp={acp} elicitation={elicitation} />
         </div>
       ))}
     </div>

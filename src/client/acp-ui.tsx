@@ -987,6 +987,41 @@ const STYLE = `
 .ntr-permission-option:focus-visible, .ntr-permission-cancel:focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary, #2563eb); outline-offset: 2px; }
 .ntr-permission-cancel { margin-left: auto; color: var(--dsw-alias-label-secondary, #6b7280); }
 .ntr-permission-error { padding: 4px 8px; border-radius: 6px; background: color-mix(in srgb, var(--dsw-alias-state-error-primary, #b91c1c) 12%, transparent); color: var(--dsw-alias-state-error-primary, #b91c1c); font-size: 11px; word-break: break-word; }
+/* ---- Elicitation form dock (conversation.input.dock, elicitation-dock.tsx) ---- */
+.ntr-elicit-dock {
+  box-sizing: border-box;
+  width: calc(100% - var(--dsh-composer-side-clearance, 16px) - var(--dsh-composer-side-clearance, 16px));
+  max-width: var(--dsh-composer-card-max-width, 920px);
+  margin: 0 auto;
+  display: flex; flex-direction: column; gap: 8px;
+  max-height: min(46vh, 420px); overflow-y: auto;
+  font-size: 12px; line-height: 1.5;
+}
+.ntr-elicit-card { display: flex; flex-direction: column; gap: 10px; padding: 10px 12px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); border-left: 3px solid var(--dsw-alias-state-business-primary, #2563eb); border-radius: 10px; background: var(--dsw-alias-bg-layer-1, #fff); }
+.ntr-elicit-head { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ntr-elicit-title { font-weight: 600; color: var(--dsw-alias-label-primary, inherit); word-break: break-word; }
+.ntr-elicit-desc { color: var(--dsw-alias-label-secondary, #6b7280); word-break: break-word; }
+.ntr-elicit-fields { display: flex; flex-direction: column; gap: 10px; }
+.ntr-elicit-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.ntr-elicit-checkbox-row { flex-direction: row; align-items: center; flex-wrap: wrap; gap: 6px; cursor: pointer; }
+.ntr-elicit-field-label { font-weight: 500; color: var(--dsw-alias-label-primary, inherit); }
+.ntr-elicit-required { margin-left: 3px; color: var(--dsw-alias-state-error-primary, #b91c1c); }
+.ntr-elicit-field-desc { font-size: 11px; color: var(--dsw-alias-label-secondary, #6b7280); }
+.ntr-elicit-options { display: flex; flex-direction: column; gap: 4px; }
+.ntr-elicit-option { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; font: inherit; font-size: 12px; line-height: 1.4; padding: 6px 10px; border-radius: 7px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: inherit; cursor: pointer; text-align: left; }
+.ntr-elicit-option:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-active, #0000000d); }
+.ntr-elicit-option.is-selected { border-color: var(--dsw-alias-state-business-primary, #2563eb); background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 10%, var(--dsw-alias-bg-layer-1, #fff)); }
+.ntr-elicit-option:disabled { opacity: 0.5; cursor: default; }
+.ntr-elicit-option:focus-visible, .ntr-elicit-submit:focus-visible, .ntr-elicit-secondary:focus-visible, .ntr-elicit-input:focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary, #2563eb); outline-offset: 2px; }
+.ntr-elicit-option-label { font-weight: 500; }
+.ntr-elicit-option-desc { font-size: 11px; color: var(--dsw-alias-label-secondary, #6b7280); }
+.ntr-elicit-input { box-sizing: border-box; width: 100%; font: inherit; padding: 5px 8px; border-radius: 7px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: inherit; }
+.ntr-elicit-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.ntr-elicit-submit { font: inherit; font-size: 12px; font-weight: 500; line-height: 1.4; padding: 4px 12px; border-radius: 7px; border: 1px solid var(--dsw-alias-state-business-primary, #2563eb); background: var(--dsw-alias-state-business-primary, #2563eb); color: var(--dsw-alias-label-primary-foreground, #fff); cursor: pointer; }
+.ntr-elicit-submit:disabled { opacity: 0.5; cursor: default; }
+.ntr-elicit-secondary { font: inherit; font-size: 12px; line-height: 1.4; padding: 4px 10px; border-radius: 7px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: var(--dsw-alias-label-secondary, #6b7280); cursor: pointer; }
+.ntr-elicit-secondary:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-active, #0000000d); }
+.ntr-elicit-secondary:disabled { opacity: 0.5; cursor: default; }
 /* ---- Released-session banner (conversation.input.dock, released-banner.tsx) ---- */
 /* Same composer-width formula as the permission dock above: the slot spans
    the column, the card lines up with the input box. One row of state + one

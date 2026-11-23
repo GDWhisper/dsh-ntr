@@ -27,6 +27,7 @@ import { AcpSettingsDialog } from './settings-dialog.tsx'
 import { SaveGuardToast } from './save-guard-toast.tsx'
 import { SubagentDetailDialog } from './subagent-detail.tsx'
 import { PermissionDock } from './permission-dock.tsx'
+import { ElicitationDock } from './elicitation-dock.tsx'
 import { ReleasedBanner } from './released-banner.tsx'
 import { QuotaBanner } from './quota-banner.tsx'
 import { AcpBranchAction, resolveHostFork } from './branch-action.tsx'
@@ -381,22 +382,19 @@ export function apply(ctx: Context): void {
     inject: (sessionId: unknown) => chatFace(sessionId),
   }, AcpComposerAgentTag as unknown as SlotComponent<any>)), 'dsh-ntr: composer agent tag')
 
-  // Pending permission asks for the staged conversation, above the composer
-  // card (`conversation.input.dock` — a session-scoped list slot; the host's
-  // own queue/todo docks register the same way). The slot spans the whole
-  // conversation column, so the dock component applies the composer's own
-  // width formula to line up with the input box. Every ask is dispatched as
-  // broadcast as `permission/request`; the dock renders only the ones carrying
-  // this conversation's id, so it needs no ACP-mode gate. Asks without a chat
-  // identity stay on the settings-panel ledger.
+  // Pending permission & elicitation asks for the staged conversation (`conversation.input.dock`).
   ctx.effect(() => ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
     name: 'conversation.input.dock',
     id: 'acp-permissions',
     order: 10,
-    // The positional inject argument is the session binding key — the chat
-    // session id this dock belongs to (same contract as every other entry).
     inject: (sessionId: unknown) => chatFace(sessionId),
   }, PermissionDock as unknown as SlotComponent<any>)), 'dsh-ntr: conversation permission dock')
+  ctx.effect(() => ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
+    name: 'conversation.input.dock',
+    id: 'acp-elicitations',
+    order: 11,
+    inject: (sessionId: unknown) => chatFace(sessionId),
+  }, ElicitationDock as unknown as SlotComponent<any>)), 'dsh-ntr: conversation elicitation dock')
 
   // The released-session banner in the same dock seat: when this
   // conversation's agent process is parked (idle release or crash), one row
