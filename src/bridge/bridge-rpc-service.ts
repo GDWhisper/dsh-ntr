@@ -9,6 +9,7 @@
 import type { ContentBlock } from '@agentclientprotocol/sdk'
 import type { EventHub } from '../impl.ts'
 import { AcpError, randomUUID } from '../impl.ts'
+import type { ElicitationOutcome } from '../protocol.ts'
 import type { BridgeRegistryService } from './bridge-registry-service.ts'
 import { describeError } from './errors.ts'
 import { isPerSessionAgent, type BridgeScope } from './identity.ts'
@@ -253,6 +254,15 @@ export class BridgeRpcService {
       return
     }
     throw new AcpError('unknown_request', `acp: no pending permission ${requestId}`)
+  }
+
+  respondElicitation(requestId: string, outcome: ElicitationOutcome): void {
+    for (const bridge of this.host.bridgeRegistry.bridges.values()) {
+      if (!bridge.elicitations.has(requestId)) continue
+      bridge.elicitations.respond(requestId, outcome)
+      return
+    }
+    throw new AcpError('unknown_request', `acp: no pending elicitation ${requestId}`)
   }
 
   transcript(sessionId: string, afterSeq: number | undefined): { session: unknown; entries: Array<{ seq: number; update: unknown }> } {

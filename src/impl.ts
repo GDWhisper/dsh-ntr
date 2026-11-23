@@ -102,6 +102,17 @@ export {
   pickAutoOption,
 } from './impl/permission.ts'
 
+// ---- ACP form elicitation ----
+
+export type { ParsedElicitationForm, PendingElicitationEntry } from './impl/elicitation.ts'
+export {
+  ElicitationLedger,
+  elicitationReplayFrames,
+  elicitationRequestFrame,
+  parseElicitationForm,
+  validateElicitationOutcome,
+} from './impl/elicitation.ts'
+
 // ---- Agent skills (pure half) ----
 
 export type { SkillDirTable, SkillFlavor } from './impl/skills.ts'

@@ -1,28 +1,12 @@
 import { join } from 'node:path'
 import { existsSync, readFileSync } from 'node:fs'
-import {
-  type ContentBlock,
-  type SessionUpdate,
-} from '@agentclientprotocol/sdk'
-import {
-  EventHub,
-  buildAdapterModelId,
-  isAcpToolContinuation,
-  parseCatalogOptions,
-  randomUUID,
-  selectForwardPrompt,
-  extractSessionTitlePlaceholder,
-  isAbsolutePath,
-  splitAdapterModelId,
-} from '../impl.ts'
+import type { ContentBlock, SessionUpdate } from '@agentclientprotocol/sdk'
+import { EventHub, buildAdapterModelId, isAcpToolContinuation, parseCatalogOptions, randomUUID, selectForwardPrompt, extractSessionTitlePlaceholder, isAbsolutePath, splitAdapterModelId } from '../impl.ts'
+import type { PendingPermissionView, RosterPresetRow } from '../impl.ts'
 import type {
-  PendingPermissionView,
-  RosterPresetRow,
-} from '../impl.ts'
-import type {
-  AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSaveResult, AgentSkillsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, GenerateOptions,
+  AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSaveResult, AgentSkillsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, ElicitationOutcome, GenerateOptions,
   LlmResolvedModelInfo,
-  AcpIdleRelease, ActiveTurnView, ApprovalDeadlineKey, ApprovalDeadlinePatch, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, SaveGateFlushResult, SaveGateStatus, SessionView, StreamChunk,
+  AcpIdleRelease, ActiveTurnView, ApprovalDeadlineKey, ApprovalDeadlinePatch, PendingElicitationView, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, SaveGateFlushResult, SaveGateStatus, SessionView, StreamChunk,
   SubagentDetailResult, SubagentRecord,
 } from '../protocol.ts'
 import { SESSION_TITLE_PREFIX } from '../protocol.ts'
@@ -859,9 +843,8 @@ export class BridgeManager {
     return this.watchdog.backgroundTuning
   }
 
-  pendingPermissionViews(): PendingPermissionView[] {
-    return this.watchdog.pendingPermissionViews()
-  }
+  pendingPermissionViews(): PendingPermissionView[] { return this.watchdog.pendingPermissionViews() }
+  pendingElicitationViews(): PendingElicitationView[] { return this.watchdog.pendingElicitationViews() }
 
   hasActiveTurns(): boolean {
     return this.watchdog.hasActiveTurns()
@@ -1126,9 +1109,8 @@ export class BridgeManager {
     return this.rpc.setConfigOption(sessionId, configId, value)
   }
 
-  respondPermission(requestId: string, optionId: string | undefined): void {
-    this.rpc.respondPermission(requestId, optionId)
-  }
+  respondPermission(requestId: string, optionId: string | undefined): void { this.rpc.respondPermission(requestId, optionId) }
+  respondElicitation(requestId: string, outcome: ElicitationOutcome): void { this.rpc.respondElicitation(requestId, outcome) }
 
   transcript(sessionId: string, afterSeq: number | undefined): { session: unknown; entries: Array<{ seq: number; update: unknown }> } {
     return this.rpc.transcript(sessionId, afterSeq)

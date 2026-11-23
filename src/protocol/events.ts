@@ -9,6 +9,7 @@
 
 import type { SessionUpdate } from '@agentclientprotocol/sdk'
 import type { SubagentRecord } from '../protocol-subagent.ts'
+import type { ElicitationFieldView } from './elicitation.ts'
 import type { PermissionTimeoutMode } from './ui.ts'
 import type { SaveGateStatus } from './save-gate.ts'
 import type { AcpReleaseCause, AgentProcessState, AgentView, SessionView } from './views.ts'
@@ -132,6 +133,24 @@ export type AcpEvent =
    * of its own that is not in it (one resolved while it was disconnected).
    */
   | { type: 'permission/synced'; requestIds: string[] }
+  /**
+   * One outstanding ACP form elicitation (`elicitation/create`), broadcast once
+   * on creation and replayed as-is on SSE reconnect (terminated by
+   * `elicitation/synced`).
+   */
+  | {
+      type: 'elicitation/request'
+      requestId: string
+      sessionId: string
+      dshSessionId?: string
+      toolCallId?: string
+      message: string
+      title?: string
+      description?: string
+      fields: ElicitationFieldView[]
+    }
+  | { type: 'elicitation/resolved'; requestId: string; sessionId: string; action: 'accept' | 'decline' | 'cancel' }
+  | { type: 'elicitation/synced'; requestIds: string[] }
   | { type: 'turn/start'; sessionId: string; turnId: string; text: string }
   | {
       type: 'turn/metrics'

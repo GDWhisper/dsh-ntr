@@ -6,6 +6,7 @@
 
 import type { AcpApprovalDeadlines, AcpConversationChoice, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSkillEntry, AgentView, ChatSessionView, DetectedAgentInfo, PluginUpdateState, SaveGateStatus, SessionView, SubagentRecord } from "../../protocol.ts"
 import type { Block } from "./blocks.ts"
+import type { PendingElicitation } from "./elicitation.ts"
 import type { PendingPermission } from "./permission.ts"
 import type { SaveBanner } from "./save-gate.ts"
 import type { SubagentDetailState } from "./subagent.ts"
@@ -87,6 +88,7 @@ export interface UiState {
   activeSessionId?: string
   blocks: Block[]
   permissions: PendingPermission[]
+  elicitations: PendingElicitation[]
   busy: boolean
   /**
    * The settings page's one-line banner for its OWN action failures. Agent-side

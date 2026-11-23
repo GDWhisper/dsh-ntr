@@ -9,7 +9,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { ConnectionRpcHandler, HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
 import { ACP_PRESET_ID, AcpLlmAdapter, BridgeManager, PLUGIN_VERSION, type DshAgentLike } from './bridge.ts'
-import { appendExternalSubagentCatalog, EventHub, dispatchRpc, permissionReplayFrames, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
+import { appendExternalSubagentCatalog, elicitationReplayFrames, EventHub, dispatchRpc, permissionReplayFrames, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
 import { ArchiveReleaseTracker, archiveActivityFrames } from './archive-release.ts'
 import type { SessionActivityLike } from './archive-release.ts'
 import { AcpSaveGate } from './save-gate.ts'
@@ -639,7 +639,10 @@ export function apply(ctx: Context, config?: unknown): void {
             // meantime arrives both live and in the snapshot — the client folds
             // both by request id — and the terminator's live set prunes anything
             // this client still holds from before a disconnect.
-            for (const frame of permissionReplayFrames(manager.pendingPermissionViews())) {
+            for (const frame of [
+              ...permissionReplayFrames(manager.pendingPermissionViews()),
+              ...elicitationReplayFrames(manager.pendingElicitationViews()),
+            ]) {
               try {
                 controller.enqueue(encoder.encode(formatSse(frame)))
               } catch {
