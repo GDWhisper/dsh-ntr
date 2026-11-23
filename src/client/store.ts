@@ -528,9 +528,9 @@ export class AcpStore {
     return this.catalogService.loadCachedModels(agentId)
   }
 
-  /** Explicit probe, or a visible page refreshing a stale snapshot (`agent/probe-models`); `model` fetches just that model's thought levels, `silent` keeps a failure off the page notice, `staleAfterMs` makes the age budget the caller's. */
-  async probeModels(agentId: string, model?: string, options?: { silent?: boolean; staleAfterMs?: number }): Promise<void> {
-    return this.catalogService.probeModels(agentId, model, options)
+  /** Explicit probe (`agent/probe-models`); `model` fetches just that model's thought levels for the card. */
+  async probeModels(agentId: string, model?: string): Promise<void> {
+    return this.catalogService.probeModels(agentId, model)
   }
 
   /** Cached, deduped read of one agent's `agent/catalog` (what the composer chips and the model seat render). */

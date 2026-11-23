@@ -13,7 +13,7 @@
 ### 约束 8：ACP 模型进入 DSH 目录
 
 - **退役**：「为了让 ACP 会话能发消息，必须先进模型目录」这个前提。`listModels('acp')` 返回空是隔离手段，不是发消息的门禁。
-- **仍然有效**：`agent/catalog` 作为 agent 自己的模型面；纯内存应答、探测只允许五种有手势来源；变体默认开放（缺省 = 全部，显式 `[]` = 只留 base）；目录热更新；`set_config_option` 不喂 `absorbCatalog`。见 [state.md §4](./state.md)。
+- **仍然有效**：`agent/catalog` 作为 agent 自己的模型面；纯内存应答、探测只允许四种有手势来源；变体默认开放（缺省 = 全部，显式 `[]` = 只留 base）；目录热更新；`set_config_option` 不喂 `absorbCatalog`。见 [state.md §4](./state.md)。
 
 ### 约束 15：DSH Access mode 裁决
 

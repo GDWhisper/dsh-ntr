@@ -11,7 +11,7 @@ import { createElement } from 'react'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 import { AcpSettingsSection } from '../../src/client/panel.tsx'
-import { axisChoices, CHOICE_LABEL_MAX, CHOICE_OPTION_MAX, choiceLabel, clipChoiceText, resolvedAxisDefaultLabel, textColumns, thoughtOptionForModel } from '../../src/client/panel/subagent-defaults.tsx'
+import { axisChoices, catalogAge, CHOICE_LABEL_MAX, CHOICE_OPTION_MAX, choiceLabel, clipChoiceText, resolvedAxisDefaultLabel, textColumns, thoughtOptionForModel } from '../../src/client/panel/subagent-defaults.tsx'
 import { AcpStore, type RpcCall } from '../../src/client/store.ts'
 import { displayDelegateLabel as browserDisplayDelegateLabel, subagentPanelRows } from '../../src/client/subagent-panel.tsx'
 import { ModelCatalogService, type CatalogHost } from '../../src/bridge/catalog-service.ts'
@@ -33,17 +33,10 @@ function writes(calls: PanelRpcCall[], endpoint: string): unknown[] {
 }
 
 /** Mount the settings section with a delegate view the wrapper keeps authoritative. */
-async function mountDefaults(seed: AcpDelegateSettings, options: { failWrite?: boolean; probeFails?: boolean; probeDelay?: boolean; keepCatalogTimes?: boolean; catalogs?: Record<string, AgentProbeModelsResult | null>; locale?: (zh: string, en: string) => string } = {}) {
-  // A seeded catalog is "read a moment ago" unless a test WANTS a stale one:
-  // the page refreshes stale snapshots on sight, so leaving the fixture's old
-  // timestamps in place would probe in every unrelated case.
-  const catalogs = options.catalogs === undefined || options.keepCatalogTimes === true
-    ? options.catalogs
-    : Object.fromEntries(Object.entries(options.catalogs).map(([id, entry]) => [id, entry === null ? null : { ...entry, updatedAt: Date.now() }]))
-  const base = createPanelFixture(catalogs === undefined ? {} : { catalogs })
+async function mountDefaults(seed: AcpDelegateSettings, options: { failWrite?: boolean; catalogs?: Record<string, AgentProbeModelsResult | null>; locale?: (zh: string, en: string) => string } = {}) {
+  const base = createPanelFixture(options.catalogs === undefined ? {} : { catalogs: options.catalogs })
   let current = structuredClone(seed)
   const calls: PanelRpcCall[] = []
-  let releaseProbe: (() => void) | undefined
   const rpc: RpcCall = async (channel, endpoint, payload) => {
     calls.push({ channel, endpoint, payload: structuredClone(payload) })
     if (channel === '/acp' && endpoint === 'ui/delegate') return { ok: true, value: { delegate: structuredClone(current) } }
@@ -74,20 +67,12 @@ async function mountDefaults(seed: AcpDelegateSettings, options: { failWrite?: b
       current = next
       return { ok: true, value: { delegate: structuredClone(current) } }
     }
-    if (channel === '/acp' && endpoint === 'agent/probe-models' && options.probeFails === true) {
-      return { ok: false, error: { code: 'agent_unreachable', message: 'boom' } }
-    }
-    if (channel === '/acp' && endpoint === 'agent/probe-models' && options.probeDelay === true) {
-      // Hold the answer until the test releases it: that is how a batch's
-      // "one at a time" and a mid-flight category switch become observable.
-      await new Promise<void>(resolve => { releaseProbe = resolve })
-    }
     return base.rpc(channel, endpoint, payload)
   }
   const store = new AcpStore(rpc, options.locale ?? (zh => zh))
   await store.resync()
   render(createElement(AcpSettingsSection, { acp: store }))
-  return { store, calls, releaseProbe: () => releaseProbe?.() }
+  return { store, calls }
 }
 
 /** The default-agent picker (its aria-label is the visible row title). */
@@ -186,8 +171,8 @@ describe('SubagentDefaults — per-agent axes', () => {
     expect(optionValues(axisSelect('思考等级', 'CodeBuddy'))).toEqual(['', 'medium', 'high'])
     // No mode option published → only 默认.
     expect(optionValues(axisSelect('模式', 'CodeBuddy'))).toEqual([''])
-    // The catalog read is the memory-only route; a probe follows only a snapshot
-    // the cache itself admits is old.
+    // The catalog read is the memory-only route: opening the page never spawns,
+    // and the probe waits for the user's own click.
     expect(screen.queryByRole('button', { name: '获取目录' })).toBeNull()
     expect(writes(calls, 'agent/cached-models').length).toBeGreaterThan(0)
     expect(writes(calls, 'agent/probe-models')).toEqual([])
@@ -307,7 +292,7 @@ describe('SubagentDefaults — per-agent axes', () => {
   it('marks kept model/mode values stale when the catalog is read but the axes are absent', async () => {
     // The catalog WAS read (an entry exists) but publishes no model/mode slot:
     // that is evidence the kept values no longer exist — warning-colored and
-    // kept, with no fetch gesture (there is nothing left to fetch).
+    // kept, with the row's 刷新目录 still able to ask the agent again.
     const catalog: AgentProbeModelsResult = { agentId: 'codebuddy', updatedAt: 1, catalog: {} }
     const { store } = await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'gone', mode: 'lost' } } }, { catalogs: { codebuddy: catalog } })
     await category('子代理')
@@ -415,11 +400,11 @@ describe('SubagentDefaults — gating', () => {
   })
 })
 
-describe('SubagentDefaults — a visible page refreshes a stale catalog', () => {
-  /** A cached snapshot the page can render but cannot call current. */
-  const stale = (agentId: string): AgentProbeModelsResult => ({
+describe('SubagentDefaults — catalog freshness is the user’s call', () => {
+  /** A cached snapshot with the age the row is expected to name. */
+  const cached = (agentId: string, updatedAt: number): AgentProbeModelsResult => ({
     agentId,
-    updatedAt: 1,
+    updatedAt,
     catalog: {
       model: {
         configId: 'model', name: 'Model', currentValue: 'hy4flash-free',
@@ -428,77 +413,51 @@ describe('SubagentDefaults — a visible page refreshes a stale catalog', () => 
     },
   })
 
-  it('probes the old snapshots once the section is visible, one agent at a time', async () => {
-    const { calls } = await mountDefaults(
-      { ...BASE, globalDefaultAgent: 'codebuddy', resolvedDefaultAgent: 'codebuddy' },
-      { catalogs: { codebuddy: stale('codebuddy'), pi: stale('pi') }, keepCatalogTimes: true },
-    )
-    await category('子代理')
-    await waitFor(() => expect(writes(calls, 'agent/probe-models')).toEqual([{ agentId: 'codebuddy' }, { agentId: 'pi' }]))
-  })
-
-  it('leaves a snapshot read a moment ago alone', async () => {
-    const { calls } = await mountDefaults({ ...BASE })
+  it('never probes on its own: opening the page only reads the cache', async () => {
+    const { calls } = await mountDefaults({ ...BASE }, { catalogs: { codebuddy: cached('codebuddy', 1), pi: cached('pi', 1) } })
     await category('子代理')
     await waitFor(() => expect(screen.getByRole('combobox', { name: '模型 · CodeBuddy' })).toBeDefined())
-    expect(writes(calls, 'agent/probe-models')).toEqual([])
-  })
-
-  it('probes nothing while the section is still hidden', async () => {
-    const { calls } = await mountDefaults({ ...BASE }, { catalogs: { codebuddy: stale('codebuddy') }, keepCatalogTimes: true })
+    // Stale or not, the page spends no probe: one probe can start an agent process.
     await new Promise(resolve => setTimeout(resolve, 50))
     expect(writes(calls, 'agent/probe-models')).toEqual([])
   })
 
-  it('keeps an automatic refresh failure on the row, never in the page notice', async () => {
-    const { store } = await mountDefaults({ ...BASE }, { catalogs: { codebuddy: stale('codebuddy') }, keepCatalogTimes: true, probeFails: true })
+  it('shows the snapshot age and probes only when 刷新目录 is clicked', async () => {
+    const { calls } = await mountDefaults({ ...BASE }, { catalogs: { codebuddy: cached('codebuddy', Date.now() - 3 * 24 * 60 * 60_000) } })
     await category('子代理')
-    // The catalog is cached, so the button that appears is the retry, not the
-    // first-fetch: the failure is reported where the stale value lives.
-    await screen.findByRole('button', { name: '刷新目录' })
-    expect(screen.getByText(/⚠ boom/)).toBeDefined()
-    expect(store.getSnapshot().notice).toBeUndefined()
-    expect(store.getSnapshot().probeErrors?.codebuddy).toContain('boom')
+    const row = screen.getByRole('combobox', { name: '模型 · CodeBuddy' }).closest('.dwa-preference-block') as HTMLElement
+    expect(within(row).getByText('目录更新于 3 天前')).toBeDefined()
+    expect(writes(calls, 'agent/probe-models')).toEqual([])
+    await click(within(row).getByRole('button', { name: '刷新目录' }))
+    await waitFor(() => expect(writes(calls, 'agent/probe-models')).toEqual([{ agentId: 'codebuddy' }]))
   })
 
-  it('does not re-probe an unchanged answer on a remount', async () => {
-    const first = await mountDefaults({ ...BASE }, { catalogs: { codebuddy: stale('codebuddy') }, keepCatalogTimes: true })
+  it('an unread catalog keeps 获取目录 and shows no age', async () => {
+    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: null } })
     await category('子代理')
-    await waitFor(() => expect(writes(first.calls, 'agent/probe-models')).toEqual([{ agentId: 'codebuddy' }]))
-    // Remount onto the SAME store, the way a reopened settings page does. The
-    // host keeps an unchanged answer's old `updatedAt`, so only the attempt's
-    // own stamp can stop this probe.
-    cleanup()
-    render(createElement(AcpSettingsSection, { acp: first.store }))
-    await category('子代理')
+    const row = screen.getByRole('button', { name: '获取目录' }).closest('.dwa-preference-block') as HTMLElement
+    expect(within(row).queryByText(/目录更新于/)).toBeNull()
+    // `pi` still has a dated snapshot, so the age line is a per-row fact.
+    expect(screen.getAllByText(/目录更新于/).length).toBeGreaterThan(0)
+  })
+
+  it('pulls nothing while the section stays hidden', async () => {
+    const { calls } = await mountDefaults({ ...BASE }, { catalogs: { codebuddy: cached('codebuddy', 1) } })
     await new Promise(resolve => setTimeout(resolve, 50))
-    expect(writes(first.calls, 'agent/probe-models')).toHaveLength(1)
+    expect(writes(calls, 'agent/cached-models')).toEqual([])
+    expect(writes(calls, 'agent/probe-models')).toEqual([])
   })
+})
 
-  it('runs one probe at a time, so the second agent waits for the first answer', async () => {
-    const run = await mountDefaults(
-      { ...BASE },
-      { catalogs: { codebuddy: stale('codebuddy'), pi: stale('pi') }, keepCatalogTimes: true, probeDelay: true },
-    )
-    await category('子代理')
-    await waitFor(() => expect(writes(run.calls, 'agent/probe-models')).toEqual([{ agentId: 'codebuddy' }]))
-    expect(writes(run.calls, 'agent/probe-models')).toHaveLength(1)
-    run.releaseProbe()
-    await waitFor(() => expect(writes(run.calls, 'agent/probe-models')).toHaveLength(2))
-    run.releaseProbe()
-  })
-
-  it('stops the batch when the section is hidden mid-flight', async () => {
-    const run = await mountDefaults(
-      { ...BASE },
-      { catalogs: { codebuddy: stale('codebuddy'), pi: stale('pi') }, keepCatalogTimes: true, probeDelay: true },
-    )
-    await category('子代理')
-    await waitFor(() => expect(writes(run.calls, 'agent/probe-models')).toEqual([{ agentId: 'codebuddy' }]))
-    await category('日志')
-    run.releaseProbe()
-    await new Promise(resolve => setTimeout(resolve, 50))
-    expect(writes(run.calls, 'agent/probe-models')).toHaveLength(1)
+describe('catalogAge — the snapshot age in words', () => {
+  const T0 = 1_700_000_000_000
+  it('names minutes, hours and days, and stays silent on an undated snapshot', () => {
+    expect(catalogAge(undefined)).toBeUndefined()
+    expect(catalogAge(0)).toBeUndefined()
+    expect(catalogAge(T0, T0)).toEqual({ zh: '刚刚', en: 'a moment ago' })
+    expect(catalogAge(T0, T0 + 90_000)).toEqual({ zh: '1 分钟前', en: '1 min ago' })
+    expect(catalogAge(T0, T0 + 3 * 3_600_000)).toEqual({ zh: '3 小时前', en: '3 h ago' })
+    expect(catalogAge(T0, T0 + 50 * 3_600_000)).toEqual({ zh: '2 天前', en: '2 d ago' })
   })
 })
 

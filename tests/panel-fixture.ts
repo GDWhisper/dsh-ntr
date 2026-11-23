@@ -86,11 +86,9 @@ export interface PanelFixture {
 }
 
 const WORKSPACE = '/workspace/ntr-demo'
-// "Read a moment ago": the snapshot a settings page may trust without probing.
-// A test that needs a STALE catalog seeds its own old `updatedAt` — the page
-// refreshes whatever the cache admits is old, so an ancient default here would
-// make every unrelated mount spawn.
-const CATALOG_TIME = Date.now()
+// A fixed epoch: the fixture's catalog is a dated snapshot the settings page
+// displays by age. Nothing here triggers a probe — freshness is a user gesture.
+const CATALOG_TIME = Date.UTC(2026, 9, 28, 10, 30)
 
 const DEFAULT_PLUGIN_UPDATE: PluginUpdateState = {
   status: 'current', current: '0.2.1', installed: '0.2.1', latest: '0.2.1',
