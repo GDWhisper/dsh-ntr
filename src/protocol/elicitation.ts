@@ -6,6 +6,16 @@
  * existing `../protocol.ts` import keeps resolving through it. Pure types only.
  */
 
+/** Maximum lengths and counts enforced on incoming ACP elicitation payloads. */
+export const MAX_ELICITATION_MESSAGE_CHARS = 2000
+export const MAX_ELICITATION_TITLE_CHARS = 200
+export const MAX_ELICITATION_DESC_CHARS = 500
+export const MAX_ELICITATION_FIELDS = 20
+export const MAX_ELICITATION_OPTIONS = 50
+export const MAX_ELICITATION_OPTION_LABEL_CHARS = 200
+export const MAX_ELICITATION_FIELD_NAME_CHARS = 128
+export const MAX_ELICITATION_OPTION_VALUE_CHARS = 512
+
 /** Allowed primitive / array values carried in an accepted elicitation form. */
 export type ElicitationContentValue = string | number | boolean | string[]
 
@@ -57,6 +67,8 @@ export interface PendingElicitationFields {
   description?: string
   /** Ordered form fields derived from `requestedSchema.properties`. */
   fields: ElicitationFieldView[]
+  /** Epoch ms when this request expires and auto-cancels; absent when unbounded. */
+  deadlineAt?: number
 }
 
 /** One outstanding elicitation ask as the browser renders and replays it. */

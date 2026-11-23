@@ -11,6 +11,7 @@
 import { useState } from 'react'
 import type { ElicitationFieldView, ElicitationOutcome } from '../protocol.ts'
 import { ensureAcpStyle, useUi } from './acp-ui.tsx'
+import { DeadlineBadge, PendingDockShell, useDeadlineClock } from './pending-dock.tsx'
 import {
   buildElicitationContent,
   elicitationsForSession,
@@ -29,22 +30,24 @@ export function ElicitationDock({ acp, sessionId }: ElicitationDockProps) {
   ensureAcpStyle()
   const ui = useUi(acp)
   const pending = elicitationsForSession(ui.elicitations, String(sessionId))
+  const now = useDeadlineClock(pending.some(item => item.deadlineAt !== undefined))
   if (pending.length === 0) return null
   return (
-    <div
+    <PendingDockShell
       className="ntr-elicit-dock"
-      role="region"
-      aria-label={acp.label('待回答的智能体提问', 'Pending agent questions')}
+      ariaLabel={acp.label('待回答的智能体提问', 'Pending agent questions')}
     >
       {pending.map(item => (
-        <ElicitationAskCard key={item.requestId} acp={acp} elicitation={item} />
+        <ElicitationAskCard key={item.requestId} acp={acp} elicitation={item} now={now} />
       ))}
-    </div>
+    </PendingDockShell>
   )
 }
 
-export function ElicitationAskCard(props: { acp: AcpStore; elicitation: PendingElicitation }) {
-  const { acp, elicitation } = props
+export function ElicitationAskCard(props: { acp: AcpStore; elicitation: PendingElicitation; now?: number }) {
+  const { acp, elicitation, now } = props
+  const ownNow = useDeadlineClock(now === undefined && elicitation.deadlineAt !== undefined)
+  const effectiveNow = now ?? ownNow
   const [draft, setDraft] = useState<ElicitationDraft>(() => initialElicitationDraft(elicitation.fields))
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
@@ -82,7 +85,10 @@ export function ElicitationAskCard(props: { acp: AcpStore; elicitation: PendingE
   return (
     <div className="ntr-elicit-card">
       <div className="ntr-elicit-head">
-        <div className="ntr-elicit-title">{headline}</div>
+        <div className="ntr-elicit-head-row">
+          <div className="ntr-elicit-title">{headline}</div>
+          <DeadlineBadge acp={acp} deadlineAt={elicitation.deadlineAt} now={effectiveNow} mode="abort" />
+        </div>
         {subtitle !== undefined && <div className="ntr-elicit-desc">{subtitle}</div>}
       </div>
       {elicitation.fields.length > 0 && (

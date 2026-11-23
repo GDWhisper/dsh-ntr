@@ -106,6 +106,7 @@ export function apply(ctx: Context, config?: unknown): void {
     {
       startupTimeoutMs: resolved.startupTimeoutMs,
       permissionTimeoutMs: resolved.permissionTimeoutMs,
+      ...(resolved.elicitationTimeoutMs === undefined ? {} : { elicitationTimeoutMs: resolved.elicitationTimeoutMs }),
       permissionTimeoutMode: resolved.permissionTimeoutMode,
       cancelFallbackMs: resolved.cancelFallbackMs,
       staleCancelRetryDelayMs: resolved.staleCancelRetryDelayMs,

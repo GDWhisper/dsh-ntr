@@ -5,6 +5,7 @@
  */
 
 import type { PermissionTimeoutMode } from "../../protocol.ts"
+import { pendingForSession } from "./pending.ts"
 
 /**
  * One permission ask waiting for a human. Every field is copied VERBATIM from
@@ -40,7 +41,7 @@ export function permissionsForSession(
   permissions: readonly PendingPermission[],
   dshSessionId: string,
 ): PendingPermission[] {
-  return permissions.filter(permission => permission.dshSessionId === dshSessionId)
+  return pendingForSession(permissions, dshSessionId)
 }
 
 /**

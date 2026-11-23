@@ -6,6 +6,7 @@
 import type { AcpStore, UiState } from '../store.ts'
 import type { Translate } from '../acp-view.tsx'
 import { ElicitationAskCard } from '../elicitation-dock.tsx'
+import { useDeadlineClock } from '../pending-dock.tsx'
 import type { AgentTestResult } from '../../protocol.ts'
 
 /**
@@ -123,11 +124,12 @@ export function agentTestHint(result: AgentTestResult, t: Translate): string | u
  */
 export function PermissionMirrorCard(props: { acp: AcpStore; ui: UiState }) {
   const { acp, ui } = props
+  const now = useDeadlineClock(ui.elicitations.some(e => e.deadlineAt !== undefined))
   if (!permissionLedgerCard(ui).visible) return null
   return (
     <div className="dwa-card dwa-card-warn" style={{ marginBottom: 16 }}>
       <div style={{ fontWeight: 600, marginBottom: 4 }}>
-        {acp.label('待处理权限请求', 'Pending Permission Requests')}
+        {acp.label('待处理权限与提问', 'Pending Permissions & Questions')}
       </div>
       <div className="dwa-hint" style={{ marginBottom: 8 }}>
         {acp.label(
@@ -160,7 +162,7 @@ export function PermissionMirrorCard(props: { acp: AcpStore; ui: UiState }) {
       ))}
       {ui.elicitations.map(elicitation => (
         <div key={elicitation.requestId} style={{ marginTop: 8 }}>
-          <ElicitationAskCard acp={acp} elicitation={elicitation} />
+          <ElicitationAskCard acp={acp} elicitation={elicitation} now={now} />
         </div>
       ))}
     </div>

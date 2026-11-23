@@ -1,7 +1,7 @@
-# 对话内 dock：权限卡与横幅
+# 对话内 dock：权限卡、表单提问卡与横幅
 
-本文是 [AGENTS.md](../AGENTS.md) 的展开层，覆盖 `conversation.input.dock` 的三个事务条目（权限卡 / 释放横幅 / 限流横幅），自 [ui.md](./ui.md) §10 家族拆出，节号沿用全仓连续编号。座位、芯片、视图、消息动作仍在 [ui.md](./ui.md)；设置页与保存横幅见 [ui-panel.md](./ui-panel.md)。
-三条都是纯附加条目：帧集合 / 行集本身就是闸门，本会话没有该事务就不渲染，普通会话不会凭空多一张卡；注册与隔离检查的总规矩见 [ui.md §7](./ui.md)。
+本文是 [AGENTS.md](../AGENTS.md) 的展开层，覆盖 `conversation.input.dock` 的四个事务条目（权限卡 / 表单提问卡 / 释放横幅 / 限流横幅），自 [ui.md](./ui.md) §10 家族拆出，节号沿用全仓连续编号。座位、芯片、视图、消息动作仍在 [ui.md](./ui.md)；设置页与保存横幅见 [ui-panel.md](./ui-panel.md)。
+四条都是纯附加条目：帧集合 / 行集本身就是闸门，本会话没有该事务就不渲染，普通会话不会凭空多一张卡；非 NTR 会话里该槽位由 DSH 原生的队列 / Todo dock 持有，本插件所有条目严格按会话自门禁、绝不遮蔽宿主条目；注册与隔离检查的总规矩见 [ui.md §7](./ui.md)。
 
 ## 10. 对话内权限卡（`conversation.input.dock`）
 
@@ -15,6 +15,14 @@
 - **堆叠**：多问按**到达顺序**最旧在上，列表高度上限 `min(38vh, 320px)` 内滚动——连续询问不会把 composer 推出屏幕。
 - **设置页是镜像，不是替代**：`permissionLedgerCard` 只要 `ui.permissions` 非空就渲染可答复卡片（`approvalRouted` / `fellBackFromConversation` 已删除），文案是「对话打开时在那边的卡片上回答；这里兜底显示其他会话的询问。」每行写 `toolName`（有 `reason` 时附在后面），按钮同样原样。两个面回答的是同一份 `PendingPermission`，写入都走 `respondPermission`。
 - 聊天里那行提示（`TurnStreamController.permissionLine`）指向真正的答案面：有 `dshSessionId` 说「对话卡片」，`/acp` 询问说「设置页」。
+
+### 10.0.1 表单提问卡（`acp-elicitations`，同座）
+
+`ElicitationDock`（`src/client/elicitation-dock.tsx`）在 `conversation.input.dock`（`id: 'acp-elicitations'`, `order: 11`）渲染 ACP `elicitation/create` 表单提问，并与 `PermissionDock` 共用 `PendingDockShell`、`useDeadlineClock`、`DeadlineBadge`（`src/client/pending-dock.tsx`）与 `.ntr-pending-dock` 宽度/限高公式。
+
+- **非 NTR 会话不渲染**：按 `elicitationsForSession(ui.elicitations, dshSessionId)` 自门禁（共用 `pendingForSession`）；无 `dshSessionId` 的 `/acp` 提问仅进设置页「待处理权限与提问」镜像。
+- **字段与动作**：按 schema 渲染 `single-select` / `multi-select` / `boolean` / `string` / `number` / `integer`（支持默认值与可选/必填校验，客户端 `buildElicitationContent` 与服务端 `validateElicitationOutcome` 均校验枚举成员与字段范围），底部固定 **Submit / Decline / Cancel**，不截获全局 Enter / Esc；携带 `deadlineAt` 时显示同款倒计时（`elicitationTimeoutMs`，默认 300s，到期宿主按 `cancel` 收场）。
+- **清理**：`session/closed` / `session/released` 仅清理对应会话的条目；SSE `elicitation/synced` 收敛活集合。
 
 ### 10.1 释放横幅（`acp-released-banner`，同座）
 
@@ -43,6 +51,8 @@ agent 因配额拒绝本轮时，`conversation.input.dock` 的第三条目 `Quot
 
 | 主题 | 位置 |
 |---|---|
+| 共享 dock 壳体 | `src/client/pending-dock.tsx` · `PendingDockShell` / `DeadlineBadge` / `useDeadlineClock`；`src/client/store/pending.ts` · `pendingForSession` / `upsertPendingRequest` / `removePendingRequest` / `syncPendingRequests` |
 | 权限卡 | `src/client/permission-dock.tsx` · `PermissionDock` / `PermissionAskCard`；`src/client/store/permission.ts` · `permissionsForSession` / `deadlineRemainingLabel`；`src/client/index.tsx` · `acp-permissions` 注册处 |
+| 表单提问卡 | `src/client/elicitation-dock.tsx` · `ElicitationDock` / `ElicitationAskCard`；`src/client/store/elicitation.ts` · `elicitationsForSession` / `reduceElicitationEvent` / `buildElicitationContent`；`src/client/index.tsx` · `acp-elicitations` 注册处 |
 | 释放横幅 | `src/client/released-banner.tsx` · `ReleasedBanner` / `releasedBannerVisible`；`src/client/store/chat-sessions.ts` · `resumeChatSession`；`src/client/store/blocks.ts` · `withSessionReleased`；`src/client/index.tsx` · `acp-released-banner` 注册处 |
 | 限流横幅 | `src/client/quota-banner.tsx` · `QuotaBanner` / `quotaRefusalMessage`；`src/client/index.tsx` · `acp-quota-banner` 注册处；`src/bridge/shape.ts` · `agentRefusalDetail` / `snapshot` 的 `quotaRefusal` |
