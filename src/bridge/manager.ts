@@ -37,6 +37,7 @@ import {
 
 import type {
   AcpModeResolver,
+  BridgeReleaseReport,
   BridgeTuning,
   DshAgentLike,
   SessionWorkspaceResolver,
@@ -434,7 +435,7 @@ export class BridgeManager {
         if (withStatus) {
           const def = this.defsMap.get(agentId)
           if (def !== undefined) {
-            const view = this.aggregateView(def)
+            const view = this.bridgeRegistry.aggregateView(def)
             // The aggregate is the agent's state; the view rides along only
             // when a holder exists, exactly as this frame always did.
             this.hub.broadcast({
@@ -511,8 +512,8 @@ export class BridgeManager {
     onForkCapability?: (agentId: string, supported: boolean) => void,
   ): AgentBridge {
     return new AgentBridge(def, this.hub, this.transcriptMax, onConnectionLost, onCatalog, onCommands, this.tuning, () => this.sessionWorkspaceResolver, onSessionsDirty, onForkCapability, bridge => {
-      this.publishAgentStatus(bridge.def.id)
-      this.noticeBridgeFailure(bridge)
+      this.bridgeRegistry.publishAgentStatus(bridge.def.id)
+      this.bridgeRegistry.noticeBridgeFailure(bridge)
     }, (session, update) => this.subagents.trackSessionBackgroundDispatch(session, update), (session, update) => this.subagents.trackBackgroundDrainText(session, update), (session, status) => {
       // A session teardown that skips `clearAmbientState` must still stop the
       // transcript watch: its writer is the process that is going away. The
@@ -1012,24 +1013,17 @@ export class BridgeManager {
     this.bridgeRegistry.connectionLost(bridge, reason)
   }
 
-  private aggregateView(def: AcpAgentDef): AgentView {
-    return this.bridgeRegistry.aggregateView(def)
-  }
-
-  private publishAgentStatus(agentId: string): void {
-    this.bridgeRegistry.publishAgentStatus(agentId)
-  }
-
   agentViews(): AgentView[] {
     return this.bridgeRegistry.agentViews()
   }
 
-  private noticeBridgeFailure(bridge: AgentBridge): void {
-    this.bridgeRegistry.noticeBridgeFailure(bridge)
-  }
-
   async stopAgent(agentId: string, persist = true): Promise<void> {
     return this.bridgeRegistry.stopAgent(agentId, persist)
+  }
+
+  /** On-demand idle release behind `acp_release` (see `BridgeRegistryService.releaseIdle`). */
+  releaseIdleProcesses(agentId?: string): BridgeReleaseReport {
+    return this.bridgeRegistry.releaseIdle(agentId)
   }
 
   async shutdownAll(): Promise<void> {
@@ -1043,7 +1037,9 @@ export class BridgeManager {
 
   /** Save one definition; the gate semantics live in `AgentAdminService.saveAgent`. */
   async saveAgent(def: AcpAgentDef, mode: AgentSaveMode = 'direct'): Promise<AgentSaveResult> {
-    return this.admin.saveAgent(def, mode)
+    const result = await this.admin.saveAgent(def, mode)
+    this.delegateRegistration?.sync() // the roster (id / title) must reach the NEXT request header
+    return result
   }
 
   /** Lightweight model-visibility update: no process restart. */
@@ -1063,7 +1059,8 @@ export class BridgeManager {
 
   /** Delete one definition and every pointer into it. */
   async deleteAgent(agentId: string): Promise<void> {
-    return this.admin.deleteAgent(agentId)
+    await this.admin.deleteAgent(agentId)
+    this.delegateRegistration?.sync()
   }
 
   /** Probe a throwaway process built from raw form values. */

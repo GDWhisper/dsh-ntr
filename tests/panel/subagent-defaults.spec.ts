@@ -233,6 +233,27 @@ describe('SubagentDefaults — per-agent axes', () => {
     await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ agentDefaults: { codebuddy: { model: 'deepseek-v3', mode: 'ask', effort: 'high' } } }]))
   })
 
+  it('commits the description on blur, trimmed, keeping the other axes', async () => {
+    const { store, calls } = await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3' } } })
+    await category('子代理')
+    const input = screen.getByLabelText('描述（写给主代理看） · CodeBuddy') as HTMLInputElement
+    expect(input.value).toBe('')
+    fireEvent.change(input, { target: { value: '  通用编码  ' } })
+    fireEvent.blur(input)
+    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ agentDefaults: { codebuddy: { model: 'deepseek-v3', description: '通用编码' } } }]))
+    expect(store.getSnapshot().delegate?.agentDefaults?.codebuddy).toEqual({ model: 'deepseek-v3', description: '通用编码' })
+  })
+
+  it('clearing the description deletes only that key and keeps the axes', async () => {
+    const { calls } = await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3', description: '通用编码' } } })
+    await category('子代理')
+    const input = screen.getByLabelText('描述（写给主代理看） · CodeBuddy') as HTMLInputElement
+    expect(input.value).toBe('通用编码')
+    fireEvent.change(input, { target: { value: '   ' } })
+    fireEvent.blur(input)
+    await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ agentDefaults: { codebuddy: { model: 'deepseek-v3' } } }]))
+  })
+
   it('marks a stale model and mode as warning-colored kept options, never auto-clears', async () => {
     const catalog: AgentProbeModelsResult = {
       agentId: 'codebuddy', updatedAt: 1,

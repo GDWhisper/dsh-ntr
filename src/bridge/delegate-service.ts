@@ -38,8 +38,8 @@
  */
 import type { AcpEvent, AcpDelegateAgentDefaults, AcpDelegatePolicy, AcpDelegateAsyncOutput, AcpStartSessionOpts, DelegateGuidance } from '../protocol.ts'
 import { DELEGATE_TIMEOUT_MAX_MS } from '../protocol.ts'
-import { isAbsolutePath, planDelegateEffort, planDelegateModeAndModel } from '../impl.ts'
-import type { DelegateChoiceSet, DelegateChoiceWrite, DelegateLiveOptions } from '../impl.ts'
+import { isAbsolutePath, planDelegateEffort, planDelegateModeAndModel, delegateRosterText } from '../impl.ts'
+import type { DelegateAgentDoc, DelegateChoiceSet, DelegateChoiceWrite, DelegateLiveOptions } from '../impl.ts'
 import { isPerSessionAgent } from './identity.ts'
 import { describeError } from './errors.ts'
 import { chunkTextOf, codebuddyMetaOf } from './turn-stream.ts'
@@ -137,6 +137,21 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/**
+ * The `agent` parameter description: the resolution rule plus the live roster.
+ * The roster is the ONE place the caller learns "who is good at what" without
+ * spawning anything — each row carries the user's description and the
+ * persisted delegation defaults (see `delegateRosterText`). Absent roster
+ * (older wiring / tests) falls back to the plain rule so the schema never
+ * renders a half-built list.
+ */
+function delegateAgentParamDescription(roster: readonly DelegateAgentDoc[] | undefined): string {
+  const base = '已配置的 agent id；省略 = 子代理设置的默认 agent（未设置则跟随全局默认）'
+  if (roster === undefined) return base
+  const text = delegateRosterText(roster)
+  return text === '' ? base : `${base}\n${text}`
+}
+
 /** Keep the ONE error vocabulary: every surfaced message carries the prefix. */
 function prefixed(message: string): string {
   return message.startsWith('acp_delegate:') ? message : `acp_delegate: ${message}`
@@ -198,6 +213,8 @@ export function acpDelegateToolDefinition(opts: {
   guidance: DelegateGuidance
   execute: AcpDelegateExecute | AcpDelegateActivationExecute
   mode?: 'legacy' | 'native'
+  /** The configured agents, described for the caller; absent = the short generic line. */
+  roster?: readonly DelegateAgentDoc[]
 }): {
   name: string
   description: string
@@ -217,7 +234,7 @@ export function acpDelegateToolDefinition(opts: {
       type: 'object',
       properties: {
         task: { type: 'string', description: '完整任务描述（子代理看不到本会话上下文）' },
-        agent: { type: 'string', description: '已配置的 agent id；省略 = 子代理设置的默认 agent（未设置则跟随全局默认）' },
+        agent: { type: 'string', description: delegateAgentParamDescription(opts.roster) },
         cwd: { type: 'string', description: '工作目录；省略 = 继承调用会话工作区；显式指定须在该工作区或该 agent 的 allowedCwdRoots 内' },
         model: { type: 'string', description: '模型 id；省略 = 子代理设置中该 agent 的默认模型；显式指定而 agent 不提供时报错' },
         effort: { type: 'string', description: '思考等级；省略 = 子代理设置默认；不支持时自动丢弃并留痕' },

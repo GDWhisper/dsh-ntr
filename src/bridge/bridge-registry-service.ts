@@ -15,6 +15,7 @@ import { AcpError } from '../impl.ts'
 import type { AcpAgentDef, AgentView, SessionView } from '../protocol.ts'
 import { SHUTDOWN_BUDGET_MS } from './agent-bridge.ts'
 import type { AgentBridge } from './agent-bridge.ts'
+import type { BridgeReleaseReport, BridgeReleasedEntry, BridgeSkippedEntry } from './types.ts'
 import type { ModelCatalogService } from './catalog-service.ts'
 import { bridgeKey, isPerSessionAgent, type BridgeScope } from './identity.ts'
 import type { SessionRegistryService } from './session-registry-service.ts'
@@ -404,6 +405,39 @@ export class BridgeRegistryService {
       if (remaining <= 0) this.stoppingAgents.delete(agentId)
       else this.stoppingAgents.set(agentId, remaining)
     }
+  }
+
+  /**
+   * ON-DEMAND idle release (the `acp_release` tool): park every releasable
+   * process NOW instead of waiting out the idle timer. Eligibility is the
+   * bridge's own idle rule (constraint 19) — it never interrupts work and
+   * never parks a session the agent could not reload. The released holder
+   * stays in the table as a stopped process slot (A1 session holders are
+   * pruned when discardable), so the next message resumes through
+   * `session/load` exactly like an idle release.
+   */
+  releaseIdle(agentId?: string): BridgeReleaseReport {
+    const released: BridgeReleasedEntry[] = []
+    const skipped: BridgeSkippedEntry[] = []
+    // Snapshot first: releasing mutates the map (pruneBridge below).
+    const entries: Array<{ key: string; bridge: AgentBridge }> = []
+    for (const [key, bridge] of this.bridges) {
+      if (bridge.state !== 'ready') continue
+      if (agentId !== undefined && bridge.def?.id !== agentId) continue
+      entries.push({ key, bridge })
+    }
+    for (const { key, bridge } of entries) {
+      const blocker = bridge.idleReleaseBlocker()
+      if (blocker !== undefined) {
+        skipped.push({ agentId: bridge.def.id, reason: blocker })
+        continue
+      }
+      const sessions = bridge.sessionList.length
+      bridge.releaseAll(`released on request of the main agent (${String(sessions)} sessions)`, 'idle')
+      released.push({ agentId: bridge.def.id, sessions })
+      this.pruneBridge(key)
+    }
+    return { released, skipped }
   }
 
   /**

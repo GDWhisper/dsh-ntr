@@ -9,7 +9,7 @@
 
 export { PLUGIN_VERSION, PER_SESSION_AGENT_IDS, isPerSessionAgent, bridgeKey, perSessionLaunchArgs, perSessionLaunchEnv } from './bridge/identity.ts'
 export type { BridgeScope } from './bridge/identity.ts'
-export type { AcpModeResolver, BridgeTuning, DshAgentLike, SessionWorkspaceResolver, StartAttempt, SubagentCatalogReporter } from './bridge/types.ts'
+export type { AcpModeResolver, BridgeTuning, DshAgentLike, SessionWorkspaceResolver, StartAttempt, SubagentCatalogReporter, BridgeReleaseReport, BridgeReleasedEntry, BridgeReleaseSkipReason, BridgeSkippedEntry } from './bridge/types.ts'
 export { ACP_PRESET_ID, AGENT_PRESETS, defaultAgentWorkspace, ensureDefaultWorkspace, pluginStateDir, rewriteLegacyWorkspaceRoots } from './bridge/state-paths.ts'
 export type { AgentPreset } from './bridge/state-paths.ts'
 export { detectHostAgents, ensureAgentExecutable, findExecutable, killProcessTree, npmInstallGlobal, windowsShimLaunch } from './bridge/process.ts'
@@ -32,5 +32,7 @@ export { ACP_SUBAGENT_PROVIDER, AcpSubagentProvider, acpDelegateActivationExecut
 export type { DelegateSubagentsLike } from './bridge/delegate-provider.ts'
 export { AcpDelegateRegistration } from './bridge/delegate-registration.ts'
 export type { DelegateRegistrationCtx } from './bridge/delegate-registration.ts'
+export { acpReleaseToolDefinition } from './bridge/release-tool.ts'
+export type { AcpReleaseHost, AcpReleaseOutput } from './bridge/release-tool.ts'
 export { AcpDelegateForceMask, DELEGATE_FORCE_DENY_CANDIDATES } from './bridge/delegate-force-mask.ts'
 export type { DelegateForceMaskCtx } from './bridge/delegate-force-mask.ts'

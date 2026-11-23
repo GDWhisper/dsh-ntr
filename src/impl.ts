@@ -61,6 +61,11 @@ export {
 export type { DelegateChoiceSet, DelegateChoiceWrite, DelegateLiveOptions } from './impl/delegate-choices.ts'
 export { planDelegateEffort, planDelegateModeAndModel } from './impl/delegate-choices.ts'
 
+// ---- Delegation roster text (pure; rendered into the tool schema) ----
+
+export type { DelegateAgentDoc } from './impl/delegate-doc.ts'
+export { delegateAgentDoc, delegateAgentDocs, delegateAgentDocLine, delegateRosterDigest, delegateRosterText } from './impl/delegate-doc.ts'
+
 // ---- Workspace guard ----
 
 export { canonicalizeFsPath, isAbsolutePath, isUnderPath, resolveFsPath, resolveSessionCwd } from './impl/paths.ts'

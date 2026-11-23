@@ -9,7 +9,7 @@
  */
 
 import type { AcpAgentDef, AcpDelegateAgentDefaults, AcpDelegateConfig, AcpMcpServerDef, AcpPluginConfig, AcpTagHalo, ApprovalDeadlineKey, DelegateGuidance, DelegateSetPayload, DelegateSettingKey, PermissionTimeoutMode } from '../protocol.ts'
-import { DEFAULT_IDLE_TIMEOUT_MS, DELEGATE_TIMEOUT_MAX_MS, DELEGATE_TIMEOUT_MIN_MS, IDLE_RELEASE_MS } from '../protocol.ts'
+import { DEFAULT_IDLE_TIMEOUT_MS, DELEGATE_DESCRIPTION_MAX, DELEGATE_TIMEOUT_MAX_MS, DELEGATE_TIMEOUT_MIN_MS, IDLE_RELEASE_MS } from '../protocol.ts'
 import { splitCommandLine } from './command-line.ts'
 import { AcpError } from './errors.ts'
 import { isAbsolutePath } from './paths.ts'
@@ -230,10 +230,12 @@ function validateDelegateDefaultAgent(raw: unknown, code: 'bad_config' | 'bad_pa
 
 /**
  * One per-agent defaults entry: an object whose optional model/effort/mode
- * values are NON-EMPTY strings. Shape only — a value the agent no longer
- * offers is a stale preference that stays persisted (the runtime degrades it
- * with a note), so there is deliberately NO catalog check here. Unknown keys
- * are dropped by the rebuild, like every other door in this file.
+ * values are NON-EMPTY strings, plus an optional free-text `description` (trimmed,
+ * capped at {@link DELEGATE_DESCRIPTION_MAX}; an all-whitespace value is dropped
+ * exactly like an absent one). Shape only — a value the agent no longer offers
+ * is a stale preference that stays persisted (the runtime degrades it with a
+ * note), so there is deliberately NO catalog check here. Unknown keys are
+ * dropped by the rebuild, like every other door in this file.
  */
 function validateDelegateDefaultsEntry(raw: unknown, code: 'bad_config' | 'bad_payload', context: string): AcpDelegateAgentDefaults {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -248,6 +250,19 @@ function validateDelegateDefaultsEntry(raw: unknown, code: 'bad_config' | 'bad_p
       throw new AcpError(code, `acp: ${context}.${key} must be a non-empty string`)
     }
     out[key] = value
+  }
+  const description = row.description
+  if (description !== undefined) {
+    if (typeof description !== 'string') {
+      throw new AcpError(code, `acp: ${context}.description must be a string`)
+    }
+    const trimmed = description.trim()
+    if (trimmed.length > DELEGATE_DESCRIPTION_MAX) {
+      throw new AcpError(code, `acp: ${context}.description must be at most ${String(DELEGATE_DESCRIPTION_MAX)} characters`)
+    }
+    // Blank = "not written": the persisted file carries no empty entry, so the
+    // tool schema never renders a dangling "：" with nothing behind it.
+    if (trimmed !== '') out.description = trimmed
   }
   return out
 }

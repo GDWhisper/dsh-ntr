@@ -1,8 +1,9 @@
 /**
  * The delegation-defaults section of the subagent card (T3). It edits ONLY the
- * `acp_delegate` tool's four-axis defaults — which agent a delegation lands on
+ * `acp_delegate` tool's per-agent profile — which agent a delegation lands on
  * when the caller names none, and per-agent model / thought-level / mode
- * defaults. It never touches the chat plane's own selections.
+ * defaults plus the free-text description the caller reads before choosing.
+ * It never touches the chat plane's own selections.
  *
  * Value chain per axis: explicit tool argument > this section's persisted
  * default > the agent process's own default. The view the host reports is the
@@ -26,8 +27,9 @@
  * var() fallbacks. Copy is one line per control (constraint 33); override facts
  * hang on the row they override and a reset appears only on a real override.
  */
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { AcpAgentCatalog, AcpCatalogChoice, AcpCatalogOption, AcpDelegateAgentDefaults, AcpDelegateSettings } from '../../protocol.ts'
+import { DELEGATE_DESCRIPTION_MAX } from '../../protocol.ts'
 import type { AcpStore, UiState } from '../store.ts'
 
 /** Warn foreground for a kept-but-stale / deleted option (constraint 34). */
@@ -250,6 +252,39 @@ export function delegateEntriesEqual(
   return (a?.model ?? undefined) === (b?.model ?? undefined)
     && (a?.effort ?? undefined) === (b?.effort ?? undefined)
     && (a?.mode ?? undefined) === (b?.mode ?? undefined)
+    && (a?.description ?? undefined) === (b?.description ?? undefined)
+}
+
+/**
+ * The caller-facing description input. Local draft + commit on blur: typing
+ * must not fire one RPC per keystroke, while a value that lands from another
+ * tab (or a config reset) replaces the draft through the value prop.
+ */
+function DescriptionInput(props: { acp: AcpStore; title: string; value: string | undefined; onCommit: (raw: string) => void }) {
+  const { acp, title, value, onCommit } = props
+  const committed = value ?? ''
+  const [draft, setDraft] = useState(committed)
+  const seen = useRef(committed)
+  useEffect(() => {
+    if (seen.current === committed) return
+    seen.current = committed
+    setDraft(committed)
+  }, [committed])
+  const label = acp.label('描述（写给主代理看）', 'Description (shown to the caller)')
+  return (
+    <label style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 10 }}>
+      <span className="dwa-form-label">{label}</span>
+      <input
+        className="dwa-input"
+        aria-label={`${label} · ${title}`}
+        maxLength={DELEGATE_DESCRIPTION_MAX}
+        placeholder={acp.label('这个 agent 擅长什么，什么时候该用它', 'What this agent is good at, and when to use it')}
+        value={draft}
+        onChange={event => setDraft(event.target.value)}
+        onBlur={() => onCommit(draft)}
+      />
+    </label>
+  )
 }
 
 /** The「当前：X」fact the default option names; undefined when nothing is set. */
@@ -351,14 +386,31 @@ function AgentDefaultsRow(props: { acp: AcpStore; ui: UiState; delegate: AcpDele
     if (delegateEntriesEqual(next, entry)) return
     void acp.setDelegateSettings({ agentDefaults: { [agentId]: next } })
   }
+  // The description rides in the SAME entry (one per-agent profile): blank
+  // deletes it so the schema renders no dangling separator.
+  const writeDescription = (raw: string): void => {
+    const next: AcpDelegateAgentDefaults = { ...entry }
+    const trimmed = raw.trim()
+    if (trimmed === '') delete next.description
+    else next.description = trimmed
+    if (delegateEntriesEqual(next, entry)) return
+    void acp.setDelegateSettings({ agentDefaults: { [agentId]: next } })
+  }
 
   // Override fact + reset only when the config file names an entry that the
   // running value outranks (constraint 33). Reset deletes the override entry.
   const overridden = configuredEntry !== undefined && !delegateEntriesEqual(configuredEntry, entry)
+  // The override fact is ONE line: a 300-character description would blow the
+  // row apart, so it is clipped like every other long value in the card.
+  const configuredDescription = configuredEntry?.description
+  const shownDescription = configuredDescription === undefined || configuredDescription.length <= 24
+    ? configuredDescription
+    : `${configuredDescription.slice(0, 24)}…`
   const configuredText = configuredEntry === undefined ? '' : [
     configuredEntry.model === undefined ? undefined : acp.label(`模型 ${configuredEntry.model}`, `model ${configuredEntry.model}`),
     configuredEntry.effort === undefined ? undefined : acp.label(`等级 ${configuredEntry.effort}`, `effort ${configuredEntry.effort}`),
     configuredEntry.mode === undefined ? undefined : acp.label(`模式 ${configuredEntry.mode}`, `mode ${configuredEntry.mode}`),
+    shownDescription === undefined ? undefined : acp.label(`描述「${shownDescription}」`, `description "${shownDescription}"`),
   ].filter(part => part !== undefined).join(' · ')
 
   return (
@@ -377,6 +429,10 @@ function AgentDefaultsRow(props: { acp: AcpStore; ui: UiState; delegate: AcpDele
           {acp.label('等级作用于运行时实际模型，不支持会自动丢弃。', 'The level applies to the runtime model; unsupported values are dropped.')}
         </div>
       )}
+      <DescriptionInput acp={acp} title={title} value={entry?.description} onCommit={writeDescription} />
+      <div className="dwa-preference-copy">
+        {acp.label('描述会写进 acp_delegate 的 agent 选项说明，主代理据此挑选。', 'Shown in acp_delegate\'s agent parameter description so the caller can pick.')}
+      </div>
       <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
         <button type="button" className="dwa-btn dwa-btn-secondary" disabled={probing} onClick={() => void acp.probeModels(agentId)}>
           {probing

@@ -614,16 +614,16 @@ describe('acp_delegate registration sync', () => {
     expect(tools.registered[0].definition.timeoutMs).toBe(86_400_000)
   })
 
-  it('default-value changes do not re-register: the description is static', () => {
+  it('default-agent changes do not re-register: they are read live per run', () => {
     const tools = fakeToolsCtx()
     tools.install()
     const { registration, config } = makeRegistration(tools.ctx)
     config.guidance = 'on'
     registration.sync()
     const first = tools.registered[0].definition
-    // The live config gains the new choice-default keys; guidance and the
-    // window are unchanged, so the signature must not move.
-    Object.assign(config, { defaultAgent: 'beta', agentDefaults: { alpha: { model: 'm' } } })
+    // The live config gains the default-agent pointer; guidance, the window and
+    // the roster are unchanged, so the signature must not move.
+    Object.assign(config, { defaultAgent: 'beta' })
     registration.sync()
     registration.sync()
     expect(tools.disposerCalls()).toBe(0)

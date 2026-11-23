@@ -540,7 +540,7 @@ export class AgentBridge {
 
   /**
    * The last startup / connection error. The manager folds it into the
-   * aggregated status frame (see `BridgeManager.publishAgentStatus`); the
+   * aggregated status frame (see `BridgeRegistryService.publishAgentStatus`); the
    * bridge itself only puts it on its own frame when it has no manager.
    */
   get errorText(): string | undefined {
@@ -650,16 +650,15 @@ export class AgentBridge {
     return false
   }
 
-  /**
-   * An idle teardown is safe when nothing is WORKING. Idle live sessions do not
-   * block it: `releaseAll` parks them as `released` (never closed), and the next
-   * prompt brings them back with `session/load`. The exception is an agent that
-   * does not advertise `loadSession`: releasing would lose a conversation it
-   * cannot reload, so there the old session-less rule stands.
-   */
+  /** An idle teardown is safe when nothing is WORKING (see `idleReleaseBlocker`). */
   private canIdleRelease(): boolean {
-    if (this.hasActiveWork(false)) return false
-    return this.sessions.size === 0 || this.initResult?.agentCapabilities?.loadSession === true
+    return this.state === 'ready' && this.idleReleaseBlocker() === undefined
+  }
+
+  /** The idle timer's own eligibility, plus the reason an on-demand release must skip. */
+  idleReleaseBlocker(): 'busy' | 'no-resume' | undefined {
+    if (this.hasActiveWork(false)) return 'busy'
+    return this.sessions.size > 0 && !this.supportsSessionLoad() ? 'no-resume' : undefined
   }
 
   /** Whether the agent advertises `session/load`, i.e. a parked session can come back. */

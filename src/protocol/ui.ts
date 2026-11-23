@@ -239,16 +239,33 @@ export const DELEGATE_TIMEOUT_MIN_MS = 1_000
 export const DELEGATE_TIMEOUT_MAX_MS = 86_400_000
 
 /**
- * Per-agent delegation defaults for the three choice axes. Every value is a
- * NON-EMPTY string; an absent key means "follow the agent process's own
- * default" (the axis is simply not written). These are persisted preferences:
- * a value the agent no longer offers stays stored and is marked stale at
- * runtime — validation checks shape only, never the catalog.
+ * Upper bound of one agent's free-text delegation description, in UTF-16 code
+ * units. It rides in the tool schema (the caller reads it before choosing an
+ * agent), so a paragraph would cost every request's header: 300 characters is
+ * enough for "what this agent is good at" without crowding out the roster.
+ */
+export const DELEGATE_DESCRIPTION_MAX = 300
+
+/**
+ * Per-agent delegation profile: the three choice-axis defaults plus an
+ * optional free-text description of what that agent is good at.
+ *
+ * Axis values are NON-EMPTY strings; an absent key means "follow the agent
+ * process's own default" (the axis is simply not written). These are persisted
+ * preferences: a value the agent no longer offers stays stored and is marked
+ * stale at runtime — validation checks shape only, never the catalog.
+ *
+ * The `description` is written by the USER for the CALLER's benefit: it is
+ * rendered into `acp_delegate`'s `agent` parameter description so the main
+ * agent can pick the right delegate without probing every agent. It never
+ * reaches the delegated agent itself (that sees only the task text).
  */
 export interface AcpDelegateAgentDefaults {
   model?: string
   effort?: string
   mode?: string
+  /** What this agent is good at; trimmed, at most {@link DELEGATE_DESCRIPTION_MAX}. */
+  description?: string
 }
 
 /** The delegate setting a write may name, by field name. */

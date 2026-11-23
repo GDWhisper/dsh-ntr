@@ -463,3 +463,31 @@ export interface DshAgentLike {
   /** The host's inbox+driver wake: queues the message and starts a step. */
   followup?: (message: unknown) => unknown
 }
+
+// ---- On-demand idle release (`acp_release`) ----
+
+/** One READY process that an on-demand release parked and killed. */
+export interface BridgeReleasedEntry {
+  agentId: string
+  /** How many live sessions were parked (resumable through `session/load`). */
+  sessions: number
+}
+
+/**
+ * Why one ready process stayed up. `busy` = a turn / approval / command is
+ * still in flight (the release never interrupts work); `no-resume` = live
+ * sessions exist but the agent does not advertise `session/load`, so parking
+ * would lose a conversation it could not reload.
+ */
+export type BridgeReleaseSkipReason = 'busy' | 'no-resume'
+
+export interface BridgeSkippedEntry {
+  agentId: string
+  reason: BridgeReleaseSkipReason
+}
+
+/** The on-demand release's outcome, reported verbatim to the caller. */
+export interface BridgeReleaseReport {
+  released: BridgeReleasedEntry[]
+  skipped: BridgeSkippedEntry[]
+}

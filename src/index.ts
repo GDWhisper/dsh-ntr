@@ -9,7 +9,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { ConnectionRpcHandler, HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
 import { ACP_PRESET_ID, AcpLlmAdapter, AcpDelegateForceMask, AcpDelegateRegistration, AcpDelegateService, AcpSubagentProvider, BridgeManager, PLUGIN_VERSION, type DshAgentLike, type DelegateForceMaskCtx, type DelegateSubagentsLike } from './bridge.ts'
-import { appendExternalSubagentCatalog, EventHub, dispatchRpc, permissionReplayFrames, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
+import { appendExternalSubagentCatalog, delegateAgentDocs, EventHub, dispatchRpc, permissionReplayFrames, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
 import { ArchiveReleaseTracker, archiveActivityFrames } from './archive-release.ts'
 import type { SessionActivityLike } from './archive-release.ts'
 import { AcpSaveGate } from './save-gate.ts'
@@ -372,7 +372,23 @@ export function apply(ctx: Context, config?: unknown): void {
       try { disposer?.() } catch { /* teardown never throws */ }
     }
   }, 'dsh-ntr: acp subagent provider')
-  const delegateRegistration = new AcpDelegateRegistration({ ctx, service: delegateService, config: () => manager.delegateConfig(), forceMask: delegateForceMask, notify: delegateNotify, subagents: probeSubagents })
+  const delegateRegistration = new AcpDelegateRegistration({
+    ctx,
+    service: delegateService,
+    config: () => manager.delegateConfig(),
+    forceMask: delegateForceMask,
+    notify: delegateNotify,
+    subagents: probeSubagents,
+    // The schema's roster (per-agent description + delegation defaults) read
+    // live from the manager; the registration hashes it into its signature so
+    // an edit lands in the next request header.
+    roster: () => delegateAgentDocs(manager.agentViews(), manager.delegateSettings()?.agentDefaults),
+    // `acp_release`: the same idle release the timer runs, on demand.
+    release: {
+      agents: () => manager.agentViews().map(view => ({ id: view.id, title: view.title })),
+      release: async agentId => manager.releaseIdleProcesses(agentId),
+    },
+  })
   manager.setDelegateRegistration(delegateRegistration)
   // Registration lifecycle: this initial sync is the REAL first registration
   // (the manager's boot replay ran before the seam was wired); unload / HMR
