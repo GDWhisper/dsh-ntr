@@ -16,9 +16,15 @@
  * catalog is simply unread there is no evidence of staleness, so the value is
  * kept as a plain option and a「获取目录」gesture offers to populate it.
  *
- * Catalog reads are the existing memory-only `loadCachedModels` (never spawns);
- * the only spawn is the explicit「获取目录」button (`probeModels`). Reads are
- * gated on the section being visible so a hidden page does not pull catalogs.
+ * Catalog reads start with the memory-only `loadCachedModels` (never spawns).
+ * The only spawn is `probeModels`: the「获取目录」button, plus — once the section
+ * is VISIBLE — one silent refresh per agent whose cached snapshot is older than
+ * `CATALOG_AUTO_PROBE_MS`. Page entry is the gesture and the agent count is the
+ * spend; the catalog service owns the budget (`staleAfterMs`, which also counts
+ * a previous automatic attempt) so a remount cannot re-probe an unchanged
+ * answer. Agents run one at a time, and a category switch mid-batch stops it.
+ * Every read and probe is gated on the section being visible, so a hidden page
+ * neither pulls nor refreshes a catalog.
  *
  * Colors follow constraint 34 through host alias tokens; literals sit only in
  * var() fallbacks. Copy is one line per control (constraint 33); override facts
@@ -27,6 +33,7 @@
 import { useEffect, useRef } from 'react'
 import type { AcpAgentCatalog, AcpCatalogChoice, AcpCatalogOption, AcpDelegateAgentDefaults, AcpDelegateSettings } from '../../protocol.ts'
 import type { AcpStore, UiState } from '../store.ts'
+import { CATALOG_AUTO_PROBE_MS } from '../store/catalog.ts'
 
 /** Warn foreground for a kept-but-stale / deleted option (constraint 34). */
 const WARN_FG = 'var(--dsw-alias-state-warn-primary, #b45309)'
@@ -358,10 +365,12 @@ function AgentDefaultsRow(props: { acp: AcpStore; ui: UiState; delegate: AcpDele
           {acp.label('等级作用于运行时实际模型，不支持会自动丢弃。', 'The level applies to the runtime model; unsupported values are dropped.')}
         </div>
       )}
-      {catalogMissing && (
+      {(catalogMissing || probeError !== undefined || probing) && (
         <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
           <button type="button" className="dwa-btn dwa-btn-secondary" disabled={probing} onClick={() => void acp.probeModels(agentId)}>
-            {probing ? acp.label('正在获取目录…', 'Fetching catalog…') : acp.label('获取目录', 'Fetch catalog')}
+            {probing
+              ? (catalogMissing ? acp.label('正在获取目录…', 'Fetching catalog…') : acp.label('正在刷新目录…', 'Refreshing catalog…'))
+              : (catalogMissing ? acp.label('获取目录', 'Fetch catalog') : acp.label('刷新目录', 'Refresh catalog'))}
           </button>
           {probeError !== undefined && (
             <span className="dwa-error" style={{ wordBreak: 'break-word' }}>⚠ {probeError}</span>
@@ -394,17 +403,43 @@ export function SubagentDefaults(props: { acp: AcpStore; ui: UiState }) {
   const delegate = ui.delegate
   const rootRef = useRef<HTMLDivElement | null>(null)
   const requested = useRef<Set<string>>(new Set())
+  /** One batch at a time: a commit mid-probe must not start the next agent. */
+  const running = useRef(false)
   // Re-check visibility every render: the page wrapper toggles `hidden` without
   // remounting, and a hidden section must not pull catalogs (constraint 8).
   // `loadCachedModels` is memory-only and deduped, so the guard keeps it cheap.
+  // A visible page then refreshes what the cache admits is old — the host never
+  // probes on its own, and a probe nobody asked for must not touch the notice
+  // line, so it is silent. Agents are visited ONE AT A TIME, and an age budget
+  // the catalog service owns keeps a remount from probing an unchanged answer
+  // again (the host keeps that answer's old `updatedAt`).
   useEffect(() => {
     if (delegate === undefined) return
     if (rootRef.current === null || rootRef.current.closest('[hidden]') !== null) return
-    for (const agent of ui.agents) {
-      if (requested.current.has(agent.id)) continue
-      requested.current.add(agent.id)
-      void acp.loadCachedModels(agent.id)
-    }
+    if (running.current) return
+    running.current = true
+    void (async () => {
+      try {
+        for (const agent of ui.agents) {
+          // A category switch during the batch stops it: the section is hidden now.
+          if (rootRef.current === null || rootRef.current.closest('[hidden]') !== null) return
+          if (requested.current.has(agent.id)) continue
+          requested.current.add(agent.id)
+          await acp.loadCachedModels(agent.id)
+          // The snapshot after the read: the cache may have landed just now.
+          const now = acp.getSnapshot()
+          // Unread stays the button's case. A standing failure keeps its ⚠ and the
+          // retry button until the user acts, so a broken agent cannot slow every
+          // page entry with a fresh attempt. A probe already in flight needs none.
+          if (now.modelCatalogs[agent.id] === undefined || now.probeErrors[agent.id] !== undefined || now.probingModels[agent.id] === true) continue
+          // Hidden during the read: start no probe anyway.
+          if (rootRef.current === null || rootRef.current.closest('[hidden]') !== null) return
+          await acp.probeModels(agent.id, undefined, { silent: true, staleAfterMs: CATALOG_AUTO_PROBE_MS })
+        }
+      } finally {
+        running.current = false
+      }
+    })()
   })
   if (delegate === undefined) return null
 

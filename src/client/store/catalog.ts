@@ -3,10 +3,11 @@
  * P3b): the cached/persisted catalog panes, the explicit probe, the ready-to-
  * render seat surface, the exposure filter writes and the invalidation hook.
  *
- * Nothing here spawns: `agent/catalog` answers from the host's memory and
- * `agent/cached-models` reads the persisted file. Only `probeModels` (an
- * explicit gesture) asks the host to start a process, and it is the one call
- * that also updates the settings card's probe state.
+ * Nothing here spawns by itself: `agent/catalog` answers from the host's memory
+ * and `agent/cached-models` reads the persisted file. Only `probeModels` asks
+ * the host to start a process — an explicit gesture, or a VISIBLE settings page
+ * refreshing a snapshot older than {@link CATALOG_AUTO_PROBE_MS} — and it is
+ * the one call that also updates the settings card's probe state.
  *
  * The service never imports the facade; the RPC face, the snapshot, the label
  * resolver, `flashError` and the roster `resync` arrive through
@@ -15,6 +16,15 @@
 
 import type { AgentCatalogResult, AgentProbeModelsResult } from '../../protocol.ts'
 import type { UiState } from './state.ts'
+
+/**
+ * How old a PERSISTED catalog may get before a VISIBLE page refreshes it
+ * without being asked. The host never probes on its own: page entry is the
+ * gesture and this age is the budget, so a click-through costs a probe and a
+ * second look costs nothing. Ten minutes still catches an agent whose own
+ * default changed underneath the cache (CodeBuddy's CLI model switch).
+ */
+export const CATALOG_AUTO_PROBE_MS = 10 * 60_000
 
 /** What the catalog service needs from the store, injected. */
 export interface CatalogHost {
@@ -37,6 +47,13 @@ export class CatalogService {
   private readonly seatCatalogReads = new Set<string>()
   /** In-flight `agent/cached-models` reads, keyed by agent id. */
   private readonly cachedModelReads = new Set<string>()
+  /**
+   * When this browser half last issued an AUTOMATIC refresh, per agent. It is
+   * the other half of the freshness budget: the host keeps an unchanged probe's
+   * old `updatedAt` (`absorbCatalog` returns the existing entry), so the cache
+   * stamp alone would never age out and every remount would probe again.
+   */
+  private readonly autoProbeAt = new Map<string, number>()
 
   constructor(private readonly host: CatalogHost) {}
 
@@ -68,8 +85,25 @@ export class CatalogService {
     }
   }
 
-  /** Ask the host to probe one agent's model catalog (spawn + throwaway session); `model` fetches just that model's thought levels for the card, without the page notice. */
-  async probeModels(agentId: string, model?: string): Promise<void> {
+  /**
+   * Ask the host to probe one agent's model catalog (spawn + throwaway session).
+   * `model` fetches just that model's thought levels for the card, without the
+   * page notice. `silent` keeps an AUTOMATIC refresh's failure on the agent's
+   * own row instead of the page notice. `staleAfterMs` makes the call itself
+   * budgeted: an unread catalog, a snapshot younger than that, or an attempt
+   * this browser half already made inside the window is skipped without spawning.
+   */
+  async probeModels(agentId: string, model?: string, options?: { silent?: boolean; staleAfterMs?: number }): Promise<void> {
+    const silent = options?.silent === true
+    // The budget belongs to the CATALOG-level refresh only: a per-model probe
+    // would otherwise stamp an attempt and suppress a later automatic refresh.
+    if (options?.staleAfterMs !== undefined && model === undefined) {
+      const cached = this.host.state().modelCatalogs[agentId]
+      if (cached === undefined) return
+      const last = Math.max(cached.updatedAt, this.autoProbeAt.get(agentId) ?? 0)
+      if (Date.now() - last < options.staleAfterMs) return
+      this.autoProbeAt.set(agentId, Date.now())
+    }
     const previousError = this.host.state().probeErrors[agentId]
     const current = this.host.state()
     this.host.mutate({
@@ -101,7 +135,9 @@ export class CatalogService {
         : msg
       const now = this.host.state()
       this.host.mutate({
-        ...(model === undefined ? { notice } : {}),
+        // A probe nobody asked for must not push its failure into the page
+        // notice line; the row keeps its own ⚠ and the retry button.
+        ...(model === undefined && !silent ? { notice } : {}),
         probingModels: { ...now.probingModels, [agentId]: false },
         probeErrors: { ...now.probeErrors, [agentId]: notice },
       })

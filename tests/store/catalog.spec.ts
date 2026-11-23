@@ -236,6 +236,52 @@ describe('AcpStore agent management', () => {
     expect(state.notice).toBeUndefined()
   })
 
+  it('a silent probe keeps its failure on the row and out of the page notice', async () => {
+    const store = new AcpStore(
+      async (_channel, endpoint) => endpoint !== 'agent/probe-models'
+        ? { ok: true, value: {} }
+        : { ok: false, error: { code: 'agent_unreachable', message: 'boom' } },
+      (zh) => zh,
+    )
+    // The page refreshes stale snapshots on its own; a failure nobody asked for
+    // must not take over the settings page's notice line.
+    await store.probeModels('codebuddy', undefined, { silent: true })
+    expect(store.getSnapshot().probingModels.codebuddy).toBe(false)
+    expect(store.getSnapshot().probeErrors.codebuddy).toContain('boom')
+    expect(store.getSnapshot().notice).toBeUndefined()
+  })
+
+  it('staleAfterMs spends itself: a repeat attempt inside the window never spawns', async () => {
+    const endpoints: string[] = []
+    const store = new AcpStore(async (_channel, endpoint) => {
+      endpoints.push(endpoint)
+      if (endpoint === 'agent/cached-models') return { ok: true, value: { agentId: 'codebuddy', updatedAt: 1, catalog: {} } }
+      if (endpoint === 'agent/probe-models') return { ok: true, value: { agentId: 'codebuddy', catalog: {}, updatedAt: 1 } }
+      return { ok: true, value: {} }
+    }, (zh: string) => zh)
+    await store.loadCachedModels('codebuddy')
+    await store.probeModels('codebuddy', undefined, { silent: true, staleAfterMs: 600_000 })
+    expect(endpoints.filter(endpoint => endpoint === 'agent/probe-models')).toHaveLength(1)
+    // The answer kept its old stamp (an unchanged probe), so the attempt's own
+    // time is what ages out — otherwise every remount would probe again.
+    await store.probeModels('codebuddy', undefined, { silent: true, staleAfterMs: 600_000 })
+    expect(endpoints.filter(endpoint => endpoint === 'agent/probe-models')).toHaveLength(1)
+  })
+
+  it('staleAfterMs leaves a fresh snapshot and an unread catalog alone', async () => {
+    const endpoints: string[] = []
+    const store = new AcpStore(async (_channel, endpoint) => {
+      endpoints.push(endpoint)
+      if (endpoint === 'agent/cached-models') return { ok: true, value: { agentId: 'codebuddy', updatedAt: Date.now(), catalog: {} } }
+      return { ok: true, value: {} }
+    }, (zh: string) => zh)
+    await store.loadCachedModels('codebuddy')
+    await store.probeModels('codebuddy', undefined, { silent: true, staleAfterMs: 600_000 })
+    // Unread: the「获取目录」button owns that case.
+    await store.probeModels('pi', undefined, { silent: true, staleAfterMs: 600_000 })
+    expect(endpoints).not.toContain('agent/probe-models')
+  })
+
   it('loadCachedModels fills the panes from the persisted catalog, once per agent', async () => {
     const endpoints: string[] = []
     const store = new AcpStore(
