@@ -2,6 +2,76 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [0.5.0] - 2026-11-24
+
+这一版把 NTR 的 agent 接入宿主原生子智能体链路，让委派成为可定制、可中断的一等能力，并重排设置页、加固会话与关闭路径。
+
+### 新增
+
+- **acp**：原生 DSH 会话可以把独立任务交给 NTR 里配置的 ACP agent，回答折叠回当前会话；委派按宿主子智能体的方式运行，可在清单中查看并中断。([7fdb029](https://github.com/GDWhisper/dsh-ntr/commit/7fdb029))
+- **acp**：委派可指定 agent、模型、思考等级与模式；设置页可为每个 agent 保存这四轴的默认值，取值依次用工具参数、该 agent 的默认值、进程自身默认。([1fe1998](https://github.com/GDWhisper/dsh-ntr/commit/1fe1998))
+- **acp**：agent 可以写一段描述，随委派工具的清单提供给调用方挑选；新增按需释放空闲 agent 进程的能力。([7977243](https://github.com/GDWhisper/dsh-ntr/commit/7977243))
+- **acp**：每个 agent 可设置默认会话模式（设置页「高级」），新会话首轮的模式不再被探测流程改写。([0a82904](https://github.com/GDWhisper/dsh-ntr/commit/0a82904))
+
+### 改进
+
+- **acp**：引导强度各档改为显示当前状态提示，去掉反复出现的档位说明。([c9cdf29](https://github.com/GDWhisper/dsh-ntr/commit/c9cdf29))
+- **ui**：设置页滑块刻度的标签对齐到档位。([9c74b19](https://github.com/GDWhisper/dsh-ntr/commit/9c74b19))
+- **acp**：委派的工作区继承当前会话的工作区，不再落到 agent 自己的默认目录。([c449b8b](https://github.com/GDWhisper/dsh-ntr/commit/c449b8b))
+- **acp**：委派回答不再被长度上限截断，长时间任务也能带回完整结论。([2a42df7](https://github.com/GDWhisper/dsh-ntr/commit/2a42df7))
+- **acp**：添加 agent 时不再提供 Gemini CLI 一键预设，仍可手动配置为自定义 agent。([8c9b193](https://github.com/GDWhisper/dsh-ntr/commit/8c9b193))
+- **acp**：委派设置不再要求选择审批方式，超时从多档滑块改为直接填写分钟数。([276f2f5](https://github.com/GDWhisper/dsh-ntr/commit/276f2f5))
+- **acp**：委派超时改为静默计时，持续有输出就不会中断，默认 40 分钟静默后停止，另有 24 小时绝对兜底。([010fe17](https://github.com/GDWhisper/dsh-ntr/commit/010fe17))
+- **ui**：委派下拉项显示模型描述与进程当前默认值，长选项按列宽截断。([0e1e572](https://github.com/GDWhisper/dsh-ntr/commit/0e1e572))
+- **ui**：模型目录只在明确点击时刷新并显示缓存时间，打开设置页不会启动 agent。([16c462e](https://github.com/GDWhisper/dsh-ntr/commit/16c462e))
+- **acp**：委派工具说明改成与宿主自带委派工具一致的表述。([20a61c4](https://github.com/GDWhisper/dsh-ntr/commit/20a61c4))
+- **ui**：设置页统一为「标签 + 卡片 + 行」的排版和三级标题层次，子智能体配置默认折叠为每张 agent 一行摘要。([d1b3f70](https://github.com/GDWhisper/dsh-ntr/commit/d1b3f70))
+- **ui**：委派相关文案统一用「子智能体 / 主智能体」。([d76494c](https://github.com/GDWhisper/dsh-ntr/commit/d76494c))
+- **ui**：设置入口图标改为交织的三环。([fc63b22](https://github.com/GDWhisper/dsh-ntr/commit/fc63b22))
+
+### 修复
+
+- **acp**：工具可用性提示只在宿主确实缺少能力时出现，不再把关闭状态误报为未就绪。([22fa9c4](https://github.com/GDWhisper/dsh-ntr/commit/22fa9c4))
+- **acp**：负载下正常回合的正文不再从聊天界面消失，也不再误报没有文本回复。([c5a4067](https://github.com/GDWhisper/dsh-ntr/commit/c5a4067))
+- **acp**：Windows 下关闭 agent 更可靠，宿主退出不再留下存活的子进程。([fd6a85e](https://github.com/GDWhisper/dsh-ntr/commit/fd6a85e))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.4.7...v0.5.0
+
+---
+
+This release wires NTR agents into the host's native subagent chain, making delegation a first-class, customizable and interruptible capability, while reorganizing the settings page and hardening conversation and shutdown paths.
+
+### Added
+
+- **acp**: native DSH conversations can hand self-contained tasks to ACP agents configured in NTR, with the answer folded back into the current conversation; delegations run as native host subagents, visible and interruptible from the subagent list. ([7fdb029](https://github.com/GDWhisper/dsh-ntr/commit/7fdb029))
+- **acp**: delegations can specify agent, model, thinking level and mode; per-agent defaults for all four axes are saved in settings, resolved from the tool argument, the agent's default, then the process default. ([1fe1998](https://github.com/GDWhisper/dsh-ntr/commit/1fe1998))
+- **acp**: agents can carry a description shown in the delegation tool's roster so the caller can pick by capability; idle agent processes can now be released on demand. ([7977243](https://github.com/GDWhisper/dsh-ntr/commit/7977243))
+- **acp**: agents can set a default conversation mode under Advanced, so the first turn of a new conversation is no longer rewritten by probing. ([0a82904](https://github.com/GDWhisper/dsh-ntr/commit/0a82904))
+
+### Improved
+
+- **acp**: each guidance rung now shows its current status instead of a repeated explanatory sentence. ([c9cdf29](https://github.com/GDWhisper/dsh-ntr/commit/c9cdf29))
+- **ui**: slider tick labels align to their rungs. ([9c74b19](https://github.com/GDWhisper/dsh-ntr/commit/9c74b19))
+- **acp**: delegations inherit the current conversation's workspace instead of landing in the agent's own default directory. ([c449b8b](https://github.com/GDWhisper/dsh-ntr/commit/c449b8b))
+- **acp**: delegated answers are no longer cut by an output cap, so long runs keep their conclusion. ([2a42df7](https://github.com/GDWhisper/dsh-ntr/commit/2a42df7))
+- **acp**: the Gemini CLI built-in preset is no longer offered in the add-agent picker; it can still be added manually. ([8c9b193](https://github.com/GDWhisper/dsh-ntr/commit/8c9b193))
+- **acp**: delegations no longer ask for an approval mode, and the timeout is set as a plain minute value instead of a multi-rung slider. ([276f2f5](https://github.com/GDWhisper/dsh-ntr/commit/276f2f5))
+- **acp**: the delegation timeout is a silence window — continuous output keeps it alive, the default stops after 40 minutes of silence, and a fixed 24-hour backstop remains. ([010fe17](https://github.com/GDWhisper/dsh-ntr/commit/010fe17))
+- **ui**: delegation dropdowns show model descriptions and the process's current default, with long options clipped to the column width. ([0e1e572](https://github.com/GDWhisper/dsh-ntr/commit/0e1e572))
+- **ui**: the model catalog refreshes only on an explicit click and shows its age; opening settings no longer starts agents. ([16c462e](https://github.com/GDWhisper/dsh-ntr/commit/16c462e))
+- **acp**: the delegation tool description now matches the host's own delegation tools. ([20a61c4](https://github.com/GDWhisper/dsh-ntr/commit/20a61c4))
+- **ui**: settings pages share one label/card/row grammar with three heading levels, and subagent profiles arrive folded to one summary line per agent. ([d1b3f70](https://github.com/GDWhisper/dsh-ntr/commit/d1b3f70))
+- **ui**: delegation copy consistently says 子智能体 / 主智能体. ([d76494c](https://github.com/GDWhisper/dsh-ntr/commit/d76494c))
+- **ui**: the settings entry icon is now a woven triple ring. ([fc63b22](https://github.com/GDWhisper/dsh-ntr/commit/fc63b22))
+
+### Fixed
+
+- **acp**: the tool-availability warning appears only for a real host gap, not when the feature is simply switched off. ([22fa9c4](https://github.com/GDWhisper/dsh-ntr/commit/22fa9c4))
+- **acp**: under load, a normal turn's answer no longer disappears from the chat view or triggers a false "no text reply" warning. ([c5a4067](https://github.com/GDWhisper/dsh-ntr/commit/c5a4067))
+- **acp**: shutting down agents on Windows is more reliable and no longer leaves live child processes behind. ([fd6a85e](https://github.com/GDWhisper/dsh-ntr/commit/fd6a85e))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.4.7...v0.5.0
+
 ## [0.4.7] - 2026-11-18
 
 这一版集中修正 Antigravity 会话中回复混入回显内容与子代理失败静默的问题，并让输入区的长菜单可以搜索和滚动。
