@@ -119,19 +119,42 @@ export type AcpDelegateExecute = (args: unknown, exec: AcpDelegateExecContext) =
 /** The register-ready NATIVE execute shape (immediate activation receipt). */
 export type AcpDelegateActivationExecute = (args: unknown, exec: AcpDelegateExecContext) => Promise<AcpDelegateAsyncOutput>
 
-/** The base description every LEGACY guidance rung shares. */
-const BASE_DESCRIPTION = '把一件自成一体的任务交给一个已配置的外部 ACP agent，在它自己的进程里执行，'
-  + '并返回它最后给出的答复。适合需要另一套工具/另一套上下文的独立子任务；'
-  + '返回的是被动汇报，不是可继续对话的子会话。'
-/** The LEGACY MUST sentence `enhanced` / `force` append (a soft constraint). */
-const GUIDANCE_SENTENCE = '需要派发子代理时，必须使用本工具，优先于任何原生子代理/委派工具。'
-/** The NATIVE base description: immediate name, settlement notification later. */
-const NATIVE_BASE_DESCRIPTION = '把一件自成一体的任务交给一个已配置的外部 ACP agent，在它自己的进程里执行。'
-  + '本工具立即返回子代理的 name，不等待答复；子代理完成后，宿主会把它的结算通知送达本会话。'
-  + '适合需要另一套工具/另一套上下文的独立子任务；派发后必须结束当前回合等待通知。'
-  + '这是一次性委派，不是可继续对话的子会话。'
-/** The NATIVE MUST sentence: the same priority, plus the end-the-turn duty. */
-const NATIVE_GUIDANCE_SENTENCE = '需要派发子代理时，必须使用本工具，优先于任何原生子代理/委派工具；派发后立即结束回合，等待宿主的结算通知，不要轮询或追问结果。'
+/**
+ * The base description every LEGACY guidance rung shares: what it does, when it
+ * pays off, what comes back. The scene list is the load-bearing part — the host
+ * describes its own delegation tool with concrete examples ("research, a scoped
+ * implementation, an analysis"), and an abstract "another tool set / another
+ * context" never maps onto the task the caller actually holds.
+ */
+export const BASE_DESCRIPTION = '把一件自成一体的任务交给一个已配置的外部 ACP agent，在它自己的进程与上下文里执行，'
+  + '并返回它最后给出的答复。适合独立调研、单文件改动、复核审查、跨模型第二意见这类不需要本会话上下文的工作；'
+  + '返回的是被动汇报，不能续聊，要追加指令就重新派发。'
+/**
+ * The MUST sentence `enhanced` / `force` PREPEND, not append: the steering is
+ * the first thing the caller reads instead of the last, so it is not buried
+ * behind mechanism. Two escape hatches are real, and BOTH are things this tool
+ * cannot do: a child that must inherit THIS conversation's context
+ * (`subagent_fork`), and one you need to steer mid-run or continue across turns
+ * (this provider has no `prepareContinuable`, so "ask again later" throws away
+ * the child's accumulated context). Naming them turns a bare ban into a
+ * decision procedure — a rule that hides its own exceptions gets ignored.
+ */
+export const GUIDANCE_PREFIX = '需要派发子代理时必须使用本工具（优先于任何原生子代理/委派工具）；只有子代理必须继承本会话上下文、或需要中途追加指令与多轮续聊时才用原生。'
+/**
+ * The NATIVE base description: immediate name, settlement notification later.
+ * "可以继续做不相交的工作" mirrors the host's own delegation guidance (the host
+ * steers `subagent` / `subagent_fork` callers to keep working while a child
+ * runs): `delivery: 'parent'` is the SAME host path for both shells, and
+ * `notifySettlement` steers the notice into a busy parent turn instead of
+ * dropping it — the old "派发后必须结束当前回合" was self-imposed. The shared
+ * workspace is why the file-conflict guard comes along with it: an ACP child
+ * inherits the caller's cwd, so "不相交" is a promise the caller has to keep.
+ */
+export const NATIVE_BASE_DESCRIPTION = '把一件自成一体的任务交给一个已配置的外部 ACP agent，在它自己的进程与上下文里执行，'
+  + '再把最终答复带回本会话。适合独立调研、单文件改动、复核审查、跨模型第二意见这类不需要本会话上下文的工作。'
+  + '只回最终答复、不回中间步骤；调用立即返回子代理的 name，不等待结果。'
+  + '派发后可以继续做不相交的工作（别和它改同一批文件，合并前复核 diff 并跑测试），只剩等待时结束本回合，'
+  + '宿主会把结算通知送达并起下一轮；这是一次性委派，不能续聊，要追加指令就重新派发。'
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -146,7 +169,7 @@ function messageOf(error: unknown): string {
  * renders a half-built list.
  */
 function delegateAgentParamDescription(roster: readonly DelegateAgentDoc[] | undefined): string {
-  const base = '已配置的 agent id；省略 = 子代理设置的默认 agent（未设置则跟随全局默认）'
+  const base = '已配置的 agent id；省略 = 子代理设置的默认 agent（未配置或已失效时回落到全局默认 agent），两者都空则报错'
   if (roster === undefined) return base
   const text = delegateRosterText(roster)
   return text === '' ? base : `${base}\n${text}`
@@ -225,8 +248,8 @@ export function acpDelegateToolDefinition(opts: {
 } {
   const native = opts.mode === 'native'
   const base = native ? NATIVE_BASE_DESCRIPTION : BASE_DESCRIPTION
-  const sentence = native ? NATIVE_GUIDANCE_SENTENCE : GUIDANCE_SENTENCE
-  const description = opts.guidance === 'enhanced' || opts.guidance === 'force' ? base + sentence : base
+  const steering = opts.guidance === 'enhanced' || opts.guidance === 'force'
+  const description = steering ? GUIDANCE_PREFIX + base : base
   return {
     name: 'acp_delegate',
     description,
@@ -257,7 +280,7 @@ export function acpDelegateToolDefinition(opts: {
         render: (_args: unknown, value: unknown) => {
           const row = (typeof value === 'object' && value !== null ? value : {}) as { kind?: unknown; name?: unknown; agent?: unknown; error?: unknown; text?: unknown }
           if (row.kind === 'activation') {
-            return [{ type: 'text', text: `已委派给 ACP agent ${String(row.agent ?? '')}：子代理 ${String(row.name ?? '')} 已在后台开始执行。请结束当前回合；完成后宿主会把它的答复作为通知送达本会话。` }]
+            return [{ type: 'text', text: `已委派给 ACP agent ${String(row.agent ?? '')}：子代理 ${String(row.name ?? '')} 已在后台开始执行。可继续做不相交的工作；只剩等待时结束本回合，完成后宿主会把它的答复作为通知送达本会话。` }]
           }
           if (row.kind === 'error') return [{ type: 'text', text: `acp_delegate 委派失败：${String(row.error ?? '')}` }]
           return [{ type: 'text', text: String(row.text ?? '') }]

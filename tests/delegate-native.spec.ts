@@ -11,7 +11,7 @@
 import { describe, expect, it } from 'vitest'
 import { AcpSubagentProvider, acpDelegateActivationExecute, type DelegateSubagentsLike } from '../src/bridge/delegate-provider.ts'
 import { AcpDelegateRegistration, type DelegateRegistrationCtx } from '../src/bridge/delegate-registration.ts'
-import { AcpDelegateService, acpDelegateToolDefinition } from '../src/bridge/delegate-service.ts'
+import { AcpDelegateService, acpDelegateToolDefinition, GUIDANCE_PREFIX, NATIVE_BASE_DESCRIPTION } from '../src/bridge/delegate-service.ts'
 import { delegateLabel } from '../src/impl.ts'
 import type { AcpDelegateAsyncOutput, DelegateGuidance } from '../src/protocol.ts'
 import { configOptionsOf, fakeMask, fakeSubagentsService, fakeToolsCtx, happyPrompt, makeHost, modesOf, tick } from './delegate-harness.ts'
@@ -197,25 +197,30 @@ describe('acp_delegate registration shell selection', () => {
     config.guidance = 'on'
     registration.sync()
     const definition = tools.registered[0].definition
+    expect(definition.description).toBe(NATIVE_BASE_DESCRIPTION)
     expect(definition.description).toContain('立即返回子代理的 name')
     expect(definition.description).toContain('结算通知')
-    expect(definition.description).toContain('必须结束当前回合等待通知')
-    expect(definition.description).not.toContain('必须使用本工具')
+    // The end-turn duty is now the host's own soft rule ("continue useful work,
+    // end the turn only when waiting is all that is left"), not a plugin ban.
+    expect(definition.description).toContain('只剩等待时结束本回合')
+    // Nothing else kept the old ban from creeping back; this does.
+    expect(definition.description).not.toMatch(/派发后(必须|立即)结束/)
+    expect(definition.description).not.toContain('优先于任何原生子代理/委派工具')
     expect(definition.output?.schema.required).toEqual(['kind'])
     const value = await definition.execute({ task: 'x', agent: 'alpha' }, execWithAgent) as unknown as AcpDelegateAsyncOutput
     expect(value).toEqual({ kind: 'activation', name: 'agent-1', agent: 'alpha' })
-    // enhanced/force append the native MUST sentence with the end-turn duty.
+    // enhanced/force PREPEND the native MUST sentence; the end-turn rule stays in the base.
     for (const guidance of ['enhanced', 'force'] as const) {
       config.guidance = guidance
       registration.sync()
-      expect(tools.registered[0].definition.description).toContain('必须使用本工具，优先于任何原生子代理/委派工具；派发后立即结束回合')
+      expect(tools.registered[0].definition.description).toBe(GUIDANCE_PREFIX + NATIVE_BASE_DESCRIPTION)
     }
   })
 
   it('the native render speaks the delegation receipt and the refusal', () => {
     const definition = acpDelegateToolDefinition({ guidance: 'on', mode: 'native', execute: async () => ({ kind: 'activation', name: 'agent-1', agent: 'alpha' }) })
     expect(definition.output.render({}, { kind: 'activation', name: 'agent-1', agent: 'alpha' }))
-      .toEqual([{ type: 'text', text: '已委派给 ACP agent alpha：子代理 agent-1 已在后台开始执行。请结束当前回合；完成后宿主会把它的答复作为通知送达本会话。' }])
+      .toEqual([{ type: 'text', text: '已委派给 ACP agent alpha：子代理 agent-1 已在后台开始执行。可继续做不相交的工作；只剩等待时结束本回合，完成后宿主会把它的答复作为通知送达本会话。' }])
     expect(definition.output.render({}, { kind: 'error', error: 'ACTIVATION_LIMIT_REACHED: full' }))
       .toEqual([{ type: 'text', text: 'acp_delegate 委派失败：ACTIVATION_LIMIT_REACHED: full' }])
     expect(definition.output.render({}, undefined)).toEqual([{ type: 'text', text: '' }])
@@ -252,7 +257,7 @@ describe('acp_delegate registration shell selection', () => {
     registration.sync()
     expect(tools.disposerCalls()).toBe(1)
     expect(tools.registered[0].definition.description).toContain('并返回它最后给出的答复')
-    expect(tools.registered[0].definition.description).toContain('必须使用本工具')
+    expect(tools.registered[0].definition.description).toContain('优先于任何原生子代理/委派工具')
     config.guidance = 'off'
     registration.sync()
     expect(tools.registered).toHaveLength(0)

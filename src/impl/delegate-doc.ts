@@ -79,10 +79,17 @@ export function delegateAgentDocLine(doc: DelegateAgentDoc): string {
  * The whole block ('' when no agent is configured). One line per agent, in the
  * roster's own order — never sorted here, so the settings page and the schema
  * agree on what "first" means.
+ *
+ * The header only promises a choice when the caller actually HAS grounds to
+ * choose: "可按特性挑选" with every description blank would invite a blind pick
+ * among rows that differ only in their defaults, so it names that fact instead
+ * and lets the caller fall back to the omitted-`agent` path.
  */
 export function delegateRosterText(docs: readonly DelegateAgentDoc[]): string {
   if (docs.length === 0) return ''
-  return ['可按特性挑选：', ...docs.map(doc => delegateAgentDocLine(doc))].join('\n')
+  const described = docs.some(doc => doc.description !== undefined && oneLineDescription(doc.description) !== '')
+  const head = described ? '可按特性挑选：' : '已配置的 agent（均未填写擅长描述）：'
+  return [head, ...docs.map(doc => delegateAgentDocLine(doc))].join('\n')
 }
 
 /**
@@ -91,13 +98,15 @@ export function delegateRosterText(docs: readonly DelegateAgentDoc[]): string {
  * header, while an unrelated settings write must not churn the tool list.
  * Fields are joined with separators that cannot appear in agent ids; missing
  * axes read as '' so "unset" and "explicitly empty" (impossible after
- * validation) cannot hash differently.
+ * validation) cannot hash differently. The description is hashed FOLDED, the
+ * same value the row renders — a whitespace-only or punctuation-only edit
+ * renders identically, so it must not trigger a re-registration either.
  */
 export function delegateRosterDigest(docs: readonly DelegateAgentDoc[]): string {
   return docs.map(doc => [
     doc.id,
     doc.title,
-    doc.description ?? '',
+    doc.description === undefined ? '' : oneLineDescription(doc.description),
     doc.model ?? '',
     doc.effort ?? '',
     doc.mode ?? '',

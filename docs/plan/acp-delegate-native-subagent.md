@@ -107,7 +107,7 @@ provider.start 收到的 request.signal **不是 exec.signal 原对象**，是�
 - label 编码路由：显示字段兼任路由载体 → 纯函数对 + 等价测试钉死，格式变更必须同改两处。
 - 手拷贝截断语义：宿主升级可能漂移 → 等价测试 + devDep 版本钉住；升级宿主时复核。
 - 容量挤占：长跑委派占共享 8 槽，可能挤掉原生子代理名额 → 拒绝错误明示模型；静默窗保证最终释放。
-- 异步语义变化：模型必须结束回合等通知；同步折叠答复退役 → 本分支核心验收点。
+- 异步语义变化：同步折叠答复退役 → 本分支核心验收点。**定稿偏离**：原写的「模型必须结束回合等通知」已作废——宿主 `notifySettlement` 对忙碌父回合按 `steer` 投递，派发后可以继续做不相交的工作，见 [AGENTS/architecture.md §5](../../AGENTS/architecture.md)。
 - 面板行仍是禁用叶子：实时状态/点击穿透要宿主改（选项 C），本方案不承诺。
 - 类型 devDep 墙：dsh-subagent/dsh-llm/dsh-session/dsh-agent 四个类型包锁 0.2.2-rc.5 + cordis 4.1.0，`.npmrc` legacy-peer-deps 忽略两代 peer 冲突；宿主升级时需同步 bump 并复核 peer（typecheck 会报断链，流程见 [AGENTS/host.md §5](../../AGENTS/host.md)）。
 - **接缝被宿主 HMR 替换 → NO_PROVIDER（本分支暂缓重注册）**：`wireSubagentProvider` 以 `providerDisposer !== undefined` 为已注册标志；宿主 HMR 替换 `subagents` 服务后，旧注册随旧服务消失，但插件 fiber 未拆除、标志不重置，`ctx.inject(['subagents'])` 的重判被标志挡住 → 新服务无 provider，`startActivation` 报 `NO_PROVIDER`。**明示错误、无悬空、失败安全**（工具折成 `{kind:'error'}`，模型读得到原因）；重载插件即恢复。重注册（探测服务身份变化后重置标志）留待后续分支。

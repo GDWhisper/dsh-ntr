@@ -37,7 +37,7 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 - `sessions.append` / `subagent/catalog` —— detached ACP worker 的外部子代理目录事实（`wireSubagentCatalog` → `appendExternalSubagentCatalog`）：只写 `mode: 'external'`，无子会话 / activity / continuation；宿主没有该事件时 `append` 抛错即静默跳过。它写进宿主 session log，不落 `~/.dsh/dsh-ntr/`。
 - `agentPresets` —— preset roster（`wirePresetRoster`）
 - `agents` —— idle background drain 的唤醒入口（`wireChatAgent` → `BridgeManager.setDshAgentResolver`）：`ctx.get('agents').list()` 按 `agent.session.id` 找到该聊天的 agent，调用 `agent.followup(...)` 注入一条隐藏唤醒消息；宿主没有该注册表或 `list` / `followup` 缺失时退回「drain 只进 transcript」。这是**唯一的** `agents` 调用点，与审批无关（见下方「宿主审批服务不再是协作方」说明）。
-- `subagents` —— 原生子代理接缝（`probeSubagents` 结构化探针：`registerProvider` + `startActivation` 双在才认）：在场时注册 `acp` provider（`wireSubagentProvider`，effect 作用域 disposer，先于工具首次 sync）并让 `acp_delegate` 走 native 异步壳；缺席回落 legacy 同步壳（措辞/行为逐字节不变）。迟到经 `ctx.inject(['subagents'])` 重判壳位与 provider。宿主 0.2.2-rc.5+（`@deepseek-ai/dsh-subagent`），契约与裁决见 [architecture.md §5](./architecture.md)。
+- `subagents` —— 原生子代理接缝（`probeSubagents` 结构化探针：`registerProvider` + `startActivation` 双在才认）：在场时注册 `acp` provider（`wireSubagentProvider`，effect 作用域 disposer，先于工具首次 sync）并让 `acp_delegate` 走 native 异步壳；缺席回落 legacy 同步壳（行为不变，描述文案两壳同步改写）。迟到经 `ctx.inject(['subagents'])` 重判壳位与 provider。宿主 0.2.2-rc.5+（`@deepseek-ai/dsh-subagent`），契约与裁决见 [architecture.md §5](./architecture.md)。
 - 浏览器侧 `sessions` —— 经 `service<T>(name)` 在调用点惰性解析（见 [ui.md](./ui.md)）
 
 服务缺失必须是**可用性下降**，不是加载失败；可选服务迟到时由 `ctx.inject` 补挂，不得让插件整体不激活。

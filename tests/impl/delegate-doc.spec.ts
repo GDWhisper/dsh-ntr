@@ -39,11 +39,27 @@ describe('delegate roster rows (the tool schema grammar)', () => {
     expect(delegateRosterText([])).toBe('')
   })
 
+  it('drops the "pick by trait" header when no row carries a description', () => {
+    const text = delegateRosterText([{ id: 'a', title: 'A' }, { id: 'b', title: 'B', model: 'm' }])
+    expect(text.split('\n')).toEqual([
+      '已配置的 agent（均未填写擅长描述）：',
+      '- a（A）：委派默认：跟随进程自身',
+      '- b（B）：委派默认：模型 m',
+    ])
+    // A whitespace-only description is not a ground to choose either.
+    expect(delegateRosterText([{ id: 'a', title: 'A', description: '   ' }]).split('\n')[0])
+      .toBe('已配置的 agent（均未填写擅长描述）：')
+  })
+
   it('digests every rendered field, in order, with absent axes reading as empty', () => {
     const base = delegateRosterDigest([{ id: 'a', title: 'A' }])
     expect(delegateRosterDigest([{ id: 'a', title: 'A', description: undefined }])).toBe(base)
     expect(delegateRosterDigest([{ id: 'a', title: 'A', description: 'x' }])).not.toBe(base)
     expect(delegateRosterDigest([{ id: 'b', title: 'A' }])).not.toBe(base)
+    // Hashed FOLDED, like the row renders: an edit that renders the same row
+    // must not churn the tool list (whitespace runs, trailing punctuation).
+    expect(delegateRosterDigest([{ id: 'agy', title: 'AGY', description: '  联网  调研。' }]))
+      .toBe(delegateRosterDigest([{ id: 'agy', title: 'AGY', description: '联网 调研' }]))
     // Order is part of the fact: the same rows in another order must re-register.
     const one = delegateRosterDigest([{ id: 'a', title: 'A' }, { id: 'b', title: 'B' }])
     const two = delegateRosterDigest([{ id: 'b', title: 'B' }, { id: 'a', title: 'A' }])
