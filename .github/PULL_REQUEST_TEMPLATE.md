@@ -20,7 +20,7 @@
 
 <!-- 写实际跑过的命令与结果；没跑的说明原因。/ List commands you actually ran and the result; explain anything skipped. -->
 
-- [ ] `npm run prepack`（行数门禁 + typecheck + tests + build / size gate + typecheck + tests + build）
+- [ ] `npm run verify`（行数门禁 + typecheck + tests + build / size gate + typecheck + tests + build）
 - [ ] 定向用例（`npx vitest run <file>` / targeted tests）
 - [ ] 手工验证（写步骤与观察到的结果 / describe steps and observations）
 

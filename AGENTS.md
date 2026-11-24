@@ -13,7 +13,7 @@
 
 ## 快速命令
 
-- 提交前全量验证：`npm run prepack`（行数门禁 + typecheck + `vitest run tests` + build，见 [package.json](./package.json) `scripts`）
+- 提交前全量验证：`npm run verify`（行数门禁 + typecheck + `vitest run tests` + build，见 [package.json](./package.json) `scripts`）；`npm run prepack` 只做打包门禁（行数门禁 + build），它会被 `npm pack` / `npm publish` 自动触发，回归不许挂在那里
 - 单文件 / 单用例：`npx vitest run tests/bridge.spec.ts -t "spawns, initializes"`
 - 只重建浏览器 Bundle：`npx tsdown`
 - 挂到本地 DSH：`dsh plugin --profile web add ./`
@@ -138,7 +138,7 @@
 ## Git 提交
 
 Conventional Commits，英文，正文写动机与影响：`feat(acp):` / `fix(update):` / `chore(release):` / `docs(release):`；改本文件或 `AGENTS/` 下任何文档的提交统一用 `docs(agents):` 前缀；`lib/` 是构建产物，不提交。
-- **通过验收即可自行提交**：代码改动通过 `npm run prepack`、独立上下文审核通过、审核提出的必修项已修（修复类改动附变异验证），且只暂存本任务文件时，直接提交，不再逐次征求用户同意；缺任一条就停在「已修复待确认」。纯文档改动以行数门禁与 diff 自查代替 prepack。前缀按上一条判定。
+- **通过验收即可自行提交**：代码改动通过 `npm run verify`、独立上下文审核通过、审核提出的必修项已修（修复类改动附变异验证），且只暂存本任务文件时，直接提交，不再逐次征求用户同意；缺任一条就停在「已修复待确认」。纯文档改动以行数门禁与 diff 自查代替 verify。前缀按上一条判定。
 
 ## 文档维护纪律
 

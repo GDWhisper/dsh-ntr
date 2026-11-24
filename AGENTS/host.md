@@ -55,7 +55,7 @@ NTR 模式的存在形式只有一种：本包 `package.json` 的 `dsh.bundle.pa
 
 **何时读**：DSH 升级后 NTR 报错或表现异常。只读这一节，按症状表定位后再翻对应文档；不要先通读 architecture。
 
-**冒烟顺序**：`npm run prepack` 排除自身回归 → 确认宿主版本（桌面版看 `resources/app.asar` 内 `dsh/package.json`，CLI 跑 `dsh --version`）→ 新建会话选 NTR（roster 有 `acp`、composer 出现 ACP 底座）→ 选 agent 发「只回复 ok」→ 确认 NTR 面有实时数据（transcript 增量 / 审批卡）→ 再切一次模型并触发一个工具调用。
+**冒烟顺序**：`npm run verify` 排除自身回归 → 确认宿主版本（桌面版看 `resources/app.asar` 内 `dsh/package.json`，CLI 跑 `dsh --version`）→ 新建会话选 NTR（roster 有 `acp`、composer 出现 ACP 底座）→ 选 agent 发「只回复 ok」→ 确认 NTR 面有实时数据（transcript 增量 / 审批卡）→ 再切一次模型并触发一个工具调用。
 
 **版本分叉**：有 `agent.model.select` 的宿主（0.2.2+）在 step preparation 前固定路由，guard 用 `agent.model.select()` 写入；没有的宿主（0.2.1-）继续走 `agent/request` 改写。排查先看这一条属于哪边。
 
