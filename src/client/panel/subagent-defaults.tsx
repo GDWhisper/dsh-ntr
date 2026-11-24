@@ -492,14 +492,16 @@ export function SubagentDefaults(props: { acp: AcpStore; ui: UiState }) {
   if (delegate === undefined) return null
 
   const roster = ui.agents
-  const rosterIds = new Set(roster.map(agent => agent.id))
   const current = delegate.defaultAgent
+  const configuredDefault = delegate.configured?.defaultAgent
+  if (roster.length === 0 && current === undefined && configuredDefault === undefined) return null
+
+  const rosterIds = new Set(roster.map(agent => agent.id))
   const deleted = current !== undefined && !rosterIds.has(current)
   const resolved = resolvedDefaultAgent(delegate)
   const defaultOptionLabel = resolved === undefined
     ? acp.label('默认（未设置）', 'Default (not set)')
     : acp.label(`默认（当前：${resolved}）`, `Default (now: ${resolved})`)
-  const configuredDefault = delegate.configured?.defaultAgent
   const defaultOverridden = configuredDefault !== undefined && configuredDefault !== current
 
   return (

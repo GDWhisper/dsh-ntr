@@ -33,8 +33,8 @@ function writes(calls: PanelRpcCall[], endpoint: string): unknown[] {
 }
 
 /** Mount the settings section with a delegate view the wrapper keeps authoritative. */
-async function mountDefaults(seed: AcpDelegateSettings, options: { failWrite?: boolean; catalogs?: Record<string, AgentProbeModelsResult | null>; locale?: (zh: string, en: string) => string } = {}) {
-  const base = createPanelFixture(options.catalogs === undefined ? {} : { catalogs: options.catalogs })
+async function mountDefaults(seed: AcpDelegateSettings, options: { agents?: AcpAgentDef[]; failWrite?: boolean; catalogs?: Record<string, AgentProbeModelsResult | null>; locale?: (zh: string, en: string) => string } = {}) {
+  const base = createPanelFixture({ agents: options.agents, catalogs: options.catalogs })
   let current = structuredClone(seed)
   const calls: PanelRpcCall[] = []
   const rpc: RpcCall = async (channel, endpoint, payload) => {
@@ -418,6 +418,30 @@ describe('SubagentDefaults — gating', () => {
     await mountPanel()
     expect(screen.queryByRole('combobox', { name: '默认智能体' })).toBeNull()
     expect(screen.queryByText('委派默认')).toBeNull()
+  })
+
+  it('hides only the defaults section when no agents or default values exist', async () => {
+    await mountDefaults(BASE, { agents: [] })
+    await category('子代理')
+    expect(screen.getByRole('slider', { name: '子代理委派' })).toBeDefined()
+    expect(screen.queryByRole('combobox', { name: '默认智能体' })).toBeNull()
+    expect(screen.queryByText('委派默认')).toBeNull()
+  })
+
+  it('keeps a deleted default recoverable with an empty roster', async () => {
+    await mountDefaults({ ...BASE, defaultAgent: 'ghost', resolvedDefaultAgent: 'ghost' }, { agents: [] })
+    await category('子代理')
+    const select = defaultAgentSelect()
+    expect(select.value).toBe('ghost')
+    expect(screen.getByRole('option', { name: 'ghost（已删除）' })).toBeDefined()
+  })
+
+  it('keeps a config-file default recoverable with an empty roster', async () => {
+    await mountDefaults({ ...BASE, configured: { defaultAgent: 'ghost' } }, { agents: [] })
+    await category('子代理')
+    expect(defaultAgentSelect().value).toBe('')
+    expect(screen.getByText(/配置文件要求：ghost/)).toBeDefined()
+    expect(screen.getByRole('button', { name: '恢复配置文件的值' })).toBeDefined()
   })
 })
 
