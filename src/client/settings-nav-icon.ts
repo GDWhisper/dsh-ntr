@@ -46,12 +46,52 @@ const GLYPH_MARK = 'data-dsh-ntr-glyph'
  * filled lens. The triangle's bounding box is centred in the grid: 2.05 units
  * top and bottom, 1.42 left and right once the 1.8 stroke is counted, so no
  * part of the outline is clipped at the edges.
+ *
+ * The rings WEAVE: a crossing pair of circles meets twice, and each ring passes
+ * over its neighbour at one of the two and under it at the other, so the
+ * dominance runs round the triangle as a cycle (top over left, left over right,
+ * right over top). A ring that were on top at BOTH crossings would read as a
+ * flat stack, which is why the outline is cut instead: every ring's own mask
+ * hides the two crossings it goes under. The cut is a disc of r 2.4 — the
+ * hidden stroke plus about half a stroke of air on each side, which is what
+ * keeps the break visible at the 16 px the nav renders at (the crossings are
+ * shallow, ~41°, so the covering stroke already eats 1.36 units either way).
+ *
+ * Only the OUTLINE is masked. The 8% wash says "surface", not "depth", so it
+ * stays continuous behind the weave — which is why each ring is two circles:
+ * an unmasked fill and a masked stroke.
+ *
+ * A mask reference that fails to resolve is ignored by the renderer (the ring
+ * then draws whole), so a broken id costs the weave, never the glyph.
  */
 const TRIPLE_RING_MARKUP =
   '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
-  '<circle cx="12" cy="7.95" r="5" stroke="currentColor" stroke-width="1.8" fill="currentColor" fill-opacity="0.08" />' +
-  '<circle cx="7.32" cy="16.05" r="5" stroke="currentColor" stroke-width="1.8" fill="currentColor" fill-opacity="0.08" />' +
-  '<circle cx="16.68" cy="16.05" r="5" stroke="currentColor" stroke-width="1.8" fill="currentColor" fill-opacity="0.08" />' +
+  '<defs>' +
+  // Under-crossings per ring: top hides at its two inner crossings, the left
+  // ring at its outer-left and bottom ones, the right ring at its outer-right
+  // and inner-upper ones.
+  '<mask id="dsh-ntr-ring-top" maskUnits="userSpaceOnUse" x="0" y="0" width="24" height="24">' +
+  '<rect width="24" height="24" fill="#fff" />' +
+  '<circle cx="11.189" cy="12.883" r="2.4" fill="#000" />' +
+  '<circle cx="12.811" cy="12.883" r="2.4" fill="#000" />' +
+  '</mask>' +
+  '<mask id="dsh-ntr-ring-left" maskUnits="userSpaceOnUse" x="0" y="0" width="24" height="24">' +
+  '<rect width="24" height="24" fill="#fff" />' +
+  '<circle cx="8.131" cy="11.117" r="2.4" fill="#000" />' +
+  '<circle cx="12" cy="17.81" r="2.4" fill="#000" />' +
+  '</mask>' +
+  '<mask id="dsh-ntr-ring-right" maskUnits="userSpaceOnUse" x="0" y="0" width="24" height="24">' +
+  '<rect width="24" height="24" fill="#fff" />' +
+  '<circle cx="15.869" cy="11.117" r="2.4" fill="#000" />' +
+  '<circle cx="12" cy="14.29" r="2.4" fill="#000" />' +
+  '</mask>' +
+  '</defs>' +
+  '<circle cx="12" cy="7.95" r="5" fill="currentColor" fill-opacity="0.08" />' +
+  '<circle cx="7.32" cy="16.05" r="5" fill="currentColor" fill-opacity="0.08" />' +
+  '<circle cx="16.68" cy="16.05" r="5" fill="currentColor" fill-opacity="0.08" />' +
+  '<circle cx="12" cy="7.95" r="5" stroke="currentColor" stroke-width="1.8" mask="url(#dsh-ntr-ring-top)" />' +
+  '<circle cx="7.32" cy="16.05" r="5" stroke="currentColor" stroke-width="1.8" mask="url(#dsh-ntr-ring-left)" />' +
+  '<circle cx="16.68" cy="16.05" r="5" stroke="currentColor" stroke-width="1.8" mask="url(#dsh-ntr-ring-right)" />' +
   '</svg>'
 
 interface SwappedGlyph {

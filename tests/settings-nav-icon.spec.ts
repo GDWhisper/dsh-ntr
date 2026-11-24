@@ -41,11 +41,17 @@ describe('installSettingsNavIcon', () => {
     expect(glyph!.getAttribute('class')).toBe('navIcon')
     expect(glyph!.getAttribute('aria-hidden')).toBe('true')
     // Three interlocking rings in a TRIANGLE: three distinct centres, and two of
-    // them sharing a row — a row arrangement would put all three on one.
-    const rings = Array.from(glyph!.querySelectorAll('circle'))
+    // them sharing a row — a row arrangement would put all three on one. The
+    // masked circles are the three outlines (the wash is unmasked).
+    const rings = Array.from(glyph!.querySelectorAll('circle[mask]'))
     expect(rings.length).toBe(3)
     expect(new Set(rings.map(ring => `${ring.getAttribute('cx')},${ring.getAttribute('cy')}`)).size).toBe(3)
     expect(new Set(rings.map(ring => ring.getAttribute('cy'))).size).toBe(2)
+    // The weave: every outline is cut at exactly the two crossings it passes
+    // UNDER. Three cuts would dash a ring, one would leave it on top everywhere.
+    const masks = Array.from(glyph!.querySelectorAll('mask'))
+    expect(masks.length).toBe(3)
+    for (const mask of masks) expect(mask.querySelectorAll('circle').length).toBe(2)
     expect(button.hasAttribute('data-dsh-ntr-nav-icon')).toBe(true)
     cleanup()
   })
@@ -168,7 +174,7 @@ describe('installSettingsNavIcon', () => {
     await flushRaf()
 
     expect(second.button.hasAttribute('data-dsh-ntr-nav-icon')).toBe(true)
-    expect(second.button.querySelectorAll('circle').length).toBe(3)
+    expect(second.button.querySelectorAll('circle[mask]').length).toBe(3)
     cleanup()
   })
 })
