@@ -67,7 +67,10 @@ const STYLE = `
 .dwa-btn-danger:hover { background: var(--dsw-alias-interactive-bg-hover-danger, #fee2e2); }
 .dwa-section { margin-bottom: 24px; }
 .dwa-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
-.dwa-section-title { font-size: 13px; font-weight: 550; margin: 0; display: flex; align-items: center; gap: 8px; }
+.dwa-section-title { font-size: 15px; font-weight: 600; margin: 0; display: flex; align-items: center; gap: 8px; }
+/* A section nested inside a card (e.g. 委派默认 inside 子代理): one step below the
+ * card title, so three levels read as three levels instead of two. */
+.dwa-subsection-title { font-size: 14px; }
 .dwa-section-copy { margin: 3px 0 0; font-size: var(--ntr-font-xs); color: var(--ntr-muted); }
 .dwa-card { border: var(--ntr-line); border-radius: var(--ntr-radius); padding: 16px; background: var(--dsw-alias-bg-layer-1, #fff); font-size: var(--ntr-font); line-height: 1.55; }
 .dwa-card-warn { border-color: color-mix(in srgb, var(--ntr-warn) 30%, var(--dsw-alias-border-l2, #e5e7eb)); background: var(--dsw-alias-state-warn-tertiary, #fffbeb); }
@@ -261,7 +264,7 @@ const STYLE = `
    each (中/止, 自动推/进), which read as broken rather than as choices. */
 .dwa-preference-block { padding: 12px 0; }
 .dwa-preference-block + .dwa-preference-block { border-top: var(--ntr-line); }
-.dwa-preference-label { font-size: var(--ntr-font-sm); font-weight: 600; }
+.dwa-preference-label { font-size: var(--ntr-font); font-weight: 600; }
 .dwa-preference-copy { margin-top: 2px; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
 .dwa-seg-wide { display: flex; width: 100%; margin-top: 10px; }
 .dwa-seg-wide > button { flex: 1; }

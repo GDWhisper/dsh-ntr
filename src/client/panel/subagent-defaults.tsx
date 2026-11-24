@@ -505,10 +505,18 @@ export function SubagentDefaults(props: { acp: AcpStore; ui: UiState }) {
   const defaultOverridden = configuredDefault !== undefined && configuredDefault !== current
 
   return (
-    <div ref={rootRef} style={{ marginTop: 20 }}>
+    <div
+      ref={rootRef}
+      style={{
+        marginTop: 24,
+        padding: '16px 18px',
+        borderRadius: 10,
+        background: 'var(--dsw-alias-bg-layer-2, #f8f9fa)',
+      }}
+    >
       <div className="dwa-section-heading">
         <div>
-          <h4 className="dwa-section-title">{acp.label('委派默认', 'Delegation defaults')}</h4>
+          <h4 className="dwa-section-title dwa-subsection-title">{acp.label('委派默认', 'Delegation defaults')}</h4>
           <p className="dwa-section-copy">
             {acp.label('只影响 acp_delegate 委派，不改变聊天中的选择。', 'Affects acp_delegate delegations only, never the chat selections.')}
           </p>
