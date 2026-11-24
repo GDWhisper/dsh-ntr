@@ -4,6 +4,15 @@
 
 **已被取代的细节**：下文描述的 echo guard 挂钟窗口（`agyLateOutputEchoMs`）已删除；守卫改为事件绑定（活到下一轮收口 / 生命周期边界），且思考与正文各持一键。现行设计见 `src/bridge/agy-echo-guard.ts` 与 [AGENTS/protocol.md](../../../AGENTS/protocol.md) §6。
 
+**未合并的探索分支（`fix/agy-late-output-delivery`，2026-11-12/13，4 个提交）**：分支在 `d73b7b0` 之后另走了一套实现（`session.ambient` + `applyEchoGuard`，与 main 的 `session.drains` + `ReplayEchoGuard` 已分叉），**从未进入 main**——main 用后来的 activity-driven 方案覆盖了同一主题（`e387103` → `04d172b` → `d0a345a`），所以不能按 cherry-pick 判断等价。逐条对比后，仍有两条行为缺口与三块实测知识只存在于该分支：
+
+- **wake 之后不重臂（main 缺口）**：arm 点只有 `TurnStreamController.closeTurn` 的 `current` 分支；wake 回合没有 ACP 控制器、`closeTurn` 不跑，投递时 watch 已 disarm，于是同一段后台续跑的第二份答案不主动投递（文本不丢，等下一次 prompt 的积压回放）。分支的修法是在 `BridgeManager.streamPrompt` 的 wake 分支重臂，并且用 `LiveSession` 上保存的 `{ path, offset, lastStepIndex }` **续读**，不要调 `AgyTranscriptTail.baseline()`——基线跳到 EOF 会丢「投递 → 重臂」之间写入的步。注意重臂时机要避开 `claimTurn` 窗口：`poll` 一见 `isBusy` 就 disarm。
+- **轮询噪声无闸（main 缺口）**：main 只取最后一条 DONE planner，所以等待期若先安静下来，`I am waiting…` 这类状态行会被当成晚到答案投递并撤表，真答案反要等用户下次发言。分支的判据：`SYSTEM_MESSAGE` 的 `sender` 无斜杠 = 子代理/定时任务报告（开闸）、`<acpSessionId>/task-N` = agy 自己的工时计时器（不开闸）、`sender=system` = 关闸；`GENERIC` 的 `RUNNING` 或正文匹配 `Task: … Status: RUNNING` 置等待态，同步工具步（`read_file` / `manage_subagents list`）不得清等待态。
+- **实测数字**：研究子代理在父 transcript 静默 **754 秒**（12m34s）后才写出答案，当时的 10 分钟固定窗把它整个丢掉——这是现行空闲窗默认 30 分钟且任何新步续期的由来（[AGENTS/protocol.md](../../../AGENTS/protocol.md) §6.4）。
+- **语义反坑**：分支里 `agyLateOutputMaxMs: 0` = 无期限；**main 里 `0` = 关 watch**（`arm()` 早退）。分支的测试构造照搬会变成「什么都不发生」。
+
+分支的 `reportGate` 字段在 main 不存在；它的回归守卫（新后台任务启动时重置闸门）只有在补上前两条之后才有意义。分支的测试用例（16 条）除上述场景外，其余与 main 的 `tests/agy-late-output*.spec.ts` 等价或更弱，不值得搬。
+
 本文件是 [docs/todo.md](../../todo.md) 里「Antigravity 后台结果不推送」的实施方案。先读 [AGENTS.md](../../../AGENTS.md)、[AGENTS/protocol.md](../../../AGENTS/protocol.md) 的 §6.2 / §6.3，再读本文件。
 
 本版已按对抗审核结论修订（6 条阻塞 + 12 条建议），设计细节以本文件为准。
