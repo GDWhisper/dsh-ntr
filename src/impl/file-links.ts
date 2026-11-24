@@ -1,57 +1,76 @@
 /**
  * Streaming normalizer for Markdown `file://` links emitted by ACP agents.
  *
+ * Host coupling contract:
  * Agents such as Antigravity (`agy acp`) format local file references as
- * `[name](file:///abs/path#L10-L20)`. DSH's chat Markdown renderer only treats
- * a link destination as a clickable local file when `URL.canParse()` returns
- * false (plain POSIX paths `/...`, relative paths `./...`, or Windows drive
- * paths `C:/...`): a `file://` URI falls through to the external-link anchor
- * without a click handler, so it looks like a link but cannot be opened.
+ * `[name](file:///abs/path#L10-L20)`. DSH's chat Markdown renderer first strips
+ * `#...` fragments, calls `decodeURIComponent` on the path part, and then
+ * accepts the destination as a clickable local file only when it matches the
+ * host local-path whitelist (`/^(?:[\\/]\|\.{1,2}[\\/]|[a-z]:[\\/])/i`) OR
+ * `!URL.canParse(decoded)`. A `file://` URI fails both checks and falls through
+ * to an unclickable external anchor. If the host renderer changes that rule,
+ * this rewriter will silently diverge (recorded in `AGENTS/architecture.md`).
  *
- * Rewriting `](file:///` and `](file://localhost/` (and their `<...>` forms)
- * to bare paths at the adapter stream boundary makes links open in DSH's file
- * sidebar while leaving the ACP transcript, echo guard, code blocks, inline
- * code, non-local UNC hosts, and non-`file:` URLs untouched.
+ * Streaming state-machine contract (`MarkdownFileLinkRewriter`):
+ * - Bounded lookahead: at most `MAX_LINK_LOOKAHEAD` (25) characters are ever
+ *   buffered in `linkBuf` (`](<` + `file://` + `localhost/` + `C%3A/`).
+ * - State set:
+ *   1. Fenced code block (`fenceChar`, `fenceLen`, `fenceQuoteDepth`,
+ *      `closingFencePending`, `pendingBacktickFence`, `pendingFenceQuoteDepth`)
+ *   2. 4-space / tab indented code block (`canStartIndentedCode`,
+ *      `inIndentedCode`) — entered only at document start or after a blank line
+ *      (CommonMark §4.4), never mid-paragraph
+ *   3. Inline code span (`inlineTicks`) — reset across blank lines so an
+ *      unclosed backtick in one paragraph never suppresses links in later ones
+ *   4. Link prefix lookahead (`linkBuf`), delegating local authority & Windows
+ *      drive classification to the shared `classifyLocalFileUrlHead` primitive
+ *      in `src/impl/paths.ts`
+ * - Reset / flush contract: `flush()` finishes any open delimiter run and emits
+ *   raw `linkBuf` verbatim, so truncated EOF prefixes (`](file:///C`, etc.) are
+ *   never mutated or truncated.
  *
  * Pure logic only — no Node APIs, no ACP SDK runtime values.
  */
 
 import type { StreamChunk } from '../protocol.ts'
+import { classifyLocalFileUrlHead } from './paths.ts'
 
 const FILE_SCHEME = 'file://'
-const LOCALHOST_HOST = 'localhost/'
 
-type LinkPhase = 'none' | 'prefix' | 'drive'
-
-function isAsciiLetter(ch: string): boolean {
-  const code = ch.charCodeAt(0)
-  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122)
-}
+/** Maximum lookahead buffered in `linkBuf`: `](<` + `file://` + `localhost/` + `C%3A/`. */
+export const MAX_LINK_LOOKAHEAD = 25
 
 /**
  * Stateful, bounded-lookahead rewriter for Markdown `file://` link prefixes.
  *
- * Only holds back characters while matching a `](file://...` prefix (at most
- * ~26 chars) so arbitrary chunk boundaries produce the exact same output as
- * rewriting the full string at once.
+ * Every transition is strictly single-character deterministic so arbitrary
+ * chunk boundaries produce the exact same output as rewriting at once.
  */
 export class MarkdownFileLinkRewriter {
-  // Markdown code-context tracking so code examples are never modified.
+  // Line-start prefix tracking (indent, blockquote depth, blank-line resets).
   private lineStart = true
   private lineIndent = 0
+  private lineQuoteDepth = 0
+  private afterQuoteMarker = false
+  private lineHasContent = false
+  private canStartIndentedCode = true
+  private inIndentedCode = false
+
+  // Markdown code-context tracking so code examples are never modified.
   private fenceChar: '`' | '~' | null = null
   private fenceLen = 0
+  private fenceQuoteDepth = 0
   private closingFencePending = false
   private pendingBacktickFence = 0
+  private pendingFenceQuoteDepth = 0
   private inlineTicks = 0
   private runChar: '`' | '~' | null = null
   private runLen = 0
   private runAtFenceStart = false
+  private runQuoteDepth = 0
 
-  // Link prefix lookahead state (only active outside code).
-  private linkPhase: LinkPhase = 'none'
+  // Bounded link-prefix lookahead buffer (active iff non-empty, only outside code).
   private linkBuf = ''
-  private driveBuf = ''
 
   push(chunk: string): string {
     if (chunk === '') return ''
@@ -64,19 +83,9 @@ export class MarkdownFileLinkRewriter {
 
   flush(): string {
     this.finishRun()
-    if (this.linkPhase === 'none') return ''
-    let out: string
-    if (this.linkPhase === 'prefix') {
-      out = this.linkBuf
-    } else if (this.driveBuf === '') {
-      out = this.linkBuf
-    } else {
-      const opener = this.linkBuf.startsWith('](<') ? '](<' : ']('
-      out = `${opener}/${this.driveBuf}`
-    }
-    this.linkPhase = 'none'
+    if (this.linkBuf === '') return ''
+    const out = this.linkBuf
     this.linkBuf = ''
-    this.driveBuf = ''
     return out
   }
 
@@ -87,18 +96,44 @@ export class MarkdownFileLinkRewriter {
     }
 
     // Active link-prefix matching (only entered outside code).
-    if (this.linkPhase !== 'none') {
+    if (this.linkBuf !== '') {
       return this.stepLink(ch)
     }
 
-    // Inside a fenced code block: only watch for a valid closing fence.
+    // Inside a fenced code block: watch for blockquote drop or closing fence.
     if (this.fenceChar !== null) {
       return this.stepInsideFence(ch)
+    }
+
+    // Inside a 4-space / tab indented code line: pass through until newline.
+    if (this.inIndentedCode) {
+      if (ch === '\n') this.finishLine()
+      return ch
     }
 
     // Inside a backtick fence opening line or an inline code span.
     if (this.pendingBacktickFence > 0 || this.inlineTicks > 0) {
       return this.stepInsideInlineOrOpeningLine(ch)
+    }
+
+    // Line-start whitespace / blockquote prefixes (outside code).
+    if (this.lineStart && this.consumeLinePrefix(ch)) {
+      return ch
+    }
+    if (ch === '\n') {
+      this.finishLine()
+      return ch
+    }
+
+    // First non-prefix character on a line: decide whether indented code starts.
+    if (this.lineStart) {
+      if (this.lineIndent >= 4 && this.canStartIndentedCode) {
+        this.inIndentedCode = true
+        this.lineStart = false
+        this.lineHasContent = true
+        return ch
+      }
+      this.canStartIndentedCode = false
     }
 
     // Outside code: check for fence/inline-code delimiters first.
@@ -107,49 +142,121 @@ export class MarkdownFileLinkRewriter {
         this.runChar = ch
         this.runLen = 1
         this.runAtFenceStart = this.lineStart && this.lineIndent <= 3
+        this.runQuoteDepth = this.lineQuoteDepth
         this.lineStart = false
+        this.lineHasContent = true
       } else {
         this.runLen += 1
       }
       return ch
     }
 
-    this.advanceLineState(ch)
+    this.lineStart = false
+    this.lineHasContent = true
 
     if (ch === ']') {
-      this.linkPhase = 'prefix'
       this.linkBuf = ']'
       return ''
     }
     return ch
   }
 
+  private consumeLinePrefix(ch: string): boolean {
+    if (ch === '\r') return true
+    if (ch === ' ') {
+      if (this.afterQuoteMarker) {
+        this.afterQuoteMarker = false
+      } else {
+        this.lineIndent += 1
+      }
+      return true
+    }
+    if (ch === '\t') {
+      if (this.afterQuoteMarker) {
+        this.afterQuoteMarker = false
+        this.lineIndent += 2
+      } else {
+        this.lineIndent += 4 - (this.lineIndent % 4)
+      }
+      return true
+    }
+    if (ch === '>' && this.lineIndent <= 3) {
+      this.lineQuoteDepth += 1
+      this.lineIndent = 0
+      this.afterQuoteMarker = true
+      return true
+    }
+    this.afterQuoteMarker = false
+    return false
+  }
+
+  private finishLine(): void {
+    if (!this.lineHasContent) {
+      // Blank line resets unclosed inline backticks and permits indented code.
+      this.inlineTicks = 0
+      this.canStartIndentedCode = true
+    }
+    this.inIndentedCode = false
+    this.lineStart = true
+    this.lineIndent = 0
+    this.lineQuoteDepth = 0
+    this.afterQuoteMarker = false
+    this.lineHasContent = false
+  }
+
+  private closeFence(): void {
+    this.fenceChar = null
+    this.fenceLen = 0
+    this.fenceQuoteDepth = 0
+    this.closingFencePending = false
+    this.canStartIndentedCode = true
+  }
+
   private stepInsideFence(ch: string): string {
     if (this.closingFencePending) {
       if (ch === ' ' || ch === '\t' || ch === '\r') return ch
       if (ch === '\n') {
-        this.fenceChar = null
-        this.fenceLen = 0
-        this.closingFencePending = false
-        this.lineStart = true
-        this.lineIndent = 0
+        this.closeFence()
+        this.finishLine()
         return ch
       }
       this.closingFencePending = false
+      this.lineHasContent = true
       return ch
     }
-    if (ch === this.fenceChar && (this.runChar === ch || (this.lineStart && this.lineIndent <= 3))) {
+    if (this.lineStart && this.consumeLinePrefix(ch)) {
+      return ch
+    }
+    if (ch === '\n') {
+      if (this.lineQuoteDepth < this.fenceQuoteDepth) {
+        this.closeFence()
+      }
+      this.finishLine()
+      return ch
+    }
+    // Leaving a blockquote terminates any fenced code block opened inside it.
+    if (this.lineStart && this.lineQuoteDepth < this.fenceQuoteDepth) {
+      this.closeFence()
+      return this.step(ch)
+    }
+    if (
+      ch === this.fenceChar
+      && (this.runChar === ch || (this.lineStart && this.lineIndent <= 3 && this.lineQuoteDepth === this.fenceQuoteDepth))
+    ) {
       if (this.runChar === null) {
         this.runChar = ch
         this.runLen = 1
         this.runAtFenceStart = true
+        this.runQuoteDepth = this.lineQuoteDepth
         this.lineStart = false
+        this.lineHasContent = true
       } else {
         this.runLen += 1
       }
       return ch
     }
-    this.advanceLineState(ch)
+    this.lineStart = false
+    this.lineHasContent = true
     return ch
   }
 
@@ -159,22 +266,33 @@ export class MarkdownFileLinkRewriter {
         this.runChar = '`'
         this.runLen = 1
         this.runAtFenceStart = false
+        this.runQuoteDepth = this.lineQuoteDepth
       } else {
         this.runLen += 1
       }
       this.lineStart = false
+      this.lineHasContent = true
       return ch
     }
     if (ch === '\n' && this.pendingBacktickFence > 0) {
       // Opening line ended without another backtick: confirmed fenced code block.
       this.fenceChar = '`'
       this.fenceLen = this.pendingBacktickFence
+      this.fenceQuoteDepth = this.pendingFenceQuoteDepth
       this.pendingBacktickFence = 0
-      this.lineStart = true
-      this.lineIndent = 0
+      this.pendingFenceQuoteDepth = 0
+      this.finishLine()
       return ch
     }
-    this.advanceLineState(ch)
+    if (this.lineStart && this.consumeLinePrefix(ch)) {
+      return ch
+    }
+    if (ch === '\n') {
+      this.finishLine()
+      return ch
+    }
+    this.lineStart = false
+    this.lineHasContent = true
     return ch
   }
 
@@ -182,9 +300,11 @@ export class MarkdownFileLinkRewriter {
     const ch = this.runChar
     const len = this.runLen
     const atFenceStart = this.runAtFenceStart
+    const quoteDepth = this.runQuoteDepth
     this.runChar = null
     this.runLen = 0
     this.runAtFenceStart = false
+    this.runQuoteDepth = 0
     if (ch === null) return
 
     if (this.fenceChar !== null) {
@@ -198,9 +318,11 @@ export class MarkdownFileLinkRewriter {
       // not a fenced code block (CommonMark §4.5).
       if (len === this.pendingBacktickFence) {
         this.pendingBacktickFence = 0
+        this.pendingFenceQuoteDepth = 0
       } else {
         this.inlineTicks = this.pendingBacktickFence
         this.pendingBacktickFence = 0
+        this.pendingFenceQuoteDepth = 0
       }
       return
     }
@@ -214,8 +336,10 @@ export class MarkdownFileLinkRewriter {
       if (ch === '~') {
         this.fenceChar = '~'
         this.fenceLen = len
+        this.fenceQuoteDepth = quoteDepth
       } else {
         this.pendingBacktickFence = len
+        this.pendingFenceQuoteDepth = quoteDepth
       }
       return
     }
@@ -224,25 +348,7 @@ export class MarkdownFileLinkRewriter {
     }
   }
 
-  private advanceLineState(ch: string): void {
-    if (ch === '\n') {
-      this.lineStart = true
-      this.lineIndent = 0
-    } else if (this.lineStart && ch === ' ') {
-      this.lineIndent += 1
-    } else if (ch !== '\r') {
-      this.lineStart = false
-    }
-  }
-
   private stepLink(ch: string): string {
-    if (this.linkPhase === 'prefix') {
-      return this.stepLinkPrefix(ch)
-    }
-    return this.stepDrivePeek(ch)
-  }
-
-  private stepLinkPrefix(ch: string): string {
     const buf = this.linkBuf
     if (buf === ']') {
       if (ch === '(') {
@@ -264,86 +370,34 @@ export class MarkdownFileLinkRewriter {
       }
       return this.abortLink(ch)
     }
-    const hostPart = afterOpener.slice(FILE_SCHEME.length)
-    if (hostPart === '' && ch === '/') {
-      this.linkBuf += '/'
-      this.linkPhase = 'drive'
-      this.driveBuf = ''
-      return ''
-    }
-    if (ch.toLowerCase() === LOCALHOST_HOST[hostPart.length]) {
+    const nextAfterScheme = afterOpener.slice(FILE_SCHEME.length) + ch
+    const head = classifyLocalFileUrlHead(nextAfterScheme)
+    if (head.kind === 'incomplete') {
       this.linkBuf += ch
-      if (hostPart.length + 1 === LOCALHOST_HOST.length) {
-        this.linkPhase = 'drive'
-        this.driveBuf = ''
-      }
       return ''
     }
-    return this.abortLink(ch)
-  }
-
-  private stepDrivePeek(ch: string): string {
-    const opener = this.linkBuf.startsWith('](<') ? '](<' : ']('
-    const d = this.driveBuf
-    if (d.length === 0) {
-      if (isAsciiLetter(ch)) {
-        this.driveBuf = ch
-        return ''
-      }
-      return this.finishLink(`${opener}/`, ch)
+    if (head.kind === 'remote') {
+      return this.abortLink(ch)
     }
-    if (d.length === 1) {
-      if (ch === ':' || ch === '%') {
-        this.driveBuf += ch
-        return ''
-      }
-      return this.finishLink(`${opener}/${d}`, ch)
-    }
-    if (d.length === 2) {
-      if (d[1] === ':') {
-        if (ch === '/' || ch === '\\') {
-          this.resetLink()
-          this.advanceLineState(ch)
-          return `${opener}${d}${ch}`
-        }
-        return this.finishLink(`${opener}/${d}`, ch)
-      }
-      if (ch === '3') {
-        this.driveBuf += ch
-        return ''
-      }
-      return this.finishLink(`${opener}/${d}`, ch)
-    }
-    if (d.length === 3) {
-      if (ch === 'a' || ch === 'A') {
-        this.driveBuf += ch
-        return ''
-      }
-      return this.finishLink(`${opener}/${d}`, ch)
-    }
-    if (ch === '/' || ch === '\\') {
-      this.resetLink()
-      this.advanceLineState(ch)
-      return `${opener}${d}${ch}`
-    }
-    return this.finishLink(`${opener}/${d}`, ch)
-  }
-
-  private resetLink(): void {
-    this.linkPhase = 'none'
+    const opener = openerLen === 3 ? '](<' : ']('
     this.linkBuf = ''
-    this.driveBuf = ''
+    if (head.kind === 'drive') {
+      this.lineStart = false
+      this.lineHasContent = true
+      return `${opener}${head.driveLetter}:${head.sep}`
+    }
+    const tail = nextAfterScheme.slice(head.consumed)
+    let out = `${opener}/`
+    for (let i = 0; i < tail.length; i++) {
+      out += this.step(tail[i]!)
+    }
+    return out
   }
 
   private abortLink(ch: string): string {
     const flushed = this.linkBuf
-    this.resetLink()
+    this.linkBuf = ''
     return flushed + this.step(ch)
-  }
-
-  private finishLink(prefix: string, ch: string): string {
-    this.resetLink()
-    return prefix + this.step(ch)
   }
 }
 

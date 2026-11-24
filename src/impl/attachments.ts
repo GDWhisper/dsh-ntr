@@ -8,22 +8,27 @@
  * APIs, no ACP SDK runtime values.
  */
 
+import { classifyLocalFileUrlHead } from './paths.ts'
+
 export function normalizeFileUrlToPath(uri: string): string {
-  if (!uri.startsWith('file://')) return uri
-  let raw = uri.slice('file://'.length)
+  if (!/^file:\/\//i.test(uri)) return uri
+  const afterScheme = uri.slice('file://'.length)
+  const head = classifyLocalFileUrlHead(afterScheme, { allowBareDrive: true })
+  let path: string
+  if (head.kind === 'drive') {
+    path = `${head.driveLetter}:${head.sep}${afterScheme.slice(head.consumed)}`
+  } else if (head.kind === 'posix') {
+    path = `/${afterScheme.slice(head.consumed)}`
+  } else if (head.kind === 'incomplete') {
+    path = afterScheme.startsWith('/') ? afterScheme : `/${afterScheme.replace(/^localhost\/?/i, '')}`
+  } else {
+    path = `//${afterScheme}`
+  }
   try {
-    raw = decodeURIComponent(raw)
-  } catch {}
-  if (raw.startsWith('localhost/')) {
-    raw = raw.slice('localhost'.length)
+    return decodeURIComponent(path)
+  } catch {
+    return path
   }
-  if (/^\/?[a-zA-Z]:/.test(raw)) {
-    return raw.startsWith('/') ? raw.slice(1) : raw
-  }
-  if (raw.startsWith('/')) {
-    return raw
-  }
-  return `//${raw}`
 }
 
 function expandHomePath(p: string): string {

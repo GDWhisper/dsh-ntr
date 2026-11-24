@@ -68,7 +68,8 @@ export { delegateAgentDoc, delegateAgentDocs, delegateAgentDocLine, delegateRost
 
 // ---- Workspace guard ----
 
-export { canonicalizeFsPath, isAbsolutePath, isUnderPath, resolveFsPath, resolveSessionCwd } from './impl/paths.ts'
+export type { LocalFileUrlHead } from './impl/paths.ts'
+export { canonicalizeFsPath, classifyLocalFileUrlHead, isAbsolutePath, isUnderPath, resolveFsPath, resolveSessionCwd } from './impl/paths.ts'
 
 // ---- Child environment ----
 
@@ -116,7 +117,7 @@ export {
   resolveImageContent,
 } from './impl/image.ts'
 export { normalizeFileUrlToPath, resolveImageAttachmentFromContext } from './impl/attachments.ts'
-export { MarkdownFileLinkRewriter, normalizeMarkdownFileLinks, rewriteStreamFileLinks } from './impl/file-links.ts'
+export { MAX_LINK_LOOKAHEAD, MarkdownFileLinkRewriter, normalizeMarkdownFileLinks, rewriteStreamFileLinks } from './impl/file-links.ts'
 
 export type { ForwardPromptSelection } from './impl/forward.ts'
 export { SESSION_TITLE_PLACEHOLDER_MAX, extractSessionTitlePlaceholder, selectForwardPrompt } from './impl/forward.ts'
