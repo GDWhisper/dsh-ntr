@@ -270,7 +270,7 @@ function DescriptionInput(props: { acp: AcpStore; title: string; value: string |
     seen.current = committed
     setDraft(committed)
   }, [committed])
-  const label = acp.label('描述（写给主代理看）', 'Description (shown to the caller)')
+  const label = acp.label('描述（写给主智能体看）', 'Description (shown to the caller)')
   return (
     <label className="dwa-field" style={{ marginTop: 12 }}>
       <span className="dwa-field-label">{label}</span>
@@ -490,7 +490,7 @@ function AgentDefaultsRow(props: {
         )}
         <DescriptionInput acp={acp} title={title} value={entry?.description} onCommit={writeDescription} />
         <div className="dwa-preference-copy">
-          {acp.label('描述会写进 acp_delegate 的 agent 选项说明，主代理据此挑选。', 'Shown in acp_delegate\'s agent parameter description so the caller can pick.')}
+          {acp.label('描述会写进 acp_delegate 的 agent 选项说明，主智能体据此挑选。', 'Shown in acp_delegate\'s agent parameter description so the caller can pick.')}
         </div>
         {overridden && (
           <div className="dwa-deadline-flag">

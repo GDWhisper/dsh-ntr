@@ -174,7 +174,7 @@ describe('SubagentDefaults — per-agent axes', () => {
   it('commits the description on blur, trimmed, keeping the other axes', async () => {
     const { store, calls } = await mountDefaults({ ...DELEGATE_BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3' } } })
     await category('子智能体')
-    const input = screen.getByLabelText('描述（写给主代理看） · CodeBuddy') as HTMLInputElement
+    const input = screen.getByLabelText('描述（写给主智能体看） · CodeBuddy') as HTMLInputElement
     expect(input.value).toBe('')
     fireEvent.change(input, { target: { value: '  通用编码  ' } })
     fireEvent.blur(input)
@@ -185,7 +185,7 @@ describe('SubagentDefaults — per-agent axes', () => {
   it('clearing the description deletes only that key and keeps the axes', async () => {
     const { calls } = await mountDefaults({ ...DELEGATE_BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3', description: '通用编码' } } })
     await category('子智能体')
-    const input = screen.getByLabelText('描述（写给主代理看） · CodeBuddy') as HTMLInputElement
+    const input = screen.getByLabelText('描述（写给主智能体看） · CodeBuddy') as HTMLInputElement
     expect(input.value).toBe('通用编码')
     fireEvent.change(input, { target: { value: '   ' } })
     fireEvent.blur(input)

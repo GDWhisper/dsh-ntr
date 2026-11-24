@@ -81,13 +81,13 @@ describe('SubagentDefaults — folding one agent', () => {
 
     // The description commits on blur, so its draft lives in the input alone:
     // folding must display-toggle the body, never unmount it.
-    const input = screen.getByLabelText('描述（写给主代理看） · CodeBuddy') as HTMLInputElement
+    const input = screen.getByLabelText('描述（写给主智能体看） · CodeBuddy') as HTMLInputElement
     fireEvent.change(input, { target: { value: '正在编辑的草稿' } })
     await click(headOf('codebuddy'))
     expect(body()?.hasAttribute('hidden')).toBe(true)
     expect(headOf('codebuddy').getAttribute('aria-expanded')).toBe('false')
-    expect(screen.getByLabelText('描述（写给主代理看） · CodeBuddy')).toBe(input)
-    expect((screen.getByLabelText('描述（写给主代理看） · CodeBuddy') as HTMLInputElement).value).toBe('正在编辑的草稿')
+    expect(screen.getByLabelText('描述（写给主智能体看） · CodeBuddy')).toBe(input)
+    expect((screen.getByLabelText('描述（写给主智能体看） · CodeBuddy') as HTMLInputElement).value).toBe('正在编辑的草稿')
 
     // 全部展开 appears as soon as anything is folded, and folding every card
     // flips the control back.
