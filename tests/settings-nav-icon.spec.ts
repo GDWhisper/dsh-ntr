@@ -40,7 +40,11 @@ describe('installSettingsNavIcon', () => {
     expect(glyph!.getAttribute('height')).toBe('16')
     expect(glyph!.getAttribute('class')).toBe('navIcon')
     expect(glyph!.getAttribute('aria-hidden')).toBe('true')
-    expect(glyph!.querySelectorAll('circle').length).toBe(2)
+    // Three interlocking rings — and three DIFFERENT centres, since a stacked
+    // copy of one circle would satisfy a bare count.
+    const rings = Array.from(glyph!.querySelectorAll('circle'))
+    expect(rings.length).toBe(3)
+    expect(new Set(rings.map(ring => `${ring.getAttribute('cx')},${ring.getAttribute('cy')}`)).size).toBe(3)
     expect(button.hasAttribute('data-dsh-ntr-nav-icon')).toBe(true)
     cleanup()
   })
@@ -163,7 +167,7 @@ describe('installSettingsNavIcon', () => {
     await flushRaf()
 
     expect(second.button.hasAttribute('data-dsh-ntr-nav-icon')).toBe(true)
-    expect(second.button.querySelectorAll('circle').length).toBe(2)
+    expect(second.button.querySelectorAll('circle').length).toBe(3)
     cleanup()
   })
 })

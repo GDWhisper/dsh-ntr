@@ -35,14 +35,21 @@ const GLYPH_ATTR = 'data-dsh-ntr-nav-icon'
 const GLYPH_MARK = 'data-dsh-ntr-glyph'
 
 /**
- * Interlocking double ring, drawn in the shell's idiom: 24 grid, two rings
- * overlapping — the DSH display layer meeting the ACP agent layer. Filled
- * with `currentColor` at low opacity for the overlap; no literal colors.
+ * Interlocking triple ring, drawn in the shell's idiom: 24 grid, three equal
+ * rings in a row at the same overlap the old pair used (spacing = radius), the
+ * outer two being the layers that meet — the DSH display layer and the ACP
+ * agent layer — and the middle one the bridge that joins them. Filled with
+ * `currentColor` at low opacity; no literal colors.
+ *
+ * Three rings have to be smaller than two (r 5 vs 6) to stay inside the shell's
+ * 24 grid: at three radii the old size would clip its strokes on both edges,
+ * and the row leaves 1.1 units of margin once the 1.8 stroke is accounted for.
  */
-const DOUBLE_RING_MARKUP =
+const TRIPLE_RING_MARKUP =
   '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
-  '<circle cx="9" cy="12" r="6" stroke="currentColor" stroke-width="1.8" fill="currentColor" fill-opacity="0.08" />' +
-  '<circle cx="15" cy="12" r="6" stroke="currentColor" stroke-width="1.8" fill="currentColor" fill-opacity="0.08" />' +
+  '<circle cx="7" cy="12" r="5" stroke="currentColor" stroke-width="1.8" fill="currentColor" fill-opacity="0.08" />' +
+  '<circle cx="12" cy="12" r="5" stroke="currentColor" stroke-width="1.8" fill="currentColor" fill-opacity="0.08" />' +
+  '<circle cx="17" cy="12" r="5" stroke="currentColor" stroke-width="1.8" fill="currentColor" fill-opacity="0.08" />' +
   '</svg>'
 
 interface SwappedGlyph {
@@ -70,7 +77,7 @@ function swapNavGlyph(records: SwappedGlyph[]): void {
     if (gear === null) continue
 
     const holder = document.createElement('template')
-    holder.innerHTML = DOUBLE_RING_MARKUP
+    holder.innerHTML = TRIPLE_RING_MARKUP
     const glyph = holder.content.firstElementChild
     if (glyph === null) continue
 
