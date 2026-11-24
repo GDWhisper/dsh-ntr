@@ -18,26 +18,29 @@ const ALIAS = {
  * taxing the other's work.
  *
  * `bridge`: specs that drive real agent child processes over the real clock
- * (spawn ≈ 0.23 s each, ~3 per case; 474 cases). Unbounded file-level
- * parallelism used to starve Windows process creation and time out timing
- * cases — including ones nobody touched — so this bucket runs in ONE fork and
- * never more. See docs/plan/archive/bridge-split.md.
+ * (spawn ≈ 0.23 s each, ~3 per case; 474 cases). This bucket runs in ONE fork
+ * and never more. That is measured, not inherited caution: with two forks, 4
+ * of 8 full-suite runs went red — `a1-per-session` timing out on liveness, and
+ * panel renders blowing the 5 s default once the extra fork's child churn
+ * landed on them. Each extra fork multiplies process creation, and Windows
+ * process creation is what these cases wait on. See
+ * docs/plan/archive/bridge-split.md for the original 20-fork failure.
  *
  * `unit`: everything else — pure functions, jsdom renders, and a handful of
  * specs that DO spawn (quota-refusal, skills-server, agy-late-output, and the
  * symlink-counting cases in skills.spec.ts). Those are this split's residual
- * risk: they run concurrently with each other and beside the bridge fork, so a
- * timing flake in this bucket should be read as this worker budget being too
- * wide BEFORE it is read as a product bug. The bucket cost ~117 s of the
- * suite's ~410 s when it ran alone on one fork, and because Vitest runs the
- * two projects concurrently it now hides under the bridge bucket instead of
- * adding to it.
+ * risk: they run concurrently with each other, so a timing flake in this
+ * bucket should be read as this worker budget being too tight BEFORE it is
+ * read as a product bug. The bucket cost ~117 s of the suite's ~410 s when it
+ * ran alone on one fork, and because Vitest runs the two projects concurrently
+ * it now hides under the bridge bucket instead of adding to it.
  *
  * Two worker knobs, and neither means what it looks like:
  *   - `maxWorkers` is ROOT-ONLY (`ProjectConfig` omits it) but it is a
  *     PER-POOL ceiling, not a run-wide one: forks and threads build their own
- *     pools. Peak here is 1 fork + 3 threads = 4 processes, matching a 4-vCPU
- *     runner — raising it gives back the headroom the bridge fork needs.
+ *     pools. Peak here is 1 fork + 3 threads = 4 processes. Dropping it to 2
+ *     was tried and is worse: the thread pool then starves the panel renders
+ *     into 5 s timeouts while the forks multiply anyway.
  *   - inside a project, `poolOptions` narrows to `singleFork` / `isolate`
  *     only. `maxForks` is accepted and SILENTLY IGNORED in a project — that is
  *     how the bridge bucket once ran 20 ways at once and mass-timed-out.
