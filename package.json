@@ -33,7 +33,8 @@
     "check:size": "node scripts/check-file-size.mjs",
     "build": "tsc -p tsconfig.json && tsdown --config-loader native",
     "test": "vitest run tests",
-    "prepack": "npm run check:size && npm run typecheck && npm test && npm run build"
+    "prepack": "npm run check:size && npm run build",
+    "verify": "npm run prepack && npm test"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.4.0",
