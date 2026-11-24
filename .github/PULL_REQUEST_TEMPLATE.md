@@ -1,5 +1,5 @@
-> 开 PR 前请读 [CONTRIBUTING.md](../CONTRIBUTING.md)：分支命名、必须通过的检查、提交信息规范都在那里。
-> Read [CONTRIBUTING.md](../CONTRIBUTING.md) before opening this PR — branch naming, required checks, and commit conventions live there.
+> 开 PR 前请读 [CONTRIBUTING.md](https://github.com/GDWhisper/dsh-ntr/blob/main/CONTRIBUTING.md)：分支命名、必须通过的检查、提交信息规范都在那里。
+> Read [CONTRIBUTING.md](https://github.com/GDWhisper/dsh-ntr/blob/main/CONTRIBUTING.md) before opening this PR — branch naming, required checks, and commit conventions live there.
 
 ## 摘要 / Summary
 
