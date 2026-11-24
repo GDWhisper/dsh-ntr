@@ -80,6 +80,13 @@
 
 `turn/end` 的权威来源是 `session/prompt` 的响应。响应到达后隔一个宏任务把已进入 transcript 的尾部补折进当前段再收口（`flushScheduledClose` / `drainTail`；stale 回合不补读，final `turn/metrics` 先于 `turn/end`）；settle 后紧接的拆除（`TurnStreamController.dispose`）清掉排队的收口，不补第二帧 `turn/end`。被并入 CodeBuddy 后台 drain 的回合是**延后收口**：响应已回、正文随 drain 到达，quiet（`ambientQuietMs`）/ 硬上限（`ambientMaxMs`）只收口这一轮、不杀进程（[protocol.md §6.2](./protocol.md)）；quiet 收口把 drain 的 requestId 记进 `DrainLedger.retired` 环再停用它（`retireAmbientId` + `stopDrain`；复活 run 的迟到正文只留在 transcript），hard 上限收口保留 active 记录并刷新活动时钟、交给 `ambientStaleMs` 惰性过期，`DrainLedger.notices` 去重环两种收口都不清（仅过期时随记录清），正常 settle 也不清——同一 drain 的重复宣告保持静默，下一次被并入的 prompt 仍识别为 steered。强制定稿只有两条受控路径：`session/cancel` 后的 `armCancelFallback`（人已经按过取消），与 `TurnWatchdogService.reapStalledTurns` 的无活动看门狗（会话 running 且未关闭 / 未释放、段开着——控制器须属于同一个 `LiveSession`，stale 按不存在处理、`/acp` 无控制器按开着——无待答审批，且 agent 连续静默超过 `turnStallMs`；`activeToolCalls` 非空时 `turnStallToolMs`，按 `toolCallId` 计集合，并行调用等最后一个结束）。**开火只收口 turn、不杀进程**；杀进程只发生在下一条消息的 `prepareStalledSession` 善后：有 `loadSession` 走 `releaseAll` + `session/load`，没有则 `forceReset`（`/acp` 下次 prompt 报 `session_reset`）并告知上下文已丢；暂定首轮零可见产出被收口时锁回滚、会话关闭，notice 说明这一轮已丢弃、下一条消息新建 ACP 会话（不得承诺 resume）。正常结束但零可见产出必须显式告警。完整判据见 [protocol.md §6.1](./protocol.md)。
 
+### 2.4 本地 `file://` Markdown 链接重写
+
+`AcpLlmAdapter.stream` 只在对话轮次（`purpose === undefined`）把出口流包一层 `rewriteStreamFileLinks`（`src/impl/file-links.ts`），把本地 `file:///` / `file://localhost/` 链接（含 `<...>` 包裹形式）转为纯路径，原始 ACP transcript、echo guard 与辅助调用（`session-title` 等）一律不改。
+
+- **宿主渲染耦合点（双份真相）**：什么算可点击的本地文件链接目前分在两处——DSH 聊天 Markdown 渲染器先剥 `#...`、再 `decodeURIComponent`，满足本地路径白名单（`/^(?:[\\/]\|\.{1,2}[\\/]|[a-z]:[\\/])/i`）或 `!URL.canParse(decoded)` 才走文件侧栏；本重写器负责把 `file://` 前缀拆成宿主可认的纯路径。宿主规则改动会让本模块静默失配，修改须同步核对。
+- **有界流式状态机契约**：`MarkdownFileLinkRewriter` 每步只做单字符转移，只在 `linkBuf` 缓冲最多 `MAX_LINK_LOOKAHEAD`（25）个字符（`1` 字符 / 任意 2 段切分不变）；跟踪围栏代码块（含引用块 `>` 嵌套深度 `fenceQuoteDepth`，离开引用层即关闭围栏）、文首/空行后的 4 空格/Tab 缩进代码块、以及跨空行自动清零的行内反引号；`flush()` 原样回吐未完成的 `linkBuf`，绝不截断 `](file:///C` 一类半截前缀。本地 authority 与 Windows 盘符头判定复用 `src/impl/paths.ts` · `classifyLocalFileUrlHead`（与 `normalizeFileUrlToPath` 共用）。
+
 ## 3. 会话 ↔ agent 绑定
 
 `session/chat-bind` / `session/chat-model-set` / `session/chat-effort-set` / `session/chat-mode-set` 指向「这条 DSH 会话由哪个 agent 服务」，**不写全局默认模型，也不经 `session/selectModel`**。
@@ -162,6 +169,7 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 | 主题 | 位置 |
 |---|---|
 | 消息选择 / 转发 | `src/impl.ts` · `selectForwardPrompt`；`src/bridge/manager.ts` · `streamPrompt` |
+| 本地 `file://` 链接重写 | `src/impl.ts` · `rewriteStreamFileLinks` / `normalizeMarkdownFileLinks` / `MarkdownFileLinkRewriter` / `classifyLocalFileUrlHead`；`src/bridge/adapter.ts` · `AcpLlmAdapter.stream` |
 | 工具卡快照 / delta / 输出注册 | `src/impl.ts` · `acpToolCallFromUpdate` / `acpToolCallDelta` / `acpToolCallArgsOf` / `isFinalToolCallStatus`；`src/bridge/registries.ts` · `recordAcpToolOutput` / `waitForToolOutput`；详见 [protocol.md](./protocol.md) |
 | 绑定 RPC | `src/impl.ts` · `dispatchRpc('session/chat-*')`；`src/bridge/session-registry-service.ts` · `bindChatAgent`；`src/bridge/chat-choice-service.ts` · `setChatSessionModel` / `setChatSessionEffort` / `setChatSessionMode` |
 | 路由选择 / 老宿主请求改写 | `presets/acp/acp-guard.mjs` · `selectBoundRoute` / `agent/request`；`src/bridge/chat-choice-service.ts` · `conversationRouteModel` |
@@ -180,7 +188,7 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 | `src/protocol-subagent.ts` | 子代理记录与详情的契约半区（`SubagentRecord` / `SubagentDetailEntry` / `SubagentDetailPayload` / 上限常量）：纯类型与常量，由 `protocol.ts` 重导出 |
 | `src/subagent-records.ts` | 子代理记录的归一与封顶（`normalizeSubagentRecord` / `capSubagentRecords` / `subagentToolCallId` / `boundSubagentDetailEntry`）：纯函数，由 `impl.ts` 重导出 |
 | `src/usage.ts` | `usage_update` 样本 → 上下文读数（`mergeUsageSample`）：可读样本替换读数，`size <= 0` 的成本帧（CodeBuddy 后台 team member）只并 `cost`、保留上次 `used/size`；纯函数，宿主 `AgentBridge` 与测试共用 |
-| `src/impl.ts` | 纯宿主端逻辑的桶：只有再导出，逻辑本体按簇在 `src/impl/`（`errors` / `validate` / `command-line` / `paths` / `env` / `catalog` / `content` / `image` + `attachments` / `forward` / `permission` / `skills` / `session-log` / `runtime` 运行时持有者 / `dispatch` RPC 分发）。文档里的 `src/impl.ts · 符号` 一律指「经桶定位」，本体在对应簇：`dispatchRpc` / `AcpManager` → `dispatch.ts`，`Transcript` / `EventHub` / `PermissionLedger` → `runtime.ts`，其余按名字找簇 |
+| `src/impl.ts` | 纯宿主端逻辑的桶：只有再导出，逻辑本体按簇在 `src/impl/`（`errors` / `validate` / `command-line` / `paths` / `env` / `catalog` / `content` / `image` + `attachments` + `file-links` / `forward` / `permission` / `skills` / `session-log` / `runtime` 运行时持有者 / `dispatch` RPC 分发）。文档里的 `src/impl.ts · 符号` 一律指「经桶定位」，本体在对应簇：`dispatchRpc` / `AcpManager` → `dispatch.ts`，`Transcript` / `EventHub` / `PermissionLedger` → `runtime.ts`，其余按名字找簇 |
 | `src/bridge/` | 宿主 ↔ ACP 子进程的 stdio 桥：进程、回合、绑定、锁、数据折叠 |
 | `src/skills-scan.ts` | 宿主侧 skill 目录扫描：按 agent 风味（`skillFlavorOf`，`src/impl.ts`）扫 project/global/system 三层目录并解析 SKILL.md，喂给 `agent/skills` RPC（`src/bridge/skills-service.ts` · `SkillsService.agentSkills`，内存 TTL 缓存）；只读文件系统，不 spawn、不落盘 |
 | `src/update.ts` | 内置更新：资格矩阵、registry 探测，把安装委托给宿主 `pluginManager`；不下载、不替换文件、不重启 |

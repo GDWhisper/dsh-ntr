@@ -289,3 +289,95 @@ export function isUnderPath(path: string, root: string): boolean {
   if (trimmedRoot === '') return path.startsWith('/') && !isWin32Style(path)
   return trimmedPath === trimmedRoot || trimmedPath.startsWith(`${trimmedRoot}/`)
 }
+
+// ---- Local `file://` URL head classification ----
+
+/**
+ * Classification of the substring immediately following `file://` (scheme
+ * already stripped). Shared by `normalizeFileUrlToPath` and
+ * `MarkdownFileLinkRewriter` so local authority and Windows drive-head rules
+ * stay in one place.
+ */
+export type LocalFileUrlHead =
+  | { readonly kind: 'incomplete' }
+  | { readonly kind: 'remote' }
+  | { readonly kind: 'posix'; readonly consumed: number }
+  | { readonly kind: 'drive'; readonly consumed: number; readonly driveLetter: string; readonly sep: '/' | '\\' }
+
+const LOCALHOST_AUTHORITY = 'localhost/'
+
+function isAsciiLetterChar(ch: string): boolean {
+  const code = ch.charCodeAt(0)
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122)
+}
+
+/**
+ * Classify the local authority and optional Windows drive head immediately
+ * following `file://`.
+ *
+ * - Empty authority (`/` → `file:///...`) and `localhost/` (case-insensitive)
+ *   are local; any other host (e.g. `server/share`) is `remote`.
+ * - A leading `/` after the local authority is stripped ONLY when confirmed to
+ *   be a Windows drive head (`[A-Za-z]:/` or `[A-Za-z]%3[Aa]/`, or `\`):
+ *   incomplete prefixes return `incomplete` so streaming callers hold them
+ *   verbatim until the separating slash (or non-drive character) arrives.
+ * - `allowBareDrive` additionally recognizes legacy `file://C:/...` forms used
+ *   by attachment paths.
+ */
+export function classifyLocalFileUrlHead(
+  afterScheme: string,
+  options?: { readonly allowBareDrive?: boolean },
+): LocalFileUrlHead {
+  if (afterScheme === '') return { kind: 'incomplete' }
+  let authorityLen = 0
+  if (afterScheme[0] === '/') {
+    authorityLen = 1
+  } else {
+    const lower = afterScheme.toLowerCase()
+    if (lower.startsWith(LOCALHOST_AUTHORITY)) {
+      authorityLen = LOCALHOST_AUTHORITY.length
+    } else if (LOCALHOST_AUTHORITY.startsWith(lower)) {
+      return { kind: 'incomplete' }
+    } else if (options?.allowBareDrive === true) {
+      const bare = /^([A-Za-z])(?::|%3[Aa])([\\/])/.exec(afterScheme)
+      if (bare !== null) {
+        return {
+          kind: 'drive',
+          consumed: bare[0].length,
+          driveLetter: bare[1]!,
+          sep: bare[2] as '/' | '\\',
+        }
+      }
+      return { kind: 'remote' }
+    } else {
+      return { kind: 'remote' }
+    }
+  }
+
+  const rest = afterScheme.slice(authorityLen)
+  if (rest === '') return { kind: 'incomplete' }
+  const first = rest[0]!
+  if (!isAsciiLetterChar(first)) {
+    return { kind: 'posix', consumed: authorityLen }
+  }
+  if (rest.length === 1) return { kind: 'incomplete' }
+  if (rest[1] === ':') {
+    if (rest.length === 2) return { kind: 'incomplete' }
+    if (rest[2] === '/' || rest[2] === '\\') {
+      return { kind: 'drive', consumed: authorityLen + 3, driveLetter: first, sep: rest[2] }
+    }
+    return { kind: 'posix', consumed: authorityLen }
+  }
+  if (rest[1] === '%') {
+    if (rest.length === 2) return { kind: 'incomplete' }
+    if (rest[2] !== '3') return { kind: 'posix', consumed: authorityLen }
+    if (rest.length === 3) return { kind: 'incomplete' }
+    if (rest[3] !== 'a' && rest[3] !== 'A') return { kind: 'posix', consumed: authorityLen }
+    if (rest.length === 4) return { kind: 'incomplete' }
+    if (rest[4] === '/' || rest[4] === '\\') {
+      return { kind: 'drive', consumed: authorityLen + 5, driveLetter: first, sep: rest[4] }
+    }
+    return { kind: 'posix', consumed: authorityLen }
+  }
+  return { kind: 'posix', consumed: authorityLen }
+}
