@@ -139,7 +139,7 @@ export const BASE_DESCRIPTION = '把一件自成一体的任务交给一个已�
  * the child's accumulated context). Naming them turns a bare ban into a
  * decision procedure — a rule that hides its own exceptions gets ignored.
  */
-export const GUIDANCE_PREFIX = '需要派发子代理时必须使用本工具（优先于任何原生子代理/委派工具）；只有子代理必须继承本会话上下文、或需要中途追加指令与多轮续聊时才用原生。'
+export const GUIDANCE_PREFIX = '需要派发子智能体时必须使用本工具（优先于任何原生子智能体/委派工具）；只有子智能体必须继承本会话上下文、或需要中途追加指令与多轮续聊时才用原生。'
 /**
  * The NATIVE base description: immediate name, settlement notification later.
  * "可以继续做不相交的工作" mirrors the host's own delegation guidance (the host
@@ -152,7 +152,7 @@ export const GUIDANCE_PREFIX = '需要派发子代理时必须使用本工具（
  */
 export const NATIVE_BASE_DESCRIPTION = '把一件自成一体的任务交给一个已配置的外部 ACP agent，在它自己的进程与上下文里执行，'
   + '再把最终答复带回本会话。适合独立调研、单文件改动、复核审查、跨模型第二意见这类不需要本会话上下文的工作。'
-  + '只回最终答复、不回中间步骤；调用立即返回子代理的 name，不等待结果。'
+  + '只回最终答复、不回中间步骤；调用立即返回子智能体的 name，不等待结果。'
   + '派发后可以继续做不相交的工作（别和它改同一批文件，合并前复核 diff 并跑测试），只剩等待时结束本回合，'
   + '宿主会把结算通知送达并起下一轮；这是一次性委派，不能续聊，要追加指令就重新派发。'
 
@@ -169,7 +169,7 @@ function messageOf(error: unknown): string {
  * renders a half-built list.
  */
 function delegateAgentParamDescription(roster: readonly DelegateAgentDoc[] | undefined): string {
-  const base = '已配置的 agent id；省略 = 子代理设置的默认 agent（未配置或已失效时回落到全局默认 agent），两者都空则报错'
+  const base = '已配置的 agent id；省略 = 用子智能体委派配置的默认 agent（未配置或已失效时回落到全局默认 agent），两者都空则报错'
   if (roster === undefined) return base
   const text = delegateRosterText(roster)
   return text === '' ? base : `${base}\n${text}`
@@ -256,12 +256,12 @@ export function acpDelegateToolDefinition(opts: {
     parameters: {
       type: 'object',
       properties: {
-        task: { type: 'string', description: '完整任务描述（子代理看不到本会话上下文）' },
+        task: { type: 'string', description: '完整任务描述（子智能体看不到本会话上下文）' },
         agent: { type: 'string', description: delegateAgentParamDescription(opts.roster) },
         cwd: { type: 'string', description: '工作目录；省略 = 继承调用会话工作区；显式指定须在该工作区或该 agent 的 allowedCwdRoots 内' },
-        model: { type: 'string', description: '模型 id；省略 = 子代理设置中该 agent 的默认模型；显式指定而 agent 不提供时报错' },
-        effort: { type: 'string', description: '思考等级；省略 = 子代理设置默认；不支持时自动丢弃并留痕' },
-        mode: { type: 'string', description: '工作模式 id；省略 = 子代理设置默认；显式指定而 agent 不提供时报错' },
+        model: { type: 'string', description: '模型 id；省略 = 用子智能体委派配置中该 agent 的默认模型；显式指定而 agent 不提供时报错' },
+        effort: { type: 'string', description: '思考等级；省略 = 用子智能体委派配置的默认值；不支持时自动丢弃并留痕' },
+        mode: { type: 'string', description: '工作模式 id；省略 = 用子智能体委派配置的默认值；显式指定而 agent 不提供时报错' },
       },
       required: ['task'],
     },
@@ -280,7 +280,7 @@ export function acpDelegateToolDefinition(opts: {
         render: (_args: unknown, value: unknown) => {
           const row = (typeof value === 'object' && value !== null ? value : {}) as { kind?: unknown; name?: unknown; agent?: unknown; error?: unknown; text?: unknown }
           if (row.kind === 'activation') {
-            return [{ type: 'text', text: `已委派给 ACP agent ${String(row.agent ?? '')}：子代理 ${String(row.name ?? '')} 已在后台开始执行。可继续做不相交的工作；只剩等待时结束本回合，完成后宿主会把它的答复作为通知送达本会话。` }]
+            return [{ type: 'text', text: `已委派给 ACP agent ${String(row.agent ?? '')}：子智能体 ${String(row.name ?? '')} 已在后台开始执行。可继续做不相交的工作；只剩等待时结束本回合，完成后宿主会把它的答复作为通知送达本会话。` }]
           }
           if (row.kind === 'error') return [{ type: 'text', text: `acp_delegate 委派失败：${String(row.error ?? '')}` }]
           return [{ type: 'text', text: String(row.text ?? '') }]

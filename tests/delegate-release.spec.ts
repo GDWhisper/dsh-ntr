@@ -91,7 +91,7 @@ describe('acp_release registration', () => {
     const { registration, registered } = makeRegistration({
       guidance: 'on',
       roster: () => [
-        { id: 'codebuddy', title: 'CodeBuddy', description: '通用编码，支持子代理' },
+        { id: 'codebuddy', title: 'CodeBuddy', description: '通用编码，支持子智能体' },
         { id: 'qoder', title: 'Qoder', effort: 'xhigh' },
       ],
     })
@@ -100,7 +100,7 @@ describe('acp_release registration', () => {
       properties?: { agent?: { description?: string } }
     } | undefined)?.properties?.agent)
     expect(agent?.description).toContain('可按特性挑选：')
-    expect(agent?.description).toContain('- codebuddy（CodeBuddy）：通用编码，支持子代理；委派默认：跟随进程自身')
+    expect(agent?.description).toContain('- codebuddy（CodeBuddy）：通用编码，支持子智能体；委派默认：跟随进程自身')
     expect(agent?.description).toContain('- qoder（Qoder）：委派默认：等级 xhigh')
   })
 

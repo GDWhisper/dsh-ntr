@@ -514,7 +514,7 @@ describe('acp_delegate tool definition (register-ready)', () => {
     for (const guidance of ['off', 'on'] as const) {
       const definition = acpDelegateToolDefinition({ guidance, execute })
       expect(definition.description).toBe(BASE_DESCRIPTION)
-      expect(definition.description).not.toContain('优先于任何原生子代理/委派工具')
+      expect(definition.description).not.toContain('优先于任何原生子智能体/委派工具')
       expect(definition.timeoutMs).toBe(86_400_000) // the backstop is rung-independent too
     }
     for (const guidance of ['enhanced', 'force'] as const) {
@@ -528,10 +528,10 @@ describe('acp_delegate tool definition (register-ready)', () => {
   it('the choice parameters state the value chain and the failure semantics', () => {
     const definition = acpDelegateToolDefinition({ guidance: 'on', execute })
     const properties = definition.parameters.properties as Record<string, { type: string; description: string }>
-    expect(properties.agent.description).toBe('已配置的 agent id；省略 = 子代理设置的默认 agent（未配置或已失效时回落到全局默认 agent），两者都空则报错')
-    expect(properties.model).toEqual({ type: 'string', description: '模型 id；省略 = 子代理设置中该 agent 的默认模型；显式指定而 agent 不提供时报错' })
-    expect(properties.effort).toEqual({ type: 'string', description: '思考等级；省略 = 子代理设置默认；不支持时自动丢弃并留痕' })
-    expect(properties.mode).toEqual({ type: 'string', description: '工作模式 id；省略 = 子代理设置默认；显式指定而 agent 不提供时报错' })
+    expect(properties.agent.description).toBe('已配置的 agent id；省略 = 用子智能体委派配置的默认 agent（未配置或已失效时回落到全局默认 agent），两者都空则报错')
+    expect(properties.model).toEqual({ type: 'string', description: '模型 id；省略 = 用子智能体委派配置中该 agent 的默认模型；显式指定而 agent 不提供时报错' })
+    expect(properties.effort).toEqual({ type: 'string', description: '思考等级；省略 = 用子智能体委派配置的默认值；不支持时自动丢弃并留痕' })
+    expect(properties.mode).toEqual({ type: 'string', description: '工作模式 id；省略 = 用子智能体委派配置的默认值；显式指定而 agent 不提供时报错' })
     // The new axes are optional: only task stays required.
     expect(definition.parameters.required).toEqual(['task'])
   })
@@ -608,12 +608,12 @@ describe('acp_delegate registration sync', () => {
     const { registration, config } = makeRegistration(tools.ctx)
     config.guidance = 'on'
     registration.sync()
-    expect(tools.registered[0].definition.description).not.toContain('优先于任何原生子代理/委派工具')
+    expect(tools.registered[0].definition.description).not.toContain('优先于任何原生子智能体/委派工具')
     config.guidance = 'enhanced'
     registration.sync()
     expect(tools.disposerCalls()).toBe(1)
     expect(tools.registered).toHaveLength(1)
-    expect(tools.registered[0].definition.description).toContain('优先于任何原生子代理/委派工具')
+    expect(tools.registered[0].definition.description).toContain('优先于任何原生子智能体/委派工具')
     config.timeoutMs = 300_000
     registration.sync()
     expect(tools.disposerCalls()).toBe(2) // the settings signature still re-registers on a window change
