@@ -131,8 +131,8 @@ export function SkillsMcpPreference(props: {
           The info icon sits beside the switch it explains. */}
       <div className="dwa-card dwa-skills-card">
         <div className="dwa-skills-card-text">
-          <h3 className="dwa-section-title">{acp.label('DSH 技能发现', 'DSH Skill Discovery')}</h3>
-          <p className="dwa-section-copy">{acp.label(EXPLANATION[0], EXPLANATION[1])}</p>
+          <h3 className="dwa-row-title">{acp.label('DSH 技能发现', 'DSH Skill Discovery')}</h3>
+          <p className="dwa-row-desc">{acp.label(EXPLANATION[0], EXPLANATION[1])}</p>
         </div>
         <div className="dwa-skills-card-control">
           <Tooltip label={acp.label(DETAIL[0], DETAIL[1])} side="top">

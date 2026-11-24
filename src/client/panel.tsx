@@ -181,7 +181,9 @@ export function AcpSettingsSection(props: WithStore) {
       {page === 'diagnostics' && (
         <section className="dwa-section">
           <h3 className="dwa-section-title">{acp.label('连接诊断', 'Connection diagnostics')}</h3>
-          <div className="dwa-preference-row"><span>{acp.label('宿主事件流', 'Host event stream')}</span><span className="dwa-hint">{streamText(ui.stream, acp)}</span></div>
+          <div className="dwa-preferences">
+            <div className="dwa-preference-row"><span>{acp.label('宿主事件流', 'Host event stream')}</span><span className="dwa-hint">{streamText(ui.stream, acp)}</span></div>
+          </div>
           <div className="dwa-row-actions">
             <button type="button" className="dwa-btn" onClick={() => { void acp.resync(); void acp.detectAgents() }} disabled={ui.detecting}>
               {ui.detecting ? acp.label('检测中...', 'Detecting...') : acp.label('重新检测与刷新', 'Re-detect & Refresh')}
@@ -240,22 +242,27 @@ export function AcpSettingsSection(props: WithStore) {
           </div>
         )}
 
-        <div className="dwa-agent-list">
-          {configured.map(({ info, synthesized }) => {
-            const activeAgent = ui.agents.find(a => a.id === info.id)
-            return (
-              <AgentRow
-                key={info.id}
-                detected={info}
-                activeAgent={activeAgent}
-                acp={acp}
-                isDefault={ui.defaultAgent === info.id}
-                synthesized={synthesized}
-                active={page === 'agents'}
-              />
-            )
-          })}
-        </div>
+        {/* The roster card only exists when there is a roster: an empty one
+            would draw a border-and-radius box with nothing in it, right under
+            the empty-state block that already says why it is empty. */}
+        {configured.length > 0 && (
+          <div className="dwa-agent-list">
+            {configured.map(({ info, synthesized }) => {
+              const activeAgent = ui.agents.find(a => a.id === info.id)
+              return (
+                <AgentRow
+                  key={info.id}
+                  detected={info}
+                  activeAgent={activeAgent}
+                  acp={acp}
+                  isDefault={ui.defaultAgent === info.id}
+                  synthesized={synthesized}
+                  active={page === 'agents'}
+                />
+              )
+            })}
+          </div>
+        )}
       </section>
 
       <section className="dwa-section" hidden={page !== 'add'} aria-label={acp.label('添加智能体', 'Add agent')}>

@@ -111,9 +111,9 @@ describe('SubagentCard', () => {
     await mountDelegate({ ...BASE, guidance: 'enhanced' })
     await category('子代理')
     const note = screen.getByText('该档位会增强工具描述，引导大模型优先使用本工具。')
-    expect(note.className).toContain('dwa-deadline-warn')
-    expect(note.getAttribute('style')).toContain('--dsw-alias-state-warn-primary')
-    expect(note.getAttribute('style')).toContain('--dsw-alias-state-warn-tertiary')
+    // The warn tone is the box's DEFAULT: no modifier, so the stylesheet's own
+    // warn pair is what it wears.
+    expect(note.className).toBe('dwa-deadline-warn')
     expect(screen.queryByText(/强制模式会屏蔽/)).toBeNull()
   })
 
@@ -122,9 +122,22 @@ describe('SubagentCard', () => {
     await category('子代理')
     const note = screen.getByText('强制模式会屏蔽 DSH 的原生 subagent 能力，请谨慎开启。')
     expect(note.className).toContain('dwa-deadline-warn')
-    expect(note.getAttribute('style')).toContain('--dsw-alias-state-error-primary')
-    expect(note.getAttribute('style')).toContain('--dsw-alias-interactive-bg-hover-danger')
+    expect(note.className).toContain('is-danger')
     expect(screen.queryByText(/该档位会增强工具描述/)).toBeNull()
+  })
+
+  it('injects one whole stylesheet, never a string cut short by a stray delimiter', async () => {
+    await mountDelegate(BASE)
+    const style = [...document.head.querySelectorAll('style')]
+      .map(node => node.textContent ?? '')
+      .find(text => text.includes('.dwa-deadline-warn')) ?? ''
+    // STYLE is a template literal, so a stray backtick or a `${` splits it into
+    // two halves that are each still valid TypeScript — the loss is silent. The
+    // first and last rules plus balanced braces are the cheapest proof that the
+    // whole sheet is in the document, not just its head.
+    expect(style).toContain('.dwa-root {')
+    expect(style).toContain('prefers-reduced-motion: reduce')
+    expect((style.match(/\{/g) ?? []).length).toBe((style.match(/\}/g) ?? []).length)
   })
 
   it('shows the off hint as a neutral banner and the on hint as a success banner', async () => {
@@ -132,16 +145,34 @@ describe('SubagentCard', () => {
     await category('子代理')
     const offHint = screen.getByText('子代理功能关闭，当前NTR不作为原生dsh的子代理工具')
     expect(offHint.className).toContain('dwa-deadline-warn')
-    expect(offHint.getAttribute('style')).toContain('--dsw-alias-label-primary')
-    expect(offHint.getAttribute('style')).toContain('--dsw-alias-bg-layer-2')
+    expect(offHint.className).toContain('is-neutral')
     expect(screen.queryByText(/关闭 = 不注册本工具/)).toBeNull()
     fireEvent.change(screen.getByRole('slider', { name: '子代理委派' }), { target: { value: '1' } })
     const onHint = await screen.findByText('NTR将作为子代理工具注册进原生dsh会话中，下一轮对话生效')
     expect(onHint.className).toContain('dwa-deadline-warn')
-    expect(onHint.getAttribute('style')).toContain('--dsw-alias-state-success-primary')
-    expect(onHint.getAttribute('style')).toContain('--dsw-alias-state-success-tertiary')
+    expect(onHint.className).toContain('is-success')
     expect(screen.queryByText('子代理功能关闭，当前NTR不作为原生dsh的子代理工具')).toBeNull()
     expect(screen.queryByText(/关闭 = 不注册本工具/)).toBeNull()
+  })
+
+  it('declares every note tone with host alias tokens, never a literal', async () => {
+    // The tones moved out of inline styles and into the stylesheet, so the
+    // token fact is asserted where it is written. jsdom does not resolve CSS
+    // custom properties, so the rule text is the evidence.
+    await mountDelegate({ ...BASE, guidance: 'force' })
+    const style = [...document.head.querySelectorAll('style')]
+      .map(node => node.textContent ?? '')
+      .find(text => text.includes('.dwa-deadline-warn')) ?? ''
+    const rule = (selector: string): string => {
+      const start = style.indexOf(selector)
+      expect(start).toBeGreaterThan(-1)
+      return style.slice(start, style.indexOf('}', start))
+    }
+    // Default warn pair, then the three modifiers.
+    expect(rule('.dwa-deadline-warn {')).toContain('--dsw-alias-state-warn-tertiary')
+    expect(rule('.dwa-deadline-warn.is-neutral')).toContain('--dsw-alias-bg-layer-2')
+    expect(rule('.dwa-deadline-warn.is-success')).toContain('--dsw-alias-state-success-tertiary')
+    expect(rule('.dwa-deadline-warn.is-danger')).toContain('--dsw-alias-interactive-bg-hover-danger')
   })
 
   it('removes the ladder sentence on every rung, keeping only the warn boxes', async () => {

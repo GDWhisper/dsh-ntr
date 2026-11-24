@@ -80,40 +80,31 @@ function delegateOverrideNote<K extends DelegateSettingKey>(
 }
 
 /**
- * The guidance row's hint, per rung. `off` and `on` render as the same banner
- * shape as the per-rung warnings (`.dwa-deadline-warn`: tinted background,
- * colored left border): off a neutral fact in the primary label color on a
- * layer background, on a success-green confirmation that the tool registers
- * next turn. enhanced / force return undefined — their warn boxes below are
- * the only note. Colors are host alias tokens only (constraint 34,
- * state-*-primary foreground on state-*-tertiary background); literals sit in
- * the var() fallbacks.
+ * The guidance row's hint, per rung. `off` and `on` render as the same box
+ * shape the per-rung warnings use (`.dwa-deadline-warn`): off a neutral fact
+ * in the primary label color on a layer background, on a success-green
+ * confirmation that the tool registers next turn. enhanced / force return
+ * undefined — their own boxes below are the only note. The TONE is a class
+ * (`is-neutral` / `is-success`), not an inline style: the ink pair lives in the
+ * stylesheet with every other color (constraint 34).
  */
 function guidanceHint(guidance: DelegateGuidance, acp: AcpStore): {
   text: string
-  box: { color: string; background: string; borderLeftColor: string }
+  tone: 'neutral' | 'success'
 } | undefined {
   if (guidance === 'off') return {
     text: acp.label(
       '子代理功能关闭，当前NTR不作为原生dsh的子代理工具',
       'Subagents are off; NTR does not act as a native DSH subagent tool.',
     ),
-    box: {
-      color: 'var(--dsw-alias-label-primary, #111827)',
-      background: 'var(--dsw-alias-bg-layer-2, #f3f4f6)',
-      borderLeftColor: 'var(--dsw-alias-label-primary, #111827)',
-    },
+    tone: 'neutral',
   }
   if (guidance === 'on') return {
     text: acp.label(
       'NTR将作为子代理工具注册进原生dsh会话中，下一轮对话生效',
       'NTR registers as a subagent tool in native DSH sessions, effective next turn.',
     ),
-    box: {
-      color: 'var(--dsw-alias-state-success-primary, #16a34a)',
-      background: 'var(--dsw-alias-state-success-tertiary, #dcfce7)',
-      borderLeftColor: 'var(--dsw-alias-state-success-primary, #16a34a)',
-    },
+    tone: 'success',
   }
   return undefined
 }
@@ -139,7 +130,7 @@ function DelegateTimeoutInput(props: { ms: number; name: string; onCommit: (ms: 
   }
   return (
     <input
-      className="dwa-input"
+      className="dwa-input dwa-input-short"
       type="number"
       step="any"
       value={draft}
@@ -186,8 +177,10 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
       </div>
       <div className="dwa-preferences">
         <div className="dwa-preference-block">
-          <div className="dwa-preference-label">{acp.label('子代理委派', 'Delegation')}</div>
-          <div className="dwa-deadline-value">{guidanceText(delegate.guidance, acp)}</div>
+          <div className="dwa-preference-label">
+            {acp.label('子代理委派', 'Delegation')}
+            <span className="dwa-deadline-value">{guidanceText(delegate.guidance, acp)}</span>
+          </div>
           <input
             className="dwa-deadline-range"
             type="range"
@@ -207,16 +200,10 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
             ))}
           </div>
           {hint !== undefined && (
-            <div className="dwa-deadline-warn" style={hint.box}>{hint.text}</div>
+            <div className={`dwa-deadline-warn is-${hint.tone}`}>{hint.text}</div>
           )}
           {delegate.guidance === 'enhanced' && (
-            <div
-              className="dwa-deadline-warn"
-              style={{
-                color: 'var(--dsw-alias-state-warn-primary, #b45309)',
-                background: 'var(--dsw-alias-state-warn-tertiary, #fffbeb)',
-              }}
-            >
+            <div className="dwa-deadline-warn">
               {acp.label(
                 '该档位会增强工具描述，引导大模型优先使用本工具。',
                 'This rung strengthens the tool description, steering the model to prefer this tool.',
@@ -224,14 +211,7 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
             </div>
           )}
           {delegate.guidance === 'force' && (
-            <div
-              className="dwa-deadline-warn"
-              style={{
-                color: 'var(--dsw-alias-state-error-primary, #dc2626)',
-                background: 'var(--dsw-alias-interactive-bg-hover-danger, #fee2e2)',
-                borderLeftColor: 'var(--dsw-alias-state-error-primary, #dc2626)',
-              }}
-            >
+            <div className="dwa-deadline-warn is-danger">
               {acp.label(
                 '强制模式会屏蔽 DSH 的原生 subagent 能力，请谨慎开启。',
                 'Force mode masks DSH’s native subagent tools — enable it with care.',
@@ -247,18 +227,30 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
           {guidanceNote !== undefined && <div className="dwa-deadline-flag">⚠ {guidanceNote}</div>}
         </div>
         <div className="dwa-preference-block">
-          <div className="dwa-preference-label">{acp.label('单次时限', 'Time limit')}</div>
-          <div className="dwa-deadline-value">{delegateTimeoutText(delegate.timeoutMs, acp)}</div>
-          <DelegateTimeoutInput
-            ms={delegate.timeoutMs}
-            name={acp.label('单次时限', 'Time limit')}
-            onCommit={ms => void acp.setDelegateSettings({ timeoutMs: ms })}
-          />
-          <div className="dwa-preference-copy">
-            {acp.label(
-              '持续无新产出达到该时长即中止并报错；默认跟随全局，可手填覆盖。',
-              'Aborts and errors after this much silence with no new output; defaults to the global window, hand-fill to override.',
-            )}
+          {/* Label and value on one line, the hand-filled box opposite it: the
+              row reads as "this setting = this value" before the sentence that
+              explains when it fires. */}
+          <div className="dwa-row-split">
+            <div className="dwa-row-main">
+              <div className="dwa-preference-label">
+                {acp.label('单次时限', 'Time limit')}
+                <span className="dwa-deadline-value">{delegateTimeoutText(delegate.timeoutMs, acp)}</span>
+              </div>
+              <div className="dwa-preference-copy">
+                {acp.label(
+                  '持续无新产出达到该时长即中止并报错；默认跟随全局，可手填覆盖。',
+                  'Aborts and errors after this much silence with no new output; defaults to the global window, hand-fill to override.',
+                )}
+              </div>
+            </div>
+            <div className="dwa-row-side">
+              <DelegateTimeoutInput
+                ms={delegate.timeoutMs}
+                name={acp.label('单次时限', 'Time limit')}
+                onCommit={ms => void acp.setDelegateSettings({ timeoutMs: ms })}
+              />
+              <span className="dwa-hint">{acp.label('分钟', 'min')}</span>
+            </div>
           </div>
           {timeoutNote !== undefined && <div className="dwa-deadline-flag">⚠ {timeoutNote}</div>}
           {overridden && (

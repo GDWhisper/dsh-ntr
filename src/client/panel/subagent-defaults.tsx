@@ -272,8 +272,8 @@ function DescriptionInput(props: { acp: AcpStore; title: string; value: string |
   }, [committed])
   const label = acp.label('描述（写给主代理看）', 'Description (shown to the caller)')
   return (
-    <label style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 10 }}>
-      <span className="dwa-form-label">{label}</span>
+    <label className="dwa-field" style={{ marginTop: 12 }}>
+      <span className="dwa-field-label">{label}</span>
       <input
         className="dwa-input"
         aria-label={`${label} · ${title}`}
@@ -338,8 +338,8 @@ function AxisSelect(props: {
       `${defaultLabel.text} is what the agent reports as current, but the agent's own list does not include it, so no description is available.`,
     )
   return (
-    <label title={unlistedHint} style={{ display: 'flex', flexDirection: 'column', gap: 4, flex: '1 1 150px', minWidth: 150 }}>
-      <span className="dwa-form-label">{axisName}</span>
+    <label className="dwa-field" title={unlistedHint}>
+      <span className="dwa-field-label">{axisName}</span>
       <select
         className="dwa-select"
         aria-label={`${axisName} · ${title}`}
@@ -366,9 +366,39 @@ function AxisSelect(props: {
   )
 }
 
-/** One configured agent's row of three axis defaults. */
-function AgentDefaultsRow(props: { acp: AcpStore; ui: UiState; delegate: AcpDelegateSettings; agentId: string; title: string }) {
-  const { acp, ui, delegate, agentId, title } = props
+/** A chosen axis's own NAME, for the summary pills: a pill is a fact, not a
+ *  menu row, so it never carries the description's consumption multiplier. */
+function axisValueName(choices: AcpCatalogChoice[] | undefined, value: string): string {
+  const hit = choices?.find(choice => choice.value === value)
+  return hit === undefined || hit.name === '' ? value : hit.name
+}
+
+/**
+ * One configured agent's delegation profile, as a foldable card.
+ *
+ * The head is the summary line: the agent's name, plus what this profile
+ * actually changes about it — the axes it sets and whether it outranks the
+ * config file. That is the fact the old layout could not show without reading
+ * four controls and comparing them with「默认」, and it is why the head exists
+ * at all. The body is the form: the three axes as one row of three equal
+ * columns (the old `flex: 1 1 150px` wrapped them into a lopsided 2+1), the
+ * description, and one footer that holds the catalog's age, its refresh
+ * gesture and the config-file reset.
+ *
+ * Folding is display-toggled, never unmounted: the description keeps a local
+ * draft that is committed on blur, and folding mid-edit must not lose it.
+ */
+function AgentDefaultsRow(props: {
+  acp: AcpStore
+  ui: UiState
+  delegate: AcpDelegateSettings
+  agentId: string
+  title: string
+  /** Folded or open — owned by the section so「全部收起」can drive every row. */
+  open: boolean
+  onToggle: () => void
+}) {
+  const { acp, ui, delegate, agentId, title, open, onToggle } = props
   const catalog = ui.modelCatalogs[agentId]?.catalog
   const age = catalogAge(ui.modelCatalogs[agentId]?.updatedAt)
   const entry = delegate.agentDefaults?.[agentId]
@@ -376,6 +406,7 @@ function AgentDefaultsRow(props: { acp: AcpStore; ui: UiState; delegate: AcpDele
   const probing = ui.probingModels[agentId] === true
   const probeError = ui.probeErrors[agentId]
   const catalogMissing = ui.modelCatalogs[agentId] === undefined
+  const bodyId = `dwa-delegate-defaults-${agentId}`
 
   // Write one axis by replacing the whole entry (the ui/delegate-set contract):
   // keep the other axes as they are, set or drop this one. A no-op writes nothing.
@@ -413,61 +444,102 @@ function AgentDefaultsRow(props: { acp: AcpStore; ui: UiState; delegate: AcpDele
     shownDescription === undefined ? undefined : acp.label(`描述「${shownDescription}」`, `description "${shownDescription}"`),
   ].filter(part => part !== undefined).join(' · ')
 
+  // What this profile sets, and nothing else: an axis left on「默认」follows
+  // the agent process, so naming it would be noise on every row.
+  const setAxes = [
+    entry?.model === undefined ? undefined : acp.label(`模型 ${axisValueName(axisChoices(catalog, 'model', entry.model), entry.model)}`, `Model ${axisValueName(axisChoices(catalog, 'model', entry.model), entry.model)}`),
+    entry?.effort === undefined ? undefined : acp.label(`等级 ${axisValueName(axisChoices(catalog, 'effort', entry.model), entry.effort)}`, `Level ${axisValueName(axisChoices(catalog, 'effort', entry.model), entry.effort)}`),
+    entry?.mode === undefined ? undefined : acp.label(`模式 ${axisValueName(axisChoices(catalog, 'mode', entry.model), entry.mode)}`, `Mode ${axisValueName(axisChoices(catalog, 'mode', entry.model), entry.mode)}`),
+  ].filter((text): text is string => text !== undefined)
+
   return (
     <div className="dwa-preference-block">
-      <div className="dwa-preference-label">{title}</div>
-      <div className="dwa-preference-copy">
-        {acp.label('委派该智能体时的默认选择；「默认」跟随智能体进程自身。', 'Defaults when delegating to this agent; "Default" follows the agent process itself.')}
-      </div>
-      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 8 }}>
-        <AxisSelect acp={acp} title={title} axis="model" value={entry?.model} choices={axisChoices(catalog, 'model', entry?.model)} defaultLabel={resolvedAxisDefaultLabel(catalog, 'model', entry?.model)} onChange={value => writeAxis('model', value)} />
-        <AxisSelect acp={acp} title={title} axis="effort" value={entry?.effort} choices={axisChoices(catalog, 'effort', entry?.model)} defaultLabel={resolvedAxisDefaultLabel(catalog, 'effort', entry?.model)} onChange={value => writeAxis('effort', value)} />
-        <AxisSelect acp={acp} title={title} axis="mode" value={entry?.mode} choices={axisChoices(catalog, 'mode', entry?.model)} defaultLabel={resolvedAxisDefaultLabel(catalog, 'mode', entry?.model)} onChange={value => writeAxis('mode', value)} />
-      </div>
-      {entry?.model === undefined && (
-        <div className="dwa-preference-copy">
-          {acp.label('等级作用于运行时实际模型，不支持会自动丢弃。', 'The level applies to the runtime model; unsupported values are dropped.')}
-        </div>
-      )}
-      <DescriptionInput acp={acp} title={title} value={entry?.description} onCommit={writeDescription} />
-      <div className="dwa-preference-copy">
-        {acp.label('描述会写进 acp_delegate 的 agent 选项说明，主代理据此挑选。', 'Shown in acp_delegate\'s agent parameter description so the caller can pick.')}
-      </div>
-      <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-        <button type="button" className="dwa-btn dwa-btn-secondary" disabled={probing} onClick={() => void acp.probeModels(agentId)}>
-          {probing
-            ? (catalogMissing ? acp.label('正在获取目录…', 'Fetching catalog…') : acp.label('正在刷新目录…', 'Refreshing catalog…'))
-            : (catalogMissing ? acp.label('获取目录', 'Fetch catalog') : acp.label('刷新目录', 'Refresh catalog'))}
-        </button>
-        {age !== undefined && !probing && (
-          <span className="dwa-preference-copy" style={{ margin: 0 }}>
-            {acp.label(`目录更新于 ${age.zh}`, `Catalog read ${age.en}`)}
+      <button
+        type="button"
+        className="dwa-acc-head"
+        aria-expanded={open}
+        aria-controls={bodyId}
+        onClick={onToggle}
+      >
+        <span className="dwa-agent-avatar dwa-acc-avatar" aria-hidden>{title.slice(0, 2).toUpperCase()}</span>
+        <span className="dwa-acc-titles">
+          <span className="dwa-acc-name">{title}</span>
+          <span className="dwa-acc-pills">
+            {setAxes.length === 0
+              ? <span className="dwa-sum-pill">{acp.label('全部跟随进程默认', 'All follow the process')}</span>
+              : setAxes.map(text => <span key={text} className="dwa-sum-pill is-set">{text}</span>)}
+            {entry?.description !== undefined && (
+              <span className="dwa-sum-pill">{acp.label('已填描述', 'Description set')}</span>
+            )}
+            {overridden && <span className="dwa-sum-pill is-warn">{acp.label('覆盖配置文件', 'Overrides config')}</span>}
           </span>
+        </span>
+        <span className="dwa-caret" aria-hidden>{open ? '▴' : '▾'}</span>
+      </button>
+
+      <div className="dwa-acc-body" id={bodyId} hidden={!open}>
+        <div className="dwa-axis-grid">
+          <AxisSelect acp={acp} title={title} axis="model" value={entry?.model} choices={axisChoices(catalog, 'model', entry?.model)} defaultLabel={resolvedAxisDefaultLabel(catalog, 'model', entry?.model)} onChange={value => writeAxis('model', value)} />
+          <AxisSelect acp={acp} title={title} axis="effort" value={entry?.effort} choices={axisChoices(catalog, 'effort', entry?.model)} defaultLabel={resolvedAxisDefaultLabel(catalog, 'effort', entry?.model)} onChange={value => writeAxis('effort', value)} />
+          <AxisSelect acp={acp} title={title} axis="mode" value={entry?.mode} choices={axisChoices(catalog, 'mode', entry?.model)} defaultLabel={resolvedAxisDefaultLabel(catalog, 'mode', entry?.model)} onChange={value => writeAxis('mode', value)} />
+        </div>
+        {entry?.model === undefined && (
+          <div className="dwa-preference-copy" style={{ marginTop: 8 }}>
+            {acp.label('等级作用于运行时实际模型，不支持会自动丢弃。', 'The level applies to the runtime model; unsupported values are dropped.')}
+          </div>
         )}
-        {probeError !== undefined && (
-          <span className="dwa-error" style={{ wordBreak: 'break-word' }}>⚠ {probeError}</span>
+        <DescriptionInput acp={acp} title={title} value={entry?.description} onCommit={writeDescription} />
+        <div className="dwa-preference-copy">
+          {acp.label('描述会写进 acp_delegate 的 agent 选项说明，主代理据此挑选。', 'Shown in acp_delegate\'s agent parameter description so the caller can pick.')}
+        </div>
+        {overridden && (
+          <div className="dwa-deadline-flag">
+            ⚠ {acp.label(`配置文件要求：${configuredText || '全部默认'}`, `The config file asks for: ${configuredText || 'all defaults'}.`)}
+          </div>
         )}
+        {/* One footer for the card's slow, low-frequency actions: the catalog's
+            age next to the gesture that refreshes it, and the reset that only
+            exists when something really outranks the config file. */}
+        <div className="dwa-acc-foot">
+          <div className="dwa-acc-meta">
+            {/* While a probe is in flight the button beside it already says so;
+                the age would be a second claim about a snapshot being replaced. */}
+            {!probing && age !== undefined && (
+              <span>{acp.label(`目录更新于 ${age.zh}`, `Catalog read ${age.en}`)}</span>
+            )}
+            {probeError !== undefined && (
+              <span className="dwa-error" style={{ wordBreak: 'break-word' }}>⚠ {probeError}</span>
+            )}
+          </div>
+          <div className="dwa-row-actions">
+            <button type="button" className="dwa-btn dwa-btn-secondary" disabled={probing} onClick={() => void acp.probeModels(agentId)}>
+              {probing
+                ? (catalogMissing ? acp.label('正在获取目录…', 'Fetching catalog…') : acp.label('正在刷新目录…', 'Refreshing catalog…'))
+                : (catalogMissing ? acp.label('获取目录', 'Fetch catalog') : acp.label('刷新目录', 'Refresh catalog'))}
+            </button>
+            {overridden && (
+              <button type="button" className="dwa-btn dwa-btn-quiet" onClick={() => void acp.setDelegateSettings({ agentDefaults: { [agentId]: null } })}>
+                {acp.label('恢复配置文件的值', 'Use config file value')}
+              </button>
+            )}
+          </div>
+        </div>
       </div>
-      {overridden && (
-        <div className="dwa-deadline-flag">
-          ⚠ {acp.label(`配置文件要求：${configuredText || '全部默认'}`, `The config file asks for: ${configuredText || 'all defaults'}.`)}
-        </div>
-      )}
-      {overridden && (
-        <div className="dwa-deadline-reset">
-          <button type="button" className="dwa-btn dwa-btn-secondary" onClick={() => void acp.setDelegateSettings({ agentDefaults: { [agentId]: null } })}>
-            {acp.label('恢复配置文件的值', 'Use config file value')}
-          </button>
-        </div>
-      )}
     </div>
   )
 }
 
 /**
- * The delegation-defaults section: a default-agent picker plus one row per
- * configured agent. Mounted inside SubagentCard; returns nothing on a host half
- * that reports no delegate view (the card already gates, this is defensive).
+ * The delegation-defaults section: a default-agent picker, then one foldable
+ * card per configured agent. Mounted inside SubagentCard; returns nothing on a
+ * host half that reports no delegate view (the card already gates, this is
+ * defensive).
+ *
+ * The two levels are SIBLINGS, not a card inside a card: the picker is one card
+ * and each agent's profile is its own, because a fold is a boundary and nesting
+ * two surfaces would put two borders around one boundary. The section label
+ * carries the one rule shared by all of them (「默认」follows the agent
+ * process), so no card has to repeat it.
  */
 export function SubagentDefaults(props: { acp: AcpStore; ui: UiState }) {
   const { acp, ui } = props
@@ -504,51 +576,72 @@ export function SubagentDefaults(props: { acp: AcpStore; ui: UiState }) {
     : acp.label(`默认（当前：${resolved}）`, `Default (now: ${resolved})`)
   const defaultOverridden = configuredDefault !== undefined && configuredDefault !== current
 
+  // Fold state lives here so one control can drive every card. Expanded by
+  // default: a first visit must show every control rather than a stack of
+  // summaries with the form hidden behind a click.
+  const [collapsed, setCollapsed] = useState<readonly string[]>([])
+  const isCollapsed = (id: string): boolean => collapsed.includes(id)
+  const toggleAgent = (id: string): void => {
+    setCollapsed(current => current.includes(id) ? current.filter(other => other !== id) : [...current, id])
+  }
+  const allFolded = roster.length > 0 && roster.every(agent => isCollapsed(agent.id))
+
   return (
-    <div
-      ref={rootRef}
-      style={{
-        marginTop: 24,
-        padding: '16px 18px',
-        borderRadius: 10,
-        background: 'var(--dsw-alias-bg-layer-2, #f8f9fa)',
-      }}
-    >
+    <div ref={rootRef} style={{ marginTop: 28 }}>
       <div className="dwa-section-heading">
         <div>
           <h4 className="dwa-section-title dwa-subsection-title">{acp.label('委派默认', 'Delegation defaults')}</h4>
           <p className="dwa-section-copy">
-            {acp.label('只影响 acp_delegate 委派，不改变聊天中的选择。', 'Affects acp_delegate delegations only, never the chat selections.')}
+            {acp.label(
+              '只影响 acp_delegate 委派；「默认」跟随智能体进程自身。',
+              'Affects acp_delegate delegations only; "Default" follows the agent process itself.',
+            )}
           </p>
         </div>
+        {roster.length > 1 && (
+          <button
+            type="button"
+            className="dwa-btn dwa-btn-quiet"
+            onClick={() => setCollapsed(allFolded ? [] : roster.map(agent => agent.id))}
+          >
+            {allFolded
+              ? acp.label('全部展开', 'Expand all')
+              : acp.label('全部收起', 'Collapse all')}
+          </button>
+        )}
       </div>
+
       <div className="dwa-preferences">
         <div className="dwa-preference-block">
-          <div className="dwa-preference-label">{acp.label('默认智能体', 'Default agent')}</div>
-          <div className="dwa-preference-copy">
-            {acp.label('委派未指明智能体时使用；「默认」跟随「设为默认智能体」的选择。', 'Used when a delegation names no agent; "Default" follows "Set as default agent".')}
-          </div>
-          <div style={{ marginTop: 8, maxWidth: 360 }}>
-            <select
-              className="dwa-select"
-              aria-label={acp.label('默认智能体', 'Default agent')}
-              value={current ?? ''}
-              onChange={event => {
-                const value = event.target.value
-                if (value === '') void acp.resetDelegateSetting('defaultAgent')
-                else void acp.setDelegateSettings({ defaultAgent: value })
-              }}
-            >
-              <option value="">{defaultOptionLabel}</option>
-              {roster.map(agent => (
-                <option key={agent.id} value={agent.id}>{agent.title}</option>
-              ))}
-              {deleted && (
-                <option value={current} style={{ color: WARN_FG }}>
-                  {acp.label(`${current}（已删除）`, `${current} (deleted)`)}
-                </option>
-              )}
-            </select>
+          <div className="dwa-row-split">
+            <div className="dwa-row-main">
+              <div className="dwa-preference-label">{acp.label('默认智能体', 'Default agent')}</div>
+              <div className="dwa-preference-copy">
+                {acp.label('委派未指明智能体时使用；「默认」跟随「设为默认智能体」的选择。', 'Used when a delegation names no agent; "Default" follows "Set as default agent".')}
+              </div>
+            </div>
+            <div className="dwa-row-side dwa-row-side-select">
+              <select
+                className="dwa-select"
+                aria-label={acp.label('默认智能体', 'Default agent')}
+                value={current ?? ''}
+                onChange={event => {
+                  const value = event.target.value
+                  if (value === '') void acp.resetDelegateSetting('defaultAgent')
+                  else void acp.setDelegateSettings({ defaultAgent: value })
+                }}
+              >
+                <option value="">{defaultOptionLabel}</option>
+                {roster.map(agent => (
+                  <option key={agent.id} value={agent.id}>{agent.title}</option>
+                ))}
+                {deleted && (
+                  <option value={current} style={{ color: WARN_FG }}>
+                    {acp.label(`${current}（已删除）`, `${current} (deleted)`)}
+                  </option>
+                )}
+              </select>
+            </div>
           </div>
           {defaultOverridden && (
             <div className="dwa-deadline-flag">
@@ -563,8 +656,23 @@ export function SubagentDefaults(props: { acp: AcpStore; ui: UiState }) {
             </div>
           )}
         </div>
+      </div>
+
+      {/* One card per agent, as siblings of the picker above — not rows inside
+          it: each one's fold is its own boundary, and a nested card would put
+          two surfaces inside each other. */}
+      <div className="dwa-default-list">
         {roster.map(agent => (
-          <AgentDefaultsRow key={agent.id} acp={acp} ui={ui} delegate={delegate} agentId={agent.id} title={agent.title} />
+          <AgentDefaultsRow
+            key={agent.id}
+            acp={acp}
+            ui={ui}
+            delegate={delegate}
+            agentId={agent.id}
+            title={agent.title}
+            open={!isCollapsed(agent.id)}
+            onToggle={() => toggleAgent(agent.id)}
+          />
         ))}
       </div>
     </div>

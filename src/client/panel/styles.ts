@@ -12,9 +12,17 @@
 const STYLE = `
 .dwa-root {
   --ntr-gap-1: 4px; --ntr-gap-2: 8px; --ntr-gap-3: 12px; --ntr-gap-4: 16px;
-  --ntr-radius: 10px; --ntr-radius-sm: 7px;
+  --ntr-radius: 12px; --ntr-radius-sm: 8px;
   --ntr-font: 13px; --ntr-font-sm: 12px; --ntr-font-xs: 11px;
   --ntr-line: 1px solid var(--dsw-alias-border-l2, #e5e7eb);
+  /* Row dividers INSIDE a card: one step lighter than a card's own edge, so a
+     card reads as one surface and its rows read as its contents. */
+  --ntr-line-quiet: 1px solid var(--dsw-alias-border-l3, #eef0f3);
+  /* The only elevation in the panel. Kept literal on purpose: the host theme
+     publishes colours, not shadows, so a token here would be invented.
+     Black, not a tinted near-black: §11 exempts exactly this form, and a
+     shadow is not an ink color that has to follow the theme. */
+  --ntr-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 1px 1px rgba(0, 0, 0, 0.02);
   --ntr-muted: var(--dsw-alias-label-secondary, #6b7280);
   --ntr-danger: var(--dsw-alias-state-error-primary, #dc2626);
   --ntr-warn: var(--dsw-alias-state-warn-label, #b45309);
@@ -65,14 +73,38 @@ const STYLE = `
 .dwa-btn-quiet:hover { border-color: transparent; color: var(--dsw-alias-label-primary, #111827); }
 .dwa-btn-danger { color: var(--ntr-danger); border-color: var(--dsw-alias-state-error-secondary, #fca5a5); }
 .dwa-btn-danger:hover { background: var(--dsw-alias-interactive-bg-hover-danger, #fee2e2); }
-.dwa-section { margin-bottom: 24px; }
+/* ── The panel's one grammar: label → card → row ──────────────────────────
+ * Three levels, three treatments, and nothing else:
+ *   label  a small secondary-ink line above a card (.dwa-section-title);
+ *   card   the only elevated surface, and cards never nest (a block that
+ *          needs its own boundary becomes its own card, listed under the
+ *          section's first one);
+ *   row    a divider-separated band inside one card (.dwa-preference-*).
+ * Before this, every control sat in the same white slab separated by uniform
+ * 1px rules at 14 / 13 / 12px of bold, so a section, an agent and a field all
+ * looked like peers. */
+.dwa-section { margin-bottom: 28px; }
 .dwa-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
-.dwa-section-title { font-size: 15px; font-weight: 600; margin: 0; display: flex; align-items: center; gap: 8px; }
-/* A section nested inside a card (e.g. 委派默认 inside 子代理): one step below the
- * card title, so three levels read as three levels instead of two. */
-.dwa-subsection-title { font-size: 14px; }
+.dwa-section-title { font-size: var(--ntr-font-sm); font-weight: 650; margin: 0; display: flex; align-items: center; gap: 8px; color: var(--dsw-alias-label-secondary, #4b5563); }
+/* 委派默认 is a SECOND label of the 子代理 page, not a title inside a card: it
+ * sits at the same weight as the page's own section label, because its cards
+ * are siblings of that section's card. */
+.dwa-subsection-title { font-size: var(--ntr-font-sm); font-weight: 650; color: var(--dsw-alias-label-secondary, #4b5563); }
 .dwa-section-copy { margin: 3px 0 0; font-size: var(--ntr-font-xs); color: var(--ntr-muted); }
 .dwa-card { border: var(--ntr-line); border-radius: var(--ntr-radius); padding: 16px; background: var(--dsw-alias-bg-layer-1, #fff); font-size: var(--ntr-font); line-height: 1.55; }
+/* A card's own title and one-line copy (used where the card IS the section). */
+.dwa-row-title { margin: 0; font-size: var(--ntr-font); font-weight: 600; color: var(--dsw-alias-label-primary, #111827); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dwa-row-desc { margin: 2px 0 0; font-size: var(--ntr-font-sm); color: var(--ntr-muted); }
+/* Label/copy on one side, the control on the other; wraps to a stack before it
+ * squeezes either half. */
+.dwa-row-split { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.dwa-row-main { min-width: 0; flex: 1 1 220px; }
+.dwa-row-side { display: flex; align-items: center; gap: 8px; flex: none; flex-wrap: wrap; }
+/* A select on the row's right: wide enough to read a model name, and capped so
+   a long「默认（…）」option cannot stretch the row past the card. A CLASS, not an
+   inline style — an inline flex-basis survives the stack-to-column query below,
+   where that basis would become a 320px-tall empty box above the control. */
+.dwa-row-side-select { flex: 0 1 320px; min-width: 200px; }
 .dwa-card-warn { border-color: color-mix(in srgb, var(--ntr-warn) 30%, var(--dsw-alias-border-l2, #e5e7eb)); background: var(--dsw-alias-state-warn-tertiary, #fffbeb); }
 .dwa-mode-banner { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 16px; align-items: start; margin-bottom: 24px; padding: 14px 16px; }
 .dwa-mode-title { display: flex; align-items: center; gap: 8px; font-weight: 650; }
@@ -114,9 +146,17 @@ const STYLE = `
 .dwa-update-notes-url { color: var(--ntr-muted); font-size: var(--ntr-font-xs); overflow-wrap: anywhere; }
 .dwa-update-notes-url a { color: inherit; text-decoration: underline; }
 .dwa-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
-.dwa-agent-list { display: flex; flex-direction: column; border-top: var(--ntr-line); }
-.dwa-agent-card { border-bottom: var(--ntr-line); min-width: 0; }
-.dwa-agent-row { display: grid; grid-template-columns: 38px minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 16px 0; }
+/* The agent roster is ONE card, and each agent is a row inside it — the same
+ * grammar as every other settings section, so the 智能体 page stops being a
+ * bare list separated by rules. NO overflow clipping here on purpose: the
+ * ⋯ menu (.dwa-menu, absolute inside a relatively positioned wrapper) is
+ * painted past the last row, and clipping the card would cut the whole menu —
+ * including its「确认移除？」confirmation — off at the bottom edge. Nothing in a
+ * row touches the rounded corners, so the radius needs no clip to hold. */
+.dwa-agent-list { display: flex; flex-direction: column; border: var(--ntr-line); border-radius: var(--ntr-radius); background: var(--dsw-alias-bg-layer-1, #fff); box-shadow: var(--ntr-shadow); }
+.dwa-agent-card { min-width: 0; }
+.dwa-agent-card + .dwa-agent-card { border-top: var(--ntr-line-quiet); }
+.dwa-agent-row { display: grid; grid-template-columns: 38px minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 12px 16px; }
 .dwa-agent-avatar { display: grid; place-items: center; width: 38px; height: 38px; border: var(--ntr-line); border-radius: 9px; background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: var(--ntr-muted); font: 12px var(--ds-font-family-code, monospace); }
 .dwa-caret { font-size: 14px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; width: 1em; }
 .dwa-caret-btn { font: inherit; border: none; background: var(--dsw-alias-bg-layer-2, #f3f4f6); width: 28px; height: 28px; padding: 0; border-radius: var(--ntr-radius-sm); display: inline-flex; align-items: center; justify-content: center; color: var(--ntr-muted); cursor: pointer; }
@@ -126,15 +166,20 @@ const STYLE = `
 .dwa-agent-name { font-size: 13px; font-weight: 550; overflow-wrap: anywhere; }
 .dwa-agent-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 4px; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
 .dwa-agent-meta-separator { opacity: 0.45; }
-.dwa-agent-body { padding: 0 0 24px 52px; }
+/* The detail body lines up with the row's own text column: 16px card inset +
+   38px avatar + 14px gap. */
+.dwa-agent-body { padding: 4px 16px 18px 68px; }
 .dwa-subsection { min-width: 0; }
 .dwa-form-row { display: flex; gap: var(--ntr-gap-3); margin-bottom: 14px; align-items: stretch; }
 .dwa-form-col { flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-.dwa-form-label { font-size: var(--ntr-font-sm); font-weight: 600; color: var(--dsw-alias-label-primary, #374151); }
+/* Field labels sit one step below a row title and use secondary ink: primary
+   ink is reserved for the thing the row IS (its title, an agent's name), so a
+   form of eight labels cannot compete with the card's own hierarchy. */
+.dwa-form-label { font-size: var(--ntr-font-sm); font-weight: 600; color: var(--dsw-alias-label-secondary, #4b5563); }
 .dwa-hint { font-size: var(--ntr-font-xs); line-height: 1.55; color: var(--ntr-muted); }
 .dwa-error { font-size: var(--ntr-font-xs); color: var(--ntr-danger); }
 .dwa-input { min-height: 36px; font: inherit; font-size: var(--ntr-font-sm); padding: 7px 10px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-1, #fff); color: inherit; width: 100%; box-sizing: border-box; }
-.dwa-select { min-height: 32px; font: inherit; font-size: var(--ntr-font-sm); padding: 5px 8px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-1, #fff); color: inherit; }
+.dwa-select { min-height: 32px; font: inherit; font-size: var(--ntr-font-sm); padding: 5px 8px; border: 1px solid var(--dsw-alias-border-l2, #d1d5db); border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-bg-layer-1, #fff); color: inherit; width: 100%; box-sizing: border-box; max-width: 100%; }
 .dwa-input:hover, .dwa-select:hover { border-color: var(--dsw-alias-border-l1, #9ca3af); }
 .dwa-input:focus, .dwa-select:focus { border-color: var(--ntr-accent); }
 .dwa-input-mono, .dwa-mono { font-family: var(--ds-font-family-code, ui-monospace), SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
@@ -186,7 +231,7 @@ const STYLE = `
    on the left, the switch on the right. It owns the 技能 page, so nothing here
    is positioned relative to the agent roster; the per-agent list below it is a
    separate block, not part of this card. */
-.dwa-skills-card { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.dwa-skills-card { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; box-shadow: var(--ntr-shadow); }
 .dwa-skills-card-text { min-width: 0; }
 /* The switch's side of the card: centred, so the info icon loses the top margin
    it needed when the card stacked its contents. */
@@ -194,8 +239,8 @@ const STYLE = `
 .dwa-skills-card-control .dwa-info-btn { margin-top: 0; }
 /* The per-agent opt-outs listed under the master card: the same row visual
    language the other settings rows use, so the list reads as the card's
-   continuation instead of a second section with its own heading. */
-.dwa-skills-agents { margin-top: 12px; }
+   continuation instead of a second section with its own heading. The surface
+   itself is declared with the other card rules, near the end of the sheet. */
 /* The row's right side: the switch plus a fixed-width warning slot beside it,
    so a warning appearing changes colour only, never the layout. */
 .dwa-skills-row-control { display: inline-flex; align-items: center; gap: 8px; }
@@ -256,22 +301,35 @@ const STYLE = `
 .dwa-seg > button { min-height: 32px; font: inherit; font-size: var(--ntr-font-sm); color: var(--ntr-muted); border: 1px solid transparent; border-radius: 4px; background: transparent; padding: 4px 12px; cursor: pointer; white-space: nowrap; }
 .dwa-seg > button:hover { background: var(--dsw-alias-interactive-bg-active, #f3f4f6); }
 .dwa-seg > button.is-on { background: var(--dsw-alias-bg-layer-1, #fff); border: var(--ntr-line); color: var(--dsw-alias-label-primary, #111827); font-weight: 550; }
-.dwa-preferences { border-top: var(--ntr-line); }
-.dwa-preference-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px 0; }
-.dwa-preference-row + .dwa-preference-row { border-top: var(--ntr-line); }
-/* A control that needs the whole card: the label sits above it, not beside
+/* Every settings row on every page lives in one of these: the card is the
+ * surface, a row is a band inside it, and the divider between rows is one step
+ * lighter than the card's own edge. The container owns the boundary now, which
+ * is why the blocks carry padding instead of their own top rules. */
+.dwa-preferences { border: var(--ntr-line); border-radius: var(--ntr-radius); background: var(--dsw-alias-bg-layer-1, #fff); box-shadow: var(--ntr-shadow); overflow: hidden; }
+.dwa-preference-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 16px; }
+.dwa-preference-row + .dwa-preference-row { border-top: var(--ntr-line-quiet); }
+/* A control that needs the whole row: the label sits above it, not beside
    it. A right-aligned segmented control squeezed its labels into two lines
    each (中/止, 自动推/进), which read as broken rather than as choices. */
-.dwa-preference-block { padding: 12px 0; }
-.dwa-preference-block + .dwa-preference-block { border-top: var(--ntr-line); }
-.dwa-preference-label { font-size: var(--ntr-font); font-weight: 600; }
+.dwa-preference-block { padding: 16px; }
+.dwa-preference-block + .dwa-preference-block { border-top: var(--ntr-line-quiet); }
+/* INLINE on purpose: the readout beside it is an inline pill, so a row's label
+   and the row's own state share one line instead of stacking as two blocks. */
+.dwa-preference-label { font-size: var(--ntr-font); font-weight: 600; display: inline; }
 .dwa-preference-copy { margin-top: 2px; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
 .dwa-seg-wide { display: flex; width: 100%; margin-top: 10px; }
 .dwa-seg-wide > button { flex: 1; }
-/* The wait window, as a slider: the number is the headline, the rungs are the
-   scale under the track. */
-.dwa-deadline-value { margin-top: 8px; font-size: 20px; font-weight: 600; }
-.dwa-deadline-range { width: 100%; margin-top: 6px; accent-color: var(--ntr-accent); }
+/* The state of a bounded value (a slider rung, a hand-filled window): a pill
+   beside the row's label, NOT a 20px headline. The label is the row's
+   identity and the value is its current state, so they belong on one line —
+   as a headline it outranked the section title above it. */
+.dwa-deadline-value {
+  display: inline-flex; align-items: center; margin: 0 0 0 8px; padding: 1px 9px;
+  border-radius: 999px; background: var(--dsw-alias-state-business-tertiary, #dbeafe);
+  color: var(--dsw-alias-state-business-primary, #2563eb);
+  font-size: var(--ntr-font-sm); font-weight: 650; font-variant-numeric: tabular-nums; line-height: 1.6;
+}
+.dwa-deadline-range { width: 100%; margin-top: 10px; accent-color: var(--ntr-accent); }
 .dwa-deadline-range:disabled { opacity: 0.4; }
 /* Tick labels center on the exact rung fraction (inline left from tickLeft);
    space-between drifted them off the track when label widths differed. */
@@ -283,8 +341,18 @@ const STYLE = `
    the muted gray every other hint uses: the value the config file is
    outranking, on the row it belongs to. */
 .dwa-deadline-flag { margin-top: 4px; font-size: var(--ntr-font-xs); font-weight: 550; color: var(--ntr-warn); }
-.dwa-deadline-warn { margin-top: 10px; padding: 9px 12px; border-left: 3px solid var(--dsw-alias-state-warn-primary, #d97706); background: var(--dsw-alias-state-warn-secondary, #fffbeb); border-radius: var(--ntr-radius-sm); font-size: var(--ntr-font-xs); line-height: 1.55; }
+/* A standing fact a control cannot put in its own label (a rung that masks
+   host tools, a mode that answers on your behalf): a tinted box. No rule on
+   the left edge — that is decoration pretending to be hierarchy; the tint is
+   the signal. Tones are host alias pairs (constraint 34). */
+.dwa-deadline-warn { margin-top: 10px; padding: 9px 12px; border-radius: var(--ntr-radius-sm); background: var(--dsw-alias-state-warn-tertiary, #fffbeb); color: var(--ntr-warn); font-size: var(--ntr-font-xs); line-height: 1.55; }
+.dwa-deadline-warn.is-neutral { background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: var(--dsw-alias-label-primary, #111827); }
+.dwa-deadline-warn.is-success { background: var(--dsw-alias-state-success-tertiary, #dcfce7); color: var(--ntr-success); }
+.dwa-deadline-warn.is-danger { background: var(--dsw-alias-interactive-bg-hover-danger, #fee2e2); color: var(--ntr-danger); }
 .dwa-deadline-reset { display: flex; justify-content: flex-end; margin-top: 8px; }
+/* A reset that closes a whole card's rows is a footer band, not a floating
+   button: it gets the same divider and padding the rows above it have. */
+.dwa-preferences > .dwa-deadline-reset { margin-top: 0; padding: 12px 16px; border-top: var(--ntr-line-quiet); }
 /* Runtime log: one bounded list, newest first. The time column never wraps;
    the message is the only cell that may break anywhere. */
 .dwa-log-list { list-style: none; margin: 0; padding: 0; border: var(--ntr-line); border-radius: var(--ntr-radius); overflow: hidden; }
@@ -296,12 +364,63 @@ const STYLE = `
 .dwa-log-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ntr-danger); display: inline-block; margin-left: 6px; }
 .dwa-log-level.is-info { background: var(--dsw-alias-state-business-tertiary, #dbeafe); color: var(--dsw-alias-state-business-primary, #2563eb); }
 .dwa-log-level.is-error { background: var(--dsw-alias-state-error-tertiary, #fef2f2); color: var(--ntr-danger); }
+/* ── The per-agent delegation defaults (「委派默认」) ────────────────────────
+ * One card per agent. The head is the summary line — name plus what this
+ * agent's delegation profile actually overrides — and the whole band is the
+ * fold button, so folding one agent never means hunting for a caret. The body
+ * stays MOUNTED and is display-toggled: an in-progress description draft (a
+ * local value committed on blur) must survive folding, exactly like the agent
+ * roster cards above. */
+.dwa-default-list { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
+/* The cards are .dwa-preference-block too, so the tests and the row grammar
+ * still find one block per agent; the list overrides the row treatment (a row
+ * is a band in a card, a card is its own boundary). */
+.dwa-default-list > .dwa-preference-block {
+  padding: 0; border: var(--ntr-line); border-radius: var(--ntr-radius);
+  background: var(--dsw-alias-bg-layer-1, #fff); box-shadow: var(--ntr-shadow); overflow: hidden;
+}
+.dwa-acc-head { display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; align-items: center; gap: 12px; width: 100%; box-sizing: border-box; padding: 12px 16px; border: 0; background: transparent; font: inherit; color: inherit; text-align: left; cursor: pointer; }
+.dwa-acc-head:hover { background: color-mix(in srgb, var(--dsw-alias-bg-layer-2, #f3f4f6) 55%, transparent); }
+.dwa-acc-avatar { width: 32px; height: 32px; border-radius: var(--ntr-radius-sm); font-size: var(--ntr-font-xs); }
+.dwa-acc-titles { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.dwa-acc-name { font-size: var(--ntr-font); font-weight: 600; overflow-wrap: anywhere; }
+.dwa-acc-pills { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+/* What a delegation profile overrides, at a glance: the value is the fact, so
+   a set axis reads in business ink and an unset one stays quiet gray. */
+.dwa-sum-pill { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 7px; border-radius: 5px; font-size: var(--ntr-font-xs); line-height: 1.6; background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: var(--ntr-muted); }
+.dwa-sum-pill.is-set { background: var(--dsw-alias-state-business-tertiary, #dbeafe); color: var(--dsw-alias-state-business-primary, #2563eb); font-weight: 550; }
+/* A profile that outranks the config file says so even while folded: the head
+   is the only band a collapsed card shows, and constraint 33 does not allow an
+   override fact to hide behind a click. */
+.dwa-sum-pill.is-warn { background: var(--dsw-alias-state-warn-tertiary, #fef3c7); color: var(--ntr-warn); font-weight: 550; }
+/* One step of surface, tinted: the head is the summary, the body is the form. */
+.dwa-acc-body { padding: 14px 16px 16px; border-top: var(--ntr-line-quiet); background: color-mix(in srgb, var(--dsw-alias-bg-layer-2, #f3f4f6) 42%, var(--dsw-alias-bg-layer-1, #fff)); }
+.dwa-acc-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-top: 14px; padding-top: 12px; border-top: var(--ntr-line-quiet); }
+.dwa-acc-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: var(--ntr-muted); font-size: var(--ntr-font-xs); }
+/* The three axes are ONE decision, so they get one row of three equal
+   columns. The old flex: 1 1 150px wrapped them into a lopsided 2+1 at the
+   panel's usual width, and the odd one out stretched full width. */
+.dwa-axis-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+.dwa-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.dwa-field-label { font-size: var(--ntr-font-xs); font-weight: 600; color: var(--dsw-alias-label-secondary, #4b5563); }
+/* A short numeric input (minutes): the row says what it is, so the box does
+   not need the full width the other inputs take. */
+.dwa-input-short { max-width: 132px; }
+/* ── The 技能 page ────────────────────────────────────────────────────────
+ * The master switch is a card and the per-agent opt-outs are the card's own
+ * continuation: one surface, rows inside it, no second heading. Not clipped
+ * for the same reason the roster is not: each row carries a host Tooltip, and
+ * a clipped card would cut the bubble off at the bottom edge. */
+.dwa-skills-agents { margin-top: 12px; border: var(--ntr-line); border-radius: var(--ntr-radius); background: var(--dsw-alias-bg-layer-1, #fff); box-shadow: var(--ntr-shadow); }
+.dwa-skills-agents .dwa-preference-row { padding: 12px 16px; }
 @media (max-width: 640px) {
   .dwa-root { padding: 20px 16px; }
 }
 @container (max-width: 640px) {
   .dwa-page-header { align-items: flex-start; flex-wrap: wrap; }
-  .dwa-agent-body { padding-left: 0; }
+  /* The roster card owns its own padding now, so a stacked body must keep the
+     card's inset instead of running to the edge. */
+  .dwa-agent-body { padding-left: 16px; }
   .dwa-agent-row { grid-template-columns: 32px minmax(0, 1fr) auto; gap: 10px; }
   .dwa-agent-avatar { width: 32px; height: 32px; }
   .dwa-section-heading { flex-wrap: wrap; }
@@ -317,6 +436,15 @@ const STYLE = `
      switch onto a second line. */
   .dwa-skills-agents .dwa-preference-row { flex-direction: row; align-items: center; }
   .dwa-default-hint { align-items: flex-start; flex-direction: column; }
+  /* The three axes stack rather than shrink: three selects of ~90px each
+     truncate every model name into noise. */
+  .dwa-axis-grid { grid-template-columns: minmax(0, 1fr); }
+  .dwa-row-split { flex-direction: column; align-items: stretch; }
+  /* The split's halves are sized by its ROW axis (flex-basis 220px); once the
+     split stacks, that basis becomes a HEIGHT and leaves a dead gap under a
+     one-line label. */
+  .dwa-row-split > .dwa-row-main { flex: none; }
+  .dwa-row-side-select { flex: none; width: 100%; min-width: 0; }
   /* The slider's scale: up to eight rungs with full unit words ("15 分钟")
      need a smaller face before they can collide on a narrow panel. Labels
      sit at fixed rung fractions (tickLeft), so a shorter scale does not

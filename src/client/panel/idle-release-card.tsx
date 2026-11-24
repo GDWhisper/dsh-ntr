@@ -60,8 +60,10 @@ export function IdleReleaseCard(props: { acp: AcpStore; ui: UiState }) {
       </div>
       <div className="dwa-preferences">
         <div className="dwa-preference-block">
-          <div className="dwa-preference-label">{acp.label('释放窗口', 'Release window')}</div>
-          <div className="dwa-deadline-value">{idleWindowText(release.idleTimeoutMs, acp)}</div>
+          <div className="dwa-preference-label">
+            {acp.label('释放窗口', 'Release window')}
+            <span className="dwa-deadline-value">{idleWindowText(release.idleTimeoutMs, acp)}</span>
+          </div>
           <input
             className="dwa-deadline-range"
             type="range"

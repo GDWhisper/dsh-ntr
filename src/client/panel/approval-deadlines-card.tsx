@@ -222,9 +222,11 @@ function DeadlineSliderBlock(props: {
       )
   return (
     <div className="dwa-preference-block">
-      <div className="dwa-preference-label">{acp.label('等待时长', 'How long to wait')}</div>
-      <div className="dwa-deadline-value">
-        {effective === undefined ? acp.label('一直等待', 'Always') : deadlineText(effective, acp)}
+      <div className="dwa-preference-label">
+        {acp.label('等待时长', 'How long to wait')}
+        <span className="dwa-deadline-value">
+          {effective === undefined ? acp.label('一直等待', 'Always') : deadlineText(effective, acp)}
+        </span>
       </div>
       {effective !== undefined && (
         <>

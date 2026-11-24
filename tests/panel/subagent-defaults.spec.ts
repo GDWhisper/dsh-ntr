@@ -8,87 +8,21 @@
 // explicit fetch gesture, and the hand-copies pinned to the host
 // (displayDelegateLabel title strip, thoughtOptionForModel read rule).
 import { createElement } from 'react'
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
-import { AcpSettingsSection } from '../../src/client/panel.tsx'
 import { axisChoices, catalogAge, CHOICE_LABEL_MAX, CHOICE_OPTION_MAX, choiceLabel, clipChoiceText, resolvedAxisDefaultLabel, textColumns, thoughtOptionForModel } from '../../src/client/panel/subagent-defaults.tsx'
-import { AcpStore, type RpcCall } from '../../src/client/store.ts'
 import { displayDelegateLabel as browserDisplayDelegateLabel, subagentPanelRows } from '../../src/client/subagent-panel.tsx'
 import { ModelCatalogService, type CatalogHost } from '../../src/bridge/catalog-service.ts'
 import { EventHub } from '../../src/impl.ts'
 import { delegateLabel, displayDelegateLabel as hostDisplayDelegateLabel } from '../../src/impl/delegate-label.ts'
-import type { AcpAgentCatalog, AcpAgentDef, AcpCatalogChoice, AcpCatalogOption, AcpDelegateSettings, AgentProbeModelsResult, DelegateSetPayload, SubagentRecord } from '../../src/protocol.ts'
-import { createPanelFixture, type PanelRpcCall } from '../panel-fixture.ts'
-import { category, click, mountPanel } from './harness.ts'
+import type { AcpAgentCatalog, AcpCatalogChoice, AcpCatalogOption, SubagentRecord } from '../../src/protocol.ts'
+import { axisSelect, category, click, DELEGATE_BASE, defaultAgentSelect, mountDefaults, mountPanel, optionValues, writes } from './harness.ts'
 
 afterEach(cleanup)
 
-const BASE: AcpDelegateSettings = {
-  guidance: 'on', timeoutMs: 2_400_000, defaultTimeoutMs: 2_400_000,
-  toolAvailable: true, restrictAvailable: true,
-}
-
-function writes(calls: PanelRpcCall[], endpoint: string): unknown[] {
-  return calls.filter(call => call.endpoint === endpoint).map(call => call.payload)
-}
-
-/** Mount the settings section with a delegate view the wrapper keeps authoritative. */
-async function mountDefaults(seed: AcpDelegateSettings, options: { agents?: AcpAgentDef[]; failWrite?: boolean; catalogs?: Record<string, AgentProbeModelsResult | null>; locale?: (zh: string, en: string) => string } = {}) {
-  const base = createPanelFixture({ agents: options.agents, catalogs: options.catalogs })
-  let current = structuredClone(seed)
-  const calls: PanelRpcCall[] = []
-  const rpc: RpcCall = async (channel, endpoint, payload) => {
-    calls.push({ channel, endpoint, payload: structuredClone(payload) })
-    if (channel === '/acp' && endpoint === 'ui/delegate') return { ok: true, value: { delegate: structuredClone(current) } }
-    if (channel === '/acp' && endpoint === 'ui/delegate-set') {
-      if (options.failWrite === true) return { ok: false, error: { code: 'bad_payload', message: 'no' } }
-      const patch = structuredClone(payload) as DelegateSetPayload
-      const next: AcpDelegateSettings = { ...current }
-      if (patch.guidance !== undefined) next.guidance = patch.guidance
-      if (patch.timeoutMs !== undefined) next.timeoutMs = patch.timeoutMs
-      if (patch.defaultAgent !== undefined) next.defaultAgent = patch.defaultAgent
-      if (patch.agentDefaults !== undefined) {
-        const merged = { ...(current.agentDefaults ?? {}) }
-        for (const [id, entry] of Object.entries(patch.agentDefaults)) {
-          if (entry === null) delete merged[id]
-          else merged[id] = entry
-        }
-        next.agentDefaults = merged
-      }
-      for (const key of patch.reset ?? []) {
-        if (key === 'defaultAgent') next.defaultAgent = current.configured?.defaultAgent
-        if (key === 'agentDefaults') next.agentDefaults = current.configured?.agentDefaults ?? {}
-        if (key === 'guidance') next.guidance = current.configured?.guidance ?? 'off'
-        if (key === 'timeoutMs') next.timeoutMs = current.configured?.timeoutMs ?? current.defaultTimeoutMs ?? next.timeoutMs
-      }
-      // Host view hygiene (delegateSettingsView): an empty map is NO key.
-      if (next.agentDefaults !== undefined && Object.keys(next.agentDefaults).length === 0) delete next.agentDefaults
-      next.resolvedDefaultAgent = next.defaultAgent ?? next.globalDefaultAgent
-      current = next
-      return { ok: true, value: { delegate: structuredClone(current) } }
-    }
-    return base.rpc(channel, endpoint, payload)
-  }
-  const store = new AcpStore(rpc, options.locale ?? (zh => zh))
-  await store.resync()
-  render(createElement(AcpSettingsSection, { acp: store }))
-  return { store, calls }
-}
-
-/** The default-agent picker (its aria-label is the visible row title). */
-function defaultAgentSelect(): HTMLSelectElement {
-  return screen.getByRole('combobox', { name: '默认智能体' }) as HTMLSelectElement
-}
-function axisSelect(axis: '模型' | '思考等级' | '模式', title: string): HTMLSelectElement {
-  return screen.getByRole('combobox', { name: `${axis} · ${title}` }) as HTMLSelectElement
-}
-function optionValues(select: HTMLSelectElement): string[] {
-  return Array.from(select.options).map(option => option.value)
-}
-
 describe('SubagentDefaults — default agent', () => {
   it('offers 默认（当前：X） plus every configured agent, and selects 默认 when no override', async () => {
-    await mountDefaults({ ...BASE, globalDefaultAgent: 'codebuddy', resolvedDefaultAgent: 'codebuddy' })
+    await mountDefaults({ ...DELEGATE_BASE, globalDefaultAgent: 'codebuddy', resolvedDefaultAgent: 'codebuddy' })
     await category('子代理')
     const select = defaultAgentSelect()
     expect(select.value).toBe('')
@@ -99,24 +33,28 @@ describe('SubagentDefaults — default agent', () => {
   })
 
   it('says 默认（未设置） when neither a resolved nor a global default exists', async () => {
-    await mountDefaults({ ...BASE })
+    await mountDefaults({ ...DELEGATE_BASE })
     await category('子代理')
     expect(screen.getByRole('option', { name: '默认（未设置）' })).toBeDefined()
   })
 
   it('names the visible「设为默认智能体」control and says 智能体 without Agent drift', async () => {
-    await mountDefaults({ ...BASE, globalDefaultAgent: 'codebuddy', resolvedDefaultAgent: 'codebuddy' })
+    await mountDefaults({ ...DELEGATE_BASE, globalDefaultAgent: 'codebuddy', resolvedDefaultAgent: 'codebuddy' })
     await category('子代理')
     // The copy names the ModelCatalogBlock button verbatim (constraint 33).
     expect(screen.getByText('委派未指明智能体时使用；「默认」跟随「设为默认智能体」的选择。')).toBeDefined()
-    // One such row per configured agent, all in the same terminology.
-    expect(screen.getAllByText('委派该智能体时的默认选择；「默认」跟随智能体进程自身。')).toHaveLength(2)
+    // The per-agent「默认 follows the process」sentence is GONE from the rows: the
+    // axis dropdown's own「默认（X）」option names the process default, so
+    // repeating the rule on every agent was boilerplate (constraint 33).
+    expect(screen.queryByText('委派该智能体时的默认选择；「默认」跟随智能体进程自身。')).toBeNull()
+    // Said ONCE, on the section that owns the rule.
+    expect(screen.getByText('只影响 acp_delegate 委派；「默认」跟随智能体进程自身。')).toBeDefined()
     const section = screen.getByText('委派默认').closest('.dwa-section-heading')?.parentElement
     expect(section?.textContent ?? '').not.toContain('Agent')
   })
 
   it('picking an agent writes {defaultAgent:id} immediately', async () => {
-    const { store, calls } = await mountDefaults({ ...BASE, globalDefaultAgent: 'codebuddy', resolvedDefaultAgent: 'codebuddy' })
+    const { store, calls } = await mountDefaults({ ...DELEGATE_BASE, globalDefaultAgent: 'codebuddy', resolvedDefaultAgent: 'codebuddy' })
     await category('子代理')
     fireEvent.change(defaultAgentSelect(), { target: { value: 'pi' } })
     await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ defaultAgent: 'pi' }]))
@@ -125,7 +63,7 @@ describe('SubagentDefaults — default agent', () => {
   })
 
   it('picking 默认 writes reset:[defaultAgent]', async () => {
-    const { calls } = await mountDefaults({ ...BASE, defaultAgent: 'pi', resolvedDefaultAgent: 'pi', globalDefaultAgent: 'codebuddy' })
+    const { calls } = await mountDefaults({ ...DELEGATE_BASE, defaultAgent: 'pi', resolvedDefaultAgent: 'pi', globalDefaultAgent: 'codebuddy' })
     await category('子代理')
     expect(defaultAgentSelect().value).toBe('pi')
     fireEvent.change(defaultAgentSelect(), { target: { value: '' } })
@@ -133,7 +71,7 @@ describe('SubagentDefaults — default agent', () => {
   })
 
   it('keeps a deleted default agent as a warning-colored selected option, never clears it', async () => {
-    const { store } = await mountDefaults({ ...BASE, defaultAgent: 'ghost', resolvedDefaultAgent: 'ghost', globalDefaultAgent: 'codebuddy' })
+    const { store } = await mountDefaults({ ...DELEGATE_BASE, defaultAgent: 'ghost', resolvedDefaultAgent: 'ghost', globalDefaultAgent: 'codebuddy' })
     await category('子代理')
     const select = defaultAgentSelect()
     expect(select.value).toBe('ghost')
@@ -144,7 +82,7 @@ describe('SubagentDefaults — default agent', () => {
   })
 
   it('shows the config-file fact and a reset only when the default really overrides it', async () => {
-    const { calls } = await mountDefaults({ ...BASE, defaultAgent: 'pi', resolvedDefaultAgent: 'pi', globalDefaultAgent: 'codebuddy', configured: { defaultAgent: 'codebuddy' } })
+    const { calls } = await mountDefaults({ ...DELEGATE_BASE, defaultAgent: 'pi', resolvedDefaultAgent: 'pi', globalDefaultAgent: 'codebuddy', configured: { defaultAgent: 'codebuddy' } })
     await category('子代理')
     const note = screen.getByText(/配置文件要求：codebuddy/)
     expect(note.className).toContain('dwa-deadline-flag')
@@ -153,7 +91,7 @@ describe('SubagentDefaults — default agent', () => {
   })
 
   it('no override fact and no reset when the effective default matches the config', async () => {
-    await mountDefaults({ ...BASE, defaultAgent: 'codebuddy', resolvedDefaultAgent: 'codebuddy', configured: { defaultAgent: 'codebuddy' } })
+    await mountDefaults({ ...DELEGATE_BASE, defaultAgent: 'codebuddy', resolvedDefaultAgent: 'codebuddy', configured: { defaultAgent: 'codebuddy' } })
     await category('子代理')
     expect(screen.queryByText(/配置文件要求/)).toBeNull()
     expect(screen.queryByRole('button', { name: '恢复配置文件的值' })).toBeNull()
@@ -162,7 +100,7 @@ describe('SubagentDefaults — default agent', () => {
 
 describe('SubagentDefaults — per-agent axes', () => {
   it('renders model/effort/mode selects from the memory-only catalog', async () => {
-    const { calls } = await mountDefaults({ ...BASE })
+    const { calls } = await mountDefaults({ ...DELEGATE_BASE })
     await category('子代理')
     const model = axisSelect('模型', 'CodeBuddy')
     await waitFor(() => expect(optionValues(model)).toContain('deepseek-v3'))
@@ -179,7 +117,7 @@ describe('SubagentDefaults — per-agent axes', () => {
   })
 
   it('model options carry the agent description (consumption multiplier), distinguishing same-name variants', async () => {
-    await mountDefaults({ ...BASE }, {
+    await mountDefaults({ ...DELEGATE_BASE }, {
       catalogs: {
         codebuddy: {
           catalog: {
@@ -206,7 +144,7 @@ describe('SubagentDefaults — per-agent axes', () => {
   })
 
   it('setting a model writes the whole entry with that axis', async () => {
-    const { store, calls } = await mountDefaults({ ...BASE })
+    const { store, calls } = await mountDefaults({ ...DELEGATE_BASE })
     await category('子代理')
     const model = axisSelect('模型', 'CodeBuddy')
     await waitFor(() => expect(optionValues(model)).toContain('claude-sonnet-4'))
@@ -216,7 +154,7 @@ describe('SubagentDefaults — per-agent axes', () => {
   })
 
   it('clearing the last axis stores an {} all-default override (shadows the baseline)', async () => {
-    const { calls } = await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3' } } })
+    const { calls } = await mountDefaults({ ...DELEGATE_BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3' } } })
     await category('子代理')
     const model = axisSelect('模型', 'CodeBuddy')
     await waitFor(() => expect(model.value).toBe('deepseek-v3'))
@@ -225,7 +163,7 @@ describe('SubagentDefaults — per-agent axes', () => {
   })
 
   it('keeps the other axes when one changes', async () => {
-    const { calls } = await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3', mode: 'ask' } } })
+    const { calls } = await mountDefaults({ ...DELEGATE_BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3', mode: 'ask' } } })
     await category('子代理')
     const effort = axisSelect('思考等级', 'CodeBuddy')
     await waitFor(() => expect(optionValues(effort)).toContain('high'))
@@ -234,7 +172,7 @@ describe('SubagentDefaults — per-agent axes', () => {
   })
 
   it('commits the description on blur, trimmed, keeping the other axes', async () => {
-    const { store, calls } = await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3' } } })
+    const { store, calls } = await mountDefaults({ ...DELEGATE_BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3' } } })
     await category('子代理')
     const input = screen.getByLabelText('描述（写给主代理看） · CodeBuddy') as HTMLInputElement
     expect(input.value).toBe('')
@@ -245,7 +183,7 @@ describe('SubagentDefaults — per-agent axes', () => {
   })
 
   it('clearing the description deletes only that key and keeps the axes', async () => {
-    const { calls } = await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3', description: '通用编码' } } })
+    const { calls } = await mountDefaults({ ...DELEGATE_BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3', description: '通用编码' } } })
     await category('子代理')
     const input = screen.getByLabelText('描述（写给主代理看） · CodeBuddy') as HTMLInputElement
     expect(input.value).toBe('通用编码')
@@ -262,7 +200,7 @@ describe('SubagentDefaults — per-agent axes', () => {
         mode: { configId: 'mode', name: 'Mode', currentValue: 'o1', choices: [{ value: 'o1', name: 'O1' }, { value: 'o2', name: 'O2' }] },
       },
     }
-    const { store } = await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'gone', mode: 'lost' } } }, { catalogs: { codebuddy: catalog } })
+    const { store } = await mountDefaults({ ...DELEGATE_BASE, agentDefaults: { codebuddy: { model: 'gone', mode: 'lost' } } }, { catalogs: { codebuddy: catalog } })
     await category('子代理')
     const model = axisSelect('模型', 'CodeBuddy')
     await waitFor(() => expect(optionValues(model)).toContain('gone'))
@@ -283,7 +221,7 @@ describe('SubagentDefaults — per-agent axes', () => {
         thought: { configId: 'thought_level', name: 'Thinking', currentValue: 'e1', choices: [{ value: 'e1', name: 'E1' }, { value: 'e2', name: 'E2' }] },
       },
     }
-    const { store } = await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'm1', effort: 'nope' } } }, { catalogs: { codebuddy: catalog } })
+    const { store } = await mountDefaults({ ...DELEGATE_BASE, agentDefaults: { codebuddy: { model: 'm1', effort: 'nope' } } }, { catalogs: { codebuddy: catalog } })
     await category('子代理')
     const effort = axisSelect('思考等级', 'CodeBuddy')
     await waitFor(() => expect(optionValues(effort)).toContain('nope'))
@@ -296,7 +234,7 @@ describe('SubagentDefaults — per-agent axes', () => {
   it('keeps a persisted value plain (not stale) while its catalog axis is unread', async () => {
     // pi publishes no thought slot and no mode: with no evidence of staleness the
     // kept values stay plain, and the missing catalog offers the fetch gesture.
-    const { store } = await mountDefaults({ ...BASE, agentDefaults: { pi: { effort: 'x', mode: 'y' } } }, { catalogs: { pi: null } })
+    const { store } = await mountDefaults({ ...DELEGATE_BASE, agentDefaults: { pi: { effort: 'x', mode: 'y' } } }, { catalogs: { pi: null } })
     await category('子代理')
     const effort = axisSelect('思考等级', 'pi')
     await waitFor(() => expect(optionValues(effort)).toContain('x'))
@@ -315,7 +253,7 @@ describe('SubagentDefaults — per-agent axes', () => {
     // that is evidence the kept values no longer exist — warning-colored and
     // kept, with the row's 刷新目录 still able to ask the agent again.
     const catalog: AgentProbeModelsResult = { agentId: 'codebuddy', updatedAt: 1, catalog: {} }
-    const { store } = await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'gone', mode: 'lost' } } }, { catalogs: { codebuddy: catalog } })
+    const { store } = await mountDefaults({ ...DELEGATE_BASE, agentDefaults: { codebuddy: { model: 'gone', mode: 'lost' } } }, { catalogs: { codebuddy: catalog } })
     await category('子代理')
     const model = axisSelect('模型', 'CodeBuddy')
     await waitFor(() => expect(optionValues(model)).toContain('gone'))
@@ -340,7 +278,7 @@ describe('SubagentDefaults — per-agent axes', () => {
         thoughtByModel: { m1: null },
       },
     }
-    const { store } = await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'm1', effort: 'x' } } }, { catalogs: { codebuddy: catalog } })
+    const { store } = await mountDefaults({ ...DELEGATE_BASE, agentDefaults: { codebuddy: { model: 'm1', effort: 'x' } } }, { catalogs: { codebuddy: catalog } })
     await category('子代理')
     const effort = axisSelect('思考等级', 'CodeBuddy')
     await waitFor(() => expect(optionValues(effort)).toContain('x'))
@@ -362,7 +300,7 @@ describe('SubagentDefaults — per-agent axes', () => {
         },
       },
     }
-    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: catalog } })
+    await mountDefaults({ ...DELEGATE_BASE }, { catalogs: { codebuddy: catalog } })
     await category('子代理')
     const effort = axisSelect('思考等级', 'CodeBuddy')
     const block = axisSelect('模型', 'CodeBuddy').closest('.dwa-preference-block') as HTMLElement
@@ -376,7 +314,7 @@ describe('SubagentDefaults — per-agent axes', () => {
   })
 
   it('shows the per-agent config-file fact and a reset that deletes the override entry', async () => {
-    const { calls } = await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'claude-sonnet-4' } }, configured: { agentDefaults: { codebuddy: { model: 'deepseek-v3' } } } })
+    const { calls } = await mountDefaults({ ...DELEGATE_BASE, agentDefaults: { codebuddy: { model: 'claude-sonnet-4' } }, configured: { agentDefaults: { codebuddy: { model: 'deepseek-v3' } } } })
     await category('子代理')
     await waitFor(() => expect(optionValues(axisSelect('模型', 'CodeBuddy'))).toContain('claude-sonnet-4'))
     expect(screen.getByText(/配置文件要求：模型 deepseek-v3/).className).toContain('dwa-deadline-flag')
@@ -385,7 +323,7 @@ describe('SubagentDefaults — per-agent axes', () => {
   })
 
   it('no per-agent reset when the entry matches the config baseline', async () => {
-    await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3' } }, configured: { agentDefaults: { codebuddy: { model: 'deepseek-v3' } } } })
+    await mountDefaults({ ...DELEGATE_BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3' } }, configured: { agentDefaults: { codebuddy: { model: 'deepseek-v3' } } } })
     await category('子代理')
     await waitFor(() => expect(optionValues(axisSelect('模型', 'CodeBuddy'))).toContain('deepseek-v3'))
     expect(screen.queryByText(/配置文件要求/)).toBeNull()
@@ -393,7 +331,7 @@ describe('SubagentDefaults — per-agent axes', () => {
   })
 
   it('offers 获取目录 only when the catalog is missing, and probes on click', async () => {
-    const { calls } = await mountDefaults({ ...BASE }, { catalogs: { codebuddy: null } })
+    const { calls } = await mountDefaults({ ...DELEGATE_BASE }, { catalogs: { codebuddy: null } })
     await category('子代理')
     const button = await screen.findByRole('button', { name: '获取目录' })
     await click(button)
@@ -401,7 +339,7 @@ describe('SubagentDefaults — per-agent axes', () => {
   })
 
   it('reverts the whole delegate view when a defaults write is refused', async () => {
-    const seed: AcpDelegateSettings = { ...BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3' } } }
+    const seed: AcpDelegateSettings = { ...DELEGATE_BASE, agentDefaults: { codebuddy: { model: 'deepseek-v3' } } }
     const { store } = await mountDefaults(seed, { failWrite: true })
     await category('子代理')
     const model = axisSelect('模型', 'CodeBuddy')
@@ -421,7 +359,7 @@ describe('SubagentDefaults — gating', () => {
   })
 
   it('hides only the defaults section when no agents or default values exist', async () => {
-    await mountDefaults(BASE, { agents: [] })
+    await mountDefaults(DELEGATE_BASE, { agents: [] })
     await category('子代理')
     expect(screen.getByRole('slider', { name: '子代理委派' })).toBeDefined()
     expect(screen.queryByRole('combobox', { name: '默认智能体' })).toBeNull()
@@ -429,7 +367,7 @@ describe('SubagentDefaults — gating', () => {
   })
 
   it('keeps a deleted default recoverable with an empty roster', async () => {
-    await mountDefaults({ ...BASE, defaultAgent: 'ghost', resolvedDefaultAgent: 'ghost' }, { agents: [] })
+    await mountDefaults({ ...DELEGATE_BASE, defaultAgent: 'ghost', resolvedDefaultAgent: 'ghost' }, { agents: [] })
     await category('子代理')
     const select = defaultAgentSelect()
     expect(select.value).toBe('ghost')
@@ -437,7 +375,7 @@ describe('SubagentDefaults — gating', () => {
   })
 
   it('keeps a config-file default recoverable with an empty roster', async () => {
-    await mountDefaults({ ...BASE, configured: { defaultAgent: 'ghost' } }, { agents: [] })
+    await mountDefaults({ ...DELEGATE_BASE, configured: { defaultAgent: 'ghost' } }, { agents: [] })
     await category('子代理')
     expect(defaultAgentSelect().value).toBe('')
     expect(screen.getByText(/配置文件要求：ghost/)).toBeDefined()
@@ -459,7 +397,7 @@ describe('SubagentDefaults — catalog freshness is the user’s call', () => {
   })
 
   it('never probes on its own: opening the page only reads the cache', async () => {
-    const { calls } = await mountDefaults({ ...BASE }, { catalogs: { codebuddy: cached('codebuddy', 1), pi: cached('pi', 1) } })
+    const { calls } = await mountDefaults({ ...DELEGATE_BASE }, { catalogs: { codebuddy: cached('codebuddy', 1), pi: cached('pi', 1) } })
     await category('子代理')
     await waitFor(() => expect(screen.getByRole('combobox', { name: '模型 · CodeBuddy' })).toBeDefined())
     // Stale or not, the page spends no probe: one probe can start an agent process.
@@ -468,7 +406,7 @@ describe('SubagentDefaults — catalog freshness is the user’s call', () => {
   })
 
   it('shows the snapshot age and probes only when 刷新目录 is clicked', async () => {
-    const { calls } = await mountDefaults({ ...BASE }, { catalogs: { codebuddy: cached('codebuddy', Date.now() - 3 * 24 * 60 * 60_000) } })
+    const { calls } = await mountDefaults({ ...DELEGATE_BASE }, { catalogs: { codebuddy: cached('codebuddy', Date.now() - 3 * 24 * 60 * 60_000) } })
     await category('子代理')
     const row = screen.getByRole('combobox', { name: '模型 · CodeBuddy' }).closest('.dwa-preference-block') as HTMLElement
     expect(within(row).getByText('目录更新于 3 天前')).toBeDefined()
@@ -478,7 +416,7 @@ describe('SubagentDefaults — catalog freshness is the user’s call', () => {
   })
 
   it('an unread catalog keeps 获取目录 and shows no age', async () => {
-    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: null } })
+    await mountDefaults({ ...DELEGATE_BASE }, { catalogs: { codebuddy: null } })
     await category('子代理')
     const row = screen.getByRole('button', { name: '获取目录' }).closest('.dwa-preference-block') as HTMLElement
     expect(within(row).queryByText(/目录更新于/)).toBeNull()
@@ -487,7 +425,7 @@ describe('SubagentDefaults — catalog freshness is the user’s call', () => {
   })
 
   it('pulls nothing while the section stays hidden', async () => {
-    const { calls } = await mountDefaults({ ...BASE }, { catalogs: { codebuddy: cached('codebuddy', 1) } })
+    const { calls } = await mountDefaults({ ...DELEGATE_BASE }, { catalogs: { codebuddy: cached('codebuddy', 1) } })
     await new Promise(resolve => setTimeout(resolve, 50))
     expect(writes(calls, 'agent/cached-models')).toEqual([])
     expect(writes(calls, 'agent/probe-models')).toEqual([])
@@ -771,7 +709,7 @@ describe('resolvedAxisDefaultLabel — the process default the 默认 option spe
   })
 
   it('the 默认 option spells the resolved process default in parentheses when the catalog is known', async () => {
-    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: knownCatalog } })
+    await mountDefaults({ ...DELEGATE_BASE }, { catalogs: { codebuddy: knownCatalog } })
     await category('子代理')
     const model = axisSelect('模型', 'CodeBuddy')
     await waitFor(() => expect(optionValues(model)).toContain('m1'))
@@ -785,7 +723,7 @@ describe('resolvedAxisDefaultLabel — the process default the 默认 option spe
   })
 
   it('the 默认 option stays plain 默认 while the catalog is unread', async () => {
-    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: null } })
+    await mountDefaults({ ...DELEGATE_BASE }, { catalogs: { codebuddy: null } })
     await category('子代理')
     // The fetch gesture proves the memory-only read settled as missing.
     await screen.findByRole('button', { name: '获取目录' })
@@ -798,7 +736,7 @@ describe('resolvedAxisDefaultLabel — the process default the 默认 option spe
   })
 
   it('the English locale spells Default (X) with the same resolved label', async () => {
-    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: knownCatalog }, locale: (zh, en) => en })
+    await mountDefaults({ ...DELEGATE_BASE }, { catalogs: { codebuddy: knownCatalog }, locale: (zh, en) => en })
     await click(within(screen.getByRole('navigation', { name: 'NTR settings categories' })).getByRole('button', { name: 'Subagents' }))
     const model = screen.getByRole('combobox', { name: 'Model · CodeBuddy' }) as HTMLSelectElement
     await waitFor(() => expect(optionValues(model)).toContain('m1'))
@@ -824,7 +762,7 @@ describe('resolvedAxisDefaultLabel — the process default the 默认 option spe
   })
 
   it('the parentheses match the hit row verbatim, description included', async () => {
-    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: hy4Catalog('hy4flash-free') } })
+    await mountDefaults({ ...DELEGATE_BASE }, { catalogs: { codebuddy: hy4Catalog('hy4flash-free') } })
     await category('子代理')
     const model = axisSelect('模型', 'CodeBuddy')
     await waitFor(() => expect(optionValues(model)).toContain('hy4flash-free'))
@@ -837,7 +775,7 @@ describe('resolvedAxisDefaultLabel — the process default the 默认 option spe
   })
 
   it('same-name variants: currentValue pointing at the SECOND choice carries its description', async () => {
-    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: hy4Catalog('hy4flash') } })
+    await mountDefaults({ ...DELEGATE_BASE }, { catalogs: { codebuddy: hy4Catalog('hy4flash') } })
     await category('子代理')
     const model = axisSelect('模型', 'CodeBuddy')
     await waitFor(() => expect(optionValues(model)).toContain('hy4flash'))
@@ -848,7 +786,7 @@ describe('resolvedAxisDefaultLabel — the process default the 默认 option spe
 
   it('a hit without a description spells the bare name in parentheses', async () => {
     const catalog: AgentProbeModelsResult = { agentId: 'codebuddy', updatedAt: 1, catalog: { model: slot('plain', [{ value: 'plain', name: 'Plain' }]) } }
-    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: catalog } })
+    await mountDefaults({ ...DELEGATE_BASE }, { catalogs: { codebuddy: catalog } })
     await category('子代理')
     const model = axisSelect('模型', 'CodeBuddy')
     await waitFor(() => expect(optionValues(model)).toContain('plain'))
@@ -856,7 +794,7 @@ describe('resolvedAxisDefaultLabel — the process default the 默认 option spe
   })
 
   it('a currentValue outside the choices spells the raw value marked 未在列表中 — no alias guessed', async () => {
-    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: hy4Catalog('hy4free') } })
+    await mountDefaults({ ...DELEGATE_BASE }, { catalogs: { codebuddy: hy4Catalog('hy4free') } })
     await category('子代理')
     const model = axisSelect('模型', 'CodeBuddy')
     await waitFor(() => expect(optionValues(model)).toContain('hy4flash-free'))
@@ -872,7 +810,7 @@ describe('resolvedAxisDefaultLabel — the process default the 默认 option spe
   })
 
   it('the English locale marks the unlisted value "not listed"', async () => {
-    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: hy4Catalog('hy4free') }, locale: (zh, en) => en })
+    await mountDefaults({ ...DELEGATE_BASE }, { catalogs: { codebuddy: hy4Catalog('hy4free') }, locale: (zh, en) => en })
     await click(within(screen.getByRole('navigation', { name: 'NTR settings categories' })).getByRole('button', { name: 'Subagents' }))
     const model = screen.getByRole('combobox', { name: 'Model · CodeBuddy' }) as HTMLSelectElement
     await waitFor(() => expect(optionValues(model)).toContain('hy4flash-free'))
@@ -887,7 +825,7 @@ describe('resolvedAxisDefaultLabel — the process default the 默认 option spe
       agentId: 'codebuddy', updatedAt: 1,
       catalog: { model: slot(longId, [{ value: 'm1', name: 'Model One' }]) },
     }
-    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: catalog }, locale: (zh, en) => en })
+    await mountDefaults({ ...DELEGATE_BASE }, { catalogs: { codebuddy: catalog }, locale: (zh, en) => en })
     await click(within(screen.getByRole('navigation', { name: 'NTR settings categories' })).getByRole('button', { name: 'Subagents' }))
     const model = screen.getByRole('combobox', { name: 'Model · CodeBuddy' }) as HTMLSelectElement
     await waitFor(() => expect(optionValues(model)).toContain('m1'))
@@ -904,7 +842,7 @@ describe('resolvedAxisDefaultLabel — the process default the 默认 option spe
       agentId: 'codebuddy', updatedAt: 1,
       catalog: { model: slot('m1', [{ value: 'm1', name: 'Model One' }]) },
     }
-    await mountDefaults({ ...BASE, agentDefaults: { codebuddy: { model: longId } } }, { catalogs: { codebuddy: catalog } })
+    await mountDefaults({ ...DELEGATE_BASE, agentDefaults: { codebuddy: { model: longId } } }, { catalogs: { codebuddy: catalog } })
     await category('子代理')
     const model = axisSelect('模型', 'CodeBuddy')
     await waitFor(() => expect(optionValues(model)).toContain('m1'))
@@ -927,7 +865,7 @@ describe('resolvedAxisDefaultLabel — the process default the 默认 option spe
         ]),
       },
     }
-    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: catalog } })
+    await mountDefaults({ ...DELEGATE_BASE }, { catalogs: { codebuddy: catalog } })
     await category('子代理')
     const mode = axisSelect('模式', 'CodeBuddy')
     await waitFor(() => expect(optionValues(mode)).toContain('auto'))
@@ -952,7 +890,7 @@ describe('resolvedAxisDefaultLabel — the process default the 默认 option spe
         mode: slot('', [{ value: 'o1', name: 'Mode One' }]),
       },
     }
-    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: catalog } })
+    await mountDefaults({ ...DELEGATE_BASE }, { catalogs: { codebuddy: catalog } })
     await category('子代理')
     // The mode row proves the catalog settled (a boolean model slot renders nothing).
     await waitFor(() => expect(optionValues(axisSelect('模式', 'CodeBuddy'))).toContain('o1'))
@@ -971,7 +909,7 @@ describe('resolvedAxisDefaultLabel — the process default the 默认 option spe
         thoughtByModel: { m1: slot('deep', [{ value: 'deep', name: 'Deep', description: 'deeper thinking' }]) },
       },
     }
-    await mountDefaults({ ...BASE }, { catalogs: { codebuddy: catalog } })
+    await mountDefaults({ ...DELEGATE_BASE }, { catalogs: { codebuddy: catalog } })
     await category('子代理')
     const effort = axisSelect('思考等级', 'CodeBuddy')
     await waitFor(() => expect(optionValues(effort)).toContain('deep'))
