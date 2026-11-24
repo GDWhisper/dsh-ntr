@@ -531,6 +531,7 @@ describe('windows shim launch', () => {
   it.runIf(process.platform === 'win32')('killProcessTree reaps the agent behind the cmd.exe wrapper', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dsh-ntr tree '))
     let child: ReturnType<typeof spawn> | undefined
+    let grandchild = 0
     try {
       const marker = join(dir, 'grandchild.pid')
       const script = join(dir, 'sleeper.mjs')
@@ -543,15 +544,28 @@ describe('windows shim launch', () => {
       const cmdPid = child.pid
       expect(cmdPid).toBeDefined()
 
-      const grandchild = await waitForPid(marker)
+      grandchild = await waitForPid(marker)
       expect(isAlive(grandchild)).toBe(true)
 
       // Killing only the direct child (what the old Windows branch did) would
       // leave this process running: `taskkill /T` must see the tree intact.
       killProcessTree(cmdPid as number)
-      await until(() => !isAlive(grandchild))
+      // `taskkill` is a de-facto async kill — it is a process of its own, and it
+      // measured 1.1 s to land on an idle box, 2.2 s under process-creation
+      // pressure. The deadline below is a failure bound, not a speed assertion,
+      // so give the OS room instead of racing a loaded suite.
+      await until(() => !isAlive(grandchild), 20_000)
       expect(isAlive(grandchild)).toBe(false)
     } finally {
+      // By pid, before the tree attempt: once cmd.exe is gone `taskkill /T`
+      // cannot reach the sleeper, so a failed case used to leave it running
+      // forever — leaked sleepers accumulate across runs and add process
+      // pressure to every later one.
+      if (grandchild > 0) {
+        try {
+          process.kill(grandchild, 'SIGKILL')
+        } catch { /* already gone */ }
+      }
       if (child?.pid !== undefined) killProcessTree(child.pid)
       rmSync(dir, { recursive: true, force: true })
     }
