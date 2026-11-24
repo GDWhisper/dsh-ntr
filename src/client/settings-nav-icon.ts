@@ -36,20 +36,22 @@ const GLYPH_MARK = 'data-dsh-ntr-glyph'
 
 /**
  * Interlocking triple ring, drawn in the shell's idiom: 24 grid, three equal
- * rings in a row at the same overlap the old pair used (spacing = radius), the
- * outer two being the layers that meet — the DSH display layer and the ACP
- * agent layer — and the middle one the bridge that joins them. Filled with
- * `currentColor` at low opacity; no literal colors.
+ * rings on an equilateral triangle (one on top, two below), each locked to its
+ * two neighbours — the DSH display shell, the bridge, the ACP agent process,
+ * with no privileged ring in the middle.
  *
- * Three rings have to be smaller than two (r 5 vs 6) to stay inside the shell's
- * 24 grid: at three radii the old size would clip its strokes on both edges,
- * and the row leaves 1.1 units of margin once the 1.8 stroke is accounted for.
+ * Geometry: r 5 on a circumradius of 5.4 (side 9.36 < 2r, so every pair
+ * overlaps by a third of a diameter) while the centroid stays OUTSIDE all three
+ * rings — that is what leaves the middle a small triangular gap instead of a
+ * filled lens. The triangle's bounding box is centred in the grid: 2.05 units
+ * top and bottom, 1.42 left and right once the 1.8 stroke is counted, so no
+ * part of the outline is clipped at the edges.
  */
 const TRIPLE_RING_MARKUP =
   '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
-  '<circle cx="7" cy="12" r="5" stroke="currentColor" stroke-width="1.8" fill="currentColor" fill-opacity="0.08" />' +
-  '<circle cx="12" cy="12" r="5" stroke="currentColor" stroke-width="1.8" fill="currentColor" fill-opacity="0.08" />' +
-  '<circle cx="17" cy="12" r="5" stroke="currentColor" stroke-width="1.8" fill="currentColor" fill-opacity="0.08" />' +
+  '<circle cx="12" cy="7.95" r="5" stroke="currentColor" stroke-width="1.8" fill="currentColor" fill-opacity="0.08" />' +
+  '<circle cx="7.32" cy="16.05" r="5" stroke="currentColor" stroke-width="1.8" fill="currentColor" fill-opacity="0.08" />' +
+  '<circle cx="16.68" cy="16.05" r="5" stroke="currentColor" stroke-width="1.8" fill="currentColor" fill-opacity="0.08" />' +
   '</svg>'
 
 interface SwappedGlyph {

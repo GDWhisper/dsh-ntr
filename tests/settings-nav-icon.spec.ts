@@ -40,11 +40,12 @@ describe('installSettingsNavIcon', () => {
     expect(glyph!.getAttribute('height')).toBe('16')
     expect(glyph!.getAttribute('class')).toBe('navIcon')
     expect(glyph!.getAttribute('aria-hidden')).toBe('true')
-    // Three interlocking rings — and three DIFFERENT centres, since a stacked
-    // copy of one circle would satisfy a bare count.
+    // Three interlocking rings in a TRIANGLE: three distinct centres, and two of
+    // them sharing a row — a row arrangement would put all three on one.
     const rings = Array.from(glyph!.querySelectorAll('circle'))
     expect(rings.length).toBe(3)
     expect(new Set(rings.map(ring => `${ring.getAttribute('cx')},${ring.getAttribute('cy')}`)).size).toBe(3)
+    expect(new Set(rings.map(ring => ring.getAttribute('cy'))).size).toBe(2)
     expect(button.hasAttribute('data-dsh-ntr-nav-icon')).toBe(true)
     cleanup()
   })
