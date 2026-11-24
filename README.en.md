@@ -326,6 +326,12 @@ Code map: `src/index.ts` (plugin entry) · `src/protocol.ts` (shared types) · `
 
 ---
 
+## Contributing
+
+Open PRs from a branch in your own fork, based on `main`. `main` is protected: changes land only through a PR with at least one approval — no direct pushes. Branch naming, required checks, and commit conventions live in [CONTRIBUTING.md](./CONTRIBUTING.md).
+
+---
+
 ## License
 
 This project is licensed under the [Apache 2.0 License](LICENSE).

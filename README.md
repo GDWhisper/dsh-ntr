@@ -326,6 +326,12 @@ dsh plugin --profile web add ./   # 挂载到 Web Profile
 
 ---
 
+## 参与贡献
+
+PR 请从你自己的 fork 开分支提出，base 选 `main`。`main` 已开启分支保护：只接受经 PR 的合入、至少一个 approval，不接受直推。分支命名、必须通过的检查、提交信息规范见 [CONTRIBUTING.md](./CONTRIBUTING.md)。
+
+---
+
 ## 开源协议
 
 本项目采用 [Apache 2.0](LICENSE) 许可证开源。

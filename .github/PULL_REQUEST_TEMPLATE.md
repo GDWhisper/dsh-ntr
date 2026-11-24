@@ -1,3 +1,6 @@
+> 开 PR 前请读 [CONTRIBUTING.md](../CONTRIBUTING.md)：分支命名、必须通过的检查、提交信息规范都在那里。
+> Read [CONTRIBUTING.md](../CONTRIBUTING.md) before opening this PR — branch naming, required checks, and commit conventions live there.
+
 ## 摘要 / Summary
 
 <!-- 一句话：这个 PR 做了什么。/ One sentence: what this PR does. -->
@@ -31,6 +34,7 @@
 
 ## 检查清单 / Checklist
 
+- [ ] PR 来自独立分支（`feat/` `fix/` `docs/`），base 为 `main`，已 rebase 到最新 `main`，不含无关的合并提交 / The PR comes from its own branch (`feat/` `fix/` `docs/`) based on `main`, rebased onto the latest `main`, with no unrelated merge commits
 - [ ] 提交信息符合 Conventional Commits，英文正文写明动机与影响 / Commit messages follow Conventional Commits with an English body covering motivation and impact
 - [ ] 未提交 `lib/` 构建产物 / No build output from `lib/` is committed
 - [ ] 新文件 ≤ 1000 行；单文件超 500 行或净增 200 行已在上面说明 / New files are ≤ 1000 lines; files over 500 lines or a +200-line delta are explained above
