@@ -82,19 +82,19 @@ describe('SubagentCard', () => {
   it('hides the page and the nav item on a host without the delegate RPC', async () => {
     await mountPanel()
     const nav = screen.getByRole('navigation', { name: 'NTR 设置分类' })
-    expect(within(nav).queryByRole('button', { name: '子代理' })).toBeNull()
-    expect(screen.queryByRole('heading', { name: '子代理' })).toBeNull()
-    expect(screen.queryByRole('slider', { name: '子代理委派', hidden: true })).toBeNull()
+    expect(within(nav).queryByRole('button', { name: '子智能体' })).toBeNull()
+    expect(screen.queryByRole('heading', { name: '子智能体' })).toBeNull()
+    expect(screen.queryByRole('slider', { name: '子智能体委派', hidden: true })).toBeNull()
   })
 
   it('writes the picked guidance rung immediately, optimistically, never as an agent save', async () => {
     const { store, calls } = await mountDelegate(BASE)
-    await category('子代理')
-    expect(screen.getByRole('heading', { name: '子代理' })).toBeDefined()
+    await category('子智能体')
+    expect(screen.getByRole('heading', { name: '子智能体' })).toBeDefined()
     // off/on carry no enhanced/force warning text; their banners are checked below.
     expect(screen.queryByText(/该档位会增强工具描述/)).toBeNull()
     expect(screen.queryByText(/强制模式会屏蔽/)).toBeNull()
-    const slider = screen.getByRole('slider', { name: '子代理委派' }) as HTMLInputElement
+    const slider = screen.getByRole('slider', { name: '子智能体委派' }) as HTMLInputElement
     expect(slider.value).toBe('0')
     fireEvent.change(slider, { target: { value: '1' } })
     await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ guidance: 'on' }]))
@@ -109,7 +109,7 @@ describe('SubagentCard', () => {
 
   it('shows the enhanced note in warning tokens', async () => {
     await mountDelegate({ ...BASE, guidance: 'enhanced' })
-    await category('子代理')
+    await category('子智能体')
     const note = screen.getByText('该档位会增强工具描述，引导大模型优先使用本工具。')
     // The warn tone is the box's DEFAULT: no modifier, so the stylesheet's own
     // warn pair is what it wears.
@@ -119,7 +119,7 @@ describe('SubagentCard', () => {
 
   it('shows the force note in danger tokens', async () => {
     await mountDelegate({ ...BASE, guidance: 'force' })
-    await category('子代理')
+    await category('子智能体')
     const note = screen.getByText('强制模式会屏蔽 DSH 的原生 subagent 能力，请谨慎开启。')
     expect(note.className).toContain('dwa-deadline-warn')
     expect(note.className).toContain('is-danger')
@@ -142,16 +142,16 @@ describe('SubagentCard', () => {
 
   it('shows the off hint as a neutral banner and the on hint as a success banner', async () => {
     await mountDelegate(BASE)
-    await category('子代理')
-    const offHint = screen.getByText('子代理功能关闭，当前NTR不作为原生dsh的子代理工具')
+    await category('子智能体')
+    const offHint = screen.getByText('子智能体功能关闭，当前NTR不作为原生dsh的子智能体工具')
     expect(offHint.className).toContain('dwa-deadline-warn')
     expect(offHint.className).toContain('is-neutral')
     expect(screen.queryByText(/关闭 = 不注册本工具/)).toBeNull()
-    fireEvent.change(screen.getByRole('slider', { name: '子代理委派' }), { target: { value: '1' } })
-    const onHint = await screen.findByText('NTR将作为子代理工具注册进原生dsh会话中，下一轮对话生效')
+    fireEvent.change(screen.getByRole('slider', { name: '子智能体委派' }), { target: { value: '1' } })
+    const onHint = await screen.findByText('NTR将作为子智能体工具注册进原生dsh会话中，下一轮对话生效')
     expect(onHint.className).toContain('dwa-deadline-warn')
     expect(onHint.className).toContain('is-success')
-    expect(screen.queryByText('子代理功能关闭，当前NTR不作为原生dsh的子代理工具')).toBeNull()
+    expect(screen.queryByText('子智能体功能关闭，当前NTR不作为原生dsh的子智能体工具')).toBeNull()
     expect(screen.queryByText(/关闭 = 不注册本工具/)).toBeNull()
   })
 
@@ -177,21 +177,21 @@ describe('SubagentCard', () => {
 
   it('removes the ladder sentence on every rung, keeping only the warn boxes', async () => {
     await mountDelegate({ ...BASE, guidance: 'enhanced' })
-    await category('子代理')
+    await category('子智能体')
     expect(screen.queryByText(/关闭 = 不注册本工具/)).toBeNull()
-    expect(screen.queryByText(/子代理功能关闭/)).toBeNull()
-    expect(screen.queryByText(/NTR将作为子代理工具注册/)).toBeNull()
+    expect(screen.queryByText(/子智能体功能关闭/)).toBeNull()
+    expect(screen.queryByText(/NTR将作为子智能体工具注册/)).toBeNull()
     expect(screen.getByText('该档位会增强工具描述，引导大模型优先使用本工具。')).toBeDefined()
     cleanup()
     await mountDelegate({ ...BASE, guidance: 'force' })
-    await category('子代理')
+    await category('子智能体')
     expect(screen.queryByText(/关闭 = 不注册本工具/)).toBeNull()
     expect(screen.getByText('强制模式会屏蔽 DSH 的原生 subagent 能力，请谨慎开启。')).toBeDefined()
   })
 
   it('centers the guidance tick labels on the exact rung fractions', async () => {
     await mountDelegate(BASE)
-    await category('子代理')
+    await category('子智能体')
     const guidanceLefts = ['关闭', '开启', '引导增强', '强制模式'].map(name =>
       Number.parseFloat(screen.getByText(name, { selector: '.dwa-deadline-ticks span' }).style.left))
     expect(guidanceLefts[0]).toBe(0)
@@ -202,7 +202,7 @@ describe('SubagentCard', () => {
 
   it('renders no permission row — the delegation policy is always auto', async () => {
     await mountDelegate(BASE)
-    await category('子代理')
+    await category('子智能体')
     expect(screen.queryByRole('button', { name: '自动代答' })).toBeNull()
     expect(screen.queryByRole('button', { name: '直接拒绝' })).toBeNull()
     expect(screen.queryByRole('button', { name: '人工确认' })).toBeNull()
@@ -212,7 +212,7 @@ describe('SubagentCard', () => {
 
   it('writes a hand-filled minute value as round(minutes*60000)', async () => {
     const { calls } = await mountDelegate(BASE)
-    await category('子代理')
+    await category('子智能体')
     const input = screen.getByRole('spinbutton', { name: '单次时限' }) as HTMLInputElement
     // The display value is the exact ms/60000 with no trailing zeros.
     expect(input.value).toBe('40')
@@ -223,7 +223,7 @@ describe('SubagentCard', () => {
 
   it('commits a hand-filled minute value on Enter as round(minutes*60000)', async () => {
     const { calls } = await mountDelegate(BASE)
-    await category('子代理')
+    await category('子智能体')
     const input = screen.getByRole('spinbutton', { name: '单次时限' }) as HTMLInputElement
     fireEvent.change(input, { target: { value: '90' } })
     fireEvent.keyDown(input, { key: 'Enter' })
@@ -232,7 +232,7 @@ describe('SubagentCard', () => {
 
   it('snaps an empty, non-numeric or out-of-range draft back on blur, without writing', async () => {
     const { calls } = await mountDelegate(BASE)
-    await category('子代理')
+    await category('子智能体')
     const input = screen.getByRole('spinbutton', { name: '单次时限' }) as HTMLInputElement
     // 0 minutes → 0 ms (below the 1 s floor); 1500 minutes → 25 h (above the 24 h ceiling).
     for (const bad of ['', 'abc', '0', '1500']) {
@@ -246,7 +246,7 @@ describe('SubagentCard', () => {
 
   it('prints an off-grid window exactly, with no slider to round it', async () => {
     await mountDelegate({ ...BASE, timeoutMs: 700_000 })
-    await category('子代理')
+    await category('子智能体')
     expect(screen.getByText('700 秒', { selector: '.dwa-deadline-value' })).toBeDefined()
     expect(screen.queryByRole('slider', { name: '单次时限' })).toBeNull()
   })
@@ -256,7 +256,7 @@ describe('SubagentCard', () => {
       ...BASE, guidance: 'force', timeoutMs: 900_000, defaultTimeoutMs: 300_000,
       configured: { guidance: 'on', timeoutMs: 300_000 },
     })
-    await category('子代理')
+    await category('子智能体')
     expect(screen.getByText(/配置文件要求：开启/).className).toContain('dwa-deadline-flag')
     expect(screen.getByText(/配置文件要求：5 分钟/).className).toContain('dwa-deadline-flag')
     // The window overrides the baseline → a reset labelled to the config value appears.
@@ -266,7 +266,7 @@ describe('SubagentCard', () => {
 
   it('offers no reset button and no override facts when nothing is overridden', async () => {
     await mountDelegate({ ...BASE, guidance: 'on', configured: { guidance: 'on' } })
-    await category('子代理')
+    await category('子智能体')
     expect(screen.queryByText(/配置文件要求/)).toBeNull()
     expect(screen.queryByRole('button', { name: '恢复配置文件的值' })).toBeNull()
     expect(screen.queryByRole('button', { name: '恢复默认值' })).toBeNull()
@@ -274,7 +274,7 @@ describe('SubagentCard', () => {
 
   it('resetting the window restores the baseline and hides the reset button', async () => {
     const { store, calls } = await mountDelegate({ ...BASE, timeoutMs: 5_400_000 })
-    await category('子代理')
+    await category('子智能体')
     expect(screen.getByText('90 分钟', { selector: '.dwa-deadline-value' })).toBeDefined()
     await click(screen.getByRole('button', { name: '恢复默认值' }))
     await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toEqual([{ reset: ['timeoutMs'] }]))
@@ -286,7 +286,7 @@ describe('SubagentCard', () => {
     // The old half reports the running window but no baseline: the card must
     // not invent one, so no reset appears even though the value looks changed.
     await mountDelegate({ guidance: 'off', timeoutMs: 5_400_000, toolAvailable: true, restrictAvailable: true })
-    await category('子代理')
+    await category('子智能体')
     expect(screen.getByText('90 分钟', { selector: '.dwa-deadline-value' })).toBeDefined()
     expect(screen.queryByRole('button', { name: '恢复默认值' })).toBeNull()
     expect(screen.queryByRole('button', { name: '恢复配置文件的值' })).toBeNull()
@@ -294,31 +294,31 @@ describe('SubagentCard', () => {
 
   it('reports a missing tool service as a fact beside the switch', async () => {
     await mountDelegate({ ...BASE, toolAvailable: false })
-    await category('子代理')
+    await category('子智能体')
     expect(screen.getByText(/宿主未提供工具服务，此开关暂不生效/)).toBeDefined()
     expect(screen.queryByText(/宿主未提供工具遮蔽服务/)).toBeNull()
   })
 
   it('shows no missing-service warning while off on a capable host', async () => {
     await mountDelegate({ ...BASE, guidance: 'off', toolAvailable: true })
-    await category('子代理')
+    await category('子智能体')
     expect(screen.queryByText(/宿主未提供工具服务/)).toBeNull()
   })
 
   it('reports the force degradation only while force is picked', async () => {
     await mountDelegate({ ...BASE, guidance: 'force', restrictAvailable: false })
-    await category('子代理')
+    await category('子智能体')
     expect(screen.getByText(/宿主未提供工具遮蔽服务，强制模式暂按引导增强生效/)).toBeDefined()
     cleanup()
     await mountDelegate({ ...BASE, guidance: 'enhanced', restrictAvailable: false })
-    await category('子代理')
+    await category('子智能体')
     expect(screen.queryByText(/宿主未提供工具遮蔽服务/)).toBeNull()
   })
 
   it('reverts the card to the last host answer when a write is refused', async () => {
     const { store } = await mountDelegate(BASE, { failWrite: true })
-    await category('子代理')
-    fireEvent.change(screen.getByRole('slider', { name: '子代理委派' }), { target: { value: '2' } })
+    await category('子智能体')
+    fireEvent.change(screen.getByRole('slider', { name: '子智能体委派' }), { target: { value: '2' } })
     await waitFor(() => expect(store.getSnapshot().notice).toBe('no'))
     expect(store.getSnapshot().delegate?.guidance).toBe('off')
     expect(screen.getByText('关闭', { selector: '.dwa-deadline-value' })).toBeDefined()
@@ -326,9 +326,9 @@ describe('SubagentCard', () => {
 
   it('mounts the delegation-defaults section and writes a per-agent default through the card', async () => {
     const { store, calls } = await mountDelegate({ ...BASE, globalDefaultAgent: 'codebuddy', resolvedDefaultAgent: 'codebuddy' })
-    await category('子代理')
-    expect(screen.getByText('委派默认')).toBeDefined()
-    expect((screen.getByRole('combobox', { name: '默认智能体' }) as HTMLSelectElement).value).toBe('')
+    await category('子智能体')
+    expect(screen.getByText('子智能体委派配置')).toBeDefined()
+    expect((screen.getByRole('combobox', { name: '默认子智能体' }) as HTMLSelectElement).value).toBe('')
     const model = screen.getByRole('combobox', { name: '模型 · CodeBuddy' }) as HTMLSelectElement
     await waitFor(() => expect(Array.from(model.options).map(option => option.value)).toContain('claude-sonnet-4'))
     fireEvent.change(model, { target: { value: 'claude-sonnet-4' } })

@@ -40,7 +40,7 @@ describe('SubagentDefaults — the card head', () => {
       ...DELEGATE_BASE,
       agentDefaults: { codebuddy: { model: 'deepseek-v3', effort: 'high', description: '只改单文件' } },
     })
-    await category('子代理')
+    await category('子智能体')
     // Set axes are named; the description is a fact, not a value.
     const pills = pillsOf('codebuddy')
     expect(within(pills).getByText('模型 DeepSeek V3')).toBeDefined()
@@ -59,7 +59,7 @@ describe('SubagentDefaults — the card head', () => {
       agentDefaults: { codebuddy: { model: 'deepseek-v3' } },
       configured: { agentDefaults: { codebuddy: { model: 'gpt-5' } } },
     })
-    await category('子代理')
+    await category('子智能体')
     // Constraint 33: an override fact may not hide behind a click, and the head
     // is the only band a folded card shows — so the fact rides there too.
     await click(headOf('codebuddy'))
@@ -72,7 +72,7 @@ describe('SubagentDefaults — the card head', () => {
 describe('SubagentDefaults — folding one agent', () => {
   it('folds without unmounting the form, and 全部收起 drives every card', async () => {
     await mountDefaults({ ...DELEGATE_BASE })
-    await category('子代理')
+    await category('子智能体')
     const body = (): HTMLElement | null => document.getElementById('dwa-delegate-defaults-codebuddy')
     // Expanded by default: a first visit must show the controls, not a stack of
     // summaries with the form behind a click.

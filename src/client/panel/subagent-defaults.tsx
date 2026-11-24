@@ -1,9 +1,9 @@
 /**
- * The delegation-defaults section of the subagent card (T3). It edits ONLY the
- * `acp_delegate` tool's per-agent profile — which agent a delegation lands on
- * when the caller names none, and per-agent model / thought-level / mode
- * defaults plus the free-text description the caller reads before choosing.
- * It never touches the chat plane's own selections.
+ * The agent delegation config (「子智能体委派配置」) of the subagent card. It edits
+ * ONLY the `acp_delegate` tool's per-agent profile — which agent a delegation
+ * lands on when the caller names none, and per-agent model / thought-level /
+ * mode defaults plus the free-text description the caller reads before
+ * choosing. It never touches the chat plane's own selections.
  *
  * Value chain per axis: explicit tool argument > this section's persisted
  * default > the agent process's own default. The view the host reports is the
@@ -530,7 +530,7 @@ function AgentDefaultsRow(props: {
 }
 
 /**
- * The delegation-defaults section: a default-agent picker, then one foldable
+ * The agent delegation config section: a default-agent picker, then one foldable
  * card per configured agent. Mounted inside SubagentCard; returns nothing on a
  * host half that reports no delegate view (the card already gates, this is
  * defensive).
@@ -590,11 +590,11 @@ export function SubagentDefaults(props: { acp: AcpStore; ui: UiState }) {
     <div ref={rootRef} style={{ marginTop: 28 }}>
       <div className="dwa-section-heading">
         <div>
-          <h4 className="dwa-section-title dwa-subsection-title">{acp.label('委派默认', 'Delegation defaults')}</h4>
+          <h4 className="dwa-section-title dwa-subsection-title">{acp.label('子智能体委派配置', 'Agent delegation')}</h4>
           <p className="dwa-section-copy">
             {acp.label(
-              '只影响 acp_delegate 委派；「默认」跟随智能体进程自身。',
-              'Affects acp_delegate delegations only; "Default" follows the agent process itself.',
+              '只影响 acp_delegate；「默认」跟随智能体进程自身。',
+              'Affects acp_delegate only; "Default" follows the agent process itself.',
             )}
           </p>
         </div>
@@ -615,15 +615,15 @@ export function SubagentDefaults(props: { acp: AcpStore; ui: UiState }) {
         <div className="dwa-preference-block">
           <div className="dwa-row-split">
             <div className="dwa-row-main">
-              <div className="dwa-preference-label">{acp.label('默认智能体', 'Default agent')}</div>
+              <div className="dwa-preference-label">{acp.label('默认子智能体', 'Default agent')}</div>
               <div className="dwa-preference-copy">
-                {acp.label('委派未指明智能体时使用；「默认」跟随「设为默认智能体」的选择。', 'Used when a delegation names no agent; "Default" follows "Set as default agent".')}
+                {acp.label('委派未指明子智能体时使用；「默认」跟随「设为默认智能体」的选择。', 'Used when a delegation names no agent; "Default" follows "Set as default agent".')}
               </div>
             </div>
             <div className="dwa-row-side dwa-row-side-select">
               <select
                 className="dwa-select"
-                aria-label={acp.label('默认智能体', 'Default agent')}
+                aria-label={acp.label('默认子智能体', 'Default agent')}
                 value={current ?? ''}
                 onChange={event => {
                   const value = event.target.value

@@ -171,7 +171,7 @@ export function AcpSettingsSection(props: WithStore) {
         <button type="button" aria-pressed={page === 'skills'} onClick={() => setPage('skills')}>{acp.label('技能', 'Skills')}</button>
         {ui.approvalDeadlines !== undefined && <button type="button" aria-pressed={page === 'approvals'} onClick={() => setPage('approvals')}>{acp.label('审批时限', 'Approval deadlines')}</button>}
         {ui.idleRelease !== undefined && <button type="button" aria-pressed={page === 'processes'} onClick={() => setPage('processes')}>{acp.label('进程管理', 'Processes')}</button>}
-        {ui.delegate !== undefined && <button type="button" aria-pressed={page === 'subagents'} onClick={() => setPage('subagents')}>{acp.label('子代理', 'Subagents')}</button>}
+        {ui.delegate !== undefined && <button type="button" aria-pressed={page === 'subagents'} onClick={() => setPage('subagents')}>{acp.label('子智能体', 'Subagents')}</button>}
         <button type="button" aria-pressed={page === 'appearance'} onClick={() => setPage('appearance')}>{acp.label('对话外观', 'Appearance')}</button>
         <button type="button" aria-pressed={page === 'logs'} onClick={() => setPage('logs')}>
           {acp.label('日志', 'Logs')}

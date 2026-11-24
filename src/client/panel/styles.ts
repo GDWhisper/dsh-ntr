@@ -86,7 +86,7 @@ const STYLE = `
 .dwa-section { margin-bottom: 28px; }
 .dwa-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
 .dwa-section-title { font-size: var(--ntr-font-sm); font-weight: 650; margin: 0; display: flex; align-items: center; gap: 8px; color: var(--dsw-alias-label-secondary, #4b5563); }
-/* 委派默认 is a SECOND label of the 子代理 page, not a title inside a card: it
+/* 子智能体委派配置 is a SECOND label of the 子智能体 page, not a title inside a card: it
  * sits at the same weight as the page's own section label, because its cards
  * are siblings of that section's card. */
 .dwa-subsection-title { font-size: var(--ntr-font-sm); font-weight: 650; color: var(--dsw-alias-label-secondary, #4b5563); }
@@ -364,7 +364,7 @@ const STYLE = `
 .dwa-log-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ntr-danger); display: inline-block; margin-left: 6px; }
 .dwa-log-level.is-info { background: var(--dsw-alias-state-business-tertiary, #dbeafe); color: var(--dsw-alias-state-business-primary, #2563eb); }
 .dwa-log-level.is-error { background: var(--dsw-alias-state-error-tertiary, #fef2f2); color: var(--ntr-danger); }
-/* ── The per-agent delegation defaults (「委派默认」) ────────────────────────
+/* ── The per-agent delegation config (「子智能体委派配置」) ────────────────────
  * One card per agent. The head is the summary line — name plus what this
  * agent's delegation profile actually overrides — and the whole band is the
  * fold button, so folding one agent never means hunting for a caret. The body

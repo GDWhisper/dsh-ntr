@@ -126,7 +126,7 @@ export async function mountDefaults(
 
 /** The default-agent picker (its aria-label is the visible row title). */
 export function defaultAgentSelect(): HTMLSelectElement {
-  return screen.getByRole('combobox', { name: '默认智能体' }) as HTMLSelectElement
+  return screen.getByRole('combobox', { name: '默认子智能体' }) as HTMLSelectElement
 }
 
 /** One agent's axis dropdown, addressed by its aria-label. */

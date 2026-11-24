@@ -94,14 +94,14 @@ function guidanceHint(guidance: DelegateGuidance, acp: AcpStore): {
 } | undefined {
   if (guidance === 'off') return {
     text: acp.label(
-      '子代理功能关闭，当前NTR不作为原生dsh的子代理工具',
+      '子智能体功能关闭，当前NTR不作为原生dsh的子智能体工具',
       'Subagents are off; NTR does not act as a native DSH subagent tool.',
     ),
     tone: 'neutral',
   }
   if (guidance === 'on') return {
     text: acp.label(
-      'NTR将作为子代理工具注册进原生dsh会话中，下一轮对话生效',
+      'NTR将作为子智能体工具注册进原生dsh会话中，下一轮对话生效',
       'NTR registers as a subagent tool in native DSH sessions, effective next turn.',
     ),
     tone: 'success',
@@ -169,7 +169,7 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
     <section className="dwa-section">
       <div className="dwa-section-heading">
         <div>
-          <h3 className="dwa-section-title">{acp.label('子代理', 'Subagents')}</h3>
+          <h3 className="dwa-section-title">{acp.label('子智能体', 'Subagents')}</h3>
           <p className="dwa-section-copy">
             {acp.label('把任务委派给已接入的 ACP agent。', 'Delegate tasks to your connected ACP agents.')}
           </p>
@@ -178,7 +178,7 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
       <div className="dwa-preferences">
         <div className="dwa-preference-block">
           <div className="dwa-preference-label">
-            {acp.label('子代理委派', 'Delegation')}
+            {acp.label('子智能体委派', 'Delegation')}
             <span className="dwa-deadline-value">{guidanceText(delegate.guidance, acp)}</span>
           </div>
           <input
@@ -188,7 +188,7 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
             max={DELEGATE_GUIDANCE.length - 1}
             step={1}
             value={DELEGATE_GUIDANCE.indexOf(delegate.guidance)}
-            aria-label={acp.label('子代理委派', 'Delegation')}
+            aria-label={acp.label('子智能体委派', 'Delegation')}
             onChange={event => {
               const next = DELEGATE_GUIDANCE[Number(event.target.value)]
               if (next !== undefined && next !== delegate.guidance) void acp.setDelegateSettings({ guidance: next })

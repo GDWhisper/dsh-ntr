@@ -241,7 +241,7 @@ describe('the agy step view in the detail overlay', () => {
   it('says the transcript is unreadable explicitly', () => {
     const key = subagentKey('chat-1', 'acp:d1')
     const dialog = openDialog(fakeStore({ records: [record()], details: { [key]: loadedDetail([noticeEntry('unreadable')]) } }))
-    expect(dialog.textContent).toContain('读不到这个子代理的 transcript')
+    expect(dialog.textContent).toContain('读不到这个子智能体的 transcript')
   })
 
   it('states bad lines and the read window with their facts', () => {

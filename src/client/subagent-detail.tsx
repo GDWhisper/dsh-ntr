@@ -560,7 +560,7 @@ export function SubagentDetailDialog({ acp }: SubagentDetailDialogProps) {
                       {waiting
                         ? t('正在读取明细…', 'loading detail…')
                         : t(
-                          '子代理 transcript 还没有步骤；它可能刚开始工作。',
+                          '子智能体 transcript 还没有步骤；它可能刚开始工作。',
                           'The child transcript has no steps yet; it may have just started.',
                         )}
                     </div>

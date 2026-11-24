@@ -176,7 +176,7 @@ export function agyStepKindLabel(kind: AgyStepView['kind'], t: Translate): strin
 function noticeCopy(view: AgyStepView, t: Translate): string {
   if (view.notice === 'unreadable') {
     return t(
-      '读不到这个子代理的 transcript：文件不存在或不可读。',
+      '读不到这个子智能体的 transcript：文件不存在或不可读。',
       'Cannot read this subagent’s transcript: the file is missing or unreadable.',
     )
   }
