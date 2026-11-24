@@ -546,6 +546,15 @@ export function SubagentDefaults(props: { acp: AcpStore; ui: UiState }) {
   const delegate = ui.delegate
   const rootRef = useRef<HTMLDivElement | null>(null)
   const requested = useRef<Set<string>>(new Set())
+  // Fold state lives here so one control can drive every card. FOLDED is the
+  // default: this section answers "who can I delegate to, and what does that
+  // agent change?" — one summary line per agent answers both, and the form is
+  // one click away on that agent's own head. The OPEN set is what's remembered
+  // rather than the folded one, so folded stays the zero state: a roster that
+  // arrives after the first render is folded too, with no state to migrate.
+  // Kept ABOVE the early returns: a section that first renders with no roster
+  // must not gain a hook when one fills in.
+  const [openIds, setOpenIds] = useState<readonly string[]>([])
   // Re-check visibility every render: the page wrapper toggles `hidden` without
   // remounting, and a hidden section must not pull catalogs (constraint 8).
   // `loadCachedModels` is memory-only and deduped, so the guard keeps it cheap.
@@ -576,15 +585,11 @@ export function SubagentDefaults(props: { acp: AcpStore; ui: UiState }) {
     : acp.label(`默认（当前：${resolved}）`, `Default (now: ${resolved})`)
   const defaultOverridden = configuredDefault !== undefined && configuredDefault !== current
 
-  // Fold state lives here so one control can drive every card. Expanded by
-  // default: a first visit must show every control rather than a stack of
-  // summaries with the form hidden behind a click.
-  const [collapsed, setCollapsed] = useState<readonly string[]>([])
-  const isCollapsed = (id: string): boolean => collapsed.includes(id)
+  const isOpen = (id: string): boolean => openIds.includes(id)
   const toggleAgent = (id: string): void => {
-    setCollapsed(current => current.includes(id) ? current.filter(other => other !== id) : [...current, id])
+    setOpenIds(current => current.includes(id) ? current.filter(other => other !== id) : [...current, id])
   }
-  const allFolded = roster.length > 0 && roster.every(agent => isCollapsed(agent.id))
+  const allFolded = roster.length > 0 && !roster.some(agent => isOpen(agent.id))
 
   return (
     <div ref={rootRef} style={{ marginTop: 28 }}>
@@ -602,7 +607,7 @@ export function SubagentDefaults(props: { acp: AcpStore; ui: UiState }) {
           <button
             type="button"
             className="dwa-btn dwa-btn-quiet"
-            onClick={() => setCollapsed(allFolded ? [] : roster.map(agent => agent.id))}
+            onClick={() => setOpenIds(allFolded ? roster.map(agent => agent.id) : [])}
           >
             {allFolded
               ? acp.label('全部展开', 'Expand all')
@@ -670,7 +675,7 @@ export function SubagentDefaults(props: { acp: AcpStore; ui: UiState }) {
             delegate={delegate}
             agentId={agent.id}
             title={agent.title}
-            open={!isCollapsed(agent.id)}
+            open={isOpen(agent.id)}
             onToggle={() => toggleAgent(agent.id)}
           />
         ))}

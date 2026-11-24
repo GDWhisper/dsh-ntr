@@ -14,7 +14,7 @@ import { AcpSettingsSection } from '../../src/client/panel.tsx'
 import { AcpStore, type RpcCall } from '../../src/client/store.ts'
 import type { AcpDelegateSettings, DelegateSetPayload } from '../../src/protocol.ts'
 import { createPanelFixture, type PanelRpcCall } from '../panel-fixture.ts'
-import { category, click, mountPanel } from './harness.ts'
+import { category, click, expandCard, mountPanel } from './harness.ts'
 
 afterEach(cleanup)
 
@@ -329,6 +329,8 @@ describe('SubagentCard', () => {
     await category('子智能体')
     expect(screen.getByText('子智能体委派配置')).toBeDefined()
     expect((screen.getByRole('combobox', { name: '默认子智能体' }) as HTMLSelectElement).value).toBe('')
+    // The cards arrive folded; the axes are behind this agent's own head.
+    await expandCard('codebuddy')
     const model = screen.getByRole('combobox', { name: '模型 · CodeBuddy' }) as HTMLSelectElement
     await waitFor(() => expect(Array.from(model.options).map(option => option.value)).toContain('claude-sonnet-4'))
     fireEvent.change(model, { target: { value: 'claude-sonnet-4' } })

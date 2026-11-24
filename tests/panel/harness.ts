@@ -73,6 +73,13 @@ export function writes(calls: PanelRpcCall[], endpoint: string): unknown[] {
  * authoritative: it applies each `ui/delegate-set` patch to its own snapshot and
  * answers with the new view, the same contract the host half honours. Two spec
  * files cover this section, so the stub lives here rather than in either one.
+ *
+ * The delegation cards open FOLDED (a first visit is a stack of summaries — see
+ * `subagent-defaults-fold.spec.ts`, which pins that default). A spec about the
+ * axes therefore opens them first with the head's own click. The subagents page
+ * is mounted but hidden at this point, so that click is the gesture a user makes
+ * one navigation later: it writes no RPC and the fold state is the same.
+ * `keepFolded` skips the gesture for the spec that covers the flat state itself.
  */
 export async function mountDefaults(
   seed: AcpDelegateSettings,
@@ -81,6 +88,7 @@ export async function mountDefaults(
     failWrite?: boolean
     catalogs?: Record<string, AgentProbeModelsResult | null>
     locale?: (zh: string, en: string) => string
+    keepFolded?: boolean
   } = {},
 ): Promise<{ store: AcpStore; calls: PanelRpcCall[] }> {
   const base = createPanelFixture({ agents: options.agents, catalogs: options.catalogs })
@@ -121,7 +129,29 @@ export async function mountDefaults(
   const store = new AcpStore(rpc, options.locale ?? (zh => zh))
   await store.resync()
   render(createElement(AcpSettingsSection, { acp: store }))
+  if (options.keepFolded !== true) await expandAllCards()
   return { store, calls }
+}
+
+/** The head button of one agent's delegation card (the card's only button). */
+function cardHead(agentId: string): HTMLElement {
+  const body = document.getElementById(`dwa-delegate-defaults-${agentId}`)
+  const head = body?.parentElement?.querySelector('button')
+  if (head == null) throw new Error(`no delegation card for ${agentId}`)
+  return head
+}
+
+/** Open one delegation card, if it is folded. */
+export async function expandCard(agentId: string): Promise<void> {
+  const head = cardHead(agentId)
+  if (head.getAttribute('aria-expanded') === 'false') await click(head)
+}
+
+/** Open every delegation card on the page, if any is folded. */
+export async function expandAllCards(): Promise<void> {
+  for (const head of Array.from(document.querySelectorAll<HTMLElement>('.dwa-acc-head'))) {
+    if (head.getAttribute('aria-expanded') === 'false') await click(head)
+  }
 }
 
 /** The default-agent picker (its aria-label is the visible row title). */
