@@ -225,7 +225,23 @@ export async function disposeChild(child: ChildProcess, budgetMs: number): Promi
   // confirm a SIGKILL / taskkill landed, and it must fit inside the same budget.
   if (await waitForChildExit(child, Math.max(0, budgetMs - KILL_ESCALATION_GRACE_MS))) return
   if (windows) {
+    // Redundant tree attempt first, then the backstop that spawns nothing.
+    //
+    // `taskkill` is itself a process: measured on this machine it needs
+    // ~1.1 s to land on an idle box and ~2.2 s under process-creation
+    // pressure, while `child.kill` is TerminateProcess on a handle we already
+    // hold — immediate, and it cannot fail for lack of process quota. Without
+    // it, a budget spent waiting on the external killer runs out with the
+    // child still alive even though the OS could have ended it at once.
+    //
+    // Order is load-bearing: the handle kill only takes the DIRECT child, so a
+    // `cmd.exe` shim must still be alive when `/T` enumerates, or the agent it
+    // spawned is re-parented out of reach (see `killProcessTree`). Hence the
+    // tree attempt above runs first, and this runs only after it failed.
     killProcessTree(pid)
+    try {
+      child.kill('SIGKILL')
+    } catch { /* already gone */ }
   } else {
     try {
       process.kill(-pid, 'SIGKILL')
