@@ -2,6 +2,34 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [0.5.1] - 2026-11-25
+
+这一版让委派如实回报子任务的真实结局，并允许按 agent 单独关闭委派能力。
+
+### 新增
+
+- **delegate**：每个 agent 可单独关闭「参与子智能体委派」；关闭后不再出现在委派候选与默认选择里，设置页「子智能体」分区也标上了 BETA。([3edb93a](https://github.com/GDWhisper/dsh-ntr/commit/3edb93a))
+
+### 修复
+
+- **acp**：委派的子任务结束时如实回报拒绝、达到 token 上限、取消或出错等结局，不再一律显示成功；工具说明同时写明外部子智能体不出现在清单、不能作为等待目标。([456c88f](https://github.com/GDWhisper/dsh-ntr/commit/456c88f))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.5.0...v0.5.1
+
+---
+
+This release makes delegation report how child tasks actually ended and lets each agent opt out of delegation.
+
+### Added
+
+- **delegate**: each agent can be switched out of subagent delegation; disabled agents no longer appear in the delegation roster or default choices, and the Subagents section in settings is marked BETA. ([3edb93a](https://github.com/GDWhisper/dsh-ntr/commit/3edb93a))
+
+### Fixed
+
+- **acp**: delegated child tasks now report their real ending — refusal, token limit, cancellation or error — instead of always looking successful; the delegation docs also state that external leaves are absent from the subagent list and cannot be waited on. ([456c88f](https://github.com/GDWhisper/dsh-ntr/commit/456c88f))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.5.0...v0.5.1
+
 ## [0.5.0] - 2026-11-24
 
 这一版把 NTR 的 agent 接入宿主原生子智能体链路，让委派成为可定制、可中断的一等能力，并重排设置页、加固会话与关闭路径。
