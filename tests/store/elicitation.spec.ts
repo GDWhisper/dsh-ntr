@@ -31,6 +31,8 @@ describe('client store elicitation helpers', () => {
       dshSessionId: 'chat-1',
       message: 'Pick one',
       fields,
+      omittedFields: 2,
+      omittedOptions: 3,
       deadlineAt: 1_700_000_000_000,
     })!
     // Duplicate requestId replaces the entry idempotently without growing the list.
@@ -41,6 +43,8 @@ describe('client store elicitation helpers', () => {
       dshSessionId: 'chat-1',
       message: 'Pick one updated',
       fields,
+      omittedFields: 2,
+      omittedOptions: 3,
       deadlineAt: 1_700_000_005_000,
     })!
     list = reduceElicitationEvent(list, {
@@ -52,7 +56,7 @@ describe('client store elicitation helpers', () => {
     })!
     expect(list).toHaveLength(2)
     expect(elicitationsForSession(list, 'chat-1')).toMatchObject([
-      { requestId: 'r1', message: 'Pick one updated', deadlineAt: 1_700_000_005_000 },
+      { requestId: 'r1', message: 'Pick one updated', omittedFields: 2, omittedOptions: 3, deadlineAt: 1_700_000_005_000 },
     ])
     expect(elicitationsForSession(list, 'chat-2')).toEqual([])
 

@@ -17,6 +17,7 @@ import {
 import type { AcpManager } from '../../src/impl.ts'
 import {
   MAX_ELICITATION_DESC_CHARS,
+  MAX_ELICITATION_FIELD_NAME_CHARS,
   MAX_ELICITATION_FIELDS,
   MAX_ELICITATION_MESSAGE_CHARS,
   MAX_ELICITATION_OPTION_LABEL_CHARS,
@@ -269,6 +270,36 @@ describe('ACP form elicitation parsing and validation', () => {
     expect(parsed.fields[0]?.description?.length).toBe(MAX_ELICITATION_DESC_CHARS)
     expect(parsed.fields[0]?.options).toHaveLength(MAX_ELICITATION_OPTIONS)
     expect(parsed.fields[0]?.options?.[0]?.label.length).toBe(MAX_ELICITATION_OPTION_LABEL_CHARS)
+    expect(parsed.omittedFields).toBe(5)
+    expect(parsed.omittedOptions).toBe(5)
+  })
+
+  it('counts dropped options but not option sources superseded by a winning source', () => {
+    const parsed = parseElicitationForm({
+      mode: 'form',
+      sessionId: 'acp-1',
+      message: 'Caps',
+      requestedSchema: {
+        type: 'object',
+        properties: {
+          pick: { type: 'string', oneOf: [{ const: 'a' }], enum: ['x', 'y'] },
+          noConst: { type: 'string', oneOf: [{ title: 'No const here' }] },
+          bad: { type: 'string', enum: [42, 17] },
+          big: { type: 'string', enum: ['ok', 42, 'v'.repeat(513)] },
+          '': { type: 'string' },
+          ['n'.repeat(MAX_ELICITATION_FIELD_NAME_CHARS + 1)]: { type: 'string' },
+        },
+      },
+    })!
+
+    expect(parsed.fields.map(field => field.name)).toEqual(['pick', 'noConst', 'bad', 'big'])
+    expect(parsed.fields[0]).toMatchObject({ kind: 'single-select', options: [{ value: 'a', label: 'a' }] })
+    expect(parsed.fields[1]?.kind).toBe('string')
+    expect(parsed.fields[2]?.kind).toBe('string')
+    expect(parsed.fields[3]).toMatchObject({ kind: 'single-select', options: [{ value: 'ok', label: 'ok' }] })
+    expect(parsed.omittedFields).toBe(2)
+    // `pick`'s enum is superseded by oneOf (not counted); noConst=1, bad=2, big=2.
+    expect(parsed.omittedOptions).toBe(5)
   })
 })
 
@@ -279,6 +310,8 @@ describe('ElicitationLedger, replay frames, and RPC dispatch', () => {
     const view = {
       dshSessionId: 'dsh-1',
       message: 'Pick one',
+      omittedFields: 4,
+      omittedOptions: 6,
       deadlineAt: 1_700_000_000_000,
       fields: [{ name: 'choice', kind: 'single-select' as const, title: 'Choice', required: true, options: [{ value: 'a', label: 'A' }] }],
     }
@@ -289,7 +322,7 @@ describe('ElicitationLedger, replay frames, and RPC dispatch', () => {
     expect(ledger.hasPendingFor('s9')).toBe(false)
 
     const liveFrame = elicitationRequestFrame({ requestId: id1, sessionId: 's1', ...view })
-    expect(liveFrame).toMatchObject({ deadlineAt: 1_700_000_000_000 })
+    expect(liveFrame).toMatchObject({ omittedFields: 4, omittedOptions: 6, deadlineAt: 1_700_000_000_000 })
     const replay = elicitationReplayFrames(ledger.pendingViews())
     expect(replay[0]).toEqual(liveFrame)
     expect(replay.at(-1)).toEqual({ type: 'elicitation/synced', requestIds: [id1, id2] })

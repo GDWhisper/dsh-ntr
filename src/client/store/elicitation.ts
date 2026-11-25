@@ -51,6 +51,8 @@ export function reduceElicitationEvent(
         ...(event.title === undefined ? {} : { title: event.title }),
         ...(event.description === undefined ? {} : { description: event.description }),
         fields: event.fields,
+        ...(event.omittedFields === undefined ? {} : { omittedFields: event.omittedFields }),
+        ...(event.omittedOptions === undefined ? {} : { omittedOptions: event.omittedOptions }),
         ...(event.deadlineAt === undefined ? {} : { deadlineAt: event.deadlineAt }),
       }
       return upsertPendingRequest(current, entry)

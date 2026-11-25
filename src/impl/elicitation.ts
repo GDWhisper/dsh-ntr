@@ -34,6 +34,19 @@ export interface ParsedElicitationForm {
   title?: string
   description?: string
   fields: ElicitationFieldView[]
+  omittedFields?: number
+  omittedOptions?: number
+}
+
+interface ParseTally {
+  omittedFields: number
+  omittedOptions: number
+}
+
+/** One option source's result, plus what it had to drop. */
+interface ParsedOptions {
+  options: ElicitationOption[]
+  omitted: number
 }
 
 function nonEmptyString(value: unknown): string | undefined {
@@ -53,14 +66,21 @@ function finiteNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
-function parseEnumOptions(raw: unknown): ElicitationOption[] | undefined {
+function parseEnumOptions(raw: unknown): ParsedOptions | undefined {
   if (!Array.isArray(raw) || raw.length === 0) return undefined
   const out: ElicitationOption[] = []
+  let omitted = 0
   for (const item of raw) {
-    if (out.length >= MAX_ELICITATION_OPTIONS) break
-    if (typeof item !== 'object' || item === null || Array.isArray(item)) continue
+    if (out.length >= MAX_ELICITATION_OPTIONS
+      || typeof item !== 'object' || item === null || Array.isArray(item)) {
+      omitted += 1
+      continue
+    }
     const row = item as Record<string, unknown>
-    if (typeof row.const !== 'string' || row.const.length > MAX_ELICITATION_OPTION_VALUE_CHARS) continue
+    if (typeof row.const !== 'string' || row.const.length > MAX_ELICITATION_OPTION_VALUE_CHARS) {
+      omitted += 1
+      continue
+    }
     const rawLabel = typeof row.title === 'string' && row.title !== '' ? row.title : row.const
     const label = truncateWithEllipsis(rawLabel, MAX_ELICITATION_OPTION_LABEL_CHARS)
     const description = cappedText(row.description, MAX_ELICITATION_DESC_CHARS)
@@ -70,26 +90,47 @@ function parseEnumOptions(raw: unknown): ElicitationOption[] | undefined {
       ...(description === undefined ? {} : { description }),
     })
   }
-  return out.length > 0 ? out : undefined
+  return { options: out, omitted }
 }
 
-function parsePlainEnum(raw: unknown, rawNames?: unknown): ElicitationOption[] | undefined {
+function parsePlainEnum(raw: unknown, rawNames?: unknown): ParsedOptions | undefined {
   if (!Array.isArray(raw) || raw.length === 0) return undefined
   const names = Array.isArray(rawNames) ? rawNames : undefined
   const out: ElicitationOption[] = []
+  let omitted = 0
   for (let i = 0; i < raw.length; i++) {
-    if (out.length >= MAX_ELICITATION_OPTIONS) break
     const value = raw[i]
-    if (typeof value !== 'string' || value.length > MAX_ELICITATION_OPTION_VALUE_CHARS) continue
+    if (out.length >= MAX_ELICITATION_OPTIONS
+      || typeof value !== 'string' || value.length > MAX_ELICITATION_OPTION_VALUE_CHARS) {
+      omitted += 1
+      continue
+    }
     const rawLabel = names !== undefined && typeof names[i] === 'string' && names[i] !== ''
       ? (names[i] as string)
       : value
     out.push({ value, label: truncateWithEllipsis(rawLabel, MAX_ELICITATION_OPTION_LABEL_CHARS) })
   }
-  return out.length > 0 ? out : undefined
+  return { options: out, omitted }
 }
 
-function parseField(name: string, raw: unknown, required: boolean): ElicitationFieldView {
+/**
+ * Try option sources in priority order. The first source with usable options
+ * wins and only ITS omissions count; a source superseded that way was not
+ * "lost". When no source yields any option, the field degrades to a text
+ * input, so every option those sources dropped is lost — sum them all.
+ */
+function pickOptions(sources: ReadonlyArray<() => ParsedOptions | undefined>): { picked?: ParsedOptions; dropped: number } {
+  let dropped = 0
+  for (const source of sources) {
+    const parsed = source()
+    if (parsed === undefined) continue
+    if (parsed.options.length > 0) return { picked: parsed, dropped: 0 }
+    dropped += parsed.omitted
+  }
+  return { dropped }
+}
+
+function parseField(name: string, raw: unknown, required: boolean, tally: ParseTally): ElicitationFieldView {
   const row = (typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>
   const type = typeof row.type === 'string' ? row.type : 'string'
   const title = cappedText(row.title, MAX_ELICITATION_TITLE_CHARS)
@@ -127,10 +168,13 @@ function parseField(name: string, raw: unknown, required: boolean): ElicitationF
     const items = (typeof row.items === 'object' && row.items !== null && !Array.isArray(row.items)
       ? row.items
       : {}) as Record<string, unknown>
-    const options = parseEnumOptions(items.anyOf)
-      ?? parseEnumOptions(items.oneOf)
-      ?? parsePlainEnum(items.enum, items.enumNames)
-      ?? []
+    const { picked, dropped } = pickOptions([
+      () => parseEnumOptions(items.anyOf),
+      () => parseEnumOptions(items.oneOf),
+      () => parsePlainEnum(items.enum, items.enumNames),
+    ])
+    const options = picked?.options ?? []
+    tally.omittedOptions += picked?.omitted ?? dropped
     const minItems = finiteNumber(row.minItems)
     const maxItems = finiteNumber(row.maxItems)
     const defaultArr = Array.isArray(row.default)
@@ -147,12 +191,16 @@ function parseField(name: string, raw: unknown, required: boolean): ElicitationF
   }
 
   // `string` (or unknown/custom schema type degraded to text input so nothing is dropped).
-  const options = parseEnumOptions(row.oneOf) ?? parsePlainEnum(row.enum, row.enumNames)
-  if (options !== undefined) {
+  const { picked, dropped } = pickOptions([
+    () => parseEnumOptions(row.oneOf),
+    () => parsePlainEnum(row.enum, row.enumNames),
+  ])
+  tally.omittedOptions += picked?.omitted ?? dropped
+  if (picked !== undefined) {
     return {
       ...base,
       kind: 'single-select',
-      options,
+      options: picked.options,
       ...(typeof row.default === 'string' ? { defaultValue: row.default } : {}),
     }
   }
@@ -197,10 +245,14 @@ export function parseElicitationForm(raw: unknown): ParsedElicitationForm | unde
     ? schema.properties
     : {}) as Record<string, unknown>
   const fields: ElicitationFieldView[] = []
+  const tally: ParseTally = { omittedFields: 0, omittedOptions: 0 }
   for (const [name, prop] of Object.entries(properties)) {
-    if (fields.length >= MAX_ELICITATION_FIELDS) break
-    if (name === '' || name.length > MAX_ELICITATION_FIELD_NAME_CHARS) continue
-    fields.push(parseField(name, prop, requiredSet.has(name)))
+    if (fields.length >= MAX_ELICITATION_FIELDS
+      || name === '' || name.length > MAX_ELICITATION_FIELD_NAME_CHARS) {
+      tally.omittedFields += 1
+      continue
+    }
+    fields.push(parseField(name, prop, requiredSet.has(name), tally))
   }
   return {
     acpSessionId,
@@ -209,6 +261,8 @@ export function parseElicitationForm(raw: unknown): ParsedElicitationForm | unde
     ...(title === undefined ? {} : { title }),
     ...(description === undefined ? {} : { description }),
     fields,
+    ...(tally.omittedFields === 0 ? {} : { omittedFields: tally.omittedFields }),
+    ...(tally.omittedOptions === 0 ? {} : { omittedOptions: tally.omittedOptions }),
   }
 }
 
@@ -334,6 +388,8 @@ export function elicitationRequestFrame(view: PendingElicitationView): AcpEvent 
     ...(view.title === undefined ? {} : { title: view.title }),
     ...(view.description === undefined ? {} : { description: view.description }),
     fields: view.fields,
+    ...(view.omittedFields === undefined ? {} : { omittedFields: view.omittedFields }),
+    ...(view.omittedOptions === undefined ? {} : { omittedOptions: view.omittedOptions }),
     ...(view.deadlineAt === undefined ? {} : { deadlineAt: view.deadlineAt }),
   }
 }

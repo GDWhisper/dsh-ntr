@@ -112,8 +112,8 @@ export class AgentBridge {
    * was started with.
    */
   private permissionTimeoutMs: number
-  private elicitationTimeoutMs: number
-  private readonly explicitElicitationTimeout: boolean
+  /** Deployment-level form elicitation deadline; independent of the approval window and not hot-rewritten. */
+  private readonly elicitationTimeoutMs: number
   private permissionTimeoutMode: PermissionTimeoutMode
   private readonly cancelFallbackMs: number
   private readonly staleCancelRetryDelayMs: number
@@ -263,7 +263,6 @@ export class AgentBridge {
     // 不等待 (0) is the `auto` mode's business; under `abort` it would refuse
     // every ask on arrival, so the window is floored to the shortest real wait.
     this.permissionTimeoutMs = normalizeApprovalWindow(this.permissionTimeoutMode, merged.permissionTimeoutMs)
-    this.explicitElicitationTimeout = tuning?.elicitationTimeoutMs !== undefined
     this.elicitationTimeoutMs = merged.elicitationTimeoutMs
     this.cancelFallbackMs = merged.cancelFallbackMs
     this.staleCancelRetryDelayMs = merged.staleCancelRetryDelayMs
@@ -294,9 +293,6 @@ export class AgentBridge {
     // (不等待 under `abort`): floor it, so the ask waits instead of refusing
     // on arrival.
     this.permissionTimeoutMs = normalizeApprovalWindow(this.permissionTimeoutMode, this.permissionTimeoutMs)
-    if (!this.explicitElicitationTimeout && patch.permissionTimeoutMs !== undefined && patch.permissionTimeoutMs > 0) {
-      this.elicitationTimeoutMs = patch.permissionTimeoutMs
-    }
   }
 
   /**

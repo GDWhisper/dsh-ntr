@@ -108,6 +108,22 @@ describe('ElicitationDock', () => {
     })
   })
 
+  it('surfaces fields and options omitted at the schema caps', () => {
+    const { acp } = fakeStore([
+      {
+        requestId: 'req-cap',
+        sessionId: 's1',
+        dshSessionId: 'chat-1',
+        message: 'Too much schema',
+        fields: [],
+        omittedFields: 3,
+        omittedOptions: 5,
+      },
+    ])
+    render(createElement(ElicitationDock, { acp, sessionId: 'chat-1' }))
+    expect(screen.getByText('Content over the cap was omitted: 3 field(s), 5 option(s)')).toBeTruthy()
+  })
+
   it('renders deadline countdown and sends both decline and cancel actions', async () => {
     const { acp, respond } = fakeStore([
       {
