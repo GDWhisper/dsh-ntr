@@ -389,4 +389,22 @@ describe('delegate choice settings (settings layer)', () => {
     expect(calls.sync).toBe(2)
     expect(settings.persistedSettings().delegate).toBeUndefined()
   })
+
+  it('persists enabled: false per agent across restart and resets to config baseline', async () => {
+    const { host } = fakeHost()
+    const settings = new SettingsService(host)
+    settings.setConfiguredDelegate({ agentDefaults: { alpha: { enabled: false } } })
+    expect(settings.delegateSettings().agentDefaults).toEqual({ alpha: { enabled: false } })
+    await settings.setDelegateSettings({ agentDefaults: { alpha: {}, beta: { enabled: false, model: 'm' } } })
+    expect(settings.delegateSettings().agentDefaults).toEqual({ alpha: {}, beta: { enabled: false, model: 'm' } })
+
+    const snapshot = JSON.parse(JSON.stringify(settings.persistedSettings())) as Record<string, unknown>
+    const second = new SettingsService(fakeHost().host)
+    second.setConfiguredDelegate({ agentDefaults: { alpha: { enabled: false } } })
+    second.loadPersistedSettings(snapshot)
+    expect(second.delegateSettings().agentDefaults).toEqual({ alpha: {}, beta: { enabled: false, model: 'm' } })
+
+    await second.setDelegateSettings({ agentDefaults: { alpha: null } })
+    expect(second.delegateSettings().agentDefaults?.alpha).toEqual({ enabled: false })
+  })
 })

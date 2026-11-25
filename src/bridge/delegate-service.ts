@@ -527,32 +527,50 @@ export class AcpDelegateService {
   }
 
   /**
-   * Step 2: resolve the agent id; errors list the configured ids. The chain:
-   * explicit arg (must be configured) → the delegate default-agent setting
-   * (ONLY while still configured; a deleted target degrades one level with a
-   * note) → the plugin-global default (already filtered for deleted agents)
-   * → the no-default error. A stale delegate default with no global fallback
-   * is the plain no-default error — no note without a fallback to name.
+   * Step 2: resolve the agent id; errors list the enabled configured ids. The
+   * chain: explicit arg (must be configured AND enabled) → the delegate
+   * default-agent setting (ONLY while still configured and enabled; a deleted
+   * or disabled target degrades one level with a note) → the plugin-global
+   * default (ONLY while enabled; never silently runs a disabled agent) → an
+   * explicit error naming the disabled/missing default or enabled roster.
    */
   private resolveAgent(agentArg: string | undefined): { agentId: string; notes: string[] } {
     const configured = this.host.agents()
-    const ids = configured.map(agent => agent.id).join(', ')
+    const agentDefaults = this.host.delegateConfig().agentDefaults
+    const isEnabled = (id: string): boolean => agentDefaults[id]?.enabled !== false
+    const enabled = configured.filter(agent => isEnabled(agent.id))
+    const ids = enabled.map(agent => agent.id).join(', ')
     if (agentArg !== undefined) {
       if (!configured.some(agent => agent.id === agentArg)) {
         throw new Error(`acp_delegate: unknown agent "${agentArg}" (configured: ${ids})`)
       }
+      if (!isEnabled(agentArg)) {
+        throw new Error(`acp_delegate: agent "${agentArg}" is disabled for delegation (enabled: ${ids === '' ? 'none' : ids})`)
+      }
       return { agentId: agentArg, notes: [] }
     }
     const delegateDefault = this.host.delegateConfig().defaultAgent
-    if (delegateDefault !== undefined && configured.some(agent => agent.id === delegateDefault)) {
+    if (delegateDefault !== undefined && configured.some(agent => agent.id === delegateDefault) && isEnabled(delegateDefault)) {
       return { agentId: delegateDefault, notes: [] }
     }
     const fallback = this.host.defaultAgent()
-    if (fallback !== undefined) {
+    if (fallback !== undefined && isEnabled(fallback)) {
+      const reason = delegateDefault !== undefined && configured.some(agent => agent.id === delegateDefault)
+        ? '已禁用'
+        : '已失效'
       return {
         agentId: fallback,
-        notes: delegateDefault === undefined ? [] : [`默认 agent「${delegateDefault}」已失效，改用全局默认「${fallback}」`],
+        notes: delegateDefault === undefined ? [] : [`默认 agent「${delegateDefault}」${reason}，改用全局默认「${fallback}」`],
       }
+    }
+    if (enabled.length === 0 && configured.length > 0) {
+      throw new Error('acp_delegate: all configured agents are disabled for delegation')
+    }
+    if (delegateDefault !== undefined && configured.some(agent => agent.id === delegateDefault) && !isEnabled(delegateDefault)) {
+      throw new Error(`acp_delegate: default agent "${delegateDefault}" is disabled for delegation; name an enabled one explicitly (enabled: ${ids})`)
+    }
+    if (fallback !== undefined && !isEnabled(fallback)) {
+      throw new Error(`acp_delegate: default agent "${fallback}" is disabled for delegation; name an enabled one explicitly (enabled: ${ids})`)
     }
     throw new Error(`acp_delegate: no default agent configured; name one explicitly (configured: ${ids})`)
   }

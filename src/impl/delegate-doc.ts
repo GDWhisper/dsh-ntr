@@ -36,12 +36,18 @@ export function delegateAgentDoc(agentId: string, title: string, entry: AcpDeleg
   return doc
 }
 
-/** The whole roster: every configured agent plus its persisted delegation profile. */
+/**
+ * The whole roster: every enabled configured agent plus its persisted
+ * delegation profile (agents explicitly marked `enabled: false` are omitted
+ * from the caller's choice list).
+ */
 export function delegateAgentDocs(
   views: readonly { id: string; title: string }[],
   defaults: Record<string, AcpDelegateAgentDefaults> | undefined,
 ): DelegateAgentDoc[] {
-  return views.map(view => delegateAgentDoc(view.id, view.title, defaults?.[view.id]))
+  return views
+    .filter(view => defaults?.[view.id]?.enabled !== false)
+    .map(view => delegateAgentDoc(view.id, view.title, defaults?.[view.id]))
 }
 
 /**

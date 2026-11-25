@@ -263,6 +263,8 @@ export const DELEGATE_DESCRIPTION_MAX = 300
  * reaches the delegated agent itself (that sees only the task text).
  */
 export interface AcpDelegateAgentDefaults {
+  /** Whether this agent participates in `acp_delegate`; omitted means enabled (only `false` is persisted). */
+  enabled?: boolean
   model?: string
   effort?: string
   mode?: string

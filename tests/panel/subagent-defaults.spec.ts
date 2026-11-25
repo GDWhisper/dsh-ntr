@@ -918,3 +918,43 @@ describe('resolvedAxisDefaultLabel — the process default the 默认 option spe
     expect(option.textContent).toBe('默认（Deep · deeper thinking）')
   })
 })
+
+describe('SubagentDefaults — disabling agents for delegation', () => {
+  it('excludes disabled agents from the default-agent picker, marks a disabled selection, and warns when all are disabled', async () => {
+    await mountDefaults({
+      ...DELEGATE_BASE,
+      defaultAgent: 'codebuddy',
+      resolvedDefaultAgent: 'codebuddy',
+      agentDefaults: { codebuddy: { enabled: false } },
+    })
+    await category('子智能体')
+    const select = defaultAgentSelect()
+    expect(select.value).toBe('codebuddy')
+    expect(optionValues(select)).toEqual(['', 'pi', 'codebuddy'])
+    const disabledOpt = within(select).getByRole('option', { name: 'CodeBuddy（已禁用）' }) as HTMLOptionElement
+    expect(disabledOpt.getAttribute('style')).toContain('--dsw-alias-state-warn-primary')
+    expect(screen.getByText(/当前指定的默认子智能体已禁用/).className).toContain('dwa-deadline-flag')
+    expect(screen.getByText('当前已禁用子智能体委派，启用后以下配置生效。').className).toContain('is-neutral')
+
+    // Disabling the remaining agent surfaces the all-disabled warning while keeping the guidance rung intact.
+    await click(screen.getByRole('checkbox', { name: '参与子智能体委派 · pi' }))
+    expect(await screen.findByText('所有智能体均已禁用，当前无法通过 acp_delegate 委派任务。')).toBeDefined()
+    expect((screen.getByRole('slider', { name: '子智能体委派' }) as HTMLInputElement).value).toBe('1')
+  })
+
+  it('flags a disabled global default in the default option and shows disabled in config baseline notes', async () => {
+    await mountDefaults({
+      ...DELEGATE_BASE,
+      globalDefaultAgent: 'codebuddy',
+      resolvedDefaultAgent: 'codebuddy',
+      agentDefaults: { codebuddy: {} },
+      configured: { agentDefaults: { codebuddy: { enabled: false } } },
+    })
+    await category('子智能体')
+    expect(screen.getByText(/配置文件要求：已禁用/).className).toContain('dwa-deadline-flag')
+
+    await click(screen.getByRole('checkbox', { name: '参与子智能体委派 · CodeBuddy' }))
+    expect(await screen.findByRole('option', { name: '默认（当前：codebuddy，已禁用）' })).toBeDefined()
+    expect(screen.getByText(/当前跟随的全局默认智能体已禁用/).className).toContain('dwa-deadline-flag')
+  })
+})

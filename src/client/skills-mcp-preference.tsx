@@ -75,14 +75,15 @@ const MASTER_OFF_WARNING = [
 ] as const
 
 /**
- * The capsule switch both levels use: a track with a knob that slides.
+ * The capsule switch shared by settings rows (「技能」and「子智能体」): a track
+ * with a knob that slides.
  *
  * The real checkbox covers the track and stays transparent, so the pointer, the
  * keyboard and assistive tech all get the platform's own behaviour — a pill is
  * a look, not a new control. The track and the knob are plain spans, which is
  * what keeps it cheap: no state to hold, no ARIA to keep in sync.
  */
-function PillSwitch(props: {
+export function PillSwitch(props: {
   checked: boolean
   onChange: (checked: boolean) => void
   /** The accessible name: no row spells its switch out in visible text. */

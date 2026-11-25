@@ -169,7 +169,10 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
     <section className="dwa-section">
       <div className="dwa-section-heading">
         <div>
-          <h3 className="dwa-section-title">{acp.label('子智能体', 'Subagents')}</h3>
+          <h3 className="dwa-section-title">
+            {acp.label('子智能体', 'Subagents')}
+            <span className="dwa-badge dwa-badge-info">BETA</span>
+          </h3>
           <p className="dwa-section-copy">
             {acp.label('把任务委派给已接入的 ACP agent。', 'Delegate tasks to your connected ACP agents.')}
           </p>

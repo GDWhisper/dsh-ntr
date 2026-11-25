@@ -293,6 +293,33 @@ describe('acp_delegate execute semantics', () => {
       .rejects.toThrow('acp_delegate: no default agent configured; name one explicitly (configured: alpha, beta, codebuddy)')
   })
 
+  it('rejects disabled agents on explicit call and never silently falls back to a disabled default', async () => {
+    const f = makeHost()
+    happyPrompt(f)
+    f.config.agentDefaults = { beta: { enabled: false } }
+    // Explicit call to disabled agent is rejected before any session starts.
+    await expect(new AcpDelegateService(f.host).execute({ task: 'x', agent: 'beta' }, {}))
+      .rejects.toThrow('acp_delegate: agent "beta" is disabled for delegation (enabled: alpha, codebuddy)')
+    expect(f.calls.startSession).toHaveLength(0)
+
+    // Disabled delegate default falls back to enabled global default with a note.
+    f.config.defaultAgent = 'beta'
+    const res = await new AcpDelegateService(f.host).execute({ task: 'x' }, {})
+    expect(res.agent).toBe('alpha')
+    expect(res.notes).toBe('默认 agent「beta」已禁用，改用全局默认「alpha」')
+
+    // Disabled global default with no enabled delegate default is refused.
+    f.config.defaultAgent = undefined
+    f.config.agentDefaults = { alpha: { enabled: false } }
+    await expect(new AcpDelegateService(f.host).execute({ task: 'x' }, {}))
+      .rejects.toThrow('acp_delegate: default agent "alpha" is disabled for delegation; name an enabled one explicitly (enabled: beta, codebuddy)')
+
+    // All agents disabled gives a dedicated error.
+    f.config.agentDefaults = { alpha: { enabled: false }, beta: { enabled: false }, codebuddy: { enabled: false } }
+    await expect(new AcpDelegateService(f.host).execute({ task: 'x' }, {}))
+      .rejects.toThrow('acp_delegate: all configured agents are disabled for delegation')
+  })
+
   it('a rejected prompt surfaces as an acp_delegate error after cleanup', async () => {
     const f = makeHost()
     f.onPrompt(async () => { throw new Error('turn_in_flight') })

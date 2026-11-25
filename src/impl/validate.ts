@@ -243,6 +243,13 @@ function validateDelegateDefaultsEntry(raw: unknown, code: 'bad_config' | 'bad_p
   }
   const row = raw as Record<string, unknown>
   const out: AcpDelegateAgentDefaults = {}
+  if (row.enabled !== undefined) {
+    if (typeof row.enabled !== 'boolean') {
+      throw new AcpError(code, `acp: ${context}.enabled must be a boolean`)
+    }
+    // Absent = enabled: normalize `true` away so enabling leaves no residue.
+    if (row.enabled === false) out.enabled = false
+  }
   for (const key of ['model', 'effort', 'mode'] as const) {
     const value = row[key]
     if (value === undefined) continue

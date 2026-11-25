@@ -31,6 +31,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { AcpAgentCatalog, AcpCatalogChoice, AcpCatalogOption, AcpDelegateAgentDefaults, AcpDelegateSettings } from '../../protocol.ts'
 import { DELEGATE_DESCRIPTION_MAX } from '../../protocol.ts'
 import type { AcpStore, UiState } from '../store.ts'
+import { PillSwitch } from '../skills-mcp-preference.tsx'
 
 /** Warn foreground for a kept-but-stale / deleted option (constraint 34). */
 const WARN_FG = 'var(--dsw-alias-state-warn-primary, #b45309)'
@@ -244,12 +245,21 @@ function staleValueText(acp: AcpStore, text: string): string {
   return acp.label(`${text}${stale.zh}`, `${text}${stale.en}`)
 }
 
-/** Canonical equality of two per-agent entries (absent axis = follow default). */
+/** Whether an agent may participate in `acp_delegate` (absent = enabled). */
+export function isDelegateAgentEnabled(
+  agentDefaults: Record<string, AcpDelegateAgentDefaults> | undefined,
+  agentId: string,
+): boolean {
+  return agentDefaults?.[agentId]?.enabled !== false
+}
+
+/** Canonical equality of two per-agent entries (absent axis = follow default, absent enabled = true). */
 export function delegateEntriesEqual(
   a: AcpDelegateAgentDefaults | undefined,
   b: AcpDelegateAgentDefaults | undefined,
 ): boolean {
-  return (a?.model ?? undefined) === (b?.model ?? undefined)
+  return (a?.enabled !== false) === (b?.enabled !== false)
+    && (a?.model ?? undefined) === (b?.model ?? undefined)
     && (a?.effort ?? undefined) === (b?.effort ?? undefined)
     && (a?.mode ?? undefined) === (b?.mode ?? undefined)
     && (a?.description ?? undefined) === (b?.description ?? undefined)
@@ -417,6 +427,13 @@ function AgentDefaultsRow(props: {
     if (delegateEntriesEqual(next, entry)) return
     void acp.setDelegateSettings({ agentDefaults: { [agentId]: next } })
   }
+  const writeEnabled = (nextEnabled: boolean): void => {
+    const next: AcpDelegateAgentDefaults = { ...entry }
+    if (nextEnabled) delete next.enabled
+    else next.enabled = false
+    if (delegateEntriesEqual(next, entry)) return
+    void acp.setDelegateSettings({ agentDefaults: { [agentId]: next } })
+  }
   // The description rides in the SAME entry (one per-agent profile): blank
   // deletes it so the schema renders no dangling separator.
   const writeDescription = (raw: string): void => {
@@ -428,6 +445,7 @@ function AgentDefaultsRow(props: {
     void acp.setDelegateSettings({ agentDefaults: { [agentId]: next } })
   }
 
+  const enabled = entry?.enabled !== false
   // Override fact + reset only when the config file names an entry that the
   // running value outranks (constraint 33). Reset deletes the override entry.
   const overridden = configuredEntry !== undefined && !delegateEntriesEqual(configuredEntry, entry)
@@ -438,6 +456,7 @@ function AgentDefaultsRow(props: {
     ? configuredDescription
     : `${configuredDescription.slice(0, 24)}…`
   const configuredText = configuredEntry === undefined ? '' : [
+    configuredEntry.enabled === false ? acp.label('已禁用', 'disabled') : undefined,
     configuredEntry.model === undefined ? undefined : acp.label(`模型 ${configuredEntry.model}`, `model ${configuredEntry.model}`),
     configuredEntry.effort === undefined ? undefined : acp.label(`等级 ${configuredEntry.effort}`, `effort ${configuredEntry.effort}`),
     configuredEntry.mode === undefined ? undefined : acp.label(`模式 ${configuredEntry.mode}`, `mode ${configuredEntry.mode}`),
@@ -454,30 +473,54 @@ function AgentDefaultsRow(props: {
 
   return (
     <div className="dwa-preference-block">
-      <button
-        type="button"
-        className="dwa-acc-head"
-        aria-expanded={open}
-        aria-controls={bodyId}
-        onClick={onToggle}
-      >
-        <span className="dwa-agent-avatar dwa-acc-avatar" aria-hidden>{title.slice(0, 2).toUpperCase()}</span>
-        <span className="dwa-acc-titles">
-          <span className="dwa-acc-name">{title}</span>
-          <span className="dwa-acc-pills">
-            {setAxes.length === 0
-              ? <span className="dwa-sum-pill">{acp.label('全部跟随进程默认', 'All follow the process')}</span>
-              : setAxes.map(text => <span key={text} className="dwa-sum-pill is-set">{text}</span>)}
-            {entry?.description !== undefined && (
-              <span className="dwa-sum-pill">{acp.label('已填描述', 'Description set')}</span>
-            )}
-            {overridden && <span className="dwa-sum-pill is-warn">{acp.label('覆盖配置文件', 'Overrides config')}</span>}
+      <div className={`dwa-acc-head${enabled ? '' : ' is-disabled'}`}>
+        <button
+          type="button"
+          className="dwa-acc-toggle"
+          aria-expanded={open}
+          aria-controls={bodyId}
+          onClick={onToggle}
+        >
+          <span className="dwa-agent-avatar dwa-acc-avatar" aria-hidden>{title.slice(0, 2).toUpperCase()}</span>
+          <span className="dwa-acc-titles">
+            <span className="dwa-acc-name">{title}</span>
+            <span className="dwa-acc-pills">
+              {enabled ? (
+                <>
+                  {setAxes.length === 0
+                    ? <span className="dwa-sum-pill">{acp.label('全部跟随进程默认', 'All follow the process')}</span>
+                    : setAxes.map(text => <span key={text} className="dwa-sum-pill is-set">{text}</span>)}
+                  {entry?.description !== undefined && (
+                    <span className="dwa-sum-pill">{acp.label('已填描述', 'Description set')}</span>
+                  )}
+                </>
+              ) : (
+                <span className="dwa-sum-pill">{acp.label('已禁用', 'Disabled')}</span>
+              )}
+              {overridden && <span className="dwa-sum-pill is-warn">{acp.label('覆盖配置文件', 'Overrides config')}</span>}
+            </span>
           </span>
+        </button>
+        <span className="dwa-acc-side">
+          <span className="dwa-acc-divider" aria-hidden="true" />
+          <PillSwitch
+            checked={enabled}
+            label={acp.label(`参与子智能体委派 · ${title}`, `Enable subagent delegation · ${title}`)}
+            onChange={writeEnabled}
+          />
+          <span className="dwa-caret dwa-acc-caret" aria-hidden="true" onClick={onToggle}>{open ? '▴' : '▾'}</span>
         </span>
-        <span className="dwa-caret" aria-hidden>{open ? '▴' : '▾'}</span>
-      </button>
+      </div>
 
       <div className="dwa-acc-body" id={bodyId} hidden={!open}>
+        {!enabled && (
+          <div className="dwa-deadline-warn is-neutral" style={{ marginTop: 0, marginBottom: 12 }}>
+            {acp.label(
+              '当前已禁用子智能体委派，启用后以下配置生效。',
+              'Subagent delegation is disabled; these settings take effect once enabled.',
+            )}
+          </div>
+        )}
         <div className="dwa-axis-grid">
           <AxisSelect acp={acp} title={title} axis="model" value={entry?.model} choices={axisChoices(catalog, 'model', entry?.model)} defaultLabel={resolvedAxisDefaultLabel(catalog, 'model', entry?.model)} onChange={value => writeAxis('model', value)} />
           <AxisSelect acp={acp} title={title} axis="effort" value={entry?.effort} choices={axisChoices(catalog, 'effort', entry?.model)} defaultLabel={resolvedAxisDefaultLabel(catalog, 'effort', entry?.model)} onChange={value => writeAxis('effort', value)} />
@@ -573,16 +616,23 @@ export function SubagentDefaults(props: { acp: AcpStore; ui: UiState }) {
   if (delegate === undefined) return null
 
   const roster = ui.agents
+  const enabledRoster = roster.filter(agent => isDelegateAgentEnabled(delegate.agentDefaults, agent.id))
+  const allDisabled = roster.length > 0 && enabledRoster.length === 0
   const current = delegate.defaultAgent
   const configuredDefault = delegate.configured?.defaultAgent
   if (roster.length === 0 && current === undefined && configuredDefault === undefined) return null
 
   const rosterIds = new Set(roster.map(agent => agent.id))
   const deleted = current !== undefined && !rosterIds.has(current)
+  const currentDisabled = current !== undefined && rosterIds.has(current) && !isDelegateAgentEnabled(delegate.agentDefaults, current)
+  const currentTitle = roster.find(agent => agent.id === current)?.title ?? current
   const resolved = resolvedDefaultAgent(delegate)
+  const globalDisabled = current === undefined && resolved !== undefined && rosterIds.has(resolved) && !isDelegateAgentEnabled(delegate.agentDefaults, resolved)
   const defaultOptionLabel = resolved === undefined
     ? acp.label('默认（未设置）', 'Default (not set)')
-    : acp.label(`默认（当前：${resolved}）`, `Default (now: ${resolved})`)
+    : globalDisabled
+      ? acp.label(`默认（当前：${resolved}，已禁用）`, `Default (now: ${resolved}, disabled)`)
+      : acp.label(`默认（当前：${resolved}）`, `Default (now: ${resolved})`)
   const defaultOverridden = configuredDefault !== undefined && configuredDefault !== current
 
   const isOpen = (id: string): boolean => openIds.includes(id)
@@ -616,6 +666,15 @@ export function SubagentDefaults(props: { acp: AcpStore; ui: UiState }) {
         )}
       </div>
 
+      {allDisabled && (
+        <div className="dwa-deadline-warn" style={{ marginTop: 0, marginBottom: 12 }}>
+          {acp.label(
+            '所有智能体均已禁用，当前无法通过 acp_delegate 委派任务。',
+            'All agents are disabled; acp_delegate cannot run delegations right now.',
+          )}
+        </div>
+      )}
+
       <div className="dwa-preferences">
         <div className="dwa-preference-block">
           <div className="dwa-row-split">
@@ -637,7 +696,7 @@ export function SubagentDefaults(props: { acp: AcpStore; ui: UiState }) {
                 }}
               >
                 <option value="">{defaultOptionLabel}</option>
-                {roster.map(agent => (
+                {enabledRoster.map(agent => (
                   <option key={agent.id} value={agent.id}>{agent.title}</option>
                 ))}
                 {deleted && (
@@ -645,9 +704,24 @@ export function SubagentDefaults(props: { acp: AcpStore; ui: UiState }) {
                     {acp.label(`${current}（已删除）`, `${current} (deleted)`)}
                   </option>
                 )}
+                {currentDisabled && (
+                  <option value={current} style={{ color: WARN_FG }}>
+                    {acp.label(`${currentTitle}（已禁用）`, `${currentTitle} (disabled)`)}
+                  </option>
+                )}
               </select>
             </div>
           </div>
+          {currentDisabled && (
+            <div className="dwa-deadline-flag">
+              ⚠ {acp.label('当前指定的默认子智能体已禁用，未指明智能体的委派将回落或报错。', 'The selected default subagent is disabled; delegations without an agent will fall back or fail.')}
+            </div>
+          )}
+          {globalDisabled && (
+            <div className="dwa-deadline-flag">
+              ⚠ {acp.label('当前跟随的全局默认智能体已禁用，未指明智能体的委派将无法执行。', 'The global default agent currently followed is disabled; delegations without an agent will fail.')}
+            </div>
+          )}
           {defaultOverridden && (
             <div className="dwa-deadline-flag">
               ⚠ {acp.label(`配置文件要求：${configuredDefault}`, `The config file asks for ${configuredDefault}.`)}

@@ -379,8 +379,14 @@ const STYLE = `
   padding: 0; border: var(--ntr-line); border-radius: var(--ntr-radius);
   background: var(--dsw-alias-bg-layer-1, #fff); box-shadow: var(--ntr-shadow); overflow: hidden;
 }
-.dwa-acc-head { display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; align-items: center; gap: 12px; width: 100%; box-sizing: border-box; padding: 12px 16px; border: 0; background: transparent; font: inherit; color: inherit; text-align: left; cursor: pointer; }
-.dwa-acc-head:hover { background: color-mix(in srgb, var(--dsw-alias-bg-layer-2, #f3f4f6) 55%, transparent); }
+.dwa-acc-head { display: flex; align-items: center; gap: 12px; width: 100%; box-sizing: border-box; }
+.dwa-acc-toggle { flex: 1 1 0; min-width: 0; display: grid; grid-template-columns: 32px minmax(0, 1fr); align-items: center; gap: 12px; padding: 12px 0 12px 16px; border: 0; background: transparent; font: inherit; color: inherit; text-align: left; cursor: pointer; }
+.dwa-acc-toggle:hover, .dwa-acc-caret:hover { background: color-mix(in srgb, var(--dsw-alias-bg-layer-2, #f3f4f6) 55%, transparent); }
+.dwa-acc-toggle:focus-visible { outline-offset: -2px; border-radius: var(--ntr-radius); }
+.dwa-acc-head.is-disabled .dwa-acc-avatar, .dwa-acc-head.is-disabled .dwa-acc-name { opacity: 0.55; }
+.dwa-acc-side { display: inline-flex; align-items: center; gap: 10px; flex: none; padding-right: 12px; }
+.dwa-acc-divider { width: 1px; height: 18px; background: var(--dsw-alias-border-l3, #eef0f3); flex: none; }
+.dwa-acc-caret { padding: 8px 4px; border-radius: var(--ntr-radius-sm); color: var(--ntr-muted); cursor: pointer; }
 .dwa-acc-avatar { width: 32px; height: 32px; border-radius: var(--ntr-radius-sm); font-size: var(--ntr-font-xs); }
 .dwa-acc-titles { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .dwa-acc-name { font-size: var(--ntr-font); font-weight: 600; overflow-wrap: anywhere; }

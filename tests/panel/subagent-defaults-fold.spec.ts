@@ -7,7 +7,7 @@
 // agent, the form behind that agent's own head — and that folding is a display
 // toggle rather than a remount (the description keeps a local draft that commits
 // on blur, so unmounting it would drop what the user was typing).
-import { cleanup, fireEvent, screen, within } from '@testing-library/react'
+import { cleanup, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 import { category, click, DELEGATE_BASE, mountDefaults } from './harness.ts'
 
@@ -66,6 +66,38 @@ describe('SubagentDefaults — the card head', () => {
     expect(cardOf('codebuddy').querySelector('.dwa-acc-body')?.hasAttribute('hidden')).toBe(true)
     expect(within(pillsOf('codebuddy')).getByText('覆盖配置文件')).toBeDefined()
     expect(within(pillsOf('pi')).queryByText('覆盖配置文件')).toBeNull()
+  })
+
+  it('toggles delegation participation via the head pill switch without folding, keeping saved settings intact', async () => {
+    const { store, calls } = await mountDefaults({
+      ...DELEGATE_BASE,
+      agentDefaults: { codebuddy: { model: 'deepseek-v3', description: '只改单文件' } },
+    }, { keepFolded: true })
+    await category('子智能体')
+    const toggle = screen.getByRole('checkbox', { name: '参与子智能体委派 · CodeBuddy' }) as HTMLInputElement
+    expect(toggle.checked).toBe(true)
+    expect(headOf('codebuddy').getAttribute('aria-expanded')).toBe('false')
+
+    // Disable: writes enabled: false while preserving model/description, does not unfold the card.
+    await click(toggle)
+    await waitFor(() => expect(store.getSnapshot().delegate?.agentDefaults?.codebuddy).toEqual({
+      model: 'deepseek-v3', description: '只改单文件', enabled: false,
+    }))
+    expect(headOf('codebuddy').getAttribute('aria-expanded')).toBe('false')
+    expect(cardOf('codebuddy').querySelector('.dwa-acc-head')?.className).toContain('is-disabled')
+    const pills = pillsOf('codebuddy')
+    expect(within(pills).getByText('已禁用')).toBeDefined()
+    expect(within(pills).queryByText('模型 DeepSeek V3')).toBeNull()
+    expect(within(pills).queryByText('已填描述')).toBeNull()
+
+    // Re-enable: drops enabled while restoring the preserved summary pills.
+    await click(toggle)
+    await waitFor(() => expect(store.getSnapshot().delegate?.agentDefaults?.codebuddy).toEqual({
+      model: 'deepseek-v3', description: '只改单文件',
+    }))
+    expect(within(pillsOf('codebuddy')).getByText('模型 DeepSeek V3')).toBeDefined()
+    expect(within(pillsOf('codebuddy')).getByText('已填描述')).toBeDefined()
+    expect(calls.some(call => call.endpoint === 'agent/save')).toBe(false)
   })
 })
 

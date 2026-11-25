@@ -149,7 +149,7 @@ export async function expandCard(agentId: string): Promise<void> {
 
 /** Open every delegation card on the page, if any is folded. */
 export async function expandAllCards(): Promise<void> {
-  for (const head of Array.from(document.querySelectorAll<HTMLElement>('.dwa-acc-head'))) {
+  for (const head of Array.from(document.querySelectorAll<HTMLElement>('.dwa-acc-head [aria-expanded]'))) {
     if (head.getAttribute('aria-expanded') === 'false') await click(head)
   }
 }

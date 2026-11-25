@@ -73,20 +73,30 @@ describe('delegate roster rows (the tool schema grammar)', () => {
       .toEqual({ id: 'codebuddy', title: 'CodeBuddy' })
   })
 
-  it('builds every row from the live views, joining defaults by id', () => {
+  it('builds every row from the live views, joining defaults by id and omitting disabled agents', () => {
     expect(delegateAgentDocs(
-      [{ id: 'a', title: 'A' }, { id: 'b', title: 'B' }],
-      { b: { effort: 'high' } },
+      [{ id: 'a', title: 'A' }, { id: 'b', title: 'B' }, { id: 'c', title: 'C' }],
+      { b: { effort: 'high' }, c: { enabled: false, description: 'hidden' } },
     )).toEqual([
       { id: 'a', title: 'A' },
       { id: 'b', title: 'B', effort: 'high' },
     ])
     expect(delegateAgentDocs([{ id: 'a', title: 'A' }], undefined)).toEqual([{ id: 'a', title: 'A' }])
     expect(delegateAgentDocs([], { a: { model: 'm' } })).toEqual([])
+    expect(delegateRosterDigest(delegateAgentDocs([{ id: 'a', title: 'A' }, { id: 'b', title: 'B' }], { b: { enabled: false } })))
+      .not.toBe(delegateRosterDigest(delegateAgentDocs([{ id: 'a', title: 'A' }, { id: 'b', title: 'B' }], undefined)))
   })
 })
 
-describe('delegate description validation', () => {
+describe('delegate description and enabled validation', () => {
+  it('keeps explicit enabled: false, normalizes enabled: true away, and rejects non-booleans', () => {
+    expect(validateDelegateSettings({ agentDefaults: { codebuddy: { enabled: false, model: 'm' } } }))
+      .toEqual({ agentDefaults: { codebuddy: { enabled: false, model: 'm' } } })
+    expect(validateDelegateSettings({ agentDefaults: { codebuddy: { enabled: true, model: 'm' } } }))
+      .toEqual({ agentDefaults: { codebuddy: { model: 'm' } } })
+    expect(() => validateDelegateSettings({ agentDefaults: { codebuddy: { enabled: 'false' } } }))
+      .toThrow(/enabled must be a boolean/)
+  })
   it('keeps a trimmed description and drops an all-whitespace one', () => {
     expect(validateDelegateSettings({ agentDefaults: { codebuddy: { description: '  通用编码  ' } } }))
       .toEqual({ agentDefaults: { codebuddy: { description: '通用编码' } } })

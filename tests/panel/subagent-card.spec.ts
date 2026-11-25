@@ -83,14 +83,15 @@ describe('SubagentCard', () => {
     await mountPanel()
     const nav = screen.getByRole('navigation', { name: 'NTR 设置分类' })
     expect(within(nav).queryByRole('button', { name: '子智能体' })).toBeNull()
-    expect(screen.queryByRole('heading', { name: '子智能体' })).toBeNull()
+    expect(screen.queryByRole('heading', { level: 3, name: /^子智能体/ })).toBeNull()
     expect(screen.queryByRole('slider', { name: '子智能体委派', hidden: true })).toBeNull()
   })
 
   it('writes the picked guidance rung immediately, optimistically, never as an agent save', async () => {
     const { store, calls } = await mountDelegate(BASE)
     await category('子智能体')
-    expect(screen.getByRole('heading', { name: '子智能体' })).toBeDefined()
+    const heading = screen.getByRole('heading', { level: 3, name: /^子智能体/ })
+    expect(within(heading).getByText('BETA').className).toContain('dwa-badge-info')
     // off/on carry no enhanced/force warning text; their banners are checked below.
     expect(screen.queryByText(/该档位会增强工具描述/)).toBeNull()
     expect(screen.queryByText(/强制模式会屏蔽/)).toBeNull()
