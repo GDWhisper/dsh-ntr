@@ -81,39 +81,120 @@ function outputBlocksOf(text: string): Array<{ type: 'text'; text: string }> {
 }
 
 /**
- * Merge the diagnostic parts (the failure detail and the degradation notes)
- * into ONE bounded diagnostic; undefined when nothing is present. The notes
- * reserve their own byte budget (impl/delegate-label.ts ·
- * mergeDelegateDiagnostic) so a long turnError can never eat them — a
- * stale-default degradation must reach the parent even when the turn itself
- * also reported an error.
+ * Map the ACP turn's OWN stop reason onto the host's vocabulary
+ * (`dsh-subagent` · SubagentStopReasonMap). `refusal` and `max_tokens` are the
+ * agent's verdicts, and the host already names them in the settlement summary
+ * ("declined the task" / "ran out of room before it finished"), so collapsing
+ * them into `completed` tells the parent the opposite of what happened; a
+ * `cancelled` turn is unfinished, not a success. Everything else — `end_turn`,
+ * and `max_turn_requests` which has no host counterpart — reads as
+ * `completed`, with the latter named in the diagnostic
+ * ({@link unmappedStopNote}).
  */
-function diagnosticOf(turnError: string | undefined, notes: string | undefined): string | undefined {
-  return mergeDelegateDiagnostic(turnError, notes)
+function hostStopReasonOf(stopReason: string | undefined): SubagentResult['stopReason'] {
+  switch (stopReason) {
+    case 'refusal': return 'refusal'
+    case 'max_tokens': return 'max-tokens'
+    case 'cancelled': return 'aborted'
+    default: return 'completed'
+  }
+}
+
+/**
+ * The terminal state one ended settlement maps onto. The ACP turn's own reason
+ * wins whenever it names something (refusal / token ceiling / cancellation), but
+ * an ERROR-ONLY turn/end — the watchdog's forced close, a dead process, a
+ * rejected prompt — carries a failure with no stop reason of its own, and the
+ * host's `error` is the honest terminal there: calling it `completed` would be
+ * the very flattening this mapping exists to remove.
+ */
+function hostTerminalOf(settlement: AcpDelegateSettlement): SubagentResult['stopReason'] {
+  const mapped = hostStopReasonOf(settlement.stopReason)
+  return mapped === 'completed' && settlement.turnError !== undefined ? 'error' : mapped
+}
+
+/**
+ * The one ending the host's vocabulary cannot express. `max_turn_requests` is
+ * a real ending (the child hit its own turn-request ceiling), so the run is not
+ * an error — but the answer may be cut short while the summary says "finished"
+ * either way, so the plugin names it.
+ */
+function unmappedStopNote(stopReason: string | undefined): string | undefined {
+  if (stopReason === undefined || stopReason === '' || stopReason === 'end_turn') return undefined
+  if (hostStopReasonOf(stopReason) !== 'completed') return undefined
+  return `ACP 停因 ${stopReason}：这一回合不是正常结束，答复可能不完整`
+}
+
+/**
+ * The delegation's ask ledger as ONE line. Every permission ask a child hits is
+ * answered by its own session policy (`auto` + zero window,
+ * delegate-service.ts · autoPolicyFor), so nobody else ever sees them: this
+ * settlement is the parent's only notice that the child cleared N gates by
+ * itself, and `refused` is the one case the child actually LOST a tool call to
+ * (the ask could not be auto-picked and degraded to a refusal). Absent when the
+ * child never asked.
+ */
+function askCountsNote(autoAnswered: number, refused: number): string | undefined {
+  if (autoAnswered <= 0 && refused <= 0) return undefined
+  const parts: string[] = []
+  if (autoAnswered > 0) parts.push(`自动代答 ${String(autoAnswered)} 个`)
+  if (refused > 0) parts.push(`拒绝 ${String(refused)} 个`)
+  return `委派会话的审批：${parts.join('、')}`
+}
+
+/** The diagnostic's leading facts (failure detail, ending note) as one text. */
+function leadingFacts(...facts: Array<string | undefined>): string | undefined {
+  const kept = facts.filter((fact): fact is string => fact !== undefined && fact !== '')
+  return kept.length === 0 ? undefined : kept.join('\n')
+}
+
+/**
+ * The RESERVED side of the merge: the degradation notes plus the ask counts.
+ * Counts ride this side (impl/delegate-label.ts · mergeDelegateDiagnostic keeps
+ * a byte budget for it) so an extreme failure text can never truncate them
+ * away — they are the smallest and least recoverable fact the settlement adds.
+ */
+function reservedFacts(notes: string | undefined, counts: string | undefined): string | undefined {
+  const kept = [notes, counts].filter((fact): fact is string => fact !== undefined && fact !== '')
+  return kept.length === 0 ? undefined : kept.join('；')
 }
 
 /**
  * Map one core settlement onto the host's terminal result (plan §4):
- * ended → completed, aborted → aborted, timed-out / prompt-error → error with
- * the failure detail as a bounded diagnostic. Partial folded text rides along
- * on every outcome (the host's own cancel path keeps its output snapshot too);
- * a normal end with no text keeps the legacy placeholder so the parent still
- * reads a fact instead of an empty notification. No footer is written into
- * output — the host's settlement summary already names the child and the stop
- * reason; the plugin never double-writes the catalog or the record stream.
+ * ended → its own ending ({@link hostTerminalOf}), aborted → aborted,
+ * timed-out / prompt-error → error. Each carries ONE bounded diagnostic
+ * (impl/delegate-label.ts · mergeDelegateDiagnostic, ≤4096 UTF-8 bytes, notes
+ * reserved) made of the failure detail and the unnameable ending up front and
+ * the notes with the ask counts on the reserved side; all-empty → no diagnostic
+ * at all. Partial folded text rides along on every outcome (the host's own
+ * cancel path keeps its output snapshot too); a normal end with no text keeps
+ * the legacy placeholder so the parent still reads a fact instead of an empty
+ * notification. No footer is written into output — the host's settlement
+ * summary already names the child and its stop reason, and the host appends
+ * this diagnostic on EVERY terminal state (`dsh-subagent` ·
+ * createSettlementMessage), which is what carries the ask counts to a
+ * `completed` parent at all; the plugin never double-writes the catalog or the
+ * record stream.
  */
 function resultOfSettlement(settlement: AcpDelegateSettlement): SubagentResult {
+  const counts = askCountsNote(settlement.autoAnswered, settlement.refused)
   switch (settlement.outcome) {
     case 'ended': {
       const text = settlement.text === '' ? '(the agent returned no text)' : settlement.text
-      const result: SubagentResult = { output: [{ type: 'text', text }], stopReason: 'completed' }
+      const result: SubagentResult = {
+        output: [{ type: 'text', text }],
+        stopReason: hostTerminalOf(settlement),
+      }
       // A watchdog error-only turn/end still carries the agent's failure detail.
-      const diagnostic = diagnosticOf(settlement.turnError, settlement.notes)
+      const diagnostic = mergeDelegateDiagnostic(
+        leadingFacts(settlement.turnError, unmappedStopNote(settlement.stopReason)),
+        reservedFacts(settlement.notes, counts),
+      )
       return diagnostic === undefined ? result : { ...result, diagnostic }
     }
     case 'aborted': {
       const result: SubagentResult = { output: outputBlocksOf(settlement.text), stopReason: 'aborted' }
-      const diagnostic = diagnosticOf(undefined, settlement.notes)
+      const diagnostic = mergeDelegateDiagnostic(undefined, reservedFacts(settlement.notes, counts))
       return diagnostic === undefined ? result : { ...result, diagnostic }
     }
     case 'timed-out':
@@ -121,7 +202,10 @@ function resultOfSettlement(settlement: AcpDelegateSettlement): SubagentResult {
       return {
         output: outputBlocksOf(settlement.text),
         stopReason: 'error',
-        diagnostic: diagnosticOf(settlement.error ?? `acp_delegate: ${settlement.outcome}`, settlement.notes) as string,
+        diagnostic: mergeDelegateDiagnostic(
+          leadingFacts(settlement.error ?? `acp_delegate: ${settlement.outcome}`),
+          reservedFacts(settlement.notes, counts),
+        ) as string,
       }
   }
 }

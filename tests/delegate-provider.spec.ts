@@ -81,15 +81,133 @@ describe('AcpSubagentProvider settlement outcomes', () => {
     expect(result.output).toEqual([{ type: 'text', text: '(the agent returned no text)' }])
   })
 
-  it('watchdog error-only turn/end: completed with the agent failure detail as diagnostic', async () => {
+  it('watchdog error-only turn/end: error, with the agent failure detail as diagnostic', async () => {
     const { f, provider } = makeProvider()
     f.onPrompt(async (sessionId) => {
       f.emit({ type: 'turn/end', sessionId, turnId: '', error: 'agent went silent (inactivity timeout)' })
       return { turnId: 'real' }
     })
     const result = await (await provider.start(makeRequest().request)).result
-    expect(result.stopReason).toBe('completed')
+    // The failure outranks "finished": the host's own failure path says the
+    // same thing for a child that never ended its turn.
+    expect(result.stopReason).toBe('error')
     expect(result.diagnostic).toBe('agent went silent (inactivity timeout)')
+  })
+
+  it('the ACP turn\'s own ending is mapped, never flattened into completed', async () => {
+    // The host's vocabulary already names these endings in the settlement
+    // summary; reporting "finished" for a refusal is the opposite of the fact.
+    for (const [acpStopReason, hostStopReason] of [
+      ['refusal', 'refusal'],
+      ['max_tokens', 'max-tokens'],
+      ['cancelled', 'aborted'],
+    ] as const) {
+      const { f, provider } = makeProvider()
+      f.onPrompt(async (sessionId) => {
+        f.emit({ type: 'turn/end', sessionId, turnId: 't', stopReason: acpStopReason })
+        return { turnId: 't' }
+      })
+      const result = await (await provider.start(makeRequest().request)).result
+      expect(result.stopReason).toBe(hostStopReason)
+      expect(result.diagnostic).toBeUndefined() // the host summary names it
+    }
+  })
+
+  it('max_turn_requests has no host twin: completed stops being silent about it', async () => {
+    const { f, provider } = makeProvider()
+    f.onPrompt(async (sessionId) => {
+      f.emit({ type: 'session/update', sessionId, seq: 1, update: chunk('cut short') })
+      f.emit({ type: 'turn/end', sessionId, turnId: 't', stopReason: 'max_turn_requests' })
+      return { turnId: 't' }
+    })
+    const result = await (await provider.start(makeRequest().request)).result
+    expect(result.stopReason).toBe('completed')
+    expect(result.output).toEqual([{ type: 'text', text: 'cut short' }])
+    expect(result.diagnostic).toBe('ACP 停因 max_turn_requests：这一回合不是正常结束，答复可能不完整')
+  })
+
+  it('auto-answered / refused asks reach the parent as ONE diagnostic line', async () => {
+    const { f, provider } = makeProvider()
+    f.onPrompt(async (sessionId) => {
+      // The delegation's own policy answers these, so this settlement is the
+      // only place the parent ever learns the child hit them.
+      f.emit({ type: 'permission/expired', sessionId, toolCall: {}, timeoutMs: 0, outcome: { outcome: 'selected', optionId: 'yes' } })
+      f.emit({ type: 'permission/expired', sessionId, toolCall: {}, timeoutMs: 0, outcome: { outcome: 'cancelled' } })
+      f.emit({ type: 'session/update', sessionId, seq: 1, update: chunk('done') })
+      f.emit({ type: 'turn/end', sessionId, turnId: 't', stopReason: 'end_turn' })
+      return { turnId: 't' }
+    })
+    const result = await (await provider.start(makeRequest().request)).result
+    expect(result.stopReason).toBe('completed')
+    expect(result.diagnostic).toBe('委派会话的审批：自动代答 1 个、拒绝 1 个')
+  })
+
+  it('a quiet child with no asks keeps the diagnostic absent', async () => {
+    const { f, provider } = makeProvider()
+    happyPrompt(f, 'clean')
+    const result = await (await provider.start(makeRequest().request)).result
+    expect(result).toEqual({ output: [{ type: 'text', text: 'clean' }], stopReason: 'completed' })
+  })
+
+  it('failure + unnameable ending + counts + notes merge into ONE diagnostic, in that order', async () => {
+    const { f, provider } = makeProvider()
+    f.config.agentDefaults = { alpha: { mode: 'ghost-o' } }
+    f.liveOptions.set('session-1', { modes: modesOf('default') })
+    f.onPrompt(async (sessionId) => {
+      f.emit({ type: 'permission/expired', sessionId, toolCall: {}, timeoutMs: 0, outcome: { outcome: 'selected', optionId: 'yes' } })
+      f.emit({ type: 'turn/end', sessionId, turnId: 't', stopReason: 'max_turn_requests', error: 'turn budget spent' })
+      return { turnId: 't' }
+    })
+    const result = await (await provider.start(makeRequest().request)).result
+    // The failure outranks the mapped "completed"...
+    expect(result.stopReason).toBe('error')
+    // ...and all four facts survive in their fixed slots.
+    expect(result.diagnostic).toBe(
+      'turn budget spent\nACP 停因 max_turn_requests：这一回合不是正常结束，答复可能不完整\nagent「alpha」不再提供默认模式「ghost-o」，本次使用启动模式；委派会话的审批：自动代答 1 个',
+    )
+  })
+
+  it('an extreme failure text cannot truncate the ask counts away', async () => {
+    const { f, provider } = makeProvider()
+    f.onPrompt(async (sessionId) => {
+      f.emit({ type: 'permission/expired', sessionId, toolCall: {}, timeoutMs: 0, outcome: { outcome: 'selected', optionId: 'yes' } })
+      f.emit({ type: 'turn/end', sessionId, turnId: '', error: 'x'.repeat(20_000) })
+      return { turnId: 'real' }
+    })
+    const result = await (await provider.start(makeRequest().request)).result
+    // The counts ride the RESERVED side of the merge, so the 20k failure text
+    // is the part that gets truncated.
+    expect(result.diagnostic?.endsWith('委派会话的审批：自动代答 1 个')).toBe(true)
+    expect(result.diagnostic).toContain('[diagnostic truncated]')
+    expect(new TextEncoder().encode(result.diagnostic ?? '').byteLength).toBeLessThanOrEqual(MAX_DELEGATE_DIAGNOSTIC_BYTES)
+  })
+
+  it('an aborted run reports the notes first and the ask counts after', async () => {
+    const { f, provider } = makeProvider()
+    f.config.agentDefaults = { alpha: { effort: 'ghost-e' } }
+    f.liveOptions.set('session-1', { configOptions: configOptionsOf(['m1'], ['high']) })
+    f.onPrompt(async (sessionId) => {
+      f.emit({ type: 'permission/expired', sessionId, toolCall: {}, timeoutMs: 0, outcome: { outcome: 'selected', optionId: 'yes' } })
+      return { turnId: 't' } // never ends: the parent aborts
+    })
+    const { request, controller } = makeRequest()
+    const run = await provider.start(request)
+    await tick()
+    controller.abort()
+    const result = await run.result
+    expect(result.stopReason).toBe('aborted')
+    expect(result.diagnostic).toBe('agent「alpha」的默认思考等级「ghost-e」不受当前模型支持，本次不设置；委派会话的审批：自动代答 1 个')
+  })
+
+  it('a prompt error keeps the ask counts too', async () => {
+    const { f, provider } = makeProvider()
+    f.onPrompt(async (sessionId) => {
+      f.emit({ type: 'permission/expired', sessionId, toolCall: {}, timeoutMs: 0, outcome: { outcome: 'cancelled' } })
+      throw new Error('turn_in_flight')
+    })
+    const result = await (await provider.start(makeRequest().request)).result
+    expect(result.stopReason).toBe('error')
+    expect(result.diagnostic).toBe('acp_delegate: turn_in_flight\n委派会话的审批：拒绝 1 个')
   })
 
   it('silence window: error + bounded diagnostic, cancel then close, partial text kept', async () => {
@@ -326,7 +444,7 @@ describe('AcpSubagentProvider degradation notes', () => {
       return { turnId: 'real' }
     })
     const result = await (await provider.start(makeRequest().request)).result
-    expect(result.stopReason).toBe('completed')
+    expect(result.stopReason).toBe('error')
     expect(result.diagnostic).toBe('agent went silent (inactivity timeout)\nagent「alpha」不再提供默认模式「ghost-o」，本次使用启动模式')
   })
 
@@ -364,7 +482,7 @@ describe('AcpSubagentProvider degradation notes', () => {
       return { turnId: 'real' }
     })
     const result = await (await provider.start(makeRequest().request)).result
-    expect(result.stopReason).toBe('completed')
+    expect(result.stopReason).toBe('error')
     const notes = 'agent「alpha」不再提供默认模式「ghost-o」，本次使用启动模式'
     expect(result.diagnostic?.endsWith(`\n${notes}`)).toBe(true)
     expect(result.diagnostic).toContain('[diagnostic truncated]')

@@ -140,6 +140,18 @@ export const BASE_DESCRIPTION = '把一件自成一体的任务交给一个已�
  * decision procedure — a rule that hides its own exceptions gets ignored.
  */
 export const GUIDANCE_PREFIX = '需要派发子智能体时必须使用本工具（优先于任何原生子智能体/委派工具）；只有子智能体必须继承本会话上下文、或需要中途追加指令与多轮续聊时才用原生。'
+
+/**
+ * The corollary a caller cannot guess, shared VERBATIM by the description and
+ * the activation receipt so the two can never drift: an external leaf is
+ * filtered out of `list_agents` (the host lists continuable children only) and
+ * has no pollable status. The wording stays precise about what a `wait_agent`
+ * call does and does not do — it returns on the NEXT input to this session,
+ * which the settlement notice becomes, but the child itself cannot be named as
+ * the thing to wait for and its progress cannot be read.
+ */
+export const DELEGATE_NOT_POLLABLE_NOTE = '它不出现在 `list_agents` 里，也没有可轮询的运行状态：`wait_agent` 不能指定等它，也查不到它的进度'
+
 /**
  * The NATIVE base description: immediate name, settlement notification later.
  * "可以继续做不相交的工作" mirrors the host's own delegation guidance (the host
@@ -149,12 +161,20 @@ export const GUIDANCE_PREFIX = '需要派发子智能体时必须使用本工具
  * dropping it — the old "派发后必须结束当前回合" was self-imposed. The shared
  * workspace is why the file-conflict guard comes along with it: an ACP child
  * inherits the caller's cwd, so "不相交" is a promise the caller has to keep.
+ *
+ * The not-pollable note is load-bearing, not decoration: a real session showed
+ * a caller read an empty `list_agents` answer (the root alone), then invent a
+ * `wait_agent(240s)` that timed out while the settlement notice was still on
+ * its way. Naming the absence is the only way a caller can choose correctly
+ * between "keep working", "end the turn" and "wait" — and the receipt repeats
+ * it, because that is the exact moment the choice is made.
  */
 export const NATIVE_BASE_DESCRIPTION = '把一件自成一体的任务交给一个已配置的外部 ACP agent，在它自己的进程与上下文里执行，'
   + '再把最终答复带回本会话。适合独立调研、单文件改动、复核审查、跨模型第二意见这类不需要本会话上下文的工作。'
   + '只回最终答复、不回中间步骤；调用立即返回子智能体的 name，不等待结果。'
-  + '派发后可以继续做不相交的工作（别和它改同一批文件，合并前复核 diff 并跑测试），只剩等待时结束本回合，'
-  + '宿主会把结算通知送达并起下一轮；这是一次性委派，不能续聊，要追加指令就重新派发。'
+  + '派发后可以继续做不相交的工作（别和它改同一批文件，合并前复核 diff 并跑测试）；只剩等待时结束本回合，'
+  + '宿主会把结算通知送达并起下一轮。' + DELEGATE_NOT_POLLABLE_NOTE + '，别守着等。'
+  + '这是一次性委派，不能续聊，要追加指令就重新派发。'
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -280,7 +300,11 @@ export function acpDelegateToolDefinition(opts: {
         render: (_args: unknown, value: unknown) => {
           const row = (typeof value === 'object' && value !== null ? value : {}) as { kind?: unknown; name?: unknown; agent?: unknown; error?: unknown; text?: unknown }
           if (row.kind === 'activation') {
-            return [{ type: 'text', text: `已委派给 ACP agent ${String(row.agent ?? '')}：子智能体 ${String(row.name ?? '')} 已在后台开始执行。可继续做不相交的工作；只剩等待时结束本回合，完成后宿主会把它的答复作为通知送达本会话。` }]
+            // The receipt repeats the not-pollable note on purpose: it is read
+            // at the exact moment a caller decides how to wait, which is where
+            // the invented `wait_agent` came from. Same constant, so the two
+            // surfaces cannot drift.
+            return [{ type: 'text', text: `已委派给 ACP agent ${String(row.agent ?? '')}：子智能体 ${String(row.name ?? '')} 已在后台开始执行。可继续做不相交的工作；只剩等待时结束本回合，完成后宿主会把它的答复作为通知送达本会话。${DELEGATE_NOT_POLLABLE_NOTE}，别守着等。` }]
           }
           if (row.kind === 'error') return [{ type: 'text', text: `acp_delegate 委派失败：${String(row.error ?? '')}` }]
           return [{ type: 'text', text: String(row.text ?? '') }]

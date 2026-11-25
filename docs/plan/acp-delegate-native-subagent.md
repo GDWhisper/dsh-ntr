@@ -52,7 +52,7 @@ provider.start 收到的 request.signal **不是 exec.signal 原对象**，是�
 
 ## 4. 结算与生命周期契约（provider 必须满足）
 
-- result **发布后永不 reject**（基础设施故障除外）；outcome 映射：ended→completed、aborted（signal/dispose/interrupt）→aborted、timed-out→error+diagnostic、prompt-error→error+diagnostic。
+- result **发布后永不 reject**（基础设施故障除外）；outcome 映射：ended→按 ACP 自己的 stopReason（`hostStopReasonOf`：`refusal`/`max_tokens`/`cancelled`→宿主对应值，其余 completed；**只有 error 没有 stopReason 的 turn/end 落 error**）、aborted（signal/dispose/interrupt）→aborted、timed-out→error+diagnostic、prompt-error→error+diagnostic；diagnostic 至多由「失败细节 + 无法命名的停因」与「降级 notes + 代答/拒绝审批计数」两侧合并而成，全空则省略。
 - dispose 幂等：cancel ACP 回合 → close 会话 → 保证 result 落定（aborted）。与正常收口的 closeOnce 协调，settle 恰一次。
 - 响应 request.signal：abort → 取消剩余工作 → settle aborted。
 - 静默窗在**两壳共享的核心 run**（`touchSilence`）；24h 绝对兜底是 **native-only**：`begin` 的可选 `absoluteBudgetMs` 内置计时器（legacy 壳省略、仍用宿主工具预算）。到点 cancel + settle error。**任何路径不得让 result 悬空**（防 waitForTreeWork 挂死）。**缓冲 cause 优先**：run 安装 settle 之前到达的外部 cause（dispose / 绝对到期）先缓冲、bind 时按序 drain；排队期间 24h 到期时缓冲的 timed-out 压过 queue-abort，settle 成 timed-out 而非 aborted。

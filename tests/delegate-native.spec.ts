@@ -11,7 +11,7 @@
 import { describe, expect, it } from 'vitest'
 import { AcpSubagentProvider, acpDelegateActivationExecute, type DelegateSubagentsLike } from '../src/bridge/delegate-provider.ts'
 import { AcpDelegateRegistration, type DelegateRegistrationCtx } from '../src/bridge/delegate-registration.ts'
-import { AcpDelegateService, acpDelegateToolDefinition, GUIDANCE_PREFIX, NATIVE_BASE_DESCRIPTION } from '../src/bridge/delegate-service.ts'
+import { AcpDelegateService, acpDelegateToolDefinition, DELEGATE_NOT_POLLABLE_NOTE, GUIDANCE_PREFIX, NATIVE_BASE_DESCRIPTION } from '../src/bridge/delegate-service.ts'
 import { delegateLabel } from '../src/impl.ts'
 import type { AcpDelegateAsyncOutput, DelegateGuidance } from '../src/protocol.ts'
 import { configOptionsOf, fakeMask, fakeSubagentsService, fakeToolsCtx, happyPrompt, makeHost, modesOf, tick } from './delegate-harness.ts'
@@ -203,6 +203,12 @@ describe('acp_delegate registration shell selection', () => {
     // The end-turn duty is now the host's own soft rule ("continue useful work,
     // end the turn only when waiting is all that is left"), not a plugin ban.
     expect(definition.description).toContain('只剩等待时结束本回合')
+    // ...and the corollary the caller cannot guess: an external leaf is absent
+    // from `list_agents` and has no pollable status. Pinned as the SHARED
+    // sentence (not two loose words): a description that merely mentions the
+    // tool names — "you can watch it with `wait_agent`" — would pass a
+    // substring test and be exactly the wrong advice.
+    expect(definition.description).toContain(DELEGATE_NOT_POLLABLE_NOTE)
     // Nothing else kept the old ban from creeping back; this does.
     expect(definition.description).not.toMatch(/派发后(必须|立即)结束/)
     expect(definition.description).not.toContain('优先于任何原生子智能体/委派工具')
@@ -220,7 +226,7 @@ describe('acp_delegate registration shell selection', () => {
   it('the native render speaks the delegation receipt and the refusal', () => {
     const definition = acpDelegateToolDefinition({ guidance: 'on', mode: 'native', execute: async () => ({ kind: 'activation', name: 'agent-1', agent: 'alpha' }) })
     expect(definition.output.render({}, { kind: 'activation', name: 'agent-1', agent: 'alpha' }))
-      .toEqual([{ type: 'text', text: '已委派给 ACP agent alpha：子智能体 agent-1 已在后台开始执行。可继续做不相交的工作；只剩等待时结束本回合，完成后宿主会把它的答复作为通知送达本会话。' }])
+      .toEqual([{ type: 'text', text: `已委派给 ACP agent alpha：子智能体 agent-1 已在后台开始执行。可继续做不相交的工作；只剩等待时结束本回合，完成后宿主会把它的答复作为通知送达本会话。${DELEGATE_NOT_POLLABLE_NOTE}，别守着等。` }])
     expect(definition.output.render({}, { kind: 'error', error: 'ACTIVATION_LIMIT_REACHED: full' }))
       .toEqual([{ type: 'text', text: 'acp_delegate 委派失败：ACTIVATION_LIMIT_REACHED: full' }])
     expect(definition.output.render({}, undefined)).toEqual([{ type: 'text', text: '' }])
