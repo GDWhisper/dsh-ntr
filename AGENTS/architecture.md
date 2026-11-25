@@ -85,7 +85,7 @@
 `AcpLlmAdapter.stream` 只在对话轮次（`purpose === undefined`）把出口流包一层 `rewriteStreamFileLinks`（`src/impl/file-links.ts`），把本地 `file:///` / `file://localhost/` 链接（含 `<...>` 包裹形式）转为纯路径，原始 ACP transcript、echo guard 与辅助调用（`session-title` 等）一律不改。
 
 - **宿主渲染耦合点（双份真相）**：什么算可点击的本地文件链接目前分在两处——DSH 聊天 Markdown 渲染器先剥 `#...`、再 `decodeURIComponent`，满足本地路径白名单（`/^(?:[\\/]\|\.{1,2}[\\/]|[a-z]:[\\/])/i`）或 `!URL.canParse(decoded)` 才走文件侧栏；本重写器负责把 `file://` 前缀拆成宿主可认的纯路径。宿主规则改动会让本模块静默失配，修改须同步核对。
-- **有界流式状态机契约**：`MarkdownFileLinkRewriter` 每步只做单字符转移，只在 `linkBuf` 缓冲最多 `MAX_LINK_LOOKAHEAD`（25）个字符（`1` 字符 / 任意 2 段切分不变）；跟踪围栏代码块（含引用块 `>` 嵌套深度 `fenceQuoteDepth`，离开引用层即关闭围栏）、文首/空行后的 4 空格/Tab 缩进代码块、以及跨空行自动清零的行内反引号；`flush()` 原样回吐未完成的 `linkBuf`，绝不截断 `](file:///C` 一类半截前缀。本地 authority 与 Windows 盘符头判定复用 `src/impl/paths.ts` · `classifyLocalFileUrlHead`（与 `normalizeFileUrlToPath` 共用）。
+- **有界流式状态机契约**：`MarkdownFileLinkRewriter` 每步只做单字符转移，`linkBuf` 只暂存未判定的本地头，分类器保证等待在首个非歧义字符处结束（构造上最长 `](<file://localhost/C%3A/`，25 字符；`1` 字符 / 任意 2 段切分不变）；跟踪围栏代码块（含引用块 `>` 嵌套深度 `fenceQuoteDepth`，离开引用层即关闭围栏）、文首/空行后的 4 空格/Tab 缩进代码块（列表项内阈值为项内容缩进 +4，按 bullet / ordered 标记维护内容缩进栈）、跨空行自动清零的行内反引号、以及代码外反斜杠转义（被转义的分隔符不开启围栏 / span / 链接 / 列表标记）；`flush()` 原样回吐未完成的 `linkBuf`，绝不截断 `](file:///C` 一类半截前缀。本地 authority 与 Windows 盘符头判定复用 `src/impl/paths.ts` · `classifyLocalFileUrlHead`（与 `normalizeFileUrlToPath` 共用；后者先解码一次再分类，`%2F` 等编码分隔符还原后仍按盘符路径处理）。
 
 ## 3. 会话 ↔ agent 绑定
 

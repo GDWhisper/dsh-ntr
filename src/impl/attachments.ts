@@ -12,23 +12,25 @@ import { classifyLocalFileUrlHead } from './paths.ts'
 
 export function normalizeFileUrlToPath(uri: string): string {
   if (!/^file:\/\//i.test(uri)) return uri
-  const afterScheme = uri.slice('file://'.length)
-  const head = classifyLocalFileUrlHead(afterScheme, { allowBareDrive: true })
-  let path: string
-  if (head.kind === 'drive') {
-    path = `${head.driveLetter}:${head.sep}${afterScheme.slice(head.consumed)}`
-  } else if (head.kind === 'posix') {
-    path = `/${afterScheme.slice(head.consumed)}`
-  } else if (head.kind === 'incomplete') {
-    path = afterScheme.startsWith('/') ? afterScheme : `/${afterScheme.replace(/^localhost\/?/i, '')}`
-  } else {
-    path = `//${afterScheme}`
-  }
+  // Decode BEFORE classifying: `file:///C:%2Fwork` is a drive head only once
+  // the escaped separator is read as `/` (single decode — '%252F' stays '%2F').
+  let afterScheme = uri.slice('file://'.length)
   try {
-    return decodeURIComponent(path)
-  } catch {
-    return path
+    afterScheme = decodeURIComponent(afterScheme)
+  } catch { /* keep the raw spelling; the classifier handles it as-is */ }
+  const head = classifyLocalFileUrlHead(afterScheme, { allowBareDrive: true })
+  if (head.kind === 'drive') {
+    return `${head.driveLetter}:${head.sep}${afterScheme.slice(head.consumed)}`
   }
+  if (head.kind === 'posix') return `/${afterScheme.slice(head.consumed)}`
+  if (head.kind === 'incomplete') {
+    const path = afterScheme.startsWith('/') ? afterScheme : `/${afterScheme.replace(/^localhost\/?/i, '')}`
+    // A completed URL will not grow: a bare drive root (`file:///C:`) is a
+    // drive, while `file:///C` stays a POSIX path.
+    const bareDrive = /^\/([A-Za-z]):$/.exec(path)
+    return bareDrive === null ? path : `${bareDrive[1]}:`
+  }
+  return `//${afterScheme}`
 }
 
 function expandHomePath(p: string): string {

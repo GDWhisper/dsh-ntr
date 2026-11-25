@@ -12,19 +12,26 @@
  * this rewriter will silently diverge (recorded in `AGENTS/architecture.md`).
  *
  * Streaming state-machine contract (`MarkdownFileLinkRewriter`):
- * - Bounded lookahead: at most `MAX_LINK_LOOKAHEAD` (25) characters are ever
- *   buffered in `linkBuf` (`](<` + `file://` + `localhost/` + `C%3A/`).
+ * - Bounded lookahead: `linkBuf` only holds an incomplete `](`/`](<` local-head
+ *   prefix; `classifyLocalFileUrlHead` ends the wait at the first
+ *   non-ambiguous character, so the buffer is bounded by construction
+ *   (longest ambiguous prefix `](<file://localhost/C%3A/` is 25 chars).
  * - State set:
  *   1. Fenced code block (`fenceChar`, `fenceLen`, `fenceQuoteDepth`,
  *      `closingFencePending`, `pendingBacktickFence`, `pendingFenceQuoteDepth`)
  *   2. 4-space / tab indented code block (`canStartIndentedCode`,
  *      `inIndentedCode`) — entered only at document start or after a blank line
- *      (CommonMark §4.4), never mid-paragraph
+ *      (CommonMark §4.4), never mid-paragraph; the threshold is measured from
+ *      the enclosing list item's content column when one is open
  *   3. Inline code span (`inlineTicks`) — reset across blank lines so an
  *      unclosed backtick in one paragraph never suppresses links in later ones
  *   4. Link prefix lookahead (`linkBuf`), delegating local authority & Windows
  *      drive classification to the shared `classifyLocalFileUrlHead` primitive
  *      in `src/impl/paths.ts`
+ *   5. Backslash escapes (`escapePending`) — outside code an escaped delimiter
+ *      is literal and never opens a span, fence, link or list marker
+ *   6. Enclosing list items (`listStack`) — content indents tracked from bullet
+ *      and ordered markers, popped on dedent or when the quote depth drops
  * - Reset / flush contract: `flush()` finishes any open delimiter run and emits
  *   raw `linkBuf` verbatim, so truncated EOF prefixes (`](file:///C`, etc.) are
  *   never mutated or truncated.
@@ -36,9 +43,6 @@ import type { StreamChunk } from '../protocol.ts'
 import { classifyLocalFileUrlHead } from './paths.ts'
 
 const FILE_SCHEME = 'file://'
-
-/** Maximum lookahead buffered in `linkBuf`: `](<` + `file://` + `localhost/` + `C%3A/`. */
-export const MAX_LINK_LOOKAHEAD = 25
 
 /**
  * Stateful, bounded-lookahead rewriter for Markdown `file://` link prefixes.
@@ -55,6 +59,17 @@ export class MarkdownFileLinkRewriter {
   private lineHasContent = false
   private canStartIndentedCode = true
   private inIndentedCode = false
+  private escapePending = false
+
+  // Enclosing list items (content indents): indented code after a blank line is
+  // measured from the item's content column, not from the page margin.
+  private listStack: Array<{ readonly contentIndent: number; readonly quoteDepth: number }> = []
+  private markerPhase: 'none' | 'bullet' | 'digits' | 'punct' | 'spaces' = 'none'
+  private markerIndent = 0
+  private markerLen = 0
+  private markerDigits = 0
+  private markerSpaces = 0
+  private markerQuoteDepth = 0
 
   // Markdown code-context tracking so code examples are never modified.
   private fenceChar: '`' | '~' | null = null
@@ -121,19 +136,39 @@ export class MarkdownFileLinkRewriter {
       return ch
     }
     if (ch === '\n') {
+      this.advanceMarkerProbe(ch)
       this.finishLine()
       return ch
     }
 
     // First non-prefix character on a line: decide whether indented code starts.
     if (this.lineStart) {
-      if (this.lineIndent >= 4 && this.canStartIndentedCode) {
+      this.pruneListStack()
+      if (this.lineIndent >= this.indentedCodeThreshold() && this.canStartIndentedCode) {
         this.inIndentedCode = true
         this.lineStart = false
         this.lineHasContent = true
         return ch
       }
       this.canStartIndentedCode = false
+      this.startMarkerProbe(ch)
+    } else {
+      this.advanceMarkerProbe(ch)
+    }
+
+    // Outside code an escaped character is literal: it cannot open a fence,
+    // close a span, start a link, or extend a list marker.
+    if (this.escapePending) {
+      this.escapePending = false
+      this.lineStart = false
+      this.lineHasContent = true
+      return ch
+    }
+    if (ch === '\\') {
+      this.escapePending = true
+      this.lineStart = false
+      this.lineHasContent = true
+      return ch
     }
 
     // Outside code: check for fence/inline-code delimiters first.
@@ -202,6 +237,92 @@ export class MarkdownFileLinkRewriter {
     this.lineQuoteDepth = 0
     this.afterQuoteMarker = false
     this.lineHasContent = false
+    this.escapePending = false
+    this.markerPhase = 'none'
+  }
+
+  private pruneListStack(): void {
+    while (this.listStack.length > 0) {
+      const top = this.listStack[this.listStack.length - 1]!
+      if (top.quoteDepth > this.lineQuoteDepth || this.lineIndent < top.contentIndent) {
+        this.listStack.pop()
+      } else {
+        break
+      }
+    }
+  }
+
+  private indentedCodeThreshold(): number {
+    const top = this.listStack[this.listStack.length - 1]
+    return top === undefined ? 4 : top.contentIndent + 4
+  }
+
+  private startMarkerProbe(ch: string): void {
+    this.markerQuoteDepth = this.lineQuoteDepth
+    this.markerIndent = this.lineIndent
+    this.markerDigits = 0
+    this.markerSpaces = 0
+    if (ch === '-' || ch === '+' || ch === '*') {
+      this.markerPhase = 'bullet'
+      this.markerLen = 1
+    } else if (ch >= '0' && ch <= '9') {
+      this.markerPhase = 'digits'
+      this.markerLen = 1
+      this.markerDigits = 1
+    } else {
+      this.markerPhase = 'none'
+    }
+  }
+
+  private advanceMarkerProbe(ch: string): void {
+    if (ch === '\r') return
+    switch (this.markerPhase) {
+      case 'none':
+        return
+      case 'bullet':
+        if (ch === ' ' || ch === '\t') this.beginMarkerSpaces()
+        else if (ch === '\n') this.confirmMarker(1)
+        else this.markerPhase = 'none'
+        return
+      case 'digits':
+        if (ch >= '0' && ch <= '9' && this.markerDigits < 9) {
+          this.markerDigits += 1
+          this.markerLen += 1
+        } else if ((ch === '.' || ch === ')') && this.markerDigits > 0) {
+          this.markerPhase = 'punct'
+          this.markerLen += 1
+        } else {
+          this.markerPhase = 'none'
+        }
+        return
+      case 'punct':
+        if (ch === ' ' || ch === '\t') this.beginMarkerSpaces()
+        else if (ch === '\n') this.confirmMarker(1)
+        else this.markerPhase = 'none'
+        return
+      case 'spaces':
+        if (ch === ' ' || ch === '\t') {
+          this.markerSpaces += 1
+        } else {
+          // CommonMark: 5+ spaces after the marker keep W = 1.
+          this.confirmMarker(this.markerSpaces > 4 ? 1 : this.markerSpaces)
+        }
+        return
+    }
+  }
+
+  private beginMarkerSpaces(): void {
+    this.markerPhase = 'spaces'
+    this.markerSpaces = 1
+  }
+
+  private confirmMarker(spaces: number): void {
+    this.markerPhase = 'none'
+    if (this.listStack.length >= 16) return
+    this.listStack.push({
+      contentIndent: this.markerIndent + this.markerLen + spaces,
+      quoteDepth: this.markerQuoteDepth,
+    })
   }
 
   private closeFence(): void {

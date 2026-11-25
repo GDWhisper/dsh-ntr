@@ -83,8 +83,19 @@ describe('Markdown file:// link normalization', () => {
     expect(classifyLocalFileUrlHead('server/share/x.txt')).toEqual({ kind: 'remote' })
 
     expect(normalizeFileUrlToPath('file:///C%3A/work/a.png')).toBe('C:/work/a.png')
+    expect(normalizeFileUrlToPath('file:///C:%2Fwork/a.png')).toBe('C:/work/a.png')
+    expect(normalizeFileUrlToPath('file:///a%3A/b')).toBe('a:/b')
     expect(normalizeFileUrlToPath('file:///a:b/c')).toBe('/a:b/c')
     expect(normalizeFileUrlToPath('file:///a%3Ab/c')).toBe('/a:b/c')
+    expect(normalizeFileUrlToPath('file:///a%252Fb')).toBe('/a%2Fb')
+    // A completed URL cannot grow: a bare drive root is a drive, `file:///C` is not.
+    expect(normalizeFileUrlToPath('file:///C:')).toBe('C:')
+    expect(normalizeFileUrlToPath('file:///C')).toBe('/C')
+    expect(normalizeFileUrlToPath('file://localhost')).toBe('/')
+    expect(normalizeFileUrlToPath('file://LOCALHOST/tmp/a.png')).toBe('/tmp/a.png')
+    expect(normalizeFileUrlToPath('FILE:///C:/work/a.png')).toBe('C:/work/a.png')
+    expect(normalizeFileUrlToPath('file://server/share/a.png')).toBe('//server/share/a.png')
+    expect(normalizeFileUrlToPath('https://example.com/a.png')).toBe('https://example.com/a.png')
   })
 
   it('supports CommonMark angle-bracketed destinations', () => {
@@ -192,6 +203,76 @@ describe('Markdown file:// link normalization', () => {
       .toBe('`code\n[keep](file:///Users/a.ts)`')
   })
 
+  it('treats backslash-escaped delimiters as literal text outside code', () => {
+    const bs = '\\'
+    const tick = '`'
+    expect(normalizeMarkdownFileLinks(`Escaped ${bs}${tick} tick, see [a](file:///Users/a.ts)`))
+      .toBe(`Escaped ${bs}${tick} tick, see [a](/Users/a.ts)`)
+    // An escaped backslash is literal, so the following backtick really opens a span.
+    expect(normalizeMarkdownFileLinks(`Even ${bs}${bs}${tick}code [b](file:///Users/b.ts)${tick} then [c](file:///Users/c.ts)`))
+      .toBe(`Even ${bs}${bs}${tick}code [b](file:///Users/b.ts)${tick} then [c](/Users/c.ts)`)
+    // Inside a code span the backslash is literal and cannot escape the closer.
+    expect(normalizeMarkdownFileLinks(`Code ${tick}a${bs}${tick} [d](file:///Users/d.ts)`))
+      .toBe(`Code ${tick}a${bs}${tick} [d](/Users/d.ts)`)
+    expect(normalizeMarkdownFileLinks('\\~~~\n[f](file:///Users/f.ts)'))
+      .toBe('\\~~~\n[f](/Users/f.ts)')
+  })
+
+  it('measures indented code from the enclosing list item and leaves the list on dedent', () => {
+    const input = [
+      '- item',
+      '',
+      '    [list-para](file:///Users/list-para.ts)',
+      '',
+      '- item',
+      '',
+      '      [list-code](file:///Users/list-code.ts)',
+      '',
+      '  - inner',
+      '',
+      '      [inner-para](file:///Users/inner-para.ts)',
+      '',
+      '        [inner-code](file:///Users/inner-code.ts)',
+      '',
+      'Paragraph',
+      '',
+      '    [after-list](file:///Users/after-list.ts)',
+      '',
+      '1. step',
+      '',
+      '    [ordered-para](file:///Users/ordered-para.ts)',
+    ].join('\n')
+
+    const expected = [
+      '- item',
+      '',
+      '    [list-para](/Users/list-para.ts)',
+      '',
+      '- item',
+      '',
+      '      [list-code](file:///Users/list-code.ts)',
+      '',
+      '  - inner',
+      '',
+      '      [inner-para](/Users/inner-para.ts)',
+      '',
+      '        [inner-code](file:///Users/inner-code.ts)',
+      '',
+      'Paragraph',
+      '',
+      '    [after-list](file:///Users/after-list.ts)',
+      '',
+      '1. step',
+      '',
+      '    [ordered-para](/Users/ordered-para.ts)',
+    ].join('\n')
+
+    expect(normalizeMarkdownFileLinks(input)).toBe(expected)
+    // An escaped bullet is not a list marker, so the top-level threshold stays 4.
+    expect(normalizeMarkdownFileLinks('\\- not a list\n\n    [x](file:///Users/x.ts)'))
+      .toBe('\\- not a list\n\n    [x](file:///Users/x.ts)')
+  })
+
   it('handles adversarial prefixes and preserves truncated mid-drive tails verbatim on flush', () => {
     expect(normalizeMarkdownFileLinks('[x](](file:///Users/a.ts)')).toBe('[x](](/Users/a.ts)')
     expect(normalizeMarkdownFileLinks('[x](file://foo](file:///Users/a.ts)')).toBe('[x](file://foo](/Users/a.ts)')
@@ -213,6 +294,11 @@ describe('Markdown file:// link normalization', () => {
       'A ` stray',
       '',
       '    [indented](file:///Users/keep-ind.ts)',
+      '',
+      '- item',
+      '',
+      '    [list-para](file:///Users/list-para.ts)',
+      'Escaped \\` tick and [z](file:///Users/z.ts)',
       '',
       '> ~~~md',
       '> [qt](file:///Users/keep-qt.ts)',
