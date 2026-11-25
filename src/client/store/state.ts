@@ -4,7 +4,7 @@
  * (split plan P3a), which re-exports it unchanged.
  */
 
-import type { AcpApprovalDeadlines, AcpConversationChoice, AcpDelegateSettings, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSkillEntry, AgentView, ChatSessionView, DetectedAgentInfo, PluginUpdateState, SaveGateStatus, SessionView, SubagentRecord } from "../../protocol.ts"
+import type { AcpApprovalDeadlines, AcpConversationChoice, AcpDelegateSettings, AcpIdleRelease, AcpPresetStatus, AcpSharedMcpSettings, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSkillEntry, AgentView, ChatSessionView, DetectedAgentInfo, PluginUpdateState, SaveGateStatus, SessionView, SubagentRecord } from "../../protocol.ts"
 import type { Block } from "./blocks.ts"
 import type { PendingElicitation } from "./elicitation.ts"
 import type { PendingPermission } from "./permission.ts"
@@ -169,6 +169,8 @@ export interface UiState {
    * is the authority.
    */
   skillsMcpEnabled?: boolean
+  /** Unified MCP settings (global servers + optional host sync). Absent on older hosts. */
+  sharedMcp?: AcpSharedMcpSettings
   /**
    * The approval deadlines in force, as the settings card edits them. Absent on
    * a host half from before the card existed, which hides the card rather than

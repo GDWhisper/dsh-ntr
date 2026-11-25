@@ -25,6 +25,8 @@ import type {
   IdleReleaseResult,
   IdleReleaseSetPayload,
   PermissionTimeoutMode,
+  SharedMcpResult,
+  SharedMcpSetPayload,
   SkillsMcpResult,
 } from '../../protocol.ts'
 import {
@@ -139,6 +141,35 @@ export class SettingsService {
       this.host.mutate({ skillsMcpEnabled: result.skillsMcpEnabled === true })
     } catch (error) {
       this.host.mutate({ skillsMcpEnabled: previous })
+      this.host.flashError(error)
+    }
+  }
+
+  /** Re-read unified MCP view (including latest host `dsh-mcp-manager` entries) silently on older hosts. */
+  async refreshSharedMcp(): Promise<void> {
+    try {
+      const result = await this.host.call<SharedMcpResult>('ui/shared-mcp')
+      this.host.mutate({ sharedMcp: result.sharedMcp })
+    } catch { /* older host or transient error keeps last snapshot */ }
+  }
+
+  /** Write unified MCP servers and/or host sync toggle (optimistic; host answer is authority). */
+  async setSharedMcp(patch: SharedMcpSetPayload): Promise<void> {
+    const previous = this.host.state().sharedMcp
+    if (previous !== undefined) {
+      this.host.mutate({
+        sharedMcp: {
+          ...previous,
+          ...(patch.servers === undefined ? {} : { servers: patch.servers }),
+          ...(patch.hostSyncEnabled === undefined ? {} : { hostSyncEnabled: patch.hostSyncEnabled }),
+        },
+      })
+    }
+    try {
+      const result = await this.host.call<SharedMcpResult>('ui/shared-mcp-set', patch)
+      this.host.mutate({ sharedMcp: result.sharedMcp })
+    } catch (error) {
+      this.host.mutate({ sharedMcp: previous })
       this.host.flashError(error)
     }
   }

@@ -131,10 +131,85 @@ export interface AcpAgentDef {
    * they were created with.
    */
   skillsMcpEnabled?: boolean
+  /**
+   * Whether plugin-wide shared MCP servers and host-synced MCP servers are
+   * offered to this agent. Omitted means enabled; only an explicit `false`
+   * opt-out is persisted. Flipped via `agent/set-shared-mcp`, never `agent/save`.
+   */
+  sharedMcpEnabled?: boolean
 }
 
 /** How an MCP server is reached. `acp` (agent→client `mcp/message`) is NOT supported. */
 export type AcpMcpTransport = 'stdio' | 'http' | 'sse'
+
+/** Maximum number of MCP servers in a single server list. */
+export const MCP_SERVERS_MAX = 32
+/** Maximum length of one MCP server `name` (namespaces `mcp__<name>__<tool>`). */
+export const MCP_SERVER_NAME_MAX = 64
+
+function mcpStringMapError(value: unknown, label: string): string | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return `acp: ${label} must be an object`
+  }
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof entry !== 'string') return `acp: ${label}.${key} must be a string`
+  }
+  return undefined
+}
+
+/**
+ * Validate a list of normalized `AcpMcpServerDef` entries, returning the first
+ * violation message or `undefined` when valid. Pure helper shared by the host
+ * validator (`validateMcpServers`) and browser forms (`parseMcpServers`).
+ */
+export function findMcpServersError(raw: unknown, label = 'mcpServers'): string | undefined {
+  if (!Array.isArray(raw)) return `acp: ${label} must be an array of MCP servers`
+  if (raw.length > MCP_SERVERS_MAX) {
+    return `acp: ${label} may hold at most ${String(MCP_SERVERS_MAX)} MCP servers`
+  }
+  const seen = new Set<string>()
+  for (const [index, entry] of raw.entries()) {
+    const at = `${label}[${String(index)}]`
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+      return `acp: ${at} must be an object`
+    }
+    const row = entry as Record<string, unknown>
+    const name = row.name
+    if (typeof name !== 'string' || name.trim() === '' || name.length > MCP_SERVER_NAME_MAX) {
+      return `acp: ${at}.name must be a non-empty string of at most ${String(MCP_SERVER_NAME_MAX)} chars`
+    }
+    if (seen.has(name)) {
+      return `acp: ${at}.name "${name}" is used by more than one MCP server`
+    }
+    seen.add(name)
+    const transport = row.transport
+    if (transport === 'acp') {
+      return `acp: ${at}.transport "acp" is not supported (the agent would have to call back into this plugin over mcp/message)`
+    }
+    if (transport === 'stdio') {
+      if (typeof row.command !== 'string' || row.command.trim() === '') {
+        return `acp: ${at}.command must be a non-empty string for a stdio MCP server`
+      }
+      if (row.args !== undefined && (!Array.isArray(row.args) || row.args.some(a => typeof a !== 'string'))) {
+        return `acp: ${at}.args must be an array of strings`
+      }
+      const envErr = mcpStringMapError(row.env, `${at}.env`)
+      if (envErr !== undefined) return envErr
+      continue
+    }
+    if (transport === 'http' || transport === 'sse') {
+      if (typeof row.url !== 'string' || row.url.trim() === '') {
+        return `acp: ${at}.url must be a non-empty string for a ${transport} MCP server`
+      }
+      const headersErr = mcpStringMapError(row.headers, `${at}.headers`)
+      if (headersErr !== undefined) return headersErr
+      continue
+    }
+    return `acp: ${at}.transport must be "stdio", "http" or "sse"`
+  }
+  return undefined
+}
 
 /**
  * One MCP server, in the plugin's normalized shape.

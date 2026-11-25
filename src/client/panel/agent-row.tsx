@@ -115,6 +115,11 @@ export function AgentRow({
     setForm(prev => ({ ...prev, skillsMcpEnabled: serverSkillsMcp }))
   }, [serverSkillsMcp])
 
+  const serverSharedMcp = detected.currentConfig?.sharedMcpEnabled !== false
+  useEffect(() => {
+    setForm(prev => ({ ...prev, sharedMcpEnabled: serverSharedMcp }))
+  }, [serverSharedMcp])
+
   const serverDefaultMode = detected.currentConfig?.defaultMode ?? ''
   useEffect(() => {
     // The default mode is another lightweight-RPC field: carry the host answer

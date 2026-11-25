@@ -8,15 +8,15 @@ import type {
   RosterPresetRow,
 } from '../impl.ts'
 import type {
-  AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSaveResult, AgentSkillsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, ElicitationOutcome, GenerateOptions,
+  AcpAgentCatalog, AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpPresetStatus, AcpSharedMcpSettings, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSaveResult, AgentSkillsResult, AgentTestResult, AgentView, ChatSessionView, ChatTranscriptView, DetectedAgentInfo, ElicitationOutcome, GenerateOptions,
   LlmResolvedModelInfo,
-  AcpIdleRelease, ActiveTurnView, ApprovalDeadlineKey, ApprovalDeadlinePatch, PendingElicitationView, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, SaveGateFlushResult, SaveGateStatus, SessionView, StreamChunk,
+  AcpIdleRelease, ActiveTurnView, ApprovalDeadlineKey, ApprovalDeadlinePatch, PendingElicitationView, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, SaveGateFlushResult, SaveGateStatus, SessionView, SharedMcpSetPayload, StreamChunk,
   AcpDelegateAgentDefaults, AcpDelegateConfig, AcpDelegatePolicy, AcpDelegateSettings, AcpStartSessionOpts, DelegateGuidance, DelegateSetPayload,
   SubagentDetailResult, SubagentRecord,
 } from '../protocol.ts'
 import { SESSION_TITLE_PREFIX } from '../protocol.ts'
 import type { AcpSaveGate } from '../save-gate.ts'
-import type { UpdateService } from '../update.ts'
+import type { UpdateService } from '../update.ts'; import type { HostMcpSnapshot } from './host-mcp.ts'
 import {
   bridgeKey,
   type BridgeScope,
@@ -513,7 +513,7 @@ export class BridgeManager {
       // agy dispatch tracking shares the late-output agent probe (production:
       // the launch command line; tests: the injected seam).
       if (this.lateOutput.isAgentFor(session.agentId)) this.subagents.trackAgyDispatch(session, update)
-    }, () => this.tuning.skillsMcpEnabled)
+    }, () => this.settings.sessionMcpContext())
   }
 
   /**
@@ -1039,10 +1039,8 @@ export class BridgeManager {
     return this.admin.setAutoDiscoverModels(agentId, autoDiscoverModels)
   }
 
-  /** Per-agent `dsh-skills` opt-out; in-place edit, strictly persisted, no restart. */
-  async setSkillsMcp(agentId: string, skillsMcpEnabled: boolean): Promise<void> {
-    return this.admin.setSkillsMcp(agentId, skillsMcpEnabled)
-  }
+  async setSkillsMcp(agentId: string, skillsMcpEnabled: boolean): Promise<void> { return this.admin.setSkillsMcp(agentId, skillsMcpEnabled) }
+  async setSharedMcpAgent(agentId: string, sharedMcpEnabled: boolean): Promise<void> { return this.admin.setSharedMcp(agentId, sharedMcpEnabled) }
 
   /** Per-agent default chat mode; in-place edit, strictly persisted, no restart. */
   async setDefaultMode(agentId: string, defaultMode?: string): Promise<void> {
@@ -1180,15 +1178,11 @@ export class BridgeManager {
 
   setDelegateRegistration(reg: { sync(): void; readonly toolAvailable: boolean; readonly restrictAvailable: boolean }): void { this.delegateRegistration = reg }
 
-  /** Whether the built-in `dsh-skills` MCP server is offered (see `SettingsService`). */
-  skillsMcpEnabled(): boolean {
-    return this.settings.skillsMcpEnabled()
-  }
-
-  /** Write the skills MCP switch: strict persist first, then hot-apply (see `SettingsService`). */
-  async setSkillsMcpEnabled(value: boolean): Promise<void> {
-    return this.settings.setSkillsMcpEnabled(value)
-  }
+  skillsMcpEnabled(): boolean { return this.settings.skillsMcpEnabled() }
+  async setSkillsMcpEnabled(value: boolean): Promise<void> { return this.settings.setSkillsMcpEnabled(value) }
+  setHostMcpReader(reader?: () => HostMcpSnapshot): void { this.settings.setHostMcpReader(reader) }
+  sharedMcp(): AcpSharedMcpSettings { return this.settings.sharedMcp() }
+  async setSharedMcp(patch: SharedMcpSetPayload): Promise<void> { return this.settings.setSharedMcp(patch) }
 
   /**
    * External-worker lifecycle records plus the idle-drain report wake-ups.

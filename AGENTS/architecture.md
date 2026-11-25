@@ -140,7 +140,7 @@ NTR 模式表达为 agent preset（`presets/acp/acp.patch.yml` 的 `preset-acp` 
 - **严禁**由 preset 或宿主侧宣称能屏蔽非 ACP 模型（`buildModelCatalog` 无 per-session 过滤 seam）。
 - 「是否 NTR 会话」必须读会话日志的 preset（`sessionAgentPreset`，镜像 `dsh-agent-presets` 的 `resolveSessionPreset`，经 `setAcpModeResolver` 注入），**严禁**自建标记位。
 
-**MCP 工具不在这层**。MCP 服务器由 **agent 进程自己**拉起与管理：要么是 agent 自己配置的那批（agent 读自己的配置文件，与本插件无关），要么是 agent 定义里 `mcpServers` 声明的那批（插件在 `session/new` / `session/load` 时把清单交给 agent，见 [protocol.md §1](./protocol.md)）。两种都在 agent 进程内，既不是宿主 `ctx.tools` 的工具，也不经 `tools/execute` 虚拟工具那条路 —— 所以「NTR preset 不挂工具行」与「NTR 会话能用 MCP 工具」并不矛盾。宿主侧 MCP（`dsh-mcp-client` → `ctx.tools`）**不经此路**转发：宿主不暴露那批服务器的可读清单，agent 也够不着宿主的工具注册表。
+**MCP 工具不在这层**。MCP 服务器由 **agent 进程自己**拉起与管理：要么是 agent 自己配置的那批（agent 读自己的配置文件，与本插件无关），要么是 agent 定义里 `mcpServers` 声明的那批（插件在 `session/new` / `session/load` 时把清单交给 agent，见 [protocol.md §1](./protocol.md)）。两种都在 agent 进程内，既不是宿主 `ctx.tools` 的工具，也不经 `tools/execute` 虚拟工具那条路 —— 所以「NTR preset 不挂工具行」与「NTR 会话能用 MCP 工具」并不矛盾。宿主侧 MCP（`dsh-mcp-client` → `ctx.tools`）的工具注册表仍不经此路转发给 agent；但当宿主提供 `@deepseek-ai/dsh-mcp-manager`（`ctx.mcpManager`，DSH 0.2.2+）时，插件经可选接缝只读 `ctx.mcpManager.config.servers.get()`，在用户主动开启「同步 DSH 宿主 MCP」后将已启用且不含 `${credential:...}` 模板的条目与插件全局 `sharedMcpServers` 一并经 `sessionMcpServers` 合并下发（优先级：agent 私有 > 插件全局 > 宿主同步 > 内置 `dsh-skills`）。
 
 原「权限裁决也进 preset」的实现已退役：权限原样映射，见 [permissions.md](./permissions.md)。
 

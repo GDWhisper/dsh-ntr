@@ -11,9 +11,9 @@
  */
 
 import type {
-  AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpDelegateSettings, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AcpEvent, ActiveTurnView, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSaveResult, AgentSkillsResult, AgentTestResult,
+  AcpAgentDef, AcpApprovalDeadlines, AcpConversationChoice, AcpDelegateSettings, AcpIdleRelease, AcpPresetStatus, AcpSharedMcpSettings, AcpTagHalo, AcpEvent, ActiveTurnView, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSaveResult, AgentSkillsResult, AgentTestResult,
   AgentView, ApprovalDeadlinePatch, ChatSessionView, ChatTranscriptView, DelegateSetPayload, DetectedAgentInfo, ElicitationOutcome, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, RpcResult,
-  SaveGateFlushResult, SaveGateStatus, SubagentDetailResult,
+  SaveGateFlushResult, SaveGateStatus, SharedMcpSetPayload, SubagentDetailResult,
 } from '../protocol.ts'
 import { DEFAULT_MODE_MAX, DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO, pluginReleaseUrl } from '../protocol.ts'
 import { subagentToolCallId } from '../subagent-records.ts'
@@ -21,7 +21,7 @@ import { validateElicitationOutcome } from './elicitation.ts'
 import { AcpError } from './errors.ts'
 import type { PromptContentBlock } from './image.ts'
 import {
-  normalizeExposedModels, validateAgentDef, validateApprovalDeadlines, validateDelegateSettings, validateIdleReleaseMs, validatePermissionTimeoutMode, validateTagHalo,
+  normalizeExposedModels, validateAgentDef, validateApprovalDeadlines, validateDelegateSettings, validateIdleReleaseMs, validateMcpServers, validatePermissionTimeoutMode, validateTagHalo,
 } from './validate.ts'
 
 // ---- RPC surface ----
@@ -71,6 +71,10 @@ export interface AcpManager {
   skillsMcpEnabled?(): boolean
   /** Write the skills MCP switch: strict persist, then hot-apply. */
   setSkillsMcpEnabled?(value: boolean): Promise<void>
+  /** Unified MCP settings (shared servers + optional host `dsh-mcp-manager` sync). */
+  sharedMcp?(): AcpSharedMcpSettings
+  /** Write unified MCP servers and/or host sync toggle (strict persist). */
+  setSharedMcp?(patch: SharedMcpSetPayload): Promise<void>
   /**
    * The approval deadline in force, with the facts that explain an override
    * (the `cordis.patch.yml` baseline it outranks). `undefined` on a host half
@@ -130,6 +134,7 @@ export interface AcpManager {
    * must not go through `agent/save`. See {@link AcpAgentDef.skillsMcpEnabled}.
    */
   setSkillsMcp?(agentId: string, skillsMcpEnabled: boolean): Promise<void>
+  setSharedMcpAgent?(agentId: string, sharedMcpEnabled: boolean): Promise<void>
   /** Per-agent default chat mode; `undefined` / blank clears it. */
   setDefaultMode?(agentId: string, defaultMode?: string): Promise<void>
   probeAgentModels?(agentId: string, model?: string): Promise<AgentProbeModelsResult>
@@ -704,6 +709,25 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         await manager.setSkillsMcpEnabled?.(body.skillsMcpEnabled)
         return ok({ skillsMcpEnabled: manager.skillsMcpEnabled?.() === true })
       }
+      case 'ui/shared-mcp':
+        return ok({ sharedMcp: manager.sharedMcp?.() })
+      case 'ui/shared-mcp-set': {
+        const patch: SharedMcpSetPayload = {}
+        if (body.servers !== undefined) {
+          patch.servers = validateMcpServers(body.servers, 'sharedMcp.servers', 'bad_payload')
+        }
+        if (body.hostSyncEnabled !== undefined) {
+          if (typeof body.hostSyncEnabled !== 'boolean') {
+            throw new AcpError('bad_payload', 'acp: hostSyncEnabled must be boolean')
+          }
+          patch.hostSyncEnabled = body.hostSyncEnabled
+        }
+        if (patch.servers === undefined && patch.hostSyncEnabled === undefined) {
+          throw new AcpError('bad_payload', 'acp: sharedMcp patch must name servers or hostSyncEnabled')
+        }
+        await manager.setSharedMcp?.(patch)
+        return ok({ sharedMcp: manager.sharedMcp?.() })
+      }
       case 'ui/approval-deadlines':
         // Absent on a host half from before the card existed: the browser then
         // renders nothing rather than a number it cannot trust.
@@ -771,6 +795,14 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
           return fail('bad_payload', 'acp: skillsMcpEnabled must be a boolean')
         }
         await manager.setSkillsMcp?.(agentId, body.skillsMcpEnabled)
+        return ok({ done: true })
+      }
+      case 'agent/set-shared-mcp': {
+        const agentId = str(body, 'agentId', 64)
+        if (typeof body.sharedMcpEnabled !== 'boolean') {
+          return fail('bad_payload', 'acp: sharedMcpEnabled must be a boolean')
+        }
+        await manager.setSharedMcpAgent?.(agentId, body.sharedMcpEnabled)
         return ok({ done: true })
       }
       case 'agent/set-default-mode': {

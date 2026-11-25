@@ -279,6 +279,9 @@ export class AgentAdminService {
     if (def.skillsMcpEnabled === undefined && this.host.defOf(def.id)?.skillsMcpEnabled === false) {
       def = { ...def, skillsMcpEnabled: false }
     }
+    if (def.sharedMcpEnabled === undefined && this.host.defOf(def.id)?.sharedMcpEnabled === false) {
+      def = { ...def, sharedMcpEnabled: false }
+    }
     // Same rule for the default chat mode. The lightweight RPC is usable while
     // a save is queued, and an older browser bundle does not carry the field;
     // an omitted key inherits the live value. Clearing it is the RPC's job.
@@ -410,6 +413,23 @@ export class AgentAdminService {
     }
     // Same frame set as `setExposedModels`: the agent's state is republished
     // and the browser patches its copy of the definition from `agent/exposure`.
+    this.host.publishCatalog(agentId, true)
+  }
+
+  /** Per-agent opt-out from unified shared/host MCP servers (in-place, strict persist, no restart). */
+  async setSharedMcp(agentId: string, sharedMcpEnabled: boolean): Promise<void> {
+    const def = this.host.defOf(agentId)
+    if (def === undefined) throw new AcpError('unknown_agent', `acp: agent "${agentId}" is not configured`)
+    const previous = def.sharedMcpEnabled
+    if (sharedMcpEnabled) delete def.sharedMcpEnabled
+    else def.sharedMcpEnabled = false
+    try {
+      this.host.persistAgents(true)
+    } catch (error) {
+      if (previous === undefined) delete def.sharedMcpEnabled
+      else def.sharedMcpEnabled = previous
+      throw error
+    }
     this.host.publishCatalog(agentId, true)
   }
 

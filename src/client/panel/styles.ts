@@ -50,7 +50,7 @@ const STYLE = `
 .dwa-health-status { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .dwa-health-status > span:last-child:not(:nth-child(2)) { padding-left: 12px; border-left: var(--ntr-line); }
 .dwa-back { margin-bottom: 16px; }
-.dwa-root button:focus-visible, .dwa-root input:focus-visible, .dwa-root select:focus-visible {
+.dwa-root button:focus-visible, .dwa-root input:focus-visible, .dwa-root select:focus-visible, .dwa-root textarea:focus-visible {
   outline: 2px solid var(--ntr-accent); outline-offset: 2px;
 }
 .dwa-page-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 28px; }
@@ -461,6 +461,16 @@ const STYLE = `
   .dwa-root *, .dwa-root *::before, .dwa-root *::after { transition: none !important; }
   .dwa-model-row:hover .dwa-model-row-value-text { animation: none !important; }
 }
+
+.dwa-mcp-card { display: flex; flex-direction: column; gap: 10px; box-shadow: var(--ntr-shadow); }
+.dwa-mcp-card + .dwa-mcp-card { margin-top: 12px; }
+.dwa-mcp-textarea { min-height: 112px; resize: vertical; }
+.dwa-mcp-host-list { display: flex; flex-direction: column; gap: 6px; padding-top: 10px; border-top: var(--ntr-line-quiet); }
+.dwa-mcp-host-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: var(--ntr-font-sm); }
+.dwa-mcp-host-name { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.dwa-mcp-host-transport { font-size: var(--ntr-font-xs); color: var(--ntr-muted); }
+.dwa-mcp-agents { margin-top: 20px; }
+.dwa-mcp-agents .dwa-skills-agents { margin-top: 0; }
 `
 
 let styleMounted = false

@@ -71,6 +71,8 @@ export type AcpEvent =
     exposedModels?: string[]
     autoDiscoverModels: boolean
     skillsMcpEnabled: boolean
+    /** Resolved per-agent opt-in to unified shared/host MCP servers (`!== false`). */
+    sharedMcpEnabled?: boolean
     /** New-chat default mode; absent = follow the agent's own initial mode. */
     defaultMode?: string
   }

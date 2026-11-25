@@ -38,7 +38,7 @@ import { SkillsService } from "./store/skills.ts"
 import { SubagentDetailService } from "./store/subagent-detail.ts"
 import { UpdateService } from "./store/update.ts"
 
-import type { AcpApprovalDeadlines, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentTestResult, AgentView, ApprovalDeadlinesResult, DelegateResult, DelegateSetPayload, DelegateSettingKey, DetectedAgentInfo, ElicitationOutcome, IdleReleaseResult, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, AgentSkillEntry, SubagentDetailEntry } from '../protocol.ts'
+import type { AcpApprovalDeadlines, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentTestResult, AgentView, ApprovalDeadlinesResult, DelegateResult, DelegateSetPayload, DelegateSettingKey, DetectedAgentInfo, ElicitationOutcome, IdleReleaseResult, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, AgentSkillEntry, SharedMcpResult, SharedMcpSetPayload, SubagentDetailEntry } from '../protocol.ts'
 import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO } from '../protocol.ts'
 import { commitFrame, consumeVerdict, invalidateVerdict, markUnsettled, peekVerdict, projectAcpMode, settleFromHost, type AcpVerdict } from './acp-verdict.ts'
 
@@ -399,7 +399,7 @@ export class AcpStore {
   /** Snapshot refresh used on panel open and after a stream outage. */
   async resync(): Promise<void> {
     try {
-      const [{ agents }, { sessions }, defaultAgentInfo, detectResult, presetResult, tagHaloResult, titlePrefixResult, skillsMcpResult, deadlinesResult, idleReleaseResult, delegateResult, saveGateResult, versionResult] = await Promise.all([
+      const [{ agents }, { sessions }, defaultAgentInfo, detectResult, presetResult, tagHaloResult, titlePrefixResult, skillsMcpResult, sharedMcpResult, deadlinesResult, idleReleaseResult, delegateResult, saveGateResult, versionResult] = await Promise.all([
         this.call<{ agents: AgentView[] }>('agents/list'),
         this.call<{ sessions: SessionView[] }>('sessions/list'),
         // The plugin's OWN default ACP agent — a plugin-private id, not a DSH
@@ -412,8 +412,8 @@ export class AcpStore {
         this.call<{ halo: AcpTagHalo }>('ui/tag-halo').catch(() => ({ halo: { ...DEFAULT_TAG_HALO } })),
         // Host without the endpoint (older half) keeps the local default (on).
         this.call<{ titlePrefix: boolean }>('ui/session-title-prefix').catch(() => ({ titlePrefix: DEFAULT_SESSION_TITLE_PREFIX })),
-        // Absent / older half: stays UNREAD (`undefined`), never a guessed on.
         this.call<{ skillsMcpEnabled: boolean }>('ui/skills-mcp').catch(() => ({} as { skillsMcpEnabled?: boolean })),
+        this.call<SharedMcpResult>('ui/shared-mcp').catch(() => ({ sharedMcp: undefined })),
         // `undefined` (older half) hides the deadline card instead of showing a
         // number this browser made up.
         this.call<ApprovalDeadlinesResult>('ui/approval-deadlines').catch(() => ({ deadlines: undefined })),
@@ -447,6 +447,7 @@ export class AcpStore {
         tagHalo: tagHaloResult?.halo ?? { ...DEFAULT_TAG_HALO },
         titlePrefix: titlePrefixResult?.titlePrefix ?? DEFAULT_SESSION_TITLE_PREFIX,
         ...(skillsMcpResult.skillsMcpEnabled === undefined ? {} : { skillsMcpEnabled: skillsMcpResult.skillsMcpEnabled }),
+        sharedMcp: sharedMcpResult.sharedMcp,
         approvalDeadlines: deadlinesResult.deadlines,
         idleRelease: idleReleaseResult.idleRelease,
         delegate: delegateResult.delegate,
@@ -556,10 +557,8 @@ export class AcpStore {
     return this.catalogService.setAutoDiscoverModels(agentId, autoDiscoverModels)
   }
 
-  /** Toggle one agent's `dsh-skills` opt-out (lightweight: no restart, no save gate). */
-  async setAgentSkillsMcp(agentId: string, skillsMcpEnabled: boolean): Promise<void> {
-    return this.agentAdminService.setAgentSkillsMcp(agentId, skillsMcpEnabled)
-  }
+  async setAgentSkillsMcp(agentId: string, skillsMcpEnabled: boolean): Promise<void> { return this.agentAdminService.setAgentSkillsMcp(agentId, skillsMcpEnabled) }
+  async setAgentSharedMcp(agentId: string, sharedMcpEnabled: boolean): Promise<void> { return this.agentAdminService.setAgentSharedMcp(agentId, sharedMcpEnabled) }
 
   /** Set one agent's default chat mode (lightweight: no restart, no save gate). */
   async setAgentDefaultMode(agentId: string, defaultMode?: string): Promise<void> { return this.agentAdminService.setAgentDefaultMode(agentId, defaultMode) }
@@ -974,10 +973,9 @@ export class AcpStore {
     return this.settingsService.setTitlePrefix(value)
   }
 
-  /** Write the built-in skills MCP switch (optimistic; the host answer is the authority). */
-  async setSkillsMcpEnabled(value: boolean): Promise<void> {
-    return this.settingsService.setSkillsMcp(value)
-  }
+  async setSkillsMcpEnabled(value: boolean): Promise<void> { return this.settingsService.setSkillsMcp(value) }
+  async refreshSharedMcp(): Promise<void> { return this.settingsService.refreshSharedMcp() }
+  async setSharedMcp(patch: SharedMcpSetPayload): Promise<void> { return this.settingsService.setSharedMcp(patch) }
 
   /** Write the approval deadline, or drop the persisted override with `reset`. */
   async setApprovalDeadline(ms: number): Promise<void> {
@@ -1293,14 +1291,10 @@ export class AcpStore {
         // omits it, and a missing field means "not opted out" (the field is
         // only ever persisted as `false`).
         const skillsMcpOff = event.skillsMcpEnabled === false
+        const sharedMcpOff = event.sharedMcpEnabled === false
         const detectedAgents = this.state.detectedAgents.map(info => {
           if (info.id !== event.agentId || info.currentConfig === undefined) return info
-          const currentConfig = {
-            ...info.currentConfig,
-            exposedModels,
-            autoDiscoverModels: event.autoDiscoverModels,
-            skillsMcpEnabled: skillsMcpOff ? false : undefined,
-          }
+          const currentConfig = { ...info.currentConfig, exposedModels, autoDiscoverModels: event.autoDiscoverModels, skillsMcpEnabled: skillsMcpOff ? false : undefined, sharedMcpEnabled: sharedMcpOff ? false : undefined }
           if (event.defaultMode === undefined) delete currentConfig.defaultMode
           else currentConfig.defaultMode = event.defaultMode
           return { ...info, currentConfig }

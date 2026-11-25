@@ -41,7 +41,7 @@ import {
 import type { LiveSession } from './turn-stream.ts'
 import { assertLifecycle, beginTurnSlot, freshSessionFacts, hasPromptSlot, isSettling, lifecycleOf, markClosed, markLive, markParked, openTurnSlot, releasePromptSlot, settleTurnSlot } from './session-lifecycle.ts'
 import { permissionAskReason, snapshot } from './shape.ts'
-import { sessionMcpServers, toAcpMcpServers } from './mcp.ts'
+import { resolveSessionMcp, toAcpMcpServers, type SessionMcpLiveContext } from './mcp.ts'
 import { DEFAULT_TUNING } from './tuning.ts'
 import {
   FS_MAX_READ_BYTES,
@@ -255,7 +255,7 @@ export class AgentBridge {
      */
     private readonly onSessionAgyDispatch?: (session: LiveSession, update: SessionUpdate) => void,
     /** Live `dsh-skills` switch, read per request (see `mcpServersForSession`); absent → off. */
-    private readonly skillsMcpEnabled?: () => boolean,
+    private readonly skillsMcpEnabled?: () => boolean | SessionMcpLiveContext,
   ) {
     const merged = { ...DEFAULT_TUNING, ...tuning }
     this.startupTimeoutMs = merged.startupTimeoutMs
@@ -987,9 +987,9 @@ export class AgentBridge {
     }
   }
 
-  /** Every session-creating request sends this ONE list, read at request time (AGENTS.md rule 32); `dsh-skills` needs the live master switch AND the per-agent opt-out. */
+  /** Every session-creating request sends this ONE list, read at request time (AGENTS.md rule 32). */
   private mcpServersForSession(): McpServer[] {
-    return toAcpMcpServers(sessionMcpServers(this.def.mcpServers, (this.skillsMcpEnabled?.() ?? false) && this.def.skillsMcpEnabled !== false))
+    return toAcpMcpServers(resolveSessionMcp(this.def, this.skillsMcpEnabled?.()))
   }
 
   /** The body of {@link createSession}; the caller keeps `pendingCreates` for it. */

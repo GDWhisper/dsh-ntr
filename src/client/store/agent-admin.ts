@@ -261,6 +261,22 @@ export class AgentAdminService {
     }
   }
 
+  /** Toggle one agent's unified MCP opt-out (lightweight: no restart, no save gate). */
+  async setAgentSharedMcp(agentId: string, sharedMcpEnabled: boolean): Promise<void> {
+    const previous = this.sharedMcpOf(agentId)
+    this.writeSharedMcp(agentId, sharedMcpEnabled)
+    try {
+      await this.host.call('agent/set-shared-mcp', { agentId, sharedMcpEnabled })
+      await this.host.resync()
+    } catch (error) {
+      this.writeSharedMcp(agentId, previous)
+      const msg = error instanceof Error ? error.message : String(error)
+      this.host.flashError(msg.includes('unknown endpoint agent/set-shared-mcp')
+        ? new Error(this.host.label('宿主服务运行着旧版本代码，请在终端重启 dsh web 服务以启用统一 MCP 开关。', 'Host running older version. Please restart dsh web to enable the unified MCP switch.'))
+        : error)
+    }
+  }
+
   /**
    * Set (or clear) one agent's default chat mode. Same lightweight contract as
    * `setAgentSkillsMcp`: optimistic roster patch, host RPC, authoritative
@@ -320,6 +336,19 @@ export class AgentAdminService {
                 ...(skillsMcpEnabled ? { skillsMcpEnabled: undefined } : { skillsMcpEnabled: false }),
               },
             }
+          : info),
+    })
+  }
+
+  private sharedMcpOf(agentId: string): boolean {
+    return this.host.state().detectedAgents.find(entry => entry.id === agentId)?.currentConfig?.sharedMcpEnabled !== false
+  }
+
+  private writeSharedMcp(agentId: string, sharedMcpEnabled: boolean): void {
+    this.host.mutate({
+      detectedAgents: this.host.state().detectedAgents.map(info =>
+        info.id === agentId && info.currentConfig !== undefined
+          ? { ...info, currentConfig: { ...info.currentConfig, ...(sharedMcpEnabled ? { sharedMcpEnabled: undefined } : { sharedMcpEnabled: false }) } }
           : info),
     })
   }

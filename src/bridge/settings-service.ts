@@ -22,6 +22,7 @@ import {
   normalizeApprovalWindow,
   validateApprovalDeadlines,
   validateDelegateConfig,
+  validateMcpServers,
   validatePermissionTimeoutMode,
   validateTagHalo,
 } from '../impl.ts'
@@ -31,7 +32,9 @@ import type {
   AcpDelegateConfig,
   AcpDelegateSettings,
   AcpIdleRelease,
+  AcpMcpServerDef,
   AcpPresetStatus,
+  AcpSharedMcpSettings,
   AcpTagHalo,
   ApprovalDeadlineKey,
   ApprovalDeadlinePatch,
@@ -41,7 +44,10 @@ import type {
   PermissionTimeoutMode,
   PluginReleaseNotes,
   PluginUpdateState,
+  SharedMcpSetPayload,
 } from '../protocol.ts'
+import type { HostMcpSnapshot } from './host-mcp.ts'
+import type { SessionMcpLiveContext } from './mcp.ts'
 import {
   DEFAULT_DELEGATE_GUIDANCE,
   DEFAULT_SESSION_TITLE_PREFIX,
@@ -112,6 +118,8 @@ export interface PersistedSettings {
    * so a fresh deployment's state file stays exactly what it was.
    */
   skillsMcpEnabled?: boolean
+  sharedMcpServers?: AcpMcpServerDef[]
+  hostMcpSyncEnabled?: boolean
   approvalDeadlines?: ApprovalDeadlinePatch
   idleRelease?: { idleTimeoutMs: number }
   /**
@@ -147,6 +155,9 @@ export class SettingsService {
    * stop when the switch goes off.
    */
   private skillsMcpEnabledSetting?: boolean
+  private sharedMcpServersSetting?: AcpMcpServerDef[]
+  private hostMcpSyncEnabledSetting?: boolean
+  private hostMcpReader?: () => HostMcpSnapshot
   /**
    * What `cordis.patch.yml` asked for — ONLY if it actually named the key.
    * This is the deployment baseline, kept apart from {@link deadlineOverride}
@@ -430,6 +441,56 @@ export class SettingsService {
    */
   applySkillsMcpTuning(): void {
     this.host.replaceTuning({ ...this.host.currentTuning(), skillsMcpEnabled: this.skillsMcpEnabled() })
+  }
+
+  /** Wire the optional host `dsh-mcp-manager` snapshot reader (host entry only). */
+  setHostMcpReader(reader?: () => HostMcpSnapshot): void {
+    this.hostMcpReader = reader
+  }
+
+  /** Unified MCP settings view for the settings page's「MCP」tab. */
+  sharedMcp(): AcpSharedMcpSettings {
+    const host = this.hostMcpReader?.() ?? { available: false, summaries: [], servers: [] }
+    return {
+      servers: (this.sharedMcpServersSetting ?? []).map(s => ({ ...s })),
+      hostSyncEnabled: this.hostMcpSyncEnabledSetting === true,
+      hostAvailable: host.available,
+      ...(host.available ? { hostServers: host.summaries } : {}),
+    }
+  }
+
+  /** Strictly persist and hot-apply unified MCP servers and/or host sync toggle. */
+  async setSharedMcp(patch: SharedMcpSetPayload): Promise<void> {
+    const prevServers = this.sharedMcpServersSetting
+    const prevHostSync = this.hostMcpSyncEnabledSetting
+    if (patch.servers !== undefined) {
+      const validated = validateMcpServers(patch.servers, 'sharedMcp.servers', 'bad_payload')
+      this.sharedMcpServersSetting = validated.length === 0 ? undefined : validated
+    }
+    if (patch.hostSyncEnabled !== undefined) {
+      if (typeof patch.hostSyncEnabled !== 'boolean') {
+        this.sharedMcpServersSetting = prevServers
+        throw new AcpError('bad_payload', 'acp: hostSyncEnabled must be a boolean')
+      }
+      this.hostMcpSyncEnabledSetting = patch.hostSyncEnabled
+    }
+    try {
+      this.host.persistAgentsStrict()
+    } catch (error) {
+      this.sharedMcpServersSetting = prevServers
+      this.hostMcpSyncEnabledSetting = prevHostSync
+      throw error
+    }
+  }
+
+  /** Live per-request MCP context consumed by `AgentBridge.mcpServersForSession`. */
+  sessionMcpContext(): SessionMcpLiveContext {
+    const host = this.hostMcpSyncEnabledSetting === true ? this.hostMcpReader?.().servers : undefined
+    return {
+      skills: this.host.currentTuning().skillsMcpEnabled,
+      ...(this.sharedMcpServersSetting === undefined ? {} : { shared: this.sharedMcpServersSetting }),
+      ...(host === undefined || host.length === 0 ? {} : { host }),
+    }
   }
 
   /**
@@ -763,6 +824,18 @@ export class SettingsService {
     // explicit `false` survives the round trip instead of becoming "unset").
     const storedSkillsMcp = parsed.skillsMcpEnabled
     this.skillsMcpEnabledSetting = typeof storedSkillsMcp === 'boolean' ? storedSkillsMcp : undefined
+    if (parsed.sharedMcpServers === undefined) {
+      this.sharedMcpServersSetting = undefined
+    } else {
+      try {
+        const validated = validateMcpServers(parsed.sharedMcpServers, 'sharedMcpServers', 'bad_config')
+        this.sharedMcpServersSetting = validated.length === 0 ? undefined : validated
+      } catch {
+        this.sharedMcpServersSetting = undefined
+      }
+    }
+    const storedHostMcpSync = parsed.hostMcpSyncEnabled
+    this.hostMcpSyncEnabledSetting = typeof storedHostMcpSync === 'boolean' ? storedHostMcpSync : undefined
     // The settings page's approval-deadline override. Re-validated on every
     // boot because the state file is user- and version-editable: an unreadable
     // value must not poison the deadline, and a value the validator accepts
@@ -856,6 +929,12 @@ export class SettingsService {
       ...(this.skillsMcpEnabledSetting === undefined
         ? {}
         : { skillsMcpEnabled: this.skillsMcpEnabledSetting }),
+      ...(this.sharedMcpServersSetting === undefined || this.sharedMcpServersSetting.length === 0
+        ? {}
+        : { sharedMcpServers: this.sharedMcpServersSetting }),
+      ...(this.hostMcpSyncEnabledSetting === undefined
+        ? {}
+        : { hostMcpSyncEnabled: this.hostMcpSyncEnabledSetting }),
       ...(Object.keys(this.deadlineOverride).length === 0
         ? {}
         : { approvalDeadlines: { ...this.deadlineOverride } }),

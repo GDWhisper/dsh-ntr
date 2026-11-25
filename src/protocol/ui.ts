@@ -45,9 +45,45 @@ export interface SessionTitlePrefixSetPayload { titlePrefix: boolean }
  * offered to agents. Default off; the answer is the value the host would use
  * for the NEXT session it creates (the switch never touches a live process).
  */
+import type { AcpMcpServerDef, AcpMcpTransport } from './agent-def.ts'
+
 export type SkillsMcpResult = { skillsMcpEnabled: boolean }
 /** `ui/skills-mcp-set`: write the switch. Strictly a boolean, strict persist. */
 export interface SkillsMcpSetPayload { skillsMcpEnabled: boolean }
+
+/** Read-only summary of one host `dsh-mcp-manager` server shown on the MCP settings page. */
+export interface AcpHostMcpServerSummary {
+  name: string
+  transport: AcpMcpTransport
+  enabled: boolean
+  /** True when the host entry contains `${credential:...}` (or other `${...}`) templates and is skipped. */
+  hasCredentialTemplate?: boolean
+  /** True when a stdio entry declares `cwd` (ACP wire format does not carry per-server cwd). */
+  hasCwd?: boolean
+  /** Whether this host entry is eligible to be synced when host sync is enabled. */
+  syncable: boolean
+}
+
+/**
+ * Unified MCP configuration managed on the settings page's「MCP」tab.
+ * - `servers`: plugin-wide shared MCP servers offered to every non-opted-out agent.
+ * - `hostSyncEnabled`: whether syncable host `dsh-mcp-manager` entries are merged at session creation.
+ * - `hostAvailable`: whether `ctx.mcpManager` is present on this host.
+ * - `hostServers`: read-only summary of host entries when `hostAvailable` is true.
+ */
+export interface AcpSharedMcpSettings {
+  servers: AcpMcpServerDef[]
+  hostSyncEnabled: boolean
+  hostAvailable: boolean
+  hostServers?: AcpHostMcpServerSummary[]
+}
+/** `ui/shared-mcp`: read the unified MCP settings in force. */
+export type SharedMcpResult = { sharedMcp?: AcpSharedMcpSettings }
+/** `ui/shared-mcp-set`: update shared servers and/or host sync toggle (strict persist). */
+export interface SharedMcpSetPayload {
+  servers?: AcpMcpServerDef[]
+  hostSyncEnabled?: boolean
+}
 
 /** The approval deadline the settings page can edit, by field name. ONE window. */
 export type ApprovalDeadlineKey = 'permissionTimeoutMs'

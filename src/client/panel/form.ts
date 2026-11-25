@@ -11,6 +11,7 @@
  */
 import { formatCommandLine, splitCommandLine } from '../acp-ui.tsx'
 import type { AcpAgentDef, AcpMcpServerDef, AgentSavePayload, AgentView, DetectedAgentInfo } from '../../protocol.ts'
+import { findMcpServersError } from '../../protocol.ts'
 import { canonicalJson, exposureKey, sameStringArray, sameStringMap } from './shared.ts'
 
 /** Everything the connection form edits, in one object (kept in the row). */
@@ -57,6 +58,7 @@ export interface AgentForm {
    * current value instead of wiping it (see `buildPayload`).
    */
   skillsMcpEnabled: boolean
+  sharedMcpEnabled: boolean
 }
 
 function idleText(value: number | undefined): string {
@@ -81,9 +83,8 @@ export function idleValid(raw: string): boolean {
  * themselves sorted by name): reformatting the text — reordering keys,
  * re-indenting, listing the servers in another order — is not a change. The
  * ARGV array inside a server keeps its order, because there it is the command
- * line. The browser half needs no copy of the host's per-server validation: a
- * list the host would reject simply never matches, and the host's own error is
- * what the user sees.
+ * line. Schema validation uses the shared `findMcpServersError` contract so
+ * malformed entries are caught client-side before clicking Save.
  */
 function mcpKey(servers: readonly AcpMcpServerDef[] | undefined): string {
   if (servers === undefined || servers.length === 0) return 'none'
@@ -101,31 +102,26 @@ function mcpKey(servers: readonly AcpMcpServerDef[] | undefined): string {
  * The MCP server list as the form holds it: the raw JSON text the user typed.
  *
  * Parsing happens on the way OUT (`buildPayload`), never on the way in, so a
- * half-typed value never throws inside a render. An unparseable text yields
- * `undefined`, which the form reports as invalid (`mcpInvalid`) and refuses to
- * save — better than sending a truncated list.
+ * half-typed value never throws inside a render. An unparseable or schema-invalid
+ * text yields `undefined`, which the form reports as invalid (`mcpInvalid`) and
+ * refuses to save — better than sending a broken list.
  */
-function parseMcpServers(text: string): AcpMcpServerDef[] | undefined {
+export function parseMcpServers(text: string): AcpMcpServerDef[] | undefined {
   const trimmed = text.trim()
   if (trimmed === '') return undefined
   try {
     const parsed: unknown = JSON.parse(trimmed)
-    if (!Array.isArray(parsed)) return undefined
+    if (findMcpServersError(parsed) !== undefined) return undefined
     return parsed as AcpMcpServerDef[]
   } catch {
     return undefined
   }
 }
 
-/** Whether the MCP server text parses as a list at all (the host validates the rest). */
+/** Whether the MCP server text is blank or satisfies the shared MCP server schema. */
 export function mcpTextValid(text: string): boolean {
   const trimmed = text.trim()
-  if (trimmed === '') return true
-  try {
-    return Array.isArray(JSON.parse(trimmed))
-  } catch {
-    return false
-  }
+  return trimmed === '' || parseMcpServers(trimmed) !== undefined
 }
 
 export function initialForm(detected: DetectedAgentInfo, activeAgent: AgentView | undefined): AgentForm {
@@ -161,6 +157,7 @@ export function initialForm(detected: DetectedAgentInfo, activeAgent: AgentView 
     // On is the default and the only state the file does not spell out, so an
     // absent field seeds the form as on.
     skillsMcpEnabled: config?.skillsMcpEnabled !== false,
+    sharedMcpEnabled: config?.sharedMcpEnabled !== false,
   }
 }
 
@@ -187,6 +184,7 @@ export function payloadEquals(payload: AgentSavePayload, current: AcpAgentDef): 
   // Compared as an effective boolean: absent and `true` are both "on", so a
   // card that never touched the per-agent switch is not dirty.
   if ((payload.skillsMcpEnabled !== false) !== (current.skillsMcpEnabled !== false)) return false
+  if ((payload.sharedMcpEnabled !== false) !== (current.sharedMcpEnabled !== false)) return false
   // The per-agent OVERRIDE, compared as stored: an absent field on both sides
   // means "follow the global window" and is not a change; a field on one
   // side only means the user is adding or dropping an override.
@@ -241,6 +239,7 @@ export function buildPayload(form: AgentForm, detected: DetectedAgentInfo, newCu
     // the host rebuilds the definition from this payload. On is the default,
     // so only the opt-out is sent (and only that is persisted).
     ...(form.skillsMcpEnabled ? {} : { skillsMcpEnabled: false }),
+    ...(form.sharedMcpEnabled ? {} : { sharedMcpEnabled: false }),
   }
   if (form.rootsOpen) {
     if (cwd !== '') payload.cwd = cwd

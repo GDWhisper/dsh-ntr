@@ -93,6 +93,8 @@ export interface AgentSavePayload {
    * omitted field would silently re-enable the built-in server. Absent = on.
    */
   skillsMcpEnabled?: boolean
+  /** Per-agent opt-out from unified shared/host MCP servers. Carried by the form so `agent/save` does not wipe it. */
+  sharedMcpEnabled?: boolean
   /**
    * How `agent/save` treats live turns. The host is the authority: a caller
    * that omits this gets `confirmationRequired` when the target agent is busy,

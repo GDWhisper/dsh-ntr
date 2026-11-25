@@ -1,7 +1,7 @@
 import { fileURLToPath } from 'node:url'
 
 import type { McpServer, McpServerHttp, McpServerSse, McpServerStdio } from '@agentclientprotocol/sdk'
-import type { AcpMcpServerDef } from '../protocol.ts'
+import type { AcpAgentDef, AcpMcpServerDef } from '../protocol.ts'
 import { pluginStateDir } from './state-paths.ts'
 
 /**
@@ -10,6 +10,17 @@ import { pluginStateDir } from './state-paths.ts'
  * collision key the merger checks before appending anything.
  */
 export const DSH_SKILLS_MCP_NAME = 'dsh-skills'
+
+/**
+ * Live per-request MCP context read by `AgentBridge.mcpServersForSession`.
+ * Passing a plain `boolean` remains supported for pure bridge unit tests that
+ * only toggle `dsh-skills`.
+ */
+export interface SessionMcpLiveContext {
+  skills: boolean
+  shared?: readonly AcpMcpServerDef[]
+  host?: readonly AcpMcpServerDef[]
+}
 
 /**
  * The built-in `dsh-skills` server, in the plugin's normalized shape.
@@ -46,24 +57,62 @@ export function dshSkillsMcpServer(): AcpMcpServerDef {
  *
  * The agent keeps MCP servers per PROCESS, so a probe or fork handing over a
  * different list replaces the tools of every live session on that connection —
- * which is why all four entry points must go through this function and read the
- * switch at request time (see `agent-bridge.ts`'s `skillsMcpEnabled` seam).
+ * which is why all four entry points must go through this function and read
+ * every live switch at request time.
  *
- * The result is a NEW array every time; the input array, its server objects and
- * the `AcpAgentDef` are never touched, and the built-in entry exists only in the
- * request that is being assembled — it must never reach `agents.json`. A user
- * server already named `dsh-skills` wins: the built-in item is skipped rather
- * than merged into (or replacing) the user's definition.
+ * Precedence (first-seen `name` wins, no duplicates):
+ *   1. agent-private `defs` (`AcpAgentDef.mcpServers`)
+ *   2. plugin-wide `shared` (`sharedMcpServers`)
+ *   3. host-synced `hostSynced` (`ctx.mcpManager.config.servers`)
+ *   4. built-in `dsh-skills` (when `skillsMcpEnabled`)
+ *
+ * The result is a NEW array every time; input arrays, server objects and the
+ * `AcpAgentDef` are never mutated, and merged entries exist only in the request
+ * being assembled — they never reach `agents.json`'s per-agent definitions.
  */
 export function sessionMcpServers(
   defs: AcpMcpServerDef[] | undefined,
   skillsMcpEnabled: boolean,
   builtin: AcpMcpServerDef = dshSkillsMcpServer(),
+  shared?: readonly AcpMcpServerDef[],
+  hostSynced?: readonly AcpMcpServerDef[],
 ): AcpMcpServerDef[] {
-  const user = defs ?? []
-  if (!skillsMcpEnabled) return [...user]
-  if (user.some(def => def.name === DSH_SKILLS_MCP_NAME)) return [...user]
-  return [...user, builtin]
+  const result: AcpMcpServerDef[] = []
+  const seen = new Set<string>()
+  const append = (items: readonly AcpMcpServerDef[] | undefined): void => {
+    if (items === undefined) return
+    for (const def of items) {
+      if (seen.has(def.name)) continue
+      seen.add(def.name)
+      result.push(def)
+    }
+  }
+  append(defs)
+  append(shared)
+  append(hostSynced)
+  if (skillsMcpEnabled && !seen.has(builtin.name)) result.push(builtin)
+  return result
+}
+
+/**
+ * Resolve one agent's effective MCP list from its definition and the live
+ * request-time seam. Honors both per-agent opt-outs (`skillsMcpEnabled !== false`
+ * and `sharedMcpEnabled !== false`) without mutating `def`.
+ */
+export function resolveSessionMcp(
+  def: Pick<AcpAgentDef, 'mcpServers' | 'skillsMcpEnabled' | 'sharedMcpEnabled'>,
+  live: boolean | SessionMcpLiveContext | undefined,
+): AcpMcpServerDef[] {
+  const ctx: SessionMcpLiveContext = typeof live === 'boolean' ? { skills: live } : (live ?? { skills: false })
+  const skillsOn = ctx.skills && def.skillsMcpEnabled !== false
+  const sharedOn = def.sharedMcpEnabled !== false
+  return sessionMcpServers(
+    def.mcpServers,
+    skillsOn,
+    dshSkillsMcpServer(),
+    sharedOn ? ctx.shared : undefined,
+    sharedOn ? ctx.host : undefined,
+  )
 }
 
 /**

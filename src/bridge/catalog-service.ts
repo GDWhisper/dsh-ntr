@@ -398,6 +398,7 @@ export class ModelCatalogService {
       // otherwise be invisible to an open card (and a later full save would
       // then write the stale value back).
       skillsMcpEnabled: def.skillsMcpEnabled !== false,
+      sharedMcpEnabled: def.sharedMcpEnabled !== false,
       // Same reason as the skills flag: an open card patches its definition
       // copy from this frame, and the composer's pre-first-message mode
       // fallback reads the same field.

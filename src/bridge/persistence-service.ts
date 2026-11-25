@@ -254,6 +254,12 @@ export class PersistenceService {
         ...(persistedSettings.skillsMcpEnabled === undefined
           ? {}
           : { skillsMcpEnabled: persistedSettings.skillsMcpEnabled }),
+        ...(persistedSettings.sharedMcpServers === undefined || persistedSettings.sharedMcpServers.length === 0
+          ? {}
+          : { sharedMcpServers: persistedSettings.sharedMcpServers }),
+        ...(persistedSettings.hostMcpSyncEnabled === undefined
+          ? {}
+          : { hostMcpSyncEnabled: persistedSettings.hostMcpSyncEnabled }),
         agents,
         // The settings page's approval deadlines. Absent while none was ever
         // written, so a fresh deployment's state file stays exactly as it was.

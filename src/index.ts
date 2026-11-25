@@ -8,7 +8,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { ConnectionRpcHandler, HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
-import { ACP_PRESET_ID, AcpLlmAdapter, AcpDelegateForceMask, AcpDelegateRegistration, AcpDelegateService, AcpSubagentProvider, BridgeManager, PLUGIN_VERSION, type DshAgentLike, type DelegateForceMaskCtx, type DelegateSubagentsLike } from './bridge.ts'
+import { ACP_PRESET_ID, AcpLlmAdapter, AcpDelegateForceMask, AcpDelegateRegistration, AcpDelegateService, AcpSubagentProvider, BridgeManager, PLUGIN_VERSION, readHostMcpSnapshot, type DshAgentLike, type DelegateForceMaskCtx, type DelegateSubagentsLike, type HostMcpManagerLike } from './bridge.ts'
 import { appendExternalSubagentCatalog, delegateAgentDocs, elicitationReplayFrames, EventHub, dispatchRpc, permissionReplayFrames, sessionAgentPreset, sessionAgentPresetFromLog, validateConfig } from './impl.ts'
 import { ArchiveReleaseTracker, archiveActivityFrames } from './archive-release.ts'
 import type { SessionActivityLike } from './archive-release.ts'
@@ -443,6 +443,21 @@ export function apply(ctx: Context, config?: unknown): void {
   if (typeof ctx.inject === 'function') {
     // Late arrival: the registry may still be loading when this plugin applies.
     ctx.inject(['agentPresets'], () => { wirePresetRoster() })
+  }
+
+  /**
+   * Optional host MCP manager (`ctx.mcpManager`, DSH 0.2.2+): probed
+   * structurally and never declared in top-level `inject` so older hosts keep
+   * loading this plugin. Read lazily per request / settings open.
+   */
+  const wireHostMcp = (): void => {
+    const hostMcp = (typeof ctx.get === 'function' ? ctx.get('mcpManager') : undefined) as HostMcpManagerLike | undefined
+    if (hostMcp === undefined || typeof hostMcp.config?.servers?.get !== 'function') return
+    manager.setHostMcpReader(() => readHostMcpSnapshot(hostMcp))
+  }
+  wireHostMcp()
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['mcpManager'], () => { wireHostMcp() })
   }
 
   /**

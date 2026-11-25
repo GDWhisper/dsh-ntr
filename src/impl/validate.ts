@@ -9,7 +9,7 @@
  */
 
 import type { AcpAgentDef, AcpDelegateAgentDefaults, AcpDelegateConfig, AcpMcpServerDef, AcpPluginConfig, AcpTagHalo, ApprovalDeadlineKey, DelegateGuidance, DelegateSetPayload, DelegateSettingKey, PermissionTimeoutMode } from '../protocol.ts'
-import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_MODE_MAX, DELEGATE_DESCRIPTION_MAX, DELEGATE_TIMEOUT_MAX_MS, DELEGATE_TIMEOUT_MIN_MS, IDLE_RELEASE_MS } from '../protocol.ts'
+import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_MODE_MAX, DELEGATE_DESCRIPTION_MAX, DELEGATE_TIMEOUT_MAX_MS, DELEGATE_TIMEOUT_MIN_MS, IDLE_RELEASE_MS, findMcpServersError } from '../protocol.ts'
 import { splitCommandLine } from './command-line.ts'
 import { AcpError } from './errors.ts'
 import { isAbsolutePath } from './paths.ts'
@@ -359,99 +359,18 @@ export function validateDelegateSettings(raw: unknown): DelegateSetPayload {
 
 
 /**
- * Bound on the number of MCP servers one agent may declare. An MCP server is
- * a process (stdio) or a remote endpoint the agent connects to at session
- * setup, so this list is small in practice; the cap refuses a file-sized list
- * rather than a hostile one.
- */
-const MCP_SERVERS_MAX = 32
-
-/**
- * Bound on one MCP server's `name`. The name namespaces the agent's tools as
- * `mcp__<name>__<tool>`, so it has to stay short enough for a tool name.
- */
-const MCP_SERVER_NAME_MAX = 64
-
-/**
- * Validate one agent's `mcpServers` list (the plugin's normalized shape, NOT
- * the ACP wire shape).
+ * Validate one agent's or shared `mcpServers` list (the plugin's normalized
+ * shape, NOT the ACP wire shape).
  *
  * THE ENTRIES ARE RETURNED AS THE USER WROTE THEM — not rebuilt, not
- * defaulted. That is deliberate: the settings panel holds this list as JSON
- * text, and it compares what it would send against what the host stored. A
- * host that reshaped the entries (filling `args: []`, reordering the keys)
- * would make the panel report a change where there is none, and the card
- * would never come clean. So this function VALIDATES and leaves the shape
- * alone; the ACP wire conversion (src/bridge.ts) supplies the defaults the
- * protocol wants.
- *
- * The ACP-transport variant is rejected rather than ignored: it needs the
- * client side of `mcp/message`, which is not in the ACP SDK's stable surface,
- * and no agent advertises `mcpCapabilities.acp`. Accepting it would produce a
- * server the agent can never reach.
+ * defaulted (settings panel diffs canonical JSON without reshaping keys).
+ * Delegates exact schema checks to `findMcpServersError` so the browser form
+ * enforces the identical rules before saving.
  */
 export function validateMcpServers(raw: unknown, label: string, code: 'bad_config' | 'bad_payload'): AcpMcpServerDef[] {
-  if (!Array.isArray(raw)) throw new AcpError(code, `acp: ${label} must be an array of MCP servers`)
-  if (raw.length > MCP_SERVERS_MAX) {
-    throw new AcpError(code, `acp: ${label} may hold at most ${String(MCP_SERVERS_MAX)} MCP servers`)
-  }
-  const seen = new Set<string>()
-  const out: AcpMcpServerDef[] = []
-  for (const [index, entry] of raw.entries()) {
-    const at = `${label}[${String(index)}]`
-    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
-      throw new AcpError(code, `acp: ${at} must be an object`)
-    }
-    const row = entry as Record<string, unknown>
-    const name = row.name
-    if (typeof name !== 'string' || name.trim() === '' || name.length > MCP_SERVER_NAME_MAX) {
-      throw new AcpError(code, `acp: ${at}.name must be a non-empty string of at most ${String(MCP_SERVER_NAME_MAX)} chars`)
-    }
-    if (seen.has(name)) {
-      // The name namespaces the agent's tools (`mcp__<name>__<tool>`), so two
-      // servers sharing one would collide inside the agent.
-      throw new AcpError(code, `acp: ${at}.name "${name}" is used by more than one MCP server`)
-    }
-    seen.add(name)
-    const transport = row.transport
-    if (transport === 'acp') {
-      throw new AcpError(code, `acp: ${at}.transport "acp" is not supported (the agent would have to call back into this plugin over mcp/message)`)
-    }
-    if (transport === 'stdio') {
-      const command = row.command
-      if (typeof command !== 'string' || command.trim() === '') {
-        throw new AcpError(code, `acp: ${at}.command must be a non-empty string for a stdio MCP server`)
-      }
-      if (row.args !== undefined && (!Array.isArray(row.args) || row.args.some(a => typeof a !== 'string'))) {
-        throw new AcpError(code, `acp: ${at}.args must be an array of strings`)
-      }
-      stringMap(row.env, `${at}.env`, code)
-      out.push(entry as AcpMcpServerDef)
-      continue
-    }
-    if (transport === 'http' || transport === 'sse') {
-      const url = row.url
-      if (typeof url !== 'string' || url.trim() === '') {
-        throw new AcpError(code, `acp: ${at}.url must be a non-empty string for a ${transport} MCP server`)
-      }
-      stringMap(row.headers, `${at}.headers`, code)
-      out.push(entry as AcpMcpServerDef)
-      continue
-    }
-    throw new AcpError(code, `acp: ${at}.transport must be "stdio", "http" or "sse"`)
-  }
-  return out
-}
-
-/** One `Record<string,string>` field of an MCP server (env / headers). */
-function stringMap(value: unknown, label: string, code: 'bad_config' | 'bad_payload'): void {
-  if (value === undefined) return
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    throw new AcpError(code, `acp: ${label} must be an object`)
-  }
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-    if (typeof entry !== 'string') throw new AcpError(code, `acp: ${label}.${key} must be a string`)
-  }
+  const err = findMcpServersError(raw, label)
+  if (err !== undefined) throw new AcpError(code, err)
+  return [...(raw as AcpMcpServerDef[])]
 }
 
 /**
@@ -562,6 +481,10 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
   if (skillsMcpEnabled !== undefined && typeof skillsMcpEnabled !== 'boolean') {
     throw new AcpError('bad_config', `acp: agent "${id}" skillsMcpEnabled must be a boolean`)
   }
+  const sharedMcpEnabled = row.sharedMcpEnabled
+  if (sharedMcpEnabled !== undefined && typeof sharedMcpEnabled !== 'boolean') {
+    throw new AcpError('bad_config', `acp: agent "${id}" sharedMcpEnabled must be a boolean`)
+  }
   return {
     id,
     title,
@@ -577,6 +500,7 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
     ...(mcpServers === undefined ? {} : { mcpServers }),
     ...(defaultMode === undefined ? {} : { defaultMode }),
     ...(skillsMcpEnabled === false ? { skillsMcpEnabled: false } : {}),
+    ...(sharedMcpEnabled === false ? { sharedMcpEnabled: false } : {}),
   }
 }
 

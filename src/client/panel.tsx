@@ -32,6 +32,7 @@ import { PluginUpdateBadge, PluginUpdateCard, updateCardVisible } from './panel/
 import { partitionAgents, streamText, useUi } from './panel/shared.ts'
 import { ensureStyle } from './panel/styles.ts'
 import { SkillsMcpPreference } from './skills-mcp-preference.tsx'
+import { SharedMcpPreference } from './shared-mcp-preference.tsx'
 import { SubagentCard } from './panel/subagent-card.tsx'
 
 interface WithStore { acp: AcpStore }
@@ -45,7 +46,7 @@ const NEW_AGENT_SEED: DetectedAgentInfo = {
   defaultArgs: [],
 }
 
-type SettingsPage = 'agents' | 'skills' | 'add' | 'approvals' | 'processes' | 'subagents' | 'appearance' | 'logs' | 'diagnostics'
+type SettingsPage = 'agents' | 'mcp' | 'skills' | 'add' | 'approvals' | 'processes' | 'subagents' | 'appearance' | 'logs' | 'diagnostics'
 
 /**
  * Local wall-clock `HH:MM:SS` for one runtime-log line. Hand-built on purpose:
@@ -77,6 +78,9 @@ export function AcpSettingsSection(props: WithStore) {
   useEffect(() => {
     if (page === 'logs' && ui.logUnread > 0) acp.markLogsRead()
   }, [acp, page, ui.logUnread])
+  useEffect(() => {
+    if (page === 'mcp') void acp.refreshSharedMcp?.()
+  }, [acp, page])
   const { configured, available } = partitionAgents(ui.detectedAgents, ui.agents)
   // The 技能 page lists the same agents the 智能体 page does, in the same order,
   // under the master switch they are narrowed by. The name follows the roster's
@@ -86,6 +90,11 @@ export function AcpSettingsSection(props: WithStore) {
     id: info.id,
     name: ui.agents.find(agent => agent.id === info.id)?.title ?? info.currentConfig?.title ?? info.name,
     enabled: info.currentConfig?.skillsMcpEnabled !== false,
+  }))
+  const sharedMcpAgents = configured.map(({ info }) => ({
+    id: info.id,
+    name: ui.agents.find(agent => agent.id === info.id)?.title ?? info.currentConfig?.title ?? info.name,
+    enabled: info.currentConfig?.sharedMcpEnabled !== false,
   }))
   const selected = addTarget ?? available[0] ?? NEW_AGENT_SEED
   const openAdd = (): void => {
@@ -168,6 +177,7 @@ export function AcpSettingsSection(props: WithStore) {
       )}
       <nav className="dwa-tabs" aria-label={acp.label('NTR 设置分类', 'NTR settings categories')}>
         <button type="button" aria-pressed={page === 'agents'} onClick={() => setPage('agents')}>{acp.label('智能体', 'Agents')}</button>
+        {ui.sharedMcp !== undefined && <button type="button" aria-pressed={page === 'mcp'} onClick={() => setPage('mcp')}>MCP</button>}
         <button type="button" aria-pressed={page === 'skills'} onClick={() => setPage('skills')}>{acp.label('技能', 'Skills')}</button>
         {ui.approvalDeadlines !== undefined && <button type="button" aria-pressed={page === 'approvals'} onClick={() => setPage('approvals')}>{acp.label('审批时限', 'Approval deadlines')}</button>}
         {ui.idleRelease !== undefined && <button type="button" aria-pressed={page === 'processes'} onClick={() => setPage('processes')}>{acp.label('进程管理', 'Processes')}</button>}
@@ -219,6 +229,7 @@ export function AcpSettingsSection(props: WithStore) {
           offered, with the per-agent opt-outs listed under it. Its own page on
           purpose: the agents page manages agents, and this is one
           deployment-wide capability, not one of them. */}
+      {page === 'mcp' && <SharedMcpPreference acp={acp} ui={ui} agents={sharedMcpAgents} />}
       {page === 'skills' && <SkillsMcpPreference acp={acp} ui={ui} agents={skillsAgents} />}
 
       {/* Keep editors mounted so navigation preserves unsaved values. */}
