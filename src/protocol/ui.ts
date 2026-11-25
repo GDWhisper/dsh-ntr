@@ -86,7 +86,7 @@ export interface SharedMcpSetPayload {
 }
 
 /** The approval deadline the settings page can edit, by field name. ONE window. */
-export type ApprovalDeadlineKey = 'permissionTimeoutMs'
+export type ApprovalDeadlineKey = 'permissionTimeoutMs' | 'elicitationTimeoutMs'
 
 /**
  * The idle-release windows the settings page offers, in MILLISECONDS.
@@ -184,6 +184,8 @@ export interface AcpApprovalDeadlines {
    * and the settings panel's ledger): one question, one answer, one number.
    */
   permissionTimeoutMs: number
+  /** Independent form-question window; `0` means no deadline. Absent on older hosts. */
+  elicitationTimeoutMs?: number
   /** What an expired deadline does. Always present: `wait` is the default. */
   mode: PermissionTimeoutMode
   /** The config-file value for the window, when the file names one. */
@@ -204,6 +206,7 @@ export type ApprovalDeadlinesResult = { deadlines?: AcpApprovalDeadlines }
  */
 export interface ApprovalDeadlinePatch {
   permissionTimeoutMs?: number
+  elicitationTimeoutMs?: number
   mode?: PermissionTimeoutMode
 }
 /**

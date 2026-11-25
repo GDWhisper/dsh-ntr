@@ -322,8 +322,8 @@ export interface AcpPluginConfig {
    * releases the waiting agent turn.
    *
    * Default 300000 ms (5 minutes). An INDEPENDENT window: it does not follow
-   * {@link AcpPluginConfig.permissionTimeoutMs}, and the settings page does
-   * not rewrite it. `0` disables the elicitation deadline.
+   * {@link AcpPluginConfig.permissionTimeoutMs}; the settings page may outrank
+   * this baseline through `ui/approval-deadlines`. `0` disables the deadline.
    */
   elicitationTimeoutMs?: number
   /**

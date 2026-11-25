@@ -152,8 +152,9 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
   const preset = options.preset === null ? null : structuredClone<AcpPresetStatus>(options.preset ?? {
     id: 'acp', source: 'dsh-ntr/presets/acp/acp.patch.yml', installed: true,
   })
-  const initialDeadlines = structuredClone<AcpApprovalDeadlines>(options.approvalDeadlines ?? { mode: 'wait', permissionTimeoutMs: 300_000 })
+  const initialDeadlines = structuredClone<AcpApprovalDeadlines>(options.approvalDeadlines ?? { mode: 'wait', permissionTimeoutMs: 300_000, elicitationTimeoutMs: 300_000 })
   let deadlineMode = initialDeadlines.mode
+  let elicitationWindow = initialDeadlines.elicitationTimeoutMs
   const initialIdleRelease = options.idleRelease === null || options.idleRelease === undefined
     ? { idleTimeoutMs: 1_800_000, defaultIdleTimeoutMs: 1_800_000 }
     : structuredClone(options.idleRelease)
@@ -217,6 +218,7 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
       ...initialDeadlines, mode: deadlineMode,
       // Match the host's effective abort floor without losing the stored window.
       permissionTimeoutMs: deadlineMode === 'abort' && deadlineWindow === 0 ? 30_000 : deadlineWindow,
+      ...(elicitationWindow === undefined ? {} : { elicitationTimeoutMs: elicitationWindow }),
     }
   }
 
@@ -401,9 +403,11 @@ export function createPanelFixture(options: PanelFixtureOptions = {}): PanelFixt
           if (patch.reset === true) {
             deadlineMode = initialDeadlines.configuredMode ?? 'wait'
             deadlineWindow = initialDeadlines.configured?.permissionTimeoutMs ?? 300_000
+            elicitationWindow = initialDeadlines.configured?.elicitationTimeoutMs ?? initialDeadlines.elicitationTimeoutMs
           } else {
             deadlineMode = patch.mode ?? deadlineMode
             deadlineWindow = patch.permissionTimeoutMs ?? deadlineWindow
+            elicitationWindow = patch.elicitationTimeoutMs ?? elicitationWindow
           }
           return ok({ deadlines: approvalDeadlines() })
         }

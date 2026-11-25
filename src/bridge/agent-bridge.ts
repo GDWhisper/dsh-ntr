@@ -112,8 +112,8 @@ export class AgentBridge {
    * was started with.
    */
   private permissionTimeoutMs: number
-  /** Deployment-level form elicitation deadline; independent of the approval window and not hot-rewritten. */
-  private readonly elicitationTimeoutMs: number
+  /** Independent form-question deadline; hot writes affect the next ask, never an armed timer. */
+  private elicitationTimeoutMs: number
   private permissionTimeoutMode: PermissionTimeoutMode
   private readonly cancelFallbackMs: number
   private readonly staleCancelRetryDelayMs: number
@@ -286,8 +286,9 @@ export class AgentBridge {
    * keeps the window it was started with, and the next ask reads the new value.
    * Re-arming would move the goalposts under a human who is already deciding.
    */
-  applyApprovalDeadlines(patch: { permissionTimeoutMs?: number; mode?: PermissionTimeoutMode }): void {
+  applyApprovalDeadlines(patch: { permissionTimeoutMs?: number; elicitationTimeoutMs?: number; mode?: PermissionTimeoutMode }): void {
     if (patch.permissionTimeoutMs !== undefined) this.permissionTimeoutMs = patch.permissionTimeoutMs
+    if (patch.elicitationTimeoutMs !== undefined) this.elicitationTimeoutMs = patch.elicitationTimeoutMs
     if (patch.mode !== undefined) this.permissionTimeoutMode = patch.mode
     // A mode switch can leave a window behind that the new mode cannot run
     // (不等待 under `abort`): floor it, so the ask waits instead of refusing

@@ -981,7 +981,7 @@ export class AcpStore {
   async setApprovalDeadline(ms: number): Promise<void> {
     return this.settingsService.setApprovalDeadline(ms)
   }
-
+  async setElicitationDeadline(ms: number): Promise<void> { return this.settingsService.setElicitationDeadline(ms) }
   /** Write what an expired approval deadline DOES (`abort` / `auto` / `wait`). */
   async setApprovalTimeoutMode(mode: PermissionTimeoutMode): Promise<void> {
     return this.settingsService.setApprovalTimeoutMode(mode)

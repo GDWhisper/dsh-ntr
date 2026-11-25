@@ -95,8 +95,8 @@ export function deadlineSliderIndex(ms: number, mode: PermissionTimeoutMode = 'a
 const DEADLINE_MODES: readonly PermissionTimeoutMode[] = ['abort', 'auto', 'wait']
 
 /** `5 分钟` / `30 秒` / `不等待` — the readout and the tick label, one formatter. */
-function deadlineText(ms: number, acp: AcpStore): string {
-  if (ms <= 0) return acp.label('不等待', 'No wait')
+function deadlineText(ms: number, acp: AcpStore, zeroLabel?: [string, string]): string {
+  if (ms <= 0) return zeroLabel === undefined ? acp.label('不等待', 'No wait') : acp.label(zeroLabel[0], zeroLabel[1])
   const seconds = Math.round(ms / 1000)
   if (seconds < 60) return acp.label(`${String(seconds)} 秒`, `${String(seconds)}s`)
   const minutes = Math.round(seconds / 60)
@@ -258,12 +258,56 @@ function DeadlineSliderBlock(props: {
   )
 }
 
+function elicitationText(ms: number, acp: AcpStore): string {
+  return deadlineText(ms, acp, ['不设限', 'No limit'])
+}
+
+/** The form-question deadline shares the rungs, but zero means "no deadline". */
+function ElicitationDeadlineBlock(props: { acp: AcpStore; value: number; override?: string }) {
+  const { acp, value, override } = props
+  const index = deadlineSliderIndex(value)
+  return (
+    <div className="dwa-preference-block">
+      <div className="dwa-preference-label">
+        {acp.label('表单提问时限', 'Form question deadline')}
+        <span className="dwa-deadline-value">{elicitationText(value, acp)}</span>
+      </div>
+      <input
+        className="dwa-deadline-range"
+        type="range"
+        min={0}
+        max={DEADLINE_LADDER.length - 1}
+        step={1}
+        value={index}
+        aria-label={acp.label('表单提问时限', 'Form question deadline')}
+        onChange={event => {
+          const next = DEADLINE_LADDER[Number(event.target.value)]
+          if (next !== undefined && next !== value) void acp.setElicitationDeadline(next)
+        }}
+      />
+      <div className="dwa-deadline-ticks">
+        {DEADLINE_LADDER.map((rung, i) => (
+          <span key={rung} style={{ left: tickLeft(i, DEADLINE_LADDER.length) }}>{elicitationText(rung, acp)}</span>
+        ))}
+      </div>
+      <div className="dwa-preference-copy">
+        {value === 0
+          ? acp.label('表单提问将一直等待，直到提交、跳过或取消。', 'Form questions wait until you submit, decline, or cancel.')
+          : acp.label('超过该时长仍未提交，表单提问将自动取消。', 'Unsubmitted form questions are cancelled after this window.')}
+      </div>
+      {override !== undefined && (
+        <div className="dwa-deadline-flag">⚠ {override}</div>
+      )}
+    </div>
+  )
+}
+
 /**
  * The facts the card has to show, decided from what the host reported.
  *
- * The card carries TWO controls, and they are orthogonal: one window (how
- * long) and one mode (what happens). An override can sit on either of them,
- * so each is decided on its own.
+ * The card carries THREE controls: the approval window (how long), the approval
+ * mode (what happens), and the independent form-question window. An override
+ * can sit on any of them, so each is decided on its own.
  *
  * `overridden` is what gates the reset button. A baseline that AGREES with the
  * running value is not an override, and offering a reset for it would be a
@@ -273,6 +317,8 @@ export function approvalDeadlineFacts(deadlines: AcpApprovalDeadlines): {
   /** The config-file window the card's window outranks — undefined when
    *  nothing is being outranked. */
   baseline: number | undefined
+  /** The config-file form-question window this card outranks, when it differs. */
+  elicitationBaseline: number | undefined
   /** The config-file mode the card's mode outranks, when it differs. */
   modeBaseline: PermissionTimeoutMode | undefined
   /** A reset is only honest when something is actually being outranked. */
@@ -282,27 +328,33 @@ export function approvalDeadlineFacts(deadlines: AcpApprovalDeadlines): {
   const baseline = configured === undefined || configured === deadlines.permissionTimeoutMs
     ? undefined
     : configured
+  const configuredElicitation = deadlines.configured?.elicitationTimeoutMs
+  const elicitationBaseline = configuredElicitation === undefined || configuredElicitation === deadlines.elicitationTimeoutMs
+    ? undefined
+    : configuredElicitation
   const modeBaseline = deadlines.configuredMode !== undefined && deadlines.configuredMode !== deadlines.mode
     ? deadlines.configuredMode
     : undefined
   return {
     baseline,
+    elicitationBaseline,
     modeBaseline,
-    overridden: baseline !== undefined || modeBaseline !== undefined,
+    overridden: baseline !== undefined || elicitationBaseline !== undefined || modeBaseline !== undefined,
   }
 }
 
 /**
  * The approval-deadline card.
  *
- * TWO controls, and they are orthogonal: one window (how long) and one mode
- * (what happens). One window covers both places an ask can wait — the
- * conversation's approval card and the settings panel's ledger — because they
- * ask the same question and the answer should not differ by where the card
- * happens to be drawn.
+ * THREE controls: the approval window (how long), the approval mode (what
+ * happens), and the independent form-question window. One approval window
+ * covers both places an ask can wait — the conversation's approval card and
+ * the settings panel's ledger — because they ask the same question and the
+ * answer should not differ by where the card happens to be drawn. Form
+ * questions stay independent: expiry always cancels, so there is no mode.
  *
- * The two controls are ONE system, and the card says so in a sentence: the
- * window says how long to wait, the mode says what happens when nobody
+ * The approval controls are ONE system, and the card says so in a sentence:
+ * the window says how long to wait, the mode says what happens when nobody
  * answered. That sentence is the thing the previous three-row layout kept
  * missing.
  *
@@ -329,6 +381,12 @@ export function ApprovalDeadlinesCard(props: { acp: AcpStore; ui: UiState }) {
       `配置文件（cordis.patch.yml）设为「${modeText(facts.modeBaseline, acp)}」，此处设置优先。`,
       `The config file (cordis.patch.yml) asks for "${modeText(facts.modeBaseline, acp)}"; the value set here wins.`,
     )
+  const elicitationNote = facts.elicitationBaseline === undefined
+    ? undefined
+    : acp.label(
+      `配置文件（cordis.patch.yml）设为 ${elicitationText(facts.elicitationBaseline, acp)}，此处设置优先。`,
+      `The config file (cordis.patch.yml) asks for ${elicitationText(facts.elicitationBaseline, acp)}; the value set here wins.`,
+    )
   // In `wait` mode there is no deadline at all, so the slider shows the one
   // thing that is true: no deadline.
   const waitMode = deadlines.mode === 'wait'
@@ -339,8 +397,8 @@ export function ApprovalDeadlinesCard(props: { acp: AcpStore; ui: UiState }) {
           <h3 className="dwa-section-title">{acp.label('审批时限', 'Approval deadlines')}</h3>
           <p className="dwa-section-copy">
             {acp.label(
-              '权限请求的等待时长与超时处理方式。',
-              'How long to wait for a permission request, and what happens when nobody answers.',
+              '权限请求与表单提问的等待时长，以及权限超时后的处理方式。',
+              'How long to wait for permission requests and form questions, and what happens when a permission ask expires.',
             )}
           </p>
         </div>
@@ -353,6 +411,9 @@ export function ApprovalDeadlinesCard(props: { acp: AcpStore; ui: UiState }) {
           mode={deadlines.mode}
           override={baselineNote}
         />
+        {deadlines.elicitationTimeoutMs !== undefined && (
+          <ElicitationDeadlineBlock acp={acp} value={deadlines.elicitationTimeoutMs} override={elicitationNote} />
+        )}
         {facts.overridden && (
           <div className="dwa-deadline-reset">
             <button type="button" className="dwa-btn dwa-btn-secondary" onClick={() => void acp.resetApprovalDeadlines()}>

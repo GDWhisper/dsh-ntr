@@ -97,6 +97,8 @@ export interface SettingsHost {
 export class SettingsService {
   constructor(private readonly host: SettingsHost) {}
 
+  private approvalDeadlineWriteSeq = 0
+
   async setTagHalo(halo: AcpTagHalo): Promise<void> {
     const previous = this.host.state().tagHalo
     this.host.mutate({ tagHalo: halo })
@@ -197,6 +199,11 @@ export class SettingsService {
     await this.writeApprovalDeadlines({ mode })
   }
 
+  /** Write the independent form-question window; `0` means no deadline. */
+  async setElicitationDeadline(ms: number): Promise<void> {
+    await this.writeApprovalDeadlines({ elicitationTimeoutMs: ms })
+  }
+
   /** Drop the persisted override: the config file (or the built-in default) decides again. */
   async resetApprovalDeadlines(): Promise<void> {
     await this.writeApprovalDeadlines({ reset: true })
@@ -250,6 +257,7 @@ export class SettingsService {
   }
 
   private async writeApprovalDeadlines(payload: ApprovalDeadlinesSetPayload): Promise<void> {
+    const seq = ++this.approvalDeadlineWriteSeq
     const previous = this.host.state().approvalDeadlines
     // Optimistic only where it is safe: the effective numbers and the mode move
     // now, and the override facts (`configured`) stay as the host last reported
@@ -259,15 +267,18 @@ export class SettingsService {
         approvalDeadlines: {
           ...previous,
           ...(payload.permissionTimeoutMs === undefined ? {} : { permissionTimeoutMs: payload.permissionTimeoutMs }),
+          ...(payload.elicitationTimeoutMs === undefined ? {} : { elicitationTimeoutMs: payload.elicitationTimeoutMs }),
           ...(payload.mode === undefined ? {} : { mode: payload.mode }),
         },
       })
     }
     try {
       const result = await this.host.call<ApprovalDeadlinesResult>('ui/approval-deadlines-set', payload)
-      this.host.mutate({ approvalDeadlines: result.deadlines })
+      // Only the newest write may commit an authoritative answer: an older RPC
+      // returning late must not roll back a newer slider pick or failure state.
+      if (seq === this.approvalDeadlineWriteSeq) this.host.mutate({ approvalDeadlines: result.deadlines })
     } catch (error) {
-      this.host.mutate({ approvalDeadlines: previous })
+      if (seq === this.approvalDeadlineWriteSeq) this.host.mutate({ approvalDeadlines: previous })
       this.host.flashError(error)
     }
   }

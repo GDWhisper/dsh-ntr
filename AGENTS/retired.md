@@ -35,7 +35,7 @@
 ### 两个等待窗口（对话一处、ledger 一处）
 
 - **退役**：`nativeApprovalTimeoutMs` / `permissionFallbackTimeoutMs` 两个可设窗口，以及那个「一视同仁覆盖两者」的 `permissionTimeoutMs` 总闸；设置页卡片的三行版（到点怎么处理 + 对话里的询问 + 待处理权限请求里的询问）。理由：两处询问问的是同一个问题（「有人在吗」），分成两个数字只会让用户**看不出它们是不是一套**，还会配出互相矛盾的值（对话 5 分钟、ledger 1 小时）。总闸则让「卡片里那个数」和「真正生效的数」不是同一个数——卡片在骗人。
-- **仍然有效**：**一个**窗口 `permissionTimeoutMs`（默认 300_000，`0` = 不等待）+ 一档到点行为；卡片只剩两个控件并有一句话把两者说成一套。见 [permissions.md §2.4](./permissions.md) 与 [ui-panel.md §8](./ui-panel.md)。
+- **仍然有效**：**一个**窗口 `permissionTimeoutMs`（默认 300_000，`0` = 不等待）+ 一档到点行为；审批控件只剩两个并有一句话把两者说成一套（表单提问时限是另一独立控件）。见 [permissions.md §2.4](./permissions.md) 与 [ui-panel.md §8](./ui-panel.md)。
 - **旧配置仍被接受**：`validateConfig` 把 `nativeApprovalTimeoutMs` / `permissionFallbackTimeoutMs` 折叠进新键（新键在场时忽略旧键），所以老的 `cordis.patch.yml` 不会静默回到默认值。
 
 ### 时长轴上的「一直等待」档（以及 `0` = 一直等的旧义）

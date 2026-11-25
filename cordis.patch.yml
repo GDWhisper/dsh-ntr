@@ -63,8 +63,9 @@
         #                              Deadline for ACP form elicitation asks
         #                              (`elicitation/create`). INDEPENDENT of
         #                              `permissionTimeoutMs` — it does not follow
-        #                              it, and the Settings page does not rewrite
-        #                              it. 0 = no deadline (the ask stays pending
+        #                              it, and the Settings page's 表单提问时限
+        #                              control may outrank it. 0 = no deadline
+        #                              (the ask stays pending
         #                              until answered or the session ends). On
         #                              expiry the ask settles as `cancel` plus one
         #                              `agent/notice`.

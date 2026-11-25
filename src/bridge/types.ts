@@ -80,7 +80,7 @@ export interface BridgeTuning {
    * How long an ACP form elicitation (`elicitation/create`) may sit
    * unanswered before timing out and settling as `cancel` (+ `agent/notice`).
    * Independent of {@link BridgeTuning.permissionTimeoutMs}. Default 300000 ms;
-   * `0` disables the deadline.
+   * `0` disables the deadline. Settings writes affect the NEXT ask only.
    */
   elicitationTimeoutMs?: number
   /**

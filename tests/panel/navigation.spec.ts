@@ -184,7 +184,7 @@ describe('AcpSettingsSection navigation', () => {
     // labels repeat it, so the readout is read from the value block.
     expect(screen.getByText('30 分钟', { selector: '.dwa-deadline-value' })).toBeDefined()
     // Every other rung is labeled; 30 minutes is the middle of the 13 rungs.
-    expect(screen.getByText('30 分钟', { selector: '.dwa-deadline-ticks span' }).style.left).toBe('50%')
+    expect(screen.getAllByText('30 分钟', { selector: '.dwa-deadline-ticks span' }).map(el => el.style.left)).toContain('50%')
 
     const slider = screen.getByRole('slider', { name: '释放窗口' }) as HTMLInputElement
     // The ladder is 1 minute, then 5-minute steps: index 3 is 15 minutes.

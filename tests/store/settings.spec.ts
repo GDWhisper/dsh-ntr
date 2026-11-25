@@ -106,7 +106,7 @@ describe('AcpStore agent management', () => {
         if (endpoint === 'ui/approval-deadlines-set') {
           sent.push(payload as Record<string, unknown>)
           // The host answer is the authority: it echoes what is now in force.
-          return { ok: true, value: { deadlines: { permissionTimeoutMs: 30_000, mode: 'auto', configured: { permissionTimeoutMs: 600_000 } } } }
+          return { ok: true, value: { deadlines: { permissionTimeoutMs: 30_000, elicitationTimeoutMs: 0, mode: 'auto', configured: { permissionTimeoutMs: 600_000 } } } }
         }
         return { ok: true, value: {} }
       },
@@ -125,9 +125,14 @@ describe('AcpStore agent management', () => {
     expect(sent[1]).toEqual({ mode: 'auto' })
     expect(store.getSnapshot().approvalDeadlines).toMatchObject({ mode: 'auto' })
 
+    // The form-question window uses the same optimistic write path.
+    await store.setElicitationDeadline(0)
+    expect(sent[2]).toEqual({ elicitationTimeoutMs: 0 })
+    expect(store.getSnapshot().approvalDeadlines).toMatchObject({ elicitationTimeoutMs: 0 })
+
     // `reset` is its own payload, not a deadline.
     await store.resetApprovalDeadlines()
-    expect(sent[2]).toEqual({ reset: true })
+    expect(sent[3]).toEqual({ reset: true })
 
     // A host half without the route leaves the card hidden rather than showing
     // a number this browser invented.
@@ -162,6 +167,40 @@ describe('AcpStore agent management', () => {
     await failing.resync()
     await failing.setApprovalDeadline('nativeApprovalTimeoutMs', 30_000)
     expect(failing.getSnapshot().approvalDeadlines).toEqual({ nativeApprovalTimeoutMs: 300_000, permissionFallbackTimeoutMs: 300_000 })
+  })
+
+  it('keeps only the newest approval-deadline answer when writes finish out of order', async () => {
+    const pending = new Map<number, (answer: unknown) => void>()
+    const store = new AcpStore(async (_channel, endpoint, payload) => {
+      if (endpoint === 'agents/list') return { ok: true, value: { agents: [] } }
+      if (endpoint === 'sessions/list') return { ok: true, value: { sessions: [] } }
+      if (endpoint === 'agents/detect') return { ok: true, value: { agents: [] } }
+      if (endpoint === 'ui/approval-deadlines') {
+        return { ok: true, value: { deadlines: { permissionTimeoutMs: 300_000, elicitationTimeoutMs: 300_000, mode: 'wait' } } }
+      }
+      if (endpoint === 'ui/approval-deadlines-set') {
+        const patch = payload as { elicitationTimeoutMs?: number }
+        return await new Promise(resolve => { pending.set(patch.elicitationTimeoutMs ?? 0, resolve) })
+      }
+      return { ok: true, value: {} }
+    }, zh => zh)
+    await store.resync()
+    const older = store.setElicitationDeadline(30_000)
+    const newer = store.setElicitationDeadline(60_000)
+    pending.get(60_000)?.({ ok: true, value: { deadlines: { permissionTimeoutMs: 300_000, elicitationTimeoutMs: 60_000, mode: 'wait' } } })
+    await newer
+    expect(store.getSnapshot().approvalDeadlines?.elicitationTimeoutMs).toBe(60_000)
+    pending.get(30_000)?.({ ok: true, value: { deadlines: { permissionTimeoutMs: 300_000, elicitationTimeoutMs: 30_000, mode: 'wait' } } })
+    await older
+    expect(store.getSnapshot().approvalDeadlines?.elicitationTimeoutMs).toBe(60_000)
+
+    const staleFailure = store.setElicitationDeadline(90_000)
+    const latest = store.setElicitationDeadline(120_000)
+    pending.get(120_000)?.({ ok: true, value: { deadlines: { permissionTimeoutMs: 300_000, elicitationTimeoutMs: 120_000, mode: 'wait' } } })
+    await latest
+    pending.get(90_000)?.({ ok: false, error: { code: 'bad_payload', message: 'late failure' } })
+    await staleFailure
+    expect(store.getSnapshot().approvalDeadlines?.elicitationTimeoutMs).toBe(120_000)
   })
 
   it('reads the delegate settings on resync, writes optimistically, and resets one key', async () => {

@@ -149,7 +149,7 @@ export function validateApprovalDeadlineMs(raw: unknown, label: string, code: 'b
  */
 export function validateApprovalDeadlines(value: unknown): Partial<Record<ApprovalDeadlineKey, number>> {
   if (value === null || typeof value !== 'object') throw new AcpError('bad_payload', 'acp: approval deadlines must be an object')
-  const { permissionTimeoutMs } = value as { permissionTimeoutMs?: unknown }
+  const { permissionTimeoutMs, elicitationTimeoutMs } = value as { permissionTimeoutMs?: unknown; elicitationTimeoutMs?: unknown }
   const out: Partial<Record<ApprovalDeadlineKey, number>> = {}
   if (permissionTimeoutMs !== undefined) {
     out.permissionTimeoutMs = validateApprovalDeadlineMs(
@@ -157,6 +157,14 @@ export function validateApprovalDeadlines(value: unknown): Partial<Record<Approv
       'permissionTimeoutMs',
       'bad_payload',
       '(0 = 不等待，仅自动推进档可用)',
+    )
+  }
+  if (elicitationTimeoutMs !== undefined) {
+    out.elicitationTimeoutMs = validateApprovalDeadlineMs(
+      elicitationTimeoutMs,
+      'elicitationTimeoutMs',
+      'bad_payload',
+      '(0 = no deadline)',
     )
   }
   return out

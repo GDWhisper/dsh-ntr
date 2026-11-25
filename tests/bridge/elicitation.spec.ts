@@ -97,6 +97,42 @@ describe('handleBridgeElicitationRequest', () => {
     expect(events.some(e => e.type === 'elicitation/resolved' && e.requestId === req!.requestId && e.action === 'accept')).toBe(true)
   })
 
+  it('applies a rewritten form-question deadline to the next ask only', async () => {
+    const hub = new EventHub()
+    const elicitations = new ElicitationLedger()
+    const events: AcpEvent[] = []
+    hub.subscribe(e => { events.push(e) })
+    const session = fakeSession()
+    const host = {
+      agentId: 'mock-agent',
+      elicitationTimeoutMs: 25,
+      hub,
+      elicitations,
+      sessionByAcpId: () => session,
+      touch: () => undefined,
+    }
+
+    const first = handleBridgeElicitationRequest(host, {
+      mode: 'form', sessionId: 'acp-s1', message: 'First timed question',
+      requestedSchema: { type: 'object', properties: {} },
+    })
+    const firstFrame = events.find((e): e is Extract<AcpEvent, { type: 'elicitation/request' }> => e.type === 'elicitation/request')
+    host.elicitationTimeoutMs = 300_000
+    const second = handleBridgeElicitationRequest(host, {
+      mode: 'form', sessionId: 'acp-s1', message: 'Second question',
+      requestedSchema: { type: 'object', properties: {} },
+    })
+    const frames = events.filter((e): e is Extract<AcpEvent, { type: 'elicitation/request' }> => e.type === 'elicitation/request')
+    expect(frames).toHaveLength(2)
+    // The already armed first timer keeps its 25ms window; the next ask reads 5 minutes.
+    expect(frames[1]!.deadlineAt! - frames[0]!.deadlineAt!).toBeGreaterThan(200_000)
+
+    elicitations.respond(frames[1]!.requestId, { action: 'cancel' })
+    await second
+    expect(await first).toEqual({ action: 'cancel' })
+    expect(firstFrame?.deadlineAt).toBeTypeOf('number')
+  })
+
   it('settles cancelled when the ACP request AbortSignal fires', async () => {
     const hub = new EventHub()
     const elicitations = new ElicitationLedger()

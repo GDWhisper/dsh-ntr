@@ -734,7 +734,7 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         return ok({ deadlines: manager.approvalDeadlines?.() })
       case 'ui/approval-deadlines-set': {
         const patch: ApprovalDeadlinePatch = {
-          ...validateApprovalDeadlines({ permissionTimeoutMs: body.permissionTimeoutMs }),
+          ...validateApprovalDeadlines({ permissionTimeoutMs: body.permissionTimeoutMs, elicitationTimeoutMs: body.elicitationTimeoutMs }),
           ...(body.mode === undefined ? {} : { mode: validatePermissionTimeoutMode(body.mode, 'bad_payload') }),
         }
         await manager.setApprovalDeadlines?.(patch, body.reset === true)

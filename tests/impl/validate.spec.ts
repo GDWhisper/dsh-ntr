@@ -175,6 +175,8 @@ describe('validateConfig', () => {
     expect(validateApprovalDeadlines({ permissionTimeoutMs: 60_000 })).toEqual({ permissionTimeoutMs: 60_000 })
     expect(validateApprovalDeadlines({})).toEqual({})
     expect(validateApprovalDeadlines({ permissionTimeoutMs: 0 })).toEqual({ permissionTimeoutMs: 0 })
+    expect(validateApprovalDeadlines({ elicitationTimeoutMs: 0 })).toEqual({ elicitationTimeoutMs: 0 })
+    expect(validateApprovalDeadlines({ elicitationTimeoutMs: 300_000 })).toEqual({ elicitationTimeoutMs: 300_000 })
     // `reset` is not a deadline and must not land in the persisted override.
     expect(validateApprovalDeadlines({ reset: true })).toEqual({})
     // The legacy keys are gone from the write path: an old browser half must
@@ -182,6 +184,7 @@ describe('validateConfig', () => {
     expect(validateApprovalDeadlines({ nativeApprovalTimeoutMs: 60_000 })).toEqual({})
     for (const bad of [-1, 1.5, 86_400_001, '60000', null]) {
       expect(() => validateApprovalDeadlines({ permissionTimeoutMs: bad })).toThrow(/permissionTimeoutMs/)
+      expect(() => validateApprovalDeadlines({ elicitationTimeoutMs: bad })).toThrow(/elicitationTimeoutMs/)
     }
     expect(() => validateApprovalDeadlines(null)).toThrow(/approval deadlines must be an object/)
   })

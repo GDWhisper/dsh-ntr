@@ -59,8 +59,12 @@ export function ElicitationAskCard(props: { acp: AcpStore; elicitation: PendingE
   const ownNow = useDeadlineClock(now === undefined && elicitation.deadlineAt !== undefined)
   const effectiveNow = now ?? ownNow
   const [draft, setDraft] = useState<ElicitationDraft>(() => initialElicitationDraft(elicitation.fields))
+  const [step, setStep] = useState(0)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
+  const lastStep = Math.max(0, elicitation.fields.length - 1)
+  const currentField = elicitation.fields[step]
+  const paged = elicitation.fields.length > 1
 
   const submit = (outcome: ElicitationOutcome): void => {
     if (busy) return
@@ -74,9 +78,15 @@ export function ElicitationAskCard(props: { acp: AcpStore; elicitation: PendingE
   }
 
   const onAccept = (): void => {
-    const built = buildElicitationContent(elicitation.fields, draft, (zh, en) => acp.label(zh, en))
+    const fields = step < lastStep && currentField !== undefined ? [currentField] : elicitation.fields
+    const built = buildElicitationContent(fields, draft, (zh, en) => acp.label(zh, en))
     if (!built.ok) {
       setError(built.error)
+      return
+    }
+    if (step < lastStep) {
+      setError(undefined)
+      setStep(step + 1)
       return
     }
     submit({ action: 'accept', content: built.content })
@@ -103,7 +113,12 @@ export function ElicitationAskCard(props: { acp: AcpStore; elicitation: PendingE
       </div>
       {elicitation.fields.length > 0 && (
         <div className="ntr-elicit-fields">
-          {elicitation.fields.map(field => (
+          {paged && (
+            <div className="ntr-elicit-step" aria-live="polite">
+              {acp.label(`问题 ${String(step + 1)} / ${String(elicitation.fields.length)}`, `Question ${String(step + 1)} of ${String(elicitation.fields.length)}`)}
+            </div>
+          )}
+          {(paged ? [currentField] : elicitation.fields).map(field => field !== undefined && (
             <ElicitationFieldRow
               key={field.name}
               field={field}
@@ -114,14 +129,19 @@ export function ElicitationAskCard(props: { acp: AcpStore; elicitation: PendingE
           ))}
         </div>
       )}
-      {((elicitation.omittedFields ?? 0) > 0 || (elicitation.omittedOptions ?? 0) > 0) && (
+      {step === lastStep && ((elicitation.omittedFields ?? 0) > 0 || (elicitation.omittedOptions ?? 0) > 0) && (
         <div className="ntr-elicit-desc ntr-elicit-omitted">
           {omittedNotice(acp, elicitation.omittedFields, elicitation.omittedOptions)}
         </div>
       )}
       <div className="ntr-elicit-actions">
+        {step > 0 && (
+          <button type="button" className="ntr-elicit-secondary" disabled={busy} onClick={() => { setError(undefined); setStep(step - 1) }}>
+            {acp.label('上一步', 'Back')}
+          </button>
+        )}
         <button type="button" className="ntr-elicit-submit" disabled={busy} onClick={onAccept}>
-          {acp.label('提交', 'Submit')}
+          {step < lastStep ? acp.label('下一步', 'Next') : acp.label('提交', 'Submit')}
         </button>
         <button type="button" className="ntr-elicit-secondary" disabled={busy} onClick={() => { submit({ action: 'decline' }) }}>
           {acp.label('跳过', 'Decline')}

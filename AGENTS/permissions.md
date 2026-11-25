@@ -62,7 +62,7 @@ ACP `session/request_permission` 原样映射：选项列表 / 名称 / 顺序 /
 
 - **不转移**：早期版本在 native 窗口到点后「撤回」，再把同一问题改走 ledger；这条连同 native 路由一起退役了。转移只买到一个「第二机会」，却把问题送到用户不在看的页面——那既不是挂起也不是取消，是没人要的混合态。现在到点**就地收场**：`announceExpiredAsk` 算出答案，`permissions.respond` 结算**同一个** ledger 条目（`settleExpiredAsk` 只用于 `auto` + `0` 的到达路径）。
 - **`auto` 的选法**：`pickAutoOption`（`src/impl.ts`）按 kind 优先级 `allow_always → allow_once → reject_once → reject_always → 首个可选项`。ACP 的 `PermissionOption` 只有 `{optionId, name, kind, _meta?}`，**没有「默认选项」字段**，只能按 kind 挑；挑不出合法选项时降级 `abort`（不瞎猜、不永久挂起）。与 OmniTerm dev 的 `pick_auto_option` 同策略（`allow_always` 优先由用户 2026-09-21 拍板）。
-- **审批只有一个等待窗口 `permissionTimeoutMs`**（默认 300_000，`0` = 不等待）：对话 dock 卡与设置页镜像问的是同一个问题（「有人在吗」），所以共用一个答案。早期版本是两个窗口（`nativeApprovalTimeoutMs` / `permissionFallbackTimeoutMs`），它们把设置卡变成三个看不出关联的旋钮——用户看不出「三行是不是一套」，而且两处可以配出互相矛盾的值。**一个数字管两处**，卡片因此只剩两个控件。
+- **审批只有一个等待窗口 `permissionTimeoutMs`**（默认 300_000，`0` = 不等待）：对话 dock 卡与设置页镜像问的是同一个问题（「有人在吗」），所以共用一个答案。早期版本是两个窗口（`nativeApprovalTimeoutMs` / `permissionFallbackTimeoutMs`），它们把设置卡变成三个看不出关联的旋钮——用户看不出「三行是不是一套」，而且两处可以配出互相矛盾的值。**一个数字管两处**，审批卡片因此只剩模式与等待时长两个关联控件；表单提问另有独立时限控件（§5）。
 - **定时器与人的答复赛跑**：条目一建立就 arm，所以**一张正常渲染出来、你只是还没点**的卡片同样会到点被拒。期限存在的理由是**无人值守的会话不该无限挂起**，不是「宿主没渲染」的探针——从插件这一侧看，「人太慢」和「没人看」长得一模一样。写 UI 文案时别把它读成前者。
 - **模式与窗口都在询问开始时读一次**：已持定时器的询问不改口径，正在决定中的人不该被移动球门。`deadlineAt` 也在同一时刻算出并进入帧、聊天行与定时器——慢读者不能把期限读长。
 - **`wait` 不 arm 任何定时器**：「一直等」就是一直等，窗口配多少都一样；`wait` 下 `deadlineAt` 也不进帧。`wait` 是**唯一**能表达「永不到期」的档。
@@ -93,7 +93,7 @@ ACP `session/request_permission` 原样映射：选项列表 / 名称 / 顺序 /
 
 ### 2.4 设置页热改一个窗口与一档到点行为
 
-`permissionTimeoutMs` / `permissionTimeoutMode` 在 **NTR 设置 → 审批时限** 卡片里改，不用重启插件进程，也不用杀活动会话。卡片只有**两个控件**，和 OmniTerm dev 同形：一个到点行为（三档互斥按钮）+ 一根时长滑块。
+`permissionTimeoutMs` / `permissionTimeoutMode` 在 **NTR 设置 → 审批时限** 卡片里改，不用重启插件进程，也不用杀活动会话。审批是两个关联控件：一个到点行为（三档互斥按钮）+ 一根时长滑块；同卡另有独立的「表单提问时限」滑块（§5），不与审批模式混用。
 
 **三层取值，优先级从高到低**：
 
@@ -184,7 +184,7 @@ to the config file"、"adopts a deadline the settings page writes while a sessio
 
 ## 5. 表单提问（`elicitation/create`）
 
-`AgentBridge` 在 ACP `initialize` 声明 `clientCapabilities.elicitation.form = {}`，由 `handleBridgeElicitationRequest`（`src/bridge/elicitation-bridge.ts`）接住 `elicitation/create`（非 `form` 模式回 `cancel`）；与审批共享纯账本 `PendingRequestLedger` / `pendingReplayFrames`（`src/impl/pending-request.ts` → `ElicitationLedger` / `elicitationReplayFrames`）。入口处按协议上限（`MAX_ELICITATION_*`：`message` 2000、`title` 200、`description` 500、20 字段、50 选项）截断或限制，被裁掉的字段 / 选项数随请求上报（`omittedFields` / `omittedOptions`），对话卡显示一行省略提示；响应经 `validateElicitationOutcome`（服务端 `ElicitationLedger.respond` 复核）拒绝未声明字段与枚举外选项，校验失败保留 pending。期限 `elicitationTimeoutMs` 是**独立**窗口（部署配置，默认 300_000；`0` 不设限；不跟随 `permissionTimeoutMs`，设置页也不改写它），到期结算 `cancel` 并广播 `agent/notice` + `elicitation/resolved`；`signal` 撤回、`session/cancel`、`closeSession`、`releaseAll` 同走 `settlePermissions` 清理。
+`AgentBridge` 在 ACP `initialize` 声明 `clientCapabilities.elicitation.form = {}`，由 `handleBridgeElicitationRequest`（`src/bridge/elicitation-bridge.ts`）接住 `elicitation/create`（非 `form` 模式回 `cancel`）；与审批共享纯账本 `PendingRequestLedger` / `pendingReplayFrames`（`src/impl/pending-request.ts` → `ElicitationLedger` / `elicitationReplayFrames`）。入口处按协议上限（`MAX_ELICITATION_*`：`message` 2000、`title` 200、`description` 500、20 字段、50 选项）截断或限制，被裁掉的字段 / 选项数随请求上报（`omittedFields` / `omittedOptions`），对话卡在最后一页显示一行省略提示；响应经 `validateElicitationOutcome`（服务端 `ElicitationLedger.respond` 复核）拒绝未声明字段与枚举外选项，校验失败保留 pending。多字段表单在客户端分步展示，但协议与账本仍是一问一答：最后一页提交完整 `content`。期限 `elicitationTimeoutMs` 是**独立**窗口（默认 300_000；`0` 不设限；不跟随 `permissionTimeoutMs`），可在设置页「审批时限」的「表单提问时限」子栏目经 `ui/approval-deadlines` 热改，覆盖落 `agents.json` 的 `approvalDeadlines.elicitationTimeoutMs` 并压过 `cordis.patch.yml`；新值只作用于下一次询问，已启动的倒计时不重排，到期结算 `cancel` 并广播 `agent/notice` + `elicitation/resolved`；`signal` 撤回、`session/cancel`、`closeSession`、`releaseAll` 同走 `settlePermissions` 清理。
 
 ## 代码索引
 

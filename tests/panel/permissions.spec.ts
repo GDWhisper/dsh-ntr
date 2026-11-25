@@ -82,7 +82,7 @@ describe('AcpSettingsSection permissions', () => {
     expect(slider.value).toBe(slider.min)
     expect(fixture.store.getSnapshot().approvalDeadlines).toMatchObject({ mode: 'abort', permissionTimeoutMs: 30_000 })
     // Tick labels sit on the exact rung fractions (abort ladder: 7 rungs).
-    expect(screen.getByText('15 分钟', { selector: '.dwa-deadline-ticks span' }).style.left).toBe('50%')
+    expect(screen.getAllByText('15 分钟', { selector: '.dwa-deadline-ticks span' }).map(el => el.style.left)).toContain('50%')
     // Switching back must restore the ZERO, not keep the abort floor: a mode
     // write carries no window, and the host keeps the user's raw pick.
     await click(screen.getByRole('button', { name: '自动推进' }))
@@ -104,6 +104,33 @@ describe('AcpSettingsSection permissions', () => {
     await click(screen.getByRole('button', { name: '一直等待' }))
     expect(screen.queryByRole('slider', { name: '等待时长', hidden: true })).toBeNull()
     expect(payloads(fixture, 'ui/approval-deadlines-set').at(-1)).toEqual({ mode: 'wait' })
+  })
+
+  it('edits the independent form-question deadline, with zero meaning no deadline', async () => {
+    const fixture = await mountPanel({ approvalDeadlines: {
+      mode: 'wait', permissionTimeoutMs: 300_000, elicitationTimeoutMs: 900_000,
+      configured: { elicitationTimeoutMs: 300_000 },
+    } })
+    await category('审批时限')
+    const slider = screen.getByRole('slider', { name: '表单提问时限' }) as HTMLInputElement
+    expect(screen.getByText(/配置文件（cordis.patch.yml）设为 5 分钟/)).toBeDefined()
+    await act(async () => { fireEvent.change(slider, { target: { value: '0' } }) })
+    expect(payloads(fixture, 'ui/approval-deadlines-set')).toEqual([{ elicitationTimeoutMs: 0 }])
+    expect(fixture.store.getSnapshot().approvalDeadlines).toMatchObject({ elicitationTimeoutMs: 0 })
+    expect(screen.getAllByText('不设限').length).toBeGreaterThan(0)
+    expect(fixture.store.getSnapshot().approvalDeadlines).toMatchObject({ mode: 'wait', permissionTimeoutMs: 300_000 })
+
+    await click(screen.getByRole('button', { name: '恢复配置文件的值' }))
+    expect(payloads(fixture, 'ui/approval-deadlines-set').at(-1)).toEqual({ reset: true })
+    expect(fixture.store.getSnapshot().approvalDeadlines).toMatchObject({ elicitationTimeoutMs: 300_000 })
+  })
+
+  it('hides the form-question deadline block when the host does not report it', async () => {
+    const fixture = await mountPanel({ approvalDeadlines: { mode: 'wait', permissionTimeoutMs: 300_000 } })
+    await category('审批时限')
+    expect(screen.getByRole('button', { name: '一直等待' })).toBeDefined()
+    expect(screen.queryByRole('slider', { name: '表单提问时限', hidden: true })).toBeNull()
+    expect(screen.queryByText('表单提问时限')).toBeNull()
   })
 
   it('resets a real approval override to the host baseline', async () => {

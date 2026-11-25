@@ -37,7 +37,7 @@ describe('ElicitationDock', () => {
     expect(container.firstChild).toBeNull()
   })
 
-  it('renders form fields, validates required fields, and submits selected answers', () => {
+  it('pages through fields, validates each step, and preserves every answer', () => {
     const { acp, respond } = fakeStore([
       {
         requestId: 'req-42',
@@ -83,19 +83,28 @@ describe('ElicitationDock', () => {
 
     render(createElement(ElicitationDock, { acp, sessionId: 'chat-1' }))
     expect(screen.getByText('Confirm deployment options')).toBeTruthy()
+    expect(screen.getByText('Question 1 of 4')).toBeTruthy()
+    expect(screen.queryByText('Release Tag')).toBeNull()
 
-    // Submitting before selecting required field shows inline error and does not call RPC.
-    fireEvent.click(screen.getByRole('button', { name: 'Submit' }))
+    // Each page validates its own required answer before advancing.
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }))
     expect(screen.getByRole('alert')).toBeTruthy()
     expect(respond).not.toHaveBeenCalled()
 
-    // Select single-select, multi-select, boolean, and string fields.
     fireEvent.click(screen.getByRole('radio', { name: /Blue\/Green/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }))
     fireEvent.click(screen.getByRole('checkbox', { name: 'Lint' }))
     fireEvent.click(screen.getByRole('checkbox', { name: 'Unit Tests' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }))
     fireEvent.click(screen.getByLabelText('Send Notification'))
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }))
     fireEvent.change(screen.getByLabelText('Release Tag'), { target: { value: 'v1.2.3' } })
 
+    // Going back keeps earlier answers without resubmitting partial content.
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+    expect(screen.getByLabelText('Send Notification')).toHaveProperty('checked', true)
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }))
+    expect(screen.getByLabelText('Release Tag')).toHaveProperty('value', 'v1.2.3')
     fireEvent.click(screen.getByRole('button', { name: 'Submit' }))
     expect(respond).toHaveBeenCalledWith('req-42', {
       action: 'accept',
@@ -106,6 +115,83 @@ describe('ElicitationDock', () => {
         tag: 'v1.2.3',
       },
     })
+  })
+
+  it('keeps decline and cancel available on an intermediate page', async () => {
+    const { acp, respond } = fakeStore([
+      {
+        requestId: 'req-paged',
+        sessionId: 's1',
+        dshSessionId: 'chat-1',
+        message: 'Two questions',
+        fields: [
+          { name: 'first', kind: 'string', title: 'First', required: false },
+          { name: 'second', kind: 'string', title: 'Second', required: false },
+        ],
+      },
+    ])
+    render(createElement(ElicitationDock, { acp, sessionId: 'chat-1' }))
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Decline' })) })
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Cancel' })) })
+    expect(respond).toHaveBeenNthCalledWith(1, 'req-paged', { action: 'decline' })
+    expect(respond).toHaveBeenNthCalledWith(2, 'req-paged', { action: 'cancel' })
+  })
+
+  it('keeps two cards on independent pages and submits them separately', () => {
+    const twoFields = (prefix: string) => [
+      { name: `${prefix}-first`, kind: 'string' as const, title: `${prefix} first`, required: false },
+      { name: `${prefix}-second`, kind: 'string' as const, title: `${prefix} second`, required: false },
+    ]
+    const { acp, respond } = fakeStore([
+      { requestId: 'req-a', sessionId: 's1', dshSessionId: 'chat-1', message: 'Card A', fields: twoFields('a') },
+      { requestId: 'req-b', sessionId: 's1', dshSessionId: 'chat-1', message: 'Card B', fields: twoFields('b') },
+    ])
+    render(createElement(ElicitationDock, { acp, sessionId: 'chat-1' }))
+    fireEvent.change(screen.getByLabelText('a first'), { target: { value: 'answer a1' } })
+    fireEvent.click(screen.getAllByRole('button', { name: 'Next' })[0]!)
+    fireEvent.change(screen.getByLabelText('a second'), { target: { value: 'answer a2' } })
+    expect(screen.getByText('Question 1 of 2')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Submit' }))
+    expect(respond).toHaveBeenCalledWith('req-a', { action: 'accept', content: { 'a-first': 'answer a1', 'a-second': 'answer a2' } })
+    expect(screen.getByText('a second')).toBeTruthy()
+    expect(screen.getByLabelText('b first')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }))
+    fireEvent.click(screen.getAllByRole('button', { name: 'Submit' })[1]!)
+    expect(respond).toHaveBeenLastCalledWith('req-b', { action: 'accept', content: {} })
+  })
+
+  it('disables a card while submitting and preserves its page after failure', async () => {
+    let settle!: (answer: unknown) => void
+    let attempts = 0
+    const respond = vi.fn(() => new Promise((_resolve, reject) => {
+      attempts += 1
+      settle = attempts === 1 ? () => { reject(new Error('network down')) } : () => { _resolve(undefined) }
+    }))
+    const request: PendingElicitation = {
+      requestId: 'req-retry', sessionId: 's1', dshSessionId: 'chat-1', message: 'Retry',
+      fields: [
+        { name: 'first', kind: 'string', title: 'First', required: false },
+        { name: 'second', kind: 'string', title: 'Second', required: false },
+      ],
+    }
+    const snapshot = { elicitations: [request] } as unknown as UiState
+    const acp = {
+      getSnapshot: () => snapshot, subscribe: () => () => undefined,
+      label: (_zh: string, en: string) => en, respondElicitation: respond,
+    } as unknown as AcpStore
+    render(createElement(ElicitationDock, { acp, sessionId: 'chat-1' }))
+    fireEvent.change(screen.getByLabelText('First'), { target: { value: 'kept' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Submit' }))
+    expect(screen.getByRole('button', { name: 'Submit' })).toHaveProperty('disabled', true)
+    await act(async () => { settle(undefined) })
+    expect(respond).toHaveBeenCalledTimes(1)
+    expect(screen.getByText('network down')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+    expect(screen.getByLabelText('First')).toHaveProperty('value', 'kept')
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }))
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Submit' })) })
+    expect(respond).toHaveBeenCalledTimes(2)
   })
 
   it('surfaces fields and options omitted at the schema caps', () => {

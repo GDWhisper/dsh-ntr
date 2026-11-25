@@ -134,7 +134,8 @@
 
 ## 7. 未决权限询问（仅内存）
 
-待答的权限询问是**运行时状态，不落盘**：`agents.json` 里与权限有关的只有 `approvalDeadlines`（设置页热改的期限与模式，见 [permissions.md §2.4](./permissions.md)）。宿主半区的 `PermissionLedger` 与浏览器 `UiState.permissions` 都随进程 / 页面消失，重连靠 `permissionReplayFrames` 重放未决项，并以 `permission/synced` 的活集合收尾。
+待答的权限询问是**运行时状态，不落盘**：`agents.json` 里与权限 / 表单时限有关的只有 `approvalDeadlines`（设置页热改的审批期限 / 模式与表单提问期限，见 [permissions.md §2.4](./permissions.md)）。
+宿主半区的 `PermissionLedger` 与浏览器 `UiState.permissions` 都随进程 / 页面消失，重连靠 `permissionReplayFrames` 重放未决项，并以 `permission/synced` 的活集合收尾。
 
 - **帧字段**（实时广播与重放共用 `permissionRequestFrame`，字段逐项一致）：`requestId`、`sessionId`（ACP 会话 id）、`dshSessionId?`（`/acp` RPC 会话没有）、`toolCall`（原样保留）、`toolName`（宿主经 `permissionToolName` 派生，含 `_meta` 里 `toolName` 的兜底）、`reason?`（`permissionAskReason` 的一行摘要）、`options`（原样，含顺序与 `kind`）、`timeoutMode`（`wait` / `abort` / `auto`）、`deadlineAt?`（epoch ms；`wait` 模式没有期限时缺席）。重放帧缺一项，靠它过滤 / 显示的对话卡就会在重连后静默丢询问。
 - `session/cancel`、`session/close`（先 settle 未决询问，再发 `session/close` 请求）、`releaseAll` 都会答复未决询问，卡片不会跨回合残留。

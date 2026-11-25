@@ -923,12 +923,8 @@ describe('the agent-lock hand-off clock', () => {
 })
 
 describe('approvalDeadlineFacts', () => {
-  // The card carries TWO controls — one window (how long) and one mode (what
-  // happens) — and an override can sit on either, so each is decided on its
-  // own. The reset button is honest only when something is ACTUALLY being
-  // outranked: offering it for a baseline that AGREES with the running value
-  // would put a button on the face of the settings that does nothing
-  // (observed live).
+  // Each baseline is decided on its own; a reset is honest only when something
+  // is actually outranked (an agreeing baseline would be a do-nothing button).
   const base = { permissionTimeoutMs: 300_000, mode: 'abort' as const }
   it('reports no override when the config file says nothing', () => {
     const facts = approvalDeadlineFacts(base)
@@ -951,10 +947,9 @@ describe('approvalDeadlineFacts', () => {
     expect(facts.modeBaseline).toBeUndefined()
     expect(facts.overridden).toBe(false)
   })
-  it('reports the mode baseline when the card outranks it', () => {
-    const facts = approvalDeadlineFacts({ ...base, mode: 'auto', configuredMode: 'wait' })
-    expect(facts.modeBaseline).toBe('wait')
-    expect(facts.overridden).toBe(true)
+  it('reports the independent form-question baseline only when it is outranked', () => {
+    expect(approvalDeadlineFacts({ ...base, elicitationTimeoutMs: 0, configured: { elicitationTimeoutMs: 0 } }).overridden).toBe(false)
+    expect(approvalDeadlineFacts({ ...base, elicitationTimeoutMs: 0, configured: { elicitationTimeoutMs: 300_000 } })).toMatchObject({ elicitationBaseline: 300_000, overridden: true })
   })
 })
 

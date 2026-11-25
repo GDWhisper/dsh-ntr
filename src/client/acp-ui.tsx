@@ -997,6 +997,7 @@ const STYLE = `
 .ntr-elicit-desc { color: var(--dsw-alias-label-secondary, #6b7280); word-break: break-word; }
 .ntr-elicit-omitted { color: var(--dsw-alias-state-warn-primary, #d97706); }
 .ntr-elicit-fields { display: flex; flex-direction: column; gap: 10px; }
+.ntr-elicit-step { font-size: 11px; color: var(--dsw-alias-label-secondary, #6b7280); }
 .ntr-elicit-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .ntr-elicit-checkbox-row { flex-direction: row; align-items: center; flex-wrap: wrap; gap: 6px; cursor: pointer; }
 .ntr-elicit-field-label { font-weight: 500; color: var(--dsw-alias-label-primary, inherit); }

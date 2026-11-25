@@ -70,7 +70,7 @@ import type { BridgeTuning } from './types.ts'
  * import of the bridge implementation.
  */
 export interface SettingsBridge {
-  applyApprovalDeadlines(patch: { permissionTimeoutMs?: number; mode?: PermissionTimeoutMode }): void
+  applyApprovalDeadlines(patch: { permissionTimeoutMs?: number; elicitationTimeoutMs?: number; mode?: PermissionTimeoutMode }): void
   applyIdleRelease(defaultIdleTimeoutMs: number): void
 }
 
@@ -184,6 +184,8 @@ export class SettingsService {
    * — a direct consumer, a test — gets `DEFAULT_TUNING` here and stays correct.
    */
   private baselineDeadline: number
+  /** The independent form-question window before any settings-page override. */
+  private baselineElicitationTimeoutMs: number
   /**
    * The mode before any override — the tuning the manager was constructed
    * with, which already carries the validated config file or the built-in
@@ -253,6 +255,7 @@ export class SettingsService {
     // so only these three need a snapshot.
     const tuning = host.currentTuning()
     this.baselineDeadline = tuning.permissionTimeoutMs
+    this.baselineElicitationTimeoutMs = tuning.elicitationTimeoutMs
     this.baselineIdleTimeoutMs = tuning.idleTimeoutMs
     this.baselineMode = tuning.permissionTimeoutMode
   }
@@ -537,8 +540,12 @@ export class SettingsService {
     const effectiveMode = mode ?? this.configuredMode ?? this.baselineMode
     const raw = values.permissionTimeoutMs
     const window = raw === undefined ? undefined : normalizeApprovalWindow(effectiveMode, raw)
-    this.configuredDeadlines = window === undefined ? {} : { permissionTimeoutMs: window }
+    this.configuredDeadlines = {
+      ...(window === undefined ? {} : { permissionTimeoutMs: window }),
+      ...(values.elicitationTimeoutMs === undefined ? {} : { elicitationTimeoutMs: values.elicitationTimeoutMs }),
+    }
     if (window !== undefined) this.baselineDeadline = window
+    if (values.elicitationTimeoutMs !== undefined) this.baselineElicitationTimeoutMs = values.elicitationTimeoutMs
     if (mode !== undefined) {
       this.configuredMode = mode
       this.baselineMode = mode
@@ -559,6 +566,7 @@ export class SettingsService {
     const tuning = this.host.currentTuning()
     const deadlines: AcpApprovalDeadlines = {
       permissionTimeoutMs: tuning.permissionTimeoutMs,
+      elicitationTimeoutMs: tuning.elicitationTimeoutMs,
       mode: tuning.permissionTimeoutMode,
     }
     if (Object.keys(this.configuredDeadlines).length > 0) deadlines.configured = { ...this.configuredDeadlines }
@@ -742,7 +750,9 @@ export class SettingsService {
     // re-gated here rather than trusted). The validators also drop unknown
     // keys, which is what keeps a stale payload from poisoning state.
     const merged = reset ? {} : { ...this.deadlineOverride, ...patch }
-    const window = validateApprovalDeadlines(merged).permissionTimeoutMs
+    const validated = validateApprovalDeadlines(merged)
+    const window = validated.permissionTimeoutMs
+    const elicitationTimeoutMs = validated.elicitationTimeoutMs
     const mode = merged.mode === undefined
       ? undefined
       : validatePermissionTimeoutMode(merged.mode, 'bad_payload')
@@ -753,6 +763,7 @@ export class SettingsService {
     // never restore the zero the user actually picked.
     this.deadlineOverride = {
       ...(window === undefined ? {} : { permissionTimeoutMs: window }),
+      ...(elicitationTimeoutMs === undefined ? {} : { elicitationTimeoutMs }),
       ...(mode === undefined ? {} : { mode }),
     }
     this.applyDeadlineTuning()
@@ -779,12 +790,14 @@ export class SettingsService {
       permissionTimeoutMode,
       this.deadlineOverride.permissionTimeoutMs ?? this.baselineDeadline,
     )
+    const elicitationTimeoutMs = this.deadlineOverride.elicitationTimeoutMs ?? this.baselineElicitationTimeoutMs
     this.host.replaceTuning({
       ...this.host.currentTuning(),
       permissionTimeoutMs,
+      elicitationTimeoutMs,
       permissionTimeoutMode,
     })
-    const patch = { permissionTimeoutMs, mode: permissionTimeoutMode }
+    const patch = { permissionTimeoutMs, elicitationTimeoutMs, mode: permissionTimeoutMode }
     for (const bridge of this.host.bridges()) bridge.applyApprovalDeadlines(patch)
   }
 
@@ -851,9 +864,11 @@ export class SettingsService {
       const legacy = raw as { nativeApprovalTimeoutMs?: unknown; permissionFallbackTimeoutMs?: unknown }
       const legacyWindow = legacy.nativeApprovalTimeoutMs ?? legacy.permissionFallbackTimeoutMs
       const legacyNever = legacyWindow === 0
+      const windows = validateApprovalDeadlines(raw)
       const window = legacyNever
         ? undefined
-        : validateApprovalDeadlines(raw).permissionTimeoutMs
+        : windows.permissionTimeoutMs
+      const elicitationTimeoutMs = windows.elicitationTimeoutMs
       const mode = legacyNever
         ? ('wait' as const)
         : ((raw as { mode?: unknown }).mode === undefined
@@ -866,6 +881,7 @@ export class SettingsService {
       // `auto` could never recover the zero.
       this.deadlineOverride = {
         ...(window === undefined ? {} : { permissionTimeoutMs: window }),
+        ...(elicitationTimeoutMs === undefined ? {} : { elicitationTimeoutMs }),
         ...(mode === undefined ? {} : { mode }),
       }
     } catch {

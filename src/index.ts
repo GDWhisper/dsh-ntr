@@ -297,6 +297,9 @@ export function apply(ctx: Context, config?: unknown): void {
   if (typeof rawWindow === 'number' && Number.isFinite(rawWindow)) {
     configuredDeadlines.permissionTimeoutMs = rawWindow
   }
+  if (typeof rawConfig.elicitationTimeoutMs === 'number' && Number.isFinite(rawConfig.elicitationTimeoutMs)) {
+    configuredDeadlines.elicitationTimeoutMs = rawConfig.elicitationTimeoutMs
+  }
   // The mode is declared the same way: only when the file actually names it.
   const configuredMode = rawConfig.permissionTimeoutMode === 'abort' || rawConfig.permissionTimeoutMode === 'auto' || rawConfig.permissionTimeoutMode === 'wait'
     ? rawConfig.permissionTimeoutMode

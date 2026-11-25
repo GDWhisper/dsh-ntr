@@ -336,6 +336,11 @@ describe('dispatchRpc', () => {
     await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { permissionTimeoutMs: 0 }))
       .resolves.toMatchObject({ ok: true })
     expect(manager.calls).toContainEqual(['setApprovalDeadlines', { permissionTimeoutMs: 0 }, false])
+    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { elicitationTimeoutMs: 300_000 })).resolves.toMatchObject({ ok: true })
+    expect(manager.calls).toContainEqual(['setApprovalDeadlines', { elicitationTimeoutMs: 300_000 }, false])
+    // Form questions keep zero as the meaningful "no deadline" value.
+    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { elicitationTimeoutMs: 0 })).resolves.toMatchObject({ ok: true })
+    expect(manager.calls).toContainEqual(['setApprovalDeadlines', { elicitationTimeoutMs: 0 }, false])
     // An unknown key is dropped rather than persisted into state, and the two
     // legacy windows can no longer be smuggled back in.
     await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { bogusKey: 5 })).resolves.toMatchObject({ ok: true })

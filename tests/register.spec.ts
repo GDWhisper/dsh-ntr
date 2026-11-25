@@ -347,6 +347,7 @@ describe('host plugin contract', () => {
       // reason — "the file says `wait`" and "nothing was configured" are
       // different facts.
       permissionTimeoutMs: 600_000,
+      elicitationTimeoutMs: 900_000,
       permissionTimeoutMode: 'wait',
     })
     const ask = async (endpoint: string, payload: unknown = {}): Promise<Record<string, unknown>> => {
@@ -356,8 +357,9 @@ describe('host plugin contract', () => {
 
     expect((await ask('ui/approval-deadlines')).deadlines).toEqual({
       permissionTimeoutMs: 600_000,
+      elicitationTimeoutMs: 900_000,
       mode: 'wait',
-      configured: { permissionTimeoutMs: 600_000 },
+      configured: { permissionTimeoutMs: 600_000, elicitationTimeoutMs: 900_000 },
       configuredMode: 'wait',
     })
 
@@ -375,9 +377,13 @@ describe('host plugin contract', () => {
     expect(await rpcHandler!('ui/approval-deadlines-set', { mode: 'maybe' }, new AbortController().signal))
       .toMatchObject({ ok: false, error: { code: 'bad_payload' } })
 
+    // The independent form-question window is writable through the same route.
+    expect((await ask('ui/approval-deadlines-set', { elicitationTimeoutMs: 0 })).deadlines)
+      .toMatchObject({ elicitationTimeoutMs: 0, configured: { elicitationTimeoutMs: 900_000 } })
+
     // Reset returns to the file's value.
     expect((await ask('ui/approval-deadlines-set', { reset: true })).deadlines)
-      .toMatchObject({ permissionTimeoutMs: 600_000, mode: 'wait' })
+      .toMatchObject({ permissionTimeoutMs: 600_000, elicitationTimeoutMs: 900_000, mode: 'wait' })
   })
 
   it('never touches the host model layer at all — no route, no default, no guard', async () => {
