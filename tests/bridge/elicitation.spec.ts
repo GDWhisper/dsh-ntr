@@ -18,12 +18,28 @@ import type { AcpAgentDef, AcpEvent } from '../../src/protocol.ts'
 import { settleTranscript } from './harness.ts'
 
 const tempDirs: string[] = []
-afterEach(() => {
+afterEach(async () => {
   while (tempDirs.length > 0) {
-    const dir = tempDirs.pop()!
-    rmSync(dir, { recursive: true, force: true })
+    await removeTempDir(tempDirs.pop()!)
   }
 })
+
+/**
+ * On Windows the mock agent can still hold the temp dir as its cwd for a moment
+ * after `stopAgent` (teardown kills are fire-and-forget), so rmdir fails with
+ * EPERM until the child is gone. Retry briefly instead of failing the suite.
+ */
+async function removeTempDir(dir: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+      return
+    } catch (error) {
+      if (attempt >= 50) throw error
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+  }
+}
 
 function fakeSession(overrides: Partial<LiveSession> = {}): LiveSession {
   return {

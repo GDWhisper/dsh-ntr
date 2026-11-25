@@ -55,6 +55,8 @@ export async function handleBridgeElicitationRequest(
     ...(form.title === undefined ? {} : { title: form.title }),
     ...(form.description === undefined ? {} : { description: form.description }),
     fields: form.fields,
+    ...(form.omittedFields === undefined ? {} : { omittedFields: form.omittedFields }),
+    ...(form.omittedOptions === undefined ? {} : { omittedOptions: form.omittedOptions }),
     ...(deadlineAt === undefined ? {} : { deadlineAt }),
   }
 

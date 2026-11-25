@@ -21,7 +21,7 @@
 `ElicitationDock`（`src/client/elicitation-dock.tsx`）在 `conversation.input.dock`（`id: 'acp-elicitations'`, `order: 11`）渲染 ACP `elicitation/create` 表单提问，并与 `PermissionDock` 共用 `PendingDockShell`、`useDeadlineClock`、`DeadlineBadge`（`src/client/pending-dock.tsx`）与 `.ntr-pending-dock` 宽度/限高公式。
 
 - **非 NTR 会话不渲染**：按 `elicitationsForSession(ui.elicitations, dshSessionId)` 自门禁（共用 `pendingForSession`）；无 `dshSessionId` 的 `/acp` 提问仅进设置页「待处理权限与提问」镜像。
-- **字段与动作**：按 schema 渲染 `single-select` / `multi-select` / `boolean` / `string` / `number` / `integer`（支持默认值与可选/必填校验，客户端 `buildElicitationContent` 与服务端 `validateElicitationOutcome` 均校验枚举成员与字段范围），底部固定 **Submit / Decline / Cancel**，不截获全局 Enter / Esc；携带 `deadlineAt` 时显示同款倒计时（`elicitationTimeoutMs`，默认 300s，到期宿主按 `cancel` 收场）。
+- **字段与动作**：按 schema 渲染 `single-select` / `multi-select` / `boolean` / `string` / `number` / `integer`（支持默认值与可选/必填校验，客户端 `buildElicitationContent` 与服务端 `validateElicitationOutcome` 均校验枚举成员与字段范围），底部固定 **Submit / Decline / Cancel**，不截获全局 Enter / Esc；`omittedFields` / `omittedOptions` 非空时在字段区下显示一行省略提示；携带 `deadlineAt` 时显示同款倒计时（`elicitationTimeoutMs`，默认 300s，到期宿主按 `cancel` 收场）。
 - **清理**：`session/closed` / `session/released` 仅清理对应会话的条目；SSE `elicitation/synced` 收敛活集合。
 
 ### 10.1 释放横幅（`acp-released-banner`，同座）

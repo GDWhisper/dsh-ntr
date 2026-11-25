@@ -995,6 +995,7 @@ const STYLE = `
 .ntr-elicit-head-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; min-width: 0; }
 .ntr-elicit-title { flex: 1; min-width: 0; font-weight: 600; color: var(--dsw-alias-label-primary, inherit); word-break: break-word; }
 .ntr-elicit-desc { color: var(--dsw-alias-label-secondary, #6b7280); word-break: break-word; }
+.ntr-elicit-omitted { color: var(--dsw-alias-state-warn-primary, #d97706); }
 .ntr-elicit-fields { display: flex; flex-direction: column; gap: 10px; }
 .ntr-elicit-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .ntr-elicit-checkbox-row { flex-direction: row; align-items: center; flex-wrap: wrap; gap: 6px; cursor: pointer; }

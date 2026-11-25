@@ -44,6 +44,16 @@ export function ElicitationDock({ acp, sessionId }: ElicitationDockProps) {
   )
 }
 
+function omittedNotice(acp: AcpStore, fields: number | undefined, options: number | undefined): string {
+  const parts: string[] = []
+  if (fields !== undefined && fields > 0) parts.push(acp.label(`${String(fields)} 个字段`, `${String(fields)} field(s)`))
+  if (options !== undefined && options > 0) parts.push(acp.label(`${String(options)} 个选项`, `${String(options)} option(s)`))
+  return acp.label(
+    `部分内容超过上限已省略：${parts.join('、')}`,
+    `Content over the cap was omitted: ${parts.join(', ')}`,
+  )
+}
+
 export function ElicitationAskCard(props: { acp: AcpStore; elicitation: PendingElicitation; now?: number }) {
   const { acp, elicitation, now } = props
   const ownNow = useDeadlineClock(now === undefined && elicitation.deadlineAt !== undefined)
@@ -102,6 +112,11 @@ export function ElicitationAskCard(props: { acp: AcpStore; elicitation: PendingE
               onChange={value => { setField(field.name, value) }}
             />
           ))}
+        </div>
+      )}
+      {((elicitation.omittedFields ?? 0) > 0 || (elicitation.omittedOptions ?? 0) > 0) && (
+        <div className="ntr-elicit-desc ntr-elicit-omitted">
+          {omittedNotice(acp, elicitation.omittedFields, elicitation.omittedOptions)}
         </div>
       )}
       <div className="ntr-elicit-actions">

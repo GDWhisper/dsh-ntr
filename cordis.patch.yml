@@ -59,6 +59,15 @@
         #                              the default window — never to 不等待, which
         #                              would silently turn "wait forever" into
         #                              "answer at once".
+        # elicitationTimeoutMs: 300000
+        #                              Deadline for ACP form elicitation asks
+        #                              (`elicitation/create`). INDEPENDENT of
+        #                              `permissionTimeoutMs` — it does not follow
+        #                              it, and the Settings page does not rewrite
+        #                              it. 0 = no deadline (the ask stays pending
+        #                              until answered or the session ends). On
+        #                              expiry the ask settles as `cancel` plus one
+        #                              `agent/notice`.
         # permissionTimeoutMode: wait
         #                              What an EXPIRED deadline does — three values, no
         #                              more:

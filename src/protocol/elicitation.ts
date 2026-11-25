@@ -67,6 +67,10 @@ export interface PendingElicitationFields {
   description?: string
   /** Ordered form fields derived from `requestedSchema.properties`. */
   fields: ElicitationFieldView[]
+  /** Count of schema properties omitted for exceeding the field or name caps. */
+  omittedFields?: number
+  /** Count of selectable options omitted for exceeding caps or malformed shape. */
+  omittedOptions?: number
   /** Epoch ms when this request expires and auto-cancels; absent when unbounded. */
   deadlineAt?: number
 }
