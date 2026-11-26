@@ -351,16 +351,22 @@ export class BridgeRegistryService {
   }
 
   /**
-   * Kill this agent's process and forget its chat-bound session records.
+   * Kill this agent's process and forget the records of the sessions it closes.
    *
-   * The removed records ARE persisted (`persist` defaults to true): a stop
-   * closes the agent-side sessions on purpose, so leaving them in `agents.json`
-   * would resurrect them as resumable after the next host restart. Save and
+   * `persist` (default) writes `agents.json` before returning. The rows of the
+   * sessions this stop closes are removed and MUST be persisted as removed:
+   * their agent-side sessions got `session/close`, so a row left behind would
+   * resurrect a destroyed conversation on the next host restart. Save and
    * delete pass `false` because each performs its own strict registry write
    * immediately afterwards; a second best-effort write there would race the
    * definition it is about to replace.
+   *
+   * `keepReleased` (default) spares the parked rows: a stop sends
+   * `session/close` only for the live ones, so a parked record's agent-side
+   * session survives the stop and the row stays the conversation's only path
+   * back to it. Delete passes `false` — it removes the agent itself.
    */
-  async stopAgent(agentId: string, persist = true): Promise<void> {
+  async stopAgent(agentId: string, persist = true, keepReleased = true): Promise<void> {
     // Close the gate FIRST, synchronously and before the snapshot: from here
     // until this call returns, `bridgeFor` refuses to mint or hand out a holder
     // for this agent. Without it a message arriving during the `await` below
@@ -386,7 +392,7 @@ export class BridgeRegistryService {
       for (const bridge of bridges) {
         for (const sessionId of this.sessionIdsOf(bridge)) owned.add(sessionId)
       }
-      for (const sessionId of this.host.registry.dropSessionsOfAgent(agentId)) owned.add(sessionId)
+      for (const sessionId of this.host.registry.dropSessionsOfAgent(agentId, keepReleased)) owned.add(sessionId)
       this.host.disposeTurnStreamsOf(controller => owned.has(controller.session.sessionId))
       if (persist) this.host.persistAgents()
       // One stop per process, all at once: the children are independent, so the

@@ -148,11 +148,24 @@ export class SessionRegistryService {
     this.dshSessionMap.set(this.keyOf(session.dshSessionId ?? 'ephemeral', session.agentId), session)
   }
 
-  /** Drop every record of one agent (the stop / delete path); returns their ACP session ids. */
-  dropSessionsOfAgent(agentId: string): string[] {
+  /**
+   * Drop the records of one agent (the stop / delete path); returns their ACP
+   * session ids.
+   *
+   * `keepReleased` spares the parked rows. A stop only closes the sessions it
+   * still has a process for, and a parked record's agent-side session was never
+   * closed by us — the row is the only pointer a later `session/load` has
+   * (constraint 10). Delete passes `false`: the agent is gone, and a row naming
+   * it would come back the moment the same id is added again.
+   *
+   * The flag is REQUIRED: a default here would let a new direct caller silently
+   * pick the wrong half of the stop / delete split.
+   */
+  dropSessionsOfAgent(agentId: string, keepReleased: boolean): string[] {
     const dropped: string[] = []
     for (const [key, session] of this.dshSessionMap) {
       if (session.agentId !== agentId) continue
+      if (keepReleased && lifecycleOf(session) === 'parked') continue
       dropped.push(session.sessionId)
       this.dshSessionMap.delete(key)
     }
