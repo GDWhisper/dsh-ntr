@@ -45,6 +45,7 @@ import type { AcpChatInjected, AcpHostForkFace, AcpSessionFace, AcpSessionsSnaps
 import { createSlashIsolation, slashAcpVerdict } from './slash-isolation.ts'
 import type { SlashSource } from './slash-isolation.ts'
 import { SETTINGS_NAV_LABEL, installSettingsNavIcon } from './settings-nav-icon.ts'
+import { installAcpToolView } from './acp-tool-view.tsx'
 
 export const name = 'dsh-ntr-client'
 export const inject = ['slots', 'connection']
@@ -296,6 +297,7 @@ export function apply(ctx: Context): void {
     inject: () => ({ acp: store }),
   }, AcpSettingsSection)), 'dsh-ntr: settings section')
   ctx.effect(() => installSettingsNavIcon(), 'dsh-ntr: settings nav icon')
+  ctx.effect(() => installAcpToolView(ctx, store), 'dsh-ntr: ACP tool view')
 
   // The same NTR settings, opened from the composer when the agent roster is
   // empty (the agent base's picker action). It rides the frame's overlay layer
