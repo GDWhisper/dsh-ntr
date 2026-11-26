@@ -14,7 +14,7 @@
 2. **默认不代答**：问题到期只结算 `cancelled`；`pickAutoOption` 对问题**一律不参与**（它按 kind 优先级先挑 `allow_always`，对问题是错的答案）。
 3. **代答是用户显式开的一档**：新增独立轴 `questionTimeoutMode: 'cancel' | 'first'`，默认 `'cancel'`。`'first'` = 到期选**第一个**可选项。
 4. **「推荐选项」是近似，不是协议语义**：ACP 的 `PermissionOption` 规范字段只有 `optionId` / `name` / `kind`（外加可选 `_meta` 扩展点），规范没有定义任何推荐位，也不允许假定 `_meta` 里某个键的含义。实现按选项顺序取第一项；UI 文案写「到期自动选第一项」，**不写「推荐项」**。将来若抓到 agy 在 `_meta` 里显式标注，再升级取值链（显式标记 > 第一项）。
-5. **问题用独立的等待窗口**：沿用 `elicitationTimeoutMs`（默认 300s，`0` = 不设限），不受 `permissionTimeoutMs` 与 `permissionTimeoutMode` 影响。
+5. **问题用独立的等待窗口**：沿用 `elicitationTimeoutMs`（默认 `0` = 不设限），不受 `permissionTimeoutMs` 与 `permissionTimeoutMode` 影响。
 6. **开关粒度**：全局一档（与 `elicitationTimeoutMs` 同级），不做 per-agent 覆盖（§10 记录为已定）。
 7. **`0` = 不设限，自动选择不触发**：不静默改写用户选的 0，只在设置页同一行提示（约束 33：覆盖事实可见）。
 

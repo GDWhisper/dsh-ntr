@@ -11,9 +11,9 @@ describe('approval deadline persistence (isolated manager)', () => {
   it('edits an approval deadline live, persists it, and resets to the config file', async () => {
     const storage = `${tmpdir()}/acp-deadlines-${Date.now()}.json`
     const gm = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
-    // Nothing configured, nothing overridden: the built-in 5-minute window and
-    // the default mode.
-    expect(gm.approvalDeadlines()).toEqual({ permissionTimeoutMs: 300_000, elicitationTimeoutMs: 300_000, mode: 'wait', questionTimeoutMode: 'cancel' })
+    // Nothing configured, nothing overridden: the built-in 5-minute approval
+    // window, the built-in no-deadline form window, and the default mode.
+    expect(gm.approvalDeadlines()).toEqual({ permissionTimeoutMs: 300_000, elicitationTimeoutMs: 0, mode: 'wait', questionTimeoutMode: 'cancel' })
     // A deployment that names the window in `cordis.patch.yml` reports it as
     // the reset target — "the file says 10 minutes" and "nothing was
     // configured, 5 is the built-in default" are different facts, and the

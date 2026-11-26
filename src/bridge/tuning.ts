@@ -4,7 +4,9 @@ import { DEFAULT_IDLE_TIMEOUT_MS } from '../protocol.ts'
 export const DEFAULT_TUNING: Required<BridgeTuning> = {
   startupTimeoutMs: 60_000,
   permissionTimeoutMs: 300_000,
-  elicitationTimeoutMs: 300_000,
+  // Form questions wait until the user answers: an unset deadline is the
+  // default, so a forgotten form never turns into a silent cancel.
+  elicitationTimeoutMs: 0,
   permissionTimeoutMode: 'wait',
   questionTimeoutMode: 'cancel',
   cancelFallbackMs: 15_000,

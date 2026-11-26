@@ -346,9 +346,11 @@ export interface AcpPluginConfig {
    * `cancel`, broadcasts `elicitation/resolved` and one `agent/notice`, and
    * releases the waiting agent turn.
    *
-   * Default 300000 ms (5 minutes). An INDEPENDENT window: it does not follow
+   * Default `0` — no deadline; the ask waits until the user answers, declines
+   * or cancels it. An INDEPENDENT window: it does not follow
    * {@link AcpPluginConfig.permissionTimeoutMs}; the settings page may outrank
-   * this baseline through `ui/approval-deadlines`. `0` disables the deadline.
+   * this baseline through `ui/approval-deadlines`. A positive value bounds the
+   * wait and settles as `cancel` on expiry.
    */
   elicitationTimeoutMs?: number
   /**

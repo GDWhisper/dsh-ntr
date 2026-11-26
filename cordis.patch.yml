@@ -59,7 +59,7 @@
         #                              the default window — never to 不等待, which
         #                              would silently turn "wait forever" into
         #                              "answer at once".
-        # elicitationTimeoutMs: 300000
+        # elicitationTimeoutMs: 0
         #                              Deadline for ACP form elicitation asks
         #                              (`elicitation/create`). INDEPENDENT of
         #                              `permissionTimeoutMs` — it does not follow
