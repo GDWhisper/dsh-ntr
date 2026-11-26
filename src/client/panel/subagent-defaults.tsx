@@ -93,6 +93,29 @@ export function isStaleValue(value: string | undefined, choices: AcpCatalogChoic
 }
 
 /**
+ * The agent process's own current VALUE on one axis — what a「默认」selection
+ * resolves to at runtime, read from the SAME slots {@link
+ * resolvedAxisDefaultLabel} spells out (one read rule, two consumers: the
+ * dropdown's parentheses and the folded head's pill). `undefined` = nothing to
+ * name: an unread catalog, a missing / boolean slot, a null or empty current
+ * value, or — effort only — a model never observed with the axis. The pill name
+ * comes from {@link axisValueName}, so a value absent from the axis's own list
+ * spells raw instead of borrowing an alias.
+ */
+export function processDefaultValue(
+  catalog: AcpAgentCatalog | undefined,
+  axis: 'model' | 'effort' | 'mode',
+  modelValue: string | undefined,
+): string | undefined {
+  const slot = axis === 'effort'
+    ? thoughtOptionForModel(catalog, modelValue)
+    : axis === 'model' ? catalog?.model : catalog?.mode
+  if (slot === undefined || slot === null || slot.kind === 'boolean') return undefined
+  const value = slot.currentValue
+  return value === null || value === '' ? undefined : value
+}
+
+/**
  * The copy the「默认」option wraps a row in, plus the markers the unlisted and
  * stale rows append. Held once and reused by the width budget below, so a
  * wording change cannot silently break the cap.
@@ -195,9 +218,10 @@ export function choiceLabel(choice: AcpCatalogChoice): string {
 
 /**
  * The process-own default LABEL one axis's「默认」option spells out in
- * parentheses, read from the slot's `currentValue` — the same fact the whole
- * UI treats as the agent process's own current default. `undefined` = nothing
- * to name (unread catalog, missing / boolean slot, no current value), so the
+ * parentheses, read from the slot's `currentValue` ({@link
+ * processDefaultValue}) — the same fact the whole UI treats as the agent
+ * process's own current default. `undefined` = nothing to name (unread
+ * catalog, missing / boolean slot, no current value), so the
  * option stays plain「默认」. The effort axis reads the SAME effective-model
  * slot as `axisChoices`. A hit spells the SAME `choiceLabel` text as that
  * choice's ordinary row (`listed: true`), so the parentheses match a row
@@ -212,13 +236,9 @@ export function resolvedAxisDefaultLabel(
   axis: 'model' | 'effort' | 'mode',
   modelValue: string | undefined,
 ): { text: string; listed: boolean } | undefined {
-  const slot = axis === 'effort'
-    ? thoughtOptionForModel(catalog, modelValue)
-    : axis === 'model' ? catalog?.model : catalog?.mode
-  if (slot === undefined || slot === null || slot.kind === 'boolean') return undefined
-  const value = slot.currentValue
-  if (value === null || value === '') return undefined
-  const choice = slot.choices.find(candidate => candidate.value === value)
+  const value = processDefaultValue(catalog, axis, modelValue)
+  if (value === undefined) return undefined
+  const choice = (axisChoices(catalog, axis, modelValue) ?? []).find(candidate => candidate.value === value)
   return choice !== undefined && choice.name !== ''
     ? { text: choiceLabel(choice), listed: true }
     // The marker's columns come out of the same option budget, so the「默认」
@@ -386,14 +406,15 @@ function axisValueName(choices: AcpCatalogChoice[] | undefined, value: string): 
 /**
  * One configured agent's delegation profile, as a foldable card.
  *
- * The head is the summary line: the agent's name, plus what this profile
- * actually changes about it — the axes it sets and whether it outranks the
- * config file. That is the fact the old layout could not show without reading
- * four controls and comparing them with「默认」, and it is why the head exists
- * at all. The body is the form: the three axes as one row of three equal
- * columns (the old `flex: 1 1 150px` wrapped them into a lopsided 2+1), the
- * description, and one footer that holds the catalog's age, its refresh
- * gesture and the config-file reset.
+ * The head is the summary line: the agent's name, one pill per axis naming the
+ * value that will actually run — the profile's own pick highlighted, the agent
+ * process's current value plain when the axis is left on「默认」— plus whether
+ * the profile outranks the config file. The old layout could not show any of
+ * that without reading four controls and comparing them with「默认」, and that
+ * is why the head exists at all. The body is the form: the three axes as one
+ * row of three equal columns (the old `flex: 1 1 150px` wrapped them into a
+ * lopsided 2+1), the description, and one footer that holds the catalog's age,
+ * its refresh gesture and the config-file reset.
  *
  * Folding is display-toggled, never unmounted: the description keeps a local
  * draft that is committed on blur, and folding mid-edit must not lose it.
@@ -463,13 +484,25 @@ function AgentDefaultsRow(props: {
     shownDescription === undefined ? undefined : acp.label(`描述「${shownDescription}」`, `description "${shownDescription}"`),
   ].filter(part => part !== undefined).join(' · ')
 
-  // What this profile sets, and nothing else: an axis left on「默认」follows
-  // the agent process, so naming it would be noise on every row.
-  const setAxes = [
-    entry?.model === undefined ? undefined : acp.label(`模型 ${axisValueName(axisChoices(catalog, 'model', entry.model), entry.model)}`, `Model ${axisValueName(axisChoices(catalog, 'model', entry.model), entry.model)}`),
-    entry?.effort === undefined ? undefined : acp.label(`等级 ${axisValueName(axisChoices(catalog, 'effort', entry.model), entry.effort)}`, `Level ${axisValueName(axisChoices(catalog, 'effort', entry.model), entry.effort)}`),
-    entry?.mode === undefined ? undefined : acp.label(`模式 ${axisValueName(axisChoices(catalog, 'mode', entry.model), entry.mode)}`, `Mode ${axisValueName(axisChoices(catalog, 'mode', entry.model), entry.mode)}`),
-  ].filter((text): text is string => text !== undefined)
+  // One pill per axis: the value this profile SETS (highlighted `is-set`), or —
+  // for an axis left on「默认」— the agent process's own current value the
+  // cached catalog reports (plain). The head therefore answers "what will this
+  // agent run with" without opening the card, and still shows at a glance which
+  // of those values the profile overrides. An axis the catalog says nothing
+  // about (unread snapshot, missing / boolean slot, no current value, an
+  // unobserved model) gets no pill — there is no value to name, and inventing
+  // one would be a lie; a card that knows nothing on any axis falls back to the
+  // one plain sentence below.
+  const axisPills = (['model', 'effort', 'mode'] as const).flatMap(axis => {
+    const set = entry?.[axis]
+    const value = set ?? processDefaultValue(catalog, axis, entry?.model)
+    if (value === undefined) return []
+    const axisName = axis === 'model' ? acp.label('模型', 'Model')
+      : axis === 'effort' ? acp.label('等级', 'Level')
+        : acp.label('模式', 'Mode')
+    const text = `${axisName} ${axisValueName(axisChoices(catalog, axis, entry?.model), value)}`
+    return [{ text, set: set !== undefined }]
+  })
 
   return (
     <div className="dwa-preference-block">
@@ -487,9 +520,11 @@ function AgentDefaultsRow(props: {
             <span className="dwa-acc-pills">
               {enabled ? (
                 <>
-                  {setAxes.length === 0
+                  {axisPills.length === 0
                     ? <span className="dwa-sum-pill">{acp.label('全部跟随进程默认', 'All follow the process')}</span>
-                    : setAxes.map(text => <span key={text} className="dwa-sum-pill is-set">{text}</span>)}
+                    : axisPills.map(pill => (
+                      <span key={pill.text} className={pill.set ? 'dwa-sum-pill is-set' : 'dwa-sum-pill'}>{pill.text}</span>
+                    ))}
                   {entry?.description !== undefined && (
                     <span className="dwa-sum-pill">{acp.label('已填描述', 'Description set')}</span>
                   )}

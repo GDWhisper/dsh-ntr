@@ -63,6 +63,26 @@ export const DELEGATE_BASE: AcpDelegateSettings = {
   toolAvailable: true, restrictAvailable: true,
 }
 
+/**
+ * One agent's real cached shape: same-name variants told apart ONLY by
+ * description, and a process currentValue (`hy4free`) the agent reports while
+ * its own list does not include it. Shared by the label read-rule specs and the
+ * folded-head specs, so the raw-value path is pinned from both consumers.
+ */
+export const hy4Catalog = (currentValue: string): AgentProbeModelsResult => ({
+  agentId: 'codebuddy', updatedAt: 1,
+  catalog: {
+    model: {
+      configId: 'model', name: 'Model', currentValue,
+      choices: [
+        { value: 'hy4std', name: 'Hy4 std', description: 'x0.01 credits' },
+        { value: 'hy4flash-free', name: 'Hy4 flash', description: 'x0.00 credits' },
+        { value: 'hy4flash', name: 'Hy4 flash', description: 'x0.03 credits' },
+      ],
+    },
+  },
+})
+
 /** The payloads written to one endpoint. */
 export function writes(calls: PanelRpcCall[], endpoint: string): unknown[] {
   return calls.filter(call => call.endpoint === endpoint).map(call => call.payload)

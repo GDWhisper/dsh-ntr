@@ -1,15 +1,16 @@
 // @vitest-environment jsdom
 // The delegation-defaults CARD itself — the figure the spec file next door
 // (`subagent-defaults.spec.ts`) covers the axes and the catalog through.
-// Three facts live only here: what the folded head summarises (the one thing the
-// old row layout could not show without reading four controls and comparing
-// them with「默认」), that a first visit arrives FOLDED — one summary line per
-// agent, the form behind that agent's own head — and that folding is a display
-// toggle rather than a remount (the description keeps a local draft that commits
-// on blur, so unmounting it would drop what the user was typing).
+// Three facts live only here: what the folded head summarises (one pill per
+// axis naming the value that will actually run — the profile's own pick
+// highlighted, the agent process's current value plain), that a first visit
+// arrives FOLDED — one summary line per agent, the form behind that agent's
+// own head — and that folding is a display toggle rather than a remount (the
+// description keeps a local draft that commits on blur, so unmounting it would
+// drop what the user was typing).
 import { cleanup, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
-import { category, click, DELEGATE_BASE, mountDefaults } from './harness.ts'
+import { category, click, DELEGATE_BASE, hy4Catalog, mountDefaults } from './harness.ts'
 
 afterEach(cleanup)
 
@@ -36,20 +37,78 @@ function pillsOf(agentId: string): HTMLElement {
 }
 
 describe('SubagentDefaults — the card head', () => {
-  it('summarises the axes this profile really sets, and says so when it sets none', async () => {
+  it('names every axis’s effective value on the folded head — the profile’s pick highlighted, the process default plain', async () => {
     await mountDefaults({
       ...DELEGATE_BASE,
       agentDefaults: { codebuddy: { model: 'deepseek-v3', effort: 'high', description: '只改单文件' } },
     }, { keepFolded: true })
     await category('子智能体')
-    // Set axes are named; the description is a fact, not a value.
+    // The head answers "what will this agent run with" without opening the
+    // card: the two axes this profile sets are named AND highlighted, so the
+    // override stays visible at a glance. The cached catalog arrives on its own
+    // async read, so the name resolution is awaited rather than assumed.
     const pills = pillsOf('codebuddy')
-    expect(within(pills).getByText('模型 DeepSeek V3')).toBeDefined()
-    expect(within(pills).getByText('等级 High')).toBeDefined()
+    await waitFor(() => {
+      expect(within(pills).getByText('模型 DeepSeek V3').className).toContain('is-set')
+      expect(within(pills).getByText('等级 High').className).toContain('is-set')
+    })
     expect(within(pills).getByText('已填描述')).toBeDefined()
+    // CodeBuddy publishes no mode slot, so no mode pill is invented, and a head
+    // that named three values no longer needs the catch-all sentence.
+    expect(within(pills).queryByText(/^模式 /)).toBeNull()
     expect(within(pills).queryByText('全部跟随进程默认')).toBeNull()
-    // An agent with no entry says exactly that instead of showing three「默认」
-    // pills that say nothing.
+    // pi sets nothing: its model pill names the PROCESS value the cached
+    // catalog reports, plain — no longer waiting for the user to override.
+    const piPills = pillsOf('pi')
+    await waitFor(() => expect(within(piPills).getByText('模型 GPT-5')).toBeDefined())
+    expect(within(piPills).getByText('模型 GPT-5').className).not.toContain('is-set')
+    // pi publishes no thought / mode slot either, so those axes stay silent
+    // instead of showing a raw-id pill.
+    expect(within(piPills).queryByText(/^等级 /)).toBeNull()
+    expect(within(piPills).queryByText(/^模式 /)).toBeNull()
+    expect(within(piPills).queryByText('全部跟随进程默认')).toBeNull()
+  })
+
+  it('mixes a highlighted set axis with a plain inherited one on the same head', async () => {
+    await mountDefaults({ ...DELEGATE_BASE, agentDefaults: { codebuddy: { effort: 'high' } } }, { keepFolded: true })
+    await category('子智能体')
+    const pills = pillsOf('codebuddy')
+    // The model follows the process — named from the cached catalog, plain; the
+    // level is this profile's own pick — highlighted. Both name resolutions
+    // wait for the catalog's async read.
+    await waitFor(() => {
+      expect(within(pills).getByText('模型 DeepSeek V3').className).not.toContain('is-set')
+      expect(within(pills).getByText('等级 High').className).toContain('is-set')
+    })
+    expect(within(pills).queryByText('全部跟随进程默认')).toBeNull()
+  })
+
+  it('spells a process value the agent never listed as the raw id, never an alias', async () => {
+    // CodeBuddy reports hy4free as current while its own list offers
+    // hy4flash-free: the pill names the value that will actually run, and no
+    // same-name variant is ever guessed in its place.
+    await mountDefaults({ ...DELEGATE_BASE }, { catalogs: { codebuddy: hy4Catalog('hy4free') }, keepFolded: true })
+    await category('子智能体')
+    await waitFor(() => expect(within(pillsOf('codebuddy')).getByText('模型 hy4free')).toBeDefined())
+    expect(within(pillsOf('codebuddy')).queryByText('模型 Hy4 flash')).toBeNull()
+    expect(within(pillsOf('codebuddy')).getByText('模型 hy4free').className).not.toContain('is-set')
+  })
+
+  it('keeps the one fallback sentence for an agent whose catalog names no value on any axis', async () => {
+    // A snapshot that was READ but carries no slot at all — what an agent with no
+    // configOptions reports. The read settles, and there is still nothing to name.
+    await mountDefaults({ ...DELEGATE_BASE }, {
+      catalogs: { pi: { agentId: 'pi', updatedAt: 1, catalog: {} } },
+      keepFolded: true,
+    })
+    await category('子智能体')
+    // codebuddy's snapshot names its process values…
+    await waitFor(() => expect(within(pillsOf('codebuddy')).getByText('模型 DeepSeek V3')).toBeDefined())
+    expect(within(pillsOf('codebuddy')).queryByText('全部跟随进程默认')).toBeNull()
+    // …and pi's read provably settled — its footer gesture flipped from
+    // 「获取目录」 to 「刷新目录」 — with nothing on any axis, so the head says so
+    // in one sentence rather than inventing a pill (constraint 8: no probe).
+    await within(cardOf('pi')).findByRole('button', { name: '刷新目录', hidden: true })
     expect(within(pillsOf('pi')).getByText('全部跟随进程默认')).toBeDefined()
     expect(within(pillsOf('pi')).queryByText(/^模型 /)).toBeNull()
   })
