@@ -102,7 +102,7 @@ describe("a segmented turn interleaves like a native multi-step turn (isolated m
     const cardArgs = first
       .filter((c): c is Extract<StreamChunk, { type: 'tool-call-delta' }> => c.type === 'tool-call-delta')
       .map(c => c.argumentsDelta).join('')
-    expect(cardArgs).toBe('{"description":"fake tool"}')
+    expect(cardArgs).toBe('{"description":"fake tool","kind":"other"}')
 
     // Step 2 (the continuation) carries the post-call answer and NO card: the
     // turn's last settled message is tool-free, so the loop completes here.
