@@ -1381,14 +1381,17 @@ export class AgentBridge {
     if (inflight !== undefined) return inflight
     // An inflight resume also counts as work (see `releaseIfIdle`).
     this.touch()
-    const promise = this.doResumeSession(session).finally(() => {
+    const attempt = (session.resumeAttempt ?? 0) + 1
+    session.resumeAttempt = attempt
+    const promise = this.doResumeSession(session, attempt).finally(() => {
       this.resuming.delete(session.sessionId)
     })
     this.resuming.set(session.sessionId, promise)
     return promise
   }
 
-  private async doResumeSession(session: LiveSession): Promise<LiveSession> {
+  private async doResumeSession(session: LiveSession, attempt: number): Promise<LiveSession> {
+    const epoch = this.teardownEpoch
     try {
       // The cwd was validated when the session was created, but allowed roots
       // may have narrowed since; re-check before handing the path back. A chat
@@ -1442,6 +1445,11 @@ export class AgentBridge {
         conn.agent.request(methods.agent.session.load, { sessionId: session.acpSessionId, cwd: resolved, mcpServers: this.mcpServersForSession() }),
         'session/load',
       ).finally(() => { session.loadingHistory = false })
+      // A teardown or a newer attempt may have taken over while the load was in
+      // flight: registering now would strand the record on a swept bridge.
+      if (this.teardownEpoch !== epoch || session.resumeAttempt !== attempt) {
+        throw new AcpError('agent_stopping', `acp: the resume of session "${session.sessionId}" was abandoned; send again once it is settled`)
+      }
       if (this.onCatalog !== undefined && usableConfigOptions(result.configOptions)) {
         this.onCatalog(this.def.id, result.configOptions)
       }
@@ -1469,11 +1477,14 @@ export class AgentBridge {
       this.onSessionsDirty?.()
       return session
     } catch (error) {
-      this.acpIndex.delete(session.acpSessionId)
-      this.sessions.delete(session.sessionId)
-      markParked(session, this.released)
-      this.hub.broadcast({ type: 'session/released', sessionId: session.sessionId, session: snapshot(session), reason: 'resume failed', cause: 'resume-failed' })
-      this.onSessionsDirty?.()
+      // Only the CURRENT attempt may park/clear (a newer resume owns the record).
+      if (session.resumeAttempt === attempt) {
+        this.acpIndex.delete(session.acpSessionId)
+        this.sessions.delete(session.sessionId)
+        markParked(session, this.released)
+        this.hub.broadcast({ type: 'session/released', sessionId: session.sessionId, session: snapshot(session), reason: 'resume failed', cause: 'resume-failed' })
+        this.onSessionsDirty?.()
+      }
       throw error
     }
   }
@@ -1557,7 +1568,7 @@ export class AgentBridge {
     return session
   }
 
-  /** Drop a released session record for good (user closed it or the agent was stopped). */
+  /** Drop a released session record for good (the session was closed, not merely stopped). */
   dropReleased(sessionId: string): boolean {
     // The record is discarded; its lifecycle stays 'parked' for any reader that still holds it.
     return this.released.delete(sessionId)
@@ -1706,7 +1717,9 @@ export class AgentBridge {
     for (const session of [...this.sessions.values()]) {
       await this.closeSession(session, reason)
     }
-    // A deliberate stop is not a crash: nothing stays resumable.
+    // A deliberate stop is not a crash: closed sessions stay destroyed. Parked
+    // registry rows are `stopAgent`'s call; an abandoned resume's catch may park
+    // into this holder, which the next message resumes on a fresh one.
     this.released.clear()
     this.conn?.close()
     this.conn = undefined
@@ -1791,9 +1804,10 @@ export class AgentBridge {
    * Host shutdown: park every live session as RELEASED (resumable, exactly as a
    * crash would leave it), then WAIT for the child to die.
    *
-   * Deliberately not `stop`: `stop` asks every session's agent to
-   * `session/close` and then clears the released records — i.e. it DESTROYS the
-   * conversations. A host shutdown is not the user's "stop this agent" gesture:
+   * Deliberately not `stop`: `stop` asks every live session's agent to
+   * `session/close` and then clears this bridge's released records, destroying
+   * the LIVE conversations (a parked row survives via `stopAgent`). A host
+   * shutdown is not the user's "stop this agent" gesture:
    * the host is coming back, and the conversations must come back with it
    * (constraint 10, plus the `chatSessions` records that outlive the restart).
    * Skipping the per-session RPC is also what keeps teardown bounded: N sessions

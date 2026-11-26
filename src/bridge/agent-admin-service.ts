@@ -48,7 +48,8 @@ import { classifyTestFailure } from './test-failure.ts'
  * Two members are deliberately composite, because the caller must never see a
  * half-applied step:
  * - {@link stopAgent} stops every live bridge AND drops the bare process slot
- *   in one guarded step (a no-op when the agent has no process);
+ *   in one guarded step (with no process it still handles the session records
+ *   per `keepReleased`, which is what delete relies on);
  * - {@link removeDef} drops the definition AND every pointer into it (the
  *   persisted default, the request-path route bindings, the catalog / fork
  *   cache).

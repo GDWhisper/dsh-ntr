@@ -124,7 +124,7 @@ NTR 底座（`conversation.input.model`，`AcpSessionControls`）**只作首轮�
 - 流式更新靠 store 把 SSE 的 `session/update` 折进被观察的 transcript（`chatTranscripts` + `MAX_WATCHED` 上限）；**严禁**视图自己轮询。
 - **空流文案分两态**（`historyAwaitsReplay`）：released 且 `hasHistory`（恢复自磁盘的记录，历史在 agent 侧等回放）说「历史将在恢复后回放显示」；否则才是「还没有消息」——对一条聊天面里还留着昨天对话的会话说「还没有消息」，正是本文件文案规则要防的自相矛盾。
 
-**空状态有两种含义**：`chatTranscriptOf` 回 `undefined` 同时覆盖「从没被 NTR agent 服务过」与「ACP 会话记录已经没了」（`closeSession` / `forgetDshSession` 销毁记录，进程停掉就丢 bridge），而绑定与 chip 仍指着那个 agent。用一句话描述两种状态会让视图与芯片互相矛盾。
+**空状态有两种含义**：`chatTranscriptOf` 回 `undefined` 同时覆盖「从没被 NTR agent 服务过」与「ACP 会话记录已经没了」（`closeSession` / `forgetDshSession` 销毁记录；停止 agent 会关闭 live 行、它们照旧消失，但已 parked 的记录保留——停止只清 bridge 本地的挂起表，注册表行还在），而绑定与 chip 仍指着那个 agent。用一句话描述两种状态会让视图与芯片互相矛盾。
 
 - `boundAgentOf`（活会话 → 宿主 `chatBoundAgent` → 持久 `chatChoice`）先判「这台会话有没有 agent」，`acpEmptyCopy` 再选文案。
 - 有绑定时说「这个会话当前没有可显示的 ACP 会话」并提示「给它发一条消息」，hint 写 `绑定的是 · <agent>`；什么都没有时才说「这个会话还没有 NTR agent 参与」。

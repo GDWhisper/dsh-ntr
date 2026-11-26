@@ -607,9 +607,9 @@ describe('agent save/delete and released chat sessions (isolated manager)', () =
   }
 
   /** One conversation whose agent crashed once, so its record is parked. */
-  const parked = async (agentId: string, dshSessionId: string, storage: string): Promise<BridgeManager> => {
+  const parked = async (agentId: string, dshSessionId: string, storage: string, extra: Partial<AcpAgentDef> = {}): Promise<BridgeManager> => {
     const localHub = new EventHub()
-    const gm = new BridgeManager([{ ...targetDef, id: agentId }], localHub, 100, storage, `${storage}.catalog.json`)
+    const gm = new BridgeManager([{ ...targetDef, id: agentId, ...extra }], localHub, 100, storage, `${storage}.catalog.json`)
     // A save probes the model catalog by spawning; this suite owns its children.
     ;(gm as unknown as { probeAgentModels: (id: string) => Promise<unknown> }).probeAgentModels = async () => {}
     gm.bindChatAgent(dshSessionId, agentId)
@@ -673,6 +673,66 @@ describe('agent save/delete and released chat sessions (isolated manager)', () =
       expect(gm.chatSessions('dsh-new')).toEqual([])
       await chatTurn(gm, 'dsh-old', 'mixed', 'back again')
       expect(await chatEcho(gm, 'dsh-old')).toContain('REPLAYED: earlier conversation')
+    } finally {
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
+  it('keeps a record whose session/load is still in flight during the save', async () => {
+    const storage = `${tmpdir()}/acp-save-inflight-${Date.now()}.json`
+    const def: AcpAgentDef = { ...targetDef, id: 'racy', env: { MOCK_LOAD_DELAY_MS: '1200' } }
+    const gm = await parked('racy', 'dsh-racy', storage, def)
+    try {
+      const row = gm.chatSessions('dsh-racy')[0]
+      expect(row?.released).toBe(true)
+      // Replay lands first, the load RESPONSE is held open: the record is
+      // already marked live while the bridge has not registered it yet, so the
+      // stop cannot close it. Dropping the row here would lose the conversation.
+      void gm.setMode(row?.sessionId as string, 'default').catch(() => { /* the save tears the resume down */ })
+      await until(() => gm.chatSessions('dsh-racy')[0]?.released !== true)
+      await gm.saveAgent(def, 'direct')
+      expect(rows(storage).map(saved => saved.dshSessionId)).toEqual(['dsh-racy'])
+      expect(gm.chatSessions('dsh-racy')[0]?.released).toBe(true)
+      await chatTurn(gm, 'dsh-racy', 'racy', 'back again')
+      expect(await chatEcho(gm, 'dsh-racy')).toContain('REPLAYED: earlier conversation')
+    } finally {
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
+  it('refuses to borrow a parked holder while the agent is stopping', async () => {
+    const storage = `${tmpdir()}/acp-stop-gate-${Date.now()}.json`
+    const def: AcpAgentDef = { ...targetDef, id: 'gated', env: { MOCK_IGNORE_CLOSE: '1' } }
+    const gm = await parked('gated', 'dsh-gated', storage, def)
+    try {
+      await chatTurn(gm, 'dsh-live', 'gated', 'hello')
+      expect(gm.chatSessions('dsh-live')).toHaveLength(1)
+      // The wedged agent holds the live `session/close` open, so this stop is
+      // still awaiting when the next call lands.
+      const stopping = gm.stopAgent('gated')
+      await expect(gm.getOrCreateDshSession('dsh-gated', 'gated'))
+        .rejects.toMatchObject({ code: 'agent_stopping' })
+      await stopping
+      // The public stop persists, and the parked row it kept is still there.
+      expect(rows(storage).map(row => row.dshSessionId)).toEqual(['dsh-gated'])
+      expect(gm.chatSessions('dsh-gated')[0]?.released).toBe(true)
+      expect(gm.chatSessions('dsh-live')).toEqual([])
+    } finally {
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
+  it('drops the released rows of a saved, process-less agent on delete', async () => {
+    const storage = `${tmpdir()}/acp-save-then-delete-${Date.now()}.json`
+    const gm = await parked('gone', 'dsh-gone', storage)
+    try {
+      // The save removes the process slot but keeps the parked row; delete is
+      // the one gesture that must still drop it without a bridge to stop.
+      await gm.saveAgent({ ...targetDef, id: 'gone' }, 'direct')
+      expect(rows(storage)).toHaveLength(1)
+      await gm.deleteAgent('gone')
+      expect(rows(storage)).toEqual([])
+      expect(gm.chatSessions('dsh-gone')).toEqual([])
     } finally {
       await gm.shutdownAll()
     }
