@@ -2,6 +2,60 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [0.5.3] - 2026-11-26
+
+这一版补齐 Antigravity 的固定选择题、上下文压缩与失败原因呈现，并修掉停止或保存 agent 时丢掉聊天会话的两处缺陷。
+
+### 新增
+
+- **acp**：Antigravity 的固定选择题以问题卡单独呈现，不再被审批模式代答或跳过；到期可在「审批时限」选择取消或自动选第一项，对话与设置页同步显示。([22a2820](https://github.com/GDWhisper/dsh-ntr/commit/22a2820))
+- **acp**：Antigravity 压缩上下文时，对话内实时显示压缩过程与摘要，静默的 `/compact` 不再误报上游失败。([2096aba](https://github.com/GDWhisper/dsh-ntr/commit/2096aba))
+- **acp**：Antigravity 权限请求附带的安全警告显示在审批卡片上，对话与设置页镜像一致。([2096aba](https://github.com/GDWhisper/dsh-ntr/commit/2096aba))
+- **acp**：Antigravity 的配额、鉴权与接口失败从本地数据库读出后呈现到对话与 `/acp` 两面；配额被拒时首轮会话保留，限流横幅有处可显。([2096aba](https://github.com/GDWhisper/dsh-ntr/commit/2096aba))
+
+### 改进
+
+- **acp**：Antigravity agent 默认关闭 `fs.writeTextFile`，修改走 unified diff 而非整文件写入，可在设置页按 agent 显式开启。([2096aba](https://github.com/GDWhisper/dsh-ntr/commit/2096aba))
+
+### 修复
+
+- **acp**：保存 agent 不再丢掉空闲挂起的聊天会话，下一条消息恢复原上下文；只有删除 agent 才清空其会话记录。([f075665](https://github.com/GDWhisper/dsh-ntr/commit/f075665))
+- **acp**：带「其他」自定义输入的选择题不再拆成两页，一个逻辑问题一页展示。([1dc3772](https://github.com/GDWhisper/dsh-ntr/commit/1dc3772))
+- **acp**：停止 agent 不再摧毁恢复进行中的会话。([e09d2b4](https://github.com/GDWhisper/dsh-ntr/commit/e09d2b4))
+
+### 贡献者
+
+- [@wghango-sudo](https://github.com/wghango-sudo)（首次贡献）
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.5.2...v0.5.3
+
+---
+
+This release completes Antigravity's fixed-choice questions, context compaction, and failure reporting, and fixes two defects that dropped chat conversations when an agent was stopped or saved.
+
+### Added
+
+- **acp**: Antigravity's fixed-choice questions render as question cards instead of being auto-answered or skipped; expiry can cancel or auto-pick the first option under Approval deadlines, and cards appear in both the conversation dock and the Settings mirror. ([22a2820](https://github.com/GDWhisper/dsh-ntr/commit/22a2820))
+- **acp**: context compaction in Antigravity now streams its progress and summary into the conversation, and a silent `/compact` no longer reports a false upstream failure. ([2096aba](https://github.com/GDWhisper/dsh-ntr/commit/2096aba))
+- **acp**: security warnings attached to Antigravity permission requests now appear on the approval cards in the conversation and the Settings mirror. ([2096aba](https://github.com/GDWhisper/dsh-ntr/commit/2096aba))
+- **acp**: quota, authentication, and API failures recorded in Antigravity's local database now surface in the conversation and on the `/acp` plane; a quota refusal keeps the first-turn session alive so the rate-limit banner has somewhere to show. ([2096aba](https://github.com/GDWhisper/dsh-ntr/commit/2096aba))
+
+### Improved
+
+- **acp**: `fs.writeTextFile` is now disabled by default for Antigravity agents so edits stay unified diffs instead of whole-file writes; it can be enabled per agent in Settings. ([2096aba](https://github.com/GDWhisper/dsh-ntr/commit/2096aba))
+
+### Fixed
+
+- **acp**: saving an agent no longer drops its idle-parked conversations — the next message resumes the original context; only deleting the agent clears its conversation records. ([f075665](https://github.com/GDWhisper/dsh-ntr/commit/f075665))
+- **acp**: a choice question with a custom "other" answer stays on a single page instead of splitting into two. ([1dc3772](https://github.com/GDWhisper/dsh-ntr/commit/1dc3772))
+- **acp**: stopping an agent no longer destroys a conversation whose resume is still in flight. ([e09d2b4](https://github.com/GDWhisper/dsh-ntr/commit/e09d2b4))
+
+### Contributors
+
+- [@wghango-sudo](https://github.com/wghango-sudo) (first contribution)
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.5.2...v0.5.3
+
 ## [0.5.2] - 2026-11-26
 
 这一版补上 ACP 表单提问与插件级共享 MCP 管理，并让 agent 回复里的本地文件链接可以直接打开。
