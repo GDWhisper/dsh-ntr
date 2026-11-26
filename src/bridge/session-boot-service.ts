@@ -65,6 +65,10 @@ export class SessionBootService {
       throw new AcpError('unknown_session', `acp: no ACP session is bound to chat session ${dshSessionId}`)
     }
     if (lifecycleOf(target) !== 'parked') return
+    // Acquisition, not a read: a stop owns the agent until its teardown lands.
+    if (this.host.bridgeRegistry.isStopping(target.agentId)) {
+      throw new AcpError('agent_stopping', `acp: agent "${target.agentId}" is stopping; send again once it has stopped`)
+    }
     // The parked record belongs to the holder it was parked on (A1); resuming
     // on any other process would open the same session twice.
     const bridge = this.host.bridgeRegistry.bridgeForSession(target)
@@ -98,10 +102,14 @@ export class SessionBootService {
         )
       }
     }
+    if (this.host.bridgeRegistry.isStopping(agentId)) {
+      throw new AcpError('agent_stopping', `acp: agent "${agentId}" is stopping; send again once it has stopped`)
+    }
     const existing = this.host.registry.sessionAt(dshSessionId, agentId)
     if (existing !== undefined && lifecycleOf(existing) === 'live') {
       const owner = this.host.bridgeRegistry.bridgeOwning(agentId, existing.sessionId)
-      // A LIVE record must have a holder. This state is not reachable today:
+      // A LIVE record must have a holder. Outside a stop window this state is
+      // unreachable:
       // every production deletion path parks the record first (`closeSession` /
       // `forceReset` set `closed`, a failed resume sets `released`), so only the
       // test suite synthesizes a live record without an owner to pin this

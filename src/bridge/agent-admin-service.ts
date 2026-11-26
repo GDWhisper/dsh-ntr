@@ -48,7 +48,8 @@ import { classifyTestFailure } from './test-failure.ts'
  * Two members are deliberately composite, because the caller must never see a
  * half-applied step:
  * - {@link stopAgent} stops every live bridge AND drops the bare process slot
- *   in one guarded step (a no-op when the agent has no process);
+ *   in one guarded step (with no process it still handles the session records
+ *   per `keepReleased`, which is what delete relies on);
  * - {@link removeDef} drops the definition AND every pointer into it (the
  *   persisted default, the request-path route bindings, the catalog / fork
  *   cache).
@@ -70,10 +71,14 @@ export interface AgentAdminHost {
   /** Whether any process slot exists for the agent (the save / delete stop guard). */
   hasBridge(agentId: string): boolean
   /**
-   * Stop every live bridge of the agent and drop its bare process slot. A
-   * no-op when no bridge exists, so a caller may fire it unconditionally.
+   * Stop every live bridge of the agent and drop its bare process slot. With
+   * no process there is nothing to tear down; the session records are still
+   * handled per `keepReleased`, so a caller may fire it unconditionally.
+   * `keepReleased` (default) spares the parked records (see
+   * `BridgeRegistryService.stopAgent`); a delete passes `false` so the removed
+   * agent cannot resurrect its contexts.
    */
-  stopAgent(agentId: string, persist?: boolean): Promise<void>
+  stopAgent(agentId: string, persist?: boolean, keepReleased?: boolean): Promise<void>
   /**
    * Write `agents.json`. `strict` is for a user-awaited save/delete: a failed
    * write throws `persist_failed` instead of staying silent. `staged` lands in
@@ -470,10 +475,10 @@ export class AgentAdminService {
     // and a deferred snapshot flushing afterwards would write the definition
     // straight back into `agents.json` (the deleted agent would come back).
     this.saveGate?.cancel(`agent-save:${agentId}`)
-    if (this.host.hasBridge(agentId)) {
-      // This method performs its own strict registry write below.
-      await this.host.stopAgent(agentId, false)
-    }
+    // This method performs its own strict registry write below. `keepReleased:
+    // false` drops the parked rows too: the agent is gone, and leaving them
+    // would hand their contexts back the moment the same id is added again.
+    await this.host.stopAgent(agentId, false, false)
     // Definition AND every pointer into it: the persisted default, the route
     // bindings and the catalog / fork cache, in that order.
     this.host.removeDef(agentId)

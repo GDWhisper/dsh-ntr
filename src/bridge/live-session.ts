@@ -70,6 +70,13 @@ export interface LiveSession {
    */
   lifecycle: SessionLifecycle
   /**
+   * The generation of the resume attempt currently allowed to touch this
+   * record. A stop can abandon a `session/load` that is still starting up; the
+   * next message may then start a NEW resume on a new holder with the SAME
+   * record. The abandoned attempt must not park or register it afterwards.
+   */
+  resumeAttempt?: number
+  /**
    * The agent-side session has history while the LOCAL buffer is empty: this
    * record was restored from disk after a host restart (the replay has not
    * landed yet), or a resume cleared the buffer ahead of the replay. The ACP

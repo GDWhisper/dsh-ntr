@@ -410,7 +410,9 @@ export interface AcpEmptyCopy {
  * where two real defects lived. `chatTranscriptOf` answering `undefined` covers
  * TWO different states — "this conversation has never been served by an NTR
  * agent" and "its ACP session record is gone" (a closed session is destroyed by
- * `closeSession`/`forgetDshSession`, a stopped agent drops its bridge) while the
+ * `closeSession`/`forgetDshSession`; a stop closes live rows but keeps the
+ * parked one, so only a close or delete leaves a parked conversation without
+ * a record) while the
  * binding and the composer chip still name the agent. Claiming the first state
  * in both cases made the view contradict the chip sitting one row above it.
  *
