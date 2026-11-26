@@ -193,6 +193,127 @@ describe('ACP tool-call notifications → tool-call stream chunks', () => {
     expect(text).toContain('"terminalId":"t1"')
   })
 
+  it('extracts toolKind, rawToolName (name then case-sensitive _meta *toolName), and valid locations in deterministic key order', () => {
+    const snapshot = acpToolCallFromUpdate({
+      toolCallId: 'm1',
+      title: 'Read src/app.ts',
+      kind: 'read',
+      name: 'Read',
+      _meta: { 'codebuddy.ai/toolName': 'IgnoredBecauseNamePresent' },
+      locations: [
+        { path: 'src/app.ts', line: 12 },
+        { path: 'src/util.ts', line: 0 },
+        { path: 'src/nolines.ts', line: null },
+        { path: 'src/float.ts', line: 3.5 },
+        { path: 'src/inf.ts', line: Number.POSITIVE_INFINITY },
+        { path: 'src/strline.ts', line: '10' },
+        { path: '' },
+        { line: 5 },
+        null,
+        'invalid',
+      ],
+      rawInput: { path: 'src/app.ts' },
+    })!
+
+    expect(snapshot.name).toBe(ACP_TOOL_CALL_NAME)
+    expect(snapshot.toolKind).toBe('read')
+    expect(snapshot.rawToolName).toBe('Read')
+    expect(snapshot.locations).toEqual([
+      { path: 'src/app.ts', line: 12 },
+      { path: 'src/util.ts', line: 0 },
+      { path: 'src/nolines.ts' },
+      { path: 'src/float.ts' },
+      { path: 'src/inf.ts' },
+      { path: 'src/strline.ts' },
+    ])
+
+    const parsed = JSON.parse(snapshot.argsRaw) as Record<string, unknown>
+    expect(Object.keys(parsed)).toEqual(['description', 'kind', 'tool', 'locations', 'input'])
+    expect(parsed).toEqual({
+      description: 'Read src/app.ts',
+      kind: 'read',
+      tool: 'Read',
+      locations: snapshot.locations,
+      input: { path: 'src/app.ts' },
+    })
+
+    // Fallback to _meta key ending with case-sensitive 'toolName'; lowercase 'toolname' is ignored.
+    const metaOnly = acpToolCallFromUpdate({
+      toolCallId: 'm2',
+      title: 'Run tests',
+      _meta: { 'other/toolname': 'WrongCase', 'codebuddy.ai/toolName': 'Bash', empty: '' },
+      locations: [],
+    })!
+    expect(metaOnly.rawToolName).toBe('Bash')
+    expect(metaOnly.locations).toBeUndefined()
+    expect(Object.keys(JSON.parse(metaOnly.argsRaw) as Record<string, unknown>)).toEqual(['description', 'tool'])
+
+    // Direct 'toolName' key in _meta also matches, while non-string or empty values are ignored.
+    const directMeta = acpToolCallFromUpdate({
+      toolCallId: 'm3',
+      title: 'Edit file',
+      kind: '',
+      name: '',
+      _meta: { 'a/toolName': '', 'b/toolName': 42, toolName: 'Edit' },
+    })!
+    expect(directMeta.toolKind).toBeUndefined()
+    expect(directMeta.rawToolName).toBe('Edit')
+    expect(Object.keys(JSON.parse(directMeta.argsRaw) as Record<string, unknown>)).toEqual(['description', 'tool'])
+  })
+
+  it('preserves toolKind, rawToolName, and locations across partial tool_call_update frames and overwrites only on non-empty values', () => {
+    const snapshot = acpToolCallFromUpdate({
+      toolCallId: 'u1',
+      title: 'Run ls',
+      kind: 'execute',
+      _meta: { 'codebuddy.ai/toolName': 'Bash' },
+      locations: [{ path: 'src/a.ts', line: 3 }],
+      rawInput: { command: 'ls' },
+    })!
+
+    // Partial update with new rawInput omitting kind / tool / locations preserves prior metadata and keeps description first.
+    acpToolCallDelta(snapshot, { toolCallId: 'u1', rawInput: { command: 'ls -la' } })
+    expect(snapshot.toolKind).toBe('execute')
+    expect(snapshot.rawToolName).toBe('Bash')
+    expect(snapshot.locations).toEqual([{ path: 'src/a.ts', line: 3 }])
+    const afterInput = JSON.parse(snapshot.argsRaw) as Record<string, unknown>
+    expect(Object.keys(afterInput)).toEqual(['description', 'kind', 'tool', 'locations', 'input'])
+    expect(afterInput.input).toEqual({ command: 'ls -la' })
+
+    // Empty / invalid incoming metadata does not clear previously observed metadata.
+    acpToolCallDelta(snapshot, {
+      toolCallId: 'u1',
+      kind: '',
+      name: '',
+      _meta: { 'codebuddy.ai/toolName': '' },
+      locations: [{ path: '' }],
+      status: 'in_progress',
+    })
+    expect(snapshot.toolKind).toBe('execute')
+    expect(snapshot.rawToolName).toBe('Bash')
+    expect(snapshot.locations).toEqual([{ path: 'src/a.ts', line: 3 }])
+
+    // Metadata-only update overwrites with non-empty values while preserving description and existing input.
+    acpToolCallDelta(snapshot, {
+      toolCallId: 'u1',
+      kind: 'edit',
+      name: 'Write',
+      locations: [{ path: 'src/b.ts', line: 9 }],
+    })
+    expect(snapshot.toolKind).toBe('edit')
+    expect(snapshot.rawToolName).toBe('Write')
+    expect(snapshot.locations).toEqual([{ path: 'src/b.ts', line: 9 }])
+    const afterMeta = JSON.parse(snapshot.argsRaw) as Record<string, unknown>
+    expect(Object.keys(afterMeta)).toEqual(['description', 'kind', 'tool', 'locations', 'input'])
+    expect(afterMeta).toEqual({
+      description: 'Run ls',
+      kind: 'edit',
+      tool: 'Write',
+      locations: [{ path: 'src/b.ts', line: 9 }],
+      input: { command: 'ls -la' },
+    })
+  })
+
   it('describes a notification it has no card for without dropping its payload', () => {
     expect(describeUnhandledUpdate('plan', {
       entries: [{ content: 'fix the bug', status: 'in_progress', priority: 'high' }],

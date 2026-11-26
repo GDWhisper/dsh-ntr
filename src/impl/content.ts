@@ -53,19 +53,96 @@ export const ACP_TOOL_CALL_NAME = 'dsh_ntr__acp_tool_call'
  * disclosed input under `input`, so nothing is dropped when the name became a
  * constant and the host's preparing row can read the operation live.
  */
+/** A validated file location declared on an ACP tool call. */
+export interface AcpToolLocation {
+  path: string
+  line?: number
+}
+
+/**
+ * One ACP tool call, narrowed to what the Chat plane's tool-call renderer shows.
+ *
+ * `callId` is the ACP `toolCallId` - the only identity the agent gives, and the
+ * Chat renderer's grouping key. `name` is the fixed ACP_TOOL_CALL_NAME (empty
+ * only for a content-less status-only update, which the bridge skips as a
+ * phantom card). `title` is the agent's own label, often a whole command;
+ * `argsRaw` is a JSON object carrying that label in `description`, any
+ * preserved ACP metadata (`kind`, `tool`, `locations`), and the disclosed input
+ * under `input`, so nothing is dropped when the name became a constant and the
+ * host's preparing row can read the operation live.
+ */
 export interface AcpToolCallSnapshot {
   callId: string
   name: string
   /** The agent's own `title` label (kept so title-less updates don't drop it). */
   title: string
-  /** JSON argument payload: `description` (the operation) plus `input` (verbatim). */
+  /** JSON argument payload: `description`, optional metadata (`kind`, `tool`, `locations`), plus `input`. */
   argsRaw: string
+  /** ACP `ToolCall.kind` (e.g. `execute`, `read`, `edit`), when disclosed. */
+  toolKind?: string
+  /** Raw ACP tool name (`update.name` or `_meta` `*toolName`), when disclosed. */
+  rawToolName?: string
+  /** Validated `ToolCall.locations` entries, when disclosed. */
+  locations?: AcpToolLocation[]
+}
+
+interface AcpToolMetadata {
+  toolKind?: string
+  rawToolName?: string
+  locations?: AcpToolLocation[]
 }
 
 /** A delta of tool-call content, folded into the open snapshot. */
 export type AcpToolCallDelta =
   | { kind: 'name'; name: string }
   | { kind: 'args'; text: string }
+
+/** Extract declared `toolKind`, `rawToolName`, and `locations` from an ACP tool-call frame without guessing. */
+function acpToolMetadataOf(update: Record<string, unknown>): AcpToolMetadata {
+  const toolKind = typeof update.kind === 'string' && update.kind !== '' ? update.kind : undefined
+  const rawToolName = rawToolNameOf(update)
+  const locations = toolLocationsOf(update.locations)
+  return {
+    ...(toolKind === undefined ? {} : { toolKind }),
+    ...(rawToolName === undefined ? {} : { rawToolName }),
+    ...(locations === undefined ? {} : { locations }),
+  }
+}
+
+/** Read `update.name` first, else a `_meta` string entry whose key has case-sensitive suffix `'toolName'`. */
+function rawToolNameOf(update: Record<string, unknown>): string | undefined {
+  if (typeof update.name === 'string' && update.name !== '') return update.name
+  const meta = update._meta
+  if (typeof meta !== 'object' || meta === null || Array.isArray(meta)) return undefined
+  for (const [key, value] of Object.entries(meta as Record<string, unknown>)) {
+    if (key.endsWith('toolName') && typeof value === 'string' && value !== '') return value
+  }
+  return undefined
+}
+
+/** Keep only `locations` entries with a non-empty string `path` and optional finite integer `line`. */
+function toolLocationsOf(raw: unknown): AcpToolLocation[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const out: AcpToolLocation[] = []
+  for (const entry of raw) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue
+    const row = entry as Record<string, unknown>
+    if (typeof row.path !== 'string' || row.path === '') continue
+    const loc: AcpToolLocation = { path: row.path }
+    if (typeof row.line === 'number' && Number.isInteger(row.line)) loc.line = row.line
+    out.push(loc)
+  }
+  return out.length > 0 ? out : undefined
+}
+
+/** Recover a previously serialized `input` field when a metadata-only update omits `rawInput`/`arguments`. */
+function preservedInputOf(argsRaw: string): { hasInput: boolean; value: unknown } | undefined {
+  if (argsRaw === '') return undefined
+  const parsed = parseJson(argsRaw)
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+  if (!Object.hasOwn(parsed, 'input')) return undefined
+  return { hasInput: true, value: (parsed as Record<string, unknown>).input }
+}
 
 /**
  * Build the card's argument payload as a JSON object the host's live preparing
@@ -75,22 +152,38 @@ export type AcpToolCallDelta =
  * variant) and, while the tool runs, renders ONLY a one-line summary parsed from
  * a `description` field (`argumentSummary` reads `args.text("description")`); it
  * never shows the raw body during preparing. So the operation label goes into
- * `description` — the FIRST key, readable as soon as the JSON lands — and the
- * agent's disclosed input is preserved as a structured copy under `input`
- * (constraint 29: no silent drop; the verbatim text stays in the ACP transcript
- * via `toolInputOf`). The old `title\n{json}` text was not valid JSON, so the host read
- * no field and the preparing row fell back to the bare tool name: the operation
- * was invisible until the tool finished. Both the creating and the updating path
- * use this, so a rewritten title still lands in `description`. No truncation: the
- * full text is kept (a cut would need a marker).
+ * `description` — the FIRST key, readable as soon as the JSON lands — followed
+ * deterministically by `kind`, `tool`, `locations`, and `input` (constraint 29:
+ * no silent drop; the verbatim text stays in the ACP transcript via `toolInputOf`).
  */
-function acpToolArgsJson(title: string, args: string): string {
+function acpToolArgsJson(
+  title: string,
+  args: string,
+  meta: AcpToolMetadata = {},
+  preservedInput?: { hasInput: boolean; value: unknown },
+): string {
   const parsed = args === '' ? undefined : parseJson(args)
-  const description = operationLabel(title, args, parsed)
-  if (description === undefined && args === '') return ''
+  const hasInput = args !== '' || preservedInput?.hasInput === true
+  const inputValue = args !== '' ? (parsed === undefined ? args : parsed) : preservedInput?.value
+  const labelArgs = args !== ''
+    ? args
+    : (hasInput ? (typeof inputValue === 'string' ? inputValue : jsonOf(inputValue)) : '')
+  const labelParsed = args !== '' ? parsed : (typeof inputValue === 'object' ? inputValue : undefined)
+  const description = operationLabel(title, labelArgs, labelParsed)
+  const hasLocations = meta.locations !== undefined && meta.locations.length > 0
+  if (
+    description === undefined
+    && !hasInput
+    && meta.toolKind === undefined
+    && meta.rawToolName === undefined
+    && !hasLocations
+  ) return ''
   const payload: Record<string, unknown> = {}
   if (description !== undefined) payload.description = description
-  if (args !== '') payload.input = parsed === undefined ? args : parsed
+  if (meta.toolKind !== undefined) payload.kind = meta.toolKind
+  if (meta.rawToolName !== undefined) payload.tool = meta.rawToolName
+  if (hasLocations) payload.locations = meta.locations
+  if (hasInput) payload.input = inputValue
   return JSON.stringify(payload)
 }
 
@@ -156,12 +249,13 @@ export function acpToolCallFromUpdate(update: Record<string, unknown>): AcpToolC
   const callId = typeof update.toolCallId === 'string' ? update.toolCallId.trim() : ''
   if (callId === '') return undefined
   const title = typeof update.title === 'string' && update.title !== '' ? update.title : ''
-  const argsRaw = acpToolArgsJson(title, acpToolCallArgsOf(update))
+  const meta = acpToolMetadataOf(update)
+  const argsRaw = acpToolArgsJson(title, acpToolCallArgsOf(update), meta)
   // A content-less status-only update keeps an empty name: the bridge's
   // phantom-card guard relies on (name === '' && argsRaw === '') to skip it.
   // Every real card gets the fixed constant, never the agent's own title.
   const name = argsRaw === '' ? '' : ACP_TOOL_CALL_NAME
-  return { callId, name, title, argsRaw }
+  return { callId, name, title, argsRaw, ...meta }
 }
 
 /**
@@ -183,13 +277,27 @@ export function isFinalToolCallStatus(status: unknown): boolean {
  * so the deltas produced here are the extension suffix only, and the snapshot
  * itself always moves to the latest known text (the closing `block-end` frame
  * replaces the block wholesale, which is what makes a non-extension update
- * land correctly in the settled card).
+ * land correctly in the settled card). Previously observed `toolKind`,
+ * `rawToolName`, and `locations` are preserved when omitted.
  */
 export function acpToolCallDelta(
   snapshot: AcpToolCallSnapshot,
   update: Record<string, unknown>,
 ): AcpToolCallDelta[] {
   const deltas: AcpToolCallDelta[] = []
+  const incomingMeta = acpToolMetadataOf(update)
+  const hasMetaUpdate =
+    incomingMeta.toolKind !== undefined
+    || incomingMeta.rawToolName !== undefined
+    || incomingMeta.locations !== undefined
+  if (incomingMeta.toolKind !== undefined) snapshot.toolKind = incomingMeta.toolKind
+  if (incomingMeta.rawToolName !== undefined) snapshot.rawToolName = incomingMeta.rawToolName
+  if (incomingMeta.locations !== undefined) snapshot.locations = incomingMeta.locations
+  const mergedMeta: AcpToolMetadata = {
+    ...(snapshot.toolKind === undefined ? {} : { toolKind: snapshot.toolKind }),
+    ...(snapshot.rawToolName === undefined ? {} : { rawToolName: snapshot.rawToolName }),
+    ...(snapshot.locations === undefined ? {} : { locations: snapshot.locations }),
+  }
   // The card name is a fixed constant. Agents (codebuddy among them) rewrite
   // `title` mid-call, so emitting that raw text as a name delta would re-inject
   // a long shell command as a host tool name. Emit NO name delta; the (possibly
@@ -197,7 +305,7 @@ export function acpToolCallDelta(
   // this path and acpToolCallFromUpdate.
   const incoming = typeof update.title === 'string' && update.title !== '' ? update.title : ''
   const args = acpToolCallArgsOf(update)
-  if (incoming === '' && args === '') {
+  if (incoming === '' && args === '' && !hasMetaUpdate) {
     // A status-only update carries no new body text: keep the card as-is, and
     // let `content` fill only a call whose agent never disclosed any input.
     if (snapshot.argsRaw === '') {
@@ -207,7 +315,7 @@ export function acpToolCallDelta(
           snapshot.name = ACP_TOOL_CALL_NAME
           deltas.push({ kind: 'name', name: ACP_TOOL_CALL_NAME })
         }
-        const json = acpToolArgsJson(text, '')
+        const json = acpToolArgsJson(text, '', mergedMeta)
         deltas.push({ kind: 'args', text: json })
         snapshot.argsRaw = json
       }
@@ -216,7 +324,15 @@ export function acpToolCallDelta(
   }
   const title = incoming !== '' ? incoming : snapshot.title
   snapshot.title = title
-  const next = acpToolArgsJson(title, args)
+  const contentFallback = title === '' && args === '' && snapshot.argsRaw === ''
+    ? updateContentToText(update.content)
+    : ''
+  const next = acpToolArgsJson(
+    title !== '' ? title : contentFallback,
+    args,
+    mergedMeta,
+    args === '' ? preservedInputOf(snapshot.argsRaw) : undefined,
+  )
   if (snapshot.name !== ACP_TOOL_CALL_NAME) {
     snapshot.name = ACP_TOOL_CALL_NAME
     deltas.push({ kind: 'name', name: ACP_TOOL_CALL_NAME })
