@@ -391,10 +391,12 @@ const STYLE = `
 .dwa-acc-titles { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .dwa-acc-name { font-size: var(--ntr-font); font-weight: 600; overflow-wrap: anywhere; }
 .dwa-acc-pills { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
-/* What a delegation profile overrides, at a glance: the value is the fact, so
-   a set axis reads in business ink and an unset one stays quiet gray. */
+/* Every axis value the head names — the profile's own pick and the process
+   default it falls back to alike — reads as ONE badge: the value is the fact,
+   and a second colour would only say which of them the user typed, which the
+   body's dropdowns already answer. */
 .dwa-sum-pill { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 7px; border-radius: 5px; font-size: var(--ntr-font-xs); line-height: 1.6; background: var(--dsw-alias-bg-layer-2, #f3f4f6); color: var(--ntr-muted); }
-.dwa-sum-pill.is-set { background: var(--dsw-alias-state-business-tertiary, #dbeafe); color: var(--dsw-alias-state-business-primary, #2563eb); font-weight: 550; }
+.dwa-sum-pill.is-value { background: var(--dsw-alias-state-business-tertiary, #dbeafe); color: var(--dsw-alias-state-business-primary, #2563eb); font-weight: 550; }
 /* A profile that outranks the config file says so even while folded: the head
    is the only band a collapsed card shows, and constraint 33 does not allow an
    override fact to hide behind a click. */

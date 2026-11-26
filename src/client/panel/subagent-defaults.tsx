@@ -406,15 +406,15 @@ function axisValueName(choices: AcpCatalogChoice[] | undefined, value: string): 
 /**
  * One configured agent's delegation profile, as a foldable card.
  *
- * The head is the summary line: the agent's name, one pill per axis naming the
- * value that will actually run — the profile's own pick highlighted, the agent
- * process's current value plain when the axis is left on「默认」— plus whether
- * the profile outranks the config file. The old layout could not show any of
- * that without reading four controls and comparing them with「默认」, and that
- * is why the head exists at all. The body is the form: the three axes as one
- * row of three equal columns (the old `flex: 1 1 150px` wrapped them into a
- * lopsided 2+1), the description, and one footer that holds the catalog's age,
- * its refresh gesture and the config-file reset.
+ * The head is the summary line: the agent's name, one badge per axis naming the
+ * value that will actually run — the profile's own pick and the agent process's
+ * current value alike, in one style — plus whether the profile outranks the
+ * config file. The old layout could not show any of that without reading four
+ * controls and comparing them with「默认」, and that is why the head exists at
+ * all. The body is the form: the three axes as one row of three equal columns
+ * (the old `flex: 1 1 150px` wrapped them into a lopsided 2+1), the description,
+ * and one footer that holds the catalog's age, its refresh gesture and the
+ * config-file reset.
  *
  * Folding is display-toggled, never unmounted: the description keeps a local
  * draft that is committed on blur, and folding mid-edit must not lose it.
@@ -484,24 +484,22 @@ function AgentDefaultsRow(props: {
     shownDescription === undefined ? undefined : acp.label(`描述「${shownDescription}」`, `description "${shownDescription}"`),
   ].filter(part => part !== undefined).join(' · ')
 
-  // One pill per axis: the value this profile SETS (highlighted `is-set`), or —
+  // One pill per axis, all in the same badge: the value this profile SETS, or —
   // for an axis left on「默认」— the agent process's own current value the
-  // cached catalog reports (plain). The head therefore answers "what will this
-  // agent run with" without opening the card, and still shows at a glance which
-  // of those values the profile overrides. An axis the catalog says nothing
-  // about (unread snapshot, missing / boolean slot, no current value, an
-  // unobserved model) gets no pill — there is no value to name, and inventing
-  // one would be a lie; a card that knows nothing on any axis falls back to the
-  // one plain sentence below.
+  // cached catalog reports. The head therefore answers "what will this agent
+  // run with" without opening the card, and no colour is spent on saying which
+  // of the two a value is (the body's dropdowns answer that, and constraint 33
+  // keeps the head to facts). An axis the catalog says nothing about (unread
+  // snapshot, missing / boolean slot, no current value, an unobserved model)
+  // gets no pill — there is no value to name, and inventing one would be a lie;
+  // a card that knows nothing on any axis falls back to the sentence below.
   const axisPills = (['model', 'effort', 'mode'] as const).flatMap(axis => {
-    const set = entry?.[axis]
-    const value = set ?? processDefaultValue(catalog, axis, entry?.model)
+    const value = entry?.[axis] ?? processDefaultValue(catalog, axis, entry?.model)
     if (value === undefined) return []
     const axisName = axis === 'model' ? acp.label('模型', 'Model')
       : axis === 'effort' ? acp.label('等级', 'Level')
         : acp.label('模式', 'Mode')
-    const text = `${axisName} ${axisValueName(axisChoices(catalog, axis, entry?.model), value)}`
-    return [{ text, set: set !== undefined }]
+    return [`${axisName} ${axisValueName(axisChoices(catalog, axis, entry?.model), value)}`]
   })
 
   return (
@@ -522,9 +520,7 @@ function AgentDefaultsRow(props: {
                 <>
                   {axisPills.length === 0
                     ? <span className="dwa-sum-pill">{acp.label('全部跟随进程默认', 'All follow the process')}</span>
-                    : axisPills.map(pill => (
-                      <span key={pill.text} className={pill.set ? 'dwa-sum-pill is-set' : 'dwa-sum-pill'}>{pill.text}</span>
-                    ))}
+                    : axisPills.map(text => <span key={text} className="dwa-sum-pill is-value">{text}</span>)}
                   {entry?.description !== undefined && (
                     <span className="dwa-sum-pill">{acp.label('已填描述', 'Description set')}</span>
                   )}

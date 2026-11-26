@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 // The delegation-defaults CARD itself — the figure the spec file next door
 // (`subagent-defaults.spec.ts`) covers the axes and the catalog through.
-// Three facts live only here: what the folded head summarises (one pill per
-// axis naming the value that will actually run — the profile's own pick
-// highlighted, the agent process's current value plain), that a first visit
+// Three facts live only here: what the folded head summarises (one badge per
+// axis naming the value that will actually run — the profile's own pick and
+// the agent process's current value alike, in one style), that a first visit
 // arrives FOLDED — one summary line per agent, the form behind that agent's
 // own head — and that folding is a display toggle rather than a remount (the
 // description keeps a local draft that commits on blur, so unmounting it would
@@ -37,20 +37,21 @@ function pillsOf(agentId: string): HTMLElement {
 }
 
 describe('SubagentDefaults — the card head', () => {
-  it('names every axis’s effective value on the folded head — the profile’s pick highlighted, the process default plain', async () => {
+  it('names every axis’s effective value on the folded head, all in one badge style', async () => {
     await mountDefaults({
       ...DELEGATE_BASE,
       agentDefaults: { codebuddy: { model: 'deepseek-v3', effort: 'high', description: '只改单文件' } },
     }, { keepFolded: true })
     await category('子智能体')
     // The head answers "what will this agent run with" without opening the
-    // card: the two axes this profile sets are named AND highlighted, so the
-    // override stays visible at a glance. The cached catalog arrives on its own
-    // async read, so the name resolution is awaited rather than assumed.
+    // card, and every axis value reads as the SAME badge — the profile's own
+    // pick and the process default it falls back to are both just values, so no
+    // second style splits them. The cached catalog arrives on its own async
+    // read, so the name resolution is awaited rather than assumed.
     const pills = pillsOf('codebuddy')
     await waitFor(() => {
-      expect(within(pills).getByText('模型 DeepSeek V3').className).toContain('is-set')
-      expect(within(pills).getByText('等级 High').className).toContain('is-set')
+      expect(within(pills).getByText('模型 DeepSeek V3').className).toContain('is-value')
+      expect(within(pills).getByText('等级 High').className).toContain('is-value')
     })
     expect(within(pills).getByText('已填描述')).toBeDefined()
     // CodeBuddy publishes no mode slot, so no mode pill is invented, and a head
@@ -58,10 +59,10 @@ describe('SubagentDefaults — the card head', () => {
     expect(within(pills).queryByText(/^模式 /)).toBeNull()
     expect(within(pills).queryByText('全部跟随进程默认')).toBeNull()
     // pi sets nothing: its model pill names the PROCESS value the cached
-    // catalog reports, plain — no longer waiting for the user to override.
+    // catalog reports — same badge, no longer waiting for the user to override.
     const piPills = pillsOf('pi')
     await waitFor(() => expect(within(piPills).getByText('模型 GPT-5')).toBeDefined())
-    expect(within(piPills).getByText('模型 GPT-5').className).not.toContain('is-set')
+    expect(within(piPills).getByText('模型 GPT-5').className).toContain('is-value')
     // pi publishes no thought / mode slot either, so those axes stay silent
     // instead of showing a raw-id pill.
     expect(within(piPills).queryByText(/^等级 /)).toBeNull()
@@ -69,16 +70,16 @@ describe('SubagentDefaults — the card head', () => {
     expect(within(piPills).queryByText('全部跟随进程默认')).toBeNull()
   })
 
-  it('mixes a highlighted set axis with a plain inherited one on the same head', async () => {
+  it('names an inherited axis and a set axis in the same badge on one head', async () => {
     await mountDefaults({ ...DELEGATE_BASE, agentDefaults: { codebuddy: { effort: 'high' } } }, { keepFolded: true })
     await category('子智能体')
     const pills = pillsOf('codebuddy')
-    // The model follows the process — named from the cached catalog, plain; the
-    // level is this profile's own pick — highlighted. Both name resolutions
-    // wait for the catalog's async read.
+    // The model follows the process, the level is this profile's own pick — and
+    // both render as the same badge. Both name resolutions wait for the
+    // catalog's async read.
     await waitFor(() => {
-      expect(within(pills).getByText('模型 DeepSeek V3').className).not.toContain('is-set')
-      expect(within(pills).getByText('等级 High').className).toContain('is-set')
+      expect(within(pills).getByText('模型 DeepSeek V3').className).toContain('is-value')
+      expect(within(pills).getByText('等级 High').className).toContain('is-value')
     })
     expect(within(pills).queryByText('全部跟随进程默认')).toBeNull()
   })
@@ -91,7 +92,7 @@ describe('SubagentDefaults — the card head', () => {
     await category('子智能体')
     await waitFor(() => expect(within(pillsOf('codebuddy')).getByText('模型 hy4free')).toBeDefined())
     expect(within(pillsOf('codebuddy')).queryByText('模型 Hy4 flash')).toBeNull()
-    expect(within(pillsOf('codebuddy')).getByText('模型 hy4free').className).not.toContain('is-set')
+    expect(within(pillsOf('codebuddy')).getByText('模型 hy4free').className).toContain('is-value')
   })
 
   it('keeps the one fallback sentence for an agent whose catalog names no value on any axis', async () => {
