@@ -102,7 +102,7 @@ export class BridgeRegistryService {
     // EXISTING holder — it is already in the stop snapshot and going down, so
     // handing it out would act on a dying process — and never mint a new one.
     if (this.stoppingAgents.has(agentId)) {
-      throw new AcpError('agent_stopping', `acp: agent "${agentId}" is stopping; send again once it has stopped`)
+      throw this.stoppingError(agentId)
     }
     const key = bridgeKey(agentId, scope)
     let bridge = this.bridges.get(key)
@@ -155,10 +155,17 @@ export class BridgeRegistryService {
     return undefined
   }
 
+  /** Whether a stop currently owns this agent (see `stopAgent`). */
+  isStopping(agentId: string): boolean {
+    return this.stoppingAgents.has(agentId)
+  }
+
   /**
    * The bridge that OWNS a session right now: live, parked, or resuming. Never
    * throws and never creates, so a lookup for a session that is already gone
-   * cannot resurrect a process.
+   * cannot resurrect a process. A stop does NOT change this answer: acquisition
+   * entry points check {@link isStopping} themselves, while read and teardown
+   * paths still need the holder they find here.
    */
   bridgeOwning(agentId: string, sessionId: string): AgentBridge | undefined {
     for (const bridge of this.bridges.values()) {
@@ -235,21 +242,35 @@ export class BridgeRegistryService {
   async locateOrResume(sessionId: string): Promise<{ bridge: AgentBridge; session: LiveSession }> {
     for (const bridge of this.bridges.values()) {
       const session = bridge.hasSession(sessionId)
-      if (session !== undefined) return { bridge, session }
+      if (session !== undefined) {
+        // A holder that is already going down must not serve this interaction.
+        if (this.stoppingAgents.has(bridge.def.id)) throw this.stoppingError(bridge.def.id)
+        return { bridge, session }
+      }
     }
     for (const bridge of this.bridges.values()) {
       const released = bridge.hasReleased(sessionId)
       if (released !== undefined) {
+        // The row was kept by `stopAgent(keepReleased)`, but the process that
+        // parked it is mid-teardown: lending it would resume into a doomed
+        // connection. Refuse with the same gate as a fresh acquisition.
+        if (this.stoppingAgents.has(bridge.def.id)) throw this.stoppingError(bridge.def.id)
         bridge.takeReleased(sessionId)
         const session = await bridge.resumeSession(released)
         return { bridge, session }
       }
       const inflight = bridge.inflightResume(sessionId)
       if (inflight !== undefined) {
+        if (this.stoppingAgents.has(bridge.def.id)) throw this.stoppingError(bridge.def.id)
         return { bridge, session: await inflight }
       }
     }
     throw new AcpError('unknown_session', `acp: no live session ${sessionId}`)
+  }
+
+  /** The one refusal every acquisition path gives while a stop owns the agent. */
+  private stoppingError(agentId: string): AcpError {
+    return new AcpError('agent_stopping', `acp: agent "${agentId}" is stopping; send again once it has stopped`)
   }
 
   connectionLost(bridge: AgentBridge, reason: string): void {
@@ -392,7 +413,20 @@ export class BridgeRegistryService {
       for (const bridge of bridges) {
         for (const sessionId of this.sessionIdsOf(bridge)) owned.add(sessionId)
       }
-      for (const sessionId of this.host.registry.dropSessionsOfAgent(agentId, keepReleased)) owned.add(sessionId)
+      // Sessions mid-recovery are `live` in the registry but not yet in the
+      // bridge's `sessions` map, so this stop cannot `session/close` them.
+      // Their rows must survive or the conversation is lost (constraint 10);
+      // delete still drops everything.
+      const resuming = new Set<string>()
+      if (keepReleased) {
+        for (const session of this.host.registry.sessions()) {
+          if (session.agentId !== agentId) continue
+          if (bridges.some(bridge => bridge.inflightResume(session.sessionId) !== undefined)) {
+            resuming.add(session.sessionId)
+          }
+        }
+      }
+      for (const sessionId of this.host.registry.dropSessionsOfAgent(agentId, keepReleased, resuming)) owned.add(sessionId)
       this.host.disposeTurnStreamsOf(controller => owned.has(controller.session.sessionId))
       if (persist) this.host.persistAgents()
       // One stop per process, all at once: the children are independent, so the

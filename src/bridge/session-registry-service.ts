@@ -160,11 +160,17 @@ export class SessionRegistryService {
    *
    * The flag is REQUIRED: a default here would let a new direct caller silently
    * pick the wrong half of the stop / delete split.
+   *
+   * `preserve` names sessions the caller is bringing back RIGHT NOW: a resume
+   * flips its record to live before `session/load` answers, while the session is
+   * not in the bridge's `sessions` map yet — the stop cannot close it, so the
+   * row must survive or the conversation is lost mid-recovery.
    */
-  dropSessionsOfAgent(agentId: string, keepReleased: boolean): string[] {
+  dropSessionsOfAgent(agentId: string, keepReleased: boolean, preserve?: ReadonlySet<string>): string[] {
     const dropped: string[] = []
     for (const [key, session] of this.dshSessionMap) {
       if (session.agentId !== agentId) continue
+      if (preserve?.has(session.sessionId) === true) continue
       if (keepReleased && lifecycleOf(session) === 'parked') continue
       dropped.push(session.sessionId)
       this.dshSessionMap.delete(key)

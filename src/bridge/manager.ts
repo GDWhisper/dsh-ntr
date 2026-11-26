@@ -1388,7 +1388,11 @@ export class BridgeManager {
       }
       const segment = controller.startSegment()
       const onAbort = () => {
-        void this.bridgeForSession(controller.session).cancel(controller.session)
+        // Same rule as the main turn's abort: an abort must never CREATE a
+        // process, and a missing owner means there is nothing left to cancel
+        // (a stop in flight or a rolled-back first turn).
+        const owner = this.bridgeOwning(controller.session.agentId, controller.session.sessionId)
+        if (owner !== undefined) void owner.cancel(controller.session)
         controller.abortActiveSegment()
       }
       if (options.signal?.aborted) onAbort()
