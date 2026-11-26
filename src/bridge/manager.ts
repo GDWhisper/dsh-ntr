@@ -1844,7 +1844,7 @@ export class BridgeManager {
             controller.noteRecentRetiredDrain()
           }
           controller.settle(result.stopReason === 'cancelled'
-            ? { kind: 'cancelled' }
+            ? { kind: 'cancelled', ...(result.usage !== undefined ? { usage: result.usage } : {}) }
             // A refusal carries the agent's own reason (`agentRefusalDetail`),
             // and the zero-output line quotes it: a quota was already settled
             // above as an error, so what reaches here is the agent declining
@@ -1853,6 +1853,7 @@ export class BridgeManager {
               kind: 'stop',
               stopReason: result.stopReason,
               ...(refusal !== undefined ? { refusal: refusal.message } : {}),
+              ...(result.usage !== undefined ? { usage: result.usage } : {}),
             })
         })
         .catch((err: unknown) => {

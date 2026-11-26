@@ -9,10 +9,12 @@ import {
   isFinalToolCallStatus,
   updateContentToText,
   type AcpToolCallSnapshot,
+  type AcpTurnUsage,
   type Transcript,
 } from '../impl.ts'
 import type { AcpEvent, PermissionOutcome, StreamChunk } from '../protocol.ts'
-import { OUTPUT_CHARS_PER_TOKEN, TurnTpsTracker } from '../tps.ts'
+import { TurnTpsTracker } from '../tps.ts'
+import { TurnUsageLedger } from './turn-usage-ledger.ts'
 import { BACKGROUND_REPORT_MAX, recordAcpToolOutput, releaseAllToolOutputWaiters } from './registries.ts'
 import type { BackgroundDispatch, BackgroundReport, BridgeTuning } from './types.ts'
 import { AsyncQueue } from './async-queue.ts'
@@ -398,8 +400,8 @@ type SegmentFinishReason =
 
 /** Why a turn ended, as seen by {@link TurnStreamController.settle}. */
 type TurnSettle =
-  | { kind: 'stop'; stopReason: string; refusal?: string }
-  | { kind: 'cancelled' }
+  | { kind: 'stop'; stopReason: string; refusal?: string; usage?: AcpTurnUsage }
+  | { kind: 'cancelled'; usage?: AcpTurnUsage }
   | { kind: 'error'; message: string; code?: string; errorKind?: 'quota' }
 
 /** How often a running turn's live burst aggregate is pushed to the browser. */
@@ -648,6 +650,7 @@ export class TurnStreamController {
    * arrived, and replay would double the numerator and the gaps.
    */
   private readonly tps = new TurnTpsTracker()
+  private readonly usageLedger = new TurnUsageLedger()
   private tpsSeq: number
   private lastTpsPushAt = 0
   /**
@@ -1486,6 +1489,7 @@ export class TurnStreamController {
   /** The agent settled its `session/prompt`. Ends the turn's streaming face. */
   settle(outcome: TurnSettle): void {
     if (this.settled) return
+    if (outcome.kind !== 'error' && outcome.usage !== undefined) this.usageLedger.recordPromptUsage(outcome.usage)
     // `settled` is claimed NOW (a second settle, a cancel or a watchdog that
     // races the tail drain must find the turn already spoken for), but the
     // CLOSING work waits one macrotask: the SDK dispatches `session/update`
@@ -1965,9 +1969,8 @@ export class TurnStreamController {
       seg.activeType = null
       seg.activeToolCall = undefined
     }
-    const outputTokens = Math.round(seg.outputChars / OUTPUT_CHARS_PER_TOKEN)
-    // Zero input keeps the host's cache-hit pill hidden instead of faking 0%.
-    if (outputTokens > 0) seg.queue.push({ type: 'usage', usage: { inputTokens: 0, outputTokens } })
+    const usage = this.usageLedger.takeSegmentUsage(seg.outputChars)
+    if (usage !== undefined) seg.queue.push({ type: 'usage', usage })
     seg.queue.push({ type: 'finish', reason })
     seg.queue.close()
     if (this.segment === seg) this.segment = undefined
@@ -2068,6 +2071,7 @@ export class TurnStreamController {
       // arrives between segments still belongs to this turn's output, and its
       // gaps are real. Replay never reaches this path.
       this.trackTps(typed)
+      if (String(update.sessionUpdate ?? '') === 'usage_update') this.usageLedger.observeUsageUpdate(update, typed.seq)
       const seg = this.segment
       if (seg === undefined || seg.finished) {
         // Between segments: tool outputs still reach the shared registry (the
@@ -2421,6 +2425,9 @@ export class TurnStreamController {
       }
       seg.outputChars += text.length
       this.emitProse(seg, 'text', `\n${text}\n`)
+      return true
+    } else if (kind === 'usage_update') {
+      this.usageLedger.observeUsageUpdate(update, seq)
       return true
     } else if (!BOOKKEEPING_UPDATES.has(kind) && !USER_ECHO_UPDATES.has(kind)) {
       const text = describeUnhandledUpdate(kind, update)

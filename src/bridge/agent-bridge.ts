@@ -9,10 +9,10 @@ import {
 } from '@agentclientprotocol/sdk'
 import {
   AcpError, ElicitationLedger, PermissionLedger, Transcript, childEnv, normalizeApprovalWindow,
-  parseCatalogOptions, permissionOptionWarning, permissionRequestFrame, pickQuestionDefault, randomUUID, resolveFsPath,
+  normalizePromptUsage, parseCatalogOptions, permissionOptionWarning, permissionRequestFrame, pickQuestionDefault, randomUUID, resolveFsPath,
   resolveSessionCwd, usableConfigOptions,
 } from '../impl.ts'
-import type { EventHub } from '../impl.ts'
+import type { AcpTurnUsage, EventHub } from '../impl.ts'
 import {
   effectiveWriteTextFileEnabled,
   type AcpAgentDef, type AcpReleaseCause, type AgentView, type PermissionOutcome, type PermissionOptionView, type PermissionTimeoutMode, type QuestionTimeoutMode, type SessionView,
@@ -1237,7 +1237,7 @@ export class AgentBridge {
    * `CodebuddyMeta.conversationRequestId`), which decides whether an instant
    * answer was the turn ending or a fold into a background drain.
    */
-  async runPrompt(session: LiveSession, prompt: string | ContentBlock[], turnId: string, turnGen: number): Promise<{ stopReason: string; meta?: Record<string, unknown> }> {
+  async runPrompt(session: LiveSession, prompt: string | ContentBlock[], turnId: string, turnGen: number): Promise<{ stopReason: string; meta?: Record<string, unknown>; usage?: AcpTurnUsage }> {
     const conn = this.conn
     if (conn === undefined || lifecycleOf(session) !== 'live') throw new AcpError('session_closed', 'acp: session is closed')
     this.touch()
@@ -1271,10 +1271,14 @@ export class AgentBridge {
         else this.pendingPrompts.delete(promptSessionId)
         this.touch()
       })
-      const answered = () => ({
-        stopReason: result.stopReason,
-        ...(result._meta !== undefined && result._meta !== null ? { meta: result._meta } : {}),
-      })
+      const answered = () => {
+        const usage = normalizePromptUsage(result.usage)
+        return {
+          stopReason: result.stopReason,
+          ...(result._meta !== undefined && result._meta !== null ? { meta: result._meta } : {}),
+          ...(usage !== undefined ? { usage } : {}),
+        }
+      }
       if (result.stopReason !== 'cancelled' || session.cancelRequestedAtTurn === session.turnSeq) {
         return answered()
       }

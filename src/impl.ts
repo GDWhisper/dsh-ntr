@@ -210,6 +210,11 @@ export {
 export type { PendingPermission } from './impl/runtime.ts'
 export { EventHub, PermissionLedger, Transcript } from './impl/runtime.ts'
 
+// ---- Turn token usage ----
+
+export type { AcpTurnUsage } from './impl/turn-usage.ts'
+export { extractCodebuddyUsage, normalizePromptUsage } from './impl/turn-usage.ts'
+
 // ---- RPC surface ----
 
 export type { AcpManager } from './impl/dispatch.ts'
