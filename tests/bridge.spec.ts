@@ -324,16 +324,15 @@ describe('ACP bridge over stdio (mock agent)', () => {
       event.type === 'turn/metrics' && event.dshSessionId === dshSessionId && !event.final)
     expect(live.length).toBeGreaterThan(0)
     expect(live.every(event => event.turnId === final.turnId)).toBe(true)
-    // Replay of the first segment into the continuation must not count its
-    // prose twice: the reported numerator is exactly the transcript's prose.
+    // Replay must not double-count, and anchor chunks contribute no untimed tokens.
     await settleTranscript(manager, final.sessionId)
     const transcript = await dispatchRpc(manager, 'transcript/get', { sessionId: final.sessionId })
     if (!transcript.ok) throw new Error('transcript/get failed')
-    const chars = (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
+    const proseChunks = (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
       .filter(entry => entry.update.sessionUpdate === 'agent_message_chunk' || entry.update.sessionUpdate === 'agent_thought_chunk')
       .map(entry => String((entry.update.content as { text?: string }).text ?? ''))
-      .join('').length
-    expect(final.outputTokens).toBe(Math.round(chars / OUTPUT_CHARS_PER_TOKEN))
+    expect(final.outputTokens).toBe(Math.round((proseChunks.at(-1) ?? '').length / OUTPUT_CHARS_PER_TOKEN))
+    expect(final.outputTokens).toBeLessThan(Math.round(proseChunks.join('').length / OUTPUT_CHARS_PER_TOKEN))
     const listed = await dispatchRpc(manager, 'session/chat-list', { dshSessionId })
     if (!listed.ok) throw new Error('session/chat-list failed')
     const row = (listed.value as { sessions: ChatSessionView[] }).sessions

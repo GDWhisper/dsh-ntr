@@ -17,6 +17,7 @@ import type { AgentBridge } from './agent-bridge.ts'
 import type { LiveSession, TurnStreamController } from './turn-stream.ts'
 import { isSettling, lifecycleOf } from './session-lifecycle.ts'
 import type { BridgeTuning } from './types.ts'
+import { MIN_BURST_MS } from '../tps.ts'
 
 /**
  * The manager capabilities this service leans on. Every member is a callback
@@ -249,7 +250,7 @@ export class TurnWatchdogService {
    * side: adding its tokens with zero time would inflate the session rate.
    */
   noteSessionBurst(session: LiveSession, outputTokens: number, burstMs: number): void {
-    if (outputTokens <= 0 || burstMs <= 0) return
+    if (outputTokens <= 0 || burstMs < MIN_BURST_MS) return
     const base = session.burst ?? { outputTokens: 0, burstMs: 0 }
     session.burst = {
       outputTokens: base.outputTokens + outputTokens,

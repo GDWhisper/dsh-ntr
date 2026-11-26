@@ -13,7 +13,7 @@ import {
   type Transcript,
 } from '../impl.ts'
 import type { AcpEvent, PermissionOutcome, StreamChunk } from '../protocol.ts'
-import { TurnTpsTracker } from '../tps.ts'
+import { MIN_BURST_MS, TurnTpsTracker } from '../tps.ts'
 import { TurnUsageLedger } from './turn-usage-ledger.ts'
 import { BACKGROUND_REPORT_MAX, recordAcpToolOutput, releaseAllToolOutputWaiters } from './registries.ts'
 import type { BackgroundDispatch, BackgroundReport, BridgeTuning } from './types.ts'
@@ -2119,7 +2119,7 @@ export class TurnStreamController {
     const now = Date.now()
     if (now - this.lastTpsPushAt < TPS_PUSH_INTERVAL_MS) return
     const snap = this.tps.snapshot()
-    if (snap.outputTokens <= 0 || snap.burstMs <= 0) return
+    if (snap.outputTokens <= 0 || snap.burstMs < MIN_BURST_MS) return
     this.lastTpsPushAt = now
     const base = this.session.burst ?? { outputTokens: 0, burstMs: 0 }
     this.hub.broadcast({
@@ -2138,7 +2138,7 @@ export class TurnStreamController {
     const dshSessionId = this.session.dshSessionId
     if (dshSessionId === undefined) return
     const snap = this.tps.snapshot()
-    if (snap.outputTokens > 0 && snap.burstMs > 0) {
+    if (snap.outputTokens > 0 && snap.burstMs >= MIN_BURST_MS) {
       this.manager.noteSessionBurst(this.session, snap.outputTokens, snap.burstMs)
     }
     const aggregate = this.session.burst ?? { outputTokens: 0, burstMs: 0 }
