@@ -13,7 +13,7 @@ describe('approval deadline persistence (isolated manager)', () => {
     const gm = new BridgeManager([{ ...def, id: 'picked' }], pickHub, 500, storage)
     // Nothing configured, nothing overridden: the built-in 5-minute window and
     // the default mode.
-    expect(gm.approvalDeadlines()).toEqual({ permissionTimeoutMs: 300_000, elicitationTimeoutMs: 300_000, mode: 'wait' })
+    expect(gm.approvalDeadlines()).toEqual({ permissionTimeoutMs: 300_000, elicitationTimeoutMs: 300_000, mode: 'wait', questionTimeoutMode: 'cancel' })
     // A deployment that names the window in `cordis.patch.yml` reports it as
     // the reset target — "the file says 10 minutes" and "nothing was
     // configured, 5 is the built-in default" are different facts, and the
@@ -86,7 +86,7 @@ describe('approval deadline persistence (isolated manager)', () => {
   })
 
   interface PersistedDeadlines {
-    approvalDeadlines?: { permissionTimeoutMs?: number; elicitationTimeoutMs?: number; mode?: string }
+    approvalDeadlines?: { permissionTimeoutMs?: number; elicitationTimeoutMs?: number; mode?: string; questionTimeoutMode?: string }
   }
 
     const readDeadlines = (storage: string): PersistedDeadlines['approvalDeadlines'] =>
@@ -183,6 +183,49 @@ describe('approval deadline persistence (isolated manager)', () => {
     const reloaded = new BridgeManager([{ ...def, id: 'boot-zero' }], pickHub, 500, storage)
     expect(reloaded.approvalDeadlines()).toMatchObject({ permissionTimeoutMs: 0, mode: 'auto' })
     await reloaded.shutdownAll()
+  })
+
+  it('persists questionTimeoutMode only when `first`, pushes hot to live bridges, and tolerates per-key corruption', async () => {
+    const storage = `${tmpdir()}/acp-question-mode-${Date.now()}.json`
+    const gm = new BridgeManager([{ ...def, id: 'qmode' }], pickHub, 500, storage)
+    const liveBridge = new AgentBridge({ ...def, id: 'live-q' }, pickHub, 500, () => {})
+    ;(gm as unknown as { bridges: Map<string, AgentBridge> }).bridges.set('live-q', liveBridge)
+
+    await gm.setApprovalDeadlines({ questionTimeoutMode: 'first' })
+    expect(gm.approvalDeadlines().questionTimeoutMode).toBe('first')
+    expect(readDeadlines(storage)).toEqual({ questionTimeoutMode: 'first' })
+    expect((liveBridge as unknown as { questionTimeoutMode: string }).questionTimeoutMode).toBe('first')
+
+    // Returning to the default `cancel` omits the key from disk instead of writing a phantom override.
+    await gm.setApprovalDeadlines({ questionTimeoutMode: 'cancel' })
+    expect(gm.approvalDeadlines().questionTimeoutMode).toBe('cancel')
+    expect(readDeadlines(storage)).toBeUndefined()
+    expect((liveBridge as unknown as { questionTimeoutMode: string }).questionTimeoutMode).toBe('cancel')
+
+    // `reset` restores `cancel` too.
+    await gm.setApprovalDeadlines({ questionTimeoutMode: 'first' })
+    await gm.setApprovalDeadlines({}, true)
+    expect(gm.approvalDeadlines().questionTimeoutMode).toBe('cancel')
+    expect(readDeadlines(storage)).toBeUndefined()
+    await gm.shutdownAll()
+
+    // Corrupt `questionTimeoutMode` drops ONLY that key; sibling windows survive reboot.
+    writeFileSync(storage, JSON.stringify({
+      version: 2,
+      approvalDeadlines: { permissionTimeoutMs: 60_000, elicitationTimeoutMs: 0, questionTimeoutMode: 'bogus' },
+    }), 'utf-8')
+    const tolerateQ = new BridgeManager([{ ...def, id: 'qmode' }], pickHub, 500, storage)
+    expect(tolerateQ.approvalDeadlines()).toMatchObject({ permissionTimeoutMs: 60_000, elicitationTimeoutMs: 0, questionTimeoutMode: 'cancel' })
+    await tolerateQ.shutdownAll()
+
+    // Corrupt `mode` drops ONLY `mode`; valid `questionTimeoutMode: 'first'` survives reboot.
+    writeFileSync(storage, JSON.stringify({
+      version: 2,
+      approvalDeadlines: { permissionTimeoutMs: 60_000, mode: 'bogus', questionTimeoutMode: 'first' },
+    }), 'utf-8')
+    const tolerateMode = new BridgeManager([{ ...def, id: 'qmode' }], pickHub, 500, storage)
+    expect(tolerateMode.approvalDeadlines()).toMatchObject({ permissionTimeoutMs: 60_000, mode: 'wait', questionTimeoutMode: 'first' })
+    await tolerateMode.shutdownAll()
   })
 
 })

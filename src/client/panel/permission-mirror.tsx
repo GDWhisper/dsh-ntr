@@ -7,6 +7,7 @@ import type { AcpStore, UiState } from '../store.ts'
 import type { Translate } from '../acp-view.tsx'
 import { ElicitationAskCard } from '../elicitation-dock.tsx'
 import { useDeadlineClock } from '../pending-dock.tsx'
+import { questionExpiryLabel } from '../permission-dock.tsx'
 import type { AgentTestResult } from '../../protocol.ts'
 
 /**
@@ -137,29 +138,53 @@ export function PermissionMirrorCard(props: { acp: AcpStore; ui: UiState }) {
           'Answer in the conversation card while that conversation is open; this list covers the asks whose conversation is not.',
         )}
       </div>
-      {ui.permissions.map(permission => (
-        <div key={permission.requestId} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, flexWrap: 'wrap' }}>
-          <span style={{ flex: 1, minWidth: 160 }}>
-            <span style={{ fontWeight: 600 }}>{permission.toolName}</span>
-            {permission.reason !== undefined && (
-              <span style={{ color: 'var(--ntr-muted)' }}> · {permission.reason}</span>
-            )}
-          </span>
-          {permission.options.map(option => (
+      {ui.permissions.map(permission => {
+        const question = permission.askKind === 'question'
+        const expiry = questionExpiryLabel(acp, permission)
+        return (
+          <div
+            key={permission.requestId}
+            style={question
+              ? { display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: 6, marginBottom: 8 }
+              : { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, flexWrap: 'wrap' }}
+          >
+            <span style={question ? { fontWeight: 600 } : { flex: 1, minWidth: 160 }}>
+              {question ? (
+                permission.reason ?? permission.toolName
+              ) : (
+                <>
+                  <span style={{ fontWeight: 600 }}>{permission.toolName}</span>
+                  {permission.reason !== undefined && (
+                    <span style={{ color: 'var(--ntr-muted)' }}> · {permission.reason}</span>
+                  )}
+                </>
+              )}
+            </span>
+            {permission.options.map(option => (
+              <button
+                key={option.optionId}
+                type="button"
+                className="dwa-btn"
+                style={question ? { textAlign: 'left' } : undefined}
+                onClick={() => { void acp.respondPermission(permission.requestId, option.optionId).catch(() => undefined) }}
+              >
+                {option.name}
+              </button>
+            ))}
             <button
-              key={option.optionId}
               type="button"
-              className="dwa-btn"
-              onClick={() => { void acp.respondPermission(permission.requestId, option.optionId).catch(() => undefined) }}
+              className="dwa-btn dwa-btn-quiet"
+              style={question ? { textAlign: 'left' } : undefined}
+              onClick={() => { void acp.respondPermission(permission.requestId).catch(() => undefined) }}
             >
-              {option.name}
+              {acp.label('取消', 'Cancel')}
             </button>
-          ))}
-          <button type="button" className="dwa-btn dwa-btn-quiet" onClick={() => { void acp.respondPermission(permission.requestId).catch(() => undefined) }}>
-            {acp.label('取消', 'Cancel')}
-          </button>
-        </div>
-      ))}
+            {expiry !== undefined && (
+              <div className="dwa-hint" style={{ fontSize: 11 }}>{expiry}</div>
+            )}
+          </div>
+        )
+      })}
       {ui.elicitations.map(elicitation => (
         <div key={elicitation.requestId} style={{ marginTop: 8 }}>
           <ElicitationAskCard acp={acp} elicitation={elicitation} now={now} />

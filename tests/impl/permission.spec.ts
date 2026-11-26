@@ -10,10 +10,47 @@ import {
   AcpError,
   canonicalizeFsPath,
   DELEGATE_AUTO_KIND_PRIORITY,
+  permissionAskKind,
   pickAutoOption,
+  pickQuestionDefault,
   resolveFsPath,
 } from '../../src/impl.ts'
 import type { PermissionOptionView } from '../../src/protocol.ts'
+
+describe('permissionAskKind (question vs approval)', () => {
+  it('reads Antigravity\'s question prefix off the tool call id', () => {
+    expect(permissionAskKind({ toolCallId: 'interaction_1a2b3c4d', title: 'Which approach?' })).toBe('question')
+  })
+
+  it('fail-opens to approval for anything unreadable', () => {
+    // Every branch that cannot PROVE a question must keep the approval
+    // pipeline verbatim: guessing here would stop `auto` from answering real
+    // tool asks.
+    expect(permissionAskKind({ toolCallId: 'call_1' })).toBe('approval')
+    expect(permissionAskKind({ toolCallId: '' })).toBe('approval')
+    expect(permissionAskKind({ toolCallId: 42 })).toBe('approval')
+    expect(permissionAskKind({})).toBe('approval')
+    expect(permissionAskKind(null)).toBe('approval')
+    expect(permissionAskKind(undefined)).toBe('approval')
+  })
+})
+
+describe('pickQuestionDefault (what an expired question sends in `first`)', () => {
+  const opt = (optionId: string, kind: string, name = optionId): PermissionOptionView => ({ optionId, name, kind })
+
+  it('takes the FIRST option, not the broadest permission kind', () => {
+    // `pickAutoOption` would pick `allow_always` here; a question's answer is
+    // whatever the agent listed first, and its `kind` says nothing about it.
+    expect(pickQuestionDefault([opt('q1', 'allow_once'), opt('q2', 'allow_always')])?.optionId).toBe('q1')
+    expect(pickQuestionDefault([opt('q1', 'allow_always'), opt('q2', 'allow_once')])?.optionId).toBe('q1')
+  })
+
+  it('skips unusable ids and answers nothing when none is usable', () => {
+    expect(pickQuestionDefault([opt('', 'allow_once'), opt('q2', 'reject_once')])?.optionId).toBe('q2')
+    expect(pickQuestionDefault([])).toBeUndefined()
+    expect(pickQuestionDefault([opt('', 'allow_once')])).toBeUndefined()
+  })
+})
 
 describe('pickAutoOption (what `auto` mode answers with)', () => {
   const opt = (optionId: string, kind: string, name = optionId): PermissionOptionView => ({ optionId, name, kind })

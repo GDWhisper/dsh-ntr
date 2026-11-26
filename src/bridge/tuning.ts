@@ -6,6 +6,7 @@ export const DEFAULT_TUNING: Required<BridgeTuning> = {
   permissionTimeoutMs: 300_000,
   elicitationTimeoutMs: 300_000,
   permissionTimeoutMode: 'wait',
+  questionTimeoutMode: 'cancel',
   cancelFallbackMs: 15_000,
   staleCancelRetryDelayMs: 600,
   staleCancelMaxRetries: 2,

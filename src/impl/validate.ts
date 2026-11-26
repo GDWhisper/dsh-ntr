@@ -8,7 +8,7 @@
  * APIs, no ACP SDK runtime values.
  */
 
-import type { AcpAgentDef, AcpDelegateAgentDefaults, AcpDelegateConfig, AcpMcpServerDef, AcpPluginConfig, AcpTagHalo, ApprovalDeadlineKey, DelegateGuidance, DelegateSetPayload, DelegateSettingKey, PermissionTimeoutMode } from '../protocol.ts'
+import type { AcpAgentDef, AcpDelegateAgentDefaults, AcpDelegateConfig, AcpMcpServerDef, AcpPluginConfig, AcpTagHalo, ApprovalDeadlineKey, ApprovalDeadlinePatch, DelegateGuidance, DelegateSetPayload, DelegateSettingKey, PermissionTimeoutMode, QuestionTimeoutMode } from '../protocol.ts'
 import { DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_MODE_MAX, DELEGATE_DESCRIPTION_MAX, DELEGATE_TIMEOUT_MAX_MS, DELEGATE_TIMEOUT_MIN_MS, IDLE_RELEASE_MS, findMcpServersError } from '../protocol.ts'
 import { splitCommandLine } from './command-line.ts'
 import { AcpError } from './errors.ts'
@@ -195,6 +195,48 @@ export function validatePermissionTimeoutMode(raw: unknown, code: 'bad_config' |
     throw new AcpError(code, 'acp: permissionTimeoutMode must be one of "abort", "auto", "wait"')
   }
   return raw
+}
+
+/**
+ * Validate what an expired QUESTION ask does. Two values, and the list is the
+ * whole vocabulary: the plugin either answers for the user or it does not.
+ */
+export function validateQuestionTimeoutMode(raw: unknown, code: 'bad_config' | 'bad_payload'): QuestionTimeoutMode {
+  if (raw !== 'cancel' && raw !== 'first') {
+    throw new AcpError(code, 'acp: questionTimeoutMode must be one of "cancel", "first"')
+  }
+  return raw
+}
+
+/**
+ * Re-validate persisted `approvalDeadlines` per key: an unreadable value drops
+ * only its own key rather than wiping valid sibling picks across a reboot.
+ */
+export function parsePersistedApprovalDeadlines(rawDeadlines: unknown): ApprovalDeadlinePatch {
+  if (rawDeadlines === null || typeof rawDeadlines !== 'object' || Array.isArray(rawDeadlines)) return {}
+  const raw = rawDeadlines as Record<string, unknown>
+  const legacyNever = (raw.nativeApprovalTimeoutMs ?? raw.permissionFallbackTimeoutMs) === 0
+  const safe = <T>(fn: () => T): T | undefined => {
+    try { return fn() } catch { return undefined }
+  }
+  const permissionTimeoutMs = !legacyNever && raw.permissionTimeoutMs !== undefined
+    ? safe(() => validateApprovalDeadlines({ permissionTimeoutMs: raw.permissionTimeoutMs }).permissionTimeoutMs)
+    : undefined
+  const elicitationTimeoutMs = raw.elicitationTimeoutMs !== undefined
+    ? safe(() => validateApprovalDeadlines({ elicitationTimeoutMs: raw.elicitationTimeoutMs }).elicitationTimeoutMs)
+    : undefined
+  const mode = legacyNever
+    ? ('wait' as const)
+    : (raw.mode !== undefined ? safe(() => validatePermissionTimeoutMode(raw.mode, 'bad_payload')) : undefined)
+  const questionTimeoutMode = raw.questionTimeoutMode !== undefined
+    ? safe(() => validateQuestionTimeoutMode(raw.questionTimeoutMode, 'bad_payload'))
+    : undefined
+  return {
+    ...(permissionTimeoutMs === undefined ? {} : { permissionTimeoutMs }),
+    ...(elicitationTimeoutMs === undefined ? {} : { elicitationTimeoutMs }),
+    ...(mode === undefined ? {} : { mode }),
+    ...(questionTimeoutMode === 'first' ? { questionTimeoutMode } : {}),
+  }
 }
 
 /**

@@ -9,12 +9,12 @@ import {
 } from '@agentclientprotocol/sdk'
 import {
   AcpError, ElicitationLedger, PermissionLedger, Transcript, childEnv, normalizeApprovalWindow,
-  parseCatalogOptions, permissionRequestFrame, pickAutoOption, randomUUID, resolveFsPath,
+  parseCatalogOptions, permissionRequestFrame, pickQuestionDefault, randomUUID, resolveFsPath,
   resolveSessionCwd, usableConfigOptions,
 } from '../impl.ts'
 import type { EventHub } from '../impl.ts'
 import type {
-  AcpAgentDef, AcpReleaseCause, AgentView, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, SessionView,
+  AcpAgentDef, AcpReleaseCause, AgentView, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, QuestionTimeoutMode, SessionView,
 } from '../protocol.ts'
 import { mergeUsageSample } from '../usage.ts'
 import { PLUGIN_VERSION, isPerSessionAgent, perSessionLaunchArgs, perSessionLaunchEnv } from './identity.ts'
@@ -22,6 +22,8 @@ import type { BridgeState, BridgeTuning, SessionWorkspaceResolver, StartAttempt 
 import { chatWorkspaceRoot, safeSpawnCwd } from './state-paths.ts'
 import { disposeChild, ensureAgentExecutable, findExecutable, trackAgentChild, waitForChildExit, windowsShimLaunch } from './process.ts'
 import { handleBridgeElicitationRequest } from './elicitation-bridge.ts'
+import { announceExpiredAsk, settleExpiredAsk, type ExpiredAskHost } from './expired-ask.ts'
+import { questionAskKindOf } from './question-ask.ts'
 import {
   activeDrain,
   chunkTextOf,
@@ -114,6 +116,12 @@ export class AgentBridge {
   private permissionTimeoutMs: number
   /** Independent form-question deadline; hot writes affect the next ask, never an armed timer. */
   private elicitationTimeoutMs: number
+  /**
+   * What an expired QUESTION ask does (`cancel` / `first`). Read once per ask,
+   * like the windows: a hot write never moves the goalposts under a card that
+   * already says what will happen.
+   */
+  private questionTimeoutMode: QuestionTimeoutMode
   private permissionTimeoutMode: PermissionTimeoutMode
   private readonly cancelFallbackMs: number
   private readonly staleCancelRetryDelayMs: number
@@ -264,6 +272,7 @@ export class AgentBridge {
     // every ask on arrival, so the window is floored to the shortest real wait.
     this.permissionTimeoutMs = normalizeApprovalWindow(this.permissionTimeoutMode, merged.permissionTimeoutMs)
     this.elicitationTimeoutMs = merged.elicitationTimeoutMs
+    this.questionTimeoutMode = merged.questionTimeoutMode
     this.cancelFallbackMs = merged.cancelFallbackMs
     this.staleCancelRetryDelayMs = merged.staleCancelRetryDelayMs
     this.staleCancelMaxRetries = merged.staleCancelMaxRetries
@@ -286,10 +295,11 @@ export class AgentBridge {
    * keeps the window it was started with, and the next ask reads the new value.
    * Re-arming would move the goalposts under a human who is already deciding.
    */
-  applyApprovalDeadlines(patch: { permissionTimeoutMs?: number; elicitationTimeoutMs?: number; mode?: PermissionTimeoutMode }): void {
+  applyApprovalDeadlines(patch: { permissionTimeoutMs?: number; elicitationTimeoutMs?: number; mode?: PermissionTimeoutMode; questionTimeoutMode?: QuestionTimeoutMode }): void {
     if (patch.permissionTimeoutMs !== undefined) this.permissionTimeoutMs = patch.permissionTimeoutMs
     if (patch.elicitationTimeoutMs !== undefined) this.elicitationTimeoutMs = patch.elicitationTimeoutMs
     if (patch.mode !== undefined) this.permissionTimeoutMode = patch.mode
+    if (patch.questionTimeoutMode !== undefined) this.questionTimeoutMode = patch.questionTimeoutMode
     // A mode switch can leave a window behind that the new mode cannot run
     // (不等待 under `abort`): floor it, so the ask waits instead of refusing
     // on arrival.
@@ -1847,17 +1857,29 @@ export class AgentBridge {
     // bridge knobs; the pair then sticks even if settings rewrite mid-flight.
     const mode = session.permissionPolicy?.mode ?? this.permissionTimeoutMode
     const timeoutMs = session.permissionPolicy?.windowMs ?? this.permissionTimeoutMs
+    // A question is not an approval: it is never answered by kind priority,
+    // never settled on arrival, and it waits under the form-question window.
+    const askKind = questionAskKindOf(this.def, toolCall)
+    const question = askKind === 'question'
+    const questionMode = this.questionTimeoutMode
+    const windowMs = question ? this.elicitationTimeoutMs : timeoutMs
+    // A delegated session has nobody to ask: settle at once under both
+    // `cancel` and `first` rather than waiting for a human who does not exist.
+    if (question && session.permissionPolicy !== undefined) {
+      return settleExpiredAsk(this.expiredAskHost(), session, mode, toolCall, options, 0, askKind, questionMode)
+    }
     // 不等待（0）只属自动推进：请求到达即按那一档收场，不建 ledger 条目、不发卡
     // ——问都来不及问。超时中止没有这一档（它会立刻拒绝每一问，agent 在每个门口
     // 都停住），它的窗口最短是真实等待。
-    if (mode === 'auto' && timeoutMs === 0) {
-      return this.settleExpiredAsk(session, mode, toolCall, options, 0)
+    if (!question && mode === 'auto' && timeoutMs === 0) {
+      return settleExpiredAsk(this.expiredAskHost(), session, mode, toolCall, options, 0, askKind, questionMode)
     }
     const optionViews = options.map((o): PermissionOptionView => ({ optionId: o.optionId, name: o.name, kind: o.kind }))
     const reason = permissionAskReason(toolCall)
     // Computed once, at ask creation: the frame, the chat line and the timer
     // all describe the same instant, and a slow reader cannot stretch it.
-    const deadlineAt = timeoutMs > 0 && mode !== 'wait' ? Date.now() + timeoutMs : undefined
+    const deadlineAt = windowMs > 0 && (question || mode !== 'wait') ? Date.now() + windowMs : undefined
+    const autoOption = question && deadlineAt !== undefined && questionMode === 'first' ? pickQuestionDefault(optionViews) : undefined
     const view = {
       ...(session.dshSessionId === undefined ? {} : { dshSessionId: session.dshSessionId }),
       // Kept whole for the reconnect replay: a client that connects after the
@@ -1868,6 +1890,9 @@ export class AgentBridge {
       options: optionViews,
       timeoutMode: mode,
       ...(deadlineAt === undefined ? {} : { deadlineAt }),
+      ...(question ? { askKind } : {}),
+      ...(question && deadlineAt !== undefined ? { questionTimeoutMode: questionMode } : {}),
+      ...(autoOption === undefined ? {} : { autoOptionName: autoOption.name }),
     }
     return new Promise<RequestPermissionResponse>(resolve => {
       let timer: ReturnType<typeof setTimeout> | undefined
@@ -1897,7 +1922,7 @@ export class AgentBridge {
           if (!this.permissions.has(requestId)) return
           // Settle IN PLACE: exactly one notice, one `permission/expired` (the
           // conversation's trace of the expiry) and the ledger answer.
-          const outcome = this.announceExpiredAsk(session, mode, toolCall, options, timeoutMs)
+          const outcome = announceExpiredAsk(this.expiredAskHost(), session, mode, toolCall, options, windowMs, askKind, questionMode)
           this.permissions.respond(requestId, outcome)
         }, Math.max(0, deadlineAt - Date.now()))
         timer.unref?.()
@@ -1921,71 +1946,14 @@ export class AgentBridge {
   }
 
   /**
-   * Announce and compute one ask's expiry. Shared by the 不等待 arrival path
-   * and the ledger deadline, so an expiry can never broadcast two notices or
-   * skip the `permission/expired` line: once the card is gone that frame is
-   * the conversation's only trace of what happened to the question.
+   * The expiry path's host face (see `expired-ask.ts`).
+   *
+   * The expiry logic lives outside this file for the size ratchet, and because
+   * the question branch needs the same one-notice / one-frame discipline the
+   * approval branch already had.
    */
-  private announceExpiredAsk(
-    session: LiveSession,
-    mode: PermissionTimeoutMode,
-    toolCall: unknown,
-    options: PermissionOption[],
-    timeoutMs: number,
-  ): PermissionOutcome {
-    const picked = mode === 'auto'
-      ? pickAutoOption(options.map(option => ({ optionId: option.optionId, name: option.name, kind: option.kind })), session.permissionPolicy?.preferOnce === true)
-      : undefined
-    const outcome: PermissionOutcome = picked === undefined
-      ? { outcome: 'cancelled' }
-      : { outcome: 'selected', optionId: picked.optionId }
-    const tool = permissionToolName(toolCall)
-    // 不等待（0）不是「等了 0 秒」，是没等：两种说法的区别就在这里。
-    const waited = timeoutMs > 0
-      ? `timed out after ${String(Math.round(timeoutMs / 1000))}s`
-      : 'was not waited for'
-    this.hub.broadcast({
-      type: 'agent/notice',
-      agentId: this.def.id,
-      level: 'info',
-      // Name what was missed and what was done about it — the way a human
-      // needs it: which operation sat unanswered, and what the plugin answered
-      // instead. OmniTerm's reaper writes the same "you missed this" notice.
-      text: picked === undefined
-        ? `acp: permission request for "${tool}" ${waited}; refused`
-        : `acp: permission request for "${tool}" ${waited}; answered "${picked.name}"`,
-    })
-    this.hub.broadcast({
-      type: 'permission/expired',
-      sessionId: session.sessionId,
-      toolCall,
-      timeoutMs,
-      outcome,
-      ...(picked === undefined ? {} : { optionName: picked.name }),
-    })
-    return outcome
-  }
-
-  /**
-   * Settle the 不等待 (`auto` + zero window) ask on arrival: no ledger entry
-   * and no card — nothing asks a human, so there is nothing to show. `auto`
-   * answers with the option the agent's own kinds imply ({@link pickAutoOption})
-   * and the agent CONTINUES. A mode that cannot pick an option (no options, or
-   * none with a usable id) degrades to refusing: safer than guessing, and
-   * hanging is worse than either.
-   */
-  private settleExpiredAsk(
-    session: LiveSession,
-    mode: PermissionTimeoutMode,
-    toolCall: unknown,
-    options: PermissionOption[],
-    timeoutMs: number,
-  ): RequestPermissionResponse {
-    session.lastAgentActivityAt = Date.now()
-    const outcome = this.announceExpiredAsk(session, mode, toolCall, options, timeoutMs)
-    return outcome.outcome === 'selected'
-      ? { outcome: { outcome: 'selected', optionId: outcome.optionId } }
-      : { outcome: { outcome: 'cancelled' } }
+  private expiredAskHost(): ExpiredAskHost {
+    return { agentId: this.def.id, hub: this.hub }
   }
 
   private settlePermissions(session: LiveSession): void {

@@ -21,7 +21,7 @@ import { validateElicitationOutcome } from './elicitation.ts'
 import { AcpError } from './errors.ts'
 import type { PromptContentBlock } from './image.ts'
 import {
-  normalizeExposedModels, validateAgentDef, validateApprovalDeadlines, validateDelegateSettings, validateIdleReleaseMs, validateMcpServers, validatePermissionTimeoutMode, validateTagHalo,
+  normalizeExposedModels, validateAgentDef, validateApprovalDeadlines, validateDelegateSettings, validateIdleReleaseMs, validateMcpServers, validatePermissionTimeoutMode, validateQuestionTimeoutMode, validateTagHalo,
 } from './validate.ts'
 
 // ---- RPC surface ----
@@ -736,6 +736,9 @@ export async function dispatchRpc(manager: AcpManager, endpoint: string, payload
         const patch: ApprovalDeadlinePatch = {
           ...validateApprovalDeadlines({ permissionTimeoutMs: body.permissionTimeoutMs, elicitationTimeoutMs: body.elicitationTimeoutMs }),
           ...(body.mode === undefined ? {} : { mode: validatePermissionTimeoutMode(body.mode, 'bad_payload') }),
+          ...(body.questionTimeoutMode === undefined
+            ? {}
+            : { questionTimeoutMode: validateQuestionTimeoutMode(body.questionTimeoutMode, 'bad_payload') }),
         }
         await manager.setApprovalDeadlines?.(patch, body.reset === true)
         return ok({ deadlines: manager.approvalDeadlines?.() })

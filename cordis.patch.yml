@@ -68,7 +68,12 @@
         #                              (the ask stays pending
         #                              until answered or the session ends). On
         #                              expiry the ask settles as `cancel` plus one
-        #                              `agent/notice`.
+        #                              `agent/notice`. Question-shaped permission
+        #                              asks (`askKind: 'question'`) share this
+        #                              window and expire according to runtime
+        #                              `questionTimeoutMode` (default `cancel`;
+        #                              no config-file override — only the UI
+        #                              may opt into `first`).
         # permissionTimeoutMode: wait
         #                              What an EXPIRED deadline does — three values, no
         #                              more:

@@ -25,6 +25,7 @@ import type {
   IdleReleaseResult,
   IdleReleaseSetPayload,
   PermissionTimeoutMode,
+  QuestionTimeoutMode,
   SharedMcpResult,
   SharedMcpSetPayload,
   SkillsMcpResult,
@@ -204,6 +205,15 @@ export class SettingsService {
     await this.writeApprovalDeadlines({ elicitationTimeoutMs: ms })
   }
 
+  /**
+   * Write what an expired QUESTION ask does (`cancel` / `first`). Deliberately
+   * separate from {@link setApprovalTimeoutMode}: a question is not a
+   * permission, and the two answers must not travel under one control.
+   */
+  async setQuestionTimeoutMode(mode: QuestionTimeoutMode): Promise<void> {
+    await this.writeApprovalDeadlines({ questionTimeoutMode: mode })
+  }
+
   /** Drop the persisted override: the config file (or the built-in default) decides again. */
   async resetApprovalDeadlines(): Promise<void> {
     await this.writeApprovalDeadlines({ reset: true })
@@ -269,6 +279,7 @@ export class SettingsService {
           ...(payload.permissionTimeoutMs === undefined ? {} : { permissionTimeoutMs: payload.permissionTimeoutMs }),
           ...(payload.elicitationTimeoutMs === undefined ? {} : { elicitationTimeoutMs: payload.elicitationTimeoutMs }),
           ...(payload.mode === undefined ? {} : { mode: payload.mode }),
+          ...(payload.questionTimeoutMode === undefined ? {} : { questionTimeoutMode: payload.questionTimeoutMode }),
         },
       })
     }

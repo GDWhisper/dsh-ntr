@@ -5,7 +5,7 @@
  */
 import type { AcpStore, UiState } from '../store.ts'
 import { tickLeft } from './shared.ts'
-import type { AcpApprovalDeadlines, PermissionTimeoutMode } from '../../protocol.ts'
+import type { AcpApprovalDeadlines, PermissionTimeoutMode, QuestionTimeoutMode } from '../../protocol.ts'
 
 /**
  * The ONE wait window, as the rungs the slider snaps to.
@@ -262,6 +262,53 @@ function elicitationText(ms: number, acp: AcpStore): string {
   return deadlineText(ms, acp, ['不设限', 'No limit'])
 }
 
+/**
+ * What an expired QUESTION ask does. Two rungs, because a question has no
+ * `abort` / `auto` / `wait` axis: the plugin either answers for the user or it
+ * does not. ACP declares no recommended option, so the second rung says what it
+ * actually sends — the first option — instead of promising a recommendation.
+ */
+function QuestionExpiryBlock(props: {
+  acp: AcpStore
+  mode: QuestionTimeoutMode
+  /** The form-question window in force; `0` means no deadline, so nothing fires. */
+  windowMs: number
+}) {
+  const { acp, mode, windowMs } = props
+  const copy = mode === 'first'
+    ? acp.label(
+      '超过时限未回答，自动发送第一个选项。',
+      'Past the deadline, the first option is sent for you.',
+    )
+    : acp.label(
+      '超过时限未回答，提问将被取消，不会替你选择。',
+      'Past the deadline, the question is cancelled — nothing is chosen for you.',
+    )
+  return (
+    <div className="dwa-preference-block">
+      <div className="dwa-preference-label">{acp.label('提问到期处理', 'When a question expires')}</div>
+      <div className="dwa-seg dwa-seg-wide">
+        {(['cancel', 'first'] as const).map(option => (
+          <button
+            key={option}
+            type="button"
+            className={mode === option ? 'is-on' : ''}
+            onClick={() => void acp.setQuestionTimeoutMode(option)}
+          >
+            {option === 'cancel' ? acp.label('到期取消', 'Cancel') : acp.label('自动选第一项', 'Pick first')}
+          </button>
+        ))}
+      </div>
+      <div className="dwa-preference-copy">{copy}</div>
+      {mode === 'first' && windowMs === 0 && (
+        <div className="dwa-deadline-warn">
+          {acp.label('时限为「不设限」，自动选择不会触发。', 'The window is “no limit”, so nothing will be picked.')}
+        </div>
+      )}
+    </div>
+  )
+}
+
 /** The form-question deadline shares the rungs, but zero means "no deadline". */
 function ElicitationDeadlineBlock(props: { acp: AcpStore; value: number; override?: string }) {
   const { acp, value, override } = props
@@ -305,9 +352,10 @@ function ElicitationDeadlineBlock(props: { acp: AcpStore; value: number; overrid
 /**
  * The facts the card has to show, decided from what the host reported.
  *
- * The card carries THREE controls: the approval window (how long), the approval
- * mode (what happens), and the independent form-question window. An override
- * can sit on any of them, so each is decided on its own.
+ * The card carries FOUR controls: the approval window (how long), the approval
+ * mode (what happens), the independent form-question window, and what an
+ * expired question does. An override can sit on any of them, so each is decided
+ * on its own.
  *
  * `overridden` is what gates the reset button. A baseline that AGREES with the
  * running value is not an override, and offering a reset for it would be a
@@ -321,6 +369,8 @@ export function approvalDeadlineFacts(deadlines: AcpApprovalDeadlines): {
   elicitationBaseline: number | undefined
   /** The config-file mode the card's mode outranks, when it differs. */
   modeBaseline: PermissionTimeoutMode | undefined
+  /** Built-in baseline (`cancel`) outranked when `questionTimeoutMode` is `first`. */
+  questionModeBaseline: QuestionTimeoutMode | undefined
   /** A reset is only honest when something is actually being outranked. */
   overridden: boolean
 } {
@@ -335,23 +385,32 @@ export function approvalDeadlineFacts(deadlines: AcpApprovalDeadlines): {
   const modeBaseline = deadlines.configuredMode !== undefined && deadlines.configuredMode !== deadlines.mode
     ? deadlines.configuredMode
     : undefined
+  const questionModeBaseline = deadlines.questionTimeoutMode !== undefined && deadlines.questionTimeoutMode !== 'cancel'
+    ? ('cancel' as const)
+    : undefined
   return {
     baseline,
     elicitationBaseline,
     modeBaseline,
-    overridden: baseline !== undefined || elicitationBaseline !== undefined || modeBaseline !== undefined,
+    questionModeBaseline,
+    overridden: baseline !== undefined
+      || elicitationBaseline !== undefined
+      || modeBaseline !== undefined
+      || questionModeBaseline !== undefined,
   }
 }
 
 /**
  * The approval-deadline card.
  *
- * THREE controls: the approval window (how long), the approval mode (what
- * happens), and the independent form-question window. One approval window
- * covers both places an ask can wait — the conversation's approval card and
- * the settings panel's ledger — because they ask the same question and the
- * answer should not differ by where the card happens to be drawn. Form
- * questions stay independent: expiry always cancels, so there is no mode.
+ * FOUR controls: the approval window (how long), the approval mode (what
+ * happens), the independent form-question window, and what an expired
+ * question does. One approval window covers both places an ask can wait — the
+ * conversation's approval card and the settings panel's ledger — because they
+ * ask the same question and the answer should not differ by where the card
+ * happens to be drawn. Form questions stay independent: expiry always cancels,
+ * so there is no mode; question-shaped permission asks use that same window
+ * with their own two-way expiry axis.
  *
  * The approval controls are ONE system, and the card says so in a sentence:
  * the window says how long to wait, the mode says what happens when nobody
@@ -413,6 +472,13 @@ export function ApprovalDeadlinesCard(props: { acp: AcpStore; ui: UiState }) {
         />
         {deadlines.elicitationTimeoutMs !== undefined && (
           <ElicitationDeadlineBlock acp={acp} value={deadlines.elicitationTimeoutMs} override={elicitationNote} />
+        )}
+        {deadlines.elicitationTimeoutMs !== undefined && deadlines.questionTimeoutMode !== undefined && (
+          <QuestionExpiryBlock
+            acp={acp}
+            mode={deadlines.questionTimeoutMode}
+            windowMs={deadlines.elicitationTimeoutMs}
+          />
         )}
         {facts.overridden && (
           <div className="dwa-deadline-reset">

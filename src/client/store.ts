@@ -38,7 +38,7 @@ import { SkillsService } from "./store/skills.ts"
 import { SubagentDetailService } from "./store/subagent-detail.ts"
 import { UpdateService } from "./store/update.ts"
 
-import type { AcpApprovalDeadlines, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentTestResult, AgentView, ApprovalDeadlinesResult, DelegateResult, DelegateSetPayload, DelegateSettingKey, DetectedAgentInfo, ElicitationOutcome, IdleReleaseResult, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, PluginVersionResult, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, AgentSkillEntry, SharedMcpResult, SharedMcpSetPayload, SubagentDetailEntry } from '../protocol.ts'
+import type { AcpApprovalDeadlines, AcpEvent, AcpIdleRelease, AcpPresetStatus, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSaveMode, AgentSavePayload, AgentSaveResult, AgentTestResult, AgentView, ApprovalDeadlinesResult, DelegateResult, DelegateSetPayload, DelegateSettingKey, DetectedAgentInfo, ElicitationOutcome, IdleReleaseResult, PermissionTimeoutMode, PluginReleaseNotes, PluginUpdateState, PluginVersionResult, QuestionTimeoutMode, SaveGateFlushResult, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView, AgentSkillEntry, SharedMcpResult, SharedMcpSetPayload, SubagentDetailEntry } from '../protocol.ts'
 import { DEFAULT_SAVE_GATE_TIMEOUT_MS, DEFAULT_SESSION_TITLE_PREFIX, DEFAULT_TAG_HALO } from '../protocol.ts'
 import { commitFrame, consumeVerdict, invalidateVerdict, markUnsettled, peekVerdict, projectAcpMode, settleFromHost, type AcpVerdict } from './acp-verdict.ts'
 
@@ -982,6 +982,8 @@ export class AcpStore {
     return this.settingsService.setApprovalDeadline(ms)
   }
   async setElicitationDeadline(ms: number): Promise<void> { return this.settingsService.setElicitationDeadline(ms) }
+  /** What an expired QUESTION ask does (`cancel` / `first`). */
+  async setQuestionTimeoutMode(mode: QuestionTimeoutMode): Promise<void> { return this.settingsService.setQuestionTimeoutMode(mode) }
   /** Write what an expired approval deadline DOES (`abort` / `auto` / `wait`). */
   async setApprovalTimeoutMode(mode: PermissionTimeoutMode): Promise<void> {
     return this.settingsService.setApprovalTimeoutMode(mode)
@@ -1317,6 +1319,9 @@ export class AcpStore {
           options: event.options,
           timeoutMode: event.timeoutMode,
           ...(event.deadlineAt === undefined ? {} : { deadlineAt: event.deadlineAt }),
+          ...(event.askKind === undefined ? {} : { askKind: event.askKind }),
+          ...(event.questionTimeoutMode === undefined ? {} : { questionTimeoutMode: event.questionTimeoutMode }),
+          ...(event.autoOptionName === undefined ? {} : { autoOptionName: event.autoOptionName }),
         }
         this.mutate({
           permissions: upsertPendingRequest(this.state.permissions, permission),

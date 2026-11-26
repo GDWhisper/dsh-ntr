@@ -341,6 +341,15 @@ describe('dispatchRpc', () => {
     // Form questions keep zero as the meaningful "no deadline" value.
     await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { elicitationTimeoutMs: 0 })).resolves.toMatchObject({ ok: true })
     expect(manager.calls).toContainEqual(['setApprovalDeadlines', { elicitationTimeoutMs: 0 }, false])
+    // Question expiry mode travels through the same route and accepts only `cancel` / `first`.
+    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { questionTimeoutMode: 'first' })).resolves.toMatchObject({ ok: true })
+    expect(manager.calls).toContainEqual(['setApprovalDeadlines', { questionTimeoutMode: 'first' }, false])
+    await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { questionTimeoutMode: 'cancel' })).resolves.toMatchObject({ ok: true })
+    expect(manager.calls).toContainEqual(['setApprovalDeadlines', { questionTimeoutMode: 'cancel' }, false])
+    for (const bad of ['auto', '', 1, null]) {
+      await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { questionTimeoutMode: bad }))
+        .resolves.toMatchObject({ ok: false, error: { code: 'bad_payload' } })
+    }
     // An unknown key is dropped rather than persisted into state, and the two
     // legacy windows can no longer be smuggled back in.
     await expect(dispatchRpc(manager, 'ui/approval-deadlines-set', { bogusKey: 5 })).resolves.toMatchObject({ ok: true })

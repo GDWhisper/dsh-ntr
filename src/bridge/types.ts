@@ -1,4 +1,4 @@
-import type { PermissionTimeoutMode, SessionView, SubagentStatus } from '../protocol.ts'
+import type { PermissionTimeoutMode, QuestionTimeoutMode, SessionView, SubagentStatus } from '../protocol.ts'
 
 /** What the composer showed for an agent before a conversation picked it. */
 export interface DisplayedChatDefaults {
@@ -99,6 +99,12 @@ export interface BridgeTuning {
    * deployments that would rather have a bounded turn.
    */
   permissionTimeoutMode?: PermissionTimeoutMode
+  /**
+   * What an expired QUESTION ask does. `cancel` (default) never answers for
+   * the user; `first` sends the first usable option and says so in the notice.
+   * Only question asks read this — approvals keep {@link permissionTimeoutMode}.
+   */
+  questionTimeoutMode?: QuestionTimeoutMode
   cancelFallbackMs?: number
   /**
    * How long to wait before resending a prompt the agent answered `cancelled`

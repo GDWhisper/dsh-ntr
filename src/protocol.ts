@@ -75,6 +75,7 @@ export type {
 
 export type {
   AcpEvent,
+  PermissionAskKind,
   PermissionOptionView,
   PermissionOutcome,
 } from './protocol/events.ts'
@@ -177,6 +178,7 @@ export type {
   IdleReleaseResult,
   IdleReleaseSetPayload,
   PermissionTimeoutMode,
+  QuestionTimeoutMode,
   SessionTitlePrefixResult,
   SessionTitlePrefixSetPayload,
   AcpHostMcpServerSummary,

@@ -24,6 +24,10 @@
 - **字段与动作**：按 schema 渲染 `single-select` / `multi-select` / `boolean` / `string` / `number` / `integer`（支持默认值与可选/必填校验，客户端 `buildElicitationContent` 与服务端 `validateElicitationOutcome` 均校验枚举成员与字段范围）；多字段按「问题 N / M」分步显示，逐步校验并在最后一页一次性提交完整 `content`，翻页不清草稿，底部固定 **Back/Next·Submit / Decline / Cancel**（单字段保持 Submit），不截获全局 Enter / Esc；`omittedFields` / `omittedOptions` 非空时在最后一页显示一行省略提示；携带 `deadlineAt` 时显示同款倒计时（`elicitationTimeoutMs`，默认 300s，到期宿主按 `cancel` 收场）。
 - **清理**：`session/closed` / `session/released` 仅清理对应会话的条目；SSE `elicitation/synced` 收敛活集合。
 
+### 10.0.2 问题型权限卡（同座，`askKind: 'question'`）
+
+agy 的固定选择题与审批同一方法下发，`PermissionDock` 按 `askKind` 分形态：标题用提问原文（`reason`，缺失回 `toolName`），选项**单列**、点击即答，不显示工具名、不出现「Always / 永久允许」措辞；底部一行说明到期行为（`cancel` → 取消、不代答；`first` → 自动选「X」，X 用宿主给的 `autoOptionName`，浏览器不自己推）。倒计时取 `elicitationTimeoutMs`，与审批模式无关，所以审批处于 `wait` 档时问题卡仍显示倒计时。
+
 ### 10.1 释放横幅（`acp-released-banner`，同座）
 
 会话的 agent 进程被释放（空闲回收 / 崩溃）后，`conversation.input.dock` 的第二条目 `ReleasedBanner`（`src/client/released-banner.tsx`）在输入框上方显示一行「进程已释放」+「恢复进程」按钮。释放本身按约束 19 是静默的，而「下一条消息自动恢复」的承诺从聊天面本身无法验证——横幅把它说出来，按钮把它变成一个手势。

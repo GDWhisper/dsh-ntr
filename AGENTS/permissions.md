@@ -186,6 +186,17 @@ to the config file"、"adopts a deadline the settings page writes while a sessio
 
 `AgentBridge` 在 ACP `initialize` 声明 `clientCapabilities.elicitation.form = {}`，由 `handleBridgeElicitationRequest`（`src/bridge/elicitation-bridge.ts`）接住 `elicitation/create`（非 `form` 模式回 `cancel`）；与审批共享纯账本 `PendingRequestLedger` / `pendingReplayFrames`（`src/impl/pending-request.ts` → `ElicitationLedger` / `elicitationReplayFrames`）。入口处按协议上限（`MAX_ELICITATION_*`：`message` 2000、`title` 200、`description` 500、20 字段、50 选项）截断或限制，被裁掉的字段 / 选项数随请求上报（`omittedFields` / `omittedOptions`），对话卡在最后一页显示一行省略提示；响应经 `validateElicitationOutcome`（服务端 `ElicitationLedger.respond` 复核）拒绝未声明字段与枚举外选项，校验失败保留 pending。多字段表单在客户端分步展示，但协议与账本仍是一问一答：最后一页提交完整 `content`。期限 `elicitationTimeoutMs` 是**独立**窗口（默认 300_000；`0` 不设限；不跟随 `permissionTimeoutMs`），可在设置页「审批时限」的「表单提问时限」子栏目经 `ui/approval-deadlines` 热改，覆盖落 `agents.json` 的 `approvalDeadlines.elicitationTimeoutMs` 并压过 `cordis.patch.yml`；新值只作用于下一次询问，已启动的倒计时不重排，到期结算 `cancel` 并广播 `agent/notice` + `elicitation/resolved`；`signal` 撤回、`session/cancel`、`closeSession`、`releaseAll` 同走 `settlePermissions` 清理。
 
+### 5.1 问题型 permission（`askKind: 'question'`）
+
+agy 把自己的固定选择题（「你选哪个方案」）放在 `session/request_permission` 里发，`toolCallId` 以 `interaction_` 开头。插件把它与工具审批区分开（`src/impl/permission.ts` · `permissionAskKind`；门禁 `src/bridge/question-ask.ts` · `questionAskKindOf` 只对 `isAntigravityAgent` 生效，读不出前缀一律 fail-open 回审批）：
+
+- **永不按 kind 优先级代答**：`pickAutoOption` 不参与（它会先挑 `allow_always`，对问题是错的答案）；到期取值只走 `pickQuestionDefault`（第一个 `optionId` 非空的选项，agent 原序）。
+- **独立窗口**：用 `elicitationTimeoutMs`，不看 `permissionTimeoutMode`；`0` = 不设限。
+- **独立到期轴** `questionTimeoutMode: 'cancel' | 'first'`（默认 `cancel`）：`cancel` 到期结算 `cancelled` 并留一条 notice「cancelled, not answered for you」；`first` 发送第一项并点名。窗口为 `0` 时 `first` 不触发，设置页同屏提示。
+- **委派会话**没有人类可答：`cancel` 时到达即结算 `cancelled`（不猜），`first` 按同一规则代答。
+- 帧上新增可选字段 `askKind` / `questionTimeoutMode` / `autoOptionName`（`permission/expired` 带 `askKind`）；审批帧一个字段都不加。
+- 策略与窗口在询问开始时读一次，热改只影响下一次询问。
+
 ## 代码索引
 
 | 主题 | 位置 |
@@ -195,9 +206,10 @@ to the config file"、"adopts a deadline the settings page writes while a sessio
 | 表单提问处理 | `src/bridge/elicitation-bridge.ts` · `handleBridgeElicitationRequest`；`src/impl/elicitation.ts` · `parseElicitationForm` / `validateElicitationOutcome` / `ElicitationLedger` / `elicitationRequestFrame` / `elicitationReplayFrames` |
 | 对话审批与表单卡 | `src/client/pending-dock.tsx` · `PendingDockShell` / `DeadlineBadge` / `useDeadlineClock`；`src/client/permission-dock.tsx` · `PermissionDock`；`src/client/elicitation-dock.tsx` · `ElicitationDock` / `ElicitationAskCard`；`src/client/index.tsx` · `conversation.input.dock` 注册 |
 | 重连重放 | `src/impl.ts` · `permissionRequestFrame` / `permissionReplayFrames` / `elicitationRequestFrame` / `elicitationReplayFrames`；`src/index.ts` · `/api/acp/stream` |
-| 超时收场 | `src/bridge/agent-bridge.ts` · `announceExpiredAsk` / `settleExpiredAsk`；`src/bridge/elicitation-bridge.ts` · `elicitationTimeoutMs` 到期逻辑；`src/impl.ts` · `pickAutoOption` |
-| 期限与模式热改 | `src/bridge/settings-service.ts` · `approvalDeadlines` / `applyDeadlineTuning`；`src/bridge/agent-bridge.ts` · `applyApprovalDeadlines`；`src/impl.ts` · `validateApprovalDeadlines` / `validateApprovalDeadlineMs` / `validatePermissionTimeoutMode` |
-| 期限 UI | `src/client/panel/approval-deadlines-card.tsx` · `ApprovalDeadlinesCard` / `DeadlineModeBlock` / `DeadlineSliderBlock`；`src/client/store.ts` · `setApprovalDeadline` / `setApprovalTimeoutMode` / `resetApprovalDeadlines` |
+| 超时收场 | `src/bridge/expired-ask.ts` · `announceExpiredAsk` / `settleExpiredAsk`；`src/bridge/elicitation-bridge.ts` · `elicitationTimeoutMs` 到期逻辑；`src/impl.ts` · `pickAutoOption` / `pickQuestionDefault` |
+| 问题型 permission | `src/impl/permission.ts` · `permissionAskKind` / `AGY_QUESTION_TOOL_CALL_PREFIX`；`src/bridge/question-ask.ts` · `questionAskKindOf`；`src/protocol/ui.ts` · `QuestionTimeoutMode`；`src/client/permission-dock.tsx` · `PermissionAskCard`（问题形态）；`src/bridge/expired-ask.ts` · `permissionChatLine` / `expiredChatLine` |
+| 期限与模式热改 | `src/bridge/settings-service.ts` · `approvalDeadlines` / `applyDeadlineTuning`；`src/bridge/agent-bridge.ts` · `applyApprovalDeadlines`；`src/impl.ts` · `validateApprovalDeadlines` / `validateApprovalDeadlineMs` / `validatePermissionTimeoutMode` / `validateQuestionTimeoutMode` |
+| 期限 UI | `src/client/panel/approval-deadlines-card.tsx` · `ApprovalDeadlinesCard` / `DeadlineModeBlock` / `DeadlineSliderBlock` / `QuestionExpiryBlock`；`src/client/store.ts` · `setApprovalDeadline` / `setApprovalTimeoutMode` / `setQuestionTimeoutMode` / `resetApprovalDeadlines` |
 | fs 围栏 | `src/bridge/agent-bridge.ts` · `handleFsWrite` / `guardFsPath`；`src/impl.ts` · `resolveFsPath` |
 | 设置页镜像 | `src/client/panel/permission-mirror.tsx` · `permissionLedgerCard` / `PermissionMirrorCard` |
 | 权限座位 | `src/client/model-seat.tsx` · `createPermissionSeatClaim` |

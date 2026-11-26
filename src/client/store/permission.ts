@@ -4,7 +4,7 @@
  * `src/client/store.ts` (split plan P3a), which re-exports it unchanged.
  */
 
-import type { PermissionTimeoutMode } from "../../protocol.ts"
+import type { PermissionAskKind, PermissionTimeoutMode, QuestionTimeoutMode } from "../../protocol.ts"
 import { pendingForSession } from "./pending.ts"
 
 /**
@@ -26,6 +26,12 @@ export interface PendingPermission {
   timeoutMode: PermissionTimeoutMode
   /** Epoch ms; absent in `wait` mode. */
   deadlineAt?: number
+  /** Absent = `approval`: an older host never says the word. */
+  askKind?: PermissionAskKind
+  /** Only on a question ask: what an expired deadline does. */
+  questionTimeoutMode?: QuestionTimeoutMode
+  /** Only on a question ask that WILL be answered on expiry: the option the host will send. */
+  autoOptionName?: string
 }
 
 /** Returned by {@link deadlineRemainingLabel} once the deadline has passed. */

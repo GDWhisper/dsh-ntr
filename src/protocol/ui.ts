@@ -167,6 +167,24 @@ export interface IdleReleaseSetPayload {
 export type PermissionTimeoutMode = 'abort' | 'auto' | 'wait'
 
 /**
+ * What an expired QUESTION ask does (`askKind: 'question'`).
+ *
+ * A question is not an approval: the agent is asking which answer the user
+ * wants, not whether an operation may run. There is therefore no
+ * `abort` / `auto` / `wait` axis here — the only choice is whether the plugin
+ * may answer on the user's behalf at all.
+ *
+ * - `cancel` (default): the ask expires unanswered. Nothing is guessed.
+ * - `first`: the first usable option is sent, and the notice names it.
+ *
+ * ACP declares no "recommended option" (an option is `optionId` / `name` /
+ * `kind`, where `kind` is approval vocabulary), so `first` is an approximation
+ * the user opts into — never the agent's own recommendation. See
+ * docs/plan/agy-question-asks.md.
+ */
+export type QuestionTimeoutMode = 'cancel' | 'first'
+
+/**
  * What the settings page's approval-deadline card shows: the values in force,
  * plus the facts that explain why a value the user did not pick is winning.
  *
@@ -186,6 +204,8 @@ export interface AcpApprovalDeadlines {
   permissionTimeoutMs: number
   /** Independent form-question window; `0` means no deadline. Absent on older hosts. */
   elicitationTimeoutMs?: number
+  /** What an expired QUESTION ask does; absent = `cancel` (older hosts). */
+  questionTimeoutMode?: QuestionTimeoutMode
   /** What an expired deadline does. Always present: `wait` is the default. */
   mode: PermissionTimeoutMode
   /** The config-file value for the window, when the file names one. */
@@ -208,6 +228,8 @@ export interface ApprovalDeadlinePatch {
   permissionTimeoutMs?: number
   elicitationTimeoutMs?: number
   mode?: PermissionTimeoutMode
+  /** Only for question asks; `cancel` is the default and is not persisted. */
+  questionTimeoutMode?: QuestionTimeoutMode
 }
 /**
  * `ui/approval-deadlines-set`: write the deadline, or the mode.

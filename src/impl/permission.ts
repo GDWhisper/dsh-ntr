@@ -8,7 +8,9 @@
  * APIs, no ACP SDK runtime values.
  */
 
-import type { AcpEvent, PermissionOptionView, PermissionTimeoutMode } from '../protocol.ts'
+import type {
+  AcpEvent, PermissionAskKind, PermissionOptionView, PermissionTimeoutMode, QuestionTimeoutMode,
+} from '../protocol.ts'
 import { pendingReplayFrames } from './pending-request.ts'
 
 /**
@@ -55,6 +57,44 @@ export function pickAutoOption(options: readonly PermissionOptionView[], preferO
   return options.length === 0 ? undefined : usable(options[0] as PermissionOptionView)
 }
 
+// ---- Question asks (`askKind: 'question'`) ----
+
+/**
+ * The `toolCallId` prefix Antigravity uses for its OWN fixed-choice questions,
+ * which it sends through `session/request_permission` — the approval method.
+ *
+ * External evidence only (t3code `AntigravityProtocol.ts` ·
+ * `isAntigravityUserInputRequest`); the built-in `agy acp` has not been
+ * captured yet, so this constant is the ONE place to change once it is. See
+ * docs/plan/agy-question-asks.md §2.3.
+ */
+export const AGY_QUESTION_TOOL_CALL_PREFIX = 'interaction_'
+
+/**
+ * Read one ask's semantic kind from the agent's tool call.
+ *
+ * FAIL-OPEN: an unreadable id, a missing id, or any other prefix is an
+ * `approval`, so the existing pipeline runs verbatim. Only Antigravity bridges
+ * call this at all (the gate lives in `questionAskKindOf`).
+ */
+export function permissionAskKind(toolCall: unknown): PermissionAskKind {
+  const id = (toolCall as { toolCallId?: unknown } | null | undefined)?.toolCallId
+  return typeof id === 'string' && id.startsWith(AGY_QUESTION_TOOL_CALL_PREFIX) ? 'question' : 'approval'
+}
+
+/**
+ * The option an expired QUESTION ask answers with in `first` mode: the first
+ * option with a usable id, in the agent's own order.
+ *
+ * Deliberately NOT {@link pickAutoOption}: that one ranks by permission KIND
+ * (`allow_always` first), which says nothing about which answer a question
+ * expects — and would send the broadest grant as if it were a choice.
+ * `undefined` means there is nothing to answer with; the caller cancels.
+ */
+export function pickQuestionDefault(options: readonly PermissionOptionView[]): PermissionOptionView | undefined {
+  return options.find(option => option.optionId !== '')
+}
+
 // ---- The agent's own permission vocabulary ----
 
 /** ACP `ToolCall.kind` values that are known to take a file effect. */
@@ -95,6 +135,12 @@ export interface PendingPermissionFields {
   timeoutMode: PermissionTimeoutMode
   /** Epoch ms of the deadline; absent in `wait` mode (no deadline). */
   deadlineAt?: number
+  /** Absent = `approval`; only a question ask says the word. */
+  askKind?: PermissionAskKind
+  /** Only on a question ask: what an expired deadline does. */
+  questionTimeoutMode?: QuestionTimeoutMode
+  /** Only on a question ask that WILL be answered on expiry: the option the host will send. */
+  autoOptionName?: string
 }
 
 /** One outstanding ask as a reconnecting client must be re-shown it. */
@@ -124,6 +170,9 @@ export function permissionRequestFrame(view: PendingPermissionView): AcpEvent {
     options: view.options,
     timeoutMode: view.timeoutMode,
     ...(view.deadlineAt === undefined ? {} : { deadlineAt: view.deadlineAt }),
+    ...(view.askKind === undefined ? {} : { askKind: view.askKind }),
+    ...(view.questionTimeoutMode === undefined ? {} : { questionTimeoutMode: view.questionTimeoutMode }),
+    ...(view.autoOptionName === undefined ? {} : { autoOptionName: view.autoOptionName }),
   }
 }
 

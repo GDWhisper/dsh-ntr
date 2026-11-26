@@ -359,6 +359,9 @@ describe('host plugin contract', () => {
       permissionTimeoutMs: 600_000,
       elicitationTimeoutMs: 900_000,
       mode: 'wait',
+      // Questions have their own expiry axis, unset in the file: the built-in
+      // `cancel` is reported, not a phantom override.
+      questionTimeoutMode: 'cancel',
       configured: { permissionTimeoutMs: 600_000, elicitationTimeoutMs: 900_000 },
       configuredMode: 'wait',
     })

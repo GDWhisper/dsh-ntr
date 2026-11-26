@@ -10,11 +10,22 @@
 import type { SessionUpdate } from '@agentclientprotocol/sdk'
 import type { SubagentRecord } from '../protocol-subagent.ts'
 import type { ElicitationFieldView } from './elicitation.ts'
-import type { PermissionTimeoutMode } from './ui.ts'
+import type { PermissionTimeoutMode, QuestionTimeoutMode } from './ui.ts'
 import type { SaveGateStatus } from './save-gate.ts'
 import type { AcpReleaseCause, AgentProcessState, AgentView, SessionView } from './views.ts'
 
 // ---- Host → browser events (`/api/acp/stream`, SSE) ----
+
+/**
+ * What one `session/request_permission` ask actually IS.
+ *
+ * `approval` (default) is the protocol's own meaning: may this operation run.
+ * `question` is Antigravity's use of the same method for its own fixed-choice
+ * questions (`toolCallId` prefix `interaction_`). The distinction is the
+ * plugin's reading of the wire, not a protocol field — see
+ * docs/plan/agy-question-asks.md.
+ */
+export type PermissionAskKind = 'approval' | 'question'
 
 export type AcpEvent =
   | { type: 'agent/status'; agentId: string; state: AgentProcessState; error?: string; agent?: AgentView }
@@ -104,6 +115,12 @@ export type AcpEvent =
       timeoutMode: PermissionTimeoutMode
       /** Epoch ms of the deadline; absent in `wait` mode (no deadline). */
       deadlineAt?: number
+      /** Absent = `approval`: an older host never says the word. */
+      askKind?: PermissionAskKind
+      /** Only on a question ask: what an expired deadline does. */
+      questionTimeoutMode?: QuestionTimeoutMode
+      /** Only on a question ask that WILL be answered on expiry: the option the host will send. */
+      autoOptionName?: string
     }
   | { type: 'permission/resolved'; requestId: string; sessionId: string; outcome: PermissionOutcome }
   /**
@@ -118,6 +135,8 @@ export type AcpEvent =
   | {
       type: 'permission/expired'
       sessionId: string
+      /** Absent = `approval`; a question's expiry reads differently in the chat. */
+      askKind?: PermissionAskKind
       toolCall: unknown
       /** How long the ask waited before the deadline fired. */
       timeoutMs: number

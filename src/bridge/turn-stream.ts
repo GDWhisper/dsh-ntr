@@ -21,6 +21,7 @@ import type { LiveSession } from './live-session.ts'
 import { releasePromptSlot } from './session-lifecycle.ts'
 import { activeDrain, clearNotices, drainOf, hasRecentRetiredDrain, isConsumedDrain, isRetiredDrain, markNotice, openDrainGeneration, retireDrain, reviveDrain, startDrain, stopDrain, touchDrain, type DrainDelivery } from './drain-record.ts'
 import { ReplayEchoGuard, isTextualContent } from './agy-echo-guard.ts'
+import { expiredChatLine, permissionChatLine } from './expired-ask.ts'
 export { activeDrain, drainOf, isConsumedDrain, markNotice, openDrainGeneration, startDrain, stopDrain, touchDrain }
 
 export type { LiveSession } from './live-session.ts'
@@ -2073,11 +2074,11 @@ export class TurnStreamController {
     } else if (row.type === 'permission/request') {
       this.tps.onBreak()
       const typed = event as Extract<AcpEvent, { type: 'permission/request' }>
-      this.pushProse(this.permissionLine(typed))
+      this.pushProse(permissionChatLine(typed))
     } else if (row.type === 'permission/expired') {
       this.tps.onBreak()
-      const typed = event as { toolCall: unknown; timeoutMs: number; outcome: PermissionOutcome; optionName?: string }
-      this.pushProse(this.expiredLine(typed))
+      const typed = event as Extract<AcpEvent, { type: 'permission/expired' }>
+      this.pushProse(expiredChatLine(typed))
     }
   }
 
@@ -2470,50 +2471,6 @@ export class TurnStreamController {
       ...(snapshot.name === '' ? {} : { name: snapshot.name }),
       argumentsDelta: snapshot.argsRaw,
     })
-  }
-
-  private permissionLine(event: Extract<AcpEvent, { type: 'permission/request' }>): string {
-    // `toolName` is host-derived (`permissionToolName`) so agents that omit
-    // `title` and declare it in `_meta` still name the operation here.
-    const title = event.toolName
-    // The line must point at the place the answer entry actually is: a
-    // chat-bound ask renders its card in the conversation; an `/acp`-RPC ask
-    // has no conversation, so its card lives on the settings page.
-    const lead = event.dshSessionId !== undefined
-      ? 'please answer the permission card above the composer'
-      : 'please approve in Settings'
-    // The last clause says what happens if nobody answers, and it follows the
-    // MODE: refused, answered automatically, or (in `wait`) nothing at all.
-    if (event.timeoutMode === 'wait' || event.deadlineAt === undefined) {
-      return `\n> 🔐 [Permission Required: ${title}] - ${lead}\n`
-    }
-    const remainingMs = Math.max(0, event.deadlineAt - Date.now())
-    // Floor (+1 ms for the Date.now tick), min 1: rounding up would promise time already spent.
-    const remainingS = Math.max(1, Math.floor((remainingMs + 1) / 1000))
-    const otherwise = event.timeoutMode === 'auto'
-      ? 'this request is answered automatically'
-      : 'this request is cancelled'
-    return `\n> 🔐 [Permission Required: ${title}] - ${lead} within ${String(remainingS)}s or ${otherwise}\n`
-  }
-
-  /**
-   * The line for an ask the plugin settled itself when its deadline fired.
-   *
-   * The composer card is disappearing, so the conversation has to say what
-   * happened to the question — otherwise the user is left with a vanished
-   * card and no explanation. The wording follows the outcome: refused, or
-   * answered with the option the agent's own kinds implied.
-   */
-  private expiredLine(event: { toolCall: unknown; timeoutMs: number; outcome: PermissionOutcome; optionName?: string }): string {
-    const title = permissionToolName(event.toolCall)
-    const waited = event.timeoutMs > 0
-      ? `no answer within ${String(Math.round(event.timeoutMs / 1000))}s`
-      : 'not waited for'
-    if (event.outcome.outcome === 'selected') {
-      const picked = event.optionName === undefined ? event.outcome.optionId : event.optionName
-      return `\n> 🔐 [Permission Required: ${title}] - ${waited}; answered "${picked}" automatically, continuing\n`
-    }
-    return `\n> 🔐 [Permission Required: ${title}] - ${waited}; refused\n`
   }
 }
 

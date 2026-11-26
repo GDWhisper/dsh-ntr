@@ -35,12 +35,23 @@ export interface PermissionDockProps {
   sessionId: string
 }
 
+export function questionExpiryLabel(acp: AcpStore, permission: PendingPermission): string | undefined {
+  if (permission.askKind !== 'question' || permission.deadlineAt === undefined) return undefined
+  if (permission.questionTimeoutMode === 'first' && permission.autoOptionName !== undefined && permission.autoOptionName !== '') {
+    return acp.label(
+      `到期将自动选择「${permission.autoOptionName}」`,
+      `On expiry, “${permission.autoOptionName}” is sent for you`,
+    )
+  }
+  return acp.label('到期将取消，不会替你作答', 'On expiry the question is cancelled — nothing is chosen for you')
+}
+
 export function PermissionDock({ acp, sessionId }: PermissionDockProps) {
   ensureAcpStyle()
   const ui = useUi(acp)
   const dshSessionId = String(sessionId)
   const pending = permissionsForSession(ui.permissions, dshSessionId)
-  const counting = pending.some(ask => ask.timeoutMode !== 'wait' && ask.deadlineAt !== undefined)
+  const counting = pending.some(ask => (ask.askKind === 'question' || ask.timeoutMode !== 'wait') && ask.deadlineAt !== undefined)
   const now = useDeadlineClock(counting)
   if (pending.length === 0) return null
   return (
@@ -59,6 +70,15 @@ function PermissionAskCard(props: { acp: AcpStore; permission: PendingPermission
   const { acp, permission, now } = props
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
+  // A question is not an approval: same wire method, different meaning. Its
+  // text IS the ask, its options are answers, and its expiry is its own axis.
+  const question = permission.askKind === 'question'
+  const title = question ? (permission.reason ?? permission.toolName) : permission.toolName
+  // A question's deadline comes from the form-question window, not the approval
+  // mode, so the badge must not hide behind `wait` (an approval in `wait` mode
+  // carries no deadline at all, which is why that check exists).
+  const badgeMode = question ? 'auto' : permission.timeoutMode
+  const expiry = questionExpiryLabel(acp, permission)
   const respond = (optionId?: string): void => {
     if (busy) return
     setBusy(true)
@@ -73,15 +93,15 @@ function PermissionAskCard(props: { acp: AcpStore; permission: PendingPermission
       .finally(() => { setBusy(false) })
   }
   return (
-    <div className="ntr-permission-card">
+    <div className={`ntr-permission-card${question ? ' is-question' : ''}`}>
       <div className="ntr-permission-head">
-        <span className="ntr-permission-tool">{permission.toolName}</span>
-        {permission.reason !== undefined && (
+        <span className="ntr-permission-tool">{title}</span>
+        {!question && permission.reason !== undefined && (
           <span className="ntr-permission-reason" title={permission.reason}>{permission.reason}</span>
         )}
-        <DeadlineBadge acp={acp} deadlineAt={permission.deadlineAt} now={now} mode={permission.timeoutMode} />
+        <DeadlineBadge acp={acp} deadlineAt={permission.deadlineAt} now={now} mode={badgeMode} />
       </div>
-      <div className="ntr-permission-actions">
+      <div className={`ntr-permission-actions${question ? ' is-question' : ''}`}>
         {permission.options.map(option => (
           <button
             key={option.optionId}
@@ -98,12 +118,17 @@ function PermissionAskCard(props: { acp: AcpStore; permission: PendingPermission
           type="button"
           className="ntr-permission-cancel"
           disabled={busy}
-          title={acp.label('取消这次询问（不选择任何选项）', 'Cancel this ask without choosing an option')}
+          title={question
+            ? acp.label('取消这次提问（不选择任何选项）', 'Cancel this question without choosing an option')
+            : acp.label('取消这次询问（不选择任何选项）', 'Cancel this ask without choosing an option')}
           onClick={() => { respond() }}
         >
           {acp.label('取消', 'Cancel')}
         </button>
       </div>
+      {expiry !== undefined && (
+        <div className="ntr-permission-expiry">{expiry}</div>
+      )}
       {error !== undefined && (
         <div className="ntr-permission-error" role="alert">{error}</div>
       )}

@@ -20,10 +20,12 @@ import {
   AcpError,
   acpPresetStatusFromRoster,
   normalizeApprovalWindow,
+  parsePersistedApprovalDeadlines,
   validateApprovalDeadlines,
   validateDelegateConfig,
   validateMcpServers,
   validatePermissionTimeoutMode,
+  validateQuestionTimeoutMode,
   validateTagHalo,
 } from '../impl.ts'
 import type { RosterPresetRow } from '../impl.ts'
@@ -42,6 +44,7 @@ import type {
   DelegateSetPayload,
   DelegateSettingKey,
   PermissionTimeoutMode,
+  QuestionTimeoutMode,
   PluginReleaseNotes,
   PluginUpdateState,
   SharedMcpSetPayload,
@@ -200,6 +203,12 @@ export class SettingsService {
    * write would fight with no way to tell which one is live.
    */
   private deadlineOverride: ApprovalDeadlinePatch = {}
+  /**
+   * What an expired QUESTION ask does before any override. There is no config
+   * key for it: a deployment must not be able to opt a user into answering
+   * questions for them, so this is always the built-in `cancel`.
+   */
+  private baselineQuestionTimeoutMode: QuestionTimeoutMode = 'cancel'
   /**
    * The idle-release window the settings page picked, in ms, persisted with the
    * agent registry. `undefined` means the deployment baseline runs.
@@ -568,6 +577,7 @@ export class SettingsService {
       permissionTimeoutMs: tuning.permissionTimeoutMs,
       elicitationTimeoutMs: tuning.elicitationTimeoutMs,
       mode: tuning.permissionTimeoutMode,
+      questionTimeoutMode: this.deadlineOverride.questionTimeoutMode ?? this.baselineQuestionTimeoutMode,
     }
     if (Object.keys(this.configuredDeadlines).length > 0) deadlines.configured = { ...this.configuredDeadlines }
     if (this.configuredMode !== undefined) deadlines.configuredMode = this.configuredMode
@@ -756,15 +766,21 @@ export class SettingsService {
     const mode = merged.mode === undefined
       ? undefined
       : validatePermissionTimeoutMode(merged.mode, 'bad_payload')
+    const questionTimeoutMode = merged.questionTimeoutMode === undefined
+      ? undefined
+      : validateQuestionTimeoutMode(merged.questionTimeoutMode, 'bad_payload')
     // Persist the user's RAW window, never a mode-specific rewrite: 不等待 (0)
     // belongs to `auto`, and the floor under `abort` is a RUNTIME fact applied
     // by `applyDeadlineTuning`. Flooring it here would turn a mode switch into
     // a silent edit of the stored value, so switching back to `auto` could
     // never restore the zero the user actually picked.
+    // `cancel` is the built-in default for questions and is not persisted so
+    // the state file stays clean until the user opts into `first`.
     this.deadlineOverride = {
       ...(window === undefined ? {} : { permissionTimeoutMs: window }),
       ...(elicitationTimeoutMs === undefined ? {} : { elicitationTimeoutMs }),
       ...(mode === undefined ? {} : { mode }),
+      ...(questionTimeoutMode === 'first' ? { questionTimeoutMode } : {}),
     }
     this.applyDeadlineTuning()
     this.host.persistAgents()
@@ -791,13 +807,15 @@ export class SettingsService {
       this.deadlineOverride.permissionTimeoutMs ?? this.baselineDeadline,
     )
     const elicitationTimeoutMs = this.deadlineOverride.elicitationTimeoutMs ?? this.baselineElicitationTimeoutMs
+    const questionTimeoutMode = this.deadlineOverride.questionTimeoutMode ?? this.baselineQuestionTimeoutMode
     this.host.replaceTuning({
       ...this.host.currentTuning(),
       permissionTimeoutMs,
       elicitationTimeoutMs,
       permissionTimeoutMode,
+      questionTimeoutMode,
     })
-    const patch = { permissionTimeoutMs, elicitationTimeoutMs, mode: permissionTimeoutMode }
+    const patch = { permissionTimeoutMs, elicitationTimeoutMs, mode: permissionTimeoutMode, questionTimeoutMode }
     for (const bridge of this.host.bridges()) bridge.applyApprovalDeadlines(patch)
   }
 
@@ -849,44 +867,9 @@ export class SettingsService {
     }
     const storedHostMcpSync = parsed.hostMcpSyncEnabled
     this.hostMcpSyncEnabledSetting = typeof storedHostMcpSync === 'boolean' ? storedHostMcpSync : undefined
-    // The settings page's approval-deadline override. Re-validated on every
-    // boot because the state file is user- and version-editable: an unreadable
-    // value must not poison the deadline, and a value the validator accepts
-    // must be the value that runs (a UI write that did not survive a restart
-    // would read as a broken setting).
-    try {
-      const raw = (parsed.approvalDeadlines as Record<string, unknown> | undefined) ?? {}
-      // The OLD card wrote the two legacy windows, and its 「关」 preset wrote a
-      // zero — which then meant "this window never fires". The only way to say
-      // that now is the `wait` MODE (a zero means 不等待 today), so a legacy
-      // zero carries over as the mode instead of silently turning "wait
-      // forever" into "answer immediately".
-      const legacy = raw as { nativeApprovalTimeoutMs?: unknown; permissionFallbackTimeoutMs?: unknown }
-      const legacyWindow = legacy.nativeApprovalTimeoutMs ?? legacy.permissionFallbackTimeoutMs
-      const legacyNever = legacyWindow === 0
-      const windows = validateApprovalDeadlines(raw)
-      const window = legacyNever
-        ? undefined
-        : windows.permissionTimeoutMs
-      const elicitationTimeoutMs = windows.elicitationTimeoutMs
-      const mode = legacyNever
-        ? ('wait' as const)
-        : ((raw as { mode?: unknown }).mode === undefined
-          ? undefined
-          : validatePermissionTimeoutMode((raw as { mode?: unknown }).mode, 'bad_payload'))
-      // The stored window is the user's RAW pick and is read back as-is:
-      // 不等待 (0) belongs to `auto`, and the floor under `abort` is applied at
-      // RUNTIME only (`applyDeadlineTuning`). Rewriting it here would make a
-      // restart itself change what the user chose, and a later switch back to
-      // `auto` could never recover the zero.
-      this.deadlineOverride = {
-        ...(window === undefined ? {} : { permissionTimeoutMs: window }),
-        ...(elicitationTimeoutMs === undefined ? {} : { elicitationTimeoutMs }),
-        ...(mode === undefined ? {} : { mode }),
-      }
-    } catch {
-      this.deadlineOverride = {}
-    }
+    // The settings page's approval-deadline override. Re-validated per key on
+    // every boot because the state file is user- and version-editable.
+    this.deadlineOverride = parsePersistedApprovalDeadlines(parsed.approvalDeadlines)
     // The settings page's idle-release pick. Re-validated on every boot because
     // the state file is user- and version-editable: an unreadable value must
     // not poison the window, and a value the validator accepts must be the

@@ -16,6 +16,10 @@
   - 为什么：agy 的 ACP wire 不带任何子代理生命周期 `_meta`（CodeBuddy 那套键全缺），既有面板对 agy 永远空；但 agy 私有 brain transcript 留有完整证据——派发结果含子代理 `conversationId`、子代理自己的步骤流、报告以 `SYSTEM_MESSAGE` 写回父 transcript
   - 怎么做：wire 认 `invoke_subagent` 派发 → 复用 `SubagentRecord` 六态（`childId = acp:<toolCallId>`，新增可选 `childConversationId`）；状态由子代理 transcript 轮询驱动（父 `SYSTEM_MESSAGE` 权威 + 子最后 `PLANNER_RESPONSE` DONE 兜底，「最新步 + 静默窗」双门控去重），未终态 dispatch 算活跃工作阻止空闲释放（两档静默上限复用，不是第三种强制定稿）；明细按需读子 brain transcript，浏览器只读步骤视图（详情浮层搬出 `subagent-panel.tsx`，1038→468 行数锁退役）
   - 状态：已实现待真机验收（P1–P3 落地，任务审核 + 整枝终审 + 修复波复审通过，prepack 1388 测试全绿）；§12 未决项与 §13 验收需已认证 agy 会话，真机清单与 DEFER 后续见 [docs/todo.md](./todo.md)
+- [方案：Antigravity 固定选择题的识别与到期策略（已实施 / 待抓帧）](./plan/agy-question-asks.md)
+  - 为什么：agy 的固定选择题走 `session/request_permission`（`toolCallId` 前缀 `interaction_`），今天被当工具审批——`auto` 档按 kind 优先级代答（先挑 `allow_always`），卡片也读成「允许 / 拒绝」
+  - 怎么做：给询问加显式 `askKind`（`approval` / `question`），问题不再走 `pickAutoOption`、改用独立窗口 `elicitationTimeoutMs` 与独立到期轴 `questionTimeoutMode`（默认取消，用户可显式开启「到期自动选第一项」）；卡片改问题形态，配置落 `agents.json` 的 `approvalDeadlines`
+  - 状态：已实现（宿主 + 设置卡 + 问题卡，全量审查修复与定向测试补全）；`interaction_` 前缀与选项形状待一次已认证 agy 提问抓帧确认，见方案 §2.3 / §13
 - [方案：隐式状态机显式化（分阶段执行手册）](./plan/implicit-state-machines.md)
   - 为什么：6 处生命周期靠布尔、可选值、计数器与集合成员性组合表达，存在真实非法组合（`closed && released`、`retired && consumed`）与重置缺口；全量扫描已完成并分级
   - 怎么做：按 ACP 模式 → 保存暂存 → HMR → SaveGate → 会话生命周期 → 背景 drain 六个阶段，每个阶段先双写再迁读取方后删旧字段；含行数门禁对策、验证命令、验收测试与回滚纪律

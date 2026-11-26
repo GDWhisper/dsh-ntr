@@ -22,6 +22,7 @@ export {
   APPROVAL_DEADLINE_MIN_WAIT_MS,
   normalizeApprovalWindow,
   normalizeExposedModels,
+  parsePersistedApprovalDeadlines,
   validateAgentDef,
   validateApprovalDeadlineMs,
   validateApprovalDeadlines,
@@ -33,6 +34,7 @@ export {
   validateIdleReleaseMs,
   validateMcpServers,
   validatePermissionTimeoutMode,
+  validateQuestionTimeoutMode,
   validateTagHalo,
 } from './impl/validate.ts'
 
@@ -126,13 +128,16 @@ export { SESSION_TITLE_PLACEHOLDER_MAX, extractSessionTitlePlaceholder, selectFo
 
 export type { PendingPermissionFields, PendingPermissionView } from './impl/permission.ts'
 export {
+  AGY_QUESTION_TOOL_CALL_PREFIX,
   AUTO_OPTION_KIND_PRIORITY,
   DELEGATE_AUTO_KIND_PRIORITY,
+  permissionAskKind,
   permissionReplayFrames,
   permissionRequestFrame,
   permissionToolKind,
   permissionToolPaths,
   pickAutoOption,
+  pickQuestionDefault,
 } from './impl/permission.ts'
 
 // ---- Shared pending human-input ledger ----

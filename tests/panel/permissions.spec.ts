@@ -145,4 +145,51 @@ describe('AcpSettingsSection permissions', () => {
     await act(async () => { await fixture.store.resync() })
     expect(fixture.store.getSnapshot().approvalDeadlines).toMatchObject({ mode: 'wait', permissionTimeoutMs: 300_000 })
   })
+
+  it('edits questionTimeoutMode, warns at no-limit, resets `first` back to `cancel`, and hides on older hosts', async () => {
+    const fixture = await mountPanel()
+    await category('审批时限')
+    expect(screen.getByText('提问到期处理')).toBeDefined()
+    expect(screen.queryByRole('button', { name: '恢复配置文件的值' })).toBeNull()
+
+    await click(screen.getByRole('button', { name: '自动选第一项' }))
+    expect(payloads(fixture, 'ui/approval-deadlines-set')).toEqual([{ questionTimeoutMode: 'first' }])
+    expect(fixture.store.getSnapshot().approvalDeadlines?.questionTimeoutMode).toBe('first')
+    // Switching `questionTimeoutMode` to `first` alone must reveal the reset button.
+    expect(screen.getByRole('button', { name: '恢复配置文件的值' })).toBeDefined()
+
+    const slider = screen.getByRole('slider', { name: '表单提问时限' }) as HTMLInputElement
+    await act(async () => { fireEvent.change(slider, { target: { value: '0' } }) })
+    expect(screen.getByText('时限为「不设限」，自动选择不会触发。')).toBeDefined()
+
+    await click(screen.getByRole('button', { name: '恢复配置文件的值' }))
+    expect(fixture.store.getSnapshot().approvalDeadlines?.questionTimeoutMode).toBe('cancel')
+    expect(screen.queryByRole('button', { name: '恢复配置文件的值' })).toBeNull()
+
+    cleanup()
+    await mountPanel({ approvalDeadlines: { mode: 'wait', permissionTimeoutMs: 300_000, elicitationTimeoutMs: 300_000 } })
+    await category('审批时限')
+    expect(screen.getByRole('slider', { name: '表单提问时限' })).toBeDefined()
+    expect(screen.queryByText('提问到期处理')).toBeNull()
+  })
+
+  it('mirrors question asks in Settings with question title and expiry notice', async () => {
+    const fixture = await mountPanel()
+    await category('智能体')
+    await act(async () => {
+      await fixture.applyEvent(permission({
+        requestId: 'q-mirror-1',
+        toolCall: { toolCallId: 'interaction_1', title: 'Pick strategy' },
+        toolName: 'Pick strategy',
+        reason: 'Which rollout plan should we take?',
+        askKind: 'question',
+        questionTimeoutMode: 'first',
+        autoOptionName: 'Allow once',
+        deadlineAt: Date.now() + 60_000,
+      }))
+    })
+    expect(screen.getByText('Which rollout plan should we take?')).toBeDefined()
+    expect(screen.queryByText('Pick strategy')).toBeNull()
+    expect(screen.getByText('到期将自动选择「Allow once」')).toBeDefined()
+  })
 })
