@@ -157,8 +157,11 @@ export class SessionRegistryService {
    * closed by us — the row is the only pointer a later `session/load` has
    * (constraint 10). Delete passes `false`: the agent is gone, and a row naming
    * it would come back the moment the same id is added again.
+   *
+   * The flag is REQUIRED: a default here would let a new direct caller silently
+   * pick the wrong half of the stop / delete split.
    */
-  dropSessionsOfAgent(agentId: string, keepReleased = false): string[] {
+  dropSessionsOfAgent(agentId: string, keepReleased: boolean): string[] {
     const dropped: string[] = []
     for (const [key, session] of this.dshSessionMap) {
       if (session.agentId !== agentId) continue

@@ -618,8 +618,8 @@ describe('agent save/delete and released chat sessions (isolated manager)', () =
     return gm
   }
 
-  const rows = (storage: string): Array<{ sessionId: string; acpSessionId: string }> =>
-    (JSON.parse(readFileSync(storage, 'utf-8')) as { chatSessions?: Array<{ sessionId: string; acpSessionId: string }> }).chatSessions ?? []
+  const rows = (storage: string): Array<{ sessionId: string; acpSessionId: string; dshSessionId: string }> =>
+    (JSON.parse(readFileSync(storage, 'utf-8')) as { chatSessions?: Array<{ sessionId: string; acpSessionId: string; dshSessionId: string }> }).chatSessions ?? []
 
   it('keeps a released conversation resumable through a save of the same definition', async () => {
     const storage = `${tmpdir()}/acp-save-released-${Date.now()}.json`
@@ -648,6 +648,31 @@ describe('agent save/delete and released chat sessions (isolated manager)', () =
       await gm.deleteAgent('drop-me')
       expect(rows(storage)).toEqual([])
       expect(gm.chatSessions('dsh-drop')).toEqual([])
+    } finally {
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
+  it('drops only the live rows when a restored parked conversation shares the agent', async () => {
+    const storage = `${tmpdir()}/acp-save-mixed-${Date.now()}.json`
+    const first = await parked('mixed', 'dsh-old', storage)
+    // A host restart restores the parked row from `agents.json`.
+    await first.shutdownAll()
+    const localHub = new EventHub()
+    const gm = new BridgeManager([{ ...targetDef, id: 'mixed' }], localHub, 100, storage, `${storage}.catalog.json`, false)
+    ;(gm as unknown as { probeAgentModels: (id: string) => Promise<unknown> }).probeAgentModels = async () => {}
+    try {
+      expect(gm.chatSessions('dsh-old')[0]?.released).toBe(true)
+      await chatTurn(gm, 'dsh-new', 'mixed', 'hello')
+      expect(gm.chatSessions('dsh-new')[0]?.released).toBeFalsy()
+      await gm.saveAgent({ ...targetDef, id: 'mixed' }, 'direct')
+      // The save closes the live conversation; the restored parked row survives
+      // and still comes back through `session/load`.
+      expect(rows(storage).map(row => row.dshSessionId)).toEqual(['dsh-old'])
+      expect(gm.chatSessions('dsh-old')[0]?.released).toBe(true)
+      expect(gm.chatSessions('dsh-new')).toEqual([])
+      await chatTurn(gm, 'dsh-old', 'mixed', 'back again')
+      expect(await chatEcho(gm, 'dsh-old')).toContain('REPLAYED: earlier conversation')
     } finally {
       await gm.shutdownAll()
     }

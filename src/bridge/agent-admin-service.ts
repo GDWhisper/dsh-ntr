@@ -70,10 +70,12 @@ export interface AgentAdminHost {
   /** Whether any process slot exists for the agent (the save / delete stop guard). */
   hasBridge(agentId: string): boolean
   /**
-   * Stop every live bridge of the agent and drop its bare process slot. A
-   * no-op when no bridge exists, so a caller may fire it unconditionally.
-   * `keepReleased` spares the parked records (see `BridgeRegistryService.stopAgent`);
-   * a delete passes `false` so the removed agent cannot resurrect its contexts.
+   * Stop every live bridge of the agent and drop its bare process slot. With
+   * no process there is nothing to tear down; the session records are still
+   * handled per `keepReleased`, so a caller may fire it unconditionally.
+   * `keepReleased` (default) spares the parked records (see
+   * `BridgeRegistryService.stopAgent`); a delete passes `false` so the removed
+   * agent cannot resurrect its contexts.
    */
   stopAgent(agentId: string, persist?: boolean, keepReleased?: boolean): Promise<void>
   /**
