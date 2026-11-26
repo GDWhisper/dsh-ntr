@@ -20,7 +20,7 @@
 
 ```sh
 PREV=$(git describe --tags --abbrev=0 --match 'v*')   # 起草时最近的已发布 tag
-git log --format='%h %s' "${PREV}"..HEAD
+git log --format='%h %an <%ae> %s' "${PREV}"..HEAD
 ```
 
 逐笔判定：
@@ -39,6 +39,7 @@ git log --format='%h %s' "${PREV}"..HEAD
 - [ ] `npm run verify` 通过（行数门禁 + typecheck + 全部测试 + build）
 - [ ] 已用 `git log vPREV..HEAD` 逐笔核对：区间内每个用户可见改动都有净改动条目，同一功能的多次迭代已合并去噪
 - [ ] `CHANGELOG.md` 已加本版一节，与 release note 同一套话、带提交号；中英双版、同一分区按提交顺序排列、两版末尾都有 compare 链接
+- [ ] 已按 `vPREV..HEAD` 核对外部贡献者：有则在两版变更分区后、`Full Changelog` 前附贡献者栏目，无则不展示
 - [ ] 每条条目链接的 commit 都在本版区间内；内部文档 / 测试 / 重构提交没有记成用户改动
 - [ ] release note 按下方「Release note 规则」写好
 - [ ] 要在本机 DSH 里自测：`npm run build` 后重启 DSH（宿主半区是进程内加载的）
@@ -121,10 +122,11 @@ EOF
 - 一条一行，格式 `- **scope**：净改动。([abc1234](https://github.com/GDWhisper/dsh-ntr/commit/abc1234))`；`scope` 用引入它的 commit 的 conventional scope，有 issue 就再挂 issue 链接。同一 commit 对应多条条目时可以重复挂同一个链接。
 - 同一分区按提交时间顺序排列，旧的在前。
 - 分区只留用得上的：中文 `## 新增` / `## 改进` / `## 修复`，英文对应 `## Added` / `## Improved` / `## Fixed`。
+- **贡献者栏目（有则写，无则不展示）**：统计 `vPREV..HEAD` 区间内除维护者（`GDWhisper`）与 bot（如 `[bot]` / `dependabot`）外的外部贡献者（覆盖区间内所有合入提交，不限于用户可见改动）。有外部贡献者时，放在各语言半区的变更分区之后、`**Full Changelog**` 之前：Release note 用 `## 贡献者` / `## Contributors`，`CHANGELOG.md` 节内按同级降一级用 `### 贡献者` / `### Contributors`（避开 `##` 切片边界）；按区间内首次提交的时间顺序排列，仅列主页链接 `- [@username](https://github.com/username)`（首次在本仓贡献可附 `（首次贡献）` / `(first contribution)`）。无外部贡献者时，不展示该栏目。
 - 两版末尾各一行 `**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/vPREV...vX.Y.Z`。
 - **只记确定性的净改动，折叠迭代噪音**：写这一版留下的最终行为；同一功能在区间内的多次提交必须合并为一条净改动，严禁逐笔记录排错与微调；被推翻、回退或只在开发过程中存在过的中间形态不写。`CHANGELOG.md` 与 release note 使用同一套话。
 - `CHANGELOG.md` 每节标题用 `## [X.Y.Z] - YYYY-MM-DD`，节内同样中英双版（首句总结 + `### 新增` … / `---` / 英文首句 + `### Added` …），新版本加在最上方；**节首那句必须与 release note 的首句逐字一致**，两处话术不许分叉。
-- 骨架（分区、条目、compare 链接两版各一份）：
+- 骨架（分区、贡献者、compare 链接两版各一份；「贡献者 / Contributors」仅在有外部贡献者时保留，无则省略）：
 
 ```markdown
 <一句概括本版主线的中文总结：说清这一版集中解决了什么，不复述下方条目>
@@ -136,6 +138,10 @@ EOF
 ## 修复
 
 - **acp**：关闭 DSH 后会话可恢复，退出不再拖长。([f4abd8e](https://github.com/GDWhisper/dsh-ntr/commit/f4abd8e))
+
+## 贡献者
+
+- [@contributor](https://github.com/contributor)（首次贡献）
 
 **Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.3.4...v0.3.5
 
@@ -150,6 +156,10 @@ EOF
 ## Fixed
 
 - **acp**: conversations stay recoverable after the host exits, and shutdown is prompt. ([f4abd8e](https://github.com/GDWhisper/dsh-ntr/commit/f4abd8e))
+
+## Contributors
+
+- [@contributor](https://github.com/contributor) (first contribution)
 
 **Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.3.4...v0.3.5
 ```
