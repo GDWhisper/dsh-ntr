@@ -2,6 +2,36 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [0.5.2] - 2026-11-26
+
+这一版补上 ACP 表单提问与插件级共享 MCP 管理，并让 agent 回复里的本地文件链接可以直接打开。
+
+### 新增
+
+- **acp**：agent 可以在对话里发起结构化表单提问（文本、数字、开关与单选/多选），多问题逐条展示，并带独立等待时限（默认 300 秒，0 表示不限，可在「审批时限」热改）与倒计时；设置页同步镜像所有待处理项。([3a3e0af](https://github.com/GDWhisper/dsh-ntr/commit/3a3e0af))
+- **mcp**：新增插件级「MCP」设置分区，可集中维护共享 MCP 服务器、选择同步宿主已配置的 MCP 服务器，并按 agent 单独关闭；改动即时生效，无需重启会话。([3389ea1](https://github.com/GDWhisper/dsh-ntr/commit/3389ea1))
+
+### 修复
+
+- **acp**：agent 回复里指向本地文件的链接在 DSH 聊天里可以直接点开，不再显示成无法打开的链接。([0a9de66](https://github.com/GDWhisper/dsh-ntr/commit/0a9de66))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.5.1...v0.5.2
+
+---
+
+This release adds ACP form elicitation and plugin-wide shared MCP management, and makes local file links in agent replies open directly.
+
+### Added
+
+- **acp**: agents can ask structured questions in the conversation (text, number, toggle and single/multi-select fields), showing multi-question forms one field at a time with an independent deadline (300s by default, 0 = none, hot-configurable under Approval deadlines) and a countdown; the settings page mirrors every pending request. ([3a3e0af](https://github.com/GDWhisper/dsh-ntr/commit/3a3e0af))
+- **mcp**: a new plugin-wide MCP section maintains shared MCP servers, optionally syncs the MCP servers already configured in the host, and lets each agent opt out; changes apply immediately without restarting conversations. ([3389ea1](https://github.com/GDWhisper/dsh-ntr/commit/3389ea1))
+
+### Fixed
+
+- **acp**: links to local files in agent replies now open directly from DSH chat instead of rendering as dead links. ([0a9de66](https://github.com/GDWhisper/dsh-ntr/commit/0a9de66))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.5.1...v0.5.2
+
 ## [0.5.1] - 2026-11-25
 
 这一版让委派如实回报子任务的真实结局，并允许按 agent 单独关闭委派能力。
