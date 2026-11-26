@@ -12,3 +12,6 @@ acp-workspaces/*
 !acp-workspaces/.gitkeep
 # Runtime marker written to cwd by a co-installed plugin (@hytime/dsh-thinking-effort) on DSH start
 thinking-effort-loaded.json
+# Local tool state dirs (agent tooling scratch, never shipped)
+.dsh-swarm/
+.qoder/
