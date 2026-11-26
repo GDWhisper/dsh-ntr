@@ -310,8 +310,17 @@ export const DELEGATE_TIMEOUT_MAX_MS = 86_400_000
 export const DELEGATE_DESCRIPTION_MAX = 300
 
 /**
- * Per-agent delegation profile: the three choice-axis defaults plus an
- * optional free-text description of what that agent is good at.
+ * Upper bound of one agent's delegation IDENTITY tag, in UTF-16 code units.
+ * The tag is a short classification ("Code review"), not a sentence — the
+ * description carries the detail. It rides the same roster row as the
+ * description, so it must stay short enough not to dominate the line.
+ */
+export const DELEGATE_IDENTITY_MAX = 40
+
+/**
+ * Per-agent delegation profile: the three choice-axis defaults, an optional
+ * identity tag and an optional free-text description of what that agent is
+ * good at.
  *
  * Axis values are NON-EMPTY strings; an absent key means "follow the agent
  * process's own default" (the axis is simply not written). These are persisted
@@ -322,6 +331,12 @@ export const DELEGATE_DESCRIPTION_MAX = 300
  * rendered into `acp_delegate`'s `agent` parameter description so the main
  * agent can pick the right delegate without probing every agent. It never
  * reaches the delegated agent itself (that sees only the task text).
+ *
+ * The `identity` is the same kind of fact, one level coarser: a controlled tag
+ * the caller can compare ACROSS rows without parsing prose. It is descriptive
+ * ONLY — it never joins the axis value chain (explicit arg > persisted default
+ * > the agent process's own default) and the runtime never reads it, so
+ * renaming a tag cannot change how a run executes.
  */
 export interface AcpDelegateAgentDefaults {
   /** Whether this agent participates in `acp_delegate`; omitted means enabled (only `false` is persisted). */
@@ -331,6 +346,8 @@ export interface AcpDelegateAgentDefaults {
   mode?: string
   /** What this agent is good at; trimmed, at most {@link DELEGATE_DESCRIPTION_MAX}. */
   description?: string
+  /** A short classification tag the caller can compare across rows; trimmed, at most {@link DELEGATE_IDENTITY_MAX}. */
+  identity?: string
 }
 
 /** The delegate setting a write may name, by field name. */

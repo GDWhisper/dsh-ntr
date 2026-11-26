@@ -70,6 +70,25 @@ describe('SubagentDefaults — the card head', () => {
     expect(within(piPills).queryByText('全部跟随进程默认')).toBeNull()
   })
 
+  it('names the identity tag first on the folded head, in the same badge as every axis value', async () => {
+    await mountDefaults({
+      ...DELEGATE_BASE,
+      agentDefaults: { codebuddy: { identity: 'Code review', model: 'deepseek-v3' } },
+    }, { keepFolded: true })
+    await category('子智能体')
+    // The identity is the coarsest fact about the agent — the one the caller
+    // compares across rows — so it reads before the per-axis values, and it
+    // wears the SAME badge as them: one style is the rule, and a second colour
+    // would only restate what the body's dropdowns already answer.
+    const pills = pillsOf('codebuddy')
+    await waitFor(() => {
+      expect(within(pills).getByText('身份 Code review').className).toContain('is-value')
+      expect(within(pills).getByText('模型 DeepSeek V3').className).toContain('is-value')
+    })
+    const order = Array.from(pills.querySelectorAll('.dwa-sum-pill')).map(pill => pill.textContent)
+    expect(order.indexOf('身份 Code review')).toBeLessThan(order.indexOf('模型 DeepSeek V3'))
+  })
+
   it('names an inherited axis and a set axis in the same badge on one head', async () => {
     await mountDefaults({ ...DELEGATE_BASE, agentDefaults: { codebuddy: { effort: 'high' } } }, { keepFolded: true })
     await category('子智能体')

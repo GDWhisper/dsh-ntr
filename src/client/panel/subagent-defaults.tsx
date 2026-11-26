@@ -2,8 +2,8 @@
  * The agent delegation config (「子智能体委派配置」) of the subagent card. It edits
  * ONLY the `acp_delegate` tool's per-agent profile — which agent a delegation
  * lands on when the caller names none, and per-agent model / thought-level /
- * mode defaults plus the free-text description the caller reads before
- * choosing. It never touches the chat plane's own selections.
+ * mode defaults plus the identity tag and the free-text description the caller
+ * reads before choosing. It never touches the chat plane's own selections.
  *
  * Value chain per axis: explicit tool argument > this section's persisted
  * default > the agent process's own default. The view the host reports is the
@@ -32,6 +32,7 @@ import type { AcpAgentCatalog, AcpCatalogChoice, AcpCatalogOption, AcpDelegateAg
 import { DELEGATE_DESCRIPTION_MAX } from '../../protocol.ts'
 import type { AcpStore, UiState } from '../store.ts'
 import { PillSwitch } from '../skills-mcp-preference.tsx'
+import { IdentityField } from './delegate-identity.tsx'
 
 /** Warn foreground for a kept-but-stale / deleted option (constraint 34). */
 const WARN_FG = 'var(--dsw-alias-state-warn-primary, #b45309)'
@@ -283,23 +284,25 @@ export function delegateEntriesEqual(
     && (a?.effort ?? undefined) === (b?.effort ?? undefined)
     && (a?.mode ?? undefined) === (b?.mode ?? undefined)
     && (a?.description ?? undefined) === (b?.description ?? undefined)
+    && (a?.identity ?? undefined) === (b?.identity ?? undefined)
 }
 
 /**
- * The caller-facing description input. Local draft + commit on blur: typing
- * must not fire one RPC per keystroke, while a value that lands from another
- * tab (or a config reset) replaces the draft through the value prop.
+ * The caller-facing description input. The draft lives in the ROW (not here) so
+ * the identity control can read what the user is typing before it is committed:
+ * a preset pick must never overwrite an un-blurred edit. This component is
+ * therefore controlled — typing must not fire one RPC per keystroke, while a
+ * value that lands from another tab (or a config reset) replaces the draft
+ * through the row's sync effect.
  */
-function DescriptionInput(props: { acp: AcpStore; title: string; value: string | undefined; onCommit: (raw: string) => void }) {
-  const { acp, title, value, onCommit } = props
-  const committed = value ?? ''
-  const [draft, setDraft] = useState(committed)
-  const seen = useRef(committed)
-  useEffect(() => {
-    if (seen.current === committed) return
-    seen.current = committed
-    setDraft(committed)
-  }, [committed])
+function DescriptionInput(props: {
+  acp: AcpStore
+  title: string
+  draft: string
+  onDraft: (raw: string) => void
+  onCommit: (raw: string) => void
+}) {
+  const { acp, title, draft, onDraft, onCommit } = props
   const label = acp.label('描述（写给主智能体看）', 'Description (shown to the caller)')
   return (
     <label className="dwa-field" style={{ marginTop: 12 }}>
@@ -310,7 +313,7 @@ function DescriptionInput(props: { acp: AcpStore; title: string; value: string |
         maxLength={DELEGATE_DESCRIPTION_MAX}
         placeholder={acp.label('这个 agent 擅长什么，什么时候该用它', 'What this agent is good at, and when to use it')}
         value={draft}
-        onChange={event => setDraft(event.target.value)}
+        onChange={event => onDraft(event.target.value)}
         onBlur={() => onCommit(draft)}
       />
     </label>
@@ -465,6 +468,39 @@ function AgentDefaultsRow(props: {
     if (delegateEntriesEqual(next, entry)) return
     void acp.setDelegateSettings({ agentDefaults: { [agentId]: next } })
   }
+  // The identity tag rides in the same entry. It is descriptive only, so a
+  // write never touches the axes — and `delegateEntriesEqual` keeps a re-pick
+  // of the current tag from spending an RPC.
+  const writeIdentity = (identity: string | undefined): void => {
+    const next: AcpDelegateAgentDefaults = { ...entry }
+    if (identity === undefined) delete next.identity
+    else next.identity = identity
+    if (delegateEntriesEqual(next, entry)) return
+    void acp.setDelegateSettings({ agentDefaults: { [agentId]: next } })
+  }
+  // The seeding write: identity and description land TOGETHER, so a preset
+  // pick is one entry write (and one re-registration), never two. The
+  // description written is the preset's own text, so the row's draft syncs to
+  // it through the effect below.
+  const writeIdentityWithDescription = (identity: string, description: string): void => {
+    const next: AcpDelegateAgentDefaults = { ...entry, identity, description }
+    if (delegateEntriesEqual(next, entry)) return
+    void acp.setDelegateSettings({ agentDefaults: { [agentId]: next } })
+  }
+
+  // The description draft lives HERE, one level up, so the identity control can
+  // read what the user is typing before it is committed: a preset pick must
+  // never overwrite an un-blurred edit. The sync effect keeps a value that
+  // lands from elsewhere (a config reset, a preset seed, another tab) winning
+  // over the draft, exactly as the input's own effect used to do.
+  const committedDescription = entry?.description ?? ''
+  const [descriptionDraft, setDescriptionDraft] = useState(committedDescription)
+  const seenDescription = useRef(committedDescription)
+  useEffect(() => {
+    if (seenDescription.current === committedDescription) return
+    seenDescription.current = committedDescription
+    setDescriptionDraft(committedDescription)
+  }, [committedDescription])
 
   const enabled = entry?.enabled !== false
   // Override fact + reset only when the config file names an entry that the
@@ -478,6 +514,7 @@ function AgentDefaultsRow(props: {
     : `${configuredDescription.slice(0, 24)}…`
   const configuredText = configuredEntry === undefined ? '' : [
     configuredEntry.enabled === false ? acp.label('已禁用', 'disabled') : undefined,
+    configuredEntry.identity === undefined ? undefined : acp.label(`身份 ${configuredEntry.identity}`, `identity ${configuredEntry.identity}`),
     configuredEntry.model === undefined ? undefined : acp.label(`模型 ${configuredEntry.model}`, `model ${configuredEntry.model}`),
     configuredEntry.effort === undefined ? undefined : acp.label(`等级 ${configuredEntry.effort}`, `effort ${configuredEntry.effort}`),
     configuredEntry.mode === undefined ? undefined : acp.label(`模式 ${configuredEntry.mode}`, `mode ${configuredEntry.mode}`),
@@ -518,6 +555,13 @@ function AgentDefaultsRow(props: {
             <span className="dwa-acc-pills">
               {enabled ? (
                 <>
+                  {/* The identity leads: it is the coarsest fact about the agent
+                      and the one the caller compares across rows, so it reads
+                      before the per-axis values. Same badge as every other
+                      value — one style, per the unification above. */}
+                  {entry?.identity !== undefined && (
+                    <span className="dwa-sum-pill is-value">{acp.label(`身份 ${entry.identity}`, `identity ${entry.identity}`)}</span>
+                  )}
                   {axisPills.length === 0
                     ? <span className="dwa-sum-pill">{acp.label('全部跟随进程默认', 'All follow the process')}</span>
                     : axisPills.map(text => <span key={text} className="dwa-sum-pill is-value">{text}</span>)}
@@ -562,7 +606,15 @@ function AgentDefaultsRow(props: {
             {acp.label('等级作用于运行时实际模型，不支持会自动丢弃。', 'The level applies to the runtime model; unsupported values are dropped.')}
           </div>
         )}
-        <DescriptionInput acp={acp} title={title} value={entry?.description} onCommit={writeDescription} />
+        <IdentityField
+          acp={acp}
+          title={title}
+          identity={entry?.identity}
+          description={descriptionDraft}
+          onIdentity={writeIdentity}
+          onIdentityWithDescription={writeIdentityWithDescription}
+        />
+        <DescriptionInput acp={acp} title={title} draft={descriptionDraft} onDraft={setDescriptionDraft} onCommit={writeDescription} />
         <div className="dwa-preference-copy">
           {acp.label('描述会写进 acp_delegate 的 agent 选项说明，主智能体据此挑选。', 'Shown in acp_delegate\'s agent parameter description so the caller can pick.')}
         </div>
