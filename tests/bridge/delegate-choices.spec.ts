@@ -122,10 +122,10 @@ describe('acp_delegate choice axes (mock agent)', () => {
     const result = await service.execute({ task: 'STALE echo', agent: 'dchoice' }, exec)
     expect(result.text).toContain('MOCK: echo STALE echo')
     const notes = [
-      'agent「dchoice」不再提供默认模式「ghost-mode」，本次使用启动模式',
-      'agent「dchoice」不再提供默认模型「ghost-model」，本次使用 agent 自身默认模型',
-      'agent「dchoice」的默认思考等级「ghost-effort」不受当前模型支持，本次不设置',
-    ].join('；')
+      'agent "dchoice" no longer offers default mode "ghost-mode" — using the startup mode',
+      'agent "dchoice" no longer offers default model "ghost-model" — using its own default model',
+      'agent "dchoice" default thought level "ghost-effort" is not supported by the current model — not setting it',
+    ].join('; ')
     // Exactly ONE delegation notice through the seam, and it reached the hub.
     expect(delegateNotices).toEqual([notes])
     expect(noticesOf(events.slice(startIndex))).toContain(notes)
@@ -135,7 +135,7 @@ describe('acp_delegate choice axes (mock agent)', () => {
     expect(frames).toHaveLength(1)
     expect(frames[0]?.agentId).toBe('dchoice')
     expect(result.notes).toBe(notes)
-    expect(result.text).toContain(`\n备注：${notes}`)
+    expect(result.text).toContain(`\nnotes: ${notes}`)
     // The runtime fallback NEVER rewrites the persisted configuration.
     expect(readFileSync(storage, 'utf8')).toBe(before)
     await manager.setDelegateSettings({ reset: ['agentDefaults'] })
@@ -170,7 +170,7 @@ describe('acp_delegate choice axes (mock agent)', () => {
       const plainNotices: string[] = []
       const result = await wireService(plainManager, plainNotices).execute({ task: 'REFRESH echo', agent: 'dplain' }, exec)
       expect(result.text).toContain('MOCK: echo REFRESH echo')
-      const note = 'agent「dplain」的默认思考等级「high」不受当前模型支持，本次不设置'
+      const note = 'agent "dplain" default thought level "high" is not supported by the current model — not setting it'
       expect(result.notes).toBe(note)
       expect(plainNotices).toEqual([note])
       expect(noticesOf(plainEvents)).toContain(note)

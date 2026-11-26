@@ -49,9 +49,9 @@ describe('acp_delegate agent resolution chain', () => {
     happyPrompt(f, 'degraded but running')
     const result = await new AcpDelegateService(f.host).execute({ task: 'x' }, {})
     expect(f.calls.startSession[0].agentId).toBe('alpha')
-    const note = '默认 agent「ghost」已失效，改用全局默认「alpha」'
+    const note = 'default agent "ghost" no longer exists; using the global default "alpha"'
     expect(result.notes).toBe(note)
-    expect(result.text).toContain(`\n备注：${note}`)
+    expect(result.text).toContain(`\nnotes: ${note}`)
     expect(f.notices).toEqual([note])
   })
 
@@ -72,7 +72,7 @@ describe('acp_delegate agent resolution chain', () => {
     const resolved = service.resolve({ task: 'x', model: 'm1', effort: 'high', mode: 'strict' }, {})
     expect(resolved.agentId).toBe('alpha')
     expect(resolved.choices).toEqual({ model: 'm1', effort: 'high', mode: 'strict' })
-    expect(resolved.notes).toEqual(['默认 agent「ghost」已失效，改用全局默认「alpha」'])
+    expect(resolved.notes).toEqual(['default agent "ghost" no longer exists; using the global default "alpha"'])
     // No choices named: an empty set, never undefined keys.
     expect(service.resolve({ task: 'x', agent: 'beta' }, {}).choices).toEqual({})
     expect(service.resolve({ task: 'x', agent: 'beta' }, {}).notes).toEqual([])
@@ -161,10 +161,10 @@ describe('acp_delegate choice writes', () => {
     expect(settlement.outcome).toBe('ended')
     expect(settlement.text).toBe('still runs')
     const notes = [
-      'agent「alpha」不再提供默认模式「ghost-o」，本次使用启动模式',
-      'agent「alpha」不再提供默认模型「ghost-m」，本次使用 agent 自身默认模型',
-      'agent「alpha」的默认思考等级「ghost-e」不受当前模型支持，本次不设置',
-    ].join('；')
+      'agent "alpha" no longer offers default mode "ghost-o" — using the startup mode',
+      'agent "alpha" no longer offers default model "ghost-m" — using its own default model',
+      'agent "alpha" default thought level "ghost-e" is not supported by the current model — not setting it',
+    ].join('; ')
     expect(settlement.notes).toBe(notes)
     expect(f.notices).toEqual([notes]) // exactly ONE merged notice
     expect(f.calls.prompt).toHaveLength(1)
@@ -172,7 +172,7 @@ describe('acp_delegate choice writes', () => {
     expect(f.calls.setConfig).toEqual([])
   })
 
-  it('configured defaults the agent never published degrade with the 未提供 wording', async () => {
+  it('configured defaults the agent never published degrade with the "publishes no" wording', async () => {
     const f = makeHost()
     f.config.agentDefaults = { alpha: { model: 'm1', mode: 'strict' } }
     f.liveOptions.set('session-1', {}) // publishes nothing
@@ -180,9 +180,9 @@ describe('acp_delegate choice writes', () => {
     const settlement = await new AcpDelegateService(f.host).begin({ task: 'x', agent: 'alpha' }, {}).result
     expect(settlement.outcome).toBe('ended')
     expect(settlement.notes).toBe([
-      'agent「alpha」未提供默认模式「strict」，本次使用启动模式',
-      'agent「alpha」未提供默认模型「m1」，本次使用 agent 自身默认模型',
-    ].join('；'))
+      'agent "alpha" publishes no default mode "strict" — using the startup mode',
+      'agent "alpha" publishes no default model "m1" — using its own default model',
+    ].join('; '))
     expect(f.notices).toHaveLength(1)
   })
 
@@ -193,8 +193,8 @@ describe('acp_delegate choice writes', () => {
     const settlement = await new AcpDelegateService(f.host).begin({ task: 'x', agent: 'alpha', effort: 'low' }, {}).result
     expect(settlement.outcome).toBe('ended')
     expect(settlement.text).toBe('effort dropped')
-    expect(settlement.notes).toBe('思考等级「low」不受当前模型支持，已丢弃')
-    expect(f.notices).toEqual(['思考等级「low」不受当前模型支持，已丢弃'])
+    expect(settlement.notes).toBe('thought level "low" is not supported by the current model — dropped')
+    expect(f.notices).toEqual(['thought level "low" is not supported by the current model — dropped'])
     expect(f.calls.setConfig).toEqual([])
     expect(f.calls.prompt).toHaveLength(1)
   })
@@ -256,7 +256,7 @@ describe('acp_delegate choice writes', () => {
     happyPrompt(f)
     const settlement = await new AcpDelegateService(f.host).begin({ task: 'x', agent: 'alpha', model: 'm2', effort: 'low' }, {}).result
     expect(settlement.outcome).toBe('ended')
-    expect(settlement.notes).toBe('思考等级「low」不受当前模型支持，已丢弃')
+    expect(settlement.notes).toBe('thought level "low" is not supported by the current model — dropped')
     expect(f.calls.setConfig).toEqual([{ sessionId: 'session-1', configId: 'model', value: 'm2' }])
   })
 

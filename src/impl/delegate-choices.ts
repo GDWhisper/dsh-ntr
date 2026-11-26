@@ -71,12 +71,12 @@ export function planDelegateModeAndModel(opts: {
       if (explicit.mode !== undefined) {
         return { writes: [], notes, fatal: `acp_delegate: agent "${agentId}" does not publish mode selection` }
       }
-      notes.push(`agent「${agentId}」未提供默认模式「${mode}」，本次使用启动模式`)
+      notes.push(`agent "${agentId}" publishes no default mode "${mode}" — using the startup mode`)
     } else if (!available.some(entry => entry.id === mode)) {
       if (explicit.mode !== undefined) {
         return { writes: [], notes, fatal: `acp_delegate: agent "${agentId}" does not offer mode "${mode}" (available: ${available.map(entry => entry.id).join(', ')})` }
       }
-      notes.push(`agent「${agentId}」不再提供默认模式「${mode}」，本次使用启动模式`)
+      notes.push(`agent "${agentId}" no longer offers default mode "${mode}" — using the startup mode`)
     } else {
       writes.push({ kind: 'mode', modeId: mode })
     }
@@ -90,12 +90,12 @@ export function planDelegateModeAndModel(opts: {
       if (explicit.model !== undefined) {
         return { writes: [], notes, fatal: `acp_delegate: agent "${agentId}" does not publish model selection` }
       }
-      notes.push(`agent「${agentId}」未提供默认模型「${model}」，本次使用 agent 自身默认模型`)
+      notes.push(`agent "${agentId}" publishes no default model "${model}" — using its own default model`)
     } else if (selector.choices.length > 0 && !selector.choices.some(choice => choice.value === model)) {
       if (explicit.model !== undefined) {
         return { writes: [], notes, fatal: `acp_delegate: agent "${agentId}" does not offer model "${model}" (available: ${selector.choices.map(choice => choice.value).join(', ')})` }
       }
-      notes.push(`agent「${agentId}」不再提供默认模型「${model}」，本次使用 agent 自身默认模型`)
+      notes.push(`agent "${agentId}" no longer offers default model "${model}" — using its own default model`)
     } else {
       writes.push({ kind: 'config', configId: selector.configId, value: model })
     }
@@ -124,8 +124,8 @@ export function planDelegateEffort(opts: {
   const selector = parseCatalogOptions(live.configOptions).thought
   if (selector === undefined || (selector.choices.length > 0 && !selector.choices.some(choice => choice.value === effort))) {
     notes.push(explicit.effort !== undefined
-      ? `思考等级「${effort}」不受当前模型支持，已丢弃`
-      : `agent「${agentId}」的默认思考等级「${effort}」不受当前模型支持，本次不设置`)
+      ? `thought level "${effort}" is not supported by the current model — dropped`
+      : `agent "${agentId}" default thought level "${effort}" is not supported by the current model — not setting it`)
     return { notes }
   }
   return { write: { kind: 'config', configId: selector.configId, value: effort }, notes }

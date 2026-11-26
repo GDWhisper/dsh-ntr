@@ -73,6 +73,11 @@ describe('acp_release registration', () => {
     registration.sync()
     expect(registered.map(row => row.definition.name)).toEqual(['acp_delegate', 'acp_release'])
     expect(registered.every(row => typeof row.options?.when === 'function')).toBe(true)
+    // The release tool's safety promises are schema-level copy the model reads
+    // BEFORE calling: they are pinned as sentences, not as "mentions release".
+    const release = registered.find(row => row.definition.name === 'acp_release')?.definition
+    expect(release?.description).toContain('No running turn is ever ended')
+    expect(release?.description).toContain('resume automatically on their next message')
   })
 
   it('removes both tools when the guidance switch goes off', () => {
@@ -99,9 +104,9 @@ describe('acp_release registration', () => {
     const agent = ((registered.find(row => row.definition.name === 'acp_delegate')?.definition.parameters as {
       properties?: { agent?: { description?: string } }
     } | undefined)?.properties?.agent)
-    expect(agent?.description).toContain('可按特性挑选：')
-    expect(agent?.description).toContain('- codebuddy（CodeBuddy）：通用编码，支持子智能体；委派默认：跟随进程自身')
-    expect(agent?.description).toContain('- qoder（Qoder）：委派默认：等级 xhigh')
+    expect(agent?.description).toContain('Pick by capability:')
+    expect(agent?.description).toContain('- codebuddy (CodeBuddy): 通用编码，支持子智能体; defaults: follow the process itself')
+    expect(agent?.description).toContain('- qoder (Qoder): defaults: level xhigh')
   })
 
   it('re-registers when only the roster text changes, so the next header carries it', () => {
@@ -137,15 +142,15 @@ describe('acp_release execute', () => {
     expect(release).toBeDefined()
     const out = await release?.execute({}) as { text: string }
     expect(releaseCalls).toEqual([undefined])
-    expect(out.text).toContain('已释放空闲进程：codebuddy')
-    expect(out.text).toContain('未释放：qoder（仍有进行中的工作）')
+    expect(out.text).toContain('Released idle processes: codebuddy')
+    expect(out.text).toContain('Not released: qoder (still has work in flight)')
 
     const qoder = await release?.execute({ agent: 'qoder' }) as { text: string }
     expect(releaseCalls).toEqual([undefined, 'qoder'])
-    expect(qoder.text).toContain('未释放：qoder（仍有进行中的工作）')
+    expect(qoder.text).toContain('Not released: qoder (still has work in flight)')
 
     expect(await release?.execute({ agent: 'ghost' }))
-      .toEqual({ text: 'acp_release 释放失败：未配置的 agent "ghost"（已配置：codebuddy、qoder）。' })
+      .toEqual({ text: 'acp_release failed: agent "ghost" is not configured (configured: codebuddy, qoder).' })
     expect(releaseCalls).toEqual([undefined, 'qoder'])
   })
 
@@ -158,9 +163,9 @@ describe('acp_release execute', () => {
     registration.sync()
     const def = registered.find(row => row.definition.name === 'acp_release')?.definition
     expect(await def?.execute({}))
-      .toEqual({ text: '没有可立即释放的进程：没有就绪的 ACP 进程（或全部都有进行中的工作）。' })
+      .toEqual({ text: 'Nothing to release right now: no ready ACP process (or all of them have work in flight).' })
     expect(await def?.execute({ agent: 1 }))
-      .toEqual({ text: 'acp_release 释放失败：agent 必须是非空字符串。' })
+      .toEqual({ text: 'acp_release failed: agent must be a non-empty string.' })
   })
 
   it('never throws out of the execute shell — a release failure becomes a report line', async () => {
@@ -171,7 +176,7 @@ describe('acp_release execute', () => {
     const { registration, registered } = makeRegistration({ guidance: 'on', release })
     registration.sync()
     const def = registered.find(row => row.definition.name === 'acp_release')?.definition
-    expect(await def?.execute({})).toEqual({ text: 'acp_release 释放失败：bridge exploded' })
+    expect(await def?.execute({})).toEqual({ text: 'acp_release failed: bridge exploded' })
   })
 })
 
@@ -252,7 +257,7 @@ describe('registration degraded / missing-service hosts', () => {
     expect(registration.registeredTools).toEqual(['acp_delegate', 'acp_release'])
     const release = rows.find(row => row.definition.name === 'acp_release')?.definition
     expect(await release?.execute({}))
-      .toEqual({ text: '已释放空闲进程：codebuddy。相关会话下一条消息会自动恢复。' })
+      .toEqual({ text: 'Released idle processes: codebuddy. Related sessions resume automatically on their next message.' })
     guidance = 'off'
     registration.sync()
     // The old host cannot remove the insertion; both tools must go dark.

@@ -178,8 +178,8 @@ describe('acp_delegate registration shell selection', () => {
     config.guidance = 'on'
     registration.sync()
     const definition = tools.registered[0].definition
-    expect(definition.description).toContain('并返回它最后给出的答复')
-    expect(definition.description).not.toContain('结算通知')
+    expect(definition.description).toContain('returns its final answer')
+    expect(definition.description).not.toContain('settlement notice')
     expect(definition.output?.schema.required).toEqual(['text'])
     happyPrompt(f, 'legacy answer')
     const value = await definition.execute({ task: 'x', agent: 'alpha' }, {})
@@ -198,11 +198,11 @@ describe('acp_delegate registration shell selection', () => {
     registration.sync()
     const definition = tools.registered[0].definition
     expect(definition.description).toBe(NATIVE_BASE_DESCRIPTION)
-    expect(definition.description).toContain('立即返回子智能体的 name')
-    expect(definition.description).toContain('结算通知')
+    expect(definition.description).toContain("returns the subagent's name immediately")
+    expect(definition.description).toContain('settlement notice')
     // The end-turn duty is now the host's own soft rule ("continue useful work,
     // end the turn only when waiting is all that is left"), not a plugin ban.
-    expect(definition.description).toContain('只剩等待时结束本回合')
+    expect(definition.description).toContain('when nothing is left but waiting, end this turn')
     // ...and the corollary the caller cannot guess: an external leaf is absent
     // from `list_agents` and has no pollable status. Pinned as the SHARED
     // sentence (not two loose words): a description that merely mentions the
@@ -210,8 +210,8 @@ describe('acp_delegate registration shell selection', () => {
     // substring test and be exactly the wrong advice.
     expect(definition.description).toContain(DELEGATE_NOT_POLLABLE_NOTE)
     // Nothing else kept the old ban from creeping back; this does.
-    expect(definition.description).not.toMatch(/派发后(必须|立即)结束/)
-    expect(definition.description).not.toContain('优先于任何原生子智能体/委派工具')
+    expect(definition.description).not.toMatch(/(must|have to) end (this )?turn (immediately |right )?after dispatch/)
+    expect(definition.description).not.toContain('outranks any native subagent/delegation tool')
     expect(definition.output?.schema.required).toEqual(['kind'])
     const value = await definition.execute({ task: 'x', agent: 'alpha' }, execWithAgent) as unknown as AcpDelegateAsyncOutput
     expect(value).toEqual({ kind: 'activation', name: 'agent-1', agent: 'alpha' })
@@ -226,9 +226,9 @@ describe('acp_delegate registration shell selection', () => {
   it('the native render speaks the delegation receipt and the refusal', () => {
     const definition = acpDelegateToolDefinition({ guidance: 'on', mode: 'native', execute: async () => ({ kind: 'activation', name: 'agent-1', agent: 'alpha' }) })
     expect(definition.output.render({}, { kind: 'activation', name: 'agent-1', agent: 'alpha' }))
-      .toEqual([{ type: 'text', text: `已委派给 ACP agent alpha：子智能体 agent-1 已在后台开始执行。可继续做不相交的工作；只剩等待时结束本回合，完成后宿主会把它的答复作为通知送达本会话。${DELEGATE_NOT_POLLABLE_NOTE}，别守着等。` }])
+      .toEqual([{ type: 'text', text: `Delegated to ACP agent alpha: subagent agent-1 has started running in the background. You can keep working on disjoint work; when nothing is left but waiting, end this turn and the host delivers its answer to this session as a notice once it finishes. ${DELEGATE_NOT_POLLABLE_NOTE}, so do not sit and wait.` }])
     expect(definition.output.render({}, { kind: 'error', error: 'ACTIVATION_LIMIT_REACHED: full' }))
-      .toEqual([{ type: 'text', text: 'acp_delegate 委派失败：ACTIVATION_LIMIT_REACHED: full' }])
+      .toEqual([{ type: 'text', text: 'acp_delegate failed: ACTIVATION_LIMIT_REACHED: full' }])
     expect(definition.output.render({}, undefined)).toEqual([{ type: 'text', text: '' }])
   })
 
@@ -239,13 +239,13 @@ describe('acp_delegate registration shell selection', () => {
     const { registration, config } = makeRegistration(tools.ctx, () => seam)
     config.guidance = 'on'
     registration.sync()
-    expect(tools.registered[0].definition.description).toContain('并返回它最后给出的答复') // legacy first
+    expect(tools.registered[0].definition.description).toContain('returns its final answer') // legacy first
     expect(tools.namedInjectArmed('subagents')).toBe(true)
     seam = fakeSubagentsService({ hangResult: true }).service
     tools.fireNamedInject('subagents')
     expect(tools.disposerCalls()).toBe(1) // the legacy insertion was replaced
     expect(tools.registered).toHaveLength(1)
-    expect(tools.registered[0].definition.description).toContain('立即返回子智能体的 name')
+    expect(tools.registered[0].definition.description).toContain("returns the subagent's name immediately")
   })
 
   it('guidance hot-reload re-judges the seam; off unregisters in both shells', () => {
@@ -255,15 +255,15 @@ describe('acp_delegate registration shell selection', () => {
     const { registration, config } = makeRegistration(tools.ctx, () => seam)
     config.guidance = 'on'
     registration.sync()
-    expect(tools.registered[0].definition.description).toContain('立即返回子智能体的 name')
+    expect(tools.registered[0].definition.description).toContain("returns the subagent's name immediately")
     // The seam disappears (host downgrade / service unload): a guidance change
     // re-registers the legacy shell.
     seam = undefined
     config.guidance = 'enhanced'
     registration.sync()
     expect(tools.disposerCalls()).toBe(1)
-    expect(tools.registered[0].definition.description).toContain('并返回它最后给出的答复')
-    expect(tools.registered[0].definition.description).toContain('优先于任何原生子智能体/委派工具')
+    expect(tools.registered[0].definition.description).toContain('returns its final answer')
+    expect(tools.registered[0].definition.description).toContain('outranks any native subagent/delegation tool')
     config.guidance = 'off'
     registration.sync()
     expect(tools.registered).toHaveLength(0)

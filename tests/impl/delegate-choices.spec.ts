@@ -72,7 +72,7 @@ describe('planDelegateModeAndModel · mode axis', () => {
 
   it('configured stale mode degrades to the startup mode with the fixed note', () => {
     expect(planDelegateModeAndModel({ agentId: 'a', explicit: NONE, configured: { mode: 'ghost' }, live: liveModes }))
-      .toEqual({ writes: [], notes: ['agent「a」不再提供默认模式「ghost」，本次使用启动模式'] })
+      .toEqual({ writes: [], notes: ['agent "a" no longer offers default mode "ghost" — using the startup mode'] })
   })
 
   it('explicit mode without a published mode list is fatal (absent or empty)', () => {
@@ -82,10 +82,10 @@ describe('planDelegateModeAndModel · mode axis', () => {
     }
   })
 
-  it('configured mode without a published mode list skips with the 未提供 note', () => {
+  it('configured mode without a published mode list skips with the "publishes no" note', () => {
     for (const noModes of [live({}), live({ modes: [] })]) {
       expect(planDelegateModeAndModel({ agentId: 'a', explicit: NONE, configured: { mode: 'ask' }, live: noModes }))
-        .toEqual({ writes: [], notes: ['agent「a」未提供默认模式「ask」，本次使用启动模式'] })
+        .toEqual({ writes: [], notes: ['agent "a" publishes no default mode "ask" — using the startup mode'] })
     }
   })
 })
@@ -126,7 +126,7 @@ describe('planDelegateModeAndModel · model axis', () => {
 
   it('configured stale model degrades to the agent default with the fixed note', () => {
     expect(planDelegateModeAndModel({ agentId: 'a', explicit: NONE, configured: { model: 'ghost' }, live: liveModel }))
-      .toEqual({ writes: [], notes: ['agent「a」不再提供默认模型「ghost」，本次使用 agent 自身默认模型'] })
+      .toEqual({ writes: [], notes: ['agent "a" no longer offers default model "ghost" — using its own default model'] })
   })
 
   it('explicit model without a model selector is fatal', () => {
@@ -134,9 +134,9 @@ describe('planDelegateModeAndModel · model axis', () => {
       .toEqual({ writes: [], notes: [], fatal: 'acp_delegate: agent "a" does not publish model selection' })
   })
 
-  it('configured model without a model selector skips with the 未提供 note', () => {
+  it('configured model without a model selector skips with the "publishes no" note', () => {
     expect(planDelegateModeAndModel({ agentId: 'a', explicit: NONE, configured: { model: 'x' }, live: live({}) }))
-      .toEqual({ writes: [], notes: ['agent「a」未提供默认模型「x」，本次使用 agent 自身默认模型'] })
+      .toEqual({ writes: [], notes: ['agent "a" publishes no default model "x" — using its own default model'] })
   })
 
   it('a choice-less model selector accepts any free value, explicit and configured', () => {
@@ -158,7 +158,7 @@ describe('planDelegateModeAndModel · ordering and fatal contract', () => {
 
   it('a stale configured mode notes while the model still writes', () => {
     expect(planDelegateModeAndModel({ agentId: 'a', explicit: NONE, configured: { mode: 'ghost', model: 'gpt-5' }, live: both }))
-      .toEqual({ writes: [{ kind: 'config', configId: 'model', value: 'gpt-5' }], notes: ['agent「a」不再提供默认模式「ghost」，本次使用启动模式'] })
+      .toEqual({ writes: [{ kind: 'config', configId: 'model', value: 'gpt-5' }], notes: ['agent "a" no longer offers default mode "ghost" — using the startup mode'] })
   })
 
   it('fatal means nothing is applied: writes empty even when the other axis planned', () => {
@@ -170,7 +170,7 @@ describe('planDelegateModeAndModel · ordering and fatal contract', () => {
   it('keeps earlier notes when a later axis is fatal', () => {
     const result = planDelegateModeAndModel({ agentId: 'a', explicit: { model: 'ghost' }, configured: { mode: 'ghost2' }, live: both })
     expect(result.fatal).toBe('acp_delegate: agent "a" does not offer model "ghost" (available: gpt-5)')
-    expect(result.notes).toEqual(['agent「a」不再提供默认模式「ghost2」，本次使用启动模式'])
+    expect(result.notes).toEqual(['agent "a" no longer offers default mode "ghost2" — using the startup mode'])
     expect(result.writes).toEqual([])
   })
 
@@ -211,22 +211,22 @@ describe('planDelegateEffort · never fatal', () => {
 
   it('soft-drops a stale explicit effort with the fixed note', () => {
     expect(planDelegateEffort({ agentId: 'a', explicit: { effort: 'max' }, configured: NONE, live: liveThought }))
-      .toEqual({ notes: ['思考等级「max」不受当前模型支持，已丢弃'] })
+      .toEqual({ notes: ['thought level "max" is not supported by the current model — dropped'] })
   })
 
   it('skips a stale configured effort with the fixed note', () => {
     expect(planDelegateEffort({ agentId: 'a', explicit: NONE, configured: { effort: 'max' }, live: liveThought }))
-      .toEqual({ notes: ['agent「a」的默认思考等级「max」不受当前模型支持，本次不设置'] })
+      .toEqual({ notes: ['agent "a" default thought level "max" is not supported by the current model — not setting it'] })
   })
 
   it('soft-drops an explicit effort when no thought selector is published', () => {
     expect(planDelegateEffort({ agentId: 'a', explicit: { effort: 'high' }, configured: NONE, live: live({}) }))
-      .toEqual({ notes: ['思考等级「high」不受当前模型支持，已丢弃'] })
+      .toEqual({ notes: ['thought level "high" is not supported by the current model — dropped'] })
   })
 
   it('skips a configured effort when no thought selector is published', () => {
     expect(planDelegateEffort({ agentId: 'a', explicit: NONE, configured: { effort: 'high' }, live: live({}) }))
-      .toEqual({ notes: ['agent「a」的默认思考等级「high」不受当前模型支持，本次不设置'] })
+      .toEqual({ notes: ['agent "a" default thought level "high" is not supported by the current model — not setting it'] })
   })
 
   it('a choice-less thought selector accepts any free value, explicit and configured', () => {
@@ -245,7 +245,7 @@ describe('planDelegateEffort · never fatal', () => {
     expect(planDelegateEffort({ agentId: 'a', explicit: { effort: 'high' }, configured: NONE, live: before }).write)
       .toEqual({ kind: 'config', configId: 'effort', value: 'high' })
     expect(planDelegateEffort({ agentId: 'a', explicit: { effort: 'high' }, configured: NONE, live: after }))
-      .toEqual({ notes: ['思考等级「high」不受当前模型支持，已丢弃'] })
+      .toEqual({ notes: ['thought level "high" is not supported by the current model — dropped'] })
   })
 
   it('ignores mode and model values', () => {

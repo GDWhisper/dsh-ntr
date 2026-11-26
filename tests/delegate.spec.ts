@@ -47,8 +47,8 @@ describe('acp_delegate execute semantics', () => {
     const result = await new AcpDelegateService(f.host).execute({ task: 'x', agent: 'alpha' }, {})
     expect(f.calls.policy[0].policy).toEqual({ mode: 'auto', windowMs: 0, preferOnce: true })
     expect(f.calls.respond).toHaveLength(0) // auto+0 never broadcasts a request frame
-    expect(result.text).toContain('拒绝 1 个审批')
-    expect(result.text).toContain('自动代答 1 个')
+    expect(result.text).toContain('1 approval(s) refused')
+    expect(result.text).toContain('1 auto-answered')
   })
 
   it('auto on A1 (codebuddy): preferOnce false — the ephemeral process cannot leak', async () => {
@@ -71,7 +71,7 @@ describe('acp_delegate execute semantics', () => {
     const result = await new AcpDelegateService(f.host).execute({ task: 'x', agent: 'alpha' }, {})
     expect(f.calls.policy[0].policy).toEqual({ mode: 'auto', windowMs: 0, preferOnce: true })
     expect(f.calls.respond).toHaveLength(0)
-    expect(result.text).not.toContain('拒绝')
+    expect(result.text).not.toContain('refused')
   })
 
   it('rejects an unknown agent without creating a session, listing configured ids', async () => {
@@ -306,7 +306,7 @@ describe('acp_delegate execute semantics', () => {
     f.config.defaultAgent = 'beta'
     const res = await new AcpDelegateService(f.host).execute({ task: 'x' }, {})
     expect(res.agent).toBe('alpha')
-    expect(res.notes).toBe('默认 agent「beta」已禁用，改用全局默认「alpha」')
+    expect(res.notes).toBe('default agent "beta" is disabled; using the global default "alpha"')
 
     // Disabled global default with no enabled delegate default is refused.
     f.config.defaultAgent = undefined
@@ -508,7 +508,7 @@ describe('acp_delegate workspace inheritance', () => {
   it('the cwd parameter description states inheritance and the fence', () => {
     const definition = acpDelegateToolDefinition({ guidance: 'on', execute: async () => ({ text: '', agent: '' }) })
     const cwd = (definition.parameters.properties as Record<string, { description: string }>).cwd
-    expect(cwd.description).toContain('省略 = 继承调用会话工作区')
+    expect(cwd.description).toContain('omit = inherit the calling session\'s workspace')
     expect(cwd.description).toContain('allowedCwdRoots')
   })
 })
@@ -536,12 +536,12 @@ describe('acp_delegate tool definition (register-ready)', () => {
   it('composes the description by guidance rung', () => {
     // The strength is pinned as a literal on purpose: "enhanced" promises a
     // MUST, and a quiet downgrade to "prefer" is exactly the failure this locks.
-    expect(GUIDANCE_PREFIX).toContain('必须使用本工具')
-    expect(BASE_DESCRIPTION).toContain('把一件自成一体的任务交给一个已配置的外部 ACP agent')
+    expect(GUIDANCE_PREFIX).toContain('you MUST use this tool')
+    expect(BASE_DESCRIPTION).toContain('Hand one self-contained task to a configured external ACP agent')
     for (const guidance of ['off', 'on'] as const) {
       const definition = acpDelegateToolDefinition({ guidance, execute })
       expect(definition.description).toBe(BASE_DESCRIPTION)
-      expect(definition.description).not.toContain('优先于任何原生子智能体/委派工具')
+      expect(definition.description).not.toContain('outranks any native subagent/delegation tool')
       expect(definition.timeoutMs).toBe(86_400_000) // the backstop is rung-independent too
     }
     for (const guidance of ['enhanced', 'force'] as const) {
@@ -555,10 +555,10 @@ describe('acp_delegate tool definition (register-ready)', () => {
   it('the choice parameters state the value chain and the failure semantics', () => {
     const definition = acpDelegateToolDefinition({ guidance: 'on', execute })
     const properties = definition.parameters.properties as Record<string, { type: string; description: string }>
-    expect(properties.agent.description).toBe('已配置的 agent id；省略 = 用子智能体委派配置的默认 agent（未配置或已失效时回落到全局默认 agent），两者都空则报错')
-    expect(properties.model).toEqual({ type: 'string', description: '模型 id；省略 = 用子智能体委派配置中该 agent 的默认模型；显式指定而 agent 不提供时报错' })
-    expect(properties.effort).toEqual({ type: 'string', description: '思考等级；省略 = 用子智能体委派配置的默认值；不支持时自动丢弃并留痕' })
-    expect(properties.mode).toEqual({ type: 'string', description: '工作模式 id；省略 = 用子智能体委派配置的默认值；显式指定而 agent 不提供时报错' })
+    expect(properties.agent.description).toBe('The id of a configured agent; omit = the default agent from the delegation settings (falling back to the global default agent when unset or invalid), and an error when both are empty')
+    expect(properties.model).toEqual({ type: 'string', description: 'Model id; omit = the agent\'s default model from the delegation settings; an explicit model the agent does not offer is an error' })
+    expect(properties.effort).toEqual({ type: 'string', description: 'Thought level; omit = the delegation settings default; dropped with a note when the agent does not support it' })
+    expect(properties.mode).toEqual({ type: 'string', description: 'Work mode id; omit = the delegation settings default; an explicit mode the agent does not offer is an error' })
     // The new axes are optional: only task stays required.
     expect(definition.parameters.required).toEqual(['task'])
   })
@@ -635,12 +635,12 @@ describe('acp_delegate registration sync', () => {
     const { registration, config } = makeRegistration(tools.ctx)
     config.guidance = 'on'
     registration.sync()
-    expect(tools.registered[0].definition.description).not.toContain('优先于任何原生子智能体/委派工具')
+    expect(tools.registered[0].definition.description).not.toContain('outranks any native subagent/delegation tool')
     config.guidance = 'enhanced'
     registration.sync()
     expect(tools.disposerCalls()).toBe(1)
     expect(tools.registered).toHaveLength(1)
-    expect(tools.registered[0].definition.description).toContain('优先于任何原生子智能体/委派工具')
+    expect(tools.registered[0].definition.description).toContain('outranks any native subagent/delegation tool')
     config.timeoutMs = 300_000
     registration.sync()
     expect(tools.disposerCalls()).toBe(2) // the settings signature still re-registers on a window change

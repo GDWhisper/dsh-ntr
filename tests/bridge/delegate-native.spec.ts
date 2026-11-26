@@ -153,7 +153,7 @@ describe('acp_delegate native activation (mock agent)', () => {
 
   it('old-host fallback: without the seam the SAME manager serves the legacy synchronous full text', async () => {
     const w = wire({ seam: false })
-    expect(w.definition.description).toContain('并返回它最后给出的答复')
+    expect(w.definition.description).toContain('returns its final answer')
     const value = await w.definition.execute({ task: 'legacy echo', agent: 'dnative' }, exec)
     expect(value.text).toContain('MOCK: echo legacy echo perm=none')
     expect(value.text).toContain(`— acp_delegate · dnative · cwd=${normPath(realpathSync(workspace))} · end_turn`)

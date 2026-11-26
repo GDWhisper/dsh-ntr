@@ -190,6 +190,11 @@ const STYLE = `
 .dwa-save-confirm { margin-top: 12px; }
 .dwa-save-confirm-actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
 .dwa-save-confirm-sessions { word-break: break-all; }
+/* The keep-or-replace texts: a preset description and the one it would replace,
+   both shown in full. Pre-wrap keeps a hand-written multi-sentence description
+   readable; the secondary label colour is the quiet side of the pair, so the
+   incoming preset text above reads as the louder one. */
+.dwa-identity-swap-text { display: block; white-space: pre-wrap; word-break: break-word; margin-top: 4px; color: var(--dsw-alias-label-secondary, #4b5563); }
 .dwa-form-actions > .dwa-hint:first-child { margin-right: auto; }
 .dwa-form-actions > .dwa-hint:last-child:not(:first-child) { width: 100%; }
 .dwa-menu-wrap { position: relative; }
