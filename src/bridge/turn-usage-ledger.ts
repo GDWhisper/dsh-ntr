@@ -94,7 +94,7 @@ export class TurnUsageLedger {
     const real = this.takeRealDelta()
     if (real !== undefined) {
       const deduction = Math.min(real.outputTokens, this.emittedFallbackOutput)
-      this.emittedFallbackOutput = 0
+      this.emittedFallbackOutput -= deduction
       if (deduction === 0) return real
       const outputTokens = real.outputTokens - deduction
       const totalTokens = real.totalTokens === undefined ? undefined : Math.max(0, real.totalTokens - deduction)

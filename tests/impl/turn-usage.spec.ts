@@ -233,15 +233,18 @@ describe('TurnUsageLedger', () => {
     expect(ledger.takeSegmentUsage(0)).toBeUndefined()
   })
 
-  it('keeps totalTokens consistent when fallback estimate exceeds real outputTokens', () => {
+  it('keeps totalTokens consistent and carries remaining fallback deduction across multiple real segments', () => {
     const ledger = new TurnUsageLedger()
     expect(ledger.takeSegmentUsage(80)).toEqual({ inputTokens: 0, outputTokens: 20 })
 
-    ledger.recordPromptUsage({
-      inputTokens: 500,
-      outputTokens: 10,
-      totalTokens: 510,
-      reasoningTokens: 8,
+    ledger.observeUsageUpdate({
+      sessionUpdate: 'usage_update',
+      used: 510,
+      size: 10000,
+      _meta: {
+        'codebuddy.ai/messageId': 'm1',
+        usage: { input_tokens: 500, output_tokens: 10, reasoningTokens: 8 },
+      },
     })
 
     expect(ledger.takeSegmentUsage(0)).toEqual({
@@ -249,6 +252,23 @@ describe('TurnUsageLedger', () => {
       outputTokens: 0,
       totalTokens: 500,
       reasoningTokens: 0,
+    })
+
+    ledger.observeUsageUpdate({
+      sessionUpdate: 'usage_update',
+      used: 1140,
+      size: 10000,
+      _meta: {
+        'codebuddy.ai/messageId': 'm2',
+        usage: { input_tokens: 600, output_tokens: 30, reasoningTokens: 12 },
+      },
+    })
+
+    expect(ledger.takeSegmentUsage(40)).toEqual({
+      inputTokens: 600,
+      outputTokens: 20,
+      totalTokens: 620,
+      reasoningTokens: 12,
     })
   })
 })
