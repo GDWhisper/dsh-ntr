@@ -174,7 +174,7 @@ export function SubagentCard(props: { acp: AcpStore; ui: UiState }) {
             <span className="dwa-badge dwa-badge-info">BETA</span>
           </h3>
           <p className="dwa-section-copy">
-            {acp.label('把任务委派给已接入的 ACP agent。', 'Delegate tasks to your connected ACP agents.')}
+            {acp.label('让原生 DSH 会话把任务委派给已接入的 ACP agent。', 'Let native DSH sessions delegate tasks to your connected ACP agents.')}
           </p>
         </div>
       </div>
