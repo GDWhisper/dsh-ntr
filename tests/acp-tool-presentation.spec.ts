@@ -217,6 +217,62 @@ describe('parseAcpToolPresentation', () => {
     expect(ready.filePath).toBe('/repo/src/app.ts')
     expect(ready.filePathLine).toBe(10)
     expect(ready.summary).toBe('src/app.ts')
+
+    const streamingInputArgs: AcpToolArgsView = {
+      has: key => key === 'description' || key === 'kind' || key === 'input',
+      complete: key => key === 'kind',
+      text: key => (key === 'description' ? 'Run tests' : key === 'kind' ? 'execute' : key === 'input' ? 'npm test' : undefined),
+      value: () => undefined,
+    }
+    const streamingInput = parseAcpToolPresentation({
+      phase: 'preparing',
+      args: streamingInputArgs,
+    })
+    expect(streamingInput.state).toBe('preparing')
+    expect(streamingInput.inputIsCommand).toBe(true)
+    expect(streamingInput.inputText).toBe('npm test')
+  })
+
+  it('enriches frozen result args and fallback diffs from live SSE updates while preserving authoritative result output', () => {
+    const merged = parseAcpToolPresentation({
+      phase: 'preparing',
+      args: {
+        has: key => key === 'description' || key === 'kind',
+        complete: () => true,
+        text: key => (key === 'description' ? 'shell' : key === 'kind' ? 'execute' : undefined),
+      },
+      live: {
+        title: 'npm run verify',
+        kind: 'execute',
+        tool: 'bash',
+        rawInput: { command: 'npm run verify' },
+        outputText: 'running tests...',
+        diffs: [{ path: '/repo/a.ts', oldText: 'a', newText: 'b' }],
+      },
+      cwd: '/repo',
+    })
+    expect(merged.state).toBe('preparing')
+    expect(merged.summary).toBe('npm run verify')
+    expect(merged.inputText).toBe('npm run verify')
+    expect(merged.outputText).toBe('running tests...')
+    expect(merged.diffs).toEqual([{ path: '/repo/a.ts', oldText: 'a', newText: 'b' }])
+
+    const settled = parseAcpToolPresentation({
+      phase: 'result',
+      argsRaw: JSON.stringify({ description: 'shell', kind: 'execute' }),
+      resultContent: [{ type: 'text', text: 'done' }],
+      isError: false,
+      live: {
+        title: 'echo done',
+        rawInput: { command: 'echo done' },
+        outputText: 'stale live output',
+        diffs: [{ path: '/repo/a.ts', oldText: 'a', newText: 'b' }],
+      },
+    })
+    expect(settled.summary).toBe('echo done')
+    expect(settled.inputText).toBe('echo done')
+    expect(settled.outputText).toBe('done')
+    expect(settled.diffs).toEqual([{ path: '/repo/a.ts', oldText: 'a', newText: 'b' }])
   })
 
   it('extracts structured diffs, error summaries, and interrupted state', () => {

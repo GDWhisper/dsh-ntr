@@ -14,6 +14,8 @@
  * Deliberately framework-free: React binds through `useSyncExternalStore`.
  */
 
+import type { AcpLiveToolCall } from "./acp-tool-presentation.ts"
+import { LiveToolCallIndex } from "./store/live-tools.ts"
 import { DEFAULT_KNOWN_PRESETS } from "./store/presets.ts"
 import type { Block } from "./store/blocks.ts"
 import { foldUpdate, usageFromUpdate, withSessionReleased } from "./store/blocks.ts"
@@ -117,6 +119,7 @@ export class AcpStore {
    * (`toolCallId`s can repeat across conversations).
    */
   private readonly acpSessionOwners = new Map<string, string>()
+  private readonly liveToolIndex = new LiveToolCallIndex()
   /**
    * When the seat gate last asked the host for a session's verdict (epoch ms).
    * Kept apart from {@link acpVerdicts} so a held verdict is re-asked per TTL.
@@ -231,6 +234,21 @@ export class AcpStore {
     return this.state
   }
 
+  liveToolCall(dshSessionId: string | undefined, callId: string): AcpLiveToolCall | undefined {
+    return this.liveToolIndex.get(dshSessionId, callId, this.acpSessionOwners)
+  }
+
+  private dropPendingUpdates(sessionId: string): void {
+    for (let i = this.pendingUpdates.length - 1; i >= 0; i -= 1) {
+      if (this.pendingUpdates[i]?.sessionId === sessionId) this.pendingUpdates.splice(i, 1)
+    }
+  }
+
+  private clearLiveSession(sessionId: string): void {
+    this.liveToolIndex.clearSession(sessionId)
+    this.dropPendingUpdates(sessionId)
+  }
+
   private mutate(patch: Partial<UiState>, blocksChanged = false): void {
     this.state = {
       ...this.state,
@@ -271,8 +289,10 @@ export class AcpStore {
     let chatSessions = this.state.chatSessions
     let subagentDetails = this.state.subagentDetails
     let blocksChanged = false
+    let liveToolsChanged = false
     for (const [sessionId, items] of bySession) {
       const last = items[items.length - 1]
+      if (this.liveToolIndex.foldBatch(sessionId, items)) liveToolsChanged = true
       // A worker's detail index is fed BEFORE the active-session split: the
       // conversation that dispatched it is not necessarily the ACP view's
       // active transcript, and the two never share the fold.
@@ -325,7 +345,7 @@ export class AcpStore {
     if (chatSessions !== this.state.chatSessions) patch.chatSessions = chatSessions
     if (subagentDetails !== this.state.subagentDetails) patch.subagentDetails = subagentDetails
     if (blocksChanged) patch.blocks = [...this.state.blocks]
-    if (Object.keys(patch).length > 0) this.mutate(patch)
+    if (Object.keys(patch).length > 0 || liveToolsChanged) this.mutate(patch)
   }
 
   /**
@@ -1151,6 +1171,8 @@ export class AcpStore {
         return Promise.resolve()
       }
       case 'session/closed': {
+        this.clearLiveSession(event.sessionId)
+        this.acpSessionOwners.delete(event.sessionId)
         const closingSession = this.state.sessions.find(s => s.sessionId === event.sessionId)
         const sessions = this.state.sessions.filter(s => s.sessionId !== event.sessionId)
         const active = this.state.activeSessionId === event.sessionId ? sessions[0]?.sessionId : this.state.activeSessionId
@@ -1184,6 +1206,10 @@ export class AcpStore {
         return Promise.resolve()
       }
       case 'session/released': {
+        // Drop queued frames from the dead process, but keep already-folded
+        // `liveToolIndex` snapshots so settled cards keep enriched args/diffs
+        // until `session/reset` (replay) or `session/closed`.
+        this.dropPendingUpdates(event.sessionId)
         // The agent process died: keep the session visible (marked released)
         // instead of dropping it — the next prompt resumes it via session/load.
         const sessions = this.state.sessions.some(s => s.sessionId === event.sessionId)
@@ -1233,6 +1259,7 @@ export class AcpStore {
         return Promise.resolve()
       }
       case 'session/reset': {
+        this.clearLiveSession(event.sessionId)
         // The session was resumed on a fresh process and the agent is about to
         // replay its history as fresh updates: drop local blocks and the seq
         // watermark so the replay folds in from a clean slate.
@@ -1396,6 +1423,7 @@ export class AcpStore {
         return Promise.resolve()
       }
       case 'turn/start': {
+        if (event.dshSessionId !== undefined) this.acpSessionOwners.set(event.sessionId, event.dshSessionId)
         this.openTurns.add(event.sessionId)
         this.chatSessionsService.markWatchedRunning(event.sessionId, true)
         // Every turn starts AFTER the host (re)materialized the session: a
@@ -1540,57 +1568,19 @@ function trimBlocks(blocks: Block[]): void {
 // Re-exported so every existing `./store.ts` import keeps resolving unchanged.
 
 export type { Block } from "./store/blocks.ts"
-export {
-  STATE_ONLY_UPDATES,
-  describeEvent,
-  foldUpdate,
-  jsonText,
-  replayChatRowFrames,
-  toolDetailsOf,
-  toolInputOf,
-  usageFromUpdate,
-} from "./store/blocks.ts"
-
+export { STATE_ONLY_UPDATES, describeEvent, foldUpdate, jsonText, replayChatRowFrames, toolDetailsOf, toolInputOf, usageFromUpdate } from "./store/blocks.ts"
 export type { ChatForkOutcome, ChatForkState } from "./store/fork.ts"
 export { forkStateOf } from "./store/fork.ts"
-
 export type { PendingPermission } from "./store/permission.ts"
 export { PERMISSION_DEADLINE_EXPIRED, deadlineRemainingLabel, permissionsForSession } from "./store/permission.ts"
 export type { ElicitationBuildResult, ElicitationDraft, PendingElicitation } from "./store/elicitation.ts"
 export { buildElicitationContent, elicitationsForSession, groupElicitationFields, initialElicitationDraft, reduceElicitationEvent } from "./store/elicitation.ts"
-
 export { DEFAULT_KNOWN_PRESETS } from "./store/presets.ts"
-
-export type {
-  SaveBanner,
-  SaveBannerAction,
-  SaveBannerSource,
-  SaveGateInterruptTarget,
-  SaveGateOutcomeTransition,
-} from "./store/save-gate.ts"
-export {
-  composeSaveBanners,
-  saveGateAgentId,
-  saveGateInterruptTargets,
-  saveGateIsAvailable,
-  saveGateOutcomeForLabel,
-  saveGateOutcomeSuperseded,
-  saveGateTransitions,
-} from "./store/save-gate.ts"
-
+export type { SaveBanner, SaveBannerAction, SaveBannerSource, SaveGateInterruptTarget, SaveGateOutcomeTransition } from "./store/save-gate.ts"
+export { composeSaveBanners, saveGateAgentId, saveGateInterruptTargets, saveGateIsAvailable, saveGateOutcomeForLabel, saveGateOutcomeSuperseded, saveGateTransitions } from "./store/save-gate.ts"
 export type { AgentCommand } from "./store/skills.ts"
 export { MAX_SKILL_KEYS, SKILL_MENU_TTL_MS, skillRowsKey } from "./store/skills.ts"
-
 export type { AcpLogEntry, ChatRowFrame, ChatTranscript, RpcCall, UiState } from "./store/state.ts"
 export { LOG_MAX_ENTRIES } from "./store/state.ts"
-
 export type { LiveSubagentDetailEntry, SubagentDetailState } from "./store/subagent.ts"
-export {
-  MAX_SUBAGENT_DETAIL_WORKERS,
-  SUBAGENT_RAW_MAX,
-  boundedDetailEntry,
-  compactDetailValue,
-  mergeSubagentSnapshot,
-  subagentKey,
-  subagentToolCallId,
-} from "./store/subagent.ts"
+export { MAX_SUBAGENT_DETAIL_WORKERS, SUBAGENT_RAW_MAX, boundedDetailEntry, compactDetailValue, mergeSubagentSnapshot, subagentKey, subagentToolCallId } from "./store/subagent.ts"

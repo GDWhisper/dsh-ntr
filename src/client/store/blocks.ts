@@ -128,16 +128,42 @@ function chunkText(content: unknown): string {
  * JSON.
  */
 function splitToolContent(content: unknown): { lines: string[]; diffs?: Array<{ path: string; oldText: string | null; newText: string }>; extras: string[] } {
+  const parsed = parseToolContent(content)
+  return {
+    lines: parsed.lines,
+    extras: parsed.extras,
+    ...(parsed.diffs === undefined ? {} : { diffs: parsed.diffs }),
+  }
+}
+
+/**
+ * Shared ACP tool `content` parser. Keeps `lines` (with inline diff text for
+ * `ToolCard`) alongside `outputLines` (text blocks only, for chat `AcpToolRow`
+ * which renders `diffs` in a dedicated diff block).
+ */
+export function parseToolContent(content: unknown): {
+  lines: string[]
+  outputLines: string[]
+  diffs?: Array<{ path: string; oldText: string | null; newText: string }>
+  extras: string[]
+} {
   const lines: string[] = []
+  const outputLines: string[] = []
   const extras: string[] = []
   const diffs: Array<{ path: string; oldText: string | null; newText: string }> = []
   if (!Array.isArray(content)) {
-    if (typeof content === 'string' && content !== '') lines.push(content)
-    return { lines, extras }
+    if (typeof content === 'string' && content !== '') {
+      lines.push(content)
+      outputLines.push(content)
+    }
+    return { lines, outputLines, extras }
   }
   for (const item of content) {
     if (typeof item === 'string') {
-      if (item !== '') lines.push(item)
+      if (item !== '') {
+        lines.push(item)
+        outputLines.push(item)
+      }
       continue
     }
     if (typeof item !== 'object' || item === null) continue
@@ -146,9 +172,12 @@ function splitToolContent(content: unknown): { lines: string[]; diffs?: Array<{ 
       const inner = row.content as Record<string, unknown> | undefined
       if (typeof inner === 'string') {
         lines.push(inner)
+        outputLines.push(inner)
       } else if (inner?.type === 'text') {
-        lines.push(typeof inner.text === 'string' ? inner.text : JSON.stringify(item))
-      } else if (inner?.type === 'diff' && typeof inner.path === 'string') {
+        const text = typeof inner.text === 'string' ? inner.text : JSON.stringify(item)
+        lines.push(text)
+        outputLines.push(text)
+      } else if (inner?.type === 'diff' && typeof inner.path === 'string' && inner.path !== '') {
         const diff = { path: inner.path, oldText: typeof inner.oldText === 'string' ? inner.oldText : null, newText: typeof inner.newText === 'string' ? inner.newText : '' }
         diffs.push(diff)
         lines.push(diffText(diff))
@@ -157,7 +186,7 @@ function splitToolContent(content: unknown): { lines: string[]; diffs?: Array<{ 
       }
       continue
     }
-    if (row.type === 'diff' && typeof row.path === 'string' && typeof row.newText === 'string') {
+    if (row.type === 'diff' && typeof row.path === 'string' && row.path !== '' && typeof row.newText === 'string') {
       const diff = { path: row.path, oldText: typeof row.oldText === 'string' ? row.oldText : null, newText: row.newText }
       diffs.push(diff)
       lines.push(diffText(diff))
@@ -165,11 +194,12 @@ function splitToolContent(content: unknown): { lines: string[]; diffs?: Array<{ 
     }
     if (row.type === 'text' && typeof row.text === 'string') {
       lines.push(row.text)
+      outputLines.push(row.text)
       continue
     }
     extras.push(`${String(row.type ?? 'content')} ${JSON.stringify(item)}`)
   }
-  return { lines, extras, ...(diffs.length === 0 ? {} : { diffs }) }
+  return { lines, outputLines, extras, ...(diffs.length === 0 ? {} : { diffs }) }
 }
 
 /** A structured edit as plain text: its path, then `-`/`+` lines with three lines of context. */

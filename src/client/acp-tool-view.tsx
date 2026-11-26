@@ -23,6 +23,7 @@ import { ensureAcpStyle } from './acp-ui.tsx'
 import {
   ACP_TOOL_CALL_NAME,
   parseAcpToolPresentation,
+  type AcpLiveToolCall,
   type AcpToolArgsView,
   type AcpToolCategory,
   type AcpToolDiff,
@@ -74,6 +75,7 @@ export type AcpToolRowProps = AcpToolCallOwnerBlock & {
     readonly toggle: () => void
   }
   acp?: AcpStore
+  dshSessionId?: string
 }
 
 const CHAT_DIFF_MAX_LINES = 9
@@ -295,11 +297,20 @@ function defaultPrefersZh(): boolean {
  */
 export function AcpToolRow(props: AcpToolRowProps) {
   ensureAcpStyle()
-  const { phase, block, cwd, home, openFile, inspect, useDisclosure, acp } = props
+  const { phase, block, cwd, home, openFile, inspect, useDisclosure, acp, dshSessionId } = props
+  const subscribeAcp = useCallback(
+    (cb: () => void) => (acp ? acp.subscribe(cb) : noopSubscribe()),
+    [acp],
+  )
   useSyncExternalStore(
-    acp ? (cb => acp.subscribe(cb)) : noopSubscribe,
+    subscribeAcp,
     acp ? (() => acp.getSnapshot().localeRev) : zeroSnapshot,
   )
+  const getLiveTool = useCallback(
+    (): AcpLiveToolCall | undefined => (acp !== undefined ? acp.liveToolCall(dshSessionId, props.callId) : undefined),
+    [acp, dshSessionId, props.callId],
+  )
+  const liveTool = useSyncExternalStore(subscribeAcp, getLiveTool)
   const tr = useCallback(
     (zh: string, en: string): string => (acp ? acp.label(zh, en) : defaultPrefersZh() ? zh : en),
     [acp],
@@ -312,6 +323,7 @@ export function AcpToolRow(props: AcpToolRowProps) {
         phase,
         argsRaw: undefined,
         args: block.args,
+        live: liveTool,
         cwd,
         home,
       })
@@ -321,6 +333,7 @@ export function AcpToolRow(props: AcpToolRowProps) {
         phase,
         argsRaw: block.argsRaw,
         args: block.args,
+        live: liveTool,
         cwd,
         home,
       })
@@ -333,14 +346,15 @@ export function AcpToolRow(props: AcpToolRowProps) {
       isError: block.isError,
       error: block.error,
       meta: block.meta,
+      live: liveTool,
       cwd,
       home,
     })
-  }, [phase, block, cwd, home])
+  }, [phase, block, liveTool, cwd, home])
 
   const hasDiffs = model.diffs !== undefined && model.diffs.length > 0
   const hasIo = model.inputText !== undefined || model.outputText !== undefined
-  const expandable = model.state !== 'preparing' && (hasIo || hasDiffs)
+  const expandable = hasIo || hasDiffs
   const open = expanded && expandable
   const running = model.state === 'preparing' || model.state === 'running'
   const titleText = tr(model.title.zh, model.title.en)
@@ -502,7 +516,10 @@ export function installAcpToolView(ctx: Context, store: AcpStore): () => void {
         return register({
           name: 'tool.call.toolview',
           key: ACP_TOOL_CALL_NAME,
-          inject: () => ({ acp: store }),
+          inject: (sessionId?: string) => ({
+            acp: store,
+            ...(typeof sessionId === 'string' && sessionId !== '' ? { dshSessionId: sessionId } : {}),
+          }),
         }, AcpToolRow)
       } catch {
         return () => {}

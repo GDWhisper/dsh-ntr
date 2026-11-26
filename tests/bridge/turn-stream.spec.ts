@@ -699,3 +699,73 @@ describe('the turn slot is generation-guarded (AgentBridge)', () => {
     expect(events.filter(event => event.type === 'session/released' && event.sessionId === session.sessionId)).toEqual([])
   })
 })
+
+describe('throttled block-end refresh for late tool_call_update restatements', () => {
+  const refreshScript = [
+    '(async () => {',
+    "  const { agent, methods, ndJsonStream, PROTOCOL_VERSION } = await import('@agentclientprotocol/sdk')",
+    "  const { Writable, Readable } = require('node:stream')",
+    '  const sleep = ms => new Promise(r => setTimeout(r, ms))',
+    "  agent({ name: 'refresh-fake' })",
+    '    .onRequest(methods.agent.initialize, () => ({',
+    '      protocolVersion: PROTOCOL_VERSION,',
+    '      agentCapabilities: { loadSession: false, promptCapabilities: { image: false, audio: false, embeddedContext: false } },',
+    '      authMethods: [],',
+    '    }))',
+    "    .onRequest(methods.agent.session.new, () => ({ sessionId: 'refresh-1' }))",
+    '    .onRequest(methods.agent.session.prompt, async ctx => {',
+    '      const send = update => ctx.client.notify(methods.client.session.update, { sessionId: ctx.params.sessionId, update })',
+    "      await send({ sessionUpdate: 'tool_call', toolCallId: 'r1', title: 'shell', kind: 'execute', status: 'pending' })",
+    '      await sleep(750)',
+    "      await send({ sessionUpdate: 'tool_call_update', toolCallId: 'r1', title: 'echo hello', rawInput: { command: 'echo hello' }, status: 'in_progress' })",
+    '      await sleep(900)',
+    "      await send({ sessionUpdate: 'tool_call_update', toolCallId: 'r1', status: 'completed', content: [{ type: 'text', text: 'hello' }] })",
+    "      await send({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'done' } })",
+    "      return { stopReason: 'end_turn' }",
+    '    })',
+    "    .connect(ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin)))",
+    '})()',
+  ].join('\n')
+  const refreshHub = new EventHub()
+  const refreshManager = new BridgeManager([{
+    ...def,
+    id: 'refresh',
+    args: ['-e', refreshScript],
+    cwd: process.cwd(),
+    allowedCwdRoots: [process.cwd()],
+  }], refreshHub, 500)
+  const refreshAdapter = new AcpLlmAdapter(refreshManager)
+
+  afterAll(async () => {
+    await refreshManager.shutdownAll()
+  })
+
+  it('re-emits block-end after cardSettled when late restatement arrives mid-run without emitting post-settle deltas', async () => {
+    const frames: Array<{ at: number; chunk: StreamChunk }> = []
+    const startedAt = Date.now()
+    for await (const chunk of refreshAdapter.stream({
+      provider: 'acp',
+      model: 'refresh',
+      sessionId: 'dsh-refresh-1',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'go' }] }],
+    })) {
+      frames.push({ at: Date.now() - startedAt, chunk })
+    }
+    const cardEnds = frames.filter(({ chunk }) => chunk.type === 'block-end'
+      && (chunk.block as { type?: string }).type === 'tool-call')
+    const firstTextAt = frames.find(({ chunk }) => chunk.type === 'text-delta')?.at ?? Number.POSITIVE_INFINITY
+    // 1) Initial 500ms settle ('shell')
+    // 2) Throttled 500ms refresh ('echo hello') while the tool is still running, before prose cuts the segment
+    // 3) Segment-closing block-end when 'agent_message_chunk' cuts the segment
+    expect(cardEnds).toHaveLength(3)
+    expect(cardEnds[1]!.at).toBeLessThan(firstTextAt)
+    const firstArgs = (cardEnds[0]?.chunk as Extract<StreamChunk, { type: 'block-end' }>).block as { arguments?: string }
+    const refreshedArgs = (cardEnds[1]?.chunk as Extract<StreamChunk, { type: 'block-end' }>).block as { arguments?: string }
+    expect(firstArgs.arguments).toContain('"description":"shell"')
+    expect(refreshedArgs.arguments).toContain('"description":"echo hello"')
+    expect(refreshedArgs.arguments).toContain('"command":"echo hello"')
+    const firstSettledAt = cardEnds[0]?.at ?? 0
+    const lateDeltas = frames.filter(({ chunk, at }) => chunk.type === 'tool-call-delta' && chunk.argumentsDelta !== '' && at > firstSettledAt)
+    expect(lateDeltas).toHaveLength(0)
+  }, 30_000)
+})

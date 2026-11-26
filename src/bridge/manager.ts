@@ -1695,7 +1695,13 @@ export class BridgeManager {
     session.reclaimedTurnSeq = undefined
     this.armStallTimer()
     const turnId = randomUUID()
-    this.hub.broadcast({ type: 'turn/start', sessionId: session.sessionId, turnId, text: promptText })
+    this.hub.broadcast({
+      type: 'turn/start',
+      sessionId: session.sessionId,
+      ...(session.dshSessionId === undefined ? {} : { dshSessionId: session.dshSessionId }),
+      turnId,
+      text: promptText,
+    })
 
     // The segmented turn: ONE controller for the whole agent-side prompt, one
     // segment per driver step. The first segment streams until a card-bearing

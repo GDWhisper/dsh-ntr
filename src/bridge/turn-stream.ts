@@ -384,11 +384,12 @@ interface SegmentState {
   ambient: boolean
   /**
    * Whether this segment's open card was settled early (see
-   * `settleOpenCard`). The snapshot stays open so a late restatement still
-   * folds into it; the segment's closing `block-end` then replaces the settled
-   * card with the final text.
+   * `settleOpenCard`), and the `argsRaw` snapshot last sent in `block-end`.
+   * Later restatements refresh `block-end` on a throttled window so the host's
+   * preparing row stays current without emitting post-seal deltas.
    */
   cardSettled: boolean
+  settledArgsRaw: string
   finished: boolean
 }
 
@@ -797,6 +798,7 @@ export class TurnStreamController {
         || this.backgroundHold !== undefined
         || this.pendingBackgroundHold !== undefined,
       cardSettled: false,
+      settledArgsRaw: '',
       finished: false,
     }
     this.segment = seg
@@ -1902,17 +1904,23 @@ export class TurnStreamController {
    * disclose them) and in ambient segments (they open no cards).
    */
   private armCardSettle(seg: SegmentState): void {
-    this.clearCardSettle()
-    if (this.disposed || seg.finished || seg.ambient || seg.cardSettled) return
+    if (this.disposed || seg.finished || seg.ambient) return
     const call = seg.activeToolCall
     if (seg.activeType !== 'tool-call' || call === undefined) return
-    if (call.argsRaw === '') return
+    if (call.argsRaw === '' || (seg.cardSettled && call.argsRaw === seg.settledArgsRaw)) return
+    // Before first settle: debounce so announce -> rewrite bursts fold into one block-end.
+    // After first settle: throttle at CARD_SETTLE_QUIET_MS so streaming restatements refresh without starvation.
+    if (seg.cardSettled) {
+      if (this.cardSettleTimer !== undefined) return
+    } else {
+      this.clearCardSettle()
+    }
     const timer = setTimeout(() => {
       this.cardSettleTimer = undefined
       if (this.disposed || this.segment !== seg || seg.finished) return
-      if (seg.ambient || seg.cardSettled) return
+      if (seg.ambient) return
       if (seg.activeType !== 'tool-call' || seg.activeToolCall === undefined) return
-      if (seg.activeToolCall.argsRaw === '') return
+      if (seg.activeToolCall.argsRaw === '' || (seg.cardSettled && seg.activeToolCall.argsRaw === seg.settledArgsRaw)) return
       this.settleOpenCard(seg)
     }, CARD_SETTLE_QUIET_MS)
     // Never pin the process open for a display timer alone.
@@ -1928,23 +1936,16 @@ export class TurnStreamController {
   }
 
   /**
-   * Close the open tool-call block WITHOUT ending the segment, so the host's
-   * live row settles its arguments. The block stays the segment's last block;
-   * a later non-tool event cuts the segment exactly as before.
-   *
-   * The SNAPSHOT deliberately stays open. ACP updates restate their input
-   * whole, so the agent can disclose a fuller command after the window: that
-   * update folds into the snapshot (see `foldInto`) and the segment's closing
-   * `block-end` replaces the settled card with the final text. Clearing the
-   * snapshot here would hand the same call's restatements to `seenCalls`, and
-   * the card would stay pinned to the early text for the rest of the turn.
+   * Close/refresh the open tool-call block WITHOUT ending the segment, so the
+   * host's live row settles or refreshes its arguments while the tool runs.
    */
   private settleOpenCard(seg: SegmentState): void {
     if (seg.finished) return
     const call = seg.activeToolCall
     if (seg.activeType !== 'tool-call' || call === undefined) return
-    if (seg.cardSettled) return
+    if (seg.cardSettled && call.argsRaw === seg.settledArgsRaw) return
     seg.cardSettled = true
+    seg.settledArgsRaw = call.argsRaw
     seg.queue.push({
       type: 'block-end',
       index: seg.index,
@@ -2388,10 +2389,13 @@ export class TurnStreamController {
       if (snapshot === undefined) return true
       if (seg.activeType === 'tool-call' && seg.activeToolCall?.callId === snapshot.callId) {
         const deltas = acpToolCallDelta(seg.activeToolCall, update)
-        // An early-settled block is already sealed on the host side: a
-        // concatenating delta would append to a settled view. Keep the folded
-        // snapshot only — the segment's closing `block-end` restates it whole.
-        if (seg.cardSettled) return true
+        // An early-settled block is already sealed on the host side: never emit
+        // concatenating deltas after settle. If arguments changed, re-arm a
+        // throttled `block-end` refresh so the preparing row updates mid-run.
+        if (seg.cardSettled) {
+          if (seg.activeToolCall.argsRaw !== seg.settledArgsRaw) this.armCardSettle(seg)
+          return true
+        }
         for (const delta of deltas) {
           seg.queue.push(delta.kind === 'name'
             ? { type: 'tool-call-delta', index: seg.index, id: seg.activeToolCall.callId, name: delta.name, argumentsDelta: '' }
@@ -2446,6 +2450,7 @@ export class TurnStreamController {
   private emitProse(seg: SegmentState, type: 'reasoning' | 'text', text: string): void {
     if (seg.finished) return
     if (seg.activeType !== type) {
+      if (seg.activeType === 'tool-call') this.clearCardSettle()
       if (seg.activeType !== null) {
         seg.queue.push({
           type: 'block-end',
@@ -2472,6 +2477,7 @@ export class TurnStreamController {
    */
   private openToolCallBlock(seg: SegmentState, snapshot: AcpToolCallSnapshot): void {
     if (seg.finished) return
+    if (seg.activeType === 'tool-call') this.clearCardSettle()
     if (seg.activeType !== null) {
       seg.queue.push({
         type: 'block-end',
@@ -2488,6 +2494,7 @@ export class TurnStreamController {
     // A NEW card owns its own settle window; the previous card's settlement
     // (if any) closed with the block-end above.
     seg.cardSettled = false
+    seg.settledArgsRaw = ''
     this.sawVisibleBlock = true
     seg.hasCard = true
     seg.queue.push({ type: 'block-start', index: seg.index, blockType: 'tool-call' })

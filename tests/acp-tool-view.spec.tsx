@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { createElement, memo, useState } from 'react'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import { ACP_TOOL_CALL_NAME } from '../src/client/acp-tool-presentation.ts'
@@ -220,8 +220,8 @@ describe('AcpToolRow (fallback primitives on older hosts / primitives-stub)', ()
     expect(screen.queryByText(ACP_TOOL_CALL_NAME)).toBeNull()
   })
 
-  it('disables expansion during preparing phase and streams live description', () => {
-    const { container } = renderRow({
+  it('keeps preparing row non-expandable without body, and allows expanding when streaming input or live SSE updates arrive', async () => {
+    const { container, unmount } = renderRow({
       phase: 'preparing',
       acp: makeStore(false),
       useDisclosure: makeDisclosure(true),
@@ -239,6 +239,169 @@ describe('AcpToolRow (fallback primitives on older hosts / primitives-stub)', ()
 
     expect(screen.getByText('Streaming command...')).toBeDefined()
     expect(container.querySelector('.ntr-tool-body-wrap')).toBeNull()
+    unmount()
+
+    const store = makeStore(false)
+    const feed = (event: unknown) => (store as unknown as { applyEvent(e: unknown): Promise<void> }).applyEvent(event)
+    await feed({ type: 'turn/start', sessionId: 'acp-other', dshSessionId: 'dsh-other', turnId: 't-other', text: 'hi' })
+    await feed({
+      type: 'session/update',
+      sessionId: 'acp-other',
+      seq: 1,
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'call-live',
+        title: 'OTHER CONVERSATION',
+        kind: 'execute',
+        rawInput: { command: 'rm -rf /nope' },
+        content: [{ type: 'text', text: 'other output' }],
+      },
+    })
+    await feed({ type: 'turn/start', sessionId: 'acp-1', dshSessionId: 'dsh-1', turnId: 't-1', text: 'run' })
+    await feed({
+      type: 'session/update',
+      sessionId: 'acp-1',
+      seq: 1,
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'call-live',
+        title: 'shell',
+        kind: 'execute',
+        status: 'pending',
+      },
+    })
+    store.flushUpdates()
+
+    const view = renderRow({
+      callId: 'call-live',
+      phase: 'preparing',
+      acp: store,
+      dshSessionId: 'dsh-1',
+      useDisclosure: makeDisclosure(false),
+      block: {
+        phase: 'preparing',
+        callId: 'call-live',
+        name: ACP_TOOL_CALL_NAME,
+        args: {
+          has: k => k === 'description' || k === 'kind',
+          complete: () => true,
+          text: k => (k === 'description' ? 'shell' : k === 'kind' ? 'execute' : undefined),
+        },
+      },
+    })
+    expect(screen.getByText('shell')).toBeDefined()
+    expect(view.container.querySelector('.ntr-tool-row')?.getAttribute('data-expandable')).toBeNull()
+
+    await act(async () => {
+      await feed({
+        type: 'session/update',
+        sessionId: 'acp-1',
+        seq: 2,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'call-live',
+          title: 'npm test',
+          status: 'in_progress',
+          rawInput: { command: 'npm test' },
+          content: [{ type: 'text', text: 'PASS tests/a.spec.ts' }],
+        },
+      })
+      store.flushUpdates()
+    })
+
+    expect(screen.getByText('npm test')).toBeDefined()
+    expect(screen.queryByText('OTHER CONVERSATION')).toBeNull()
+    const row = view.container.querySelector('.ntr-tool-row') as HTMLElement
+    expect(row.getAttribute('data-expandable')).toBe('true')
+    fireEvent.click(row)
+    expect(view.container.querySelector('[data-command="true"]')?.textContent).toBe('npm test')
+    expect(screen.getByText('PASS tests/a.spec.ts')).toBeDefined()
+
+    // Live diffs during `start` and preservation of enriched args + diffs when transitioning to `result`
+    // even if host BlockAssembler froze the early placeholder `argsRaw: {"description":"shell"}`.
+    await act(async () => {
+      await feed({
+        type: 'session/update',
+        sessionId: 'acp-1',
+        seq: 3,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'call-live',
+          content: [
+            { type: 'text', text: 'Updated a.ts' },
+            { type: 'diff', path: 'src/a.ts', oldText: 'const a = 1', newText: 'const a = 2' },
+          ],
+        },
+      })
+      store.flushUpdates()
+    })
+
+    view.rerender(createElement(AcpToolRow, {
+      callId: 'call-live',
+      toolName: ACP_TOOL_CALL_NAME,
+      phase: 'start',
+      acp: store,
+      dshSessionId: 'dsh-1',
+      useDisclosure: makeDisclosure(true),
+      block: {
+        phase: 'start',
+        callId: 'call-live',
+        name: ACP_TOOL_CALL_NAME,
+        argsRaw: JSON.stringify({ description: 'shell', kind: 'execute' }),
+        args: {},
+      },
+    }))
+    expect(view.container.querySelector('.ntr-tool-summary')?.textContent).toBe('npm test')
+    expect(view.container.querySelector('.ntr-tool-diff-path')?.textContent).toBe('src/a.ts')
+    expect(screen.getByText('Updated a.ts')).toBeDefined()
+
+    view.rerender(createElement(AcpToolRow, {
+      callId: 'call-live',
+      toolName: ACP_TOOL_CALL_NAME,
+      phase: 'result',
+      acp: store,
+      dshSessionId: 'dsh-1',
+      useDisclosure: makeDisclosure(true),
+      block: {
+        kind: 'tool-result',
+        callId: 'call-live',
+        name: ACP_TOOL_CALL_NAME,
+        args: {},
+        call: {
+          name: ACP_TOOL_CALL_NAME,
+          argsRaw: JSON.stringify({ description: 'shell', kind: 'execute' }),
+        },
+        content: [{ type: 'text', text: 'Final settled output' }],
+        isError: false,
+      },
+    }))
+    expect(view.container.querySelector('.ntr-tool-summary')?.textContent).toBe('npm test')
+    expect(view.container.querySelector('[data-command="true"]')?.textContent).toBe('npm test')
+    expect(view.container.querySelector('.ntr-tool-diff-path')?.textContent).toBe('src/a.ts')
+    expect(screen.getByText('Final settled output')).toBeDefined()
+
+    // Omitting dshSessionId fails closed (returns no live enrichment instead of leaking from acp-1).
+    view.rerender(createElement(AcpToolRow, {
+      callId: 'call-live',
+      toolName: ACP_TOOL_CALL_NAME,
+      phase: 'result',
+      acp: store,
+      useDisclosure: makeDisclosure(true),
+      block: {
+        kind: 'tool-result',
+        callId: 'call-live',
+        name: ACP_TOOL_CALL_NAME,
+        args: {},
+        call: {
+          name: ACP_TOOL_CALL_NAME,
+          argsRaw: JSON.stringify({ description: 'shell', kind: 'execute' }),
+        },
+        content: [{ type: 'text', text: 'Final settled output' }],
+        isError: false,
+      },
+    }))
+    expect(view.container.querySelector('.ntr-tool-summary')?.textContent).toBe('shell')
+    expect(view.container.querySelector('.ntr-tool-diff-path')).toBeNull()
   })
 })
 
@@ -340,6 +503,7 @@ describe('installAcpToolView', () => {
     expect((registrations[0] as { meta: { name: string; key: string; inject: () => unknown } }).meta.name).toBe('tool.call.toolview')
     expect((registrations[0] as { meta: { key: string } }).meta.key).toBe(ACP_TOOL_CALL_NAME)
     expect((registrations[0] as { meta: { inject: () => { acp: AcpStore } } }).meta.inject()).toEqual({ acp: store })
+    expect((registrations[0] as { meta: { inject: (id?: string) => { acp: AcpStore; dshSessionId?: string } } }).meta.inject('dsh-42')).toEqual({ acp: store, dshSessionId: 'dsh-42' })
 
     stop?.()
     expect(dispose).toHaveBeenCalledTimes(1)

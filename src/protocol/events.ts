@@ -181,7 +181,7 @@ export type AcpEvent =
     }
   | { type: 'elicitation/resolved'; requestId: string; sessionId: string; action: 'accept' | 'decline' | 'cancel' }
   | { type: 'elicitation/synced'; requestIds: string[] }
-  | { type: 'turn/start'; sessionId: string; turnId: string; text: string }
+  | { type: 'turn/start'; sessionId: string; dshSessionId?: string; turnId: string; text: string }
   | {
       type: 'turn/metrics'
       /** ACP session id (the store keys live burst state by it). */

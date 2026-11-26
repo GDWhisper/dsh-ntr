@@ -49,6 +49,16 @@ export interface AcpToolArgsView {
   value?(key: string): unknown
 }
 
+export interface AcpLiveToolCall {
+  readonly title?: string
+  readonly kind?: string
+  readonly tool?: string
+  readonly locations?: readonly AcpToolLocation[]
+  readonly rawInput?: unknown
+  readonly outputText?: string
+  readonly diffs?: readonly AcpToolDiff[]
+}
+
 export interface AcpToolPresentationInput {
   phase: 'preparing' | 'start' | 'result'
   argsRaw?: string | null
@@ -57,6 +67,7 @@ export interface AcpToolPresentationInput {
   isError?: boolean
   error?: { name?: string; code?: string; reason?: string }
   meta?: unknown
+  live?: AcpLiveToolCall
   cwd?: string
   home?: string
 }
@@ -192,7 +203,7 @@ export function classifyAcpTool(kind?: string, tool?: string): AcpToolCategory {
   return 'other'
 }
 
-function parseLocations(raw: unknown): AcpToolLocation[] {
+export function parseLocations(raw: unknown): AcpToolLocation[] {
   if (!Array.isArray(raw)) return []
   const out: AcpToolLocation[] = []
   for (const item of raw) {
@@ -267,12 +278,15 @@ function parseEnvelope(argsRaw?: string | null, args?: AcpToolArgsView): ParsedE
   const locations = parseLocations(rawLocs)
   let hasInput = false
   let rawInput: unknown
-  if (args.has?.('input') && (args.complete === undefined || args.complete('input'))) {
+  if (args.has?.('input')) {
+    const complete = args.complete === undefined || args.complete('input')
     const strVal = args.text?.('input')
     if (strVal !== undefined) {
-      hasInput = strVal !== ''
-      rawInput = strVal
-    } else {
+      if (strVal !== '') {
+        hasInput = true
+        rawInput = strVal
+      }
+    } else if (complete) {
       const objVal = args.value?.('input')
       if (objVal !== undefined) {
         hasInput = true
@@ -445,7 +459,21 @@ function extractOutputText(
  * a unified presentation model for `AcpToolRow`.
  */
 export function parseAcpToolPresentation(input: AcpToolPresentationInput): AcpToolPresentation {
-  const env = parseEnvelope(input.argsRaw, input.args)
+  const baseEnv = parseEnvelope(input.argsRaw, input.args)
+  const live = input.live
+  // Host BlockAssembler freezes `block.call.argsRaw` on the first `block-end`
+  // (at 500ms `settleOpenCard`), so late `tool_call_update` title/input/diffs
+  // stay available via live SSE enrichment even after `phase === 'result'`.
+  // Result `outputText`, `isError`, and `error` remain authoritative on `result`.
+  const env: ParsedEnvelope = live === undefined ? baseEnv : {
+    description: live.title !== undefined && live.title !== '' ? live.title : baseEnv.description,
+    kind: live.kind !== undefined && live.kind !== '' ? live.kind : baseEnv.kind,
+    tool: live.tool !== undefined && live.tool !== '' ? live.tool : baseEnv.tool,
+    locations: live.locations !== undefined && live.locations.length > 0 ? [...live.locations] : baseEnv.locations,
+    hasInput: live.rawInput !== undefined ? true : baseEnv.hasInput,
+    rawInput: live.rawInput !== undefined ? live.rawInput : baseEnv.rawInput,
+    ...(baseEnv.rawFallbackInput === undefined ? {} : { rawFallbackInput: baseEnv.rawFallbackInput }),
+  }
   const category = classifyAcpTool(env.kind, env.tool)
   const title = category === 'other' && env.tool !== undefined
     ? { zh: env.tool, en: env.tool }
@@ -467,8 +495,15 @@ export function parseAcpToolPresentation(input: AcpToolPresentationInput): AcpTo
 
   const summary = deriveSummary(category, env, filePath, input.cwd, input.home)
   const inputText = deriveInputText(category, env)
-  const diffs = input.phase === 'result' ? extractDiffs(input.meta, input.resultContent) : undefined
-  const outputText = input.phase === 'result' ? extractOutputText(input.resultContent, input.error) : undefined
+  const liveDiffs = live?.diffs !== undefined && live.diffs.length > 0 ? live.diffs : undefined
+  const diffs = input.phase === 'result'
+    ? (extractDiffs(input.meta, input.resultContent) ?? liveDiffs)
+    : liveDiffs
+  const outputText = input.phase === 'result'
+    ? extractOutputText(input.resultContent, input.error)
+    : live?.outputText !== undefined && live.outputText !== ''
+      ? live.outputText
+      : undefined
   const errorSummary = state === 'error' && outputText !== undefined ? firstLine(outputText) : undefined
 
   return {
