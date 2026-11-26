@@ -15,6 +15,7 @@ import { DeadlineBadge, PendingDockShell, useDeadlineClock } from './pending-doc
 import {
   buildElicitationContent,
   elicitationsForSession,
+  groupElicitationFields,
   initialElicitationDraft,
   type AcpStore,
   type ElicitationDraft,
@@ -62,9 +63,10 @@ export function ElicitationAskCard(props: { acp: AcpStore; elicitation: PendingE
   const [step, setStep] = useState(0)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
-  const lastStep = Math.max(0, elicitation.fields.length - 1)
-  const currentField = elicitation.fields[step]
-  const paged = elicitation.fields.length > 1
+  const pages = groupElicitationFields(elicitation.fields)
+  const lastStep = Math.max(0, pages.length - 1)
+  const currentPage = pages[step] ?? []
+  const paged = pages.length > 1
 
   const submit = (outcome: ElicitationOutcome): void => {
     if (busy) return
@@ -78,7 +80,7 @@ export function ElicitationAskCard(props: { acp: AcpStore; elicitation: PendingE
   }
 
   const onAccept = (): void => {
-    const fields = step < lastStep && currentField !== undefined ? [currentField] : elicitation.fields
+    const fields = step < lastStep ? currentPage : elicitation.fields
     const built = buildElicitationContent(fields, draft, (zh, en) => acp.label(zh, en))
     if (!built.ok) {
       setError(built.error)
@@ -115,10 +117,10 @@ export function ElicitationAskCard(props: { acp: AcpStore; elicitation: PendingE
         <div className="ntr-elicit-fields">
           {paged && (
             <div className="ntr-elicit-step" aria-live="polite">
-              {acp.label(`问题 ${String(step + 1)} / ${String(elicitation.fields.length)}`, `Question ${String(step + 1)} of ${String(elicitation.fields.length)}`)}
+              {acp.label(`问题 ${String(step + 1)} / ${String(pages.length)}`, `Question ${String(step + 1)} of ${String(pages.length)}`)}
             </div>
           )}
-          {(paged ? [currentField] : elicitation.fields).map(field => field !== undefined && (
+          {(paged ? currentPage : elicitation.fields).map(field => (
             <ElicitationFieldRow
               key={field.name}
               field={field}

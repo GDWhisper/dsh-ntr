@@ -233,4 +233,84 @@ describe('ElicitationDock', () => {
     expect(respond).toHaveBeenNthCalledWith(1, 'req-7', { action: 'decline' })
     expect(respond).toHaveBeenNthCalledWith(2, 'req-7', { action: 'cancel' })
   })
+
+  it('keeps a select question and its trailing *_other custom field on one unpaged card', () => {
+    const { acp, respond } = fakeStore([
+      {
+        requestId: 'req-agy-1',
+        sessionId: 's1',
+        dshSessionId: 'chat-1',
+        message: 'The agent has a question.',
+        fields: [
+          {
+            name: 'q1',
+            kind: 'single-select',
+            title: 'Which option?',
+            required: false,
+            options: [
+              { value: '1', label: 'Option A' },
+              { value: '2', label: 'Option B' },
+            ],
+          },
+          {
+            name: 'q1_other',
+            kind: 'string',
+            title: 'Other',
+            description: 'Optional free-form answer to: Which option?',
+            required: false,
+          },
+        ],
+      },
+    ])
+
+    render(createElement(ElicitationDock, { acp, sessionId: 'chat-1' }))
+    expect(screen.queryByText(/Question 1 of/)).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Next' })).toBeNull()
+    expect(screen.getByRole('radio', { name: 'Option A' })).toBeTruthy()
+    fireEvent.change(screen.getByLabelText(/Other/), { target: { value: 'custom reply' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Submit' }))
+    expect(respond).toHaveBeenCalledWith('req-agy-1', { action: 'accept', content: { q1_other: 'custom reply' } })
+  })
+
+  it('pages two choice+other questions into 2 logical steps instead of 4', () => {
+    const { acp, respond } = fakeStore([
+      {
+        requestId: 'req-agy-2',
+        sessionId: 's1',
+        dshSessionId: 'chat-1',
+        message: 'The agent has questions.',
+        fields: [
+          {
+            name: 'q1',
+            kind: 'single-select',
+            title: 'First question',
+            required: false,
+            options: [{ value: '1', label: 'First A' }],
+          },
+          { name: 'q1_other', kind: 'string', title: 'Other', required: false },
+          {
+            name: 'q2',
+            kind: 'single-select',
+            title: 'Second question',
+            required: false,
+            options: [{ value: '1', label: 'Second A' }],
+          },
+          { name: 'q2_other', kind: 'string', title: 'Other', required: false },
+        ],
+      },
+    ])
+
+    render(createElement(ElicitationDock, { acp, sessionId: 'chat-1' }))
+    expect(screen.getByText('Question 1 of 2')).toBeTruthy()
+    expect(screen.getByLabelText('Other')).toBeTruthy()
+    fireEvent.click(screen.getByRole('radio', { name: 'First A' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }))
+    expect(screen.getByText('Question 2 of 2')).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('Other'), { target: { value: 'custom 2' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Submit' }))
+    expect(respond).toHaveBeenCalledWith('req-agy-2', {
+      action: 'accept',
+      content: { q1: '1', q2_other: 'custom 2' },
+    })
+  })
 })

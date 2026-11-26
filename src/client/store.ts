@@ -1557,7 +1557,7 @@ export { forkStateOf } from "./store/fork.ts"
 export type { PendingPermission } from "./store/permission.ts"
 export { PERMISSION_DEADLINE_EXPIRED, deadlineRemainingLabel, permissionsForSession } from "./store/permission.ts"
 export type { ElicitationBuildResult, ElicitationDraft, PendingElicitation } from "./store/elicitation.ts"
-export { buildElicitationContent, elicitationsForSession, initialElicitationDraft, reduceElicitationEvent } from "./store/elicitation.ts"
+export { buildElicitationContent, elicitationsForSession, groupElicitationFields, initialElicitationDraft, reduceElicitationEvent } from "./store/elicitation.ts"
 
 export { DEFAULT_KNOWN_PRESETS } from "./store/presets.ts"
 

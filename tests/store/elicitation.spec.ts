@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest'
 import {
   buildElicitationContent,
   elicitationsForSession,
+  groupElicitationFields,
   initialElicitationDraft,
   reduceElicitationEvent,
   type PendingElicitation,
@@ -138,5 +139,25 @@ describe('client store elicitation helpers', () => {
       cause: 'idle',
     })
     expect(store.getSnapshot().elicitations).toEqual([])
+  })
+
+  it('groups a select field with its trailing optional *_other free-form field onto one page', () => {
+    const q1: ElicitationFieldView = {
+      name: 'q1', kind: 'single-select', title: 'Pick one', required: false,
+      options: [{ value: '1', label: 'A' }],
+    }
+    const q1Other: ElicitationFieldView = { name: 'q1_other', kind: 'string', title: 'Other', required: false }
+    const q2: ElicitationFieldView = {
+      name: 'q2', kind: 'multi-select', title: 'Pick many', required: false,
+      options: [{ value: '1', label: 'X' }],
+    }
+    const q2Other: ElicitationFieldView = { name: 'q2_other', kind: 'string', title: 'Other', required: false }
+    const requiredOther: ElicitationFieldView = { name: 'q2_other', kind: 'string', title: 'Other', required: true }
+    const unrelated: ElicitationFieldView = { name: 'note', kind: 'string', title: 'Note', required: false }
+
+    expect(groupElicitationFields([q1, q1Other])).toEqual([[q1, q1Other]])
+    expect(groupElicitationFields([q1, q1Other, q2, q2Other])).toEqual([[q1, q1Other], [q2, q2Other]])
+    expect(groupElicitationFields([q1, unrelated])).toEqual([[q1], [unrelated]])
+    expect(groupElicitationFields([q2, requiredOther])).toEqual([[q2], [requiredOther]])
   })
 })

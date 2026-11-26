@@ -66,6 +66,34 @@ export function reduceElicitationEvent(
   }
 }
 
+/**
+ * Group form fields into logical pages.
+ *
+ * Agents such as Antigravity emit each multiple-choice question as a select
+ * field (`q1`) paired with an optional free-form companion (`q1_other`).
+ * Keeping that trailing `*_other` text field on the same page as its select
+ * field prevents one question with a custom answer from paginating into two.
+ */
+export function groupElicitationFields(fields: readonly ElicitationFieldView[]): ElicitationFieldView[][] {
+  const pages: ElicitationFieldView[][] = []
+  for (let i = 0; i < fields.length; i++) {
+    const field = fields[i]!
+    const next = fields[i + 1]
+    const hasOtherCompanion = (field.kind === 'single-select' || field.kind === 'multi-select')
+      && next !== undefined
+      && next.kind === 'string'
+      && !next.required
+      && next.name === `${field.name}_other`
+    if (hasOtherCompanion) {
+      pages.push([field, next])
+      i += 1
+    } else {
+      pages.push([field])
+    }
+  }
+  return pages
+}
+
 /** Seed form inputs from each field's schema default (when declared). */
 export function initialElicitationDraft(fields: readonly ElicitationFieldView[]): ElicitationDraft {
   const draft: ElicitationDraft = {}
