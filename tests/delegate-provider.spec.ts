@@ -123,7 +123,7 @@ describe('AcpSubagentProvider settlement outcomes', () => {
     const result = await (await provider.start(makeRequest().request)).result
     expect(result.stopReason).toBe('completed')
     expect(result.output).toEqual([{ type: 'text', text: 'cut short' }])
-    expect(result.diagnostic).toBe('ACP 停因 max_turn_requests：这一回合不是正常结束，答复可能不完整')
+    expect(result.diagnostic).toBe('ACP stop reason max_turn_requests: this turn did not end normally, so the answer may be incomplete')
   })
 
   it('auto-answered / refused asks reach the parent as ONE diagnostic line', async () => {
@@ -139,7 +139,7 @@ describe('AcpSubagentProvider settlement outcomes', () => {
     })
     const result = await (await provider.start(makeRequest().request)).result
     expect(result.stopReason).toBe('completed')
-    expect(result.diagnostic).toBe('委派会话的审批：自动代答 1 个、拒绝 1 个')
+    expect(result.diagnostic).toBe('delegated session approvals: 1 auto-answered, 1 refused')
   })
 
   it('a quiet child with no asks keeps the diagnostic absent', async () => {
@@ -163,7 +163,7 @@ describe('AcpSubagentProvider settlement outcomes', () => {
     expect(result.stopReason).toBe('error')
     // ...and all four facts survive in their fixed slots.
     expect(result.diagnostic).toBe(
-      'turn budget spent\nACP 停因 max_turn_requests：这一回合不是正常结束，答复可能不完整\nagent「alpha」不再提供默认模式「ghost-o」，本次使用启动模式；委派会话的审批：自动代答 1 个',
+      'turn budget spent\nACP stop reason max_turn_requests: this turn did not end normally, so the answer may be incomplete\nagent "alpha" no longer offers default mode "ghost-o" — using the startup mode; delegated session approvals: 1 auto-answered',
     )
   })
 
@@ -177,7 +177,7 @@ describe('AcpSubagentProvider settlement outcomes', () => {
     const result = await (await provider.start(makeRequest().request)).result
     // The counts ride the RESERVED side of the merge, so the 20k failure text
     // is the part that gets truncated.
-    expect(result.diagnostic?.endsWith('委派会话的审批：自动代答 1 个')).toBe(true)
+    expect(result.diagnostic?.endsWith('delegated session approvals: 1 auto-answered')).toBe(true)
     expect(result.diagnostic).toContain('[diagnostic truncated]')
     expect(new TextEncoder().encode(result.diagnostic ?? '').byteLength).toBeLessThanOrEqual(MAX_DELEGATE_DIAGNOSTIC_BYTES)
   })
@@ -196,7 +196,7 @@ describe('AcpSubagentProvider settlement outcomes', () => {
     controller.abort()
     const result = await run.result
     expect(result.stopReason).toBe('aborted')
-    expect(result.diagnostic).toBe('agent「alpha」的默认思考等级「ghost-e」不受当前模型支持，本次不设置；委派会话的审批：自动代答 1 个')
+    expect(result.diagnostic).toBe('agent "alpha" default thought level "ghost-e" is not supported by the current model — not setting it; delegated session approvals: 1 auto-answered')
   })
 
   it('a prompt error keeps the ask counts too', async () => {
@@ -207,7 +207,7 @@ describe('AcpSubagentProvider settlement outcomes', () => {
     })
     const result = await (await provider.start(makeRequest().request)).result
     expect(result.stopReason).toBe('error')
-    expect(result.diagnostic).toBe('acp_delegate: turn_in_flight\n委派会话的审批：拒绝 1 个')
+    expect(result.diagnostic).toBe('acp_delegate: turn_in_flight\ndelegated session approvals: 1 refused')
   })
 
   it('silence window: error + bounded diagnostic, cancel then close, partial text kept', async () => {
@@ -431,7 +431,7 @@ describe('AcpSubagentProvider degradation notes', () => {
     const result = await (await provider.start(makeRequest().request)).result
     expect(result.stopReason).toBe('completed')
     expect(result.output).toEqual([{ type: 'text', text: 'answer with a note' }])
-    expect(result.diagnostic).toBe('agent「alpha」不再提供默认模型「ghost-m」，本次使用 agent 自身默认模型')
+    expect(result.diagnostic).toBe('agent "alpha" no longer offers default model "ghost-m" — using its own default model')
     expect(f.notices).toHaveLength(1)
   })
 
@@ -445,7 +445,7 @@ describe('AcpSubagentProvider degradation notes', () => {
     })
     const result = await (await provider.start(makeRequest().request)).result
     expect(result.stopReason).toBe('error')
-    expect(result.diagnostic).toBe('agent went silent (inactivity timeout)\nagent「alpha」不再提供默认模式「ghost-o」，本次使用启动模式')
+    expect(result.diagnostic).toBe('agent went silent (inactivity timeout)\nagent "alpha" no longer offers default mode "ghost-o" — using the startup mode')
   })
 
   it('an error outcome keeps BOTH the failure and the notes', async () => {
@@ -455,7 +455,7 @@ describe('AcpSubagentProvider degradation notes', () => {
     const { request } = makeRequest({ label: delegateLabel('alpha', 'do it', { model: 'ghost-m' }) })
     const result = await (await provider.start(request)).result
     expect(result.stopReason).toBe('error')
-    expect(result.diagnostic).toBe('acp_delegate: agent "alpha" does not offer model "ghost-m" (available: m1)\nagent「alpha」不再提供默认模式「ghost-o」，本次使用启动模式')
+    expect(result.diagnostic).toBe('acp_delegate: agent "alpha" does not offer model "ghost-m" (available: m1)\nagent "alpha" no longer offers default mode "ghost-o" — using the startup mode')
     expect(f.calls.prompt).toHaveLength(0)
   })
 
@@ -470,7 +470,7 @@ describe('AcpSubagentProvider degradation notes', () => {
     controller.abort()
     const result = await run.result
     expect(result.stopReason).toBe('aborted')
-    expect(result.diagnostic).toBe('agent「alpha」的默认思考等级「ghost-e」不受当前模型支持，本次不设置')
+    expect(result.diagnostic).toBe('agent "alpha" default thought level "ghost-e" is not supported by the current model — not setting it')
   })
 
   it('a long turnError cannot eat the notes: they survive whole inside the bounded diagnostic', async () => {
@@ -483,7 +483,7 @@ describe('AcpSubagentProvider degradation notes', () => {
     })
     const result = await (await provider.start(makeRequest().request)).result
     expect(result.stopReason).toBe('error')
-    const notes = 'agent「alpha」不再提供默认模式「ghost-o」，本次使用启动模式'
+    const notes = 'agent "alpha" no longer offers default mode "ghost-o" — using the startup mode'
     expect(result.diagnostic?.endsWith(`\n${notes}`)).toBe(true)
     expect(result.diagnostic).toContain('[diagnostic truncated]')
     expect(new TextEncoder().encode(result.diagnostic ?? '').byteLength).toBeLessThanOrEqual(MAX_DELEGATE_DIAGNOSTIC_BYTES)
@@ -496,7 +496,7 @@ describe('AcpSubagentProvider degradation notes', () => {
     f.onPrompt(async () => { throw new Error('y'.repeat(20_000)) })
     const result = await (await provider.start(makeRequest().request)).result
     expect(result.stopReason).toBe('error')
-    const notes = 'agent「alpha」不再提供默认模式「ghost-o」，本次使用启动模式'
+    const notes = 'agent "alpha" no longer offers default mode "ghost-o" — using the startup mode'
     expect(result.diagnostic?.endsWith(`\n${notes}`)).toBe(true)
     expect(result.diagnostic).toContain('[diagnostic truncated]')
     expect(new TextEncoder().encode(result.diagnostic ?? '').byteLength).toBeLessThanOrEqual(MAX_DELEGATE_DIAGNOSTIC_BYTES)

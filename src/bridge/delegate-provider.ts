@@ -122,7 +122,7 @@ function hostTerminalOf(settlement: AcpDelegateSettlement): SubagentResult['stop
 function unmappedStopNote(stopReason: string | undefined): string | undefined {
   if (stopReason === undefined || stopReason === '' || stopReason === 'end_turn') return undefined
   if (hostStopReasonOf(stopReason) !== 'completed') return undefined
-  return `ACP 停因 ${stopReason}：这一回合不是正常结束，答复可能不完整`
+  return `ACP stop reason ${stopReason}: this turn did not end normally, so the answer may be incomplete`
 }
 
 /**
@@ -137,9 +137,9 @@ function unmappedStopNote(stopReason: string | undefined): string | undefined {
 function askCountsNote(autoAnswered: number, refused: number): string | undefined {
   if (autoAnswered <= 0 && refused <= 0) return undefined
   const parts: string[] = []
-  if (autoAnswered > 0) parts.push(`自动代答 ${String(autoAnswered)} 个`)
-  if (refused > 0) parts.push(`拒绝 ${String(refused)} 个`)
-  return `委派会话的审批：${parts.join('、')}`
+  if (autoAnswered > 0) parts.push(`${String(autoAnswered)} auto-answered`)
+  if (refused > 0) parts.push(`${String(refused)} refused`)
+  return `delegated session approvals: ${parts.join(', ')}`
 }
 
 /** The diagnostic's leading facts (failure detail, ending note) as one text. */
@@ -156,7 +156,7 @@ function leadingFacts(...facts: Array<string | undefined>): string | undefined {
  */
 function reservedFacts(notes: string | undefined, counts: string | undefined): string | undefined {
   const kept = [notes, counts].filter((fact): fact is string => fact !== undefined && fact !== '')
-  return kept.length === 0 ? undefined : kept.join('；')
+  return kept.length === 0 ? undefined : kept.join('; ')
 }
 
 /**

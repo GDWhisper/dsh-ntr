@@ -51,17 +51,17 @@ export function delegateAgentDocs(
 }
 
 /**
- * The description must stay ONE line (the schema is a bulleted roster), and its
+ * The fragment must stay ONE line (the schema is a bulleted roster), and its
  * trailing sentence punctuation is dropped so the joined row never doubles it.
  * A hand-edited config file can carry newlines / runs of spaces; folding them
  * here is what keeps "one agent per line" true for every input.
  */
-function oneLineDescription(raw: string): string {
-  return raw.replace(/\s+/gu, ' ').replace(/[。．.；;，,]+$/u, '').trim()
+function oneLineFragment(raw: string): string {
+  return raw.replace(/\s+/gu, ' ').replace(/[。．.；;，,！？!?]+$/u, '').trim()
 }
 
 /**
- * ONE roster row: `- codebuddy（CodeBuddy）：描述；委派默认：模型 X、等级 Y。`
+ * ONE roster row: `- codebuddy (CodeBuddy): <description>; defaults: model X, level Y, mode Z`.
  * The parenthetical appears only when the display title differs from the id
  * (otherwise the id alone is the shortest true name). The defaults sentence is
  * ALWAYS present: "follow the process itself" is a fact the caller needs, not
@@ -69,16 +69,16 @@ function oneLineDescription(raw: string): string {
  */
 export function delegateAgentDocLine(doc: DelegateAgentDoc): string {
   const title = doc.title.trim()
-  const name = title === '' || title === doc.id ? doc.id : `${doc.id}（${title}）`
+  const name = title === '' || title === doc.id ? doc.id : `${doc.id} (${title})`
   const parts: string[] = []
-  const description = doc.description === undefined ? '' : oneLineDescription(doc.description)
+  const description = doc.description === undefined ? '' : oneLineFragment(doc.description)
   if (description !== '') parts.push(description)
   const defaults: string[] = []
-  if (doc.model !== undefined) defaults.push(`模型 ${doc.model}`)
-  if (doc.effort !== undefined) defaults.push(`等级 ${doc.effort}`)
-  if (doc.mode !== undefined) defaults.push(`模式 ${doc.mode}`)
-  parts.push(defaults.length === 0 ? '委派默认：跟随进程自身' : `委派默认：${defaults.join('、')}`)
-  return `- ${name}：${parts.join('；')}`
+  if (doc.model !== undefined) defaults.push(`model ${doc.model}`)
+  if (doc.effort !== undefined) defaults.push(`level ${doc.effort}`)
+  if (doc.mode !== undefined) defaults.push(`mode ${doc.mode}`)
+  parts.push(defaults.length === 0 ? 'defaults: follow the process itself' : `defaults: ${defaults.join(', ')}`)
+  return `- ${name}: ${parts.join('; ')}`
 }
 
 /**
@@ -87,14 +87,14 @@ export function delegateAgentDocLine(doc: DelegateAgentDoc): string {
  * agree on what "first" means.
  *
  * The header only promises a choice when the caller actually HAS grounds to
- * choose: "可按特性挑选" with every description blank would invite a blind pick
- * among rows that differ only in their defaults, so it names that fact instead
- * and lets the caller fall back to the omitted-`agent` path.
+ * choose: "pick by capability" with every description blank would invite a
+ * blind pick among rows that differ only in their defaults, so it names that
+ * fact instead and lets the caller fall back to the omitted-`agent` path.
  */
 export function delegateRosterText(docs: readonly DelegateAgentDoc[]): string {
   if (docs.length === 0) return ''
-  const described = docs.some(doc => doc.description !== undefined && oneLineDescription(doc.description) !== '')
-  const head = described ? '可按特性挑选：' : '已配置的 agent（均未填写擅长描述）：'
+  const described = docs.some(doc => doc.description !== undefined && oneLineFragment(doc.description) !== '')
+  const head = described ? 'Pick by capability:' : 'Configured agents (none has a "good at" line):'
   return [head, ...docs.map(doc => delegateAgentDocLine(doc))].join('\n')
 }
 
@@ -112,7 +112,7 @@ export function delegateRosterDigest(docs: readonly DelegateAgentDoc[]): string 
   return docs.map(doc => [
     doc.id,
     doc.title,
-    doc.description === undefined ? '' : oneLineDescription(doc.description),
+    doc.description === undefined ? '' : oneLineFragment(doc.description),
     doc.model ?? '',
     doc.effort ?? '',
     doc.mode ?? '',

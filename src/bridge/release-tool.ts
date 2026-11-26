@@ -32,8 +32,8 @@ export interface AcpReleaseOutput {
 }
 
 const SKIP_COPY = {
-  busy: '仍有进行中的工作',
-  'no-resume': '会话无法恢复（该 agent 不支持 session/load）',
+  busy: 'still has work in flight',
+  'no-resume': 'its sessions cannot be resumed (the agent does not support session/load)',
 } as const
 
 /** Aggregate A1's per-process rows into one line per agent. */
@@ -47,14 +47,14 @@ function summarize(rows: BridgeReleaseReport): string[] {
   }
   const lines: string[] = []
   if (released.size > 0) {
-    const parts = [...released.entries()].map(([agentId, processes]) => processes > 1 ? `${agentId}（${String(processes)} 个进程）` : agentId)
-    lines.push(`已释放空闲进程：${parts.join('、')}。相关会话下一条消息会自动恢复。`)
+    const parts = [...released.entries()].map(([agentId, processes]) => processes > 1 ? `${agentId} (${String(processes)} processes)` : agentId)
+    lines.push(`Released idle processes: ${parts.join(', ')}. Related sessions resume automatically on their next message.`)
   }
   if (skipped.size > 0) {
-    const parts = [...skipped.entries()].map(([agentId, reason]) => `${agentId}（${reason}）`)
-    lines.push(`未释放：${parts.join('、')}。`)
+    const parts = [...skipped.entries()].map(([agentId, reason]) => `${agentId} (${reason})`)
+    lines.push(`Not released: ${parts.join(', ')}.`)
   }
-  if (lines.length === 0) lines.push('没有可立即释放的进程：没有就绪的 ACP 进程（或全部都有进行中的工作）。')
+  if (lines.length === 0) lines.push('Nothing to release right now: no ready ACP process (or all of them have work in flight).')
   return lines
 }
 
@@ -71,19 +71,19 @@ export function acpReleaseToolDefinition(host: AcpReleaseHost): {
 } {
   const agents = host.agents()
   const ids = agents.map(agent => agent.id)
-  const roster = ids.length === 0 ? '（尚未配置任何 agent）' : ids.join('、')
+  const roster = ids.length === 0 ? '(no agents configured yet)' : ids.join(', ')
   const known = new Set(ids)
   return {
     name: 'acp_release',
-    description: '立即释放空闲的 ACP agent 进程（默认全部），把内存还给系统，不必等空闲超时。'
-      + '只释放没有进行中工作的进程；支持 session/load 的会话会被停放，下一条消息发出时自动恢复。'
-      + '不会结束任何正在执行的回合；不能恢复的会话会保留进程并在结果里说明原因。',
+    description: 'Release idle ACP agent processes right now (all of them by default), returning memory to the system without waiting for the idle timeout. '
+      + 'Only processes with no work in flight are released; sessions on agents that support session/load are parked and resume automatically on their next message. '
+      + 'No running turn is ever ended; sessions that cannot be resumed keep their process, and the result says why.',
     parameters: {
       type: 'object',
       properties: {
         agent: {
           type: 'string',
-          description: `只释放该 agent 的空闲进程；省略 = 全部。已配置：${roster}`,
+          description: `Release only this agent's idle processes; omit = all of them. Configured: ${roster}`,
         },
       },
     },
@@ -96,18 +96,18 @@ export function acpReleaseToolDefinition(host: AcpReleaseHost): {
       const agent = row.agent
       if (agent !== undefined) {
         if (typeof agent !== 'string' || agent === '') {
-          return { text: 'acp_release 释放失败：agent 必须是非空字符串。' }
+          return { text: 'acp_release failed: agent must be a non-empty string.' }
         }
         if (!known.has(agent)) {
-          const known = ids.length === 0 ? '（尚未配置任何 agent）' : ids.join('、')
-          return { text: `acp_release 释放失败：未配置的 agent "${agent}"（已配置：${known}）。` }
+          const known = ids.length === 0 ? '(no agents configured yet)' : ids.join(', ')
+          return { text: `acp_release failed: agent "${agent}" is not configured (configured: ${known}).` }
         }
       }
       try {
         return { text: summarize(await host.release(typeof agent === 'string' ? agent : undefined)).join('\n') }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
-        return { text: `acp_release 释放失败：${message}` }
+        return { text: `acp_release failed: ${message}` }
       }
     },
   }

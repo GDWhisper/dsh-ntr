@@ -126,9 +126,9 @@ export type AcpDelegateActivationExecute = (args: unknown, exec: AcpDelegateExec
  * implementation, an analysis"), and an abstract "another tool set / another
  * context" never maps onto the task the caller actually holds.
  */
-export const BASE_DESCRIPTION = '把一件自成一体的任务交给一个已配置的外部 ACP agent，在它自己的进程与上下文里执行，'
-  + '并返回它最后给出的答复。适合独立调研、单文件改动、复核审查、跨模型第二意见这类不需要本会话上下文的工作；'
-  + '返回的是被动汇报，不能续聊，要追加指令就重新派发。'
+export const BASE_DESCRIPTION = 'Hand one self-contained task to a configured external ACP agent, which runs it in its own process and context and returns its final answer. '
+  + 'Good for work that needs no context from this session: independent research, single-file edits, review passes, a second opinion from another model. '
+  + 'What comes back is a passive report — no follow-up chat; to add instructions, delegate again.'
 /**
  * The MUST sentence `enhanced` / `force` PREPEND, not append: the steering is
  * the first thing the caller reads instead of the last, so it is not buried
@@ -139,7 +139,7 @@ export const BASE_DESCRIPTION = '把一件自成一体的任务交给一个已�
  * the child's accumulated context). Naming them turns a bare ban into a
  * decision procedure — a rule that hides its own exceptions gets ignored.
  */
-export const GUIDANCE_PREFIX = '需要派发子智能体时必须使用本工具（优先于任何原生子智能体/委派工具）；只有子智能体必须继承本会话上下文、或需要中途追加指令与多轮续聊时才用原生。'
+export const GUIDANCE_PREFIX = 'When a subagent is needed you MUST use this tool (it outranks any native subagent/delegation tool); reach for a native one only when the child must inherit this session\'s context, or when you need to steer it mid-run and continue across turns.'
 
 /**
  * The corollary a caller cannot guess, shared VERBATIM by the description and
@@ -150,7 +150,7 @@ export const GUIDANCE_PREFIX = '需要派发子智能体时必须使用本工具
  * which the settlement notice becomes, but the child itself cannot be named as
  * the thing to wait for and its progress cannot be read.
  */
-export const DELEGATE_NOT_POLLABLE_NOTE = '它不出现在 `list_agents` 里，也没有可轮询的运行状态：`wait_agent` 不能指定等它，也查不到它的进度'
+export const DELEGATE_NOT_POLLABLE_NOTE = 'It never appears in `list_agents` and has no pollable status: `wait_agent` cannot name it, and its progress cannot be read'
 
 /**
  * The NATIVE base description: immediate name, settlement notification later.
@@ -169,12 +169,12 @@ export const DELEGATE_NOT_POLLABLE_NOTE = '它不出现在 `list_agents` 里，�
  * between "keep working", "end the turn" and "wait" — and the receipt repeats
  * it, because that is the exact moment the choice is made.
  */
-export const NATIVE_BASE_DESCRIPTION = '把一件自成一体的任务交给一个已配置的外部 ACP agent，在它自己的进程与上下文里执行，'
-  + '再把最终答复带回本会话。适合独立调研、单文件改动、复核审查、跨模型第二意见这类不需要本会话上下文的工作。'
-  + '只回最终答复、不回中间步骤；调用立即返回子智能体的 name，不等待结果。'
-  + '派发后可以继续做不相交的工作（别和它改同一批文件，合并前复核 diff 并跑测试）；只剩等待时结束本回合，'
-  + '宿主会把结算通知送达并起下一轮。' + DELEGATE_NOT_POLLABLE_NOTE + '，别守着等。'
-  + '这是一次性委派，不能续聊，要追加指令就重新派发。'
+export const NATIVE_BASE_DESCRIPTION = 'Hand one self-contained task to a configured external ACP agent, which runs it in its own process and context and brings the final answer back to this session. '
+  + 'Good for work that needs no context from this session: independent research, single-file edits, review passes, a second opinion from another model. '
+  + 'Only the final answer comes back, never the intermediate steps; the call returns the subagent\'s name immediately and does not wait for the result. '
+  + 'After dispatching you can keep working on disjoint work (do not edit the same files it edits; review the diff and run tests before merging); when nothing is left but waiting, end this turn '
+  + 'and the host delivers the settlement notice and starts the next one. ' + DELEGATE_NOT_POLLABLE_NOTE + ', so do not sit and wait. '
+  + 'This is a one-shot delegation: no follow-up chat, so delegate again to add instructions.'
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -189,7 +189,7 @@ function messageOf(error: unknown): string {
  * renders a half-built list.
  */
 function delegateAgentParamDescription(roster: readonly DelegateAgentDoc[] | undefined): string {
-  const base = '已配置的 agent id；省略 = 用子智能体委派配置的默认 agent（未配置或已失效时回落到全局默认 agent），两者都空则报错'
+  const base = 'The id of a configured agent; omit = the default agent from the delegation settings (falling back to the global default agent when unset or invalid), and an error when both are empty'
   if (roster === undefined) return base
   const text = delegateRosterText(roster)
   return text === '' ? base : `${base}\n${text}`
@@ -276,12 +276,12 @@ export function acpDelegateToolDefinition(opts: {
     parameters: {
       type: 'object',
       properties: {
-        task: { type: 'string', description: '完整任务描述（子智能体看不到本会话上下文）' },
+        task: { type: 'string', description: 'The complete task description (the subagent sees no context from this session)' },
         agent: { type: 'string', description: delegateAgentParamDescription(opts.roster) },
-        cwd: { type: 'string', description: '工作目录；省略 = 继承调用会话工作区；显式指定须在该工作区或该 agent 的 allowedCwdRoots 内' },
-        model: { type: 'string', description: '模型 id；省略 = 用子智能体委派配置中该 agent 的默认模型；显式指定而 agent 不提供时报错' },
-        effort: { type: 'string', description: '思考等级；省略 = 用子智能体委派配置的默认值；不支持时自动丢弃并留痕' },
-        mode: { type: 'string', description: '工作模式 id；省略 = 用子智能体委派配置的默认值；显式指定而 agent 不提供时报错' },
+        cwd: { type: 'string', description: 'Working directory; omit = inherit the calling session\'s workspace; an explicit path must lie in that workspace or in the agent\'s allowedCwdRoots' },
+        model: { type: 'string', description: 'Model id; omit = the agent\'s default model from the delegation settings; an explicit model the agent does not offer is an error' },
+        effort: { type: 'string', description: 'Thought level; omit = the delegation settings default; dropped with a note when the agent does not support it' },
+        mode: { type: 'string', description: 'Work mode id; omit = the delegation settings default; an explicit mode the agent does not offer is an error' },
       },
       required: ['task'],
     },
@@ -304,9 +304,9 @@ export function acpDelegateToolDefinition(opts: {
             // at the exact moment a caller decides how to wait, which is where
             // the invented `wait_agent` came from. Same constant, so the two
             // surfaces cannot drift.
-            return [{ type: 'text', text: `已委派给 ACP agent ${String(row.agent ?? '')}：子智能体 ${String(row.name ?? '')} 已在后台开始执行。可继续做不相交的工作；只剩等待时结束本回合，完成后宿主会把它的答复作为通知送达本会话。${DELEGATE_NOT_POLLABLE_NOTE}，别守着等。` }]
+            return [{ type: 'text', text: `Delegated to ACP agent ${String(row.agent ?? '')}: subagent ${String(row.name ?? '')} has started running in the background. You can keep working on disjoint work; when nothing is left but waiting, end this turn and the host delivers its answer to this session as a notice once it finishes. ${DELEGATE_NOT_POLLABLE_NOTE}, so do not sit and wait.` }]
           }
-          if (row.kind === 'error') return [{ type: 'text', text: `acp_delegate 委派失败：${String(row.error ?? '')}` }]
+          if (row.kind === 'error') return [{ type: 'text', text: `acp_delegate failed: ${String(row.error ?? '')}` }]
           return [{ type: 'text', text: String(row.text ?? '') }]
         },
       }
@@ -355,7 +355,7 @@ export interface AcpDelegateSettlement {
   error?: string
   /**
    * The merged degradation notes (agent-axis fallback + stale choice axes),
-   * one Chinese line each joined into a single text; absent when nothing
+   * one English line each joined into a single text; absent when nothing
    * degraded. The same text went to `host.notify` exactly once.
    */
   notes?: string
@@ -580,11 +580,11 @@ export class AcpDelegateService {
     const fallback = this.host.defaultAgent()
     if (fallback !== undefined && isEnabled(fallback)) {
       const reason = delegateDefault !== undefined && configured.some(agent => agent.id === delegateDefault)
-        ? '已禁用'
-        : '已失效'
+        ? 'is disabled'
+        : 'no longer exists'
       return {
         agentId: fallback,
-        notes: delegateDefault === undefined ? [] : [`默认 agent「${delegateDefault}」${reason}，改用全局默认「${fallback}」`],
+        notes: delegateDefault === undefined ? [] : [`default agent "${delegateDefault}" ${reason}; using the global default "${fallback}"`],
       }
     }
     if (enabled.length === 0 && configured.length > 0) {
@@ -883,7 +883,7 @@ export class AcpDelegateService {
       // ONE merged notice per run, and the same text on the settlement so
       // both shells can report it. The note belongs to the DELEGATED agent,
       // not the global default. A broken sink never masks the outcome.
-      settlement.notes = notes.join('；')
+      settlement.notes = notes.join('; ')
       try { this.host.notify?.(settlement.notes, agentId) } catch { /* the trail is best-effort */ }
     }
     return settlement
@@ -900,9 +900,9 @@ function legacyReport(settlement: AcpDelegateSettlement): AcpDelegateResult {
   if (settlement.outcome !== 'ended') throw new Error(settlement.error ?? `acp_delegate: ${settlement.outcome}`)
   const body = settlement.text === '' ? '(the agent returned no text)' : settlement.text
   let footer = `\n\n— acp_delegate · ${settlement.agent} · cwd=${settlement.cwd ?? ''} · ${settlement.stopReason ?? settlement.turnError ?? 'unknown'}`
-  if (settlement.refused > 0) footer += ` · 拒绝 ${String(settlement.refused)} 个审批`
-  if (settlement.autoAnswered > 0) footer += ` · 自动代答 ${String(settlement.autoAnswered)} 个`
-  if (settlement.notes !== undefined) footer += `\n备注：${settlement.notes}`
+  if (settlement.refused > 0) footer += ` · ${String(settlement.refused)} approval(s) refused`
+  if (settlement.autoAnswered > 0) footer += ` · ${String(settlement.autoAnswered)} auto-answered`
+  if (settlement.notes !== undefined) footer += `\nnotes: ${settlement.notes}`
   const result: AcpDelegateResult = { text: body + footer, agent: settlement.agent }
   if (settlement.stopReason !== undefined) result.stopReason = settlement.stopReason
   if (settlement.turnError !== undefined) result.error = settlement.turnError
