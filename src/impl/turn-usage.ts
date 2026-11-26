@@ -37,22 +37,41 @@ function readRequiredField(
   row: Record<string, unknown>,
   keys: readonly string[],
 ): { valid: boolean; value: number | undefined } {
+  let firstPositive: number | undefined
+  let sawZero = false
   for (const key of keys) {
     const raw = row[key]
     if (raw === undefined || raw === null) continue
     const count = readCount(raw)
     if (count === undefined) return { valid: false, value: undefined }
-    return { valid: true, value: count }
+    if (count > 0 && firstPositive === undefined) firstPositive = count
+    else if (count === 0) sawZero = true
   }
-  return { valid: true, value: undefined }
+  return { valid: true, value: firstPositive ?? (sawZero ? 0 : undefined) }
 }
 
-function firstCount(row: Record<string, unknown>, keys: readonly string[]): number | undefined {
-  for (const key of keys) {
+function readBucketCount(
+  row: Record<string, unknown>,
+  topKeys: readonly string[],
+  nestedSources: ReadonlyArray<readonly [unknown, readonly string[]]> = [],
+): number | undefined {
+  // Some agents (e.g. CodeBuddy rawUsage) emit Anthropic-style `0` placeholders
+  // alongside populated DeepSeek/OpenAI fields; prefer the first positive count
+  // and only fall back to `0` when every present candidate is zero.
+  let sawZero = false
+  for (const key of topKeys) {
     const count = readCount(row[key])
-    if (count !== undefined) return count
+    if (count === undefined) continue
+    if (count > 0) return count
+    sawZero = true
   }
-  return undefined
+  for (const [container, keys] of nestedSources) {
+    const count = readNestedCount(container, keys)
+    if (count === undefined) continue
+    if (count > 0) return count
+    sawZero = true
+  }
+  return sawZero ? 0 : undefined
 }
 
 function sumArrayCounts(entries: unknown, keys: readonly string[]): number | undefined {
@@ -61,7 +80,7 @@ function sumArrayCounts(entries: unknown, keys: readonly string[]): number | und
   let sawAny = false
   for (const entry of entries) {
     if (!isRecord(entry)) continue
-    const count = firstCount(entry, keys)
+    const count = readBucketCount(entry, keys)
     if (count === undefined) continue
     total += count
     sawAny = true
@@ -71,25 +90,30 @@ function sumArrayCounts(entries: unknown, keys: readonly string[]): number | und
 
 function readNestedCount(container: unknown, keys: readonly string[]): number | undefined {
   if (Array.isArray(container)) return sumArrayCounts(container, keys)
-  if (isRecord(container)) return firstCount(container, keys)
+  if (isRecord(container)) return readBucketCount(container, keys)
   return undefined
 }
 
 function readCacheReadTokens(row: Record<string, unknown>): number | undefined {
-  return firstCount(row, [
-    'cacheReadTokens',
-    'cachedReadTokens',
-    'cacheReadInputTokens',
-    'cache_read_input_tokens',
-    'prompt_cache_hit_tokens',
-  ])
-    ?? readNestedCount(row.prompt_tokens_details, ['cached_tokens', 'cachedTokens'])
-    ?? readNestedCount(row.promptTokensDetails, ['cachedTokens', 'cached_tokens'])
-    ?? readNestedCount(row.inputTokensDetails, ['cached_tokens', 'cachedTokens'])
+  return readBucketCount(
+    row,
+    [
+      'cacheReadTokens',
+      'cachedReadTokens',
+      'cacheReadInputTokens',
+      'cache_read_input_tokens',
+      'prompt_cache_hit_tokens',
+    ],
+    [
+      [row.prompt_tokens_details, ['cached_tokens', 'cachedTokens']],
+      [row.promptTokensDetails, ['cachedTokens', 'cached_tokens']],
+      [row.inputTokensDetails, ['cached_tokens', 'cachedTokens']],
+    ],
+  )
 }
 
 function readCacheWriteTokens(row: Record<string, unknown>): number | undefined {
-  return firstCount(row, [
+  return readBucketCount(row, [
     'cacheWriteTokens',
     'cachedWriteTokens',
     'cacheCreationInputTokens',
@@ -99,9 +123,15 @@ function readCacheWriteTokens(row: Record<string, unknown>): number | undefined 
 }
 
 function readReasoningTokens(row: Record<string, unknown>): number | undefined {
-  return firstCount(row, ['reasoningTokens', 'thoughtTokens', 'reasoning_tokens'])
-    ?? readNestedCount(row.outputTokensDetails, ['reasoningTokens', 'reasoning_tokens', 'thoughtTokens', 'thinkingTokens'])
-    ?? readNestedCount(row.completion_tokens_details, ['reasoning_tokens', 'reasoningTokens'])
+  return readBucketCount(
+    row,
+    ['reasoningTokens', 'thoughtTokens', 'reasoning_tokens', 'completion_thinking_tokens'],
+    [
+      [row.outputTokensDetails, ['reasoningTokens', 'reasoning_tokens', 'thoughtTokens', 'thinkingTokens']],
+      [row.output_tokens_details, ['reasoning_tokens', 'reasoningTokens', 'thoughtTokens', 'thinkingTokens']],
+      [row.completion_tokens_details, ['reasoning_tokens', 'reasoningTokens']],
+    ],
+  )
 }
 
 /**
@@ -117,7 +147,7 @@ export function normalizePromptUsage(raw: unknown): AcpTurnUsage | undefined {
 
   let inputTokens = inputField.value ?? 0
   const outputTokens = outputField.value ?? 0
-  const rawTotal = firstCount(raw, ['totalTokens', 'total_tokens'])
+  const rawTotal = readBucketCount(raw, ['totalTokens', 'total_tokens'])
   const cacheReadTokens = readCacheReadTokens(raw)
   const cacheWriteTokens = readCacheWriteTokens(raw)
   const rawReasoning = readReasoningTokens(raw)

@@ -52,6 +52,114 @@ describe('normalizePromptUsage', () => {
     expect(normalized).not.toHaveProperty('cacheWriteTokens')
   })
 
+  it('prefers positive cache and reasoning counts over 0 placeholders in sibling aliases', () => {
+    // Mirrors real CodeBuddy rawUsage payloads where `cache_read_input_tokens: 0`
+    // coexists with `prompt_cache_hit_tokens` and `prompt_tokens_details.cached_tokens`.
+    expect(normalizePromptUsage({
+      prompt_tokens: 61985,
+      completion_tokens: 1473,
+      total_tokens: 63458,
+      prompt_tokens_details: { cached_tokens: 60416 },
+      completion_tokens_details: { reasoning_tokens: 511, cached_tokens: 0 },
+      prompt_cache_hit_tokens: 60416,
+      prompt_cache_miss_tokens: 1569,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      prompt_cache_write_tokens: 0,
+      completion_thinking_tokens: 511,
+      cached_tokens: 0,
+    })).toEqual({
+      inputTokens: 1569,
+      outputTokens: 1473,
+      totalTokens: 63458,
+      cacheReadTokens: 60416,
+      cacheWriteTokens: 0,
+      reasoningTokens: 511,
+    })
+
+    // Preserves genuine 0 when every present candidate is 0, and prefers positive
+    // aliases for cacheWriteTokens and reasoningTokens as well.
+    expect(normalizePromptUsage({
+      prompt_tokens: 42398,
+      completion_tokens: 205,
+      total_tokens: 42603,
+      prompt_cache_hit_tokens: 0,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      prompt_cache_write_tokens: 0,
+      reasoningTokens: 0,
+      completion_thinking_tokens: 44,
+    })).toEqual({
+      inputTokens: 42398,
+      outputTokens: 205,
+      totalTokens: 42603,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      reasoningTokens: 44,
+    })
+
+    expect(normalizePromptUsage({
+      inputTokens: 1000,
+      outputTokens: 50,
+      totalTokens: 1300,
+      cache_creation_input_tokens: 0,
+      prompt_cache_write_tokens: 250,
+      reasoning_tokens: 0,
+      outputTokensDetails: { thinkingTokens: 20 },
+    })).toEqual({
+      inputTokens: 1000,
+      outputTokens: 50,
+      totalTokens: 1300,
+      cacheWriteTokens: 250,
+      reasoningTokens: 20,
+    })
+
+    // Top-level 0 placeholder falls through to nested cacheRead / reasoning / rawTotal aliases.
+    expect(normalizePromptUsage({
+      input_tokens: 0,
+      prompt_tokens: 1000,
+      output_tokens: 0,
+      completion_tokens: 50,
+      totalTokens: 0,
+      total_tokens: 1350,
+      cache_read_input_tokens: 0,
+      prompt_tokens_details: { cached_tokens: 300 },
+      output_tokens_details: { reasoning_tokens: 15 },
+    })).toEqual({
+      inputTokens: 1000,
+      outputTokens: 50,
+      totalTokens: 1350,
+      cacheReadTokens: 300,
+      reasoningTokens: 15,
+    })
+
+    // Empty array details omit cacheReadTokens; mixed array elements skip 0s inside entries.
+    const emptyDetails = normalizePromptUsage({
+      inputTokens: 100,
+      outputTokens: 10,
+      inputTokensDetails: [],
+    })
+    expect(emptyDetails).toEqual({ inputTokens: 100, outputTokens: 10, totalTokens: 110 })
+    expect(emptyDetails).not.toHaveProperty('cacheReadTokens')
+
+    expect(normalizePromptUsage({
+      inputTokens: 100,
+      outputTokens: 10,
+      inputTokensDetails: [{ cached_tokens: 0, cachedTokens: 80 }, { cached_tokens: 20 }],
+    })).toEqual({
+      inputTokens: 100,
+      outputTokens: 10,
+      totalTokens: 210,
+      cacheReadTokens: 100,
+    })
+
+    expect(normalizePromptUsage({
+      input_tokens: 0,
+      prompt_tokens: -1,
+      output_tokens: 10,
+    })).toBeUndefined()
+  })
+
   it('clamps reasoningTokens <= outputTokens and repairs inconsistent totalTokens', () => {
     expect(normalizePromptUsage({
       inputTokens: 100,
