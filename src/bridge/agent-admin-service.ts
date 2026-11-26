@@ -72,8 +72,10 @@ export interface AgentAdminHost {
   /**
    * Stop every live bridge of the agent and drop its bare process slot. A
    * no-op when no bridge exists, so a caller may fire it unconditionally.
+   * `keepReleased` spares the parked records (see `BridgeRegistryService.stopAgent`);
+   * a delete passes `false` so the removed agent cannot resurrect its contexts.
    */
-  stopAgent(agentId: string, persist?: boolean): Promise<void>
+  stopAgent(agentId: string, persist?: boolean, keepReleased?: boolean): Promise<void>
   /**
    * Write `agents.json`. `strict` is for a user-awaited save/delete: a failed
    * write throws `persist_failed` instead of staying silent. `staged` lands in
@@ -470,10 +472,10 @@ export class AgentAdminService {
     // and a deferred snapshot flushing afterwards would write the definition
     // straight back into `agents.json` (the deleted agent would come back).
     this.saveGate?.cancel(`agent-save:${agentId}`)
-    if (this.host.hasBridge(agentId)) {
-      // This method performs its own strict registry write below.
-      await this.host.stopAgent(agentId, false)
-    }
+    // This method performs its own strict registry write below. `keepReleased:
+    // false` drops the parked rows too: the agent is gone, and leaving them
+    // would hand their contexts back the moment the same id is added again.
+    await this.host.stopAgent(agentId, false, false)
     // Definition AND every pointer into it: the persisted default, the route
     // bindings and the catalog / fork cache, in that order.
     this.host.removeDef(agentId)

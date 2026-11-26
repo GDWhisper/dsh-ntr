@@ -3,10 +3,10 @@ import { join } from 'node:path'
 import { existsSync, mkdtempSync, readFileSync } from 'node:fs'
 import { afterAll, describe, expect, it, vi } from 'vitest'
 import { BridgeManager } from '../../src/bridge.ts'
-import { type AcpAgentDef, type AcpEvent, type ActiveTurnView } from '../../src/protocol.ts'
+import { type AcpAgentDef, type AcpEvent, type ActiveTurnView, type StreamChunk } from '../../src/protocol.ts'
 import { dispatchRpc, EventHub } from '../../src/impl.ts'
 import { AcpSaveGate } from '../../src/save-gate.ts'
-import { createBridgeHarness, MOCK } from './harness.ts'
+import { createBridgeHarness, MOCK, settleTranscript, until } from './harness.ts'
 
 const { hub, manager } = createBridgeHarness()
 
@@ -563,6 +563,96 @@ describe('agent saves behind the save gate (isolated manager)', () => {
     expect(after.chatSessions).toBeUndefined()
     await isolated.shutdownAll()
   })
+
+/**
+ * A save is a configuration write, not a session teardown: the record of a
+ * conversation that is merely parked (released) must survive it — that row is
+ * the only pointer a later `session/load` has (constraint 10). Deleting the
+ * agent stays the one gesture that drops the rows along with the definition.
+ */
+describe('agent save/delete and released chat sessions (isolated manager)', () => {
+  /** Drive one host-loop turn, including tool-card continuations. */
+  const chatTurn = async (gm: BridgeManager, dshSessionId: string, agentId: string, text: string): Promise<void> => {
+    const request = {
+      model: agentId,
+      sessionId: dshSessionId,
+      messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+    } as never
+    let messages = request.messages
+    for (let step = 0; step < 8; step += 1) {
+      const chunks: StreamChunk[] = []
+      for await (const chunk of gm.streamPrompt({ ...request, messages } as never)) chunks.push(chunk)
+      const finish = chunks.find((c): c is Extract<StreamChunk, { type: 'finish' }> => c.type === 'finish')
+      const callIds = [...new Set(chunks.filter(c => c.type === 'tool-call-delta').map(c => (c as { id: string }).id))]
+      if (finish === undefined || finish.reason.kind !== 'stop' || callIds.length === 0) return
+      messages = [...messages, ...callIds.map(id => ({
+        role: 'tool' as const,
+        source: { kind: 'tool' as const, callId: id },
+        content: [{ type: 'text' as const, text: 'staged result' }],
+      }))]
+    }
+  }
+
+  /** The agent's message text from the conversation's current host session. */
+  const chatEcho = async (gm: BridgeManager, dshSessionId: string): Promise<string> => {
+    const hostSessionId = gm.chatSessions(dshSessionId)[0]?.sessionId
+    if (hostSessionId === undefined) throw new Error('no host session')
+    await settleTranscript(gm, hostSessionId)
+    const transcript = await dispatchRpc(gm, 'transcript/get', { sessionId: hostSessionId })
+    if (!transcript.ok) throw new Error('transcript failed')
+    return (transcript.value as { entries: Array<{ update: Record<string, unknown> }> }).entries
+      .filter(entry => entry.update.sessionUpdate === 'agent_message_chunk')
+      .map(entry => String((entry.update.content as { text?: string }).text ?? ''))
+      .join('')
+  }
+
+  /** One conversation whose agent crashed once, so its record is parked. */
+  const parked = async (agentId: string, dshSessionId: string, storage: string): Promise<BridgeManager> => {
+    const localHub = new EventHub()
+    const gm = new BridgeManager([{ ...targetDef, id: agentId }], localHub, 100, storage, `${storage}.catalog.json`)
+    // A save probes the model catalog by spawning; this suite owns its children.
+    ;(gm as unknown as { probeAgentModels: (id: string) => Promise<unknown> }).probeAgentModels = async () => {}
+    gm.bindChatAgent(dshSessionId, agentId)
+    await chatTurn(gm, dshSessionId, agentId, 'DIE now')
+    await until(() => gm.chatSessions(dshSessionId)[0]?.released === true)
+    return gm
+  }
+
+  const rows = (storage: string): Array<{ sessionId: string; acpSessionId: string }> =>
+    (JSON.parse(readFileSync(storage, 'utf-8')) as { chatSessions?: Array<{ sessionId: string; acpSessionId: string }> }).chatSessions ?? []
+
+  it('keeps a released conversation resumable through a save of the same definition', async () => {
+    const storage = `${tmpdir()}/acp-save-released-${Date.now()}.json`
+    const gm = await parked('keep-me', 'dsh-keep', storage)
+    try {
+      const before = rows(storage)
+      expect(before).toHaveLength(1)
+      await gm.saveAgent({ ...targetDef, id: 'keep-me' }, 'direct')
+      // The save drops the process slot, not the parked row: the next message
+      // must come back through `session/load` on the SAME agent-side session.
+      expect(rows(storage)).toEqual(before)
+      expect(gm.chatSessions('dsh-keep')[0]).toMatchObject({ sessionId: before[0].sessionId, released: true })
+      await chatTurn(gm, 'dsh-keep', 'keep-me', 'back again')
+      expect(await chatEcho(gm, 'dsh-keep')).toContain('REPLAYED: earlier conversation')
+      expect(gm.chatSessions('dsh-keep')[0]?.sessionId).toBe(before[0].sessionId)
+    } finally {
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+
+  it('drops the released records when the agent is deleted', async () => {
+    const storage = `${tmpdir()}/acp-delete-released-${Date.now()}.json`
+    const gm = await parked('drop-me', 'dsh-drop', storage)
+    try {
+      expect(rows(storage)).toHaveLength(1)
+      await gm.deleteAgent('drop-me')
+      expect(rows(storage)).toEqual([])
+      expect(gm.chatSessions('dsh-drop')).toEqual([])
+    } finally {
+      await gm.shutdownAll()
+    }
+  }, 30_000)
+})
 
   it('does not write a probe result back after the agent was deleted', async () => {
     const storage = `${tmpdir()}/acp-probe-delete-agents-${Date.now()}.json`

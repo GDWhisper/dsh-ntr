@@ -408,9 +408,11 @@ export class BridgeManager {
         this.catalog.forgetAgent(agentId)
       },
       hasBridge: agentId => this.bridges.has(agentId) || this.bridgesOf(agentId).length > 0,
-      stopAgent: async (agentId, persist = false) => {
-        if (!this.bridges.has(agentId) && this.bridgesOf(agentId).length === 0) return
-        await this.stopAgent(agentId, persist)
+      stopAgent: async (agentId, persist = false, keepReleased = true) => {
+        // No early return on a missing process slot: delete still has to drop
+        // the agent's parked records, and the registry-level stop is a no-op
+        // when there is nothing to tear down.
+        await this.stopAgent(agentId, persist, keepReleased)
         // `stopAgent` drops every per-scope key; the bare key is the non-A1 /
         // pre-spawn slot and is removed here as well.
         this.bridges.delete(agentId)
@@ -1004,8 +1006,8 @@ export class BridgeManager {
     return this.bridgeRegistry.agentViews()
   }
 
-  async stopAgent(agentId: string, persist = true): Promise<void> {
-    return this.bridgeRegistry.stopAgent(agentId, persist)
+  async stopAgent(agentId: string, persist = true, keepReleased = true): Promise<void> {
+    return this.bridgeRegistry.stopAgent(agentId, persist, keepReleased)
   }
 
   /** On-demand idle release behind `acp_release` (see `BridgeRegistryService.releaseIdle`). */
