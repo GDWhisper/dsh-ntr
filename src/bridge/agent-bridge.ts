@@ -9,12 +9,13 @@ import {
 } from '@agentclientprotocol/sdk'
 import {
   AcpError, ElicitationLedger, PermissionLedger, Transcript, childEnv, normalizeApprovalWindow,
-  parseCatalogOptions, permissionRequestFrame, pickQuestionDefault, randomUUID, resolveFsPath,
+  parseCatalogOptions, permissionOptionWarning, permissionRequestFrame, pickQuestionDefault, randomUUID, resolveFsPath,
   resolveSessionCwd, usableConfigOptions,
 } from '../impl.ts'
 import type { EventHub } from '../impl.ts'
-import type {
-  AcpAgentDef, AcpReleaseCause, AgentView, PermissionOutcome, PermissionOptionView, PermissionTimeoutMode, QuestionTimeoutMode, SessionView,
+import {
+  effectiveWriteTextFileEnabled,
+  type AcpAgentDef, type AcpReleaseCause, type AgentView, type PermissionOutcome, type PermissionOptionView, type PermissionTimeoutMode, type QuestionTimeoutMode, type SessionView,
 } from '../protocol.ts'
 import { mergeUsageSample } from '../usage.ts'
 import { PLUGIN_VERSION, isPerSessionAgent, perSessionLaunchArgs, perSessionLaunchEnv } from './identity.ts'
@@ -831,6 +832,7 @@ export class AgentBridge {
       Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
       Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
     )
+    const writeTextFile = effectiveWriteTextFileEnabled(this.def)
     const app = client({ name: 'dsh-ntr' })
       .onNotification(methods.client.session.update, ctx => {
         this.handleSessionUpdate(ctx.params)
@@ -849,7 +851,9 @@ export class AgentBridge {
         }, ctx.params, ctx.signal)
       })
       .onRequest(methods.client.fs.readTextFile, async ctx => this.handleFsRead(ctx.params))
-      .onRequest(methods.client.fs.writeTextFile, async ctx => this.handleFsWrite(ctx.params))
+    if (writeTextFile) {
+      app.onRequest(methods.client.fs.writeTextFile, async ctx => this.handleFsWrite(ctx.params))
+    }
     const conn = app.connect(stream)
     this.conn = conn
     void conn.closed.then(() => {
@@ -866,10 +870,10 @@ export class AgentBridge {
         // `configOptions`; agents that gate `type: "boolean"` entries on it
         // would otherwise never publish them.
         clientCapabilities: {
-          fs: { readTextFile: true, writeTextFile: true },
+          fs: { readTextFile: true, writeTextFile },
           terminal: false,
           elicitation: { form: {} },
-          session: { configOptions: { boolean: {} } },
+          session: { configOptions: { boolean: {} }, compaction: {} },
         },
         clientInfo: { name: 'dsh-ntr', title: 'DSH NTR', version: PLUGIN_VERSION },
       }),
@@ -1874,7 +1878,15 @@ export class AgentBridge {
     if (!question && mode === 'auto' && timeoutMs === 0) {
       return settleExpiredAsk(this.expiredAskHost(), session, mode, toolCall, options, 0, askKind, questionMode)
     }
-    const optionViews = options.map((o): PermissionOptionView => ({ optionId: o.optionId, name: o.name, kind: o.kind }))
+    const optionViews = options.map((o): PermissionOptionView => {
+      const warning = permissionOptionWarning(o)
+      return {
+        optionId: o.optionId,
+        name: o.name,
+        kind: o.kind,
+        ...(warning === undefined ? {} : { warning }),
+      }
+    })
     const reason = permissionAskReason(toolCall)
     // Computed once, at ask creation: the frame, the chat line and the timer
     // all describe the same instant, and a slow reader cannot stretch it.

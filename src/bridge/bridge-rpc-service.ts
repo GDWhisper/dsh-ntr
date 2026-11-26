@@ -15,7 +15,13 @@ import type { BridgeRegistryService } from './bridge-registry-service.ts'
 import { describeError } from './errors.ts'
 import { isPerSessionAgent, type BridgeScope } from './identity.ts'
 import type { SessionRegistryService } from './session-registry-service.ts'
-import { agentRefusalDetail, rateLimitedTurnError, snapshot } from './shape.ts'
+import { agentRefusalDetail, snapshot } from './shape.ts'
+import {
+  resolveAgyTurnFailureFromRejection,
+  resolveAgyTurnFailureFromResponse,
+  sampleAgyDbBaseline,
+  type AgyStoreContext,
+} from './agy-failure.ts'
 import { hasPromptSlot, lifecycleOf } from './session-lifecycle.ts'
 import type { LiveSession } from './turn-stream.ts'
 import type { TurnWatchdogService } from './turn-watchdog-service.ts'
@@ -40,6 +46,8 @@ export interface BridgeRpcHost {
    * BEFORE the next prompt is sent (see `BridgeManager.prepareStalledSession`).
    */
   prepareStalledSession(session: LiveSession): Promise<{ ok: true; reset?: boolean } | { ok: false; message: string }>
+  /** Resolve Antigravity store identity/root for DB-backed failure recovery. */
+  agyStoreContext?(agentId: string): AgyStoreContext
 }
 
 /** The `/acp` RPC surface of the bridge (routed by `dispatchRpc` in `impl.ts`). */
@@ -147,45 +155,42 @@ export class BridgeRpcService {
       ? prompt
       : blocks.filter(b => b.type === 'text').map(b => (b as { text: string }).text).join('\n')
     this.host.hub.broadcast({ type: 'turn/start', sessionId, turnId, text: promptText })
+    const startSeq = session.transcript.head
+    const agyBaseline = this.host.agyStoreContext === undefined
+      ? undefined
+      : sampleAgyDbBaseline(this.host.agyStoreContext(session.agentId), session.acpSessionId)
     void bridge.runPrompt(session, blocks, turnId, turnGen)
       .then(result => {
-        // The reclaim already ended this turn locally; the answer it caused is
-        // that same turn reporting back, not a second turn end for the caller.
         if (session.reclaimedTurnSeq === turnGen) {
           session.reclaimedTurnSeq = undefined
           return
         }
-        // A superseded turn's late answer must not end the turn now on air.
         if (session.turnSeq !== turnGen) return
         this.clearOrphanPrompt(session, turnGen)
-        // The SAME rate-limit refusal the chat plane settles on (see
-        // `streamPrompt`): a refused prompt RESOLVES, so without this the turn
-        // would end as a plain `refusal` stop and the reason — which lives only
-        // in the response `_meta` — would be dropped. The banner is a chat
-        // surface, but the record hangs off the SESSION, and one LiveSession
-        // can be driven from both planes: a chat conversation whose last
-        // `/acp` answer was normal must not keep showing a quota the agent has
-        // already stopped reporting.
-        const refusal = result.stopReason === 'refusal' ? agentRefusalDetail(result.meta) : undefined
-        if (refusal?.kind === 'quota') {
-          session.quotaRefusal = { message: refusal.message, at: Date.now() }
+        const hadVisibleReply = session.transcript.since(startSeq).some(entry => {
+          const kind = (entry.update as { sessionUpdate?: unknown }).sessionUpdate
+          return kind === 'agent_message_chunk' || kind === 'agent_thought_chunk' || kind === 'tool_call'
+        })
+        const resolved = resolveAgyTurnFailureFromResponse(
+          session.agentId,
+          agyBaseline,
+          result,
+          result.stopReason !== 'cancelled' && !hadVisibleReply,
+          this.host.hub,
+        )
+        if (resolved?.kind === 'quota') {
+          session.quotaRefusal = { message: resolved.refusal.message, at: Date.now() }
           this.host.hub.broadcast({ type: 'session/meta', sessionId, session: snapshot(session) })
         } else if (session.quotaRefusal !== undefined) {
           session.quotaRefusal = undefined
           this.host.hub.broadcast({ type: 'session/meta', sessionId, session: snapshot(session) })
         }
-        // Release the shared slot BEFORE the terminal frame: a listener that
-        // sends the next prompt on `turn/end` must not read a stale claim.
         endTurn()
         session.running = false
-        if (refusal?.kind === 'quota') {
-          this.host.hub.broadcast({
-            type: 'turn/end',
-            sessionId,
-            turnId,
-            error: rateLimitedTurnError(session.agentId, refusal),
-            errorKind: 'quota',
-          })
+        if (resolved?.kind === 'quota') {
+          this.host.hub.broadcast({ type: 'turn/end', sessionId, turnId, error: resolved.turnError, errorKind: 'quota' })
+        } else if (resolved?.kind === 'error') {
+          this.host.hub.broadcast({ type: 'turn/end', sessionId, turnId, error: resolved.message })
         } else {
           this.host.hub.broadcast({ type: 'turn/end', sessionId, turnId, stopReason: result.stopReason })
         }
@@ -196,22 +201,24 @@ export class BridgeRpcService {
           return
         }
         if (session.turnSeq !== turnGen) return
-        // The turn was ended by an EXTERNAL close (idle release, agent stop):
-        // that teardown already broadcast the turn's end, and the session is
-        // parked or closed. Reporting the close's rejection again would put a
-        // second terminal frame on a turn the browser already saw finish.
         if (lifecycleOf(session) !== 'live') {
           this.clearOrphanPrompt(session, turnGen)
           return
         }
         this.clearOrphanPrompt(session, turnGen)
+        const failure = resolveAgyTurnFailureFromRejection(session.agentId, agyBaseline, error, this.host.hub)
+        if (failure.kind === 'quota') {
+          session.quotaRefusal = { message: failure.refusal.message, at: Date.now() }
+          this.host.hub.broadcast({ type: 'session/meta', sessionId, session: snapshot(session) })
+        }
         endTurn()
         session.running = false
         this.host.hub.broadcast({
           type: 'turn/end',
           sessionId,
           turnId,
-          error: describeError(error),
+          error: failure.kind === 'quota' ? failure.turnError : failure.message,
+          ...(failure.kind === 'quota' ? { errorKind: 'quota' as const } : {}),
         })
       })
       // Every outcome — normal answer, failure, reclaim early-return, or a

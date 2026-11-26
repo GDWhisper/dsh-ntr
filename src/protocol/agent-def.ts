@@ -137,6 +137,31 @@ export interface AcpAgentDef {
    * opt-out is persisted. Flipped via `agent/set-shared-mcp`, never `agent/save`.
    */
   sharedMcpEnabled?: boolean
+  /**
+   * Explicit override for advertising ACP `fs.writeTextFile` capability on
+   * `initialize`. Omitted follows agent default (`false` for `agy acp` so
+   * built-in unified diffs are preserved; `true` for generic ACP agents).
+   */
+  writeTextFileEnabled?: boolean
+}
+
+/** Whether a command+args tuple launches Antigravity's ACP server (`agy acp`). */
+export function isAntigravityCommand(def: Pick<AcpAgentDef, 'command' | 'args'>): boolean {
+  const program = def.command.split(/[\\/]/).at(-1) ?? def.command
+  const bare = program.toLowerCase().replace(/\.(exe|cmd|bat)$/, '')
+  return bare === 'agy' && (def.args ?? []).includes('acp')
+}
+
+/**
+ * Effective `fs.writeTextFile` capability advertised in `initialize`:
+ * explicit per-agent override wins; otherwise Antigravity defaults to `false`
+ * (keeping native diff output) and generic agents default to `true`.
+ */
+export function effectiveWriteTextFileEnabled(
+  def: Pick<AcpAgentDef, 'command' | 'args' | 'writeTextFileEnabled'>,
+): boolean {
+  if (typeof def.writeTextFileEnabled === 'boolean') return def.writeTextFileEnabled
+  return !isAntigravityCommand(def)
 }
 
 /** How an MCP server is reached. `acp` (agent→client `mcp/message`) is NOT supported. */

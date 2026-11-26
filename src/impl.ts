@@ -108,6 +108,15 @@ export {
   updateContentToText,
 } from './impl/content.ts'
 
+// ---- Context compaction helpers ----
+
+export {
+  compactCompletionLine,
+  compactionContentText,
+  formatCompactionNotification,
+  isCompactCommand,
+} from './impl/compaction.ts'
+
 // ---- Prompt images and the forwarded prompt ----
 
 export type { PromptContentBlock, PromptImageContent, PromptTextContent } from './impl/image.ts'
@@ -129,9 +138,12 @@ export { SESSION_TITLE_PLACEHOLDER_MAX, extractSessionTitlePlaceholder, selectFo
 export type { PendingPermissionFields, PendingPermissionView } from './impl/permission.ts'
 export {
   AGY_QUESTION_TOOL_CALL_PREFIX,
+  AGY_SECURITY_WARNING_META_KEY,
   AUTO_OPTION_KIND_PRIORITY,
   DELEGATE_AUTO_KIND_PRIORITY,
+  SECURITY_WARNING_MAX_CHARS,
   permissionAskKind,
+  permissionOptionWarning,
   permissionReplayFrames,
   permissionRequestFrame,
   permissionToolKind,

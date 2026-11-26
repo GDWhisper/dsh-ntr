@@ -63,10 +63,9 @@ export function pickAutoOption(options: readonly PermissionOptionView[], preferO
  * The `toolCallId` prefix Antigravity uses for its OWN fixed-choice questions,
  * which it sends through `session/request_permission` — the approval method.
  *
- * External evidence only (t3code `AntigravityProtocol.ts` ·
- * `isAntigravityUserInputRequest`); the built-in `agy acp` has not been
- * captured yet, so this constant is the ONE place to change once it is. See
- * docs/plan/agy-question-asks.md §2.3.
+ * Based on observed ACP wire semantics (`interaction_` prefix); built-in
+ * `agy acp` has not been captured yet, so this constant is the ONE place to
+ * change once it is. See docs/plan/agy-question-asks.md §2.3.
  */
 export const AGY_QUESTION_TOOL_CALL_PREFIX = 'interaction_'
 
@@ -80,6 +79,40 @@ export const AGY_QUESTION_TOOL_CALL_PREFIX = 'interaction_'
 export function permissionAskKind(toolCall: unknown): PermissionAskKind {
   const id = (toolCall as { toolCallId?: unknown } | null | undefined)?.toolCallId
   return typeof id === 'string' && id.startsWith(AGY_QUESTION_TOOL_CALL_PREFIX) ? 'question' : 'approval'
+}
+
+/** Optional Antigravity `_meta` security-warning key on long-lived permission options. */
+export const AGY_SECURITY_WARNING_META_KEY = 'agy.security.warning'
+/** Upper bound on surfaced security warnings so an agent payload cannot bloat cards. */
+export const SECURITY_WARNING_MAX_CHARS = 512
+
+/**
+ * Extract and normalize `_meta['agy.security.warning']` from an ACP
+ * `PermissionOption`. Supports `{ title?, message? }` objects or plain strings,
+ * bounds the output with an ellipsis marker, and returns `undefined` when absent.
+ */
+export function permissionOptionWarning(option: unknown): string | undefined {
+  if (typeof option !== 'object' || option === null) return undefined
+  const meta = (option as { _meta?: unknown })._meta
+  if (typeof meta !== 'object' || meta === null || Array.isArray(meta)) return undefined
+  const raw = (meta as Record<string, unknown>)[AGY_SECURITY_WARNING_META_KEY]
+  let text = ''
+  if (typeof raw === 'string') {
+    text = raw.trim()
+  } else if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
+    const row = raw as Record<string, unknown>
+    const title = typeof row.title === 'string' ? row.title.trim() : ''
+    const message = typeof row.message === 'string' ? row.message.trim() : ''
+    if (title !== '' && message !== '') {
+      text = message.includes(title) ? message : `${title}: ${message}`
+    } else {
+      text = message || title
+    }
+  }
+  if (text === '') return undefined
+  return text.length > SECURITY_WARNING_MAX_CHARS
+    ? `${text.slice(0, SECURITY_WARNING_MAX_CHARS - 1)}…`
+    : text
 }
 
 /**

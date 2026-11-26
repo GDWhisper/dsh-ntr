@@ -35,7 +35,7 @@
 
 | 事实 | 位置 |
 |---|---|
-| agy 的固定选择题走 `session/request_permission`，与工具审批同一方法 | 外部证据：t3code `AntigravityProtocol.ts` · `isAntigravityUserInputRequest`（`toolCallId` 前缀 `interaction_`）；其用户文档写明「Questions with fixed choices still need one of the offered answers, even in Full access」 |
+| agy 的固定选择题走 `session/request_permission`，与工具审批同一方法 | 外部实证：固定选择题以 `interaction_` 为 `toolCallId` 前缀走 `session/request_permission`；其官方交互语义为「Questions with fixed choices still need one of the offered answers, even in Full access」 |
 | 公开报告（2026-11-16）记录同一形状：`interaction_<8 hex>` + `session/request_permission`；同时提到长选项被裁剪、**无法自由文本作答** | 该报告针对独立 `antigravity-acp` v1.5.0，**不是**对内置 `agy acp` 的直接验证——只能作为假设，仍需 §2.3 抓帧；自由文本限制见 §9 |
 | 本仓对这类询问**零特判** | `src/bridge/agent-bridge.ts` · `handlePermissionRequest` 只读 session / toolCall / options，无前缀判断 |
 | `auto` + 窗口 `0` 在请求到达时立即收场 | 同文件：`mode === 'auto' && timeoutMs === 0` → `settleExpiredAsk` |
@@ -272,7 +272,7 @@ export function pickQuestionDefault(options: readonly PermissionOptionView[]): P
 
 1. `PermissionOption` 的规范字段是 `optionId` / `name` / `kind` + 可选 `_meta`；`kind` 四值确认；规范未定义任何推荐语义，也不允许假定 `_meta` 键的含义。→ §1.4 已按此改写（原稿写「只有三个字段」不准确）。
 2. `elicitation/create` 同样没有推荐答案语义，但 form schema **可以带 `default`**（客户端应预填）——与本题无关，但反向确认了「推荐」只能来自选项顺序。
-3. `interaction_` + `session/request_permission` 有公开实现（t3code）与 2026-11-16 报告支持，但报告针对独立 `antigravity-acp` v1.5.0，**不是内置 `agy acp`**。→ §2.3 第 1 条已加注：抓帧仍是唯一可信来源。
+3. `interaction_` + `session/request_permission` 有公开 ACP 适配实证与 2026-11-16 报告支持，但报告针对独立 `antigravity-acp` v1.5.0，**不是内置 `agy acp`**。→ §2.3 第 1 条已加注：抓帧仍是唯一可信来源。
 4. 未发现内置 agy 改用 `elicitation/create` 的证据（Google 文档只描述客户端体验，未写线级方法）。
 
 **仓库内复核（主代理，已改回文中）**：

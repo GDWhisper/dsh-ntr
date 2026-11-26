@@ -3,7 +3,9 @@ import {
   EventHub,
   acpToolCallDelta,
   acpToolCallFromUpdate,
+  compactCompletionLine,
   describeUnhandledUpdate,
+  formatCompactionNotification,
   isFinalToolCallStatus,
   updateContentToText,
   type AcpToolCallSnapshot,
@@ -707,6 +709,8 @@ export class TurnStreamController {
    */
   private readonly constructedAt: number
 
+  private readonly compactionStatuses = new Map<string, string>()
+
   constructor(
     private readonly manager: BridgeManager,
     private readonly hub: EventHub,
@@ -715,6 +719,7 @@ export class TurnStreamController {
     /** Releases the agent-side turn slot (the `beginTurn` settler; idempotent). */
     private readonly endTurn: () => void,
     private readonly rollbackFirstTurn: (session: LiveSession) => void,
+    private readonly compactPrompt: boolean = false,
   ) {
     this.turnSeqAtStart = session.turnSeq
     this.cursorSeq = session.transcript.head
@@ -1691,7 +1696,9 @@ export class TurnStreamController {
       // deferred turn promised. The lock therefore becomes permanent.
       if (this.session.provisionalLock === true) {
         this.session.provisionalLock = false
-        if (!this.sawVisibleBlock && ambient === undefined) this.rollbackFirstTurn(this.session)
+        if (!this.sawVisibleBlock && ambient === undefined && !(outcome.kind === 'error' && outcome.errorKind === 'quota')) {
+          this.rollbackFirstTurn(this.session)
+        }
       }
     }
     const seg = this.segment
@@ -2006,6 +2013,9 @@ export class TurnStreamController {
     }
     if (this.recentRetiredDrain) {
       return `\n[dsh-ntr] agent "${this.session.agentId}" produced no visible output this turn; it may have been folded into a background run; its output is in the ACP transcript view.\n`
+    }
+    if (this.compactPrompt) {
+      return compactCompletionLine(this.session.agentId, stopReason)
     }
     const reason = stopReason === undefined ? '' : ` (stop reason: ${stopReason})`
     return `\n[dsh-ntr] agent "${this.session.agentId}" ended the turn with no visible output${reason}. Some agents fold upstream failures — auth, billing, rate limits — into a normal stop; try resending, and check the agent process logs if it repeats.\n`
@@ -2401,6 +2411,16 @@ export class TurnStreamController {
       // Let the host's live row settle this card's real command after a short
       // quiet window, instead of waiting for the next non-tool event.
       this.armCardSettle(seg)
+      return true
+    } else if (kind === 'compaction_update' || kind === 'compaction_summary_chunk') {
+      const text = formatCompactionNotification(update, this.compactionStatuses)
+      if (text === undefined) return true
+      if (seg.hasCard) {
+        this.finishSegment(seg, { kind: 'stop' })
+        return false
+      }
+      seg.outputChars += text.length
+      this.emitProse(seg, 'text', `\n${text}\n`)
       return true
     } else if (!BOOKKEEPING_UPDATES.has(kind) && !USER_ECHO_UPDATES.has(kind)) {
       const text = describeUnhandledUpdate(kind, update)

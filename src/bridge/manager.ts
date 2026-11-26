@@ -1,7 +1,7 @@
 import { join } from 'node:path'
 import { existsSync, readFileSync } from 'node:fs'
 import type { ContentBlock, SessionUpdate } from '@agentclientprotocol/sdk'
-import { EventHub, buildAdapterModelId, isAcpToolContinuation, parseCatalogOptions, randomUUID, selectForwardPrompt, extractSessionTitlePlaceholder, isAbsolutePath, splitAdapterModelId } from '../impl.ts'
+import { EventHub, buildAdapterModelId, isAcpToolContinuation, isCompactCommand, parseCatalogOptions, randomUUID, selectForwardPrompt, extractSessionTitlePlaceholder, isAbsolutePath, splitAdapterModelId } from '../impl.ts'
 import type {
   DelegateLiveOptions,
   PendingPermissionView,
@@ -53,9 +53,14 @@ import {
 import type { LiveSession } from './turn-stream.ts'
 import {
   agentRefusalDetail,
-  rateLimitedTurnError,
   snapshot,
 } from './shape.ts'
+import {
+  resolveAgyStoreContext,
+  resolveAgyTurnFailureFromRejection,
+  resolveAgyTurnFailureFromResponse,
+  sampleAgyDbBaseline,
+} from './agy-failure.ts'
 import { DEFAULT_TUNING } from './tuning.ts'
 import { AgyLateOutputService } from './agy-late-output.ts'
 import { agyStoreRoot, isAntigravityAgent } from './agy-transcript.ts'
@@ -175,7 +180,7 @@ export class BridgeManager {
      * the defaults read the launch command line. A test injects its own agent
      * predicate and store root instead of rewriting `process.env.HOME`.
      */
-    lateOutputProbe?: { isAgent(def: AcpAgentDef): boolean; storeRoot(): string | undefined },
+    private readonly lateOutputProbe?: { isAgent(def: AcpAgentDef): boolean; storeRoot(): string | undefined },
   ) {
     // Held as a live object rather than the raw parameter: the approval
     // deadline and the idle window are rewritten in place when the settings
@@ -290,6 +295,7 @@ export class BridgeManager {
       watchdog: this.watchdog,
       registry: this.registry,
       prepareStalledSession: session => this.prepareStalledSession(session),
+      agyStoreContext: agentId => resolveAgyStoreContext(this.defsMap.get(agentId), this.lateOutputProbe),
     })
     // The archive-release cluster (see `ArchiveReleaseService`) needs the
     // session lookup, the turn stream, the session owner and the teardown.
@@ -1698,6 +1704,7 @@ export class BridgeManager {
       turnId,
       endTurn,
       victim => this.registry.rollbackFirstTurn(victim),
+      isCompactCommand(promptText),
     )
     if (session.dshSessionId !== undefined) this.rememberTurnStream(session.dshSessionId, controller)
     // The session itself carries the controller too: an EPHEMERAL turn
@@ -1733,45 +1740,38 @@ export class BridgeManager {
         : [{ type: 'text', text: promptText }]
 
       const promptBridge = this.bridgeForSession(session)
+      const agyBaseline = sampleAgyDbBaseline(
+        resolveAgyStoreContext(this.defsMap.get(agentId), this.lateOutputProbe),
+        session.acpSessionId,
+      )
       promptBridge.runPrompt(session, promptBlocks, turnId, turnGen)
         .then(result => {
-          // The reclaim already ended this turn locally, and the close it
-          // performed rejected this very request: the late answer is that same
-          // turn, not a second one to broadcast.
           if (session.reclaimedTurnSeq === turnGen) {
             session.reclaimedTurnSeq = undefined
             return
           }
           const responseMeta = codebuddyMetaOf({ _meta: result.meta })
-          // A RATE-LIMIT REFUSAL: the agent answered the prompt and declined
-          // the work because the account is over its quota. CodeBuddy says so
-          // with `stopReason: 'refusal'` plus a quota detail in the response
-          // `_meta` — a RESOLVED response, so no error path and no
-          // `describeError` ever sees the reason. Ranked BEFORE the hold /
-          // ambient branches below: a refused turn has no answer coming, so
-          // holding it open for a background run would wait on work the agent
-          // just said it will not do.
           const refusal = result.stopReason === 'refusal' ? agentRefusalDetail(result.meta) : undefined
-          if (refusal?.kind === 'quota') {
-            // The dock card reads this through `snapshot()`, so publish it
-            // BEFORE the turn ends: a browser that renders the card off
-            // `turn/end` must already know why the turn failed.
-            session.quotaRefusal = { message: refusal.message, at: Date.now() }
+          const resolvedFailure = resolveAgyTurnFailureFromResponse(
+            agentId,
+            agyBaseline,
+            result,
+            result.stopReason !== 'cancelled' && !controller.hasAgentProse,
+            this.hub,
+          )
+          if (resolvedFailure?.kind === 'quota') {
+            session.quotaRefusal = { message: resolvedFailure.refusal.message, at: Date.now() }
             this.hub.broadcast({ type: 'session/meta', sessionId: session.sessionId, session: snapshot(session) })
-            controller.settle({
-              kind: 'error',
-              message: rateLimitedTurnError(agentId, refusal),
-              code: 'rate_limited',
-              errorKind: 'quota',
-            })
+            controller.settle({ kind: 'error', message: resolvedFailure.turnError, code: 'rate_limited', errorKind: 'quota' })
             return
           }
-          // Any other answer — a normal turn, a plain refusal, a hold, an
-          // ambient fold — means the quota is no longer what stopped this
-          // session: the banner must not outlive the evidence for it.
           if (session.quotaRefusal !== undefined) {
             session.quotaRefusal = undefined
             this.hub.broadcast({ type: 'session/meta', sessionId: session.sessionId, session: snapshot(session) })
+          }
+          if (resolvedFailure?.kind === 'error') {
+            controller.settle({ kind: 'error', message: resolvedFailure.message, ...(resolvedFailure.code === undefined ? {} : { code: resolvedFailure.code }) })
+            return
           }
           // A DETACHED-WORKER DRAIN: every dispatched worker already reported
           // and the drain that carries its report is imminent, so keep this
@@ -1854,7 +1854,14 @@ export class BridgeManager {
             session.reclaimedTurnSeq = undefined
             return
           }
-          controller.settle({ kind: 'error', message: describeError(err) })
+          const failure = resolveAgyTurnFailureFromRejection(agentId, agyBaseline, err, this.hub)
+          if (failure.kind === 'quota') {
+            session.quotaRefusal = { message: failure.refusal.message, at: Date.now() }
+            this.hub.broadcast({ type: 'session/meta', sessionId: session.sessionId, session: snapshot(session) })
+            controller.settle({ kind: 'error', message: failure.turnError, code: 'rate_limited', errorKind: 'quota' })
+            return
+          }
+          controller.settle({ kind: 'error', message: failure.message, ...(failure.code === undefined ? {} : { code: failure.code }) })
         })
         // The agent's own answer closed the turn: whatever the watchdog marked
         // orphaned has just reported back and no longer needs a reclaim.

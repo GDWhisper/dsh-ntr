@@ -991,6 +991,9 @@ const STYLE = `
 .ntr-permission-actions.is-question { flex-direction: column; align-items: stretch; }
 .ntr-permission-actions.is-question .ntr-permission-cancel { margin-left: 0; }
 .ntr-permission-expiry { font-size: 11px; color: var(--dsw-alias-label-secondary, #6b7280); }
+.ntr-permission-warnings { width: 100%; display: flex; flex-direction: column; gap: 3px; }
+.ntr-permission-warning { padding: 4px 8px; border-radius: 6px; background: color-mix(in srgb, var(--dsw-alias-state-warn-primary, #d97706) 10%, transparent); color: var(--dsw-alias-state-warn-label, #b45309); font-size: 11px; word-break: break-word; }
+.ntr-permission-warning-option { font-weight: 600; }
 .ntr-permission-error { padding: 4px 8px; border-radius: 6px; background: color-mix(in srgb, var(--dsw-alias-state-error-primary, #b91c1c) 12%, transparent); color: var(--dsw-alias-state-error-primary, #b91c1c); font-size: 11px; word-break: break-word; }
 /* ---- Elicitation form dock (conversation.input.dock, elicitation-dock.tsx) ---- */
 .ntr-elicit-dock { gap: 8px; max-height: min(46vh, 420px); }

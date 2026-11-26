@@ -95,6 +95,8 @@ export interface AgentSavePayload {
   skillsMcpEnabled?: boolean
   /** Per-agent opt-out from unified shared/host MCP servers. Carried by the form so `agent/save` does not wipe it. */
   sharedMcpEnabled?: boolean
+  /** Explicit override for advertising `fs.writeTextFile`; omitted uses the agent default. */
+  writeTextFileEnabled?: boolean
   /**
    * How `agent/save` treats live turns. The host is the authority: a caller
    * that omits this gets `confirmationRequired` when the target agent is busy,

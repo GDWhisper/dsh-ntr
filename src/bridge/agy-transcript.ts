@@ -19,7 +19,7 @@
 import { homedir } from 'node:os'
 import { closeSync, openSync, readSync, statSync } from 'node:fs'
 import { join, posix, win32 } from 'node:path'
-import type { AcpAgentDef } from '../protocol.ts'
+import { isAntigravityCommand, type AcpAgentDef } from '../protocol.ts'
 import { isAbsolutePath } from '../impl.ts'
 
 /** One parsed transcript line. Unknown keys are ignored, not preserved. */
@@ -51,7 +51,7 @@ const BASELINE_TAIL_BYTES = 64 * 1024
 /** Bytes read per incremental pass. */
 const READ_CHUNK_BYTES = 512 * 1024
 /** An ACP session id is a file-name segment: refuse separators and traversal. */
-const SESSION_ID_PATTERN = /^[\w-]+$/
+export const SESSION_ID_PATTERN = /^[\w-]+$/
 /** Bytes of dispatch-result text scanned for the creation payload. */
 const DISPATCH_RESULT_SCAN_MAX = 64 * 1024
 
@@ -62,9 +62,7 @@ const DISPATCH_RESULT_SCAN_MAX = 64 * 1024
  * program name is what actually selects the transcript format.
  */
 export function isAntigravityAgent(def: AcpAgentDef): boolean {
-  const program = def.command.split(/[\\/]/).at(-1) ?? def.command
-  const bare = program.toLowerCase().replace(/\.(exe|cmd|bat)$/, '')
-  return bare === 'agy' && (def.args ?? []).includes('acp')
+  return isAntigravityCommand(def)
 }
 
 /**

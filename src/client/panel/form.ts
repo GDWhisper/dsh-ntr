@@ -59,6 +59,7 @@ export interface AgentForm {
    */
   skillsMcpEnabled: boolean
   sharedMcpEnabled: boolean
+  writeTextFileMode: 'default' | 'enabled' | 'disabled'
 }
 
 function idleText(value: number | undefined): string {
@@ -158,6 +159,11 @@ export function initialForm(detected: DetectedAgentInfo, activeAgent: AgentView 
     // absent field seeds the form as on.
     skillsMcpEnabled: config?.skillsMcpEnabled !== false,
     sharedMcpEnabled: config?.sharedMcpEnabled !== false,
+    writeTextFileMode: config?.writeTextFileEnabled === true
+      ? 'enabled'
+      : config?.writeTextFileEnabled === false
+        ? 'disabled'
+        : 'default',
   }
 }
 
@@ -189,6 +195,7 @@ export function payloadEquals(payload: AgentSavePayload, current: AcpAgentDef): 
   // means "follow the global window" and is not a change; a field on one
   // side only means the user is adding or dropping an override.
   if (payload.idleTimeoutMs !== current.idleTimeoutMs) return false
+  if (payload.writeTextFileEnabled !== current.writeTextFileEnabled) return false
   return true
 }
 
@@ -240,6 +247,11 @@ export function buildPayload(form: AgentForm, detected: DetectedAgentInfo, newCu
     // so only the opt-out is sent (and only that is persisted).
     ...(form.skillsMcpEnabled ? {} : { skillsMcpEnabled: false }),
     ...(form.sharedMcpEnabled ? {} : { sharedMcpEnabled: false }),
+    ...(form.writeTextFileMode === 'enabled'
+      ? { writeTextFileEnabled: true }
+      : form.writeTextFileMode === 'disabled'
+        ? { writeTextFileEnabled: false }
+        : {}),
   }
   if (form.rootsOpen) {
     if (cwd !== '') payload.cwd = cwd

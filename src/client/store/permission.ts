@@ -4,7 +4,7 @@
  * `src/client/store.ts` (split plan P3a), which re-exports it unchanged.
  */
 
-import type { PermissionAskKind, PermissionTimeoutMode, QuestionTimeoutMode } from "../../protocol.ts"
+import type { PermissionAskKind, PermissionOptionView, PermissionTimeoutMode, QuestionTimeoutMode } from "../../protocol.ts"
 import { pendingForSession } from "./pending.ts"
 
 /**
@@ -22,7 +22,7 @@ export interface PendingPermission {
   dshSessionId?: string
   toolName: string
   reason?: string
-  options: Array<{ optionId: string; name: string; kind: string }>
+  options: PermissionOptionView[]
   timeoutMode: PermissionTimeoutMode
   /** Epoch ms; absent in `wait` mode. */
   deadlineAt?: number

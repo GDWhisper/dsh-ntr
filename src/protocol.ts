@@ -28,7 +28,13 @@ export type {
   AcpMcpTransport,
   AcpPluginConfig,
 } from './protocol/agent-def.ts'
-export { MCP_SERVER_NAME_MAX, MCP_SERVERS_MAX, findMcpServersError } from './protocol/agent-def.ts'
+export {
+  MCP_SERVER_NAME_MAX,
+  MCP_SERVERS_MAX,
+  effectiveWriteTextFileEnabled,
+  findMcpServersError,
+  isAntigravityCommand,
+} from './protocol/agent-def.ts'
 
 export type {
   AcpPresetStatus,

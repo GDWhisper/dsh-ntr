@@ -535,6 +535,10 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
   if (sharedMcpEnabled !== undefined && typeof sharedMcpEnabled !== 'boolean') {
     throw new AcpError('bad_config', `acp: agent "${id}" sharedMcpEnabled must be a boolean`)
   }
+  const writeTextFileEnabled = row.writeTextFileEnabled
+  if (writeTextFileEnabled !== undefined && typeof writeTextFileEnabled !== 'boolean') {
+    throw new AcpError('bad_config', `acp: agent "${id}" writeTextFileEnabled must be a boolean`)
+  }
   return {
     id,
     title,
@@ -551,6 +555,7 @@ export function validateAgentDef(entry: unknown, label = 'agent'): AcpAgentDef {
     ...(defaultMode === undefined ? {} : { defaultMode }),
     ...(skillsMcpEnabled === false ? { skillsMcpEnabled: false } : {}),
     ...(sharedMcpEnabled === false ? { sharedMcpEnabled: false } : {}),
+    ...(typeof writeTextFileEnabled === 'boolean' ? { writeTextFileEnabled } : {}),
   }
 }
 

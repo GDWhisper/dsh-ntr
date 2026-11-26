@@ -46,7 +46,7 @@ export type Block =
    * `raw` the untouched payload — an agent's word the ACP view cannot format is
    * still an agent's word.
    */
-  | { kind: 'event'; event: string; text: string; raw?: string; status?: string }
+  | { kind: 'event'; event: string; text: string; raw?: string; status?: string; compactionId?: string }
   | { kind: 'notice'; tone: 'info' | 'error'; text: string }
 
 /** Raw JSON budget for one event block; the cut is marked. */
@@ -322,6 +322,62 @@ export function foldUpdate(blocks: Block[], update: Record<string, unknown>): bo
         return true
       }
       blocks.push({ kind: 'plan', entries })
+      return true
+    }
+    case 'compaction_update': {
+      const compactionId = typeof update.compactionId === 'string' ? update.compactionId : ''
+      const status = typeof update.status === 'string' && update.status !== '' ? update.status : 'unknown'
+      const summary = Array.isArray(update.summary) ? update.summary.map(chunkText).filter(Boolean).join('\n') : ''
+      const error = typeof update.error === 'string' ? update.error.trim() : ''
+      const header = error !== '' ? `compaction (${status}): ${error}` : `compaction (${status})`
+      const nextText = summary !== '' ? `${header}\n${summary}` : header
+      let rawOf: string | undefined
+      for (let i = blocks.length - 1; i >= 0 && compactionId !== ''; i--) {
+        const block = blocks[i]
+        if (block?.kind !== 'event' || block.event !== 'compaction_update' || block.compactionId !== compactionId) continue
+        const preservedBody = summary === '' && status !== 'failed' && block.text.includes('\n')
+          ? block.text.slice(block.text.indexOf('\n'))
+          : ''
+        blocks[i] = {
+          kind: 'event',
+          event: 'compaction_update',
+          compactionId,
+          status,
+          text: preservedBody !== '' ? `${header}${preservedBody}` : nextText,
+          get raw() { return rawOf ??= jsonText(update) },
+        }
+        return true
+      }
+      blocks.push({
+        kind: 'event',
+        event: 'compaction_update',
+        ...(compactionId === '' ? {} : { compactionId }),
+        status,
+        text: nextText,
+        get raw() { return rawOf ??= jsonText(update) },
+      })
+      return true
+    }
+    case 'compaction_summary_chunk': {
+      const compactionId = typeof update.compactionId === 'string' ? update.compactionId : ''
+      const text = chunkText(update.content)
+      if (text === '') return false
+      let rawOf: string | undefined
+      for (let i = blocks.length - 1; i >= 0 && compactionId !== ''; i--) {
+        const block = blocks[i]
+        if (block?.kind !== 'event' || block.event !== 'compaction_update' || block.compactionId !== compactionId) continue
+        const sep = block.text.includes('\n') ? '' : '\n'
+        blocks[i] = { ...block, text: `${block.text}${sep}${text}`, get raw() { return rawOf ??= jsonText(update) } }
+        return true
+      }
+      blocks.push({
+        kind: 'event',
+        event: 'compaction_update',
+        ...(compactionId === '' ? {} : { compactionId }),
+        status: 'in_progress',
+        text: `compaction (in_progress)\n${text}`,
+        get raw() { return rawOf ??= jsonText(update) },
+      })
       return true
     }
     default: {

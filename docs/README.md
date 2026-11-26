@@ -16,6 +16,9 @@
   - 为什么：agy 的 ACP wire 不带任何子代理生命周期 `_meta`（CodeBuddy 那套键全缺），既有面板对 agy 永远空；但 agy 私有 brain transcript 留有完整证据——派发结果含子代理 `conversationId`、子代理自己的步骤流、报告以 `SYSTEM_MESSAGE` 写回父 transcript
   - 怎么做：wire 认 `invoke_subagent` 派发 → 复用 `SubagentRecord` 六态（`childId = acp:<toolCallId>`，新增可选 `childConversationId`）；状态由子代理 transcript 轮询驱动（父 `SYSTEM_MESSAGE` 权威 + 子最后 `PLANNER_RESPONSE` DONE 兜底，「最新步 + 静默窗」双门控去重），未终态 dispatch 算活跃工作阻止空闲释放（两档静默上限复用，不是第三种强制定稿）；明细按需读子 brain transcript，浏览器只读步骤视图（详情浮层搬出 `subagent-panel.tsx`，1038→468 行数锁退役）
   - 状态：已实现待真机验收（P1–P3 落地，任务审核 + 整枝终审 + 修复波复审通过，prepack 1388 测试全绿）；§12 未决项与 §13 验收需已认证 agy 会话，真机清单与 DEFER 后续见 [docs/todo.md](./todo.md)
+- [方案：Antigravity 适配对齐实施（已实施，待真机验收）](./plan/antigravity-acp-parity-impl.md)
+  - 范围：补齐 `session.compaction` 能力与 `/compact` 零输出收口修复（§1.6）、`agy.security.warning` 权限警告透传（§1.5）、`isAntigravityAgent` 默认关闭 `fs.writeTextFile` 与显式覆盖（§1.4）、只读 `agy-session-db.ts`（§1.2）以及聊天面/`/acp` 面结构化配额与失败提示（§1.3，首轮配额拒绝不回滚以展示 `QuotaBanner`）
+  - 约束：不修改 `agy` 原生能力与 store（严格只读、fail-open）；受行数基线锁定的大文件只做微创接线，新能力与测试拆进独立模块
 - [方案：Antigravity 固定选择题的识别与到期策略（已实施 / 待抓帧）](./plan/agy-question-asks.md)
   - 为什么：agy 的固定选择题走 `session/request_permission`（`toolCallId` 前缀 `interaction_`），今天被当工具审批——`auto` 档按 kind 优先级代答（先挑 `allow_always`），卡片也读成「允许 / 拒绝」
   - 怎么做：给询问加显式 `askKind`（`approval` / `question`），问题不再走 `pickAutoOption`、改用独立窗口 `elicitationTimeoutMs` 与独立到期轴 `questionTimeoutMode`（默认取消，用户可显式开启「到期自动选第一项」）；卡片改问题形态，配置落 `agents.json` 的 `approvalDeadlines`

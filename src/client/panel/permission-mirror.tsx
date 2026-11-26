@@ -7,7 +7,7 @@ import type { AcpStore, UiState } from '../store.ts'
 import type { Translate } from '../acp-view.tsx'
 import { ElicitationAskCard } from '../elicitation-dock.tsx'
 import { useDeadlineClock } from '../pending-dock.tsx'
-import { questionExpiryLabel } from '../permission-dock.tsx'
+import { PermissionOptionWarnings, questionExpiryLabel } from '../permission-dock.tsx'
 import type { AgentTestResult } from '../../protocol.ts'
 
 /**
@@ -166,6 +166,7 @@ export function PermissionMirrorCard(props: { acp: AcpStore; ui: UiState }) {
                 type="button"
                 className="dwa-btn"
                 style={question ? { textAlign: 'left' } : undefined}
+                title={option.warning === undefined ? option.name : `${option.name}\n${option.warning}`}
                 onClick={() => { void acp.respondPermission(permission.requestId, option.optionId).catch(() => undefined) }}
               >
                 {option.name}
@@ -179,6 +180,7 @@ export function PermissionMirrorCard(props: { acp: AcpStore; ui: UiState }) {
             >
               {acp.label('取消', 'Cancel')}
             </button>
+            <PermissionOptionWarnings options={permission.options} />
             {expiry !== undefined && (
               <div className="dwa-hint" style={{ fontSize: 11 }}>{expiry}</div>
             )}

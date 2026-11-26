@@ -28,6 +28,7 @@ import { ensureAcpStyle, useUi } from './acp-ui.tsx'
 import { DeadlineBadge, PendingDockShell, useDeadlineClock } from './pending-dock.tsx'
 import { permissionsForSession } from './store.ts'
 import type { AcpStore, PendingPermission } from './store.ts'
+import type { PermissionOptionView } from '../protocol.ts'
 
 export interface PermissionDockProps {
   /** Injected face: the store plus the chat session id this dock belongs to. */
@@ -44,6 +45,21 @@ export function questionExpiryLabel(acp: AcpStore, permission: PendingPermission
     )
   }
   return acp.label('到期将取消，不会替你作答', 'On expiry the question is cancelled — nothing is chosen for you')
+}
+
+export function PermissionOptionWarnings({ options }: { options: readonly PermissionOptionView[] }) {
+  const warned = options.filter(option => option.warning !== undefined && option.warning !== '')
+  if (warned.length === 0) return null
+  return (
+    <div className="ntr-permission-warnings">
+      {warned.map(option => (
+        <div key={option.optionId} className="ntr-permission-warning">
+          <span className="ntr-permission-warning-option">{option.name}: </span>
+          <span>{option.warning}</span>
+        </div>
+      ))}
+    </div>
+  )
 }
 
 export function PermissionDock({ acp, sessionId }: PermissionDockProps) {
@@ -108,7 +124,7 @@ function PermissionAskCard(props: { acp: AcpStore; permission: PendingPermission
             type="button"
             className="ntr-permission-option"
             disabled={busy}
-            title={option.name}
+            title={option.warning === undefined ? option.name : `${option.name}\n${option.warning}`}
             onClick={() => { respond(option.optionId) }}
           >
             {option.name}
@@ -126,6 +142,7 @@ function PermissionAskCard(props: { acp: AcpStore; permission: PendingPermission
           {acp.label('取消', 'Cancel')}
         </button>
       </div>
+      <PermissionOptionWarnings options={permission.options} />
       {expiry !== undefined && (
         <div className="ntr-permission-expiry">{expiry}</div>
       )}

@@ -4,7 +4,7 @@
  */
 import { formatCommandLine, splitCommandLine } from '../acp-ui.tsx'
 import type { AcpStore } from '../store.ts'
-import type { ActiveTurnView, DetectedAgentInfo } from '../../protocol.ts'
+import { isAntigravityCommand, type ActiveTurnView, type DetectedAgentInfo } from '../../protocol.ts'
 import { AgentDefaultMode } from './agent-default-mode.tsx'
 import type { AgentForm } from './form.ts'
 import type { AgentTestOutcome } from './permission-mirror.tsx'
@@ -240,6 +240,35 @@ export function AgentDetails({
       </div>
 
       {!newCustom && isConfigured && <AgentDefaultMode acp={acp} agentId={detected.id} />}
+
+      <div className="dwa-form-row">
+        <div className="dwa-form-col">
+          <label className="dwa-form-label" htmlFor={`write-text-file-${detected.id}`}>
+            {acp.label('客户端写文件能力（fs.writeTextFile）', 'Client File Write Capability (fs.writeTextFile)')}
+          </label>
+          <select
+            id={`write-text-file-${detected.id}`}
+            className="dwa-input"
+            aria-label={acp.label('客户端写文件能力（fs.writeTextFile）', 'Client File Write Capability (fs.writeTextFile)')}
+            value={form.writeTextFileMode}
+            onChange={e => patch({ writeTextFileMode: e.target.value as typeof form.writeTextFileMode })}
+          >
+            <option value="default">
+              {isAntigravityCommand(parsedCommand)
+                ? acp.label('默认（Antigravity 关闭以保留 diff）', 'Default (disabled for Antigravity to preserve diffs)')
+                : acp.label('默认（开启）', 'Default (enabled)')}
+            </option>
+            <option value="disabled">{acp.label('关闭（由 Agent 内置编辑，保留 unified diff）', 'Disabled (agent edits natively, preserves diff)')}</option>
+            <option value="enabled">{acp.label('开启（允许 Agent 通过客户端写文件）', 'Enabled (allow agent to write via client)')}</option>
+          </select>
+          <span className="dwa-hint">
+            {acp.label(
+              '握手时向 Agent 声明；Antigravity 开启此项可能使其改用整文件覆盖而非 diff。修改后随保存重启生效。',
+              'Advertised on ACP initialize. Enabling this for Antigravity can replace unified diffs with whole-file overwrites. Applies on save/restart.',
+            )}
+          </span>
+        </div>
+      </div>
 
       <div className="dwa-form-row" style={{ flexDirection: 'column', gap: 6 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>

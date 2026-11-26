@@ -229,6 +229,8 @@ export interface PermissionOptionView {
   optionId: string
   name: string
   kind: string
+  /** Optional security notice propagated from `_meta['agy.security.warning']`. */
+  warning?: string
 }
 
 export type PermissionOutcome = { outcome: 'selected'; optionId: string } | { outcome: 'cancelled' }
