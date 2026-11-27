@@ -175,7 +175,52 @@ export function hasUnambiguousModelSelector(configOptions: unknown): boolean {
  * while the observed choices still offer it, and `null` ("the agent's own
  * default") otherwise. Slots the answer does not mention are left alone — a
  * different model may still offer them.
+ *
+ * The thought slot is the one exception to "an observed slot is folded in":
+ * its vocabulary is per-model, so an answer describing another model must NOT
+ * rewrite the agent-level slot (see {@link thoughtShapeIsAgentWide}).
  */
+
+/**
+ * Whether an observed `thought_level` shape describes the model the catalog is
+ * anchored on, and so may be folded into the AGENT-LEVEL thought slot.
+ *
+ * The vocabulary is per-model: CodeBuddy publishes `[high]` for its default
+ * model and `[low, high, max]` for another one, and the answer for the second
+ * still lists every model in the model slot. Folding that answer's levels into
+ * the agent-level slot leaves the catalog hybrid — the model slot keeps naming
+ * the first model while the thought slot offers the second one's levels — and
+ * a route with no model selection of its own reads the agent-level slot
+ * (`reasoningForModel`), so the composer offers `max`. The session's own answer
+ * then refuses it, the pick is dropped as stale, and the turn runs at the
+ * agent's default: the user's pre-first-turn switch silently reverts to `high`,
+ * which is the whole defect.
+ *
+ * The other model's levels are not lost by refusing the fold: the caller
+ * records them per model (`rememberModelThought` → `thoughtByModel`), which is
+ * the only place a per-model vocabulary can be read back from.
+ *
+ * An answer that names NO model cannot be attributed to one, so it stays
+ * agent-wide. That is also what keeps opencode's publish-on-switch shape
+ * working: it offers `effort` just for models with variants and never
+ * re-notifies, so the first such answer is the only one that can put the chip
+ * in the composer at all.
+ */
+function thoughtShapeIsAgentWide(observed: AcpAgentCatalog, mergedModelValue: string | null | undefined): boolean {
+  const observedModel = observed.model?.currentValue
+  // `undefined` = the answer carries no model slot at all; `parseCatalogOptions`
+  // normalises a blank `currentValue` to `null`, and a catalog reloaded from
+  // `model-catalog.json` may hold either. Neither names a model.
+  if (observedModel === undefined || observedModel === null || observedModel === '') return true
+  // No anchor to contradict either: a catalog that carries no model slot — or
+  // one whose previous value this very answer no longer offers — names no
+  // model, so folding the observed levels in cannot leave the hybrid this guard
+  // exists to prevent. Freezing them instead would strand the chip on the
+  // first vocabulary ever seen, which is the opposite failure.
+  if (mergedModelValue === undefined || mergedModelValue === null || mergedModelValue === '') return true
+  return mergedModelValue === observedModel
+}
+
 export function mergeCatalogShape(existing: AcpAgentCatalog | undefined, observed: AcpAgentCatalog): AcpAgentCatalog {
   const out: AcpAgentCatalog = {}
   const merge = (prev: AcpCatalogOption | undefined, next: AcpCatalogOption): AcpCatalogOption => {
@@ -196,6 +241,18 @@ export function mergeCatalogShape(existing: AcpAgentCatalog | undefined, observe
     const next = observed[slot]
     if (next === undefined) {
       if (prev !== undefined) out[slot] = prev
+      continue
+    }
+    // `model` is merged before `thought`, so `out.model` already carries the
+    // merged model value by the time this slot is reached. A thought slot the
+    // catalog does not have yet has nothing to protect — the first observation
+    // of one is what puts the chip in the composer at all — so only an
+    // already-known slot is subject to the per-model guard below.
+    if (slot === 'thought' && prev !== undefined && !thoughtShapeIsAgentWide(observed, out.model?.currentValue)) {
+      // Another model's vocabulary: the agent-level slot stays exactly as it
+      // was. That model's own shape is still recorded per model by
+      // `rememberModelThought`.
+      out[slot] = prev
       continue
     }
     out[slot] = merge(prev, next)

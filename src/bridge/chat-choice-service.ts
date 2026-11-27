@@ -363,6 +363,9 @@ export class ChatChoiceService {
    * knows it (its composer chip is built from the same route), and without it
    * `chatAgentFor` answers undefined before the first session exists, so the
    * pick would be silently dropped.
+   *
+   * A level the starting model cannot run is refused here rather than recorded
+   * and dropped at the first turn — see the pre-flight note inside.
    */
   async setChatSessionEffort(dshSessionId: string, effort: string | undefined, agentId?: string): Promise<void> {
     if (agentId !== undefined) {
@@ -372,6 +375,59 @@ export class ChatChoiceService {
       const lockedTo = this.host.lockedAgentFor(dshSessionId)
       if (lockedTo !== undefined && lockedTo !== agentId) {
         throw new AcpError('agent_locked', `acp: conversation is locked to agent "${lockedTo}" once its first turn has started`)
+      }
+    }
+    // Pre-flight the level against the model this conversation will actually
+    // start on. The composer's menu is built from the catalog, and the
+    // agent-level thought slot can advertise a vocabulary the starting model
+    // never publishes — a stale `model-catalog.json`, or a catalog whose
+    // agent-level slot was promoted by ANOTHER model's answer. Recording such
+    // a level anyway is the reported defect: the first turn runs the agent's
+    // own level, `applyChatChoice` drops the pick with one notice, and the chip
+    // snaps back, so the user's selection never took effect and its only trace
+    // was a log line. A LIVE session is the authority for its own option set
+    // (`alignSessionConfig` drops the level there with a notice — the in-turn
+    // path constraint 27 describes); with none, the catalog's per-model
+    // observation answers, and a model it has NEVER observed is not evidence,
+    // so that case stays fail-open for the send-time gate to judge. A released
+    // row is not a live session either: its pick is re-validated by
+    // `applyChatChoice` on resume.
+    const bound = agentId ?? this.host.chatAgentFor(dshSessionId)
+    if (effort !== undefined && bound !== undefined) {
+      const hasLiveSession = [...this.host.sessions()].some(session =>
+        session.dshSessionId === dshSessionId && session.agentId === bound && lifecycleOf(session) !== 'parked')
+      if (!hasLiveSession) {
+        // The pick as it stands BEFORE this write: its model is the one the
+        // first turn starts on. With no model recorded yet,
+        // `modelReasoning` answers for the catalog's current model instead.
+        // The record names this conversation's model only while it belongs to
+        // the agent being written: a patch naming a DIFFERENT agent resets the
+        // record to a clean base (`patchChatChoice`), so the old modelId is
+        // about to be dropped and says nothing about `bound` — judging the new
+        // agent's per-model observation by it could refuse a level its own
+        // model publishes.
+        const existing = this.picks.get(dshSessionId)
+        const sameAgent = existing === undefined || existing.agentId === bound
+        const { choice } = splitAdapterModelId(sameAgent ? existing?.modelId ?? '' : '')
+        const known = this.host.modelReasoning(bound, choice)
+        // `null` = observed WITHOUT the axis, and an axis published with no
+        // choices is the same verdict; a list that omits the value is that
+        // verdict with evidence attached. `undefined` = never observed, which
+        // is not evidence and stays fail-open above.
+        const unoffered = known !== undefined
+          && (known === null || known.efforts.length === 0 || !known.efforts.some(level => level.id === effort))
+        if (unoffered) {
+          const label = choice ?? 'default'
+          // Thrown, not noticed: the composer's pick surfaces it in the menu
+          // (`flashError` + rethrow, then `setAcpMenuError`), so the refusal is
+          // visible where the selection was made — the same shape
+          // `setChatSessionModel` uses for `model_unavailable`. Nothing is
+          // written: no pick, no session mirror, no notice.
+          const noAxis = known === null || known.efforts.length === 0
+          throw new AcpError('effort_unavailable', noAxis
+            ? `acp: agent "${bound}" publishes no thought levels for model "${label}"; pick another model or follow the agent default`
+            : `acp: agent "${bound}" does not offer thought level "${effort}" for model "${label}"; it offers ${known.efforts.map(level => `"${level.id}"`).join(', ')}`)
+        }
       }
     }
     // Recorded before any session exists (see `setChatSessionModel`); a released

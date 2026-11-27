@@ -288,6 +288,7 @@ const QODER_MODEL_CATEGORY = process.env.MOCK_QODER_MODEL_CATEGORY === '1'
 // Test knob: the mock's `mock-model-plain` (the variant-less model that
 // publishes no thought_level) is also selectable from the model list.
 const PLAIN_MODEL_CHOICE = process.env.MOCK_PLAIN_MODEL_CHOICE === '1'
+const MODEL_THOUGHT_SETS = process.env.MOCK_MODEL_THOUGHT_SETS === '1' // per-model vocabulary: a high, b off/high/max, plain none; rationale + why opt-in: tests/bridge/chat-picks.spec.ts
 // Test knob: publish the mode as a `category: 'mode'` select too (codebuddy /
 // opencode shape), so the agent-level catalog can carry a mode value that a
 // NEW conversation's `session/new` does not start on.
@@ -344,10 +345,9 @@ function mockConfigOptions(state = { temp: 'mid', model: DEFAULT_MODEL, effort: 
       type: 'select',
       category: 'thought_level',
       currentValue: state.effort,
-      options: [
-        { value: 'off', name: 'Off' },
-        { value: 'high', name: 'High' },
-      ],
+      options: MODEL_THOUGHT_SETS
+        ? (state.model === 'mock-model-b' ? [{ value: 'off', name: 'Off' }, { value: 'high', name: 'High' }, { value: 'max', name: 'Max' }] : [{ value: 'high', name: 'High' }])
+        : [{ value: 'off', name: 'Off' }, { value: 'high', name: 'High' }],
     }]),
     {
       configId: 'temp',

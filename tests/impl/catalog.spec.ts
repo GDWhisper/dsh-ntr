@@ -290,6 +290,141 @@ describe('mergeCatalogShape', () => {
     expect(merged.model?.currentValue).toBeNull()
     expect(merged.thought?.configId).toBe('reasoning_effort')
   })
+
+  it('keeps the agent-level thought slot when the answer describes ANOTHER model', () => {
+    // CodeBuddy's real shape (verified against `codebuddy --acp`): the thought
+    // axis' vocabulary is MODEL-dependent — its default `hy4flash-free`
+    // publishes `high` alone while another model publishes off/high/max — and
+    // the answer for the second still lists every model in the model slot.
+    // Folding those levels into the agent-level slot leaves the catalog hybrid
+    // (model slot naming the first model, thought slot offering the second
+    // one's), so a route with no model of its own reads `max` from it, the
+    // session's own answer refuses `max`, and `applyChatChoice` drops the
+    // pre-first-turn pick as stale: the turn runs the agent's own `high` and
+    // the chip snaps back — the reported "I switched to max and it ran high".
+    const existing = {
+      model: modelOption(['mock-model-a', 'mock-model-b'], 'mock-model-a'),
+      thought: { configId: 'thought', name: 'Thought Level', currentValue: 'high', choices: choiceList(['high']) },
+    }
+    const merged = mergeCatalogShape(existing, {
+      model: modelOption(['mock-model-a', 'mock-model-b'], 'mock-model-b'),
+      thought: { configId: 'thought', name: 'Thought Level', currentValue: 'max', choices: choiceList(['off', 'high', 'max']) },
+    })
+    // The narrow vocabulary stays exactly as it was: another model's levels are
+    // not the agent's. They are not lost either — `rememberModelThought` keeps
+    // them per model (`thoughtByModel`), the only place a per-model vocabulary
+    // can be read back from.
+    expect(merged.thought).toEqual(existing.thought)
+    // The MODEL slot is still free to self-correct from this same answer: the
+    // observation's choices are absorbed and the catalog's current value kept.
+    expect(merged.model).toEqual(existing.model)
+  })
+
+  it('promotes the thought slot when the answer names the model the catalog is on', () => {
+    // The guard is per-model, not per-answer: an observation about the model
+    // the catalog is anchored on is agent knowledge like any other slot. Its
+    // `currentValue` is still one session's pick, so the catalog's own value
+    // survives while the choices widen.
+    const existing = {
+      model: modelOption(['mock-model-a', 'mock-model-b'], 'mock-model-a'),
+      thought: { configId: 'thought', name: 'Thought Level', currentValue: 'high', choices: choiceList(['high']) },
+    }
+    const merged = mergeCatalogShape(existing, {
+      model: modelOption(['mock-model-a', 'mock-model-b'], 'mock-model-a'),
+      thought: { configId: 'thought', name: 'Thought Level', currentValue: 'max', choices: choiceList(['off', 'high', 'max']) },
+    })
+    expect(merged.thought?.choices.map(choice => choice.value)).toEqual(['off', 'high', 'max'])
+    expect(merged.thought?.currentValue).toBe('high')
+  })
+
+  it('promotes the thought slot from an answer that names no model at all', () => {
+    // opencode's publish-on-switch: it offers `effort` just for models with
+    // variants and never re-notifies after a client-driven set, so the first
+    // such answer is the ONLY one that can put the chip in the composer at all.
+    // An answer that names no model cannot be attributed to one, so it stays
+    // agent-wide.
+    const existing = {
+      model: modelOption(['a'], 'a'),
+      thought: { configId: 'thought', name: 'Thought Level', currentValue: 'off', choices: choiceList(['off', 'high']) },
+    }
+    const merged = mergeCatalogShape(existing, {
+      thought: { configId: 'effort', name: 'Effort', currentValue: 'high', choices: choiceList(['low', 'high', 'default']) },
+    })
+    expect(merged.thought?.configId).toBe('effort')
+    expect(merged.thought?.choices.map(choice => choice.value)).toEqual(['low', 'high', 'default'])
+    // A model slot the answer does not carry is left alone.
+    expect(merged.model).toEqual(existing.model)
+
+    // A model slot that is present but BLANK names no model either:
+    // `parseCatalogOptions` normalises an empty `currentValue` to `null`, and a
+    // catalog reloaded from `model-catalog.json` can hold one.
+    const blank = mergeCatalogShape(existing, parseCatalogOptions([
+      { configId: 'model', name: 'Model', category: 'model', currentValue: '', options: [{ value: 'a', name: 'A' }] },
+      { configId: 'effort', name: 'Effort', category: 'thought_level', currentValue: 'high', options: [
+        { value: 'low', name: 'Low' },
+        { value: 'high', name: 'High' },
+        { value: 'default', name: 'Default' },
+      ] },
+    ]))
+    expect(blank.thought?.configId).toBe('effort')
+    expect(blank.thought?.choices.map(choice => choice.value)).toEqual(['low', 'high', 'default'])
+    // The blank value is not adopted as the agent's model: the catalog keeps
+    // naming the one it is on.
+    expect(blank.model?.currentValue).toBe('a')
+  })
+
+  it('promotes the FIRST observed thought slot even when it describes another model', () => {
+    // The opencode shape again, from the other side: the agent-level slot
+    // starts out EMPTY because the model the session began on publishes no
+    // thought_level, so the first observation of one is what puts the chip in
+    // the composer at all. There is nothing to protect yet, so the per-model
+    // guard does not apply — blocking it would hide the axis until a session
+    // happened to start on a model that has one.
+    const existing = { model: modelOption(['mock-model-a', 'mock-model-b'], 'mock-model-a') }
+    const merged = mergeCatalogShape(existing, {
+      model: modelOption(['mock-model-a', 'mock-model-b'], 'mock-model-b'),
+      thought: { configId: 'thought', name: 'Thought Level', currentValue: 'max', choices: choiceList(['off', 'high', 'max']) },
+    })
+    expect(merged.thought?.choices.map(choice => choice.value)).toEqual(['off', 'high', 'max'])
+    // Still not the answer's per-session pick.
+    expect(merged.thought?.currentValue).toBeNull()
+  })
+
+  it('folds an observed axis in when the catalog names no model to contradict it', () => {
+    // The guard protects the ANCHOR, not the slot — and what it reads is the
+    // anchor AFTER the merge. With no model slot to merge into, that anchor is
+    // null (`merge` never adopts an observed `currentValue`), so there is
+    // nothing to contradict and the observed axis simply becomes the agent's
+    // knowledge. Freezing the first vocabulary instead would strand the chip
+    // on levels the agent has since moved past — the mirror image of the
+    // defect the guard exists for.
+    const existing = {
+      thought: { configId: 'thought', name: 'Thought Level', currentValue: 'high', choices: choiceList(['off', 'high']) },
+    }
+    const merged = mergeCatalogShape(existing, {
+      model: modelOption(['a'], 'a'),
+      thought: { configId: 'thought', name: 'Thought Level', currentValue: 'max', choices: choiceList(['low', 'high', 'max']) },
+    })
+    expect(merged.thought?.choices.map(choice => choice.value)).toEqual(['low', 'high', 'max'])
+    // The catalog's own value still wins over the answer's per-session pick.
+    expect(merged.thought?.currentValue).toBe('high')
+
+    // Same verdict when the answer drops the model the catalog was anchored on:
+    // the merged model slot carries no value, so nothing is contradicted and the
+    // fresh observation is the most current knowledge there is.
+    const dropped = mergeCatalogShape(
+      {
+        model: modelOption(['a'], 'a'),
+        thought: { configId: 'thought', name: 'Thought Level', currentValue: 'high', choices: choiceList(['off', 'high']) },
+      },
+      {
+        model: modelOption(['b'], 'b'),
+        thought: { configId: 'thought', name: 'Thought Level', currentValue: 'max', choices: choiceList(['low', 'high', 'max']) },
+      },
+    )
+    expect(dropped.thought?.choices.map(choice => choice.value)).toEqual(['low', 'high', 'max'])
+    expect(dropped.model?.currentValue).toBeNull()
+  })
 })
 
 function modelOption(values: string[], currentValue: string | null) {

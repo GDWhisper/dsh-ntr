@@ -833,4 +833,167 @@ describe('pre-chat pick persistence (isolated manager)', () => {
     await gm.shutdownAll()
   }, 30_000)
 
+  /**
+   * The reported defect: "a new NTR conversation shows thought level high, I
+   * switch it to max, and after the first turn it turns out it ran high".
+   *
+   * CodeBuddy's real shape (verified against `codebuddy --acp`): the thought
+   * axis' vocabulary is MODEL-dependent — a fresh `session/new` starts on the
+   * agent's own default model, which publishes a NARROW axis (`high` alone,
+   * `hy4flash-free` in production), while another model publishes a WIDE one
+   * (off/high/max, `deepseek-v4.1-flash`). A live model switch's
+   * `set_config_option` answer used to promote the WIDE vocabulary into the
+   * agent-level catalog slot while the model slot kept naming the default
+   * model, so a model-less route's menu offered `max` to a conversation whose
+   * first turn starts on the narrow model; `applyChatChoice` found it
+   * unoffered and dropped the pick with one notice, the turn ran the agent's
+   * own `high`, and the chip fell back to the catalog default — also `high`.
+   *
+   * The fixed invariant: the agent-level slot only ever describes the model
+   * the catalog is anchored on, so a model-less route never offers a level its
+   * first turn cannot run; the wide axis is recorded per model instead
+   * (`rememberModelThought` → `thoughtByModel`); and a level picked on a route
+   * that NAMES the model publishing it really runs — pick and chip row both
+   * keep it, with no notice. `MOCK_MODEL_THOUGHT_SETS` reproduces the shape
+   * (`mock-model-a`: `high` alone; `mock-model-b`: off/high/max;
+   * `mock-model-plain`: nothing), opt-in so every other test's option set
+   * stays byte-identical.
+   */
+  it('keeps another model\'s thought axis out of the agent-level slot and runs the level the picked model publishes', async () => {
+    const mixHub = new EventHub()
+    const notices: string[] = []
+    const meta: Array<Array<{ configId: string; currentValue: string }>> = []
+    mixHub.subscribe(event => {
+      if (event.type === 'agent/notice') notices.push(event.text)
+      if (event.type !== 'session/meta') return
+      const options = (event.session as unknown as { configOptions?: Array<{ configId: string; currentValue: string }> }).configOptions
+      if (options !== undefined) meta.push(options)
+    })
+    const gm = new BridgeManager(
+      [{ ...def, env: { ...def.env, MOCK_MODEL_THOUGHT_SETS: '1' } }],
+      mixHub,
+      500,
+      `${tmpdir()}/acp-mix-${Date.now()}.json`,
+    )
+    // Conversation A materializes a session (it starts on the DEFAULT model,
+    // whose axis is `high` alone), then switches to the wide model.
+    gm.bindChatAgent('dsh-mix-a', 'mock')
+    for await (const _chunk of gm.streamPrompt({
+      model: 'mock',
+      sessionId: 'dsh-mix-a',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+    } as never)) { /* drain */ }
+    await gm.setChatSessionModel('dsh-mix-a', 'mock@mock-model-b')
+    const catalog = gm.agentCatalog('mock')
+    expect(catalog.currentModel?.value).toBe('mock-model-a')
+    // NOT the mixed state: the agent-level thought slot stays the default
+    // model's narrow axis, so a model-less route cannot offer an unoffered level.
+    expect(catalog.reasoning?.efforts.map(level => level.id)).toEqual(['high'])
+    // The wide axis is recorded per model instead of being promoted.
+    expect(catalog.reasoningByModel?.['mock-model-a']?.efforts.map(level => level.id)).toEqual(['high'])
+    expect(catalog.reasoningByModel?.['mock-model-b']?.efforts.map(level => level.id)).toEqual(['off', 'high', 'max'])
+
+    // Conversation B names the wide model and picks `max` before its first turn.
+    gm.bindChatAgent('dsh-mix-b', 'mock')
+    await gm.setChatSessionModel('dsh-mix-b', 'mock@mock-model-b')
+    await gm.setChatSessionEffort('dsh-mix-b', 'max')
+    expect(gm.chatChoice('dsh-mix-b')).toMatchObject({ modelId: 'mock@mock-model-b', effort: 'max' })
+
+    // The first message materializes the session; `applyChatChoice` applies the record.
+    for await (const _chunk of gm.streamPrompt({
+      model: 'mock',
+      sessionId: 'dsh-mix-b',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+    } as never)) { /* drain */ }
+
+    // The AGENT ran `max`: its own option set names it as the current level.
+    const last = meta.at(-1) ?? []
+    expect(last.find(option => option.configId === 'model')?.currentValue).toBe('mock-model-b')
+    expect(last.find(option => option.configId === 'thought')?.currentValue).toBe('max')
+    // The pick survives in the record, and so does the row the chip reads...
+    expect(gm.chatChoice('dsh-mix-b')?.effort).toBe('max')
+    expect(gm.chatSessions('dsh-mix-b')[0]?.reasoningEffort).toBe('max')
+    // ...and because nothing was dropped there is no notice at all.
+    expect(notices.filter(text => text.includes('no longer offers thought level'))).toHaveLength(0)
+    await gm.shutdownAll()
+  }, 30_000)
+
+  it('refuses a pre-first-turn thought level the target model is known not to publish, and stays fail-open for a model it has never seen', async () => {
+    // The composer's menu is built from the catalog, so every level it offers
+    // must be one the first turn can run; the knob makes the axis per-model.
+    const hub = new EventHub()
+    const notices: string[] = []
+    hub.subscribe(event => { if (event.type === 'agent/notice') notices.push(event.text) })
+    const gm = new BridgeManager(
+      [{ ...def, env: { ...def.env, MOCK_MODEL_THOUGHT_SETS: '1' } }],
+      hub,
+      500,
+      `${tmpdir()}/acp-effort-gate-${Date.now()}.json`,
+    )
+    // Learn the starting model's vocabulary from a REAL session (`session/new`
+    // starts on the default model, whose axis is `high` alone). Nobody switches
+    // to the wide model here, so it stays UNOBSERVED — the fail-open half needs that.
+    gm.bindChatAgent('learn-sets', 'mock')
+    for await (const _chunk of gm.streamPrompt({
+      model: 'mock',
+      sessionId: 'learn-sets',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+    } as never)) { /* drain */ }
+    expect(gm.agentCatalog('mock').reasoningByModel?.['mock-model-a']?.efforts.map(level => level.id)).toEqual(['high'])
+
+    // A conversation with NO ACP session at all — the pre-first-turn window. Its
+    // route names the narrow model, so `max` is refused HERE instead of being
+    // recorded and silently dropped at the first turn.
+    gm.bindChatAgent('gate-known', 'mock')
+    await gm.setChatSessionModel('gate-known', 'mock@mock-model-a')
+    await expect(gm.setChatSessionEffort('gate-known', 'max', 'mock')).rejects.toMatchObject({ code: 'effort_unavailable' })
+    // Nothing was written: the model pick stands, the level is not recorded...
+    expect(gm.chatChoice('gate-known')).toEqual({ agentId: 'mock', modelId: 'mock@mock-model-a' })
+    // ...no session row was created for it...
+    expect(gm.chatSessions('gate-known')).toEqual([])
+    // ...and nothing was announced: a refusal is not news, it is an answer.
+    expect(notices).toEqual([])
+
+    // The same verdict for a route with no model of its own: it resolves to the
+    // model the catalog is anchored on, the narrow one.
+    gm.bindChatAgent('gate-bare', 'mock')
+    await expect(gm.setChatSessionEffort('gate-bare', 'max')).rejects.toMatchObject({ code: 'effort_unavailable' })
+    expect(gm.chatChoice('gate-bare')).toEqual({ agentId: 'mock' })
+
+    // A model the catalog has NEVER observed is not evidence either way, so the level is
+    // recorded and left to the session's own option set to judge. The witness is the WIDE
+    // model nobody has switched to yet: it really publishes `max`, so a guard that refused
+    // on ignorance would block a runnable level.
+    gm.bindChatAgent('gate-open', 'mock')
+    await gm.setChatSessionModel('gate-open', 'mock@mock-model-b')
+    await gm.setChatSessionEffort('gate-open', 'max', 'mock')
+    expect(gm.chatChoice('gate-open')).toMatchObject({ modelId: 'mock@mock-model-b', effort: 'max' })
+    expect(notices).toEqual([])
+    await gm.shutdownAll()
+  }, 30_000)
+
+  it('judges a cross-agent effort write against the agent being written, not the old pick', async () => {
+    // A write can name the agent being switched TO while the record still belongs to the previous one.
+    const gm = new BridgeManager(
+      [{ ...def, id: 'alpha', env: { ...def.env, MOCK_MODEL_THOUGHT_SETS: '1' } },
+        { ...def, id: 'beta', env: { ...def.env, MOCK_MODEL_THOUGHT_SETS: '1' } }],
+      new EventHub(), 500, `${tmpdir()}/acp-cross-${Date.now()}.json`,
+    )
+    // Each agent learns its default model's narrow axis; alpha also switches to the wide one.
+    for (const agentId of ['alpha', 'beta']) {
+      gm.bindChatAgent(`learn-${agentId}`, agentId)
+      for await (const _c of gm.streamPrompt({ model: agentId, sessionId: `learn-${agentId}`, messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] } as never)) { /* drain */ }
+    }
+    await gm.setChatSessionModel('learn-alpha', 'alpha@mock-model-b')
+    gm.bindChatAgent('dsh-cross', 'alpha')
+    await gm.setChatSessionModel('dsh-cross', 'alpha@mock-model-b')
+    // Judged against BETA (whose anchor is the narrow model), not the old pick's wide one: refused, nothing written.
+    await expect(gm.setChatSessionEffort('dsh-cross', 'max', 'beta')).rejects.toMatchObject({ code: 'effort_unavailable' })
+    expect(gm.chatChoice('dsh-cross')).toEqual({ agentId: 'alpha', modelId: 'alpha@mock-model-b' })
+    // A level beta's anchor offers goes through, and the pick resets to the clean base: the new agent, no model.
+    await gm.setChatSessionEffort('dsh-cross', 'high', 'beta')
+    expect(gm.chatChoice('dsh-cross')).toEqual({ agentId: 'beta', effort: 'high' })
+    await gm.shutdownAll()
+  }, 30_000)
+
 })
