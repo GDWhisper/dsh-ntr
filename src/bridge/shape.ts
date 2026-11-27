@@ -1,4 +1,4 @@
-import type { AgentRefusalDetail, ChatSessionForkInfo, SessionView } from '../protocol.ts'
+import type { AcpReleaseCause, AgentRefusalDetail, ChatSessionForkInfo, SessionView } from '../protocol.ts'
 import type { PersistedChatSession } from './types.ts'
 import { codebuddyMetaOf, permissionToolName } from './turn-stream.ts'
 import type { LiveSession } from './turn-stream.ts'
@@ -220,7 +220,12 @@ function snapshot(session: LiveSession): SessionView {
     running: session.running,
     closed: lifecycle === 'closed',
     ...(isSettling(session) ? { settled: true } : {}),
-    ...(lifecycle === 'parked' ? { released: true } : {}),
+    ...(lifecycle === 'parked' ? {
+      released: true,
+      ...(session.releaseCause !== undefined ? { releaseCause: session.releaseCause } : {}),
+      ...(session.releaseReason !== undefined ? { releaseReason: session.releaseReason } : {}),
+      ...(session.releasedAt !== undefined ? { releasedAt: session.releasedAt } : {}),
+    } : {}),
     ...(session.hasHistory === true ? { hasHistory: true } : {}),
     // The agent's own words only: the `at` timestamp is host-side bookkeeping
     // and no browser surface has a use for it.
@@ -258,7 +263,21 @@ function persistedChatSession(session: LiveSession): PersistedChatSession {
     ...(session.usage === undefined ? {} : { usage: session.usage }),
     ...(session.burst === undefined ? {} : { burst: session.burst }),
     ...(session.hasHistory === true || session.transcript.since(0).length > 0 ? { hasHistory: true } : {}),
+    ...(lifecycleOf(session) === 'parked' ? {
+      ...(session.releaseCause === undefined ? {} : { releaseCause: session.releaseCause }),
+      ...(session.releaseReason === undefined ? {} : { releaseReason: session.releaseReason }),
+      ...(session.releasedAt === undefined ? {} : { releasedAt: session.releasedAt }),
+    } : {}),
   }
+}
+
+const RELEASE_CAUSES: ReadonlySet<string> = new Set<AcpReleaseCause>([
+  'idle', 'workspace', 'resume-failed', 'stalled', 'died', 'shutdown', 'archived',
+])
+
+/** Tolerant shape check for a persisted release cause read back from disk. */
+function isPersistedReleaseCause(value: unknown): value is AcpReleaseCause {
+  return typeof value === 'string' && RELEASE_CAUSES.has(value)
 }
 
 /** Tolerant shape check for a `modes` value read back from disk. */
@@ -290,6 +309,7 @@ export {
   forkRowInfo,
   isPersistedBurst,
   isPersistedModes,
+  isPersistedReleaseCause,
   isPersistedUsage,
   persistedChatSession,
   rateLimitedTurnError,

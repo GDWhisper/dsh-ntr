@@ -1044,7 +1044,10 @@ const STYLE = `
 }
 .ntr-released-banner-row { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .ntr-released-banner-text { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.ntr-released-banner-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
 .ntr-released-banner-title { font-weight: 600; }
+.ntr-released-banner-time { font-size: 11px; color: var(--dsw-alias-label-tertiary, #9ca3af); font-variant-numeric: tabular-nums; }
+.ntr-released-banner-reason { color: var(--dsw-alias-label-secondary, #6b7280); font-size: 11.5px; word-break: break-word; }
 .ntr-released-banner-body { color: var(--dsw-alias-label-secondary, #6b7280); }
 .ntr-released-banner .ntr-acp-more { flex: none; white-space: nowrap; }
 /* ---- Rate-limit banner (conversation.input.dock, quota-banner.tsx) ---- */

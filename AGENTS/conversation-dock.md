@@ -31,7 +31,7 @@ agy 的固定选择题与审批同一方法下发，`PermissionDock` 按 `askKin
 
 ### 10.1 释放横幅（`acp-released-banner`，同座）
 
-会话的 agent 进程被释放（空闲回收 / 崩溃）后，`conversation.input.dock` 的第二条目 `ReleasedBanner`（`src/client/released-banner.tsx`）在输入框上方显示一行「进程已释放」+「恢复进程」按钮。释放本身按约束 19 是静默的，而「下一条消息自动恢复」的承诺从聊天面本身无法验证——横幅把它说出来，按钮把它变成一个手势。
+会话的 agent 进程被释放（热重载 / 空闲回收 / 崩溃 / 归档等）后，`conversation.input.dock` 的第二条目 `ReleasedBanner`（`src/client/released-banner.tsx`）在输入框上方显示一行「进程已释放」+ 最后一次释放的 `releaseCause` 徽章 / 释放时间 / `releaseReason` +「恢复进程」按钮。释放本身按约束 19 是静默的，而「下一条消息自动恢复」的承诺从聊天面本身无法验证——横幅把它说出来，按钮把它变成一个手势；释放原因、详情与时间同时随 `ChatSessionView` / `PersistedChatSession` 落盘，并在 SSE `session/released` 与 `ChatRowFrame` 重放里保留，保证热重载或重开页面后仍能一眼区分释放来源。
 
 - **闸门是纯函数** `releasedBannerVisible`（无 DOM 可测）：显式 `acpMode === false` 压过残留行（与挂牌同优先级）；`chatSessionsFor` 必须等于本会话；行集非空且**全部** `released`——有一行活着就说明下一条消息有人接，横幅让路；空集（没跑过 agent）不画。
 - **行集不许倒退**：`src/client/store/chat-sessions.ts` 的 `readChatSessionList` 在读发出前记下 `chatRowFrameSeq`，读回后用 `replayChatRowFrames`（`src/client/store/blocks.ts`）重放在途期间到达的 `session/released` / `session/reset` / `session/created` / `session/closed` 帧。一份恢复前的旧快照否则会盖掉 `session/reset` 的翻转，横幅就挂在一个已经有 live 进程的回合上。重放只改读回行集里已有的行，不追加别的会话的行（新建行由下一次读带回）。`turn/start`、`session/chat-resume`、`resync` 走 `loadChatSessions(..., { force: true })`：复用 `abandonChatSessionRead` 丢掉在途旧读，每轮向宿主拿一次真实行集；并发读者仍由 in-flight 去重合成一次读。

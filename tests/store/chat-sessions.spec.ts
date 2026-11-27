@@ -226,8 +226,14 @@ describe('AcpStore observed ACP transcripts (the ACP view tab)', () => {
     expect(store.getSnapshot().chatSessions[0]).toMatchObject({ sessionId: 'acp-s1' })
     expect(store.getSnapshot().chatSessions[0]?.released).toBeUndefined()
 
-    await apply({ type: 'session/released', sessionId: 'acp-s1', session: view({ released: true }), reason: 'idle release', cause: 'idle' })
-    expect(store.getSnapshot().chatSessions[0]).toMatchObject({ sessionId: 'acp-s1', released: true })
+    await apply({ type: 'session/released', sessionId: 'acp-s1', session: view({ released: true }), reason: 'idle release', cause: 'idle', releasedAt: 1_700_000_000_000 })
+    expect(store.getSnapshot().chatSessions[0]).toMatchObject({
+      sessionId: 'acp-s1',
+      released: true,
+      releaseCause: 'idle',
+      releaseReason: 'idle release',
+      releasedAt: 1_700_000_000_000,
+    })
     // An idle release is expected lifecycle: no runtime-log line, no notice.
     expect(store.getSnapshot().logs).toHaveLength(0)
     expect(store.getSnapshot().notice).toBeUndefined()
@@ -237,6 +243,51 @@ describe('AcpStore observed ACP transcripts (the ACP view tab)', () => {
     // between (a resume must not leave the banner claiming a parked process).
     await apply({ type: 'session/reset', sessionId: 'acp-s1', session: view() })
     expect(store.getSnapshot().chatSessions[0]?.released).toBe(false)
+    expect(store.getSnapshot().chatSessions[0]?.releaseCause).toBeUndefined()
+    expect(store.getSnapshot().chatSessions[0]?.releaseReason).toBeUndefined()
+    expect(store.getSnapshot().chatSessions[0]?.releasedAt).toBeUndefined()
+  })
+
+  it('falls back to Date.now() when releasedAt is missing or invalid, and updates cause on re-release', async () => {
+    let listed = { sessions: [{ agentId: 'pi', sessionId: 'acp-s1', released: true, releaseCause: 'idle', releaseReason: 'idle', releasedAt: 1_000 }] }
+    const store = new AcpStore(async (_channel, endpoint) => {
+      if (endpoint === 'session/chat-list') return { ok: true, value: listed }
+      return { ok: true, value: {} }
+    }, (zh) => zh)
+    const apply = (event: unknown): Promise<void> =>
+      (store as unknown as { applyEvent(event: unknown): Promise<void> }).applyEvent(event)
+
+    await store.loadChatSessions('chat-1')
+    // A second release on an already-released row (e.g. failed resume after idle)
+    // replaces the previous cause/reason/timestamp; invalid releasedAt falls back to Date.now().
+    await apply({
+      type: 'session/released',
+      sessionId: 'acp-s1',
+      session: view({ released: true }),
+      reason: 'resume failed',
+      cause: 'resume-failed',
+      releasedAt: 0,
+    })
+    expect(store.getSnapshot().chatSessions[0]).toMatchObject({
+      sessionId: 'acp-s1',
+      released: true,
+      releaseCause: 'resume-failed',
+      releaseReason: 'resume failed',
+    })
+    expect(store.getSnapshot().chatSessions[0]?.releasedAt).toBeGreaterThan(0)
+
+    // Older host half omitting `cause` and `releasedAt` keeps releaseCause undefined
+    // on the row while still logging the legacy `'died'` fault and stamping releasedAt.
+    await apply({
+      type: 'session/released',
+      sessionId: 'acp-s1',
+      session: view({ released: true }),
+      reason: 'legacy exit',
+    })
+    expect(store.getSnapshot().chatSessions[0]?.releaseCause).toBeUndefined()
+    expect(store.getSnapshot().chatSessions[0]?.releaseReason).toBe('legacy exit')
+    expect(store.getSnapshot().chatSessions[0]?.releasedAt).toBeGreaterThan(0)
+    expect(store.getSnapshot().logs.at(-1)?.level).toBe('error')
   })
 
   it('bounds how many transcripts stay resident', async () => {
@@ -436,12 +487,23 @@ describe('AcpStore chat-row freshness (the released banner follows the host)', (
     const pending = store.loadChatSessions('chat-1')
 
     await apply(store, {
-      type: 'session/released', sessionId: 's1', session: view({ released: true }), reason: 'agent process exited',
+      type: 'session/released',
+      sessionId: 's1',
+      session: view({ released: true }),
+      reason: 'agent process exited',
+      cause: 'died',
+      releasedAt: 1_700_000_001_234,
     })
     held.resolve({ ok: true, value: { sessions: [row()] } })
     await pending
 
-    expect(store.getSnapshot().chatSessions[0]?.released).toBe(true)
+    expect(store.getSnapshot().chatSessions[0]).toMatchObject({
+      sessionId: 's1',
+      released: true,
+      releaseCause: 'died',
+      releaseReason: 'agent process exited',
+      releasedAt: 1_700_000_001_234,
+    })
     expect(releasedBannerVisible(store.getSnapshot(), 'chat-1')).toBe(true)
   })
 
@@ -456,6 +518,32 @@ describe('AcpStore chat-row freshness (the released banner follows the host)', (
 
     expect(store.getSnapshot().chatSessions).toEqual([])
     expect(releasedBannerVisible(store.getSnapshot(), 'chat-1')).toBe(false)
+  })
+
+  it('replays session/reset followed by resume-failed session/released over a stale read', async () => {
+    const held = deferred<Answer>()
+    const { store } = makeStore([held.promise])
+    const pending = store.loadChatSessions('chat-1')
+
+    await apply(store, { type: 'session/reset', sessionId: 's1', session: view() })
+    await apply(store, {
+      type: 'session/released',
+      sessionId: 's1',
+      session: view({ released: true }),
+      reason: 'resume failed',
+      cause: 'resume-failed',
+      releasedAt: 1_700_000_005_000,
+    })
+    held.resolve({ ok: true, value: { sessions: [row(true)] } })
+    await pending
+
+    expect(store.getSnapshot().chatSessions[0]).toMatchObject({
+      sessionId: 's1',
+      released: true,
+      releaseCause: 'resume-failed',
+      releaseReason: 'resume failed',
+      releasedAt: 1_700_000_005_000,
+    })
   })
 
   it('re-reads the row list on every turn start and drops the stale in-flight read', async () => {

@@ -1,4 +1,4 @@
-import type { PermissionTimeoutMode, QuestionTimeoutMode, SessionView, SubagentStatus } from '../protocol.ts'
+import type { AcpReleaseCause, PermissionTimeoutMode, QuestionTimeoutMode, SessionView, SubagentStatus } from '../protocol.ts'
 
 /** What the composer showed for an agent before a conversation picked it. */
 export interface DisplayedChatDefaults {
@@ -390,6 +390,9 @@ export interface PersistedChatSession {
   usage?: SessionView['usage']
   burst?: SessionView['burst']
   hasHistory?: boolean
+  releaseCause?: AcpReleaseCause
+  releaseReason?: string
+  releasedAt?: number
 }
 
 /**

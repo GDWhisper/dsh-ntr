@@ -454,9 +454,20 @@ export class ChatSessionsService {
    * One chat-row lifecycle frame, recorded in arrival order. A bounded log is
    * enough: a `session/chat-list` read only needs the frames since it started.
    */
-  noteChatRowFrame(sessionId: string, kind: ChatRowFrame['kind']): void {
+  noteChatRowFrame(
+    sessionId: string,
+    kind: ChatRowFrame['kind'],
+    details?: Pick<ChatRowFrame, 'cause' | 'reason' | 'releasedAt'>,
+  ): void {
     this.chatRowFrameSeq += 1
-    this.chatRowFrames.push({ seq: this.chatRowFrameSeq, sessionId, kind })
+    this.chatRowFrames.push({
+      seq: this.chatRowFrameSeq,
+      sessionId,
+      kind,
+      ...(details?.cause === undefined ? {} : { cause: details.cause }),
+      ...(details?.reason === undefined ? {} : { reason: details.reason }),
+      ...(details?.releasedAt === undefined ? {} : { releasedAt: details.releasedAt }),
+    })
     if (this.chatRowFrames.length > 256) this.chatRowFrames.shift()
   }
 

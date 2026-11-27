@@ -41,6 +41,8 @@ export type AcpEvent =
     reason: string
     /** Host's release-cause classification; absent on an older host half. */
     cause?: AcpReleaseCause
+    /** Epoch ms when the host parked the session; absent on an older host half. */
+    releasedAt?: number
   }
   | {
     /**

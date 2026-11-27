@@ -30,6 +30,7 @@ import type { LiveSession } from './turn-stream.ts'
 import {
   isPersistedBurst,
   isPersistedModes,
+  isPersistedReleaseCause,
   isPersistedUsage,
 } from './shape.ts'
 import { describeError } from './errors.ts'
@@ -331,8 +332,9 @@ export class PersistenceService {
       if (typeof dshSessionId !== 'string' || dshSessionId === '') continue
       if (typeof cwd !== 'string') continue
       if (!defs.has(agentId)) continue
-      const { title, modelId, reasoningEffort, modes, usage, burst, hasHistory } = record as {
+      const { title, modelId, reasoningEffort, modes, usage, burst, hasHistory, releaseCause, releaseReason, releasedAt } = record as {
         title?: unknown; modelId?: unknown; reasoningEffort?: unknown; modes?: unknown; usage?: unknown; burst?: unknown; hasHistory?: unknown
+        releaseCause?: unknown; releaseReason?: unknown; releasedAt?: unknown
       }
       sessions.push({
         sessionId,
@@ -349,6 +351,9 @@ export class PersistenceService {
         ...(isPersistedUsage(usage) ? { usage } : {}),
         ...(isPersistedBurst(burst) ? { burst } : {}),
         ...(hasHistory === true ? { hasHistory: true } : {}),
+        ...(isPersistedReleaseCause(releaseCause) ? { releaseCause } : {}),
+        ...(typeof releaseReason === 'string' && releaseReason !== '' ? { releaseReason } : {}),
+        ...(typeof releasedAt === 'number' && Number.isFinite(releasedAt) && releasedAt > 0 ? { releasedAt } : {}),
         running: false,
         turnSeq: 0,
         lifecycle: 'parked',

@@ -127,6 +127,12 @@ export interface SessionView {
    * recover") when the agent declares the `loadSession` capability.
    */
   released?: boolean
+  /** Host classification of the last release, when parked. */
+  releaseCause?: AcpReleaseCause
+  /** Host diagnostic reason for the last release, when parked. */
+  releaseReason?: string
+  /** Epoch ms when the session was last released, when parked. */
+  releasedAt?: number
   /**
    * The agent-side session has history while the local buffer is empty: the
    * record was restored from disk after a host restart (the `session/load`

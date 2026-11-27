@@ -663,16 +663,44 @@ describe('host shutdown (isolated managers)', () => {
     // out is exactly how the parked records would vanish from disk. A late call
     // is normal traffic — any RPC that records a composer choice writes again.
     mgr.bindChatAgent('dsh-shutdown-late', 'shutdown')
-    const onDisk = JSON.parse(readFileSync(storage, 'utf-8')) as { chatSessions?: Array<{ dshSessionId?: string }> }
+    const onDisk = JSON.parse(readFileSync(storage, 'utf-8')) as {
+      chatSessions?: Array<{ dshSessionId?: string; releaseCause?: string; releaseReason?: string; releasedAt?: number }>
+    }
     expect(onDisk.chatSessions?.map(row => row.dshSessionId)).toEqual(['dsh-shutdown-1'])
+    expect(onDisk.chatSessions?.[0]).toMatchObject({
+      dshSessionId: 'dsh-shutdown-1',
+      releaseCause: 'shutdown',
+      releaseReason: 'the host is shutting down',
+      releasedAt: expect.any(Number),
+    })
 
     // A fresh manager over the same file IS the restarted host: the record must
     // come back parked (released → the next message resumes it), never closed.
     const restarted = new BridgeManager([{ ...def, id: 'shutdown' }], shutdownHub, 500, storage)
     try {
       expect(restarted.chatSessions('dsh-shutdown-1')).toMatchObject([
-        { sessionId, agentId: 'shutdown', released: true },
+        {
+          sessionId,
+          agentId: 'shutdown',
+          released: true,
+          releaseCause: 'shutdown',
+          releaseReason: 'the host is shutting down',
+          releasedAt: expect.any(Number),
+        },
       ])
+      // Successful resume clears release observability from both live views and disk.
+      await restarted.resumeChatSession('dsh-shutdown-1')
+      const liveRow = restarted.chatSessions('dsh-shutdown-1')[0]
+      expect(liveRow?.released).toBeUndefined()
+      expect(liveRow?.releaseCause).toBeUndefined()
+      expect(liveRow?.releaseReason).toBeUndefined()
+      expect(liveRow?.releasedAt).toBeUndefined()
+      const afterResume = JSON.parse(readFileSync(storage, 'utf-8')) as {
+        chatSessions?: Array<{ dshSessionId?: string; releaseCause?: string; releaseReason?: string; releasedAt?: number }>
+      }
+      expect(afterResume.chatSessions?.[0]?.releaseCause).toBeUndefined()
+      expect(afterResume.chatSessions?.[0]?.releaseReason).toBeUndefined()
+      expect(afterResume.chatSessions?.[0]?.releasedAt).toBeUndefined()
     } finally {
       await restarted.shutdownAll()
       rmSync(stateDir, { recursive: true, force: true })

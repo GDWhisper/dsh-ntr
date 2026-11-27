@@ -4,7 +4,7 @@
  * keep that file inside the size ratchet; the shape is unchanged.
  */
 import type { Transcript } from '../impl.ts'
-import type { AcpDelegatePolicy, SessionView } from '../protocol.ts'
+import type { AcpDelegatePolicy, AcpReleaseCause, SessionView } from '../protocol.ts'
 import type { DrainLedger } from './drain-record.ts'
 import type { BackgroundDispatch, BackgroundReport } from './types.ts'
 import type { TurnStreamController } from './turn-stream.ts'
@@ -69,6 +69,12 @@ export interface LiveSession {
    * against the released-record map at every lifecycle boundary.
    */
   lifecycle: SessionLifecycle
+  /** Host classification of the last release, kept while parked. */
+  releaseCause?: AcpReleaseCause
+  /** Host diagnostic reason for the last release, kept while parked. */
+  releaseReason?: string
+  /** Epoch ms when the session was last released, kept while parked. */
+  releasedAt?: number
   /**
    * The generation of the resume attempt currently allowed to touch this
    * record. A stop can abandon a `session/load` that is still starting up; the

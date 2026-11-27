@@ -18,7 +18,7 @@ import type { AcpLiveToolCall } from "./acp-tool-presentation.ts"
 import { LiveToolCallIndex } from "./store/live-tools.ts"
 import { DEFAULT_KNOWN_PRESETS } from "./store/presets.ts"
 import type { Block } from "./store/blocks.ts"
-import { foldUpdate, usageFromUpdate, withSessionReleased } from "./store/blocks.ts"
+import { foldUpdate, releaseDetailsFromEvent, usageFromUpdate, withSessionReleased, type ReleaseDetails } from "./store/blocks.ts"
 import type { ChatForkOutcome } from "./store/fork.ts"
 import { reduceElicitationEvent } from "./store/elicitation.ts"
 import { removePendingRequest, syncPendingRequests, upsertPendingRequest } from "./store/pending.ts"
@@ -1102,9 +1102,9 @@ export class AcpStore {
    * The log itself lives in `store/chat-sessions.ts` — its only reader is the
    * `session/chat-list` answer this facade hands to that service.
    */
-  private noteChatRowFrame(event: AcpEvent): void {
+  private noteChatRowFrame(event: AcpEvent, release?: ReleaseDetails): void {
     switch (event.type) {
-      case 'session/released': this.chatSessionsService.noteChatRowFrame(event.sessionId, 'released'); break
+      case 'session/released': this.chatSessionsService.noteChatRowFrame(event.sessionId, 'released', release); break
       case 'session/reset': this.chatSessionsService.noteChatRowFrame(event.sessionId, 'reset'); break
       case 'session/created': this.chatSessionsService.noteChatRowFrame(event.sessionId, 'created'); break
       case 'session/closed': this.chatSessionsService.noteChatRowFrame(event.sessionId, 'closed'); break
@@ -1112,7 +1112,8 @@ export class AcpStore {
   }
 
   private applyEvent(event: AcpEvent): Promise<void> {
-    this.noteChatRowFrame(event)
+    const release = event.type === 'session/released' ? releaseDetailsFromEvent(event, Date.now()) : undefined
+    this.noteChatRowFrame(event, release)
     switch (event.type) {
       case 'agent/notice': {
         if (event.agentId === 'hmr') {
@@ -1219,11 +1220,11 @@ export class AcpStore {
         // The composer's own list (`session/chat-list` views) must flip too, or
         // the agent tag's live halo keeps breathing for a process that is gone:
         // nothing else re-reads this list until the next turn settles.
-        const chatSessions = withSessionReleased(this.state.chatSessions, event.sessionId, true)
+        const chatSessions = withSessionReleased(this.state.chatSessions, event.sessionId, true, release)
         // One runtime-log line per release cause; `idle` and `archived` stay
         // silent on purpose (an expected lifecycle transition or the user's own
         // archive gesture, not a fault).
-        const cause = event.cause ?? 'died'
+        const cause = release?.cause ?? 'died'
         let log: Partial<Pick<UiState, 'logs' | 'logUnread'>> = {}
         if (cause === 'workspace') {
           log = this.logService.patch(this.state, 'info', this.locale(
@@ -1567,7 +1568,7 @@ function trimBlocks(blocks: Block[]): void {
 // ---- Pure functions and types moved out of this file (split plan P3a) ----
 // Re-exported so every existing `./store.ts` import keeps resolving unchanged.
 
-export type { Block } from "./store/blocks.ts"
+export type { Block, ReleaseDetails } from "./store/blocks.ts"
 export { STATE_ONLY_UPDATES, describeEvent, foldUpdate, jsonText, replayChatRowFrames, toolDetailsOf, toolInputOf, usageFromUpdate } from "./store/blocks.ts"
 export type { ChatForkOutcome, ChatForkState } from "./store/fork.ts"
 export { forkStateOf } from "./store/fork.ts"

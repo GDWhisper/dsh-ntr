@@ -16,9 +16,16 @@
  * are pure; the `mark*` helpers own the lifecycle transitions and verify the
  * state they start from BEFORE mutating the record.
  */
+import type { AcpReleaseCause } from '../protocol.ts'
 import type { LiveSession } from './live-session.ts'
 
 export type SessionLifecycle = 'live' | 'parked' | 'closed'
+
+export interface SessionReleaseInfo {
+  cause: AcpReleaseCause
+  reason: string
+  at: number
+}
 
 /**
  * The prompt slot + settle gate of the turn on air.
@@ -135,12 +142,24 @@ function assertStartsFrom(session: LiveSession, allowed: readonly SessionLifecyc
 export function markLive(session: LiveSession): void {
   assertStartsFrom(session, ['parked'])
   session.lifecycle = 'live'
+  session.releaseCause = undefined
+  session.releaseReason = undefined
+  session.releasedAt = undefined
 }
 
 /** Park `session` after verifying it was not already closed; register the resumable record. */
-export function markParked(session: LiveSession, released: Map<string, LiveSession>): void {
+export function markParked(
+  session: LiveSession,
+  released: Map<string, LiveSession>,
+  release?: SessionReleaseInfo,
+): void {
   assertStartsFrom(session, ['live', 'parked'])
   session.lifecycle = 'parked'
+  if (release !== undefined) {
+    session.releaseCause = release.cause
+    session.releaseReason = release.reason
+    session.releasedAt = release.at
+  }
   released.set(session.sessionId, session)
 }
 

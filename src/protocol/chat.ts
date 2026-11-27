@@ -8,7 +8,7 @@
  */
 
 import type { SubagentRecord } from '../protocol-subagent.ts'
-import type { SessionView } from './views.ts'
+import type { AcpReleaseCause, SessionView } from './views.ts'
 
 /**
  * One ACP agent session currently backing a DSH chat session, looked up by the
@@ -51,6 +51,12 @@ export interface ChatSessionView {
   burst?: SessionView['burst']
   /** The agent process died; the session awaits a `session/load` resume. */
   released?: boolean
+  /** Host classification of the last release (`session/released`), when parked. */
+  releaseCause?: AcpReleaseCause
+  /** Host diagnostic reason for the last release, when parked. */
+  releaseReason?: string
+  /** Epoch ms when the session was last released, when parked. */
+  releasedAt?: number
   /** The agent is running a turn on this session right now. */
   running?: boolean
   /**

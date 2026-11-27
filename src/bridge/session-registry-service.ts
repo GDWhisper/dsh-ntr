@@ -242,7 +242,12 @@ export class SessionRegistryService {
         ...(session.availableCommands === undefined ? {} : { availableCommands: session.availableCommands }),
         ...(session.usage === undefined ? {} : { usage: session.usage }),
         ...(session.burst === undefined ? {} : { burst: session.burst }),
-        ...(lifecycleOf(session) === 'parked' ? { released: true } : {}),
+        ...(lifecycleOf(session) === 'parked' ? {
+          released: true,
+          ...(session.releaseCause === undefined ? {} : { releaseCause: session.releaseCause }),
+          ...(session.releaseReason === undefined ? {} : { releaseReason: session.releaseReason }),
+          ...(session.releasedAt === undefined ? {} : { releasedAt: session.releasedAt }),
+        } : {}),
         ...(session.running ? { running: true } : {}),
         ...(subagents === undefined || subagents.length === 0 ? {} : { subagents: [...subagents] }),
         ...forkRowInfo(session, this.host.canForkNow(session.agentId)),

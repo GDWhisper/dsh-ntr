@@ -1499,8 +1499,9 @@ export class AgentBridge {
       if (session.resumeAttempt === attempt) {
         this.acpIndex.delete(session.acpSessionId)
         this.sessions.delete(session.sessionId)
-        markParked(session, this.released)
-        this.hub.broadcast({ type: 'session/released', sessionId: session.sessionId, session: snapshot(session), reason: 'resume failed', cause: 'resume-failed' })
+        const releasedAt = Date.now()
+        markParked(session, this.released, { cause: 'resume-failed', reason: 'resume failed', at: releasedAt })
+        this.hub.broadcast({ type: 'session/released', sessionId: session.sessionId, session: snapshot(session), reason: 'resume failed', cause: 'resume-failed', releasedAt })
         this.onSessionsDirty?.()
       }
       throw error
@@ -1543,6 +1544,7 @@ export class AgentBridge {
    */
   private parkSessions(reason: string, cause: AcpReleaseCause): number {
     let parked = 0
+    const releasedAt = Date.now()
     for (const session of [...this.sessions.values()]) {
       // A session already being closed is `closeSession`'s to delete. Parking
       // it would mark it resumable, and `doResumeSession` marks the record live
@@ -1563,9 +1565,9 @@ export class AgentBridge {
       // with it, and a stale ambient would misclassify the NEXT prompt.
       session.activeToolCalls.clear()
       clearAmbientState(session)
-      markParked(session, this.released)
+      markParked(session, this.released, { cause, reason, at: releasedAt })
       this.settlePermissions(session)
-      this.hub.broadcast({ type: 'session/released', sessionId: session.sessionId, session: snapshot(session), reason, cause })
+      this.hub.broadcast({ type: 'session/released', sessionId: session.sessionId, session: snapshot(session), reason, cause, releasedAt })
       parked += 1
     }
     this.sessions.clear()

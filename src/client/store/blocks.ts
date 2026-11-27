@@ -5,7 +5,7 @@
  * re-exports every symbol here, so callers keep importing `./store.ts`.
  */
 
-import type { ChatSessionView, SessionView } from "../../protocol.ts"
+import type { AcpReleaseCause, ChatSessionView, SessionView } from "../../protocol.ts"
 import type { ChatRowFrame } from "./state.ts"
 
 export type Block =
@@ -466,22 +466,90 @@ export function usageFromUpdate(update: Record<string, unknown>): SessionView['u
   return { used, size }
 }
 
+export interface ReleaseDetails {
+  cause?: AcpReleaseCause
+  reason?: string
+  releasedAt?: number
+}
+
+function validPositiveTimestamp(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
+}
+
+/** Extract normalized release observability details from a `session/released` event. */
+export function releaseDetailsFromEvent(
+  event: {
+    cause?: AcpReleaseCause
+    reason?: string
+    releasedAt?: number
+    session?: { releaseCause?: AcpReleaseCause; releaseReason?: string; releasedAt?: number }
+  },
+  fallbackAt: number,
+): ReleaseDetails {
+  const cause = event.cause ?? event.session?.releaseCause
+  const eventReason = typeof event.reason === 'string' ? event.reason.trim() : ''
+  const sessionReason = typeof event.session?.releaseReason === 'string' ? event.session.releaseReason.trim() : ''
+  const rawReason = eventReason !== '' ? eventReason : sessionReason
+  const releasedAt = validPositiveTimestamp(event.releasedAt)
+    ?? validPositiveTimestamp(event.session?.releasedAt)
+    ?? fallbackAt
+  return {
+    ...(cause === undefined ? {} : { cause }),
+    ...(rawReason === '' ? {} : { reason: rawReason }),
+    releasedAt,
+  }
+}
+
 /**
  * Flip one chat row's `released` flag (release/resume bookkeeping). The
  * composer's own list (`session/chat-list` rows) has no other live writer —
- * `session/released` must mark it, `session/reset` must un-mark it, or the
- * agent tag's halo and the released banner read yesterday's process state.
+ * `session/released` must mark it (with cause/reason/timestamp), `session/reset`
+ * must un-mark it, or the agent tag's halo and the released banner read
+ * yesterday's process state.
  */
-export function withSessionReleased<T extends { sessionId: string; released?: boolean }>(
+export function withSessionReleased<T extends {
+  sessionId: string
+  released?: boolean
+  releaseCause?: AcpReleaseCause
+  releaseReason?: string
+  releasedAt?: number
+}>(
   rows: T[],
   sessionId: string,
   released: boolean,
+  details?: ReleaseDetails,
 ): T[] {
   let changed = false
   const next = rows.map(row => {
-    if (row.sessionId !== sessionId || (row.released === true) === released) return row
+    if (row.sessionId !== sessionId) return row
+    if (!released) {
+      if ((row.released === true) === false
+        && row.releaseCause === undefined
+        && row.releaseReason === undefined
+        && row.releasedAt === undefined) return row
+      changed = true
+      const copy = { ...row, released: false }
+      delete copy.releaseCause
+      delete copy.releaseReason
+      delete copy.releasedAt
+      return copy
+    }
+    const nextCause = details === undefined ? row.releaseCause : details.cause
+    const nextReason = details === undefined ? row.releaseReason : details.reason
+    const nextAt = details === undefined ? row.releasedAt : details.releasedAt
+    if (row.released === true
+      && row.releaseCause === nextCause
+      && row.releaseReason === nextReason
+      && row.releasedAt === nextAt) return row
     changed = true
-    return { ...row, released }
+    const copy = { ...row, released: true }
+    if (nextCause === undefined) delete copy.releaseCause
+    else copy.releaseCause = nextCause
+    if (nextReason === undefined) delete copy.releaseReason
+    else copy.releaseReason = nextReason
+    if (nextAt === undefined) delete copy.releasedAt
+    else copy.releasedAt = nextAt
+    return copy
   })
   return changed ? next : rows
 }
@@ -506,9 +574,15 @@ export function replayChatRowFrames(
       case 'closed':
         next = next.filter(row => row.sessionId !== frame.sessionId)
         break
-      case 'released':
-        next = withSessionReleased(next, frame.sessionId, true)
+      case 'released': {
+        const hasDetails = frame.cause !== undefined || frame.reason !== undefined || frame.releasedAt !== undefined
+        next = withSessionReleased(next, frame.sessionId, true, hasDetails ? {
+          ...(frame.cause === undefined ? {} : { cause: frame.cause }),
+          ...(frame.reason === undefined ? {} : { reason: frame.reason }),
+          ...(frame.releasedAt === undefined ? {} : { releasedAt: frame.releasedAt }),
+        } : undefined)
         break
+      }
       case 'reset':
       case 'created':
         next = withSessionReleased(next, frame.sessionId, false)

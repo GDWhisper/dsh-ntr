@@ -4,7 +4,7 @@
  * (split plan P3a), which re-exports it unchanged.
  */
 
-import type { AcpApprovalDeadlines, AcpConversationChoice, AcpDelegateSettings, AcpIdleRelease, AcpPresetStatus, AcpSharedMcpSettings, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSkillEntry, AgentView, ChatSessionView, DetectedAgentInfo, PluginUpdateState, SaveGateStatus, SessionView, SubagentRecord } from "../../protocol.ts"
+import type { AcpApprovalDeadlines, AcpConversationChoice, AcpDelegateSettings, AcpIdleRelease, AcpPresetStatus, AcpReleaseCause, AcpSharedMcpSettings, AcpTagHalo, AgentCatalogResult, AgentProbeModelsResult, AgentSkillEntry, AgentView, ChatSessionView, DetectedAgentInfo, PluginUpdateState, SaveGateStatus, SessionView, SubagentRecord } from "../../protocol.ts"
 import type { Block } from "./blocks.ts"
 import type { PendingElicitation } from "./elicitation.ts"
 import type { PendingPermission } from "./permission.ts"
@@ -26,6 +26,9 @@ export interface ChatRowFrame {
   seq: number
   sessionId: string
   kind: 'released' | 'reset' | 'created' | 'closed'
+  cause?: AcpReleaseCause
+  reason?: string
+  releasedAt?: number
 }
 
 /** The unary RPC face (narrowed `ctx.connection.rpc.call`). */
