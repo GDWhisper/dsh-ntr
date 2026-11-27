@@ -2,6 +2,54 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [0.5.4] - 2026-11-27
+
+这一版把对话里的工具调用画成真实类型的卡片并实时补全，读数改用 agent 上报的真实用量，同时补上子智能体的身份标签与委派轴展示。
+
+### 新增
+
+- **acp**：对话里的工具调用按真实类型渲染成对应卡片（读写文件、终端命令等），并在执行过程中实时补齐参数、输出与 diff。([0610559](https://github.com/GDWhisper/dsh-ntr/commit/0610559), [3185f44](https://github.com/GDWhisper/dsh-ntr/commit/3185f44))
+- **acp**：agent 上报真实 token 用量时，每轮用量与缓存命中率按真实值显示；没有上报时仍按字符估算。([a14bad4](https://github.com/GDWhisper/dsh-ntr/commit/a14bad4))
+- **ui**：子智能体页的每个 agent 新增身份标签（通用 / 代码审查 / 调研三套预设），选预设可带出描述，已写自定义描述时先确认保留还是替换；身份或描述为空时卡片头部给出提示。([88138c0](https://github.com/GDWhisper/dsh-ntr/commit/88138c0), [251b75e](https://github.com/GDWhisper/dsh-ntr/commit/251b75e))
+
+### 改进
+
+- **ui**：子智能体卡片头部为每条委派轴显示实际生效值，留在「默认」也写明继承到的值。([676e31a](https://github.com/GDWhisper/dsh-ntr/commit/676e31a))
+- **acp**：表单提问默认不再定时取消，一直等待提交、跳过或取消，需要时限时仍可在「审批时限」设置。([966d8d8](https://github.com/GDWhisper/dsh-ntr/commit/966d8d8))
+- **acp**：会话释放横幅写明释放原因与时间。([4bc7d49](https://github.com/GDWhisper/dsh-ntr/commit/4bc7d49))
+
+### 修复
+
+- **ui**：子智能体页说明写明由原生 DSH 会话发起委派。([c93e64f](https://github.com/GDWhisper/dsh-ntr/commit/c93e64f))
+- **acp**：tok/s 读数不再因攒批吐字虚高，中文按实际字符加权计算。([a337d39](https://github.com/GDWhisper/dsh-ntr/commit/a337d39))
+- **acp**：首条消息前切换的思考等级不再被丢弃并回退到 agent 默认值。([98c748c](https://github.com/GDWhisper/dsh-ntr/commit/98c748c))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.5.3...v0.5.4
+
+---
+
+This release renders tool calls as their real card types with live enrichment, switches token readings to the usage agents actually report, and adds identity tags and per-axis values to subagents.
+
+### Added
+
+- **acp**: tool calls in the conversation render as their real card types (file edits, terminal commands and so on) and fill in arguments, output and diffs live while they run. ([0610559](https://github.com/GDWhisper/dsh-ntr/commit/0610559), [3185f44](https://github.com/GDWhisper/dsh-ntr/commit/3185f44))
+- **acp**: when an agent reports real token usage, per-turn usage and cache hit rate show the real numbers; agents that report nothing keep the character-based estimate. ([a14bad4](https://github.com/GDWhisper/dsh-ntr/commit/a14bad4))
+- **ui**: every agent on the subagents page gains an identity tag with three presets (general-purpose, code-reviewer, research); picking a preset can fill in the description after confirming when a custom one would be replaced, and the card head warns while identity or description is empty. ([88138c0](https://github.com/GDWhisper/dsh-ntr/commit/88138c0), [251b75e](https://github.com/GDWhisper/dsh-ntr/commit/251b75e))
+
+### Improved
+
+- **ui**: the subagent card head shows each delegation axis's effective value, naming the inherited value when an axis is left on the default. ([676e31a](https://github.com/GDWhisper/dsh-ntr/commit/676e31a))
+- **acp**: form questions no longer expire on a timer by default and wait until submitted, skipped or cancelled; a deadline can still be set under Approval deadlines. ([966d8d8](https://github.com/GDWhisper/dsh-ntr/commit/966d8d8))
+- **acp**: the released-session banner states the release cause and time. ([4bc7d49](https://github.com/GDWhisper/dsh-ntr/commit/4bc7d49))
+
+### Fixed
+
+- **ui**: the subagents page copy states that the native DSH session is what delegates tasks. ([c93e64f](https://github.com/GDWhisper/dsh-ntr/commit/c93e64f))
+- **acp**: tok/s readings no longer spike on batched output, and CJK throughput is counted by actual characters. ([a337d39](https://github.com/GDWhisper/dsh-ntr/commit/a337d39))
+- **acp**: a thought level switched before the first message is no longer dropped and reverted to the agent default. ([98c748c](https://github.com/GDWhisper/dsh-ntr/commit/98c748c))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.5.3...v0.5.4
+
 ## [0.5.3] - 2026-11-26
 
 这一版补齐 Antigravity 的固定选择题、上下文压缩与失败原因呈现，并修掉停止或保存 agent 时丢掉聊天会话的两处缺陷。
