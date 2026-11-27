@@ -503,6 +503,8 @@ function AgentDefaultsRow(props: {
   }, [committedDescription])
 
   const enabled = entry?.enabled !== false
+  const hasIdentity = (entry?.identity?.trim() ?? '') !== ''
+  const hasDescription = (entry?.description?.trim() ?? '') !== ''
   // Override fact + reset only when the config file names an entry that the
   // running value outranks (constraint 33). Reset deletes the override entry.
   const overridden = configuredEntry !== undefined && !delegateEntriesEqual(configuredEntry, entry)
@@ -559,14 +561,17 @@ function AgentDefaultsRow(props: {
                       and the one the caller compares across rows, so it reads
                       before the per-axis values. Same badge as every other
                       value — one style, per the unification above. */}
-                  {entry?.identity !== undefined && (
-                    <span className="dwa-sum-pill is-value">{acp.label(`身份 ${entry.identity}`, `identity ${entry.identity}`)}</span>
+                  {hasIdentity && (
+                    <span className="dwa-sum-pill is-value">{acp.label(`身份 ${entry!.identity}`, `identity ${entry!.identity}`)}</span>
                   )}
                   {axisPills.length === 0
                     ? <span className="dwa-sum-pill">{acp.label('全部跟随进程默认', 'All follow the process')}</span>
                     : axisPills.map(text => <span key={text} className="dwa-sum-pill is-value">{text}</span>)}
-                  {entry?.description !== undefined && (
-                    <span className="dwa-sum-pill">{acp.label('已填描述', 'Description set')}</span>
+                  {!hasIdentity && (
+                    <span className="dwa-sum-pill is-warn">{acp.label('未填身份', 'No identity')}</span>
+                  )}
+                  {!hasDescription && (
+                    <span className="dwa-sum-pill is-warn">{acp.label('未填描述', 'No description')}</span>
                   )}
                 </>
               ) : (

@@ -35,25 +35,25 @@ function presetText(identity: string): string {
 describe('the identity seeding rule', () => {
   it('seeds when there is nothing to destroy', () => {
     // A blank description is the whole point of a preset.
-    expect(identityFillDecision('Code review', undefined, undefined)).toBe('fill')
-    expect(identityFillDecision('Code review', undefined, '   ')).toBe('fill')
+    expect(identityFillDecision('code-reviewer', undefined, undefined)).toBe('fill')
+    expect(identityFillDecision('code-reviewer', undefined, '   ')).toBe('fill')
     // Swapping one preset for another is not losing user work: the text on
     // screen is still the CURRENT identity's own seed.
-    expect(identityFillDecision('Research', 'Code review', presetText('Code review'))).toBe('fill')
+    expect(identityFillDecision('Research', 'code-reviewer', presetText('code-reviewer'))).toBe('fill')
   })
 
   it('asks when the description is the user’s own', () => {
-    expect(identityFillDecision('Research', 'Code review', '只改单文件，别碰测试')).toBe('confirm')
+    expect(identityFillDecision('Research', 'code-reviewer', '只改单文件，别碰测试')).toBe('confirm')
     // Another preset's text under a CUSTOM identity is still user text.
-    expect(identityFillDecision('Code review', '我的标签', presetText('Research'))).toBe('confirm')
+    expect(identityFillDecision('code-reviewer', '我的标签', presetText('Research'))).toBe('confirm')
   })
 
   it('leaves the description alone when there is nothing to seed', () => {
     // A custom tag carries no preset text, and clearing the tag never reaches
     // this rule at all.
-    expect(identityFillDecision('运维值守', 'Code review', '我自己的描述')).toBe('none')
+    expect(identityFillDecision('运维值守', 'code-reviewer', '我自己的描述')).toBe('none')
     // A preset whose own text is empty has nothing to seed either.
-    expect(identityFillDecision('Code review', 'Research', '我自己的描述')).toBe('confirm')
+    expect(identityFillDecision('code-reviewer', 'Research', '我自己的描述')).toBe('confirm')
   })
 })
 
@@ -79,23 +79,23 @@ describe('the identity control', () => {
   it('seeds the description from the preset in ONE write', async () => {
     const { calls } = await mountDefaults({ ...DELEGATE_BASE }, {})
     await category('子智能体')
-    await pickIdentity('Code review')
+    await pickIdentity('code-reviewer')
     await waitFor(() => expect(writes(calls, 'ui/delegate-set')).toHaveLength(1))
     expect(writes(calls, 'ui/delegate-set')[0]).toEqual({
-      agentDefaults: { codebuddy: { identity: 'Code review', description: presetText('Code review') } },
+      agentDefaults: { codebuddy: { identity: 'code-reviewer', description: presetText('code-reviewer') } },
     })
     // The seeded text lands in the description input's own draft, so the user
     // sees what the caller will read.
     await waitFor(() => {
       expect((screen.getByRole('textbox', { name: `描述（写给主智能体看） · ${TITLE}` }) as HTMLInputElement).value)
-        .toBe(presetText('Code review'))
+        .toBe(presetText('code-reviewer'))
     })
   })
 
   it('swaps one preset for another without asking', async () => {
     const { calls } = await mountDefaults({
       ...DELEGATE_BASE,
-      agentDefaults: { codebuddy: { identity: 'Code review', description: presetText('Code review') } },
+      agentDefaults: { codebuddy: { identity: 'code-reviewer', description: presetText('code-reviewer') } },
     }, {})
     await category('子智能体')
     await pickIdentity('Research')
@@ -109,7 +109,7 @@ describe('the identity control', () => {
   it('asks before replacing a description the user wrote, and 不替换 keeps it', async () => {
     const { calls } = await mountDefaults({
       ...DELEGATE_BASE,
-      agentDefaults: { codebuddy: { identity: 'Code review', description: '只改单文件，别碰测试' } },
+      agentDefaults: { codebuddy: { identity: 'code-reviewer', description: '只改单文件，别碰测试' } },
     }, {})
     await category('子智能体')
     await pickIdentity('Research')
@@ -131,7 +131,7 @@ describe('the identity control', () => {
   it('替换 writes the identity and the preset description together', async () => {
     const { calls } = await mountDefaults({
       ...DELEGATE_BASE,
-      agentDefaults: { codebuddy: { identity: 'Code review', description: '只改单文件，别碰测试' } },
+      agentDefaults: { codebuddy: { identity: 'code-reviewer', description: '只改单文件，别碰测试' } },
     }, {})
     await category('子智能体')
     await pickIdentity('Research')
@@ -220,7 +220,7 @@ describe('the identity control', () => {
     // user can see on screen and has not committed.
     const input = screen.getByRole('textbox', { name: `描述（写给主智能体看） · ${TITLE}` }) as HTMLInputElement
     await act(async () => { fireEvent.change(input, { target: { value: '正在写，还没提交' } }) })
-    await pickIdentity('Code review')
+    await pickIdentity('code-reviewer')
     const dialog = screen.getByRole('alertdialog', { name: '替换描述' })
     expect(within(dialog).getByText('正在写，还没提交')).toBeDefined()
     expect(writes(calls, 'ui/delegate-set')).toHaveLength(0)
@@ -232,7 +232,7 @@ describe('the identity control', () => {
       agentDefaults: { codebuddy: { description: '我自己的描述' } },
     }, {})
     await category('子智能体')
-    await pickIdentity('Code review')
+    await pickIdentity('code-reviewer')
     expect(screen.getByRole('alertdialog', { name: '替换描述' })).toBeDefined()
     // Moving off the pick must close the old question: its buttons would
     // otherwise write back an identity the user has already left. (The custom
@@ -246,13 +246,13 @@ describe('the identity control', () => {
     await mountDefaults({
       ...DELEGATE_BASE,
       agentDefaults: { codebuddy: { model: 'deepseek-v3' } },
-      configured: { agentDefaults: { codebuddy: { identity: 'Code review' } } },
+      configured: { agentDefaults: { codebuddy: { identity: 'code-reviewer' } } },
     }, {})
     await category('子智能体')
     // The override fact must name what the config file actually asks for: a row
     // claiming「全部默认」while the file names an identity is a lie (constraint 33).
     await waitFor(() => {
-      expect(screen.getByText(/配置文件要求：/).textContent).toContain('身份 Code review')
+      expect(screen.getByText(/配置文件要求：/).textContent).toContain('身份 code-reviewer')
     })
   })
 })

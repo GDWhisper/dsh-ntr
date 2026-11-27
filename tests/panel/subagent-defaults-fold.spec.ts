@@ -53,7 +53,8 @@ describe('SubagentDefaults — the card head', () => {
       expect(within(pills).getByText('模型 DeepSeek V3').className).toContain('is-value')
       expect(within(pills).getByText('等级 High').className).toContain('is-value')
     })
-    expect(within(pills).getByText('已填描述')).toBeDefined()
+    expect(within(pills).queryByText('未填描述')).toBeNull()
+    expect(within(pills).getByText('未填身份').className).toContain('is-warn')
     // CodeBuddy publishes no mode slot, so no mode pill is invented, and a head
     // that named three values no longer needs the catch-all sentence.
     expect(within(pills).queryByText(/^模式 /)).toBeNull()
@@ -63,11 +64,25 @@ describe('SubagentDefaults — the card head', () => {
     const piPills = pillsOf('pi')
     await waitFor(() => expect(within(piPills).getByText('模型 GPT-5')).toBeDefined())
     expect(within(piPills).getByText('模型 GPT-5').className).toContain('is-value')
+    expect(within(piPills).getByText('未填身份').className).toContain('is-warn')
+    expect(within(piPills).getByText('未填描述').className).toContain('is-warn')
     // pi publishes no thought / mode slot either, so those axes stay silent
     // instead of showing a raw-id pill.
     expect(within(piPills).queryByText(/^等级 /)).toBeNull()
     expect(within(piPills).queryByText(/^模式 /)).toBeNull()
     expect(within(piPills).queryByText('全部跟随进程默认')).toBeNull()
+  })
+
+  it('hides missing-field warning pills once both identity and description are filled', async () => {
+    await mountDefaults({
+      ...DELEGATE_BASE,
+      agentDefaults: { codebuddy: { identity: 'code-reviewer', description: '只改单文件' } },
+    }, { keepFolded: true })
+    await category('子智能体')
+    const pills = pillsOf('codebuddy')
+    expect(within(pills).getByText('身份 code-reviewer').className).toContain('is-value')
+    expect(within(pills).queryByText('未填身份')).toBeNull()
+    expect(within(pills).queryByText('未填描述')).toBeNull()
   })
 
   it('names the identity tag first on the folded head, in the same badge as every axis value', async () => {
@@ -85,6 +100,8 @@ describe('SubagentDefaults — the card head', () => {
       expect(within(pills).getByText('身份 Code review').className).toContain('is-value')
       expect(within(pills).getByText('模型 DeepSeek V3').className).toContain('is-value')
     })
+    expect(within(pills).queryByText('未填身份')).toBeNull()
+    expect(within(pills).getByText('未填描述').className).toContain('is-warn')
     const order = Array.from(pills.querySelectorAll('.dwa-sum-pill')).map(pill => pill.textContent)
     expect(order.indexOf('身份 Code review')).toBeLessThan(order.indexOf('模型 DeepSeek V3'))
   })
@@ -167,7 +184,8 @@ describe('SubagentDefaults — the card head', () => {
     const pills = pillsOf('codebuddy')
     expect(within(pills).getByText('已禁用')).toBeDefined()
     expect(within(pills).queryByText('模型 DeepSeek V3')).toBeNull()
-    expect(within(pills).queryByText('已填描述')).toBeNull()
+    expect(within(pills).queryByText('未填身份')).toBeNull()
+    expect(within(pills).queryByText('未填描述')).toBeNull()
 
     // Re-enable: drops enabled while restoring the preserved summary pills.
     await click(toggle)
@@ -175,7 +193,8 @@ describe('SubagentDefaults — the card head', () => {
       model: 'deepseek-v3', description: '只改单文件',
     }))
     expect(within(pillsOf('codebuddy')).getByText('模型 DeepSeek V3')).toBeDefined()
-    expect(within(pillsOf('codebuddy')).getByText('已填描述')).toBeDefined()
+    expect(within(pillsOf('codebuddy')).getByText('未填身份').className).toContain('is-warn')
+    expect(within(pillsOf('codebuddy')).queryByText('未填描述')).toBeNull()
     expect(calls.some(call => call.endpoint === 'agent/save')).toBe(false)
   })
 })

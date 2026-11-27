@@ -41,12 +41,12 @@ export interface DelegateIdentityPreset {
  */
 export const DELEGATE_IDENTITY_PRESETS: readonly DelegateIdentityPreset[] = [
   {
-    identity: 'General execution',
-    description: 'Self-contained implementation work: single-file edits, tests, command runs for verification. Not design or review.',
+    identity: 'general-purpose',
+    description: 'General-purpose agent for researching complex questions, searching for code, and executing multi-step tasks.',
   },
   {
-    identity: 'Code review',
-    description: 'Read-only review of diffs and implementations; returns a severity-ordered findings list and changes no files.',
+    identity: 'code-reviewer',
+    description: 'Reviews new or modified code for logic bugs, edge cases, security risks, performance issues, and convention deviations, providing severity-ordered feedback. Ideal for pre-commit checks, PR reviews, and refactoring assessments. Accepts diffs, file paths, or code snippets.',
   },
   {
     identity: 'Research',
