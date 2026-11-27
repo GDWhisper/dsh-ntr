@@ -55,6 +55,8 @@ export interface HmrGuardOptions {
   giveUpMs?: number
   /** User-visible notification; the host entry forwards it to the runtime log. */
   notify?: (message: string) => void
+  /** Called once when a previously deferred reload completes or is superseded. */
+  onSettled?: () => void
 }
 
 /** The empty reconciliation `refresh` accepts while the turn is running. */
@@ -107,6 +109,7 @@ export function installHmrReconcileGuard(
 ): HmrGuardHandle {
   const logger = options.logger
   const notify = options.notify
+  const onSettled = options.onSettled
   const warn = (message: string): void => {
     try { logger?.warn(`dsh-ntr: ${message}`) } catch { /* logging must never break install */ }
   }
@@ -186,10 +189,14 @@ export function installHmrReconcileGuard(
   /** The deferred reload ran: forget the wait, its timers and the idle listener. */
   const settle = (): void => {
     if (phase === 'closed') return
+    const wasDeferred = hasDeferredReload()
     phase = 'idle'
     attempts = 0
     clearTimers()
     clearIdleListener()
+    if (wasDeferred) {
+      try { onSettled?.() } catch { /* a notification must never break the guard */ }
+    }
   }
 
   /** One explicit report per wait; a later turn boundary starts a fresh cycle. */

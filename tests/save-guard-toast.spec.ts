@@ -9,6 +9,7 @@
 import { createElement } from 'react'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { AcpStore } from '../src/client/store.ts'
 import { SaveGuardToast, saveGuardToastKind } from '../src/client/save-guard-toast.tsx'
 import type { SaveGateStatus } from '../src/protocol.ts'
 import { createPanelFixture } from './panel-fixture.ts'
@@ -90,9 +91,20 @@ describe('SaveGuardToast banners', () => {
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
-  it('announces the HMR reload delay and auto-hides a success line', async () => {
+  it('announces the HMR reload delay only in a running NTR session at top-right and auto-hides a success line', async () => {
     vi.useFakeTimers()
-    const fixture = await mount()
+    const fixture = createPanelFixture()
+    await fixture.ready
+    let activePanelId: string | null = null
+    const usePanelInfo = <T,>(selector: (info: { activePanelId: string | null }) => T): T => selector({ activePanelId })
+    const scrollEl = document.createElement('div')
+    scrollEl.setAttribute('data-conversation-scroll', '')
+    scrollEl.getBoundingClientRect = () => ({
+      top: 76, left: 260, right: 1000, bottom: 700, width: 740, height: 624, x: 260, y: 76, toJSON: () => ({}),
+    })
+    document.body.append(scrollEl)
+    const view = render(createElement(SaveGuardToast, { acp: fixture.store, usePanelInfo }))
+
     await act(async () => {
       await fixture.applyEvent({
         type: 'agent/notice',
@@ -101,25 +113,61 @@ describe('SaveGuardToast banners', () => {
         text: 'acp: hmr reconcile is still deferred after 60s: the ACP turn has not ended.',
       })
     })
+    // Hidden until viewing a running NTR session.
+    expect(screen.queryByRole('alert')).toBeNull()
+
+    await act(async () => {
+      fixture.store.noteStagedSession({ sessionId: 'dsh-1', isAcp: true })
+      await fixture.applyEvent({
+        type: 'save/status',
+        status: {
+          canSave: false,
+          gateAvailable: true,
+          activeTurns: 1,
+          activeSessions: [{ sessionId: 'acp-1', dshSessionId: 'dsh-1', agentId: 'codebuddy' }],
+          pending: [{ id: 'save-1', label: 'settings:llm-pi-ai', queuedAt: 1 }],
+          timeoutMs: 600_000,
+        },
+      })
+    })
+    const alert = screen.getByRole('alert')
+    expect(alert.textContent).toContain('热重载')
+    const cornerStack = alert.parentElement
+    expect(cornerStack?.className).toBe('ntr-hmr-delay-stack')
+    expect(cornerStack?.style.top).toBe('88px')
+    expect(cornerStack?.style.right).toBe(`${String(Math.round(window.innerWidth - 1000) + 16)}px`)
+
+    // Switching to Settings hides the HMR notice while keeping the global held-save toast.
+    activePanelId = 'settings'
+    view.rerender(createElement(SaveGuardToast, { acp: fixture.store, usePanelInfo }))
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByText('配置已暂存')).toBeDefined()
+    // Pressing Escape on Settings does NOT silently dismiss the hidden HMR banner.
+    fireEvent.keyDown(document, { key: 'Escape' })
+
+    // Switching back to the running NTR session shows it again.
+    activePanelId = null
+    view.rerender(createElement(SaveGuardToast, { acp: fixture.store, usePanelInfo }))
+    expect(screen.getByRole('alert').textContent).toContain('热重载')
+
+    // Switching to a non-NTR session hides it.
+    await act(async () => {
+      fixture.store.noteStagedSession({ sessionId: 'dsh-plain', isAcp: false })
+    })
+    expect(screen.queryByRole('alert')).toBeNull()
+
+    // Back to running NTR session, then turn ends -> immediately hides and success auto-dismisses.
+    await act(async () => {
+      fixture.store.noteStagedSession({ sessionId: 'dsh-1', isAcp: true })
+    })
     expect(screen.getByRole('alert').textContent).toContain('热重载')
 
     await act(async () => {
       await fixture.applyEvent({
         type: 'save/status',
         status: {
-          canSave: false,
-          activeTurns: 1,
-          activeSessions: [{ sessionId: 'acp-1', agentId: 'codebuddy' }],
-          pending: [{ id: 'save-1', label: 'settings:llm-pi-ai', queuedAt: 1 }],
-          timeoutMs: 600_000,
-        },
-      })
-    })
-    await act(async () => {
-      await fixture.applyEvent({
-        type: 'save/status',
-        status: {
           canSave: true,
+          gateAvailable: true,
           activeTurns: 0,
           activeSessions: [],
           pending: [],
@@ -129,9 +177,121 @@ describe('SaveGuardToast banners', () => {
       })
     })
     expect(screen.getByText('保存成功')).toBeDefined()
-    expect(screen.getByRole('alert').textContent).toContain('热重载')
+    expect(screen.queryByRole('alert')).toBeNull()
     await act(async () => { vi.advanceTimersByTime(2500) })
     expect(screen.queryByText('保存成功')).toBeNull()
+    scrollEl.remove()
+  })
+
+  it('hides hmr-delay on idle NTR sessions, keeps it intact on Escape while hidden, and supports chatSessions fallback', async () => {
+    const fixture = createPanelFixture()
+    await fixture.ready
+    let activePanelId: string | null = 'settings'
+    const usePanelInfo = <T,>(selector: (info: { activePanelId: string | null }) => T): T => selector({ activePanelId })
+    const view = render(createElement(SaveGuardToast, { acp: fixture.store, usePanelInfo }))
+
+    await act(async () => {
+      await fixture.applyEvent({
+        type: 'agent/notice',
+        agentId: 'hmr',
+        level: 'info',
+        text: 'acp: hmr reconcile is still deferred after 60s: the ACP turn has not ended.',
+      })
+      await fixture.applyEvent({
+        type: 'save/status',
+        status: {
+          canSave: false,
+          gateAvailable: true,
+          activeTurns: 1,
+          activeSessions: [{ sessionId: 'acp-1', dshSessionId: 'dsh-running', agentId: 'codebuddy' }],
+          pending: [],
+          timeoutMs: 600_000,
+          lastOutcomes: { 'settings:llm-pi-ai': { at: 5, status: 'failed', label: 'settings:llm-pi-ai', message: 'boom' } },
+        },
+      })
+      fixture.store.noteStagedSession({ sessionId: 'dsh-running', isAcp: true })
+    })
+
+    // On Settings: only the global save-failed alert shows; Escape dismisses it, NOT the hidden hmr-delay.
+    expect(screen.getByRole('alert').textContent).toContain('boom')
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByRole('alert')).toBeNull()
+
+    // Switch to conversation on an IDLE NTR session -> still hidden.
+    activePanelId = null
+    await act(async () => {
+      fixture.store.noteStagedSession({ sessionId: 'dsh-idle', isAcp: true })
+    })
+    view.rerender(createElement(SaveGuardToast, { acp: fixture.store, usePanelInfo }))
+    expect(screen.queryByRole('alert')).toBeNull()
+
+    // Switch to the RUNNING NTR session -> hmr-delay survived and now renders; Escape dismisses it.
+    await act(async () => {
+      fixture.store.noteStagedSession({ sessionId: 'dsh-running', isAcp: true })
+    })
+    expect(screen.getByRole('alert').textContent).toContain('热重载')
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('tracks delayed [data-conversation-scroll] mount via ResizeObserver and falls back to chatSessions when gateAvailable is false', async () => {
+    const observed: Element[] = []
+    const originalRO = globalThis.ResizeObserver
+    globalThis.ResizeObserver = class {
+      observe(el: Element) { observed.push(el) }
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver
+    try {
+      const store = new AcpStore(async (_ch, endpoint) => {
+        if (endpoint === 'session/chat-list') {
+          return {
+            ok: true,
+            value: {
+              acpMode: true,
+              sessions: [{
+                sessionId: 'acp-1',
+                agentId: 'codebuddy',
+                acpSessionId: 'acp-1',
+                cwd: '/tmp',
+                running: true,
+                closed: false,
+                seq: 1,
+              }],
+            },
+          }
+        }
+        return { ok: true, value: {} }
+      }, (zh) => zh)
+      await act(async () => {
+        await store.loadChatSessions('dsh-legacy')
+        store.noteStagedSession({ sessionId: 'dsh-legacy', isAcp: true })
+        await (store as unknown as { applyEvent(event: unknown): Promise<void> }).applyEvent({
+          type: 'agent/notice',
+          agentId: 'hmr',
+          level: 'info',
+          text: 'acp: hmr reconcile is still deferred after 60s: the ACP turn has not ended.',
+        })
+      })
+      render(createElement(SaveGuardToast, { acp: store }))
+      expect(screen.getByRole('alert').textContent).toContain('热重载')
+
+      // Mount [data-conversation-scroll] after initial render and flush animation frame.
+      const scrollEl = document.createElement('div')
+      scrollEl.setAttribute('data-conversation-scroll', '')
+      scrollEl.getBoundingClientRect = () => ({
+        top: 80, left: 200, right: 900, bottom: 700, width: 700, height: 620, x: 200, y: 80, toJSON: () => ({}),
+      })
+      document.body.append(scrollEl)
+      await act(async () => {
+        await new Promise(resolve => setTimeout(resolve, 30))
+      })
+      expect(observed).toContain(scrollEl)
+      expect(screen.getByRole('alert').parentElement?.style.top).toBe('92px')
+      scrollEl.remove()
+    } finally {
+      globalThis.ResizeObserver = originalRO
+    }
   })
 
   it('pins the banner stack to the page top, centered', async () => {

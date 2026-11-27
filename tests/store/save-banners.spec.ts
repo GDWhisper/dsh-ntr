@@ -373,7 +373,7 @@ describe('save banners', () => {
     expect(store.getSnapshot().saveBanners).toHaveLength(1)
   })
 
-  it('surfaces the HMR reload delay from agent/notice as an alert banner', async () => {
+  it('surfaces the HMR reload delay from agent/notice as an alert banner and clears on hmr/settled', async () => {
     const store = createStore()
     await emit(store, {
       type: 'agent/notice',
@@ -384,6 +384,9 @@ describe('save banners', () => {
     expect(store.getSnapshot().saveBanners.find(entry => entry.key === 'hmr-delay'))
       .toMatchObject({ source: 'hmr-delay', level: 'error', actions: ['dismiss'] })
     expect(store.getSnapshot().saveBanners[0]?.body).toContain('热重载')
+
+    await emit(store, { type: 'hmr/settled' })
+    expect(store.getSnapshot().saveBanners.find(entry => entry.key === 'hmr-delay')).toBeUndefined()
   })
 
   it('shows an expiry banner and a partial force-flush banner', async () => {

@@ -807,6 +807,13 @@ export class AcpStore {
     this.mutate({ seatDiag: text })
   }
 
+  /** Record the staged main-view conversation and whether it runs ACP mode. */
+  noteStagedSession(staged: { sessionId: string; isAcp: boolean } | undefined): void {
+    const prev = this.state.stagedSession
+    if (prev?.sessionId === staged?.sessionId && prev?.isAcp === staged?.isAcp) return
+    this.mutate({ stagedSession: staged })
+  }
+
   /**
    * Record the permission-seat gate's last decision (`conversation.input.permission`).
    */
@@ -1463,6 +1470,7 @@ export class AcpStore {
         }
         return Promise.resolve()
       }
+      case 'hmr/settled': this.saveBannersService.clearHmrDelayBanner(); return Promise.resolve()
       case 'save/status': {
         const status = normalizeSaveGateStatus(event.status)
         this.mutate({

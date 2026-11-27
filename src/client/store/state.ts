@@ -100,6 +100,8 @@ export interface UiState {
   notice?: string
   /** Page-top save banners; failures stay until dismissed, success auto-hides. */
   saveBanners: SaveBanner[]
+  /** Currently staged main-view conversation and whether it runs ACP mode. */
+  stagedSession?: { sessionId: string; isAcp: boolean }
   /** Agent-side runtime log, append order oldest→newest, capped at {@link LOG_MAX_ENTRIES}. */
   logs: AcpLogEntry[]
   /** Lines appended since the user last opened the log; reset by {@link AcpStore.markLogsRead}. */

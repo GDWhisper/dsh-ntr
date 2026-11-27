@@ -381,4 +381,33 @@ describe('installHmrReconcileGuard', () => {
       vi.useRealTimers()
     }
   })
+
+  it('invokes onSettled only when a deferred reload finishes or is superseded, never on normal idle or dispose', async () => {
+    const { host } = fakeHost()
+    const { gate, state, fireIdle } = fakeGate(false)
+    let settledCount = 0
+    const restore = installHmrReconcileGuard(host, gate, {
+      retryDelayMs: 0,
+      onSettled: () => { settledCount += 1 },
+    })
+
+    // Normal idle reconcile never entered deferred state.
+    await host.reconcileProfile('idle-run')
+    expect(settledCount).toBe(0)
+
+    // Defer while busy, then finish after idle -> fires once.
+    state.active = true
+    await host.reconcileProfile('deferred-run')
+    expect(settledCount).toBe(0)
+    state.active = false
+    fireIdle()
+    await tick()
+    expect(settledCount).toBe(1)
+
+    // Defer again, then dispose before idle -> never fires on teardown.
+    state.active = true
+    await host.reconcileProfile('disposed-run')
+    restore()
+    expect(settledCount).toBe(1)
+  })
 })

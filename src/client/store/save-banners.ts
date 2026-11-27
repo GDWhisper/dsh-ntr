@@ -658,6 +658,12 @@ export class SaveBannersService {
     }
   }
 
+  /** Drop any lingering `hmr-delay` banner once the deferred reload settles. */
+  clearHmrDelayBanner(): void {
+    const next = this.host.state().saveBanners.filter(banner => banner.key !== 'hmr-delay')
+    if (next.length !== this.host.state().saveBanners.length) this.host.mutate({ saveBanners: next })
+  }
+
   /**
    * Add or replace one banner. The key IS the dedupe rule; failure rows are
    * never dropped by count, and only one transient success row is kept.

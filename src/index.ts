@@ -240,6 +240,7 @@ export function apply(ctx: Context, config?: unknown): void {
    * missing / reshaped service simply leaves HMR alone.
    */
   let restoreHmrGuard: (() => void) | undefined
+  let hmrDeferred = false
   const installHmrGuard = (): void => {
     if (restoreHmrGuard !== undefined) return
     const hmr = typeof ctx.get === 'function' ? ctx.get('hmr') : undefined
@@ -251,7 +252,12 @@ export function apply(ctx: Context, config?: unknown): void {
       // report and the never-idle deadline land in the runtime log.
       retryDelayMs: 1_000,
       notify: message => {
+        hmrDeferred = true
         hub.broadcast({ type: 'agent/notice', agentId: 'hmr', level: 'info', text: `acp: ${message}` })
+      },
+      onSettled: () => {
+        hmrDeferred = false
+        hub.broadcast({ type: 'hmr/settled' })
       },
     })
     // A degraded attempt (missing reconcileProfile / runExclusive, a frozen
@@ -267,6 +273,10 @@ export function apply(ctx: Context, config?: unknown): void {
     ctx.inject(['hmr'], () => { installHmrGuard() })
   }
   ctx.effect(() => () => {
+    if (hmrDeferred) {
+      hmrDeferred = false
+      hub.broadcast({ type: 'hmr/settled' })
+    }
     restoreHmrGuard?.()
     restoreHmrGuard = undefined
   }, 'dsh-ntr: hmr hot-reload guard')
@@ -759,6 +769,7 @@ export function apply(ctx: Context, config?: unknown): void {
             for (const frame of [
               ...permissionReplayFrames(manager.pendingPermissionViews()),
               ...elicitationReplayFrames(manager.pendingElicitationViews()),
+              ...(hmrDeferred ? [] : [{ type: 'hmr/settled' } as const]),
             ]) {
               try {
                 controller.enqueue(encoder.encode(formatSse(frame)))

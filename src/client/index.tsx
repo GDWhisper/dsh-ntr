@@ -40,7 +40,7 @@ import {
   PERMISSION_SEAT_KEY,
 } from './model-seat.tsx'
 import type { ModelSeatClaim, SeatSlots } from './model-seat.tsx'
-import { acpModeFromPresetEvent, ACP_PRESET_ID, rowAgentPreset, stagedIsAcpMode, stagedSessionOf } from './acp-ui.tsx'
+import { acpModeFromPresetEvent, ACP_PRESET_ID, rowAgentPreset, stagedIsAcpMode, stagedSessionOf, stagedSessionVerdict } from './acp-ui.tsx'
 import type { AcpChatInjected, AcpHostForkFace, AcpSessionFace, AcpSessionsSnapshot, SessionListSource } from './acp-ui.tsx'
 import { createSlashIsolation, slashAcpVerdict } from './slash-isolation.ts'
 import type { SlashSource } from './slash-isolation.ts'
@@ -901,11 +901,10 @@ export function apply(ctx: Context): void {
       gateRunning = true
       try {
         syncAcpMode()
+        store.noteStagedSession(stagedSessionVerdict(sessionsList()?.getSnapshot(), acpModeVerdict, currentScopeSessionId()))
         store.noteSeatDiag(seatDiag)
         store.notePermissionSeatDiag(permissionSeatDiag)
-      } finally {
-        gateRunning = false
-      }
+      } finally { gateRunning = false }
     }
     attach()
     // The store mutates when `session/chat-list` answers, so the fallback
@@ -945,8 +944,8 @@ export function apply(ctx: Context): void {
       if (permissionClaim !== undefined) { permissionClaim.release(); permissionClaim = undefined }
       if (activityClaim !== undefined) { activityClaim.release(); activityClaim = undefined }
       if (subagentCatalogClaim !== undefined) { subagentCatalogClaim.release(); subagentCatalogClaim = undefined }
-      store.noteSeatDiag('gate disposed')
-      store.notePermissionSeatDiag('gate disposed')
+      store.noteStagedSession(undefined)
+      store.noteSeatDiag('gate disposed'); store.notePermissionSeatDiag('gate disposed')
     }
   }, 'dsh-ntr: ACP mode tracking')
 

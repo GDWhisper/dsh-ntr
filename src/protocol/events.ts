@@ -203,6 +203,11 @@ export type AcpEvent =
    * toast from this frame; the settings page's own save promise is the host
    * half's business.
    */
+  /**
+   * A deferred profile HMR reconciliation settled (succeeded or superseded at
+   * idle). Clears any lingering `hmr-delay` banner in the browser.
+   */
+  | { type: 'hmr/settled' }
   | { type: 'save/status'; status: SaveGateStatus }
   /**
    * One external worker's plugin-owned lifecycle record changed state.

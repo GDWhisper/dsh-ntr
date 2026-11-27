@@ -396,6 +396,19 @@ export function stagedIsAcpMode(
   return acpMode?.(staged.sessionId) === true
 }
 
+/** Staged main-view conversation id + ACP verdict (undefined when absent or subagent). */
+export function stagedSessionVerdict(
+  snapshot: AcpSessionsSnapshot | undefined,
+  acpMode?: (sessionId: string) => boolean | undefined,
+  currentSessionId?: string,
+): { sessionId: string; isAcp: boolean } | undefined {
+  const staged = stagedSessionOf(snapshot, currentSessionId)
+  if (staged === undefined || staged.subagent) return undefined
+  const listed = rowAgentPreset(staged.row)
+  const isAcp = listed !== undefined ? listed === ACP_PRESET_ID : acpMode?.(staged.sessionId) === true
+  return { sessionId: staged.sessionId, isAcp }
+}
+
 /**
  * The ACP-mode verdict a committed `agent-preset/selected` frame carries. The
  * frame is `[sessionId, agentPreset]` and the runtime broadcasts it the moment
@@ -1107,6 +1120,9 @@ const STYLE = `
   pointer-events: auto;
 }
 .ntr-save-guard-toast.is-error { border-left-color: var(--dsw-alias-state-error-primary, #b91c1c); }
+/* Conversation-corner HMR delay notice (shell.overlay anchored to scrollport top-right). */
+.ntr-hmr-delay-stack { max-height: calc(100vh - 32px); overflow-y: auto; overscroll-behavior: contain; }
+.ntr-hmr-delay-stack .ntr-save-guard-toast { max-width: min(340px, calc(100vw - 40px)); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.1); }
 /* Fold control for the failure rows beyond the six shown by default. */
 .ntr-save-guard-fold {
   align-self: center;

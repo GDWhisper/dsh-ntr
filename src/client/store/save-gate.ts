@@ -5,7 +5,7 @@
  * `src/client/store.ts` (split plan P3a), which re-exports it unchanged.
  */
 
-import type { AgentView, DetectedAgentInfo, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView } from "../../protocol.ts"
+import type { AgentView, ChatSessionView, DetectedAgentInfo, SaveGateOutcomeView, SaveGatePendingView, SaveGateStatus, SessionView } from "../../protocol.ts"
 
 /**
  * One page-top save banner. Save failures, expiry, rejection, partial force
@@ -190,4 +190,30 @@ export function saveGateTransitions(
     outcomes.push({ label, outcome, wasPending: wasPending.has(label), isPending: isPending.has(label) })
   }
   return { addedPending, outcomes }
+}
+
+/**
+ * Whether the user is currently viewing a running NTR conversation (not
+ * Settings, not a non-NTR conversation, and not an idle/released NTR
+ * conversation). Drives visibility of the top-right `hmr-delay` banner.
+ */
+export function isViewingRunningNtrSession(
+  state: {
+    stagedSession?: { sessionId: string; isAcp: boolean }
+    saveGate: SaveGateStatus
+    chatSessionsFor?: string
+    chatSessions: readonly ChatSessionView[]
+  },
+  activePanelId?: string | null,
+): boolean {
+  if (activePanelId !== undefined && activePanelId !== null) return false
+  const staged = state.stagedSession
+  if (staged === undefined || !staged.isAcp) return false
+  const activeOnGate = (state.saveGate.activeSessions ?? []).some(
+    view => view.dshSessionId === staged.sessionId,
+  )
+  if (saveGateIsAvailable(state.saveGate)) return activeOnGate
+  if (activeOnGate) return true
+  return state.chatSessionsFor === staged.sessionId
+    && state.chatSessions.some(session => session.running && session.released !== true)
 }
