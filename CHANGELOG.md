@@ -2,6 +2,34 @@
 
 面向用户的版本改动记录，从 0.2.0 起维护。只记每一版留下的确定性净改动；被推翻、回退或只在开发过程中存在过的中间形态不记。条目与 GitHub Release 用同一套话，规则见 [AGENTS.md](./AGENTS.md) 约束 35。
 
+## [0.5.5] - 2026-11-27
+
+这一版把热重载延迟提示收进正在运行的 NTR 会话，并修掉首条消息前选择的思考等级被 agent 配置更新覆盖的问题。
+
+### 改进
+
+- **acp**：热重载被延迟的提示不再占用全局顶部，只在正在运行的 NTR 会话右上角显示，切走会话、回合结束或重载完成后消失。([2c6a67f](https://github.com/GDWhisper/dsh-ntr/commit/2c6a67f))
+
+### 修复
+
+- **acp**：首条消息前选择的思考等级不再被 agent 推送的配置更新覆盖。([bbcd5f5](https://github.com/GDWhisper/dsh-ntr/commit/bbcd5f5))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.5.4...v0.5.5
+
+---
+
+This release keeps the hot-reload delay notice inside actively running NTR conversations and stops agent config updates from overwriting a thought level chosen before the first message.
+
+### Improved
+
+- **acp**: the deferred hot-reload notice no longer occupies the global top of the page and appears only in the top-right corner of a running NTR conversation, clearing when the user switches away, the turn ends or the reload settles. ([2c6a67f](https://github.com/GDWhisper/dsh-ntr/commit/2c6a67f))
+
+### Fixed
+
+- **acp**: a thought level chosen before the first message is no longer overwritten by config updates pushed by the agent. ([bbcd5f5](https://github.com/GDWhisper/dsh-ntr/commit/bbcd5f5))
+
+**Full Changelog**: https://github.com/GDWhisper/dsh-ntr/compare/v0.5.4...v0.5.5
+
 ## [0.5.4] - 2026-11-27
 
 这一版把对话里的工具调用画成真实类型的卡片并实时补全，读数改用 agent 上报的真实用量，同时补上子智能体的身份标签与委派轴展示。
