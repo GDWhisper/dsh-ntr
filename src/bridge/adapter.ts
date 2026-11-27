@@ -50,14 +50,16 @@ export class AcpLlmAdapter implements LlmAdapterLike {
   }
 
   async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<PreparedAdapterCall> {
+    const resolved = await this.resolveModel(provider, model, signal)
+    const preparedDefaultEffort = resolved.reasoning?.defaultEffort ?? null
     return {
-      model: await this.resolveModel(provider, model, signal),
-      stream: (options: GenerateOptions) => this.stream(options),
+      model: resolved,
+      stream: (options: GenerateOptions) => this.stream(options, preparedDefaultEffort),
     }
   }
 
-  stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    const raw = this.manager.streamPrompt(options)
+  stream(options: GenerateOptions, preparedDefaultEffort?: string | null): AsyncIterable<StreamChunk> {
+    const raw = this.manager.streamPrompt(options, preparedDefaultEffort)
     return options.purpose === undefined ? rewriteStreamFileLinks(raw) : raw
   }
 }

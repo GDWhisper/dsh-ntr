@@ -2160,7 +2160,9 @@ export class AgentBridge {
         // Empty answers never overwrite the last known set — see `usableConfigOptions`.
         if (!usableConfigOptions(update.configOptions)) break
         session.configOptions = update.configOptions
-        this.onCatalog?.(this.def.id, session.configOptions)
+        // Pushed per-session update (same as setConfigOption): fold shape only so
+        // one session's pick never overwrites `reasoning.defaultEffort` / `currentModel`.
+        this.onCatalog?.(this.def.id, session.configOptions, true)
         break
       case 'available_commands_update':
         // Spread the whole command, not just name+description: the protocol

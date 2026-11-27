@@ -1232,7 +1232,7 @@ export class BridgeManager {
     return this.boot.reclaimChatPrompt(session, controller, signal)
   }
 
-  async *streamPrompt(options: GenerateOptions): AsyncIterable<StreamChunk> {
+  async *streamPrompt(options: GenerateOptions, preparedDefaultEffort?: string | null): AsyncIterable<StreamChunk> {
     // The plugin's own conversation↔agent mapping decides who serves the turn
     // (see `bindChatAgent`): the driver may arrive here with the previous
     // agent's id (the logged request header replays) or a session that has
@@ -1463,6 +1463,8 @@ export class BridgeManager {
       return
     }
 
+    // Capture BEFORE `getOrCreateDshSession`: boot/resume/`config_option_update` can move `modelDefaultEffort`.
+    const defaultEffortAtStart = preparedDefaultEffort === undefined ? this.choices.modelDefaultEffort(agentId) : (preparedDefaultEffort ?? undefined)
     let session: LiveSession
     // Same key `getOrCreateDshSession` looks up: a session the watchdog left
     // orphaned must be reclaimed BEFORE the acquisition, so this message cannot
@@ -1620,9 +1622,7 @@ export class BridgeManager {
     // An adapter-DEFAULTED effort is not a choice (see `modelDefaultEffort`):
     // recording or re-applying one would revert the seat's own pick.
     const requestedEffort = options.reasoningEffort
-    const turnEffort = requestedEffort !== undefined && requestedEffort === this.choices.modelDefaultEffort(agentId)
-      ? undefined
-      : requestedEffort
+    const turnEffort = requestedEffort !== undefined && requestedEffort === defaultEffortAtStart ? undefined : requestedEffort
     const aligned = await this.choices.alignSessionConfig(session, choice, turnEffort)
     // The config may have changed between the pre-flight check and this
     // alignment (a `config_option_update` landed in that window). Same rule:
