@@ -91,8 +91,24 @@ export async function settleTranscript(manager: BridgeManager, sessionId: string
   }
 }
 
-/** Poll a condition with a deadline: process death has no event we can await. */
-export async function until(condition: () => boolean, timeoutMs = 10_000): Promise<void> {
+/**
+ * Poll a condition with a deadline: process death has no event we can await.
+ *
+ * The default is 20 s, and that number is measured rather than guessed. In a
+ * full-suite run the liveness probe behind `killTestProcessTree` — the exact
+ * call that reddened the gate with `condition never became true` — took 6.46 s
+ * of its 10 s budget, and the same Windows tree-reap in `reliability.spec.ts`
+ * ("killProcessTree reaps the agent behind the cmd.exe wrapper") took 7.6 s:
+ * taskkill's own spawn and the OS reaping the child both queue behind the
+ * bridge fork's process churn and the unit bucket's threads. 10 s is not a
+ * budget for that, it is a coin flip. The call sites that already carried a
+ * bound chose 15 s or 20 s for this reason; the default now agrees with them.
+ *
+ * The budget only ever matters when a condition is slow — a fast one returns
+ * on its first poll — and no spec asserts that a condition FAILS to arrive, so
+ * this widens the wait, never the claim.
+ */
+export async function until(condition: () => boolean, timeoutMs = 20_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (!condition()) {
     if (Date.now() > deadline) throw new Error('condition never became true')

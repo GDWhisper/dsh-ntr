@@ -77,7 +77,11 @@ describe('Antigravity subagent transcript polling', () => {
     const created = pollHarness(options)
     cleanups.push(async () => {
       await created.manager.shutdownAll()
-      rmSync(created.workspace, { recursive: true, force: true })
+      // Windows keeps the killed agent's transcript handles open for a moment,
+      // and `force` only ignores a missing path — so the delete races EPERM
+      // until the OS releases them. Retry, as `bridge.spec.ts` does for the
+      // same observation; a temp dir that outlives the run is not a failure.
+      rmSync(created.workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
     })
     return created
   }
