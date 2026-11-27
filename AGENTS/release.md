@@ -48,7 +48,7 @@ git log --format='%h %an <%ae> %s' "${PREV}"..HEAD
 
 ### 1. 提交代码
 
-Conventional Commits，英文；正文写动机与影响，不写「某年某月修过什么」。
+确认日常开发提交已按 [AGENTS.md](../AGENTS.md) 中的「Git 提交」规则完成。
 
 ### 2. bump 版本
 

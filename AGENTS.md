@@ -18,6 +18,11 @@
 - 只重建浏览器 Bundle：`npx tsdown`
 - 挂到本地 DSH：`dsh plugin --profile web add ./`
 
+## Git 提交
+
+- **格式与边界**：英文 Conventional Commits（`feat(acp):` / `fix(update):` / `chore(release):` / `docs(release):`；纯改本文件或 `AGENTS/` 下文档用 `docs(agents):`），正文写面向用户的动机与影响，不写「某年某月修过什么」；**严禁**写 AI 工具署名（`Co-Authored-By` / `Generated with` 等，`.githooks/commit-msg` 会拦截）；**严禁**日常提交改写 `CHANGELOG.md`（仅发版时由提交区间生成）；动了 `AGENTS/` 描述的代码同提交改对应文档；`lib/` 是构建产物，不提交，只暂存本任务文件。
+- **通过验收即可自行提交**：代码改动通过 `npm run verify`、独立上下文审核通过、审核提出的必修项已修（修复类改动附变异验证），且只暂存本任务文件时，直接提交，不再逐次征求用户同意；缺任一条就停在「已修复待确认」。纯文档改动以行数门禁与 diff 自查代替 verify。前缀按上一条判定。
+
 ## 硬约束（摘要）
 
 > 40 条编号全部有效；每条是规则摘要，细节与「为什么」在箭头指向的文档。
@@ -83,7 +88,7 @@
 
 ### 发版、用量与内置更新（35、36、37）
 
-35. **CHANGELOG 只记确定性的净改动，严禁日常提交修改**：日常任务只在 Commit 正文写明面向用户的动机与影响，严禁改写 `CHANGELOG.md`；CHANGELOG 统一在发版时由发版流程提取提交区间，同一功能或 bug 的多次微调合并为一条净改动（去噪、避免流水账），挂引入它的核心提交链接；与 GitHub release note 同一套话（中英双版、中文在前、`---` 分隔），只写最终可见行为，不写旧行为对照与中间形态；区间含外部贡献者时在两版变更分区后、`Full Changelog` 前附贡献者栏目，无则不展示。→ [release.md](./AGENTS/release.md)
+35. **CHANGELOG 只记确定性的净改动（发版时统一生成）**：发版流程提取提交区间，同一功能或 bug 的多次微调合并为一条净改动（去噪、避免流水账），挂引入它的核心提交链接；与 GitHub release note 同一套话（中英双版、中文在前、`---` 分隔），只写最终可见行为，不写旧行为对照与中间形态；区间含外部贡献者时在两版变更分区后、`Full Changelog` 前附贡献者栏目，无则不展示。→ [release.md](./AGENTS/release.md)
 36. **`usage_update` 是上下文占用，不是请求 token**：`used` / `size` 只写 `session.usage`（ACP 视图与 composer 占用环的 `used/size`，实时落点见 [ui.md §4.1](./AGENTS/ui.md)）；原生聊天流的 `usage` 块只能是按段估算的输出 token（正文 + 思考字符 ÷4，`inputTokens: 0`），**严禁**把 `size` / `used` 映射成 input/output（宿主的原生 ContextMeter 也不吃这条数据）；缓存命中率无数据源，工具参数不计入估算；插件 burst tok/s（`turn/metrics` / `session.burst`）只供同 id `activity` 影子显示，**严禁**回写 `usage` 或另开第二处读数。**成本帧不是读数**：`size <= 0` 的 `usage_update`（CodeBuddy 后台 team member 的 `used: 0, size: 0` + cost）只并 `cost`、保留上次 `used/size`（`src/usage.ts` · `mergeUsageSample`），浏览器 `usageFromUpdate` 与 `isPersistedUsage` 同样拒收——否则占用环会在等待后台子智能体期间消失，并把 0/0 落盘。→ [protocol.md §8](./AGENTS/protocol.md)
 37. **内置更新只转述宿主的安装，绝不自己下载 / 替换 / 重启**：`plugin/update-check` 与 `plugin/update-apply`（只收精确且高于运行版本的 `x.y.z`）都回 `PluginUpdateState`，实现是 `src/update.ts` 的 `UpdateService`；check / apply 的数据源只有 `ctx.get('pluginManager')` 的 `listBundles()` / `registries()` 与直接 GET packument；安装与回滚只调 `installBundle('dsh-ntr@<version>', { enabled: true, registry? })`（HMR 下按宿主原生更新语义先 `removeBundle` 再重试，失败先 remove 再回滚）——**不是自替换**：文件操作全由 pluginManager 完成，且必须由人点击触发。
     资格**正向判定 registry spec**：按最后一个 `@` 拆开、只判 spec 半边；裸 `x.y.z` / 范围 / `*`·`x` / dist-tag 才可更新，含 `:` / `/` / `\` 或以 `.` 开头一律 `source-install` 永不升级；无 pluginManager / 缺方法 / 旧宿主不报 `source` → `unsupported`；`readOnlyReason` 或 `removable === false` → `managed`；磁盘版本经 `compareVersions` ≠ 运行版本 → `restart-required`（不冒充 latest）。
@@ -134,11 +139,6 @@
 | [release.md](./AGENTS/release.md) | 发版：更新 CHANGELOG、bump 版本、打 tag、npm 发布、写 GitHub release note | 发布流程、版本规则或 CHANGELOG 口径变化 |
 
 历史推导与实测日志：[acp-convergence.md](./docs/acp-convergence.md)、[acp-mode.md](./docs/acp-mode.md)、[acp-permission-and-sandbox.md](./docs/acp-permission-and-sandbox.md)。待办：[docs/todo.md](./docs/todo.md)（本仓唯一待办清单）。宿主机制见 [dsh-plugin-development-guide.md](./docs/dsh-plugin-development-guide.md)；依赖版本看 `package.json`，TS 选项看 `tsconfig.json`，ACP 规范查 `node_modules/@agentclientprotocol/sdk` 的类型定义。文档不记「某年某月修过什么」——版本净改动进 `CHANGELOG.md`（约束 35），推导进上述收敛记录；JSX / CSS 细节直接看实现文件。
-
-## Git 提交
-
-Conventional Commits，英文，正文写动机与影响：`feat(acp):` / `fix(update):` / `chore(release):` / `docs(release):`；改本文件或 `AGENTS/` 下任何文档的提交统一用 `docs(agents):` 前缀；`lib/` 是构建产物，不提交。
-- **通过验收即可自行提交**：代码改动通过 `npm run verify`、独立上下文审核通过、审核提出的必修项已修（修复类改动附变异验证），且只暂存本任务文件时，直接提交，不再逐次征求用户同意；缺任一条就停在「已修复待确认」。纯文档改动以行数门禁与 diff 自查代替 verify。前缀按上一条判定。
 
 ## 文档维护纪律
 
