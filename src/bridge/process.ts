@@ -1,18 +1,24 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { homedir } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { basename, delimiter, dirname, join } from 'node:path'
 import { accessSync, constants, existsSync, realpathSync } from 'node:fs'
 
 import { AcpError, quoteCommandToken } from '../impl.ts'
 import type { AcpAgentDef, DetectedAgentInfo } from '../protocol.ts'
 import { AGENT_PRESETS } from './state-paths.ts'
 
+function executableLaunchPath(candidate: string): string {
+  if (process.platform === 'win32') return realpathSync(candidate)
+  // Anchor the directory before spawn changes cwd. Multicall programs dispatch on the link name.
+  return join(realpathSync.native(dirname(candidate)), basename(candidate))
+}
+
 export function findExecutable(command: string): string | undefined {
   if (command.includes('/') || command.includes('\\')) {
     if (existsSync(command)) {
       try {
         accessSync(command, constants.X_OK)
-        return realpathSync(command)
+        return executableLaunchPath(command)
       } catch {
         return undefined
       }
@@ -39,7 +45,7 @@ export function findExecutable(command: string): string | undefined {
       if (existsSync(candidate)) {
         try {
           accessSync(candidate, constants.X_OK)
-          return realpathSync(candidate)
+          return executableLaunchPath(candidate)
         } catch {
           // Continue searching
         }

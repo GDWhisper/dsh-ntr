@@ -202,7 +202,7 @@ coordinator 用 `Agent` 工具派发 detached worker、说「已派…」，随�
 
 **语义**：`AcpAgentDef.command` 是**一整条命令行**，不是裸程序名。`codebuddy --acp` 整条粘进设置页唯一的「启动命令」框是正确用法。
 
-- 解析只走 `validateAgentDef` → `splitCommandLine`（`src/impl.ts`）：引号感知，首 token 为程序，其余**前置**并入 `args`。
+- 解析只走 `validateAgentDef` → `splitCommandLine`（`src/impl.ts`）：引号感知，首 token 为程序，其余**前置**并入 `args`。POSIX 上 `findExecutable` 固定宿主找到的目录，保留可执行文件的符号链接名。Vite+ 的 `npx` 等程序靠这个名字选择命令。
 - `validateAgentDef` 返回的 `command` 是**裸路径**（spawn 要的就是不带引号的它）。折叠的幂等只对**不含空白**的 command 成立；`C:\Program Files\a.exe` 被原样重校验时会在空格处再切一刀。
 - `loadPersistedAgents` 每次启动重校验，靠 `quoteLegacyCommand` 补差：先把 command token 重新引号化再重校验，且只在该路径盘上存在时这么做。**严禁**给持久化的 `command` 加引号来「修」它——会弄坏两条 spawn 路径。
 - **严禁**回到「命令 / 参数」两框语义：`command: 'codebuddy --acp'` 曾被当成文件名，spawn ENOENT → SDK 报 `ACP connection closed`，与真实原因毫不像。
